@@ -1,0 +1,15 @@
+{
+  "name": "sparkle",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.7.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev:desktop": "pnpm --filter @sparkle/desktop dev",
+    "build:desktop": "pnpm --filter @sparkle/desktop build",
+    "tauri": "pnpm --filter @sparkle/desktop tauri",
+    "tauri:dev": "pnpm --filter @sparkle/desktop tauri dev"
+  }
+}
