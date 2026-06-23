@@ -2,8 +2,7 @@
 //! in a pseudo-terminal on THEIR machine under THEIR login. Sparkle is a
 //! terminal-emulator UI on top — it never reads or stores the auth token; the genuine
 //! `claude` binary authenticates itself, exactly as in any terminal/IDE. This is the
-//! ToS-compliant way to let people use their Claude Max subscription (see bead
-//! ): local, real binary, no token extraction.
+//! ToS-compliant way to let people use their Claude Max subscription: local, real binary, no token extraction.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
