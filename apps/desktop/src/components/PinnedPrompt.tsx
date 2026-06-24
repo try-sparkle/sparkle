@@ -1,4 +1,4 @@
-import { C, FONT_WEIGHT } from "@sparkle/ui";
+import { C, FONT_WEIGHT } from "../theme/colors";
 
 /**
  * Always-visible header showing the agent's most recent prompt (spec §7) — so you

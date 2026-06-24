@@ -1,9 +1,10 @@
 import { useMemo, useState } from "react";
-import { C, FONT_WEIGHT } from "@sparkle/ui";
+import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { moveProjectFolder } from "../services/worktree";
+import { resolveDefaultBranch } from "../services/branchStatus";
 import { killPty } from "../pty";
 import { pickProjectFolder } from "../services/dialog";
 
@@ -20,9 +21,11 @@ function dirname(p: string): string {
  */
 export function ProjectModal({ project, onClose }: { project: Project; onClose: () => void }) {
   const relocateProject = useProjectStore((s) => s.relocateProject);
+  const setDefaultBranch = useProjectStore((s) => s.setDefaultBranch);
   const closeAgent = useRuntimeStore((s) => s.close);
   const [name, setName] = useState(project.name);
   const [parent, setParent] = useState(dirname(project.rootPath));
+  const [branch, setBranch] = useState(project.defaultBranch ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -42,20 +45,26 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
   };
 
   const save = async () => {
-    if (!changed) {
-      onClose();
-      return;
-    }
     setBusy(true);
     setError("");
     try {
-      // Stop the project's agents (best effort) so no orphaned Claude keeps writing to the
-      // old location. On macOS std::fs::rename moves the directory even while file handles
-      // are open, so the move itself doesn't depend on this — no fixed delay needed.
-      await Promise.all(project.agents.map((a) => killPty(a.id).catch(() => {})));
-      for (const a of project.agents) closeAgent(a.id);
-      await moveProjectFolder(project.rootPath, newRootPath);
-      relocateProject(project.id, name, newRootPath);
+      // Persist the integration branch: a typed value wins; cleared → re-auto-detect.
+      const trimmed = branch.trim();
+      if (trimmed) {
+        setDefaultBranch(project.id, trimmed);
+      } else if (project.defaultBranch) {
+        setDefaultBranch(project.id, await resolveDefaultBranch(project.rootPath));
+      }
+
+      if (changed) {
+        // Stop the project's agents (best effort) so no orphaned Claude keeps writing to the
+        // old location. On macOS std::fs::rename moves the directory even while file handles
+        // are open, so the move itself doesn't depend on this — no fixed delay needed.
+        await Promise.all(project.agents.map((a) => killPty(a.id).catch(() => {})));
+        for (const a of project.agents) closeAgent(a.id);
+        await moveProjectFolder(project.rootPath, newRootPath);
+        relocateProject(project.id, name, newRootPath);
+      }
       onClose();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -161,6 +170,30 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
               Name can't contain “/”, “\”, or be “.”/“..”.
             </span>
           )}
+        </div>
+
+        <label style={{ display: "block", color: C.muted, fontSize: 12, marginBottom: 6 }}>
+          Integration branch
+        </label>
+        <input
+          value={branch}
+          onChange={(e) => setBranch(e.target.value)}
+          placeholder="auto-detected (main)"
+          style={{
+            width: "100%",
+            background: C.forest,
+            color: C.cream,
+            border: `1px solid ${C.muted}`,
+            borderRadius: 8,
+            padding: "9px 11px",
+            fontSize: 14,
+            outline: "none",
+            marginBottom: 6,
+            boxSizing: "border-box",
+          }}
+        />
+        <div style={{ color: C.muted, fontSize: 12, marginBottom: 18 }}>
+          New agents are branched from this. Leave blank to auto-detect.
         </div>
 
         {error && (

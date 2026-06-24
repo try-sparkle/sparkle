@@ -1,12 +1,15 @@
-import { useState } from "react";
-import { C, FONT_WEIGHT } from "@sparkle/ui";
+import { useEffect, useState } from "react";
+import { C, FONT_WEIGHT } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useUiStore } from "../stores/uiStore";
 import { AgentSidebar } from "./AgentSidebar";
 import { TopBar } from "./TopBar";
 import { AgentPane } from "./AgentPane";
+import { SparkleAgentPane } from "./SparkleAgentPane";
 import { ProjectModal } from "./ProjectModal";
+import { SPARKLE_AGENT_ID } from "../services/sparkleAgent";
 
 /** Top-level layout (revised): agents in the left column, the project in the top bar, and
  * the active agent's pane filling the rest. Open agents stay mounted (sessions survive
@@ -16,7 +19,47 @@ export function Workspace() {
   const selectedProjectId = useProjectStore((s) => s.selectedProjectId);
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
   const open = useRuntimeStore((s) => s.open);
+  const reconcile = useRuntimeStore((s) => s.reconcile);
+  const activeSpecial = useUiStore((s) => s.activeSpecial);
   const [settingsProject, setSettingsProject] = useState<Project | null>(null);
+  const zoomIn = useUiStore((s) => s.zoomIn);
+  const zoomOut = useUiStore((s) => s.zoomOut);
+  const resetZoom = useUiStore((s) => s.resetZoom);
+
+  // On boot, drop any persisted open-agent ids whose agent no longer exists (e.g. deleted
+  // between launches) so a resumed session can't reference a vanished agent (bead ).
+  // projectStore hydrates synchronously from localStorage, so the first commit has the full set.
+  useEffect(() => {
+    const validIds = projects.flatMap((p) => p.agents.map((a) => a.id));
+    // The Sparkle agent is app-owned (never in a project's `agents`), so whitelist its id or
+    // reconcile would drop it from the persisted open set on every boot.
+    reconcile([...validIds, SPARKLE_AGENT_ID]);
+    // If the Sparkle view was active at last quit, re-mount its pane so it resumes.
+    if (useUiStore.getState().activeSpecial === "sparkle") open(SPARKLE_AGENT_ID);
+    // Run once on mount; the persisted open set is reconciled against the hydrated projects.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Cmd +/- to resize the terminal text, Cmd 0 to reset (matches browser/editor
+  // conventions). The size factor is applied to the terminal font only — see Terminal.tsx —
+  // so the surrounding UI chrome (sidebar, top bar, buttons) stays fixed.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.metaKey) return;
+      if (e.key === "=" || e.key === "+") {
+        e.preventDefault();
+        zoomIn();
+      } else if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        zoomOut();
+      } else if (e.key === "0") {
+        e.preventDefault();
+        resetZoom();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [zoomIn, zoomOut, resetZoom]);
 
   const project = projects.find((p) => p.id === selectedProjectId) ?? null;
   const activeAgentId = project?.selectedAgentId ?? null;
@@ -28,6 +71,10 @@ export function Workspace() {
     }
   }
   const activeIsOpen = activeAgentId !== null && openAgentIds.includes(activeAgentId);
+  // The Sparkle self-improvement agent is a global singleton, not tied to a project. It mounts
+  // once opened and stays alive; only its visibility flips with the special-view selection.
+  const sparkleActive = activeSpecial === "sparkle";
+  const sparkleOpen = openAgentIds.includes(SPARKLE_AGENT_ID);
 
   return (
     <div
@@ -49,22 +96,24 @@ export function Workspace() {
               key={agent.id}
               project={p}
               agent={agent}
-              visible={p.id === selectedProjectId && agent.id === activeAgentId}
+              visible={!sparkleActive && p.id === selectedProjectId && agent.id === activeAgentId}
             />
           ))}
 
-          {!project && (
+          {sparkleOpen && <SparkleAgentPane visible={sparkleActive} />}
+
+          {!sparkleActive && !project && (
             <Hint title="Welcome to Sparkle">
               Create a project (top bar) and choose a folder on your Mac to start building.
             </Hint>
           )}
-          {project && project.agents.length === 0 && (
+          {!sparkleActive && project && project.agents.length === 0 && (
             <Hint title={project.name}>Add an agent (left) to begin.</Hint>
           )}
-          {project && project.agents.length > 0 && !activeAgentId && (
+          {!sparkleActive && project && project.agents.length > 0 && !activeAgentId && (
             <Hint title={project.name}>Pick an agent on the left.</Hint>
           )}
-          {project && activeAgentId && !activeIsOpen && (
+          {!sparkleActive && project && activeAgentId && !activeIsOpen && (
             <Hint title={project.name}>
               <button
                 onClick={() => open(activeAgentId)}

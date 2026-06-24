@@ -53,6 +53,15 @@ pub fn pty_spawn(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
+    tracing::info!(
+        %id,
+        %command,
+        args = ?args,
+        cwd = ?cwd,
+        cols,
+        rows,
+        "pty_spawn"
+    );
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -60,6 +69,12 @@ pub fn pty_spawn(
 
     let mut cmd = CommandBuilder::new(&command);
     cmd.args(&args);
+    // A GUI-launched .app inherits no shell environment, so without these the child
+    // (claude's TUI) sees a "dumb" terminal and disables ALL ANSI color — every line
+    // renders in the default foreground (near-white). Declare a real color terminal so
+    // TUIs emit their normal palette. (env() overrides on top of the inherited env.)
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
     if let Some(dir) = cwd {
         cmd.cwd(dir);
     }
@@ -175,6 +190,7 @@ pub fn pty_resize(
 
 #[tauri::command]
 pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
+    tracing::info!(%id, "pty_kill");
     if let Some(mut session) = manager.sessions.lock().unwrap().remove(&id) {
         let _ = session.killer.kill();
     }

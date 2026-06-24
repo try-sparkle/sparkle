@@ -14,14 +14,34 @@ export function ensureProjectRepo(path: string): Promise<void> {
   return invoke("ensure_project_repo", { path });
 }
 
-/** Create (or reuse) an isolated worktree for an agent. Returns its path + branch. */
-export function createAgentWorktree(root: string, agentId: string): Promise<WorktreeInfo> {
-  return invoke<WorktreeInfo>("create_agent_worktree", { root, agentId });
+/** Create (or reuse) an isolated worktree for an agent, cut from `baseBranch` (the project's
+ *  logical integration branch). Returns its path + branch. */
+export function createAgentWorktree(
+  root: string,
+  projectId: string,
+  agentId: string,
+  baseBranch: string,
+): Promise<WorktreeInfo> {
+  return invoke<WorktreeInfo>("create_agent_worktree", { root, projectId, agentId, baseBranch });
 }
 
 /** Remove an agent's worktree (leaves the branch so it can resume later). */
-export function removeAgentWorktree(root: string, agentId: string): Promise<void> {
-  return invoke("remove_agent_worktree", { root, agentId });
+export function removeAgentWorktree(
+  root: string,
+  projectId: string,
+  agentId: string,
+): Promise<void> {
+  return invoke("remove_agent_worktree", { root, projectId, agentId });
+}
+
+/** Tripwire: throws if the worktree's git toplevel isn't the worktree itself. */
+export function assertWorkspaceIntegrity(worktree: string): Promise<void> {
+  return invoke("assert_workspace_integrity", { worktree });
+}
+
+/** Install/merge the PreToolUse write-guard into the worktree's settings.local.json. */
+export function installWorktreeGuard(worktree: string): Promise<void> {
+  return invoke("install_worktree_guard", { worktree });
 }
 
 /** Move/rename a project folder on disk and repair its worktree links. Stop the
@@ -52,9 +72,14 @@ function withRepoLock<T>(root: string, fn: () => Promise<T>): Promise<T> {
  * Ensure the project repo exists and create this agent's isolated worktree — serialized
  * per project root so concurrent agent opens can't collide on git locks.
  */
-export function prepareAgentWorkspace(root: string, agentId: string): Promise<WorktreeInfo> {
+export function prepareAgentWorkspace(
+  root: string,
+  projectId: string,
+  agentId: string,
+  baseBranch: string,
+): Promise<WorktreeInfo> {
   return withRepoLock(root, async () => {
     await ensureProjectRepo(root);
-    return createAgentWorktree(root, agentId);
+    return createAgentWorktree(root, projectId, agentId, baseBranch);
   });
 }

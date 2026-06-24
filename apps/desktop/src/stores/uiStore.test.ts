@@ -1,0 +1,82 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { useUiStore, ZOOM_MIN, ZOOM_MAX, ZOOM_STEP, ZOOM_DEFAULT, COMPOSER_DEFAULT } from "./uiStore";
+
+describe("uiStore theme", () => {
+  // The store is a module-level singleton; the rehydrate test below mutates global fields
+  // (composerHeight, etc.). Reset to defaults + clear storage so nothing leaks into later blocks.
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({
+      themePref: "auto",
+      composerHeight: COMPOSER_DEFAULT,
+      zoom: ZOOM_DEFAULT,
+      activeSpecial: null,
+    });
+  });
+
+  it("defaults themePref to 'auto'", () => {
+    expect(useUiStore.getState().themePref).toBe("auto");
+  });
+
+  it("setThemePref updates the preference", () => {
+    useUiStore.getState().setThemePref("light");
+    expect(useUiStore.getState().themePref).toBe("light");
+    useUiStore.getState().setThemePref("dark");
+    expect(useUiStore.getState().themePref).toBe("dark");
+    useUiStore.getState().setThemePref("auto");
+  });
+
+  // Load-bearing migration: an existing user's persisted blob predates themePref.
+  // Rehydrating it must fall back to the default, not leave themePref undefined.
+  it("falls back to 'auto' when the persisted blob has no themePref", async () => {
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({ state: { composerHeight: 200, zoom: 1.2, activeSpecial: null }, version: 0 }),
+    );
+    await useUiStore.persist.rehydrate();
+    expect(useUiStore.getState().themePref).toBe("auto");
+    // Sanity: a real field from the old blob did hydrate, so this isn't a no-op.
+    expect(useUiStore.getState().composerHeight).toBe(200);
+  });
+});
+
+describe("uiStore zoom", () => {
+  beforeEach(() => useUiStore.getState().resetZoom());
+
+  it("starts at and resets to the default", () => {
+    expect(useUiStore.getState().zoom).toBe(ZOOM_DEFAULT);
+  });
+
+  it("clamps setZoom above max and below min", () => {
+    useUiStore.getState().setZoom(999);
+    expect(useUiStore.getState().zoom).toBe(ZOOM_MAX);
+    useUiStore.getState().setZoom(-5);
+    expect(useUiStore.getState().zoom).toBe(ZOOM_MIN);
+  });
+
+  // The clamp keeps each value at a clean 2dp step, so re-rounding is a no-op (idempotent).
+  // (Note: zoom * 100 is NOT a safe integer check — 1.1 * 100 === 110.00000000000001.)
+  const isClean = (z: number) => z === Math.round(z * 100) / 100;
+
+  it("steps in by one increment, staying at a clean 2dp value", () => {
+    useUiStore.getState().zoomIn();
+    expect(useUiStore.getState().zoom).toBe(Math.round((ZOOM_DEFAULT + ZOOM_STEP) * 100) / 100);
+    expect(isClean(useUiStore.getState().zoom)).toBe(true);
+  });
+
+  it("never exceeds max on repeated zoomIn", () => {
+    for (let i = 0; i < 50; i++) useUiStore.getState().zoomIn();
+    expect(useUiStore.getState().zoom).toBe(ZOOM_MAX);
+  });
+
+  it("never drops below min on repeated zoomOut", () => {
+    for (let i = 0; i < 50; i++) useUiStore.getState().zoomOut();
+    expect(useUiStore.getState().zoom).toBe(ZOOM_MIN);
+  });
+
+  it("stays drift-free across many mixed steps", () => {
+    for (let i = 0; i < 20; i++) useUiStore.getState().zoomIn();
+    for (let i = 0; i < 20; i++) useUiStore.getState().zoomOut();
+    expect(isClean(useUiStore.getState().zoom)).toBe(true);
+  });
+});

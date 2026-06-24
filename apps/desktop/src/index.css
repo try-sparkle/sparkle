@@ -1,5 +1,24 @@
 @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Source+Code+Pro:wght@400;500&display=swap");
 
+/* Theme color variables — a static mirror of THEME_HEX (apps/desktop/src/theme/colors.ts).
+   THEME_HEX is canonical; an equality test (theme/cssMirror.test.ts) fails CI if these drift.
+   `:root` is the dark default; `:root[data-theme="light"]` overrides for light. Static CSS
+   (not JS) so flipping <html data-theme> re-themes with no FOUC and no re-render. */
+:root {
+  --c-forest: #0a1a3f;
+  --c-deep-forest: #0f2350;
+  --c-cream: #eaf1ff;
+  --c-muted: #8aa0c4;
+  --c-chat-bubble: #1d3a7a;
+}
+:root[data-theme="light"] {
+  --c-forest: #ffffff;
+  --c-deep-forest: #f1f4fa;
+  --c-cream: #0a1a3f;
+  --c-muted: #5b6b8c;
+  --c-chat-bubble: #d6e0f5;
+}
+
 * {
   box-sizing: border-box;
   margin: 0;
@@ -13,9 +32,9 @@ body,
 }
 
 body {
-  /* token: forest (brand navy) / cream */
-  background: #0a1a3f;
-  color: #eaf1ff;
+  /* token: forest (app background) / cream (primary text) — themed via CSS vars */
+  background: var(--c-forest);
+  color: var(--c-cream);
   font-family: "IBM Plex Sans", sans-serif;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
@@ -37,6 +56,18 @@ body {
   animation: sparkle-pulse 1.1s ease-in-out infinite;
 }
 
+/* styled hover tooltip (Tooltip.tsx) — fade + slight rise */
+@keyframes sparkle-tooltip-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 /* xterm fills its pane */
 .xterm,
 .xterm .xterm-viewport {
@@ -46,6 +77,6 @@ body {
   width: 10px;
 }
 .xterm-viewport::-webkit-scrollbar-thumb {
-  background: #1d3a7a; /* token: CHAT_USER_BUBBLE */
+  background: var(--c-chat-bubble); /* token: CHAT_USER_BUBBLE */
   border-radius: 5px;
 }

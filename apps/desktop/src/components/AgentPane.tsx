@@ -1,14 +1,18 @@
-import { useEffect, useState } from "react";
-import { C, FONT_WEIGHT } from "@sparkle/ui";
+import { useEffect, useRef, useState } from "react";
+import { C, FONT_WEIGHT } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
-import { prepareAgentWorkspace } from "../services/worktree";
-import { checkClaude } from "../preflight";
+import { prepareAgentWorkspace, installWorktreeGuard, assertWorkspaceIntegrity } from "../services/worktree";
+import { resolveDefaultBranch } from "../services/branchStatus";
+import { checkClaude, claudeHasSession } from "../preflight";
+import { buildClaudeExec } from "../services/claudeSpawn";
+import { maybeAutoName } from "../services/agentNaming";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { PinnedPrompt } from "./PinnedPrompt";
 import { Terminal } from "./Terminal";
 import { Composer } from "./Composer";
 import { Onboarding } from "./Onboarding";
+import { BrainstormPanel } from "./BrainstormPanel";
 
 type Phase = "preparing" | "ready" | "no-claude" | "error";
 
@@ -16,10 +20,6 @@ type Phase = "preparing" | "ready" | "no-claude" | "error";
 // agent (and the tools claude itself shells out to) inherit the user's real PATH/env —
 // GUI apps otherwise get a minimal PATH and can't find node/git/etc.
 const SHELL = "/bin/zsh";
-
-function shellQuote(p: string): string {
-  return `'${p.replace(/'/g, `'\\''`)}'`;
-}
 
 interface SpawnCmd {
   command: string;
@@ -43,22 +43,58 @@ export function AgentPane({
   const setAgentWorktree = useProjectStore((s) => s.setAgentWorktree);
   const setLastPrompt = useProjectStore((s) => s.setLastPrompt);
   const setStatus = useRuntimeStore((s) => s.setStatus);
+  // The composer's textarea — initial focus lands here when a tab opens.
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
+  // Imperative bridge so a printable keystroke in the terminal is routed into the composer.
+  const composerApiRef = useRef<{ insert: (text: string) => void } | null>(null);
 
   const prepare = async () => {
+    // Brainstorm agents are a Chief chat — no worktree, no PTY, nothing to prepare.
+    if (agent.kind === "brainstorm") return;
     setPhase("preparing");
     setErrorMsg("");
     setPtyReady(false);
     try {
-      const wt = await prepareAgentWorkspace(project.rootPath, agent.id);
+      // Resolve + persist the project's integration branch once, then base this agent off it.
+      // Normalize a possibly-empty resolver result the same way the store does, so the worktree
+      // and poll layers don't see a value the store guard would have nulled.
+      let base = project.defaultBranch;
+      if (!base) {
+        const resolved = (await resolveDefaultBranch(project.rootPath)).trim();
+        base = resolved || null;
+        if (base) useProjectStore.getState().setDefaultBranch(project.id, base);
+      }
+      // An agent created before defaultBranch existed has a null baseBranch — backfill it.
+      // An empty agentBase is tolerated by the Rust effective_base fallback.
+      const agentBase = agent.baseBranch ?? base ?? "";
+      const wt = await prepareAgentWorkspace(project.rootPath, project.id, agent.id, agentBase);
       setAgentWorktree(project.id, agent.id, wt.path, wt.branch);
+      // Defense in depth: install the write-guard, then refuse to spawn a broken sandbox.
+      try {
+        await installWorktreeGuard(wt.path);
+      } catch (e) {
+        console.warn("guard install failed (relocation still protects):", e);
+      }
+      await assertWorkspaceIntegrity(wt.path); // throws → caught below → error phase, no spawn
+      // Poll branch status only after the workspace passed integrity — never for a sandbox we
+      // are about to reject.
+      void useRuntimeStore
+        .getState()
+        .pollBranchStatus(project.rootPath, project.id, agent.id, agentBase);
       const claude = await checkClaude();
       if (!claude.installed || !claude.path) {
         setPhase("no-claude");
         return;
       }
+      // Resume the prior conversation if this worktree already has one (the
+      // worktree path is the session key). `--continue` errors in a directory
+      // with no history, so only add it when a session exists. Resume is a
+      // best-effort enhancement: if detection fails, fall back to a fresh
+      // `claude` rather than blocking the agent from starting at all.
+      const resume = await claudeHasSession(wt.path).catch(() => false);
       setSpawn({
         command: SHELL,
-        args: ["-l", "-c", `exec ${shellQuote(claude.path)}`],
+        args: ["-l", "-c", buildClaudeExec(claude.path, resume)],
         cwd: wt.path,
       });
       setPhase("ready");
@@ -84,6 +120,11 @@ export function AgentPane({
         background: C.forest,
       }}
     >
+      {/* Brainstorm agents render a Chief chat instead of a Claude terminal. */}
+      {agent.kind === "brainstorm" && <BrainstormPanel project={project} />}
+
+      {agent.kind !== "brainstorm" && (
+        <>
       <PinnedPrompt prompt={agent.lastPrompt} />
 
       {phase === "preparing" && (
@@ -100,8 +141,10 @@ export function AgentPane({
       )}
       {phase === "no-claude" && <Onboarding onRetry={() => void prepare()} />}
       {phase === "ready" && spawn && (
-        <>
-          <div style={{ flex: 1, minHeight: 0, padding: 6 }}>
+        // Relative stage: the terminal fills it; the composer floats over the bottom as an
+        // overlay (so dragging the composer never resizes/reflows the terminal beneath it).
+        <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
+          <div style={{ position: "absolute", inset: 0, padding: 6 }}>
             <Terminal
               agentId={agent.id}
               command={spawn.command}
@@ -110,13 +153,25 @@ export function AgentPane({
               active={visible}
               onStatus={(s) => setStatus(agent.id, s)}
               onReady={() => setPtyReady(true)}
+              onRequestFocus={() => composerInputRef.current?.focus()}
+              onComposerType={(ch) => composerApiRef.current?.insert(ch)}
             />
           </div>
           <Composer
             agentId={agent.id}
+            active={visible}
             disabled={!ptyReady}
-            onSubmitPrompt={(t) => setLastPrompt(project.id, agent.id, t)}
+            inputRef={composerInputRef}
+            composerApiRef={composerApiRef}
+            onSubmitPrompt={(t) => {
+              setLastPrompt(project.id, agent.id, t);
+              // Fire-and-forget: summarize the work into a short name (first prompt, or when
+              // the work shifts). No-ops if the name is pinned or no API key is configured.
+              void maybeAutoName(project.id, agent.id, t);
+            }}
           />
+        </div>
+      )}
         </>
       )}
     </div>

@@ -11,3 +11,9 @@ export interface ClaudeStatus {
 export function checkClaude(): Promise<ClaudeStatus> {
   return invoke<ClaudeStatus>("claude_preflight");
 }
+
+/** True if this worktree already has a prior `claude` conversation we can resume
+ * (drives `claude --continue` vs a fresh `claude` when (re)opening an agent). */
+export function claudeHasSession(worktreePath: string): Promise<boolean> {
+  return invoke<boolean>("claude_has_session", { worktreePath });
+}

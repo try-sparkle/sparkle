@@ -20,6 +20,7 @@ export const C = {
 
   // Brand sparkle accent (logo cyan)
   accent: "#34e0f0", // highlights, progress sheen, the "sparkle"
+  accentMid: "#32a6f8", // midpoint of teal→accent — the center of the logo's blue→cyan fade
 
   // Agent status dots (background on an 8px circle)
   status: {
@@ -36,19 +37,30 @@ export const C = {
 } as const;
 
 /**
- * Agent tab status taxonomy + colors (desktop workspace spec §6). One color per
- * state so a glance at a tab tells you what it needs. Never hardcode these — import
- * AGENT_STATUS. `label` is the human phrase shown in tooltips/legends.
+ * Agent tab status taxonomy + colors (desktop workspace spec §6). The taxonomy keeps
+ * eight states for precise tooltips/legends, but they collapse to exactly THREE colors
+ * so a glance tells you only what you need to act on:
+ *   GREEN  — running                              (working)
+ *   RED    — blocked on a specific answer from you (waiting, approval)
+ *   GRAY   — done / not blocked / not active       (idle, blocked, errored, done, stopped)
+ * RED is reserved for when the agent is genuinely waiting on YOUR input — a question or
+ * an approval it drew on screen. A finished turn sitting at the idle prompt is GRAY (the
+ * work is done; it isn't asking you anything), and a crashed/exited agent is GRAY too
+ * (not running ≠ waiting on you). Never hardcode these — import AGENT_STATUS. `label` is
+ * the human phrase shown on hover.
  */
+const GREEN = C.success; // #34c759 — running, leave it be
+const RED = C.sienna; //   #e0533f — needs your answer
+const GRAY = C.muted; //   #8aa0c4 — not active (legible on navy)
 export const AGENT_STATUS = {
-  idle: { color: C.muted, label: "Ready" }, // alive, awaiting your next prompt
-  working: { color: C.success, label: "Working" }, // actively producing output (green = go)
-  waiting: { color: C.amber, label: "Needs you" }, // asked a non-risky question
-  approval: { color: C.sienna, label: "Approve?" }, // caution/dangerous action pending
-  blocked: { color: C.violet, label: "Blocked" }, // stalled on something external
-  errored: { color: C.sienna, label: "Error" }, // process crashed/exited unexpectedly
-  done: { color: C.teal, label: "Done" }, // finished cleanly (blue, distinct from working)
-  stopped: { color: C.status.paused, label: "Stopped" }, // not running (persisted tab)
+  working: { color: GREEN, label: "Working" }, // actively producing output
+  idle: { color: GRAY, label: "Done — your turn" }, // finished its turn, not blocked on you
+  waiting: { color: RED, label: "Needs you" }, // asked a question (on-screen prompt)
+  approval: { color: RED, label: "Approve?" }, // caution/dangerous action pending
+  blocked: { color: GRAY, label: "Stalled" }, // quiet, no on-screen question — not blocking you
+  errored: { color: GRAY, label: "Exited" }, // process crashed/exited — not running
+  done: { color: GRAY, label: "Done" }, // finished cleanly, not active
+  stopped: { color: GRAY, label: "Stopped" }, // not running (persisted tab)
 } as const;
 
 export type AgentTabStatus = keyof typeof AGENT_STATUS;

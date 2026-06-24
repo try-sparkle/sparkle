@@ -11,5 +11,11 @@
        loading of dynamic libraries that aren't signed by our Team ID. -->
   <key>com.apple.security.cs.disable-library-validation</key>
   <true/>
+  <!-- On-device voice dictation captures the mic via CoreAudio. Under the
+       hardened runtime this entitlement is the actual gate; Info.plist's
+       NSMicrophoneUsageDescription only supplies the prompt text. Without
+       this key macOS denies capture (often with no TCC prompt). -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
 </dict>
 </plist>

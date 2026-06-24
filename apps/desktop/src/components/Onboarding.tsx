@@ -1,4 +1,4 @@
-import { C, FONT_WEIGHT } from "@sparkle/ui";
+import { C, FONT_WEIGHT } from "../theme/colors";
 
 /**
  * Shown inside an agent pane when the user's own Claude Code (`claude`) isn't found

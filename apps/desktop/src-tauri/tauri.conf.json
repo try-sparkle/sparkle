@@ -26,12 +26,14 @@
   "bundle": {
     "active": true,
     "targets": ["dmg", "app"],
+    "resources": ["resources/worktree-guard.mjs"],
     "icon": ["icons/icon.icns", "icons/icon.png"],
     "macOS": {
       "minimumSystemVersion": "11.0",
       "signingIdentity": "-",
       "hardenedRuntime": true,
-      "entitlements": "entitlements.plist"
+      "entitlements": "entitlements.plist",
+      "infoPlist": "Info.plist"
     }
   }
 }
