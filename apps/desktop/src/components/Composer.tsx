@@ -96,10 +96,23 @@ export function Composer({
   const [dropActive, setDropActive] = useState(false);
 
   // Voice dictation: appends each transcribed segment into the textarea.
-  // onSegment fires unconditionally — the backend flushes a final partial
-  // right before stop, so we must not gate this on micStatus.
+  // `dictation://partial` is a global broadcast and every open agent's pane stays
+  // mounted (visibility only toggles), so every Composer hears each segment. Gate on
+  // `active` — only the visible pane consumes — or dictation leaks into other agents'
+  // inputs (same reason the native-file-drop effect below gates on `active`).
+  // Note: gate on `active`, NOT micStatus — the backend flushes a final partial right
+  // before stop, which must still land in the pane that was being dictated into.
   const { status: micStatus, level, toggle: toggleMic, modelProgress } = useDictation({
     onSegment: (text) => {
+      // Diagnostic for the "prints twice" bug: log every segment THIS composer
+      // receives, with its agent + active flag, so the unified log shows whether one
+      // backend emission gets appended once or twice (and in which pane). Pair with
+      // the Rust "emit partial" seq logs to localize the duplicate. [dictation-dup]
+      log.info(
+        "composer",
+        `dictation recv agent=${agentId} active=${active} text=${JSON.stringify(text)}`,
+      );
+      if (!active) return;
       setValue((v) => (v ? `${v} ${text}` : text));
       inputRef?.current?.focus();
     },

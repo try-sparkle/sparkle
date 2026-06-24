@@ -1,9 +1,26 @@
 //! Tauri commands wiring mic capture → transcriber → events.
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use crate::audio::{rms_level, Capture};
 use crate::model;
 use crate::transcribe::{ParakeetTdt, Transcriber};
+
+/// Monotonic id stamped on every emitted partial so the log can prove whether a
+/// duplicate in the prompt bar came from the backend emitting the same text twice
+/// (two ids, same text) vs the frontend appending one emission twice (one id).
+static PARTIAL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Emit one transcript segment and log it (source = "accept" during capture, or
+/// "finalize" on stop) with its sequence id and text, so dictation duplicates are
+/// diagnosable from the unified log.
+fn emit_partial(app: &AppHandle, source: &str, seg: String) {
+    let seq = PARTIAL_SEQ.fetch_add(1, Ordering::Relaxed);
+    // info (not debug): the shipped build's log threshold drops debug, and this is
+    // low-frequency (once per spoken phrase), so info is safe and always visible.
+    tracing::info!(target: "dictation", seq, source, text = %seg, "emit partial");
+    let _ = app.emit("dictation://partial", seg);
+}
 
 #[derive(Default)]
 pub struct DictationSession {
@@ -37,10 +54,11 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
     // The lock must stay short-held (accept() only, no I/O). finalize() is
     // always called *after* Capture is dropped (in stop_dictation), so the
     // slow finalize path never contends with a live callback frame.
+    tracing::info!(target: "dictation", "start_dictation: capture starting");
     let capture = Capture::start(move |frame: Vec<f32>| {
         let _ = app_cb.emit("dictation://level", rms_level(&frame));
         let segs = transcriber_cap.lock().unwrap().accept(&frame);
-        for seg in segs { let _ = app_cb.emit("dictation://partial", seg); }
+        for seg in segs { emit_partial(&app_cb, "accept", seg); }
     }).map_err(|e| { let _ = app.emit("dictation://error", e.clone()); e })?;
     let mut sess = state.0.lock().unwrap();
     sess.capture = Some(capture);
@@ -55,8 +73,9 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
         sess.capture = None;            // drop Capture -> stops the cpal stream (no more frames)
         sess.transcriber.take()
     };                                  // release the session lock before the (slower) finalize
+    tracing::info!(target: "dictation", "stop_dictation: capture dropped, finalizing");
     if let Some(t) = transcriber {
-        for seg in t.lock().unwrap().finalize() { let _ = app.emit("dictation://partial", seg); }
+        for seg in t.lock().unwrap().finalize() { emit_partial(&app, "finalize", seg); }
     }
     let _ = app.emit("dictation://final", String::new());
 }

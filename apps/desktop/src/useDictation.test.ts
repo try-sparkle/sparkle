@@ -10,14 +10,19 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 // Tauri mocks — must be set up before importing the modules under test
 // ---------------------------------------------------------------------------
 
-/** Simulated event bus keyed by event name */
-const listeners: Record<string, (e: { payload: unknown }) => void> = {};
+/**
+ * Simulated event bus keyed by event name. Tauri delivers an emitted event to
+ * EVERY registered listener (a broadcast), so the mock stores an array per event
+ * — modelling the real fan-out is what lets us reproduce the cross-agent leak.
+ */
+const listeners: Record<string, Array<(e: { payload: unknown }) => void>> = {};
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: (name: string, cb: (e: { payload: unknown }) => void) => {
-    listeners[name] = cb;
+    (listeners[name] ??= []).push(cb);
     return Promise.resolve(() => {
-      delete listeners[name];
+      listeners[name] = (listeners[name] ?? []).filter((c) => c !== cb);
+      if (listeners[name].length === 0) delete listeners[name];
     });
   },
 }));
@@ -37,10 +42,9 @@ import { createDictationController } from "./useDictation";
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Emit a fake Tauri event into the listener registry */
+/** Emit a fake Tauri event — broadcast to every registered listener, like Tauri. */
 function emit(name: string, payload: unknown) {
-  const cb = listeners[name];
-  if (cb) cb({ payload });
+  for (const cb of listeners[name] ?? []) cb({ payload });
 }
 
 // ---------------------------------------------------------------------------
@@ -247,5 +251,73 @@ describe("createDictationController (hook logic without renderHook)", () => {
     });
     await ctrl.toggle();
     expect(useDictationStore.getState().modelProgress).toBeNull();
+  });
+});
+
+describe("multiple mounted composers (regression: dictation must not leak across agents)", () => {
+  // Repro for the bug where dictating into one agent's composer also filled a
+  // different agent's input box. Agent panes stay mounted-but-hidden, so each
+  // open agent's Composer registers its own `dictation://partial` listener and
+  // Tauri broadcasts every segment to all of them. The Composer's onSegment must
+  // therefore gate on `active` (only the visible pane consumes), exactly like the
+  // sibling native-file-drop effect does.
+  beforeEach(() => {
+    for (const k of Object.keys(listeners)) delete listeners[k];
+    useDictationStore.setState({
+      status: "idle",
+      level: 0,
+      error: null,
+      modelProgress: null,
+    });
+  });
+
+  /** Mirrors Composer's onSegment: append only when this pane is active (visible). */
+  function makeComposer(getActive: () => boolean) {
+    let text = "";
+    const onSegment = (seg: string) => {
+      if (!getActive()) return;
+      text = text ? `${text} ${seg}` : seg;
+    };
+    return { onSegment, getText: () => text };
+  }
+
+  it("a single broadcast segment lands ONLY in the active pane's composer", async () => {
+    let activeId = "agent-A";
+    const a = makeComposer(() => activeId === "agent-A");
+    const b = makeComposer(() => activeId === "agent-B");
+
+    // Both panes are mounted (both controllers register listeners).
+    const ctrlA = await createDictationController({ onSegment: a.onSegment });
+    const ctrlB = await createDictationController({ onSegment: b.onSegment });
+
+    // User dictates while agent A is visible.
+    emit("dictation://partial", "hello");
+    expect(a.getText()).toBe("hello");
+    expect(b.getText()).toBe(""); // must NOT leak into the hidden pane
+
+    // User switches to agent B and keeps dictating.
+    activeId = "agent-B";
+    emit("dictation://partial", "world");
+    expect(a.getText()).toBe("hello"); // unchanged — A is now hidden
+    expect(b.getText()).toBe("world");
+
+    ctrlA.cleanup();
+    ctrlB.cleanup();
+  });
+
+  it("broadcast reaches every mounted listener (why gating is required)", async () => {
+    const a = vi.fn();
+    const b = vi.fn();
+    const ctrlA = await createDictationController({ onSegment: a });
+    const ctrlB = await createDictationController({ onSegment: b });
+
+    emit("dictation://partial", "seg");
+    // Both fire — Tauri does not route by pane; the active-gate above is what
+    // confines the text to one composer.
+    expect(a).toHaveBeenCalledWith("seg");
+    expect(b).toHaveBeenCalledWith("seg");
+
+    ctrlA.cleanup();
+    ctrlB.cleanup();
   });
 });
