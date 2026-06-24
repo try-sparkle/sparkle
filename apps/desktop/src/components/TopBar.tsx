@@ -2,6 +2,7 @@ import { useState, type CSSProperties } from "react";
 import { C, AGENT_STATUS, FONT_WEIGHT } from "../theme/colors";
 import type { AgentTabStatus, Project } from "../types";
 import { ThemeToggle } from "./ThemeToggle";
+import { AgentOrderToggle } from "./AgentOrderToggle";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -263,6 +264,8 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
             >
               <div style={menuLabel}>Theme</div>
               <ThemeToggle />
+              <div style={{ ...menuLabel, paddingTop: 12 }}>Agent order</div>
+              <AgentOrderToggle />
               <div style={{ ...menuLabel, paddingTop: 12 }}>Text size</div>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <button style={zbtn} onClick={zoomOut} title="Zoom out (⌘−)">

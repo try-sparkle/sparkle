@@ -23,6 +23,12 @@ const clampZoom = (z: number) =>
 // circular dependency — theme.ts depends on the store, never the reverse.
 export type ThemePref = "auto" | "light" | "dark";
 
+// Sidebar agent ordering. "attention" reorders the top-level agent stack so the agents
+// that need you (red — waiting/approval) float to the top and happily-building ones sink
+// down (see engine/agentOrdering.ts). "manual" keeps insertion order, like before this
+// feature. Default is "attention" — reordering is the out-of-the-box behavior.
+export type AgentOrdering = "attention" | "manual";
+
 interface UiState {
   composerHeight: number;
   setComposerHeight: (h: number) => void;
@@ -41,6 +47,9 @@ interface UiState {
   // to set <html data-theme> before first paint and avoid a flash of the wrong theme.
   themePref: ThemePref;
   setThemePref: (v: ThemePref) => void;
+  // Sidebar agent ordering preference (see AgentOrdering). Persisted in `sparkle-ui`.
+  agentOrdering: AgentOrdering;
+  setAgentOrdering: (v: AgentOrdering) => void;
 }
 
 export const useUiStore = create<UiState>()(
@@ -57,6 +66,8 @@ export const useUiStore = create<UiState>()(
       setActiveSpecial: (v) => set({ activeSpecial: v }),
       themePref: "auto",
       setThemePref: (v) => set({ themePref: v }),
+      agentOrdering: "attention",
+      setAgentOrdering: (v) => set({ agentOrdering: v }),
     }),
     { name: "sparkle-ui", storage: createJSONStorage(() => localStorage) },
   ),

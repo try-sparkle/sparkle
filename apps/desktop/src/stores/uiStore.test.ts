@@ -11,6 +11,7 @@ describe("uiStore theme", () => {
       composerHeight: COMPOSER_DEFAULT,
       zoom: ZOOM_DEFAULT,
       activeSpecial: null,
+      agentOrdering: "attention",
     });
   });
 
@@ -37,6 +38,36 @@ describe("uiStore theme", () => {
     expect(useUiStore.getState().themePref).toBe("auto");
     // Sanity: a real field from the old blob did hydrate, so this isn't a no-op.
     expect(useUiStore.getState().composerHeight).toBe(200);
+  });
+});
+
+describe("uiStore agentOrdering", () => {
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({ agentOrdering: "attention" });
+  });
+
+  it("defaults agentOrdering to 'attention' (reordering on by default)", () => {
+    expect(useUiStore.getState().agentOrdering).toBe("attention");
+  });
+
+  it("setAgentOrdering switches to 'manual' and back", () => {
+    useUiStore.getState().setAgentOrdering("manual");
+    expect(useUiStore.getState().agentOrdering).toBe("manual");
+    useUiStore.getState().setAgentOrdering("attention");
+    expect(useUiStore.getState().agentOrdering).toBe("attention");
+  });
+
+  // Migration: an existing user's persisted blob predates agentOrdering. Rehydrating it
+  // must fall back to the default rather than leaving the field undefined.
+  it("falls back to 'attention' when the persisted blob has no agentOrdering", async () => {
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({ state: { composerHeight: 180, zoom: 1.0, activeSpecial: null }, version: 0 }),
+    );
+    await useUiStore.persist.rehydrate();
+    expect(useUiStore.getState().agentOrdering).toBe("attention");
+    expect(useUiStore.getState().composerHeight).toBe(180);
   });
 });
 

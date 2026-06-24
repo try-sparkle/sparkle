@@ -10,6 +10,7 @@ import { removeAgentWorktree } from "../services/worktree";
 import { refreshAgentBranch } from "../services/branchStatus";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 import { stalenessTier, growNudge } from "../engine/nudges";
+import { sortAgentsByAttention } from "../engine/agentOrdering";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
 import { Tooltip } from "./Tooltip";
@@ -54,6 +55,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
+  const agentOrdering = useUiStore((s) => s.agentOrdering);
   const [editing, setEditing] = useState<string | null>(null);
 
   // Draggable column width — persisted to localStorage so it survives relaunch. Clamped to
@@ -207,7 +209,15 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           );
           const isTopLevel = (a: (typeof project.agents)[number]) =>
             !a.parentId || !buildIds.has(a.parentId);
-          return project.agents.filter(isTopLevel).map((top) => {
+          // Only the top-level stack reorders; nested workers stay under their parent in
+          // insertion order. Selection is tracked by id (project.selectedAgentId), so re-sorting
+          // never changes which agent is open. "manual" keeps insertion order, as before.
+          const topLevel = project.agents.filter(isTopLevel);
+          const ordered =
+            agentOrdering === "attention"
+              ? sortAgentsByAttention(topLevel, status)
+              : topLevel;
+          return ordered.map((top) => {
             const workers =
               top.kind === "build"
                 ? project.agents.filter((w) => w.parentId === top.id)
