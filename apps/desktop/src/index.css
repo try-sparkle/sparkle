@@ -18,4 +18,34 @@ body {
   color: #eaf1ff;
   font-family: "IBM Plex Sans", sans-serif;
   -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* "working" status dot pulse */
+@keyframes sparkle-pulse {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+.sparkle-pulse {
+  animation: sparkle-pulse 1.1s ease-in-out infinite;
+}
+
+/* xterm fills its pane */
+.xterm,
+.xterm .xterm-viewport {
+  height: 100%;
+}
+.xterm-viewport::-webkit-scrollbar {
+  width: 10px;
+}
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: #1d3a7a; /* token: CHAT_USER_BUBBLE */
+  border-radius: 5px;
 }

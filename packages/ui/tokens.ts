@@ -29,7 +29,29 @@ export const C = {
     paused: "#3a4a6a", // muted navy
     complete: "#0a1a3f", // navy (rendered with an accent/blue border)
   },
+
+  // New brand-aligned colors for the desktop status taxonomy (spec §6).
+  violet: "#8b6df0", // blocked / stalled on something external
+  success: "#34c759", // done / completed cleanly
 } as const;
+
+/**
+ * Agent tab status taxonomy + colors (desktop workspace spec §6). One color per
+ * state so a glance at a tab tells you what it needs. Never hardcode these — import
+ * AGENT_STATUS. `label` is the human phrase shown in tooltips/legends.
+ */
+export const AGENT_STATUS = {
+  idle: { color: C.muted, label: "Ready" }, // alive, awaiting your next prompt
+  working: { color: C.success, label: "Working" }, // actively producing output (green = go)
+  waiting: { color: C.amber, label: "Needs you" }, // asked a non-risky question
+  approval: { color: C.sienna, label: "Approve?" }, // caution/dangerous action pending
+  blocked: { color: C.violet, label: "Blocked" }, // stalled on something external
+  errored: { color: C.sienna, label: "Error" }, // process crashed/exited unexpectedly
+  done: { color: C.teal, label: "Done" }, // finished cleanly (blue, distinct from working)
+  stopped: { color: C.status.paused, label: "Stopped" }, // not running (persisted tab)
+} as const;
+
+export type AgentTabStatus = keyof typeof AGENT_STATUS;
 
 export const FONT = {
   ui: '"IBM Plex Sans", sans-serif',

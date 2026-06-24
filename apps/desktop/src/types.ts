@@ -1,55 +1,27 @@
-// Client-side view models for the desktop dashboard. These mirror the orchestration
-// DB/socket shapes (§10/§11) but carry only what the UI renders.
+// Desktop workspace domain types (spec §4). Projects hold agent tabs; agent tabs are
+// rendered one-per-tab with a real `claude` PTY underneath. Live runtime state (status,
+// PTY handles) is NOT stored here — see stores/runtimeStore.ts.
+import type { AgentTabStatus } from "@sparkle/ui";
 
-export type AgentStatus =
-  | "pending"
-  | "active"
-  | "waiting"
-  | "error"
-  | "paused"
-  | "complete";
+export type Runtime = "local" | "cloud";
 
-export type RiskClass = "safe" | "caution" | "dangerous";
-
-export interface Session {
+export interface AgentTab {
   id: string;
   name: string;
-  branch?: string;
-  status: AgentStatus;
-  currentAction: string; // "Creating OAuth middleware"
-  progressPercent: number; // 0-100
-  tasksDone: number;
-  tasksTotal: number;
-  etaMinutes?: number;
-  waitingFor?: string; // dependency name when status === "waiting"
-  errorMessage?: string; // when status === "error"
-  rawTerminal: string[]; // raw PTY lines for Expert Mode
+  runtime: Runtime; // v1: always "local"; cloud is shown-but-disabled
+  worktreePath: string | null; // Sparkle-managed isolated dir (hidden from user)
+  branch: string | null; // hidden git branch
+  lastPrompt: string; // for the pinned header
 }
 
-export interface ChiefSignal {
-  label: string;
-  type: "pass" | "warn" | "info";
-}
-
-export interface Approval {
+export interface Project {
   id: string;
-  sessionId: string;
-  description: string;
-  riskClass: "caution" | "dangerous";
-  chiefRecommendation: string;
-  chiefSignals: ChiefSignal[];
+  name: string;
+  rootPath: string; // user-chosen folder (existing or newly created)
+  createdAt: string;
+  lastOpenedAt?: string; // updated when selected — drives "Recent Projects" ordering
+  agents: AgentTab[];
+  selectedAgentId: string | null;
 }
 
-export interface ChatAction {
-  label: string;
-  type: "primary" | "secondary" | "destructive";
-  action: string;
-}
-
-export interface ChatMessage {
-  id: string;
-  role: "user" | "chief";
-  text: string;
-  timestamp: string; // ISO 8601
-  actions?: ChatAction[];
-}
+export type { AgentTabStatus };

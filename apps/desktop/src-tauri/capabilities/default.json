@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core APIs (events for PTY streaming, window) + native folder dialog.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}
