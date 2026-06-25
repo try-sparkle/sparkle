@@ -407,8 +407,13 @@ pub fn remove_worktree_at(
 /// Remove an agent's worktree (force, to discard any uncommitted changes). The
 /// branch is intentionally left in place so reopening the agent can resume it.
 /// Idempotent: a missing worktree is not an error.
+///
+/// `async` + `spawn_blocking` so the slow part (`git worktree remove --force`,
+/// which deletes the whole worktree dir from disk) runs on the blocking thread
+/// pool instead of the main thread. A synchronous command would block the event
+/// loop and freeze the window for the 2–10s the deletion can take.
 #[tauri::command]
-pub fn remove_agent_worktree(
+pub async fn remove_agent_worktree(
     app: AppHandle,
     root: String,
     project_id: String,
@@ -416,7 +421,11 @@ pub fn remove_agent_worktree(
 ) -> Result<(), String> {
     tracing::info!(%root, %project_id, %agent_id, "remove_agent_worktree");
     let app_data = app_data_dir(&app)?;
-    remove_worktree_at(&root, &project_id, &agent_id, &app_data)
+    tauri::async_runtime::spawn_blocking(move || {
+        remove_worktree_at(&root, &project_id, &agent_id, &app_data)
+    })
+    .await
+    .map_err(|e| format!("worktree removal task failed: {e}"))?
 }
 
 /// Move/rename a project folder on disk (rename = move within the same parent), then
