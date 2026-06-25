@@ -3,7 +3,7 @@
 // restores everything. Live process/status state is NOT here (see runtimeStore).
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
-import type { AgentKind, AgentTab, Project } from "../types";
+import type { AgentKind, AgentNameVariants, AgentTab, Project } from "../types";
 
 // Options for creating an agent. `kind` defaults to "build" (the orchestrator you talk to);
 // `parentId` is set only for workers spawned under a build agent.
@@ -44,8 +44,16 @@ interface ProjectState {
   /** Manual rename: sets the name AND pins it (freezes auto-naming, shows the pin icon). */
   renameAgent: (projectId: string, agentId: string, name: string) => void;
   /** Auto-rename from the naming model. No-op if the user has pinned the name. Records the
-   *  basis prompt so we can later detect when the work has shifted enough to re-name. */
-  autoRenameAgent: (projectId: string, agentId: string, name: string, basis: string) => void;
+   *  basis prompt so we can later detect when the work has shifted enough to re-name. Pass
+   *  `variants` (short/medium/long) to enable width-fitted display + hover; `name` is the
+   *  canonical fallback (callers set it to the medium variant). */
+  autoRenameAgent: (
+    projectId: string,
+    agentId: string,
+    name: string,
+    basis: string,
+    variants?: AgentNameVariants | null,
+  ) => void;
   /** Pin/unpin the name. Unpinning re-enables auto-naming on the next prompt. */
   setNamePinned: (projectId: string, agentId: string, pinned: boolean) => void;
   selectAgent: (projectId: string, agentId: string) => void;
@@ -99,6 +107,18 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
         ...a,
         kind: a.kind ?? "build",
         parentId: a.parentId ?? null,
+      })),
+    }));
+  }
+  if (version < 4) {
+    // Width-fitted names: agents gain `autoNameVariants`. Legacy records have only a single
+    // `name`; default the field to null so display falls back to `name` until the next prompt
+    // produces variants.
+    state.projects = state.projects.map((p) => ({
+      ...p,
+      agents: (p.agents ?? []).map((a) => ({
+        ...a,
+        autoNameVariants: a.autoNameVariants ?? null,
       })),
     }));
   }
@@ -191,6 +211,7 @@ export const useProjectStore = create<ProjectState>()(
               // so the first prompt can auto-rename them.
               namePinned: opts?.name != null,
               autoNameBasis: null,
+              autoNameVariants: null,
             };
             return { ...p, agents: [...p.agents, agent], selectedAgentId: id };
           }),
@@ -217,19 +238,27 @@ export const useProjectStore = create<ProjectState>()(
       renameAgent: (projectId, agentId, name) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
-            // A manual rename pins the name: from here on it won't auto-change.
-            mapAgent(p, agentId, (a) => ({ ...a, name: name.trim() || a.name, namePinned: true })),
+            // A manual rename pins the name: from here on it won't auto-change. Clear the
+            // auto-name variants too — pinned means "`name` only" (see types.ts), and the
+            // sidebar prefers variants over `name`, so leaving them would keep showing the
+            // stale auto-name instead of the user's chosen one.
+            mapAgent(p, agentId, (a) => ({
+              ...a,
+              name: name.trim() || a.name,
+              namePinned: true,
+              autoNameVariants: null,
+            })),
           ),
         })),
 
-      autoRenameAgent: (projectId, agentId, name, basis) =>
+      autoRenameAgent: (projectId, agentId, name, basis, variants) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) =>
               // Respect a pinned name — never overwrite a name the user chose by hand.
               a.namePinned || !name.trim()
                 ? a
-                : { ...a, name: name.trim(), autoNameBasis: basis },
+                : { ...a, name: name.trim(), autoNameBasis: basis, autoNameVariants: variants ?? null },
             ),
           ),
         })),
@@ -271,7 +300,8 @@ export const useProjectStore = create<ProjectState>()(
       // `undefined` — an undefined baseBranch would otherwise send "" to the git commands.
       // v2 backfills the auto-naming fields (namePinned/autoNameBasis). v3 backfills the
       // Brainstorm/Build kind + parentId (separate step so records already at v2 still get them).
-      version: 3,
+      // v4 backfills autoNameVariants (width-fitted names) to null.
+      version: 4,
       migrate: (persisted, version) => migratePersisted(persisted, version) as ProjectState,
     },
   ),

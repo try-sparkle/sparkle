@@ -16,18 +16,24 @@ const MAX_WIDTH = 420;
 export function Tooltip({
   label,
   value,
+  mono = true,
   children,
 }: {
   /** Small muted caption above the value, e.g. "Working in:". */
   label?: string;
-  /** The emphasized line — a path, name, etc. Rendered in mono for paths. */
-  value: ReactNode;
+  /** The emphasized line — a path, name, etc. When null/empty no card shows on hover (the
+   *  trigger still renders), so callers can keep a stable wrapper and toggle only the card. */
+  value?: ReactNode;
+  /** Mono font for the value (default — suits paths). Pass false for prose like names. */
+  mono?: boolean;
   children: ReactNode;
 }) {
   const triggerRef = useRef<HTMLSpanElement>(null);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
 
   const show = () => {
+    // No value → no card (the wrapper is inert but keeps the child mounted in place).
+    if (value === null || value === undefined || value === "") return;
     // Measure the actual child, not the wrapper: the wrapper is `display: contents`
     // and so generates no box — getBoundingClientRect() on it returns a zero rect in
     // the Tauri/Chromium webview, which would anchor the tooltip to (0,0).
@@ -53,6 +59,9 @@ export function Tooltip({
         {children}
       </span>
       {pos &&
+        value !== null &&
+        value !== undefined &&
+        value !== "" &&
         createPortal(
           <div
             // Don't let the tooltip eat pointer events or flicker the trigger.
@@ -91,10 +100,11 @@ export function Tooltip({
             <span
               style={{
                 color: C.cream,
-                fontFamily: FONT.mono,
+                // Paths read best in mono; prose (e.g. an agent name) reads best in the UI font.
+                fontFamily: mono ? FONT.mono : FONT.ui,
                 fontSize: 12,
                 lineHeight: 1.4,
-                wordBreak: "break-all",
+                wordBreak: mono ? "break-all" : "normal",
               }}
             >
               {value}

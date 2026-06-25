@@ -34,7 +34,12 @@ describe("projectStore default/base branch", () => {
     const out = migratePersisted(legacy, 0) as {
       projects: Array<{
         defaultBranch: unknown;
-        agents: Array<{ baseBranch: unknown; namePinned: unknown; autoNameBasis: unknown }>;
+        agents: Array<{
+          baseBranch: unknown;
+          namePinned: unknown;
+          autoNameBasis: unknown;
+          autoNameVariants: unknown;
+        }>;
       }>;
     };
     expect(out.projects[0]!.defaultBranch).toBeNull();
@@ -42,6 +47,8 @@ describe("projectStore default/base branch", () => {
     // A pre-existing name is treated as user-chosen, so it's pinned (won't auto-rename).
     expect(out.projects[0]!.agents[0]!.namePinned).toBe(true);
     expect(out.projects[0]!.agents[0]!.autoNameBasis).toBeNull();
+    // Width-fitted name variants are backfilled to null (display falls back to `name`).
+    expect(out.projects[0]!.agents[0]!.autoNameVariants).toBeNull();
   });
 });
 
@@ -69,6 +76,25 @@ describe("projectStore auto-naming", () => {
     const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
     expect(agent.name).toBe("My Agent");
     expect(agent.namePinned).toBe(true);
+  });
+
+  it("a manual rename clears the auto-name variants (pinned = name only)", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore.getState().addAgent(pid);
+    // Auto-name first so variants are populated, then rename by hand.
+    useProjectStore.getState().autoRenameAgent(pid, aid, "Fix Login", "fix the login bug", {
+      short: "Fix Login",
+      medium: "Fix The Login Redirect",
+      long: "Fix The Login Redirect Loop On Mobile Safari",
+    });
+    let agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
+    expect(agent.autoNameVariants).not.toBeNull();
+
+    useProjectStore.getState().renameAgent(pid, aid, "My Agent");
+    agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
+    expect(agent.name).toBe("My Agent");
+    // Variants must be wiped so the sidebar shows the chosen name, not the stale auto-name.
+    expect(agent.autoNameVariants).toBeNull();
   });
 
   it("unpinning re-enables auto-rename", () => {

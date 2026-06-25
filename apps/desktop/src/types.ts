@@ -11,6 +11,15 @@ export type Runtime = "local" | "cloud";
 // terminal agent in its own worktree, shown indented under its build parent in the sidebar.
 export type AgentKind = "brainstorm" | "build" | "worker";
 
+// Three length variants of an auto-generated name (spec: width-fitted agent names). The
+// sidebar renders the longest variant that fits the column and reveals `long` on hover. Word
+// budgets: short 2–4, medium 5–6, long 8–10. Produced together in one naming call.
+export interface AgentNameVariants {
+  short: string;
+  medium: string;
+  long: string;
+}
+
 export interface AgentTab {
   id: string;
   name: string;
@@ -27,6 +36,10 @@ export interface AgentTab {
   // shifted enough to re-name. Null until the first auto-name lands.
   namePinned: boolean;
   autoNameBasis: string | null;
+  // The three length variants behind the current auto-name (spec: width-fitted names). Null
+  // until the first auto-name lands, and for pinned/manually-named agents (which use `name`
+  // only). `name` stays the canonical fallback — set to the medium variant when these exist.
+  autoNameVariants: AgentNameVariants | null;
 }
 
 export interface Project {

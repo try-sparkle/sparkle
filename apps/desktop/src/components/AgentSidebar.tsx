@@ -14,6 +14,7 @@ import { sortAgentsByAttention } from "../engine/agentOrdering";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
 import { Tooltip } from "./Tooltip";
+import { FittedAgentName } from "./FittedAgentName";
 
 /**
  * Left column: the current project's agents as a vertical list (spec layout, revised).
@@ -271,7 +272,13 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                     autoFocus
                     defaultValue={a.name}
                     onBlur={(e) => {
-                      renameAgent(project.id, a.id, e.target.value);
+                      // Only commit a real change. A no-op blur (double-click to edit, then
+                      // click away without typing) must NOT pin the name or wipe the auto-name
+                      // variants — that would silently freeze width-fitting for this agent.
+                      const next = e.target.value;
+                      if (next.trim() && next !== a.name) {
+                        renameAgent(project.id, a.id, next);
+                      }
                       setEditing(null);
                     }}
                     onKeyDown={(e) => {
@@ -294,27 +301,16 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                   />
                 ) : (
                   <div style={{ display: "flex", alignItems: "center", gap: 4, minWidth: 0 }}>
-                    <span
-                      // Double-click to rename. A single click must NOT enter edit mode —
-                      // it just selects the agent (the row's onClick), so clicking a tab in
-                      // the list never accidentally pins/renames it.
+                    <FittedAgentName
+                      variants={a.autoNameVariants}
+                      name={a.name}
+                      color={color}
+                      active={isActive}
                       onDoubleClick={(e) => {
                         e.stopPropagation();
                         setEditing(a.id);
                       }}
-                      title="Double-click to rename"
-                      style={{
-                        // The whole name takes its status color.
-                        color,
-                        fontSize: 13,
-                        fontWeight: isActive ? FONT_WEIGHT.semibold : FONT_WEIGHT.medium,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {a.name}
-                    </span>
+                    />
                     {a.namePinned && (
                       // Pinned = a name the user set by hand; it won't auto-change. Click to
                       // unpin and let the agent name itself again on the next prompt.

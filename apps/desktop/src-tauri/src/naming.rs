@@ -1,7 +1,9 @@
-// Auto-naming: turn an agent's first (or meaningfully-changed) prompt into a 2–4 word
-// label by asking the cheapest Claude model (Haiku 4.5) for a terse summary. The call
-// lives in Rust — not the webview — so the BYOK Anthropic key never ships in the JS
-// bundle and we can read it from the user's `.env.local` on disk.
+// Auto-naming: turn an agent's first (or meaningfully-changed) prompt into THREE length
+// variants of a label (short 2–4 / medium 5–6 / long 8–10 words) by asking the cheapest
+// Claude model (Haiku 4.5) for a terse summary in one call. The webview picks the longest
+// variant that fits the sidebar column and reveals the long form on hover. The call lives
+// in Rust — not the webview — so the BYOK Anthropic key never ships in the JS bundle and we
+// can read it from the user's `.env.local` on disk.
 //
 // Key resolution (first hit wins): ANTHROPIC_API_KEY env, ANTHROPIC_API env, then `.env.local`
 // at EXACT paths only — the current dir (DEBUG builds only) and `$HOME/Projects/sparkle/.env.local`.
@@ -20,8 +22,21 @@ use std::path::{Path, PathBuf};
 const NAMING_MODEL: &str = "claude-haiku-4-5";
 
 const SYSTEM_PROMPT: &str = "You name coding-agent sessions. Given the user's prompt to a \
-coding agent, reply with a 2-4 word title (Title Case) summarizing the work. No quotes, no \
-punctuation, no trailing period, no preamble — just the title. Example: 'Fix Login Redirect'.";
+coding agent, summarize the SAME work as three Title Case titles of increasing length. Reply \
+with ONLY a JSON object — no preamble, no markdown fences: \
+{\"short\": \"2-4 words\", \"medium\": \"5-6 words\", \"long\": \"8-10 words\"}. Each value is a \
+title (no surrounding quotes, no trailing punctuation). \
+Example: {\"short\": \"Fix Login Redirect\", \"medium\": \"Fix OAuth Login Redirect Loop\", \
+\"long\": \"Fix OAuth Login Redirect Loop After Token Refresh\"}.";
+
+/// The three length variants of an auto-name. Serialized to the webview as
+/// `{ short, medium, long }`; the UI renders the longest one that fits the column.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AgentName {
+    pub short: String,
+    pub medium: String,
+    pub long: String,
+}
 
 /// Pull `KEY=value` out of a dotenv-style file body, honoring optional surrounding quotes.
 /// Candidate keys are tried in priority order — the first one present and non-empty wins,
@@ -104,9 +119,9 @@ fn resolve_anthropic_key() -> Option<String> {
     resolve_env_secret(&["ANTHROPIC_API_KEY", "ANTHROPIC_API"])
 }
 
-/// Trim the model's reply down to a clean 2–4 word title. Defensive against the model
-/// adding quotes, a leading "Title:", or running long.
-fn sanitize_name(raw: &str) -> String {
+/// Trim the model's reply down to a clean title of at most `max_words` words. Defensive
+/// against the model adding quotes, a leading "Title:", or running long.
+fn sanitize_name(raw: &str, max_words: usize) -> String {
     let mut s = raw.trim().trim_matches('"').trim_matches('\'').trim();
     // Drop a leading label like "Title:" / "Name:" if the model added one — but only for known
     // label words, so a real title that happens to contain a colon ("Fix: Auth Bug") is kept.
@@ -116,14 +131,57 @@ fn sanitize_name(raw: &str) -> String {
             s = rest.trim();
         }
     }
-    let words: Vec<&str> = s.split_whitespace().take(4).collect();
+    let words: Vec<&str> = s.split_whitespace().take(max_words).collect();
     words.join(" ").trim_end_matches(['.', ',']).to_string()
 }
 
-/// Generate a short agent name from a prompt. Returns Err on any failure (no key, network,
-/// HTTP error, empty result) so the caller can silently keep the existing name.
+/// Parse the model's reply into the three length variants. The model is asked for a bare JSON
+/// object, but tolerate stray prose or ```json fences by slicing from the first `{` to the
+/// last `}`. Returns None if no usable object is found so the caller can fall back.
+fn parse_variants(text: &str) -> Option<AgentName> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    let slice = text.get(start..=end)?;
+    let v: serde_json::Value = serde_json::from_str(slice).ok()?;
+    let field = |k: &str, cap: usize| {
+        v.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(|s| sanitize_name(s, cap))
+            .unwrap_or_default()
+    };
+    let name = normalize(AgentName {
+        short: field("short", 4),
+        medium: field("medium", 6),
+        long: field("long", 10),
+    });
+    // At least one variant must have survived sanitizing.
+    if name.short.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Backfill any empty variant from a longer-then-shorter neighbor so the UI always has a
+/// non-empty string to show at every length (e.g. the model omitted "long" → reuse "medium").
+fn normalize(mut n: AgentName) -> AgentName {
+    if n.medium.is_empty() {
+        n.medium = if !n.long.is_empty() { n.long.clone() } else { n.short.clone() };
+    }
+    if n.long.is_empty() {
+        n.long = n.medium.clone();
+    }
+    if n.short.is_empty() {
+        n.short = n.medium.clone();
+    }
+    n
+}
+
+/// Generate the three length variants of an agent name from a prompt. Returns Err on any
+/// failure (no key, network, HTTP error, empty result) so the caller can silently keep the
+/// existing name.
 #[tauri::command]
-pub async fn generate_agent_name(prompt: String) -> Result<String, String> {
+pub async fn generate_agent_name(prompt: String) -> Result<AgentName, String> {
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() {
         return Err("empty prompt".into());
@@ -137,12 +195,15 @@ pub async fn generate_agent_name(prompt: String) -> Result<String, String> {
         .map_err(|e| format!("join error: {e}"))?
 }
 
-fn call_anthropic(key: &str, prompt: &str) -> Result<String, String> {
+fn call_anthropic(key: &str, prompt: &str) -> Result<AgentName, String> {
     // Serialize/parse via serde_json directly so we don't depend on ureq's optional `json`
     // feature (the crate is pulled in without it).
     let body = serde_json::json!({
+        // Three titles (plus JSON braces/keys/quotes) need more room than the old single
+        // 2–4 word reply; budget headroom so a slightly verbose reply isn't truncated
+        // mid-JSON (which would silently drop us to the single-title fallback). Still cheap.
         "model": NAMING_MODEL,
-        "max_tokens": 24,
+        "max_tokens": 200,
         "system": SYSTEM_PROMPT,
         "messages": [{ "role": "user", "content": prompt }],
     });
@@ -184,11 +245,21 @@ fn call_anthropic(key: &str, prompt: &str) -> Result<String, String> {
         }
     }
 
-    let name = sanitize_name(&text);
-    if name.is_empty() {
+    // Preferred path: the model returned the JSON object with all three variants.
+    if let Some(name) = parse_variants(&text) {
+        return Ok(name);
+    }
+    // Fallback: treat the whole reply as one plain title and derive the variants from it, so a
+    // model that ignored the JSON instruction still yields a usable (if uniform) name.
+    let long = sanitize_name(&text, 10);
+    if long.is_empty() {
         return Err("model returned no usable name".into());
     }
-    Ok(name)
+    Ok(normalize(AgentName {
+        short: sanitize_name(&text, 4),
+        medium: sanitize_name(&text, 6),
+        long,
+    }))
 }
 
 #[cfg(test)]
@@ -237,11 +308,70 @@ mod tests {
 
     #[test]
     fn sanitize_trims_quotes_prefix_and_length() {
-        assert_eq!(sanitize_name("\"Fix Login Redirect\""), "Fix Login Redirect");
-        assert_eq!(sanitize_name("Title: Add Dark Mode"), "Add Dark Mode");
-        assert_eq!(sanitize_name("One Two Three Four Five"), "One Two Three Four");
-        assert_eq!(sanitize_name("Refactor Auth."), "Refactor Auth");
+        assert_eq!(sanitize_name("\"Fix Login Redirect\"", 4), "Fix Login Redirect");
+        assert_eq!(sanitize_name("Title: Add Dark Mode", 4), "Add Dark Mode");
+        assert_eq!(sanitize_name("One Two Three Four Five", 4), "One Two Three Four");
+        assert_eq!(sanitize_name("Refactor Auth.", 4), "Refactor Auth");
         // A real title containing a colon must NOT have its first word eaten.
-        assert_eq!(sanitize_name("Fix: Auth Bug"), "Fix: Auth Bug");
+        assert_eq!(sanitize_name("Fix: Auth Bug", 4), "Fix: Auth Bug");
+    }
+
+    #[test]
+    fn sanitize_respects_the_word_cap() {
+        let six = "One Two Three Four Five Six Seven Eight";
+        assert_eq!(sanitize_name(six, 6), "One Two Three Four Five Six");
+        assert_eq!(sanitize_name(six, 10), "One Two Three Four Five Six Seven Eight");
+    }
+
+    #[test]
+    fn parses_the_three_variant_object() {
+        let reply = r#"{"short":"Fix Login Redirect","medium":"Fix OAuth Login Redirect Loop","long":"Fix OAuth Login Redirect Loop After Token Refresh"}"#;
+        let n = parse_variants(reply).expect("should parse");
+        assert_eq!(n.short, "Fix Login Redirect");
+        assert_eq!(n.medium, "Fix OAuth Login Redirect Loop");
+        assert_eq!(n.long, "Fix OAuth Login Redirect Loop After Token Refresh");
+    }
+
+    #[test]
+    fn parses_through_markdown_fences_and_prose() {
+        let reply = "Sure! Here you go:\n```json\n{\"short\": \"Add Dark Mode\", \"medium\": \"Add Dark Mode Toggle Setting\", \"long\": \"Add Dark Mode Toggle To Settings Page Header\"}\n```";
+        let n = parse_variants(reply).expect("should parse despite fences");
+        assert_eq!(n.short, "Add Dark Mode");
+        assert_eq!(n.medium, "Add Dark Mode Toggle Setting");
+    }
+
+    #[test]
+    fn parse_caps_each_variant_length() {
+        // Model ignores the word budgets — we still clamp to 4/6/10.
+        let reply = r#"{"short":"A B C D E F","medium":"A B C D E F G H","long":"A B C D E F G H I J K L"}"#;
+        let n = parse_variants(reply).expect("should parse");
+        assert_eq!(n.short.split_whitespace().count(), 4);
+        assert_eq!(n.medium.split_whitespace().count(), 6);
+        assert_eq!(n.long.split_whitespace().count(), 10);
+    }
+
+    #[test]
+    fn normalize_backfills_missing_variants() {
+        // Only "short" present → medium and long reuse it.
+        let n = normalize(AgentName {
+            short: "Fix Bug".into(),
+            medium: String::new(),
+            long: String::new(),
+        });
+        assert_eq!(n.medium, "Fix Bug");
+        assert_eq!(n.long, "Fix Bug");
+        // Only "long" present → short and medium reuse it.
+        let n = normalize(AgentName {
+            short: String::new(),
+            medium: String::new(),
+            long: "Fix The Login Redirect Loop Bug".into(),
+        });
+        assert_eq!(n.short, "Fix The Login Redirect Loop Bug");
+        assert_eq!(n.medium, "Fix The Login Redirect Loop Bug");
+    }
+
+    #[test]
+    fn parse_variants_rejects_non_object() {
+        assert!(parse_variants("just a plain title, no json").is_none());
     }
 }
