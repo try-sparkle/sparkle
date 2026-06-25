@@ -188,4 +188,34 @@ describe("syncMarkdownToChief — store glue ()", () => {
     release();
     await first;
   });
+
+  it("backs off a failing endpoint, then retries after the cooldown and resets on success ()", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    runtime.__resetChiefSyncBackoff();
+    vi.useFakeTimers();
+    try {
+      // First tick: the endpoint is unreachable → throws, arming the backoff (base 5s).
+      syncAgentMarkdown.mockRejectedValueOnce(new TypeError("Load failed"));
+      await runtime.syncMarkdownToChief(projectId, agentId);
+      expect(syncAgentMarkdown).toHaveBeenCalledTimes(1);
+
+      // A tick well within the cooldown is skipped entirely — no second fetch at the dead endpoint.
+      vi.advanceTimersByTime(1_000);
+      await runtime.syncMarkdownToChief(projectId, agentId);
+      expect(syncAgentMarkdown).toHaveBeenCalledTimes(1);
+
+      // Past the cooldown the sync is attempted again; this time it succeeds and clears the backoff.
+      vi.advanceTimersByTime(5_000);
+      syncAgentMarkdown.mockResolvedValueOnce({ headSha: "h", uploaded: [], chiefProjectId: "p" });
+      await runtime.syncMarkdownToChief(projectId, agentId);
+      expect(syncAgentMarkdown).toHaveBeenCalledTimes(2);
+
+      // Backoff was reset by the success, so the very next tick runs immediately (no cooldown).
+      syncAgentMarkdown.mockResolvedValueOnce({ headSha: "h", uploaded: [], chiefProjectId: "p" });
+      await runtime.syncMarkdownToChief(projectId, agentId);
+      expect(syncAgentMarkdown).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

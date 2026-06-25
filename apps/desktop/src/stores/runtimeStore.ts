@@ -20,6 +20,20 @@ import { useProjectStore } from "./projectStore";
 // ensureChiefProject, racing to create two duplicate projects. One sync per agent at a time.
 const syncingAgents = new Set<string>();
 
+// Per-agent failure backoff (). When the Chief endpoint is unreachable the sync
+// throws ("Load failed") on every poll tick; the watermark stays un-advanced and the next tick
+// retries immediately, so a dead endpoint gets hammered every poll for the app's lifetime (and
+// floods the log). After a failure we skip this agent's sync until an exponential, capped
+// cooldown elapses; the next successful round-trip clears it. The happy path is unaffected.
+const SYNC_BACKOFF_BASE_MS = 5_000;
+const SYNC_BACKOFF_CAP_MS = 5 * 60_000;
+const syncBackoff = new Map<string, { until: number; fails: number }>();
+
+/** Test-only: clear the Chief-sync backoff state between cases. */
+export function __resetChiefSyncBackoff(): void {
+  syncBackoff.clear();
+}
+
 /** After a status poll, push any newly-committed markdown to the agent's Chief project so the
  *  Brainstorm agent stays current. Best-effort + store-driven: pulls PAT/project/marker from
  *  the stores, leaves the watermark un-advanced on failure so the next tick retries. Brainstorm
@@ -32,6 +46,8 @@ export async function syncMarkdownToChief(projectId: string, agentId: string): P
   const agent = project?.agents.find((a) => a.id === agentId);
   if (!project || !agent || agent.kind === "brainstorm") return;
   if (syncingAgents.has(agentId)) return; // a sync for this agent is already running
+  const backoff = syncBackoff.get(agentId);
+  if (backoff && Date.now() < backoff.until) return; // cooling down after a recent failure
   syncingAgents.add(agentId);
   try {
     const res = await syncAgentMarkdown({
@@ -42,6 +58,7 @@ export async function syncMarkdownToChief(projectId: string, agentId: string): P
       chiefProjectId: settings.chiefProjectByProject[projectId],
       sinceSha: settings.chiefSyncByAgent[agentId],
     });
+    syncBackoff.delete(agentId); // round-trip succeeded → endpoint healthy, reset backoff
     if (!res) return;
     if (res.chiefProjectId && res.chiefProjectId !== settings.chiefProjectByProject[projectId]) {
       settings.setChiefProject(projectId, res.chiefProjectId);
@@ -50,8 +67,12 @@ export async function syncMarkdownToChief(projectId: string, agentId: string): P
       settings.setChiefSync(agentId, res.headSha);
     }
   } catch (e) {
-    // Best-effort: a Chief/git hiccup must not break the UI. The un-advanced marker retries.
-    console.debug("chief markdown sync failed for", agentId, e);
+    // Best-effort: a Chief/git hiccup must not break the UI. Back off so we don't retry a dead
+    // endpoint every poll tick; the un-advanced marker is reattempted once the cooldown elapses.
+    const fails = (syncBackoff.get(agentId)?.fails ?? 0) + 1;
+    const delay = Math.min(SYNC_BACKOFF_BASE_MS * 2 ** (fails - 1), SYNC_BACKOFF_CAP_MS);
+    syncBackoff.set(agentId, { until: Date.now() + delay, fails });
+    console.debug("chief markdown sync failed for", agentId, `(backoff ${delay}ms)`, e);
   } finally {
     syncingAgents.delete(agentId);
   }
