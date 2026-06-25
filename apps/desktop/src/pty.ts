@@ -34,9 +34,23 @@ export function spawnPty(opts: SpawnPtyOptions): Promise<void> {
   });
 }
 
+// A PTY can exit (and have its session reaped on the Rust side) a beat before a stray
+// keystroke or a ResizeObserver-driven resize reaches it — pty_write / pty_resize then
+// return Err("no such pty"). Callers fire these and forget, so an un-caught rejection would
+// surface as an app-level "unhandled rejection" ERROR (logger.ts) and flood the log. That's
+// an expected teardown race, not a real failure, so swallow exactly this error and let any
+// other error propagate.
+function isExitedPtyError(e: unknown): boolean {
+  return String((e as { message?: string })?.message ?? e).includes("no such pty");
+}
+
+function ignoreExitedPty(e: unknown): void {
+  if (!isExitedPtyError(e)) throw e;
+}
+
 /** Write to a PTY's stdin — e.g. approve ("y\n") / deny ("n\n") or user keystrokes. */
 export function writePty(id: string, data: string): Promise<void> {
-  return invoke("pty_write", { id, data });
+  return invoke<void>("pty_write", { id, data }).catch(ignoreExitedPty);
 }
 
 // Bracketed-paste wrappers: ESC[200~ … ESC[201~. ESC is char code 27 — constructed here so
@@ -56,7 +70,7 @@ export async function submitPrompt(id: string, text: string): Promise<void> {
 }
 
 export function resizePty(id: string, cols: number, rows: number): Promise<void> {
-  return invoke("pty_resize", { id, cols, rows });
+  return invoke<void>("pty_resize", { id, cols, rows }).catch(ignoreExitedPty);
 }
 
 export function killPty(id: string): Promise<void> {
@@ -87,4 +101,18 @@ export function createWorkerWorktree(args: {
 
 export function readWorkerResult(worktree: string): Promise<string | null> {
   return invoke("read_worker_result", { worktree });
+}
+
+/**
+ * Swallow the benign "no such pty" race for fire-and-forget writes/resizes/kills.
+ * A late resize after an agent exits, or input racing PTY teardown, rejects with
+ * "no such pty" — the PTY is simply gone, nothing to do. Anything else is
+ * unexpected and gets logged rather than silently dropped. The matched literal is
+ * the NO_SUCH_PTY constant in src-tauri/src/pty.rs; keep the two in sync. Use as:
+ *   void resizePty(id, c, r).catch(ignorePtyGone);
+ */
+export function ignorePtyGone(err: unknown): void {
+  const msg = typeof err === "string" ? err : (err as { message?: string })?.message ?? String(err);
+  if (msg.includes("no such pty")) return;
+  console.error("pty operation failed:", err);
 }

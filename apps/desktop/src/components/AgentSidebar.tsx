@@ -251,7 +251,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           // Indent by tree position, not by parentId: the group head (top) sits at depth 0 — so
           // an orphaned worker surfaced as its own head isn't mis-indented — and real children at 1.
           const depth = a.id === top.id ? 0 : 1;
-          const kindGlyph = a.kind === "brainstorm" ? "✦" : a.kind === "worker" ? "↳" : "⚒";
+          const kindGlyph =
+            a.kind === "brainstorm" ? "✦" : a.kind === "worker" ? "↳" : a.kind === "shell" ? "▶" : "⚒";
           return (
             <div
               key={a.id}

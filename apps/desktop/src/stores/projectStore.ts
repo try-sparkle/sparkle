@@ -17,13 +17,14 @@ export interface AddAgentOpts {
   name?: string;
   task?: string;
   parentBranch?: string;
+  shellCommand?: string;
 }
 
 // Default display name for a freshly created agent, numbered within its kind so you get
 // "Build 1", "Worker 2", etc. Brainstorm agents are singular per project by convention.
 function defaultAgentName(p: Project, kind: AgentKind): string {
   if (kind === "brainstorm") return "Brainstorm";
-  const label = kind === "worker" ? "Worker" : "Build";
+  const label = kind === "worker" ? "Worker" : kind === "shell" ? "Shell" : "Build";
   const n = p.agents.filter((a) => a.kind === kind).length + 1;
   return `${label} ${n}`;
 }
@@ -147,6 +148,31 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
       })),
     }));
   }
+  if (version < 6) {
+    // Run-as-cmd "shell" agents (terminal selection popup) added the shellCommand field.
+    // Folded in from PR #62 as v6: it shipped as v4 on its own branch, but main had already
+    // taken v4 (autoNameVariants) and v5 (promptHistory), so it becomes the next step here.
+    state.projects = state.projects.map((p) => ({
+      ...p,
+      agents: (p.agents ?? []).map((a) => ({ ...a, shellCommand: (a as AgentTab).shellCommand ?? null })),
+    }));
+  }
+  // Version-collision safety net. PR #62 shipped shellCommand as v4 on its own branch while main
+  // independently used v4=autoNameVariants and v5=promptHistory. A store persisted under #62's v4
+  // would report version===4, so the version-gated `< 4` block above (now autoNameVariants) is
+  // skipped and that agent rehydrates with autoNameVariants `undefined` — violating its
+  // non-optional type. Normalize all three fields unconditionally (idempotent `??` no-ops on
+  // records that already have them) so every agent satisfies its type regardless of which branch's
+  // version number it was saved under.
+  state.projects = state.projects.map((p) => ({
+    ...p,
+    agents: (p.agents ?? []).map((a) => ({
+      ...a,
+      autoNameVariants: a.autoNameVariants ?? null,
+      promptHistory: a.promptHistory ?? [],
+      shellCommand: (a as AgentTab).shellCommand ?? null,
+    })),
+  }));
   return state;
 }
 
@@ -252,6 +278,7 @@ export const useProjectStore = create<ProjectState>()(
               namePinned: opts?.name != null,
               autoNameBasis: null,
               autoNameVariants: null,
+              shellCommand: opts?.shellCommand ?? null,
             };
             return { ...p, agents: [...p.agents, agent], selectedAgentId: id };
           }),
@@ -352,8 +379,9 @@ export const useProjectStore = create<ProjectState>()(
       // v2 backfills the auto-naming fields (namePinned/autoNameBasis). v3 backfills the
       // Brainstorm/Build kind + parentId (separate step so records already at v2 still get them).
       // v4 backfills autoNameVariants (width-fitted names) to null. v5 backfills promptHistory
-      // (the pinned-header dropdown) as an empty array.
-      version: 5,
+      // (the pinned-header dropdown) as an empty array. v6 backfills shellCommand: null for the
+      // Run-as-cmd "shell" agent kind (folded in from PR #62).
+      version: 6,
       migrate: (persisted, version) => migratePersisted(persisted, version) as ProjectState,
     },
   ),

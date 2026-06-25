@@ -94,6 +94,12 @@ fn validate_spawn_inner(
     Ok(Some(real))
 }
 
+/// Returned (as the `Err` string) when a write/resize/kill targets a PTY that has
+/// already exited — a benign race the frontend expects. `ignorePtyGone` in
+/// `apps/desktop/src/pty.ts` substring-matches this exact text to swallow the
+/// rejection, so keep the two in sync if you ever rephrase it.
+const NO_SUCH_PTY: &str = "no such pty";
+
 /// Spawn `command` in a PTY. Output streams to the frontend via the `pty:output`
 /// event; `pty:exit` fires when the process ends.
 #[tauri::command]
@@ -220,7 +226,7 @@ pub fn pty_spawn(
 #[tauri::command]
 pub fn pty_write(manager: State<PtyManager>, id: String, data: String) -> Result<(), String> {
     let mut sessions = manager.sessions.lock().unwrap();
-    let session = sessions.get_mut(&id).ok_or("no such pty")?;
+    let session = sessions.get_mut(&id).ok_or(NO_SUCH_PTY)?;
     session.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
     session.writer.flush().map_err(|e| e.to_string())?;
     Ok(())
@@ -234,7 +240,7 @@ pub fn pty_resize(
     rows: u16,
 ) -> Result<(), String> {
     let sessions = manager.sessions.lock().unwrap();
-    let session = sessions.get(&id).ok_or("no such pty")?;
+    let session = sessions.get(&id).ok_or(NO_SUCH_PTY)?;
     session
         .master
         .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })

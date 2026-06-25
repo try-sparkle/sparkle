@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Project } from "../types";
 import { useSettingsStore, effectiveChiefPat } from "../stores/settingsStore";
+import { useHandoffStore } from "../stores/handoffStore";
 import {
   ensureChiefProject,
   startChat,
@@ -39,8 +40,12 @@ export function BrainstormPanel({ project, agentId }: { project: Project; agentI
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [linking, setLinking] = useState(false);
+  const handoff = useHandoffStore((s) => s.pending);
+  const clearHandoff = useHandoffStore((s) => s.clear);
+
   const chatIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   // Attempt the auto-link at most ONCE per (project, pat) pair. Without this, a failed link
   // (Chief outage / bad PAT) would re-fire the effect via setLinking(false) and retry forever,
   // hammering the API. The key changes only when the user connects a new PAT or switches project,
@@ -133,6 +138,25 @@ export function BrainstormPanel({ project, agentId }: { project: Project; agentI
     });
   }, [agentId]);
 
+  // A terminal-selection action queued a prompt for this project's brainstorm agent. Prefill it
+  // (and auto-send for Explain/Ask). Runs once per queued handoff, then clears it.
+  // Guard on `pat`: if Chief is not yet connected the composer isn't mounted, so deferring keeps
+  // the handoff alive until the user connects and the next render re-runs this effect.
+  useEffect(() => {
+    if (!handoff || handoff.projectId !== project.id || !pat) return;
+    const { text, autoSend } = handoff;
+    clearHandoff();
+    if (autoSend) {
+      void sendText(text);
+    } else {
+      setInput(text);
+      inputRef.current?.focus();
+    }
+    // `sendText` is stable enough for this one-shot; the deps are the intentional gates
+    // (handoff to consume, project.id to scope it, pat to defer until Chief is connected).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handoff, project.id, pat]);
+
   // ---- No PAT yet: connect state -------------------------------------------------
   if (!pat) {
     return <ConnectChief onSave={setChiefPat} />;
@@ -184,6 +208,7 @@ export function BrainstormPanel({ project, agentId }: { project: Project; agentI
       {/* Composer */}
       <div style={{ display: "flex", gap: 8, padding: 12, borderTop: `1px solid ${C.deepForest}` }}>
         <textarea
+          ref={inputRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {

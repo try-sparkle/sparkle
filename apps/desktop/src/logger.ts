@@ -27,6 +27,20 @@ const realConsole = {
 // Reentrancy guard: if invoke() ever logs to console on failure, we must not re-forward.
 let forwarding = false;
 
+// Known-benign, high-frequency messages emitted by Tauri's OWN JS runtime (not our code)
+// that would otherwise flood the persistent log and bury real signal. The chief offender
+// is "[TAURI] Couldn't find callback id N", which Tauri logs once per in-flight IPC
+// callback whenever the webview reloads while Rust is mid-async-operation — thousands of
+// lines per reload — and is harmless (Tauri transparently falls back). These are still
+// printed to the live console (devtools) via the real console methods; we just don't
+// forward them to the log file. Match on a stable substring of each message.
+const LOG_FORWARD_DENYLIST = ["Couldn't find callback id"];
+
+/** Whether an auto-captured console line should be forwarded to the persistent log. */
+export function shouldForwardConsole(message: string): boolean {
+  return !LOG_FORWARD_DENYLIST.some((needle) => message.includes(needle));
+}
+
 function forward(level: Level, scope: string, message: string) {
   if (forwarding) return;
   forwarding = true;
@@ -79,7 +93,9 @@ export function initLogger() {
   const patch = (name: "log" | "info" | "warn" | "error" | "debug", level: Level) => {
     console[name] = (...args: unknown[]) => {
       realConsole[name](...args);
-      forward(level, "console", render(args));
+      const line = render(args);
+      // Drop known-benign Tauri-internal noise from the log file (still printed above).
+      if (shouldForwardConsole(line)) forward(level, "console", line);
     };
   };
   patch("log", "info");

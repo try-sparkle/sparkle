@@ -34,6 +34,7 @@ function agent(id: string, kind: AgentKind): AgentTab {
     namePinned: false,
     autoNameBasis: null,
     autoNameVariants: null,
+    shellCommand: null,
   };
 }
 

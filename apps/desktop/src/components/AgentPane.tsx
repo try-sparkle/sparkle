@@ -32,6 +32,21 @@ type Phase = "preparing" | "ready" | "no-claude" | "error";
 // GUI apps otherwise get a minimal PATH and can't find node/git/etc.
 const SHELL = "/bin/zsh";
 
+/**
+ * Build the argv for a shell agent spawn. Exported for unit testing of the injection-safety
+ * invariant: the command must live in the positional-arg slot (args[4]) and must NEVER be
+ * interpolated into the script string (args[2]).
+ *
+ *   shell -l -c 'eval "$1"; exec "$0" -l'  <shell-as-$0>  <cmd-as-$1>
+ *
+ * `eval "$1"` runs the command through the shell's argument-word expansion, not through a
+ * string-embedded substitution, so trailing backslashes / unclosed quotes in the selection
+ * can't escape into the surrounding script.
+ */
+export function buildShellSpawnArgs(shell: string, cmd: string): string[] {
+  return ["-l", "-c", 'eval "$1"; exec "$0" -l', shell, cmd];
+}
+
 interface SpawnCmd {
   command: string;
   args: string[];
@@ -95,6 +110,23 @@ export function AgentPane({
   const prepare = async () => {
     // Brainstorm agents are a Chief chat — no worktree, no PTY, nothing to prepare.
     if (agent.kind === "brainstorm") return;
+    // Shell agents (Run-as-cmd) run a raw command in the project root, then drop into an
+    // interactive login shell so output stays visible and follow-up commands work. No worktree,
+    // no claude — spawn straight away.
+    if (agent.kind === "shell") {
+      // `SHELL` is defined at the top of this file. Pass the command as a positional arg ($1),
+      // NEVER interpolated into the script, so a selection ending in a backslash/quote can't
+      // swallow the trailing interactive shell. $0 is the shell path; `eval "$1"` runs the
+      // command, then we exec a login shell.
+      const cmd = agent.shellCommand ?? "";
+      setSpawn({
+        command: SHELL,
+        args: buildShellSpawnArgs(SHELL, cmd),
+        cwd: project.rootPath,
+      });
+      setPhase("ready");
+      return;
+    }
     setPhase("preparing");
     setErrorMsg("");
     setPtyReady(false);
@@ -265,6 +297,8 @@ export function AgentPane({
           <div style={{ position: "absolute", inset: 0, padding: 6 }}>
             <Terminal
               agentId={agent.id}
+              projectId={project.id}
+              projectRootPath={project.rootPath}
               command={spawn.command}
               args={spawn.args}
               cwd={spawn.cwd}

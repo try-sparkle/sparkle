@@ -7,12 +7,14 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, CHAT_USER_BUBBLE, xtermTheme } from "../theme/colors";
 import { useResolvedTheme } from "../theme/theme";
 import type { AgentTabStatus } from "../types";
-import { spawnPty, writePty, killPty, resizePty, onPtyOutput, onPtyExit } from "../pty";
+import { spawnPty, writePty, killPty, resizePty, onPtyOutput, onPtyExit, ignorePtyGone } from "../pty";
 import { StatusEngine } from "../engine/statusEngine";
 import { snapshotScreen } from "../engine/screenSnapshot";
 import { useUiStore } from "../stores/uiStore";
 import { isComposerToggleKey } from "./composerToggle";
 import { wheelToScrollLines } from "./terminalScroll";
+import { SelectionPopup } from "./SelectionPopup";
+import { recoverFromWebglContextLoss } from "./terminalWebgl";
 
 // Terminal font size at 100%. The ⋯-menu "Text size" control (and Cmd +/-) multiplies
 // this by the `zoom` factor, so it scales the terminal text only — not the UI chrome.
@@ -111,6 +113,8 @@ function flashRow(term: XTerm, marker: IMarker, timers: Set<number>): void {
  */
 export function Terminal({
   agentId,
+  projectId,
+  projectRootPath,
   command,
   args,
   cwd,
@@ -123,6 +127,8 @@ export function Terminal({
   apiRef,
 }: {
   agentId: string;
+  projectId: string;
+  projectRootPath: string;
   command: string;
   args: string[];
   cwd: string;
@@ -157,6 +163,8 @@ export function Terminal({
   // Brief "Copied to clipboard" flash shown after a mouse selection is copied.
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<number | null>(null);
+  // Floating actions for the current selection — anchored at the mouse-up point.
+  const [popup, setPopup] = useState<{ x: number; y: number; text: string } | null>(null);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -199,12 +207,14 @@ export function Terminal({
     // crisp, exactly-aligned box-drawing. Fall back silently if WebGL is unavailable.
     try {
       const webgl = new WebglAddon();
-      // On context loss the addon disposes itself and the default renderer takes over; null the
-      // ref too so the re-theme effect doesn't call clearTextureAtlas() on a disposed addon
-      // (term.refresh alone repaints under the default renderer).
+      // On a lost GPU context the default renderer must take over and the screen must be
+      // repainted, else it stays blank/stale until the next PTY write. recoverFromWebglContextLoss
+      // disposes the addon, nulls the ref (so the re-theme effect doesn't touch a disposed addon),
+      // and forces a full refresh.
       webgl.onContextLoss(() => {
-        webgl.dispose();
-        webglRef.current = null;
+        recoverFromWebglContextLoss(webgl, termRef.current, () => {
+          webglRef.current = null;
+        });
       });
       term.loadAddon(webgl);
       webglRef.current = webgl;
@@ -231,7 +241,7 @@ export function Terminal({
 
     // Forward keystrokes typed directly in the terminal to the PTY.
     term.onData((d) => {
-      void writePty(agentId, d);
+      void writePty(agentId, d).catch(ignorePtyGone);
     });
 
     // The terminal is a real terminal: every keystroke reaches the PTY, so Claude's menus
@@ -327,7 +337,7 @@ export function Terminal({
     // Copy-on-select: when the user finishes a mouse selection, copy it to the clipboard
     // and flash a confirmation so the (otherwise invisible) copy is obvious. A plain click
     // leaves an empty selection — nothing is copied and no toast shows.
-    const onMouseUp = () => {
+    const onMouseUp = (e: MouseEvent) => {
       const sel = term.getSelection();
       if (!sel || sel.trim().length === 0) return;
       void copyToClipboard(sel).then((ok) => {
@@ -338,13 +348,18 @@ export function Terminal({
         if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
         copiedTimer.current = window.setTimeout(() => setCopied(false), 1100);
       });
+      // Open the action popup at the cursor regardless of clipboard timing.
+      setPopup({ x: e.clientX, y: e.clientY, text: sel });
     };
+    // A new drag (mousedown) dismisses any open popup before the next selection.
+    const onMouseDown = () => setPopup(null);
     container.addEventListener("mouseup", onMouseUp);
+    container.addEventListener("mousedown", onMouseDown);
 
     const ro = new ResizeObserver(() => {
       try {
         fit.fit();
-        void resizePty(agentId, term.cols, term.rows);
+        void resizePty(agentId, term.cols, term.rows).catch(ignorePtyGone);
       } catch {
         /* ignore transient fit errors while hidden */
       }
@@ -361,9 +376,10 @@ export function Terminal({
       markersRef.current.clear();
       ro.disconnect();
       container.removeEventListener("mouseup", onMouseUp);
+      container.removeEventListener("mousedown", onMouseDown);
       if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
       for (const off of unlistens) off();
-      void killPty(agentId);
+      void killPty(agentId).catch(ignorePtyGone);
       engine.dispose();
       term.dispose();
       webglRef.current = null;
@@ -383,7 +399,7 @@ export function Terminal({
       try {
         fit.fit();
         onRequestFocusRef.current?.();
-        void resizePty(agentId, term.cols, term.rows);
+        void resizePty(agentId, term.cols, term.rows).catch(ignorePtyGone);
       } catch {
         /* ignore */
       }
@@ -401,7 +417,7 @@ export function Terminal({
     const raf = requestAnimationFrame(() => {
       try {
         fit.fit();
-        void resizePty(agentId, term.cols, term.rows);
+        void resizePty(agentId, term.cols, term.rows).catch(ignorePtyGone);
       } catch {
         /* ignore transient fit errors */
       }
@@ -450,6 +466,17 @@ export function Terminal({
       >
         ✓ Copied to clipboard
       </div>
+      {popup && (
+        <SelectionPopup
+          x={popup.x}
+          y={popup.y}
+          text={popup.text}
+          agentId={agentId}
+          projectId={projectId}
+          projectRootPath={projectRootPath}
+          onClose={() => setPopup(null)}
+        />
+      )}
     </div>
   );
 }

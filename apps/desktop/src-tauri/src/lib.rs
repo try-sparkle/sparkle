@@ -15,6 +15,7 @@ mod screenshot;
 mod socket;
 mod sparkle_agent;
 mod worktree;
+mod notes;
 
 use pty::PtyManager;
 use tauri::Manager;
@@ -74,7 +75,9 @@ pub fn run() {
             connectivity::probe_connectivity,
             chief::chief_pat,
             bridge::start_orchestration_bridge,
-            bridge::stop_orchestration_bridge
+            bridge::stop_orchestration_bridge,
+            notes::append_note,
+            notes::create_bead
         ])
         // TODO(phase1):
         //  - deep-link handler for sparkle://oauth/callback (only if/when Anthropic

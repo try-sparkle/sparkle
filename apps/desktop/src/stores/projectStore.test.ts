@@ -187,6 +187,56 @@ describe("projectStore prompt history", () => {
   });
 });
 
+describe("projectStore shell agent", () => {
+  beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
+
+  it("addAgent persists a shell agent's command", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore
+      .getState()
+      .addAgent(pid, { kind: "shell", name: "npm run build", shellCommand: "npm run build" });
+    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
+    expect(agent.kind).toBe("shell");
+    expect(agent.shellCommand).toBe("npm run build");
+    expect(agent.namePinned).toBe(true); // explicit name → pinned, won't auto-rename
+  });
+
+  it("migrate normalizes a PR #62 v4-collision record (shellCommand but no autoNameVariants)", () => {
+    // PR #62 shipped shellCommand as v4 on its own branch; main used v4=autoNameVariants. A store
+    // saved under #62's v4 reports version 4, so the version-gated `< 4` block is skipped. The
+    // unconditional safety net must still backfill autoNameVariants (and leave shellCommand intact).
+    const collided = {
+      projects: [
+        {
+          id: "p",
+          name: "Old",
+          rootPath: "/x",
+          defaultBranch: "main",
+          agents: [
+            {
+              id: "a",
+              name: "A",
+              kind: "shell",
+              parentId: null,
+              lastPrompt: "",
+              shellCommand: "npm run build", // present (it was #62's v4 addition)
+              // autoNameVariants intentionally absent — main's v4 block is skipped for version 4
+            },
+          ],
+        },
+      ],
+      selectedProjectId: null,
+    } as unknown;
+    const out = migratePersisted(collided, 4) as {
+      projects: Array<{ agents: Array<{ autoNameVariants: unknown; shellCommand: unknown; promptHistory: unknown }> }>;
+    };
+    const agent = out.projects[0]!.agents[0]!;
+    expect(agent.autoNameVariants).toBeNull(); // backfilled by the safety net despite version 4
+    expect(agent.shellCommand).toBe("npm run build"); // preserved
+    expect(agent.promptHistory).toEqual([]); // also normalized
+  });
+});
+
 // Pure migration tests — no store instantiation, so they don't depend on a localStorage shim
 // (the action-based suite above needs one; see the test-env bead).
 describe("projectStore migration — Brainstorm/Build (v3)", () => {
@@ -222,5 +272,47 @@ describe("projectStore migration — Brainstorm/Build (v3)", () => {
     expect(out.projects[0]!.agents[0]!.kind).toBe("build");
     expect(out.projects[0]!.agents[0]!.parentId).toBeNull();
     expect(out.projects[0]!.agents[0]!.baseBranch).toBeNull();
+  });
+});
+
+describe("projectStore migration — shell/shellCommand (v4)", () => {
+  it("v4 backfills shellCommand: null on agents that predate the shell kind", () => {
+    // A v3 record has kind/parentId but no shellCommand field.
+    const v3 = {
+      projects: [
+        {
+          id: "p",
+          name: "Old",
+          rootPath: "/x",
+          defaultBranch: "main",
+          agents: [{ id: "a", name: "Build 1", kind: "build", parentId: null, baseBranch: "main" }],
+        },
+      ],
+      selectedProjectId: null,
+    } as unknown;
+    const out = migratePersisted(v3, 3) as {
+      projects: Array<{ agents: Array<{ shellCommand: unknown }> }>;
+    };
+    expect(out.projects[0]!.agents[0]!.shellCommand).toBeNull();
+  });
+
+  it("v4 migration preserves an existing shellCommand value", () => {
+    // A record that somehow already has shellCommand set (e.g. written by a newer client
+    // then loaded by an older one and re-migrated) must not clobber the value.
+    const withShell = {
+      projects: [
+        {
+          id: "p",
+          name: "P",
+          rootPath: "/x",
+          agents: [{ id: "a", name: "Shell 1", kind: "shell", shellCommand: "npm test" }],
+        },
+      ],
+      selectedProjectId: null,
+    } as unknown;
+    const out = migratePersisted(withShell, 3) as {
+      projects: Array<{ agents: Array<{ shellCommand: unknown }> }>;
+    };
+    expect(out.projects[0]!.agents[0]!.shellCommand).toBe("npm test");
   });
 });

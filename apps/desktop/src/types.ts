@@ -9,7 +9,7 @@ export type Runtime = "local" | "cloud";
 // Chief over the project's knowledge (no worktree/PTY). A "build" agent is a master
 // orchestrator you talk to (a Claude terminal) that spawns "worker" sub-agents — each a
 // terminal agent in its own worktree, shown indented under its build parent in the sidebar.
-export type AgentKind = "brainstorm" | "build" | "worker";
+export type AgentKind = "brainstorm" | "build" | "worker" | "shell";
 
 // Three length variants of an auto-generated name (spec: width-fitted agent names). The
 // sidebar renders the longest variant that fits the column and reveals `long` on hover. Word
@@ -33,7 +33,7 @@ export interface PromptHistoryEntry {
 export interface AgentTab {
   id: string;
   name: string;
-  kind: AgentKind; // brainstorm | build | worker (legacy agents migrate to "build")
+  kind: AgentKind; // brainstorm | build | worker | shell (legacy agents migrate to "build")
   parentId: string | null; // for workers: the build agent that owns them; else null
   runtime: Runtime; // v1: always "local"; cloud is shown-but-disabled
   worktreePath: string | null; // Sparkle-managed isolated dir (hidden from user)
@@ -57,6 +57,9 @@ export interface AgentTab {
   // until the first auto-name lands, and for pinned/manually-named agents (which use `name`
   // only). `name` stays the canonical fallback — set to the medium variant when these exist.
   autoNameVariants: AgentNameVariants | null;
+  // For "shell" agents (Run-as-cmd from the terminal selection popup): the command this tab
+  // runs on spawn. Null for all other kinds.
+  shellCommand: string | null;
 }
 
 export interface Project {

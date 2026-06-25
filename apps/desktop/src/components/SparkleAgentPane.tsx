@@ -25,6 +25,7 @@ interface SpawnCmd {
   command: string;
   args: string[];
   cwd: string;
+  projectRootPath: string;
 }
 
 /**
@@ -84,6 +85,7 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
           }),
         ],
         cwd: wt.path,
+        projectRootPath: ws.repoPath,
       });
       setPhase("ready");
     } catch (e) {
@@ -135,6 +137,8 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
           <div style={{ position: "absolute", inset: 0, padding: 6 }}>
             <Terminal
               agentId={SPARKLE_AGENT_ID}
+              projectId={SPARKLE_PROJECT_ID}
+              projectRootPath={spawn.projectRootPath}
               command={spawn.command}
               args={spawn.args}
               cwd={spawn.cwd}
