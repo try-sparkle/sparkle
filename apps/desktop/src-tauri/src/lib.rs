@@ -1,3 +1,4 @@
+mod attachments;
 mod attention;
 mod audio;
 mod bridge;
@@ -55,6 +56,10 @@ pub fn run() {
             preflight::claude_preflight,
             claude::claude_has_session,
             screenshot::capture_screen_region,
+            attachments::load_attachment,
+            attachments::copy_image_to_clipboard,
+            attachments::copy_file_to,
+            attachments::copy_files_to_dir,
             worktree::ensure_project_repo,
             worktree::create_agent_worktree,
             worktree::create_worker_worktree,

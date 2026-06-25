@@ -176,7 +176,7 @@ export function BrainstormPanel({ project, agentId }: { project: Project; agentI
           fontSize: 12,
         }}
       >
-        <span style={{ fontSize: 14 }}>✦</span>
+        <span style={{ fontSize: 21 }}>✦</span>
         <span>
           Brainstorming with Chief over{" "}
           <span style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold }}>{project.name}</span>

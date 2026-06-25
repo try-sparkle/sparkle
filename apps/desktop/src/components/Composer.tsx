@@ -3,6 +3,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type ClipboardEvent,
   type KeyboardEvent,
   type PointerEvent,
   type RefObject,
@@ -10,7 +11,21 @@ import {
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../theme/colors";
 import { submitPrompt } from "../pty";
-import { captureScreenRegion, type Screenshot } from "../screenshot";
+import { captureScreenRegion } from "../screenshot";
+import { AttachmentRow } from "./composer/AttachmentRow";
+import {
+  buildSendPayload,
+  buildDisplay,
+  countLines,
+  shouldPasteAsPill,
+  type Attachment,
+  type TextBlock,
+} from "./composer/attachments";
+import {
+  loadAttachment,
+  screenshotAttachment,
+  nextId,
+} from "./composer/attachmentsApi";
 import {
   useUiStore,
   COMPOSER_MIN,
@@ -119,9 +134,13 @@ export function Composer({
     };
   }, [active, disabled, inputRef]);
 
-  // Screenshots attached to the next message. On send we splice their file paths
-  // into the text so the Claude Code CLI reads each PNG from disk.
-  const [attachments, setAttachments] = useState<Screenshot[]>([]);
+  // Files riding along with the next message — screenshots and dropped images/files.
+  // On send their paths are prefixed to the text so the Claude Code CLI reads each from
+  // disk. Rendered as selectable tiles in the AttachmentRow above the textarea.
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  // Large pastes collapsed into clickable pills (rather than flooding the textarea).
+  // Their full text is expanded inline into the payload on send.
+  const [textBlocks, setTextBlocks] = useState<TextBlock[]>([]);
   const [capturing, setCapturing] = useState(false);
   const height = useUiStore((s) => s.composerHeight);
   const setComposerHeight = useUiStore((s) => s.setComposerHeight);
@@ -186,7 +205,7 @@ export function Composer({
     // unmounted and the measurement early-returns (autoHeight freezes), so without this a
     // minimize→restore that changes nothing else would show the stale pre-minimize height.
     // `userSized` is a dep so toggling manual control re-resolves the height immediately.
-  }, [value, height, attachments.length, minimized, userSized]);
+  }, [value, height, attachments.length, textBlocks.length, minimized, userSized]);
 
   // The viewport cap depends on window height — re-measure on resize. Registered once.
   useEffect(() => {
@@ -214,10 +233,11 @@ export function Composer({
     if (!disabled && !minimized) inputRef?.current?.focus();
   }, [disabled, inputRef, minimized]);
 
-  // Native file drag-and-drop: drag a log file (or any file) onto the active composer and
-  // its absolute path is appended to the message, so it can be sent to the agent — which
-  // reads the file straight from disk (same trick as screenshot attachments). Tauri's
-  // webview drag-drop event carries real filesystem paths; a plain HTML5 drop in a
+  // Native file drag-and-drop: drag a file (image or otherwise) onto the active composer
+  // and it becomes a tile above the textarea — image files preview as a thumbnail, others
+  // show as a file chip. The tile carries the file's absolute path, prefixed to the message
+  // on send so the agent reads it straight from disk (same trick as screenshot attachments).
+  // Tauri's webview drag-drop event carries real filesystem paths; a plain HTML5 drop in a
   // sandboxed webview does not. Only the visible pane listens (others stay mounted).
   useEffect(() => {
     if (!active) return;
@@ -235,10 +255,22 @@ export function Composer({
           const paths = p.paths ?? [];
           if (paths.length === 0) return;
           log.info("composer", `dropped ${paths.length} file(s) into chat`, paths);
-          const joined = paths.join(" ");
-          setValue((v) => (v ? `${v}${v.endsWith(" ") ? "" : " "}${joined} ` : `${joined} `));
-          setMinimized(false); // surface the box so the appended path is visible/editable
+          setMinimized(false); // surface the box so the new tiles are visible
           inputRef?.current?.focus();
+          // Load each dropped file into an attachment tile (images get a preview), then
+          // append them in drop order — loads resolve at different speeds, so collect them
+          // before appending rather than racing. A failed load is logged and skipped.
+          void Promise.all(
+            paths.map((path) =>
+              loadAttachment(path).catch((e) => {
+                log.error("composer", "load dropped file failed", { path, e });
+                return null;
+              }),
+            ),
+          ).then((loaded) => {
+            const ok = loaded.filter((a): a is Attachment => a !== null);
+            if (ok.length) setAttachments((prev) => [...prev, ...ok]);
+          });
         }
       })
       .then((fn) => {
@@ -261,7 +293,9 @@ export function Composer({
     setCapturing(true);
     try {
       const shot = await captureScreenRegion();
-      if (shot) setAttachments((prev) => [...prev, shot]);
+      if (shot) {
+        setAttachments((prev) => [...prev, screenshotAttachment(shot.path, shot.dataUrl)]);
+      }
     } catch (err) {
       console.error("screen capture failed", err);
     } finally {
@@ -269,31 +303,55 @@ export function Composer({
     }
   };
 
-  const removeAttachment = (path: string) =>
-    setAttachments((prev) => prev.filter((a) => a.path !== path));
+  const removeAttachment = (id: string) =>
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  const removeTextBlock = (id: string) =>
+    setTextBlocks((prev) => prev.filter((b) => b.id !== id));
+
+  // A large paste collapses into a pill instead of flooding the textarea. The threshold is
+  // "more than five lines" (see shouldPasteAsPill). Shorter pastes fall through to the
+  // textarea's native insert. "Show as regular text" (from the pill modal) reverses this by
+  // appending the block's raw text back into the box and dropping the pill.
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const text = e.clipboardData.getData("text/plain");
+    if (!shouldPasteAsPill(text)) return; // native paste
+    e.preventDefault();
+    setTextBlocks((prev) => [
+      ...prev,
+      { id: nextId("blk"), text, lineCount: countLines(text) },
+    ]);
+  };
+
+  const showBlockAsText = (block: TextBlock) => {
+    setValue((v) => (v ? `${v}${v.endsWith("\n") ? "" : "\n"}${block.text}` : block.text));
+    removeTextBlock(block.id);
+    inputRef?.current?.focus();
+  };
 
   const send = async () => {
     if (disabled) return; // PTY not spawned yet — don't drop the prompt
     const text = value.trim();
-    const shots = attachments;
-    if (!text && shots.length === 0) return;
-    // What the CLI receives: each screenshot's file path prefixed to the typed
-    // prompt, so it reads the images from disk. A bare image (no text) is valid.
-    const payload = [...shots.map((a) => a.path), text].filter(Boolean).join(" ");
-    // What the transcript shows: the human text plus a count of attached shots —
-    // never the raw temp-file paths (which would be an ugly user-visible leak).
-    const display = [
-      text,
-      shots.length ? `📷 ${shots.length} screenshot${shots.length > 1 ? "s" : ""}` : "",
-    ]
-      .filter(Boolean)
-      .join("  ");
+    const atts = attachments;
+    const blocks = textBlocks;
+    if (!text && atts.length === 0 && blocks.length === 0) return;
+    // What the CLI receives: attachment paths prefixed to the body (pasted-text pills
+    // expanded inline + the typed text). A bare attachment/pill with no text is valid.
+    const payload = buildSendPayload({ attachments: atts, textBlocks: blocks, typed: value });
+    // What the transcript shows: the typed text plus compact counts — never raw temp-file
+    // paths (an ugly leak) and never a wall of pasted text.
+    const display = buildDisplay({ attachments: atts, textBlocks: blocks, typed: value });
     setValue("");
     setAttachments([]);
-    // Remember the typed text (not the screenshot-annotated display string) so it can be
+    setTextBlocks([]);
+    // Remember the typed text (not the attachment-annotated display string) so it can be
     // offered as a ghost-text suggestion next time the user types its prefix.
     if (text) recordPrompt(text);
-    log.info("composer", "send prompt", { agentId, chars: text.length, shots: shots.length });
+    log.info("composer", "send prompt", {
+      agentId,
+      chars: text.length,
+      attachments: atts.length,
+      textBlocks: blocks.length,
+    });
     onSubmitPrompt(display);
     await submitPrompt(agentId, payload);
   };
@@ -429,7 +487,7 @@ export function Composer({
   // blue, which a native textarea placeholder can't do). Only show it in the clean empty state
   // where the textarea sits at the top of its column, so the overlay lines up with row one.
   const showRichPlaceholder =
-    !value && !disabled && !dropActive && attachments.length === 0;
+    !value && !disabled && !dropActive && attachments.length === 0 && textBlocks.length === 0;
 
   // The composer is one overlay in two states. Minimized → it collapses to the slim handle
   // bar, exposing the terminal input; otherwise the handle sits atop the full message box.
@@ -490,48 +548,13 @@ export function Composer({
       {!minimized && (
       <div style={{ flex: 1, minHeight: 0, display: "flex", gap: 8, padding: "0 10px 10px", alignItems: "stretch" }}>
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 6, position: "relative" }}>
-          {attachments.length > 0 && (
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", flex: "0 0 auto" }}>
-              {attachments.map((a) => (
-                <div key={a.path} style={{ position: "relative", lineHeight: 0 }}>
-                  <img
-                    src={a.dataUrl}
-                    alt="screen capture"
-                    title={a.path}
-                    style={{
-                      height: 46,
-                      maxWidth: 96,
-                      objectFit: "cover",
-                      borderRadius: 6,
-                      border: `1px solid ${CHAT_USER_BUBBLE}`,
-                      display: "block",
-                    }}
-                  />
-                  <button
-                    onClick={() => removeAttachment(a.path)}
-                    title="Remove"
-                    style={{
-                      position: "absolute",
-                      top: -6,
-                      right: -6,
-                      width: 18,
-                      height: 18,
-                      borderRadius: 9,
-                      background: C.sienna,
-                      color: C.cream,
-                      border: "none",
-                      cursor: "pointer",
-                      fontSize: 12,
-                      lineHeight: "18px",
-                      padding: 0,
-                    }}
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
+          <AttachmentRow
+            textBlocks={textBlocks}
+            attachments={attachments}
+            onRemoveTextBlock={removeTextBlock}
+            onRemoveAttachment={removeAttachment}
+            onShowAsText={showBlockAsText}
+          />
           {/* The textarea and a mirror layer share one positioning context. The mirror sits
               behind a transparent-background textarea and re-renders the exact same text, but
               transparent — so only the trailing ghost suffix (painted muted) shows through.
@@ -578,6 +601,7 @@ export function Composer({
                 syncCaret();
               }}
               onKeyDown={onKeyDown}
+              onPaste={onPaste}
               onKeyUp={syncCaret}
               onSelect={syncCaret}
               onClick={syncCaret}
