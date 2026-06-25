@@ -42,6 +42,7 @@ import {
   shouldRestoreFromBar,
 } from "./composerDrag";
 import { isComposerToggleKey } from "./composerToggle";
+import { arrowOverflowDirection } from "./composerArrowOverflow";
 import { useDictationStore } from "../stores/dictationStore";
 import { log } from "../logger";
 
@@ -87,6 +88,7 @@ export function Composer({
   disabled = false,
   inputRef,
   onSubmitPrompt,
+  onArrowOverflow,
 }: {
   agentId: string;
   // Only the visible pane's composer reacts to native file drops (panes stay mounted).
@@ -94,6 +96,10 @@ export function Composer({
   disabled?: boolean;
   inputRef?: RefObject<HTMLTextAreaElement | null>;
   onSubmitPrompt: (text: string) => void;
+  // Called when a vertical arrow runs off the edge of the text: Down off the last line, Up off
+  // the first. Lets the parent hand focus (and the keypress) to the terminal so the user can
+  // drive Claude's menus without clicking. Omit to keep arrows purely native.
+  onArrowOverflow?: (dir: "up" | "down") => void;
 }) {
   const [value, setValue] = useState("");
   // True while a native file (e.g. a log) is dragged over the window — drives the drop hint.
@@ -415,6 +421,31 @@ export function Composer({
       e.preventDefault();
       e.stopPropagation();
       setGhostDismissed(true);
+    }
+    // A vertical arrow that runs off the edge of the text crosses into the terminal: Down off
+    // the last line, Up off the first. Inside the text it stays native (move the caret a line),
+    // so multi-line editing is unaffected — only the overflow press hands off. The edge logic
+    // (modifiers, selection, IME, line position) lives in arrowOverflowDirection so it's unit-
+    // tested; here we just act on its verdict.
+    if (onArrowOverflow && taRef.current) {
+      const ta = taRef.current;
+      const dir = arrowOverflowDirection({
+        key: e.key,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        isComposing: e.nativeEvent.isComposing,
+        ghostActive: ghost !== "",
+        value: ta.value,
+        selectionStart: ta.selectionStart,
+        selectionEnd: ta.selectionEnd,
+      });
+      if (dir) {
+        e.preventDefault();
+        onArrowOverflow(dir);
+        return;
+      }
     }
   };
 

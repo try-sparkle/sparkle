@@ -12,6 +12,7 @@ import { StatusEngine } from "../engine/statusEngine";
 import { snapshotScreen } from "../engine/screenSnapshot";
 import { useUiStore } from "../stores/uiStore";
 import { isComposerToggleKey } from "./composerToggle";
+import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
 import { SelectionPopup } from "./SelectionPopup";
 import { recoverFromWebglContextLoss } from "./terminalWebgl";
@@ -65,6 +66,11 @@ async function copyToClipboard(text: string): Promise<boolean> {
 export interface TerminalApi {
   markPrompt: (id: string) => void;
   scrollToPrompt: (id: string) => boolean;
+  // Hand a vertical arrow off from the composer: focus the terminal AND inject the keypress in
+  // one shot, so a single Down (off the composer's last line) or Up (off its first line) both
+  // moves focus here and drives whatever's waiting — e.g. Claude's permission menu. The escape
+  // sequence honors the app's cursor-key mode (DECCKM) so it lands the same as a real keypress.
+  arrowFromComposer: (dir: "up" | "down") => void;
 }
 
 /**
@@ -309,6 +315,13 @@ export function Terminal({
           term.scrollToLine(Math.max(0, m.line - 3));
           flashRow(term, m, flashTimersRef.current);
           return true;
+        },
+        arrowFromComposer: (dir) => {
+          term.focus();
+          // Encode against the app's cursor-key mode (DECCKM) so the bytes match a real keypress;
+          // see arrowKeySequence. `term.modes` reflects whatever the running TUI last requested.
+          const seq = arrowKeySequence(dir, term.modes.applicationCursorKeysMode);
+          void writePty(agentId, seq).catch(ignorePtyGone);
         },
       };
     }

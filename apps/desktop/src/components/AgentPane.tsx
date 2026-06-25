@@ -430,6 +430,7 @@ export function AgentPane({
             active={visible}
             disabled={!ptyReady}
             inputRef={composerInputRef}
+            onArrowOverflow={(dir) => terminalApiRef.current?.arrowFromComposer(dir)}
             onSubmitPrompt={(t) => {
               // Record the prompt (pinned header + history) and mark where it landed in the
               // terminal so the history dropdown can scroll back to it later.
