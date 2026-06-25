@@ -197,14 +197,14 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             title="Chat with Chief over this project's knowledge"
             style={createBtnStyle(C.accent, C.accentMid, ON_BRAND_FILL_DARK)} // cyan (the "S" color) leads; black icon+text
           >
-            ✦ Brainstorm
+            <span style={{ fontSize: 19.5 }}>✦</span> Brainstorm
           </button>
           <button
             onClick={onAddBuild}
             title="A master orchestrator that spawns worker agents to get work done"
             style={createBtnStyle(C.accentMid, C.teal, ON_BRAND_FILL)} // blue leads (matches logo's right side); white icon+text
           >
-            ⚒ Build
+            <span style={{ fontSize: 26 }}>⚒</span> Build
           </button>
         </div>
       )}
@@ -273,7 +273,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             >
               <span
                 title={a.kind}
-                style={{ fontSize: a.kind === "build" ? 14.4 : 12, color: C.muted, flex: "0 0 auto", width: 12, textAlign: "center" }}
+                style={{ fontSize: a.kind === "build" ? 28.8 : 12, color: C.muted, flex: "0 0 auto", width: a.kind === "build" ? 24 : 12, textAlign: "center" }}
               >
                 {kindGlyph}
               </span>
