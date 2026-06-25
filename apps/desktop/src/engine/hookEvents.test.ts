@@ -4,7 +4,6 @@ import { HookStatusEngine, hookEventToStatus, parseHookLine } from "./hookEvents
 describe("hookEventToStatus", () => {
   it("maps in-turn lifecycle events to working (green)", () => {
     for (const event of [
-      "SessionStart",
       "UserPromptSubmit",
       "PreToolUse",
       "PostToolUse",
@@ -12,6 +11,13 @@ describe("hookEventToStatus", () => {
     ]) {
       expect(hookEventToStatus({ event })).toBe("working");
     }
+  });
+
+  it("maps SessionStart (spawn/resume, no turn yet) to idle (gray, NOT green)", () => {
+    // Regression: a resumed session on app launch fires SessionStart with no Stop after it, so
+    // mapping it to "working" left every agent stuck green. A starting session is idle until the
+    // first UserPromptSubmit.
+    expect(hookEventToStatus({ event: "SessionStart" })).toBe("idle");
   });
 
   it("maps a permission Notification to approval (red)", () => {
@@ -23,15 +29,18 @@ describe("hookEventToStatus", () => {
     ).toBe("approval");
   });
 
-  it("maps an idle/input Notification to waiting (red)", () => {
+  it("maps a non-permission idle Notification to idle (gray, NOT red)", () => {
+    // Regression: Claude's idle-60s ping fires after a turn ends (often while a background shell
+    // keeps running). It is NOT the agent asking you anything, so it must stay gray — red is
+    // reserved for genuine approval prompts.
     expect(
       hookEventToStatus({
         event: "Notification",
         message: "Claude is waiting for your input",
       }),
-    ).toBe("waiting");
-    // A bare Notification with no message is a non-permission attention ping → waiting.
-    expect(hookEventToStatus({ event: "Notification" })).toBe("waiting");
+    ).toBe("idle");
+    // A bare Notification with no message is a non-permission idle ping → idle (gray), not red.
+    expect(hookEventToStatus({ event: "Notification" })).toBe("idle");
   });
 
   it("maps Stop (turn finished) to idle (gray — your turn)", () => {
@@ -94,6 +103,29 @@ describe("HookStatusEngine", () => {
     engine.ingest({ event: "PostToolUse", tool: "Bash" });
     engine.ingest({ event: "Stop" });
     expect(onStatus).toHaveBeenLastCalledWith("idle");
+  });
+
+  it("a resumed session with no new turn settles idle (gray), not working (green)", () => {
+    // The reported bug: launch the app, every agent resumes (SessionStart) and glows green
+    // forever because no Stop follows. SessionStart must land on idle so the dot is gray until
+    // the user actually sends a prompt.
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "SessionStart" });
+    expect(onStatus).toHaveBeenLastCalledWith("idle");
+  });
+
+  it("a finished turn that idle-pings stays gray, never flips to red", () => {
+    // The inverse bug: an agent finishes (Stop → idle) with a background shell still running, then
+    // Claude's idle-60s Notification fires. That ping must NOT turn the dot red — it's not asking
+    // anything. Status stays idle (gray).
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "UserPromptSubmit" });
+    engine.ingest({ event: "Stop" });
+    engine.ingest({ event: "Notification", message: "Claude is waiting for your input" });
+    expect(onStatus).toHaveBeenLastCalledWith("idle");
+    expect(onStatus).not.toHaveBeenCalledWith("waiting");
   });
 
   it("surfaces a permission request as approval, then back to working once granted", () => {

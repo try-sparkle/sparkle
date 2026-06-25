@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   resolveComposerDrag,
   resolveComposerRenderHeight,
+  resolveComposerReset,
   shouldRestoreFromBar,
 } from "./composerDrag";
 
@@ -140,6 +141,21 @@ describe("resolveComposerRenderHeight", () => {
     expect(
       resolveComposerRenderHeight({ height: 10, desired: 78, userSized: true, ...geo }),
     ).toBe(64);
+  });
+});
+
+describe("resolveComposerReset", () => {
+  it("snaps an open composer back to the rest height and clears manual sizing", () => {
+    // After a send / on a new thread: a previously tall (dragged or auto-expanded) box returns
+    // to the compact default and re-arms auto-grow for the next message.
+    expect(resolveComposerReset({ minimized: false, rest: 72 })).toEqual({
+      height: 72,
+      userSized: false,
+    });
+  });
+
+  it("leaves a minimized composer untouched (the deliberate keep-tucked exception)", () => {
+    expect(resolveComposerReset({ minimized: true, rest: 72 })).toBeNull();
   });
 });
 

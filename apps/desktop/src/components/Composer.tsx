@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -9,7 +10,7 @@ import {
   type RefObject,
 } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../theme/colors";
+import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { submitPrompt } from "../pty";
 import { captureScreenRegion } from "../screenshot";
 import { AttachmentRow } from "./composer/AttachmentRow";
@@ -30,6 +31,7 @@ import {
   useUiStore,
   COMPOSER_MIN,
   COMPOSER_SNAP,
+  COMPOSER_DEFAULT,
   COMPOSER_BAR,
   COMPOSER_SNAP_THRESHOLD,
   COMPOSER_MINIMIZE_THRESHOLD,
@@ -39,6 +41,7 @@ import { usePromptHistoryStore, computeGhost } from "../stores/promptHistoryStor
 import {
   resolveComposerDrag,
   resolveComposerRenderHeight,
+  resolveComposerReset,
   shouldRestoreFromBar,
 } from "./composerDrag";
 import { isComposerToggleKey } from "./composerToggle";
@@ -155,6 +158,28 @@ export function Composer({
   const userSized = useUiStore((s) => s.composerUserSized);
   const setComposerUserSized = useUiStore((s) => s.setComposerUserSized);
   const dragRef = useRef<{ startY: number; startH: number; startMin: boolean } | null>(null);
+
+  // Snap the composer back to its regular rest height and drop any manual sizing — used right
+  // after a send and when a brand-new thread's composer mounts, so a long message (or a
+  // previously dragged size leaking in via the shared store) never leaves the box stuck tall.
+  // A fully minimized composer is the one exception: that's a deliberate "keep it tucked away"
+  // choice, so resolveComposerReset returns null and we leave the slim bar exactly as it is.
+  const resetComposerSize = useCallback(() => {
+    const reset = resolveComposerReset({
+      minimized: useUiStore.getState().composerMinimized,
+      rest: COMPOSER_DEFAULT,
+    });
+    if (!reset) return;
+    setComposerHeight(reset.height);
+    setComposerUserSized(reset.userSized);
+  }, [setComposerHeight, setComposerUserSized]);
+
+  // On mount the composer belongs to a freshly started thread (panes stay mounted, so this fires
+  // once per new thread, never on a tab switch). Start it at the rest height — unless minimized,
+  // which we honor — via useLayoutEffect so a stale tall height never flashes before first paint.
+  useLayoutEffect(() => {
+    resetComposerSize();
+  }, [resetComposerSize]);
 
   // The composer auto-grows upward to fit the typed message. `height` (the persisted,
   // drag-set height) is the floor; content can push the composer taller up to the cap.
@@ -349,6 +374,10 @@ export function Composer({
     setValue("");
     setAttachments([]);
     setTextBlocks([]);
+    // The draft is gone — snap the box back to its regular rest height so a long message doesn't
+    // leave it sitting tall (clears any manual sizing too). Send is unreachable while minimized,
+    // so this never fights the keep-minimized exception.
+    resetComposerSize();
     // Remember the typed text (not the attachment-annotated display string) so it can be
     // offered as a ghost-text suggestion next time the user types its prefix.
     if (text) recordPrompt(text);
@@ -536,12 +565,14 @@ export function Composer({
         zIndex: 5,
         display: "flex",
         flexDirection: "column",
-        background: C.forest,
-        borderTop: `1px solid ${C.deepForest}`,
+        // Minimized → no chrome: the strip is transparent so only the little gradient pull tab
+        // floats over the exposed terminal. Open → the solid message-box surface with its top rule.
+        background: minimized ? "transparent" : C.forest,
+        borderTop: minimized ? "none" : `1px solid ${C.deepForest}`,
       }}
     >
       {/* Persistent grab handle: open → thin pill (drag up taller, down to minimize); minimized
-          → the full slim bar (click or drag up to bring the message box back). ⌘J also toggles. */}
+          → a little gradient pull tab (click or drag up to bring the message box back). ⌘J also toggles. */}
       <div
         onPointerDown={onHandleDown}
         onPointerMove={onHandleMove}
@@ -549,14 +580,16 @@ export function Composer({
         onPointerCancel={onHandleUp}
         title={
           minimized
-            ? "Click or drag up to bring back the message box (⌘J)"
+            ? "Click or drag up to bring back the prompt box (⌘J)"
             : "Drag to resize · drag down to minimize (⌘J)"
         }
         style={{
           height: minimized ? COMPOSER_BAR : 10,
           flex: "0 0 auto",
           display: "flex",
-          alignItems: "center",
+          // Minimized: anchor the pull tab to the very bottom edge so its rounded top reads as a
+          // tab rising out of the window. Open: center the thin grab pill in the handle strip.
+          alignItems: minimized ? "flex-end" : "center",
           justifyContent: "center",
           gap: 6,
           cursor: "ns-resize",
@@ -567,10 +600,28 @@ export function Composer({
         }}
       >
         {minimized ? (
-          <>
+          // A little gradient pull tab carrying the Sparkle logo's shading (lighter teal → darker
+          // blue) and an upward caret, inviting the user back into the modern voice-enabled box.
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              padding: "3px 16px",
+              // Rounded only on top: the flat bottom meets the window edge, so it reads as a tab.
+              borderRadius: "9px 9px 0 0",
+              background: `linear-gradient(180deg, ${C.accent} 0%, ${C.teal} 100%)`,
+              color: ON_BRAND_FILL,
+              fontWeight: FONT_WEIGHT.semibold,
+              fontSize: 12,
+              lineHeight: 1.2,
+              whiteSpace: "nowrap",
+              boxShadow: "0 -1px 6px rgba(0,0,0,0.28)",
+            }}
+          >
             <span style={{ fontSize: 10 }}>▴</span>
-            <span>Message your agent</span>
-          </>
+            <span>Use the modern prompt box with voice</span>
+          </div>
         ) : (
           <div style={{ width: 36, height: 3, borderRadius: 2, background: C.muted, opacity: 0.6 }} />
         )}

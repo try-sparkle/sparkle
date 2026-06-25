@@ -96,6 +96,23 @@ export function resolveComposerRenderHeight(p: ComposerHeightInput): number {
   return clamp(Math.max(p.height, Math.min(p.cap, p.desired)), p.min, p.cap);
 }
 
+// Should the composer snap back to its rest height (and drop manual sizing)? Called at the
+// two moments a fresh draft begins: right after a send, and when a brand-new thread's composer
+// mounts. Returns the size state to apply, or null to leave the composer untouched.
+//
+// The ONE exception is a fully minimized composer: that's a deliberate "keep it tucked away"
+// choice (the terminal is exposed to answer Claude's menus), so we never disturb it — the
+// reset is skipped and the minimized bar stays put. For an open composer we return the rest
+// height with userSized cleared, so the box returns to its compact default and auto-grows to
+// fit the next message instead of staying stuck at a previously dragged (or auto-expanded) size.
+export function resolveComposerReset(p: {
+  minimized: boolean; // is the composer currently tucked into its slim bar?
+  rest: number; // the rest/default open height to snap back to (COMPOSER_DEFAULT)
+}): { height: number; userSized: boolean } | null {
+  if (p.minimized) return null;
+  return { height: p.rest, userSized: false };
+}
+
 // Should releasing the handle bring the composer back from the minimized bar? Used by the
 // pointer-UP handler so a click — or any upward tug the snap math intentionally left minimized
 // (the sub-threshold dead-zone) — restores, while a downward tug (abort) does not. Restore

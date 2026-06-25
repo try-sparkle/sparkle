@@ -25,9 +25,13 @@ export interface HookEvent {
   session_id?: string;
 }
 
-// A Notification fires both when Claude needs permission for a tool ("…needs your
-// permission to use Bash") and when it has idled waiting for input. Permission requests are
-// the caution/dangerous "approval" case; everything else is a plain "needs you" question.
+// A Notification fires for two very different reasons: when Claude needs permission for a tool
+// ("…needs your permission to use Bash") and when the prompt has simply sat IDLE (~60s) after a
+// turn ended. Only the permission case is a genuine "approve this?" that should go red. The idle
+// ping is NOT the agent asking you anything — it fires after the turn is already over (often while
+// a background shell keeps running) — so it must stay gray, never red. Red is reserved for real
+// approval prompts; treating the idle ping as red was the false-red bug (an agent that's done or
+// working in the background showing as if it were blocking on you).
 const PERMISSION_RE = /\b(permission|approve|allow)\b/i;
 
 /** Pure map from a single hook event to a status, or null when the event shouldn't change it.
@@ -35,7 +39,13 @@ const PERMISSION_RE = /\b(permission|approve|allow)\b/i;
  *  fully determines the current state without needing history. */
 export function hookEventToStatus(ev: HookEvent): AgentTabStatus | null {
   switch (ev.event) {
+    // A session merely STARTING (a fresh spawn, or a `--continue` resume on app launch) is not
+    // the agent working — it's sitting at the prompt, idle, until you send something. Mapping it
+    // to "working" was the bug behind every agent glowing green on launch: SessionStart fires with
+    // no Stop after it (there's no turn to stop), so the green never cleared. Idle (gray, "your
+    // turn") is the truthful resting state; the very next UserPromptSubmit flips it to green.
     case "SessionStart":
+      return "idle";
     case "UserPromptSubmit":
     case "PreToolUse":
     case "PostToolUse":
@@ -43,7 +53,9 @@ export function hookEventToStatus(ev: HookEvent): AgentTabStatus | null {
     case "SubagentStop":
       return "working";
     case "Notification":
-      return PERMISSION_RE.test(ev.message ?? "") ? "approval" : "waiting";
+      // Permission request → red (approval). Any other notification is Claude's idle ping after a
+      // finished turn → gray (idle), NOT a red "needs you". See PERMISSION_RE note above.
+      return PERMISSION_RE.test(ev.message ?? "") ? "approval" : "idle";
     // Claude finished responding for this turn: done with its turn, not blocked on you (gray).
     case "Stop":
       return "idle";
