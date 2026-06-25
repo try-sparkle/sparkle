@@ -8,6 +8,21 @@ import { useDictationStore } from "../stores/dictationStore";
 
 const BAR_COUNT = 24;
 
+/**
+ * Map a raw RMS audio level → bar-height fraction in [0,1].
+ *
+ * The backend emits `rms_level` where 0 = silence and 1 = full-scale clip
+ * (see src-tauri/src/audio.rs). Normal speech RMS only reaches ~0.03–0.15, so a
+ * linear 1:1 map leaves every bar pinned at the ~8% idle floor — the meter reads
+ * as static dotted lines even while the mic is working (it was). We apply a
+ * perceptual sqrt curve (loudness perception is roughly logarithmic) plus gain so
+ * ordinary speech sweeps most of the bar's height, then clamp to [0,1].
+ */
+export function barFraction(level: number): number {
+  const GAIN = 1.8;
+  return Math.min(1, Math.sqrt(Math.max(0, level)) * GAIN);
+}
+
 /** The hint caption under the waveform. Null when muted (mic released). */
 export function captionFor(phase: Phase, enabled: boolean): string | null {
   if (!enabled) return null;
@@ -89,7 +104,7 @@ export function LogoWaveform() {
               key={i}
               style={{
                 flex: 1,
-                height: `${Math.max(8, h * 100)}%`,
+                height: `${Math.max(8, barFraction(h) * 100)}%`,
                 borderRadius: 1,
                 // Gray when passive; brand blue→cyan fade across the row when active.
                 background: active
