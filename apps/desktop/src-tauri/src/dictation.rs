@@ -55,6 +55,17 @@ pub struct DictationSession {
 pub struct DictationState(pub Arc<Mutex<DictationSession>>);
 impl Default for DictationState { fn default() -> Self { Self(Arc::new(Mutex::new(DictationSession::default()))) } }
 
+impl DictationState {
+    /// Stop any in-flight capture by dropping the cpal stream, so CoreAudio stops invoking the
+    /// audio callback. Called on app exit () to quiesce the audio IOThread BEFORE
+    /// static destructors run — closing the shutdown-race window that produced the SIGABRT in
+    /// . Unlike stop_dictation this skips finalize(): at exit the trailing segment is
+    /// moot and we want the fastest possible teardown. Idempotent and poison-tolerant.
+    pub fn stop_capture(&self) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).capture = None;
+    }
+}
+
 // SAFETY: cpal::Stream on CoreAudio is !Send, guarded behind a Mutex.
 // ParakeetTdt is genuinely Send (its recognizer/VAD fields are Send+Sync),
 // so sharing it via Arc<Mutex<ParakeetTdt>> across threads is sound.
@@ -108,7 +119,18 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::segment_fingerprint;
+    use super::{segment_fingerprint, DictationState};
+
+    #[test]
+    fn stop_capture_is_a_safe_idempotent_noop_without_an_active_capture() {
+        // The app-exit path () calls stop_capture unconditionally, including when no
+        // dictation was ever started. It must not panic and must leave the session clean, even
+        // when called repeatedly.
+        let state = DictationState::default();
+        state.stop_capture();
+        state.stop_capture();
+        assert!(state.0.lock().unwrap().capture.is_none());
+    }
 
     #[test]
     fn identical_text_yields_identical_fingerprint() {

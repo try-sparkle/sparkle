@@ -99,11 +99,11 @@ pub fn run() {
         //  - keychain plugin for BYOK token storage
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")
-        .run(|app, event| {
+        .run(|app, event| match event {
             // macOS: clicking the Dock icon when all windows are hidden/closed ("Reopen") must
             // bring a window back — otherwise a last-window "keep agents running" hide is
             // unreachable except via Cmd+Q (see multi-window design, decision #4).
-            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+            tauri::RunEvent::Reopen { has_visible_windows, .. } => {
                 if !has_visible_windows {
                     // Prefer the canonical "main" window; fall back to any window. Our close path
                     // only ever hide()s the last window (never destroys it), so there is normally
@@ -117,5 +117,14 @@ pub fn run() {
                     }
                 }
             }
+            // Stop dictation capture before the process tears down (). RunEvent::Exit
+            // fires as the event loop leaves, BEFORE the static-destructor / exit() phase where a
+            // still-live CoreAudio callback otherwise raced teardown and aborted ().
+            // Dropping the cpal stream here quiesces the audio IOThread first. Idempotent, so a
+            // no-active-capture exit is a cheap no-op.
+            tauri::RunEvent::Exit => {
+                app.state::<dictation::DictationState>().stop_capture();
+            }
+            _ => {}
         });
 }
