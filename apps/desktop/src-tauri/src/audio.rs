@@ -54,10 +54,27 @@ pub struct Capture {
     stream: cpal::Stream,
 }
 
+/// Panic firewall (). cpal invokes the audio data callbacks from CoreAudio's
+/// `extern "C"` render callback, on the `com.apple.audio.IOThread.client` thread. A Rust panic
+/// in the frame handler — a poisoned transcriber mutex, an FFI panic inside the ASR model, an
+/// arithmetic slip on a malformed frame — CANNOT unwind across that C boundary: it hits
+/// `panic_cannot_unwind` and `abort()`s the whole process. (Observed on app quit while a
+/// dictation capture was still live: the callback fired mid-teardown and took the app down with
+/// SIGABRT.) This wrapper catches the unwind so one bad frame is dropped, never fatal; the
+/// default panic hook still records the panic to the unified log. Capture::start funnels every
+/// sample-format callback through it.
+fn firewall_frame_handler(
+    mut on_frame: impl FnMut(Vec<f32>) + Send + 'static,
+) -> impl FnMut(Vec<f32>) + Send + 'static {
+    move |frame: Vec<f32>| {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_frame(frame)));
+    }
+}
+
 impl Capture {
     #[allow(dead_code)]
     pub fn start(
-        mut on_frame: impl FnMut(Vec<f32>) + Send + 'static,
+        on_frame: impl FnMut(Vec<f32>) + Send + 'static,
     ) -> Result<Capture, String> {
         let host = cpal::default_host();
         let device = host
@@ -70,6 +87,10 @@ impl Capture {
         let in_rate = cfg.sample_rate().0;
         let sample_format = cfg.sample_format();
         let stream_config = cfg.into();
+
+        // Funnel the handler through the panic firewall so a panic on the audio thread is
+        // contained, not propagated into CoreAudio's extern "C" callback (see the fn doc).
+        let mut on_frame = firewall_frame_handler(on_frame);
 
         // Build an input stream, dispatching on the device's native sample format
         // so we never ask cpal to reinterpret bytes incorrectly.
@@ -143,6 +164,31 @@ mod tests {
     fn resample_48k_to_16k_thirds_the_length() {
         let out = downmix_resample(&vec![0.5; 4800], 1, 48_000);
         assert!((out.len() as i32 - 1600).abs() <= 1);
+    }
+
+    // Regression guard for : a panic in the frame handler must be caught, not allowed
+    // to unwind (which, from CoreAudio's extern "C" render callback, aborts the whole process).
+    // Exercises the SHIPPED `firewall_frame_handler` — the same wrapper Capture::start uses — so
+    // removing or weakening the production firewall fails this test.
+    #[test]
+    fn frame_handler_panic_is_contained_not_propagated() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_inner = ran.clone();
+        let mut firewalled = firewall_frame_handler(move |_frame: Vec<f32>| {
+            ran_inner.store(true, Ordering::SeqCst);
+            panic!("simulated poisoned-mutex / FFI panic");
+        });
+        // Silence the default panic hook's stderr output for this one intentional panic, then
+        // restore it. This is the only test that touches the global hook, so the brief window is
+        // acceptable (roborev 92q); add a shared mutex here if more panic tests are introduced.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        firewalled(vec![0.1, 0.2, 0.3]); // returns normally despite the inner panic
+        std::panic::set_hook(prev);
+        // The handler ran (and panicked); reaching this line proves the firewall contained it.
+        assert!(ran.load(Ordering::SeqCst), "the firewalled handler should have been invoked");
     }
 
     // Regression guard for : this module captures the mic via

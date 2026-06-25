@@ -66,7 +66,7 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
     // Guard against double-start: if a session is active, return early.
     // Without this, a second call would drop the first session's transcriber without
     // calling finalize(), silently losing the trailing segment the first session buffered.
-    if state.0.lock().unwrap().capture.is_some() { return Ok(()); }
+    if state.0.lock().unwrap_or_else(|p| p.into_inner()).capture.is_some() { return Ok(()); }
 
     let root = app.path().app_data_dir().map_err(|e| e.to_string())?.join("models");
     let app_for_progress = app.clone();
@@ -81,10 +81,12 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
     tracing::info!(target: "dictation", "start_dictation: capture starting");
     let capture = Capture::start(move |frame: Vec<f32>| {
         let _ = app_cb.emit("dictation://level", rms_level(&frame));
-        let segs = transcriber_cap.lock().unwrap().accept(&frame);
+        // Poison-tolerant (): a prior panicked frame must not wedge dictation. The
+        // audio.rs panic firewall already prevents such a panic from aborting the process.
+        let segs = transcriber_cap.lock().unwrap_or_else(|p| p.into_inner()).accept(&frame);
         for seg in segs { emit_partial(&app_cb, "accept", seg); }
     }).map_err(|e| { let _ = app.emit("dictation://error", e.clone()); e })?;
-    let mut sess = state.0.lock().unwrap();
+    let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
     sess.capture = Some(capture);
     sess.transcriber = Some(transcriber);
     Ok(())
@@ -93,13 +95,13 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
 #[tauri::command]
 pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
     let transcriber = {
-        let mut sess = state.0.lock().unwrap();
+        let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
         sess.capture = None;            // drop Capture -> stops the cpal stream (no more frames)
         sess.transcriber.take()
     };                                  // release the session lock before the (slower) finalize
     tracing::info!(target: "dictation", "stop_dictation: capture dropped, finalizing");
     if let Some(t) = transcriber {
-        for seg in t.lock().unwrap().finalize() { emit_partial(&app, "finalize", seg); }
+        for seg in t.lock().unwrap_or_else(|p| p.into_inner()).finalize() { emit_partial(&app, "finalize", seg); }
     }
     let _ = app.emit("dictation://final", String::new());
 }

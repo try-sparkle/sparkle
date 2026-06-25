@@ -84,7 +84,9 @@ impl ParakeetTdt {
     }
 
     fn transcribe(&self, samples: &[f32]) -> String {
-        let rec = self.recognizer.lock().unwrap();
+        // Poison-tolerant lock (): a panic elsewhere on the audio thread must not
+        // wedge dictation for the app's lifetime — recover the guard and carry on.
+        let rec = self.recognizer.lock().unwrap_or_else(|p| p.into_inner());
         let stream = rec.create_stream();
         stream.accept_waveform(16_000, samples);
         rec.decode(&stream);
@@ -93,7 +95,7 @@ impl ParakeetTdt {
 
     fn drain_segments(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let mut vad = self.vad.lock().unwrap();
+        let mut vad = self.vad.lock().unwrap_or_else(|p| p.into_inner());
         // SAFETY: front() returns an owned SpeechSegment whose Drop calls
         // SherpaOnnxDestroySpeechSegment on the raw pointer returned by
         // SherpaOnnxVoiceActivityDetectorFront. That pointer may alias the VAD-internal
@@ -106,7 +108,7 @@ impl ParakeetTdt {
             drop(vad); // release before the (slower) transcribe call
             let text = self.transcribe(&samples).trim().to_string();
             if !text.is_empty() { out.push(text); }
-            vad = self.vad.lock().unwrap();
+            vad = self.vad.lock().unwrap_or_else(|p| p.into_inner());
         }
         out
     }
@@ -116,7 +118,7 @@ impl Transcriber for ParakeetTdt {
     fn accept(&mut self, frame: &[f32]) -> Vec<String> {
         for w in self.window.push(frame) {
             // API deviation: accept_waveform takes &[f32], not Vec<f32>
-            self.vad.lock().unwrap().accept_waveform(&w);
+            self.vad.lock().unwrap_or_else(|p| p.into_inner()).accept_waveform(&w);
         }
         self.drain_segments()
     }
@@ -126,9 +128,9 @@ impl Transcriber for ParakeetTdt {
             // handing it to the VAD, which requires exactly 512-sample chunks.
             let mut padded = [0f32; 512];
             padded[..tail.len()].copy_from_slice(&tail);
-            self.vad.lock().unwrap().accept_waveform(&padded);
+            self.vad.lock().unwrap_or_else(|p| p.into_inner()).accept_waveform(&padded);
         }
-        self.vad.lock().unwrap().flush();
+        self.vad.lock().unwrap_or_else(|p| p.into_inner()).flush();
         self.drain_segments()
     }
 }
