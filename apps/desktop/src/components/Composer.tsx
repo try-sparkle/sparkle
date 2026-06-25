@@ -11,7 +11,17 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../theme/colors";
 import { writePty } from "../pty";
 import { captureScreenRegion, type Screenshot } from "../screenshot";
-import { useUiStore, COMPOSER_MIN } from "../stores/uiStore";
+import {
+  useUiStore,
+  COMPOSER_MIN,
+  COMPOSER_SNAP,
+  COMPOSER_BAR,
+  COMPOSER_SNAP_THRESHOLD,
+  COMPOSER_MINIMIZE_THRESHOLD,
+  COMPOSER_RESTORE_THRESHOLD,
+} from "../stores/uiStore";
+import { resolveComposerDrag, shouldRestoreFromBar } from "./composerDrag";
+import { isComposerToggleKey } from "./composerToggle";
 import { useDictation } from "../useDictation";
 import { useDictationStore } from "../stores/dictationStore";
 import { log } from "../logger";
@@ -69,17 +79,20 @@ function CameraIcon() {
  * multi-line, and Cmd+A/C/V all work natively. ⏎ sends, ⇧⏎ inserts a newline. Send
  * injects into the PTY via bracketed paste, then (after a beat) a carriage return.
  *
- * The composer is a bottom overlay floating over the terminal: the grab handle at the top
- * drags it taller (up, over the terminal) or shorter, and the height persists (uiStore).
+ * The composer is a bottom overlay floating over the terminal. At rest it sits at the snap
+ * height, covering Claude's terminal input line — so the user types here by default (that's
+ * the gentle steer toward the box). The grab handle drags it taller for multi-line prompts,
+ * or DOWN past the floor to MINIMIZE into a slim bar that exposes the terminal input for
+ * answering Claude's menus directly. ⌘J toggles the two. Minimized state + height persist
+ * globally (uiStore), so the choice sticks across every agent tab and across relaunch.
  * Because it overlays rather than shares the flex column, dragging never resizes the
- * terminal beneath it. All input belongs here — the terminal bounces focus back to us.
+ * terminal beneath it.
  */
 export function Composer({
   agentId,
   active = true,
   disabled = false,
   inputRef,
-  composerApiRef,
   onSubmitPrompt,
 }: {
   agentId: string;
@@ -87,8 +100,6 @@ export function Composer({
   active?: boolean;
   disabled?: boolean;
   inputRef?: RefObject<HTMLTextAreaElement | null>;
-  // Imperative hook so the terminal can route a typed character into this composer.
-  composerApiRef?: RefObject<{ insert: (text: string) => void } | null>;
   onSubmitPrompt: (text: string) => void;
 }) {
   const [value, setValue] = useState("");
@@ -114,6 +125,7 @@ export function Composer({
       );
       if (!active) return;
       setValue((v) => (v ? `${v} ${text}` : text));
+      setMinimized(false); // dictated text lands in the box — make sure it's visible
       inputRef?.current?.focus();
     },
   });
@@ -125,7 +137,9 @@ export function Composer({
   const [capturing, setCapturing] = useState(false);
   const height = useUiStore((s) => s.composerHeight);
   const setComposerHeight = useUiStore((s) => s.setComposerHeight);
-  const dragRef = useRef<{ startY: number; startH: number } | null>(null);
+  const minimized = useUiStore((s) => s.composerMinimized);
+  const setMinimized = useUiStore((s) => s.setComposerMinimized);
+  const dragRef = useRef<{ startY: number; startH: number; startMin: boolean } | null>(null);
 
   // The composer auto-grows upward to fit the typed message. `height` (the persisted,
   // drag-set height) is the floor; content can push the composer taller up to the cap.
@@ -169,7 +183,10 @@ export function Composer({
       setAutoHeight(next);
     };
     recomputeHeightRef.current();
-  }, [value, height, attachments.length, modelProgress, dictationError]);
+    // `minimized` is a dep so autoHeight re-measures on restore: while minimized the textarea is
+    // unmounted and the measurement early-returns (autoHeight freezes), so without this a
+    // minimize→restore that changes nothing else would show the stale pre-minimize height.
+  }, [value, height, attachments.length, modelProgress, dictationError, minimized]);
 
   // The viewport cap depends on window height — re-measure on resize. Registered once.
   useEffect(() => {
@@ -192,26 +209,10 @@ export function Composer({
   }, [setComposerHeight]);
 
   // Once the PTY is live, pull focus into the composer so the user types here, not the
-  // terminal underneath.
+  // terminal underneath — unless it's minimized (then the terminal owns focus; see AgentPane).
   useEffect(() => {
-    if (!disabled) inputRef?.current?.focus();
-  }, [disabled, inputRef]);
-
-  // Expose insert() so the terminal can hand off prompt-typing to the composer: focus
-  // here and append the character the user just pressed in the terminal.
-  useEffect(() => {
-    if (!composerApiRef) return;
-    composerApiRef.current = {
-      insert: (text: string) => {
-        if (disabled) return; // textarea is hidden/disabled until the PTY is ready
-        setValue((v) => v + text);
-        inputRef?.current?.focus();
-      },
-    };
-    return () => {
-      if (composerApiRef) composerApiRef.current = null;
-    };
-  }, [composerApiRef, inputRef, disabled]);
+    if (!disabled && !minimized) inputRef?.current?.focus();
+  }, [disabled, inputRef, minimized]);
 
   // Native file drag-and-drop: drag a log file (or any file) onto the active composer and
   // its absolute path is appended to the message, so it can be sent to the agent — which
@@ -236,6 +237,7 @@ export function Composer({
           log.info("composer", `dropped ${paths.length} file(s) into chat`, paths);
           const joined = paths.join(" ");
           setValue((v) => (v ? `${v}${v.endsWith(" ") ? "" : " "}${joined} ` : `${joined} `));
+          setMinimized(false); // surface the box so the appended path is visible/editable
           inputRef?.current?.focus();
         }
       })
@@ -249,7 +251,7 @@ export function Composer({
       setDropActive(false);
       unlisten?.();
     };
-  }, [active, inputRef]);
+  }, [active, inputRef, setMinimized]);
 
   // Open the native macOS crosshair picker and stash the result as a thumbnail.
   // Esc (cancel) resolves null — a quiet no-op. While the picker is up the call
@@ -296,6 +298,12 @@ export function Composer({
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (isComposerToggleKey(e)) {
+      // ⌘J: tuck the composer away and hand focus to the terminal (AgentPane moves it).
+      e.preventDefault();
+      setMinimized(true);
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void send();
@@ -303,27 +311,56 @@ export function Composer({
   };
 
   // Pointer-capture keeps move/up events scoped to the handle element, so they're cleaned
-  // up automatically if the component unmounts mid-drag (no leaked window listeners).
+  // up automatically if the component unmounts mid-drag (no leaked window listeners). The
+  // handle is a SINGLE element rendered in both the open and minimized states (below), so
+  // capture survives the minimize/restore transition — the drag stays smooth across it.
   const onHandleDown = (e: PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
     // Base the drag on the height actually on screen (which may be auto-expanded above the
     // stored floor), so the handle tracks the cursor from the first pixel instead of having
     // to close the auto-expand gap first.
-    dragRef.current = { startY: e.clientY, startH: autoHeight };
+    dragRef.current = { startY: e.clientY, startH: autoHeight, startMin: minimized };
   };
   const onHandleMove = (e: PointerEvent<HTMLDivElement>) => {
     const d = dragRef.current;
     if (!d) return;
-    // Drag up (clientY decreases) => taller. Cap so it can't fully bury the rest.
-    setComposerHeight(Math.min(maxComposerHeight(), d.startH + (d.startY - e.clientY)));
+    const r = resolveComposerDrag(
+      { startHeight: d.startH, startMinimized: d.startMin, dy: d.startY - e.clientY, floor: height },
+      {
+        snap: COMPOSER_SNAP,
+        min: COMPOSER_MIN,
+        max: maxComposerHeight(),
+        snapThreshold: COMPOSER_SNAP_THRESHOLD,
+        minimizeThreshold: COMPOSER_MINIMIZE_THRESHOLD,
+        restoreThreshold: COMPOSER_RESTORE_THRESHOLD,
+      },
+    );
+    setComposerHeight(r.height);
+    setMinimized(r.minimized);
   };
   const onHandleUp = (e: PointerEvent<HTMLDivElement>) => {
+    const d = dragRef.current;
     dragRef.current = null;
     try {
       e.currentTarget.releasePointerCapture(e.pointerId);
     } catch {
       /* already released */
+    }
+    // pointercancel is an aborted gesture, not a release — clean up but never restore on it.
+    if (!d || e.type !== "pointerup") return;
+    // From the minimized bar, a click or any upward release brings the composer back —
+    // including the sub-threshold drag the snap math intentionally leaves minimized, so there's
+    // no dead zone. Restore just flips the flag: the remembered open height is already in the
+    // store (so a tall composer comes back tall). A downward tug stays minimized.
+    if (
+      shouldRestoreFromBar({
+        startMinimized: d.startMin,
+        dy: d.startY - e.clientY,
+        stillMinimized: useUiStore.getState().composerMinimized,
+      })
+    ) {
+      setMinimized(false);
     }
   };
 
@@ -335,6 +372,10 @@ export function Composer({
   const showRichPlaceholder =
     !value && !disabled && !dropActive && attachments.length === 0 && !modelProgress && !dictationError;
 
+  // The composer is one overlay in two states. Minimized → it collapses to the slim handle
+  // bar, exposing the terminal input; otherwise the handle sits atop the full message box.
+  // The handle (the drag target / pointer-capture owner) is the SAME element in both states,
+  // so a drag that crosses the minimize/restore line never loses its capture.
   return (
     <div
       ref={containerRef}
@@ -343,7 +384,7 @@ export function Composer({
         left: 0,
         right: 0,
         bottom: 0,
-        height: autoHeight,
+        height: minimized ? COMPOSER_BAR : autoHeight,
         zIndex: 5,
         display: "flex",
         flexDirection: "column",
@@ -351,24 +392,43 @@ export function Composer({
         borderTop: `1px solid ${C.deepForest}`,
       }}
     >
-      {/* Grab handle */}
+      {/* Persistent grab handle: open → thin pill (drag up taller, down to minimize); minimized
+          → the full slim bar (click or drag up to bring the message box back). ⌘J also toggles. */}
       <div
         onPointerDown={onHandleDown}
         onPointerMove={onHandleMove}
         onPointerUp={onHandleUp}
-        title="Drag to resize"
+        onPointerCancel={onHandleUp}
+        title={
+          minimized
+            ? "Click or drag up to bring back the message box (⌘J)"
+            : "Drag to resize · drag down to minimize (⌘J)"
+        }
         style={{
-          height: 10,
+          height: minimized ? COMPOSER_BAR : 10,
           flex: "0 0 auto",
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
+          gap: 6,
           cursor: "ns-resize",
+          color: C.muted,
+          fontFamily: '"IBM Plex Sans", sans-serif',
+          fontSize: 12,
+          userSelect: "none",
         }}
       >
-        <div style={{ width: 36, height: 3, borderRadius: 2, background: C.muted, opacity: 0.6 }} />
+        {minimized ? (
+          <>
+            <span style={{ fontSize: 10 }}>▴</span>
+            <span>Message your agent</span>
+          </>
+        ) : (
+          <div style={{ width: 36, height: 3, borderRadius: 2, background: C.muted, opacity: 0.6 }} />
+        )}
       </div>
 
+      {!minimized && (
       <div style={{ flex: 1, minHeight: 0, display: "flex", gap: 8, padding: "0 10px 10px", alignItems: "stretch" }}>
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 6, position: "relative" }}>
           {attachments.length > 0 && (
@@ -588,6 +648,7 @@ export function Composer({
           Send
         </button>
       </div>
+      )}
     </div>
   );
 }

@@ -2,11 +2,23 @@
 // composer height, so the size you drag it to sticks across tabs and relaunches.
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
+import { migratePersistedUi } from "./composerPersist";
 
 export const COMPOSER_MIN = 64;
-// Tall enough that, as a bottom overlay, the composer covers Claude's terminal input box
-// at rest — so the user always types here, never into the terminal underneath.
-export const COMPOSER_DEFAULT = 128;
+// The rest height: tall enough that, as a bottom overlay, the composer just covers Claude's
+// terminal input line — so the user types here by default, never into the terminal beneath.
+// Drag-snaps land here (see composerDrag.ts), so it doubles as the restore target.
+export const COMPOSER_SNAP = 72;
+export const COMPOSER_DEFAULT = COMPOSER_SNAP;
+// Slim bar shown when minimized: enough for the grab handle + a "bring it back" hint, while
+// the terminal input underneath is fully exposed for answering Claude's menus.
+export const COMPOSER_BAR = 22;
+// Drag tuning (shared with composerDrag.ts via the Composer): a magnet around the snap
+// height, the raw height a downward drag must reach to minimize, and the upward distance
+// needed to restore from the minimized bar.
+export const COMPOSER_SNAP_THRESHOLD = 24;
+export const COMPOSER_MINIMIZE_THRESHOLD = 40;
+export const COMPOSER_RESTORE_THRESHOLD = 24;
 
 // Terminal text-size factor (Cmd +/- and the ⋯ menu "Text size"). Applied as a multiplier
 // on the terminal font size only (see Terminal.tsx), so the text scales while the UI chrome
@@ -32,6 +44,11 @@ export type AgentOrdering = "attention" | "manual";
 interface UiState {
   composerHeight: number;
   setComposerHeight: (h: number) => void;
+  // Whether the composer is tucked into its slim bar (terminal input exposed). Persisted
+  // globally so it stays minimized across every agent tab and across relaunch, until the
+  // user brings it back. composerHeight remembers the open size to restore to.
+  composerMinimized: boolean;
+  setComposerMinimized: (v: boolean) => void;
   zoom: number;
   setZoom: (z: number) => void;
   zoomIn: () => void;
@@ -57,6 +74,8 @@ export const useUiStore = create<UiState>()(
     (set) => ({
       composerHeight: COMPOSER_DEFAULT,
       setComposerHeight: (h) => set({ composerHeight: Math.max(COMPOSER_MIN, h) }),
+      composerMinimized: false,
+      setComposerMinimized: (v) => set({ composerMinimized: v }),
       zoom: ZOOM_DEFAULT,
       setZoom: (z) => set({ zoom: clampZoom(z) }),
       zoomIn: () => set((s) => ({ zoom: clampZoom(s.zoom + ZOOM_STEP) })),
@@ -69,6 +88,16 @@ export const useUiStore = create<UiState>()(
       agentOrdering: "attention",
       setAgentOrdering: (v) => set({ agentOrdering: v }),
     }),
-    { name: "sparkle-ui", storage: createJSONStorage(() => localStorage) },
+    {
+      name: "sparkle-ui",
+      storage: createJSONStorage(() => localStorage),
+      // v1: the rest height shrank from 128 to the compact COMPOSER_SNAP. The pure
+      // migratePersistedUi resets only users still parked on the OLD default, preserving a
+      // height anyone deliberately dragged to. (composerMinimized hydrates from its default
+      // via the usual shallow merge — no migration needed for the new field.)
+      version: 1,
+      migrate: (persisted, version) =>
+        migratePersistedUi(persisted as Record<string, unknown>, version, COMPOSER_SNAP) as unknown as UiState,
+    },
   ),
 );

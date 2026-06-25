@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -9,7 +9,7 @@ import { spawnPty, writePty, killPty, resizePty, onPtyOutput, onPtyExit } from "
 import { StatusEngine } from "../engine/statusEngine";
 import { snapshotScreen } from "../engine/screenSnapshot";
 import { useUiStore } from "../stores/uiStore";
-import { shouldRouteToComposer } from "./terminalInput";
+import { isComposerToggleKey } from "./composerToggle";
 import { wheelToScrollLines } from "./terminalScroll";
 
 // Terminal font size at 100%. The ⋯-menu "Text size" control (and Cmd +/-) multiplies
@@ -67,7 +67,7 @@ export function Terminal({
   onReady,
   onExit,
   onRequestFocus,
-  onComposerType,
+  focusRef,
 }: {
   agentId: string;
   command: string;
@@ -79,10 +79,9 @@ export function Terminal({
   onExit?: () => void;
   // Called when the active tab is shown, to put initial focus in the composer.
   onRequestFocus?: () => void;
-  // Called when the user types a printable character in the terminal — the parent routes
-  // it into the composer (carrying the char). Mouse selection, Cmd+C copy, and arrow/enter
-  // TUI-menu navigation still work directly in the terminal.
-  onComposerType?: (ch: string) => void;
+  // The parent sets this to an imperative focus() so it can move focus into the terminal
+  // (e.g. on ⌘J / when the composer minimizes) without the user clicking it.
+  focusRef?: RefObject<(() => void) | null>;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -93,8 +92,6 @@ export function Terminal({
   // Latest onRequestFocus, read by the (agentId-keyed) effect without re-subscribing.
   const onRequestFocusRef = useRef(onRequestFocus);
   onRequestFocusRef.current = onRequestFocus;
-  const onComposerTypeRef = useRef(onComposerType);
-  onComposerTypeRef.current = onComposerType;
   const zoom = useUiStore((s) => s.zoom);
   const resolvedTheme = useResolvedTheme();
   // Brief "Copied to clipboard" flash shown after a mouse selection is copied.
@@ -150,6 +147,8 @@ export function Terminal({
     }
     termRef.current = term;
     fitRef.current = fit;
+    // Let the parent move focus into the terminal imperatively (⌘J / composer minimize).
+    if (focusRef) focusRef.current = () => term.focus();
 
     // Engine owns the tab status. It reads the rendered screen on settle (via getScreen)
     // to decide red-vs-gray, so it must be created after the terminal exists.
@@ -164,16 +163,18 @@ export function Terminal({
       void writePty(agentId, d);
     });
 
-    // Keep the terminal fully usable for text selection, copy, and TUI menu navigation,
-    // but route prompt-typing to the composer: a bare printable character pops the user
-    // into the composer (carrying that character). Modifier combos (Cmd+C copy/paste,
-    // etc.), arrows, Enter, Tab, Esc and other control keys stay in the terminal so menus
-    // and selection keep working underneath.
+    // The terminal is a real terminal: every keystroke reaches the PTY, so Claude's menus
+    // (number picks, arrows, Enter, Esc) and mouse-select + Cmd+C copy all work directly.
+    // The one exception is ⌘J — it bounces focus back to the composer (and restores it if
+    // minimized) instead of going to the PTY, so the user can hop back to the prompt box.
     term.attachCustomKeyEventHandler((e) => {
-      if (shouldRouteToComposer(e, term.buffer.active.type)) {
-        onComposerTypeRef.current?.(e.key);
+      if (isComposerToggleKey(e)) {
+        useUiStore.getState().setComposerMinimized(false);
+        onRequestFocusRef.current?.();
         return false;
       }
+      // Swallow the whole ⌘J chord (incl. the keyup) so no stray sequence reaches the PTY.
+      if (e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === "j") return false;
       return true;
     });
 
@@ -249,6 +250,7 @@ export function Terminal({
 
     return () => {
       disposed = true;
+      if (focusRef) focusRef.current = null;
       ro.disconnect();
       container.removeEventListener("mouseup", onMouseUp);
       if (copiedTimer.current) window.clearTimeout(copiedTimer.current);

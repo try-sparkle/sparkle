@@ -8,6 +8,7 @@ import { buildClaudeExec } from "../services/claudeSpawn";
 import { maybeAutoName } from "../services/agentNaming";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useUiStore } from "../stores/uiStore";
 import { PinnedPrompt } from "./PinnedPrompt";
 import { Terminal } from "./Terminal";
 import { Composer } from "./Composer";
@@ -45,8 +46,10 @@ export function AgentPane({
   const setStatus = useRuntimeStore((s) => s.setStatus);
   // The composer's textarea — initial focus lands here when a tab opens.
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
-  // Imperative bridge so a printable keystroke in the terminal is routed into the composer.
-  const composerApiRef = useRef<{ insert: (text: string) => void } | null>(null);
+  // The terminal's imperative focus(), so we can move focus into it when the composer
+  // minimizes (or on ⌘J) without the user clicking the terminal.
+  const termFocusRef = useRef<(() => void) | null>(null);
+  const composerMinimized = useUiStore((s) => s.composerMinimized);
 
   const prepare = async () => {
     // Brainstorm agents are a Chief chat — no worktree, no PTY, nothing to prepare.
@@ -110,6 +113,18 @@ export function AgentPane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent.id]);
 
+  // Focus follows the minimized state on the visible pane: minimized → terminal (so the user
+  // can answer Claude's menus), restored → composer (so they type in the box). Drives both the
+  // drag-to-minimize path and ⌘J. rAF lets the just-rendered surface mount/show first.
+  useEffect(() => {
+    if (!visible || !ptyReady) return;
+    const raf = requestAnimationFrame(() => {
+      if (composerMinimized) termFocusRef.current?.();
+      else composerInputRef.current?.focus();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [composerMinimized, visible, ptyReady]);
+
   return (
     <div
       style={{
@@ -154,7 +169,7 @@ export function AgentPane({
               onStatus={(s) => setStatus(agent.id, s)}
               onReady={() => setPtyReady(true)}
               onRequestFocus={() => composerInputRef.current?.focus()}
-              onComposerType={(ch) => composerApiRef.current?.insert(ch)}
+              focusRef={termFocusRef}
             />
           </div>
           <Composer
@@ -162,7 +177,6 @@ export function AgentPane({
             active={visible}
             disabled={!ptyReady}
             inputRef={composerInputRef}
-            composerApiRef={composerApiRef}
             onSubmitPrompt={(t) => {
               setLastPrompt(project.id, agent.id, t);
               // Fire-and-forget: summarize the work into a short name (first prompt, or when

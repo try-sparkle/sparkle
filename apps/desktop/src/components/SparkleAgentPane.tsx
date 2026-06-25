@@ -11,6 +11,7 @@ import {
   SPARKLE_PROJECT_ID,
 } from "../services/sparkleAgent";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useUiStore } from "../stores/uiStore";
 import { PinnedPrompt } from "./PinnedPrompt";
 import { Terminal } from "./Terminal";
 import { Composer } from "./Composer";
@@ -41,7 +42,8 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
   const [lastPrompt, setLastPrompt] = useState("");
   const setStatus = useRuntimeStore((s) => s.setStatus);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
-  const composerApiRef = useRef<{ insert: (text: string) => void } | null>(null);
+  const termFocusRef = useRef<(() => void) | null>(null);
+  const composerMinimized = useUiStore((s) => s.composerMinimized);
 
   const prepare = async () => {
     setPhase("preparing");
@@ -96,6 +98,17 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Focus follows the minimized state: minimized → terminal (answer Claude's menus),
+  // restored → composer (type in the box). Mirrors AgentPane.
+  useEffect(() => {
+    if (!visible || !ptyReady) return;
+    const raf = requestAnimationFrame(() => {
+      if (composerMinimized) termFocusRef.current?.();
+      else composerInputRef.current?.focus();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [composerMinimized, visible, ptyReady]);
+
   return (
     <div
       style={{
@@ -129,7 +142,7 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
               onStatus={(s) => setStatus(SPARKLE_AGENT_ID, s)}
               onReady={() => setPtyReady(true)}
               onRequestFocus={() => composerInputRef.current?.focus()}
-              onComposerType={(ch) => composerApiRef.current?.insert(ch)}
+              focusRef={termFocusRef}
             />
           </div>
           <Composer
@@ -137,7 +150,6 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
             active={visible}
             disabled={!ptyReady}
             inputRef={composerInputRef}
-            composerApiRef={composerApiRef}
             onSubmitPrompt={(t) => setLastPrompt(t)}
           />
         </div>
