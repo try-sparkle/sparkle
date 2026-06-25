@@ -90,3 +90,18 @@ export function prepareAgentWorkspace(
     return createAgentWorktree(root, projectId, agentId, baseBranch);
   });
 }
+
+/**
+ * Remove this agent's worktree — serialized on the SAME per-root lock as
+ * prepareAgentWorkspace. Closing one agent (git worktree remove) while another opens on
+ * the same project root (git init/commit/worktree add) would otherwise race on
+ * `.git/index.lock`. Always route agent-close cleanup through this, never the raw
+ * removeAgentWorktree bridge, so removal queues behind any in-flight prepare/remove.
+ */
+export function removeAgentWorkspace(
+  root: string,
+  projectId: string,
+  agentId: string,
+): Promise<void> {
+  return withRepoLock(root, () => removeAgentWorktree(root, projectId, agentId));
+}

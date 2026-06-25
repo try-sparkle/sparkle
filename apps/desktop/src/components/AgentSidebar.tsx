@@ -6,7 +6,7 @@ import type { Project, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
-import { removeAgentWorktree } from "../services/worktree";
+import { removeAgentWorkspace } from "../services/worktree";
 import { refreshAgentBranch } from "../services/branchStatus";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 import { stalenessTier, growNudge } from "../engine/nudges";
@@ -149,7 +149,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const childIds = project.agents.filter((a) => a.parentId === id).map((a) => a.id);
     for (const cid of [id, ...childIds]) {
       close(cid);
-      void removeAgentWorktree(project.rootPath, project.id, cid).catch(() => {});
+      void removeAgentWorkspace(project.rootPath, project.id, cid).catch(() => {});
     }
     removeAgent(project.id, id);
   };
