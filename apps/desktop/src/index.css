@@ -10,6 +10,8 @@
   --c-cream: #eaf1ff;
   --c-muted: #8aa0c4;
   --c-chat-bubble: #1d3a7a;
+  --c-accent-ink: #34e0f0;
+  --c-agent-idle: #8aa0c4;
 }
 :root[data-theme="light"] {
   --c-forest: #ffffff;
@@ -17,6 +19,8 @@
   --c-cream: #0a1a3f;
   --c-muted: #5b6b8c;
   --c-chat-bubble: #d6e0f5;
+  --c-accent-ink: #0a1a3f;
+  --c-agent-idle: #3f4e6b;
 }
 
 * {

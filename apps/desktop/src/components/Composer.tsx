@@ -329,6 +329,12 @@ export function Composer({
 
   const micDisabled = modelProgress !== null || (disabled && micStatus !== "listening");
 
+  // The default placeholder is rendered as a styled overlay (so "Hey Sparkle" can be bold +
+  // blue, which a native textarea placeholder can't do). Only show it in the clean empty state
+  // where the textarea sits at the top of its column, so the overlay lines up with row one.
+  const showRichPlaceholder =
+    !value && !disabled && !dropActive && attachments.length === 0 && !modelProgress && !dictationError;
+
   return (
     <div
       ref={containerRef}
@@ -364,7 +370,7 @@ export function Composer({
       </div>
 
       <div style={{ flex: 1, minHeight: 0, display: "flex", gap: 8, padding: "0 10px 10px", alignItems: "stretch" }}>
-        <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 6, position: "relative" }}>
           {attachments.length > 0 && (
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap", flex: "0 0 auto" }}>
               {attachments.map((a) => (
@@ -447,7 +453,9 @@ export function Composer({
                 ? "Drop the file here to attach it…"
                 : disabled
                 ? "Starting your agent…"
-                : "Message your agent…   (Enter to send, Shift+Enter for a new line, or drag in a log file)"
+                : showRichPlaceholder
+                ? "" // the styled overlay below renders this state's placeholder
+                : 'Just say "Hey Sparkle" and I\'ll start listening to you talk.'
             }
             spellCheck={false}
             style={{
@@ -467,6 +475,29 @@ export function Composer({
               opacity: disabled ? 0.6 : 1,
             }}
           />
+          {showRichPlaceholder && (
+            // Styled stand-in for the native placeholder so "Hey Sparkle" can be bold + blue.
+            // Aligned to the textarea's first text line (1px border + 8px/10px padding) and
+            // click-through so it never blocks focusing the textarea underneath.
+            <div
+              aria-hidden
+              style={{
+                position: "absolute",
+                top: 9,
+                left: 11,
+                right: 11,
+                pointerEvents: "none",
+                color: C.muted,
+                fontFamily: '"IBM Plex Sans", sans-serif',
+                fontSize: 14,
+                lineHeight: 1.4,
+              }}
+            >
+              Just say{" "}
+              <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>&quot;Hey Sparkle&quot;</span>{" "}
+              and I&apos;ll start listening to you talk.
+            </div>
+          )}
         </div>
         <button
           onClick={() => void toggleMic()}

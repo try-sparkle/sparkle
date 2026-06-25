@@ -147,7 +147,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
             onClick={() => void chooseLocation()}
             style={{
               background: "transparent",
-              color: C.accent,
+              color: C.accentInk,
               border: `1px solid ${C.muted}`,
               borderRadius: 8,
               padding: "8px 12px",

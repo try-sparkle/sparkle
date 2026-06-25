@@ -8,8 +8,8 @@
 import { C as BRAND } from "@sparkle/ui";
 
 export const THEME_HEX = {
-  dark: { forest: "#0a1a3f", deepForest: "#0f2350", cream: "#eaf1ff", muted: "#8aa0c4", chatBubble: "#1d3a7a" },
-  light: { forest: "#ffffff", deepForest: "#f1f4fa", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#d6e0f5" },
+  dark: { forest: "#0a1a3f", deepForest: "#0f2350", cream: "#eaf1ff", muted: "#8aa0c4", chatBubble: "#1d3a7a", accentInk: "#34e0f0", agentIdle: "#8aa0c4" },
+  light: { forest: "#ffffff", deepForest: "#f1f4fa", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#d6e0f5", accentInk: "#0a1a3f", agentIdle: "#3f4e6b" },
 } as const;
 
 // Themed token object for component inline styles. The four theme-dependent tokens become
@@ -22,6 +22,14 @@ export const C = {
   deepForest: "var(--c-deep-forest)",
   cream: "var(--c-cream)",
   muted: "var(--c-muted)",
+  // Cyan (brand accent) is legible as TEXT only on dark backgrounds. As text it must flip to
+  // dark ink in light mode — so this themed token is cyan in dark, navy in light. Use it for
+  // accent-colored text/glyphs; keep BRAND.accent (constant cyan) for fills/strokes/borders.
+  accentInk: "var(--c-accent-ink)",
+  // Inactive (done/stopped) agent name text. The brand "gray" (#8aa0c4) is too light to read
+  // on the light sidebar, so this themed token keeps it in dark mode but goes much darker in
+  // light. (AGENT_STATUS green/red are brand-constant and fine in both themes.)
+  agentIdle: "var(--c-agent-idle)",
 };
 
 export const CHAT_USER_BUBBLE = "var(--c-chat-bubble)";
@@ -30,6 +38,10 @@ export const CHAT_USER_BUBBLE = "var(--c-chat-bubble)";
 // across themes, so this must stay light in BOTH — use the brand cream LITERAL, not the themed
 // var, which flips to navy ink in light mode and would go low-contrast on teal.
 export const ON_BRAND_FILL = BRAND.cream;
+
+// Counterpart for text/icons sitting on a LIGHT brand fill (e.g. the cyan Brainstorm button),
+// where dark ink reads better than cream. Constant navy in both themes — the fill is constant too.
+export const ON_BRAND_FILL_DARK = BRAND.forest;
 
 // xterm cannot use CSS var() — it needs concrete hex. Build its theme from THEME_HEX indexed
 // by the resolved theme (order-independent, unlike reading the live data-theme). `cursor` is

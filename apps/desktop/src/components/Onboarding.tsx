@@ -32,7 +32,7 @@ export function Onboarding({ onRetry }: { onRetry: () => void }) {
         href="https://docs.claude.com/en/docs/claude-code/setup"
         target="_blank"
         rel="noreferrer"
-        style={{ color: C.accent, fontWeight: FONT_WEIGHT.medium }}
+        style={{ color: C.accentInk, fontWeight: FONT_WEIGHT.medium }}
       >
         How to install Claude Code →
       </a>

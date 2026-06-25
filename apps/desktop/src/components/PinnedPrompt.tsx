@@ -17,7 +17,7 @@ export function PinnedPrompt({ prompt }: { prompt: string }) {
         minHeight: 20,
       }}
     >
-      <span style={{ color: C.accent, flex: "0 0 auto" }}>⤷</span>
+      <span style={{ color: C.accentInk, flex: "0 0 auto" }}>⤷</span>
       <span
         title={prompt || undefined}
         style={{

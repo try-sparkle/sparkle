@@ -1,5 +1,5 @@
 import { useState, type CSSProperties } from "react";
-import { C, AGENT_STATUS, FONT_WEIGHT } from "../theme/colors";
+import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import type { AgentTabStatus, Project } from "../types";
 import { ThemeToggle } from "./ThemeToggle";
 import { AgentOrderToggle } from "./AgentOrderToggle";
@@ -225,7 +225,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       </div>
 
       <button
-        style={{ ...btn, borderColor: C.teal, background: C.teal }}
+        style={{ ...btn, borderColor: C.teal, background: C.teal, color: ON_BRAND_FILL }}
         onClick={() => void pickAndAdd("New project — choose or create its folder")}
       >
         New

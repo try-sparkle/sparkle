@@ -50,7 +50,7 @@ export function StatusBar() {
           border: "none",
           padding: 0,
           margin: 0,
-          color: C.accent,
+          color: C.accentInk,
           fontSize: 11,
           fontFamily: '"IBM Plex Sans", sans-serif',
           cursor: "pointer",

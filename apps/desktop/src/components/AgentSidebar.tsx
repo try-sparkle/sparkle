@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { TbPinFilled } from "react-icons/tb";
-import { C, AGENT_STATUS, FONT_WEIGHT, CHAT_USER_BUBBLE } from "../theme/colors";
+import { C, AGENT_STATUS, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK } from "../theme/colors";
 import type { Project, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -21,24 +21,23 @@ import { Tooltip } from "./Tooltip";
  * to open the agent, double-click the agent name to rename it, ×
  * to close. "+ Agent" adds one.
  */
-// Shared style for the two create buttons (Brainstorm / Build). The stroke is a left→right
-// gradient so the pair reproduces the Sparkle logo's blue→cyan fade: Brainstorm runs
-// dark-blue→mid, Build picks up mid→cyan. Solid (not dashed) and ~2× the old 1px stroke so the
-// fade reads clearly. Rounded corners are preserved by compositing a solid fill on the
-// padding-box beneath the gradient border-box; the fill matches the sidebar, so the button
-// still reads as transparent.
-function createBtnStyle(from: string, to: string, text: string): React.CSSProperties {
+// Shared style for the two create buttons (Brainstorm / Build): a solid gradient fill with
+// NO border/stroke, so the button reads as a button without an edge of a different shade on
+// its sides. The gradient runs left→right to reproduce the Sparkle logo's blue→cyan fade:
+// Brainstorm runs blue→mid, Build picks up mid→cyan. `fillText` is the per-button ink chosen
+// for contrast on that fill.
+function createBtnStyle(from: string, to: string, fillText: string): React.CSSProperties {
   return {
     flex: 1,
     padding: "9px 10px",
-    background: `linear-gradient(${C.deepForest}, ${C.deepForest}) padding-box, linear-gradient(90deg, ${from}, ${to}) border-box`,
-    color: text,
-    border: "2px solid transparent",
+    border: "none",
     borderRadius: 8,
     cursor: "pointer",
     fontFamily: '"IBM Plex Sans", sans-serif',
     fontSize: 13,
     whiteSpace: "nowrap",
+    background: `linear-gradient(90deg, ${from}, ${to})`,
+    color: fillText,
   };
 }
 
@@ -184,14 +183,14 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           <button
             onClick={onAddBrainstorm}
             title="Chat with Chief over this project's knowledge"
-            style={createBtnStyle(C.teal, C.accentMid, C.teal)}
+            style={createBtnStyle(C.accent, C.accentMid, ON_BRAND_FILL_DARK)} // cyan (the "S" color) leads; black icon+text
           >
             ✦ Brainstorm
           </button>
           <button
             onClick={onAddBuild}
             title="A master orchestrator that spawns worker agents to get work done"
-            style={createBtnStyle(C.accentMid, C.accent, C.accent)}
+            style={createBtnStyle(C.accentMid, C.teal, ON_BRAND_FILL)} // blue leads (matches logo's right side); white icon+text
           >
             ⚒ Build
           </button>
@@ -226,7 +225,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               <div key={top.id}>
                 {[top, ...workers].map((a) => {
           const st = status[a.id] ?? "stopped";
-          const color = AGENT_STATUS[st].color;
+          // Idle/inactive agents (idle, blocked, errored, done, stopped all share the brand
+          // GRAY) use a themed gray that's much darker in light mode for readability; active
+          // green/red statuses keep their brand color. Compare to a known-gray status ("done")
+          // instead of enumerating, so this tracks the AGENT_STATUS taxonomy if it changes.
+          const color =
+            AGENT_STATUS[st].color === AGENT_STATUS.done.color ? C.agentIdle : AGENT_STATUS[st].color;
           const isActive = !activeSpecial && project.selectedAgentId === a.id;
           const bs = branchStatus[a.id];
           const tier = bs ? stalenessTier(bs.behind) : "none";
@@ -248,11 +252,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                 marginLeft: depth * 16,
                 borderRadius: 8,
                 cursor: "pointer",
-                // Selected agent: a lighter, bluer lift (reads as "raised/active" — a
-                // darker patch reads as recessed and is hard to spot on the dark sidebar)
-                // plus a bright teal bar on the left edge as the unmistakable selected mark.
+                // Selected agent: a lighter, bluer lift (reads as "raised/active") with no
+                // border or accent bar — a clean filled highlight, no edge of a different shade.
                 background: isActive ? CHAT_USER_BUBBLE : "transparent",
-                boxShadow: isActive ? `inset 3px 0 0 0 ${C.teal}` : "none",
                 marginBottom: 2,
               }}
             >
@@ -394,7 +396,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                       }
                       style={{
                         fontSize: 10,
-                        color: tier === "warn" ? C.accent : C.muted,
+                        color: tier === "warn" ? C.accentInk : C.muted,
                         background: "transparent",
                         border: "none",
                         cursor: busy ? "not-allowed" : "pointer",
@@ -522,9 +524,8 @@ function SparkleAgentRow({
         padding: "8px 10px",
         borderRadius: 8,
         cursor: "pointer",
-        // Match the agent rows' selected treatment: lighter tinted lift + teal left bar.
+        // Match the agent rows' selected treatment: a clean lighter lift, no accent bar.
         background: active ? CHAT_USER_BUBBLE : "transparent",
-        boxShadow: active ? `inset 3px 0 0 0 ${C.teal}` : "none",
         borderTop: `1px solid ${C.forest}`,
       }}
     >
