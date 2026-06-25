@@ -60,10 +60,12 @@ fn search_dotenv(start: &Path, keys: &[&str]) -> Option<String> {
     None
 }
 
-/// Best-effort BYOK key lookup. See module docs for the resolution order.
-fn resolve_anthropic_key() -> Option<String> {
-    let keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_API"];
-
+/// Best-effort secret lookup shared by the BYOK integrations (Anthropic key, Chief PAT). Tries,
+/// in order: each name in `keys` as a process env var → a `.env.local` walked up from the cwd →
+/// the same from the executable's dir → the known dev location `$HOME/Projects/sparkle/.env.local`.
+/// First non-empty hit wins; None if nothing matches. Reading at runtime (not build time) keeps
+/// secrets out of the shipped JS bundle and binary.
+pub(crate) fn resolve_env_secret(keys: &[&str]) -> Option<String> {
     for k in keys {
         if let Ok(v) = std::env::var(k) {
             let v = v.trim();
@@ -74,13 +76,13 @@ fn resolve_anthropic_key() -> Option<String> {
     }
 
     if let Ok(cwd) = std::env::current_dir() {
-        if let Some(v) = search_dotenv(&cwd, &keys) {
+        if let Some(v) = search_dotenv(&cwd, keys) {
             return Some(v);
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            if let Some(v) = search_dotenv(dir, &keys) {
+            if let Some(v) = search_dotenv(dir, keys) {
                 return Some(v);
             }
         }
@@ -89,12 +91,17 @@ fn resolve_anthropic_key() -> Option<String> {
     if let Some(home) = std::env::var_os("HOME") {
         let dev = PathBuf::from(home).join("Projects/sparkle/.env.local");
         if let Ok(body) = std::fs::read_to_string(&dev) {
-            if let Some(v) = parse_env_value(&body, &keys) {
+            if let Some(v) = parse_env_value(&body, keys) {
                 return Some(v);
             }
         }
     }
     None
+}
+
+/// Best-effort BYOK key lookup. See module docs for the resolution order.
+fn resolve_anthropic_key() -> Option<String> {
+    resolve_env_secret(&["ANTHROPIC_API_KEY", "ANTHROPIC_API"])
 }
 
 /// Trim the model's reply down to a clean 2–4 word title. Defensive against the model
@@ -204,6 +211,19 @@ mod tests {
     fn empty_value_is_ignored() {
         let body = "ANTHROPIC_API=\n";
         assert_eq!(parse_env_value(body, &["ANTHROPIC_API"]), None);
+    }
+
+    #[test]
+    fn resolve_env_secret_reads_a_process_env_var() {
+        // Uniquely-named so it can't collide with a real var, and — since resolve_env_secret also
+        // walks cwd/$HOME `.env.local` — so no stray dotenv along that chain could define it and
+        // make the absent-case assertion below flaky. The env var is the first link in the chain;
+        // the second assertion exercises the full fall-through to a clean None.
+        let key = "SPARKLE_CHIEF_RESOLVER_TEST_KEY";
+        std::env::set_var(key, "  pat_resolved  ");
+        assert_eq!(resolve_env_secret(&[key]), Some("pat_resolved".to_string()));
+        std::env::remove_var(key);
+        assert_eq!(resolve_env_secret(&[key]), None, "absent var, no dotenv hit → None");
     }
 
     #[test]

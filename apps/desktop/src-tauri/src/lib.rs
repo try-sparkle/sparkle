@@ -1,4 +1,5 @@
 mod audio;
+mod chief;
 mod claude;
 mod dictation;
 mod logging;
@@ -51,6 +52,7 @@ pub fn run() {
             worktree::install_worktree_guard,
             worktree::project_default_branch,
             worktree::agent_branch_status,
+            worktree::markdown_changed_since,
             worktree::refresh_agent_branch,
             sparkle_agent::ensure_sparkle_repo,
             dictation::start_dictation,
@@ -59,7 +61,8 @@ pub fn run() {
             logging::log_dir,
             logging::reveal_logs,
             logging::frontend_log,
-            naming::generate_agent_name
+            naming::generate_agent_name,
+            chief::chief_pat
         ])
         // TODO(phase1):
         //  - deep-link handler for sparkle://oauth/callback (only if/when Anthropic

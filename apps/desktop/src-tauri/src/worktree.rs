@@ -308,6 +308,102 @@ pub fn agent_branch_status(
 }
 
 #[derive(Serialize)]
+pub struct MarkdownChange {
+    /// Repo-root-relative path of the markdown file.
+    path: String,
+    /// Current content of the file in the worktree.
+    content: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownSync {
+    /// The worktree's current HEAD — the caller stores this as the next sync marker.
+    head_sha: String,
+    files: Vec<MarkdownChange>,
+}
+
+/// Core (AppHandle-free, testable): markdown files an agent committed that the Chief library
+/// hasn't seen yet. `since_sha` is the last-synced commit; empty/unknown reseeds from every
+/// tracked markdown file. The reseed intentionally includes docs inherited from the base branch
+/// (not just ones this agent authored) — the goal is to give Chief the full catch-up of existing
+/// project docs, and assets are named by path + commit, not attributed to an agent. `dirs` are
+/// directory pathspecs to scope to (e.g. `PRD`, `docs/superpowers/specs`); only `.md` files under
+/// them are returned, with current content.
+pub fn markdown_changed_since_at(
+    project_id: &str,
+    agent_id: &str,
+    since_sha: &str,
+    dirs: &[String],
+    app_data: &Path,
+) -> Result<MarkdownSync, String> {
+    let wt = worktree_path(app_data, project_id, agent_id);
+    let wt_str = wt.to_string_lossy().to_string();
+    let head = git(&wt_str, &["rev-parse", "HEAD"])?;
+
+    // A non-empty marker is only usable if it still resolves to a commit in this worktree.
+    // Anything else (empty, rewritten history, typo) reseeds rather than erroring.
+    let since_valid = !since_sha.is_empty()
+        && git(
+            &wt_str,
+            &["rev-parse", "--verify", "--quiet", &format!("{since_sha}^{{commit}}")],
+        )
+        .is_ok();
+
+    // `-c core.quotePath=false` keeps non-ASCII paths (e.g. `PRD/café.md`) raw instead of
+    // C-quoted (`"PRD/caf\303\251.md"`), which would fail the `.md` suffix test below and be
+    // silently dropped.
+    let range = format!("{since_sha}..HEAD");
+    let mut args: Vec<&str> = if since_valid {
+        vec![
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--name-only",
+            "--diff-filter=ACMR",
+            &range,
+            "--",
+        ]
+    } else {
+        vec!["-c", "core.quotePath=false", "ls-files", "--"]
+    };
+    for d in dirs {
+        args.push(d.as_str());
+    }
+    // Propagate (don't swallow) a listing failure: a transient git error must leave the marker
+    // un-advanced so the next tick retries the range, rather than reporting an empty result that
+    // advances HEAD past commits whose markdown was never examined.
+    let listing = git(&wt_str, &args)?;
+
+    let mut files = Vec::new();
+    for rel in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // Scope to markdown; a directory pathspec also matches sibling non-md files.
+        if !rel.ends_with(".md") {
+            continue;
+        }
+        // Read the file's CURRENT content from the worktree (not the historical blob). A file
+        // that was changed then deleted, or is unreadable, is skipped rather than fatal.
+        if let Ok(content) = std::fs::read_to_string(wt.join(rel)) {
+            files.push(MarkdownChange { path: rel.to_string(), content });
+        }
+    }
+    Ok(MarkdownSync { head_sha: head, files })
+}
+
+/// Markdown an agent committed since `since_sha`, scoped to `dirs`, for upload into Chief.
+#[tauri::command]
+pub fn markdown_changed_since(
+    app: AppHandle,
+    project_id: String,
+    agent_id: String,
+    since_sha: String,
+    dirs: Vec<String>,
+) -> Result<MarkdownSync, String> {
+    let app_data = app_data_dir(&app)?;
+    markdown_changed_since_at(&project_id, &agent_id, &since_sha, &dirs, &app_data)
+}
+
+#[derive(Serialize)]
 #[serde(untagged)]
 pub enum RefreshOutcome {
     Ok { ok: bool, ahead: u32, behind: u32 },
@@ -917,6 +1013,54 @@ mod tests {
         std::fs::write(Path::new(&info.path).join("uncommitted.txt"), "u").unwrap();
         let st2 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
         assert!(st2.dirty, "uncommitted file flips dirty");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn markdown_changed_since_seeds_then_increments_scoped_to_dirs() {
+        let root = unique_root("md-sync");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("md-sync-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "md1", "main", &app_data).unwrap();
+        let wt = Path::new(&info.path);
+        let dirs = vec!["PRD".to_string(), "docs/superpowers/specs".to_string()];
+
+        // Commit a progress doc, a spec, an out-of-scope README, and an in-scope non-md file.
+        std::fs::create_dir_all(wt.join("PRD")).unwrap();
+        std::fs::create_dir_all(wt.join("docs/superpowers/specs")).unwrap();
+        std::fs::write(wt.join("PRD/main.md"), "# progress v1").unwrap();
+        std::fs::write(wt.join("docs/superpowers/specs/x.md"), "# spec").unwrap();
+        std::fs::write(wt.join("PRD/notes.txt"), "not markdown").unwrap();
+        std::fs::write(wt.join("README.md"), "# readme outside scope").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "docs"]).unwrap();
+        let after_first = git(&info.path, &["rev-parse", "HEAD"]).unwrap();
+
+        // Seed (empty since): both in-scope markdown files, with their content; nothing else.
+        let seed = markdown_changed_since_at("p", "md1", "", &dirs, &app_data).unwrap();
+        let mut paths: Vec<&str> = seed.files.iter().map(|f| f.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["PRD/main.md", "docs/superpowers/specs/x.md"]);
+        let prd = seed.files.iter().find(|f| f.path == "PRD/main.md").unwrap();
+        assert_eq!(prd.content, "# progress v1");
+        assert_eq!(seed.head_sha, after_first);
+
+        // Increment: change only the progress doc; since=after_first → only that file.
+        std::fs::write(wt.join("PRD/main.md"), "# progress v2").unwrap();
+        git(&info.path, &["commit", "-am", "update progress"]).unwrap();
+        let inc = markdown_changed_since_at("p", "md1", &after_first, &dirs, &app_data).unwrap();
+        let inc_paths: Vec<&str> = inc.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(inc_paths, vec!["PRD/main.md"]);
+        assert_eq!(inc.files[0].content, "# progress v2", "current content, not the old blob");
+
+        // A bogus/unknown since falls back to a full seed rather than erroring.
+        let fallback = markdown_changed_since_at("p", "md1", "deadbeef", &dirs, &app_data).unwrap();
+        assert_eq!(fallback.files.len(), 2, "unknown sha → reseed");
+
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
     }

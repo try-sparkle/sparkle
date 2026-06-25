@@ -6,7 +6,23 @@
 // (see vite.config.ts). In a non-dev build we hit the API directly; the packaged Tauri app
 // will eventually route this through the Tauri HTTP plugin (epic ).
 
+import { invoke } from "@tauri-apps/api/core";
+
 const BASE = import.meta.env.DEV ? "/chief-api" : "https://api.storytell.ai";
+
+/**
+ * Ask the Rust backend for a Chief PAT resolved from the environment / `.env.local` at runtime
+ * (the `chief_pat` command — mirrors how the Anthropic BYOK key is read). Returns "" when none is
+ * configured so the caller can fall back to the connect screen. Never throws.
+ */
+export async function resolveEnvChiefPat(): Promise<string> {
+  try {
+    return ((await invoke<string>("chief_pat")) ?? "").trim();
+  } catch {
+    // No env token (or not running under Tauri) — the user can still paste one.
+    return "";
+  }
+}
 
 export class ChiefError extends Error {
   constructor(
@@ -73,6 +89,76 @@ export async function listProjects(pat: string): Promise<ChiefProject[]> {
     | ChiefProject[];
   if (Array.isArray(body)) return body;
   return body.data ?? body.projects ?? [];
+}
+
+// --- Library assets (3-step upload) -----------------------------------------------------
+// POST /v1/assets reserves a record + mints a signed upload URL; PUT the bytes to it; then
+// POST /v1/assets/{id}/complete finalizes ingestion. A content-dedup hit comes back from
+// step 1 as `already_exists: true` (no URL), in which case there's nothing more to do.
+
+interface CreateAssetResponse {
+  asset_id: string;
+  already_exists: boolean;
+  // Present only when already_exists is false (a fresh upload was reserved).
+  upload_url?: string;
+  upload_method?: string;
+  upload_headers?: Record<string, string>;
+  expires_at?: string;
+  // Present on a dedup hit instead of the upload fields.
+  status?: string;
+}
+
+export interface UploadAssetResult {
+  assetId: string;
+  /** True when Chief already had this exact content — we skipped the PUT + complete. */
+  alreadyExists: boolean;
+}
+
+/**
+ * Upload `content` into `projectId`'s library as an asset named `filename`. Runs the 3-step
+ * flow (create → PUT signed url → complete), or short-circuits on a server-side content-dedup
+ * hit. The signed PUT targets an absolute storage URL, so it bypasses the `/chief-api` proxy.
+ */
+export async function uploadAsset(
+  pat: string,
+  projectId: string,
+  filename: string,
+  content: string,
+  mimeType = "text/markdown",
+): Promise<UploadAssetResult> {
+  const createRes = await fetch(`${BASE}/v1/assets`, {
+    method: "POST",
+    headers: headers(pat, projectId),
+    body: JSON.stringify({ filename, mime_type: mimeType }),
+  });
+  const created = (await parseOrThrow(createRes)) as CreateAssetResponse;
+  // A genuine content-dedup hit: Chief already has these bytes — nothing more to do.
+  if (created.already_exists) {
+    return { assetId: created.asset_id, alreadyExists: true };
+  }
+  // A fresh reservation MUST carry an upload URL. Its absence is a malformed response, not a
+  // dedup hit — surface it (rather than silently "succeeding") so the bytes aren't dropped and
+  // the caller leaves its sync marker un-advanced for retry.
+  if (!created.upload_url) {
+    throw new ChiefError(`Chief returned no upload url for "${filename}"`);
+  }
+
+  const put = await fetch(created.upload_url, {
+    method: created.upload_method ?? "PUT",
+    headers: created.upload_headers ?? { "Content-Type": mimeType },
+    body: content,
+  });
+  if (!put.ok) {
+    throw new ChiefError(`asset upload failed (${put.status})`, put.status);
+  }
+
+  const completeRes = await fetch(`${BASE}/v1/assets/${created.asset_id}/complete`, {
+    method: "POST",
+    headers: headers(pat, projectId),
+    body: "{}",
+  });
+  await parseOrThrow(completeRes);
+  return { assetId: created.asset_id, alreadyExists: false };
 }
 
 export interface StartChatResult {
@@ -158,9 +244,17 @@ export async function pollForResponse(
   }
 }
 
+// Concurrent ensureChiefProject calls for the SAME (pat, name) share one in-flight promise.
+// The list-then-create below is non-atomic, so without this two Build agents in the same project
+// (both with no linked Chief project yet) could each list, find nothing, and each create — two
+// duplicate projects. Keyed by pat+name; cleared when the call settles.
+const inflightEnsure = new Map<string, Promise<string>>();
+
 /**
  * Ensure a Chief project exists for this Sparkle project. Reuses a stored mapping, else reuses
  * an existing Chief project with the same name, else creates one. Returns the Chief project id.
+ * Safe under concurrency: simultaneous calls for the same project collapse to a single
+ * list-then-create (in this process) so agents don't race to create duplicates.
  */
 export async function ensureChiefProject(
   pat: string,
@@ -171,13 +265,25 @@ export async function ensureChiefProject(
   // Match and create against the SAME (truncated) name Chief will actually store, so a project
   // name >128 chars doesn't make the reuse lookup miss its own previously-created project.
   const stored = name.slice(0, 128);
+  const key = `${pat} ${stored}`;
+  const pending = inflightEnsure.get(key);
+  if (pending) return pending;
+
+  const run = (async () => {
+    try {
+      const projects = await listProjects(pat);
+      const match = projects.find((p) => p.name === stored);
+      if (match) return match.project_id;
+    } catch {
+      // listing is best-effort; fall through to create
+    }
+    const created = await createProject(pat, stored, `Sparkle project: ${name}`);
+    return created.project_id;
+  })();
+  inflightEnsure.set(key, run);
   try {
-    const projects = await listProjects(pat);
-    const match = projects.find((p) => p.name === stored);
-    if (match) return match.project_id;
-  } catch {
-    // listing is best-effort; fall through to create
+    return await run;
+  } finally {
+    inflightEnsure.delete(key);
   }
-  const created = await createProject(pat, stored, `Sparkle project: ${name}`);
-  return created.project_id;
 }

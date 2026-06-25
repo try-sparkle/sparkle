@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Project } from "../types";
-import { useSettingsStore, effectiveChiefPat, hasEnvChiefPat } from "../stores/settingsStore";
+import { useSettingsStore, effectiveChiefPat } from "../stores/settingsStore";
 import {
   ensureChiefProject,
   startChat,
@@ -23,11 +23,14 @@ interface ChatMsg {
  */
 export function BrainstormPanel({ project }: { project: Project }) {
   const chiefPatStored = useSettingsStore((s) => s.chiefPat);
+  const runtimeChiefPat = useSettingsStore((s) => s.runtimeChiefPat);
   const setChiefPat = useSettingsStore((s) => s.setChiefPat);
   const chiefProjectByProject = useSettingsStore((s) => s.chiefProjectByProject);
   const setChiefProject = useSettingsStore((s) => s.setChiefProject);
 
-  const pat = effectiveChiefPat(chiefPatStored);
+  // Subscribing to runtimeChiefPat above means this re-renders (and drops the connect screen)
+  // once the env-resolved PAT lands from the Rust backend at startup.
+  const pat = effectiveChiefPat(chiefPatStored, runtimeChiefPat);
   const chiefProjectId = chiefProjectByProject[project.id];
 
   const [messages, setMessages] = useState<ChatMsg[]>([]);
@@ -259,7 +262,6 @@ function ConnectChief({ onSave }: { onSave: (pat: string) => void }) {
       <div style={{ color: C.muted, fontSize: 13, maxWidth: 420, lineHeight: 1.6 }}>
         Paste a Chief Personal Access Token (starts with <code>pat_</code>). The Brainstorm agent
         chats with Chief over this project's library.
-        {hasEnvChiefPat ? " (A token was found in your environment.)" : ""}
       </div>
       <input
         value={val}

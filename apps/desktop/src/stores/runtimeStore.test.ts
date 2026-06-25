@@ -27,14 +27,32 @@ vi.mock("../services/branchStatus", () => ({
   agentBranchStatus: (...a: unknown[]) => agentBranchStatus(...a),
 }));
 
+// Mocked Chief sync so the store-glue tests don't touch Tauri/Chief.
+const syncAgentMarkdown = vi.fn();
+vi.mock("../services/chiefSync", () => ({
+  syncAgentMarkdown: (...a: unknown[]) => syncAgentMarkdown(...a),
+  MARKDOWN_DIRS: ["PRD", "docs/superpowers/specs"],
+}));
+
 async function freshStore() {
   vi.resetModules();
   const mod = await import("./runtimeStore");
   return mod.useRuntimeStore;
 }
 
+// Fresh runtime + settings + project stores from the SAME post-reset module graph, so state set
+// on these instances is the state `syncMarkdownToChief` reads.
+async function freshModules() {
+  vi.resetModules();
+  const runtime = await import("./runtimeStore");
+  const settings = await import("./settingsStore");
+  const projects = await import("./projectStore");
+  return { runtime, settings, projects };
+}
+
 beforeEach(() => {
   agentBranchStatus.mockReset();
+  syncAgentMarkdown.mockReset();
   (globalThis as unknown as { localStorage: Storage }).localStorage =
     new MemoryStorage() as unknown as Storage;
 });
@@ -108,5 +126,66 @@ describe("runtimeStore branch status", () => {
     agentBranchStatus.mockRejectedValue(new Error("git boom"));
     await useRuntimeStore.getState().pollBranchStatus("/root", "p1", "a1", "main");
     expect(useRuntimeStore.getState().branchStatus["a1"]).toEqual(old);
+  });
+});
+
+describe("syncMarkdownToChief — store glue ()", () => {
+  // Seed a connected PAT + a project with one agent of the given kind; returns ids + handles.
+  async function setup(kind: "build" | "brainstorm") {
+    const { runtime, settings, projects } = await freshModules();
+    settings.useSettingsStore.getState().setChiefPat("pat_x");
+    const projectId = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
+    const agentId = projects.useProjectStore.getState().addAgent(projectId, { kind });
+    return { runtime, settings, projectId, agentId };
+  }
+
+  it("skips Brainstorm agents (they have no worktree / commits)", async () => {
+    const { runtime, projectId, agentId } = await setup("brainstorm");
+    await runtime.syncMarkdownToChief(projectId, agentId);
+    expect(syncAgentMarkdown).not.toHaveBeenCalled();
+  });
+
+  it("does nothing without a connected PAT", async () => {
+    const { runtime, settings, projectId, agentId } = await setup("build");
+    settings.useSettingsStore.setState({ chiefPat: "" });
+    await runtime.syncMarkdownToChief(projectId, agentId);
+    expect(syncAgentMarkdown).not.toHaveBeenCalled();
+  });
+
+  it("persists a newly-created Chief project id and advances the agent's watermark", async () => {
+    const { runtime, settings, projectId, agentId } = await setup("build");
+    syncAgentMarkdown.mockResolvedValue({
+      headSha: "head1",
+      uploaded: ["PRD/main.md @ head1"],
+      chiefProjectId: "project_created",
+    });
+
+    await runtime.syncMarkdownToChief(projectId, agentId);
+
+    // Passed the stored marker (none yet) + project name through to the sync service.
+    expect(syncAgentMarkdown).toHaveBeenCalledWith(
+      expect.objectContaining({ pat: "pat_x", projectName: "Sparkle-Desktop", agentId }),
+    );
+    expect(settings.useSettingsStore.getState().chiefProjectByProject[projectId]).toBe(
+      "project_created",
+    );
+    expect(settings.useSettingsStore.getState().chiefSyncByAgent[agentId]).toBe("head1");
+  });
+
+  it("runs only one sync per agent at a time (no create-create race)", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    let release!: () => void;
+    syncAgentMarkdown.mockReturnValue(
+      new Promise((resolve) => {
+        release = () => resolve({ headSha: "h", uploaded: [], chiefProjectId: "p" });
+      }),
+    );
+
+    const first = runtime.syncMarkdownToChief(projectId, agentId); // takes the lock, awaits
+    await runtime.syncMarkdownToChief(projectId, agentId); // sees in-flight, returns immediately
+
+    expect(syncAgentMarkdown).toHaveBeenCalledTimes(1);
+    release();
+    await first;
   });
 });
