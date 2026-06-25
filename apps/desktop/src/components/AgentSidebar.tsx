@@ -566,16 +566,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                     ⬆ Land
                   </button>
                 )}
-              <span
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onClose(a.id);
-                }}
-                title="Close agent"
-                style={{ color: C.muted, fontSize: 15, lineHeight: 1, flex: "0 0 auto" }}
-              >
-                ×
-              </span>
+              <CloseAgentButton onClose={() => onClose(a.id)} />
             </div>
           );
             }; // end renderRow
@@ -700,6 +691,45 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         }}
       />
     </div>
+  );
+}
+
+/** Close (×) control on each agent row. ~50% larger than the old glyph, with a thin pill
+ *  that fades in on hover to make the hit target feel intentional. */
+function CloseAgentButton({ onClose }: { onClose: () => void }) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        onClose();
+      }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      title="Close agent"
+      aria-label="Close agent"
+      style={{
+        color: hover ? C.accentInk : C.muted,
+        // Glyph kept smaller than the 22px box so the × sits comfortably inside the hover pill.
+        fontSize: 18,
+        lineHeight: 1,
+        flex: "0 0 auto",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: 22,
+        height: 22,
+        padding: 0,
+        cursor: "pointer",
+        borderRadius: 999,
+        border: `1px solid ${hover ? C.muted : "transparent"}`,
+        background: hover ? C.deepForest : "transparent",
+        transition: "background 120ms ease, border-color 120ms ease, color 120ms ease",
+      }}
+    >
+      ×
+    </button>
   );
 }
 
