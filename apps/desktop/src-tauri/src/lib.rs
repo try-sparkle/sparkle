@@ -1,3 +1,4 @@
+mod attention;
 mod audio;
 mod bridge;
 mod chief;
@@ -29,6 +30,7 @@ pub fn run() {
         .manage(PtyManager::default())
         .manage(dictation::DictationState::default())
         .manage(bridge::BridgeManager::default())
+        .manage(attention::BadgeCounts::default())
         .setup(|app| {
             // Stand up unified logging before anything else so startup itself is captured.
             match logging::init(&app.handle()) {
@@ -40,6 +42,8 @@ pub fn run() {
                 // Logging is best-effort: a failure here must not stop the app from booting.
                 Err(e) => eprintln!("failed to initialize logging: {e}"),
             }
+            // Attribute notifications to Sparkle's bundle id (best-effort; see attention.rs).
+            attention::init_application();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -77,7 +81,9 @@ pub fn run() {
             bridge::start_orchestration_bridge,
             bridge::stop_orchestration_bridge,
             notes::append_note,
-            notes::create_bead
+            notes::create_bead,
+            attention::set_window_attention,
+            attention::notify_attention
         ])
         // TODO(phase1):
         //  - deep-link handler for sparkle://oauth/callback (only if/when Anthropic

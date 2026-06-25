@@ -27,6 +27,11 @@ ureq = "2"
 bzip2 = "0.4"
 tar = "0.4"
 tauri-plugin-global-shortcut = "2"
+# Native macOS Notification Center integration. We use mac-notification-sys directly rather
+# than tauri-plugin-notification because on desktop the plugin discards click events — and we
+# need the click to route to the specific worker that asked. mac-notification-sys returns the
+# interaction (Click / ActionButton) so we can emit a focus-agent event. macOS-only app.
+mac-notification-sys = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

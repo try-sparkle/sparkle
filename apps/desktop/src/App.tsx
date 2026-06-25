@@ -6,6 +6,14 @@ import { useConnectionMonitor } from "./connectionMonitor";
 import { resolveEnvChiefPat } from "./services/chief";
 import { useSettingsStore } from "./stores/settingsStore";
 import { CurrentProjectProvider } from "./windowContext";
+import { useAttentionNotifications } from "./useAttentionNotifications";
+
+// Owns the dock badge + Notification Center banners + click-to-worker routing. Rendered inside
+// the provider (it reads this window's current project) and paints no UI of its own.
+function AttentionController() {
+  useAttentionNotifications();
+  return null;
+}
 
 export function App() {
   // Single writer of <html data-theme> for the whole app (owns the matchMedia subscription).
@@ -26,6 +34,7 @@ export function App() {
 
   return (
     <CurrentProjectProvider>
+      <AttentionController />
       <Workspace />
     </CurrentProjectProvider>
   );
