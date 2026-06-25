@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, CHAT_USER_BUBBLE, xtermTheme } from "../theme/colors";
 import { useResolvedTheme } from "../theme/theme";
 import type { AgentTabStatus } from "../types";
@@ -123,6 +125,17 @@ export function Terminal({
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
+    // Make http(s) URLs in terminal output clickable. The default addon handler uses
+    // window.open, which the Tauri webview blocks for external URLs; route through the
+    // opener plugin instead so links launch in the OS default browser.
+    term.loadAddon(
+      new WebLinksAddon((event, uri) => {
+        event.preventDefault();
+        openUrl(uri).catch((err) =>
+          console.error("Failed to open URL from terminal:", uri, err),
+        );
+      }),
+    );
     term.open(container);
     // WebGL renderer enables customGlyphs (the default DOM renderer does not), giving
     // crisp, exactly-aligned box-drawing. Fall back silently if WebGL is unavailable.
