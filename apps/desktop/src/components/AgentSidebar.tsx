@@ -14,6 +14,7 @@ import { sortAgentsByAttention } from "../engine/agentOrdering";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
 import { Tooltip } from "./Tooltip";
+import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
 
 /**
@@ -166,6 +167,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           <img src="/sparkle-logo.svg" alt="Sparkle" style={{ height: 25 }} />
         </a>
       </div>
+      <LogoWaveform />
       <div
         style={{
           padding: "6px 14px",

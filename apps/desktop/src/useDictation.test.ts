@@ -5,6 +5,7 @@
  * Tauri APIs are mocked so the test runs in a plain Node/jsdom environment.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { advance } from "./voice/wakeMachine";
 
 // ---------------------------------------------------------------------------
 // Tauri mocks — must be set up before importing the modules under test
@@ -254,13 +255,42 @@ describe("createDictationController (hook logic without renderHook)", () => {
   });
 });
 
+describe("ambient segment routing via the phase machine", () => {
+  beforeEach(() => {
+    useDictationStore.setState({ phase: "passive", insertTarget: null, enabled: true });
+  });
+
+  it("passive: wake segment flips phase to active and inserts the remainder", () => {
+    const inserted: string[] = [];
+    useDictationStore.getState().registerInsert((t) => inserted.push(t));
+
+    // Simulate what the ambient onSegment does (the hook wires this to dictation://partial):
+    const seg = "hey sparkle open the settings";
+    const r = advance(useDictationStore.getState().phase, seg);
+    useDictationStore.getState().setPhase(r.phase);
+    if (r.insert) useDictationStore.getState().insert(r.insert);
+
+    expect(useDictationStore.getState().phase).toBe("active");
+    expect(inserted).toEqual(["open the settings"]);
+  });
+
+  it("passive: non-wake speech does not insert", () => {
+    const inserted: string[] = [];
+    useDictationStore.getState().registerInsert((t) => inserted.push(t));
+    const r = advance("passive", "just talking to a colleague");
+    if (r.insert) useDictationStore.getState().insert(r.insert);
+    expect(inserted).toEqual([]);
+    expect(r.phase).toBe("passive");
+  });
+});
+
 describe("multiple mounted composers (regression: dictation must not leak across agents)", () => {
   // Repro for the bug where dictating into one agent's composer also filled a
-  // different agent's input box. Agent panes stay mounted-but-hidden, so each
-  // open agent's Composer registers its own `dictation://partial` listener and
-  // Tauri broadcasts every segment to all of them. The Composer's onSegment must
-  // therefore gate on `active` (only the visible pane consumes), exactly like the
-  // sibling native-file-drop effect does.
+  // different agent's input box. Agent panes stay mounted-but-hidden and the
+  // dictation pipeline broadcasts every segment. Leak prevention is now a single
+  // shared insertTarget in the store: only the active/visible pane calls
+  // registerInsert(), and its cleanup guard (insertTarget === append) avoids a
+  // stale pane clobbering a newer one. These tests drive that real mechanism.
   beforeEach(() => {
     for (const k of Object.keys(listeners)) delete listeners[k];
     useDictationStore.setState({
@@ -268,41 +298,36 @@ describe("multiple mounted composers (regression: dictation must not leak across
       level: 0,
       error: null,
       modelProgress: null,
+      phase: "passive",
+      enabled: true,
+      insertTarget: null,
     });
   });
 
-  /** Mirrors Composer's onSegment: append only when this pane is active (visible). */
-  function makeComposer(getActive: () => boolean) {
-    let text = "";
-    const onSegment = (seg: string) => {
-      if (!getActive()) return;
-      text = text ? `${text} ${seg}` : seg;
-    };
-    return { onSegment, getText: () => text };
-  }
+  it("only the active pane's registered target receives insert(); switching panes re-targets", () => {
+    const a: string[] = [];
+    const b: string[] = [];
+    const appendA = (t: string) => a.push(t);
+    const appendB = (t: string) => b.push(t);
+    const store = () => useDictationStore.getState();
 
-  it("a single broadcast segment lands ONLY in the active pane's composer", async () => {
-    let activeId = "agent-A";
-    const a = makeComposer(() => activeId === "agent-A");
-    const b = makeComposer(() => activeId === "agent-B");
+    // Pane A is the visible pane → it registers as the single insert target.
+    store().registerInsert(appendA);
+    store().insert("hello");
+    expect(a).toEqual(["hello"]);
+    expect(b).toEqual([]); // must NOT leak into the hidden pane
 
-    // Both panes are mounted (both controllers register listeners).
-    const ctrlA = await createDictationController({ onSegment: a.onSegment });
-    const ctrlB = await createDictationController({ onSegment: b.onSegment });
+    // User switches to pane B; B registers and becomes the sole target.
+    store().registerInsert(appendB);
+    store().insert("world");
+    expect(b).toEqual(["world"]);
+    expect(a).toEqual(["hello"]); // A no longer receives anything
 
-    // User dictates while agent A is visible.
-    emit("dictation://partial", "hello");
-    expect(a.getText()).toBe("hello");
-    expect(b.getText()).toBe(""); // must NOT leak into the hidden pane
-
-    // User switches to agent B and keeps dictating.
-    activeId = "agent-B";
-    emit("dictation://partial", "world");
-    expect(a.getText()).toBe("hello"); // unchanged — A is now hidden
-    expect(b.getText()).toBe("world");
-
-    ctrlA.cleanup();
-    ctrlB.cleanup();
+    // Pane A's late cleanup must NOT clobber B's registration (the guard).
+    if (store().insertTarget === appendA) store().registerInsert(null);
+    expect(store().insertTarget).toBe(appendB);
+    store().insert("still B");
+    expect(b).toEqual(["world", "still B"]);
   });
 
   it("broadcast reaches every mounted listener (why gating is required)", async () => {

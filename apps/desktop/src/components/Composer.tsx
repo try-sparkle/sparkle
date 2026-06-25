@@ -22,7 +22,6 @@ import {
 } from "../stores/uiStore";
 import { resolveComposerDrag, shouldRestoreFromBar } from "./composerDrag";
 import { isComposerToggleKey } from "./composerToggle";
-import { useDictation } from "../useDictation";
 import { useDictationStore } from "../stores/dictationStore";
 import { log } from "../logger";
 
@@ -33,26 +32,6 @@ const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140)
 const ESC = String.fromCharCode(27);
 const PASTE_START = `${ESC}[200~`;
 const PASTE_END = `${ESC}[201~`;
-
-/** Microphone glyph for the voice-dictation button. Filled when active (recording). */
-function MicIcon({ active }: { active: boolean }) {
-  return (
-    <svg
-      width="20"
-      height="20"
-      viewBox="0 0 24 24"
-      fill={active ? "currentColor" : "none"}
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <rect x="9" y="3" width="6" height="11" rx="3" />
-      <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
-    </svg>
-  );
-}
 
 /** Simple camera glyph for the screen-capture button. Inherits color via currentColor. */
 function CameraIcon() {
@@ -108,30 +87,23 @@ export function Composer({
   // While focused, the placeholder switches from the "Hey Sparkle" voice prompt to a typing hint.
   const [focused, setFocused] = useState(false);
 
-  // Voice dictation: appends each transcribed segment into the textarea.
-  // `dictation://partial` is a global broadcast and every open agent's pane stays
-  // mounted (visibility only toggles), so every Composer hears each segment. Gate on
-  // `active` — only the visible pane consumes — or dictation leaks into other agents'
-  // inputs (same reason the native-file-drop effect below gates on `active`).
-  // Note: gate on `active`, NOT micStatus — the backend flushes a final partial right
-  // before stop, which must still land in the pane that was being dictated into.
-  const { status: micStatus, level, toggle: toggleMic, modelProgress } = useDictation({
-    onSegment: (text) => {
-      // Diagnostic for the "prints twice" bug: log every segment THIS composer
-      // receives, with its agent + active flag, so the unified log shows whether one
-      // backend emission gets appended once or twice (and in which pane). Pair with
-      // the Rust "emit partial" seq logs to localize the duplicate. [dictation-dup]
-      log.info(
-        "composer",
-        `dictation recv agent=${agentId} active=${active} text=${JSON.stringify(text)}`,
-      );
-      if (!active) return;
+  // When this composer is the visible/active pane, make it the target for
+  // wake-word dictation. Only the visible pane registers (one at a time), so
+  // dictation never leaks into another agent's input.
+  useEffect(() => {
+    if (!active || disabled) return;
+    const append = (text: string) => {
       setValue((v) => (v ? `${v} ${text}` : text));
       setMinimized(false); // dictated text lands in the box — make sure it's visible
       inputRef?.current?.focus();
-    },
-  });
-  const dictationError = useDictationStore((s) => s.error);
+    };
+    useDictationStore.getState().registerInsert(append);
+    return () => {
+      // Only clear if we're still the registered target (avoid clobbering a newer pane).
+      const store = useDictationStore.getState();
+      if (store.insertTarget === append) store.registerInsert(null);
+    };
+  }, [active, disabled, inputRef]);
 
   // Screenshots attached to the next message. On send we splice their file paths
   // into the text so the Claude Code CLI reads each PNG from disk.
@@ -188,7 +160,7 @@ export function Composer({
     // `minimized` is a dep so autoHeight re-measures on restore: while minimized the textarea is
     // unmounted and the measurement early-returns (autoHeight freezes), so without this a
     // minimize→restore that changes nothing else would show the stale pre-minimize height.
-  }, [value, height, attachments.length, modelProgress, dictationError, minimized]);
+  }, [value, height, attachments.length, minimized]);
 
   // The viewport cap depends on window height — re-measure on resize. Registered once.
   useEffect(() => {
@@ -366,13 +338,11 @@ export function Composer({
     }
   };
 
-  const micDisabled = modelProgress !== null || (disabled && micStatus !== "listening");
-
   // The default placeholder is rendered as a styled overlay (so "Hey Sparkle" can be bold +
   // blue, which a native textarea placeholder can't do). Only show it in the clean empty state
   // where the textarea sits at the top of its column, so the overlay lines up with row one.
   const showRichPlaceholder =
-    !value && !disabled && !dropActive && attachments.length === 0 && !modelProgress && !dictationError;
+    !value && !disabled && !dropActive && attachments.length === 0;
 
   // The composer is one overlay in two states. Minimized → it collapses to the slim handle
   // bar, exposing the terminal input; otherwise the handle sits atop the full message box.
@@ -475,35 +445,6 @@ export function Composer({
               ))}
             </div>
           )}
-          {modelProgress && (
-            <div
-              style={{
-                flex: "0 0 auto",
-                fontSize: 12,
-                color: C.muted,
-                paddingBottom: 2,
-                fontFamily: '"IBM Plex Sans", sans-serif',
-              }}
-            >
-              Downloading voice model…{" "}
-              {modelProgress.total
-                ? `${Math.round((modelProgress.done / modelProgress.total) * 100)}%`
-                : ""}
-            </div>
-          )}
-          {dictationError && (
-            <div
-              style={{
-                flex: "0 0 auto",
-                fontSize: 12,
-                color: C.sienna,
-                paddingBottom: 2,
-                fontFamily: '"IBM Plex Sans", sans-serif',
-              }}
-            >
-              ⚠ {dictationError}
-            </div>
-          )}
           <textarea
             ref={setTaRef}
             value={value}
@@ -571,53 +512,6 @@ export function Composer({
             </div>
           )}
         </div>
-        <button
-          onClick={() => void toggleMic()}
-          disabled={micDisabled}
-          title={
-            modelProgress !== null
-              ? "Downloading voice model…"
-              : micStatus === "listening"
-              ? "Stop dictation"
-              : "Dictate (voice → text)"
-          }
-          style={{
-            alignSelf: "flex-end",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            width: 40,
-            height: 40,
-            // While model is downloading: muted border, no teal fill (preparing state).
-            // While actively recording: teal fill.
-            // Otherwise: transparent (idle).
-            background:
-              modelProgress !== null
-                ? "transparent"
-                : micStatus === "listening"
-                ? C.teal
-                : "transparent",
-            color:
-              modelProgress !== null ? C.muted : C.cream,
-            border:
-              modelProgress !== null
-                ? `1.5px dashed ${C.muted}`
-                : micStatus === "listening"
-                ? `1.5px solid ${C.teal}`
-                : `1.5px dashed ${C.muted}`,
-            borderRadius: 8,
-            cursor: micDisabled ? "not-allowed" : "pointer",
-            opacity: micDisabled ? 0.5 : 1,
-            padding: 0,
-            // subtle live-level pulse while listening (suppressed while downloading)
-            boxShadow:
-              modelProgress === null && micStatus === "listening"
-                ? `0 0 0 ${Math.round(level * 12)}px ${C.teal}22`
-                : "none",
-          }}
-        >
-          {modelProgress !== null ? "⋯" : <MicIcon active={micStatus === "listening"} />}
-        </button>
         <button
           onClick={() => void capture()}
           disabled={disabled || capturing}
