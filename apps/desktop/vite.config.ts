@@ -40,6 +40,16 @@ export default defineConfig(({ mode }) => ({
   clearScreen: false,
   define: {
     "import.meta.env.VITE_CHIEF_PAT": JSON.stringify(devChiefPat(mode)),
+    // App version baked in at build time (analytics super-property). Resolved
+    // relative to THIS config file (not cwd) so a release script invoking the
+    // build from the monorepo root still reads the desktop package's version.
+    __SPARKLE_APP_VERSION__: JSON.stringify(
+      (
+        JSON.parse(
+          readFileSync(resolve(import.meta.dirname, "package.json"), "utf8"),
+        ) as { version?: string }
+      ).version ?? "0.0.0",
+    ),
   },
   server: {
     port: 1420,

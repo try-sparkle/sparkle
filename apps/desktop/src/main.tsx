@@ -1,6 +1,7 @@
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
 import { initLogger } from "./logger";
+import { initAnalytics } from "./analytics";
 import { resolveThemeFromStorage } from "./theme/theme";
 import "@xterm/xterm/css/xterm.css";
 import "./index.css";
@@ -12,6 +13,10 @@ document.documentElement.dataset.theme = resolveThemeFromStorage(localStorage.ge
 
 // Stand up unified logging first so console.* calls and errors during render are captured.
 initLogger();
+
+// Analytics (PostHog) — masked session replay + autocapture + lifecycle events.
+// No-ops when no key is configured. Started after the logger so init errors surface.
+initAnalytics();
 
 // NOTE: no React.StrictMode — its double-invoke of effects would spawn each agent's PTY
 // twice (one would leak). Each AgentPane owns a single live PTY.

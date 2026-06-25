@@ -16,6 +16,7 @@ import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
 import { SelectionPopup } from "./SelectionPopup";
 import { recoverFromWebglContextLoss } from "./terminalWebgl";
+import { PH_NO_CAPTURE_CLASS } from "@sparkle/core";
 
 // Terminal font size at 100%. The ⋯-menu "Text size" control (and Cmd +/-) multiplies
 // this by the `zoom` factor, so it scales the terminal text only — not the UI chrome.
@@ -453,7 +454,12 @@ export function Terminal({
   }, [resolvedTheme]);
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "100%" }}>
+    // ph-no-capture: terminal panes render source code, command output, and
+    // secrets — never include them in PostHog session replay.
+    <div
+      className={PH_NO_CAPTURE_CLASS}
+      style={{ position: "relative", width: "100%", height: "100%" }}
+    >
       <div ref={containerRef} style={{ width: "100%", height: "100%", overflow: "hidden" }} />
       {/* Copy-to-clipboard flash. Fades out via opacity; pointer-events:none so it never
           intercepts a selection drag underneath it. */}
