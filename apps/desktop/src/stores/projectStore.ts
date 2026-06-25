@@ -11,6 +11,8 @@ export interface AddAgentOpts {
   kind?: AgentKind;
   parentId?: string | null;
   name?: string;
+  task?: string;
+  parentBranch?: string;
 }
 
 // Default display name for a freshly created agent, numbered within its kind so you get
@@ -205,6 +207,8 @@ export const useProjectStore = create<ProjectState>()(
               branch: null,
               baseBranch: p.defaultBranch,
               lastPrompt: "",
+              task: opts?.task,
+              parentBranch: opts?.parentBranch,
               // Pin only an explicit caller-supplied name (opts.name — e.g. an import): that's a
               // deliberate choice auto-naming must not overwrite. Agents created without opts.name —
               // including the kind-based "Build 1"/"Worker 2"/"Brainstorm" defaults — stay unpinned

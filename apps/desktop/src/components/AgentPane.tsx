@@ -5,6 +5,8 @@ import { prepareAgentWorkspace, installWorktreeGuard, assertWorkspaceIntegrity }
 import { resolveDefaultBranch } from "../services/branchStatus";
 import { checkClaude, claudeHasSession } from "../preflight";
 import { buildClaudeExec } from "../services/claudeSpawn";
+import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult } from "../services/buildAgent";
+import { readWorkerResult } from "../pty";
 import { maybeAutoName } from "../services/agentNaming";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -44,6 +46,9 @@ export function AgentPane({
   const setAgentWorktree = useProjectStore((s) => s.setAgentWorktree);
   const setLastPrompt = useProjectStore((s) => s.setLastPrompt);
   const setStatus = useRuntimeStore((s) => s.setStatus);
+  // Tracks whether the last spawn was a fresh session (not a --continue resume). Used in the
+  // worker exit handler to skip stale result re-reads on resumed sessions.
+  const wasFreshLaunchRef = useRef(false);
   // The composer's textarea — initial focus lands here when a tab opens.
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   // The terminal's imperative focus(), so we can move focus into it when the composer
@@ -95,9 +100,40 @@ export function AgentPane({
       // best-effort enhancement: if detection fails, fall back to a fresh
       // `claude` rather than blocking the agent from starting at all.
       const resume = await claudeHasSession(wt.path).catch(() => false);
+      // Record whether this is a fresh launch so the worker exit handler can
+      // distinguish a first-run (which should produce result.json) from a
+      // reopened/resumed session (where result.json was already consumed earlier).
+      // Known Plan-1 limitation: the ref tracks the LATEST prepare(), not a per-PTY
+      // snapshot. If a worker tab is reopened (a second prepare() with resume=true)
+      // while its first PTY is still running, that first PTY's exit will read the
+      // newer `false` and skip the result log. This only loses a console line on an
+      // improbable reopen-while-running race; per-result tracking is deferred to Plan 2.
+      wasFreshLaunchRef.current = !resume;
+      let exec: string;
+      if (agent.kind === "worker") {
+        // The persona's parentBranch is the PARENT build agent's branch (what the worker was cut
+        // from) — resolve it via parentId. Do NOT use agent.baseBranch: that's the logical
+        // integration branch (e.g. "main"), which differs from what spawnWorker passed to
+        // create_worker_worktree (the parent build agent's actual working branch).
+        // Prefer the branch persisted at spawn time (agent.parentBranch); fall back to the
+        // live parent agent record. If neither resolves, warn — the worker persona will have
+        // a blank parentBranch, which is a configuration issue but not fatal.
+        const liveParentBranch = project.agents.find((a) => a.id === agent.parentId)?.branch;
+        const parentBranch = agent.parentBranch ?? liveParentBranch ?? "";
+        if (!parentBranch) {
+          console.warn(`[worker ${agent.id}] no resolvable parent branch — parentBranch will be empty in persona`);
+        }
+        const resultPath = `${wt.path}/${WORKER_RESULT_RELPATH}`;
+        exec = buildClaudeExec(claude.path, resume, {
+          appendSystemPrompt: workerPersona({ parentBranch, resultPath }),
+          initialPrompt: workerMission(agent.task ?? "", agent.id),
+        });
+      } else {
+        exec = buildClaudeExec(claude.path, resume);
+      }
       setSpawn({
         command: SHELL,
-        args: ["-l", "-c", buildClaudeExec(claude.path, resume)],
+        args: ["-l", "-c", exec],
         cwd: wt.path,
       });
       setPhase("ready");
@@ -168,6 +204,33 @@ export function AgentPane({
               active={visible}
               onStatus={(s) => setStatus(agent.id, s)}
               onReady={() => setPtyReady(true)}
+              onExit={() => {
+                // NOTE (Plan-1 limitation): this block fires only when the PTY process actually
+                // exits — i.e. the user explicitly quits `claude` (e.g. /exit). Because
+                // buildClaudeExec launches `claude` in its interactive REPL mode, an active worker
+                // that finishes its task and writes result.json will remain alive in the REPL; it
+                // does NOT exit. The Terminal component also removes its exit listener before
+                // killPty, so a programmatic kill won't reach here either. In practice this
+                // block rarely fires for interactive workers. Plan 2 reads result.json by polling
+                // via `read_worker_result` — NOT on PTY exit.
+                //
+                // Only read result.json for worker agents on a FRESH launch. A resumed worker
+                // already reported (and the result was consumed) in an earlier session; re-reading
+                // would re-announce a stale file. Per-result de-dup tracking is Plan 2 — gating
+                // the whole read on wasFreshLaunch is sufficient for Plan 1.
+                if (wasFreshLaunchRef.current && agent.kind === "worker" && agent.worktreePath) {
+                  readWorkerResult(agent.worktreePath)
+                    .then((raw) => {
+                      if (!raw) {
+                        console.warn(`[worker ${agent.id}] exited with no result.json`);
+                        return;
+                      }
+                      const r = parseWorkerResult(raw);
+                      console.info(`[worker ${agent.id}] ${r.status}: ${r.summary}`);
+                    })
+                    .catch((e) => console.error(`[worker ${agent.id}] bad result.json`, e));
+                }
+              }}
               onRequestFocus={() => composerInputRef.current?.focus()}
               focusRef={termFocusRef}
             />

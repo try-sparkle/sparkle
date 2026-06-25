@@ -10,6 +10,7 @@ import { removeAgentWorktree } from "../services/worktree";
 import { refreshAgentBranch } from "../services/branchStatus";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 import { stalenessTier, growNudge } from "../engine/nudges";
+import { spawnWorker } from "../services/workerSpawn";
 import { sortAgentsByAttention } from "../engine/agentOrdering";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
@@ -114,12 +115,20 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     selectAgent(project.id, id);
     open(id);
   };
+  // Temporary manual trigger for spawning workers (Plan 2 will replace this with autonomous
+  // orchestration via the MCP bridge). Prompts the user for a task description, cuts the
+  // worker worktree from the parent build agent's branch, and opens the new worker tab.
   const onAddWorker = (parentId: string) => {
     if (!project) return;
+    const task = window.prompt("Worker task?")?.trim();
+    if (!task) return;
     setActiveSpecial(null);
-    const id = addAgent(project.id, { kind: "worker", parentId });
-    selectAgent(project.id, id);
-    open(id);
+    spawnWorker({ projectId: project.id, parentAgentId: parentId, task })
+      .then((id) => {
+        selectAgent(project.id, id);
+        open(id);
+      })
+      .catch((e) => console.error("spawnWorker failed", e));
   };
   const onSelectSparkle = () => {
     setActiveSpecial("sparkle");

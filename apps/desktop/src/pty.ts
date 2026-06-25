@@ -72,3 +72,19 @@ export function onPtyOutput(cb: (e: PtyOutput) => void): Promise<UnlistenFn> {
 export function onPtyExit(cb: (e: PtyExit) => void): Promise<UnlistenFn> {
   return listen<PtyExit>("pty:exit", (ev) => cb(ev.payload));
 }
+
+export type { WorktreeInfo } from "./services/worktree";
+import type { WorktreeInfo } from "./services/worktree";
+
+export function createWorkerWorktree(args: {
+  root: string; projectId: string; workerId: string; parentBranch: string;
+}): Promise<WorktreeInfo> {
+  return invoke("create_worker_worktree", {
+    root: args.root, projectId: args.projectId,
+    workerId: args.workerId, parentBranch: args.parentBranch,
+  });
+}
+
+export function readWorkerResult(worktree: string): Promise<string | null> {
+  return invoke("read_worker_result", { worktree });
+}

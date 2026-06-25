@@ -228,6 +228,69 @@ pub fn create_worktree_at(
     Ok(WorktreeInfo { path: wt_str, branch })
 }
 
+/// Cut a worker's worktree from a parent agent's LOCAL branch, with NO network fetch.
+/// Workers branch off another agent's local branch (e.g. `sparkle/agent-<build>`), which never
+/// exists on a remote — so unlike `create_worktree_at` we never touch `origin`. Idempotent.
+pub fn create_worktree_from_local(
+    root: &str,
+    project_id: &str,
+    worker_id: &str,
+    local_base_branch: &str,
+    app_data: &Path,
+) -> Result<WorktreeInfo, String> {
+    let base = local_base_branch.trim();
+    if base.is_empty() {
+        return Err("parent_branch is required".into());
+    }
+    // The base must exist locally — workers descend from a sibling agent's local branch.
+    git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{base}")])
+        .map_err(|_| format!("parent branch '{base}' does not exist locally"))?;
+
+    let branch = format!("sparkle/agent-{worker_id}");
+    let wt = worktree_path(app_data, project_id, worker_id);
+    let wt_str = wt.to_string_lossy().to_string();
+
+    // Idempotent: existing valid worktree → return it. This path is keyed by `worker_id`, which
+    // is a fresh UUID per worker agent and never reused across cuts, so an existing worktree here
+    // is always THIS worker's own (already on `sparkle/agent-<worker_id>`) — not a stale cut from
+    // a different base. We therefore don't re-verify its branch/ancestry.
+    if wt.exists() && git(&wt_str, &["rev-parse", "--is-inside-work-tree"]).is_ok() {
+        return Ok(WorktreeInfo { path: wt_str, branch });
+    }
+    if let Some(parent) = wt.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create worktree dir: {e}"))?;
+    }
+
+    let branch_exists =
+        git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
+    if branch_exists {
+        // Recovery path: the worker's own branch already exists but its worktree dir is gone
+        // (e.g. externally deleted). Under the UUID `worker_id` invariant this branch is always
+        // THIS worker's — already cut from `base` on the first call — so re-attaching it (rather
+        // than re-cutting from `base`) is correct and preserves the lineage established then. We
+        // intentionally do NOT pass `base` here: a re-cut would discard the worker's own commits.
+        git(root, &["worktree", "add", &wt_str, &branch])?;
+    } else {
+        git(root, &["worktree", "add", "-b", &branch, &wt_str, base])?;
+    }
+    Ok(WorktreeInfo { path: wt_str, branch })
+}
+
+/// Create (or return) a worker's worktree, cut from `parent_branch` (a local branch).
+#[tauri::command]
+pub fn create_worker_worktree(
+    app: AppHandle,
+    root: String,
+    project_id: String,
+    worker_id: String,
+    parent_branch: String,
+) -> Result<WorktreeInfo, String> {
+    tracing::info!(%root, %project_id, %worker_id, %parent_branch, "create_worker_worktree");
+    let app_data = app_data_dir(&app)?;
+    create_worktree_from_local(&root, &project_id, &worker_id, &parent_branch, &app_data)
+        .inspect_err(|e| tracing::error!(%worker_id, error = %e, "create_worker_worktree failed"))
+}
+
 /// Create (or return, if it already exists) the isolated worktree for `agent_id`.
 /// Idempotent: re-running for an existing worktree returns its info without error.
 /// `base_branch` is the logical integration branch (e.g. `main`) the new branch is cut from.
@@ -649,6 +712,21 @@ pub fn install_worktree_guard(app: AppHandle, worktree: String) -> Result<(), St
 /// Minimal POSIX single-quote escaping for embedding a path in a hook command string.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Read a worker's `.sparkle/result.json` from its worktree. `Ok(None)` if not yet written.
+pub fn read_worker_result_at(worktree: &Path) -> Result<Option<String>, String> {
+    let path = worktree.join(".sparkle").join("result.json");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("failed to read worker result: {e}")),
+    }
+}
+
+#[tauri::command]
+pub fn read_worker_result(worktree: String) -> Result<Option<String>, String> {
+    read_worker_result_at(Path::new(&worktree))
 }
 
 #[cfg(test)]
@@ -1134,5 +1212,104 @@ mod tests {
         let head2 = git(&root_str, &["rev-parse", "HEAD"]).unwrap();
         assert_eq!(head1, head2, "no extra commit on re-run");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worker_worktree_is_cut_from_parent_local_branch() {
+        let root = unique_root("worker-cut");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("worker-cut-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+
+        // Parent agent "build1" gets a worktree off HEAD, then makes a unique commit on its branch.
+        let parent = create_worktree_at(&root_str, "p", "build1", "HEAD", &app_data).unwrap();
+        std::fs::write(Path::new(&parent.path).join("PARENT_MARK.txt"), "x").unwrap();
+        git(&parent.path, &["add", "-A"]).unwrap();
+        git(&parent.path, &["commit", "-m", "parent unique commit"]).unwrap();
+
+        // Worker "w1" is cut from the parent's LOCAL branch — must contain the parent's commit.
+        let worker =
+            create_worktree_from_local(&root_str, "p", "w1", &parent.branch, &app_data).unwrap();
+        assert_eq!(worker.branch, "sparkle/agent-w1");
+        assert!(Path::new(&worker.path).join("PARENT_MARK.txt").exists(),
+            "worker branch should descend from the parent branch");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn worker_prepare_idempotent_does_not_reclobber_lineage() {
+        // CRITICAL lineage guard: when the worker tab opens, AgentPane.prepare() calls
+        // create_worktree_at with the worker's baseBranch (= project default, e.g. "main"). That must
+        // NOT re-cut the worker off main — the idempotency short-circuit (worktree.rs:202, which runs
+        // BEFORE any base resolution) returns the existing parent-branch worktree unchanged. This test
+        // pins that behavior so a future change to the guard can't silently clobber worker lineage.
+        let root = unique_root("worker-prep");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("worker-prep-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+
+        let parent = create_worktree_at(&root_str, "p", "build1", "HEAD", &app_data).unwrap();
+        std::fs::write(Path::new(&parent.path).join("PARENT_MARK.txt"), "x").unwrap();
+        git(&parent.path, &["add", "-A"]).unwrap();
+        git(&parent.path, &["commit", "-m", "parent unique commit"]).unwrap();
+
+        let worker = create_worktree_from_local(&root_str, "p", "w1", &parent.branch, &app_data).unwrap();
+        // Simulate the subsequent prepare() call with the project default base.
+        let again = create_worktree_at(&root_str, "p", "w1", "main", &app_data).unwrap();
+        assert_eq!(again.path, worker.path);
+        assert!(Path::new(&again.path).join("PARENT_MARK.txt").exists(),
+            "parent-branch lineage must be preserved, not re-cut from main");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn worker_worktree_rejects_empty_parent_branch() {
+        let root = unique_root("worker-empty");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("worker-empty-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+
+        for bad in ["", "   "] {
+            let err = create_worktree_from_local(&root_str, "p", "w1", bad, &app_data)
+                .err()
+                .expect("expected Err for empty parent_branch");
+            assert!(err.contains("parent_branch is required"), "got: {err}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn worker_worktree_rejects_nonexistent_local_base() {
+        let root = unique_root("worker-nobase");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("worker-nobase-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+
+        let err = create_worktree_from_local(&root_str, "p", "w1", "sparkle/agent-missing", &app_data)
+            .err()
+            .expect("expected Err for nonexistent local base");
+        assert!(err.contains("does not exist locally"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn read_worker_result_returns_none_then_some() {
+        let dir = unique_root("worker-result");
+        // Absent → None.
+        assert!(read_worker_result_at(&dir).unwrap().is_none());
+        // Present → Some(contents).
+        let sparkle = dir.join(".sparkle");
+        std::fs::create_dir_all(&sparkle).unwrap();
+        std::fs::write(sparkle.join("result.json"), r#"{"ok":true}"#).unwrap();
+        assert_eq!(read_worker_result_at(&dir).unwrap().as_deref(), Some(r#"{"ok":true}"#));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
