@@ -1,4 +1,4 @@
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { ModalShell } from "./ModalShell";
 
 /** Shown when the window's close (red traffic light) is requested. Lets the user keep this
@@ -17,17 +17,20 @@ export function ClosePrompt({
   return (
     <ModalShell width={440} zIndex={200} onCancel={onCancel}>
       <div style={{ fontSize: 16, fontWeight: FONT_WEIGHT.semibold, marginBottom: 6 }}>
-        Close “{projectName}”?
+        Close {projectName} Project Window?
       </div>
       <div style={{ color: C.muted, fontSize: 13, marginBottom: 18 }}>
-        Keep this project's agents running in the background, or stop them and close?
+        Do you want to keep {projectName}'s agents running in the background until you fully quit
+        the Sparkle app, or stop the agents when you close this window?
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         <button
           onClick={onKeep}
           style={{
             background: C.teal,
-            color: C.cream,
+            // White-on-blue: ON_BRAND_FILL stays light in both themes (C.cream flips to
+            // navy in light mode, which would go low-contrast on the blue fill).
+            color: ON_BRAND_FILL,
             border: "none",
             borderRadius: 8,
             padding: "11px 14px",
@@ -37,7 +40,7 @@ export function ClosePrompt({
             textAlign: "left",
           }}
         >
-          Keep agents running
+          Keep agents running in the background
         </button>
         <button
           onClick={onKill}
@@ -52,7 +55,7 @@ export function ClosePrompt({
             textAlign: "left",
           }}
         >
-          Kill agents &amp; close project
+          Stop the agents as well
         </button>
       </div>
       <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>

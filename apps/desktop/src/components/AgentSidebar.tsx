@@ -44,6 +44,12 @@ function createBtnStyle(from: string, to: string, fillText: string): React.CSSPr
     whiteSpace: "nowrap",
     background: `linear-gradient(90deg, ${from}, ${to})`,
     color: fillText,
+    // Flex-center the (enlarged, line-height-0) glyph against the label so the
+    // icon sits on the label's vertical center rather than its text baseline.
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 7,
   };
 }
 
@@ -288,14 +294,18 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             title="Chat with Chief over this project's knowledge"
             style={createBtnStyle(C.accent, C.accentMid, ON_BRAND_FILL_DARK)} // cyan (the "S" color) leads; black icon+text
           >
-            <span style={{ fontSize: 19.5 }}>✦</span> Brainstorm
+            {/* translateY corrects the glyph's font-baseline offset so its ink centers on the
+                label (measured: ✦ otherwise sits ~2px low, ⚒ ~6px low against these fonts). */}
+            <span style={{ fontSize: 19.5, lineHeight: 0, transform: "translateY(-0.5px)" }}>✦</span>
+            <span>Brainstorm</span>
           </button>
           <button
             onClick={onAddBuild}
             title="A master orchestrator that spawns worker agents to get work done"
             style={createBtnStyle(C.accentMid, C.teal, ON_BRAND_FILL)} // blue leads (matches logo's right side); white icon+text
           >
-            <span style={{ fontSize: 26 }}>⚒</span> Build
+            <span style={{ fontSize: 26, lineHeight: 0, transform: "translateY(-3.5px)" }}>⚒</span>
+            <span>Build</span>
           </button>
         </div>
       )}
@@ -370,7 +380,17 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             >
               <span
                 title={a.kind}
-                style={{ fontSize: a.kind === "build" ? 28.8 : 12, color: C.muted, flex: "0 0 auto", width: a.kind === "build" ? 24 : 12, textAlign: "center" }}
+                style={{
+                  fontSize: a.kind === "build" ? 28.8 : a.kind === "brainstorm" ? 19.5 : 12,
+                  color: C.muted,
+                  flex: "0 0 auto",
+                  width: a.kind === "build" ? 24 : a.kind === "brainstorm" ? 20 : 12,
+                  textAlign: "center",
+                  // Keep the enlarged Build (⚒) / Brainstorm (✦) glyphs from driving the row's
+                  // height — line-height 0 lets the big glyph overflow its line box (it stays
+                  // centered) so rows keep their original, compact height.
+                  lineHeight: 0,
+                }}
               >
                 {kindGlyph}
               </span>
@@ -652,8 +672,14 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         })()}
         {project && project.agents.length === 0 && (
           <div style={{ color: C.muted, fontSize: 12, padding: 10, lineHeight: 1.5 }}>
-            No agents yet. Start a <strong>✦ Brainstorm</strong> to think with Chief, or a{" "}
-            <strong>⚒ Build</strong> to orchestrate workers.
+            <div>No agents are running.</div>
+            <div style={{ marginTop: 8 }}>
+              • Start a <strong>✦ Brainstorm</strong> agent to define what you want to build
+            </div>
+            <div style={{ marginTop: 8 }}>
+              • Start a <strong>⚒ Build</strong> agent to orchestrate workers and get started
+              building
+            </div>
           </div>
         )}
         {!project && (

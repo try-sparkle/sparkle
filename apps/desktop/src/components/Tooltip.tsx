@@ -64,7 +64,10 @@ export function Tooltip({
         value !== "" &&
         createPortal(
           <div
-            // Don't let the tooltip eat pointer events or flicker the trigger.
+            // The card itself stays transparent to pointer events so it can't eat
+            // hover/flicker the trigger — but the close button below re-enables them
+            // for itself, giving a manual escape hatch when mouseLeave doesn't fire
+            // (an intermittent Tauri/Chromium webview quirk that leaves it stuck open).
             style={{
               position: "fixed",
               left: pos.left,
@@ -72,7 +75,8 @@ export function Tooltip({
               zIndex: 9999,
               pointerEvents: "none",
               maxWidth: MAX_WIDTH,
-              padding: "8px 10px",
+              // Extra right padding leaves room for the close button.
+              padding: "8px 26px 8px 10px",
               background: C.deepForest,
               border: `1px solid ${C.forest}`,
               borderRadius: 8,
@@ -83,6 +87,38 @@ export function Tooltip({
               animation: "sparkle-tooltip-in 90ms ease-out",
             }}
           >
+            <button
+              type="button"
+              aria-label="Close"
+              onClick={hide}
+              style={{
+                position: "absolute",
+                top: 4,
+                right: 4,
+                pointerEvents: "auto",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 16,
+                height: 16,
+                padding: 0,
+                border: "none",
+                background: "transparent",
+                color: C.muted,
+                fontFamily: FONT.ui,
+                fontSize: 14,
+                lineHeight: 1,
+                cursor: "pointer",
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.color = C.cream;
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.color = C.muted;
+              }}
+            >
+              ×
+            </button>
             {label && (
               <span
                 style={{
