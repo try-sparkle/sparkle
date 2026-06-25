@@ -21,11 +21,17 @@ use std::path::{Path, PathBuf};
 /// skill: claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.)
 const NAMING_MODEL: &str = "claude-haiku-4-5";
 
-const SYSTEM_PROMPT: &str = "You name coding-agent sessions. Given the user's prompt to a \
-coding agent, summarize the SAME work as three Title Case titles of increasing length. Reply \
-with ONLY a JSON object — no preamble, no markdown fences: \
+const SYSTEM_PROMPT: &str = "You name coding-agent sessions by the SUBSTANCE of the work — the \
+feature, component, or problem being worked on — NOT by restating an operational command. \
+Given the user's prompt, do EXACTLY ONE of these:\n\
+- If the prompt is just an operational/process command or an acknowledgement with no describable \
+subject of work (e.g. 'push to production', 'commit and push', 'run the tests', 'continue', \
+'retry', 'looks good', a greeting), reply with EXACTLY the single word SKIP and nothing else.\n\
+- Otherwise, summarize the SAME work as three Title Case titles of increasing length. Reply with \
+ONLY a JSON object — no preamble, no markdown fences: \
 {\"short\": \"2-4 words\", \"medium\": \"5-6 words\", \"long\": \"8-10 words\"}. Each value is a \
-title (no surrounding quotes, no trailing punctuation). \
+title (no surrounding quotes, no trailing punctuation). Name the subject of the work, e.g. \
+'Voice Dictation Pipeline', never a command like 'Push Code Changes'.\n\
 Example: {\"short\": \"Fix Login Redirect\", \"medium\": \"Fix OAuth Login Redirect Loop\", \
 \"long\": \"Fix OAuth Login Redirect Loop After Token Refresh\"}.";
 
@@ -177,6 +183,39 @@ fn normalize(mut n: AgentName) -> AgentName {
     n
 }
 
+/// Interpret the model's reply text into the three name variants. Returns Err when the prompt
+/// was operational or too thin to describe work (the model replies with a bare `SKIP` token) or
+/// when no usable title can be derived — both flow through the caller's swallow-on-error path,
+/// leaving the agent's current name untouched.
+fn interpret_reply(text: &str) -> Result<AgentName, String> {
+    // SKIP sentinel: match only the BARE token (optionally wrapped in quotes/punctuation). A real
+    // titled reply is a JSON object containing `{`, so we require its absence first — that makes
+    // "never a JSON object" exact, so a genuine title like {"short":"Skip Onboarding",…} is named
+    // normally rather than dropped even though it contains the word "skip".
+    let trimmed = text.trim();
+    if !trimmed.contains('{') {
+        let token = trimmed.trim_matches(|c: char| !c.is_alphanumeric());
+        if token.eq_ignore_ascii_case("SKIP") {
+            return Err("naming skipped (operational or low-content prompt)".into());
+        }
+    }
+    // Preferred path: the model returned the JSON object with all three variants.
+    if let Some(name) = parse_variants(text) {
+        return Ok(name);
+    }
+    // Fallback: treat the whole reply as one plain title and derive the variants from it, so a
+    // model that ignored the JSON instruction still yields a usable (if uniform) name.
+    let long = sanitize_name(text, 10);
+    if long.is_empty() {
+        return Err("model returned no usable name".into());
+    }
+    Ok(normalize(AgentName {
+        short: sanitize_name(text, 4),
+        medium: sanitize_name(text, 6),
+        long,
+    }))
+}
+
 /// Generate the three length variants of an agent name from a prompt. Returns Err on any
 /// failure (no key, network, HTTP error, empty result) so the caller can silently keep the
 /// existing name.
@@ -245,21 +284,7 @@ fn call_anthropic(key: &str, prompt: &str) -> Result<AgentName, String> {
         }
     }
 
-    // Preferred path: the model returned the JSON object with all three variants.
-    if let Some(name) = parse_variants(&text) {
-        return Ok(name);
-    }
-    // Fallback: treat the whole reply as one plain title and derive the variants from it, so a
-    // model that ignored the JSON instruction still yields a usable (if uniform) name.
-    let long = sanitize_name(&text, 10);
-    if long.is_empty() {
-        return Err("model returned no usable name".into());
-    }
-    Ok(normalize(AgentName {
-        short: sanitize_name(&text, 4),
-        medium: sanitize_name(&text, 6),
-        long,
-    }))
+    interpret_reply(&text)
 }
 
 #[cfg(test)]
@@ -373,5 +398,44 @@ mod tests {
     #[test]
     fn parse_variants_rejects_non_object() {
         assert!(parse_variants("just a plain title, no json").is_none());
+    }
+
+    #[test]
+    fn interpret_reply_skips_the_bare_sentinel() {
+        // The model returns a bare SKIP token for operational/thin prompts → Err so the caller
+        // (and the frontend's swallow-on-error path) leaves the existing name untouched.
+        assert!(interpret_reply("SKIP").is_err());
+        assert!(interpret_reply("skip").is_err());
+        assert!(interpret_reply("  SKIP.  ").is_err());
+        assert!(interpret_reply("\"SKIP\"").is_err());
+    }
+
+    #[test]
+    fn interpret_reply_keeps_a_real_title_containing_the_word_skip() {
+        // A genuine title with "skip" in it arrives as a JSON object, NOT the bare sentinel —
+        // it must be named normally, not dropped.
+        let reply = r#"{"short":"Skip Onboarding","medium":"Skip Onboarding Step Flow","long":"Add A Skip Button To The Onboarding Step Flow"}"#;
+        let n = interpret_reply(reply).expect("a titled object must not be treated as SKIP");
+        assert_eq!(n.short, "Skip Onboarding");
+    }
+
+    #[test]
+    fn interpret_reply_parses_the_variant_object() {
+        let reply = r#"{"short":"Fix Auth Bug","medium":"Fix OAuth Login Bug","long":"Fix OAuth Login Bug On Token Refresh"}"#;
+        let n = interpret_reply(reply).expect("should parse");
+        assert_eq!(n.short, "Fix Auth Bug");
+        assert_eq!(n.medium, "Fix OAuth Login Bug");
+    }
+
+    #[test]
+    fn interpret_reply_falls_back_to_a_plain_title() {
+        let n = interpret_reply("Voice Dictation Pipeline").expect("plain title is usable");
+        assert_eq!(n.long, "Voice Dictation Pipeline");
+        assert_eq!(n.short, "Voice Dictation Pipeline"); // ≤4 words, so short == full
+    }
+
+    #[test]
+    fn interpret_reply_errors_on_empty() {
+        assert!(interpret_reply("   ").is_err());
     }
 }

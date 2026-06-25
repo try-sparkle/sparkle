@@ -30,6 +30,34 @@ function contentWords(text: string): Set<string> {
   );
 }
 
+// Purely-operational words. A prompt whose content words are ALL in this set (e.g. "push to
+// production", "merge to main", "looks good") describes no work to name — it's a process command
+// or an ack — so we skip naming it WITHOUT a backend call. Deliberately conservative: it only
+// fires when the WHOLE prompt is tactical ("run the onboarding analysis" still names, because
+// onboarding/analysis aren't here), so anything subtler is left to the model's own SKIP judgment.
+const TACTICAL = new Set([
+  // git / build / deploy operations
+  "push", "commit", "deploy", "ship", "merge", "rebase", "pull", "rerun", "redeploy", "revert",
+  "undo", "redo", "build", "rebuild", "run", "production", "prod", "staging", "main", "master",
+  "branch", "release",
+  // build / test / CI chores (only skipped when the WHOLE prompt is one — "write tests for the
+  // billing webhook" still names because "billing"/"webhook" survive). All ≥3 chars; shorter
+  // tokens (e.g. "ci") never reach here since contentWords drops words under 3 chars.
+  "test", "tests", "lint", "lints", "typecheck", "format", "fmt", "checks",
+  // flow control
+  "continue", "resume", "proceed", "again", "stop", "cancel", "abort", "approve", "reject",
+  // acknowledgements / filler
+  "yes", "yep", "yeah", "sure", "okay", "lgtm", "looks", "good", "great", "perfect", "nice",
+  "thanks", "thank", "done", "cool", "awesome", "fine",
+]);
+
+/** True iff every content word is operational/ack (so there's no work subject to name). */
+function isTacticalOnly(words: Set<string>): boolean {
+  if (words.size === 0) return false;
+  for (const w of words) if (!TACTICAL.has(w)) return false;
+  return true;
+}
+
 /** Jaccard overlap of two word sets (1 = identical, 0 = disjoint). */
 function similarity(a: Set<string>, b: Set<string>): number {
   if (a.size === 0 && b.size === 0) return 1;
@@ -51,6 +79,9 @@ export function shouldRename(opts: {
   const words = contentWords(opts.prompt);
   // Need at least a little substance — don't burn a call on "ok" / "continue" / "yes".
   if (opts.namePinned || words.size < 2) return false;
+  // Skip prompts that are entirely an operational command or an ack — no work to name, no call.
+  // (Anything subtler is caught by the model's own SKIP judgment in naming.rs.)
+  if (isTacticalOnly(words)) return false;
   // First substantive prompt for this agent: always name it.
   if (!opts.autoNameBasis) return true;
   // Otherwise only re-name when the work has clearly shifted.
