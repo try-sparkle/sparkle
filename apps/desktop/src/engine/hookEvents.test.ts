@@ -157,4 +157,113 @@ describe("HookStatusEngine", () => {
     engine.ingest({ event: "PreCompact" }); // unknown → no change
     expect(onStatus).not.toHaveBeenCalled();
   });
+
+  it("keeps working for an in-turn SubagentStop (one of several subagents finished)", () => {
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "UserPromptSubmit" });
+    engine.ingest({ event: "PreToolUse", tool: "Task" }); // dispatched a subagent
+    engine.ingest({ event: "SubagentStop" }); // subagent done, main turn keeps going
+    expect(onStatus).toHaveBeenLastCalledWith("working");
+  });
+
+  it("does NOT resurrect a finished agent: a SubagentStop after Stop settles to idle (gray)", () => {
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "UserPromptSubmit" });
+    engine.ingest({ event: "PreToolUse", tool: "Task" });
+    engine.ingest({ event: "Stop" }); // main turn ended → idle
+    expect(onStatus).toHaveBeenLastCalledWith("idle");
+    // A background subagent outlives the turn and emits SubagentStop out of order. It must
+    // NOT flip the finished tab back to green.
+    engine.ingest({ event: "SubagentStop" });
+    expect(onStatus).toHaveBeenLastCalledWith("idle");
+  });
+
+  it("a late SubagentStop after the Stop+idle-ping sequence lands on idle, not green", () => {
+    // The exact real-world out-of-order log that left tabs stuck green:
+    // Stop → Notification("waiting for input") → SubagentStop.
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "UserPromptSubmit" });
+    engine.ingest({ event: "Stop" });
+    engine.ingest({ event: "Notification", message: "Claude is waiting for your input" });
+    engine.ingest({ event: "SubagentStop" });
+    expect(onStatus).toHaveBeenLastCalledWith("idle");
+  });
+
+  it("does not clobber a terminal `done` (SessionEnd) with a trailing SubagentStop", () => {
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "UserPromptSubmit" });
+    engine.ingest({ event: "SessionEnd" }); // → done
+    expect(onStatus).toHaveBeenLastCalledWith("done");
+    onStatus.mockClear();
+    engine.ingest({ event: "SubagentStop" }); // stray trailing event — must not downgrade done
+    expect(onStatus).not.toHaveBeenCalled();
+  });
+
+  it("treats a leading SubagentStop (nothing shown yet) as in-turn working, not forced idle", () => {
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "SubagentStop" }); // first event ever — status still null
+    expect(onStatus).toHaveBeenLastCalledWith("working");
+  });
+
+  it("ignores a background subagent's tool calls after Stop (finding 1: no green resurrection)", () => {
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "UserPromptSubmit", session_id: "m" });
+    engine.ingest({ event: "PreToolUse", session_id: "m", tool: "Task" });
+    engine.ingest({ event: "Stop", session_id: "m" }); // main turn ended → idle
+    expect(onStatus).toHaveBeenLastCalledWith("idle");
+    onStatus.mockClear();
+    // A background subagent (same main session_id) keeps emitting tool calls after the Stop.
+    engine.ingest({ event: "PreToolUse", session_id: "m", tool: "Bash" });
+    engine.ingest({ event: "PostToolUse", session_id: "m", tool: "Bash" });
+    expect(onStatus).not.toHaveBeenCalled(); // suppressed — never back to working
+    engine.ingest({ event: "SubagentStop", session_id: "m" }); // it finishes → stays idle
+    expect(onStatus).not.toHaveBeenCalledWith("working");
+  });
+
+  it("reopens to working when a new UserPromptSubmit arrives after Stop", () => {
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "UserPromptSubmit", session_id: "m" });
+    engine.ingest({ event: "Stop", session_id: "m" }); // idle
+    engine.ingest({ event: "PreToolUse", session_id: "m" }); // background noise — ignored
+    expect(onStatus).toHaveBeenLastCalledWith("idle");
+    engine.ingest({ event: "UserPromptSubmit", session_id: "m" }); // user sends a new prompt
+    expect(onStatus).toHaveBeenLastCalledWith("working");
+  });
+});
+
+describe("HookStatusEngine — session scoping", () => {
+  it("locks onto the first session and ignores other (background) sessions", () => {
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "UserPromptSubmit", session_id: "main" });
+    engine.ingest({ event: "PreToolUse", session_id: "main", tool: "Bash" });
+    expect(onStatus).toHaveBeenLastCalledWith("working");
+    onStatus.mockClear();
+    // A concurrent background `claude` one-shot writes its whole lifecycle to the same log.
+    engine.ingest({ event: "SessionStart", session_id: "bg" });
+    engine.ingest({ event: "UserPromptSubmit", session_id: "bg" });
+    engine.ingest({ event: "Stop", session_id: "bg" });
+    engine.ingest({ event: "SessionEnd", session_id: "bg" });
+    // None of it touched the main tab — no churn at all.
+    expect(onStatus).not.toHaveBeenCalled();
+  });
+
+  it("a background session's Stop/SessionEnd does not gray out the live main agent", () => {
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    engine.ingest({ event: "UserPromptSubmit", session_id: "main" });
+    engine.ingest({ event: "PreToolUse", session_id: "main", tool: "Edit" });
+    engine.ingest({ event: "SessionEnd", session_id: "bg" }); // background call ends — ignored
+    engine.ingest({ event: "PostToolUse", session_id: "main", tool: "Edit" }); // main keeps working
+    expect(onStatus).toHaveBeenLastCalledWith("working");
+    expect(onStatus).not.toHaveBeenCalledWith("done");
+    expect(onStatus).not.toHaveBeenCalledWith("idle");
+  });
 });

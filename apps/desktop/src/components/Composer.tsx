@@ -30,6 +30,7 @@ import {
 import {
   useUiStore,
   COMPOSER_MIN,
+  COMPOSER_MIN_TEXTAREA,
   COMPOSER_SNAP,
   COMPOSER_DEFAULT,
   COMPOSER_BAR,
@@ -40,6 +41,7 @@ import {
 import { usePromptHistoryStore, computeGhost } from "../stores/promptHistoryStore";
 import {
   resolveComposerDrag,
+  resolveComposerFloor,
   resolveComposerRenderHeight,
   resolveComposerReset,
   shouldRestoreFromBar,
@@ -50,6 +52,31 @@ import { useDictationStore } from "../stores/dictationStore";
 import { log } from "../logger";
 
 const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140);
+
+// Mic-hot ("audio is active") placeholder, sourced from one place so the native-textarea
+// fallback and the styled overlay can't drift apart. The overlay paints SEND_IT as a gradient;
+// the native string (a narrow, near-dead path) reuses the same words verbatim.
+const SEND_IT = "Send it";
+const MIC_HOT_PREFIX = "I'm listening, so just start talking. Say ";
+const MIC_HOT_SUFFIX =
+  " to stop. (or if you want to be a slowpoke, start typing here instead.)";
+const MIC_HOT_PLACEHOLDER = `${MIC_HOT_PREFIX}${SEND_IT}${MIC_HOT_SUFFIX}`;
+
+/** "Send it" in the same teal→cyan gradient used for the caption under the waveform. */
+function SendIt() {
+  return (
+    <span
+      style={{
+        fontWeight: FONT_WEIGHT.bold,
+        background: `linear-gradient(90deg, ${C.teal}, ${C.accent})`,
+        WebkitBackgroundClip: "text",
+        WebkitTextFillColor: "transparent",
+      }}
+    >
+      {SEND_IT}
+    </span>
+  );
+}
 
 /** Simple camera glyph for the screen-capture button. Inherits color via currentColor. */
 function CameraIcon() {
@@ -109,6 +136,9 @@ export function Composer({
   const [dropActive, setDropActive] = useState(false);
   // While focused, the placeholder switches from the "Hey Sparkle" voice prompt to a typing hint.
   const [focused, setFocused] = useState(false);
+  // Mic hot ("audio is active") → the placeholder drops the wake-word prompt and invites the
+  // user to just start talking, since Sparkle is already listening.
+  const audioActive = useDictationStore((s) => s.enabled);
 
   // Inline ghost-text autocomplete. `history` is the global list of past prompts; `caretAtEnd`
   // gates the suggestion so it only appears when the caret is at the very end of the text
@@ -219,6 +249,15 @@ export function Composer({
       ta.style.flex = prevFlex;
       ta.style.height = prevHeight;
       const desired = overhead + contentH + borderY;
+      // Attachment thumbnails eat a fixed row above the textarea; raise the height floor so they
+      // can't squeeze the input to a sliver (overhead already includes the thumb row). Without
+      // attachments this is just COMPOSER_MIN, so the drag-down behavior is unchanged.
+      const min = resolveComposerFloor({
+        baseMin: COMPOSER_MIN,
+        overhead,
+        minTextarea: COMPOSER_MIN_TEXTAREA,
+        hasAttachments: attachments.length > 0,
+      });
       // Once the user has hand-sized the composer, `height` IS the rendered height (the draft
       // scrolls past it) — so the handle can drag it shorter than its content. Until then the
       // composer auto-grows from the rest height to fit the draft. (Pure policy in composerDrag.)
@@ -226,7 +265,7 @@ export function Composer({
         height,
         desired,
         userSized,
-        min: COMPOSER_MIN,
+        min,
         cap: maxComposerHeight(),
       });
       setAutoHeight(next);
@@ -702,6 +741,8 @@ export function Composer({
                   ? "Starting your agent…"
                   : showRichPlaceholder
                   ? "" // the styled overlay below renders this state's placeholder
+                  : audioActive
+                  ? MIC_HOT_PLACEHOLDER
                   : "Just say Hey Sparkle and I'll start listening as you talk."
               }
               spellCheck={false}
@@ -751,7 +792,16 @@ export function Composer({
                 lineHeight: 1.4,
               }}
             >
-              {focused ? (
+              {audioActive ? (
+                // The mic-hot copy intentionally subsumes the typing hint ("…or start typing
+                // here instead"), so it stays put on focus rather than swapping to the muted
+                // focused hint below — that hint remains live only when the mic is muted.
+                <>
+                  {MIC_HOT_PREFIX}
+                  <SendIt />
+                  {MIC_HOT_SUFFIX}
+                </>
+              ) : focused ? (
                 "…or type your command here (speaking is 3x faster)"
               ) : (
                 <>

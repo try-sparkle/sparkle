@@ -93,13 +93,34 @@ export interface HookStatusEngineOpts {
   onStatus: (s: AgentTabStatus) => void;
 }
 
+/** Events that (re)open the main turn — only a new prompt or session start. Notably NOT tool
+ *  events: a background subagent's PreToolUse/PostToolUse must not reopen a turn closed by Stop. */
+const TURN_OPENERS = new Set(["SessionStart", "UserPromptSubmit"]);
+/** Events that close the main turn (Claude finished its turn, or the session ended). */
+const TURN_CLOSERS = new Set(["Stop", "SessionEnd"]);
+
 /** Stateful adapter mirroring StatusEngine's onStatus/dedup contract so callers can swap it in
- *  wherever the scraping engine is wired. Holds only the current status — the event stream itself
- *  carries all the state we need. Starts from a null baseline and does NOT emit on construction:
- *  the first real event (commonly UserPromptSubmit/PreToolUse → "working") must always reach the
- *  UI, so seeding the baseline with a concrete status would let dedup swallow it. */
+ *  wherever the scraping engine is wired. It carries the two pieces of history the pure,
+ *  latest-event-wins `hookEventToStatus` can't:
+ *
+ *  1. SESSION LOCK. The per-agent hook log is keyed by worktree, so it interleaves the main
+ *     interactive agent with background one-shot `claude` calls run in the same worktree (each a
+ *     full SessionStart→…→SessionEnd) AND its subagents (whose events carry the MAIN session_id).
+ *     We lock onto the first session_id we see — and because the watcher starts at EOF
+ *     (skipExisting), that first event is the freshly-spawned main agent's. Events from any OTHER
+ *     session are ignored, so a concurrent background call's Stop/SessionEnd can't flip this tab.
+ *
+ *  2. TURN-CLOSED. Once the main turn closes (Stop/SessionEnd), trailing background-subagent
+ *     events under the same (main) session_id must not resurrect the finished tab to green:
+ *     PreToolUse/PostToolUse are ignored, and a trailing SubagentStop settles to idle (gray).
+ *
+ *  Starts from a null status baseline (does NOT emit on construction): the first real event must
+ *  always reach the UI, so seeding a concrete baseline would let dedup swallow it. `turnClosed`
+ *  starts false so a first tool event (watcher attaching mid-turn) still reads "working". */
 export class HookStatusEngine {
   private status: AgentTabStatus | null = null;
+  private mainSession: string | null = null;
+  private turnClosed = false;
 
   constructor(private readonly opts: HookStatusEngineOpts) {}
 
@@ -112,6 +133,36 @@ export class HookStatusEngine {
 
   /** Feed one parsed hook event. Unknown events leave the status unchanged. */
   ingest(ev: HookEvent): void {
+    // Session lock: adopt the first session_id we see as the main agent's; drop any other
+    // session's events (events with no session_id at all are kept — defensive for older logs).
+    // ASSUMPTION: the main agent's first post-EOF event precedes any background `claude` call it
+    // later spawns — true at spawn, when nothing else is running yet. A re-prepare while a prior
+    // background one-shot is still mid-flight could mis-lock onto that background session; this is
+    // rare and accepted (a fresh spawn re-creates the engine and re-locks correctly).
+    if (ev.session_id) {
+      if (this.mainSession === null) this.mainSession = ev.session_id;
+      else if (ev.session_id !== this.mainSession) return;
+    }
+
+    if (TURN_OPENERS.has(ev.event)) this.turnClosed = false;
+    else if (TURN_CLOSERS.has(ev.event)) this.turnClosed = true;
+
+    // After the turn has closed, trailing background-subagent events (same main session_id) must
+    // not flip the finished tab back to green: tool calls are ignored, and a trailing SubagentStop
+    // settles the agent's background work to idle (gray). We don't clobber a terminal `done`
+    // (SessionEnd). A post-close `waiting` CAN occur — the idle-ping Notification ("Claude is
+    // waiting for your input") fires ~60s after Stop and maps to waiting (red) — but it's benign
+    // ("your turn"), not a real blocking question (those only arrive mid-turn), so overriding it
+    // to gray on a trailing SubagentStop is intentional. (Whether the idle-ping itself should read
+    // gray rather than red is a separate, still-open question.)
+    if (this.turnClosed) {
+      if (ev.event === "PreToolUse" || ev.event === "PostToolUse") return;
+      if (ev.event === "SubagentStop") {
+        if (this.status !== "done") this.set("idle");
+        return;
+      }
+    }
+
     const next = hookEventToStatus(ev);
     if (next) this.set(next);
   }

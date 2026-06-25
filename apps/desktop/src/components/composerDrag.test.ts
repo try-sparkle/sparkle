@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   resolveComposerDrag,
+  resolveComposerFloor,
   resolveComposerRenderHeight,
   resolveComposerReset,
   shouldRestoreFromBar,
@@ -156,6 +157,25 @@ describe("resolveComposerReset", () => {
 
   it("leaves a minimized composer untouched (the deliberate keep-tucked exception)", () => {
     expect(resolveComposerReset({ minimized: true, rest: 72 })).toBeNull();
+  });
+});
+
+describe("resolveComposerFloor", () => {
+  const base = { baseMin: 64, minTextarea: 36 };
+
+  it("is the plain base floor when there are no attachments", () => {
+    expect(resolveComposerFloor({ ...base, overhead: 120, hasAttachments: false })).toBe(64);
+  });
+
+  it("raises the floor to keep the textarea usable when attachments are present", () => {
+    // overhead (handle + buttons + padding + the 46px thumb row) = 110 → floor leaves room for
+    // a usable textarea: 110 + 36 = 146. This is what stops a user-sized composer from squeezing
+    // the input to a sliver when a screenshot is attached.
+    expect(resolveComposerFloor({ ...base, overhead: 110, hasAttachments: true })).toBe(146);
+  });
+
+  it("never drops below the base floor even if attachment overhead is tiny", () => {
+    expect(resolveComposerFloor({ ...base, overhead: 10, hasAttachments: true })).toBe(64);
   });
 });
 

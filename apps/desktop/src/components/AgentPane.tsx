@@ -187,10 +187,17 @@ export function AgentPane({
           agentId: agent.id,
           onStatus: (s) => router.fromHook(s),
         });
-        hookWatcherRef.current = watchHookEvents(logPath, (ev) => {
-          router.activate(); // a real event arrived — hooks now own the status
-          hookEngine.ingest(ev);
-        });
+        hookWatcherRef.current = watchHookEvents(
+          logPath,
+          (ev) => {
+            router.activate(); // a real event arrived — hooks now own the status
+            hookEngine.ingest(ev);
+          },
+          // Start at EOF: the log is keyed by worktree and accumulates prior runs + background
+          // one-shot `claude` sessions. We want status from THIS spawn's session, which the engine
+          // locks onto from the first event it sees — so the stale backlog must not be replayed.
+          { skipExisting: true },
+        );
       } catch (e) {
         console.warn("hook install failed; using screen-status fallback:", e);
       }

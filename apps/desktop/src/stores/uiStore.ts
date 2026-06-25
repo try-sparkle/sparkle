@@ -5,6 +5,10 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import { migratePersistedUi } from "./composerPersist";
 
 export const COMPOSER_MIN = 64;
+// Smallest usable textarea height (≈ one line + its vertical padding). Used as the floor's
+// reserved input space when screenshot thumbnails push the composer's chrome taller, so an
+// attachment can never squeeze the input box to a sliver. See resolveComposerFloor.
+export const COMPOSER_MIN_TEXTAREA = 36;
 // The rest height: tall enough that, as a bottom overlay, the composer just covers Claude's
 // terminal input line — so the user types here by default, never into the terminal beneath.
 // Drag-snaps land here (see composerDrag.ts), so it doubles as the restore target.

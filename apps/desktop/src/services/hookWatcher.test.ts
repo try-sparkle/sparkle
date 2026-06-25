@@ -72,6 +72,28 @@ describe("watchHookEvents", () => {
     expect(poll.mock.calls.length).toBe(callsAfterStop);
   });
 
+  it("skipExisting drains the pre-existing backlog without dispatching it, then tails new events", async () => {
+    const { poll, calls } = queuedPoll([
+      // First poll returns the stale backlog (prior runs + background sessions) — must be skipped.
+      { lines: [JSON.stringify({ event: "Stop" }), JSON.stringify({ event: "SessionEnd" })], offset: 100 },
+      // Second poll returns a genuinely new event — must be dispatched.
+      { lines: [JSON.stringify({ event: "UserPromptSubmit" })], offset: 130 },
+    ]);
+    const events: HookEvent[] = [];
+    const w = watchHookEvents("/log", (e) => events.push(e), {
+      intervalMs: 1,
+      poll,
+      skipExisting: true,
+    });
+    await vi.waitFor(() => expect(events.length).toBe(1));
+    w.stop();
+    // The backlog was skipped; only the post-EOF event reached the consumer.
+    expect(events.map((e) => e.event)).toEqual(["UserPromptSubmit"]);
+    // The offset still advanced past the skipped backlog so we don't re-read it.
+    expect(calls[0]!.offset).toBe(0);
+    expect(calls[1]!.offset).toBe(100);
+  });
+
   it("survives a transient poll rejection and keeps going", async () => {
     let n = 0;
     const poll = vi.fn(async (_l: string, offset: number) => {

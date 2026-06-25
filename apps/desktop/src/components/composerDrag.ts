@@ -113,6 +113,23 @@ export function resolveComposerReset(p: {
   return { height: p.rest, userSized: false };
 }
 
+// The composer's height floor. Normally the base open-height minimum, but attachment thumbnails
+// (screenshot previews) sit in a fixed-height row ABOVE the textarea in the input column, eating
+// vertical space. In user-sized mode the composer is pinned to the dragged height regardless of
+// content, so without lifting the floor those thumbs squeeze the textarea to an unusable sliver
+// (the reported bug). When attachments are present, raise the floor to the measured chrome
+// (`overhead`, which already includes the thumb row) plus one usable line of textarea. Kept pure
+// (no DOM) so it's unit-tested alongside the rest of the height policy.
+export function resolveComposerFloor(p: {
+  baseMin: number;
+  overhead: number;
+  minTextarea: number;
+  hasAttachments: boolean;
+}): number {
+  if (!p.hasAttachments) return p.baseMin;
+  return Math.max(p.baseMin, p.overhead + p.minTextarea);
+}
+
 // Should releasing the handle bring the composer back from the minimized bar? Used by the
 // pointer-UP handler so a click — or any upward tug the snap math intentionally left minimized
 // (the sub-threshold dead-zone) — restores, while a downward tug (abort) does not. Restore

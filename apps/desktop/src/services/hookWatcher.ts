@@ -24,6 +24,12 @@ const defaultPoll: PollFn = (logPath, offset) =>
 export interface WatchOpts {
   intervalMs?: number;
   poll?: PollFn;
+  /** Skip everything already in the log (start at EOF) and only dispatch newly-appended events.
+   *  The per-agent log is keyed by worktree, so it accumulates every past `claude` run plus any
+   *  background one-shot sessions. Status must derive from the session this watch is for (the
+   *  freshly-spawned agent), so we drain the stale backlog without dispatching it — the first
+   *  event the consumer sees is then the live session's, which it can lock onto. */
+  skipExisting?: boolean;
 }
 
 /** Begin tailing `logPath`; calls `onEvent` for each parsed hook event in order. Returns a
@@ -37,6 +43,9 @@ export function watchHookEvents(
   const intervalMs = opts.intervalMs ?? 500;
   const poll = opts.poll ?? defaultPoll;
   let offset = 0;
+  // When skipExisting, the first poll only advances the offset past the existing backlog without
+  // dispatching it. Flips false after that first drain so all later polls dispatch normally.
+  let skipping = opts.skipExisting ?? false;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -48,9 +57,13 @@ export function watchHookEvents(
       // consumer (e.g. an unmounted pane) after the caller has stopped us.
       if (stopped) return;
       offset = chunk.offset;
-      for (const line of chunk.lines) {
-        const ev = parseHookLine(line);
-        if (ev) onEvent(ev);
+      if (skipping) {
+        skipping = false; // drained the pre-existing backlog; dispatch from here on
+      } else {
+        for (const line of chunk.lines) {
+          const ev = parseHookLine(line);
+          if (ev) onEvent(ev);
+        }
       }
     } catch {
       // transient (file not created yet, mid-rotation) — retry next tick

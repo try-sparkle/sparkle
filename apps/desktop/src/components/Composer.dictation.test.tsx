@@ -29,7 +29,7 @@ import { usePromptHistoryStore } from "../stores/promptHistoryStore";
 
 beforeEach(() => {
   submitPrompt.mockClear();
-  useDictationStore.setState({ insertTarget: null });
+  useDictationStore.setState({ insertTarget: null, enabled: true });
   useUiStore.getState().setComposerMinimized(false);
   usePromptHistoryStore.setState({ history: [] });
 });
@@ -89,6 +89,53 @@ describe("Composer — dictation wiring", () => {
     expect(typeof useDictationStore.getState().insertTarget).toBe("function");
     act(() => unmount());
     expect(useDictationStore.getState().insertTarget).toBeNull();
+  });
+});
+
+describe("Composer — placeholder reflects audio state", () => {
+  it("invites the user to just start talking while the mic is hot", () => {
+    act(() => useDictationStore.setState({ enabled: true }));
+    renderComposer();
+    const body = document.body.textContent ?? "";
+    expect(body).toContain("I'm listening, so just start talking.");
+    expect(body).toContain("Send it"); // the teal→cyan gradient stop cue
+    expect(body).toContain("start typing here instead");
+    expect(body).not.toContain("Hey Sparkle");
+  });
+
+  it("keeps the mic-hot copy on focus (it subsumes the typing hint)", () => {
+    act(() => useDictationStore.setState({ enabled: true }));
+    renderComposer();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    // Actually focus the box (mouseDown flips `focused`, focus moves activeElement) so the test
+    // exercises a real focus state change rather than passing tautologically.
+    fireEvent.mouseDown(ta);
+    fireEvent.focus(ta);
+    expect(document.activeElement).toBe(ta);
+    const body = document.body.textContent ?? "";
+    // Mic-hot copy stays put on focus; the muted focused hint must NOT appear.
+    expect(body).toContain("I'm listening, so just start talking.");
+    expect(body).not.toContain("or type your command here");
+  });
+
+  it("falls back to the wake-word prompt when the mic is muted", () => {
+    act(() => useDictationStore.setState({ enabled: false }));
+    renderComposer();
+    const body = document.body.textContent ?? "";
+    expect(body).toContain("Hey Sparkle");
+    expect(body).not.toContain("I'm listening, so just start talking.");
+    expect(body).not.toContain("Send it"); // the gradient cue is mic-hot-only
+  });
+
+  it("shows the muted focused typing hint only when the mic is muted", () => {
+    act(() => useDictationStore.setState({ enabled: false }));
+    renderComposer();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.mouseDown(ta);
+    fireEvent.focus(ta);
+    expect(document.activeElement).toBe(ta);
+    const body = document.body.textContent ?? "";
+    expect(body).toContain("or type your command here");
   });
 });
 
