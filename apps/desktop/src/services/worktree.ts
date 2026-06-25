@@ -44,6 +44,13 @@ export function installWorktreeGuard(worktree: string): Promise<void> {
   return invoke("install_worktree_guard", { worktree });
 }
 
+/** Register Claude Code event hooks () in the worktree's settings.local.json so the
+ *  app gets structured lifecycle events instead of scraping the TUI. Resolves to the absolute
+ *  event-log path the emitter appends to (which a watcher then tails). */
+export function installAgentHooks(worktree: string): Promise<string> {
+  return invoke<string>("install_agent_hooks", { worktree });
+}
+
 /** Move/rename a project folder on disk and repair its worktree links. Stop the
  * project's agents before calling (their PTYs hold the old working directory). */
 export function moveProjectFolder(oldPath: string, newPath: string): Promise<void> {

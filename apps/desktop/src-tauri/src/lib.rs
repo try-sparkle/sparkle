@@ -3,6 +3,7 @@ mod chief;
 mod claude;
 mod connectivity;
 mod dictation;
+mod hooks;
 mod logging;
 mod model;
 mod naming;
@@ -52,6 +53,8 @@ pub fn run() {
             worktree::move_project,
             worktree::assert_workspace_integrity,
             worktree::install_worktree_guard,
+            hooks::install_agent_hooks,
+            hooks::read_events_since,
             worktree::project_default_branch,
             worktree::agent_branch_status,
             worktree::markdown_changed_since,

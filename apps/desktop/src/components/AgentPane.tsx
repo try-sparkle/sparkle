@@ -1,13 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
-import { prepareAgentWorkspace, installWorktreeGuard, assertWorkspaceIntegrity } from "../services/worktree";
+import {
+  prepareAgentWorkspace,
+  installWorktreeGuard,
+  installAgentHooks,
+  assertWorkspaceIntegrity,
+} from "../services/worktree";
 import { resolveDefaultBranch } from "../services/branchStatus";
 import { checkClaude, claudeHasSession } from "../preflight";
 import { buildClaudeExec } from "../services/claudeSpawn";
 import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult } from "../services/buildAgent";
 import { readWorkerResult } from "../pty";
 import { maybeAutoName } from "../services/agentNaming";
+import { HookStatusEngine } from "../engine/hookEvents";
+import { createStatusRouter, type StatusRouter } from "../engine/statusRouter";
+import { watchHookEvents, type HookWatcher } from "../services/hookWatcher";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -69,12 +77,30 @@ export function AgentPane({
     scrolledOutTimer.current = window.setTimeout(() => setScrolledOut(false), 2600);
   };
 
+  // Status routing: Claude Code's hook events are authoritative, but the screen scraper drives
+  // until the first hook arrives (and for non-Claude programs that never emit one). The router
+  // arbitrates; the watcher feeds the hook engine and activates the router on the first event.
+  const routerRef = useRef<StatusRouter | null>(null);
+  if (!routerRef.current) routerRef.current = createStatusRouter((s) => setStatus(agent.id, s));
+  const hookWatcherRef = useRef<HookWatcher | null>(null);
+
+  const stopHookWatch = () => {
+    hookWatcherRef.current?.stop();
+    hookWatcherRef.current = null;
+    // Hand status authority back to the scraper until the next run's first hook event, so a
+    // restart doesn't stay frozen on the prior run's last hook status.
+    routerRef.current?.reset();
+  };
+
   const prepare = async () => {
     // Brainstorm agents are a Chief chat — no worktree, no PTY, nothing to prepare.
     if (agent.kind === "brainstorm") return;
     setPhase("preparing");
     setErrorMsg("");
     setPtyReady(false);
+    // A re-prepare (Try again) restarts the agent from scratch — drop any prior hook watcher so
+    // hooks for the new run start clean.
+    stopHookWatch();
     try {
       // Resolve + persist the project's integration branch once, then base this agent off it.
       // Normalize a possibly-empty resolver result the same way the store does, so the worktree
@@ -95,6 +121,24 @@ export function AgentPane({
         await installWorktreeGuard(wt.path);
       } catch (e) {
         console.warn("guard install failed (relocation still protects):", e);
+      }
+      // Register Claude Code event hooks and start tailing the per-agent event log, so status is
+      // driven by Claude's own lifecycle once it starts emitting. Best-effort: if this fails the
+      // router simply stays on the screen-scraping fallback. Must run before the PTY spawns so the
+      // hooks are in settings.local.json when `claude` reads it.
+      try {
+        const logPath = await installAgentHooks(wt.path);
+        const router = routerRef.current!;
+        const hookEngine = new HookStatusEngine({
+          agentId: agent.id,
+          onStatus: (s) => router.fromHook(s),
+        });
+        hookWatcherRef.current = watchHookEvents(logPath, (ev) => {
+          router.activate(); // a real event arrived — hooks now own the status
+          hookEngine.ingest(ev);
+        });
+      } catch (e) {
+        console.warn("hook install failed; using screen-status fallback:", e);
       }
       await assertWorkspaceIntegrity(wt.path); // throws → caught below → error phase, no spawn
       // Poll branch status only after the workspace passed integrity — never for a sandbox we
@@ -158,6 +202,8 @@ export function AgentPane({
 
   useEffect(() => {
     void prepare();
+    // Stop tailing the event log when the pane unmounts (tab/agent closed).
+    return () => stopHookWatch();
     // Prepare once per agent (agent.id is stable for this component's life).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent.id]);
@@ -223,7 +269,7 @@ export function AgentPane({
               args={spawn.args}
               cwd={spawn.cwd}
               active={visible}
-              onStatus={(s) => setStatus(agent.id, s)}
+              onStatus={(s) => routerRef.current!.fromScreen(s)}
               onReady={() => setPtyReady(true)}
               onExit={() => {
                 // NOTE (Plan-1 limitation): this block fires only when the PTY process actually
