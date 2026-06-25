@@ -105,6 +105,8 @@ export function Composer({
   const [value, setValue] = useState("");
   // True while a native file (e.g. a log) is dragged over the window — drives the drop hint.
   const [dropActive, setDropActive] = useState(false);
+  // While focused, the placeholder switches from the "Hey Sparkle" voice prompt to a typing hint.
+  const [focused, setFocused] = useState(false);
 
   // Voice dictation: appends each transcribed segment into the textarea.
   // `dictation://partial` is a global broadcast and every open agent's pane stays
@@ -507,6 +509,10 @@ export function Composer({
             value={value}
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={onKeyDown}
+            // Swap to the typing hint on a real click, not on the mount auto-focus (which would
+            // otherwise hide the "Hey Sparkle" voice prompt before the user ever interacts).
+            onMouseDown={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
             disabled={disabled}
             placeholder={
               dropActive
@@ -515,7 +521,7 @@ export function Composer({
                 ? "Starting your agent…"
                 : showRichPlaceholder
                 ? "" // the styled overlay below renders this state's placeholder
-                : 'Just say "Hey Sparkle" and I\'ll start listening to you talk.'
+                : "Just say Hey Sparkle and I'll start listening as you talk."
             }
             spellCheck={false}
             style={{
@@ -553,9 +559,15 @@ export function Composer({
                 lineHeight: 1.4,
               }}
             >
-              Just say{" "}
-              <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>&quot;Hey Sparkle&quot;</span>{" "}
-              and I&apos;ll start listening to you talk.
+              {focused ? (
+                "…or type your command here (speaking is 3x faster)"
+              ) : (
+                <>
+                  Just say{" "}
+                  <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>Hey Sparkle</span>{" "}
+                  and I&apos;ll start listening as you talk.
+                </>
+              )}
             </div>
           )}
         </div>
