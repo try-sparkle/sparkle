@@ -7,6 +7,7 @@ import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import type { AgentTabStatus } from "../types";
 import type { BranchStatus } from "../services/branchStatus";
+import type { WorkflowStageId } from "../engine/workflowStage";
 import { agentBranchStatus } from "../services/branchStatus";
 import { syncAgentMarkdown } from "../services/chiefSync";
 import { useSettingsStore, effectiveChiefPat } from "./settingsStore";
@@ -59,11 +60,17 @@ interface RuntimeState {
   status: Record<string, AgentTabStatus>; // agentId -> status (live-only, never persisted)
   openAgentIds: string[]; // agents whose pane is mounted + PTY alive (persisted)
   branchStatus: Record<string, BranchStatus>; // agentId -> live ahead/behind/dirty/size (live-only)
+  // agentId -> the furthest workflow stage we KNOW the work has reached (Pull Request / On Main /
+  // Merged), which local git can't infer on its own. The workflow tracker overlays this on top of
+  // the git-derived stage (see engine/workflowStage.resolveStage). Live-only: re-derived/re-pushed
+  // as signals arrive; PR/merge detection and the orchestration bridge call setWorkflowStage.
+  workflowStage: Record<string, WorkflowStageId>;
 
   open: (agentId: string) => void;
   close: (agentId: string) => void;
   setStatus: (agentId: string, status: AgentTabStatus) => void;
   setBranchStatus: (agentId: string, s: BranchStatus) => void;
+  setWorkflowStage: (agentId: string, stage: WorkflowStageId) => void;
   /** Fetch + store this agent's branch status. Best-effort: a transient git error is swallowed
    *  so the UI never breaks. */
   pollBranchStatus: (
@@ -84,6 +91,7 @@ export const useRuntimeStore = create<RuntimeState>()(
       status: {},
       openAgentIds: [],
       branchStatus: {},
+      workflowStage: {},
 
       open: (agentId) =>
         set((s) =>
@@ -96,10 +104,12 @@ export const useRuntimeStore = create<RuntimeState>()(
         set((s) => {
           const { [agentId]: _removed, ...status } = s.status;
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
+          const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           return {
             openAgentIds: s.openAgentIds.filter((id) => id !== agentId),
             status,
             branchStatus,
+            workflowStage,
           };
         }),
 
@@ -108,6 +118,9 @@ export const useRuntimeStore = create<RuntimeState>()(
 
       setBranchStatus: (agentId, s) =>
         set((st) => ({ branchStatus: { ...st.branchStatus, [agentId]: s } })),
+
+      setWorkflowStage: (agentId, stage) =>
+        set((st) => ({ workflowStage: { ...st.workflowStage, [agentId]: stage } })),
 
       pollBranchStatus: async (root, projectId, agentId, baseBranch) => {
         try {

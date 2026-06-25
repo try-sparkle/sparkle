@@ -17,6 +17,9 @@ import { StatusBar } from "./StatusBar";
 import { Tooltip } from "./Tooltip";
 import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
+import { WorkflowTracker } from "./WorkflowTracker";
+import { resolveStage, rollupStages, stageMeta } from "../engine/workflowStage";
+import type { WorkflowStageId } from "../engine/workflowStage";
 
 /**
  * Left column: the current project's agents as a vertical list (spec layout, revised).
@@ -54,10 +57,16 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const close = useRuntimeStore((s) => s.close);
   const status = useRuntimeStore((s) => s.status);
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
+  const workflowStage = useRuntimeStore((s) => s.workflowStage);
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
   const agentOrdering = useUiStore((s) => s.agentOrdering);
+  const collapsedOrchestrators = useUiStore((s) => s.collapsedOrchestrators);
+  const toggleOrchestratorCollapsed = useUiStore((s) => s.toggleOrchestratorCollapsed);
+  // The workflow stage an agent's own git state + any known override resolves to.
+  const stageOf = (id: string): WorkflowStageId =>
+    resolveStage(branchStatus[id], workflowStage[id]);
   const [editing, setEditing] = useState<string | null>(null);
 
   // Draggable column width — persisted to localStorage so it survives relaunch. Clamped to
@@ -233,9 +242,15 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               top.kind === "build"
                 ? project.agents.filter((w) => w.parentId === top.id)
                 : [];
-            return (
-              <div key={top.id}>
-                {[top, ...workers].map((a) => {
+            // The orchestrator's chevron rolls up its workers (overall = least-advanced worker);
+            // with no workers it just shows its own git stage. A worker/brainstorm/shell row shows
+            // its own. (Brainstorm has no worktree, so it resolves to the harmless start stage and
+            // we simply don't render a tracker for it — see renderRow.)
+            const workerStages = workers.map((w) => stageOf(w.id));
+            const rollup = rollupStages(workerStages);
+            const collapsed =
+              top.kind === "build" && workers.length > 0 && (collapsedOrchestrators[top.id] ?? true);
+            const renderRow = (a: (typeof project.agents)[number], trackerStage: WorkflowStageId | null) => {
           const st = status[a.id] ?? "stopped";
           // Idle/inactive agents (idle, blocked, errored, done, stopped all share the brand
           // GRAY) use a themed gray that's much darker in light mode for readability; active
@@ -370,6 +385,17 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                     {"⁦" + (a.worktreePath ?? project.rootPath) + "⁩"}
                   </span>
                 </Tooltip>
+                {/* Domino's-tracker chevrons: how far this work has progressed toward merged.
+                    For an orchestrator this is the roll-up of its workers; for a worker it's its
+                    own git stage. Brainstorm agents have no worktree, so trackerStage is null. */}
+                {trackerStage && (
+                  <div style={{ marginTop: 3 }}>
+                    <WorkflowTracker
+                      stage={trackerStage}
+                      labelPrefix={a.kind === "build" && workers.length > 0 ? "Overall: " : undefined}
+                    />
+                  </div>
+                )}
               </div>
               {bs && (tier !== "none" || grow) && (
                 <div style={{ display: "flex", gap: 6, alignItems: "center", flex: "0 0 auto" }}>
@@ -437,8 +463,63 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               </span>
             </div>
           );
-                })}
-                {/* Under a build agent: spawn another worker into the tree. */}
+            }; // end renderRow
+
+            // The orchestrator's own chevron: the roll-up of its workers, or its own git stage when
+            // it has none. Brainstorm/shell agents have no git workflow → no tracker (null).
+            const headStage: WorkflowStageId | null =
+              top.kind === "brainstorm" || top.kind === "shell"
+                ? null
+                : rollup
+                  ? rollup.stage
+                  : stageOf(top.id);
+            const dom = rollup ? stageMeta(rollup.dominant) : null;
+            return (
+              <div key={top.id}>
+                {renderRow(top, headStage)}
+                {/* Collapsible worker roll-up. Workers start collapsed: a compact "N workers ·
+                    mostly X" bar the user clicks to expand into each worker's own tracker. */}
+                {top.kind === "build" && workers.length > 0 && (
+                  <div
+                    onClick={() => toggleOrchestratorCollapsed(top.id)}
+                    title={collapsed ? "Show worker agents" : "Hide worker agents"}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      marginLeft: 16,
+                      padding: "2px 10px 4px",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <span style={{ width: 12, textAlign: "center", color: C.muted, fontSize: 10 }}>
+                      {collapsed ? "▸" : "▾"}
+                    </span>
+                    <span style={{ color: C.muted, fontSize: 11, flex: "0 0 auto" }}>
+                      {workers.length} worker{workers.length === 1 ? "" : "s"}
+                    </span>
+                    {collapsed && dom && (
+                      <span
+                        style={{
+                          color: dom.color,
+                          fontSize: 10,
+                          fontWeight: 600,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        · mostly {dom.label}
+                      </span>
+                    )}
+                  </div>
+                )}
+                {/* Expanded: each worker's own row + tracker. */}
+                {top.kind === "build" &&
+                  !collapsed &&
+                  workers.map((w) => renderRow(w, stageOf(w.id)))}
+                {/* Under a build agent: spawn another worker into the tree. Shown regardless of
+                    collapse state so adding a worker never requires expanding the subtree first. */}
                 {top.kind === "build" && (
                   <button
                     onClick={() => onAddWorker(top.id)}

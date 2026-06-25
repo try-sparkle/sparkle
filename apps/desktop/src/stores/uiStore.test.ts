@@ -71,6 +71,30 @@ describe("uiStore agentOrdering", () => {
   });
 });
 
+describe("uiStore orchestrator collapse", () => {
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({ collapsedOrchestrators: {} });
+  });
+
+  it("workers start collapsed (a missing entry reads as collapsed)", () => {
+    expect(useUiStore.getState().isOrchestratorCollapsed("build-1")).toBe(true);
+  });
+
+  it("toggle expands then re-collapses, scoped per build agent", () => {
+    const { toggleOrchestratorCollapsed, isOrchestratorCollapsed } = useUiStore.getState();
+    toggleOrchestratorCollapsed("build-1");
+    expect(useUiStore.getState().isOrchestratorCollapsed("build-1")).toBe(false);
+    // A different orchestrator is unaffected — still collapsed by default.
+    expect(useUiStore.getState().isOrchestratorCollapsed("build-2")).toBe(true);
+    useUiStore.getState().toggleOrchestratorCollapsed("build-1");
+    expect(useUiStore.getState().isOrchestratorCollapsed("build-1")).toBe(true);
+    // Reference the destructured selectors so they're not flagged unused.
+    expect(typeof toggleOrchestratorCollapsed).toBe("function");
+    expect(typeof isOrchestratorCollapsed).toBe("function");
+  });
+});
+
 describe("uiStore zoom", () => {
   beforeEach(() => useUiStore.getState().resetZoom());
 

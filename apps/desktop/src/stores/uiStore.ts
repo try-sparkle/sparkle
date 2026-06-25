@@ -75,11 +75,18 @@ interface UiState {
   // Sidebar agent ordering preference (see AgentOrdering). Persisted in `sparkle-ui`.
   agentOrdering: AgentOrdering;
   setAgentOrdering: (v: AgentOrdering) => void;
+  // Per build-agent: whether its worker subtree is collapsed in the sidebar. A build agent's
+  // workers start COLLAPSED (a missing entry reads as collapsed) so a busy orchestrator shows a
+  // compact "N workers" roll-up by default; the user expands to see each worker's own tracker.
+  // Keyed by the build agent's id; persisted so the choice survives relaunch.
+  collapsedOrchestrators: Record<string, boolean>;
+  isOrchestratorCollapsed: (id: string) => boolean;
+  toggleOrchestratorCollapsed: (id: string) => void;
 }
 
 export const useUiStore = create<UiState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       composerHeight: COMPOSER_DEFAULT,
       setComposerHeight: (h) => set({ composerHeight: Math.max(COMPOSER_MIN, h) }),
       composerUserSized: false,
@@ -97,6 +104,14 @@ export const useUiStore = create<UiState>()(
       setThemePref: (v) => set({ themePref: v }),
       agentOrdering: "attention",
       setAgentOrdering: (v) => set({ agentOrdering: v }),
+      collapsedOrchestrators: {},
+      // Absent → collapsed (workers start hidden behind the roll-up).
+      isOrchestratorCollapsed: (id) => get().collapsedOrchestrators[id] ?? true,
+      toggleOrchestratorCollapsed: (id) =>
+        set((s) => {
+          const cur = s.collapsedOrchestrators[id] ?? true;
+          return { collapsedOrchestrators: { ...s.collapsedOrchestrators, [id]: !cur } };
+        }),
     }),
     {
       name: "sparkle-ui",
