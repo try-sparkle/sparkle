@@ -20,6 +20,7 @@ import {
   COMPOSER_MINIMIZE_THRESHOLD,
   COMPOSER_RESTORE_THRESHOLD,
 } from "../stores/uiStore";
+import { usePromptHistoryStore, computeGhost } from "../stores/promptHistoryStore";
 import { resolveComposerDrag, shouldRestoreFromBar } from "./composerDrag";
 import { isComposerToggleKey } from "./composerToggle";
 import { useDictationStore } from "../stores/dictationStore";
@@ -80,6 +81,21 @@ export function Composer({
   const [dropActive, setDropActive] = useState(false);
   // While focused, the placeholder switches from the "Hey Sparkle" voice prompt to a typing hint.
   const [focused, setFocused] = useState(false);
+
+  // Inline ghost-text autocomplete. `history` is the global list of past prompts; `caretAtEnd`
+  // gates the suggestion so it only appears when the caret is at the very end of the text
+  // (never while editing mid-line). The ghost is the suffix of the most recent past prompt
+  // that starts with what's typed — accept the whole thing with → or Tab.
+  const history = usePromptHistoryStore((s) => s.history);
+  const recordPrompt = usePromptHistoryStore((s) => s.record);
+  const [caretAtEnd, setCaretAtEnd] = useState(true);
+  // Escape dismisses the current ghost so a keyboard-only user can Tab out of the composer
+  // without first accepting the suggestion (Tab otherwise accepts). Reset on the next edit so
+  // typing more brings suggestions back.
+  const [ghostDismissed, setGhostDismissed] = useState(false);
+  const ghost = caretAtEnd && !ghostDismissed ? computeGhost(value, history) : "";
+  // Backing mirror behind the textarea, used to paint the ghost suffix (see render).
+  const ghostRef = useRef<HTMLDivElement | null>(null);
 
   // When this composer is the visible/active pane, make it the target for
   // wake-word dictation. Only the visible pane registers (one at a time), so
@@ -258,9 +274,38 @@ export function Composer({
       .join("  ");
     setValue("");
     setAttachments([]);
+    // Remember the typed text (not the screenshot-annotated display string) so it can be
+    // offered as a ghost-text suggestion next time the user types its prefix.
+    if (text) recordPrompt(text);
     log.info("composer", "send prompt", { agentId, chars: text.length, shots: shots.length });
     onSubmitPrompt(display);
     await submitPrompt(agentId, payload);
+  };
+
+  // Accept the ghost completion: replace the input with the full past prompt and drop the
+  // caret at the end. Only reachable when a ghost is showing (which implies caret-at-end).
+  const acceptGhost = () => {
+    const full = value + ghost;
+    setValue(full);
+    setCaretAtEnd(true);
+    // Selection must be set after React commits the new value, or it snaps back. Re-sync the
+    // mirror's scroll too: moving the caret to the end can scroll the textarea programmatically
+    // without firing onScroll, which would briefly misalign the painted text on long inputs.
+    requestAnimationFrame(() => {
+      const ta = taRef.current;
+      if (ta) {
+        ta.selectionStart = ta.selectionEnd = full.length;
+        if (ghostRef.current) ghostRef.current.scrollTop = ta.scrollTop;
+      }
+    });
+  };
+
+  // Keep `caretAtEnd` in sync with the real caret so the ghost hides the moment the user
+  // moves into the middle of the text (arrow-left, click, select) and returns when at the end.
+  const syncCaret = () => {
+    const ta = taRef.current;
+    if (!ta) return;
+    setCaretAtEnd(ta.selectionStart === ta.value.length && ta.selectionEnd === ta.value.length);
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -273,6 +318,29 @@ export function Composer({
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void send();
+      return;
+    }
+    // → or Tab accepts the ghost when one is showing. At end-of-text → is otherwise a no-op,
+    // and Tab is repurposed as accept (the user's choice) — Escape dismisses the ghost first
+    // to free Tab for focus movement when needed. Shift+Tab is left alone so backward focus
+    // traversal still works. Skip while an IME composition is active, so a →/Tab that commits
+    // a CJK candidate isn't hijacked into accepting the ghost.
+    if (
+      ghost &&
+      !e.nativeEvent.isComposing &&
+      (e.key === "ArrowRight" || (e.key === "Tab" && !e.shiftKey))
+    ) {
+      e.preventDefault();
+      acceptGhost();
+      return;
+    }
+    // Escape dismisses the visible ghost (without clearing the input) so Tab can move focus.
+    // Consume the event (stopPropagation) so dismissing the ghost doesn't also fire an
+    // ancestor/global Escape handler in the same keystroke — Escape's effect stays predictable.
+    if (ghost && e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      setGhostDismissed(true);
     }
   };
 
@@ -437,43 +505,101 @@ export function Composer({
               ))}
             </div>
           )}
-          <textarea
-            ref={setTaRef}
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            onKeyDown={onKeyDown}
-            // Swap to the typing hint on a real click, not on the mount auto-focus (which would
-            // otherwise hide the "Hey Sparkle" voice prompt before the user ever interacts).
-            onMouseDown={() => setFocused(true)}
-            onBlur={() => setFocused(false)}
-            disabled={disabled}
-            placeholder={
-              dropActive
-                ? "Drop the file here to attach it…"
-                : disabled
-                ? "Starting your agent…"
-                : showRichPlaceholder
-                ? "" // the styled overlay below renders this state's placeholder
-                : "Just say Hey Sparkle and I'll start listening as you talk."
-            }
-            spellCheck={false}
-            style={{
-              flex: 1,
-              minHeight: 0,
-              resize: "none",
-              background: C.deepForest,
-              color: C.cream,
-              // Highlight the drop target while a file is dragged over the window.
-              border: dropActive ? `1.5px dashed ${C.teal}` : `1px solid ${CHAT_USER_BUBBLE}`,
-              borderRadius: 8,
-              padding: "8px 10px",
-              fontFamily: '"IBM Plex Sans", sans-serif',
-              fontSize: 14,
-              lineHeight: 1.4,
-              outline: "none",
-              opacity: disabled ? 0.6 : 1,
-            }}
-          />
+          {/* The textarea and a mirror layer share one positioning context. The mirror sits
+              behind a transparent-background textarea and re-renders the exact same text, but
+              transparent — so only the trailing ghost suffix (painted muted) shows through.
+              Because both boxes use identical font, padding, border width, and wrapping, the
+              ghost lines up perfectly with the real caret, even across wrapped lines. */}
+          <div style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}>
+            <div
+              ref={ghostRef}
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                inset: 0,
+                zIndex: 0,
+                overflow: "hidden",
+                pointerEvents: "none",
+                boxSizing: "border-box",
+                background: C.deepForest,
+                // Transparent border of the same width keeps the content box aligned with the
+                // textarea's (whose visible border is painted on top).
+                border: dropActive ? "1.5px solid transparent" : "1px solid transparent",
+                borderRadius: 8,
+                padding: "8px 10px",
+                fontFamily: '"IBM Plex Sans", sans-serif',
+                fontSize: 14,
+                lineHeight: 1.4,
+                whiteSpace: "pre-wrap",
+                overflowWrap: "break-word",
+                // Reserve the scrollbar gutter in both layers so the text content box width
+                // matches even when the textarea overflows and shows a scrollbar — otherwise
+                // lines would wrap at different points and the ghost would drift.
+                scrollbarGutter: "stable",
+                opacity: disabled ? 0.6 : 1,
+              }}
+            >
+              <span style={{ color: "transparent" }}>{value}</span>
+              <span style={{ color: C.muted }}>{ghost}</span>
+            </div>
+            <textarea
+              ref={setTaRef}
+              value={value}
+              onChange={(e) => {
+                setValue(e.target.value);
+                setGhostDismissed(false); // a fresh edit re-enables suggestions
+                syncCaret();
+              }}
+              onKeyDown={onKeyDown}
+              onKeyUp={syncCaret}
+              onSelect={syncCaret}
+              onClick={syncCaret}
+              onScroll={(e) => {
+                if (ghostRef.current) ghostRef.current.scrollTop = e.currentTarget.scrollTop;
+              }}
+              // Swap to the typing hint on a real click, not on the mount auto-focus (which would
+              // otherwise hide the "Hey Sparkle" voice prompt before the user ever interacts).
+              onMouseDown={() => setFocused(true)}
+              onBlur={() => setFocused(false)}
+              disabled={disabled}
+              placeholder={
+                dropActive
+                  ? "Drop the file here to attach it…"
+                  : disabled
+                  ? "Starting your agent…"
+                  : showRichPlaceholder
+                  ? "" // the styled overlay below renders this state's placeholder
+                  : "Just say Hey Sparkle and I'll start listening as you talk."
+              }
+              spellCheck={false}
+              style={{
+                position: "relative",
+                zIndex: 1,
+                flex: 1,
+                minHeight: 0,
+                resize: "none",
+                boxSizing: "border-box",
+                // Transparent so the mirror's ghost suffix shows through behind the real text.
+                background: "transparent",
+                color: C.cream,
+                // Highlight the drop target while a file is dragged over the window.
+                border: dropActive ? `1.5px dashed ${C.teal}` : `1px solid ${CHAT_USER_BUBBLE}`,
+                borderRadius: 8,
+                padding: "8px 10px",
+                fontFamily: '"IBM Plex Sans", sans-serif',
+                fontSize: 14,
+                lineHeight: 1.4,
+                // Match the mirror's long-token wrapping so a pasted URL/path breaks at the
+                // same point in both layers and the ghost stays aligned with the caret.
+                overflowWrap: "break-word",
+                // Keep the scrollbar gutter reserved (mirror does the same) so the text width
+                // is identical with or without a vertical scrollbar — no wrap drift.
+                scrollbarGutter: "stable",
+                outline: "none",
+                opacity: disabled ? 0.6 : 1,
+              }}
+            />
+          </div>
           {showRichPlaceholder && (
             // Styled stand-in for the native placeholder so "Hey Sparkle" can be bold + blue.
             // Aligned to the textarea's first text line (1px border + 8px/10px padding) and
