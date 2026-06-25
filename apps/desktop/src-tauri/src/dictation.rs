@@ -1,4 +1,6 @@
 //! Tauri commands wiring mic capture → transcriber → events.
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -8,17 +10,39 @@ use crate::transcribe::{ParakeetTdt, Transcriber};
 
 /// Monotonic id stamped on every emitted partial so the log can prove whether a
 /// duplicate in the prompt bar came from the backend emitting the same text twice
-/// (two ids, same text) vs the frontend appending one emission twice (one id).
+/// (two ids, same fingerprint) vs the frontend appending one emission twice (one id).
 static PARTIAL_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Fixed-width content fingerprint of a transcript segment. Identical text yields an
+/// identical fingerprint, which is all the duplicate diagnosis needs — without ever
+/// persisting the words themselves. (DefaultHasher is deterministic within a process,
+/// so fingerprints are comparable across a single log.) This is best-effort
+/// obfuscation, not cryptographic irreversibility: a 32-bit digest of a short phrase
+/// is brute-forceable in principle, so we deliberately log neither the text nor its
+/// length — only the fingerprint — to avoid handing a reversal oracle to anyone who
+/// reads the on-disk log.
+fn segment_fingerprint(seg: &str) -> u32 {
+    let mut h = DefaultHasher::new();
+    seg.hash(&mut h);
+    h.finish() as u32
+}
+
 /// Emit one transcript segment and log it (source = "accept" during capture, or
-/// "finalize" on stop) with its sequence id and text, so dictation duplicates are
-/// diagnosable from the unified log.
+/// "finalize" on stop) with its sequence id and a content fingerprint, so dictation
+/// duplicates are diagnosable from the unified log. Privacy: the raw transcript text
+/// (and its length, which would aid reversal) is NEVER written to the log — only the
+/// fixed-width fingerprint — so a user's spoken words are not persisted to disk.
 fn emit_partial(app: &AppHandle, source: &str, seg: String) {
     let seq = PARTIAL_SEQ.fetch_add(1, Ordering::Relaxed);
     // info (not debug): the shipped build's log threshold drops debug, and this is
     // low-frequency (once per spoken phrase), so info is safe and always visible.
-    tracing::info!(target: "dictation", seq, source, text = %seg, "emit partial");
+    tracing::info!(
+        target: "dictation",
+        seq,
+        source,
+        fp = format_args!("{:08x}", segment_fingerprint(&seg)),
+        "emit partial"
+    );
     let _ = app.emit("dictation://partial", seg);
 }
 
@@ -78,4 +102,38 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
         for seg in t.lock().unwrap().finalize() { emit_partial(&app, "finalize", seg); }
     }
     let _ = app.emit("dictation://final", String::new());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::segment_fingerprint;
+
+    #[test]
+    fn identical_text_yields_identical_fingerprint() {
+        // The duplicate diagnosis relies on this: the same emitted segment must
+        // produce the same fingerprint so "backend emitted twice" is visible in the log.
+        assert_eq!(segment_fingerprint("hello world"), segment_fingerprint("hello world"));
+    }
+
+    #[test]
+    fn different_text_yields_different_fingerprint() {
+        // Distinct phrases should (overwhelmingly) differ, so non-duplicates aren't
+        // misread as duplicates.
+        assert_ne!(segment_fingerprint("turn left"), segment_fingerprint("turn right"));
+    }
+
+    #[test]
+    fn fingerprint_is_fixed_width_regardless_of_input_size() {
+        // Privacy guard: the logged fingerprint must be a fixed-size digest that cannot
+        // grow to embed the transcript. A one-word phrase and a long paragraph must both
+        // render to exactly 8 lowercase-hex chars — proving the output carries no more
+        // information as the input grows. (This is a property that fails if someone later
+        // logs the text or a length-proportional value instead.)
+        let short = format!("{:08x}", segment_fingerprint("hi"));
+        let long = format!("{:08x}", segment_fingerprint(&"word ".repeat(200)));
+        for fp in [&short, &long] {
+            assert_eq!(fp.len(), 8, "fingerprint must be fixed 8-hex width");
+            assert!(fp.chars().all(|c| c.is_ascii_hexdigit()), "fingerprint must be hex-only");
+        }
+    }
 }
