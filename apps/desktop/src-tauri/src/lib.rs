@@ -17,6 +17,7 @@ mod sparkle_agent;
 mod worktree;
 
 use pty::PtyManager;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -79,6 +80,25 @@ pub fn run() {
         //  - deep-link handler for sparkle://oauth/callback (only if/when Anthropic
         //    permits subscription OAuth; default is BYOK)
         //  - keychain plugin for BYOK token storage
-        .run(tauri::generate_context!())
-        .expect("error while running Sparkle");
+        .build(tauri::generate_context!())
+        .expect("error while building Sparkle")
+        .run(|app, event| {
+            // macOS: clicking the Dock icon when all windows are hidden/closed ("Reopen") must
+            // bring a window back — otherwise a last-window "keep agents running" hide is
+            // unreachable except via Cmd+Q (see multi-window design, decision #4).
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                if !has_visible_windows {
+                    // Prefer the canonical "main" window; fall back to any window. Our close path
+                    // only ever hide()s the last window (never destroys it), so there is normally
+                    // ≥1 window to reveal; the `if let Some` still guards the zero-window case.
+                    let win = app
+                        .get_webview_window("main")
+                        .or_else(|| app.webview_windows().into_values().next());
+                    if let Some(win) = win {
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
+                }
+            }
+        });
 }

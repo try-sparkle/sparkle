@@ -39,6 +39,9 @@ interface ProjectState {
   addProject: (name: string, rootPath: string) => string;
   removeProject: (id: string) => void;
   selectProject: (id: string) => void;
+  /** Bump lastOpenedAt only (for Recent ordering) without claiming the shared
+   *  selectedProjectId — multi-window: each window owns its own current project. */
+  touchProjectOpened: (id: string) => void;
   /** Update name + folder location together (after the on-disk move succeeds). Recomputes
    * each agent's worktree path under the new root. */
   relocateProject: (id: string, newName: string, newRootPath: string) => void;
@@ -151,6 +154,10 @@ function mapAgent(p: Project, agentId: string, fn: (a: AgentTab) => AgentTab): P
   return { ...p, agents: p.agents.map((a) => (a.id === agentId ? fn(a) : a)) };
 }
 
+/** localStorage key the project store persists under. Shared so cross-window sync
+ *  (crossWindowSync.ts) listens on the same key instead of duplicating the literal. */
+export const PROJECTS_PERSIST_KEY = "sparkle-projects";
+
 export const useProjectStore = create<ProjectState>()(
   persist(
     (set) => ({
@@ -185,6 +192,14 @@ export const useProjectStore = create<ProjectState>()(
       selectProject: (id) =>
         set((s) => ({
           selectedProjectId: id,
+          projects: mapProject(s.projects, id, (p) => ({
+            ...p,
+            lastOpenedAt: new Date().toISOString(),
+          })),
+        })),
+
+      touchProjectOpened: (id) =>
+        set((s) => ({
           projects: mapProject(s.projects, id, (p) => ({
             ...p,
             lastOpenedAt: new Date().toISOString(),
@@ -329,7 +344,7 @@ export const useProjectStore = create<ProjectState>()(
       },
     }),
     {
-      name: "sparkle-projects",
+      name: PROJECTS_PERSIST_KEY,
       storage: createJSONStorage(() => localStorage),
       // Bumped when the persisted shape gains fields. v1 backfills the main-first-defaults
       // fields so legacy records rehydrate with `null` (matching fresh records) rather than

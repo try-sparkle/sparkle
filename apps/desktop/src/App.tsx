@@ -5,6 +5,7 @@ import { useApplyTheme } from "./theme/theme";
 import { useConnectionMonitor } from "./connectionMonitor";
 import { resolveEnvChiefPat } from "./services/chief";
 import { useSettingsStore } from "./stores/settingsStore";
+import { CurrentProjectProvider } from "./windowContext";
 
 export function App() {
   // Single writer of <html data-theme> for the whole app (owns the matchMedia subscription).
@@ -23,5 +24,9 @@ export function App() {
     );
   }, []);
 
-  return <Workspace />;
+  return (
+    <CurrentProjectProvider>
+      <Workspace />
+    </CurrentProjectProvider>
+  );
 }

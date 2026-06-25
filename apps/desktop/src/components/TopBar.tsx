@@ -7,6 +7,14 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { pickProjectFolder, basename } from "../services/dialog";
+import { openProjectInWindow, defaultDeps, type OpenMode } from "../services/projectWindows";
+import { resolveOpenTarget, type OpenTarget } from "../services/openTarget";
+import { OpenTargetDialog } from "./OpenTargetDialog";
+import {
+  useCurrentProjectId,
+  useReplaceCurrentProject,
+  useCurrentWindowLabel,
+} from "../windowContext";
 import { StatusDot } from "./StatusDot";
 
 /** Most common status across a project's agents — drives the project's color (spec). */
@@ -73,9 +81,11 @@ const menuLabel: CSSProperties = {
  */
 export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => void }) {
   const projects = useProjectStore((s) => s.projects);
-  const selectedProjectId = useProjectStore((s) => s.selectedProjectId);
-  const selectProject = useProjectStore((s) => s.selectProject);
   const addProject = useProjectStore((s) => s.addProject);
+  const touchProjectOpened = useProjectStore((s) => s.touchProjectOpened);
+  const currentProjectId = useCurrentProjectId();
+  const replaceCurrent = useReplaceCurrentProject();
+  const windowLabel = useCurrentWindowLabel();
   const statusMap = useRuntimeStore((s) => s.status);
   const zoom = useUiStore((s) => s.zoom);
   const zoomIn = useUiStore((s) => s.zoomIn);
@@ -83,17 +93,43 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const resetZoom = useUiStore((s) => s.resetZoom);
   const [recentOpen, setRecentOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  // A project waiting on a replace/new-window choice (null = dialog closed). A "new" target
+  // carries a not-yet-created folder so we only persist the project once the user actually picks
+  // a target — cancelling the dialog must not leave an orphan project in Recent.
+  const [pending, setPending] = useState<OpenTarget | null>(null);
 
-  const project = projects.find((p) => p.id === selectedProjectId) ?? null;
+  const project = projects.find((p) => p.id === currentProjectId) ?? null;
   // Recent first (most recently opened), so the "Recent Projects" label is honest.
   const recent = [...projects].sort((a, b) =>
     (b.lastOpenedAt ?? b.createdAt).localeCompare(a.lastOpenedAt ?? a.createdAt),
   );
 
-  const pickAndAdd = async (title: string) => {
+  const route = (projectId: string, mode: OpenMode) =>
+    void openProjectInWindow(
+      projectId,
+      mode,
+      defaultDeps(replaceCurrent, touchProjectOpened, windowLabel),
+    );
+
+  // Resolve a pending target to a concrete project id (creating it only now, on commit) and open.
+  const resolveAndRoute = (p: OpenTarget, mode: OpenMode) => {
+    const id = p.kind === "existing" ? p.id : addProject(p.name, p.path);
+    route(id, mode);
+  };
+
+  // No project open in this window → skip the prompt and just take over the window.
+  const openOrAsk = (p: OpenTarget) => {
+    if (!currentProjectId) resolveAndRoute(p, "replace");
+    else setPending(p);
+  };
+
+  const pickAndOpen = async (title: string) => {
     setRecentOpen(false);
-    const path = await pickProjectFolder(title);
-    if (path) addProject(basename(path), path);
+    const picked = await pickProjectFolder(title);
+    if (!picked) return;
+    // Map the folder to an existing project (reuse) or a not-yet-created one — created only on
+    // commit (resolveAndRoute), so cancelling adds nothing.
+    openOrAsk(resolveOpenTarget(picked, projects, basename));
   };
 
   return (
@@ -148,7 +184,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       {/* Push the actions to the right. */}
       <div style={{ flex: 1 }} />
 
-      <button style={btn} onClick={() => void pickAndAdd("Open a project — choose its folder")}>
+      <button style={btn} onClick={() => void pickAndOpen("Open a project — choose its folder")}>
         Open Project
       </button>
 
@@ -191,8 +227,8 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
                 <div
                   key={p.id}
                   onClick={() => {
-                    selectProject(p.id);
                     setRecentOpen(false);
+                    openOrAsk({ kind: "existing", id: p.id });
                   }}
                   title={p.rootPath}
                   style={{
@@ -202,7 +238,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
                     padding: "8px 10px",
                     borderRadius: 6,
                     cursor: "pointer",
-                    background: p.id === selectedProjectId ? C.forest : "transparent",
+                    background: p.id === currentProjectId ? C.forest : "transparent",
                   }}
                 >
                   <StatusDot status={majorityStatus(p, statusMap)} size={8} />
@@ -226,7 +262,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
 
       <button
         style={{ ...btn, borderColor: C.teal, background: C.teal, color: ON_BRAND_FILL }}
-        onClick={() => void pickAndAdd("New project — choose or create its folder")}
+        onClick={() => void pickAndOpen("New project — choose or create its folder")}
       >
         New
       </button>
@@ -286,6 +322,16 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
           </>
         )}
       </div>
+
+      {pending && (
+        <OpenTargetDialog
+          onChoose={(mode) => {
+            resolveAndRoute(pending, mode);
+            setPending(null);
+          }}
+          onCancel={() => setPending(null)}
+        />
+      )}
     </div>
   );
 }

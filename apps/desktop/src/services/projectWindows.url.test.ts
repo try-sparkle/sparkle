@@ -1,0 +1,45 @@
+import { describe, it, expect } from "vitest";
+import {
+  projectWindowUrl,
+  parseProjectIdFromSearch,
+  parseWindowLabelFromSearch,
+  computeInitialProjectId,
+} from "./projectWindows.url";
+
+describe("projectWindows.url", () => {
+  it("builds an index url carrying the project id and opaque label, round-tripping both", () => {
+    const url = projectWindowUrl("abc-123", "win-xyz");
+    const search = url.slice(url.indexOf("?"));
+    expect(parseProjectIdFromSearch(search)).toBe("abc-123");
+    expect(parseWindowLabelFromSearch(search)).toBe("win-xyz");
+  });
+
+  it("parses the project id from a search string", () => {
+    expect(parseProjectIdFromSearch("?project=abc-123")).toBe("abc-123");
+    expect(parseProjectIdFromSearch("?foo=1&project=xy")).toBe("xy");
+  });
+
+  it("parses the window label, null when absent (the main window)", () => {
+    expect(parseWindowLabelFromSearch("?project=p&label=win-9")).toBe("win-9");
+    expect(parseWindowLabelFromSearch("?project=p")).toBeNull();
+    expect(parseWindowLabelFromSearch("")).toBeNull();
+  });
+
+  it("returns null when no project param is present or empty", () => {
+    expect(parseProjectIdFromSearch("")).toBeNull();
+    expect(parseProjectIdFromSearch("?foo=1")).toBeNull();
+    expect(parseProjectIdFromSearch("?project=")).toBeNull();
+  });
+
+  it("computeInitialProjectId: param wins over the restore hint", () => {
+    expect(
+      computeInitialProjectId("?project=p1", { selectedProjectId: "p2", firstProjectId: "p3" }),
+    ).toBe("p1");
+  });
+
+  it("computeInitialProjectId: no param falls back to selected, then first, then null", () => {
+    expect(computeInitialProjectId("", { selectedProjectId: "p2", firstProjectId: "p3" })).toBe("p2");
+    expect(computeInitialProjectId("", { selectedProjectId: null, firstProjectId: "p3" })).toBe("p3");
+    expect(computeInitialProjectId("", { selectedProjectId: null, firstProjectId: null })).toBeNull();
+  });
+});

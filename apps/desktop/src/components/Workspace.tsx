@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { getCurrentWindow, getAllWindows } from "@tauri-apps/api/window";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
@@ -10,19 +11,34 @@ import { OfflineBanner } from "./OfflineBanner";
 import { AgentPane } from "./AgentPane";
 import { SparkleAgentPane } from "./SparkleAgentPane";
 import { ProjectModal } from "./ProjectModal";
+import { ClosePrompt } from "./ClosePrompt";
 import { SPARKLE_AGENT_ID } from "../services/sparkleAgent";
+import {
+  useCurrentProjectId,
+  useIsMainWindow,
+  useCurrentWindowLabel,
+} from "../windowContext";
+import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
+import { killProjectAgents, planWindowClose } from "../services/windowClose";
+import { clearWindowProject } from "../services/windowRegistry";
 
 /** Top-level layout (revised): agents in the left column, the project in the top bar, and
- * the active agent's pane filling the rest. Open agents stay mounted (sessions survive
- * tab/project switches); only the active one is visible. */
+ * the active agent's pane filling the rest. Each window renders only its current project's
+ * open agents; within that project they stay mounted across agent-tab switches (only the
+ * active one is visible). Switching the window to another project ("Replace") unmounts the
+ * displaced project's panes — their PTYs stay alive in Rust, and the panes reattach (replaying
+ * scrollback) when that project is opened again, the same way a fresh window mounts them. */
 export function Workspace() {
   const projects = useProjectStore((s) => s.projects);
-  const selectedProjectId = useProjectStore((s) => s.selectedProjectId);
+  const currentProjectId = useCurrentProjectId();
+  const isMainWindow = useIsMainWindow();
+  const currentWindowLabel = useCurrentWindowLabel();
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
   const open = useRuntimeStore((s) => s.open);
   const reconcile = useRuntimeStore((s) => s.reconcile);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const [settingsProject, setSettingsProject] = useState<Project | null>(null);
+  const [closing, setClosing] = useState(false);
   const zoomIn = useUiStore((s) => s.zoomIn);
   const zoomOut = useUiStore((s) => s.zoomOut);
   const resetZoom = useUiStore((s) => s.resetZoom);
@@ -31,14 +47,35 @@ export function Workspace() {
   // between launches) so a resumed session can't reference a vanished agent (bead ).
   // projectStore hydrates synchronously from localStorage, so the first commit has the full set.
   useEffect(() => {
+    // validIds MUST stay derived from ALL projects, not just this window's current project:
+    // runtimeStore.openAgentIds is shared across windows, so a window-scoped reconcile would
+    // evict other windows' live PTYs from the persisted open set. Keep it global.
     const validIds = projects.flatMap((p) => p.agents.map((a) => a.id));
     // The Sparkle agent is app-owned (never in a project's `agents`), so whitelist its id or
     // reconcile would drop it from the persisted open set on every boot.
     reconcile([...validIds, SPARKLE_AGENT_ID]);
-    // If the Sparkle view was active at last quit, re-mount its pane so it resumes.
-    if (useUiStore.getState().activeSpecial === "sparkle") open(SPARKLE_AGENT_ID);
+    // If the Sparkle view was active at last quit, re-mount its pane so it resumes. The Sparkle
+    // singleton is owned by the main window only (gated below) so it never double-mounts across
+    // windows; don't re-open it in a secondary project window.
+    if (isMainWindow && useUiStore.getState().activeSpecial === "sparkle") open(SPARKLE_AGENT_ID);
     // Run once on mount; the persisted open set is reconciled against the hydrated projects.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Keep this window's project list in sync with changes made in other windows.
+  useEffect(() => subscribeToCrossWindowSync(), []);
+
+  // Intercept the window's close (red traffic light) so we can ask keep-vs-kill before closing.
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlisten: undefined | (() => void);
+    void getCurrentWindow()
+      .onCloseRequested((event) => {
+        event.preventDefault();
+        setClosing(true);
+      })
+      .then((u) => (unlisten = u));
+    return () => unlisten?.();
   }, []);
 
   // Cmd +/- to resize the terminal text, Cmd 0 to reset (matches browser/editor
@@ -62,20 +99,46 @@ export function Workspace() {
     return () => window.removeEventListener("keydown", onKey);
   }, [zoomIn, zoomOut, resetZoom]);
 
-  const project = projects.find((p) => p.id === selectedProjectId) ?? null;
+  const project = projects.find((p) => p.id === currentProjectId) ?? null;
   const activeAgentId = project?.selectedAgentId ?? null;
 
+  // Only mount THIS window's project's agents. Each window owns one project; mounting every
+  // project's agents in every window would attach two xterms to the same PTY.
   const live: Array<{ project: Project; agent: AgentTab }> = [];
-  for (const p of projects) {
-    for (const a of p.agents) {
-      if (openAgentIds.includes(a.id)) live.push({ project: p, agent: a });
+  if (project) {
+    for (const a of project.agents) {
+      if (openAgentIds.includes(a.id)) live.push({ project, agent: a });
     }
   }
   const activeIsOpen = activeAgentId !== null && openAgentIds.includes(activeAgentId);
-  // The Sparkle self-improvement agent is a global singleton, not tied to a project. It mounts
-  // once opened and stays alive; only its visibility flips with the special-view selection.
-  const sparkleActive = activeSpecial === "sparkle";
-  const sparkleOpen = openAgentIds.includes(SPARKLE_AGENT_ID);
+  // The Sparkle self-improvement agent is a global singleton. Gate it to the main window so it
+  // never double-mounts across windows.
+  const sparkleActive = isMainWindow && activeSpecial === "sparkle";
+  const sparkleOpen = isMainWindow && openAgentIds.includes(SPARKLE_AGENT_ID);
+
+  const finishClose = async (mode: "keep" | "kill") => {
+    // Dismiss the prompt immediately so a second click on Keep/Kill (the handler awaits below)
+    // can't re-enter this flow.
+    setClosing(false);
+    const win = getCurrentWindow();
+    // "Keep agents running" keeps a project's PTYs alive only while the app PROCESS lives:
+    // closing a non-last window destroys it but the app stays up (other windows), so its agents
+    // survive; the LAST window is hidden (not destroyed) to keep the process — and thus every
+    // project's kept agents — alive. Choosing "Kill … & close" on the last window quits the app,
+    // which necessarily stops all other projects' kept agents too (standard app-quit semantics).
+    // NOTE: isLast is read from getAllWindows() after an await; two windows closing in the same
+    // frame could both see >1 and both destroy. That's human-impossible at our operating point
+    // and only degrades to the normal last-window-quit; a Rust-side last-window check would be
+    // the robust fix if it ever matters.
+    const all = await getAllWindows();
+    const plan = planWindowClose(mode, all.length <= 1, isMainWindow);
+    if (plan.killAgents && project) await killProjectAgents(project);
+    // Keep the registry mapping when only hiding, so a later open can find and reveal the hidden
+    // window (the Rust RunEvent::Reopen handler re-shows it on Dock click).
+    if (plan.clearRegistry) clearWindowProject(currentWindowLabel);
+    if (plan.hide) await win.hide();
+    else await win.destroy();
+  };
 
   return (
     <div
@@ -101,7 +164,7 @@ export function Workspace() {
               key={agent.id}
               project={p}
               agent={agent}
-              visible={!sparkleActive && p.id === selectedProjectId && agent.id === activeAgentId}
+              visible={!sparkleActive && agent.id === activeAgentId}
             />
           ))}
 
@@ -145,6 +208,15 @@ export function Workspace() {
         <ProjectModal
           project={projects.find((p) => p.id === settingsProject.id) ?? settingsProject}
           onClose={() => setSettingsProject(null)}
+        />
+      )}
+
+      {closing && (
+        <ClosePrompt
+          projectName={project?.name ?? "this project"}
+          onKeep={() => void finishClose("keep")}
+          onKill={() => void finishClose("kill")}
+          onCancel={() => setClosing(false)}
         />
       )}
     </div>

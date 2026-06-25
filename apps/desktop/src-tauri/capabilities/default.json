@@ -1,10 +1,17 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core APIs (events for PTY streaming, window) + native folder dialog + open external URLs.",
-  "windows": ["main"],
+  "description": "Core APIs (events for PTY streaming, window) + native folder dialog + open external URLs. Multi-window: project-* windows created at runtime.",
+  "windows": ["main", "project-*"],
   "permissions": [
     "core:default",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-set-focus",
+    "core:window:allow-unminimize",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
     "dialog:default",
     {
       "identifier": "opener:allow-open-url",
