@@ -30,6 +30,7 @@ function agent(id: string, kind: AgentKind): AgentTab {
     branch: null,
     baseBranch: null,
     lastPrompt: "",
+    promptHistory: [],
     namePinned: false,
     autoNameBasis: null,
     autoNameVariants: null,

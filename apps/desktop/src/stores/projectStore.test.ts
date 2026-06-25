@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { useProjectStore, migratePersisted } from "./projectStore";
+import { useProjectStore, migratePersisted, PROMPT_HISTORY_LIMIT } from "./projectStore";
 
 describe("projectStore default/base branch", () => {
   beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
@@ -105,6 +105,85 @@ describe("projectStore auto-naming", () => {
     useProjectStore.getState().autoRenameAgent(pid, aid, "Auto Name", "some prompt");
     const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
     expect(agent.name).toBe("Auto Name");
+  });
+});
+
+describe("projectStore prompt history", () => {
+  beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
+
+  const seed = () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore.getState().addAgent(pid);
+    return { pid, aid };
+  };
+  const agentOf = (aid: string) =>
+    useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
+
+  it("a fresh agent starts with an empty prompt history", () => {
+    const { aid } = seed();
+    expect(agentOf(aid).promptHistory).toEqual([]);
+  });
+
+  it("appendPrompt sets lastPrompt, appends oldest-first, and returns the new entry's id", () => {
+    const { pid, aid } = seed();
+    const id1 = useProjectStore.getState().appendPrompt(pid, aid, "first");
+    const id2 = useProjectStore.getState().appendPrompt(pid, aid, "second");
+    const agent = agentOf(aid);
+    expect(agent.lastPrompt).toBe("second");
+    expect(agent.promptHistory.map((e) => e.text)).toEqual(["first", "second"]);
+    // The returned id matches the appended entry, so the caller can key a scroll marker to it.
+    expect(agent.promptHistory[0]!.id).toBe(id1);
+    expect(agent.promptHistory[1]!.id).toBe(id2);
+    expect(id1).not.toBe(id2);
+    expect(typeof agent.promptHistory[0]!.at).toBe("number");
+  });
+
+  it("keeps identical prompts as distinct entries (each is its own conversation point)", () => {
+    const { pid, aid } = seed();
+    useProjectStore.getState().appendPrompt(pid, aid, "same");
+    useProjectStore.getState().appendPrompt(pid, aid, "same");
+    expect(agentOf(aid).promptHistory).toHaveLength(2);
+  });
+
+  it("caps the history to the most recent PROMPT_HISTORY_LIMIT entries", () => {
+    const { pid, aid } = seed();
+    for (let i = 0; i < PROMPT_HISTORY_LIMIT + 5; i++) {
+      useProjectStore.getState().appendPrompt(pid, aid, `p${i}`);
+    }
+    const hist = agentOf(aid).promptHistory;
+    expect(hist).toHaveLength(PROMPT_HISTORY_LIMIT);
+    // The oldest five fell off; the newest is retained.
+    expect(hist[0]!.text).toBe("p5");
+    expect(hist[hist.length - 1]!.text).toBe(`p${PROMPT_HISTORY_LIMIT + 4}`);
+  });
+
+  it("migrate (v5) backfills promptHistory as [] without seeding from lastPrompt", () => {
+    // A v4 record already has autoNameVariants but predates the prompt-history field.
+    const v4 = {
+      projects: [
+        {
+          id: "p",
+          name: "Old",
+          rootPath: "/x",
+          defaultBranch: "main",
+          agents: [
+            {
+              id: "a",
+              name: "A",
+              kind: "build",
+              parentId: null,
+              lastPrompt: "old prompt",
+              autoNameVariants: null,
+            },
+          ],
+        },
+      ],
+      selectedProjectId: null,
+    } as unknown;
+    const out = migratePersisted(v4, 4) as {
+      projects: Array<{ agents: Array<{ promptHistory: unknown }> }>;
+    };
+    expect(out.projects[0]!.agents[0]!.promptHistory).toEqual([]);
   });
 });
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import { prepareAgentWorkspace, installWorktreeGuard, assertWorkspaceIntegrity } from "../services/worktree";
 import { resolveDefaultBranch } from "../services/branchStatus";
@@ -12,7 +12,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { PinnedPrompt } from "./PinnedPrompt";
-import { Terminal } from "./Terminal";
+import { Terminal, type TerminalApi } from "./Terminal";
 import { Composer } from "./Composer";
 import { Onboarding } from "./Onboarding";
 import { BrainstormPanel } from "./BrainstormPanel";
@@ -44,7 +44,7 @@ export function AgentPane({
   const [spawn, setSpawn] = useState<SpawnCmd | null>(null);
   const [ptyReady, setPtyReady] = useState(false);
   const setAgentWorktree = useProjectStore((s) => s.setAgentWorktree);
-  const setLastPrompt = useProjectStore((s) => s.setLastPrompt);
+  const appendPrompt = useProjectStore((s) => s.appendPrompt);
   const setStatus = useRuntimeStore((s) => s.setStatus);
   // Tracks whether the last spawn was a fresh session (not a --continue resume). Used in the
   // worker exit handler to skip stale result re-reads on resumed sessions.
@@ -55,6 +55,19 @@ export function AgentPane({
   // minimizes (or on ⌘J) without the user clicking the terminal.
   const termFocusRef = useRef<(() => void) | null>(null);
   const composerMinimized = useUiStore((s) => s.composerMinimized);
+  // Imperative bridge to the terminal: mark where each prompt was sent, scroll back to it on pick.
+  const terminalApiRef = useRef<TerminalApi | null>(null);
+  // Brief toast when a picked prompt's line has scrolled out of the terminal's history.
+  const [scrolledOut, setScrolledOut] = useState(false);
+  const scrolledOutTimer = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (scrolledOutTimer.current) window.clearTimeout(scrolledOutTimer.current);
+  }, []);
+  const flashScrolledOut = () => {
+    setScrolledOut(true);
+    if (scrolledOutTimer.current) window.clearTimeout(scrolledOutTimer.current);
+    scrolledOutTimer.current = window.setTimeout(() => setScrolledOut(false), 2600);
+  };
 
   const prepare = async () => {
     // Brainstorm agents are a Chief chat — no worktree, no PTY, nothing to prepare.
@@ -176,7 +189,15 @@ export function AgentPane({
 
       {agent.kind !== "brainstorm" && (
         <>
-      <PinnedPrompt prompt={agent.lastPrompt} />
+      <PinnedPrompt
+        prompt={agent.lastPrompt}
+        history={agent.promptHistory ?? []}
+        onSelectPrompt={(id) => {
+          // scrollToPrompt returns false when the line has scrolled out of the buffer (or the
+          // marker never existed — e.g. a prompt from a previous session after a restart).
+          if (!terminalApiRef.current?.scrollToPrompt(id)) flashScrolledOut();
+        }}
+      />
 
       {phase === "preparing" && (
         <Centered>Preparing your agent's safe workspace…</Centered>
@@ -233,6 +254,7 @@ export function AgentPane({
               }}
               onRequestFocus={() => composerInputRef.current?.focus()}
               focusRef={termFocusRef}
+              apiRef={terminalApiRef}
             />
           </div>
           <Composer
@@ -241,16 +263,48 @@ export function AgentPane({
             disabled={!ptyReady}
             inputRef={composerInputRef}
             onSubmitPrompt={(t) => {
-              setLastPrompt(project.id, agent.id, t);
+              // Record the prompt (pinned header + history) and mark where it landed in the
+              // terminal so the history dropdown can scroll back to it later.
+              const id = appendPrompt(project.id, agent.id, t);
+              terminalApiRef.current?.markPrompt(id);
               // Fire-and-forget: summarize the work into a short name (first prompt, or when
               // the work shifts). No-ops if the name is pinned or no API key is configured.
               void maybeAutoName(project.id, agent.id, t);
             }}
           />
+          {scrolledOut && <ScrolledOutToast />}
         </div>
       )}
         </>
       )}
+    </div>
+  );
+}
+
+// Shown briefly when a picked history prompt can't be located in the terminal's scrollback
+// (its line aged out of the 8000-line buffer, or it's from a previous session). Mirrors the
+// terminal's copy-confirmation toast styling. pointer-events:none so it never blocks the UI.
+function ScrolledOutToast() {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: 12,
+        left: "50%",
+        transform: "translateX(-50%)",
+        padding: "6px 14px",
+        borderRadius: 8,
+        background: C.deepForest,
+        color: C.cream,
+        border: `1px solid ${CHAT_USER_BUBBLE}`,
+        fontFamily: '"IBM Plex Sans", sans-serif',
+        fontSize: 13,
+        boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
+        pointerEvents: "none",
+        zIndex: 30,
+      }}
+    >
+      ⌁ That part of the conversation has scrolled out of the terminal's history
     </div>
   );
 }

@@ -5,6 +5,10 @@ import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import type { AgentKind, AgentNameVariants, AgentTab, Project } from "../types";
 
+// Cap on how many prompts we keep per agent so the persisted localStorage record stays bounded.
+// The oldest entries fall off; the most recent PROMPT_HISTORY_LIMIT are kept.
+export const PROMPT_HISTORY_LIMIT = 100;
+
 // Options for creating an agent. `kind` defaults to "build" (the orchestrator you talk to);
 // `parentId` is set only for workers spawned under a build agent.
 export interface AddAgentOpts {
@@ -60,7 +64,10 @@ interface ProjectState {
   setNamePinned: (projectId: string, agentId: string, pinned: boolean) => void;
   selectAgent: (projectId: string, agentId: string) => void;
   setAgentWorktree: (projectId: string, agentId: string, path: string, branch: string) => void;
-  setLastPrompt: (projectId: string, agentId: string, prompt: string) => void;
+  /** Record a submitted prompt: updates `lastPrompt` (pinned header) AND appends to
+   *  `promptHistory` (capped). Returns the new entry's id so the caller can register the matching
+   *  terminal scroll marker under the same key. */
+  appendPrompt: (projectId: string, agentId: string, text: string) => string;
 }
 
 function mapProject(
@@ -121,6 +128,19 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
       agents: (p.agents ?? []).map((a) => ({
         ...a,
         autoNameVariants: a.autoNameVariants ?? null,
+      })),
+    }));
+  }
+  if (version < 5) {
+    // Prompt history (pinned-header dropdown). Backfill an empty array so existing agents
+    // rehydrate with a defined list. We intentionally do NOT seed it from the legacy single
+    // `lastPrompt`: that prompt predates the feature so it has no scroll marker, and its submit
+    // time is unknown — history simply starts accumulating from the next prompt.
+    state.projects = state.projects.map((p) => ({
+      ...p,
+      agents: (p.agents ?? []).map((a) => ({
+        ...a,
+        promptHistory: a.promptHistory ?? [],
       })),
     }));
   }
@@ -207,6 +227,7 @@ export const useProjectStore = create<ProjectState>()(
               branch: null,
               baseBranch: p.defaultBranch,
               lastPrompt: "",
+              promptHistory: [],
               task: opts?.task,
               parentBranch: opts?.parentBranch,
               // Pin only an explicit caller-supplied name (opts.name — e.g. an import): that's a
@@ -289,12 +310,23 @@ export const useProjectStore = create<ProjectState>()(
           ),
         })),
 
-      setLastPrompt: (projectId, agentId, prompt) =>
+      appendPrompt: (projectId, agentId, text) => {
+        const id = uuid();
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
-            mapAgent(p, agentId, (a) => ({ ...a, lastPrompt: prompt })),
+            mapAgent(p, agentId, (a) => ({
+              ...a,
+              lastPrompt: text,
+              // Append newest-last, then keep only the most recent entries so the persisted
+              // record can't grow without bound. The dropdown reverses this for display.
+              promptHistory: [...(a.promptHistory ?? []), { id, text, at: Date.now() }].slice(
+                -PROMPT_HISTORY_LIMIT,
+              ),
+            })),
           ),
-        })),
+        }));
+        return id;
+      },
     }),
     {
       name: "sparkle-projects",
@@ -304,8 +336,9 @@ export const useProjectStore = create<ProjectState>()(
       // `undefined` — an undefined baseBranch would otherwise send "" to the git commands.
       // v2 backfills the auto-naming fields (namePinned/autoNameBasis). v3 backfills the
       // Brainstorm/Build kind + parentId (separate step so records already at v2 still get them).
-      // v4 backfills autoNameVariants (width-fitted names) to null.
-      version: 4,
+      // v4 backfills autoNameVariants (width-fitted names) to null. v5 backfills promptHistory
+      // (the pinned-header dropdown) as an empty array.
+      version: 5,
       migrate: (persisted, version) => migratePersisted(persisted, version) as ProjectState,
     },
   ),
