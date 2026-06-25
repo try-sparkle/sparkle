@@ -6,6 +6,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { AgentSidebar } from "./AgentSidebar";
 import { TopBar } from "./TopBar";
+import { OfflineBanner } from "./OfflineBanner";
 import { AgentPane } from "./AgentPane";
 import { SparkleAgentPane } from "./SparkleAgentPane";
 import { ProjectModal } from "./ProjectModal";
@@ -80,6 +81,7 @@ export function Workspace() {
     <div
       style={{
         display: "flex",
+        flexDirection: "column",
         height: "100vh",
         width: "100vw",
         background: C.forest,
@@ -87,9 +89,12 @@ export function Workspace() {
         fontFamily: '"IBM Plex Sans", sans-serif',
       }}
     >
-      <AgentSidebar project={project} />
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-        <TopBar onOpenSettings={setSettingsProject} />
+      {/* Spans the very top of the app, just below the window chrome, above the sidebar + bar. */}
+      <OfflineBanner />
+      <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
+        <AgentSidebar project={project} />
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+          <TopBar onOpenSettings={setSettingsProject} />
         <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
           {live.map(({ project: p, agent }) => (
             <AgentPane
@@ -132,6 +137,7 @@ export function Workspace() {
               </button>
             </Hint>
           )}
+          </div>
         </div>
       </div>
 

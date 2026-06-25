@@ -9,6 +9,7 @@ import {
   pollForResponse,
   ChiefError,
 } from "../services/chief";
+import { registerBrainstorm } from "../services/brainstormBridge";
 
 interface ChatMsg {
   role: "user" | "assistant";
@@ -21,7 +22,7 @@ interface ChatMsg {
  * after the Sparkle project, then every turn chats over that project's content. No worktree,
  * no PTY — this is a knowledge conversation, not a build agent. (Epic , phase .)
  */
-export function BrainstormPanel({ project }: { project: Project }) {
+export function BrainstormPanel({ project, agentId }: { project: Project; agentId: string }) {
   const chiefPatStored = useSettingsStore((s) => s.chiefPat);
   const runtimeChiefPat = useSettingsStore((s) => s.runtimeChiefPat);
   const setChiefPat = useSettingsStore((s) => s.setChiefPat);
@@ -73,15 +74,15 @@ export function BrainstormPanel({ project }: { project: Project }) {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages, sending]);
 
-  const send = async () => {
-    const prompt = input.trim();
+  // Core send, given an explicit prompt. Used by the composer (the typed message) and by the
+  // connectivity re-query (a "status update" nudge delivered through the brainstorm bridge).
+  const sendText = async (prompt: string) => {
     if (!prompt || sending) return;
     if (!pat) {
       setError("Connect Chief first.");
       return;
     }
     setError("");
-    setInput("");
     setMessages((m) => [...m, { role: "user", text: prompt }]);
     setSending(true);
     try {
@@ -110,6 +111,27 @@ export function BrainstormPanel({ project }: { project: Project }) {
       setSending(false);
     }
   };
+
+  // The composer's send: take the typed input, clear it, and dispatch.
+  const send = () => {
+    const prompt = input.trim();
+    if (!prompt || sending) return; // don't clear the box if a turn is already in flight
+    setInput("");
+    void sendText(prompt);
+  };
+
+  // Register this panel so the connectivity re-query can deliver its "status update" nudge here.
+  // We keep the latest sendText in a ref (it closes over state that changes each render) and
+  // register a stable wrapper once per agent. The nudge only fires for an already-active
+  // conversation — there's nothing to "update" on a chat that never started.
+  const sendTextRef = useRef(sendText);
+  sendTextRef.current = sendText;
+  useEffect(() => {
+    return registerBrainstorm(agentId, (text) => {
+      if (!chatIdRef.current) return; // no conversation yet — skip
+      void sendTextRef.current(text);
+    });
+  }, [agentId]);
 
   // ---- No PAT yet: connect state -------------------------------------------------
   if (!pat) {

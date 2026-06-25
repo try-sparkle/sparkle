@@ -1,6 +1,7 @@
 mod audio;
 mod chief;
 mod claude;
+mod connectivity;
 mod dictation;
 mod logging;
 mod model;
@@ -62,6 +63,7 @@ pub fn run() {
             logging::reveal_logs,
             logging::frontend_log,
             naming::generate_agent_name,
+            connectivity::probe_connectivity,
             chief::chief_pat
         ])
         // TODO(phase1):

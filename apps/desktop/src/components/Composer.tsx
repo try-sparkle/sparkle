@@ -9,7 +9,7 @@ import {
 } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../theme/colors";
-import { writePty } from "../pty";
+import { submitPrompt } from "../pty";
 import { captureScreenRegion, type Screenshot } from "../screenshot";
 import {
   useUiStore,
@@ -26,12 +26,6 @@ import { useDictationStore } from "../stores/dictationStore";
 import { log } from "../logger";
 
 const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140);
-
-// Bracketed-paste wrappers: ESC[200~ … ESC[201~. ESC is char code 27 — constructed
-// here so the source file contains no literal ESC byte.
-const ESC = String.fromCharCode(27);
-const PASTE_START = `${ESC}[200~`;
-const PASTE_END = `${ESC}[201~`;
 
 /** Simple camera glyph for the screen-capture button. Inherits color via currentColor. */
 function CameraIcon() {
@@ -266,9 +260,7 @@ export function Composer({
     setAttachments([]);
     log.info("composer", "send prompt", { agentId, chars: text.length, shots: shots.length });
     onSubmitPrompt(display);
-    await writePty(agentId, `${PASTE_START}${payload}${PASTE_END}`);
-    await new Promise((r) => setTimeout(r, 60));
-    await writePty(agentId, "\r");
+    await submitPrompt(agentId, payload);
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {

@@ -39,6 +39,22 @@ export function writePty(id: string, data: string): Promise<void> {
   return invoke("pty_write", { id, data });
 }
 
+// Bracketed-paste wrappers: ESC[200~ … ESC[201~. ESC is char code 27 — constructed here so
+// the source contains no literal ESC byte. Pasting (vs. raw typing) lets the CLI treat a
+// multi-line prompt as one atomic block.
+const ESC = String.fromCharCode(27);
+export const PASTE_START = `${ESC}[200~`;
+export const PASTE_END = `${ESC}[201~`;
+
+/** Submit a full prompt to an agent's PTY: deliver it as one bracketed paste, then (after a
+ *  beat, so the CLI has finished ingesting the paste) a carriage return to send it. Shared by
+ *  the composer and the connectivity re-query. */
+export async function submitPrompt(id: string, text: string): Promise<void> {
+  await writePty(id, `${PASTE_START}${text}${PASTE_END}`);
+  await new Promise((r) => setTimeout(r, 60));
+  await writePty(id, "\r");
+}
+
 export function resizePty(id: string, cols: number, rows: number): Promise<void> {
   return invoke("pty_resize", { id, cols, rows });
 }

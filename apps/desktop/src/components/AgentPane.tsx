@@ -136,7 +136,7 @@ export function AgentPane({
       }}
     >
       {/* Brainstorm agents render a Chief chat instead of a Claude terminal. */}
-      {agent.kind === "brainstorm" && <BrainstormPanel project={project} />}
+      {agent.kind === "brainstorm" && <BrainstormPanel project={project} agentId={agent.id} />}
 
       {agent.kind !== "brainstorm" && (
         <>
