@@ -1,4 +1,5 @@
 mod audio;
+mod bridge;
 mod chief;
 mod claude;
 mod connectivity;
@@ -25,6 +26,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(PtyManager::default())
         .manage(dictation::DictationState::default())
+        .manage(bridge::BridgeManager::default())
         .setup(|app| {
             // Stand up unified logging before anything else so startup itself is captured.
             match logging::init(&app.handle()) {
@@ -69,7 +71,9 @@ pub fn run() {
             logging::frontend_log,
             naming::generate_agent_name,
             connectivity::probe_connectivity,
-            chief::chief_pat
+            chief::chief_pat,
+            bridge::start_orchestration_bridge,
+            bridge::stop_orchestration_bridge
         ])
         // TODO(phase1):
         //  - deep-link handler for sparkle://oauth/callback (only if/when Anthropic

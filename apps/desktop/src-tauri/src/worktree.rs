@@ -25,6 +25,11 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path().app_data_dir().map_err(|e| format!("no app data dir: {e}"))
 }
 
+/// Public wrapper around `app_data_dir` for use by other modules (e.g. bridge.rs).
+pub fn app_data_dir_pub(app: &AppHandle) -> Result<PathBuf, String> {
+    app_data_dir(app)
+}
+
 #[derive(Serialize)]
 pub struct WorktreeInfo {
     /// Absolute path to the agent's isolated worktree directory.
