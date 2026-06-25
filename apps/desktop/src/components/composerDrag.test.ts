@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { resolveComposerDrag, shouldRestoreFromBar } from "./composerDrag";
+import {
+  resolveComposerDrag,
+  resolveComposerRenderHeight,
+  shouldRestoreFromBar,
+} from "./composerDrag";
 
 // Fixed geometry for deterministic tests (mirrors the uiStore constants closely):
 // snap = the "covers the terminal input" rest height; min = open-height floor.
@@ -90,6 +94,52 @@ describe("resolveComposerDrag", () => {
     const r = resolveComposerDrag({ startHeight: 120, startMinimized: false, dy: -90 }, opts);
     expect(r.minimized).toBe(true);
     expect(r.height).toBe(120);
+  });
+});
+
+describe("resolveComposerRenderHeight", () => {
+  const geo = { min: 64, cap: 600 };
+
+  it("auto-grows to fit the draft when the user hasn't manually sized it", () => {
+    expect(
+      resolveComposerRenderHeight({ height: 72, desired: 250, userSized: false, ...geo }),
+    ).toBe(250);
+  });
+
+  it("rests at the fit-to-content height for a short draft in auto-grow mode", () => {
+    expect(
+      resolveComposerRenderHeight({ height: 72, desired: 78, userSized: false, ...geo }),
+    ).toBe(78);
+  });
+
+  it("caps auto-grow at the viewport ceiling", () => {
+    expect(
+      resolveComposerRenderHeight({ height: 72, desired: 5000, userSized: false, ...geo }),
+    ).toBe(600);
+  });
+
+  it("honors a manually dragged height SHORTER than the draft (the draft scrolls)", () => {
+    // The regression this fixes: dragging the handle DOWN used to have no visible effect —
+    // the content's fit-height (250) always won over the dragged height. Now a user-sized 100
+    // wins and the textarea scrolls. This is the "can size up but not down" bug.
+    expect(
+      resolveComposerRenderHeight({ height: 100, desired: 250, userSized: true, ...geo }),
+    ).toBe(100);
+  });
+
+  it("honors a manually dragged height TALLER than the draft (empty space below)", () => {
+    expect(
+      resolveComposerRenderHeight({ height: 300, desired: 78, userSized: true, ...geo }),
+    ).toBe(300);
+  });
+
+  it("clamps a user-sized height to [min, cap]", () => {
+    expect(
+      resolveComposerRenderHeight({ height: 9999, desired: 78, userSized: true, ...geo }),
+    ).toBe(600);
+    expect(
+      resolveComposerRenderHeight({ height: 10, desired: 78, userSized: true, ...geo }),
+    ).toBe(64);
   });
 });
 

@@ -44,6 +44,14 @@ export type AgentOrdering = "attention" | "manual";
 interface UiState {
   composerHeight: number;
   setComposerHeight: (h: number) => void;
+  // Whether the user has hand-sized the composer by dragging the handle to a real height
+  // (anything other than the snap rest). When true, composerHeight is the composer's ACTUAL
+  // height (the textarea scrolls past it) instead of just a floor the draft can grow above —
+  // that's what lets the handle drag the box SHORTER than its content, not only taller.
+  // Dragging back to the snap rest clears it, re-enabling auto-grow. Persisted so the choice
+  // survives relaunch. (Existing users default to false and flip true on their next resize.)
+  composerUserSized: boolean;
+  setComposerUserSized: (v: boolean) => void;
   // Whether the composer is tucked into its slim bar (terminal input exposed). Persisted
   // globally so it stays minimized across every agent tab and across relaunch, until the
   // user brings it back. composerHeight remembers the open size to restore to.
@@ -74,6 +82,8 @@ export const useUiStore = create<UiState>()(
     (set) => ({
       composerHeight: COMPOSER_DEFAULT,
       setComposerHeight: (h) => set({ composerHeight: Math.max(COMPOSER_MIN, h) }),
+      composerUserSized: false,
+      setComposerUserSized: (v) => set({ composerUserSized: v }),
       composerMinimized: false,
       setComposerMinimized: (v) => set({ composerMinimized: v }),
       zoom: ZOOM_DEFAULT,

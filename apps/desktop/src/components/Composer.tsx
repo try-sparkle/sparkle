@@ -21,7 +21,11 @@ import {
   COMPOSER_RESTORE_THRESHOLD,
 } from "../stores/uiStore";
 import { usePromptHistoryStore, computeGhost } from "../stores/promptHistoryStore";
-import { resolveComposerDrag, shouldRestoreFromBar } from "./composerDrag";
+import {
+  resolveComposerDrag,
+  resolveComposerRenderHeight,
+  shouldRestoreFromBar,
+} from "./composerDrag";
 import { isComposerToggleKey } from "./composerToggle";
 import { useDictationStore } from "../stores/dictationStore";
 import { log } from "../logger";
@@ -123,6 +127,8 @@ export function Composer({
   const setComposerHeight = useUiStore((s) => s.setComposerHeight);
   const minimized = useUiStore((s) => s.composerMinimized);
   const setMinimized = useUiStore((s) => s.setComposerMinimized);
+  const userSized = useUiStore((s) => s.composerUserSized);
+  const setComposerUserSized = useUiStore((s) => s.setComposerUserSized);
   const dragRef = useRef<{ startY: number; startH: number; startMin: boolean } | null>(null);
 
   // The composer auto-grows upward to fit the typed message. `height` (the persisted,
@@ -163,14 +169,24 @@ export function Composer({
       ta.style.flex = prevFlex;
       ta.style.height = prevHeight;
       const desired = overhead + contentH + borderY;
-      const next = Math.max(height, Math.min(maxComposerHeight(), desired));
+      // Once the user has hand-sized the composer, `height` IS the rendered height (the draft
+      // scrolls past it) — so the handle can drag it shorter than its content. Until then the
+      // composer auto-grows from the rest height to fit the draft. (Pure policy in composerDrag.)
+      const next = resolveComposerRenderHeight({
+        height,
+        desired,
+        userSized,
+        min: COMPOSER_MIN,
+        cap: maxComposerHeight(),
+      });
       setAutoHeight(next);
     };
     recomputeHeightRef.current();
     // `minimized` is a dep so autoHeight re-measures on restore: while minimized the textarea is
     // unmounted and the measurement early-returns (autoHeight freezes), so without this a
     // minimize→restore that changes nothing else would show the stale pre-minimize height.
-  }, [value, height, attachments.length, minimized]);
+    // `userSized` is a dep so toggling manual control re-resolves the height immediately.
+  }, [value, height, attachments.length, minimized, userSized]);
 
   // The viewport cap depends on window height — re-measure on resize. Registered once.
   useEffect(() => {
@@ -372,6 +388,17 @@ export function Composer({
     );
     setComposerHeight(r.height);
     setMinimized(r.minimized);
+    // A resize drag (not a minimize) hands manual control to the user, so the dragged height
+    // becomes the composer's actual height — letting them size it DOWN past the content. Landing
+    // back on the snap rest clears that, re-enabling auto-grow. Minimize drags don't touch the
+    // flag, so a minimize→restore returns to whatever mode the composer was in.
+    // The equality is exact because withSnap() (composerDrag.ts) returns precisely COMPOSER_SNAP
+    // inside the magnet range. Guard the write so we only touch the persisted store when the
+    // mode actually flips, not on every move frame of the drag.
+    if (!r.minimized) {
+      const nextSized = r.height !== COMPOSER_SNAP;
+      if (nextSized !== userSized) setComposerUserSized(nextSized);
+    }
   };
   const onHandleUp = (e: PointerEvent<HTMLDivElement>) => {
     const d = dragRef.current;

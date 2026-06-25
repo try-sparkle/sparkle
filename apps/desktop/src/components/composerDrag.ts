@@ -69,6 +69,33 @@ export function resolveComposerDrag(
   return { minimized: false, height: withSnap(clamp(raw, o.min, o.max), o) };
 }
 
+export interface ComposerHeightInput {
+  // The persisted height the user last chose by dragging (or the default rest height).
+  height: number;
+  // The measured height that would show the whole draft without scrolling (chrome + content).
+  desired: number;
+  // Has the user taken manual control by dragging the handle to a real size? When true the
+  // composer is pinned to `height` and the textarea scrolls if the draft overflows — this is
+  // what lets the composer be dragged SHORTER than its content. When false the composer
+  // auto-grows from the rest height to fit the draft (the out-of-the-box behavior for quick
+  // messages that haven't been hand-sized).
+  userSized: boolean;
+  min: number; // open-height floor
+  cap: number; // viewport-dependent ceiling (maxComposerHeight)
+}
+
+// Resolve the composer's actual rendered height. Two modes:
+//  • userSized → honor the dragged height exactly, clamped to [min, cap]; the textarea scrolls
+//    when the draft is taller. This is what makes the handle able to size the composer DOWN,
+//    not just up: content no longer forces the box open.
+//  • auto-grow → max(rest height, fit-to-content), capped to the viewport. Empty/short drafts
+//    rest small; a long draft pushes the box taller up to the cap, then it scrolls.
+// Kept pure (no DOM) so the height policy is unit-tested alongside the drag geometry.
+export function resolveComposerRenderHeight(p: ComposerHeightInput): number {
+  if (p.userSized) return clamp(p.height, p.min, p.cap);
+  return clamp(Math.max(p.height, Math.min(p.cap, p.desired)), p.min, p.cap);
+}
+
 // Should releasing the handle bring the composer back from the minimized bar? Used by the
 // pointer-UP handler so a click — or any upward tug the snap math intentionally left minimized
 // (the sub-threshold dead-zone) — restores, while a downward tug (abort) does not. Restore
