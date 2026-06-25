@@ -3,10 +3,11 @@
 // lives in Rust — not the webview — so the BYOK Anthropic key never ships in the JS
 // bundle and we can read it from the user's `.env.local` on disk.
 //
-// Key resolution (first hit wins): ANTHROPIC_API_KEY env, ANTHROPIC_API env, then a
-// `.env.local` walked up from the working dir / the executable, finally
-// `$HOME/Projects/sparkle/.env.local`. Either `ANTHROPIC_API_KEY=` or `ANTHROPIC_API=`
-// is accepted inside the file (the user named theirs `ANTHROPIC_API`).
+// Key resolution (first hit wins): ANTHROPIC_API_KEY env, ANTHROPIC_API env, then `.env.local`
+// at EXACT paths only — the current dir (DEBUG builds only) and `$HOME/Projects/sparkle/.env.local`.
+// We deliberately do NOT walk parent directories (that was a key-injection vector); see
+// `resolve_anthropic_key`. Either `ANTHROPIC_API_KEY=` or `ANTHROPIC_API=` is accepted inside the
+// file (the user named theirs `ANTHROPIC_API`).
 //
 // Everything degrades gracefully: no key, or any network/parse failure, returns Err — the
 // frontend treats that as "leave the current name alone", so the feature is a no-op until
@@ -47,24 +48,29 @@ fn parse_env_value(body: &str, keys: &[&str]) -> Option<String> {
     None
 }
 
-/// Walk `start` and its ancestors looking for a `.env.local` that defines a key.
-fn search_dotenv(start: &Path, keys: &[&str]) -> Option<String> {
-    for dir in start.ancestors() {
-        let candidate = dir.join(".env.local");
-        if let Ok(body) = std::fs::read_to_string(&candidate) {
-            if let Some(v) = parse_env_value(&body, keys) {
-                return Some(v);
-            }
-        }
-    }
-    None
+/// Read ONE dotenv file at the exact `path` and pull the first matching key. Deliberately not
+/// a directory walk — see `resolve_anthropic_key` for why ancestor traversal is unsafe.
+fn read_dotenv_key(path: &Path, keys: &[&str]) -> Option<String> {
+    let body = std::fs::read_to_string(path).ok()?;
+    parse_env_value(&body, keys)
 }
 
-/// Best-effort secret lookup shared by the BYOK integrations (Anthropic key, Chief PAT). Tries,
-/// in order: each name in `keys` as a process env var → a `.env.local` walked up from the cwd →
-/// the same from the executable's dir → the known dev location `$HOME/Projects/sparkle/.env.local`.
-/// First non-empty hit wins; None if nothing matches. Reading at runtime (not build time) keeps
-/// secrets out of the shipped JS bundle and binary.
+/// Best-effort secret lookup shared by the BYOK integrations (Anthropic key, Chief PAT).
+/// Resolution order (first non-empty wins):
+///   1. each name in `keys` as a process env var (all builds).
+///   2. DEBUG builds only: `.env.local` in the process's current dir (the repo root in `tauri dev`).
+///   3. `$HOME/Projects/sparkle/.env.local` — the known dev repo location (all builds).
+///
+/// SECURITY: we read only those EXACT paths and never walk parent directories. A prior version
+/// walked the ancestors of `current_dir()` and `current_exe()` for any `.env.local`, which let
+/// anyone who could drop a `.env.local` into a parent dir of the app's working/exe dir (a shared
+/// project folder, `/Applications`, a temp dir the CWD happened to land in) substitute their OWN
+/// secret — a key-injection vector. The CWD read (#2) is itself a narrower variant (current_dir()
+/// is wherever the binary was launched from), so it's gated to DEBUG builds and never compiled
+/// into the packaged app; the `$HOME/Projects/sparkle` path (#3) sits inside the user's own home,
+/// where writing already implies the user's own privileges. Reading at runtime (not build time)
+/// keeps secrets out of the shipped bundle/binary. (Longer term these should live in the OS
+/// keychain — see the TODO in lib.rs.)
 pub(crate) fn resolve_env_secret(keys: &[&str]) -> Option<String> {
     for k in keys {
         if let Ok(v) = std::env::var(k) {
@@ -75,25 +81,19 @@ pub(crate) fn resolve_env_secret(keys: &[&str]) -> Option<String> {
         }
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(v) = search_dotenv(&cwd, keys) {
-            return Some(v);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if let Some(v) = search_dotenv(dir, keys) {
+    // Dev convenience only — not compiled into release/packaged builds (see SECURITY note).
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Some(v) = read_dotenv_key(&cwd.join(".env.local"), keys) {
                 return Some(v);
             }
         }
     }
-    // Known dev location: the repo the desktop app is built from.
     if let Some(home) = std::env::var_os("HOME") {
         let dev = PathBuf::from(home).join("Projects/sparkle/.env.local");
-        if let Ok(body) = std::fs::read_to_string(&dev) {
-            if let Some(v) = parse_env_value(&body, keys) {
-                return Some(v);
-            }
+        if let Some(v) = read_dotenv_key(&dev, keys) {
+            return Some(v);
         }
     }
     None
@@ -157,10 +157,16 @@ fn call_anthropic(key: &str, prompt: &str) -> Result<String, String> {
     let raw = match resp {
         Ok(r) => r.into_string().map_err(|e| format!("read body: {e}"))?,
         Err(ureq::Error::Status(code, r)) => {
+            // Don't surface the upstream response body to the UI: it can echo request context,
+            // and the API key lives in this function. Log it for debugging, return a generic msg.
             let detail = r.into_string().unwrap_or_default();
-            return Err(format!("Anthropic HTTP {code}: {detail}"));
+            tracing::debug!(code, detail = %detail, "anthropic naming call returned an error status");
+            return Err(format!("naming failed (Anthropic HTTP {code})"));
         }
-        Err(e) => return Err(format!("request failed: {e}")),
+        Err(e) => {
+            tracing::debug!(error = %e, "anthropic naming request failed");
+            return Err("naming request failed".into());
+        }
     };
     let json: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("bad JSON: {e}"))?;
@@ -191,10 +197,13 @@ mod tests {
 
     #[test]
     fn parses_either_key_name() {
-        let body = "# comment\nANTHROPIC_API=\"dummy-value-123\"\nOTHER=1\n";
+        // Fixture value is a deliberately non-secret-shaped placeholder: this test only
+        // exercises dotenv parsing, and a real key prefix here would (correctly) trip the
+        // publish leak-gate since this file is in the public export.
+        let body = "# comment\nANTHROPIC_API=\"dummy-key-value\"\nOTHER=1\n";
         assert_eq!(
             parse_env_value(body, &["ANTHROPIC_API_KEY", "ANTHROPIC_API"]),
-            Some("dummy-value-123".to_string())
+            Some("dummy-key-value".to_string())
         );
     }
 

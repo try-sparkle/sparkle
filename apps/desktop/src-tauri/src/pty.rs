@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -40,6 +41,59 @@ struct PtyEnd {
     id: String,
 }
 
+/// Defense-in-depth checks before spawning — NOT the primary security boundary.
+///
+/// `pty_spawn` exists to launch the user's own `claude` via `/bin/zsh -lc '…'`, so by design
+/// it runs whatever shell script the webview hands it; a binary allowlist can't change that
+/// (`/bin/zsh -c '<anything>'` is the legitimate pattern). The REAL boundary is the WebView's
+/// integrity: a strict CSP with no remote origins and no `unsafe-eval` (see tauri.conf.json),
+/// plus a frontend that never renders agent/file output as executable HTML. These checks only
+/// stop the obvious misuses and catch bugs:
+///  - `command` must be a non-empty ABSOLUTE path (no `$PATH`-relative name resolution).
+///  - `cwd`, if given, must resolve to a directory INSIDE the app's managed worktrees dir —
+///    every real caller passes an agent worktree under `<app_data>/worktrees/…`.
+///
+/// Returns the canonicalized cwd (if any) so the caller spawns into the *validated* path rather
+/// than the original string — closing a check-vs-use symlink-swap window.
+fn validate_spawn(
+    app: &AppHandle,
+    command: &str,
+    cwd: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    let worktrees = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("pty_spawn: no app data dir: {e}"))?
+        .join("worktrees");
+    validate_spawn_inner(&worktrees, command, cwd)
+}
+
+/// Pure, AppHandle-free core of `validate_spawn` (so it can be unit-tested). `worktrees_base` is
+/// `<app_data>/worktrees`.
+fn validate_spawn_inner(
+    worktrees_base: &Path,
+    command: &str,
+    cwd: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    if command.is_empty() || !Path::new(command).is_absolute() {
+        return Err("pty_spawn: command must be a non-empty absolute path".into());
+    }
+    let Some(cwd) = cwd else { return Ok(None) };
+    // Canonicalize BOTH sides fully (resolving macOS /var→/private/var, ~/Library, a symlinked
+    // `worktrees`, and any `../` in the supplied cwd) so the containment compare is between two
+    // real paths. If the worktrees base can't be resolved (e.g. it doesn't exist yet) we reject
+    // rather than compare against a half-resolved path — fail-closed, and any legitimate cwd
+    // implies the base already exists.
+    let base = worktrees_base
+        .canonicalize()
+        .map_err(|e| format!("pty_spawn: worktrees dir unavailable: {e}"))?;
+    let real = std::fs::canonicalize(cwd).map_err(|e| format!("pty_spawn: invalid cwd: {e}"))?;
+    if !real.starts_with(&base) {
+        return Err("pty_spawn: cwd is outside the managed worktrees directory".into());
+    }
+    Ok(Some(real))
+}
+
 /// Spawn `command` in a PTY. Output streams to the frontend via the `pty:output`
 /// event; `pty:exit` fires when the process ends.
 #[tauri::command]
@@ -53,15 +107,13 @@ pub fn pty_spawn(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    tracing::info!(
-        %id,
-        %command,
-        args = ?args,
-        cwd = ?cwd,
-        cols,
-        rows,
-        "pty_spawn"
-    );
+    let validated_cwd = validate_spawn(&app, &command, cwd.as_deref())?;
+    // Log the command and arg COUNT at info, but keep the full args at debug only: the args
+    // carry the built `zsh -c '…'` script, which embeds the user's prompt/persona (and could
+    // in principle carry a secret passed as a flag) — not something to write to the shared
+    // daily log by default.
+    tracing::info!(%id, %command, arg_count = args.len(), cwd = ?cwd, cols, rows, "pty_spawn");
+    tracing::debug!(%id, args = ?args, "pty_spawn args (may contain prompt text)");
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -75,7 +127,9 @@ pub fn pty_spawn(
     // TUIs emit their normal palette. (env() overrides on top of the inherited env.)
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    if let Some(dir) = cwd {
+    // Spawn into the *validated, canonicalized* cwd (not the original string), so a symlink swap
+    // between check and use can't redirect the working dir outside the worktrees tree.
+    if let Some(dir) = validated_cwd {
         cmd.cwd(dir);
     }
 
@@ -195,4 +249,79 @@ pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
         let _ = session.killer.kill();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_spawn_inner;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    /// Create a unique `<tmp>/-test-<pid>-<n>` with a real `worktrees/proj/agent`
+    /// inside, and return the `worktrees` base.
+    fn worktrees_base() -> PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("-test-{}-{}", std::process::id(), n));
+        let _ = fs::remove_dir_all(&root);
+        let base = root.join("worktrees");
+        fs::create_dir_all(base.join("proj").join("agent")).unwrap();
+        base
+    }
+
+    #[test]
+    fn rejects_relative_or_empty_command() {
+        let base = worktrees_base();
+        assert!(validate_spawn_inner(&base, "", None).is_err());
+        assert!(validate_spawn_inner(&base, "bin/zsh", None).is_err());
+        // An absolute path passes the command check even if it doesn't exist (we only require
+        // absoluteness, not existence — the legit command is /bin/zsh).
+        assert!(validate_spawn_inner(&base, "/bin/zsh", None).is_ok());
+    }
+
+    #[test]
+    fn none_cwd_passes_through() {
+        let base = worktrees_base();
+        assert_eq!(validate_spawn_inner(&base, "/bin/zsh", None).unwrap(), None);
+    }
+
+    #[test]
+    fn accepts_cwd_inside_worktrees() {
+        let base = worktrees_base();
+        let cwd = base.join("proj").join("agent");
+        let got = validate_spawn_inner(&base, "/bin/zsh", Some(cwd.to_str().unwrap())).unwrap();
+        assert_eq!(got, Some(cwd.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn rejects_cwd_outside_worktrees() {
+        let base = worktrees_base();
+        let outside = std::env::temp_dir();
+        assert!(
+            validate_spawn_inner(&base, "/bin/zsh", Some(outside.to_str().unwrap())).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_dotdot_escape_cwd() {
+        let base = worktrees_base();
+        // <base>/proj/agent/../../.. climbs above the worktrees base.
+        let escape = base.join("proj").join("agent").join("..").join("..").join("..");
+        assert!(validate_spawn_inner(&base, "/bin/zsh", Some(escape.to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn rejects_sibling_prefix_dir() {
+        // A string-prefix compare would wrongly admit `<app_data>/worktrees-evil`; component-wise
+        // starts_with must reject it. This test pins that behavior.
+        let base = worktrees_base();
+        let sibling = base.with_file_name("worktrees-evil");
+        fs::create_dir_all(&sibling).unwrap();
+        assert!(
+            validate_spawn_inner(&base, "/bin/zsh", Some(sibling.to_str().unwrap())).is_err()
+        );
+    }
 }
