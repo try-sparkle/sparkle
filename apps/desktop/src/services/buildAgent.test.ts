@@ -3,6 +3,7 @@ import {
   parseWorkerResult,
   workerPersona,
   workerMission,
+  orchestrationPersona,
   WORKER_RESULT_RELPATH,
 } from "./buildAgent";
 
@@ -82,5 +83,58 @@ describe("workerMission", () => {
     expect(out).toContain("Implement the login form");
     // The id line must come before the task text
     expect(out.indexOf("Task agent-abc:")).toBeLessThan(out.indexOf("Implement the login form"));
+  });
+});
+
+describe("orchestrationPersona", () => {
+  const p = orchestrationPersona({ ownBranch: "sparkle/agent-build1", maxConcurrentWorkers: 4 });
+
+  it("establishes the orchestrator role and decomposition", () => {
+    expect(p).toMatch(/ORCHESTRATOR|orchestrator/);
+    expect(p).toMatch(/decompose/i);
+  });
+
+  it("states the division of labor: subagents for research, spawn_worker for code units", () => {
+    expect(p).toMatch(/subagent/i);
+    expect(p).toMatch(/read-only|research/i);
+    expect(p).toContain("spawn_worker");
+  });
+
+  it("names the wait + list tools and the concurrency cap", () => {
+    expect(p).toContain("wait_for_workers");
+    expect(p).toContain("list_workers");
+    expect(p).toContain("4"); // the cap value is interpolated
+  });
+
+  it("uses explicit batching up to the cap — no 'queues automatically' promise", () => {
+    // The persona must instruct batching explicitly and warn against exceeding the cap.
+    // It must NOT claim that spawn_worker queues transparently (that caused deadlock).
+    expect(p).not.toMatch(/queue.*automatically|automatically.*queue/i);
+    // Instructs to spawn up to the cap per batch.
+    expect(p).toMatch(/up to.*4|batch/i);
+    // Instructs to spin_down_worker to free slots before the next batch.
+    expect(p).toMatch(/spin.?down|free.*slot|slot.*free/i);
+    // Warns against exceeding the cap without spinning down first.
+    expect(p).toMatch(/exceed.*cap|reach the cap|cap.*time|not.*more than.*cap/i);
+    // Positively asserts the ACCURATE mechanism (over-cap queues but BLOCKS the REPL → deadlock/timeout),
+    // not just the absence of the old "queues automatically" phrasing.
+    expect(p).toMatch(/block|deadlock/i);
+  });
+
+  it("instructs a SEQUENTIAL merge into its own branch, never main", () => {
+    expect(p).toContain("sparkle/agent-build1"); // its own branch, the merge target
+    expect(p).toMatch(/one at a time|sequentially/i);
+    expect(p).toMatch(/never/i);
+    expect(p).toMatch(/\bmain\b/);
+    expect(p).toMatch(/conflict/i);
+  });
+
+  it("tells it to spin_down_worker after merging and to report the consolidated outcome", () => {
+    expect(p).toContain("spin_down_worker");
+    expect(p).toMatch(/report|consolidated/i);
+  });
+
+  it("reflects a different cap value", () => {
+    expect(orchestrationPersona({ ownBranch: "b", maxConcurrentWorkers: 2 })).toContain("2");
   });
 });

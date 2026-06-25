@@ -19,6 +19,7 @@ import {
   useCurrentWindowLabel,
 } from "../windowContext";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
+import { startOrchestrationListener } from "../services/orchestrationListener";
 import { killProjectAgents, planWindowClose } from "../services/windowClose";
 import { clearWindowProject } from "../services/windowRegistry";
 
@@ -64,6 +65,29 @@ export function Workspace() {
 
   // Keep this window's project list in sync with changes made in other windows.
   useEffect(() => subscribeToCrossWindowSync(), []);
+
+  // Start the orchestration listener singleton. The singleton guard in the listener prevents
+  // double-registration under React StrictMode / HMR. An `unmounted` flag handles the race
+  // where the component unmounts before the start promise resolves: if that happens we invoke
+  // the cleanup immediately so the listener is always torn down exactly once.
+  useEffect(() => {
+    let cleanup: (() => void) | undefined;
+    let unmounted = false;
+    void startOrchestrationListener()
+      .then((c) => {
+        if (unmounted) c();
+        else cleanup = c;
+      })
+      // Terminal catch: a start failure (e.g. the Tauri event bus is transiently unavailable
+      // at boot) must not become a silent unhandled rejection — surface a diagnostic. No retry
+      // here; the listener's singleton clears its start guard on failure so a later remount
+      // re-arms it.
+      .catch((e: unknown) => console.error("[orchestration] listener failed to start:", e));
+    return () => {
+      unmounted = true;
+      cleanup?.();
+    };
+  }, []);
 
   // Intercept the window's close (red traffic light) so we can ask keep-vs-kill before closing.
   useEffect(() => {

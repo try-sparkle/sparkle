@@ -9,12 +9,35 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::worktree::read_worker_result_at;
+
+/// Rendezvous map: reqId → reply sender. Used to bridge async frontend responses back to the
+/// blocking accept-thread op that emitted the request. `register_pending` inserts a fresh channel
+/// sender and returns the receiver; `resolve_pending` delivers the value and removes the entry.
+pub type PendingMap = Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>;
+
+/// Register a rendezvous for `req_id`; returns the receiver the awaiting op blocks on.
+/// Called by 2b-C async ops (unused in production until that sub-plan lands).
+#[allow(dead_code)]
+pub fn register_pending(pending: &PendingMap, req_id: &str) -> mpsc::Receiver<Value> {
+    let (tx, rx) = mpsc::channel();
+    pending.lock().unwrap().insert(req_id.to_string(), tx);
+    rx
+}
+
+/// Deliver `value` to the op awaiting `req_id` (if any), removing the entry. No-op if absent or
+/// the receiver was already dropped (e.g. the op timed out).
+pub fn resolve_pending(pending: &PendingMap, req_id: &str, value: Value) {
+    if let Some(tx) = pending.lock().unwrap().remove(req_id) {
+        let _ = tx.send(value);
+    }
+}
 
 struct BridgeHandle {
     socket_path: PathBuf,
@@ -26,6 +49,7 @@ struct BridgeHandle {
 #[derive(Default)]
 pub struct BridgeManager {
     bridges: Mutex<HashMap<String, BridgeHandle>>,
+    pending: PendingMap,
 }
 
 #[derive(Serialize)]
@@ -37,7 +61,10 @@ pub struct BridgeInfo {
 
 /// Bind the per-build-agent socket (0600), spawn the accept loop, return (socket_path, token).
 /// Idempotent: a second call for the same build_agent_id returns the existing socket + token.
+/// `app` is `Option<AppHandle>` so Rust unit tests (no Tauri runtime) can pass `None`; production
+/// passes `Some(app)`. The AppHandle is cloned into the accept thread for 2b-C's async ops.
 pub fn start_bridge_at(
+    app: Option<AppHandle>,
     manager: &BridgeManager,
     app_data: &Path,
     project_id: &str,
@@ -89,6 +116,10 @@ pub fn start_bridge_at(
     let token_t = token.clone();
     let shutdown_t = shutdown.clone();
     let alive_t = alive.clone();
+    let app_t = app.clone();
+    let pending_t = manager.pending.clone();
+    let build_id_t = build_agent_id.to_string();
+    let project_id_t = project_id.to_string();
     std::thread::spawn(move || loop {
         if shutdown_t.load(Ordering::SeqCst) {
             alive_t.store(false, Ordering::SeqCst); // FIX 2: mark dead before shutdown break
@@ -97,7 +128,11 @@ pub fn start_bridge_at(
         match listener.accept() {
             Ok((stream, _addr)) => {
                 let token_c = token_t.clone();
-                std::thread::spawn(move || serve_conn(stream, &token_c));
+                let app_c = app_t.clone();
+                let pending_c = pending_t.clone();
+                let build_c = build_id_t.clone();
+                let project_c = project_id_t.clone();
+                std::thread::spawn(move || serve_conn(stream, &token_c, app_c, pending_c, build_c, project_c));
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -124,7 +159,22 @@ pub fn start_bridge_at(
 }
 
 /// Read newline-delimited requests on one connection; write one response per request.
-fn serve_conn(stream: UnixStream, token: &str) {
+/// `app`/`pending`/`build_agent_id`/`project_id` are the connection's authoritative context:
+/// frontend round-trip ops (spawn_worker/list_workers/spin_down) emit events and await replies
+/// via this context; synchronous ops (read_result) delegate to `handle_request_line`.
+///
+/// One-request-per-connection assumption: `BridgeClient` (apps/mcp-orchestrator) opens a fresh
+/// Unix socket per call and never pipelines multiple requests on the same connection.  The loop
+/// below can handle multiple lines in principle, but the 600s blocking wait in the frontend
+/// round-trip ops would head-of-line-block any subsequent lines — callers must NOT pipeline.
+fn serve_conn(
+    stream: UnixStream,
+    token: &str,
+    app: Option<AppHandle>,
+    pending: PendingMap,
+    build_agent_id: String,
+    project_id: String,
+) {
     // An accepted stream inherits the listener's non-blocking mode; make it blocking so the
     // per-connection BufReader::lines() reads normally.
     stream.set_nonblocking(false).ok();
@@ -137,7 +187,7 @@ fn serve_conn(stream: UnixStream, token: &str) {
     for line in reader.lines() {
         let line = match line { Ok(l) => l, Err(_) => break };
         if line.trim().is_empty() { continue; }
-        let resp = handle_request_line(&line, token);
+        let resp = handle_request_line_ctx(&line, token, &app, &pending, &build_agent_id, &project_id);
         if writeln!(writer, "{resp}").is_err() { break; }
     }
 }
@@ -178,7 +228,7 @@ pub fn start_orchestration_bridge(
     build_agent_id: String,
 ) -> Result<BridgeInfo, String> {
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
-    let (sock, token) = start_bridge_at(&manager, &app_data, &project_id, &build_agent_id)?;
+    let (sock, token) = start_bridge_at(Some(app.clone()), &manager, &app_data, &project_id, &build_agent_id)?;
     Ok(BridgeInfo { socket_path: sock.to_string_lossy().to_string(), token })
 }
 
@@ -186,6 +236,52 @@ pub fn start_orchestration_bridge(
 #[tauri::command]
 pub fn stop_orchestration_bridge(manager: State<BridgeManager>, build_agent_id: String) -> Result<(), String> {
     stop_bridge(&manager, &build_agent_id);
+    Ok(())
+}
+
+/// Absolute paths the build-agent launch needs to wire its MCP server (Plan 2c): the `node`
+/// binary, and the bundled orchestrator `server.js`. Resolved in Rust because the bundled resource
+/// path is only knowable via Tauri's resource resolver and node must be found off the login shell.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPaths {
+    node_path: String,
+    server_path: String,
+}
+
+/// Resolve the node binary + the bundled mcp-orchestrator server.js (Tauri command).
+#[tauri::command]
+pub fn orchestrator_mcp_paths(app: AppHandle) -> Result<McpPaths, String> {
+    let node_path = crate::preflight::resolve_node_path()
+        .ok_or_else(|| "node not found (install Node.js; needed to run the orchestrator)".to_string())?;
+    let server = app
+        .path()
+        .resolve(
+            "resources/mcp-orchestrator-server.js",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("orchestrator server.js missing: {e}"))?;
+    if !server.exists() {
+        return Err(format!(
+            "orchestrator server.js not bundled at {} (run apps/desktop build to copy it)",
+            server.display()
+        ));
+    }
+    Ok(McpPaths {
+        node_path,
+        server_path: server.to_string_lossy().to_string(),
+    })
+}
+
+/// Deliver a frontend response back to the op that is blocking on `req_id` (Tauri command).
+/// Called by the frontend after handling an `orchestration:request` event emitted by 2b-C ops.
+#[tauri::command]
+pub fn orchestration_respond(
+    manager: State<BridgeManager>,
+    req_id: String,
+    result: Value,
+) -> Result<(), String> {
+    resolve_pending(&manager.pending, &req_id, result);
     Ok(())
 }
 
@@ -202,6 +298,14 @@ fn handle_request_line(line: &str, expected_token: &str) -> String {
     }
     match req.get("op").and_then(|o| o.as_str()) {
         Some("read_result") => {
+            // ACCEPTED EXCEPTION — path is NOT bounded to the build agent's own workers here.
+            // Unlike spawn_worker/list_workers/spin_down, which are identity-injected by
+            // handle_request_line_ctx (the bridge injects the authoritative buildAgentId from
+            // the socket handle), read_result uses the caller-supplied `worktree` path verbatim.
+            // This is intentional in a single-user, token-gated trust model: the only caller is
+            // the MCP orchestrator child process, which already holds the per-launch secret token
+            // and only reads .sparkle/result.json — it cannot write or escape the path.
+            // Bounding the path to the project worktree root is a tracked follow-up (see code review).
             let wt = req.get("worktree").and_then(|w| w.as_str()).unwrap_or("");
             match read_worker_result_at(Path::new(wt)) {
                 Ok(opt) => json!({ "id": id, "ok": true,
@@ -210,6 +314,114 @@ fn handle_request_line(line: &str, expected_token: &str) -> String {
             }
         }
         _ => json!({ "id": id, "ok": false, "error": "unknown op" }).to_string(),
+    }
+}
+
+/// Frontend round-trip timeout. Long enough to cover a spawn_worker that the listener queues
+/// behind the concurrency cap, yet bounded so a genuinely stuck frontend eventually releases the
+/// connection thread (the 2a-deferred read-timeout concern, now load-bearing for these ops).
+const ROUNDTRIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Block on a rendezvous receiver. On timeout, remove the now-stale pending entry (so a late
+/// orchestration_respond for this reqId is a harmless no-op) and return None.
+fn wait_pending(
+    rx: std::sync::mpsc::Receiver<Value>,
+    pending: &PendingMap,
+    req_id: &str,
+    timeout: std::time::Duration,
+) -> Option<Value> {
+    match rx.recv_timeout(timeout) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            resolve_pending(pending, req_id, Value::Null); // drop the stale sender entry
+            None
+        }
+    }
+}
+
+/// Handle a frontend round-trip op: register a fresh reqId BEFORE emitting (so a fast frontend
+/// reply can't race ahead of registration), emit the Tauri event with the AUTHORITATIVE identity
+/// from this socket's build-agent handle, then await the reply. The caller's message never carries
+/// buildAgentId/projectId — the bridge supplies them, closing the cross-agent/confused-deputy gap.
+fn handle_frontend_op(
+    id: Value,
+    op: &str,
+    req: &Value,
+    app: &Option<AppHandle>,
+    pending: &PendingMap,
+    build_agent_id: &str,
+    project_id: &str,
+) -> String {
+    // Validate required fields BEFORE the app handle check so a malformed request fails fast
+    // (no 600s hang) regardless of whether a Tauri app is present.
+    let payload = match op {
+        "spawn_worker" => {
+            let task = req.get("task").and_then(|t| t.as_str()).unwrap_or("");
+            if task.is_empty() {
+                return json!({ "id": id, "ok": false, "error": "missing task" }).to_string();
+            }
+            json!({ "task": task })
+        }
+        "spin_down" => {
+            let worker_id = req.get("workerId").and_then(|w| w.as_str()).unwrap_or("");
+            if worker_id.is_empty() {
+                return json!({ "id": id, "ok": false, "error": "missing workerId" }).to_string();
+            }
+            json!({ "workerId": worker_id })
+        }
+        _ => json!({}), // list_workers needs no payload
+    };
+    let app = match app {
+        Some(a) => a,
+        None => return json!({ "id": id, "ok": false, "error": "no app handle" }).to_string(),
+    };
+    let req_id = match generate_token() {
+        Ok(t) => t,
+        Err(e) => return json!({ "id": id, "ok": false, "error": format!("reqId gen: {e}") }).to_string(),
+    };
+    let rx = register_pending(pending, &req_id);
+    let event = json!({
+        "reqId": req_id,
+        "op": op,
+        "buildAgentId": build_agent_id,
+        "projectId": project_id,
+        "payload": payload,
+    });
+    if let Err(e) = app.emit("orchestration:request", event) {
+        resolve_pending(pending, &req_id, Value::Null); // clean up the entry we just registered
+        return json!({ "id": id, "ok": false, "error": format!("emit failed: {e}") }).to_string();
+    }
+    match wait_pending(rx, pending, &req_id, ROUNDTRIP_TIMEOUT) {
+        Some(val) => json!({ "id": id, "ok": true, "result": val }).to_string(),
+        None => json!({ "id": id, "ok": false, "error": "frontend round-trip timeout" }).to_string(),
+    }
+}
+
+/// Auth + dispatch with the connection's context. Frontend ops round-trip through the React layer;
+/// everything else (read_result, unknown) delegates to the pure sync `handle_request_line`.
+fn handle_request_line_ctx(
+    line: &str,
+    token: &str,
+    app: &Option<AppHandle>,
+    pending: &PendingMap,
+    build_agent_id: &str,
+    project_id: &str,
+) -> String {
+    let req: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return json!({ "id": Value::Null, "ok": false, "error": format!("bad json: {e}") }).to_string(),
+    };
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    if req.get("token").and_then(|t| t.as_str()) != Some(token) {
+        return json!({ "id": id, "ok": false, "error": "unauthorized" }).to_string();
+    }
+    match req.get("op").and_then(|o| o.as_str()) {
+        Some(op @ ("spawn_worker" | "list_workers" | "spin_down")) => {
+            handle_frontend_op(id, op, &req, app, pending, build_agent_id, project_id)
+        }
+        // read_result + unknown op: the existing pure sync handler (re-validates the token, which
+        // we already passed; cheap and keeps the 2a/2b-A unit tests of handle_request_line valid).
+        _ => handle_request_line(line, token),
     }
 }
 
@@ -315,7 +527,7 @@ mod tests {
     fn listener_serves_authed_read_result_and_rejects_bad_token() {
         let app_data = short_unique_dir("lad");
         let mgr = BridgeManager::default();
-        let (sock, token) = start_bridge_at(&mgr, &app_data, "p", "build1").unwrap();
+        let (sock, token) = start_bridge_at(None, &mgr, &app_data, "p", "build1").unwrap();
         // 0600 perms on the socket file.
         #[cfg(unix)]
         {
@@ -365,8 +577,8 @@ mod tests {
     fn start_bridge_at_is_idempotent() {
         let app_data = short_unique_dir("idem");
         let mgr = BridgeManager::default();
-        let (sock1, token1) = start_bridge_at(&mgr, &app_data, "p", "idem-agent").unwrap();
-        let (sock2, token2) = start_bridge_at(&mgr, &app_data, "p", "idem-agent").unwrap();
+        let (sock1, token1) = start_bridge_at(None, &mgr, &app_data, "p", "idem-agent").unwrap();
+        let (sock2, token2) = start_bridge_at(None, &mgr, &app_data, "p", "idem-agent").unwrap();
         assert_eq!(sock1, sock2, "idempotent: same socket path");
         assert_eq!(token1, token2, "idempotent: same token");
         stop_bridge(&mgr, "idem-agent");
@@ -378,7 +590,7 @@ mod tests {
     fn connect_fails_after_stop_bridge() {
         let app_data = short_unique_dir("stop");
         let mgr = BridgeManager::default();
-        let (sock, _token) = start_bridge_at(&mgr, &app_data, "p", "stop-agent").unwrap();
+        let (sock, _token) = start_bridge_at(None, &mgr, &app_data, "p", "stop-agent").unwrap();
         // Confirm we can connect before stop.
         assert!(UnixStream::connect(&sock).is_ok(), "should connect before stop");
         stop_bridge(&mgr, "stop-agent");
@@ -393,7 +605,7 @@ mod tests {
     fn stale_dead_handle_is_rebound() {
         let app_data = short_unique_dir("stale");
         let mgr = BridgeManager::default();
-        let (_sock1, token1) = start_bridge_at(&mgr, &app_data, "p", "stale-agent").unwrap();
+        let (_sock1, token1) = start_bridge_at(None, &mgr, &app_data, "p", "stale-agent").unwrap();
 
         // Reach into the manager and flip alive to false — simulating a fatal accept-loop exit.
         {
@@ -403,10 +615,130 @@ mod tests {
         }
 
         // A second call for the same id must detect the dead handle, tear it down, and rebind.
-        let (_sock2, token2) = start_bridge_at(&mgr, &app_data, "p", "stale-agent").unwrap();
+        let (_sock2, token2) = start_bridge_at(None, &mgr, &app_data, "p", "stale-agent").unwrap();
         assert_ne!(token1, token2, "fresh bind must produce a new token, not the stale one");
 
         stop_bridge(&mgr, "stale-agent");
         let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn pending_register_resolve_roundtrip_and_timeout() {
+        use std::time::Duration;
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // Register, resolve from another thread, receive the value.
+        let rx = register_pending(&pending, "req1");
+        let p2 = pending.clone();
+        std::thread::spawn(move || {
+            resolve_pending(&p2, "req1", serde_json::json!({ "workerId": "w1" }));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(got["workerId"], "w1");
+
+        // Unresolved request times out.
+        let rx2 = register_pending(&pending, "req2");
+        assert!(rx2.recv_timeout(Duration::from_millis(50)).is_err());
+
+        // Resolving an unknown id is a no-op (does not panic).
+        resolve_pending(&pending, "nonexistent", serde_json::json!(null));
+    }
+
+    #[test]
+    fn wait_pending_resolves_then_times_out() {
+        use std::time::Duration;
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // Resolved before the timeout → Some(value).
+        let rx = register_pending(&pending, "rp1");
+        let p2 = pending.clone();
+        std::thread::spawn(move || resolve_pending(&p2, "rp1", serde_json::json!({ "ok": 1 })));
+        let got = wait_pending(rx, &pending, "rp1", Duration::from_secs(2));
+        assert_eq!(got, Some(serde_json::json!({ "ok": 1 })));
+
+        // Never resolved → None, and the stale pending entry is removed.
+        let rx2 = register_pending(&pending, "rp2");
+        let none = wait_pending(rx2, &pending, "rp2", Duration::from_millis(20));
+        assert_eq!(none, None);
+        assert!(!pending.lock().unwrap().contains_key("rp2"), "stale entry must be removed on timeout");
+    }
+
+    #[test]
+    fn frontend_op_validates_required_fields() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        // spawn_worker with missing task → fast-fail, no hang
+        let resp = handle_request_line_ctx(
+            r#"{"id":"8","token":"T","op":"spawn_worker"}"#,
+            "T", &None, &pending, "b", "p",
+        );
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "missing task");
+        // spawn_worker with empty string task → same
+        let resp2 = handle_request_line_ctx(
+            r#"{"id":"9","token":"T","op":"spawn_worker","task":""}"#,
+            "T", &None, &pending, "b", "p",
+        );
+        let v2: serde_json::Value = serde_json::from_str(&resp2).unwrap();
+        assert_eq!(v2["error"], "missing task");
+        // spin_down with missing workerId → fast-fail
+        let resp3 = handle_request_line_ctx(
+            r#"{"id":"10","token":"T","op":"spin_down"}"#,
+            "T", &None, &pending, "b", "p",
+        );
+        let v3: serde_json::Value = serde_json::from_str(&resp3).unwrap();
+        assert_eq!(v3["error"], "missing workerId");
+        // No pending entries were registered (no hanging round-trips started)
+        assert!(pending.lock().unwrap().is_empty(), "no pending entries from validation failures");
+    }
+
+    #[test]
+    fn frontend_op_without_app_handle_errors() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let line = r#"{"id":"7","token":"T","op":"spawn_worker","task":"do it"}"#;
+        let resp = handle_request_line_ctx(line, "T", &None, &pending, "build1", "proj1");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["id"], "7");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "no app handle");
+    }
+
+    #[test]
+    fn mcp_paths_serializes_camel_case() {
+        // The frontend (Task 5 --mcp-config) depends on these exact key names.
+        let p = McpPaths {
+            node_path: "/usr/local/bin/node".to_string(),
+            server_path: "/app/resources/mcp-orchestrator-server.js".to_string(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["nodePath"], "/usr/local/bin/node");
+        assert_eq!(v["serverPath"], "/app/resources/mcp-orchestrator-server.js");
+        // No snake_case leakage.
+        assert!(v.get("node_path").is_none());
+        assert!(v.get("server_path").is_none());
+    }
+
+    #[test]
+    fn ctx_serves_read_result_and_auth_with_none_app() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        // Bad token → unauthorized even through the ctx path.
+        let bad = handle_request_line_ctx(
+            r#"{"id":"1","token":"WRONG","op":"read_result","worktree":"/x"}"#,
+            "RIGHT", &None, &pending, "b", "p",
+        );
+        let vb: serde_json::Value = serde_json::from_str(&bad).unwrap();
+        assert_eq!(vb["error"], "unauthorized");
+
+        // read_result still works (delegates to the sync handler) with a None app handle.
+        let dir = unique_dir("ctx-read");
+        let req = format!(
+            r#"{{"id":"2","token":"T","op":"read_result","worktree":"{}"}}"#,
+            dir.to_string_lossy()
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&handle_request_line_ctx(&req, "T", &None, &pending, "b", "p")).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["present"], false);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

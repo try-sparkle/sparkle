@@ -34,11 +34,14 @@ interface SettingsState {
   chiefProjectByProject: Record<string, string>;
   /** agentId -> last commit sha whose markdown we synced to Chief (the sync watermark). */
   chiefSyncByAgent: Record<string, string>;
+  /** Maximum number of concurrent workers (floored at 1). */
+  maxConcurrentWorkers: number;
 
   setChiefPat: (pat: string) => void;
   setRuntimeChiefPat: (pat: string) => void;
   setChiefProject: (sparkleProjectId: string, chiefProjectId: string) => void;
   setChiefSync: (agentId: string, sha: string) => void;
+  setMaxConcurrentWorkers: (n: number) => void;
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -48,6 +51,7 @@ export const useSettingsStore = create<SettingsState>()(
       runtimeChiefPat: "",
       chiefProjectByProject: {},
       chiefSyncByAgent: {},
+      maxConcurrentWorkers: 4,
 
       setChiefPat: (pat) => set({ chiefPat: pat.trim() }),
       setRuntimeChiefPat: (pat) => set({ runtimeChiefPat: pat.trim() }),
@@ -64,6 +68,8 @@ export const useSettingsStore = create<SettingsState>()(
         set((s) => ({
           chiefSyncByAgent: { ...s.chiefSyncByAgent, [agentId]: sha },
         })),
+
+      setMaxConcurrentWorkers: (n) => set({ maxConcurrentWorkers: Math.max(1, Math.floor(n)) }),
     }),
     {
       name: "sparkle-settings",
@@ -74,6 +80,7 @@ export const useSettingsStore = create<SettingsState>()(
         chiefPat: s.chiefPat,
         chiefProjectByProject: s.chiefProjectByProject,
         chiefSyncByAgent: s.chiefSyncByAgent,
+        maxConcurrentWorkers: s.maxConcurrentWorkers,
       }),
     },
   ),

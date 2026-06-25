@@ -10,7 +10,14 @@ import {
 import { resolveDefaultBranch } from "../services/branchStatus";
 import { checkClaude, claudeHasSession } from "../preflight";
 import { buildClaudeExec } from "../services/claudeSpawn";
-import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult } from "../services/buildAgent";
+import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult, orchestrationPersona } from "../services/buildAgent";
+import {
+  startOrchestrationBridge,
+  orchestratorMcpPaths,
+  assembleBuildSpawn,
+  stopOrchestrationBridge,
+} from "../services/orchestrationLaunch";
+import { useSettingsStore } from "../stores/settingsStore";
 import { readWorkerResult } from "../pty";
 import { maybeAutoName } from "../services/agentNaming";
 import { HookStatusEngine } from "../engine/hookEvents";
@@ -72,6 +79,15 @@ export function AgentPane({
   // Tracks whether the last spawn was a fresh session (not a --continue resume). Used in the
   // worker exit handler to skip stale result re-reads on resumed sessions.
   const wasFreshLaunchRef = useRef(false);
+  // Generation counter for the build-agent bridge lifecycle. Each prepare() run mints a unique
+  // token (++prepareRunRef.current) before starting the bridge; the effect cleanup increments it
+  // too. After startOrchestrationBridge resolves, the build branch compares its captured token
+  // against the current counter — a mismatch means this run was superseded (unmount fired, or a
+  // second prepare() started, e.g. StrictMode dev cycle or a Try-again while a prior await was
+  // in flight) and the just-started bridge must be stopped immediately.
+  // Replacing a plain boolean avoids the bug where the second prepare() reset the boolean before
+  // the first cleanup's signal could be read.
+  const prepareRunRef = useRef(0);
   // The composer's textarea — initial focus lands here when a tab opens.
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   // The terminal's imperative focus(), so we can move focus into it when the composer
@@ -127,6 +143,12 @@ export function AgentPane({
       setPhase("ready");
       return;
     }
+    // Mint a generation token at the TOP of prepare() — before any await — so that a cleanup
+    // increment that fires during *any* of the subsequent awaits (worktree prep, Claude check,
+    // session detection, bridge start…) will be captured and detectable by the build branch's
+    // post-bridge guard (myRun !== prepareRunRef.current). Placing it after the early non-async
+    // returns (brainstorm/shell) means it only runs when we're about to do async work.
+    const myRun = ++prepareRunRef.current;
     setPhase("preparing");
     setErrorMsg("");
     setPtyReady(false);
@@ -217,6 +239,59 @@ export function AgentPane({
           appendSystemPrompt: workerPersona({ parentBranch, resultPath }),
           initialPrompt: workerMission(agent.task ?? "", agent.id),
         });
+      } else if (agent.kind === "build") {
+        // Autonomous orchestrator launch (Plan 2c): start the per-build-agent bridge FIRST (claude's
+        // MCP child connects to its socket at startup), resolve the node + bundled-server paths,
+        // then spawn claude with the sparkle-orchestrator MCP server + orchestrator persona.
+        //
+        // `myRun` was minted at the top of prepare() (before all awaits) so any cleanup increment
+        // during worktree-prep, Claude-check, or bridge-start is captured — the guard below fires
+        // for unmounts that happen anywhere in the early async path, not just at the bridge await.
+        const bridge = await startOrchestrationBridge(project.id, agent.id);
+        // Guard: check our token — a mismatch means this run was superseded while we awaited.
+        if (myRun !== prepareRunRef.current) {
+          void stopOrchestrationBridge(agent.id).catch((e) =>
+            console.warn("stopOrchestrationBridge (stale-run cleanup) failed", e),
+          );
+          return;
+        }
+        // Guard: if path resolution or assembly throws after the bridge has started, stop the bridge
+        // before the outer prepare() catch surfaces the error phase — otherwise the socket + accept
+        // thread linger until the pane eventually unmounts.
+        try {
+          const paths = await orchestratorMcpPaths();
+          // Guard: check again after orchestratorMcpPaths — a cleanup increment during that
+          // await means this run was superseded; stop the bridge we started and bail out.
+          if (myRun !== prepareRunRef.current) {
+            void stopOrchestrationBridge(agent.id).catch((e) =>
+              console.warn("stopOrchestrationBridge (stale-run cleanup) failed", e),
+            );
+            return;
+          }
+          const persona = orchestrationPersona({
+            ownBranch: wt.branch,
+            maxConcurrentWorkers: useSettingsStore.getState().maxConcurrentWorkers,
+          });
+          setSpawn(
+            assembleBuildSpawn({
+              claudePath: claude.path,
+              resume,
+              cwd: wt.path,
+              persona,
+              bridge,
+              paths,
+            }),
+          );
+          setPhase("ready");
+          return;
+        } catch (e) {
+          // Bridge started but subsequent step failed — stop it before rethrowing so the outer
+          // catch can set the error phase without leaving a zombie bridge behind.
+          void stopOrchestrationBridge(agent.id).catch((stopErr) =>
+            console.warn("stopOrchestrationBridge (error path cleanup) failed", stopErr),
+          );
+          throw e;
+        }
       } else {
         exec = buildClaudeExec(claude.path, resume);
       }
@@ -235,7 +310,20 @@ export function AgentPane({
   useEffect(() => {
     void prepare();
     // Stop tailing the event log when the pane unmounts (tab/agent closed).
-    return () => stopHookWatch();
+    return () => {
+      // Increment the generation counter to invalidate any in-flight prepare() run. If
+      // startOrchestrationBridge resolves AFTER this cleanup runs, the build branch's token
+      // comparison (myRun !== prepareRunRef.current) will detect the staleness and stop the bridge.
+      prepareRunRef.current++;
+      stopHookWatch();
+      // A build agent owns an orchestration bridge for its lifetime — stop it on close so its
+      // socket + accept thread don't linger. Best-effort: a missing bridge stop is a harmless no-op.
+      if (agent.kind === "build") {
+        void stopOrchestrationBridge(agent.id).catch((e) =>
+          console.warn("stopOrchestrationBridge failed", e),
+        );
+      }
+    };
     // Prepare once per agent (agent.id is stable for this component's life).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent.id]);

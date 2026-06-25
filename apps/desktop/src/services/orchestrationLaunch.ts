@@ -1,0 +1,63 @@
+// Launch wiring for the autonomous Build agent (Plan 2c). Starts the per-build-agent orchestration
+// bridge, resolves the node + bundled-server paths, and assembles the `claude` PTY spawn so the
+// build agent comes up with the sparkle-orchestrator MCP server attached (spawn_worker /
+// list_workers / wait_for_workers / spin_down_worker) and the orchestrator persona. The bridge
+// MUST be started before the PTY spawns (claude's MCP child connects to the socket at startup) and
+// stopped when the build agent closes.
+import { invoke } from "@tauri-apps/api/core";
+import { buildClaudeExec, buildOrchestratorMcpConfig } from "./claudeSpawn";
+
+// macOS login shell — same launcher AgentPane uses for claude (login but non-interactive).
+const SHELL = "/bin/zsh";
+
+export interface BridgeInfo {
+  socketPath: string;
+  token: string;
+}
+
+export interface McpPaths {
+  nodePath: string;
+  serverPath: string;
+}
+
+/** Start (idempotently) the orchestration bridge for this build agent; returns its socket + token. */
+export function startOrchestrationBridge(
+  projectId: string,
+  buildAgentId: string,
+): Promise<BridgeInfo> {
+  return invoke<BridgeInfo>("start_orchestration_bridge", { projectId, buildAgentId });
+}
+
+/** Stop the orchestration bridge for this build agent (on close). */
+export function stopOrchestrationBridge(buildAgentId: string): Promise<void> {
+  return invoke<void>("stop_orchestration_bridge", { buildAgentId });
+}
+
+/** Resolve the node binary + the bundled orchestrator server.js absolute paths. */
+export function orchestratorMcpPaths(): Promise<McpPaths> {
+  return invoke<McpPaths>("orchestrator_mcp_paths");
+}
+
+/** Pure assembler: given a started bridge + resolved paths, produce the build agent's PTY spawn.
+ *  No initialPrompt — the user drives the build agent from the composer. */
+export function assembleBuildSpawn(opts: {
+  claudePath: string;
+  resume: boolean;
+  cwd: string;
+  persona: string;
+  bridge: BridgeInfo;
+  paths: McpPaths;
+}): { command: string; args: string[]; cwd: string } {
+  const mcpConfig = buildOrchestratorMcpConfig({
+    nodePath: opts.paths.nodePath,
+    serverPath: opts.paths.serverPath,
+    socketPath: opts.bridge.socketPath,
+    token: opts.bridge.token,
+  });
+  const exec = buildClaudeExec(opts.claudePath, opts.resume, {
+    mcpConfig,
+    strictMcpConfig: true,
+    appendSystemPrompt: opts.persona,
+  });
+  return { command: SHELL, args: ["-l", "-c", exec], cwd: opts.cwd };
+}

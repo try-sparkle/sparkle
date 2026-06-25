@@ -17,6 +17,11 @@ export interface ClaudeExecOpts {
   /** A one-shot prompt submitted on launch so the agent starts working immediately. Only
    *  passed on a FRESH session — on `--continue` the prior conversation resumes instead. */
   initialPrompt?: string;
+  /** Inline JSON passed to `claude --mcp-config` (an MCP servers config). Variadic flag, so it is
+   *  always followed by `--strict-mcp-config` (a flag) before any positional prompt. */
+  mcpConfig?: string;
+  /** Emit `--strict-mcp-config` so ONLY the --mcp-config servers load (ignore user/global MCP). */
+  strictMcpConfig?: boolean;
 }
 
 /** Build the `exec …` string passed to `zsh -l -c`. Appends `--continue` only
@@ -35,6 +40,12 @@ export function buildClaudeExec(
 ): string {
   let cmd = `exec ${shellQuote(claudePath)}`;
   if (resume) cmd += " --continue";
+  if (opts.mcpConfig) {
+    cmd += ` --mcp-config ${shellQuote(opts.mcpConfig)}`;
+    // --mcp-config is variadic (like --add-dir); a following flag terminates it. We always pair it
+    // with --strict-mcp-config so a positional prompt can never be swallowed as another config.
+    if (opts.strictMcpConfig) cmd += " --strict-mcp-config";
+  }
   if (opts.appendSystemPrompt) {
     cmd += ` --append-system-prompt ${shellQuote(opts.appendSystemPrompt)}`;
   }
@@ -54,4 +65,35 @@ export function buildClaudeExec(
     cmd += ` -- ${shellQuote(opts.initialPrompt)}`;
   }
   return `export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
+}
+
+/** Build the inline JSON for `claude --mcp-config` that launches the Sparkle orchestrator MCP
+ *  server (a stdio child) wired to this build agent's bridge. The bridge socket + token ride in
+ *  the server's `env` block — confined to this child process, NOT exported into the build agent's
+ *  shell (which would leak the token to every tool/subagent it runs). The server name
+ *  ("sparkle-orchestrator") matches the McpServer name in apps/mcp-orchestrator.
+ *
+ *  Security note: the JSON (including the bridge token) is passed as a command-line argument to
+ *  `claude`, so it is transiently visible in `ps aux` to other processes on the same host. For the
+ *  local single-user desktop this is acceptable risk; a future hardening pass could write the
+ *  config to a restrictive-mode temp file and pass the path instead (if `claude --mcp-config`
+ *  accepts a file argument). */
+export function buildOrchestratorMcpConfig(opts: {
+  nodePath: string;
+  serverPath: string;
+  socketPath: string;
+  token: string;
+}): string {
+  return JSON.stringify({
+    mcpServers: {
+      "sparkle-orchestrator": {
+        command: opts.nodePath,
+        args: [opts.serverPath],
+        env: {
+          SPARKLE_BRIDGE_SOCKET: opts.socketPath,
+          SPARKLE_BRIDGE_TOKEN: opts.token,
+        },
+      },
+    },
+  });
 }

@@ -2,7 +2,9 @@
 // from the parent's local branch, and persist the worktree. The PTY launch happens when the
 // worker tab opens (AgentPane), driven by the worker persona + the stored task.
 import { useProjectStore } from "../stores/projectStore";
-import { createWorkerWorktree, type WorktreeInfo } from "../pty";
+import { createWorkerWorktree, type WorktreeInfo, killPty } from "../pty";
+import { removeAgentWorktree } from "./worktree";
+import { useRuntimeStore } from "../stores/runtimeStore";
 
 export async function spawnWorker(args: {
   projectId: string;
@@ -48,4 +50,23 @@ export async function spawnWorker(args: {
   }
   useProjectStore.getState().setAgentWorktree(args.projectId, workerId, info.path, info.branch);
   return workerId;
+}
+
+/** Tear down a finished worker: kill its PTY, remove its worktree (branch is kept), drop its tab
+ *  and runtime entry. Idempotent for sequential calls — a worker already gone is a no-op.
+ *  Worker-only: a non-worker id is a no-op, because removeAgent cascades to a build's workers and
+ *  would orphan their PTYs/worktrees (this fn only tears down the single passed id). */
+export async function spinDownWorker(args: { projectId: string; workerId: string }): Promise<void> {
+  const project = useProjectStore.getState().projects.find((p) => p.id === args.projectId);
+  if (!project) return;
+  const worker = project.agents.find((a) => a.id === args.workerId);
+  if (!worker || worker.kind !== "worker") return;
+  // Errors are swallowed so a partially-gone worker still finishes teardown; warn so a failed
+  // PTY kill / worktree removal (e.g. a transient git error leaving an orphan on disk) is visible.
+  await killPty(args.workerId).catch((e) => console.warn("spinDownWorker: killPty failed", e));
+  await removeAgentWorktree(project.rootPath, args.projectId, args.workerId).catch((e) =>
+    console.warn("spinDownWorker: removeAgentWorktree failed", e),
+  );
+  useRuntimeStore.getState().close(args.workerId);
+  useProjectStore.getState().removeAgent(args.projectId, args.workerId);
 }

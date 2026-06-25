@@ -3,8 +3,24 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
 
+// Preserve real ../pty exports (spawnWorker tests rely on real createWorkerWorktree which
+// calls the already-mocked invoke above) — only override killPty.
+// vi.fn() with no impl → typed as Mock<any[], any>, so spreading unknown[] into it is allowed.
+// (vi.fn(() => impl) would infer [] for Args and break the spread.)
+const killPtyMock = vi.fn();
+vi.mock("../pty", async (orig) => ({
+  ...(await orig<typeof import("../pty")>()),
+  killPty: (...a: unknown[]) => killPtyMock(...a),
+}));
+const removeWtMock = vi.fn();
+vi.mock("./worktree", async (orig) => ({
+  ...(await orig<typeof import("./worktree")>()),
+  removeAgentWorktree: (...a: unknown[]) => removeWtMock(...a),
+}));
+
 import { useProjectStore } from "../stores/projectStore";
-import { spawnWorker } from "./workerSpawn";
+import { useRuntimeStore } from "../stores/runtimeStore";
+import { spawnWorker, spinDownWorker } from "./workerSpawn";
 
 describe("spawnWorker", () => {
   beforeEach(() => {
@@ -63,5 +79,84 @@ describe("spawnWorker", () => {
     expect(proj.agents.some((a) => a.kind === "worker")).toBe(false);
     // Selection is restored to the build agent the user was on before the spawn attempt.
     expect(proj.selectedAgentId).toBe(buildId);
+  });
+});
+
+describe("spinDownWorker", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks(); // restore any vi.spyOn (e.g. runtime-store close) so it can't leak between tests
+    useProjectStore.setState({ projects: [], selectedProjectId: null });
+    useRuntimeStore.setState({ status: {}, openAgentIds: [], branchStatus: {} });
+    killPtyMock.mockReset();
+    killPtyMock.mockResolvedValue(undefined);
+    removeWtMock.mockReset();
+    removeWtMock.mockResolvedValue(undefined);
+  });
+
+  it("kills pty, removes worktree, closes runtime entry, removes tab, keeps branch", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" });
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId });
+    store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
+
+    // Spy on the runtime store's close to assert the 4th teardown step fires.
+    const runtimeCloseMock = vi.spyOn(useRuntimeStore.getState(), "close");
+    await spinDownWorker({ projectId, workerId });
+
+    expect(killPtyMock).toHaveBeenCalledWith(workerId);
+    expect(removeWtMock).toHaveBeenCalledWith("/tmp/demo", projectId, workerId);
+    expect(runtimeCloseMock).toHaveBeenCalledWith(workerId); // runtime entry closed
+    const agents = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
+    expect(agents.some((a) => a.id === workerId)).toBe(false); // tab gone
+  });
+
+  it("is a no-op for an unknown project or worker id (idempotent)", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+
+    await expect(spinDownWorker({ projectId, workerId: "ghost" })).resolves.toBeUndefined();
+    await expect(spinDownWorker({ projectId: "ghost", workerId: "ghost" })).resolves.toBeUndefined();
+
+    expect(killPtyMock).not.toHaveBeenCalled();
+    expect(removeWtMock).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op when passed a build agent id (worker-only contract)", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" });
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId });
+
+    // Passing the build id must NOT tear anything down: removeAgent cascades to the build's
+    // workers, which would orphan their PTYs/worktrees (this fn only tears down the passed id).
+    await spinDownWorker({ projectId, workerId: buildId });
+
+    expect(killPtyMock).not.toHaveBeenCalled();
+    expect(removeWtMock).not.toHaveBeenCalled();
+    const agents = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
+    expect(agents.some((a) => a.id === buildId)).toBe(true); // build still present
+    expect(agents.some((a) => a.id === workerId)).toBe(true); // its worker not cascade-removed
+  });
+
+  it("still removes the tab when killPty / removeAgentWorktree reject", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" });
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId });
+    store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
+
+    killPtyMock.mockRejectedValue(new Error("pty gone"));
+    removeWtMock.mockRejectedValue(new Error("git failed"));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(spinDownWorker({ projectId, workerId })).resolves.toBeUndefined();
+
+    const agents = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
+    expect(agents.some((a) => a.id === workerId)).toBe(false); // tab removed despite failures
+    warnSpy.mockRestore();
   });
 });

@@ -42,6 +42,30 @@ fn known_claude_paths() -> Vec<PathBuf> {
     known_claude_paths_for(std::env::var_os("HOME").map(PathBuf::from))
 }
 
+/// Canonical absolute `node` locations, user-first. Mirrors `known_claude_paths_for`.
+pub fn known_node_paths_for(home: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = home {
+        paths.push(home.join(".local/bin/node"));
+    }
+    paths.push(PathBuf::from("/opt/homebrew/bin/node")); // homebrew (Apple silicon)
+    paths.push(PathBuf::from("/usr/local/bin/node")); // homebrew (Intel) / npm
+    paths
+}
+
+/// Resolve an absolute `node` path: prefer the login-shell `command -v node` (covers nvm/asdf and
+/// any PATH the user set up), then fall back to the canonical install locations. Returns None if
+/// node can't be found at all.
+pub fn resolve_node_path() -> Option<String> {
+    run_in_login_shell("command -v node")
+        .filter(|p| Path::new(p).is_absolute() && is_executable(Path::new(p)))
+        .or_else(|| {
+            first_executable(&known_node_paths_for(
+                std::env::var_os("HOME").map(PathBuf::from),
+            ))
+        })
+}
+
 /// Pure form of [`known_claude_paths`]: takes the home dir explicitly so it can be
 /// unit-tested without mutating the process-global `HOME` env var.
 fn known_claude_paths_for(home: Option<PathBuf>) -> Vec<PathBuf> {
@@ -121,5 +145,22 @@ mod tests {
         let paths = known_claude_paths_for(Some(PathBuf::from("/Users/test")));
         assert!(paths.contains(&PathBuf::from("/Users/test/.local/bin/claude")));
         assert!(paths.contains(&PathBuf::from("/Users/test/.claude/local/claude")));
+    }
+
+    #[test]
+    fn known_node_paths_prioritizes_user_then_brew_then_usr_local() {
+        let home = Some(std::path::PathBuf::from("/Users/x"));
+        let paths = super::known_node_paths_for(home);
+        let strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        assert_eq!(strs[0], "/Users/x/.local/bin/node");
+        assert!(strs.contains(&"/opt/homebrew/bin/node".to_string()));
+        assert!(strs.contains(&"/usr/local/bin/node".to_string()));
+    }
+
+    #[test]
+    fn known_node_paths_handles_no_home() {
+        let paths = super::known_node_paths_for(None);
+        // No home → no ~/.local entry, but the system locations are still present.
+        assert!(paths.iter().any(|p| p.ends_with("opt/homebrew/bin/node")));
     }
 }

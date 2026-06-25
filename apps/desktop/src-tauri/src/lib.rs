@@ -80,6 +80,8 @@ pub fn run() {
             chief::chief_pat,
             bridge::start_orchestration_bridge,
             bridge::stop_orchestration_bridge,
+            bridge::orchestration_respond,
+            bridge::orchestrator_mcp_paths,
             notes::append_note,
             notes::create_bead,
             attention::set_window_attention,

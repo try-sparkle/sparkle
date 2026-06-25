@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "predev": "node scripts/copy-mcp-server.mjs",
     "build": "tsc --noEmit && vite build",
+    "prebuild": "node scripts/copy-mcp-server.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
