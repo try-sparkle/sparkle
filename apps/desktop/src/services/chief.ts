@@ -2,13 +2,25 @@
 // Docs: https://storytell.ai. Base API: https://api.storytell.ai. Auth: `X-API-Key: pat_…`.
 // Project-scoped calls also send `X-Project-Id: project_…`.
 //
-// In the browser localhost preview we go through Vite's "/chief-api" proxy to dodge CORS
-// (see vite.config.ts). In a non-dev build we hit the API directly; the packaged Tauri app
-// will eventually route this through the Tauri HTTP plugin (epic ).
+// Two transports, one per build mode (see `httpFetch` below):
+//   • Dev (vite/tauri dev): web `fetch` hits the same-origin "/chief-api" proxy, which Vite
+//     forwards to api.storytell.ai server-side — dodging both CORS and the webview CSP.
+//   • Packaged app: there is no proxy, and api.storytell.ai sends no CORS headers, so a webview
+//     `fetch` straight to it is blocked (surfacing as a bare "Load failed"). We instead issue the
+//     request from Rust via the Tauri HTTP plugin, which bypasses CSP + CORS entirely (bead
+//     ). The host is allow-listed in src-tauri/capabilities/default.json.
 
 import { invoke } from "@tauri-apps/api/core";
+import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 
 const BASE = import.meta.env.DEV ? "/chief-api" : "https://api.storytell.ai";
+
+// In dev we keep web `fetch` so the Vite "/chief-api" proxy (and test fetch mocks) stay in play;
+// in the packaged app we go through the Tauri HTTP plugin. Same web-standard signature either way.
+// Dispatch per-call (not a captured reference) so tests that spy on `globalThis.fetch` after this
+// module loads still take effect.
+const httpFetch: typeof fetch = (...args) =>
+  (import.meta.env.DEV ? fetch : (tauriFetch as typeof fetch))(...args);
 
 /**
  * Ask the Rust backend for a Chief PAT resolved from the environment / `.env.local` at runtime
@@ -73,7 +85,7 @@ export async function createProject(
   name: string,
   description?: string,
 ): Promise<ChiefProject> {
-  const res = await fetch(`${BASE}/v1/projects`, {
+  const res = await httpFetch(`${BASE}/v1/projects`, {
     method: "POST",
     headers: headers(pat),
     body: JSON.stringify({ name: name.slice(0, 128), description }),
@@ -83,7 +95,7 @@ export async function createProject(
 
 /** List the caller's Chief projects (so we can reuse one named after the Sparkle project). */
 export async function listProjects(pat: string): Promise<ChiefProject[]> {
-  const res = await fetch(`${BASE}/v1/projects`, { headers: headers(pat) });
+  const res = await httpFetch(`${BASE}/v1/projects`, { headers: headers(pat) });
   const body = (await parseOrThrow(res)) as
     | { data?: ChiefProject[]; projects?: ChiefProject[] }
     | ChiefProject[];
@@ -126,7 +138,7 @@ export async function uploadAsset(
   content: string,
   mimeType = "text/markdown",
 ): Promise<UploadAssetResult> {
-  const createRes = await fetch(`${BASE}/v1/assets`, {
+  const createRes = await httpFetch(`${BASE}/v1/assets`, {
     method: "POST",
     headers: headers(pat, projectId),
     body: JSON.stringify({ filename, mime_type: mimeType }),
@@ -143,6 +155,10 @@ export async function uploadAsset(
     throw new ChiefError(`Chief returned no upload url for "${filename}"`);
   }
 
+  // The signed PUT goes to an absolute storage URL (not api.storytell.ai), so it stays on web
+  // `fetch`: it's outside the Tauri HTTP scope, and signed storage endpoints generally allow the
+  // PUT cross-origin. If commit-doc sync ever shows "Load failed" in the packaged app, this is the
+  // line to route through the plugin (and add the storage host to capabilities) — bead .
   const put = await fetch(created.upload_url, {
     method: created.upload_method ?? "PUT",
     headers: created.upload_headers ?? { "Content-Type": mimeType },
@@ -152,7 +168,7 @@ export async function uploadAsset(
     throw new ChiefError(`asset upload failed (${put.status})`, put.status);
   }
 
-  const completeRes = await fetch(`${BASE}/v1/assets/${created.asset_id}/complete`, {
+  const completeRes = await httpFetch(`${BASE}/v1/assets/${created.asset_id}/complete`, {
     method: "POST",
     headers: headers(pat, projectId),
     body: "{}",
@@ -173,7 +189,7 @@ export async function startChat(
   projectId: string,
   prompt: string,
 ): Promise<StartChatResult> {
-  const res = await fetch(`${BASE}/v1/chats`, {
+  const res = await httpFetch(`${BASE}/v1/chats`, {
     method: "POST",
     headers: headers(pat, projectId),
     body: JSON.stringify({ prompt }),
@@ -188,7 +204,7 @@ export async function sendMessage(
   chatId: string,
   prompt: string,
 ): Promise<{ message_id: string }> {
-  const res = await fetch(`${BASE}/v1/chats/${chatId}/messages`, {
+  const res = await httpFetch(`${BASE}/v1/chats/${chatId}/messages`, {
     method: "POST",
     headers: headers(pat, projectId),
     body: JSON.stringify({ prompt }),
@@ -211,7 +227,7 @@ export async function getMessage(
   chatId: string,
   messageId: string,
 ): Promise<ChiefMessage> {
-  const res = await fetch(`${BASE}/v1/chats/${chatId}/messages/${messageId}`, {
+  const res = await httpFetch(`${BASE}/v1/chats/${chatId}/messages/${messageId}`, {
     headers: headers(pat, projectId),
   });
   return (await parseOrThrow(res)) as ChiefMessage;

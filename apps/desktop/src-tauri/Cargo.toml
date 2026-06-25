@@ -15,6 +15,9 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+# Lets the webview reach the Chief API (api.storytell.ai) from Rust, bypassing the
+# webview's CSP and the API's lack of CORS — see chief.ts / bead .
+tauri-plugin-http = "2"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: keep the user's settings.local.json keys in their original order when we merge
 # hooks into it (default serde_json is BTreeMap-backed and would alphabetize them on every write).
