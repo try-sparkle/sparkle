@@ -31,6 +31,12 @@ function devChiefPat(mode: string): string {
 // Tauri expects a fixed dev port and an un-cleared console.
 export default defineConfig(({ mode }) => ({
   plugins: [react()],
+  // Keep a single React/React-DOM instance. The monorepo legitimately holds two
+  // React versions (mobile/Expo pins 19.2.3; web + desktop use 19.2.4); the root
+  // package.json pins 19.2.4 so @testing-library/react resolves the same copy
+  // desktop uses (otherwise jsdom render hits a null dispatcher — "Cannot read
+  // properties of null (reading 'useState')"). dedupe is belt-and-suspenders.
+  resolve: { dedupe: ["react", "react-dom"] },
   clearScreen: false,
   define: {
     "import.meta.env.VITE_CHIEF_PAT": JSON.stringify(devChiefPat(mode)),
@@ -50,8 +56,18 @@ export default defineConfig(({ mode }) => ({
       },
     },
   },
-  // Store tests run under node; test-setup.ts shims localStorage so the persist
-  // middleware doesn't crash. (Desktop tests aren't wired into CI yet — this keeps
-  // them runnable locally.)
-  test: { setupFiles: ["./src/test-setup.ts"] },
+  // Most tests run under node; test-setup.ts shims localStorage so the persist
+  // middleware doesn't crash. Component tests opt into jsdom per-file via a
+  // `// @vitest-environment jsdom` docblock (see Composer.dictation.test.tsx).
+  test: {
+    setupFiles: ["./src/test-setup.ts"],
+    // Coverage measurement only (no thresholds yet — see the CI-ratchet bead). The
+    // numbers are informational until a floor is tuned against the CI runner.
+    coverage: {
+      provider: "v8",
+      include: ["src/**/*.{ts,tsx}"],
+      exclude: ["src/**/*.test.{ts,tsx}", "src/test-setup.ts", "src/**/*.d.ts"],
+      reporter: ["text-summary", "json-summary"],
+    },
+  },
 }));
