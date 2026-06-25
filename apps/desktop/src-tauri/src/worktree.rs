@@ -375,6 +375,143 @@ pub fn agent_branch_status(
     agent_branch_status_at(&root, &project_id, &agent_id, &base_branch, &app_data)
 }
 
+/// Where an agent's work sits in the land-to-green workflow, beyond what ahead/behind can show.
+/// All reachability is "does ref X already contain the agent branch tip" — i.e. the work has
+/// landed there. Computed entirely from LOCAL refs (no fetch), so it's fast and offline-safe;
+/// `in_origin_main` reflects the last-fetched `origin/<default>`. The optional GitHub PR probe is
+/// the only network touch and is strictly best-effort (absent `gh`/remote/PR ⇒ all-None).
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowState {
+    /// Agent branch tip is contained in the LOCAL default branch (e.g. work merged into `main`).
+    in_local_main: bool,
+    /// …in `origin/<default>` as of the last fetch (landed on the remote integration branch).
+    in_origin_main: bool,
+    /// …in the parent/orchestrator branch (workers only; false when `parent_branch` is empty or
+    /// missing). This is a worker's "On Main": its work merged into its orchestrator's branch.
+    in_parent: bool,
+    /// Commits on the agent branch not yet in the local default branch (>0 ⇒ real unlanded work).
+    /// Lets the caller distinguish "did work, now merged" from "never committed anything".
+    ahead_of_local_main: u32,
+    /// Best-effort GitHub PR state for this branch via `gh`, if one is found: "open" | "merged" |
+    /// "closed". None when gh is absent/unauthed, there's no remote, or no PR matches the branch.
+    pr_state: Option<String>,
+    pr_number: Option<u64>,
+    pr_url: Option<String>,
+}
+
+/// True iff `target` exists and already contains `commit` (i.e. `commit` is an ancestor of, or
+/// equal to, `target`). A missing/invalid target ref or any git error reads as "not contained".
+fn ref_contains(root: &str, target: &str, commit: &str) -> bool {
+    if target.trim().is_empty() {
+        return false;
+    }
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(root).args(["merge-base", "--is-ancestor", commit, target]);
+    // A missing target ref makes git print "fatal: Not a valid object name" to stderr; null the
+    // child stdio so that expected, frequent case (e.g. no origin/main) doesn't spam app logs.
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    apply_noninteractive(&mut cmd);
+    matches!(cmd.status(), Ok(s) if s.success())
+}
+
+/// Best-effort GitHub PR lookup for `branch` via the `gh` CLI. Returns (state, number, url) where
+/// state is lowercased ("open"/"merged"/"closed"). Any failure — gh not installed, not authed, no
+/// network, no remote, no matching PR, unparsable output — yields all-None and never errors. Fast
+/// path: callers should only invoke this when an `origin` remote exists.
+fn probe_pr(root: &str, branch: &str) -> (Option<String>, Option<u64>, Option<String>) {
+    let none = (None, None, None);
+    if branch.trim().is_empty() {
+        return none;
+    }
+    let mut cmd = Command::new("gh");
+    cmd.arg("pr")
+        .args(["list", "--head", branch, "--state", "all", "--limit", "1", "--json", "number,state,url"])
+        .current_dir(root)
+        // Keep gh non-interactive and quiet; never let it block the poll on a prompt or updater.
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    let Ok(output) = cmd.output() else {
+        return none; // gh not installed / failed to spawn
+    };
+    if !output.status.success() {
+        return none;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Ok(rows) = serde_json::from_str::<Vec<Value>>(&stdout) else {
+        return none;
+    };
+    let Some(pr) = rows.first() else {
+        return none; // no PR for this branch
+    };
+    let state = pr.get("state").and_then(Value::as_str).map(str::to_ascii_lowercase);
+    let number = pr.get("number").and_then(Value::as_u64);
+    let url = pr.get("url").and_then(Value::as_str).map(str::to_string);
+    (state, number, url)
+}
+
+/// Core (AppHandle-free, testable): the agent's land-to-green workflow state. `parent_branch` is
+/// the orchestrator's branch for workers (empty/None for others). `probe_pr_state` gates the gh
+/// network probe so a pure-local project (or a fast poll) can skip it entirely.
+pub fn agent_workflow_state_at(
+    root: &str,
+    agent_id: &str,
+    parent_branch: &str,
+    probe_pr_state: bool,
+) -> Result<WorkflowState, String> {
+    let branch = format!("sparkle/agent-{agent_id}");
+    // The branch tip lives in the shared repo (worktree add -b created the ref), so we can resolve
+    // and compare it from `root` without touching the worktree dir.
+    let tip = match git(root, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]) {
+        Ok(sha) if !sha.is_empty() => sha,
+        // No branch yet (worktree never created) ⇒ nothing has landed anywhere.
+        _ => return Ok(WorkflowState::default()),
+    };
+
+    let default_branch = resolve_default_branch(root);
+    let in_local_main = ref_contains(root, &default_branch, &tip);
+    let origin_ref = format!("origin/{default_branch}");
+    let in_origin_main = ref_contains(root, &origin_ref, &tip);
+    let in_parent = ref_contains(root, parent_branch, &tip);
+
+    // Commits unique to the agent branch vs the local default (0 once landed into it).
+    let ahead_of_local_main = git(root, &["rev-list", "--count", &format!("{default_branch}..{branch}")])
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    // Only spend a network round-trip on the PR probe when asked AND a remote exists.
+    let (pr_state, pr_number, pr_url) = if probe_pr_state && git(root, &["remote", "get-url", "origin"]).is_ok() {
+        probe_pr(root, &branch)
+    } else {
+        (None, None, None)
+    };
+
+    Ok(WorkflowState {
+        in_local_main,
+        in_origin_main,
+        in_parent,
+        ahead_of_local_main,
+        pr_state,
+        pr_number,
+        pr_url,
+    })
+}
+
+/// Live workflow stage signals for an agent: local-ref reachability + a best-effort GitHub PR
+/// probe. See `WorkflowState`. The PR probe is gated by `probe_pr_state` (skip it on fast polls or
+/// remoteless projects).
+#[tauri::command]
+pub fn agent_workflow_state(
+    root: String,
+    agent_id: String,
+    parent_branch: String,
+    probe_pr_state: bool,
+) -> Result<WorkflowState, String> {
+    agent_workflow_state_at(&root, &agent_id, &parent_branch, probe_pr_state)
+}
+
 #[derive(Serialize)]
 pub struct MarkdownChange {
     /// Repo-root-relative path of the markdown file.
@@ -537,6 +674,111 @@ pub fn refresh_agent_branch(
 ) -> Result<RefreshOutcome, String> {
     let app_data = app_data_dir(&app)?;
     refresh_agent_branch_at(&root, &project_id, &agent_id, &base_branch, &app_data)
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum LandOutcome {
+    Ok { ok: bool, target: String },
+    Err { ok: bool, reason: String, files: Vec<String> },
+}
+
+/// Path of the worktree that currently has `branch` checked out (`refs/heads/<branch>`), via
+/// `git worktree list --porcelain`. None when no worktree has it checked out.
+fn worktree_on_branch(root: &str, branch: &str) -> Option<String> {
+    let listing = git(root, &["worktree", "list", "--porcelain"]).ok()?;
+    let want = format!("refs/heads/{branch}");
+    let mut cur_path: Option<String> = None;
+    for line in listing.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            cur_path = Some(p.trim().to_string());
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            if b.trim() == want {
+                return cur_path;
+            }
+        }
+    }
+    None
+}
+
+/// Core (AppHandle-free, testable): merge an agent's branch into `target_branch` LOCALLY. The merge
+/// runs INSIDE whichever worktree currently has `target_branch` checked out, sidestepping git's
+/// "cannot update a checked-out branch" refusal. Guarded — refuses unless that worktree is clean —
+/// and aborts cleanly on conflict so the target is byte-identical to before. `target_branch` is the
+/// orchestrator's branch for a worker, or the project's default branch for a build agent. A live
+/// PTY on the target is gated on the frontend (like refresh).
+pub fn land_agent_branch_at(
+    root: &str,
+    agent_id: &str,
+    target_branch: &str,
+) -> Result<LandOutcome, String> {
+    let err = |reason: &str, files: Vec<String>| {
+        Ok(LandOutcome::Err { ok: false, reason: reason.into(), files })
+    };
+    let target = target_branch.trim();
+    if target.is_empty() {
+        return err("no-target", vec![]);
+    }
+    let branch = format!("sparkle/agent-{agent_id}");
+    if git(root, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_err() {
+        return err("no-branch", vec![]);
+    }
+    // The target must resolve to a real commit. Otherwise the rev-list below errors and would
+    // collapse to ahead==0, masquerading a missing/typo'd target as a misleading "nothing-to-land".
+    if git(root, &["rev-parse", "--verify", "--quiet", &format!("{target}^{{commit}}")]).is_err() {
+        return err("no-target", vec![]);
+    }
+    // Nothing to land if the target already contains every commit on the branch.
+    let ahead: u32 = git(root, &["rev-list", "--count", &format!("{target}..{branch}")])
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if ahead == 0 {
+        return err("nothing-to-land", vec![]);
+    }
+    // The target must be checked out somewhere so we can merge there without fighting git.
+    let Some(wt) = worktree_on_branch(root, target) else {
+        return err("target-not-checked-out", vec![]);
+    };
+    // Never disturb a dirty target checkout (the user's main, or a busy orchestrator's tree).
+    if !git(&wt, &["status", "--porcelain"])?.is_empty() {
+        return err("dirty", vec![]);
+    }
+    let msg = format!("Land {branch} into {target}");
+    let mut merge = Command::new("git");
+    merge.arg("-C").arg(&wt).args(["merge", "--no-ff", &branch, "-m", &msg]);
+    apply_noninteractive(&mut merge);
+    match merge.output() {
+        Ok(o) if o.status.success() => Ok(LandOutcome::Ok { ok: true, target: target.to_string() }),
+        _ => {
+            // Conflicted paths distinguish a real merge conflict from a non-conflict failure (git
+            // errored, or the process failed to spawn): only the former populates --diff-filter=U.
+            let files: Vec<String> = git(&wt, &["diff", "--name-only", "--diff-filter=U"])
+                .unwrap_or_default()
+                .lines()
+                .map(|s| s.to_string())
+                .collect();
+            // Abort to leave the target byte-identical (a no-op if no merge was actually in flight).
+            let _ = git(&wt, &["merge", "--abort"]);
+            if files.is_empty() {
+                err("merge-failed", vec![])
+            } else {
+                err("conflict", files)
+            }
+        }
+    }
+}
+
+/// Merge an agent's branch into its integration target (orchestrator branch for a worker, project
+/// default for a build agent) locally. Refuses a dirty target; aborts cleanly on conflict. A live
+/// PTY on the target worktree is gated on the frontend.
+#[tauri::command]
+pub fn land_agent_branch(
+    root: String,
+    agent_id: String,
+    target_branch: String,
+) -> Result<LandOutcome, String> {
+    land_agent_branch_at(&root, &agent_id, &target_branch)
 }
 
 /// Core (AppHandle-free, testable): remove an agent's external worktree (force, to discard
@@ -1096,6 +1338,179 @@ mod tests {
         std::fs::write(Path::new(&info.path).join("uncommitted.txt"), "u").unwrap();
         let st2 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
         assert!(st2.dirty, "uncommitted file flips dirty");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn workflow_state_tracks_reachability_through_a_local_merge() {
+        let root = unique_root("wf-state");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("wf-state-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "w1", "main", &app_data).unwrap();
+
+        // No commits yet. The tip IS main's HEAD, so reachability is trivially true — the
+        // distinguishing signal that no real work exists is ahead_of_local_main == 0, which the
+        // frontend folds into its committedSeen gate to avoid a false "On Main" for a no-op agent.
+        let s0 = agent_workflow_state_at(&root_str, "w1", "", false).unwrap();
+        assert_eq!(s0.ahead_of_local_main, 0, "no work ⇒ no commits unique to the branch (the gate)");
+
+        // Agent commits real work → ahead of main, not yet contained in it.
+        std::fs::write(Path::new(&info.path).join("w.txt"), "work\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+        let s1 = agent_workflow_state_at(&root_str, "w1", "", false).unwrap();
+        assert_eq!(s1.ahead_of_local_main, 1, "one unlanded commit");
+        assert!(!s1.in_local_main, "committed but not merged into main yet");
+
+        // Land it into local main (the merge the user/orchestrator would do).
+        git(&root_str, &["merge", "--no-ff", "sparkle/agent-w1", "-m", "land w1"]).unwrap();
+        let s2 = agent_workflow_state_at(&root_str, "w1", "", false).unwrap();
+        assert!(s2.in_local_main, "after merge, main contains the agent tip → On Main");
+        assert_eq!(s2.ahead_of_local_main, 0, "no commits remain unique to the branch");
+        assert!(!s2.in_origin_main, "no origin remote in this fixture → not Merged");
+        assert!(s2.pr_state.is_none(), "no PR probe requested / no remote");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn land_merges_agent_branch_into_main_and_guards_dirty_and_empty() {
+        let root = unique_root("land");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("land-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap(); // main is checked out at root
+        // ensure_project_repo leaves .gitignore UNTRACKED; commit it so the root (our land target)
+        // starts clean — a real well-kept project root would have it committed.
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "chore: gitignore"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "L1", "main", &app_data).unwrap();
+
+        // Nothing committed yet → nothing to land.
+        match land_agent_branch_at(&root_str, "L1", "main").unwrap() {
+            LandOutcome::Err { reason, .. } => assert_eq!(reason, "nothing-to-land"),
+            LandOutcome::Ok { .. } => panic!("should refuse an empty branch"),
+        }
+
+        // Commit real work on the agent branch.
+        std::fs::write(Path::new(&info.path).join("f.txt"), "feature\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent feature"]).unwrap();
+
+        // A dirty target (root) is refused without touching anything.
+        std::fs::write(root.join("scratch.txt"), "wip").unwrap();
+        match land_agent_branch_at(&root_str, "L1", "main").unwrap() {
+            LandOutcome::Err { reason, .. } => assert_eq!(reason, "dirty"),
+            LandOutcome::Ok { .. } => panic!("should refuse a dirty target"),
+        }
+        std::fs::remove_file(root.join("scratch.txt")).unwrap();
+
+        // Clean target → the merge lands and main now contains the agent tip.
+        match land_agent_branch_at(&root_str, "L1", "main").unwrap() {
+            LandOutcome::Ok { target, ok } => {
+                assert!(ok);
+                assert_eq!(target, "main");
+            }
+            LandOutcome::Err { reason, .. } => panic!("expected land to succeed, got {reason}"),
+        }
+        let ws = agent_workflow_state_at(&root_str, "L1", "", false).unwrap();
+        assert!(ws.in_local_main, "after land, main contains the agent tip");
+        assert_eq!(ws.ahead_of_local_main, 0, "no commits remain unique to the branch");
+
+        // Re-landing is now a no-op (idempotent guard).
+        match land_agent_branch_at(&root_str, "L1", "main").unwrap() {
+            LandOutcome::Err { reason, .. } => assert_eq!(reason, "nothing-to-land"),
+            LandOutcome::Ok { .. } => panic!("re-land should be a no-op"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn land_conflict_aborts_cleanly_and_target_not_checked_out_is_reported() {
+        let root = unique_root("land-conflict");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("land-conflict-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        // A base file both sides will edit differently → a guaranteed merge conflict.
+        std::fs::write(root.join("c.txt"), "base\n").unwrap();
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "base"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "L2", "main", &app_data).unwrap();
+
+        // Agent edits c.txt one way…
+        std::fs::write(Path::new(&info.path).join("c.txt"), "agent side\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent edit"]).unwrap();
+        // …main edits the same lines another way.
+        std::fs::write(root.join("c.txt"), "main side\n").unwrap();
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "main edit"]).unwrap();
+        let main_before = git(&root_str, &["rev-parse", "main"]).unwrap();
+
+        // A target that doesn't resolve → no-target (and it returns BEFORE the rev-list, so a
+        // missing target never masquerades as "nothing-to-land" — the regression this guards).
+        match land_agent_branch_at(&root_str, "L2", "does-not-exist").unwrap() {
+            LandOutcome::Err { reason, .. } => assert_eq!(reason, "no-target"),
+            LandOutcome::Ok { .. } => panic!("a missing target can't be landed into"),
+        }
+
+        // A branch that exists but is checked out nowhere → target-not-checked-out (not "conflict").
+        git(&root_str, &["branch", "shelf", "main"]).unwrap();
+        match land_agent_branch_at(&root_str, "L2", "shelf").unwrap() {
+            LandOutcome::Err { reason, .. } => assert_eq!(reason, "target-not-checked-out"),
+            LandOutcome::Ok { .. } => panic!("a non-checked-out target can't be landed into"),
+        }
+
+        // Landing into main conflicts; it must abort cleanly and leave main byte-identical.
+        match land_agent_branch_at(&root_str, "L2", "main").unwrap() {
+            LandOutcome::Err { reason, files, .. } => {
+                assert_eq!(reason, "conflict");
+                assert!(files.iter().any(|f| f == "c.txt"), "conflicted file reported: {files:?}");
+            }
+            LandOutcome::Ok { .. } => panic!("expected a conflict"),
+        }
+        assert_eq!(git(&root_str, &["rev-parse", "main"]).unwrap(), main_before, "main HEAD unchanged");
+        assert!(git(&root_str, &["status", "--porcelain"]).unwrap().is_empty(), "abort left a clean tree");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn workflow_state_in_parent_tracks_merge_into_orchestrator_branch() {
+        let root = unique_root("wf-parent");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("wf-parent-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        // Orchestrator agent + a worker cut from the orchestrator's branch.
+        let orch = create_worktree_at(&root_str, "p", "orch", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&orch.path).join("o.txt"), "orch\n").unwrap();
+        git(&orch.path, &["add", "-A"]).unwrap();
+        git(&orch.path, &["commit", "-m", "orch base"]).unwrap();
+        let worker = create_worktree_from_local(&root_str, "p", "wk", "sparkle/agent-orch", &app_data).unwrap();
+        std::fs::write(Path::new(&worker.path).join("wk.txt"), "wk\n").unwrap();
+        git(&worker.path, &["add", "-A"]).unwrap();
+        git(&worker.path, &["commit", "-m", "worker work"]).unwrap();
+
+        // Before merge: worker not yet in orchestrator branch.
+        let s0 = agent_workflow_state_at(&root_str, "wk", "sparkle/agent-orch", false).unwrap();
+        assert!(!s0.in_parent, "worker work not yet merged into the orchestrator branch");
+
+        // Merge worker → orchestrator branch (worker's "On Main").
+        git(&orch.path, &["merge", "--no-ff", "sparkle/agent-wk", "-m", "land worker"]).unwrap();
+        let s1 = agent_workflow_state_at(&root_str, "wk", "sparkle/agent-orch", false).unwrap();
+        assert!(s1.in_parent, "orchestrator branch now contains the worker tip → worker On Main");
+        assert!(!s1.in_local_main, "orchestrator hasn't landed on main, so worker isn't Merged");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
     }

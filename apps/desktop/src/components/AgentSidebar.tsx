@@ -1,13 +1,13 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { TbPinFilled } from "react-icons/tb";
 import { C, AGENT_STATUS, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK } from "../theme/colors";
-import type { Project, AgentTabStatus } from "../types";
+import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { removeAgentWorkspace } from "../services/worktree";
-import { refreshAgentBranch } from "../services/branchStatus";
+import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 import { stalenessTier, growNudge } from "../engine/nudges";
 import { spawnWorker } from "../services/workerSpawn";
@@ -18,7 +18,7 @@ import { Tooltip } from "./Tooltip";
 import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
 import { WorkflowTracker } from "./WorkflowTracker";
-import { resolveStage, rollupStages, stageMeta } from "../engine/workflowStage";
+import { resolveStage, rollupStages, stageMeta, stageIndex } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 
 /**
@@ -67,6 +67,52 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // The workflow stage an agent's own git state + any known override resolves to.
   const stageOf = (id: string): WorkflowStageId =>
     resolveStage(branchStatus[id], workflowStage[id]);
+
+  // Keep the workflow trackers live: re-poll branch + workflow state on a modest cadence (and once
+  // immediately on project switch), so the chevrons advance toward green as work is committed, PR'd,
+  // and merged without the user touching anything. Reads fresh state from the stores inside the tick
+  // so the effect only re-subscribes on project change, not on every status update.
+  const projectId = project?.id;
+  useEffect(() => {
+    if (!projectId) return;
+    // A slow tick (the gh PR probe can take ~0.5s/agent) must not overlap the next interval.
+    let inFlight = false;
+    const tick = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const proj = useProjectStore.getState().projects.find((p) => p.id === projectId);
+        if (!proj) return;
+        const { openAgentIds, pollBranchStatus: poll } = useRuntimeStore.getState();
+        const hasWorkflow = (a: (typeof proj.agents)[number]) =>
+          a.kind !== "brainstorm" && a.kind !== "shell"; // those have no git workflow
+        // Targets: every OPEN agent, PLUS the orchestrator parent of each open worker — even when
+        // that parent's pane is closed — so a worker's "Merged" (which reads its parent's stage)
+        // can still advance. De-duped by id.
+        const targets = new Map<string, (typeof proj.agents)[number]>();
+        for (const a of proj.agents) {
+          if (!openAgentIds.includes(a.id) || !hasWorkflow(a)) continue;
+          targets.set(a.id, a);
+          if (a.kind === "worker" && a.parentId) {
+            const parent = proj.agents.find((p) => p.id === a.parentId);
+            if (parent && hasWorkflow(parent)) targets.set(parent.id, parent);
+          }
+        }
+        const all = [...targets.values()];
+        // Poll orchestrators (worker parents) first and await them, so a worker's derive in this
+        // same round reads its parent's fresh stage rather than lagging a tick behind.
+        const parents = all.filter((a) => a.kind === "build");
+        const rest = all.filter((a) => a.kind !== "build");
+        await Promise.all(parents.map((a) => poll(proj.rootPath, proj.id, a.id, a.baseBranch ?? "")));
+        await Promise.all(rest.map((a) => poll(proj.rootPath, proj.id, a.id, a.baseBranch ?? "")));
+      } finally {
+        inFlight = false;
+      }
+    };
+    void tick();
+    const id = setInterval(() => void tick(), 30_000);
+    return () => clearInterval(id);
+  }, [projectId]);
   const [editing, setEditing] = useState<string | null>(null);
 
   // Draggable column width — persisted to localStorage so it survives relaunch. Clamped to
@@ -142,6 +188,42 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const onSelectSparkle = () => {
     setActiveSpecial("sparkle");
     open(SPARKLE_AGENT_ID);
+  };
+  // Land an agent's work into its integration target: a worker → its orchestrator's branch; a build
+  // agent → the project's default branch. A local --no-ff merge (see Rust land_agent_branch); the
+  // tracker then advances to On Main on the next poll. Best-effort feedback via console for now
+  // (dirty/conflict/etc.) — a full toast is a follow-up, matching the refresh button's pattern.
+  const onLand = async (a: AgentTab) => {
+    if (!project) return;
+    // Build agents ALWAYS integrate into the project's default branch — regardless of the base they
+    // were spawned from — because that's the ref "On Main"/"Merged" reachability is measured against
+    // (Rust resolve_default_branch), so a successful Land actually advances the chevron to green. The
+    // deliberate tradeoff: a build agent intentionally cut from a NON-default integration branch is
+    // still landed into the default, not that base. baseBranch is only a last-resort fallback when
+    // the default is unknown. (In practice build agents are cut from the default, so this is rarely
+    // observable; workers, which DO target their orchestrator's branch, are handled above.)
+    const target =
+      a.kind === "worker" && a.parentId
+        ? `sparkle/agent-${a.parentId}`
+        : project.defaultBranch ?? a.baseBranch ?? "main";
+    // The target tree must be clean. For a worker the target is the live orchestrator — gate on it
+    // not actively working so we never merge under a running agent. (A build agent lands into the
+    // project root, which has no PTY of its own.)
+    const targetBusy =
+      a.kind === "worker" && a.parentId
+        ? useRuntimeStore.getState().status[a.parentId] === "working"
+        : false;
+    const r = await landAgentBranch(project.rootPath, a.id, target, targetBusy);
+    if (r.ok) {
+      // Refresh the agent and (for a worker) its orchestrator so both trackers reflect the landing.
+      void pollBranchStatus(project.rootPath, project.id, a.id, a.baseBranch ?? "");
+      if (a.kind === "worker" && a.parentId) {
+        const parent = project.agents.find((p) => p.id === a.parentId);
+        void pollBranchStatus(project.rootPath, project.id, a.parentId, parent?.baseBranch ?? "");
+      }
+    } else {
+      console.warn("land blocked:", r.reason, r.files ?? "");
+    }
   };
   const onClose = (id: string) => {
     if (!project) return;
@@ -451,6 +533,39 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                   )}
                 </div>
               )}
+              {/* Land: offer the merge-to-integration action while the agent has unlanded commits
+                  and hasn't reached On Main yet. A worker lands into its orchestrator; a build agent
+                  into the project default. */}
+              {bs &&
+                bs.ahead > 0 &&
+                a.kind !== "brainstorm" &&
+                a.kind !== "shell" &&
+                stageIndex(stageOf(a.id)) < stageIndex("main") && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void onLand(a);
+                    }}
+                    title={
+                      a.kind === "worker"
+                        ? "Land this worker into its orchestrator's branch"
+                        : "Land this work into the project's default branch"
+                    }
+                    style={{
+                      fontSize: 10,
+                      color: stageMeta("main").color,
+                      background: "transparent",
+                      border: `1px solid ${stageMeta("main").color}`,
+                      borderRadius: 5,
+                      cursor: "pointer",
+                      padding: "1px 5px",
+                      flex: "0 0 auto",
+                      fontFamily: '"IBM Plex Sans", sans-serif',
+                    }}
+                  >
+                    ⬆ Land
+                  </button>
+                )}
               <span
                 onClick={(e) => {
                   e.stopPropagation();

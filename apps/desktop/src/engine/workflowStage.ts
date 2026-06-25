@@ -2,7 +2,7 @@
 // way from a scratch edit to landed-on-main, plus the pure logic that decides which stage an
 // agent is in and how a build agent rolls up its workers. Kept free of React so it's unit-tested
 // in isolation — the chevron UI lives in components/WorkflowTracker.tsx.
-import type { BranchStatus } from "../services/branchStatus";
+import type { BranchStatus, WorkflowState } from "../services/branchStatus";
 import { C } from "../theme/colors";
 
 // Ordered earliest → final. Order is load-bearing: stageIndex/rollup/dominant all rely on it.
@@ -74,6 +74,70 @@ export function resolveStage(
   const derived = stageIndex(gitDerivedStage(bs));
   const ovr = override ? stageIndex(override) : -1;
   return stageAt(Math.max(derived, ovr, 0)).id;
+}
+
+// Everything we know about an agent at poll time, fed into the live stage derivation below.
+export interface LiveStageInputs {
+  // "build" | "worker" | etc. Only "worker" uses the parent-branch / parent-reached-main signals;
+  // every other worktree-bearing kind lands relative to the project's own main.
+  kind: string;
+  bs?: BranchStatus | null; // ahead/behind/dirty (drives Uncommitted/Committed)
+  ws?: WorkflowState | null; // reachability + PR probe (drives Pull Request/On Main/Merged)
+  prev?: WorkflowStageId | null; // the stage already recorded — derivation never regresses below it
+  // For a worker: has its parent orchestrator's OWN work reached main? That's the worker's "Merged"
+  // under worktree-relative semantics (its work shipped once the orchestrator's branch landed).
+  parentReachedMain?: boolean;
+}
+
+// Derive the live stage from all available signals, monotonically (never below `prev`). The order
+// of precedence, strongest first:
+//   • GitHub PR merged                      → Merged      (authoritative)
+//   • reachability into main/origin/parent  → On Main / Merged  (best-effort, GATED on real work)
+//   • GitHub PR open                        → Pull Request
+//   • local git ahead/dirty                 → Committed / Uncommitted
+// The reachability gate ("did this agent actually do work?") is `committedSeen`: a fresh branch's
+// tip trivially sits in main, so we only believe "landed" once we've observed commits. We take that
+// from three angles so the gate matches its intent regardless of which base `bs.ahead` was measured
+// against: `bs.ahead>0` (ahead of the agent's baseBranch), `ws.aheadOfLocalMain>0` (ahead of the
+// project default — matters when baseBranch ≠ default), or the in-session watermark `prev ≥
+// Committed`. The watermark is why `prev` matters beyond monotonicity: it remembers work existed
+// after a merge drops `ahead` to 0. KNOWN false-positive: if an agent commits, then hard-RESETS its
+// branch back to main HEAD (work discarded, not merged), the watermark still believes it landed and
+// shows "On Main". That's a rare, deliberate user action; we accept it rather than persisting a
+// per-commit merge proof.
+export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
+  const { kind, bs, ws, prev, parentReachedMain } = input;
+  let idx = stageIndex(gitDerivedStage(bs));
+  const prevIdx = prev ? stageIndex(prev) : -1;
+  const committedSeen =
+    idx >= stageIndex("committed") ||
+    prevIdx >= stageIndex("committed") ||
+    (ws?.aheadOfLocalMain ?? 0) > 0;
+
+  const bump = (id: WorkflowStageId) => {
+    idx = Math.max(idx, stageIndex(id));
+  };
+
+  if (ws) {
+    // PR probe — authoritative where present.
+    if (ws.prState === "merged") bump("merged");
+    else if (ws.prState === "open") bump("pull_request");
+
+    // Reachability — only trusted once we know real work exists (else a no-op branch reads as
+    // landed, since its tip is just main's HEAD).
+    if (committedSeen) {
+      if (kind === "worker") {
+        if (ws.inParent) bump("main"); // merged into the orchestrator's branch
+        if (parentReachedMain) bump("merged"); // …and the orchestrator's work reached main
+      } else {
+        if (ws.inLocalMain) bump("main"); // merged into local main
+        if (ws.inOriginMain) bump("merged"); // …and pushed/landed on origin/main
+      }
+    }
+  }
+
+  idx = Math.max(idx, prevIdx, 0); // monotonic within a session
+  return stageAt(idx).id;
 }
 
 export type StageCounts = Record<WorkflowStageId, number>;

@@ -8,7 +8,8 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import type { AgentTabStatus } from "../types";
 import type { BranchStatus } from "../services/branchStatus";
 import type { WorkflowStageId } from "../engine/workflowStage";
-import { agentBranchStatus } from "../services/branchStatus";
+import { agentBranchStatus, agentWorkflowState } from "../services/branchStatus";
+import { deriveLiveStage, stageIndex } from "../engine/workflowStage";
 import { syncAgentMarkdown } from "../services/chiefSync";
 import { useSettingsStore, effectiveChiefPat } from "./settingsStore";
 import { useProjectStore } from "./projectStore";
@@ -60,10 +61,10 @@ interface RuntimeState {
   status: Record<string, AgentTabStatus>; // agentId -> status (live-only, never persisted)
   openAgentIds: string[]; // agents whose pane is mounted + PTY alive (persisted)
   branchStatus: Record<string, BranchStatus>; // agentId -> live ahead/behind/dirty/size (live-only)
-  // agentId -> the furthest workflow stage we KNOW the work has reached (Pull Request / On Main /
-  // Merged), which local git can't infer on its own. The workflow tracker overlays this on top of
-  // the git-derived stage (see engine/workflowStage.resolveStage). Live-only: re-derived/re-pushed
-  // as signals arrive; PR/merge detection and the orchestration bridge call setWorkflowStage.
+  // agentId -> the furthest workflow stage we KNOW this agent's OWN work has reached. Derived each
+  // poll from local-ref reachability + an opportunistic GitHub PR probe (see refreshWorkflowStage /
+  // engine.deriveLiveStage), advanced monotonically. The sidebar overlays it on the git-derived
+  // stage (resolveStage) and rolls workers up into their orchestrator. Live-only (never persisted).
   workflowStage: Record<string, WorkflowStageId>;
 
   open: (agentId: string) => void;
@@ -79,6 +80,10 @@ interface RuntimeState {
     agentId: string,
     baseBranch: string,
   ) => Promise<void>;
+  /** Re-derive this agent's OWN workflow stage from local-ref reachability + a best-effort GitHub
+   *  PR probe, and advance the stored stage if it moved forward. Best-effort: swallows git/gh
+   *  errors. Skips brainstorm/shell agents (no git workflow). */
+  refreshWorkflowStage: (root: string, projectId: string, agentId: string) => Promise<void>;
   isOpen: (agentId: string) => boolean;
   /** Drop any open ids whose agent no longer exists (e.g. deleted between
    * launches). Call once on boot with the ids of all agents in projectStore. */
@@ -128,10 +133,44 @@ export const useRuntimeStore = create<RuntimeState>()(
           get().setBranchStatus(agentId, s);
           // Piggyback the Chief markdown sync on the same signal a commit would refresh.
           void syncMarkdownToChief(projectId, agentId);
+          // …and advance the workflow tracker from reachability + an opportunistic PR probe. Runs
+          // after setBranchStatus so deriveLiveStage sees this tick's fresh ahead/dirty counts.
+          void get().refreshWorkflowStage(root, projectId, agentId);
         } catch (e) {
           // Best-effort: a transient git error must not break the UI. Log at debug level so a
           // persistent (structural) failure — e.g. a bad baseBranch — is still diagnosable.
           console.debug("pollBranchStatus failed for", agentId, e);
+        }
+      },
+
+      refreshWorkflowStage: async (root, projectId, agentId) => {
+        try {
+          const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
+          const agent = project?.agents.find((a) => a.id === agentId);
+          // No worktree / no git workflow → nothing to track.
+          if (!agent || agent.kind === "brainstorm" || agent.kind === "shell") return;
+          // A worker integrates into its orchestrator's branch; everyone else, into project main.
+          const parentBranch =
+            agent.kind === "worker" && agent.parentId ? `sparkle/agent-${agent.parentId}` : "";
+          const ws = await agentWorkflowState(root, agentId, parentBranch, true);
+          const prev = get().workflowStage[agentId] ?? null;
+          // A worker's "Merged" = its orchestrator's OWN work has reached main. Read the parent's
+          // stored stage (set by its own poll); eventually-consistent across ticks.
+          let parentReachedMain = false;
+          if (agent.kind === "worker" && agent.parentId) {
+            const ps = get().workflowStage[agent.parentId];
+            parentReachedMain = ps ? stageIndex(ps) >= stageIndex("main") : false;
+          }
+          const next = deriveLiveStage({
+            kind: agent.kind,
+            bs: get().branchStatus[agentId],
+            ws,
+            prev,
+            parentReachedMain,
+          });
+          if (next !== prev) get().setWorkflowStage(agentId, next);
+        } catch (e) {
+          console.debug("refreshWorkflowStage failed for", agentId, e);
         }
       },
 

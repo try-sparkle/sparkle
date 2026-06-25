@@ -71,6 +71,8 @@ pub fn run() {
             hooks::read_events_since,
             worktree::project_default_branch,
             worktree::agent_branch_status,
+            worktree::agent_workflow_state,
+            worktree::land_agent_branch,
             worktree::markdown_changed_since,
             worktree::refresh_agent_branch,
             worktree::read_worker_result,

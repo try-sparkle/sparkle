@@ -7,9 +7,10 @@ import {
   resolveStage,
   rollupStages,
   dominantStage,
+  deriveLiveStage,
   type WorkflowStageId,
 } from "./workflowStage";
-import type { BranchStatus } from "../services/branchStatus";
+import type { BranchStatus, WorkflowState } from "../services/branchStatus";
 
 const bs = (p: Partial<BranchStatus>): BranchStatus => ({
   ahead: 0,
@@ -18,6 +19,17 @@ const bs = (p: Partial<BranchStatus>): BranchStatus => ({
   filesChanged: 0,
   insertions: 0,
   deletions: 0,
+  ...p,
+});
+
+const ws = (p: Partial<WorkflowState>): WorkflowState => ({
+  inLocalMain: false,
+  inOriginMain: false,
+  inParent: false,
+  aheadOfLocalMain: 0,
+  prState: null,
+  prNumber: null,
+  prUrl: null,
   ...p,
 });
 
@@ -102,6 +114,82 @@ describe("rollupStages", () => {
     expect(r.counts.committed).toBe(2);
     expect(r.counts.merged).toBe(1);
     expect(r.counts.uncommitted).toBe(0);
+  });
+});
+
+describe("deriveLiveStage", () => {
+  it("falls back to local git when there are no workflow signals", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs({ dirty: true }) })).toBe("uncommitted");
+    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 2 }) })).toBe("committed");
+  });
+
+  it("an open PR advances to Pull Request", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 1 }), ws: ws({ prState: "open" }) })).toBe(
+      "pull_request",
+    );
+  });
+
+  it("a merged PR is Merged (authoritative)", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 1 }), ws: ws({ prState: "merged" }) })).toBe(
+      "merged",
+    );
+  });
+
+  it("build agent: reachable into local main → On Main, into origin → Merged (gated on real work)", () => {
+    // ahead>0 this poll proves work exists, so reachability is believed.
+    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 1 }), ws: ws({ inLocalMain: true }) })).toBe(
+      "main",
+    );
+    expect(
+      deriveLiveStage({ kind: "build", bs: bs({ ahead: 1 }), ws: ws({ inLocalMain: true, inOriginMain: true }) }),
+    ).toBe("merged");
+  });
+
+  it("does NOT believe reachability for a no-work branch (fresh tip is trivially in main)", () => {
+    // No commits ever (bs ahead 0, no prev watermark): a fresh branch's tip sits in main, but that
+    // must NOT read as On Main.
+    expect(deriveLiveStage({ kind: "build", bs: bs({}), ws: ws({ inLocalMain: true }) })).toBe(
+      "uncommitted",
+    );
+  });
+
+  it("remembers work via the watermark after a merge drops ahead to 0", () => {
+    // The merge landed the work (ahead now 0, tip in main). prev=Committed proves work existed.
+    expect(
+      deriveLiveStage({ kind: "build", bs: bs({ ahead: 0 }), ws: ws({ inLocalMain: true }), prev: "committed" }),
+    ).toBe("main");
+  });
+
+  it("worker: inParent → On Main; parentReachedMain → Merged", () => {
+    expect(deriveLiveStage({ kind: "worker", bs: bs({ ahead: 1 }), ws: ws({ inParent: true }) })).toBe(
+      "main",
+    );
+    expect(
+      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 1 }), ws: ws({ inParent: true }), parentReachedMain: true }),
+    ).toBe("merged");
+  });
+
+  it("worker does not use local-main reachability (only its orchestrator branch)", () => {
+    // A worker's tip being in main shouldn't matter — its integration target is the orchestrator.
+    expect(deriveLiveStage({ kind: "worker", bs: bs({ ahead: 1 }), ws: ws({ inLocalMain: true }) })).toBe(
+      "committed",
+    );
+  });
+
+  it("never regresses below the previous stage", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs({ dirty: true }), prev: "merged" })).toBe("merged");
+  });
+
+  it("aheadOfLocalMain satisfies the committed gate when bs.ahead is measured against a non-default base", () => {
+    // bs.ahead == 0 (synced to its baseBranch) but the branch IS ahead of project main → work
+    // exists, so reachability into the parent should be believed even without a prev watermark.
+    expect(
+      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfLocalMain: 1, inParent: true }) }),
+    ).toBe("main");
+    // Without that signal (and no commits anywhere), the same reachability is NOT believed.
+    expect(
+      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfLocalMain: 0, inParent: true }) }),
+    ).toBe("uncommitted");
   });
 });
 
