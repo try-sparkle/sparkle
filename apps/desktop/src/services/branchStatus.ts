@@ -19,7 +19,7 @@ export interface WorkflowState {
   inLocalMain: boolean; // agent tip contained in the local default branch
   inOriginMain: boolean; // …in origin/<default> as of the last fetch
   inParent: boolean; // …in the parent/orchestrator branch (workers only)
-  aheadOfLocalMain: number; // commits unique to the branch vs local default (>0 ⇒ real unlanded work)
+  aheadOfBase: number; // commits the agent authored, vs the ref it was cut from — origin/<default> when present, else local (>0 ⇒ real unlanded work)
   prState: "open" | "merged" | "closed" | null; // GitHub PR state for the branch, if any
   prNumber: number | null;
   prUrl: string | null;

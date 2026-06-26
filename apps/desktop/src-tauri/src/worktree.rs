@@ -390,9 +390,12 @@ pub struct WorkflowState {
     /// …in the parent/orchestrator branch (workers only; false when `parent_branch` is empty or
     /// missing). This is a worker's "On Main": its work merged into its orchestrator's branch.
     in_parent: bool,
-    /// Commits on the agent branch not yet in the local default branch (>0 ⇒ real unlanded work).
-    /// Lets the caller distinguish "did work, now merged" from "never committed anything".
-    ahead_of_local_main: u32,
+    /// Commits the agent authored that aren't yet in the ref it was cut from — `origin/<default>`
+    /// when that remote-tracking ref exists, else local `<default>` (>0 ⇒ real unlanded work).
+    /// Lets the caller distinguish "did work, now merged" from "never committed anything". Measured
+    /// against the cut ref (not strictly local main) so a fresh branch off an ahead-of-local
+    /// `origin/<default>` reads 0 rather than counting inherited, un-pulled commits as its own.
+    ahead_of_base: u32,
     /// Best-effort GitHub PR state for this branch via `gh`, if one is found: "open" | "merged" |
     /// "closed". None when gh is absent/unauthed, there's no remote, or no PR matches the branch.
     pr_state: Option<String>,
@@ -475,8 +478,19 @@ pub fn agent_workflow_state_at(
     let in_origin_main = ref_contains(root, &origin_ref, &tip);
     let in_parent = ref_contains(root, parent_branch, &tip);
 
-    // Commits unique to the agent branch vs the local default (0 once landed into it).
-    let ahead_of_local_main = git(root, &["rev-list", "--count", &format!("{default_branch}..{branch}")])
+    // Commits the agent AUTHORED that aren't yet landed (0 once merged into the integration ref).
+    // Measured against the ref the branch was actually CUT FROM — `origin/<default>` when a
+    // remote-tracking ref exists (see `effective_base`, which cuts new branches from origin),
+    // else local `<default>`. Comparing against LOCAL `<default>` here is wrong when it lags the
+    // remote: a brand-new branch cut from `origin/<default>` would count the inherited, un-pulled
+    // commits as the agent's own work — tripping the frontend's `committedSeen` gate which, together
+    // with `in_origin_main` (trivially true for such a tip), falsely reads a no-op agent as "Merged".
+    let base_for_ahead = if git(root, &["rev-parse", "--verify", "--quiet", &origin_ref]).is_ok() {
+        origin_ref.clone()
+    } else {
+        default_branch.clone()
+    };
+    let ahead_of_base = git(root, &["rev-list", "--count", &format!("{base_for_ahead}..{branch}")])
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
@@ -492,7 +506,7 @@ pub fn agent_workflow_state_at(
         in_local_main,
         in_origin_main,
         in_parent,
-        ahead_of_local_main,
+        ahead_of_base,
         pr_state,
         pr_number,
         pr_url,
@@ -1353,26 +1367,67 @@ mod tests {
         let info = create_worktree_at(&root_str, "p", "w1", "main", &app_data).unwrap();
 
         // No commits yet. The tip IS main's HEAD, so reachability is trivially true — the
-        // distinguishing signal that no real work exists is ahead_of_local_main == 0, which the
+        // distinguishing signal that no real work exists is ahead_of_base == 0, which the
         // frontend folds into its committedSeen gate to avoid a false "On Main" for a no-op agent.
         let s0 = agent_workflow_state_at(&root_str, "w1", "", false).unwrap();
-        assert_eq!(s0.ahead_of_local_main, 0, "no work ⇒ no commits unique to the branch (the gate)");
+        assert_eq!(s0.ahead_of_base, 0, "no work ⇒ no commits unique to the branch (the gate)");
 
         // Agent commits real work → ahead of main, not yet contained in it.
         std::fs::write(Path::new(&info.path).join("w.txt"), "work\n").unwrap();
         git(&info.path, &["add", "-A"]).unwrap();
         git(&info.path, &["commit", "-m", "agent work"]).unwrap();
         let s1 = agent_workflow_state_at(&root_str, "w1", "", false).unwrap();
-        assert_eq!(s1.ahead_of_local_main, 1, "one unlanded commit");
+        assert_eq!(s1.ahead_of_base, 1, "one unlanded commit");
         assert!(!s1.in_local_main, "committed but not merged into main yet");
 
         // Land it into local main (the merge the user/orchestrator would do).
         git(&root_str, &["merge", "--no-ff", "sparkle/agent-w1", "-m", "land w1"]).unwrap();
         let s2 = agent_workflow_state_at(&root_str, "w1", "", false).unwrap();
         assert!(s2.in_local_main, "after merge, main contains the agent tip → On Main");
-        assert_eq!(s2.ahead_of_local_main, 0, "no commits remain unique to the branch");
+        assert_eq!(s2.ahead_of_base, 0, "no commits remain unique to the branch");
         assert!(!s2.in_origin_main, "no origin remote in this fixture → not Merged");
         assert!(s2.pr_state.is_none(), "no PR probe requested / no remote");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // Regression: a brand-new agent whose branch is cut from `origin/<default>` while the LOCAL
+    // default lags the remote must NOT read as having done work. Before the fix, `ahead_of_base`
+    // was counted against local `main`, so the inherited (un-pulled) commits looked like the agent's
+    // own — tripping the frontend `committedSeen` gate which, with `in_origin_main` trivially true,
+    // rendered a fresh no-op agent as "Merged".
+    #[test]
+    fn fresh_branch_cut_from_origin_default_reads_as_no_work_when_local_lags() {
+        let root = unique_root("wf-lag");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("wf-lag-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        // Advance the remote integration branch ahead of local main on a temp branch (local main
+        // itself never moves, so it lags origin) — exactly the state of a user who hasn't pulled.
+        git(&root_str, &["checkout", "-b", "remote-advance"]).unwrap();
+        std::fs::write(root.join("r1.txt"), "remote work\n").unwrap();
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "remote ahead"]).unwrap();
+        let remote_tip = git(&root_str, &["rev-parse", "HEAD"]).unwrap();
+        git(&root_str, &["update-ref", "refs/remotes/origin/main", &remote_tip]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        git(&root_str, &["branch", "-D", "remote-advance"]).unwrap();
+
+        // A brand-new agent: branch cut from origin/main (as effective_base would), zero authored work.
+        let wt = worktree_path(&app_data, "p", "fresh");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(&root_str, &["worktree", "add", "-b", "sparkle/agent-fresh", &wt.to_string_lossy(), "origin/main"]).unwrap();
+
+        let ws = agent_workflow_state_at(&root_str, "fresh", "", false).unwrap();
+        assert!(ws.in_origin_main, "tip IS origin/main");
+        assert!(!ws.in_local_main, "lagging local main does not contain the tip");
+        assert_eq!(
+            ws.ahead_of_base, 0,
+            "no AUTHORED work ⇒ gate stays closed even though local main lags origin (regression)"
+        );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
     }
@@ -1420,7 +1475,7 @@ mod tests {
         }
         let ws = agent_workflow_state_at(&root_str, "L1", "", false).unwrap();
         assert!(ws.in_local_main, "after land, main contains the agent tip");
-        assert_eq!(ws.ahead_of_local_main, 0, "no commits remain unique to the branch");
+        assert_eq!(ws.ahead_of_base, 0, "no commits remain unique to the branch");
 
         // Re-landing is now a no-op (idempotent guard).
         match land_agent_branch_at(&root_str, "L1", "main").unwrap() {

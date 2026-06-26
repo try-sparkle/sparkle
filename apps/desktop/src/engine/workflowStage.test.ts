@@ -26,7 +26,7 @@ const ws = (p: Partial<WorkflowState>): WorkflowState => ({
   inLocalMain: false,
   inOriginMain: false,
   inParent: false,
-  aheadOfLocalMain: 0,
+  aheadOfBase: 0,
   prState: null,
   prNumber: null,
   prUrl: null,
@@ -180,15 +180,15 @@ describe("deriveLiveStage", () => {
     expect(deriveLiveStage({ kind: "build", bs: bs({ dirty: true }), prev: "merged" })).toBe("merged");
   });
 
-  it("aheadOfLocalMain satisfies the committed gate when bs.ahead is measured against a non-default base", () => {
+  it("aheadOfBase satisfies the committed gate when bs.ahead is measured against a non-default base", () => {
     // bs.ahead == 0 (synced to its baseBranch) but the branch IS ahead of project main → work
     // exists, so reachability into the parent should be believed even without a prev watermark.
     expect(
-      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfLocalMain: 1, inParent: true }) }),
+      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfBase: 1, inParent: true }) }),
     ).toBe("main");
     // Without that signal (and no commits anywhere), the same reachability is NOT believed.
     expect(
-      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfLocalMain: 0, inParent: true }) }),
+      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfBase: 0, inParent: true }) }),
     ).toBe("uncommitted");
   });
 });

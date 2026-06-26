@@ -98,8 +98,10 @@ export interface LiveStageInputs {
 // The reachability gate ("did this agent actually do work?") is `committedSeen`: a fresh branch's
 // tip trivially sits in main, so we only believe "landed" once we've observed commits. We take that
 // from three angles so the gate matches its intent regardless of which base `bs.ahead` was measured
-// against: `bs.ahead>0` (ahead of the agent's baseBranch), `ws.aheadOfLocalMain>0` (ahead of the
-// project default — matters when baseBranch ≠ default), or the in-session watermark `prev ≥
+// against: `bs.ahead>0` (ahead of the agent's baseBranch), `ws.aheadOfBase>0` (commits the agent
+// authored vs the ref it was cut from — origin/<default> when present; matters when baseBranch ≠
+// default, and counts only authored work so a stale local default can't read as landed), or the
+// in-session watermark `prev ≥
 // Committed`. The watermark is why `prev` matters beyond monotonicity: it remembers work existed
 // after a merge drops `ahead` to 0. KNOWN false-positive: if an agent commits, then hard-RESETS its
 // branch back to main HEAD (work discarded, not merged), the watermark still believes it landed and
@@ -112,7 +114,7 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
   const committedSeen =
     idx >= stageIndex("committed") ||
     prevIdx >= stageIndex("committed") ||
-    (ws?.aheadOfLocalMain ?? 0) > 0;
+    (ws?.aheadOfBase ?? 0) > 0;
 
   const bump = (id: WorkflowStageId) => {
     idx = Math.max(idx, stageIndex(id));
