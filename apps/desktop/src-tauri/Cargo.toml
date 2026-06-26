@@ -25,6 +25,9 @@ serde = { version = "1", features = ["derive"] }
 # preserve_order: keep the user's settings.local.json keys in their original order when we merge
 # hooks into it (default serde_json is BTreeMap-backed and would alphabetize them on every write).
 serde_json = { version = "1", features = ["preserve_order"] }
+# Local searchable history store (prompts + responses). bundled = vendored SQLite with FTS5
+# compiled in (full-text search); frontend supplies id + created_at, so no time/uuid crate.
+rusqlite = { version = "0.32", features = ["bundled"] }
 portable-pty = "0.8"
 base64 = "0.22"
 sherpa-onnx = "1.13.3"

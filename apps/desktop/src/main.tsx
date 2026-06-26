@@ -3,6 +3,7 @@ import { App } from "./App";
 import { initLogger } from "./logger";
 import { initAnalytics } from "./analytics";
 import { resolveThemeFromStorage } from "./theme/theme";
+import { useHistoryStore } from "./stores/historyStore";
 import "@xterm/xterm/css/xterm.css";
 import "./index.css";
 
@@ -17,6 +18,21 @@ initLogger();
 // Analytics (PostHog) — masked session replay + autocapture + lifecycle events.
 // No-ops when no key is configured. Started after the logger so init errors surface.
 initAnalytics();
+
+// Enforce the history retention window: read the active tier, prune once on launch, then once a
+// day. Best-effort — a failure here (e.g. backend not ready) must not block the UI from rendering.
+const HISTORY_PRUNE_INTERVAL_MS = 86_400_000; // 24h
+void (async () => {
+  try {
+    await useHistoryStore.getState().loadEntitlement();
+    await useHistoryStore.getState().prune();
+  } catch {
+    // Retention is best-effort; ignore and let the next daily tick try again.
+  }
+})();
+setInterval(() => {
+  void useHistoryStore.getState().prune();
+}, HISTORY_PRUNE_INTERVAL_MS);
 
 // NOTE: no React.StrictMode — its double-invoke of effects would spawn each agent's PTY
 // twice (one would leak). Each AgentPane owns a single live PTY.

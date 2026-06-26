@@ -73,6 +73,34 @@ describe("parseHookLine", () => {
     });
   });
 
+  it("round-trips a UserPromptSubmit line carrying a prompt ()", () => {
+    const line = JSON.stringify({
+      ts: 1,
+      event: "UserPromptSubmit",
+      prompt: "fix the login bug",
+      session_id: "s1",
+    });
+    expect(parseHookLine(line)).toEqual({
+      ts: 1,
+      event: "UserPromptSubmit",
+      prompt: "fix the login bug",
+      session_id: "s1",
+    });
+  });
+
+  it("maps a Stop line's snake_case transcript_path to transcriptPath ()", () => {
+    const line = JSON.stringify({
+      ts: 2,
+      event: "Stop",
+      transcript_path: "/x/y/session.jsonl",
+      session_id: "s1",
+    });
+    const parsed = parseHookLine(line);
+    expect(parsed?.transcriptPath).toBe("/x/y/session.jsonl");
+    // The raw snake_case key is not carried through on the typed event.
+    expect((parsed as unknown as Record<string, unknown>).transcript_path).toBeUndefined();
+  });
+
   it("returns null for blank or malformed lines (never throws)", () => {
     expect(parseHookLine("")).toBeNull();
     expect(parseHookLine("   ")).toBeNull();

@@ -16,6 +16,11 @@ export function normalize(payload, ts) {
   if (typeof p.tool_name === "string") out.tool = p.tool_name;
   if (typeof p.message === "string") out.message = p.message;
   if (typeof p.session_id === "string") out.session_id = p.session_id;
+  // History capture (): UserPromptSubmit carries the user's `prompt`; Stop carries the
+  // `transcript_path` of the session JSONL. Pass both through when present so the app can persist
+  // prompts/responses to the searchable history store. Defensive: only string values survive.
+  if (typeof p.prompt === "string") out.prompt = p.prompt;
+  if (typeof p.transcript_path === "string") out.transcript_path = p.transcript_path;
   return out;
 }
 

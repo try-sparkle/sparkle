@@ -20,9 +20,11 @@ import {
 import { useSettingsStore } from "../stores/settingsStore";
 import { readWorkerResult } from "../pty";
 import { maybeAutoName } from "../services/agentNaming";
-import { HookStatusEngine } from "../engine/hookEvents";
+import { invoke } from "@tauri-apps/api/core";
+import { HookStatusEngine, type HookEvent } from "../engine/hookEvents";
 import { createStatusRouter, type StatusRouter } from "../engine/statusRouter";
 import { watchHookEvents, type HookWatcher } from "../services/hookWatcher";
+import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -118,6 +120,53 @@ export function AgentPane({
   const routerRef = useRef<StatusRouter | null>(null);
   if (!routerRef.current) routerRef.current = createStatusRouter((s) => setStatus(agent.id, s));
   const hookWatcherRef = useRef<HookWatcher | null>(null);
+  // Last response text we recorded for this agent, so a redundant Stop emission can't persist a
+  // duplicate history row: each Stop re-reads the transcript's *last* assistant turn, so two Stops
+  // for the same turn yield identical text. We dedup ONLY responses — replayed backlog is already
+  // dropped by the watcher's skipExisting drain (below), and a real UserPromptSubmit fires once per
+  // submission, so deduping prompts would wrongly swallow a genuine consecutive re-run of the same
+  // prompt (roborev 8261ded / 10135).
+  const lastResponseRef = useRef<string | undefined>(undefined);
+
+  // History capture (): persist this Build agent's prompts and responses to the
+  // searchable history store, reusing the hook pipeline rather than scraping the PTY. Only for
+  // Claude-Code-backed agents (build/worker); think/shell never reach this code path but we guard
+  // anyway. Fire-and-forget: a capture failure must NEVER break status handling, so every path is
+  // wrapped and the store's record() already swallows its own errors.
+  const captureHistoryFromHook = (ev: HookEvent) => {
+    if (agent.kind !== "build" && agent.kind !== "worker") return;
+    try {
+      const record = useHistoryStore.getState().record;
+      const base = () => ({
+        id: crypto.randomUUID(),
+        source: "build" as const,
+        projectId: project.id,
+        agentId: agent.id,
+        projectName: project.name,
+        agentName: agent.name,
+        createdAt: Date.now(),
+      });
+      if (ev.event === "UserPromptSubmit" && ev.prompt && ev.prompt.trim()) {
+        void record({ ...base(), kind: "prompt", text: ev.prompt });
+      } else if (ev.event === "Stop" && ev.transcriptPath) {
+        const path = ev.transcriptPath;
+        // Read the last assistant turn out-of-band so the status update isn't blocked on disk I/O.
+        void (async () => {
+          try {
+            const text = await invoke<string>("read_transcript_last_assistant", { path });
+            if (!text || !text.trim()) return;
+            if (text === lastResponseRef.current) return; // dup Stop for the same turn — already recorded
+            lastResponseRef.current = text;
+            void record({ ...base(), kind: "response", text });
+          } catch {
+            // best-effort capture — a missing/partial transcript just yields no response entry.
+          }
+        })();
+      }
+    } catch {
+      // Defensive: nothing in capture may surface to the status path.
+    }
+  };
 
   const stopHookWatch = () => {
     hookWatcherRef.current?.stop();
@@ -196,6 +245,8 @@ export function AgentPane({
           (ev) => {
             router.activate(); // a real event arrived — hooks now own the status
             hookEngine.ingest(ev);
+            // Persist prompts/responses to history (best-effort; never blocks/breaks status).
+            captureHistoryFromHook(ev);
           },
           // Start at EOF: the log is keyed by worktree and accumulates prior runs + background
           // one-shot `claude` sessions. We want status from THIS spawn's session, which the engine

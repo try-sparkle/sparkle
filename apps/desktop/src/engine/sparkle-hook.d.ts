@@ -4,5 +4,13 @@ declare module "*/sparkle-hook.mjs" {
   export function normalize(
     payload: unknown,
     ts: number,
-  ): { ts: number; event: string; tool?: string; message?: string; session_id?: string };
+  ): {
+    ts: number;
+    event: string;
+    tool?: string;
+    message?: string;
+    session_id?: string;
+    prompt?: string;
+    transcript_path?: string;
+  };
 }

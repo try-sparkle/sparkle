@@ -23,6 +23,11 @@ export interface HookEvent {
   /** Epoch ms the emitter stamped the event. */
   ts?: number;
   session_id?: string;
+  /** UserPromptSubmit: the user's submitted prompt text (history capture, ). */
+  prompt?: string;
+  /** Stop: path to Claude Code's session transcript JSONL. Mapped from the raw `transcript_path`
+   *  the emitter passes through; used to read the last assistant turn for history capture. */
+  transcriptPath?: string;
 }
 
 // A Notification fires for two very different reasons: when Claude needs permission for a tool
@@ -85,7 +90,15 @@ export function parseHookLine(line: string): HookEvent | null {
   ) {
     return null;
   }
-  return parsed as HookEvent;
+  const raw = parsed as Record<string, unknown>;
+  const ev = parsed as HookEvent;
+  // Map the emitter's snake_case `transcript_path` onto the camelCase `transcriptPath` the rest of
+  // the app uses (). Tolerant: a missing/non-string field simply leaves it undefined.
+  if (typeof raw.transcript_path === "string") {
+    ev.transcriptPath = raw.transcript_path;
+    delete (raw as { transcript_path?: unknown }).transcript_path;
+  }
+  return ev;
 }
 
 export interface HookStatusEngineOpts {

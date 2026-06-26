@@ -1,3 +1,20 @@
+import type { RetentionTier } from "./history";
+
+// Retention entitlement (history-search design §Retention & credit gating). Stubbed until the
+// real credit/billing system wires in: everyone is on the free 24h tier and purchasing isn't
+// available yet. The shape (async) is intentional so the real impl can do IO without a churn.
+
+/** The active history-retention tier. Stub → always the free `24h`. */
+export async function getRetentionEntitlement(): Promise<RetentionTier> {
+  return "24h";
+}
+
+/** Buy a longer retention window. Not implemented — the credit system owns this flow. */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export async function purchaseRetention(tier: RetentionTier): Promise<void> {
+  throw new Error("purchaseRetention not implemented");
+}
+
 // The metering gate (design spec §7.1). Every AI action runs through withCredits, which:
 //   1. short-circuits (no debit, no work) when AI is disabled,
 //   2. debits the estimated cost server-side BEFORE running (402 → out of credits),

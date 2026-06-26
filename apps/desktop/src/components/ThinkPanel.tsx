@@ -16,6 +16,8 @@ import { meteredAi } from "../services/sparkleApi";
 import { CHIEF_CALL_CENTS } from "../services/creditPricing";
 import { AiDisabledError, OutOfCreditsError } from "../services/credits";
 import { useAuthStore } from "../stores/authStore";
+import { useHistoryStore } from "../stores/historyStore";
+import type { HistoryEntry, HistoryKind } from "../services/history";
 
 interface ChatMsg {
   role: "user" | "assistant";
@@ -84,9 +86,34 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages, sending]);
 
-  // Core send, given an explicit prompt. Used by the composer (the typed message) and by the
-  // connectivity re-query (a "status update" nudge delivered through the think bridge).
-  const sendText = async (prompt: string) => {
+  // Fire-and-forget capture of a brainstorm turn into the durable history store (Task D,
+  // bead ). This must NEVER break the chat: we guard against both a synchronous
+  // throw and a rejected promise here, on top of the store's own best-effort swallow.
+  const recordTurn = (kind: HistoryKind, text: string) => {
+    const entry: HistoryEntry = {
+      id: crypto.randomUUID(),
+      kind,
+      source: "brainstorm",
+      projectId: project.id,
+      agentId,
+      projectName: project.name,
+      agentName: "Think",
+      text,
+      createdAt: Date.now(),
+    };
+    try {
+      void useHistoryStore.getState().record(entry).catch(() => {});
+    } catch {
+      // Capture is best-effort — a failed write must not surface into the chat flow.
+    }
+  };
+
+  // Core send, given an explicit prompt. Used by the composer (the typed message), the
+  // terminal-handoff auto-send (Explain/Ask), and the connectivity re-query (a "status update"
+  // nudge delivered through the think bridge). `capture` gates brainstorm-history recording to
+  // genuine user turns — the synthetic bridge nudge passes `capture:false` so machine-generated
+  // status prompts don't pollute the durable history/search surface.
+  const sendText = async (prompt: string, { capture = true }: { capture?: boolean } = {}) => {
     if (!prompt || sending) return;
     if (!pat) {
       setError("Connect Chief first.");
@@ -94,6 +121,7 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
     }
     setError("");
     setMessages((m) => [...m, { role: "user", text: prompt }]);
+    if (capture) recordTurn("prompt", prompt);
     setSending(true);
     try {
       // Meter the think exchange against the user's AI credits (design spec §7): the gate
@@ -116,6 +144,7 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
         },
       );
       setMessages((m) => [...m, { role: "assistant", text }]);
+      if (capture) recordTurn("response", text);
     } catch (e) {
       const msg =
         e instanceof AiDisabledError
@@ -152,7 +181,8 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
   useEffect(() => {
     return registerThink(agentId, (text) => {
       if (!chatIdRef.current) return; // no conversation yet — skip
-      void sendTextRef.current(text);
+      // A synthetic status-update nudge, not a user turn — don't capture it into history.
+      void sendTextRef.current(text, { capture: false });
     });
   }, [agentId]);
 

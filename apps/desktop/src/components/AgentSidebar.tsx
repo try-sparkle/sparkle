@@ -19,6 +19,7 @@ import { Tooltip } from "./Tooltip";
 import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
 import { WorkflowTracker } from "./WorkflowTracker";
+import { HistorySearch } from "./HistorySearch";
 import { resolveStage, rollupStages, stageMeta, stageIndex } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 
@@ -314,6 +315,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           </button>
         </div>
       )}
+
+      {/* Full-text search across all projects' prompts & responses. Lives directly under the
+          Brainstorm/Build buttons (design §Search UX); only shown with a project open. */}
+      {project && <HistorySearch />}
 
       <div style={{ flex: 1, overflowY: "auto", padding: "0 8px" }}>
         {(() => {

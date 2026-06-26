@@ -34,6 +34,37 @@ describe("sparkle-hook normalize", () => {
     expect(normalize(42, 1).event).toBe("");
   });
 
+  it("passes through a UserPromptSubmit prompt for history capture ()", () => {
+    const out = normalize(
+      { hook_event_name: "UserPromptSubmit", prompt: "fix the login bug", session_id: "s1" },
+      4000,
+    );
+    expect(out).toEqual({
+      ts: 4000,
+      event: "UserPromptSubmit",
+      prompt: "fix the login bug",
+      session_id: "s1",
+    });
+  });
+
+  it("passes through a Stop transcript_path for history capture ()", () => {
+    const out = normalize(
+      { hook_event_name: "Stop", transcript_path: "/x/y/session.jsonl", session_id: "s1" },
+      5000,
+    );
+    expect(out).toEqual({
+      ts: 5000,
+      event: "Stop",
+      transcript_path: "/x/y/session.jsonl",
+      session_id: "s1",
+    });
+  });
+
+  it("omits prompt/transcript_path when absent or wrong type (defensive)", () => {
+    const out = normalize({ hook_event_name: "Stop", prompt: 42, transcript_path: null }, 6000);
+    expect(out).toEqual({ ts: 6000, event: "Stop" });
+  });
+
   it("round-trips through parseHookLine -> hookEventToStatus", () => {
     const wire = `${JSON.stringify(normalize({ hook_event_name: "Stop" }, 3000))}\n`;
     const parsed = parseHookLine(wire);

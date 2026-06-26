@@ -3,6 +3,8 @@ import {
   AiDisabledError,
   OutOfCreditsError,
   withCredits,
+  getRetentionEntitlement,
+  purchaseRetention,
   type CreditDeps,
 } from "./credits";
 
@@ -117,5 +119,15 @@ describe("withCredits", () => {
   it("exposes the error classes", () => {
     expect(new OutOfCreditsError(0)).toBeInstanceOf(Error);
     expect(new AiDisabledError()).toBeInstanceOf(Error);
+  });
+});
+
+describe("retention entitlement (stub)", () => {
+  it("defaults to the free 24h tier", async () => {
+    await expect(getRetentionEntitlement()).resolves.toBe("24h");
+  });
+
+  it("purchaseRetention is not implemented yet — rejects", async () => {
+    await expect(purchaseRetention("7d")).rejects.toThrow("not implemented");
   });
 });

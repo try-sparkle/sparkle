@@ -8,6 +8,7 @@ mod claude;
 mod cloud;
 mod connectivity;
 mod dictation;
+mod history;
 mod hooks;
 mod logging;
 mod model;
@@ -18,6 +19,7 @@ mod transcribe;
 mod screenshot;
 mod socket;
 mod sparkle_agent;
+mod transcript;
 mod worktree;
 mod notes;
 
@@ -69,6 +71,17 @@ pub fn run() {
             }
             // Attribute notifications to Sparkle's bundle id (best-effort; see attention.rs).
             attention::init_application();
+            // Stand up the local history store (prompts + responses, FTS5) in the app-data dir.
+            // A failure here must not stop the app from booting — capture/search just won't work.
+            match app.path().app_data_dir() {
+                Ok(dir) => match history::HistoryDb::new(&dir) {
+                    Ok(db) => {
+                        app.manage(db);
+                    }
+                    Err(e) => tracing::error!("history DB init failed: {e}"),
+                },
+                Err(e) => tracing::error!("app_data_dir for history: {e}"),
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -117,6 +130,10 @@ pub fn run() {
             bridge::orchestrator_mcp_paths,
             notes::append_note,
             notes::create_bead,
+            history::history_record,
+            history::history_search,
+            history::history_prune,
+            transcript::read_transcript_last_assistant,
             auth::desktop_has_token,
             auth::desktop_sign_out,
             auth::desktop_exchange_code,
