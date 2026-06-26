@@ -6,25 +6,28 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const emit = vi.fn();
-let captured: ((e: { payload: unknown }) => void) | null = null;
+// Each store wires its own listener; capture them by event name so a test can fire the right one.
+const captured = new Map<string, (e: { payload: unknown }) => void>();
 vi.mock("@tauri-apps/api/event", () => ({
   emit: (...a: unknown[]) => emit(...a),
-  listen: (_name: string, cb: (e: { payload: unknown }) => void) => {
-    captured = cb;
+  listen: (name: string, cb: (e: { payload: unknown }) => void) => {
+    captured.set(name, cb);
     return Promise.resolve(() => {});
   },
 }));
 
 import { subscribeToCrossWindowSync } from "./crossWindowSync";
 import { useProjectStore } from "../stores/projectStore";
+import { useDictationStore } from "../stores/dictationStore";
 
 let unsub: () => void = () => {};
 
 beforeEach(() => {
   useProjectStore.setState({ projects: [], selectedProjectId: null });
+  useDictationStore.setState({ enabled: true });
   localStorage.clear();
   emit.mockClear();
-  captured = null;
+  captured.clear();
   // Minimal window shim: addEventListener/removeEventListener + the Tauri marker.
   (globalThis as unknown as { window: unknown }).window = {
     addEventListener: () => {},
@@ -59,8 +62,9 @@ describe("subscribeToCrossWindowSync", () => {
       .spyOn(useProjectStore.persist, "rehydrate")
       .mockResolvedValue(undefined as unknown as void);
     unsub = subscribeToCrossWindowSync();
-    expect(captured).not.toBeNull();
-    captured?.({ payload: undefined });
+    const fire = captured.get("sparkle://projects-changed");
+    expect(fire).toBeDefined();
+    fire?.({ payload: undefined });
     expect(rehydrate).toHaveBeenCalled();
     rehydrate.mockRestore();
   });
@@ -71,10 +75,53 @@ describe("subscribeToCrossWindowSync", () => {
     useProjectStore.getState().addProject("P", "/tmp/p");
     unsub = subscribeToCrossWindowSync();
     emit.mockClear();
-    captured?.({ payload: undefined });
+    captured.get("sparkle://projects-changed")?.({ payload: undefined });
     // Let rehydrate's promise + .finally settle.
     await new Promise((r) => setTimeout(r, 0));
     await new Promise((r) => setTimeout(r, 0));
     expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("broadcasts the dictation mute toggle across windows", () => {
+    unsub = subscribeToCrossWindowSync();
+    emit.mockClear();
+    useDictationStore.getState().setEnabled(false);
+    expect(emit).toHaveBeenCalledWith("sparkle://dictation-changed");
+  });
+
+  it("does NOT broadcast on a non-persisted dictation change (mic level)", () => {
+    unsub = subscribeToCrossWindowSync();
+    emit.mockClear();
+    useDictationStore.getState().setLevel(0.42);
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("does NOT broadcast a change that lands before hydration finishes; resumes after", () => {
+    // Force the not-yet-hydrated window. With synchronous mock storage the real store hydrates
+    // during creation, so we stub hasHydrated()/onFinishHydration() to drive the gate directly.
+    let finishHydration: (() => void) | undefined;
+    const hasHydrated = vi.spyOn(useDictationStore.persist, "hasHydrated").mockReturnValue(false);
+    const onFinish = vi
+      .spyOn(useDictationStore.persist, "onFinishHydration")
+      .mockImplementation((fn) => {
+        finishHydration = fn as () => void;
+        return () => {};
+      });
+
+    unsub = subscribeToCrossWindowSync();
+    emit.mockClear();
+
+    // A change that lands while hydration is still in flight must NOT fan out — it's the persisted
+    // value being restored, not a user toggle.
+    useDictationStore.getState().setEnabled(false);
+    expect(emit).not.toHaveBeenCalledWith("sparkle://dictation-changed");
+
+    // Once hydration settles, `last` is reseeded from the hydrated value and real toggles resume.
+    finishHydration?.();
+    useDictationStore.getState().setEnabled(true);
+    expect(emit).toHaveBeenCalledWith("sparkle://dictation-changed");
+
+    hasHydrated.mockRestore();
+    onFinish.mockRestore();
   });
 });

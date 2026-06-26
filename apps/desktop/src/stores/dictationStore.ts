@@ -1,5 +1,10 @@
 import { create } from "zustand";
+import { persist, createJSONStorage } from "zustand/middleware";
 import type { Phase } from "../voice/wakeMachine";
+
+/** localStorage key for the persisted slice (only `enabled`). Exported so the cross-window
+ *  sync service can rehydrate on the browser `storage` event. */
+export const DICTATION_PERSIST_KEY = "sparkle-dictation";
 
 type Status = "idle" | "listening" | "error";
 
@@ -21,7 +26,8 @@ interface DictationState {
   interim: string;
 
   // --- ambient always-listening ---
-  /** Mic hot (master mute). Default true (on by default at launch). */
+  /** Mic hot (master mute). Default true (on by default at launch). Persisted and synced across
+   *  all windows — toggling it off in one window keeps audio off everywhere and across relaunch. */
   enabled: boolean;
   /** passive = hearing but not typing; active = routing speech to the box. */
   phase: Phase;
@@ -45,33 +51,44 @@ interface DictationState {
   insert: (text: string) => void;
 }
 
-export const useDictationStore = create<DictationState>((set, get) => ({
-  status: "idle",
-  level: 0,
-  error: null,
-  modelProgress: null,
-  interim: "",
+export const useDictationStore = create<DictationState>()(
+  persist(
+    (set, get) => ({
+      status: "idle",
+      level: 0,
+      error: null,
+      modelProgress: null,
+      interim: "",
 
-  enabled: true,
-  phase: "passive",
-  insertTarget: null,
+      enabled: true,
+      phase: "passive",
+      insertTarget: null,
 
-  setStatus: (status) => set({ status }),
-  setLevel: (level) => set({ level }),
-  setInterim: (interim) => set({ interim }),
-  setError: (error) =>
-    set((s) => ({
-      error,
-      status: error ? "error" : s.status === "error" ? "idle" : s.status,
-    })),
-  setModelProgress: (modelProgress) => set({ modelProgress }),
+      setStatus: (status) => set({ status }),
+      setLevel: (level) => set({ level }),
+      setInterim: (interim) => set({ interim }),
+      setError: (error) =>
+        set((s) => ({
+          error,
+          status: error ? "error" : s.status === "error" ? "idle" : s.status,
+        })),
+      setModelProgress: (modelProgress) => set({ modelProgress }),
 
-  setEnabled: (enabled) => set({ enabled }),
-  setPhase: (phase) => set({ phase }),
-  togglePhase: () => set((s) => ({ phase: s.phase === "passive" ? "active" : "passive" })),
-  registerInsert: (insertTarget) => set({ insertTarget }),
-  insert: (text) => {
-    const fn = get().insertTarget;
-    if (fn) fn(text);
-  },
-}));
+      setEnabled: (enabled) => set({ enabled }),
+      setPhase: (phase) => set({ phase }),
+      togglePhase: () => set((s) => ({ phase: s.phase === "passive" ? "active" : "passive" })),
+      registerInsert: (insertTarget) => set({ insertTarget }),
+      insert: (text) => {
+        const fn = get().insertTarget;
+        if (fn) fn(text);
+      },
+    }),
+    {
+      name: DICTATION_PERSIST_KEY,
+      storage: createJSONStorage(() => localStorage),
+      // Only the master mute is a real setting; everything else (mic level, status, phase,
+      // download progress, the live insert callback) is per-session runtime that must not persist.
+      partialize: (s) => ({ enabled: s.enabled }),
+    },
+  ),
+);
