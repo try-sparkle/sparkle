@@ -40,4 +40,14 @@ describe("assembleBuildSpawn", () => {
     const exec = assembleBuildSpawn({ ...base, resume: true }).args[2];
     expect(exec).toContain("--continue");
   });
+
+  it("propagates a chosen account's configDir into the exec (multi Claude Max support)", () => {
+    const exec = assembleBuildSpawn({ ...base, configDir: "/data/accounts/ab12" }).args[2];
+    expect(exec).toContain("export CLAUDE_CONFIG_DIR='/data/accounts/ab12';");
+  });
+
+  it("omits the CLAUDE_CONFIG_DIR export when no account is chosen (default behavior)", () => {
+    const exec = assembleBuildSpawn(base).args[2];
+    expect(exec).not.toContain("CLAUDE_CONFIG_DIR");
+  });
 });

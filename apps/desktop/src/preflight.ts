@@ -13,7 +13,12 @@ export function checkClaude(): Promise<ClaudeStatus> {
 }
 
 /** True if this worktree already has a prior `claude` conversation we can resume
- * (drives `claude --continue` vs a fresh `claude` when (re)opening an agent). */
-export function claudeHasSession(worktreePath: string): Promise<boolean> {
-  return invoke<boolean>("claude_has_session", { worktreePath });
+ * (drives `claude --continue` vs a fresh `claude` when (re)opening an agent).
+ *
+ * `configDir` is the chosen account's CLAUDE_CONFIG_DIR (multi Claude Max support). Because the
+ * spawn sets it on the child only — not Sparkle's own env — the resume check must look under the
+ * SAME account, else it would miss (or falsely find) a session under the wrong config dir. Omit
+ * it to fall back to Sparkle's process env (the pre-accounts behavior). */
+export function claudeHasSession(worktreePath: string, configDir?: string): Promise<boolean> {
+  return invoke<boolean>("claude_has_session", { worktreePath, configDir });
 }

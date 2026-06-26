@@ -2,6 +2,12 @@
 // AgentPane so the resume/fresh branching (bead ) is unit-testable
 // without rendering the component.
 
+/** macOS login shell we launch `claude` (and shell commands) through, as `zsh -l -c 'exec …'`: a
+ *  login but NON-interactive shell, so it sources `.zprofile`/`.zlogin` for the user's real PATH/env
+ *  but not `.zshrc`. Shared by every spawn path (AgentPane, orchestrationLaunch, the account-login
+ *  modal) so the launcher can't silently diverge between them. */
+export const SHELL = "/bin/zsh";
+
 /** Single-quote a path for safe use inside a `zsh -c '…'` string. */
 export function shellQuote(p: string): string {
   return `'${p.replace(/'/g, `'\\''`)}'`;
@@ -22,6 +28,12 @@ export interface ClaudeExecOpts {
   mcpConfig?: string;
   /** Emit `--strict-mcp-config` so ONLY the --mcp-config servers load (ignore user/global MCP). */
   strictMcpConfig?: boolean;
+  /** Per-spawn `CLAUDE_CONFIG_DIR` for multi Claude Max account support (design spec
+   *  docs/superpowers/specs/2026-06-26-multi-max-account-design.md). When set, the exec exports it
+   *  so the child `claude` authenticates from that account's isolated config dir — confined to the
+   *  child process, never Sparkle's own env. Absent → claude uses its default (`~/.claude` or the
+   *  inherited `$CLAUDE_CONFIG_DIR`), preserving today's behavior for users who never set this up. */
+  configDir?: string;
 }
 
 /** Build the `exec …` string passed to `zsh -l -c`. Appends `--continue` only
@@ -64,7 +76,13 @@ export function buildClaudeExec(
   if (!resume && opts.initialPrompt) {
     cmd += ` -- ${shellQuote(opts.initialPrompt)}`;
   }
-  return `export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
+  // CLAUDE_CONFIG_DIR (when an account was chosen) is exported alongside PATH, before `exec`, so it
+  // applies to the child `claude` only. Order doesn't matter to the shell, but we keep it first so a
+  // reader sees the account selection up front.
+  const configExport = opts.configDir
+    ? `export CLAUDE_CONFIG_DIR=${shellQuote(opts.configDir)}; `
+    : "";
+  return `${configExport}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
 }
 
 /** Build the inline JSON for `claude --mcp-config` that launches the Sparkle orchestrator MCP

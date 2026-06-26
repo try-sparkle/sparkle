@@ -30,7 +30,11 @@ fn encode_project_slug(path: &str) -> String {
 /// The `projects` root Claude Code uses: `$CLAUDE_CONFIG_DIR/projects` when the
 /// env var is set, else `$HOME/.claude/projects`. Returns `None` when neither is
 /// resolvable. Pure form (takes the env values) so it's testable.
-fn claude_projects_root(config_dir: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+///
+/// `pub(crate)` so `accounts.rs` resolves an account's transcript root the SAME
+/// way session detection does (each account passes its own `config_dir` as
+/// `Some(..)`), instead of re-deriving the `projects` join independently.
+pub(crate) fn claude_projects_root(config_dir: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
     match config_dir {
         Some(cfg) => Some(cfg.join("projects")),
         None => home.map(|h| h.join(".claude").join("projects")),
@@ -77,16 +81,36 @@ fn claude_has_session_in(
     }
 }
 
+/// Resolve which `CLAUDE_CONFIG_DIR` a session lookup should use. An explicitly chosen account
+/// config dir (multi Claude Max support — the spawn picks an account per job and sets its config
+/// dir on the CHILD only, not Sparkle's own env) takes precedence over Sparkle's process-env
+/// value (`env`, kept as a `PathBuf` so a non-UTF8 `CLAUDE_CONFIG_DIR` retains its bytes — no lossy
+/// UTF-8 round-trip). Empty values are treated as unset in BOTH branches (the function re-asserts
+/// the env guard rather than trusting the caller to pre-filter), so neither a stray `config_dir: ""`
+/// nor an `export CLAUDE_CONFIG_DIR=` yields a relative `projects/<slug>` root that would skip the
+/// `$HOME/.claude` fallback. Pure so the precedence is unit-testable.
+fn resolve_session_config_dir(explicit: Option<&str>, env: Option<PathBuf>) -> Option<PathBuf> {
+    match explicit.filter(|s| !s.is_empty()) {
+        Some(e) => Some(PathBuf::from(e)),
+        None => env.filter(|p| !p.as_os_str().is_empty()),
+    }
+}
+
 /// True iff the agent's worktree already has a resumable `claude` conversation.
 /// Drives the `claude` vs `claude --continue` choice when (re)opening an agent.
+///
+/// `config_dir` is the chosen account's config dir (Tauri maps JS `configDir` → this
+/// `config_dir`). Since the spawn sets `CLAUDE_CONFIG_DIR` on the child only, the resume check
+/// must be told the SAME dir — otherwise it looks for the session under the wrong account. When
+/// absent, we fall back to Sparkle's own process env (the pre-accounts behavior). The env value
+/// keeps its `OsString` form through to the `PathBuf` (no lossy conversion); an empty
+/// `CLAUDE_CONFIG_DIR=` is treated as unset so the `$HOME/.claude` fallback still applies.
 #[tauri::command]
-pub fn claude_has_session(worktree_path: String) -> bool {
-    // Treat an empty CLAUDE_CONFIG_DIR (a common shell artifact, e.g.
-    // `export CLAUDE_CONFIG_DIR=`) as unset so we don't build a relative
-    // `projects/<slug>` path and skip the $HOME/.claude fallback.
-    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+pub fn claude_has_session(worktree_path: String, config_dir: Option<String>) -> bool {
+    let env = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
+    let config_dir = resolve_session_config_dir(config_dir.as_deref(), env);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     claude_has_session_in(config_dir.as_deref(), home.as_deref(), &worktree_path)
 }
@@ -463,6 +487,27 @@ mod tests {
             Some("Current Title".to_string())
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn explicit_config_dir_takes_precedence_over_env() {
+        let env = || Some(PathBuf::from("/home/me/.claude"));
+        // The chosen account's config dir (explicit) wins over Sparkle's process env.
+        assert_eq!(
+            resolve_session_config_dir(Some("/acct/ab12"), env()),
+            Some(PathBuf::from("/acct/ab12"))
+        );
+        // No explicit dir → fall back to the env value (pre-accounts behavior).
+        assert_eq!(resolve_session_config_dir(None, env()), env());
+        // An empty explicit value is treated as unset and defers to env...
+        assert_eq!(resolve_session_config_dir(Some(""), env()), env());
+        // ...and with no env, an empty explicit yields None so the $HOME/.claude branch applies.
+        assert_eq!(resolve_session_config_dir(Some(""), None), None);
+        assert_eq!(resolve_session_config_dir(None, None), None);
+        // An empty env PathBuf is guarded INSIDE the function (not just by the caller), so it's
+        // unset too — defense in depth against a future caller that forgets to pre-filter.
+        assert_eq!(resolve_session_config_dir(None, Some(PathBuf::from(""))), None);
+        assert_eq!(resolve_session_config_dir(Some(""), Some(PathBuf::from(""))), None);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod accounts;
 mod attachments;
 mod attention;
 mod audio;
@@ -39,6 +40,7 @@ pub fn run() {
         .manage(bridge::BridgeManager::default())
         .manage(auth::DeepLinkPending::default())
         .manage(attention::BadgeCounts::default())
+        .manage(accounts::AccountsLock::default())
         .setup(|app| {
             // Stand up unified logging before anything else so startup itself is captured.
             match logging::init(&app.handle()) {
@@ -144,7 +146,14 @@ pub fn run() {
             auth::desktop_redeem_promo,
             auth::desktop_take_pending_deeplink,
             attention::set_window_attention,
-            attention::notify_attention
+            attention::notify_attention,
+            accounts::accounts_list,
+            accounts::accounts_add,
+            accounts::accounts_set_nickname,
+            accounts::accounts_remove,
+            accounts::accounts_import_default,
+            accounts::accounts_mark_exhausted,
+            accounts::accounts_usage
         ])
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")
