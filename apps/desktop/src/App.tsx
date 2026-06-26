@@ -5,7 +5,6 @@ import { useAmbientVoice } from "./useDictation";
 import { useApplyTheme } from "./theme/theme";
 import { useConnectionMonitor } from "./connectionMonitor";
 import { resolveEnvChiefPat } from "./services/chief";
-import { importDefault } from "./services/accountStore";
 import { useSettingsStore } from "./stores/settingsStore";
 import { CurrentProjectProvider } from "./windowContext";
 import { useAttentionNotifications } from "./useAttentionNotifications";
@@ -32,12 +31,6 @@ export function App() {
     void resolveEnvChiefPat().then((pat) =>
       useSettingsStore.getState().setRuntimeChiefPat(pat),
     );
-  }, []);
-
-  // Multi Claude Max account support: ensure account #1 (the existing ~/.claude) always exists, so
-  // selection has a default to fall back to. Idempotent on the Rust side — a no-op once imported.
-  useEffect(() => {
-    void importDefault().catch((e) => console.warn("importDefault failed", e));
   }, []);
 
   return (

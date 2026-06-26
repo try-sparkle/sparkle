@@ -5,7 +5,10 @@
 // MUST be started before the PTY spawns (claude's MCP child connects to the socket at startup) and
 // stopped when the build agent closes.
 import { invoke } from "@tauri-apps/api/core";
-import { buildClaudeExec, buildOrchestratorMcpConfig, SHELL } from "./claudeSpawn";
+import { buildClaudeExec, buildOrchestratorMcpConfig } from "./claudeSpawn";
+
+// macOS login shell — same launcher AgentPane uses for claude (login but non-interactive).
+const SHELL = "/bin/zsh";
 
 export interface BridgeInfo {
   socketPath: string;
@@ -44,10 +47,6 @@ export function assembleBuildSpawn(opts: {
   persona: string;
   bridge: BridgeInfo;
   paths: McpPaths;
-  /** Chosen account's CLAUDE_CONFIG_DIR (multi Claude Max support). Threaded into the inner
-   *  buildClaudeExec so build/orchestrator agents honor the selected account too. Undefined →
-   *  default behavior (no per-spawn config dir). */
-  configDir?: string;
 }): { command: string; args: string[]; cwd: string } {
   const mcpConfig = buildOrchestratorMcpConfig({
     nodePath: opts.paths.nodePath,
@@ -59,7 +58,6 @@ export function assembleBuildSpawn(opts: {
     mcpConfig,
     strictMcpConfig: true,
     appendSystemPrompt: opts.persona,
-    configDir: opts.configDir,
   });
   return { command: SHELL, args: ["-l", "-c", exec], cwd: opts.cwd };
 }

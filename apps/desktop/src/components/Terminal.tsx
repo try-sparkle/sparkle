@@ -16,7 +16,6 @@ import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
 import { SelectionPopup } from "./SelectionPopup";
 import { recoverFromWebglContextLoss } from "./terminalWebgl";
-import { detectRateLimitReset } from "../services/rateLimitWatch";
 import { PH_NO_CAPTURE_CLASS } from "@sparkle/core";
 
 // Terminal font size at 100%. The ⋯-menu "Text size" control (and Cmd +/-) multiplies
@@ -130,7 +129,6 @@ export function Terminal({
   onStatus,
   onReady,
   onExit,
-  onRateLimit,
   onRequestFocus,
   focusRef,
   apiRef,
@@ -145,10 +143,6 @@ export function Terminal({
   onStatus: (s: AgentTabStatus) => void;
   onReady?: () => void;
   onExit?: () => void;
-  // Best-effort (Phase 1) multi Claude Max failover: invoked with an epoch-ms reset instant the
-  // first time this PTY's output looks like a usage/rate-limit message, so the parent can flag the
-  // chosen account exhausted. Detection is isolated and wrapped so it can never break rendering.
-  onRateLimit?: (untilEpoch: number) => void;
   // Called when the active tab is shown, to put initial focus in the composer.
   onRequestFocus?: () => void;
   // The parent sets this to an imperative focus() so it can move focus into the terminal
@@ -166,9 +160,6 @@ export function Terminal({
   // Latest onRequestFocus, read by the (agentId-keyed) effect without re-subscribing.
   const onRequestFocusRef = useRef(onRequestFocus);
   onRequestFocusRef.current = onRequestFocus;
-  // Latest onRateLimit, read by the (agentId-keyed) output effect without re-subscribing.
-  const onRateLimitRef = useRef(onRateLimit);
-  onRateLimitRef.current = onRateLimit;
   // Scroll markers for the pinned-prompt history, keyed by the history entry's id. Lives on the
   // component (not the store) because xterm markers are tied to this terminal instance.
   const markersRef = useRef<Map<string, IMarker>>(new Map());
@@ -336,32 +327,11 @@ export function Terminal({
       };
     }
 
-    // Best-effort multi Claude Max failover (Phase 1): scan output for a usage/rate-limit message
-    // and fire onRateLimit ONCE per spawn. A small rolling buffer catches a message split across
-    // chunks; `rateLimitFired` debounces repeats. Wrapped so a detection error can never disrupt
-    // term.write/engine.ingest — terminal rendering must stay bulletproof.
-    let rateLimitBuf = "";
-    let rateLimitFired = false;
-    const watchRateLimit = (chunk: string) => {
-      if (rateLimitFired || !onRateLimitRef.current) return;
-      try {
-        rateLimitBuf = (rateLimitBuf + chunk).slice(-4096);
-        const until = detectRateLimitReset(rateLimitBuf, Date.now());
-        if (until != null) {
-          rateLimitFired = true;
-          onRateLimitRef.current(until);
-        }
-      } catch {
-        /* detection is best-effort; never let it break the output pipeline */
-      }
-    };
-
     void (async () => {
       const offOut = await onPtyOutput((e) => {
         if (e.id !== agentId) return;
         term.write(e.chunk);
         engine.ingest(e.chunk);
-        watchRateLimit(e.chunk);
       });
       const offExit = await onPtyExit((e) => {
         if (e.id !== agentId) return;

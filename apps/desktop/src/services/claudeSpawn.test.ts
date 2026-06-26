@@ -59,40 +59,6 @@ describe("buildClaudeExec ()", () => {
     expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' -- '-oops looks like a flag'`);
   });
 
-  // CLAUDE_CONFIG_DIR injection for multi Claude Max account support (design spec
-  // 2026-06-26-multi-max-account-design). The chosen account's config dir must be exported into the
-  // child's env, never leak when no account is chosen, and be safely shell-quoted.
-  it("exports CLAUDE_CONFIG_DIR before PATH when a configDir is given", () => {
-    const cmd = buildClaudeExec("/bin/claude", false, { configDir: "/data/accounts/ab12" });
-    expect(cmd).toBe(
-      `export CLAUDE_CONFIG_DIR='/data/accounts/ab12'; ${PATH_PREFIX}exec '/bin/claude'`,
-    );
-  });
-
-  it("omits the CLAUDE_CONFIG_DIR export entirely when no configDir is given (default behavior)", () => {
-    const cmd = buildClaudeExec("/bin/claude", false);
-    expect(cmd).not.toContain("CLAUDE_CONFIG_DIR");
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude'`);
-  });
-
-  it("treats an empty-string configDir as no account (omits the export)", () => {
-    // Pins the truthiness gate: `configDir: ""` must behave like unset, not emit `=''`. Guards
-    // against a later refactor to `!== undefined` that would export an empty (relative) config dir.
-    const cmd = buildClaudeExec("/bin/claude", false, { configDir: "" });
-    expect(cmd).not.toContain("CLAUDE_CONFIG_DIR");
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude'`);
-  });
-
-  it("single-quotes a configDir with awkward characters and combines with other opts", () => {
-    const cmd = buildClaudeExec("/bin/claude", true, {
-      configDir: "/path with space/.claude",
-      appendSystemPrompt: "persona",
-    });
-    expect(cmd).toBe(
-      `export CLAUDE_CONFIG_DIR='/path with space/.claude'; ${PATH_PREFIX}exec '/bin/claude' --continue --append-system-prompt 'persona'`,
-    );
-  });
-
   it("skips the initial mission prompt on resume so it doesn't re-run every relaunch", () => {
     const cmd = buildClaudeExec("/bin/claude", true, {
       appendSystemPrompt: "persona",

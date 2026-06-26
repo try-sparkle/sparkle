@@ -12,11 +12,6 @@ import { pickProjectFolder, basename } from "../services/dialog";
 import { openProjectInWindow, defaultDeps, type OpenMode } from "../services/projectWindows";
 import { resolveOpenTarget, type OpenTarget } from "../services/openTarget";
 import { OpenTargetDialog } from "./OpenTargetDialog";
-import { ModalShell } from "./ModalShell";
-import { AccountsScreen } from "./AccountsScreen";
-import { AccountLoginModal } from "./AccountLoginModal";
-import { invalidateAccountState } from "../services/accountSelection";
-import type { Account } from "../services/accountStore";
 import {
   useCurrentProjectId,
   useReplaceCurrentProject,
@@ -100,10 +95,6 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const resetZoom = useUiStore((s) => s.resetZoom);
   const [recentOpen, setRecentOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
-  // Multi Claude Max account support: the "Claude accounts" settings modal, and (when the user adds
-  // an account) the interactive `claude login` modal handed off from AccountsScreen's onLogin seam.
-  const [accountsOpen, setAccountsOpen] = useState(false);
-  const [loginAccount, setLoginAccount] = useState<Account | null>(null);
   // A project waiting on a replace/new-window choice (null = dialog closed). A "new" target
   // carries a not-yet-created folder so we only persist the project once the user actually picks
   // a target — cancelling the dialog must not leave an orphan project in Recent.
@@ -314,16 +305,6 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
             >
               <div style={menuLabel}>Use AI features</div>
               <AiFeaturesMenu />
-              <div style={{ ...menuLabel, paddingTop: 12 }}>Claude accounts</div>
-              <button
-                style={{ ...btn, width: "100%", textAlign: "left" }}
-                onClick={() => {
-                  setMenuOpen(false);
-                  setAccountsOpen(true);
-                }}
-              >
-                Manage accounts…
-              </button>
               <div style={{ ...menuLabel, paddingTop: 12 }}>Theme</div>
               <ThemeToggle />
               <div style={{ ...menuLabel, paddingTop: 12 }}>Agent order</div>
@@ -356,37 +337,6 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
             setPending(null);
           }}
           onCancel={() => setPending(null)}
-        />
-      )}
-
-      {/* Claude accounts settings (multi Claude Max support). Closing invalidates the selection
-          cache so per-agent badges pick up any add/rename/remove. */}
-      {accountsOpen && (
-        <ModalShell
-          width={520}
-          onCancel={() => {
-            setAccountsOpen(false);
-            invalidateAccountState();
-          }}
-        >
-          <AccountsScreen
-            onLogin={(account) => {
-              // Hand off to the interactive login modal; close the accounts list behind it.
-              setAccountsOpen(false);
-              setLoginAccount(account);
-            }}
-          />
-        </ModalShell>
-      )}
-
-      {/* Interactive `claude login` PTY for a just-added account (AccountsScreen onLogin seam). */}
-      {loginAccount && (
-        <AccountLoginModal
-          account={loginAccount}
-          onClose={() => {
-            setLoginAccount(null);
-            invalidateAccountState();
-          }}
         />
       )}
     </div>

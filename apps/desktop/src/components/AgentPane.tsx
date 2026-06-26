@@ -9,7 +9,7 @@ import {
 } from "../services/worktree";
 import { resolveDefaultBranch } from "../services/branchStatus";
 import { checkClaude, claudeHasSession } from "../preflight";
-import { buildClaudeExec, SHELL } from "../services/claudeSpawn";
+import { buildClaudeExec } from "../services/claudeSpawn";
 import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult, orchestrationPersona } from "../services/buildAgent";
 import {
   startOrchestrationBridge,
@@ -18,8 +18,6 @@ import {
   stopOrchestrationBridge,
 } from "../services/orchestrationLaunch";
 import { useSettingsStore } from "../stores/settingsStore";
-import { setPin, markExhausted, type Account } from "../services/accountStore";
-import { chooseAccountForAgent, invalidateAccountState } from "../services/accountSelection";
 import { readWorkerResult } from "../pty";
 import { maybeAutoName } from "../services/agentNaming";
 import { invoke } from "@tauri-apps/api/core";
@@ -38,9 +36,10 @@ import { ThinkPanel } from "./ThinkPanel";
 
 type Phase = "preparing" | "ready" | "no-claude" | "error";
 
-// macOS default login shell (shared SHELL from claudeSpawn): we launch `claude` through
-// `zsh -l -c 'exec …'` so the agent (and the tools claude itself shells out to) inherit the user's
-// real PATH/env — GUI apps otherwise get a minimal PATH and can't find node/git/etc.
+// macOS default login shell. We launch `claude` through `zsh -l -c 'exec …'` so the
+// agent (and the tools claude itself shells out to) inherit the user's real PATH/env —
+// GUI apps otherwise get a minimal PATH and can't find node/git/etc.
+const SHELL = "/bin/zsh";
 
 /**
  * Build the argv for a shell agent spawn. Exported for unit testing of the injection-safety
@@ -76,13 +75,6 @@ export function AgentPane({
   const [errorMsg, setErrorMsg] = useState("");
   const [spawn, setSpawn] = useState<SpawnCmd | null>(null);
   const [ptyReady, setPtyReady] = useState(false);
-  // Multi Claude Max account support: the accounts available (for the badge dropdown) and the one
-  // THIS spawn runs under (its CLAUDE_CONFIG_DIR). `chosenAccountIdRef` mirrors the chosen id for the
-  // rate-limit failover callback (which runs outside render). Empty accounts → no badge, default spawn.
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  const [chosenAccount, setChosenAccount] = useState<Account | null>(null);
-  const chosenAccountIdRef = useRef<string | null>(null);
-  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const setAgentWorktree = useProjectStore((s) => s.setAgentWorktree);
   const appendPrompt = useProjectStore((s) => s.appendPrompt);
   const setStatus = useRuntimeStore((s) => s.setStatus);
@@ -275,23 +267,12 @@ export function AgentPane({
         setPhase("no-claude");
         return;
       }
-      // Multi Claude Max: pick the account this job runs under (lowest-usage, honoring a manual pin).
-      // No accounts configured → chosen is null → configDir undefined → spawn exactly as before.
-      // Best-effort: chooseAccountForAgent never throws (it swallows IPC errors to empty state).
-      const { chosen, state } = await chooseAccountForAgent(agent.id);
-      setAccounts(state.accounts);
-      setChosenAccount(chosen);
-      chosenAccountIdRef.current = chosen?.id ?? null;
-      const configDir = chosen?.configDir;
       // Resume the prior conversation if this worktree already has one (the
       // worktree path is the session key). `--continue` errors in a directory
       // with no history, so only add it when a session exists. Resume is a
       // best-effort enhancement: if detection fails, fall back to a fresh
       // `claude` rather than blocking the agent from starting at all.
-      // Pass the chosen account's config dir so resume detection looks under the SAME account the
-      // spawn will use (CLAUDE_CONFIG_DIR is set on the child only — see the spec's integration
-      // subtlety). Undefined configDir → Rust falls back to Sparkle's process env (prior behavior).
-      const resume = await claudeHasSession(wt.path, configDir).catch(() => false);
+      const resume = await claudeHasSession(wt.path).catch(() => false);
       // Record whether this is a fresh launch so the worker exit handler can
       // distinguish a first-run (which should produce result.json) from a
       // reopened/resumed session (where result.json was already consumed earlier).
@@ -319,7 +300,6 @@ export function AgentPane({
         exec = buildClaudeExec(claude.path, resume, {
           appendSystemPrompt: workerPersona({ parentBranch, resultPath }),
           initialPrompt: workerMission(agent.task ?? "", agent.id),
-          configDir,
         });
       } else if (agent.kind === "build") {
         // Autonomous orchestrator launch (Plan 2c): start the per-build-agent bridge FIRST (claude's
@@ -362,7 +342,6 @@ export function AgentPane({
               persona,
               bridge,
               paths,
-              configDir,
             }),
           );
           setPhase("ready");
@@ -376,7 +355,7 @@ export function AgentPane({
           throw e;
         }
       } else {
-        exec = buildClaudeExec(claude.path, resume, { configDir });
+        exec = buildClaudeExec(claude.path, resume);
       }
       setSpawn({
         command: SHELL,
@@ -410,27 +389,6 @@ export function AgentPane({
     // Prepare once per agent (agent.id is stable for this component's life).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent.id]);
-
-  // Manual override: pin this agent to a specific account. Updates the displayed badge immediately;
-  // the pinned account actually takes effect on the NEXT spawn (a re-prepare / reopen) — we don't
-  // restart a running agent out from under the user.
-  const pickAccount = (acct: Account) => {
-    setPin(agent.id, acct.id);
-    setChosenAccount(acct);
-    chosenAccountIdRef.current = acct.id;
-    setAccountMenuOpen(false);
-  };
-
-  // Best-effort Phase-1 failover: a usage/rate-limit message in this agent's output flags the chosen
-  // account exhausted so pickAccount steers the next job elsewhere. Fully isolated — any failure is
-  // swallowed and never reaches terminal rendering.
-  const handleRateLimit = (untilEpoch: number) => {
-    const id = chosenAccountIdRef.current;
-    if (!id) return;
-    void markExhausted(id, untilEpoch)
-      .then(() => invalidateAccountState())
-      .catch((e) => console.warn("markExhausted failed (best-effort failover)", e));
-  };
 
   // Focus follows the minimized state on the visible pane: minimized → terminal (so the user
   // can answer Claude's menus), restored → composer (so they type in the box). Drives both the
@@ -499,7 +457,6 @@ export function AgentPane({
               active={visible}
               onStatus={(s) => routerRef.current!.fromScreen(s)}
               onReady={() => setPtyReady(true)}
-              onRateLimit={handleRateLimit}
               onExit={() => {
                 // NOTE (Plan-1 limitation): this block fires only when the PTY process actually
                 // exits — i.e. the user explicitly quits `claude` (e.g. /exit). Because
@@ -557,17 +514,6 @@ export function AgentPane({
               }}
             />
           )}
-          {/* Account badge: which Claude account this agent runs under, click to pin a different
-              one. Only shown once at least one account exists (multi Claude Max support). */}
-          {accounts.length > 0 && chosenAccount && (
-            <AccountBadge
-              accounts={accounts}
-              chosen={chosenAccount}
-              open={accountMenuOpen}
-              onToggle={() => setAccountMenuOpen((v) => !v)}
-              onPick={pickAccount}
-            />
-          )}
           {scrolledOut && <ScrolledOutToast />}
         </div>
       )}
@@ -601,112 +547,6 @@ function ScrolledOutToast() {
       }}
     >
       ⌁ That part of the conversation has scrolled out of the terminal's history
-    </div>
-  );
-}
-
-/**
- * Small pill in the pane's top-right showing the Claude account this agent runs under. Click to
- * open a dropdown of all accounts and pin a different one for this agent (takes effect next spawn).
- * The pinned/active account is marked. Styling mirrors the app's other dark popovers (TopBar menus).
- */
-function AccountBadge({
-  accounts,
-  chosen,
-  open,
-  onToggle,
-  onPick,
-}: {
-  accounts: Account[];
-  chosen: Account;
-  open: boolean;
-  onToggle: () => void;
-  onPick: (a: Account) => void;
-}) {
-  return (
-    <div style={{ position: "absolute", top: 12, right: 12, zIndex: 20 }}>
-      <button
-        type="button"
-        title={`Claude account: ${chosen.nickname} — click to change`}
-        onClick={onToggle}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          background: C.deepForest,
-          border: `1px solid ${C.muted}`,
-          borderRadius: 6,
-          color: C.cream,
-          fontFamily: '"IBM Plex Sans", sans-serif',
-          fontSize: 11,
-          padding: "3px 8px",
-          cursor: "pointer",
-          boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
-        }}
-      >
-        <span style={{ width: 6, height: 6, borderRadius: 3, background: C.teal }} />
-        <span style={{ maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {chosen.nickname}
-        </span>
-        <span style={{ color: C.muted }}>▾</span>
-      </button>
-      {open && (
-        <>
-          <div onClick={onToggle} style={{ position: "fixed", inset: 0, zIndex: 19 }} />
-          <div
-            style={{
-              position: "absolute",
-              top: "100%",
-              right: 0,
-              marginTop: 4,
-              minWidth: 180,
-              background: C.deepForest,
-              border: `1px solid ${C.forest}`,
-              borderRadius: 8,
-              boxShadow: "0 12px 32px rgba(0,0,0,0.45)",
-              padding: 6,
-              zIndex: 21,
-            }}
-          >
-            {accounts.map((a) => {
-              const active = a.id === chosen.id;
-              return (
-                <div
-                  key={a.id}
-                  onClick={() => onPick(a)}
-                  title={a.configDir}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    padding: "6px 8px",
-                    borderRadius: 6,
-                    cursor: "pointer",
-                    fontFamily: '"IBM Plex Sans", sans-serif',
-                    fontSize: 12,
-                    color: C.cream,
-                    background: active ? C.forest : "transparent",
-                  }}
-                >
-                  <span
-                    style={{
-                      width: 6,
-                      height: 6,
-                      borderRadius: 3,
-                      background: active ? C.teal : "transparent",
-                      border: active ? "none" : `1px solid ${C.muted}`,
-                    }}
-                  />
-                  <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {a.nickname}
-                  </span>
-                  {a.isDefault && <span style={{ color: C.muted, fontSize: 10 }}>default</span>}
-                </div>
-              );
-            })}
-          </div>
-        </>
-      )}
     </div>
   );
 }
