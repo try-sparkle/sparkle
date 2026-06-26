@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { useProjectStore } from "../stores/projectStore";
 import { useSettingsStore } from "../stores/settingsStore";
+import { useRuntimeStore } from "../stores/runtimeStore";
 import { listen } from "@tauri-apps/api/event";
 
 // --- mock the Tauri event/invoke layer ---
@@ -59,6 +60,7 @@ describe("orchestrationListener", () => {
     unlistenMock.mockClear();
     // Reset the store so projects don't accumulate across tests (liveWorkerCount scans all of them).
     useProjectStore.setState({ projects: [], selectedProjectId: null });
+    useRuntimeStore.setState({ openAgentIds: [] });
     useSettingsStore.setState({ maxConcurrentWorkers: 4 });
     const store = useProjectStore.getState();
     projectId = store.addProject("Demo", "/tmp/demo");
@@ -81,6 +83,17 @@ describe("orchestrationListener", () => {
     expect(result.workerId).toBeTruthy();
     expect(result.branch).toMatch(/^sparkle\/agent-/);
     expect(result.worktree).toMatch(/^\/wt\//);
+  });
+
+  it("spawn_worker → auto-opens the worker (adds it to openAgentIds) so its PTY launches", async () => {
+    fire({ reqId: "o1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "auto-start me" } });
+    await flush();
+    const [, args] = invokeMock.mock.calls.at(-1)!;
+    const workerId = (args as { result: { workerId: string } }).result.workerId;
+    expect(workerId).toBeTruthy();
+    // Opening is what mounts AgentPane and launches the worker PTY — without it the worker would
+    // sit idle in the sidebar showing "Start this agent".
+    expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
   });
 
   it("list_workers → replies with this build agent's workers only", async () => {

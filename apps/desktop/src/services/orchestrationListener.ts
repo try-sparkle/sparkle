@@ -103,6 +103,14 @@ async function runSpawn(req: OrchestrationRequest): Promise<void> {
     });
     const project = useProjectStore.getState().projects.find((p) => p.id === req.projectId);
     const worker = project?.agents.find((a) => a.id === workerId);
+    // Auto-start the worker: opening it adds it to openAgentIds, which mounts its AgentPane and
+    // launches the PTY (worker persona + stored task). Without this the orchestrated worker sits
+    // idle in the sidebar showing "Start this agent" until a human clicks it — the manual spawn
+    // paths in AgentSidebar already call open() for exactly this reason. Gate on the worker record
+    // existing so a never-materialized id can't be stranded in openAgentIds; the per-build-agent
+    // concurrency cap is already enforced upstream (handleSpawn queues over-cap requests, and
+    // runSpawn reserves its slot via incInFlight before reaching here), so opening cannot exceed it.
+    if (worker) useRuntimeStore.getState().open(workerId);
     await respond(req.reqId, {
       workerId,
       branch: worker?.branch ?? "",
