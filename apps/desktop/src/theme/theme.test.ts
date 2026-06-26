@@ -135,4 +135,14 @@ describe("xtermTheme (concrete hex only — no CSS var())", () => {
     expect(xtermTheme("light").selectionBackground).toBe(THEME_HEX.light.chatBubble);
     expect(xtermTheme("dark").background).toBe(THEME_HEX.dark.forest);
   });
+
+  it("pins ANSI blue to the brand blue in light mode only (legible on white)", () => {
+    const light = xtermTheme("light") as Record<string, string>;
+    expect(light.blue).toBe("#2f6bff");
+    expect(light.brightBlue).toBe("#2f6bff");
+    // Dark mode keeps xterm's default ANSI palette (legible on navy) — no override.
+    const dark = xtermTheme("dark") as Record<string, string>;
+    expect(dark.blue).toBeUndefined();
+    expect(dark.brightBlue).toBeUndefined();
+  });
 });

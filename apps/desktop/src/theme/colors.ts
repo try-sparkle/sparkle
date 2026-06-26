@@ -53,6 +53,12 @@ export function xtermTheme(resolved: "light" | "dark") {
     foreground: hex.cream,
     cursor: BRAND.accent,
     selectionBackground: hex.chatBubble,
+    // ANSI blue override. xterm's default blue is a light periwinkle that reads fine on the
+    // dark-mode navy background but goes low-contrast on the light-mode white background — and
+    // TUIs like Claude Code paint headings/links/prompts in (bright) blue. In light mode we
+    // pin both to the PRIMARY brand blue (#2f6bff, the right end of the logo's blue→cyan fade),
+    // which is dark enough to stay legible on white. Dark mode keeps xterm's defaults.
+    ...(resolved === "light" ? { blue: BRAND.teal, brightBlue: BRAND.teal } : {}),
   };
 }
 
