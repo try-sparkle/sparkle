@@ -91,6 +91,7 @@ pub fn run() {
             pty::pty_kill,
             preflight::claude_preflight,
             claude::claude_has_session,
+            claude::agent_session_title,
             screenshot::capture_screen_region,
             attachments::load_attachment,
             attachments::copy_image_to_clipboard,

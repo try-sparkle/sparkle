@@ -9,6 +9,7 @@ import { useUiStore } from "../stores/uiStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { removeAgentWorkspace } from "../services/worktree";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
+import { refreshAgentTitle } from "../services/sessionTitle";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 import { stalenessTier, growNudge } from "../engine/nudges";
 import { spawnWorker } from "../services/workerSpawn";
@@ -107,6 +108,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           }
         }
         const all = [...targets.values()];
+        // Auto-name each agent from Claude Code's own session title (ai-title in the transcript) —
+        // the authoritative name once the first turn has summarized. Fire-and-forget, independent
+        // of the branch-status polls below; the store action respects pins + de-dupes.
+        for (const a of all) void refreshAgentTitle(proj.id, a.id, a.worktreePath);
         // Poll orchestrators (worker parents) first and await them, so a worker's derive in this
         // same round reads its parent's fresh stage rather than lagging a tick behind.
         const parents = all.filter((a) => a.kind === "build");

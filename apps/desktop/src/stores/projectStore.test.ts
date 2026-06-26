@@ -108,6 +108,76 @@ describe("projectStore auto-naming", () => {
   });
 });
 
+describe("projectStore applyAiTitle (Claude Code session title)", () => {
+  beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
+  const agentOf = (pid: string, aid: string) =>
+    useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
+
+  it("applies Claude Code's title as the name, records aiTitle, and derives fitting variants", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore.getState().addAgent(pid); // "Build 1" default
+    useProjectStore.getState().applyAiTitle(pid, aid, "  Debug Merged Agent On New Pop Open  ");
+    const a = agentOf(pid, aid);
+    expect(a.name).toBe("Debug Merged Agent On New Pop Open"); // trimmed
+    expect(a.aiTitle).toBe("Debug Merged Agent On New Pop Open");
+    // Width-fitting variants without a model call: caps at 4/6 words, long = full title.
+    expect(a.autoNameVariants).toEqual({
+      short: "Debug Merged Agent On",
+      medium: "Debug Merged Agent On New Pop",
+      long: "Debug Merged Agent On New Pop Open",
+    });
+  });
+
+  it("overrides a prior Haiku auto-name (the title is authoritative)", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore.getState().addAgent(pid);
+    useProjectStore.getState().autoRenameAgent(pid, aid, "Some Guess", "a thin prompt");
+    useProjectStore.getState().applyAiTitle(pid, aid, "Fix False Merged Status");
+    expect(agentOf(pid, aid).name).toBe("Fix False Merged Status");
+  });
+
+  it("never overrides a manually-pinned name", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore.getState().addAgent(pid);
+    useProjectStore.getState().renameAgent(pid, aid, "My Agent");
+    useProjectStore.getState().applyAiTitle(pid, aid, "Claude's Title");
+    expect(agentOf(pid, aid).name).toBe("My Agent");
+  });
+
+  it("an empty/whitespace title is a no-op (no name yet, keep the default)", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore.getState().addAgent(pid);
+    const before = agentOf(pid, aid).name;
+    useProjectStore.getState().applyAiTitle(pid, aid, "   ");
+    expect(agentOf(pid, aid).name).toBe(before);
+    expect(agentOf(pid, aid).aiTitle).toBeUndefined();
+  });
+
+  it("autoRenameAgent does not clobber an applied ai-title (closes the in-flight Haiku race)", () => {
+    // Race: a Haiku call started before any title existed, then the title poll applied an
+    // ai-title while it was in flight; when the Haiku call resolves it must NOT overwrite the
+    // authoritative title with its stale guess. The store is the arbiter.
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore.getState().addAgent(pid);
+    useProjectStore.getState().applyAiTitle(pid, aid, "Authoritative Title");
+    useProjectStore.getState().autoRenameAgent(pid, aid, "Late Haiku Guess", "a thin prompt");
+    expect(agentOf(pid, aid).name).toBe("Authoritative Title");
+  });
+
+  it("re-applying the same title is a no-op but a changed title updates the name", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore.getState().addAgent(pid);
+    useProjectStore.getState().applyAiTitle(pid, aid, "First Title");
+    const ref1 = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
+    useProjectStore.getState().applyAiTitle(pid, aid, "First Title"); // unchanged
+    const ref2 = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
+    expect(ref2).toBe(ref1); // same object reference → no rewrite/re-render
+    // Claude Code refined its title → the name follows.
+    useProjectStore.getState().applyAiTitle(pid, aid, "Second Refined Title");
+    expect(agentOf(pid, aid).name).toBe("Second Refined Title");
+  });
+});
+
 describe("projectStore prompt history", () => {
   beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
 

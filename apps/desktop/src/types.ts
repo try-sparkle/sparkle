@@ -57,6 +57,12 @@ export interface AgentTab {
   // until the first auto-name lands, and for pinned/manually-named agents (which use `name`
   // only). `name` stays the canonical fallback — set to the medium variant when these exist.
   autoNameVariants: AgentNameVariants | null;
+  // The last Claude Code session title (`ai-title`) applied to this agent. Claude Code derives it
+  // from the FULL conversation (prompts + responses + images), so it's the authoritative auto-name
+  // once present — it supersedes the prompt-derived Haiku name and suppresses further Haiku calls.
+  // Undefined until the first title is read; cleared semantics follow `namePinned` (a manual rename
+  // still wins). Tracked separately from `name` so we can detect when Claude Code's title changes.
+  aiTitle?: string | null;
   // For "shell" agents (Run-as-cmd from the terminal selection popup): the command this tab
   // runs on spawn. Null for all other kinds.
   shellCommand: string | null;

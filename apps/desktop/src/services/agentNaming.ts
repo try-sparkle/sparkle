@@ -102,6 +102,10 @@ export async function maybeAutoName(projectId: string, agentId: string, prompt: 
   const store = useProjectStore.getState();
   const agent = store.projects.find((p) => p.id === projectId)?.agents.find((a) => a.id === agentId);
   if (!agent) return;
+  // Once Claude Code has titled the session (ai-title, applied via sessionTitle.ts), it is the
+  // authoritative name — derived from the whole conversation, not just this prompt. Stand the
+  // prompt-only Haiku path down so the two never fight over the name (and we stop spending calls).
+  if (agent.aiTitle) return;
   if (!shouldRename({ namePinned: agent.namePinned, autoNameBasis: agent.autoNameBasis, prompt })) {
     return;
   }

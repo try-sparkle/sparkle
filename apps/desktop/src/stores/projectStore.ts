@@ -64,6 +64,11 @@ interface ProjectState {
     basis: string,
     variants?: AgentNameVariants | null,
   ) => void;
+  /** Apply Claude Code's session title (`ai-title`) as the authoritative auto-name. No-op if the
+   *  user has pinned the name, the title is empty, or it's already applied. Supersedes any
+   *  prompt-derived name and records `aiTitle` so later changes are detected and further Haiku
+   *  naming is suppressed. */
+  applyAiTitle: (projectId: string, agentId: string, title: string) => void;
   /** Pin/unpin the name. Unpinning re-enables auto-naming on the next prompt. */
   setNamePinned: (projectId: string, agentId: string, pinned: boolean) => void;
   selectAgent: (projectId: string, agentId: string) => void;
@@ -80,6 +85,16 @@ function mapProject(
   fn: (p: Project) => Project,
 ): Project[] {
   return projects.map((p) => (p.id === id ? fn(p) : p));
+}
+
+/** Derive width-fitting short/medium/long variants from a single Claude Code title by word-count
+ *  caps — so the sidebar can still shrink a long title to a narrow column (and reveal the full
+ *  form on hover) without a model call. A title of ≤4 words collapses to the same string at every
+ *  length, which renders identically to a variant-less name. Exported for unit testing. */
+export function titleVariants(title: string): AgentNameVariants {
+  const words = title.split(/\s+/).filter(Boolean);
+  const take = (n: number) => words.slice(0, n).join(" ");
+  return { short: take(4), medium: take(6), long: title };
 }
 
 /** Backfill the main-first-defaults fields on persisted state so legacy records rehydrate with
@@ -333,13 +348,40 @@ export const useProjectStore = create<ProjectState>()(
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) =>
-              // Respect a pinned name — never overwrite a name the user chose by hand.
-              a.namePinned || !name.trim()
+              // Respect a pinned name (manual) AND a Claude Code session title (authoritative).
+              // The aiTitle check makes the STORE the single arbiter of precedence, closing the
+              // race where an in-flight Haiku call (started before a title existed) resolves AFTER
+              // the title poll applied one — without it, the stale guess would clobber the title.
+              a.namePinned || a.aiTitle || !name.trim()
                 ? a
                 : { ...a, name: name.trim(), autoNameBasis: basis, autoNameVariants: variants ?? null },
             ),
           ),
         })),
+
+      applyAiTitle: (projectId, agentId, title) =>
+        set((s) => {
+          const t = title.trim();
+          if (!t) return s; // no title yet — leave the name as-is
+          // Bail BEFORE touching state when there's nothing to change — a manual rename owns the
+          // name, or this exact title is already applied. Returning `s` keeps the projects/agents
+          // array references stable, so whole-`projects` subscribers don't re-render. This is the
+          // common case: the 30s poll fires for every agent but titles rarely change once set.
+          const agent = s.projects
+            .find((p) => p.id === projectId)
+            ?.agents.find((a) => a.id === agentId);
+          if (!agent || agent.namePinned || agent.aiTitle === t) return s;
+          return {
+            projects: mapProject(s.projects, projectId, (p) =>
+              mapAgent(p, agentId, (a) => ({
+                ...a,
+                name: t,
+                aiTitle: t,
+                autoNameVariants: titleVariants(t),
+              })),
+            ),
+          };
+        }),
 
       setNamePinned: (projectId, agentId, pinned) =>
         set((s) => ({
