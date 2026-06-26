@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { Workspace } from "./components/Workspace";
+import { AuthGate } from "./components/AuthGate";
 import { useAmbientVoice } from "./useDictation";
 import { useApplyTheme } from "./theme/theme";
 import { useConnectionMonitor } from "./connectionMonitor";
@@ -23,7 +24,7 @@ export function App() {
   // App-level always-listening voice controller (mounted once).
   useAmbientVoice();
 
-  // Seed the Chief PAT from the user's environment (.env.local) at launch so the Brainstorm
+  // Seed the Chief PAT from the user's environment (.env.local) at launch so the Think
   // agent works without pasting a token. Resolved in Rust (never baked into the bundle); set
   // unconditionally — including "" — so a removed env token doesn't leave a stale value.
   useEffect(() => {
@@ -34,8 +35,10 @@ export function App() {
 
   return (
     <CurrentProjectProvider>
-      <AttentionController />
-      <Workspace />
+      <AuthGate>
+        <AttentionController />
+        <Workspace />
+      </AuthGate>
     </CurrentProjectProvider>
   );
 }

@@ -1,11 +1,12 @@
 import { useState, useEffect } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { TbPinFilled } from "react-icons/tb";
+import { TbPinFilled, TbBulb } from "react-icons/tb";
 import { C, AGENT_STATUS, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK } from "../theme/colors";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { useSettingsStore } from "../stores/settingsStore";
 import { removeAgentWorkspace } from "../services/worktree";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
@@ -27,10 +28,10 @@ import type { WorkflowStageId } from "../engine/workflowStage";
  * to open the agent, double-click the agent name to rename it, ×
  * to close. "+ Agent" adds one.
  */
-// Shared style for the two create buttons (Brainstorm / Build): a solid gradient fill with
+// Shared style for the two create buttons (Think / Build): a solid gradient fill with
 // NO border/stroke, so the button reads as a button without an edge of a different shade on
 // its sides. The gradient runs left→right to reproduce the Sparkle logo's blue→cyan fade:
-// Brainstorm runs blue→mid, Build picks up mid→cyan. `fillText` is the per-button ink chosen
+// Think runs blue→mid, Build picks up mid→cyan. `fillText` is the per-button ink chosen
 // for contrast on that fill.
 function createBtnStyle(from: string, to: string, fillText: string): React.CSSProperties {
   return {
@@ -91,7 +92,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         if (!proj) return;
         const { openAgentIds, pollBranchStatus: poll } = useRuntimeStore.getState();
         const hasWorkflow = (a: (typeof proj.agents)[number]) =>
-          a.kind !== "brainstorm" && a.kind !== "shell"; // those have no git workflow
+          a.kind !== "think" && a.kind !== "shell"; // those have no git workflow
         // Targets: every OPEN agent, PLUS the orchestrator parent of each open worker — even when
         // that parent's pane is closed — so a worker's "Merged" (which reads its parent's stage)
         // can still advance. De-duped by id.
@@ -119,6 +120,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const id = setInterval(() => void tick(), 30_000);
     return () => clearInterval(id);
   }, [projectId]);
+  // AI Brainstorming feature gate (Use AI Features menu). Off → hide the ✦ Brainstorm button.
+  const aiBrainstorm = useSettingsStore((s) => s.aiBrainstorm);
   const [editing, setEditing] = useState<string | null>(null);
 
   // Draggable column width — persisted to localStorage so it survives relaunch. Clamped to
@@ -160,12 +163,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     selectAgent(project.id, id);
     open(id);
   };
-  const onAddBrainstorm = () => {
+  const onAddThink = () => {
     if (!project) return;
     setActiveSpecial(null); // creating an agent leaves the special (Sparkle) view
-    // One brainstorm agent per project by convention — reuse it if it already exists.
-    const existing = project.agents.find((a) => a.kind === "brainstorm");
-    const id = existing ? existing.id : addAgent(project.id, { kind: "brainstorm" });
+    // One think agent per project by convention — reuse it if it already exists.
+    const existing = project.agents.find((a) => a.kind === "think");
+    const id = existing ? existing.id : addAgent(project.id, { kind: "think" });
     selectAgent(project.id, id);
     open(id);
   };
@@ -289,16 +292,18 @@ export function AgentSidebar({ project }: { project: Project | null }) {
 
       {project && (
         <div style={{ display: "flex", gap: 8, margin: "0 10px 8px" }}>
-          <button
-            onClick={onAddBrainstorm}
-            title="Chat with Chief over this project's knowledge"
-            style={createBtnStyle(C.accent, C.accentMid, ON_BRAND_FILL_DARK)} // cyan (the "S" color) leads; black icon+text
-          >
-            {/* translateY corrects the glyph's font-baseline offset so its ink centers on the
-                label (measured: ✦ otherwise sits ~2px low, ⚒ ~6px low against these fonts). */}
-            <span style={{ fontSize: 19.5, lineHeight: 0, transform: "translateY(-0.5px)" }}>✦</span>
-            <span>Brainstorm</span>
-          </button>
+          {/* AI feature-gated (the "Enable AI Thinking" toggle): off → the button disappears
+              (Build stays). main renamed Brainstorm → Think; the gate flag stays aiBrainstorm. */}
+          {aiBrainstorm && (
+            <button
+              onClick={onAddThink}
+              title="Chat with Chief over this project's knowledge"
+              style={createBtnStyle(C.accent, C.accentMid, ON_BRAND_FILL_DARK)} // cyan (the "S" color) leads; black icon+text
+            >
+              <TbBulb size={18} style={{ flexShrink: 0 }} />
+              <span>Think</span>
+            </button>
+          )}
           <button
             onClick={onAddBuild}
             title="A master orchestrator that spawns worker agents to get work done"
@@ -335,8 +340,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                 ? project.agents.filter((w) => w.parentId === top.id)
                 : [];
             // The orchestrator's chevron rolls up its workers (overall = least-advanced worker);
-            // with no workers it just shows its own git stage. A worker/brainstorm/shell row shows
-            // its own. (Brainstorm has no worktree, so it resolves to the harmless start stage and
+            // with no workers it just shows its own git stage. A worker/think/shell row shows
+            // its own. (Think has no worktree, so it resolves to the harmless start stage and
             // we simply don't render a tracker for it — see renderRow.)
             const workerStages = workers.map((w) => stageOf(w.id));
             const rollup = rollupStages(workerStages);
@@ -359,7 +364,15 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           // an orphaned worker surfaced as its own head isn't mis-indented — and real children at 1.
           const depth = a.id === top.id ? 0 : 1;
           const kindGlyph =
-            a.kind === "brainstorm" ? "✦" : a.kind === "worker" ? "↳" : a.kind === "shell" ? "▶" : "⚒";
+            a.kind === "think" ? (
+              <TbBulb size={16} />
+            ) : a.kind === "worker" ? (
+              "↳"
+            ) : a.kind === "shell" ? (
+              "▶"
+            ) : (
+              "⚒"
+            );
           return (
             <div
               key={a.id}
@@ -381,12 +394,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               <span
                 title={a.kind}
                 style={{
-                  fontSize: a.kind === "build" ? 28.8 : a.kind === "brainstorm" ? 19.5 : 12,
+                  fontSize: a.kind === "build" ? 28.8 : a.kind === "think" ? 19.5 : 12,
                   color: C.muted,
                   flex: "0 0 auto",
-                  width: a.kind === "build" ? 24 : a.kind === "brainstorm" ? 20 : 12,
+                  width: a.kind === "build" ? 24 : a.kind === "think" ? 20 : 12,
                   textAlign: "center",
-                  // Keep the enlarged Build (⚒) / Brainstorm (✦) glyphs from driving the row's
+                  // Keep the enlarged Build (⚒) glyph from driving the row's
                   // height — line-height 0 lets the big glyph overflow its line box (it stays
                   // centered) so rows keep their original, compact height.
                   lineHeight: 0,
@@ -489,7 +502,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                 </Tooltip>
                 {/* Domino's-tracker chevrons: how far this work has progressed toward merged.
                     For an orchestrator this is the roll-up of its workers; for a worker it's its
-                    own git stage. Brainstorm agents have no worktree, so trackerStage is null. */}
+                    own git stage. Think agents have no worktree, so trackerStage is null. */}
                 {trackerStage && (
                   <div style={{ marginTop: 3 }}>
                     <WorkflowTracker
@@ -558,7 +571,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                   into the project default. */}
               {bs &&
                 bs.ahead > 0 &&
-                a.kind !== "brainstorm" &&
+                a.kind !== "think" &&
                 a.kind !== "shell" &&
                 stageIndex(stageOf(a.id)) < stageIndex("main") && (
                   <button
@@ -592,9 +605,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             }; // end renderRow
 
             // The orchestrator's own chevron: the roll-up of its workers, or its own git stage when
-            // it has none. Brainstorm/shell agents have no git workflow → no tracker (null).
+            // it has none. Think/shell agents have no git workflow → no tracker (null).
             const headStage: WorkflowStageId | null =
-              top.kind === "brainstorm" || top.kind === "shell"
+              top.kind === "think" || top.kind === "shell"
                 ? null
                 : rollup
                   ? rollup.stage
@@ -673,9 +686,16 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         {project && project.agents.length === 0 && (
           <div style={{ color: C.muted, fontSize: 12, padding: 10, lineHeight: 1.5 }}>
             <div>No agents are running.</div>
-            <div style={{ marginTop: 8 }}>
-              • Start a <strong>✦ Brainstorm</strong> agent to define what you want to build
-            </div>
+            {/* Don't point at the Think button when the AI feature is gated off. */}
+            {aiBrainstorm && (
+              <div style={{ marginTop: 8 }}>
+                • Start a{" "}
+                <strong>
+                  <TbBulb size={12} style={{ verticalAlign: "-2px" }} /> Think
+                </strong>{" "}
+                agent to define what you want to build
+              </div>
+            )}
             <div style={{ marginTop: 8 }}>
               • Start a <strong>⚒ Build</strong> agent to orchestrate workers and get started
               building

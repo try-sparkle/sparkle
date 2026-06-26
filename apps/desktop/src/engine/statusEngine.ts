@@ -40,7 +40,7 @@ function stripAnsi(s: string): string {
 // the settle screen-check would. It runs the SAME classifier as settle (`screenAwaitsInput`
 // — one source of truth, zero duplicated markers), so it keys only off true interactive
 // prompts (the ❯ menu, (y/n), passphrase…). It deliberately does NOT match conversational
-// prose like "Do you want to proceed?": Claude ends brainstorm turns with exactly that
+// prose like "Do you want to proceed?": Claude ends think turns with exactly that
 // phrasing, and treating it as a blocking prompt is the false-red this whole change exists
 // to kill. A real prompt always carries an interactive marker, which we do catch.
 const ERROR_PATTERNS: RegExp[] = [

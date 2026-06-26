@@ -4,7 +4,7 @@ import { defineConfig, loadEnv } from "vite";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-// In dev, surface the user's Chief PAT to the app as VITE_CHIEF_PAT so the Brainstorm agent
+// In dev, surface the user's Chief PAT to the app as VITE_CHIEF_PAT so the Think agent
 // works on localhost without pasting a token. We look (in order) at: the process env
 // (CHIEF_API / VITE_CHIEF_PAT), Vite's own .env files, then a CHIEF_API line in the monorepo
 // root .env.local — that's where it lives in this repo. NEVER baked into a production build.

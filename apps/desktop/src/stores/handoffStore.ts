@@ -1,17 +1,17 @@
-// Ephemeral hand-off from a terminal-selection action to the Brainstorm panel: carries the
-// initial prompt (and whether to auto-send it) for the project's singleton brainstorm agent.
+// Ephemeral hand-off from a terminal-selection action to the Think panel: carries the
+// initial prompt (and whether to auto-send it) for the project's singleton think agent.
 // Deliberately NOT persisted — it's consumed on the next render and cleared.
 import { create } from "zustand";
 
-export interface BrainstormHandoff {
+export interface ThinkHandoff {
   projectId: string;
   text: string;
   autoSend: boolean;
 }
 
 interface HandoffState {
-  pending: BrainstormHandoff | null;
-  setPending: (h: BrainstormHandoff) => void;
+  pending: ThinkHandoff | null;
+  setPending: (h: ThinkHandoff) => void;
   clear: () => void;
 }
 

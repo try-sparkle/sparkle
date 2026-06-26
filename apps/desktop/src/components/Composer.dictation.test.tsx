@@ -29,7 +29,7 @@ import { usePromptHistoryStore } from "../stores/promptHistoryStore";
 
 beforeEach(() => {
   submitPrompt.mockClear();
-  useDictationStore.setState({ insertTarget: null, enabled: true });
+  useDictationStore.setState({ insertTarget: null, enabled: true, interim: "" });
   useUiStore.getState().setComposerMinimized(false);
   usePromptHistoryStore.setState({ history: [] });
 });
@@ -80,6 +80,30 @@ describe("Composer — dictation wiring", () => {
     // A second utterance appends with a separating space (not a clobber).
     act(() => useDictationStore.getState().insert("again"));
     expect(ta.value).toBe("hello world again");
+  });
+
+  it("shows the live cloud interim transcript as a muted preview, then clears it", () => {
+    renderComposer();
+    act(() => useDictationStore.getState().setInterim("hello wor"));
+    // The in-progress phrase is rendered (in the ghost mirror) so the user sees words stream in.
+    expect(screen.getByText("hello wor")).toBeTruthy();
+    // When the segment finalizes the preview is cleared (the committed text lands in the box).
+    act(() => useDictationStore.getState().setInterim(""));
+    expect(screen.queryByText("hello wor")).toBeNull();
+  });
+
+  it("renders the interim preview ONLY in the active pane (no leak across mounted composers)", () => {
+    // Two composers mounted at once (the real multi-agent layout). Like committed dictated text,
+    // the live interim preview must appear only in the active/enabled pane.
+    render(
+      <>
+        <Composer agentId="active" active disabled={false} onSubmitPrompt={vi.fn()} />
+        <Composer agentId="hidden" active={false} disabled={false} onSubmitPrompt={vi.fn()} />
+      </>,
+    );
+    act(() => useDictationStore.getState().setInterim("leaky words"));
+    // Exactly one pane paints the preview — the active one.
+    expect(screen.getAllByText("leaky words")).toHaveLength(1);
   });
 
   it("clears its insert registration on unmount (no clobber of a newer pane)", () => {

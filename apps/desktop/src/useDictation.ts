@@ -2,7 +2,28 @@ import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useDictationStore } from "./stores/dictationStore";
-import { advance } from "./voice/wakeMachine";
+import { useSettingsStore } from "./stores/settingsStore";
+import { advance, type Advance } from "./voice/wakeMachine";
+import { creditDeps } from "./services/sparkleApi";
+import {
+  createCloudDictationMeter,
+  setActiveCloudMeter,
+  stopActiveCloudMeter,
+  openMeteredCloudWindow,
+} from "./services/cloudDictationMeter";
+
+/**
+ * The cloud-stream command (if any) a wake-machine transition implies. Pure so the
+ * "local gate, then stream" wiring is unit-testable without the hook: only a *transition*
+ * acts — entering ACTIVE opens the Deepgram stream, returning to PASSIVE closes it. A segment
+ * that merely inserts text (no phase change) leaves the stream as-is.
+ */
+export function cloudStreamCommandFor(
+  r: Advance,
+): "start_cloud_stream" | "stop_cloud_stream" | null {
+  if (!r.transitioned) return null;
+  return r.phase === "active" ? "start_cloud_stream" : "stop_cloud_stream";
+}
 
 // ---------------------------------------------------------------------------
 // Controller factory
@@ -41,7 +62,29 @@ export async function createDictationController(
     listen<string>("dictation://partial", (e) => {
       // Capture started — clear any lingering model-download progress.
       useDictationStore.getState().setModelProgress(null);
+      // A committed (final) segment supersedes the live preview — clear it so the interim text
+      // doesn't briefly double up with the text that's about to land in the box.
+      useDictationStore.getState().setInterim("");
       onSegment(e.payload);
+    }),
+
+    // Cloud-only: Deepgram interim results — the live, word-by-word preview. Volatile; replaced in
+    // place and never routed through the wake machine (that only acts on committed segments).
+    listen<string>("dictation://interim", (e) => {
+      useDictationStore.getState().setInterim(e.payload);
+    }),
+
+    // The cloud (Deepgram) worker exited — clean close OR a mid-stream failure. Clear the stale
+    // interim ghost and call stop_cloud_stream, which flips cloud_active off so the capture callback
+    // resumes routing frames to the on-device model (seamless fallback; on a mid-stream death the
+    // on-device wake/stop-word path resumes instead of dictation getting stranded). Idempotent on
+    // the normal stop path (cloud already torn down).
+    listen("dictation://cloud-ended", () => {
+      // The cloud stream is gone — stop per-minute billing immediately (don't keep debiting a dead
+      // stream), clear the stale preview, and tell the backend to resume on-device routing.
+      stopActiveCloudMeter();
+      useDictationStore.getState().setInterim("");
+      invoke("stop_cloud_stream").catch(() => {});
     }),
 
     listen<number>("dictation://level", (e) => {
@@ -68,14 +111,18 @@ export async function createDictationController(
   const toggle = async () => {
     const state = useDictationStore.getState();
     if (state.status === "listening") {
+      stopActiveCloudMeter(); // stopping dictation halts per-minute cloud billing
       await invoke("stop_dictation");
       state.setModelProgress(null);
       state.setStatus("idle");
       state.setLevel(0);
+      state.setInterim("");
     } else {
       state.setError(null);
       state.setStatus("listening");
       try {
+        // The cloud-dictation preference is read LIVE at the wake→active transition (start_cloud_stream),
+        // not frozen here, so toggling the menu mid-session takes effect without restarting.
         await invoke("start_dictation");
       } catch (e) {
         state.setModelProgress(null);
@@ -101,6 +148,25 @@ export async function createDictationController(
  */
 export function useAmbientVoice(): void {
   const enabled = useDictationStore((s) => s.enabled);
+  const cloudDictation = useSettingsStore((s) => s.cloudDictation);
+  const aiComposer = useSettingsStore((s) => s.aiComposer);
+
+  // If the user turns voice dictation OR the composer off WHILE a cloud stream is open, close it
+  // immediately rather than waiting for the stop word — otherwise a billable Deepgram socket lingers
+  // (and, with the composer off, streams into a sink that no longer renders). Stop the per-minute
+  // meter too so billing halts. Idempotent; re-enabling reopens on the next wake.
+  useEffect(() => {
+    // Only when the mic is hot can a cloud stream be open, so gate on `enabled` to avoid a backend
+    // round-trip on mount / benign re-renders when nothing is streaming.
+    if (enabled && (!cloudDictation || !aiComposer)) {
+      stopActiveCloudMeter();
+      invoke("stop_cloud_stream").catch(() => {});
+      useDictationStore.getState().setInterim("");
+    }
+  }, [enabled, cloudDictation, aiComposer]);
+
+  // Monotonic id per metered cloud window, for debit idempotency keys.
+  const cloudSessionSeq = useRef(0);
 
   // Stable segment handler: runs the phase machine against the live store phase.
   const lastTransitionAt = useRef(0);
@@ -114,6 +180,53 @@ export function useAmbientVoice(): void {
     if (r.transitioned) {
       lastTransitionAt.current = now;
       store.setPhase(r.phase);
+      // "Local gate, then stream": the wake word fires from the on-device model (passive). On
+      // entering ACTIVE, meter + open the Deepgram stream; on returning to PASSIVE (stop word),
+      // stop billing + close it and resume on-device wake-word listening.
+      const cmd = cloudStreamCommandFor(r);
+      if (cmd === "start_cloud_stream") {
+        const s = useSettingsStore.getState();
+        // Only attempt the billable cloud stream when the composer exists to receive the text AND
+        // voice dictation is on. CRITICAL ordering: open FIRST, meter only on a confirmed open.
+        // start_cloud_stream returns false when the backend stays on-device (no Deepgram key,
+        // handshake failure, race discard) — in those cases we must NOT bill (else a key-less user
+        // pays for cloud dictation they never received).
+        if (s.aiComposer && s.cloudDictation) {
+          const sessionId = `cd-${now}-${cloudSessionSeq.current++}`;
+          // Billing-critical open→meter sequence lives in openMeteredCloudWindow (tested in isolation).
+          void openMeteredCloudWindow({
+            startCloudStream: () => invoke<boolean>("start_cloud_stream"),
+            stopCloudStream: () => void invoke("stop_cloud_stream").catch(() => {}),
+            isStillActive: () =>
+              useDictationStore.getState().phase === "active" &&
+              useSettingsStore.getState().aiComposer &&
+              useSettingsStore.getState().cloudDictation,
+            createMeter: () => {
+              const meter = createCloudDictationMeter({
+                consume: creditDeps.consume,
+                isAiEnabled: creditDeps.isAiEnabled,
+                setInterval: (fn, ms) => window.setInterval(fn, ms),
+                clearInterval: (h) => window.clearInterval(h),
+                onExhausted: () => {
+                  // Out of credits mid-stream → clear the singleton, close the socket, clear preview.
+                  stopActiveCloudMeter();
+                  void invoke("stop_cloud_stream").catch(() => {});
+                  useDictationStore.getState().setInterim("");
+                },
+                sessionId,
+              });
+              setActiveCloudMeter(meter);
+              return meter;
+            },
+            clearInterim: () => useDictationStore.getState().setInterim(""),
+            clearActiveMeter: () => stopActiveCloudMeter(),
+          });
+        }
+      } else if (cmd === "stop_cloud_stream") {
+        stopActiveCloudMeter();
+        invoke("stop_cloud_stream").catch(() => {});
+      }
+      if (r.phase === "passive") store.setInterim("");
     }
     if (r.insert) store.insert(r.insert);
   });
@@ -165,10 +278,12 @@ export function useAmbientVoice(): void {
           store.setEnabled(false);
         });
     } else {
+      stopActiveCloudMeter(); // muting the mic must halt per-minute cloud billing
       invoke("stop_dictation").catch(() => {});
       store.setStatus("idle");
       store.setLevel(0);
       store.setPhase("passive");
+      store.setInterim("");
     }
     return () => { activeRun = false; };
   }, [enabled]);

@@ -30,7 +30,7 @@ import { PinnedPrompt } from "./PinnedPrompt";
 import { Terminal, type TerminalApi } from "./Terminal";
 import { Composer } from "./Composer";
 import { Onboarding } from "./Onboarding";
-import { BrainstormPanel } from "./BrainstormPanel";
+import { ThinkPanel } from "./ThinkPanel";
 
 type Phase = "preparing" | "ready" | "no-claude" | "error";
 
@@ -94,6 +94,10 @@ export function AgentPane({
   // minimizes (or on ⌘J) without the user clicking the terminal.
   const termFocusRef = useRef<(() => void) | null>(null);
   const composerMinimized = useUiStore((s) => s.composerMinimized);
+  // AI feature gates (Use AI Features menu). When the composer feature is off, we render the bare
+  // terminal instead of the composer overlay; when auto-rename is off, we skip the naming call.
+  const aiComposer = useSettingsStore((s) => s.aiComposer);
+  const aiAutoRename = useSettingsStore((s) => s.aiAutoRename);
   // Imperative bridge to the terminal: mark where each prompt was sent, scroll back to it on pick.
   const terminalApiRef = useRef<TerminalApi | null>(null);
   // Brief toast when a picked prompt's line has scrolled out of the terminal's history.
@@ -124,8 +128,8 @@ export function AgentPane({
   };
 
   const prepare = async () => {
-    // Brainstorm agents are a Chief chat — no worktree, no PTY, nothing to prepare.
-    if (agent.kind === "brainstorm") return;
+    // Think agents are a Chief chat — no worktree, no PTY, nothing to prepare.
+    if (agent.kind === "think") return;
     // Shell agents (Run-as-cmd) run a raw command in the project root, then drop into an
     // interactive login shell so output stays visible and follow-up commands work. No worktree,
     // no claude — spawn straight away.
@@ -147,7 +151,7 @@ export function AgentPane({
     // increment that fires during *any* of the subsequent awaits (worktree prep, Claude check,
     // session detection, bridge start…) will be captured and detectable by the build branch's
     // post-bridge guard (myRun !== prepareRunRef.current). Placing it after the early non-async
-    // returns (brainstorm/shell) means it only runs when we're about to do async work.
+    // returns (think/shell) means it only runs when we're about to do async work.
     const myRun = ++prepareRunRef.current;
     setPhase("preparing");
     setErrorMsg("");
@@ -341,11 +345,13 @@ export function AgentPane({
   useEffect(() => {
     if (!visible || !ptyReady) return;
     const raf = requestAnimationFrame(() => {
-      if (composerMinimized) termFocusRef.current?.();
+      // No composer (feature off) or it's minimized → focus the terminal so the user can type
+      // straight into it; otherwise focus the composer textarea.
+      if (!aiComposer || composerMinimized) termFocusRef.current?.();
       else composerInputRef.current?.focus();
     });
     return () => cancelAnimationFrame(raf);
-  }, [composerMinimized, visible, ptyReady]);
+  }, [composerMinimized, visible, ptyReady, aiComposer]);
 
   return (
     <div
@@ -357,10 +363,10 @@ export function AgentPane({
         background: C.forest,
       }}
     >
-      {/* Brainstorm agents render a Chief chat instead of a Claude terminal. */}
-      {agent.kind === "brainstorm" && <BrainstormPanel project={project} agentId={agent.id} />}
+      {/* Think agents render a Chief chat instead of a Claude terminal. */}
+      {agent.kind === "think" && <ThinkPanel project={project} agentId={agent.id} />}
 
-      {agent.kind !== "brainstorm" && (
+      {agent.kind !== "think" && (
         <>
       <PinnedPrompt
         prompt={agent.lastPrompt}
@@ -432,22 +438,31 @@ export function AgentPane({
               apiRef={terminalApiRef}
             />
           </div>
-          <Composer
-            agentId={agent.id}
-            active={visible}
-            disabled={!ptyReady}
-            inputRef={composerInputRef}
-            onArrowOverflow={(dir) => terminalApiRef.current?.arrowFromComposer(dir)}
-            onSubmitPrompt={(t) => {
-              // Record the prompt (pinned header + history) and mark where it landed in the
-              // terminal so the history dropdown can scroll back to it later.
-              const id = appendPrompt(project.id, agent.id, t);
-              terminalApiRef.current?.markPrompt(id);
-              // Fire-and-forget: summarize the work into a short name (first prompt, or when
-              // the work shifts). No-ops if the name is pinned or no API key is configured.
-              void maybeAutoName(project.id, agent.id, t);
-            }}
-          />
+          {/* AI-enhanced composer (feature-gated). Off → no overlay: the user types straight into
+              the terminal beneath (and photo-drop + Send go away with it).
+              NOTE: auto-rename (maybeAutoName below) is intentionally coupled to the composer — the
+              only "a prompt was submitted" hook is the composer's onSubmitPrompt. With the composer
+              off, the user submits via raw terminal keystrokes (no prompt boundary to summarize), so
+              auto-rename can't run even if its own flag is on. That's an accepted coupling, not a bug. */}
+          {aiComposer && (
+            <Composer
+              agentId={agent.id}
+              active={visible}
+              disabled={!ptyReady}
+              inputRef={composerInputRef}
+              onArrowOverflow={(dir) => terminalApiRef.current?.arrowFromComposer(dir)}
+              onSubmitPrompt={(t) => {
+                // Record the prompt (pinned header + history) and mark where it landed in the
+                // terminal so the history dropdown can scroll back to it later.
+                const id = appendPrompt(project.id, agent.id, t);
+                terminalApiRef.current?.markPrompt(id);
+                // Fire-and-forget: summarize the work into a short name (first prompt, or when
+                // the work shifts). No-ops if the name is pinned or no API key is configured.
+                // Gated on the auto-rename AI feature.
+                if (aiAutoRename) void maybeAutoName(project.id, agent.id, t);
+              }}
+            />
+          )}
           {scrolledOut && <ScrolledOutToast />}
         </div>
       )}

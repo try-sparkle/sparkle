@@ -39,7 +39,7 @@ export const CHAT_USER_BUBBLE = "var(--c-chat-bubble)";
 // var, which flips to navy ink in light mode and would go low-contrast on teal.
 export const ON_BRAND_FILL = BRAND.cream;
 
-// Counterpart for text/icons sitting on a LIGHT brand fill (e.g. the cyan Brainstorm button),
+// Counterpart for text/icons sitting on a LIGHT brand fill (e.g. the cyan Think button),
 // where dark ink reads better than cream. Constant navy in both themes — the fill is constant too.
 export const ON_BRAND_FILL_DARK = BRAND.forest;
 

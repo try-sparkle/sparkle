@@ -131,7 +131,7 @@ describe("runtimeStore branch status", () => {
 
 describe("syncMarkdownToChief — store glue ()", () => {
   // Seed a connected PAT + a project with one agent of the given kind; returns ids + handles.
-  async function setup(kind: "build" | "brainstorm") {
+  async function setup(kind: "build" | "think") {
     const { runtime, settings, projects } = await freshModules();
     settings.useSettingsStore.getState().setChiefPat("pat_x");
     const projectId = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
@@ -139,8 +139,8 @@ describe("syncMarkdownToChief — store glue ()", () => {
     return { runtime, settings, projectId, agentId };
   }
 
-  it("skips Brainstorm agents (they have no worktree / commits)", async () => {
-    const { runtime, projectId, agentId } = await setup("brainstorm");
+  it("skips Think agents (they have no worktree / commits)", async () => {
+    const { runtime, projectId, agentId } = await setup("think");
     await runtime.syncMarkdownToChief(projectId, agentId);
     expect(syncAgentMarkdown).not.toHaveBeenCalled();
   });

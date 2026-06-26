@@ -77,3 +77,15 @@ describe("stripWakePrefix / stripStopSuffix — same-segment remainder", () => {
   it("strips multi-word Tier-2 wake prefix (hey spark all)", () =>
     expect(stripWakePrefix("hey spark all open the file")).toBe("open the file"));
 });
+
+describe("cloud (Deepgram smart_format) finals normalize before matching", () => {
+  // The cloud path routes Deepgram finals through the same matcher; smart_format capitalizes and
+  // punctuates (e.g. "Hey Sparkle." / "Send it."). normalize() lowercases + strips punctuation, so
+  // these must still match — otherwise wake/stop would break on the cloud engine.
+  it("wakes on a capitalized, punctuated 'Hey Sparkle.'", () =>
+    expect(matchesWake("Hey Sparkle.")).toBe(true));
+  it("stops on a capitalized, punctuated 'Send it.'", () =>
+    expect(matchesStop("Send it.")).toBe(true));
+  it("stops on a trailing stop phrase within a punctuated sentence", () =>
+    expect(matchesStop("Okay, that's the plan. Send it!")).toBe(true));
+});

@@ -15,6 +15,9 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+tauri-plugin-deep-link = "2"
+# Store the desktop bearer token in the macOS keychain (Security framework).
+keyring = { version = "3", features = ["apple-native"] }
 # Lets the webview reach the Chief API (api.storytell.ai) from Rust, bypassing the
 # webview's CSP and the API's lack of CORS — see chief.ts / bead .
 tauri-plugin-http = "2"
@@ -27,6 +30,9 @@ base64 = "0.22"
 sherpa-onnx = "1.13.3"
 cpal = "0.15"
 ureq = "2"
+# Blocking WebSocket client for the Deepgram Nova-3 streaming STT path. rustls (not native-tls)
+# to reuse the rustls/webpki-roots already in the tree (via reqwest/tauri) — no new system-TLS dep.
+tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "handshake"] }
 bzip2 = "0.4"
 tar = "0.4"
 tauri-plugin-global-shortcut = "2"

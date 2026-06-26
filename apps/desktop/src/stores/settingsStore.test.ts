@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { effectiveChiefPat, useSettingsStore } from "./settingsStore";
+import {
+  effectiveChiefPat,
+  aiFeatureMode,
+  migrateSettings,
+  useSettingsStore,
+  type AiFeatureFlags,
+} from "./settingsStore";
 
 describe("effectiveChiefPat — PAT resolution order", () => {
   it("prefers a user-entered (stored) PAT, trimmed", () => {
@@ -27,5 +33,95 @@ describe("maxConcurrentWorkers", () => {
     expect(useSettingsStore.getState().maxConcurrentWorkers).toBe(8);
     useSettingsStore.getState().setMaxConcurrentWorkers(0);
     expect(useSettingsStore.getState().maxConcurrentWorkers).toBe(1); // never < 1
+  });
+});
+
+describe("aiFeatureMode — derived All/Some/Off", () => {
+  const flags = (over: Partial<AiFeatureFlags>): AiFeatureFlags => ({
+    aiAutoRename: true,
+    cloudDictation: true,
+    aiBrainstorm: true,
+    aiComposer: true,
+    ...over,
+  });
+
+  it("is 'all' when every feature is on", () => {
+    expect(aiFeatureMode(flags({}))).toBe("all");
+  });
+
+  it("is 'off' when every feature is off", () => {
+    expect(
+      aiFeatureMode({ aiAutoRename: false, cloudDictation: false, aiBrainstorm: false, aiComposer: false }),
+    ).toBe("off");
+  });
+
+  it("is 'some' when any single feature differs (mixed)", () => {
+    expect(aiFeatureMode(flags({ aiComposer: false }))).toBe("some");
+    expect(aiFeatureMode(flags({ cloudDictation: false }))).toBe("some");
+    expect(
+      aiFeatureMode({ aiAutoRename: true, cloudDictation: false, aiBrainstorm: false, aiComposer: false }),
+    ).toBe("some");
+  });
+});
+
+describe("migrateSettings — v0→v1 preserves a prior AI opt-out", () => {
+  it("maps a stored aiEnabled:false to all four feature flags off (no silent re-arm)", () => {
+    const out = migrateSettings({ aiEnabled: false, chiefPat: "x" }, 0) as Record<string, unknown>;
+    expect(out.aiAutoRename).toBe(false);
+    expect(out.cloudDictation).toBe(false);
+    expect(out.aiBrainstorm).toBe(false);
+    expect(out.aiComposer).toBe(false);
+    expect(out.chiefPat).toBe("x"); // other persisted fields preserved
+  });
+  it("leaves aiEnabled:true / absent alone (on-by-default values win)", () => {
+    expect(migrateSettings({ aiEnabled: true }, 0)).toEqual({ aiEnabled: true });
+    expect(migrateSettings({ chiefPat: "x" }, 0)).toEqual({ chiefPat: "x" });
+  });
+  it("is a no-op at the current version", () => {
+    const blob = { aiEnabled: false };
+    expect(migrateSettings(blob, 1)).toBe(blob);
+  });
+});
+
+describe("settingsStore — AI feature setters", () => {
+  beforeEach(() => {
+    useSettingsStore.getState().setAllAiFeatures(true);
+  });
+
+  it("setAllAiFeatures(true) makes the mode 'all'; (false) makes it 'off'", () => {
+    useSettingsStore.getState().setAllAiFeatures(true);
+    expect(aiFeatureMode(useSettingsStore.getState())).toBe("all");
+    useSettingsStore.getState().setAllAiFeatures(false);
+    expect(aiFeatureMode(useSettingsStore.getState())).toBe("off");
+    const s = useSettingsStore.getState();
+    expect([s.aiAutoRename, s.cloudDictation, s.aiBrainstorm, s.aiComposer]).toEqual([
+      false,
+      false,
+      false,
+      false,
+    ]);
+  });
+
+  it("unchecking one feature from 'all' drops the derived mode to 'some'", () => {
+    useSettingsStore.getState().setAllAiFeatures(true);
+    useSettingsStore.getState().setAiFeature("composer", false);
+    expect(useSettingsStore.getState().aiComposer).toBe(false);
+    expect(aiFeatureMode(useSettingsStore.getState())).toBe("some");
+  });
+
+  it("setAiFeature maps each menu key to its store field", () => {
+    useSettingsStore.getState().setAllAiFeatures(false);
+    useSettingsStore.getState().setAiFeature("autoRename", true);
+    useSettingsStore.getState().setAiFeature("voiceDictation", true);
+    useSettingsStore.getState().setAiFeature("brainstorm", true);
+    useSettingsStore.getState().setAiFeature("composer", true);
+    const s = useSettingsStore.getState();
+    expect([s.aiAutoRename, s.cloudDictation, s.aiBrainstorm, s.aiComposer]).toEqual([
+      true,
+      true,
+      true,
+      true,
+    ]);
+    expect(aiFeatureMode(s)).toBe("all");
   });
 });

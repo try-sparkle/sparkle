@@ -1,9 +1,11 @@
 mod attachments;
 mod attention;
 mod audio;
+mod auth;
 mod bridge;
 mod chief;
 mod claude;
+mod cloud;
 mod connectivity;
 mod dictation;
 mod hooks;
@@ -20,18 +22,20 @@ mod worktree;
 mod notes;
 
 use pty::PtyManager;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(PtyManager::default())
         .manage(dictation::DictationState::default())
         .manage(bridge::BridgeManager::default())
+        .manage(auth::DeepLinkPending::default())
         .manage(attention::BadgeCounts::default())
         .setup(|app| {
             // Stand up unified logging before anything else so startup itself is captured.
@@ -43,6 +47,25 @@ pub fn run() {
                 ),
                 // Logging is best-effort: a failure here must not stop the app from booting.
                 Err(e) => eprintln!("failed to initialize logging: {e}"),
+            }
+            // Auth hand-off: forward an incoming sparkle://auth?code=… deep link to the webview
+            // as a "deep-link" event; AuthGate redeems the one-time code (spec §3.1, §8).
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        let s = url.to_string();
+                        // Stash it for the cold-launch case (webview listener not yet attached),
+                        // then emit for the warm (already-running) case.
+                        if let Some(pending) = handle.try_state::<auth::DeepLinkPending>() {
+                            if let Ok(mut g) = pending.0.lock() {
+                                *g = Some(s.clone());
+                            }
+                        }
+                        let _ = handle.emit("deep-link", s);
+                    }
+                });
             }
             // Attribute notifications to Sparkle's bundle id (best-effort; see attention.rs).
             attention::init_application();
@@ -79,6 +102,8 @@ pub fn run() {
             sparkle_agent::ensure_sparkle_repo,
             dictation::start_dictation,
             dictation::stop_dictation,
+            dictation::start_cloud_stream,
+            dictation::stop_cloud_stream,
             logging::app_version,
             logging::log_dir,
             logging::reveal_logs,
@@ -92,13 +117,17 @@ pub fn run() {
             bridge::orchestrator_mcp_paths,
             notes::append_note,
             notes::create_bead,
+            auth::desktop_has_token,
+            auth::desktop_sign_out,
+            auth::desktop_exchange_code,
+            auth::desktop_me,
+            auth::desktop_consume,
+            auth::desktop_refund,
+            auth::desktop_redeem_promo,
+            auth::desktop_take_pending_deeplink,
             attention::set_window_attention,
             attention::notify_attention
         ])
-        // TODO(phase1):
-        //  - deep-link handler for sparkle://oauth/callback (only if/when Anthropic
-        //    permits subscription OAuth; default is BYOK)
-        //  - keychain plugin for BYOK token storage
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")
         .run(|app, event| match event {

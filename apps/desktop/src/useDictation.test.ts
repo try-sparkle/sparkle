@@ -37,7 +37,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 // Modules under test (imported after mocks are registered)
 // ---------------------------------------------------------------------------
 import { useDictationStore } from "./stores/dictationStore";
-import { createDictationController } from "./useDictation";
+import { createDictationController, cloudStreamCommandFor } from "./useDictation";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -155,6 +155,8 @@ describe("createDictationController (hook logic without renderHook)", () => {
 
   it("toggle idle→listening: invokes start_dictation and sets status", async () => {
     await ctrl.toggle();
+    // No cloud arg: the cloud-dictation preference is read live at the wake→active transition
+    // (start_cloud_stream), so toggling the menu takes effect without restarting dictation.
     expect(invoke).toHaveBeenCalledWith("start_dictation");
     expect(useDictationStore.getState().status).toBe("listening");
   });
@@ -170,6 +172,29 @@ describe("createDictationController (hook logic without renderHook)", () => {
   it("dictation://partial forwards payload to onSegment", () => {
     emit("dictation://partial", "hello world");
     expect(onSegment).toHaveBeenCalledWith("hello world");
+  });
+
+  it("dictation://interim updates the live preview in the store", () => {
+    emit("dictation://interim", "hello wor");
+    expect(useDictationStore.getState().interim).toBe("hello wor");
+    emit("dictation://interim", "hello world");
+    expect(useDictationStore.getState().interim).toBe("hello world"); // replaced in place
+  });
+
+  it("a committed partial clears the live interim preview", () => {
+    useDictationStore.setState({ interim: "hello world" });
+    emit("dictation://partial", "Hello world.");
+    // The final segment supersedes the volatile preview so they don't double up.
+    expect(useDictationStore.getState().interim).toBe("");
+  });
+
+  it("dictation://cloud-ended clears interim and invokes stop_cloud_stream (fallback handoff)", () => {
+    useDictationStore.setState({ interim: "stale ghost" });
+    invoke.mockClear();
+    emit("dictation://cloud-ended", null);
+    // Stale preview cleared, and the backend is told to resume on-device routing.
+    expect(useDictationStore.getState().interim).toBe("");
+    expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
   });
 
   it("dictation://level updates store level", () => {
@@ -252,6 +277,25 @@ describe("createDictationController (hook logic without renderHook)", () => {
     });
     await ctrl.toggle();
     expect(useDictationStore.getState().modelProgress).toBeNull();
+  });
+});
+
+describe("cloudStreamCommandFor (local gate, then stream)", () => {
+  it("opens the cloud stream when transitioning to ACTIVE (wake word)", () => {
+    expect(cloudStreamCommandFor({ phase: "active", insert: null, transitioned: true })).toBe(
+      "start_cloud_stream",
+    );
+  });
+
+  it("closes the cloud stream when transitioning to PASSIVE (stop word)", () => {
+    expect(cloudStreamCommandFor({ phase: "passive", insert: null, transitioned: true })).toBe(
+      "stop_cloud_stream",
+    );
+  });
+
+  it("does nothing for a non-transition (text inserted mid-dictation keeps the stream open)", () => {
+    expect(cloudStreamCommandFor({ phase: "active", insert: "more words", transitioned: false })).toBeNull();
+    expect(cloudStreamCommandFor({ phase: "passive", insert: null, transitioned: false })).toBeNull();
   });
 });
 

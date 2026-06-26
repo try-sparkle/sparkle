@@ -239,9 +239,9 @@ describe("projectStore shell agent", () => {
 
 // Pure migration tests — no store instantiation, so they don't depend on a localStorage shim
 // (the action-based suite above needs one; see the test-env bead).
-describe("projectStore migration — Brainstorm/Build (v3)", () => {
+describe("projectStore migration — Think/Build (v3)", () => {
   it("v3 backfills kind=build and parentId=null on agents lacking them", () => {
-    // A v1 record has the branch fields but predates the Brainstorm/Build split.
+    // A v1 record has the branch fields but predates the Think/Build split.
     const v1 = {
       projects: [
         {
@@ -314,5 +314,32 @@ describe("projectStore migration — shell/shellCommand (v4)", () => {
       projects: Array<{ agents: Array<{ shellCommand: unknown }> }>;
     };
     expect(out.projects[0]!.agents[0]!.shellCommand).toBe("npm test");
+  });
+});
+
+describe("projectStore migration — brainstorm→think rename (v7)", () => {
+  it("remaps the legacy 'brainstorm' agent kind to 'think'", () => {
+    // A v6 record persisted before the Think rename still carries kind: "brainstorm".
+    const v6 = {
+      projects: [
+        {
+          id: "p",
+          name: "P",
+          rootPath: "/x",
+          defaultBranch: "main",
+          agents: [
+            { id: "a", name: "Brainstorm", kind: "brainstorm", parentId: null, baseBranch: null },
+            { id: "b", name: "Build 1", kind: "build", parentId: null, baseBranch: "main" },
+          ],
+        },
+      ],
+      selectedProjectId: null,
+    } as unknown;
+    const out = migratePersisted(v6, 6) as {
+      projects: Array<{ agents: Array<{ id: string; kind: unknown }> }>;
+    };
+    expect(out.projects[0]!.agents[0]!.kind).toBe("think");
+    // Non-brainstorm kinds are left untouched.
+    expect(out.projects[0]!.agents[1]!.kind).toBe("build");
   });
 });

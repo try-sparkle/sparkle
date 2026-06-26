@@ -1,11 +1,21 @@
 //! Tauri commands wiring mic capture → transcriber → events.
+//!
+//! Two transcription engines sit behind this module:
+//!   - **on-device** (Parakeet/Silero, `transcribe.rs`): always runs while the mic is hot. It
+//!     powers the always-listening wake-word detection — the free, private "gate".
+//!   - **cloud** (Deepgram Nova-3, `cloud.rs`): opened only once the user is actively dictating
+//!     (the frontend wake-word machine hits ACTIVE and calls `start_cloud_stream`), and closed
+//!     on stop. While it's open the capture callback routes frames to Deepgram instead of the
+//!     on-device model, so the cloud only ever sees speech the user intended to dictate.
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use crate::audio::{rms_level, Capture};
+use crate::cloud::DeepgramSession;
 use crate::model;
+use crate::naming::resolve_deepgram_key;
 use crate::transcribe::{ParakeetTdt, Transcriber};
 
 /// Monotonic id stamped on every emitted partial so the log can prove whether a
@@ -32,7 +42,7 @@ fn segment_fingerprint(seg: &str) -> u32 {
 /// duplicates are diagnosable from the unified log. Privacy: the raw transcript text
 /// (and its length, which would aid reversal) is NEVER written to the log — only the
 /// fixed-width fingerprint — so a user's spoken words are not persisted to disk.
-fn emit_partial(app: &AppHandle, source: &str, seg: String) {
+pub(crate) fn emit_partial(app: &AppHandle, source: &str, seg: String) {
     let seq = PARTIAL_SEQ.fetch_add(1, Ordering::Relaxed);
     // info (not debug): the shipped build's log threshold drops debug, and this is
     // low-frequency (once per spoken phrase), so info is safe and always visible.
@@ -46,10 +56,85 @@ fn emit_partial(app: &AppHandle, source: &str, seg: String) {
     let _ = app.emit("dictation://partial", seg);
 }
 
+/// Emit a live, *volatile* interim transcript (the cloud path's word-by-word preview). Unlike a
+/// committed partial this is replaced in place on the frontend and is NOT routed through the
+/// wake-word machine. Privacy: interim text changes many times per second and is never logged —
+/// we emit it to the webview and keep nothing.
+pub(crate) fn emit_interim(app: &AppHandle, seg: String) {
+    let _ = app.emit("dictation://interim", seg);
+}
+
+/// Signal that the cloud (Deepgram) worker has exited — whether a clean close or a mid-stream
+/// failure. The frontend handles this by clearing the interim preview and calling stop_cloud_stream,
+/// which flips `cloud_active` back to false so the capture callback resumes routing frames to the
+/// on-device model. Without this, a mid-stream socket death would strand dictation: frames keep
+/// going to the dead session, the on-device wake/stop-word path never resumes, and the last interim
+/// stays painted as a stale ghost.
+pub(crate) fn emit_cloud_ended(app: &AppHandle) {
+    let _ = app.emit("dictation://cloud-ended", ());
+}
+
+/// Which transcription engine to use. The on-device model is always the fallback; the cloud path
+/// is chosen only when the user enabled it, a key is present, AND the credits seam allows it.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub(crate) enum Engine {
+    Cloud,
+    Local,
+}
+
+/// Whether a freshly-opened cloud session should be installed after the (blocking) Deepgram
+/// handshake, or discarded because a stop/restart raced it. Pure so the concurrency matrix is
+/// unit-testable without sockets or threads:
+///   - `same_generation`: the session's Arcs are still the ones we captured (no stop_dictation +
+///     start_dictation swapped in a fresh session generation while we connected).
+///   - `still_current`: the cloud epoch is unchanged (no stop_cloud_stream / stop_dictation / racing
+///     start bumped it since we claimed our attempt).
+///   - `capture_present`: the mic capture is still live (not torn down by a stop).
+///   - `already_active`: a cloud stream is already installed (a racing start won).
+/// Install only when the intent that opened this stream is still exactly current.
+///
+/// CALLER CONTRACT: all four inputs MUST be sampled while holding `DictationState`'s lock (the same
+/// critical section that then stores the session), so the decision and the install are atomic. This
+/// helper is pure for testability only — evaluating any input outside the lock reopens the TOCTOU
+/// the epoch guard closes.
+pub(crate) fn should_install_cloud(
+    same_generation: bool,
+    still_current: bool,
+    capture_present: bool,
+    already_active: bool,
+) -> bool {
+    same_generation && still_current && capture_present && !already_active
+}
+
+/// Decide the engine for an active-dictation stream. This is the single seam the AI-credits
+/// system (built separately) plugs into: today `credits_ok` is a stub passed as true, but the
+/// decision table is here and unit-tested so wiring real credit checks in later is a one-line
+/// change at the call site. Offline is handled implicitly — if Cloud is chosen but the Deepgram
+/// handshake fails, the caller falls back to Local — so we don't probe connectivity here.
+pub(crate) fn choose_engine(setting_enabled: bool, key_present: bool, credits_ok: bool) -> Engine {
+    if setting_enabled && key_present && credits_ok {
+        Engine::Cloud
+    } else {
+        Engine::Local
+    }
+}
+
 #[derive(Default)]
 pub struct DictationSession {
     capture: Option<Capture>,
     transcriber: Option<Arc<Mutex<ParakeetTdt>>>,
+    /// The live Deepgram stream, present only while actively dictating with cloud enabled.
+    /// Shared with the capture callback so frames can be routed to it without rebuilding the
+    /// callback when the cloud stream opens/closes.
+    cloud: Arc<Mutex<Option<DeepgramSession>>>,
+    /// When true, the capture callback streams frames to `cloud` instead of the on-device model.
+    /// Read on every audio frame; toggled by start/stop_cloud_stream.
+    cloud_active: Arc<AtomicBool>,
+    /// Monotonic token bumped on every start_cloud_stream attempt and on every stop. start_cloud_stream
+    /// captures it before the (blocking) Deepgram handshake and re-checks it after: if it changed, a
+    /// stop/again raced the handshake and the freshly-opened session must be discarded rather than
+    /// installed. Guards the check-then-act that Arc::ptr_eq alone can't (a stop on the SAME session).
+    cloud_epoch: Arc<AtomicU64>,
 }
 
 pub struct DictationState(pub Arc<Mutex<DictationSession>>);
@@ -84,6 +169,13 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
     let paths = model::ensure(&root, move |done, total| { let _ = app_for_progress.emit("dictation://model-progress", (done, total)); })?;
     let transcriber = Arc::new(Mutex::new(ParakeetTdt::new(&paths)?));
     let transcriber_cap = transcriber.clone();
+    // Shared cloud routing state, cloned into the callback so opening/closing the cloud stream
+    // (start/stop_cloud_stream) is visible to the live callback without rebuilding it.
+    let cloud_slot: Arc<Mutex<Option<DeepgramSession>>> = Arc::new(Mutex::new(None));
+    let cloud_active = Arc::new(AtomicBool::new(false));
+    let cloud_epoch = Arc::new(AtomicU64::new(0));
+    let cloud_slot_cb = cloud_slot.clone();
+    let cloud_active_cb = cloud_active.clone();
     let app_cb = app.clone();
     // NOTE: transcriber_cap is locked on every CoreAudio callback frame.
     // The lock must stay short-held (accept() only, no I/O). finalize() is
@@ -92,25 +184,146 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
     tracing::info!(target: "dictation", "start_dictation: capture starting");
     let capture = Capture::start(move |frame: Vec<f32>| {
         let _ = app_cb.emit("dictation://level", rms_level(&frame));
-        // Poison-tolerant (): a prior panicked frame must not wedge dictation. The
-        // audio.rs panic firewall already prevents such a panic from aborting the process.
-        let segs = transcriber_cap.lock().unwrap_or_else(|p| p.into_inner()).accept(&frame);
-        for seg in segs { emit_partial(&app_cb, "accept", seg); }
+        // While the cloud stream is open (user actively dictating), route frames to Deepgram and
+        // skip the on-device model entirely. Otherwise the on-device model handles the frame —
+        // this is the always-listening wake-word gate. Locks are poison-tolerant ():
+        // a prior panicked frame must not wedge dictation; the audio.rs panic firewall already
+        // prevents such a panic from aborting the process.
+        // NOTE: on a mid-stream cloud failure there's a brief (~one event round-trip) window where
+        // cloud_active is still true but send_audio's channel is dead, so those frames are dropped
+        // rather than transcribed on-device — until the cloud-ended event drives stop_cloud_stream
+        // and flips cloud_active back. Accepted: the window is tens of ms on a rare disconnect.
+        if cloud_active_cb.load(Ordering::Relaxed) {
+            if let Some(s) = cloud_slot_cb.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                s.send_audio(&frame);
+            }
+        } else {
+            let segs = transcriber_cap.lock().unwrap_or_else(|p| p.into_inner()).accept(&frame);
+            for seg in segs { emit_partial(&app_cb, "accept", seg); }
+        }
     }).map_err(|e| { let _ = app.emit("dictation://error", e.clone()); e })?;
     let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
     sess.capture = Some(capture);
     sess.transcriber = Some(transcriber);
+    sess.cloud = cloud_slot;
+    sess.cloud_active = cloud_active;
+    sess.cloud_epoch = cloud_epoch;
     Ok(())
+}
+
+/// Open the Deepgram cloud stream for the active-dictation window. The frontend calls this only when
+/// the wake-word machine transitions to ACTIVE *and* it has already gated on the live "voice
+/// dictation" + composer settings — so this command's job is just "open if a key is present". (The
+/// voice-setting gate lives entirely in the frontend, the single source of truth; no `cloud` arg.)
+///
+/// Returns TRUE only when a live cloud socket was actually installed. Returns FALSE on every
+/// stay-on-device path (no key, handshake failure, or a stop/restart race discard) so the frontend
+/// knows NOT to start per-minute billing — otherwise a user with no DEEPGRAM_API would be charged
+/// for cloud dictation they never received.
+#[tauri::command]
+pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool {
+    // Capture, under one lock, the state we need to (a) decide whether to open a stream and
+    // (b) safely install it after the blocking handshake. The Arcs are captured by IDENTITY so we
+    // can later confirm (via ptr_eq) the session generation didn't change.
+    let (cloud_slot, cloud_active, cloud_epoch) = {
+        let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+        if sess.cloud_active.load(Ordering::Relaxed) {
+            return false; // idempotent — a repeated wake transition shouldn't open a second socket
+        }
+        (
+            sess.cloud.clone(),
+            sess.cloud_active.clone(),
+            sess.cloud_epoch.clone(),
+        )
+    };
+    let key = resolve_deepgram_key();
+    // setting_enabled is true here: the frontend already gated on the live voice setting before
+    // calling. credits_ok is the seam the AI-credits system plugs into later; true for now.
+    if choose_engine(true, key.is_some(), true) != Engine::Cloud {
+        return false; // no key → stay on the on-device model; don't consume an epoch on this path
+    }
+    let key = key.expect("choose_engine returned Cloud only when key is present");
+    // Claim this attempt only now that we're committing to open. The epoch is an atomic token, so
+    // bumping it outside the lock is sound — the post-handshake re-validation re-reads it under the
+    // lock, and any racing stop/start that bumps it meanwhile correctly invalidates this attempt.
+    let my_epoch = cloud_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+    match DeepgramSession::start(app, key) {
+        Ok(session) => {
+            // The handshake above is blocking (~hundreds of ms). Re-validate under the lock before
+            // installing, so a stop/restart that raced the handshake can't leave an orphaned stream:
+            //   - ptr_eq(cloud_active): the session generation is unchanged (no stop_dictation +
+            //     start_dictation installed fresh Arcs while we were connecting — storing into our
+            //     captured-but-now-stale Arc would orphan the worker against the new capture).
+            //   - epoch unchanged: no stop_cloud_stream / stop_dictation / racing start happened on
+            //     THIS session since we claimed our attempt (those all bump the epoch).
+            //   - capture present & not already active: belt-and-suspenders for the same intent.
+            let reject = {
+                let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+                let install = should_install_cloud(
+                    Arc::ptr_eq(&cloud_active, &sess.cloud_active),
+                    cloud_epoch.load(Ordering::Relaxed) == my_epoch,
+                    sess.capture.is_some(),
+                    cloud_active.load(Ordering::Relaxed),
+                );
+                if install {
+                    *cloud_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
+                    cloud_active.store(true, Ordering::Relaxed); // callback now routes to Deepgram
+                    None
+                } else {
+                    Some(session) // stopped/restarted during the handshake — don't install it
+                }
+            };
+            match reject {
+                None => true, // installed a live cloud socket → caller may start metering
+                Some(s) => {
+                    tracing::info!(target: "dictation", "discarding cloud stream opened during a stop/again race");
+                    // finish() suppresses the worker's cloud-ended emit, so tearing down this orphan
+                    // can't cross-talk into — and stop — the current healthy session.
+                    s.finish(); // clean close + join (bounded); never leak the worker
+                    false // not installed → caller must not bill
+                }
+            }
+        }
+        Err(e) => {
+            // Offline / bad key / handshake failure → transparently keep using the on-device model.
+            tracing::info!(target: "dictation", error = %e, "cloud stream unavailable; using on-device");
+            false
+        }
+    }
+}
+
+/// Close the Deepgram cloud stream (the frontend calls this on the stop word, or it's called
+/// during stop_dictation). Flushes Deepgram for the trailing final result, then routes frames
+/// back to the on-device model for continued wake-word listening.
+#[tauri::command]
+pub fn stop_cloud_stream(state: State<DictationState>) {
+    let session = {
+        let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+        sess.cloud_active.store(false, Ordering::Relaxed); // callback routes to on-device again
+        sess.cloud_epoch.fetch_add(1, Ordering::Relaxed); // invalidate any in-flight start_cloud_stream
+        let s = sess.cloud.lock().unwrap_or_else(|p| p.into_inner()).take();
+        s
+    }; // release locks before the (slower) finish()/join
+    if let Some(s) = session {
+        s.finish();
+    }
 }
 
 #[tauri::command]
 pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
-    let transcriber = {
+    let (transcriber, cloud_session) = {
         let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
         sess.capture = None;            // drop Capture -> stops the cpal stream (no more frames)
-        sess.transcriber.take()
+        sess.cloud_active.store(false, Ordering::Relaxed);
+        sess.cloud_epoch.fetch_add(1, Ordering::Relaxed); // invalidate any in-flight start_cloud_stream
+        let cloud_session = sess.cloud.lock().unwrap_or_else(|p| p.into_inner()).take(); // tear down any live cloud stream
+        (sess.transcriber.take(), cloud_session)
     };                                  // release the session lock before the (slower) finalize
     tracing::info!(target: "dictation", "stop_dictation: capture dropped, finalizing");
+    // Flush the cloud stream first (if dictation was stopped mid-cloud) for its trailing final.
+    if let Some(s) = cloud_session {
+        s.finish();
+    }
     if let Some(t) = transcriber {
         for seg in t.lock().unwrap_or_else(|p| p.into_inner()).finalize() { emit_partial(&app, "finalize", seg); }
     }
@@ -119,7 +332,7 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{segment_fingerprint, DictationState};
+    use super::{choose_engine, segment_fingerprint, should_install_cloud, DictationState, Engine};
 
     #[test]
     fn stop_capture_is_a_safe_idempotent_noop_without_an_active_capture() {
@@ -130,6 +343,31 @@ mod tests {
         state.stop_capture();
         state.stop_capture();
         assert!(state.0.lock().unwrap().capture.is_none());
+    }
+
+    #[test]
+    fn should_install_cloud_only_when_intent_is_still_current() {
+        // Happy path: same session generation, epoch unchanged, capture live, not already active.
+        assert!(should_install_cloud(true, true, true, false));
+        // Each race that can happen during the blocking handshake must reject (and the caller then
+        // finish()es the orphan rather than installing it):
+        assert!(!should_install_cloud(false, true, true, false), "generation swapped (stop+restart)");
+        assert!(!should_install_cloud(true, false, true, false), "epoch bumped (stop_cloud_stream/stop)");
+        assert!(!should_install_cloud(true, true, false, false), "capture torn down (stop_dictation)");
+        assert!(!should_install_cloud(true, true, true, true), "a racing start already opened one");
+        // All-false (e.g. stopped + restarted + already active) also rejects — makes the AND total.
+        assert!(!should_install_cloud(false, false, false, true));
+    }
+
+    #[test]
+    fn choose_engine_requires_setting_key_and_credits() {
+        // Cloud only when ALL three hold.
+        assert_eq!(choose_engine(true, true, true), Engine::Cloud);
+        // Any one missing → fall back to the on-device model.
+        assert_eq!(choose_engine(false, true, true), Engine::Local, "setting off");
+        assert_eq!(choose_engine(true, false, true), Engine::Local, "no key");
+        assert_eq!(choose_engine(true, true, false), Engine::Local, "no credits");
+        assert_eq!(choose_engine(false, false, false), Engine::Local);
     }
 
     #[test]

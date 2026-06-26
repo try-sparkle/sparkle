@@ -12,23 +12,36 @@ pub fn rms_level(frame: &[f32]) -> f32 {
     (sum_sq / frame.len() as f32).sqrt()
 }
 
-/// Average channels to mono, then linear-decimate to 16 kHz. Good enough for ASR
-/// (the model is robust to simple resampling); avoids a heavyweight resampler dep.
+/// Average channels to mono, then decimate to 16 kHz with a box-filter (moving-average)
+/// low-pass so we don't alias. The previous version point-sampled (`mono[i*ratio]`),
+/// which folds energy above 8 kHz back down into the speech band as noise — directly
+/// hurting ASR accuracy. Averaging every input sample that maps to an output sample is a
+/// crude but real anti-aliasing filter (a length-`ratio` boxcar), it costs one pass over
+/// the input, and it keeps us free of a heavyweight resampler dependency. Used by both the
+/// on-device model and the cloud (PCM16) path, so the win applies everywhere.
 pub fn downmix_resample(input: &[f32], channels: u16, in_rate: u32) -> Vec<f32> {
     let ch = channels.max(1) as usize;
     let mono: Vec<f32> = input
         .chunks(ch)
         .map(|c| c.iter().sum::<f32>() / ch as f32)
         .collect();
-    if in_rate == 16_000 {
+    if in_rate == 16_000 || mono.is_empty() {
         return mono;
     }
     let ratio = in_rate as f32 / 16_000.0;
-    // round() preserves the trailing sample (floor would drop ~1 sample/callback);
-    // the .min(len-1) clamp keeps the index in bounds for any non-integer ratio.
-    let out_len = (mono.len() as f32 / ratio).round() as usize;
+    // round() preserves the trailing sample (floor would drop ~1 sample/callback).
+    let out_len = (mono.len() as f32 / ratio).round().max(1.0) as usize;
+    let n = mono.len();
     (0..out_len)
-        .map(|i| mono[((i as f32 * ratio) as usize).min(mono.len() - 1)])
+        .map(|i| {
+            // Boxcar window [start, end) of the input samples mapping to output sample i.
+            // Clamp into bounds and guarantee end > start so every output averages ≥1 sample
+            // (the final window's ideal end can run just past the buffer).
+            let start = ((i as f32 * ratio) as usize).min(n - 1);
+            let end = (((i + 1) as f32 * ratio) as usize).clamp(start + 1, n);
+            let win = &mono[start..end];
+            win.iter().sum::<f32>() / win.len() as f32
+        })
         .collect()
 }
 
@@ -189,6 +202,40 @@ mod tests {
         std::panic::set_hook(prev);
         // The handler ran (and panicked); reaching this line proves the firewall contained it.
         assert!(ran.load(Ordering::SeqCst), "the firewalled handler should have been invoked");
+    }
+
+    #[test]
+    fn resample_is_anti_aliased_not_point_sampled() {
+        // A full-amplitude tone at the 48 kHz Nyquist (alternating +1/-1 = 24 kHz) sits far
+        // above the 8 kHz Nyquist of 16 kHz audio. A correct anti-aliasing decimator must
+        // attenuate it toward zero; the old point-sampling decimator (mono[i*3]) would instead
+        // alias it straight through at full amplitude as in-band noise — exactly the artifact
+        // that hurt recognition. A length-3 boxcar (48 k → 16 k) attenuates this tone ~3×
+        // (to ≈0.33), versus the old point-sampler which passed it through at full 1.0.
+        // Assert we're well under that 1.0 passthrough — the regression guard against reverting.
+        let alternating: Vec<f32> = (0..4800).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let out = downmix_resample(&alternating, 1, 48_000);
+        let energy = rms_level(&out);
+        assert!(energy < 0.5, "high-freq tone should be attenuated well below 1.0, got rms {energy}");
+    }
+
+    #[test]
+    fn resample_upsamples_sub_16k_without_panicking() {
+        // Reachable in the wild: a Bluetooth hands-free (SCO) mic can be 8 kHz, so in_rate < 16 kHz
+        // (ratio < 1) is a real path, not just a theoretical one. It can only sample-duplicate (no
+        // new information to invent), but it must not panic and must roughly double the length and
+        // preserve a DC level.
+        let out = downmix_resample(&vec![0.4; 800], 1, 8_000);
+        assert!((out.len() as i32 - 1600).abs() <= 2, "8k→16k should ~double length, got {}", out.len());
+        assert!(out.iter().all(|&s| (s - 0.4).abs() < 1e-6), "DC level must survive upsampling");
+    }
+
+    #[test]
+    fn resample_preserves_a_dc_level() {
+        // A constant (DC) signal must pass through the averaging unchanged — guards against an
+        // off-by-one window that would dip the level at the edges.
+        let out = downmix_resample(&vec![0.7; 4800], 1, 48_000);
+        assert!(out.iter().all(|&s| (s - 0.7).abs() < 1e-6), "DC level must be preserved");
     }
 
     // Regression guard for : this module captures the mic via

@@ -17,7 +17,7 @@ import {
   truncateTitle,
   fixInAgent,
   sendToAgent,
-  brainstormWith,
+  thinkWith,
   explain,
   runAsCommand,
 } from "./selectionActions";
@@ -102,12 +102,12 @@ describe("PTY actions", () => {
   });
 });
 
-describe("brainstorm hand-off", () => {
-  it("brainstormWith creates the singleton brainstorm agent and queues the text (no auto-send)", () => {
+describe("think hand-off", () => {
+  it("thinkWith creates the singleton think agent and queues the text (no auto-send)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    brainstormWith(pid, "selected text");
+    thinkWith(pid, "selected text");
     const agents = useProjectStore.getState().projects[0]!.agents;
-    expect(agents.filter((a) => a.kind === "brainstorm")).toHaveLength(1);
+    expect(agents.filter((a) => a.kind === "think")).toHaveLength(1);
     expect(useHandoffStore.getState().pending).toEqual({
       projectId: pid,
       text: "selected text",
@@ -125,14 +125,14 @@ describe("brainstorm hand-off", () => {
     });
   });
 
-  it("brainstormWith reuses an existing brainstorm agent instead of making a second", () => {
+  it("thinkWith reuses an existing think agent instead of making a second", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    brainstormWith(pid, "one");
-    brainstormWith(pid, "two");
-    const brainstorms = useProjectStore
+    thinkWith(pid, "one");
+    thinkWith(pid, "two");
+    const thinks = useProjectStore
       .getState()
-      .projects[0]!.agents.filter((a) => a.kind === "brainstorm");
-    expect(brainstorms).toHaveLength(1);
+      .projects[0]!.agents.filter((a) => a.kind === "think");
+    expect(thinks).toHaveLength(1);
   });
 });
 

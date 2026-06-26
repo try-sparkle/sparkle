@@ -1,11 +1,11 @@
 // requery — when connectivity returns, nudge every open agent so it reports where it stands.
-// PTY (build/worker) agents get the prompt typed into their terminal; Brainstorm agents get it
+// PTY (build/worker) agents get the prompt typed into their terminal; Think agents get it
 // via the imperative bridge. Driven by connectionMonitor on the offline→online edge. ()
 import type { AgentTabStatus } from "@sparkle/ui";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { submitPrompt } from "../pty";
-import { sendToBrainstorm } from "./brainstormBridge";
+import { sendToThink } from "./thinkBridge";
 import { log } from "../logger";
 
 /** What we send each agent on reconnect. One shared constant so the wording lives in one place. */
@@ -42,8 +42,8 @@ export async function requeryOpenAgents(): Promise<void> {
       // Isolate each agent: a single dead PTY (a "done"/exited process whose write rejects)
       // must not abort the loop and strand every later agent's re-query.
       try {
-        if (agent.kind === "brainstorm") {
-          sendToBrainstorm(agent.id, REQUERY_PROMPT);
+        if (agent.kind === "think") {
+          sendToThink(agent.id, REQUERY_PROMPT);
         } else {
           const st = status[agent.id];
           if (st && SAFE_TO_REQUERY.has(st)) {

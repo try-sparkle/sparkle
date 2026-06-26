@@ -3,12 +3,13 @@
 // The selection is already copied by Terminal.tsx; this card confirms that and offers ten
 // actions. Rendered through a portal (like Tooltip.tsx) so it can't be clipped by the terminal's
 // overflow:hidden, and positioned with viewport-clamped fixed coords.
-import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useCallback, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { TbBulb } from "react-icons/tb";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import { popupPosition } from "./selectionPopupPosition";
 import {
-  brainstormWith,
+  thinkWith,
   explain,
   askWith,
   fixInAgent,
@@ -22,7 +23,7 @@ import { useProjectStore } from "../stores/projectStore";
 
 const WIDTH = 300;
 
-type Action = { icon: string; label: string; run: () => void; primary?: boolean };
+type Action = { icon: ReactNode; label: string; run: () => void; primary?: boolean };
 
 export function SelectionPopup({
   x,
@@ -118,14 +119,14 @@ export function SelectionPopup({
     })();
   }, []);
 
-  // Some actions require a registered project in the store (Brainstorm, Explain, Ask, Run as cmd).
+  // Some actions require a registered project in the store (Think, Explain, Ask, Run as cmd).
   // Panes that don't map to a real project (e.g. SparkleAgentPane) pass an unregistered projectId;
   // hide those actions rather than silently no-op.
   const projectExists = useProjectStore((s) => s.projects.some((p) => p.id === projectId));
 
   const aiActions: Action[] = [
     ...(projectExists ? [
-      { icon: "✦", label: "Brainstorm", primary: true, run: () => act(() => brainstormWith(projectId, text)) },
+      { icon: <TbBulb size={15} />, label: "Think", primary: true, run: () => act(() => thinkWith(projectId, text)) },
       { icon: "💡", label: "Explain", run: () => act(() => explain(projectId, text)) },
       { icon: "💬", label: "Ask…", run: () => setMode("ask") },
     ] : []),
@@ -210,7 +211,7 @@ export function SelectionPopup({
             }}
           />
           <div style={{ fontSize: 10.5, color: C.muted, marginTop: 6 }}>
-            Opens a brainstorm thread with your question + the selected text.
+            Opens a think thread with your question + the selected text.
           </div>
         </div>
       ) : (
@@ -270,7 +271,7 @@ function Grid({ actions }: { actions: Action[] }) {
             if (!a.primary) (e.currentTarget as HTMLButtonElement).style.background = "transparent";
           }}
         >
-          <span style={{ width: 15, textAlign: "center" }}>{a.icon}</span>
+          <span style={{ width: 15, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>{a.icon}</span>
           {a.label}
         </button>
       ))}

@@ -151,7 +151,17 @@ export function Composer({
   // without first accepting the suggestion (Tab otherwise accepts). Reset on the next edit so
   // typing more brings suggestions back.
   const [ghostDismissed, setGhostDismissed] = useState(false);
-  const ghost = caretAtEnd && !ghostDismissed ? computeGhost(value, history) : "";
+  // Live cloud-dictation preview (Deepgram interim results). While speech is streaming we show
+  // the in-progress phrase as muted/italic text trailing the committed text — the real-time
+  // word-by-word feel — and suppress the autocomplete ghost so the two don't fight for the slot.
+  // The subscription itself is gated on this being the active, enabled pane — the SAME scope that
+  // routes committed dictated text (registerInsert below) — so interim churn (several frames/sec)
+  // never re-renders other mounted/hidden panes, and the preview never leaks into them.
+  const interim = useDictationStore((s) => (active && !disabled ? s.interim : ""));
+  const interimActive = !!interim;
+  const ghost = caretAtEnd && !ghostDismissed && !interimActive ? computeGhost(value, history) : "";
+  // The interim phrase is the whole thing being spoken now; render it after the committed text.
+  const interimSuffix = interimActive ? `${value && !value.endsWith(" ") ? " " : ""}${interim}` : "";
   // Backing mirror behind the textarea, used to paint the ghost suffix (see render).
   const ghostRef = useRef<HTMLDivElement | null>(null);
 
@@ -711,7 +721,9 @@ export function Composer({
               }}
             >
               <span style={{ color: "transparent" }}>{value}</span>
-              <span style={{ color: C.muted }}>{ghost}</span>
+              <span style={{ color: C.muted, fontStyle: interimActive ? "italic" : "normal" }}>
+                {ghost || interimSuffix}
+              </span>
             </div>
             <textarea
               ref={setTaRef}

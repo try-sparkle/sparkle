@@ -25,29 +25,29 @@ export function truncateTitle(text: string, max = 80): string {
   return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : firstLine;
 }
 
-/** Open (or reuse) the project's singleton brainstorm agent and queue an initial prompt. */
-export function openBrainstorm(projectId: string, text: string, autoSend: boolean): void {
+/** Open (or reuse) the project's singleton think agent and queue an initial prompt. */
+export function openThink(projectId: string, text: string, autoSend: boolean): void {
   const ps = useProjectStore.getState();
   const project = ps.projects.find((p) => p.id === projectId);
   if (!project) return;
-  const existing = project.agents.find((a) => a.kind === "brainstorm");
-  const id = existing ? existing.id : ps.addAgent(projectId, { kind: "brainstorm" });
+  const existing = project.agents.find((a) => a.kind === "think");
+  const id = existing ? existing.id : ps.addAgent(projectId, { kind: "think" });
   useUiStore.getState().setActiveSpecial(null);
   ps.selectAgent(projectId, id);
   useRuntimeStore.getState().open(id);
   useHandoffStore.getState().setPending({ projectId, text, autoSend });
 }
 
-export function brainstormWith(projectId: string, text: string): void {
-  openBrainstorm(projectId, text, false);
+export function thinkWith(projectId: string, text: string): void {
+  openThink(projectId, text, false);
 }
 
 export function explain(projectId: string, text: string): void {
-  openBrainstorm(projectId, `Explain this:\n\n${text}`, true);
+  openThink(projectId, `Explain this:\n\n${text}`, true);
 }
 
 export function askWith(projectId: string, question: string, text: string): void {
-  openBrainstorm(projectId, `${question}\n\n${text}`, true);
+  openThink(projectId, `${question}\n\n${text}`, true);
 }
 
 // Neutralize bracketed-paste markers embedded in untrusted selection text so it can't

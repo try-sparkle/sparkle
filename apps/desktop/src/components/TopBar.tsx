@@ -3,6 +3,8 @@ import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import type { AgentTabStatus, Project } from "../types";
 import { ThemeToggle } from "./ThemeToggle";
 import { AgentOrderToggle } from "./AgentOrderToggle";
+import { BalanceBadge } from "./BalanceBadge";
+import { AiFeaturesMenu } from "./AiFeaturesMenu";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -267,6 +269,9 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
         New
       </button>
 
+      {/* Remaining AI-credit balance. */}
+      <BalanceBadge />
+
       {/* ⋯ menu: app text-size (zoom) controls — mirrors Cmd +/- / Cmd 0. */}
       <div style={{ position: "relative" }}>
         <button
@@ -298,7 +303,9 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
                 zIndex: 41,
               }}
             >
-              <div style={menuLabel}>Theme</div>
+              <div style={menuLabel}>Use AI features</div>
+              <AiFeaturesMenu />
+              <div style={{ ...menuLabel, paddingTop: 12 }}>Theme</div>
               <ThemeToggle />
               <div style={{ ...menuLabel, paddingTop: 12 }}>Agent order</div>
               <AgentOrderToggle />

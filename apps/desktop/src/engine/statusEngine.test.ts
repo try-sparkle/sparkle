@@ -181,7 +181,7 @@ describe("StatusEngine", () => {
   });
 
   it("does NOT flip to red when Claude writes a question as prose mid-turn", () => {
-    // A brainstorm agent routinely ends a turn with "Do you want to proceed?" as chat
+    // A think agent routinely ends a turn with "Do you want to proceed?" as chat
     // prose — a normal turn-end (gray), not a blocking TUI prompt (red). Mid-stream prose
     // must not force red; the settle screen-check is authoritative.
     const { engine, last } = makeEngine(() => IDLE_SCREEN);

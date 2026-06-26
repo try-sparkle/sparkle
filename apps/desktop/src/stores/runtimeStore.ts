@@ -35,8 +35,8 @@ export function __resetChiefSyncBackoff(): void {
 }
 
 /** After a status poll, push any newly-committed markdown to the agent's Chief project so the
- *  Brainstorm agent stays current. Best-effort + store-driven: pulls PAT/project/marker from
- *  the stores, leaves the watermark un-advanced on failure so the next tick retries. Brainstorm
+ *  Think agent stays current. Best-effort + store-driven: pulls PAT/project/marker from
+ *  the stores, leaves the watermark un-advanced on failure so the next tick retries. Think
  *  agents are skipped — they have no worktree and produce no commits. Exported for testing. */
 export async function syncMarkdownToChief(projectId: string, agentId: string): Promise<void> {
   const settings = useSettingsStore.getState();
@@ -44,7 +44,7 @@ export async function syncMarkdownToChief(projectId: string, agentId: string): P
   if (!pat) return;
   const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
   const agent = project?.agents.find((a) => a.id === agentId);
-  if (!project || !agent || agent.kind === "brainstorm") return;
+  if (!project || !agent || agent.kind === "think") return;
   if (syncingAgents.has(agentId)) return; // a sync for this agent is already running
   const backoff = syncBackoff.get(agentId);
   if (backoff && Date.now() < backoff.until) return; // cooling down after a recent failure
@@ -103,7 +103,7 @@ interface RuntimeState {
   ) => Promise<void>;
   /** Re-derive this agent's OWN workflow stage from local-ref reachability + a best-effort GitHub
    *  PR probe, and advance the stored stage if it moved forward. Best-effort: swallows git/gh
-   *  errors. Skips brainstorm/shell agents (no git workflow). */
+   *  errors. Skips think/shell agents (no git workflow). */
   refreshWorkflowStage: (root: string, projectId: string, agentId: string) => Promise<void>;
   isOpen: (agentId: string) => boolean;
   /** Drop any open ids whose agent no longer exists (e.g. deleted between
@@ -169,7 +169,7 @@ export const useRuntimeStore = create<RuntimeState>()(
           const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
           const agent = project?.agents.find((a) => a.id === agentId);
           // No worktree / no git workflow → nothing to track.
-          if (!agent || agent.kind === "brainstorm" || agent.kind === "shell") return;
+          if (!agent || agent.kind === "think" || agent.kind === "shell") return;
           // A worker integrates into its orchestrator's branch; everyone else, into project main.
           const parentBranch =
             agent.kind === "worker" && agent.parentId ? `sparkle/agent-${agent.parentId}` : "";

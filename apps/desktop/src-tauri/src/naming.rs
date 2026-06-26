@@ -125,6 +125,14 @@ fn resolve_anthropic_key() -> Option<String> {
     resolve_env_secret(&["ANTHROPIC_API_KEY", "ANTHROPIC_API"])
 }
 
+/// Best-effort Deepgram key lookup for the cloud dictation path. The user named theirs
+/// `DEEPGRAM_API` in `.env.local` (mirroring the `ANTHROPIC_API` convention); also accept the
+/// conventional `DEEPGRAM_API_KEY`. Same resolution order and security posture as the Anthropic
+/// key (runtime read, exact paths only) — see `resolve_env_secret`.
+pub(crate) fn resolve_deepgram_key() -> Option<String> {
+    resolve_env_secret(&["DEEPGRAM_API_KEY", "DEEPGRAM_API"])
+}
+
 /// Trim the model's reply down to a clean title of at most `max_words` words. Defensive
 /// against the model adding quotes, a leading "Title:", or running long.
 fn sanitize_name(raw: &str, max_words: usize) -> String {
@@ -300,6 +308,21 @@ mod tests {
         assert_eq!(
             parse_env_value(body, &["ANTHROPIC_API_KEY", "ANTHROPIC_API"]),
             Some("dummy-key-value".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_the_deepgram_key_under_either_name() {
+        // The cloud dictation path resolves the same way; the user's file uses DEEPGRAM_API.
+        let body = "DEEPGRAM_API=\"dg-dummy\"\n";
+        assert_eq!(
+            parse_env_value(body, &["DEEPGRAM_API_KEY", "DEEPGRAM_API"]),
+            Some("dg-dummy".to_string())
+        );
+        let body2 = "DEEPGRAM_API_KEY=dg-conventional\n";
+        assert_eq!(
+            parse_env_value(body2, &["DEEPGRAM_API_KEY", "DEEPGRAM_API"]),
+            Some("dg-conventional".to_string())
         );
     }
 

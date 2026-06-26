@@ -23,6 +23,13 @@
       "csp": "default-src 'self'; connect-src 'self' http://localhost:3001 ws://localhost:3001; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:"
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["sparkle"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["dmg", "app"],

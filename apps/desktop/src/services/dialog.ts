@@ -14,13 +14,13 @@ function inTauri(): boolean {
  *
  * Dev convenience: in a plain browser preview there's no native dialog, so fall back to a
  * typed path prompt. This lets the localhost browser demo open a project (and exercise the
- * sidebar tree + Brainstorm/Chief chat); Build/Worker terminals still require the real app. */
+ * sidebar tree + Think/Chief chat); Build/Worker terminals still require the real app. */
 export async function pickProjectFolder(
   title = "Choose or create a folder for this project",
 ): Promise<string | null> {
   if (!inTauri() && import.meta.env.DEV) {
     const typed = window.prompt(
-      `${title}\n\n(Browser preview: type an absolute folder path. Terminals need the desktop app, but Brainstorm chat works here.)`,
+      `${title}\n\n(Browser preview: type an absolute folder path. Terminals need the desktop app, but Think chat works here.)`,
       "",
     );
     return typed && typed.trim() ? typed.trim() : null;

@@ -1,4 +1,4 @@
-// Resolve the Chief (Storytell) Personal Access Token from the environment so the Brainstorm
+// Resolve the Chief (Storytell) Personal Access Token from the environment so the Think
 // agent works without the user pasting a token. Read at runtime in Rust — never baked into the
 // JS bundle or the shipped binary — so a distributed build on someone else's machine simply
 // finds no token and the UI falls back to the connect screen.

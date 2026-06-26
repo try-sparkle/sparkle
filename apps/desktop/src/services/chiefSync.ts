@@ -1,5 +1,5 @@
 // chiefSync — push the markdown a Build agent commits into the matching Chief project's
-// library, so the Brainstorm agent (which chats over that library) stays current with what
+// library, so the Think agent (which chats over that library) stays current with what
 // the Build agents produce. The Rust `markdown_changed_since` command finds the files; this
 // uploads each as a per-commit asset (named with the commit short-sha) via the Chief client.
 //
@@ -65,7 +65,7 @@ export async function syncAgentMarkdown(params: SyncParams): Promise<SyncResult 
   }
 
   // There ARE docs to upload — ensure the project exists (creating it if a Build agent
-  // committed before the Brainstorm panel was ever opened).
+  // committed before the Think panel was ever opened).
   const pid = await ensureChiefProject(pat, projectName, chiefProjectId);
   const short = change.headSha.slice(0, 7);
   const uploaded: string[] = [];

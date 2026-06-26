@@ -1,5 +1,5 @@
 // settingsStore — app-level integration settings that aren't tied to a single project.
-// Currently: the Chief (Storytell) Personal Access Token used by Brainstorm agents, plus the
+// Currently: the Chief (Storytell) Personal Access Token used by Think agents, plus the
 // mapping from a Sparkle project id -> the Chief project id we auto-created for it. Persisted
 // to localStorage like the other stores.
 //
@@ -7,6 +7,63 @@
 // but a follow-up should move it into Tauri's secure store / OS keychain (tracked on the epic).
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
+
+// --- AI features (gated by the "Use AI Features" control in the ⋯ menu) ----------------------
+// Four independent on/off feature flags plus a derived All|Some|Off mode. Each feature degrades
+// to a non-AI baseline when off (on-device dictation, no auto-rename, no Brainstorm button, bare
+// terminal instead of the composer). Default ON so the app is fully featured out of the box.
+
+/** Stable identifiers for the AI features, used by the menu + the generic setter. */
+export type AiFeatureKey = "autoRename" | "voiceDictation" | "brainstorm" | "composer";
+
+/** Derived state of the master segment: every feature on / off / a mix. */
+export type AiMode = "all" | "some" | "off";
+
+/** The subset of settings state that the AI-features mode is derived from. */
+export interface AiFeatureFlags {
+  aiAutoRename: boolean;
+  /** The voice-dictation feature is the existing cloud-dictation flag (Deepgram on/off). */
+  cloudDictation: boolean;
+  aiBrainstorm: boolean;
+  aiComposer: boolean;
+}
+
+/** Map a menu feature key to its settings-store field name. */
+const AI_FEATURE_FIELD: Record<AiFeatureKey, keyof AiFeatureFlags> = {
+  autoRename: "aiAutoRename",
+  voiceDictation: "cloudDictation",
+  brainstorm: "aiBrainstorm",
+  composer: "aiComposer",
+};
+
+/** Derive the master segment from the four flags: all on → "all", all off → "off", else "some". */
+export function aiFeatureMode(f: AiFeatureFlags): AiMode {
+  const vals = [f.aiAutoRename, f.cloudDictation, f.aiBrainstorm, f.aiComposer];
+  if (vals.every(Boolean)) return "all";
+  if (vals.every((v) => !v)) return "off";
+  return "some";
+}
+
+/**
+ * Persist migration v0 → v1: the binary `aiEnabled` master became four per-feature flags (all
+ * default on). Without this, a user who set `aiEnabled=false` (to stop AI work and avoid consuming
+ * credits) would silently get every AI feature — including the billable cloud-dictation path —
+ * re-enabled on upgrade. Map a stored `aiEnabled===false` to all four flags off; absent/true lets
+ * the on-by-default values win. Pure + exported for testing.
+ */
+export function migrateSettings(persisted: unknown, version: number): unknown {
+  const prev = persisted as (Partial<AiFeatureFlags> & { aiEnabled?: boolean }) | null | undefined;
+  if (version < 1 && prev && prev.aiEnabled === false) {
+    return {
+      ...prev,
+      aiAutoRename: false,
+      cloudDictation: false,
+      aiBrainstorm: false,
+      aiComposer: false,
+    };
+  }
+  return prev;
+}
 
 // Build-time fallback PAT injected by vite.config from the user's CHIEF_API env (dev only; see
 // vite.config.ts). Empty in production builds. The primary env path is now the RUNTIME one below
@@ -36,12 +93,30 @@ interface SettingsState {
   chiefSyncByAgent: Record<string, string>;
   /** Maximum number of concurrent workers (floored at 1). */
   maxConcurrentWorkers: number;
+  /** Use the cloud streaming STT (Deepgram Nova-3) for active dictation when available. Default
+   *  on — the gold-standard path. Falls back to the on-device model automatically when off, when
+   *  no key is present, or when offline. The always-listening wake word stays on-device either way.
+   *  This is also AI feature "voiceDictation" in the Use AI Features menu. */
+  cloudDictation: boolean;
+  /** Auto-name worker agents from their first prompt (the generate_agent_name call). Off → agents
+   *  keep their default names. */
+  aiAutoRename: boolean;
+  /** Show the ✦ Brainstorm button. Off → the button is hidden. */
+  aiBrainstorm: boolean;
+  /** Use the AI-enhanced composer (ghost text, screenshot drop, dictation insert, Send). Off →
+   *  the composer is replaced by the bare terminal input. */
+  aiComposer: boolean;
 
   setChiefPat: (pat: string) => void;
   setRuntimeChiefPat: (pat: string) => void;
   setChiefProject: (sparkleProjectId: string, chiefProjectId: string) => void;
   setChiefSync: (agentId: string, sha: string) => void;
   setMaxConcurrentWorkers: (n: number) => void;
+  setCloudDictation: (on: boolean) => void;
+  /** Toggle one AI feature; the master segment re-derives automatically (aiFeatureMode). */
+  setAiFeature: (key: AiFeatureKey, on: boolean) => void;
+  /** Bulk-set every AI feature (the All / Off segments). */
+  setAllAiFeatures: (on: boolean) => void;
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -52,9 +127,17 @@ export const useSettingsStore = create<SettingsState>()(
       chiefProjectByProject: {},
       chiefSyncByAgent: {},
       maxConcurrentWorkers: 4,
+      cloudDictation: true,
+      aiAutoRename: true,
+      aiBrainstorm: true,
+      aiComposer: true,
 
       setChiefPat: (pat) => set({ chiefPat: pat.trim() }),
       setRuntimeChiefPat: (pat) => set({ runtimeChiefPat: pat.trim() }),
+      setCloudDictation: (on) => set({ cloudDictation: on }),
+      setAiFeature: (key, on) => set({ [AI_FEATURE_FIELD[key]]: on } as Partial<AiFeatureFlags>),
+      setAllAiFeatures: (on) =>
+        set({ aiAutoRename: on, cloudDictation: on, aiBrainstorm: on, aiComposer: on }),
 
       setChiefProject: (sparkleProjectId, chiefProjectId) =>
         set((s) => ({
@@ -74,6 +157,10 @@ export const useSettingsStore = create<SettingsState>()(
     {
       name: "sparkle-settings",
       storage: createJSONStorage(() => localStorage),
+      // v0 → v1: preserve a prior `aiEnabled=false` opt-out across the binary→four-flag schema
+      // change so we never silently re-arm AI/credits on upgrade (see migrateSettings).
+      version: 1,
+      migrate: migrateSettings,
       // Persist everything EXCEPT runtimeChiefPat — it's re-resolved from env at each launch, so
       // persisting it would let a removed/rotated env token linger stale until startup runs.
       partialize: (s) => ({
@@ -81,6 +168,10 @@ export const useSettingsStore = create<SettingsState>()(
         chiefProjectByProject: s.chiefProjectByProject,
         chiefSyncByAgent: s.chiefSyncByAgent,
         maxConcurrentWorkers: s.maxConcurrentWorkers,
+        cloudDictation: s.cloudDictation,
+        aiAutoRename: s.aiAutoRename,
+        aiBrainstorm: s.aiBrainstorm,
+        aiComposer: s.aiComposer,
       }),
     },
   ),

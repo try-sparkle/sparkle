@@ -14,6 +14,11 @@ interface DictationState {
   error: string | null;
   /** Non-null while the backend is downloading the whisper model (~482 MB). */
   modelProgress: ModelProgress | null;
+  /** Live, un-committed transcript from the cloud streaming engine (Deepgram interim results).
+   *  Shown as a ghosted preview that updates word-by-word; replaced in place on each interim and
+   *  cleared when the segment finalizes (committed via the normal partial → insert path). Always
+   *  "" on the on-device path, which has no interim results. */
+  interim: string;
 
   // --- ambient always-listening ---
   /** Mic hot (master mute). Default true (on by default at launch). */
@@ -25,6 +30,8 @@ interface DictationState {
 
   setStatus: (s: Status) => void;
   setLevel: (l: number) => void;
+  /** Replace the live interim preview (cloud path). Pass "" to clear it. */
+  setInterim: (text: string) => void;
   /** Setting a non-null value also transitions status to "error". Clearing with
    *  null only returns to "idle" if we were in the "error" state — an active
    *  "listening" session is left untouched. */
@@ -43,6 +50,7 @@ export const useDictationStore = create<DictationState>((set, get) => ({
   level: 0,
   error: null,
   modelProgress: null,
+  interim: "",
 
   enabled: true,
   phase: "passive",
@@ -50,6 +58,7 @@ export const useDictationStore = create<DictationState>((set, get) => ({
 
   setStatus: (status) => set({ status }),
   setLevel: (level) => set({ level }),
+  setInterim: (interim) => set({ interim }),
   setError: (error) =>
     set((s) => ({
       error,

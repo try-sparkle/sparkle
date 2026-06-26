@@ -21,9 +21,9 @@ export interface AddAgentOpts {
 }
 
 // Default display name for a freshly created agent, numbered within its kind so you get
-// "Build 1", "Worker 2", etc. Brainstorm agents are singular per project by convention.
+// "Build 1", "Worker 2", etc. Think agents are singular per project by convention.
 function defaultAgentName(p: Project, kind: AgentKind): string {
-  if (kind === "brainstorm") return "Brainstorm";
+  if (kind === "think") return "Think";
   const label = kind === "worker" ? "Worker" : kind === "shell" ? "Shell" : "Build";
   const n = p.agents.filter((a) => a.kind === kind).length + 1;
   return `${label} ${n}`;
@@ -110,7 +110,7 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
     }));
   }
   if (version < 3) {
-    // Brainstorm/Build split: every legacy agent was a plain terminal agent, which now maps to
+    // Think/Build split: every legacy agent was a plain terminal agent, which now maps to
     // a top-level "build" agent (a Claude terminal you talk to). Backfill kind + parentId so the
     // sidebar tree and panel routing have defined values. Kept as its own step (not folded into
     // the v2 block) so records already migrated to v2 — auto-naming only — still gain these.
@@ -155,6 +155,17 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
     state.projects = state.projects.map((p) => ({
       ...p,
       agents: (p.agents ?? []).map((a) => ({ ...a, shellCommand: (a as AgentTab).shellCommand ?? null })),
+    }));
+  }
+  if (version < 7) {
+    // "Think" rename: the agent kind formerly persisted as "brainstorm" is now "think". Remap the
+    // old literal so legacy records route to the Think panel instead of falling through to a build
+    // terminal. The old value is matched as a raw string since it's no longer part of AgentKind.
+    state.projects = state.projects.map((p) => ({
+      ...p,
+      agents: (p.agents ?? []).map((a) =>
+        (a.kind as string) === "brainstorm" ? { ...a, kind: "think" } : a,
+      ),
     }));
   }
   // Version-collision safety net. PR #62 shipped shellCommand as v4 on its own branch while main
@@ -273,7 +284,7 @@ export const useProjectStore = create<ProjectState>()(
               parentBranch: opts?.parentBranch,
               // Pin only an explicit caller-supplied name (opts.name — e.g. an import): that's a
               // deliberate choice auto-naming must not overwrite. Agents created without opts.name —
-              // including the kind-based "Build 1"/"Worker 2"/"Brainstorm" defaults — stay unpinned
+              // including the kind-based "Build 1"/"Worker 2"/"Think" defaults — stay unpinned
               // so the first prompt can auto-rename them.
               namePinned: opts?.name != null,
               autoNameBasis: null,
@@ -377,11 +388,12 @@ export const useProjectStore = create<ProjectState>()(
       // fields so legacy records rehydrate with `null` (matching fresh records) rather than
       // `undefined` — an undefined baseBranch would otherwise send "" to the git commands.
       // v2 backfills the auto-naming fields (namePinned/autoNameBasis). v3 backfills the
-      // Brainstorm/Build kind + parentId (separate step so records already at v2 still get them).
+      // Think/Build kind + parentId (separate step so records already at v2 still get them).
       // v4 backfills autoNameVariants (width-fitted names) to null. v5 backfills promptHistory
       // (the pinned-header dropdown) as an empty array. v6 backfills shellCommand: null for the
-      // Run-as-cmd "shell" agent kind (folded in from PR #62).
-      version: 6,
+      // Run-as-cmd "shell" agent kind (folded in from PR #62). v7 remaps the legacy
+      // "brainstorm" agent kind to "think" (the Think rename).
+      version: 7,
       migrate: (persisted, version) => migratePersisted(persisted, version) as ProjectState,
     },
   ),

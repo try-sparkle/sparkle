@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { TbBulb } from "react-icons/tb";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Project } from "../types";
 import { useSettingsStore, effectiveChiefPat } from "../stores/settingsStore";
@@ -10,7 +11,11 @@ import {
   pollForResponse,
   ChiefError,
 } from "../services/chief";
-import { registerBrainstorm } from "../services/brainstormBridge";
+import { registerThink } from "../services/thinkBridge";
+import { meteredAi } from "../services/sparkleApi";
+import { CHIEF_CALL_CENTS } from "../services/creditPricing";
+import { AiDisabledError, OutOfCreditsError } from "../services/credits";
+import { useAuthStore } from "../stores/authStore";
 
 interface ChatMsg {
   role: "user" | "assistant";
@@ -18,12 +23,12 @@ interface ChatMsg {
 }
 
 /**
- * The Brainstorm agent's surface: a chat with Chief (Storytell) scoped to a project whose
+ * The Think agent's surface: a chat with Chief (Storytell) scoped to a project whose
  * library mirrors this Sparkle project. On first use we auto-create/link a Chief project named
  * after the Sparkle project, then every turn chats over that project's content. No worktree,
  * no PTY — this is a knowledge conversation, not a build agent. (Epic , phase .)
  */
-export function BrainstormPanel({ project, agentId }: { project: Project; agentId: string }) {
+export function ThinkPanel({ project, agentId }: { project: Project; agentId: string }) {
   const chiefPatStored = useSettingsStore((s) => s.chiefPat);
   const runtimeChiefPat = useSettingsStore((s) => s.runtimeChiefPat);
   const setChiefPat = useSettingsStore((s) => s.setChiefPat);
@@ -80,7 +85,7 @@ export function BrainstormPanel({ project, agentId }: { project: Project; agentI
   }, [messages, sending]);
 
   // Core send, given an explicit prompt. Used by the composer (the typed message) and by the
-  // connectivity re-query (a "status update" nudge delivered through the brainstorm bridge).
+  // connectivity re-query (a "status update" nudge delivered through the think bridge).
   const sendText = async (prompt: string) => {
     if (!prompt || sending) return;
     if (!pat) {
@@ -91,29 +96,42 @@ export function BrainstormPanel({ project, agentId }: { project: Project; agentI
     setMessages((m) => [...m, { role: "user", text: prompt }]);
     setSending(true);
     try {
-      const pid = chiefProjectId ?? (await ensureChiefProject(pat, project.name, undefined));
-      if (!chiefProjectId) setChiefProject(project.id, pid);
+      // Meter the think exchange against the user's AI credits (design spec §7): the gate
+      // short-circuits when AI is off and debits before the Chief round-trip runs.
+      const text = await meteredAi(
+        { estimateCents: CHIEF_CALL_CENTS, reason: "chief_debit", meta: { projectId: project.id } },
+        async () => {
+          const pid = chiefProjectId ?? (await ensureChiefProject(pat, project.name, undefined));
+          if (!chiefProjectId) setChiefProject(project.id, pid);
 
-      let messageId: string;
-      if (chatIdRef.current) {
-        messageId = (await sendMessage(pat, pid, chatIdRef.current, prompt)).message_id;
-      } else {
-        const started = await startChat(pat, pid, prompt);
-        chatIdRef.current = started.chat_id;
-        messageId = started.message_id;
-      }
-      const text = await pollForResponse(pat, pid, chatIdRef.current!, messageId);
+          let messageId: string;
+          if (chatIdRef.current) {
+            messageId = (await sendMessage(pat, pid, chatIdRef.current, prompt)).message_id;
+          } else {
+            const started = await startChat(pat, pid, prompt);
+            chatIdRef.current = started.chat_id;
+            messageId = started.message_id;
+          }
+          return pollForResponse(pat, pid, chatIdRef.current!, messageId);
+        },
+      );
       setMessages((m) => [...m, { role: "assistant", text }]);
     } catch (e) {
       const msg =
-        e instanceof ChiefError
-          ? e.message
-          : e instanceof Error
-            ? e.message
-            : String(e);
+        e instanceof AiDisabledError
+          ? "AI features are off — turn them on in the ⋯ menu."
+          : e instanceof OutOfCreditsError
+            ? "Out of AI credits. Add more to keep thinking."
+            : e instanceof ChiefError
+              ? e.message
+              : e instanceof Error
+                ? e.message
+                : String(e);
       setError(msg);
     } finally {
       setSending(false);
+      // Refresh the balance so the counter reflects the debit/refund.
+      void useAuthStore.getState().refresh();
     }
   };
 
@@ -132,13 +150,13 @@ export function BrainstormPanel({ project, agentId }: { project: Project; agentI
   const sendTextRef = useRef(sendText);
   sendTextRef.current = sendText;
   useEffect(() => {
-    return registerBrainstorm(agentId, (text) => {
+    return registerThink(agentId, (text) => {
       if (!chatIdRef.current) return; // no conversation yet — skip
       void sendTextRef.current(text);
     });
   }, [agentId]);
 
-  // A terminal-selection action queued a prompt for this project's brainstorm agent. Prefill it
+  // A terminal-selection action queued a prompt for this project's think agent. Prefill it
   // (and auto-send for Explain/Ask). Runs once per queued handoff, then clears it.
   // Guard on `pat`: if Chief is not yet connected the composer isn't mounted, so deferring keeps
   // the handoff alive until the user connects and the next render re-runs this effect.
@@ -176,9 +194,9 @@ export function BrainstormPanel({ project, agentId }: { project: Project; agentI
           fontSize: 12,
         }}
       >
-        <span style={{ fontSize: 21 }}>✦</span>
+        <TbBulb size={20} style={{ flexShrink: 0 }} />
         <span>
-          Brainstorming with Chief over{" "}
+          Thinking with Chief over{" "}
           <span style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold }}>{project.name}</span>
           {linking ? " — linking project…" : chiefProjectId ? "'s library" : ""}
         </span>
@@ -302,12 +320,12 @@ function ConnectChief({ onSave }: { onSave: (pat: string) => void }) {
         height: "100%",
       }}
     >
-      <div style={{ fontSize: 28 }}>✦</div>
+      <TbBulb size={28} />
       <div style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold, fontSize: 16 }}>
-        Connect Chief to brainstorm
+        Connect Chief to think
       </div>
       <div style={{ color: C.muted, fontSize: 13, maxWidth: 420, lineHeight: 1.6 }}>
-        Paste a Chief Personal Access Token (starts with <code>pat_</code>). The Brainstorm agent
+        Paste a Chief Personal Access Token (starts with <code>pat_</code>). The Think agent
         chats with Chief over this project's library.
       </div>
       <input

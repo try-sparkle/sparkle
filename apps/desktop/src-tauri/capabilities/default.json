@@ -13,9 +13,14 @@
     "core:window:allow-close",
     "core:window:allow-destroy",
     "dialog:default",
+    "deep-link:default",
     {
       "identifier": "opener:allow-open-url",
-      "allow": [{ "url": "https://sparkle.ai" }, { "url": "https://*.sparkle.ai" }]
+      "allow": [
+        { "url": "https://sparkle.ai/*" },
+        { "url": "https://*.sparkle.ai/*" },
+        { "url": "http://localhost:3000/*" }
+      ]
     },
     {
       "identifier": "http:default",
