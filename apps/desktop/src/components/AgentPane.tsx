@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import {
   prepareAgentWorkspace,
@@ -33,7 +33,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { PinnedPrompt } from "./PinnedPrompt";
 import { Terminal, type TerminalApi } from "./Terminal";
-import { Composer } from "./Composer";
+import { Composer, type ComposerApi } from "./Composer";
 import { Onboarding } from "./Onboarding";
 import { ThinkPanel } from "./ThinkPanel";
 
@@ -101,6 +101,8 @@ export function AgentPane({
   const prepareRunRef = useRef(0);
   // The composer's textarea — initial focus lands here when a tab opens.
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
+  // Imperative bridge to push text into the composer (pinned-prompt "Send to Composer").
+  const composerApiRef = useRef<ComposerApi | null>(null);
   // The terminal's imperative focus(), so we can move focus into it when the composer
   // minimizes (or on ⌘J) without the user clicking the terminal.
   const termFocusRef = useRef<(() => void) | null>(null);
@@ -109,19 +111,8 @@ export function AgentPane({
   // terminal instead of the composer overlay; when auto-rename is off, we skip the naming call.
   const aiComposer = useAiFeature("composer");
   const aiAutoRename = useAiFeature("autoRename");
-  // Imperative bridge to the terminal: mark where each prompt was sent, scroll back to it on pick.
+  // Imperative bridge to the terminal (e.g. arrow hand-off from the composer).
   const terminalApiRef = useRef<TerminalApi | null>(null);
-  // Brief toast when a picked prompt's line has scrolled out of the terminal's history.
-  const [scrolledOut, setScrolledOut] = useState(false);
-  const scrolledOutTimer = useRef<number | null>(null);
-  useEffect(() => () => {
-    if (scrolledOutTimer.current) window.clearTimeout(scrolledOutTimer.current);
-  }, []);
-  const flashScrolledOut = () => {
-    setScrolledOut(true);
-    if (scrolledOutTimer.current) window.clearTimeout(scrolledOutTimer.current);
-    scrolledOutTimer.current = window.setTimeout(() => setScrolledOut(false), 2600);
-  };
 
   // Status routing: Claude Code's hook events are authoritative, but the screen scraper drives
   // until the first hook arrives (and for non-Claude programs that never emit one). The router
@@ -465,11 +456,10 @@ export function AgentPane({
       <PinnedPrompt
         prompt={agent.lastPrompt}
         history={agent.promptHistory ?? []}
-        onSelectPrompt={(id) => {
-          // scrollToPrompt returns false when the line has scrolled out of the buffer (or the
-          // marker never existed — e.g. a prompt from a previous session after a restart).
-          if (!terminalApiRef.current?.scrollToPrompt(id)) flashScrolledOut();
-        }}
+        // "Send to Composer" only makes sense when the composer is mounted (AI feature on).
+        onSendToComposer={
+          aiComposer ? (text) => composerApiRef.current?.insertPrompt(text) : undefined
+        }
       />
 
       {phase === "preparing" && (
@@ -545,12 +535,11 @@ export function AgentPane({
               active={visible}
               disabled={!ptyReady}
               inputRef={composerInputRef}
+              apiRef={composerApiRef}
               onArrowOverflow={(dir) => terminalApiRef.current?.arrowFromComposer(dir)}
               onSubmitPrompt={(t) => {
-                // Record the prompt (pinned header + history) and mark where it landed in the
-                // terminal so the history dropdown can scroll back to it later.
-                const id = appendPrompt(project.id, agent.id, t);
-                terminalApiRef.current?.markPrompt(id);
+                // Record the prompt for the pinned header + history dropdown.
+                appendPrompt(project.id, agent.id, t);
                 // Fire-and-forget: summarize the work into a short name (first prompt, or when
                 // the work shifts). No-ops if the name is pinned or no API key is configured.
                 // Gated on the auto-rename AI feature.
@@ -569,39 +558,10 @@ export function AgentPane({
               onPick={pickAccount}
             />
           )}
-          {scrolledOut && <ScrolledOutToast />}
         </div>
       )}
         </>
       )}
-    </div>
-  );
-}
-
-// Shown briefly when a picked history prompt can't be located in the terminal's scrollback
-// (its line aged out of the 8000-line buffer, or it's from a previous session). Mirrors the
-// terminal's copy-confirmation toast styling. pointer-events:none so it never blocks the UI.
-function ScrolledOutToast() {
-  return (
-    <div
-      style={{
-        position: "absolute",
-        top: 12,
-        left: "50%",
-        transform: "translateX(-50%)",
-        padding: "6px 14px",
-        borderRadius: 8,
-        background: C.deepForest,
-        color: C.cream,
-        border: `1px solid ${CHAT_USER_BUBBLE}`,
-        fontFamily: '"IBM Plex Sans", sans-serif',
-        fontSize: 13,
-        boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
-        pointerEvents: "none",
-        zIndex: 30,
-      }}
-    >
-      ⌁ That part of the conversation has scrolled out of the terminal's history
     </div>
   );
 }

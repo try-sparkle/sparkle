@@ -100,6 +100,15 @@ function CameraIcon() {
 }
 
 /**
+ * Imperative handle the parent uses to push text into the composer (e.g. "Send to Composer"
+ * from the pinned-prompt history). `insertPrompt` is replace-only-if-empty: it sets the box to
+ * `text` when empty, otherwise appends it on a new line — then un-minimizes and focuses.
+ */
+export interface ComposerApi {
+  insertPrompt: (text: string) => void;
+}
+
+/**
  * The friendly prompt composer (spec §7). A real <textarea>, so Shift+arrow selection,
  * multi-line, and Cmd+A/C/V all work natively. ⏎ sends, ⇧⏎ inserts a newline. Send
  * injects into the PTY via bracketed paste, then (after a beat) a carriage return.
@@ -118,6 +127,7 @@ export function Composer({
   active = true,
   disabled = false,
   inputRef,
+  apiRef,
   onSubmitPrompt,
   onArrowOverflow,
 }: {
@@ -126,6 +136,8 @@ export function Composer({
   active?: boolean;
   disabled?: boolean;
   inputRef?: RefObject<HTMLTextAreaElement | null>;
+  // Imperative bridge so the parent can push text into the box (e.g. "Send to Composer").
+  apiRef?: RefObject<ComposerApi | null>;
   onSubmitPrompt: (text: string) => void;
   // Called when a vertical arrow runs off the edge of the text: Down off the last line, Up off
   // the first. Lets the parent hand focus (and the keypress) to the terminal so the user can
@@ -202,6 +214,24 @@ export function Composer({
   const userSized = useUiStore((s) => s.composerUserSized);
   const setComposerUserSized = useUiStore((s) => s.setComposerUserSized);
   const dragRef = useRef<{ startY: number; startH: number; startMin: boolean } | null>(null);
+
+  // Expose insertPrompt to the parent (used by the pinned-prompt "Send to Composer" action).
+  // Replace-only-if-empty: drop the prompt straight in when the box is empty, otherwise append
+  // it on a new line so an in-progress draft isn't clobbered. Then surface + focus the box.
+  useEffect(() => {
+    if (!apiRef) return;
+    apiRef.current = {
+      insertPrompt: (text: string) => {
+        setValue((v) => (v.trim() ? `${v}${v.endsWith("\n") ? "" : "\n"}${text}` : text));
+        setGhostDismissed(true); // the inserted text isn't a typed prefix — don't ghost off it
+        setMinimized(false);
+        requestAnimationFrame(() => inputRef?.current?.focus());
+      },
+    };
+    return () => {
+      if (apiRef) apiRef.current = null;
+    };
+  }, [apiRef, inputRef, setMinimized]);
 
   // Snap the composer back to its regular rest height and drop any manual sizing — used right
   // after a send and when a brand-new thread's composer mounts, so a long message (or a

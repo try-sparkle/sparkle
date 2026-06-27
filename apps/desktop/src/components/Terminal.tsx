@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
-import { Terminal as XTerm, type IMarker } from "@xterm/xterm";
+import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { copyToClipboard } from "../clipboard";
 import { C, CHAT_USER_BUBBLE, xtermTheme } from "../theme/colors";
 import { useResolvedTheme } from "../theme/theme";
 import type { AgentTabStatus } from "../types";
@@ -24,93 +25,14 @@ import { PH_NO_CAPTURE_CLASS } from "@sparkle/core";
 const BASE_FONT_SIZE = 13;
 
 /**
- * Copy text to the system clipboard. Prefers the async Clipboard API (available in the
- * Tauri webview under a user gesture); falls back to a hidden-textarea execCommand for
- * environments where the async API is blocked. Returns whether the copy succeeded.
- */
-async function copyToClipboard(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    /* fall through to the execCommand path */
-  }
-  try {
-    // Selecting the temp textarea steals focus from xterm; remember the focused element
-    // (xterm's hidden input) so we can hand focus straight back after copying.
-    const prevActive = document.activeElement as HTMLElement | null;
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    ta.style.position = "fixed";
-    ta.style.top = "-1000px";
-    ta.style.opacity = "0";
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    prevActive?.focus?.();
-    return ok;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Imperative handle the parent uses to tie the pinned-prompt history to the terminal's
- * scrollback. On submit it drops a marker at the current cursor line (`markPrompt`); clicking
- * a history entry scrolls back to that marker (`scrollToPrompt`). Markers live on the xterm
- * instance, so they're session-only — `scrollToPrompt` returns false once a line has scrolled
- * out of the 8000-line buffer (marker auto-disposed) or was never marked (e.g. after a restart).
+ * Imperative handle the parent uses to drive this terminal without the user clicking it.
  */
 export interface TerminalApi {
-  markPrompt: (id: string) => void;
-  scrollToPrompt: (id: string) => boolean;
   // Hand a vertical arrow off from the composer: focus the terminal AND inject the keypress in
   // one shot, so a single Down (off the composer's last line) or Up (off its first line) both
   // moves focus here and drives whatever's waiting — e.g. Claude's permission menu. The escape
   // sequence honors the app's cursor-key mode (DECCKM) so it lands the same as a real keypress.
   arrowFromComposer: (dir: "up" | "down") => void;
-}
-
-/**
- * Briefly highlight the marked row so a scroll-to lands somewhere obvious. An xterm decoration
- * tracks the marker's line as the buffer scrolls; we tint it with the translucent brand accent
- * and fade it out, then dispose. Best-effort — the scroll already happened, so any failure here
- * is swallowed. (The decoration API only accepts #RRGGBB, so the translucent pulse is applied to
- * the DOM element in onRender rather than via the backgroundColor option.)
- *
- * The cleanup timeout id is tracked in `timers` so the terminal's unmount can clear it — otherwise
- * a tab closed within the flash window would fire the timer after `term.dispose()`. (`term.dispose`
- * already tears decorations down, so clearing the timer is enough; we don't re-dispose here.)
- */
-function flashRow(term: XTerm, marker: IMarker, timers: Set<number>): void {
-  try {
-    const dec = term.registerDecoration({ marker, width: term.cols, height: 1, layer: "top" });
-    if (!dec) return;
-    let painted = false;
-    const sub = dec.onRender((el) => {
-      if (painted) return;
-      painted = true;
-      el.style.pointerEvents = "none";
-      el.style.backgroundColor = "rgba(52, 224, 240, 0.28)"; // brand accent (#34e0f0), translucent
-      el.style.transition = "background-color 1100ms ease";
-      // Fade on the next frame so the transition has a start value to animate from.
-      requestAnimationFrame(() => {
-        el.style.backgroundColor = "rgba(52, 224, 240, 0)";
-      });
-    });
-    const t = window.setTimeout(() => {
-      timers.delete(t);
-      sub.dispose();
-      dec.dispose();
-    }, 1300);
-    timers.add(t);
-  } catch {
-    /* highlight is a nice-to-have; the scroll already landed */
-  }
 }
 
 /**
@@ -154,7 +76,7 @@ export function Terminal({
   // The parent sets this to an imperative focus() so it can move focus into the terminal
   // (e.g. on ⌘J / when the composer minimizes) without the user clicking it.
   focusRef?: RefObject<(() => void) | null>;
-  // Imperative bridge so the pinned-prompt history can mark/scroll-to points in this terminal.
+  // Imperative bridge so the parent can drive this terminal (e.g. arrow hand-off from the composer).
   apiRef?: RefObject<TerminalApi | null>;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -169,11 +91,6 @@ export function Terminal({
   // Latest onRateLimit, read by the (agentId-keyed) output effect without re-subscribing.
   const onRateLimitRef = useRef(onRateLimit);
   onRateLimitRef.current = onRateLimit;
-  // Scroll markers for the pinned-prompt history, keyed by the history entry's id. Lives on the
-  // component (not the store) because xterm markers are tied to this terminal instance.
-  const markersRef = useRef<Map<string, IMarker>>(new Map());
-  // Pending highlight-flash cleanup timers, cleared on unmount so none fire post-dispose.
-  const flashTimersRef = useRef<Set<number>>(new Set());
   const zoom = useUiStore((s) => s.zoom);
   const resolvedTheme = useResolvedTheme();
   // Brief "Copied to clipboard" flash shown after a mouse selection is copied.
@@ -297,35 +214,9 @@ export function Terminal({
       return false; // handled here — don't forward the wheel to the app
     });
 
-    // Pinned-prompt history bridge: mark where each prompt was sent, and scroll back to it on
-    // demand. Registered after `term` exists so the closures capture this instance.
+    // Imperative bridge: registered after `term` exists so the closures capture this instance.
     if (apiRef) {
-      const markers = markersRef.current;
       apiRef.current = {
-        markPrompt: (id) => {
-          try {
-            // Mark the current cursor line — where the agent is about to echo this prompt.
-            const m = term.registerMarker(0);
-            if (!m) return;
-            markers.get(id)?.dispose(); // replace any stale marker under this id
-            markers.set(id, m);
-            m.onDispose(() => {
-              // Drop it when the line scrolls out of the buffer, but only if it's still the
-              // marker we stored (markPrompt may have already replaced it).
-              if (markers.get(id) === m) markers.delete(id);
-            });
-          } catch {
-            /* marking is best-effort; the prompt still sent */
-          }
-        },
-        scrollToPrompt: (id) => {
-          const m = markers.get(id);
-          if (!m || m.isDisposed || m.line < 0) return false;
-          // Land a few rows above the prompt so there's a little context above it.
-          term.scrollToLine(Math.max(0, m.line - 3));
-          flashRow(term, m, flashTimersRef.current);
-          return true;
-        },
         arrowFromComposer: (dir) => {
           term.focus();
           // Encode against the app's cursor-key mode (DECCKM) so the bytes match a real keypress;
@@ -421,10 +312,6 @@ export function Terminal({
       disposed = true;
       if (focusRef) focusRef.current = null;
       if (apiRef) apiRef.current = null;
-      flashTimersRef.current.forEach((t) => window.clearTimeout(t));
-      flashTimersRef.current.clear();
-      markersRef.current.forEach((m) => m.dispose());
-      markersRef.current.clear();
       ro.disconnect();
       container.removeEventListener("mouseup", onMouseUp);
       container.removeEventListener("mousedown", onMouseDown);
