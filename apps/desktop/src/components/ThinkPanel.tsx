@@ -388,7 +388,7 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
         <span>
           Thinking about{" "}
           <span style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold }}>{project.name}</span>
-          {linking ? " — linking Chief…" : chiefProjectId ? " — Chief is grounding you live" : ""}
+          {linking ? " — linking project…" : chiefProjectId ? " — grounded in your library, live" : ""}
         </span>
         <div style={{ flex: 1 }} />
         {chiefProjectId && (
@@ -422,8 +422,8 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
           {messages.length === 0 && (
             <div style={{ color: C.muted, fontSize: 13, lineHeight: 1.6, maxWidth: 560 }}>
               Think out loud about <strong>{project.name}</strong>. I'll interview you to shape it into
-              a spec — one question at a time — while Chief grounds us in everything the project already
-              knows (see the rail on the right).
+              a spec — one question at a time — grounded in everything the project already knows
+              (see the rail on the right).
               <br />
               <br />
               When it's sharp, press <em>“I'm done”</em> to synthesize a PRD, then{" "}

@@ -43,7 +43,7 @@ export function LibrarianRail({
           gap: 6,
         }}
       >
-        <span>Chief is listening</span>
+        <span>Grounding, live</span>
         {status === "thinking" && (
           <span style={{ color: C.teal, fontStyle: "italic", textTransform: "none" }}>
             researching…
