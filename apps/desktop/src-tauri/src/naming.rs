@@ -203,32 +203,32 @@ fn normalize(mut n: AgentName) -> AgentName {
 /// when no usable title can be derived — both flow through the caller's swallow-on-error path,
 /// leaving the agent's current name untouched.
 fn interpret_reply(text: &str) -> Result<AgentName, String> {
-    // SKIP sentinel: match only the BARE token (optionally wrapped in quotes/punctuation). A real
-    // titled reply is a JSON object containing `{`, so we require its absence first — that makes
-    // "never a JSON object" exact, so a genuine title like {"short":"Skip Onboarding",…} is named
-    // normally rather than dropped even though it contains the word "skip".
     let trimmed = text.trim();
+    // A reply containing `{` is an attempted JSON object (the format we asked for); one without is
+    // either the bare SKIP sentinel or a plain-title reply that ignored the JSON instruction. We
+    // branch on that up front so the plain-title fallback below can NEVER stringify broken JSON.
     if !trimmed.contains('{') {
+        // SKIP sentinel: match only the BARE token (optionally wrapped in quotes/punctuation).
         let token = trimmed.trim_matches(|c: char| !c.is_alphanumeric());
         if token.eq_ignore_ascii_case("SKIP") {
             return Err("naming skipped (operational or low-content prompt)".into());
         }
+        // Plain-title fallback: a model that ignored the JSON instruction and returned a bare
+        // title still yields a usable (if uniform) name derived from the whole reply.
+        let long = sanitize_name(text, 10);
+        if long.is_empty() {
+            return Err("model returned no usable name".into());
+        }
+        return Ok(normalize(AgentName {
+            short: sanitize_name(text, 4),
+            medium: sanitize_name(text, 6),
+            long,
+        }));
     }
-    // Preferred path: the model returned the JSON object with all three variants.
-    if let Some(name) = parse_variants(text) {
-        return Ok(name);
-    }
-    // Fallback: treat the whole reply as one plain title and derive the variants from it, so a
-    // model that ignored the JSON instruction still yields a usable (if uniform) name.
-    let long = sanitize_name(text, 10);
-    if long.is_empty() {
-        return Err("model returned no usable name".into());
-    }
-    Ok(normalize(AgentName {
-        short: sanitize_name(text, 4),
-        medium: sanitize_name(text, 6),
-        long,
-    }))
+    // Attempted JSON: parse the object. If it doesn't parse — e.g. the reply was truncated
+    // mid-object so there's no closing `}` — we must NOT fall back to stringifying the raw braces
+    // (that leaked names like `{"short": "…`). Fail instead, so the caller keeps the existing name.
+    parse_variants(text).ok_or_else(|| "naming reply was malformed or truncated JSON".to_string())
 }
 
 /// Generate the three length variants of an agent name from a prompt. Returns Err on any
@@ -253,11 +253,12 @@ fn call_anthropic(key: &str, prompt: &str) -> Result<AgentName, String> {
     // Serialize/parse via serde_json directly so we don't depend on ureq's optional `json`
     // feature (the crate is pulled in without it).
     let body = serde_json::json!({
-        // Three titles (plus JSON braces/keys/quotes) need more room than the old single
-        // 2–4 word reply; budget headroom so a slightly verbose reply isn't truncated
-        // mid-JSON (which would silently drop us to the single-title fallback). Still cheap.
+        // Three titles (plus JSON braces/keys/quotes, and a ```json fence the model often adds)
+        // need real headroom: at 200 a slightly verbose reply truncated mid-JSON, leaving no
+        // closing `}` so parse_variants failed and the raw braces leaked into the name. 512 gives
+        // comfortable room for all three variants + fence and is still cheap on Haiku.
         "model": NAMING_MODEL,
-        "max_tokens": 200,
+        "max_tokens": 512,
         "system": SYSTEM_PROMPT,
         "messages": [{ "role": "user", "content": prompt }],
     });
@@ -480,5 +481,26 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("QUESTION"), "prompt must name questions, not skip them");
         assert!(SYSTEM_PROMPT.contains("do NOT skip"), "prompt must bias toward naming when unsure");
         assert!(SYSTEM_PROMPT.contains("SKIP"), "prompt must still allow SKIP for operational commands");
+    }
+
+    #[test]
+    fn interpret_reply_rejects_truncated_json_instead_of_leaking_braces() {
+        // The real bug from the field: too small a max_tokens cut the reply off mid-"medium", so
+        // there's no closing `}`. parse_variants can't parse it, and the OLD plain-title fallback
+        // stringified the raw braces into the name (e.g. `{"short": "URL Path…`). A reply that is
+        // an ATTEMPTED JSON object (contains `{`) but won't parse must now error, so the caller
+        // keeps the existing name rather than showing raw JSON.
+        let truncated =
+            "```json\n{ \"short\": \"URL Path Clickable File Navigation\", \"medium\": \"Make";
+        let out = interpret_reply(truncated);
+        assert!(out.is_err(), "truncated JSON must error, not become a name: {out:?}");
+
+        // And on the failure path nothing leaks: if it ever did return Ok, no variant may carry a
+        // stray brace or quote from the raw reply.
+        if let Ok(n) = out {
+            for v in [&n.short, &n.medium, &n.long] {
+                assert!(!v.contains('{') && !v.contains('"'), "leaked raw JSON into a name: {v}");
+            }
+        }
     }
 }
