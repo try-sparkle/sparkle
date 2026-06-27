@@ -116,6 +116,21 @@ describe("Composer — dictation wiring", () => {
   });
 });
 
+describe("Composer — auto-grow sizing baseline", () => {
+  // Regression guard for the composer-height bug (dictation crept the box taller on every
+  // utterance and a send never shrank it). Root cause was the height measurement reading the
+  // textarea's flex-stretched height instead of its content; the fix measures with
+  // align-self:flex-start + a 1-row textarea so an empty/single-line draft resolves to the snap
+  // rest height. jsdom has no layout engine (offsetHeight/scrollHeight are 0), so the measurement
+  // math itself is verified against a real engine; here we just pin the 1-row baseline that makes
+  // a fresh/just-sent composer collapse to its default rather than the textarea's 2-row default.
+  it("renders the textarea with a single-row auto-grow baseline", () => {
+    renderComposer();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(ta.rows).toBe(1);
+  });
+});
+
 describe("Composer — placeholder reflects audio state", () => {
   it("invites the user to just start talking while the mic is hot", () => {
     act(() => useDictationStore.setState({ enabled: true }));

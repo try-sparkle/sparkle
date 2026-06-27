@@ -250,14 +250,25 @@ export function Composer({
       // element, so this difference is invariant to the textarea's own height.
       const overhead = container.offsetHeight - ta.offsetHeight;
       const borderY = ta.offsetHeight - ta.clientHeight; // textarea border (client excludes it)
-      // Read the natural content height free of the flex stretch, then restore.
+      // Read the natural content height free of the flex stretch, then restore. The textarea is a
+      // child of a `display:flex` wrapper, so its height is the flex CROSS axis — pinned by the
+      // wrapper's default `align-items: stretch`. `flex:"0 0 auto"` only frees the MAIN (horizontal)
+      // axis, so without also opting out of the cross-axis stretch, `height:"auto"` is ignored and
+      // scrollHeight measures the CURRENT (stretched) height, not the content. That fed `desired`
+      // back its own height, so the box crept taller on every keystroke/dictation and never shrank
+      // after a send. Setting `align-self:flex-start` for the measurement lets height:auto collapse
+      // to the real content height. (Verified: without it, an empty textarea still measured ~its
+      // rendered height; with it, an empty/1-row textarea measures one line.)
       const prevFlex = ta.style.flex;
       const prevHeight = ta.style.height;
+      const prevAlignSelf = ta.style.alignSelf;
       ta.style.flex = "0 0 auto";
+      ta.style.alignSelf = "flex-start";
       ta.style.height = "auto";
       const contentH = ta.scrollHeight; // content + vertical padding (no border)
       ta.style.flex = prevFlex;
       ta.style.height = prevHeight;
+      ta.style.alignSelf = prevAlignSelf;
       const desired = overhead + contentH + borderY;
       // Attachment thumbnails eat a fixed row above the textarea; raise the height floor so they
       // can't squeeze the input to a sliver (overhead already includes the thumb row). Without
@@ -727,6 +738,12 @@ export function Composer({
             </div>
             <textarea
               ref={setTaRef}
+              // One row is the auto-grow baseline: when measuring (height:auto + align-self above),
+              // an empty/single-line draft collapses to one line, so `desired` lands at the snap
+              // rest height (COMPOSER_SNAP) rather than the textarea's 2-row default — that's what
+              // lets a fresh or just-sent composer sit at its compact default. Flex drives the real
+              // height the rest of the time, so `rows` only sets this measurement floor.
+              rows={1}
               value={value}
               onChange={(e) => {
                 setValue(e.target.value);
