@@ -404,6 +404,13 @@ export function Terminal({
       try {
         fit.fit();
         void resizePty(agentId, term.cols, term.rows).catch(ignorePtyGone);
+        // Force a full repaint of the viewport. When the container grows (the pane becoming
+        // visible after display:none, or the window enlarging), the rows newly brought into
+        // view can stay blank — xterm only repaints on resize when fit() actually changed the
+        // dimensions, and the WebGL renderer in particular leaves the freshly-revealed rows
+        // unpainted. Without this, buffered history shows blank until a scroll marks the rows
+        // dirty (the reported bug). Same remedy as the theme/WebGL-recovery paths below.
+        term.refresh(0, term.rows - 1);
       } catch {
         /* ignore transient fit errors while hidden */
       }
@@ -444,6 +451,12 @@ export function Terminal({
         fit.fit();
         onRequestFocusRef.current?.();
         void resizePty(agentId, term.cols, term.rows).catch(ignorePtyGone);
+        // The ResizeObserver may have already fit this terminal to the right size while it was
+        // hidden, making the fit() above a no-op — so xterm never repaints and the buffered
+        // history stays blank until the user scrolls. Force a full repaint of the now-visible
+        // viewport. (Repaint is cheap and idempotent; doing it here guarantees the becoming-
+        // active transition is covered regardless of which path won the resize race.)
+        term.refresh(0, term.rows - 1);
       } catch {
         /* ignore */
       }
