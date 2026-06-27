@@ -105,10 +105,16 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   // an account) the interactive `claude login` modal handed off from AccountsScreen's onLogin seam.
   const [accountsOpen, setAccountsOpen] = useState(false);
   const [loginAccount, setLoginAccount] = useState<Account | null>(null);
-  // A project waiting on a replace/new-window choice (null = dialog closed). A "new" target
-  // carries a not-yet-created folder so we only persist the project once the user actually picks
-  // a target — cancelling the dialog must not leave an orphan project in Recent.
-  const [pending, setPending] = useState<OpenTarget | null>(null);
+  // A pending replace/new-window choice (null = dialog closed). Two shapes:
+  //   - "target": the folder is already known (Recent) — the choice just routes it.
+  //   - "pick":  Open/New — we must ask the choice FIRST, then pop the folder picker. Showing the
+  //     picker before this dialog is the regression we guard against: the user would hit the OS
+  //     finder before ever being asked replace-vs-new-window.
+  // A "new" target carries a not-yet-created folder so we only persist the project once the user
+  // actually commits — cancelling the dialog must not leave an orphan project in Recent.
+  const [pending, setPending] = useState<
+    { type: "target"; target: OpenTarget } | { type: "pick"; title: string } | null
+  >(null);
 
   const project = projects.find((p) => p.id === currentProjectId) ?? null;
   // Recent first (most recently opened), so the "Recent Projects" label is honest.
@@ -130,18 +136,27 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   };
 
   // No project open in this window → skip the prompt and just take over the window.
-  const openOrAsk = (p: OpenTarget) => {
-    if (!currentProjectId) resolveAndRoute(p, "replace");
-    else setPending(p);
+  const openOrAsk = (target: OpenTarget) => {
+    if (!currentProjectId) resolveAndRoute(target, "replace");
+    else setPending({ type: "target", target });
   };
 
-  const pickAndOpen = async (title: string) => {
-    setRecentOpen(false);
+  // Pop the native folder picker, then open with the already-chosen mode. Map the folder to an
+  // existing project (reuse) or a not-yet-created one — created only on commit, so a cancel adds
+  // nothing.
+  const pickAndRoute = async (title: string, mode: OpenMode) => {
     const picked = await pickProjectFolder(title);
     if (!picked) return;
-    // Map the folder to an existing project (reuse) or a not-yet-created one — created only on
-    // commit (resolveAndRoute), so cancelling adds nothing.
-    openOrAsk(resolveOpenTarget(picked, projects, basename));
+    resolveAndRoute(resolveOpenTarget(picked, projects, basename), mode);
+  };
+
+  // Open / New entry point: ask replace-vs-new-window BEFORE the folder picker when a project is
+  // already open (the picker is the LAST step, not the first). With no project open there's no
+  // choice to make — go straight to the picker and take over the window.
+  const startOpen = (title: string) => {
+    setRecentOpen(false);
+    if (!currentProjectId) void pickAndRoute(title, "replace");
+    else setPending({ type: "pick", title });
   };
 
   return (
@@ -208,7 +223,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       {/* Push the actions to the right. */}
       <div style={{ flex: 1 }} />
 
-      <button style={btn} onClick={() => void pickAndOpen("Open a project — choose its folder")}>
+      <button style={btn} onClick={() => startOpen("Open a project — choose its folder")}>
         Open Project
       </button>
 
@@ -286,7 +301,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
 
       <button
         style={{ ...btn, borderColor: C.teal, background: C.teal, color: ON_BRAND_FILL }}
-        onClick={() => void pickAndOpen("New project — choose or create its folder")}
+        onClick={() => startOpen("New project — choose or create its folder")}
       >
         New
       </button>
@@ -365,8 +380,12 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       {pending && (
         <OpenTargetDialog
           onChoose={(mode) => {
-            resolveAndRoute(pending, mode);
+            const p = pending;
             setPending(null);
+            // "target": folder already known (Recent) → route it. "pick": Open/New → NOW pop the
+            // folder picker, with the mode the user just chose.
+            if (p.type === "target") resolveAndRoute(p.target, mode);
+            else void pickAndRoute(p.title, mode);
           }}
           onCancel={() => setPending(null)}
         />
