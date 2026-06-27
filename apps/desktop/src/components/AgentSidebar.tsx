@@ -685,6 +685,9 @@ function AgentRow({
     ) : (
       "⚒"
     );
+  // Width of the leading glyph slot, kept identical for the glyph and its hover-state × so the
+  // name never shifts horizontally when the row expands.
+  const glyphWidth = a.kind === "build" ? 24 : a.kind === "think" ? 20 : 12;
 
   const handleRefresh = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -707,22 +710,28 @@ function AgentRow({
     <>
       <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
         {/* The kind glyph IS the status indicator now (no separate dot): it takes the agent's
-            status color — green (working), red (needs you), gray (idle/done). */}
-        <span
-          title={`${a.kind} — ${AGENT_STATUS[st].label}`}
-          style={{
-            fontSize: a.kind === "build" ? 28.8 : a.kind === "think" ? 19.5 : 12,
-            color: statusColor,
-            flex: "0 0 auto",
-            width: a.kind === "build" ? 24 : a.kind === "think" ? 20 : 12,
-            textAlign: "center",
-            // line-height 0 lets the enlarged ⚒ overflow its line box (staying centered) so it
-            // doesn't drive the row's height.
-            lineHeight: 0,
-          }}
-        >
-          {kindGlyph}
-        </span>
+            status color — green (working), red (needs you), gray (idle/done). On hover (the
+            expanded overlay) it morphs into the × close control, occupying the same slot so the
+            name doesn't shift — there's no longer a separate close button in the right cluster. */}
+        {expanded ? (
+          <CloseAgentButton onClose={onClose} width={glyphWidth} />
+        ) : (
+          <span
+            title={`${a.kind} — ${AGENT_STATUS[st].label}`}
+            style={{
+              fontSize: a.kind === "build" ? 28.8 : a.kind === "think" ? 19.5 : 12,
+              color: statusColor,
+              flex: "0 0 auto",
+              width: glyphWidth,
+              textAlign: "center",
+              // line-height 0 lets the enlarged ⚒ overflow its line box (staying centered) so it
+              // doesn't drive the row's height.
+              lineHeight: 0,
+            }}
+          >
+            {kindGlyph}
+          </span>
+        )}
         <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 1 }}>
           {ownsInput ? (
             <input
@@ -776,7 +785,7 @@ function AgentRow({
                   style={{
                     color: statusColor,
                     fontSize: 13,
-                    fontWeight: isActive ? FONT_WEIGHT.semibold : FONT_WEIGHT.medium,
+                    fontWeight: isActive ? FONT_WEIGHT.medium : FONT_WEIGHT.regular,
                     whiteSpace: "nowrap",
                   }}
                 >
@@ -818,8 +827,9 @@ function AgentRow({
             <PathReveal path={a.worktreePath ?? project.rootPath} />
           )}
         </div>
-        {/* Right cluster: the behind/ahead pill (which also IS the catch-up / land action), close.
-            The old separate ⬆ Land button is gone — the green pill lands; the red pill rebases. */}
+        {/* Right cluster: the behind/ahead pill (which also IS the catch-up / land action). The
+            old separate ⬆ Land button is gone — the green pill lands; the red pill rebases. The
+            close × no longer lives here either: on hover the leading kind glyph becomes it. */}
         {showPill &&
           (pillBehind ? (
             // BEHIND (red): click rebases this branch onto main — catches YOU up to main. Gated on
@@ -867,7 +877,6 @@ function AgentRow({
               {pillText}
             </button>
           ))}
-        <CloseAgentButton onClose={onClose} />
       </div>
       {/* Thin progress line across the bottom of the row — fills + warms cyan→blue as the work
           advances Uncommitted → Merged. The status label only appears when expanded. */}
@@ -971,9 +980,10 @@ function PathReveal({ path }: { path: string }) {
   );
 }
 
-/** Close (×) control on each agent row. ~50% larger than the old glyph, with a thin pill
- *  that fades in on hover to make the hit target feel intentional. */
-function CloseAgentButton({ onClose }: { onClose: () => void }) {
+/** Close (×) control that stands in for the leading kind glyph while a row is hovered. It takes
+ *  the glyph's slot width so the name doesn't shift on hover, with a thin pill that fades in to
+ *  make the hit target feel intentional. */
+function CloseAgentButton({ onClose, width }: { onClose: () => void; width: number }) {
   const [hover, setHover] = useState(false);
   return (
     <button
@@ -988,14 +998,14 @@ function CloseAgentButton({ onClose }: { onClose: () => void }) {
       aria-label="Close agent"
       style={{
         color: hover ? C.accentInk : C.muted,
-        // Glyph kept smaller than the 22px box so the × sits comfortably inside the hover pill.
         fontSize: 18,
         lineHeight: 1,
         flex: "0 0 auto",
         display: "inline-flex",
         alignItems: "center",
         justifyContent: "center",
-        width: 22,
+        // Width matches the glyph slot so the name stays put; the pill stays a comfortable 22 tall.
+        width,
         height: 22,
         padding: 0,
         cursor: "pointer",

@@ -37,7 +37,7 @@ export function FittedAgentName({
   /** Canonical fallback name (also used until the first width measurement lands). */
   name: string;
   color: string;
-  /** Selected row uses the semibold weight — must match for an accurate measurement. */
+  /** Selected row uses the medium weight (others regular) — must match for an accurate measurement. */
   active: boolean;
   onDoubleClick: (e: ReactMouseEvent) => void;
   /** Don't pop the "Full name:" card — the caller reveals the full name another way (e.g. the
@@ -58,7 +58,7 @@ export function FittedAgentName({
     return () => ro.disconnect();
   }, []);
 
-  const weight = active ? FONT_WEIGHT.semibold : FONT_WEIGHT.medium;
+  const weight = active ? FONT_WEIGHT.medium : FONT_WEIGHT.regular;
   const font = `${weight} ${FONT_SIZE}px ${FONT.ui}`;
 
   // What to render: until measured (first paint) or with no variants, show the canonical
