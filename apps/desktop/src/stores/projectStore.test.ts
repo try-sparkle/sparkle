@@ -101,7 +101,7 @@ describe("projectStore auto-naming", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
     const aid = useProjectStore.getState().addAgent(pid);
     useProjectStore.getState().renameAgent(pid, aid, "My Agent");
-    useProjectStore.getState().setNamePinned(pid, aid, false);
+    useProjectStore.getState().unpinAgent(pid, aid);
     useProjectStore.getState().autoRenameAgent(pid, aid, "Auto Name", "some prompt");
     const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
     expect(agent.name).toBe("Auto Name");

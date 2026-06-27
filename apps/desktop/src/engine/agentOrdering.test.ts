@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { sortAgentsByAttention, STATUS_RANK } from "./agentOrdering";
+import { sortAgentsByAttention, orderAgents, STATUS_RANK } from "./agentOrdering";
 import type { AgentTabStatus } from "../types";
 
 // Minimal agent shape — the helper only needs `id`.
@@ -100,5 +100,57 @@ describe("sortAgentsByAttention", () => {
     expect(STATUS_RANK.working).toBeLessThan(STATUS_RANK.stopped);
     expect(STATUS_RANK.stopped).toBe(STATUS_RANK.errored);
     expect(STATUS_RANK.stopped).toBe(STATUS_RANK.blocked);
+  });
+});
+
+type Row = { id: string; pinnedIndex: number | null };
+const mk = (id: string, pinnedIndex: number | null = null): Row => ({ id, pinnedIndex });
+const allWorking = (xs: string[]) =>
+  Object.fromEntries(xs.map((id) => [id, "working" as AgentTabStatus]));
+
+describe("orderAgents — anchored pins among attention-sorted agents", () => {
+  it("anchors a pinned agent at its index; others fill around it", () => {
+    const rows = [mk("a"), mk("b", 0), mk("c")];
+    expect(orderAgents(rows, allWorking(["a", "b", "c"])).map((r) => r.id)).toEqual(["b", "a", "c"]);
+  });
+
+  it("honors a middle/bottom anchor", () => {
+    const rows = [mk("a"), mk("b"), mk("c", 2)];
+    expect(orderAgents(rows, allWorking(["a", "b", "c"])).map((r) => r.id)).toEqual(["a", "b", "c"]);
+    const rows2 = [mk("a", 1), mk("b"), mk("c")];
+    expect(orderAgents(rows2, allWorking(["a", "b", "c"])).map((r) => r.id)).toEqual(["b", "a", "c"]);
+  });
+
+  it("multiple pins insert by ascending index", () => {
+    const rows = [mk("a", 2), mk("b", 0), mk("c")];
+    expect(orderAgents(rows, allWorking(["a", "b", "c"])).map((r) => r.id)).toEqual(["b", "c", "a"]);
+  });
+
+  it("clamps out-of-range indices", () => {
+    const rows = [mk("a", 99), mk("b")];
+    expect(orderAgents(rows, allWorking(["a", "b"])).map((r) => r.id)).toEqual(["b", "a"]);
+  });
+
+  it("unanchored agents still attention-sort", () => {
+    const rows = [mk("a"), mk("b")];
+    expect(orderAgents(rows, { a: "working", b: "waiting" }).map((r) => r.id)).toEqual(["b", "a"]);
+  });
+
+  it("is id-preserving (selection safety)", () => {
+    const rows = [mk("a", 0), mk("b"), mk("c", 5)];
+    const out = orderAgents(rows, allWorking(["a", "b", "c"]));
+    expect(out.map((r) => r.id).sort()).toEqual(["a", "b", "c"]);
+    expect(out).toHaveLength(3);
+  });
+
+  it("handles an empty agent list", () => {
+    expect(orderAgents([] as Row[], {})).toEqual([]);
+  });
+
+  it("resolves two pins sharing an index by anchored-array order (ascending insert)", () => {
+    // a and b both want row 0. Ascending insert (stable on equal index) places a first, then b
+    // splices at 0 ahead of it → final order b, a, then the unanchored c.
+    const rows = [mk("a", 0), mk("b", 0), mk("c")];
+    expect(orderAgents(rows, allWorking(["a", "b", "c"])).map((r) => r.id)).toEqual(["b", "a", "c"]);
   });
 });

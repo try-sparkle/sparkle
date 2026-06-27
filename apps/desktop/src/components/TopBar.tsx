@@ -1,4 +1,4 @@
-import { useState, type CSSProperties } from "react";
+import { useState, useEffect, type CSSProperties } from "react";
 import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import type { AgentTabStatus, Project } from "../types";
 import { ThemeToggle } from "./ThemeToggle";
@@ -101,6 +101,16 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const resetZoom = useUiStore((s) => s.resetZoom);
   const [recentOpen, setRecentOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  // The settings modal is a true centered dialog now, so Escape should dismiss it (backdrop click
+  // alone isn't enough for keyboard users). Only listen while it's open.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenuOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [menuOpen]);
   // Multi Claude Max account support: the "Claude accounts" settings modal, and (when the user adds
   // an account) the interactive `claude login` modal handed off from AccountsScreen's onLogin seam.
   const [accountsOpen, setAccountsOpen] = useState(false);
@@ -323,21 +333,26 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
           <>
             <div
               onClick={() => setMenuOpen(false)}
-              style={{ position: "fixed", inset: 0, zIndex: 40 }}
+              style={{ position: "fixed", inset: 0, zIndex: 40, background: "rgba(0,0,0,0.55)" }}
             />
             <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Settings"
               style={{
-                position: "absolute",
-                top: "100%",
-                right: 0,
-                marginTop: 4,
-                minWidth: 200,
+                position: "fixed",
+                top: "50%",
+                left: "50%",
+                transform: "translate(-50%, -50%)",
+                width: "80vw",
+                height: "80vh",
                 background: C.deepForest,
                 border: `1px solid ${C.forest}`,
                 borderRadius: 8,
                 boxShadow: "0 12px 32px rgba(0,0,0,0.45)",
-                padding: 8,
+                padding: 16,
                 zIndex: 41,
+                overflowY: "auto",
               }}
             >
               <div style={menuLabel}>Use AI features</div>

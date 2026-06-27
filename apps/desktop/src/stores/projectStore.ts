@@ -51,8 +51,10 @@ interface ProjectState {
 
   addAgent: (projectId: string, opts?: AddAgentOpts) => string;
   removeAgent: (projectId: string, agentId: string) => void;
-  /** Manual rename: sets the name AND pins it (freezes auto-naming, shows the pin icon). */
-  renameAgent: (projectId: string, agentId: string, name: string) => void;
+  /** Manual rename: sets the name AND pins it (freezes auto-naming, shows the pin icon). When
+   *  the caller passes `pinnedIndex` (the agent's current displayed slot), also anchor the row
+   *  there — the unified pin (manual-agent-reorder-pin). */
+  renameAgent: (projectId: string, agentId: string, name: string, pinnedIndex?: number) => void;
   /** Auto-rename from the naming model. No-op if the user has pinned the name. Records the
    *  basis prompt so we can later detect when the work has shifted enough to re-name. Pass
    *  `variants` (short/medium/long) to enable width-fitted display + hover; `name` is the
@@ -69,8 +71,10 @@ interface ProjectState {
    *  prompt-derived name and records `aiTitle` so later changes are detected and further Haiku
    *  naming is suppressed. */
   applyAiTitle: (projectId: string, agentId: string, title: string) => void;
-  /** Pin/unpin the name. Unpinning re-enables auto-naming on the next prompt. */
-  setNamePinned: (projectId: string, agentId: string, pinned: boolean) => void;
+  /** Drag-pin a top-level agent at `index`: freeze the name AND anchor the row there. */
+  pinAgentAt: (projectId: string, agentId: string, index: number) => void;
+  /** Release a pin: clear the name freeze AND the row anchor (re-enables auto-naming + sort). */
+  unpinAgent: (projectId: string, agentId: string) => void;
   selectAgent: (projectId: string, agentId: string) => void;
   setAgentWorktree: (projectId: string, agentId: string, path: string, branch: string) => void;
   /** Record a submitted prompt: updates `lastPrompt` (pinned header) AND appends to
@@ -197,6 +201,9 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
       autoNameVariants: a.autoNameVariants ?? null,
       promptHistory: a.promptHistory ?? [],
       shellCommand: (a as AgentTab).shellCommand ?? null,
+      // v8 (manual-agent-reorder-pin): the manual reorder anchor. Default null so existing
+      // agents keep attention-sorting; do NOT touch namePinned — nothing freezes on upgrade.
+      pinnedIndex: (a as AgentTab).pinnedIndex ?? null,
     })),
   }));
   return state;
@@ -305,6 +312,7 @@ export const useProjectStore = create<ProjectState>()(
               autoNameBasis: null,
               autoNameVariants: null,
               shellCommand: opts?.shellCommand ?? null,
+              pinnedIndex: null,
             };
             return { ...p, agents: [...p.agents, agent], selectedAgentId: id };
           }),
@@ -328,18 +336,20 @@ export const useProjectStore = create<ProjectState>()(
           }),
         })),
 
-      renameAgent: (projectId, agentId, name) =>
+      renameAgent: (projectId, agentId, name, pinnedIndex) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             // A manual rename pins the name: from here on it won't auto-change. Clear the
             // auto-name variants too — pinned means "`name` only" (see types.ts), and the
             // sidebar prefers variants over `name`, so leaving them would keep showing the
-            // stale auto-name instead of the user's chosen one.
+            // stale auto-name instead of the user's chosen one. When the sidebar passes the
+            // agent's current displayed index, anchor the row there too (the unified pin).
             mapAgent(p, agentId, (a) => ({
               ...a,
               name: name.trim() || a.name,
               namePinned: true,
               autoNameVariants: null,
+              ...(pinnedIndex != null ? { pinnedIndex } : {}),
             })),
           ),
         })),
@@ -383,10 +393,26 @@ export const useProjectStore = create<ProjectState>()(
           };
         }),
 
-      setNamePinned: (projectId, agentId, pinned) =>
+      pinAgentAt: (projectId, agentId, index) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
-            mapAgent(p, agentId, (a) => ({ ...a, namePinned: pinned })),
+            // Drag-pin: freeze the name AND anchor the row. Unlike renameAgent, the NAME is not
+            // changing here — a pure reorder — so keep autoNameVariants intact. Clearing them
+            // would drop the width-fitted display back to the stale `name`, visibly changing the
+            // label on a drag (roborev 12870).
+            mapAgent(p, agentId, (a) => ({
+              ...a,
+              namePinned: true,
+              pinnedIndex: index,
+            })),
+          ),
+        })),
+
+      unpinAgent: (projectId, agentId) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            // Release both: name auto-renames again and the row rejoins the attention sort.
+            mapAgent(p, agentId, (a) => ({ ...a, namePinned: false, pinnedIndex: null })),
           ),
         })),
 
@@ -434,8 +460,9 @@ export const useProjectStore = create<ProjectState>()(
       // v4 backfills autoNameVariants (width-fitted names) to null. v5 backfills promptHistory
       // (the pinned-header dropdown) as an empty array. v6 backfills shellCommand: null for the
       // Run-as-cmd "shell" agent kind (folded in from PR #62). v7 remaps the legacy
-      // "brainstorm" agent kind to "think" (the Think rename).
-      version: 7,
+      // "brainstorm" agent kind to "think" (the Think rename). v8 backfills pinnedIndex: null
+      // (manual reorder anchor) without touching namePinned.
+      version: 8,
       migrate: (persisted, version) => migratePersisted(persisted, version) as ProjectState,
     },
   ),

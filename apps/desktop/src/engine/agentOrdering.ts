@@ -53,3 +53,28 @@ export function sortAgentsByAttention<T extends { id: string }>(
     .sort((a, b) => a.rank - b.rank || a.index - b.index)
     .map((d) => d.agent);
 }
+
+/**
+ * Order the top-level agent stack with manual pins (spec: manual-agent-reorder-pin).
+ * Agents with a numeric `pinnedIndex` are anchored to that row; the rest attention-sort
+ * (via sortAgentsByAttention) and fill the remaining rows around the anchors. Pure and
+ * id-preserving — output is a permutation of the input, so selection (by id) is safe.
+ */
+export function orderAgents<T extends { id: string; pinnedIndex: number | null }>(
+  agents: readonly T[],
+  statusMap: Record<string, AgentTabStatus>,
+): T[] {
+  const anchored = agents.filter((a) => a.pinnedIndex != null);
+  const result: T[] = sortAgentsByAttention(
+    agents.filter((a) => a.pinnedIndex == null),
+    statusMap,
+  );
+  // Insert anchors by ascending target index. Splicing into the growing result lands each
+  // anchor at its requested row (clamped to the current length); ties resolve by anchored
+  // array order. Sorting first means earlier rows are filled before later ones.
+  for (const agent of anchored.sort((x, y) => x.pinnedIndex! - y.pinnedIndex!)) {
+    const at = Math.max(0, Math.min(agent.pinnedIndex!, result.length));
+    result.splice(at, 0, agent);
+  }
+  return result;
+}

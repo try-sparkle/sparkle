@@ -14,7 +14,7 @@ import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
 import { refreshAgentTitle } from "../services/sessionTitle";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
-import { sortAgentsByAttention } from "../engine/agentOrdering";
+import { orderAgents } from "../engine/agentOrdering";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
 import { LogoWaveform } from "./LogoWaveform";
@@ -246,6 +246,18 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   //    that merged while the first modal was still up) — drained one at a time as the modal frees.
   const [mergePromptId, setMergePromptId] = useState<string | null>(null);
   const [promptedIds, setPromptedIds] = useState<Set<string>>(() => new Set());
+  // Manual reorder drag state (spec: manual-agent-reorder-pin). The id of the top-level agent
+  // currently being dragged by its grip; drop pins it at the target row via pinAgentAt.
+  const pinAgentAt = useProjectStore((s) => s.pinAgentAt);
+  const [dragId, setDragId] = useState<string | null>(null);
+  const onAgentDragStart = (id: string) => setDragId(id);
+  const onAgentDragEnd = () => setDragId(null);
+  const onAgentDrop = (index: number, targetId: string) => {
+    // Skip a self-drop (released on the agent's own row): it's a no-op move, so don't pin/freeze
+    // the name for a drag that visually did nothing (roborev 13174/13175).
+    if (dragId && project && dragId !== targetId) pinAgentAt(project.id, dragId, index);
+    setDragId(null);
+  };
   const seenStageRef = useRef<Record<string, WorkflowStageId>>({});
   const pendingRef = useRef<string[]>([]);
   useEffect(() => {
@@ -394,9 +406,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           const topLevel = project.agents.filter(isTopLevel);
           const ordered =
             agentOrdering === "attention"
-              ? sortAgentsByAttention(topLevel, status)
+              ? orderAgents(topLevel, status)
               : topLevel;
-          return ordered.map((top) => {
+          return ordered.map((top, orderedIndex) => {
             const workers =
               top.kind === "build"
                 ? project.agents.filter((w) => w.parentId === top.id)
@@ -409,7 +421,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             const rollup = rollupStages(workerStages);
             const collapsed =
               top.kind === "build" && workers.length > 0 && (collapsedOrchestrators[top.id] ?? true);
-            const renderRow = (a: (typeof project.agents)[number], trackerStage: WorkflowStageId | null) => {
+            const renderRow = (
+              a: (typeof project.agents)[number],
+              trackerStage: WorkflowStageId | null,
+              rowIndex?: number,
+            ) => {
           const st = status[a.id] ?? "stopped";
           // Idle/inactive agents (idle, blocked, errored, done, stopped all share the brand
           // GRAY) use a themed gray that's much darker in light mode for readability; active
@@ -434,6 +450,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               bs={bs}
               trackerStage={trackerStage}
               labelPrefix={a.kind === "build" && workers.length > 0 ? "Overall: " : undefined}
+              orderedIndex={rowIndex}
+              dragActive={dragId != null}
+              onDragStartAgent={onAgentDragStart}
+              onDragEndAgent={onAgentDragEnd}
+              onDropAgent={onAgentDrop}
               editing={editing === a.id}
               setEditing={setEditing}
               onSelect={() => onSelect(a.id)}
@@ -454,7 +475,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             const dom = rollup ? stageMeta(rollup.dominant) : null;
             return (
               <div key={top.id}>
-                {renderRow(top, headStage)}
+                {renderRow(top, headStage, orderedIndex)}
                 {/* Collapsible worker roll-up. Workers start collapsed: a compact "N workers ·
                     mostly X" bar the user clicks to expand into each worker's own tracker. */}
                 {top.kind === "build" && workers.length > 0 && (
@@ -581,6 +602,11 @@ function AgentRow({
   bs,
   trackerStage,
   labelPrefix,
+  orderedIndex,
+  dragActive,
+  onDragStartAgent,
+  onDragEndAgent,
+  onDropAgent,
   editing,
   setEditing,
   onSelect,
@@ -596,6 +622,14 @@ function AgentRow({
   bs?: BranchStatus;
   trackerStage: WorkflowStageId | null;
   labelPrefix?: string;
+  // The agent's current row in the ordered top-level stack (undefined for nested workers).
+  // Passed to renameAgent so a manual rename anchors the row there (the unified pin). Also the
+  // drop index for drag-reorder. The drag props are only acted on for top-level rows.
+  orderedIndex?: number;
+  dragActive: boolean;
+  onDragStartAgent: (id: string) => void;
+  onDragEndAgent: () => void;
+  onDropAgent: (index: number, targetId: string) => void;
   editing: boolean;
   setEditing: (id: string | null) => void;
   onSelect: () => void;
@@ -603,7 +637,7 @@ function AgentRow({
   onClose: () => void;
 }) {
   const renameAgent = useProjectStore((s) => s.renameAgent);
-  const setNamePinned = useProjectStore((s) => s.setNamePinned);
+  const unpinAgent = useProjectStore((s) => s.unpinAgent);
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
 
   const rowRef = useRef<HTMLDivElement>(null);
@@ -710,6 +744,34 @@ function AgentRow({
   const RowBody = ({ expanded, ownsInput }: { expanded: boolean; ownsInput: boolean }) => (
     <>
       <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+        {/* Drag grip — top-level rows only (workers keep insertion order). Dragging by the grip
+            and dropping on a row pins this agent at that row (manual-agent-reorder-pin). Hidden
+            until row hover so the rest stays clean. */}
+        {!expanded && orderedIndex != null && (
+          <span
+            draggable
+            role="button"
+            aria-label="Drag to reorder agent"
+            title="Drag to reorder"
+            onDragStart={(e) => {
+              e.stopPropagation();
+              onDragStartAgent(a.id);
+            }}
+            onDragEnd={onDragEndAgent}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              flex: "0 0 auto",
+              cursor: "grab",
+              color: C.muted,
+              fontSize: 12,
+              lineHeight: 1,
+              opacity: hover ? 0.7 : 0,
+              userSelect: "none",
+            }}
+          >
+            ⠿
+          </span>
+        )}
         {/* The kind glyph IS the status indicator now (no separate dot): it takes the agent's
             status color — green (working), red (needs you), gray (idle/done). On hover (the
             expanded overlay) it morphs into the × close control, occupying the same slot so the
@@ -748,7 +810,7 @@ function AgentRow({
                 // Only commit a real change. A no-op blur (double-click to edit, then click away
                 // without typing) must NOT pin the name or wipe the auto-name variants.
                 const next = e.target.value;
-                if (next.trim() && next !== a.name) renameAgent(project.id, a.id, next);
+                if (next.trim() && next !== a.name) renameAgent(project.id, a.id, next, orderedIndex);
                 setEditing(null);
               }}
               onKeyDown={(e) => {
@@ -808,13 +870,13 @@ function AgentRow({
                 />
               )}
               {a.namePinned && (
-                // Pinned = a name the user set by hand; it won't auto-change. Click to unpin.
+                // Pinned by hand (drag or rename): name frozen AND row anchored. Click to release both.
                 <span
                   onClick={(e) => {
                     e.stopPropagation();
-                    setNamePinned(project.id, a.id, false);
+                    unpinAgent(project.id, a.id);
                   }}
-                  title="Name pinned — won't auto-rename. Click to unpin."
+                  title="Pinned — won't auto-rename or reorder. Click to unpin."
                   style={{ display: "inline-flex", flex: "0 0 auto", cursor: "pointer", lineHeight: 1, color: C.muted }}
                 >
                   <TbPinFilled size={11} />
@@ -899,6 +961,7 @@ function AgentRow({
         onMouseEnter={show}
         onMouseLeave={hide}
         style={{
+          position: "relative",
           display: "flex",
           flexDirection: "column",
           gap: 4,
@@ -915,6 +978,19 @@ function AgentRow({
         }}
       >
         {RowBody({ expanded: false, ownsInput: editing })}
+        {/* Drop target — only while a drag is in flight and only on top-level rows. Dropping here
+            pins the dragged agent at THIS row's index (manual-agent-reorder-pin). */}
+        {orderedIndex != null && dragActive && (
+          <div
+            data-testid="agent-drop-target"
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => {
+              e.preventDefault();
+              onDropAgent(orderedIndex, a.id);
+            }}
+            style={{ position: "absolute", inset: 0, zIndex: 2 }}
+          />
+        )}
       </div>
       {showOverlay &&
         rect &&

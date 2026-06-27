@@ -34,6 +34,7 @@ function worker(id: string): AgentTab {
     autoNameBasis: null,
     autoNameVariants: null,
     shellCommand: null,
+    pinnedIndex: null,
   };
 }
 

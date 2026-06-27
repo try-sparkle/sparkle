@@ -66,6 +66,10 @@ export interface AgentTab {
   // For "shell" agents (Run-as-cmd from the terminal selection popup): the command this tab
   // runs on spawn. Null for all other kinds.
   shellCommand: string | null;
+  // Manual reorder anchor (spec: manual-agent-reorder-pin). When non-null, this top-level
+  // agent is pinned to this row index and does NOT attention-sort; unpinned agents flow
+  // around it. Set together with `namePinned` on drag/rename; cleared together on unpin.
+  pinnedIndex: number | null;
 }
 
 export interface Project {
