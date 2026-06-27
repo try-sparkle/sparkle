@@ -280,6 +280,65 @@ describe("createDictationController (hook logic without renderHook)", () => {
   });
 });
 
+describe("dictation://focus (window-focus capture gate)", () => {
+  let ctrl: Awaited<ReturnType<typeof createDictationController>>;
+
+  beforeEach(async () => {
+    invoke.mockClear();
+    for (const k of Object.keys(listeners)) delete listeners[k];
+    useDictationStore.setState({
+      status: "listening",
+      level: 0.6,
+      error: null,
+      interim: "live preview",
+      phase: "active",
+      enabled: true,
+    });
+    ctrl = await createDictationController({ onSegment: vi.fn() });
+  });
+
+  afterEach(() => ctrl?.cleanup());
+
+  it("registers a dictation://focus listener", () => {
+    expect(listeners["dictation://focus"]).toBeDefined();
+  });
+
+  it("blur (false): stops the cloud stream, resets phase/level/interim, marks idle — without disarming", () => {
+    invoke.mockClear();
+    emit("dictation://focus", false);
+    const s = useDictationStore.getState();
+    // Billable cloud stream torn down so tabbing away mid-dictation can't keep billing.
+    expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
+    expect(s.phase).toBe("passive");
+    expect(s.level).toBe(0);
+    expect(s.interim).toBe("");
+    expect(s.status).toBe("idle");
+    // The mic stays ARMED — focus is a gate on top of the mute toggle, not the toggle itself.
+    expect(s.enabled).toBe(true);
+  });
+
+  it("refocus (true) restores listening when still armed", () => {
+    useDictationStore.setState({ status: "idle", phase: "passive", enabled: true });
+    emit("dictation://focus", true);
+    expect(useDictationStore.getState().status).toBe("listening");
+  });
+
+  it("refocus (true) does NOT resume listening while muted", () => {
+    useDictationStore.setState({ status: "idle", enabled: false });
+    emit("dictation://focus", true);
+    // enabled=false means the user muted; regaining window focus must not un-mute the UI.
+    expect(useDictationStore.getState().status).toBe("idle");
+  });
+
+  it("focus events never clobber an error status", () => {
+    useDictationStore.setState({ status: "error", error: "mic not found", enabled: true });
+    emit("dictation://focus", false);
+    expect(useDictationStore.getState().status).toBe("error");
+    emit("dictation://focus", true);
+    expect(useDictationStore.getState().status).toBe("error");
+  });
+});
+
 describe("cloudStreamCommandFor (local gate, then stream)", () => {
   it("opens the cloud stream when transitioning to ACTIVE (wake word)", () => {
     expect(cloudStreamCommandFor({ phase: "active", insert: null, transitioned: true })).toBe(

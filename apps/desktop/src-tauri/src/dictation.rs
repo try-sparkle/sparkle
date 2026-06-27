@@ -129,6 +129,27 @@ pub(crate) fn capture_should_be_live(armed: bool, focused: bool) -> bool {
     armed && focused
 }
 
+/// Whether a *deferred* blur should actually commit (release the mic + notify the frontend). We
+/// defer acting on "no Sparkle window focused" by a tick because, on a window-to-window switch,
+/// macOS delivers the old window's resignKey (`Focused(false)`) BEFORE the new window's becomeKey
+/// (`Focused(true)`). Acting on the bare resignKey would spuriously pause active dictation, only to
+/// resume a few ms later — cutting an utterance in half. The deferred re-check commits only when:
+///   - `my_gen == latest_gen`: no newer focus event superseded this one (a becomeKey would have
+///     bumped the generation), AND
+///   - `!any_focused_now`: a re-poll still finds no Sparkle window focused (a real tab-away).
+/// Pure so the coalescing decision is unit-testable without threads, timers, or real windows.
+pub(crate) fn should_emit_blur(my_gen: u64, latest_gen: u64, any_focused_now: bool) -> bool {
+    my_gen == latest_gen && !any_focused_now
+}
+
+/// Empirical coalescing window for a window-to-window focus switch. macOS delivers the old window's
+/// resignKey (`Focused(false)`) and the new window's becomeKey (`Focused(true)`) within the same
+/// runloop turn, microseconds apart; we wait this long before committing a blur so the becomeKey
+/// supersedes it. Tradeoff: longer = safer coalescing if the OS is slow to deliver becomeKey under
+/// load, but more latency before the OS mic is released on a genuine tab-away. 120ms sits comfortably
+/// above the observed gap while staying imperceptible.
+const FOCUS_BLUR_COALESCE_MS: u64 = 120;
+
 #[derive(Default)]
 pub struct DictationSession {
     capture: Option<Capture>,
@@ -155,8 +176,11 @@ pub struct DictationSession {
     focused: bool,
 }
 
-pub struct DictationState(pub Arc<Mutex<DictationSession>>);
-impl Default for DictationState { fn default() -> Self { Self(Arc::new(Mutex::new(DictationSession::default()))) } }
+/// `.0` is the session; `.1` is a monotonic focus generation used to coalesce window-to-window
+/// focus switches (see `note_focus_event`): every focus event bumps it so a deferred blur from an
+/// older event can detect it's been superseded and bow out.
+pub struct DictationState(pub Arc<Mutex<DictationSession>>, pub Arc<AtomicU64>);
+impl Default for DictationState { fn default() -> Self { Self(Arc::new(Mutex::new(DictationSession::default())), Arc::new(AtomicU64::new(0))) } }
 
 impl DictationState {
     /// Stop any in-flight capture by dropping the cpal stream, so CoreAudio stops invoking the
@@ -220,6 +244,36 @@ impl DictationState {
             let _ = app.emit("dictation://focus", focused);
         }
     }
+
+    /// Entry point for a window `Focused` event, with cross-window-switch coalescing. Focus *gain*
+    /// is applied immediately (resume the mic now, and cancel any pending blur). Focus *loss* is
+    /// deferred ~120ms and re-checked via `should_emit_blur`, so flipping between two Sparkle windows
+    /// — where macOS emits the old window's resignKey before the new window's becomeKey — never looks
+    /// momentarily unfocused and so never tears down active dictation. A real tab-away (no window
+    /// regains focus within the window) still commits the blur and releases the OS mic.
+    pub fn note_focus_event(&self, app: &AppHandle, focused: bool) {
+        // Trust the event payload for a GAIN: `Focused(true)` means this window just became key —
+        // authoritative even if `is_focused()` momentarily lags the notification. Resume immediately
+        // and bump the generation so any in-flight deferred blur supersedes itself.
+        if focused {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.set_focused(app, true);
+            return;
+        }
+        // LOSS: this window resigned key. Another Sparkle window may be taking over (a window switch),
+        // so don't pause yet — defer ~one runloop turn and re-poll, letting a paired becomeKey land
+        // first. `should_emit_blur` commits the blur only if no newer focus event superseded us AND a
+        // re-poll still finds nothing focused (a real tab-away).
+        let my_gen = self.1.fetch_add(1, Ordering::SeqCst) + 1;
+        let app = app.clone();
+        let focus_gen = self.1.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(FOCUS_BLUR_COALESCE_MS));
+            if should_emit_blur(my_gen, focus_gen.load(Ordering::SeqCst), any_window_focused(&app)) {
+                app.state::<DictationState>().set_focused(&app, false);
+            }
+        });
+    }
 }
 
 /// True if at least one Sparkle window is currently the focused/active OS window. Used to seed the
@@ -252,6 +306,10 @@ fn build_capture(
         // this is the always-listening wake-word gate. Locks are poison-tolerant ():
         // a prior panicked frame must not wedge dictation; the audio.rs panic firewall already
         // prevents such a panic from aborting the process.
+        // NOTE: on a mid-stream cloud failure there's a brief (~one event round-trip) window where
+        // cloud_active is still true but send_audio's channel is dead, so those frames are dropped
+        // rather than transcribed on-device — until the cloud-ended event drives stop_cloud_stream
+        // and flips cloud_active back. Accepted: the window is tens of ms on a rare disconnect.
         if cloud_active.load(Ordering::Relaxed) {
             if let Some(s) = cloud_slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
                 s.send_audio(&frame);
@@ -446,8 +504,8 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_should_be_live, choose_engine, segment_fingerprint, should_install_cloud,
-        DictationState, Engine,
+        capture_should_be_live, choose_engine, segment_fingerprint, should_emit_blur,
+        should_install_cloud, DictationState, Engine,
     };
 
     #[test]
@@ -458,6 +516,43 @@ mod tests {
         assert!(!capture_should_be_live(true, false), "armed but unfocused → released");
         assert!(!capture_should_be_live(false, true), "muted, even if focused → off");
         assert!(!capture_should_be_live(false, false), "muted + unfocused → off");
+    }
+
+    #[test]
+    fn deferred_blur_commits_only_when_current_and_still_unfocused() {
+        // Real tab-away: this blur is still the latest event and a re-poll finds nothing focused.
+        assert!(should_emit_blur(5, 5, false), "current + unfocused → release the mic");
+        // Window-to-window switch: the new window's becomeKey bumped the generation past ours, so
+        // our older deferred blur must bow out (don't tear down the now-focused window's dictation).
+        assert!(!should_emit_blur(5, 6, false), "superseded by a newer focus event → skip");
+        // A window is focused again by the time we re-poll → skip even if not superseded.
+        assert!(!should_emit_blur(5, 5, true), "something regained focus → skip");
+        assert!(!should_emit_blur(5, 7, true), "superseded AND refocused → skip");
+    }
+
+    #[test]
+    fn a_focus_gain_supersedes_a_pending_deferred_blur() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Mirror note_focus_event's generation protocol without threads/timers, to lock in the
+        // invariant that a window-to-window switch never releases the mic: a LOSS captures
+        // my_gen = ++gen; a subsequent GAIN bumps gen again. The deferred blur then sees itself
+        // superseded (my_gen != latest) and bows out — even though its own re-poll found nothing
+        // focused. (Guards against a future refactor that drops the `+ 1` or forgets to bump on gain.)
+        let gen = AtomicU64::new(0);
+        let loss_gen = gen.fetch_add(1, Ordering::SeqCst) + 1; // window A resigns key
+        gen.fetch_add(1, Ordering::SeqCst); // window B becomes key before the deferral elapses
+        assert!(
+            !should_emit_blur(loss_gen, gen.load(Ordering::SeqCst), false),
+            "a gain after the loss must supersede the deferred blur"
+        );
+
+        // Control: an uncontested loss (real tab-away, no intervening gain) still commits.
+        let solo = AtomicU64::new(0);
+        let only_loss = solo.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(
+            should_emit_blur(only_loss, solo.load(Ordering::SeqCst), false),
+            "an uncontested loss releases the mic"
+        );
     }
 
     #[test]

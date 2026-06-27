@@ -42,21 +42,15 @@ pub fn run() {
         .manage(attention::BadgeCounts::default())
         .manage(accounts::AccountsLock::default())
         // Gate mic capture on window focus (sparkle-9oz6): Sparkle must not capture audio while the
-        // user is looking at another app. On every Focused event we recompute app-level focus — using
-        // the event's own bool for the window that changed and polling the rest — and hand it to the
-        // dictation state, which releases the OS mic when no Sparkle window is the active OS window
-        // and rebuilds it on return. Moving focus between two Sparkle windows keeps it live.
+        // user is looking at another app. Every Focused event is handed to the dictation state, which
+        // releases the OS mic when no Sparkle window is the active OS window and rebuilds it on return.
+        // Focus *loss* is coalesced (note_focus_event) so switching between two Sparkle windows — where
+        // macOS emits the old window's resignKey before the new window's becomeKey — keeps the mic live.
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Focused(now) = event {
+            if let tauri::WindowEvent::Focused(focused) = event {
                 let app = window.app_handle();
-                let this = window.label().to_string();
-                let any_focused = *now
-                    || app
-                        .webview_windows()
-                        .iter()
-                        .any(|(label, w)| label != &this && w.is_focused().unwrap_or(false));
                 app.state::<dictation::DictationState>()
-                    .set_focused(&app, any_focused);
+                    .note_focus_event(&app, *focused);
             }
         })
         .setup(|app| {
