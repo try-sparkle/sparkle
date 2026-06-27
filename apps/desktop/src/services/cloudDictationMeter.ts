@@ -46,8 +46,27 @@ export interface CloudMeterDeps {
   /** Called when a per-minute debit fails mid-stream; the caller closes the cloud stream and
    *  resumes on-device dictation. */
   onExhausted: () => void;
+  /** Called after every SUCCESSFUL per-minute debit (including the immediate first minute) so the
+   *  caller can tick the displayed balance down in real time. `balanceAfterCents` is the server's
+   *  post-debit balance, or null when the server omits it — in which case the caller falls back to
+   *  an optimistic decrement of `debitedCents` (see `nextBalanceCents`). NOT called on the
+   *  failure/exhausted paths (those refresh the balance from the server instead). */
+  onDebited?: (balanceAfterCents: number | null, debitedCents: number) => void;
   /** Stable id for this active-dictation window, used to build idempotent per-minute debit keys. */
   sessionId: string;
+}
+
+/**
+ * Resolve the balance to display after a successful debit: prefer the server's authoritative
+ * `balanceAfterCents`, but fall back to an optimistic local decrement (current − debited) when the
+ * server omits it, so the on-screen balance still moves. Pure so the wiring can be unit-tested.
+ */
+export function nextBalanceCents(
+  current: number,
+  balanceAfterCents: number | null,
+  debitedCents: number,
+): number {
+  return balanceAfterCents != null ? balanceAfterCents : current - debitedCents;
 }
 
 export interface CloudDictationMeter {
@@ -84,8 +103,12 @@ export function createCloudDictationMeter(deps: CloudMeterDeps): CloudDictationM
         console.warn(
           `[cloud-dictation] minute ${idx} debit of ${cents}¢ declined — out of credits (balance ${res.balanceCents}¢); stopping cloud stream`,
         );
+        return false;
       }
-      return res.ok;
+      // Successful debit → tick the displayed balance down in real time. Prefer the server's
+      // post-debit balance; pass null when absent so the caller can optimistically decrement.
+      deps.onDebited?.(res.balanceAfterCents ?? null, cents);
+      return true;
     } catch (e) {
       // A thrown debit (network/Rust error — e.g. the server rejecting the request) must NOT be
       // silent: this is exactly the failure that made cloud dictation invisibly fall back to the

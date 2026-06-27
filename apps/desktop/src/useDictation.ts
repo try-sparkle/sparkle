@@ -11,6 +11,7 @@ import {
   setActiveCloudMeter,
   stopActiveCloudMeter,
   openMeteredCloudWindow,
+  nextBalanceCents,
 } from "./services/cloudDictationMeter";
 
 /**
@@ -236,6 +237,18 @@ export function useAmbientVoice(): void {
                   // Surface why dictation just dropped to on-device: refresh the balance so the
                   // credits pill reflects the now-depleted balance (the user's explicit ask).
                   void useAuthStore.getState().refresh();
+                },
+                onDebited: (balanceAfterCents, debitedCents) => {
+                  // Each successful per-minute debit ticks the displayed balance down in real time.
+                  // Prefer the server's post-debit balance; optimistically decrement when it's absent.
+                  const { me } = useAuthStore.getState();
+                  if (!me) return;
+                  useAuthStore.setState({
+                    me: {
+                      ...me,
+                      balanceCents: nextBalanceCents(me.balanceCents, balanceAfterCents, debitedCents),
+                    },
+                  });
                 },
                 sessionId,
               });

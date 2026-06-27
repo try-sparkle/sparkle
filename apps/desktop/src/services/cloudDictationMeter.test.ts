@@ -3,6 +3,7 @@ import {
   createCloudDictationMeter,
   openMeteredCloudWindow,
   minuteDebitCents,
+  nextBalanceCents,
   type CloudMeterDeps,
   type CloudDictationMeter,
 } from "./cloudDictationMeter";
@@ -64,6 +65,19 @@ describe("minuteDebitCents — integer-cents accumulator", () => {
   });
 });
 
+describe("nextBalanceCents — server value vs optimistic fallback", () => {
+  it("prefers the server's post-debit balance when present", () => {
+    expect(nextBalanceCents(20000, 19994, 6)).toBe(19994);
+    // Server value wins even when it disagrees with current − debited (e.g. concurrent debits).
+    expect(nextBalanceCents(20000, 19980, 6)).toBe(19980);
+  });
+
+  it("falls back to an optimistic decrement (current − debited) when the server omits it", () => {
+    expect(nextBalanceCents(20000, null, 6)).toBe(19994);
+    expect(nextBalanceCents(19994, null, 5)).toBe(19989);
+  });
+});
+
 describe("createCloudDictationMeter", () => {
   it("reserves the first minute up front and opens only when charged", async () => {
     const consume = vi.fn(async () => okResult);
@@ -88,6 +102,91 @@ describe("createCloudDictationMeter", () => {
     );
     // The value sent is the whole-cent accumulator value (6), never the raw 5.8 the ledger 400s on —
     // pinned by minuteDebitCents above and the integrality sweep in the accumulator describe block.
+  });
+
+  it("fires onDebited with the server balance on the immediate first debit", async () => {
+    const consume = vi.fn(async () => okResult); // balanceAfterCents: 100
+    const onDebited = vi.fn();
+    const t = fakeTimer();
+    const meter = createCloudDictationMeter({
+      consume,
+      isAiEnabled: () => true,
+      setInterval: t.setInterval,
+      clearInterval: t.clearInterval,
+      onExhausted: vi.fn(),
+      onDebited,
+      sessionId: "s1",
+    });
+    expect(await meter.start()).toBe(true);
+    // The server's post-debit balance is propagated, alongside the whole-cent amount just debited.
+    expect(onDebited).toHaveBeenCalledTimes(1);
+    expect(onDebited).toHaveBeenCalledWith(100, minuteDebitCents(CLOUD_DICTATION_CENTS_PER_MIN, 0));
+  });
+
+  it("fires onDebited on each interval debit with the server balance propagated", async () => {
+    // Distinct balances per minute so we can assert the latest value flows through each tick.
+    const balances = [94, 88, 82];
+    let calls = 0;
+    const consume = vi.fn(async (): Promise<ConsumeResult> => {
+      const balanceAfterCents = balances[calls++]!;
+      return { ok: true, balanceAfterCents, ledgerId: `l${calls}` };
+    });
+    const onDebited = vi.fn();
+    const t = fakeTimer();
+    const meter = createCloudDictationMeter({
+      consume,
+      isAiEnabled: () => true,
+      setInterval: t.setInterval,
+      clearInterval: t.clearInterval,
+      onExhausted: vi.fn(),
+      onDebited,
+      sessionId: "s1",
+    });
+    await meter.start(); // minute 0 → balance 94
+    await t.tick(); // minute 1 → balance 88
+    await Promise.resolve();
+    await t.tick(); // minute 2 → balance 82
+    await Promise.resolve();
+    expect(onDebited).toHaveBeenCalledTimes(3);
+    expect(onDebited).toHaveBeenNthCalledWith(1, 94, minuteDebitCents(CLOUD_DICTATION_CENTS_PER_MIN, 0));
+    expect(onDebited).toHaveBeenNthCalledWith(2, 88, minuteDebitCents(CLOUD_DICTATION_CENTS_PER_MIN, 1));
+    expect(onDebited).toHaveBeenNthCalledWith(3, 82, minuteDebitCents(CLOUD_DICTATION_CENTS_PER_MIN, 2));
+  });
+
+  it("passes null to onDebited when the server omits balanceAfterCents (caller falls back)", async () => {
+    // Defensive: the ledger may not echo a post-debit balance. The meter forwards null so the wiring
+    // can optimistically decrement (see nextBalanceCents) instead of leaving the UI frozen.
+    const consume = vi.fn(
+      async () => ({ ok: true, balanceAfterCents: null, ledgerId: "l1" }) as unknown as ConsumeResult,
+    );
+    const onDebited = vi.fn();
+    const t = fakeTimer();
+    const meter = createCloudDictationMeter({
+      consume,
+      isAiEnabled: () => true,
+      setInterval: t.setInterval,
+      clearInterval: t.clearInterval,
+      onExhausted: vi.fn(),
+      onDebited,
+      sessionId: "s1",
+    });
+    await meter.start();
+    expect(onDebited).toHaveBeenCalledWith(null, minuteDebitCents(CLOUD_DICTATION_CENTS_PER_MIN, 0));
+  });
+
+  it("does not fire onDebited on a failed (out-of-credits) debit", async () => {
+    const onDebited = vi.fn();
+    const meter = createCloudDictationMeter({
+      consume: async () => brokeResult,
+      isAiEnabled: () => true,
+      setInterval: fakeTimer().setInterval,
+      clearInterval: fakeTimer().clearInterval,
+      onExhausted: vi.fn(),
+      onDebited,
+      sessionId: "s1",
+    });
+    await meter.start();
+    expect(onDebited).not.toHaveBeenCalled();
   });
 
   it("does not open (no debit loop) when AI is disabled", async () => {
