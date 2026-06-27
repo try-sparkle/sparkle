@@ -22,6 +22,7 @@ import { WorkflowLine } from "./WorkflowLine";
 import { HistorySearch } from "./HistorySearch";
 import { resolveStage, rollupStages, stageMeta } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import { CloseWorkerPrompt } from "./CloseWorkerPrompt";
 
 /**
  * Left column: the current project's agents as a vertical list (spec layout, revised).
@@ -232,6 +233,74 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     }
     removeAgent(project.id, id);
   };
+
+  // "Close this worker?" nudge. When a worker's branch reaches Merged, its work is in main and the
+  // worker is redundant — pop a one-time modal recommending (not forcing) closing it. State:
+  //  - mergePromptId: which worker the modal is currently asking about (null = no modal).
+  //  - promptedIds: workers we've already asked about this session, so we never re-nag.
+  //  - seenStageRef: last-observed stage per worker. We prompt ONLY on a live non-merged→merged
+  //    EDGE, never merely because a worker "is merged": first sight (incl. a worker already Merged
+  //    at mount) seeds silently, and a later poll that re-confirms Merged is not an edge either.
+  //  - pendingRef: workers that crossed the edge but haven't been shown yet (e.g. a second worker
+  //    that merged while the first modal was still up) — drained one at a time as the modal frees.
+  const [mergePromptId, setMergePromptId] = useState<string | null>(null);
+  const [promptedIds, setPromptedIds] = useState<Set<string>>(() => new Set());
+  const seenStageRef = useRef<Record<string, WorkflowStageId>>({});
+  const pendingRef = useRef<string[]>([]);
+  useEffect(() => {
+    if (!project) return;
+    const seen = seenStageRef.current;
+    const present = new Set<string>();
+    for (const a of project.agents) {
+      if (a.kind !== "worker") continue;
+      present.add(a.id);
+      // Wait for this worker's first REAL polled datum before seeding. The live stores aren't
+      // persisted (see runtimeStore), so on a fresh launch they're empty at mount and
+      // resolveStage(undefined, undefined) would yield a non-merged DEFAULT. Seeding that and
+      // then receiving a first poll of "merged" would look like a live edge and nag about a
+      // worker that was already merged before launch. Skipping until real data arrives makes
+      // that first poll the SEED, not an edge.
+      const hasData = branchStatus[a.id] !== undefined || workflowStage[a.id] !== undefined;
+      if (!hasData) continue;
+      const stage = resolveStage(branchStatus[a.id], workflowStage[a.id]);
+      const prev = seen[a.id];
+      seen[a.id] = stage;
+      // Only a live edge INTO merged qualifies. `prev === undefined` is the worker's first real
+      // datum (seed only — this is what keeps an already-Merged worker quiet, whether it was
+      // merged at mount or by the first poll); `prev === "merged"` is a re-confirm, not an edge.
+      // Queue the id unless we've already shown or queued it.
+      const edge = prev !== undefined && prev !== "merged" && stage === "merged";
+      if (edge && !promptedIds.has(a.id) && !pendingRef.current.includes(a.id)) {
+        pendingRef.current.push(a.id);
+      }
+    }
+    // Forget closed workers in the stage map + queue so a recycled id can't carry a stale stage
+    // and a closed worker can't linger unshown. (promptedIds is intentionally NOT pruned: it's a
+    // small session-scoped set, worker ids are UUIDs and never reused, and retaining it guarantees
+    // a worker we've already asked about is never asked again.)
+    for (const id of Object.keys(seen)) if (!present.has(id)) delete seen[id];
+    pendingRef.current = pendingRef.current.filter((id) => present.has(id));
+    // Show the next queued worker when no modal is up. Marking it promptedIds here makes the ask
+    // one-time even if it stays Merged across later polls.
+    if (!mergePromptId && pendingRef.current.length > 0) {
+      const id = pendingRef.current.shift() as string;
+      setMergePromptId(id);
+      setPromptedIds((s) => new Set(s).add(id));
+    }
+  }, [project, branchStatus, workflowStage, promptedIds, mergePromptId]);
+  // Drop a pending prompt if its worker was closed out from under it (e.g. via the row's × button),
+  // so a stale id can't block the modal. (Queued-but-unshown ids are pruned in the effect above.)
+  useEffect(() => {
+    if (mergePromptId && project && !project.agents.some((a) => a.id === mergePromptId)) {
+      setMergePromptId(null);
+    }
+  }, [project, mergePromptId]);
+  const onMergePromptClose = () => {
+    const id = mergePromptId;
+    setMergePromptId(null);
+    if (id) onClose(id);
+  };
+  const onMergePromptKeep = () => setMergePromptId(null);
 
   return (
     <div
@@ -468,6 +537,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
 
       {/* Bottom-left: version + "Show logs". Pinned under the agent list. */}
       <StatusBar />
+
+      {/* "Close this worker?" nudge, shown when a worker's branch reaches Merged. */}
+      {mergePromptId && (
+        <CloseWorkerPrompt onClose={onMergePromptClose} onKeep={onMergePromptKeep} />
+      )}
 
       {/* Drag handle on the right edge — resize the column wider/narrower. */}
       <div
