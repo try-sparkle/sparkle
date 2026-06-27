@@ -290,22 +290,23 @@ export function Composer({
       const overhead = container.offsetHeight - ta.offsetHeight;
       const borderY = ta.offsetHeight - ta.clientHeight; // textarea border (client excludes it)
       // Read the natural content height free of the flex stretch, then restore. The textarea is a
-      // child of a `display:flex` wrapper, so its height is the flex CROSS axis — pinned by the
-      // wrapper's default `align-items: stretch`. `flex:"0 0 auto"` only frees the MAIN (horizontal)
-      // axis, so without also opting out of the cross-axis stretch, `height:"auto"` is ignored and
-      // scrollHeight measures the CURRENT (stretched) height, not the content. That fed `desired`
-      // back its own height, so the box crept taller on every keystroke/dictation and never shrank
-      // after a send. Setting `align-self:flex-start` for the measurement lets height:auto collapse
-      // to the real content height. (Verified: without it, an empty textarea still measured ~its
-      // rendered height; with it, an empty/1-row textarea measures one line.)
-      const prevFlex = ta.style.flex;
+      // child of a `display:flex` wrapper whose direction is the default `row`, so the textarea's
+      // CROSS axis (the one pinned by `align-items: stretch`) is VERTICAL and its MAIN axis is
+      // HORIZONTAL (width). To collapse the height to content we must opt out of the cross-axis
+      // stretch — `align-self:flex-start` + `height:"auto"` — which is what lets scrollHeight report
+      // the real content height instead of the stretched height.
+      //
+      // We must NOT touch `flex` here. `flex` sizes the MAIN (horizontal) axis: setting
+      // `flex:"0 0 auto"` collapses the textarea's WIDTH to its intrinsic `cols`-based width (~20
+      // chars), which re-wraps the draft into many more lines and INFLATES scrollHeight — so the box
+      // grew to multiples of the real text, worst on dictation (long appended runs). An empty/1-row
+      // draft hid this (one line measures the same at any width), so it only bit once text wrapped.
+      // Leaving `flex:1` keeps the measured width equal to the rendered width, so wrapping matches.
       const prevHeight = ta.style.height;
       const prevAlignSelf = ta.style.alignSelf;
-      ta.style.flex = "0 0 auto";
       ta.style.alignSelf = "flex-start";
       ta.style.height = "auto";
       const contentH = ta.scrollHeight; // content + vertical padding (no border)
-      ta.style.flex = prevFlex;
       ta.style.height = prevHeight;
       ta.style.alignSelf = prevAlignSelf;
       const desired = overhead + contentH + borderY;
