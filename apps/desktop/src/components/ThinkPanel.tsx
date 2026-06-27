@@ -226,23 +226,14 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
       >
         <TbBulb size={20} style={{ flexShrink: 0 }} />
         <span>
-          Thinking with Chief over{" "}
+          Think about{" "}
           <span style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold }}>{project.name}</span>
-          {linking ? " — linking project…" : chiefProjectId ? "'s library" : ""}
+          {linking ? " — linking project…" : ""}
         </span>
       </div>
 
       {/* Transcript */}
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: 16 }}>
-        {messages.length === 0 && (
-          <div style={{ color: C.muted, fontSize: 13, lineHeight: 1.6, maxWidth: 560 }}>
-            Ask Chief anything about <strong>{project.name}</strong>. It answers from everything in
-            the project's library — including the commit progress docs your Build agents produce.
-            <br />
-            <br />
-            Try: <em>"What have we decided so far?"</em> or <em>"Summarize the open concerns."</em>
-          </div>
-        )}
         {messages.map((m, i) => (
           <Bubble key={i} role={m.role} text={m.text} />
         ))}
