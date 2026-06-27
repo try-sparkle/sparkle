@@ -24,16 +24,23 @@ const NAMING_MODEL: &str = "claude-haiku-4-5";
 const SYSTEM_PROMPT: &str = "You name coding-agent sessions by the SUBSTANCE of the work — the \
 feature, component, or problem being worked on — NOT by restating an operational command. \
 Given the user's prompt, do EXACTLY ONE of these:\n\
-- If the prompt is just an operational/process command or an acknowledgement with no describable \
-subject of work (e.g. 'push to production', 'commit and push', 'run the tests', 'continue', \
-'retry', 'looks good', a greeting), reply with EXACTLY the single word SKIP and nothing else.\n\
-- Otherwise, summarize the SAME work as three Title Case titles of increasing length. Reply with \
-ONLY a JSON object — no preamble, no markdown fences: \
+- Reply with EXACTLY the single word SKIP (and nothing else) ONLY when the prompt is purely an \
+operational/process command, an acknowledgement, or a greeting with NO subject of work to name \
+(e.g. 'push to production', 'commit and push', 'run the tests', 'continue', 'retry', 'looks good', \
+'thanks', 'hi'). When in doubt, do NOT skip — name it.\n\
+- Otherwise, name the subject of the work. A QUESTION, COMPLAINT, BUG REPORT, INVESTIGATION, or \
+DISCUSSION about a feature, component, or problem DOES have a subject and MUST be named by that \
+subject — never skipped just because it is not phrased as an imperative command. Summarize the \
+SAME work as three Title Case titles of increasing length. Reply with ONLY a JSON object — no \
+preamble, no markdown fences: \
 {\"short\": \"2-4 words\", \"medium\": \"5-6 words\", \"long\": \"8-10 words\"}. Each value is a \
 title (no surrounding quotes, no trailing punctuation). Name the subject of the work, e.g. \
 'Voice Dictation Pipeline', never a command like 'Push Code Changes'.\n\
-Example: {\"short\": \"Fix Login Redirect\", \"medium\": \"Fix OAuth Login Redirect Loop\", \
-\"long\": \"Fix OAuth Login Redirect Loop After Token Refresh\"}.";
+Examples:\n\
+{\"short\": \"Fix Login Redirect\", \"medium\": \"Fix OAuth Login Redirect Loop\", \
+\"long\": \"Fix OAuth Login Redirect Loop After Token Refresh\"}\n\
+{\"short\": \"Deepgram Dictation Streaming\", \"medium\": \"Debug Deepgram Live Dictation Streaming\", \
+\"long\": \"Investigate Why Deepgram Cloud Dictation Is Not Streaming Live\"}";
 
 /// The three length variants of an auto-name. Serialized to the webview as
 /// `{ short, medium, long }`; the UI renders the longest one that fits the column.
@@ -460,5 +467,18 @@ mod tests {
     #[test]
     fn interpret_reply_errors_on_empty() {
         assert!(interpret_reply("   ").is_err());
+    }
+
+    #[test]
+    fn system_prompt_instructs_naming_of_questions_not_just_commands() {
+        // Regression guard: a substantive QUESTION/COMPLAINT/BUG-REPORT (which has a subject of
+        // work) was being answered with SKIP by the model, so agents that opened with such a prompt
+        // (e.g. "are we using Deepgram? I don't see live streaming") kept their default "Build N"
+        // name. The fix lives in the system prompt: it must explicitly tell the model that a
+        // question/discussion still has a subject to name, while still allowing SKIP for pure
+        // operational commands. Keep both halves so a future edit can't silently regress either.
+        assert!(SYSTEM_PROMPT.contains("QUESTION"), "prompt must name questions, not skip them");
+        assert!(SYSTEM_PROMPT.contains("do NOT skip"), "prompt must bias toward naming when unsure");
+        assert!(SYSTEM_PROMPT.contains("SKIP"), "prompt must still allow SKIP for operational commands");
     }
 }
