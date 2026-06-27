@@ -11,7 +11,14 @@ import { listen } from "@tauri-apps/api/event";
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { useAuthStore } from "../stores/authStore";
 import { deriveAuthView, parseAuthCode } from "../services/entitlement";
-import { exchangeCode, openPaywall, openSignIn, redeemPromo } from "../services/sparkleApi";
+import {
+  exchangeCode,
+  openPaywall,
+  openSignIn,
+  PAYWALL_URL,
+  redeemPromo,
+  SIGN_IN_URL,
+} from "../services/sparkleApi";
 
 const screen: CSSProperties = {
   position: "fixed",
@@ -62,6 +69,17 @@ const promoInput: CSSProperties = {
 
 function Screen({ children }: { children: ReactNode }) {
   return <div style={screen}>{children}</div>;
+}
+
+/** Shown when the system-browser hand-off couldn't launch: tells the user what happened and gives
+ *  them the URL to open manually (selectable so they can copy it) so they're never fully stuck. */
+function LaunchFallback({ url }: { url: string }) {
+  return (
+    <p style={{ color: "#e5484d", fontSize: 13, margin: 0, maxWidth: 420 }} role="alert">
+      Couldn&apos;t open your browser. Open this link manually:{" "}
+      <span style={{ color: C.cream, userSelect: "text", wordBreak: "break-all" }}>{url}</span>
+    </p>
+  );
 }
 
 /** Small "Have a code?" redeemer on the paywall. Forwards the typed code to the server (the code
@@ -174,6 +192,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
     };
   }, [refresh]);
 
+  // When the system-browser hand-off can't launch (no default browser, opener-scope denial, …),
+  // openSignIn/openPaywall resolve false instead of throwing. Remember which URL failed so we can
+  // show it as a copy/paste fallback rather than leaving the user on a dead button.
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  const handOff = async (open: () => Promise<boolean>, url: string) => {
+    setFailedUrl(null);
+    const ok = await open();
+    if (!ok) setFailedUrl(url);
+  };
+
   const view = deriveAuthView({ loading, hasToken: tokenPresent, me });
 
   if (view === "entitled") return <>{children}</>;
@@ -195,9 +223,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
           <strong style={{ color: C.cream }}>$200 of AI credits</strong> to power building and
           thinking.
         </p>
-        <button style={primaryBtn} onClick={() => void openPaywall()}>
+        <button style={primaryBtn} onClick={() => void handOff(openPaywall, PAYWALL_URL)}>
           Pay $99 &amp; get $200 in credits
         </button>
+        {failedUrl && <LaunchFallback url={failedUrl} />}
         <button style={linkBtn} onClick={() => void refresh()}>
           I already paid — refresh
         </button>
@@ -214,9 +243,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
         Create an account or sign in to start building. We&apos;ll open your browser to finish
         signing in, then bring you back here.
       </p>
-      <button style={primaryBtn} onClick={() => void openSignIn()}>
+      <button style={primaryBtn} onClick={() => void handOff(openSignIn, SIGN_IN_URL)}>
         Sign in / Create account
       </button>
+      {failedUrl && <LaunchFallback url={failedUrl} />}
       <button style={linkBtn} onClick={() => void refresh()}>
         Already signed in — refresh
       </button>

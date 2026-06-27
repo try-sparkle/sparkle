@@ -14,14 +14,36 @@ import { useSettingsStore, aiFeatureMode } from "../stores/settingsStore";
 const WEB_BASE_URL =
   (import.meta.env.VITE_WEB_BASE_URL as string | undefined) ?? "https://sparkle.ai";
 
-/** Open the system browser to the Clerk sign-in → desktop hand-off. */
-export function openSignIn(): Promise<void> {
-  return openUrl(`${WEB_BASE_URL}/desktop/callback`);
+/** The two URLs the app hands off to the system browser. Exported so the UI can offer them as a
+ *  copy/paste fallback when the launch fails (no default browser, opener-scope regression, etc.). */
+export const SIGN_IN_URL = `${WEB_BASE_URL}/desktop/callback`;
+export const PAYWALL_URL = `${WEB_BASE_URL}/paywall`;
+
+// Hand off a URL to the OS browser via the opener plugin, but NEVER reject: openUrl() rejects when
+// the URL falls outside the `opener:allow-open-url` scope, when there's no default browser, or on an
+// OS denial. Left unhandled (callers used `() => void openSignIn()`) that surfaced as an "Unhandled
+// rejection: Not allowed to open url" burst AND a dead button with no feedback. Swallow + log here
+// and report success so the caller can show a manual-link fallback instead.
+async function launch(url: string): Promise<boolean> {
+  try {
+    await openUrl(url);
+    return true;
+  } catch (e) {
+    console.error("Failed to open URL in system browser:", url, e);
+    return false;
+  }
 }
 
-/** Open the system browser to the $99 paywall checkout. */
-export function openPaywall(): Promise<void> {
-  return openUrl(`${WEB_BASE_URL}/paywall`);
+/** Open the system browser to the Clerk sign-in → desktop hand-off. Resolves `false` (never
+ *  rejects) when the browser couldn't be launched, so the caller can offer the URL manually. */
+export function openSignIn(): Promise<boolean> {
+  return launch(SIGN_IN_URL);
+}
+
+/** Open the system browser to the $99 paywall checkout. Resolves `false` (never rejects) when the
+ *  browser couldn't be launched. */
+export function openPaywall(): Promise<boolean> {
+  return launch(PAYWALL_URL);
 }
 
 /** True if a desktop bearer token is stored in the keychain. */
