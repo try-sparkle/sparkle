@@ -60,6 +60,19 @@ body {
   animation: sparkle-pulse 1.1s ease-in-out infinite;
 }
 
+/* agent row hover-expand (AgentSidebar) — the row slides out to the right over the terminal,
+   revealing the full name + path. clip-path reveals left→right so it reads as "sliding out". */
+@keyframes -slide {
+  from {
+    opacity: 0;
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    opacity: 1;
+    clip-path: inset(0 0 0 0);
+  }
+}
+
 /* styled hover tooltip (Tooltip.tsx) — fade + slight rise */
 @keyframes sparkle-tooltip-in {
   from {

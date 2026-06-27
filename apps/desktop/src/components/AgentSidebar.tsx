@@ -1,7 +1,8 @@
-import { useState, useEffect } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { useState, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled, TbBulb } from "react-icons/tb";
-import { C, AGENT_STATUS, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK } from "../theme/colors";
+import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK } from "../theme/colors";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -9,19 +10,17 @@ import { useUiStore } from "../stores/uiStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { removeAgentWorkspace } from "../services/worktree";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
+import type { BranchStatus } from "../services/branchStatus";
 import { refreshAgentTitle } from "../services/sessionTitle";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
-import { stalenessTier, growNudge } from "../engine/nudges";
-import { spawnWorker } from "../services/workerSpawn";
 import { sortAgentsByAttention } from "../engine/agentOrdering";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
-import { Tooltip } from "./Tooltip";
 import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
-import { WorkflowTracker } from "./WorkflowTracker";
+import { WorkflowLine } from "./WorkflowLine";
 import { HistorySearch } from "./HistorySearch";
-import { resolveStage, rollupStages, stageMeta, stageIndex } from "../engine/workflowStage";
+import { resolveStage, rollupStages, stageMeta } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 
 /**
@@ -60,8 +59,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const selectAgent = useProjectStore((s) => s.selectAgent);
   const addAgent = useProjectStore((s) => s.addAgent);
   const removeAgent = useProjectStore((s) => s.removeAgent);
-  const renameAgent = useProjectStore((s) => s.renameAgent);
-  const setNamePinned = useProjectStore((s) => s.setNamePinned);
   const open = useRuntimeStore((s) => s.open);
   const close = useRuntimeStore((s) => s.close);
   const status = useRuntimeStore((s) => s.status);
@@ -184,21 +181,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const id = addAgent(project.id, { kind: "build" });
     selectAgent(project.id, id);
     open(id);
-  };
-  // Temporary manual trigger for spawning workers (Plan 2 will replace this with autonomous
-  // orchestration via the MCP bridge). Prompts the user for a task description, cuts the
-  // worker worktree from the parent build agent's branch, and opens the new worker tab.
-  const onAddWorker = (parentId: string) => {
-    if (!project) return;
-    const task = window.prompt("Worker task?")?.trim();
-    if (!task) return;
-    setActiveSpecial(null);
-    spawnWorker({ projectId: project.id, parentAgentId: parentId, task })
-      .then((id) => {
-        selectAgent(project.id, id);
-        open(id);
-      })
-      .catch((e) => console.error("spawnWorker failed", e));
   };
   const onSelectSparkle = () => {
     setActiveSpecial("sparkle");
@@ -367,250 +349,27 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             AGENT_STATUS[st].color === AGENT_STATUS.done.color ? C.agentIdle : AGENT_STATUS[st].color;
           const isActive = !activeSpecial && project.selectedAgentId === a.id;
           const bs = branchStatus[a.id];
-          const tier = bs ? stalenessTier(bs.behind) : "none";
-          const grow = bs ? growNudge(bs) : false;
-          const busy = st === "working";
           // Indent by tree position, not by parentId: the group head (top) sits at depth 0 — so
           // an orphaned worker surfaced as its own head isn't mis-indented — and real children at 1.
           const depth = a.id === top.id ? 0 : 1;
-          const kindGlyph =
-            a.kind === "think" ? (
-              <TbBulb size={16} />
-            ) : a.kind === "worker" ? (
-              "↳"
-            ) : a.kind === "shell" ? (
-              "▶"
-            ) : (
-              "⚒"
-            );
           return (
-            <div
+            <AgentRow
               key={a.id}
-              onClick={() => onSelect(a.id)}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                padding: "8px 10px",
-                marginLeft: depth * 16,
-                borderRadius: 8,
-                cursor: "pointer",
-                // Selected agent: a lighter, bluer lift (reads as "raised/active") with no
-                // border or accent bar — a clean filled highlight, no edge of a different shade.
-                background: isActive ? CHAT_USER_BUBBLE : "transparent",
-                marginBottom: 2,
-              }}
-            >
-              <span
-                title={a.kind}
-                style={{
-                  fontSize: a.kind === "build" ? 28.8 : a.kind === "think" ? 19.5 : 12,
-                  color: C.muted,
-                  flex: "0 0 auto",
-                  width: a.kind === "build" ? 24 : a.kind === "think" ? 20 : 12,
-                  textAlign: "center",
-                  // Keep the enlarged Build (⚒) glyph from driving the row's
-                  // height — line-height 0 lets the big glyph overflow its line box (it stays
-                  // centered) so rows keep their original, compact height.
-                  lineHeight: 0,
-                }}
-              >
-                {kindGlyph}
-              </span>
-              <StatusDot status={st} />
-              <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 1 }}>
-                {editing === a.id ? (
-                  <input
-                    autoFocus
-                    defaultValue={a.name}
-                    onBlur={(e) => {
-                      // Only commit a real change. A no-op blur (double-click to edit, then
-                      // click away without typing) must NOT pin the name or wipe the auto-name
-                      // variants — that would silently freeze width-fitting for this agent.
-                      const next = e.target.value;
-                      if (next.trim() && next !== a.name) {
-                        renameAgent(project.id, a.id, next);
-                      }
-                      setEditing(null);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                      if (e.key === "Escape") setEditing(null);
-                    }}
-                    onClick={(e) => e.stopPropagation()}
-                    style={{
-                      width: "100%",
-                      background: C.deepForest,
-                      color: C.cream,
-                      border: `1px solid ${C.teal}`,
-                      borderRadius: 4,
-                      padding: "2px 6px",
-                      fontSize: 13,
-                      outline: "none",
-                      minWidth: 0,
-                      boxSizing: "border-box",
-                    }}
-                  />
-                ) : (
-                  <div style={{ display: "flex", alignItems: "center", gap: 4, minWidth: 0 }}>
-                    <FittedAgentName
-                      variants={a.autoNameVariants}
-                      name={a.name}
-                      color={color}
-                      active={isActive}
-                      onDoubleClick={(e) => {
-                        e.stopPropagation();
-                        setEditing(a.id);
-                      }}
-                    />
-                    {a.namePinned && (
-                      // Pinned = a name the user set by hand; it won't auto-change. Click to
-                      // unpin and let the agent name itself again on the next prompt.
-                      <span
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setNamePinned(project.id, a.id, false);
-                        }}
-                        title="Name pinned — won't auto-rename. Click to unpin."
-                        style={{ display: "inline-flex", flex: "0 0 auto", cursor: "pointer", lineHeight: 1, color: C.muted }}
-                      >
-                        <TbPinFilled size={11} />
-                      </span>
-                    )}
-                  </div>
-                )}
-                {/* The agent's working directory — truncated to the column width,
-                    full path in a styled "Working in:" card on hover. The agent runs
-                    inside its isolated worktree; fall back to the project root until
-                    that worktree is created. */}
-                <Tooltip
-                  label="Working in:"
-                  value={
-                    a.worktreePath ??
-                    "Worktree is created when this agent first starts"
-                  }
-                >
-                  <span
-                    style={{
-                      color: C.muted,
-                      fontSize: 11,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                      // Show the agent's full working path including the worktree ID;
-                      // fall back to the project root until the worktree exists. `rtl`
-                      // truncates at the START (keeping the worktree-ID tail visible);
-                      // the LTR isolate (U+2066…U+2069) around the string below keeps
-                      // its slashes/segments in correct order under bidi.
-                      direction: "rtl",
-                      textAlign: "left",
-                    }}
-                  >
-                    {/* ⁦ = LTR isolate, ⁩ = pop directional isolate */}
-                    {"⁦" + (a.worktreePath ?? project.rootPath) + "⁩"}
-                  </span>
-                </Tooltip>
-                {/* Domino's-tracker chevrons: how far this work has progressed toward merged.
-                    For an orchestrator this is the roll-up of its workers; for a worker it's its
-                    own git stage. Think agents have no worktree, so trackerStage is null. */}
-                {trackerStage && (
-                  <div style={{ marginTop: 3 }}>
-                    <WorkflowTracker
-                      stage={trackerStage}
-                      labelPrefix={a.kind === "build" && workers.length > 0 ? "Overall: " : undefined}
-                    />
-                  </div>
-                )}
-              </div>
-              {bs && (tier !== "none" || grow) && (
-                <div style={{ display: "flex", gap: 6, alignItems: "center", flex: "0 0 auto" }}>
-                  {tier !== "none" && (
-                    <button
-                      disabled={busy}
-                      onClick={async (e) => {
-                        e.stopPropagation();
-                        // Re-read status at click time: the closed-over `busy` could be stale,
-                        // and this gate is the only thing stopping a rebase under a live agent.
-                        const liveBusy =
-                          useRuntimeStore.getState().status[a.id] === "working";
-                        const base = a.baseBranch ?? "";
-                        const r = await refreshAgentBranch(
-                          project.rootPath,
-                          project.id,
-                          a.id,
-                          base,
-                          liveBusy,
-                        );
-                        if (r.ok) {
-                          void pollBranchStatus(project.rootPath, project.id, a.id, base);
-                        } else {
-                          // dirty/busy/conflict — surface via title; full toast UI is a follow-up.
-                          console.warn("refresh blocked:", r.reason, r.files ?? "");
-                        }
-                      }}
-                      title={
-                        busy
-                          ? "Pause the agent before refreshing"
-                          : `${bs.behind} behind ${a.baseBranch ?? "the integration branch"} — click to refresh`
-                      }
-                      style={{
-                        fontSize: 10,
-                        color: tier === "warn" ? C.accentInk : C.muted,
-                        background: "transparent",
-                        border: "none",
-                        cursor: busy ? "not-allowed" : "pointer",
-                        opacity: busy ? 0.5 : 1,
-                        padding: 0,
-                      }}
-                    >
-                      ↻ {bs.behind}
-                    </button>
-                  )}
-                  {grow && (
-                    <span
-                      title="Large branch — consider landing or splitting"
-                      style={{ fontSize: 10, color: C.muted }}
-                    >
-                      ⤴
-                    </span>
-                  )}
-                </div>
-              )}
-              {/* Land: offer the merge-to-integration action while the agent has unlanded commits
-                  and hasn't reached On Main yet. A worker lands into its orchestrator; a build agent
-                  into the project default. */}
-              {bs &&
-                bs.ahead > 0 &&
-                a.kind !== "think" &&
-                a.kind !== "shell" &&
-                stageIndex(stageOf(a.id)) < stageIndex("main") && (
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void onLand(a);
-                    }}
-                    title={
-                      a.kind === "worker"
-                        ? "Land this worker into its orchestrator's branch"
-                        : "Land this work into the project's default branch"
-                    }
-                    style={{
-                      fontSize: 10,
-                      color: stageMeta("main").color,
-                      background: "transparent",
-                      border: `1px solid ${stageMeta("main").color}`,
-                      borderRadius: 5,
-                      cursor: "pointer",
-                      padding: "1px 5px",
-                      flex: "0 0 auto",
-                      fontFamily: '"IBM Plex Sans", sans-serif',
-                    }}
-                  >
-                    ⬆ Land
-                  </button>
-                )}
-              <CloseAgentButton onClose={() => onClose(a.id)} />
-            </div>
+              project={project}
+              a={a}
+              depth={depth}
+              isActive={isActive}
+              st={st}
+              statusColor={color}
+              bs={bs}
+              trackerStage={trackerStage}
+              labelPrefix={a.kind === "build" && workers.length > 0 ? "Overall: " : undefined}
+              editing={editing === a.id}
+              setEditing={setEditing}
+              onSelect={() => onSelect(a.id)}
+              onLand={() => onLand(a)}
+              onClose={() => onClose(a.id)}
+            />
           );
             }; // end renderRow
 
@@ -663,32 +422,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                     )}
                   </div>
                 )}
-                {/* Expanded: each worker's own row + tracker. */}
+                {/* Expanded: each worker's own row + tracker. Workers are spawned by the
+                    orchestrator agent (via the MCP bridge), not by hand — so there's no manual
+                    "+ worker" affordance here. */}
                 {top.kind === "build" &&
                   !collapsed &&
                   workers.map((w) => renderRow(w, stageOf(w.id)))}
-                {/* Under a build agent: spawn another worker into the tree. Shown regardless of
-                    collapse state so adding a worker never requires expanding the subtree first. */}
-                {top.kind === "build" && (
-                  <button
-                    onClick={() => onAddWorker(top.id)}
-                    title="Spawn a worker agent under this build agent"
-                    style={{
-                      marginLeft: 16,
-                      marginBottom: 4,
-                      padding: "4px 8px",
-                      background: "transparent",
-                      color: C.muted,
-                      border: `1px dashed ${C.forest}`,
-                      borderRadius: 6,
-                      cursor: "pointer",
-                      fontSize: 12,
-                      fontFamily: '"IBM Plex Sans", sans-serif',
-                    }}
-                  >
-                    + worker
-                  </button>
-                )}
               </div>
             );
           });
@@ -747,6 +486,414 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         }}
       />
     </div>
+  );
+}
+
+/**
+ * One agent row. Collapsed (default) it shows: the kind glyph, the status dot, the width-fitted
+ * name, a behind/ahead pill, and a thin progress line across the bottom. On hover the row "slides
+ * out" to the right OVER the terminal (a fixed-position overlay, not a modal), revealing the full
+ * name, the working-directory path, and the progress line's status label. The build glyph sits left
+ * of the dot, the dot left of the name (per spec).
+ */
+function AgentRow({
+  project,
+  a,
+  depth,
+  isActive,
+  st,
+  statusColor,
+  bs,
+  trackerStage,
+  labelPrefix,
+  editing,
+  setEditing,
+  onSelect,
+  onLand,
+  onClose,
+}: {
+  project: Project;
+  a: AgentTab;
+  depth: number;
+  isActive: boolean;
+  st: AgentTabStatus;
+  statusColor: string;
+  bs?: BranchStatus;
+  trackerStage: WorkflowStageId | null;
+  labelPrefix?: string;
+  editing: boolean;
+  setEditing: (id: string | null) => void;
+  onSelect: () => void;
+  onLand: () => void;
+  onClose: () => void;
+}) {
+  const renameAgent = useProjectStore((s) => s.renameAgent);
+  const setNamePinned = useProjectStore((s) => s.setNamePinned);
+  const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
+
+  const rowRef = useRef<HTMLDivElement>(null);
+  const hideTimer = useRef<number | null>(null);
+  // Set true the instant Escape is pressed so the input's trailing blur (which fires when the field
+  // unmounts in this Chromium webview) discards instead of committing — Escape must always cancel.
+  const cancelNextBlur = useRef(false);
+  const [hover, setHover] = useState(false);
+  const [rect, setRect] = useState<{ left: number; top: number; width: number } | null>(null);
+
+  // Hover open/close with a short close delay, so moving the cursor from the in-flow row onto the
+  // overlay sitting on top of it (which fires the row's mouseleave) doesn't flicker it shut.
+  const show = () => {
+    if (hideTimer.current) {
+      clearTimeout(hideTimer.current);
+      hideTimer.current = null;
+    }
+    const el = rowRef.current;
+    if (el) {
+      const r = el.getBoundingClientRect();
+      setRect({ left: r.left, top: r.top, width: r.width });
+    }
+    setHover(true);
+  };
+  const hide = () => {
+    if (hideTimer.current) clearTimeout(hideTimer.current);
+    hideTimer.current = window.setTimeout(() => setHover(false), 60);
+  };
+  useEffect(
+    () => () => {
+      if (hideTimer.current) clearTimeout(hideTimer.current);
+    },
+    [],
+  );
+  // The overlay is pinned to the row's rect captured at hover time; if the sidebar scrolls (or the
+  // window resizes) while it's open it would detach from its row, so just close it on either.
+  useEffect(() => {
+    if (!hover) return;
+    const close = () => setHover(false);
+    window.addEventListener("scroll", close, true); // capture: catch the sidebar's inner scroll too
+    window.addEventListener("resize", close);
+    return () => {
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+    };
+  }, [hover]);
+
+  const busy = st === "working";
+  const behind = bs?.behind ?? 0;
+  const ahead = bs?.ahead ?? 0;
+  // The pill: RED "-N" when the branch is behind main (click rebases it onto main — catch YOU up),
+  // else GREEN "+N" when it's ahead (click merges it into main — catch MAIN up to you). Behind wins
+  // when both: rebase first, and once caught up the pill flips to green to offer the land. None when
+  // even with main.
+  const showPill = !!bs && (behind > 0 || ahead > 0);
+  const pillBehind = behind > 0;
+  const pillColor = pillBehind ? C.sienna : C.success;
+  const pillText = pillBehind ? `-${behind}` : `+${ahead}`;
+  const baseLabel = a.baseBranch ?? "main";
+  // Shared pill geometry — squared off to roughly match the Land/old action pills (borderRadius 5),
+  // not a fully-round chip. The behind/ahead variants layer color + action on top.
+  const pillBase: React.CSSProperties = {
+    fontSize: 10,
+    fontWeight: 700,
+    lineHeight: 1,
+    fontFamily: FONT.ui,
+    padding: "2px 7px",
+    borderRadius: 5,
+    flex: "0 0 auto",
+    whiteSpace: "nowrap",
+  };
+
+  const kindGlyph =
+    a.kind === "think" ? (
+      <TbBulb size={16} />
+    ) : a.kind === "worker" ? (
+      "↳"
+    ) : a.kind === "shell" ? (
+      "▶"
+    ) : (
+      "⚒"
+    );
+
+  const handleRefresh = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    // Re-read status at click time: the closed-over `busy` could be stale, and this gate is the
+    // only thing stopping a rebase under a live agent.
+    const liveBusy = useRuntimeStore.getState().status[a.id] === "working";
+    const base = a.baseBranch ?? "";
+    const r = await refreshAgentBranch(project.rootPath, project.id, a.id, base, liveBusy);
+    if (r.ok) void pollBranchStatus(project.rootPath, project.id, a.id, base);
+    else console.warn("refresh blocked:", r.reason, r.files ?? ""); // toast UI is a follow-up
+  };
+
+  const fullName = a.autoNameVariants?.long || a.name;
+
+  // The row's inner content, shared by the in-flow (collapsed) and overlay (expanded) renders.
+  // `expanded` reveals the path + status label and shows the full name; `ownsInput` renders the
+  // rename <input> here. Only the in-flow row ever passes ownsInput=true (the overlay is suppressed
+  // during a rename), so there is always exactly one input — see showOverlay below.
+  const RowBody = ({ expanded, ownsInput }: { expanded: boolean; ownsInput: boolean }) => (
+    <>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+        {/* The kind glyph IS the status indicator now (no separate dot): it takes the agent's
+            status color — green (working), red (needs you), gray (idle/done). */}
+        <span
+          title={`${a.kind} — ${AGENT_STATUS[st].label}`}
+          style={{
+            fontSize: a.kind === "build" ? 28.8 : a.kind === "think" ? 19.5 : 12,
+            color: statusColor,
+            flex: "0 0 auto",
+            width: a.kind === "build" ? 24 : a.kind === "think" ? 20 : 12,
+            textAlign: "center",
+            // line-height 0 lets the enlarged ⚒ overflow its line box (staying centered) so it
+            // doesn't drive the row's height.
+            lineHeight: 0,
+          }}
+        >
+          {kindGlyph}
+        </span>
+        <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 1 }}>
+          {ownsInput ? (
+            <input
+              autoFocus
+              defaultValue={a.name}
+              onBlur={(e) => {
+                // Escape requested a cancel → consume the flag and discard without committing.
+                if (cancelNextBlur.current) {
+                  cancelNextBlur.current = false;
+                  setEditing(null);
+                  return;
+                }
+                // Only commit a real change. A no-op blur (double-click to edit, then click away
+                // without typing) must NOT pin the name or wipe the auto-name variants.
+                const next = e.target.value;
+                if (next.trim() && next !== a.name) renameAgent(project.id, a.id, next);
+                setEditing(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                if (e.key === "Escape") {
+                  // Mark cancel BEFORE blurring so the resulting onBlur discards the edit.
+                  cancelNextBlur.current = true;
+                  (e.target as HTMLInputElement).blur();
+                }
+              }}
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                width: "100%",
+                background: C.deepForest,
+                color: C.cream,
+                border: `1px solid ${C.teal}`,
+                borderRadius: 4,
+                padding: "2px 6px",
+                fontSize: 13,
+                outline: "none",
+                minWidth: 0,
+                boxSizing: "border-box",
+              }}
+            />
+          ) : (
+            <div style={{ display: "flex", alignItems: "center", gap: 4, minWidth: 0 }}>
+              {expanded ? (
+                // Expanded: the FULL name, no ellipsis — the overlay grows to fit it.
+                <span
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    setEditing(a.id);
+                  }}
+                  title="Double-click to rename"
+                  style={{
+                    color: statusColor,
+                    fontSize: 13,
+                    fontWeight: isActive ? FONT_WEIGHT.semibold : FONT_WEIGHT.medium,
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {fullName}
+                </span>
+              ) : (
+                // Collapsed: width-fitted name. Its own hover card is suppressed — the row's
+                // slide-out reveals the full name instead of a separate floating tooltip.
+                <FittedAgentName
+                  variants={a.autoNameVariants}
+                  name={a.name}
+                  color={statusColor}
+                  active={isActive}
+                  suppressTooltip
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    setEditing(a.id);
+                  }}
+                />
+              )}
+              {a.namePinned && (
+                // Pinned = a name the user set by hand; it won't auto-change. Click to unpin.
+                <span
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setNamePinned(project.id, a.id, false);
+                  }}
+                  title="Name pinned — won't auto-rename. Click to unpin."
+                  style={{ display: "inline-flex", flex: "0 0 auto", cursor: "pointer", lineHeight: 1, color: C.muted }}
+                >
+                  <TbPinFilled size={11} />
+                </span>
+              )}
+            </div>
+          )}
+          {/* The working directory — only on hover (expanded), below the name. Click it to reveal
+              the folder in Finder (underlines on hover to signal it's clickable). */}
+          {expanded && (
+            <PathReveal path={a.worktreePath ?? project.rootPath} />
+          )}
+        </div>
+        {/* Right cluster: the behind/ahead pill (which also IS the catch-up / land action), close.
+            The old separate ⬆ Land button is gone — the green pill lands; the red pill rebases. */}
+        {showPill &&
+          (pillBehind ? (
+            // BEHIND (red): click rebases this branch onto main — catches YOU up to main. Gated on
+            // the agent not actively writing (a rebase under a live PTY would race).
+            <button
+              disabled={busy}
+              onClick={handleRefresh}
+              title={
+                busy
+                  ? `Pause the agent first — ${behind} behind ${baseLabel}`
+                  : `${behind} behind ${baseLabel} — click to rebase onto ${baseLabel} (catch up)`
+              }
+              style={{
+                ...pillBase,
+                color: pillColor,
+                background: `${pillColor}22`,
+                border: `1px solid ${pillColor}`,
+                cursor: busy ? "not-allowed" : "pointer",
+                opacity: busy ? 0.6 : 1,
+              }}
+            >
+              {pillText}
+            </button>
+          ) : (
+            // AHEAD (green): click merges this branch into main — catches MAIN up to you (the old
+            // Land action). A worker lands into its orchestrator; a build agent into the default.
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onLand();
+              }}
+              title={
+                a.kind === "worker"
+                  ? `${ahead} ahead — click to merge into this worker's orchestrator branch`
+                  : `${ahead} ahead of ${baseLabel} — click to merge into ${baseLabel} (catch main up)`
+              }
+              style={{
+                ...pillBase,
+                color: pillColor,
+                background: `${pillColor}22`,
+                border: `1px solid ${pillColor}`,
+                cursor: "pointer",
+              }}
+            >
+              {pillText}
+            </button>
+          ))}
+        <CloseAgentButton onClose={onClose} />
+      </div>
+      {/* Thin progress line across the bottom of the row — fills + warms cyan→blue as the work
+          advances Uncommitted → Merged. The status label only appears when expanded. */}
+      {trackerStage && <WorkflowLine stage={trackerStage} expanded={expanded} labelPrefix={labelPrefix} />}
+    </>
+  );
+
+  const maxW = rect ? Math.max(220, window.innerWidth - rect.left - 12) : 480;
+  // Show the slide-out only while hovering AND not renaming. Suppressing it during a rename means
+  // the in-flow row is the SOLE owner of the rename <input> — the field never swaps mount points on
+  // a hover change, so a trailing unmount-blur can't silently commit a half-typed name.
+  const showOverlay = hover && !editing;
+
+  return (
+    <>
+      <div
+        ref={rowRef}
+        onClick={onSelect}
+        onMouseEnter={show}
+        onMouseLeave={hide}
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 4,
+          padding: "8px 10px",
+          marginLeft: depth * 16,
+          borderRadius: 8,
+          cursor: "pointer",
+          background: isActive ? CHAT_USER_BUBBLE : "transparent",
+          marginBottom: 2,
+          // Hide the collapsed content while the overlay stands in for it, so the name underneath
+          // doesn't "show through" the slide-out at the row's left edge. While renaming the overlay
+          // is suppressed, so the in-flow row (and its input) stays visible.
+          visibility: showOverlay ? "hidden" : "visible",
+        }}
+      >
+        {RowBody({ expanded: false, ownsInput: editing })}
+      </div>
+      {showOverlay &&
+        rect &&
+        createPortal(
+          <div
+            onClick={onSelect}
+            onMouseEnter={show}
+            onMouseLeave={hide}
+            style={{
+              position: "fixed",
+              left: rect.left,
+              top: rect.top,
+              zIndex: 50,
+              minWidth: rect.width,
+              maxWidth: maxW,
+              width: "max-content",
+              boxSizing: "border-box",
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+              padding: "8px 10px",
+              borderRadius: 8,
+              cursor: "pointer",
+              background: isActive ? CHAT_USER_BUBBLE : C.deepForest,
+              border: `1px solid ${C.forest}`,
+              boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+              animation: "-slide 140ms ease-out",
+            }}
+          >
+            {RowBody({ expanded: true, ownsInput: false })}
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+}
+
+/** The agent's working-directory path in the expanded row. Click to reveal the folder in Finder
+ *  (Tauri opener `revealItemInDir`); underlines on hover so it reads as clickable. */
+function PathReveal({ path }: { path: string }) {
+  const [hover, setHover] = useState(false);
+  return (
+    <span
+      onClick={(e) => {
+        e.stopPropagation(); // don't also select the agent
+        revealItemInDir(path).catch((err) => console.error("reveal in Finder failed:", err));
+      }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      title="Click to reveal this folder in Finder"
+      style={{
+        color: hover ? C.accentInk : C.muted,
+        fontSize: 11,
+        fontFamily: FONT.mono,
+        whiteSpace: "nowrap",
+        marginTop: 1,
+        cursor: "pointer",
+        textDecoration: hover ? "underline" : "none",
+        width: "fit-content",
+      }}
+    >
+      {path}
+    </span>
   );
 }
 

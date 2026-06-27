@@ -31,6 +31,7 @@ export function FittedAgentName({
   color,
   active,
   onDoubleClick,
+  suppressTooltip = false,
 }: {
   variants: AgentNameVariants | null;
   /** Canonical fallback name (also used until the first width measurement lands). */
@@ -39,6 +40,9 @@ export function FittedAgentName({
   /** Selected row uses the semibold weight — must match for an accurate measurement. */
   active: boolean;
   onDoubleClick: (e: ReactMouseEvent) => void;
+  /** Don't pop the "Full name:" card — the caller reveals the full name another way (e.g. the
+   *  sidebar row's hover slide-out), so a second floating card would be redundant. */
+  suppressTooltip?: boolean;
 }) {
   const wrapRef = useRef<HTMLSpanElement>(null);
   const [avail, setAvail] = useState<number | null>(null);
@@ -66,7 +70,7 @@ export function FittedAgentName({
 
   // Reveal the long form on hover only when it says more than what's currently displayed —
   // a fully-shown name in a wide column gets no redundant tooltip.
-  const showTooltip = !!variants && !!variants.long && variants.long !== display;
+  const showTooltip = !suppressTooltip && !!variants && !!variants.long && variants.long !== display;
 
   // The ResizeObserver watches THIS outer span, which is always rendered (never reparents),
   // so the observer can't go stale. flex:1 + minWidth:0 makes its content box exactly the

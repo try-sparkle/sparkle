@@ -18,6 +18,7 @@ export interface WorkflowStageMeta {
   label: string; // full readout, e.g. "Pull Request"
   short: string; // compact label for tight columns
   color: string; // the stage's lit color once reached
+  detail: string; // one-line explainer shown in the expanded (hovered) row
 }
 
 // The path to green. Colors are chosen so the bar visibly "warms up" toward done: amber while
@@ -26,11 +27,11 @@ export interface WorkflowStageMeta {
 // reached render grayed out (see WorkflowTracker); reached stages light up in their own color.
 // (These are literal brand hex from @sparkle/ui — safe to read in tests, no CSS var() here.)
 export const WORKFLOW_STAGES: readonly WorkflowStageMeta[] = [
-  { id: "uncommitted", label: "Uncommitted", short: "Uncommitted", color: C.amber }, // orange — edits in the tree, not yet saved
-  { id: "committed", label: "Committed", short: "Committed", color: C.accent }, //       cyan — commits exist on the branch
-  { id: "pull_request", label: "Pull Request", short: "PR", color: C.violet }, //        violet — a PR is open for review
-  { id: "main", label: "On Main", short: "Main", color: C.teal }, //                     blue — landed on the integration branch
-  { id: "merged", label: "Merged", short: "Merged", color: C.success }, //               green — done, the end of the path
+  { id: "uncommitted", label: "Uncommitted", short: "Uncommitted", color: C.amber, detail: "Uncommitted: if you close this agent now, you'll lose this work." }, // orange — edits in the tree, not yet saved
+  { id: "committed", label: "Committed", short: "Committed", color: C.accent, detail: "Committed: saved to this agent's branch — closing keeps the branch." }, //       cyan — commits exist on the branch
+  { id: "pull_request", label: "Pull Request", short: "PR", color: C.violet, detail: "Pull Request: a PR is open for review on GitHub." }, //        violet — a PR is open for review
+  { id: "main", label: "On Main", short: "Main", color: C.teal, detail: "On Main: merged into the integration branch (main)." }, //                     blue — landed on the integration branch
+  { id: "merged", label: "Merged", short: "Merged", color: C.success, detail: "Merged: done — this work has shipped to main." }, //               green — done, the end of the path
 ] as const;
 
 export function stageIndex(id: WorkflowStageId): number {
@@ -173,6 +174,45 @@ export function rollupStages(stages: WorkflowStageId[]): WorkflowRollup | null {
     total: stages.length,
     counts,
   };
+}
+
+// ── Progress-line palette (the thin line that replaced the chevrons) ─────────────────────────
+// The line reproduces the sparkle.ai wordmark's gradient: the cyan of the "S" on the left
+// (#34E0F0) warming to the blue of the "i" (its dotted "eye") on the right (#3E7BFF). It fills
+// left→right as work advances through the five stages, so a glance reads "how far toward merged"
+// from BOTH the fill length and its color deepening from cyan to blue. These two endpoints are the
+// literal stops of the logo's `linearGradient` (see public/sparkle-logo.svg).
+export const LINE_FROM = "#34e0f0"; // the "S" — cyan, left end of the logo gradient
+export const LINE_TO = "#3e7bff"; //   the "i"/eye — blue, right end of the logo gradient
+
+// Fraction of the bar filled at a given stage. Uncommitted already shows a short cyan stub (1/5)
+// so a brand-new branch reads as "started", and Merged fills the whole bar (5/5).
+export function stageFraction(stage: WorkflowStageId): number {
+  return (stageIndex(stage) + 1) / WORKFLOW_STAGES.length;
+}
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } {
+  const n = parseInt(hex.slice(1), 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+function rgbToHex(r: number, g: number, b: number): string {
+  return "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
+}
+
+// Linear-interpolate the logo gradient at t∈[0,1]. Used for BOTH the fill's right edge and the
+// status label, so the readout is exactly the color the line has reached at that stage.
+export function lineColorAt(t: number): string {
+  const clamp = Math.max(0, Math.min(1, t));
+  const from = hexToRgb(LINE_FROM);
+  const to = hexToRgb(LINE_TO);
+  const mix = (a: number, b: number) => Math.round(a + (b - a) * clamp);
+  return rgbToHex(mix(from.r, to.r), mix(from.g, to.g), mix(from.b, to.b));
+}
+
+// The color the line has reached at a given stage (its rightmost filled pixel): Uncommitted sits
+// near the cyan "S"; Merged lands on the blue "i".
+export function stageLineColor(stage: WorkflowStageId): string {
+  return lineColorAt(stageFraction(stage));
 }
 
 // Most-represented stage; ties break to the EARLIEST stage (we only replace on a strictly greater

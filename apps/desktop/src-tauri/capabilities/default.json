@@ -23,6 +23,7 @@
         { "url": "https://www.google.com/*" }
       ]
     },
+    "opener:allow-reveal-item-in-dir",
     {
       "identifier": "http:default",
       "allow": [{ "url": "https://api.storytell.ai/*" }]
