@@ -24,8 +24,17 @@ export const CHIEF_SYNC_DEBOUNCE_MS = 10_000;
 // sync throws ("Load failed"); without this a dead endpoint gets retried every debounced run for the
 // app's lifetime. After a failure we skip this project's sync until an exponential, capped cooldown
 // elapses; the next successful round-trip clears it.
+//
+// : even with the cap the sync retried forever (~one log line per 5 min per project ≈
+// 1.2k/day across the open projects) and the user got no signal their Think library was stale. So
+// after SYNC_GIVE_UP_FAILS consecutive failures we GIVE UP the tight retry loop and drop to a quiet
+// hourly re-probe (SYNC_GIVEUP_COOLDOWN_MS) — enough to self-heal when the endpoint returns, without
+// hammering it or the log. Logging is bounded to the first failure and the give-up transition; the
+// slow re-probes stay silent.
 const SYNC_BACKOFF_BASE_MS = 5_000;
 const SYNC_BACKOFF_CAP_MS = 5 * 60_000;
+const SYNC_GIVE_UP_FAILS = 10; // ~20 min of escalating retries (incl. a few at the 5-min cap)…
+const SYNC_GIVEUP_COOLDOWN_MS = 60 * 60_000; // …then back off to a quiet hourly re-probe.
 const syncBackoff = new Map<string, { until: number; fails: number }>();
 
 /** Test-only: clear the Chief-sync backoff state between cases. */
@@ -96,11 +105,28 @@ export async function runChiefSync(projectId: string, agentId: string): Promise<
     }
   } catch (e) {
     // Back off so we don't retry a dead endpoint every run; the un-persisted ledger is reattempted
-    // once the cooldown elapses.
+    // once the cooldown elapses. After SYNC_GIVE_UP_FAILS in a row, give up the tight loop and drop
+    // to a quiet hourly re-probe ().
+    // `fails` intentionally keeps climbing past SYNC_GIVE_UP_FAILS during a long outage: the
+    // give-up log keys on the exact `=== SYNC_GIVE_UP_FAILS` transition, so it fires once and stays
+    // quiet thereafter. (A success deletes the entry below, resetting the count to 0.)
     const fails = (syncBackoff.get(projectId)?.fails ?? 0) + 1;
-    const delay = Math.min(SYNC_BACKOFF_BASE_MS * 2 ** (fails - 1), SYNC_BACKOFF_CAP_MS);
+    const delay =
+      fails >= SYNC_GIVE_UP_FAILS
+        ? SYNC_GIVEUP_COOLDOWN_MS
+        : Math.min(SYNC_BACKOFF_BASE_MS * 2 ** (fails - 1), SYNC_BACKOFF_CAP_MS);
     syncBackoff.set(projectId, { until: Date.now() + delay, fails });
-    console.debug("chief project sync failed for", projectId, `(backoff ${delay}ms)`, e);
+    // Bound the log: emit only on the first failure (the signal) and the give-up transition, not on
+    // every silent retry in between — that per-run flood is the whole bug ().
+    if (fails === 1) {
+      console.debug("chief project sync failed for", projectId, "— backing off", e);
+    } else if (fails === SYNC_GIVE_UP_FAILS) {
+      console.debug(
+        "chief project sync giving up for",
+        projectId,
+        `after ${fails} consecutive failures; dropping to hourly re-probe`,
+      );
+    }
   } finally {
     syncingProjects.delete(projectId);
   }

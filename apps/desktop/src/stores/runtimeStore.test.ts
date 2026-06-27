@@ -255,6 +255,42 @@ describe("runChiefSync — store glue ()", () => {
     }
   });
 
+  it("gives up after repeated failures and drops to a quiet hourly re-probe ()", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    runtime.__resetChiefSyncBackoff();
+    syncProjectMarkdown.mockRejectedValue(new TypeError("Load failed"));
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    vi.useFakeTimers();
+    try {
+      // Drive 10 consecutive failures. Each retry needs the prior cooldown to elapse first; the
+      // backoff caps at 5 min, so advancing 5 min between runs guarantees every attempt fires.
+      for (let i = 0; i < 10; i++) {
+        await runtime.runChiefSync(projectId, agentId);
+        vi.advanceTimersByTime(5 * 60_000);
+      }
+      expect(syncProjectMarkdown).toHaveBeenCalledTimes(10);
+
+      // Having given up, the next run is now in the HOUR-long cooldown: 5 min later it stays quiet.
+      await runtime.runChiefSync(projectId, agentId);
+      expect(syncProjectMarkdown).toHaveBeenCalledTimes(10);
+
+      // Past the hour it re-probes exactly once (self-healing if the endpoint recovers).
+      vi.advanceTimersByTime(60 * 60_000);
+      await runtime.runChiefSync(projectId, agentId);
+      expect(syncProjectMarkdown).toHaveBeenCalledTimes(11);
+
+      // Log volume is bounded: one line on the first failure, one on the give-up transition — not
+      // one per attempt (the flood this fixes).
+      const syncLogs = debug.mock.calls.filter(
+        (c) => typeof c[0] === "string" && c[0].includes("chief project sync"),
+      );
+      expect(syncLogs).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+      debug.mockRestore();
+    }
+  });
+
   it("falls back to a workflow agent's worktree when triggered via a Think or Shell agent's id", async () => {
     const { runtime, settings, projects } = await freshModules();
     settings.useSettingsStore.getState().setChiefPat("pat_x");
