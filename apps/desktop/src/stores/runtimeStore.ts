@@ -10,21 +10,20 @@ import type { BranchStatus } from "../services/branchStatus";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { agentBranchStatus, agentWorkflowState } from "../services/branchStatus";
 import { deriveLiveStage, stageIndex } from "../engine/workflowStage";
-import { syncAgentMarkdown } from "../services/chiefSync";
+import { syncProjectMarkdown } from "../services/chiefSync";
 import { useSettingsStore, effectiveChiefPat } from "./settingsStore";
 import { useProjectStore } from "./projectStore";
 
-// Agents with a Chief markdown sync currently in flight. The poll fires `syncMarkdownToChief`
-// unawaited on every tick, so without this guard two overlapping ticks would both read the same
-// watermark, re-run the same diff, and — when no Chief project is linked yet — both call
-// ensureChiefProject, racing to create two duplicate projects. One sync per agent at a time.
-const syncingAgents = new Set<string>();
+/** Trailing-debounce window per project. The branch-status poll fires often (mount + the ~30s
+ *  connectivity probe); we coalesce those into one sync after a quiet window so a burst of commits
+ *  uploads once, not once-per-commit. Content-hash dedup in syncProjectMarkdown makes an unchanged
+ *  run a no-op regardless. */
+export const CHIEF_SYNC_DEBOUNCE_MS = 10_000;
 
-// Per-agent failure backoff (). When the Chief endpoint is unreachable the sync
-// throws ("Load failed") on every poll tick; the watermark stays un-advanced and the next tick
-// retries immediately, so a dead endpoint gets hammered every poll for the app's lifetime (and
-// floods the log). After a failure we skip this agent's sync until an exponential, capped
-// cooldown elapses; the next successful round-trip clears it. The happy path is unaffected.
+// Per-project failure backoff (, re-keyed from per-agent). When Chief is unreachable the
+// sync throws ("Load failed"); without this a dead endpoint gets retried every debounced run for the
+// app's lifetime. After a failure we skip this project's sync until an exponential, capped cooldown
+// elapses; the next successful round-trip clears it.
 const SYNC_BACKOFF_BASE_MS = 5_000;
 const SYNC_BACKOFF_CAP_MS = 5 * 60_000;
 const syncBackoff = new Map<string, { until: number; fails: number }>();
@@ -34,47 +33,76 @@ export function __resetChiefSyncBackoff(): void {
   syncBackoff.clear();
 }
 
-/** After a status poll, push any newly-committed markdown to the agent's Chief project so the
- *  Think agent stays current. Best-effort + store-driven: pulls PAT/project/marker from
- *  the stores, leaves the watermark un-advanced on failure so the next tick retries. Think
- *  agents are skipped — they have no worktree and produce no commits. Exported for testing. */
-export async function syncMarkdownToChief(projectId: string, agentId: string): Promise<void> {
+interface PendingSync {
+  timer: ReturnType<typeof setTimeout>;
+  agentId: string;
+}
+const pendingByProject = new Map<string, PendingSync>();
+// One sync per project at a time. Project-level (not per-agent) because asset identity is now
+// keyed by (Chief project, path) — two agents must not race to seed the same paths.
+const syncingProjects = new Set<string>();
+
+/** Schedule a debounced Chief sync for a project. Resets the timer on each call. */
+export function scheduleChiefSync(projectId: string, agentId: string): void {
+  const existing = pendingByProject.get(projectId);
+  if (existing) clearTimeout(existing.timer);
+  const timer = setTimeout(() => {
+    pendingByProject.delete(projectId);
+    void runChiefSync(projectId, agentId);
+  }, CHIEF_SYNC_DEBOUNCE_MS);
+  pendingByProject.set(projectId, { timer, agentId });
+}
+
+/** Push the project's current markdown to its Chief library (current-state model). Best-effort:
+ *  a Chief/git hiccup must not break the UI, and an un-persisted ledger simply retries next run. */
+export async function runChiefSync(projectId: string, agentId: string): Promise<void> {
   const settings = useSettingsStore.getState();
   const pat = effectiveChiefPat(settings.chiefPat, settings.runtimeChiefPat);
   if (!pat) return;
   const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
-  const agent = project?.agents.find((a) => a.id === agentId);
-  if (!project || !agent || agent.kind === "think") return;
-  if (syncingAgents.has(agentId)) return; // a sync for this agent is already running
-  const backoff = syncBackoff.get(agentId);
+  if (!project) return;
+  // Read markdown from a real worktree — prefer the triggering agent, else any workflow agent.
+  // think + shell agents have no worktree (mirrors the predicate in refreshWorkflowStage).
+  const hasWorktree = (kind: string) => kind !== "think" && kind !== "shell";
+  const triggering = project.agents.find((a) => a.id === agentId);
+  const syncAgent =
+    triggering && hasWorktree(triggering.kind)
+      ? triggering
+      : project.agents.find((a) => hasWorktree(a.kind));
+  if (!syncAgent) return;
+  if (syncingProjects.has(projectId)) return;
+  const backoff = syncBackoff.get(projectId);
   if (backoff && Date.now() < backoff.until) return; // cooling down after a recent failure
-  syncingAgents.add(agentId);
+  syncingProjects.add(projectId);
   try {
-    const res = await syncAgentMarkdown({
+    const chiefProjectId = settings.chiefProjectByProject[projectId];
+    const res = await syncProjectMarkdown({
       pat,
-      projectId,
+      sparkleProjectId: projectId,
       projectName: project.name,
-      agentId,
-      chiefProjectId: settings.chiefProjectByProject[projectId],
-      sinceSha: settings.chiefSyncByAgent[agentId],
+      agentId: syncAgent.id,
+      chiefProjectId,
+      docState: chiefProjectId ? (settings.chiefDocStateByProject[chiefProjectId] ?? {}) : {},
     });
-    syncBackoff.delete(agentId); // round-trip succeeded → endpoint healthy, reset backoff
+    syncBackoff.delete(projectId); // round-trip succeeded → endpoint healthy, reset backoff
     if (!res) return;
-    if (res.chiefProjectId && res.chiefProjectId !== settings.chiefProjectByProject[projectId]) {
+    if (res.chiefProjectId && res.chiefProjectId !== chiefProjectId) {
       settings.setChiefProject(projectId, res.chiefProjectId);
     }
-    if (res.headSha && res.headSha !== settings.chiefSyncByAgent[agentId]) {
-      settings.setChiefSync(agentId, res.headSha);
+    // Only persist the ledger when something actually changed — avoids a zustand state update +
+    // localStorage write on every poll cycle when the tree is unchanged.
+    if (res.chiefProjectId && (res.uploaded.length || res.deletedAssetIds.length)) {
+      settings.setChiefProjectDocState(res.chiefProjectId, res.docState);
     }
   } catch (e) {
-    // Best-effort: a Chief/git hiccup must not break the UI. Back off so we don't retry a dead
-    // endpoint every poll tick; the un-advanced marker is reattempted once the cooldown elapses.
-    const fails = (syncBackoff.get(agentId)?.fails ?? 0) + 1;
+    // Back off so we don't retry a dead endpoint every run; the un-persisted ledger is reattempted
+    // once the cooldown elapses.
+    const fails = (syncBackoff.get(projectId)?.fails ?? 0) + 1;
     const delay = Math.min(SYNC_BACKOFF_BASE_MS * 2 ** (fails - 1), SYNC_BACKOFF_CAP_MS);
-    syncBackoff.set(agentId, { until: Date.now() + delay, fails });
-    console.debug("chief markdown sync failed for", agentId, `(backoff ${delay}ms)`, e);
+    syncBackoff.set(projectId, { until: Date.now() + delay, fails });
+    console.debug("chief project sync failed for", projectId, `(backoff ${delay}ms)`, e);
   } finally {
-    syncingAgents.delete(agentId);
+    syncingProjects.delete(projectId);
   }
 }
 
@@ -152,8 +180,9 @@ export const useRuntimeStore = create<RuntimeState>()(
         try {
           const s = await agentBranchStatus(root, projectId, agentId, baseBranch);
           get().setBranchStatus(agentId, s);
-          // Piggyback the Chief markdown sync on the same signal a commit would refresh.
-          void syncMarkdownToChief(projectId, agentId);
+          // Piggyback the Chief markdown sync on the same signal a commit would refresh —
+          // debounced + coalesced per project.
+          scheduleChiefSync(projectId, agentId);
           // …and advance the workflow tracker from reachability + an opportunistic PR probe. Runs
           // after setBranchStatus so deriveLiveStage sees this tick's fresh ahead/dirty counts.
           void get().refreshWorkflowStage(root, projectId, agentId);

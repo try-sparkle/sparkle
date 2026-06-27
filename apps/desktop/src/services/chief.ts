@@ -177,37 +177,152 @@ export async function uploadAsset(
   return { assetId: created.asset_id, alreadyExists: false };
 }
 
+export interface ChiefAsset {
+  asset_id: string;
+  filename: string;
+  status?: string;
+}
+
+/** One page of the project's library. `data` is the documented array; `assets` accepted as a
+ *  fallback alias. Cursor lives in `last_id` + `has_more`. */
+export async function listAssets(
+  pat: string,
+  projectId: string,
+  opts: { afterId?: string; limit?: number } = {},
+): Promise<{ assets: ChiefAsset[]; hasMore: boolean; lastId?: string }> {
+  const params = new URLSearchParams();
+  params.set("limit", String(opts.limit ?? 100));
+  if (opts.afterId) params.set("after_id", opts.afterId);
+  const res = await httpFetch(`${BASE}/v1/assets?${params.toString()}`, {
+    headers: headers(pat, projectId),
+  });
+  const body = (await parseOrThrow(res)) as {
+    data?: ChiefAsset[];
+    assets?: ChiefAsset[];
+    has_more?: boolean;
+    last_id?: string;
+  };
+  return { assets: body.data ?? body.assets ?? [], hasMore: Boolean(body.has_more), lastId: body.last_id };
+}
+
+/** Every asset in the project, following the cursor to the end. */
+export async function listAllAssets(pat: string, projectId: string): Promise<ChiefAsset[]> {
+  const all: ChiefAsset[] = [];
+  let afterId: string | undefined;
+  const maxPages = 10_000; // safety bound against infinite loops (non-advancing cursor)
+  for (let page = 0; page < maxPages; page++) {
+    const result = await listAssets(pat, projectId, { afterId, limit: 100 });
+    all.push(...result.assets);
+    // No more data: stop
+    if (!result.hasMore) return all;
+    // has_more=true but no cursor: malformed response, error rather than silently truncate
+    if (!result.lastId) {
+      throw new ChiefError("Chief returned has_more=true but no last_id cursor");
+    }
+    // Non-advancing cursor: safety net to prevent infinite loops
+    if (result.lastId === afterId) {
+      throw new ChiefError(`Chief cursor did not advance (stuck at ${afterId})`);
+    }
+    afterId = result.lastId;
+  }
+  throw new ChiefError(`listAllAssets exceeded ${maxPages} pages (possible infinite loop)`);
+}
+
+/** Soft-delete an asset by id. 2xx (incl. 204 No Content) is success. */
+export async function deleteAsset(pat: string, projectId: string, assetId: string): Promise<void> {
+  const res = await httpFetch(`${BASE}/v1/assets/${assetId}`, {
+    method: "DELETE",
+    headers: headers(pat, projectId),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new ChiefError(text || `asset delete failed (${res.status})`, res.status);
+  }
+}
+
+/** One-time cleanup: delete EVERY asset in a Chief project (used to clear the legacy per-commit
+ *  flood before the current-state sync takes over). Returns the number deleted. */
+export async function wipeChiefLibrary(pat: string, chiefProjectId: string): Promise<number> {
+  const assets = await listAllAssets(pat, chiefProjectId);
+  let deleted = 0;
+  for (const a of assets) {
+    await deleteAsset(pat, chiefProjectId, a.asset_id);
+    deleted += 1;
+  }
+  return deleted;
+}
+
 export interface StartChatResult {
   chat_id: string;
   message_id: string;
   created_at?: string;
 }
 
-/** Start a new chat scoped to `projectId`. Async: returns ids to poll. */
+/** Restrict a chat turn's retrieval to specific library entities (any subset; omitted = whole
+ *  project). All ids are sent through verbatim under their snake_case keys. */
+export interface ChiefScope {
+  asset_ids?: string[];
+  label_ids?: string[];
+  concept_ids?: string[];
+  project_ids?: string[];
+  view_ids?: string[];
+  chat_ids?: string[];
+}
+
+/** Per-turn knobs for `startChat` / `sendMessage`. All optional; omitted fields are left off the
+ *  request body entirely (Chief applies its own defaults) rather than sent as null. `skills` are
+ *  skill NAMES (see `ensureSkill`). */
+export interface ChatOptions {
+  intelligence?: "auto" | "fast" | "expert" | "research";
+  provider?: "automatic" | "anthropic" | "openai" | "google";
+  publicData?: boolean;
+  skills?: string[];
+  scope?: ChiefScope;
+}
+
+/** Map our camelCase `ChatOptions` onto Chief's snake_case body fields, dropping anything
+ *  undefined so we never transmit explicit nulls (which Chief would treat differently from
+ *  "unset"). Returned object is spread into the request body alongside `prompt`. */
+function mapChatOptions(opts?: ChatOptions): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  if (!opts) return body;
+  if (opts.intelligence !== undefined) body.intelligence = opts.intelligence;
+  if (opts.provider !== undefined) body.provider = opts.provider;
+  if (opts.publicData !== undefined) body.public_data = opts.publicData;
+  if (opts.skills !== undefined) body.skills = opts.skills;
+  if (opts.scope !== undefined) body.scope = opts.scope;
+  return body;
+}
+
+/** Start a new chat scoped to `projectId`. Async: returns ids to poll. `opts` carries optional
+ *  per-turn knobs (intelligence/provider/public data/skills/scope). */
 export async function startChat(
   pat: string,
   projectId: string,
   prompt: string,
+  opts?: ChatOptions,
 ): Promise<StartChatResult> {
   const res = await httpFetch(`${BASE}/v1/chats`, {
     method: "POST",
     headers: headers(pat, projectId),
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({ prompt, ...mapChatOptions(opts) }),
   });
   return (await parseOrThrow(res)) as StartChatResult;
 }
 
-/** Append a follow-up turn to an existing chat. Async: returns the new message id to poll. */
+/** Append a follow-up turn to an existing chat. Async: returns the new message id to poll.
+ *  `opts` carries the same optional per-turn knobs as `startChat`. */
 export async function sendMessage(
   pat: string,
   projectId: string,
   chatId: string,
   prompt: string,
+  opts?: ChatOptions,
 ): Promise<{ message_id: string }> {
   const res = await httpFetch(`${BASE}/v1/chats/${chatId}/messages`, {
     method: "POST",
     headers: headers(pat, projectId),
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({ prompt, ...mapChatOptions(opts) }),
   });
   return (await parseOrThrow(res)) as { message_id: string };
 }
@@ -302,4 +417,176 @@ export async function ensureChiefProject(
   } finally {
     inflightEnsure.delete(key);
   }
+}
+
+// --- Memories (project-scoped long-term facts) ------------------------------------------
+// POST/GET /v1/memories, scoped by X-Project-Id. A memory is a durable note Chief carries into
+// future chats (identity/preferences/facts/etc.), separate from library assets.
+
+/** What a memory is "about" — drives how Chief weighs/recalls it. */
+export type MemoryCategory = "identity" | "preference" | "fact" | "context" | "instruction";
+
+export interface ChiefMemory {
+  memory_id?: string;
+  content: string;
+  category?: MemoryCategory;
+  /** Relative weight (server-defined scale); higher = recalled more eagerly. */
+  importance?: number;
+}
+
+/** Create a project-scoped memory. `content` is required; category/importance are optional. */
+export async function createMemory(
+  pat: string,
+  projectId: string,
+  mem: { content: string; category?: MemoryCategory; importance?: number },
+): Promise<ChiefMemory> {
+  const res = await httpFetch(`${BASE}/v1/memories`, {
+    method: "POST",
+    headers: headers(pat, projectId),
+    body: JSON.stringify({
+      content: mem.content,
+      category: mem.category,
+      importance: mem.importance,
+    }),
+  });
+  return (await parseOrThrow(res)) as ChiefMemory;
+}
+
+/** List the project's memories. Tolerates `{data}` / `{memories}` / a bare array, like
+ *  `listProjects`. */
+export async function listMemories(pat: string, projectId: string): Promise<ChiefMemory[]> {
+  const res = await httpFetch(`${BASE}/v1/memories`, { headers: headers(pat, projectId) });
+  const body = (await parseOrThrow(res)) as
+    | { data?: ChiefMemory[]; memories?: ChiefMemory[] }
+    | ChiefMemory[];
+  if (Array.isArray(body)) return body;
+  return body.data ?? body.memories ?? [];
+}
+
+// --- Skills (reusable instructions / personas) ------------------------------------------
+// POST/GET /v1/skills. A skill bundles instructions Chief can apply to a chat turn (referenced
+// by NAME in `ChatOptions.skills`). `category` distinguishes a task skill from a persona;
+// `scope` whether it lives on the project or the user.
+
+export interface ChiefSkill {
+  skill_id?: string;
+  name: string;
+  instructions?: string;
+  category?: "skill" | "persona";
+  scope?: "project" | "user";
+}
+
+/** Create a skill. `name` + `instructions` are required; category/scope default server-side. */
+export async function createSkill(
+  pat: string,
+  projectId: string,
+  skill: {
+    name: string;
+    instructions: string;
+    category?: "skill" | "persona";
+    scope?: "project" | "user";
+  },
+): Promise<ChiefSkill> {
+  const res = await httpFetch(`${BASE}/v1/skills`, {
+    method: "POST",
+    headers: headers(pat, projectId),
+    body: JSON.stringify({
+      name: skill.name,
+      instructions: skill.instructions,
+      category: skill.category,
+      scope: skill.scope,
+    }),
+  });
+  return (await parseOrThrow(res)) as ChiefSkill;
+}
+
+/** List the project's skills. Tolerates `{data}` / `{skills}` / a bare array, like
+ *  `listProjects`. */
+export async function listSkills(pat: string, projectId: string): Promise<ChiefSkill[]> {
+  const res = await httpFetch(`${BASE}/v1/skills`, { headers: headers(pat, projectId) });
+  const body = (await parseOrThrow(res)) as
+    | { data?: ChiefSkill[]; skills?: ChiefSkill[] }
+    | ChiefSkill[];
+  if (Array.isArray(body)) return body;
+  return body.data ?? body.skills ?? [];
+}
+
+// Concurrent ensureSkill calls for the SAME (pat, projectId, name) share one in-flight promise —
+// same race as ensureChiefProject: the list-then-create is non-atomic, so two callers could each
+// list, miss, and create a duplicate skill. Keyed by pat+projectId+name; cleared when settled.
+const inflightEnsureSkill = new Map<string, Promise<string>>();
+
+/**
+ * Ensure a skill named `name` exists in the project, returning the NAME to feed into
+ * `ChatOptions.skills` (chat references skills by name, not id). Reuses an existing skill with
+ * the same name, else creates it. Mirrors `ensureChiefProject`: best-effort list-then-create
+ * with in-flight dedup so simultaneous callers don't race to create duplicates.
+ */
+export async function ensureSkill(
+  pat: string,
+  projectId: string,
+  name: string,
+  instructions: string,
+  category?: "skill" | "persona",
+): Promise<string> {
+  const key = `${pat} ${projectId} ${name}`;
+  const pending = inflightEnsureSkill.get(key);
+  if (pending) return pending;
+
+  const run = (async () => {
+    try {
+      const skills = await listSkills(pat, projectId);
+      const match = skills.find((s) => s.name === name);
+      if (match) return match.name;
+    } catch {
+      // listing is best-effort; fall through to create
+    }
+    const created = await createSkill(pat, projectId, { name, instructions, category });
+    return created.name ?? name;
+  })();
+  inflightEnsureSkill.set(key, run);
+  try {
+    return await run;
+  } finally {
+    inflightEnsureSkill.delete(key);
+  }
+}
+
+// --- Labels (taxonomy tags on assets) ---------------------------------------------------
+// POST /v1/labels mints a label; POST /v1/assets/{id}/labels attaches one by name (auto-creating
+// it if absent), so attach is idempotent and the only call most callers need.
+
+/** Attach label `name` to an asset, creating the label if it doesn't yet exist. Idempotent:
+ *  re-attaching the same name is a no-op server-side. Any 2xx (incl. 204) is success. */
+export async function attachLabel(
+  pat: string,
+  projectId: string,
+  assetId: string,
+  name: string,
+): Promise<void> {
+  const res = await httpFetch(`${BASE}/v1/assets/${assetId}/labels`, {
+    method: "POST",
+    headers: headers(pat, projectId),
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new ChiefError(text || `label attach failed (${res.status})`, res.status);
+  }
+}
+
+/** Explicitly create a label (when you need its id/styling up front, rather than the auto-create
+ *  that `attachLabel` triggers). Optional `color`/`icon` style it in the Chief UI. */
+export async function createLabel(
+  pat: string,
+  projectId: string,
+  name: string,
+  opts: { color?: string; icon?: string } = {},
+): Promise<{ label_id?: string; name: string }> {
+  const res = await httpFetch(`${BASE}/v1/labels`, {
+    method: "POST",
+    headers: headers(pat, projectId),
+    body: JSON.stringify({ name, color: opts.color, icon: opts.icon }),
+  });
+  return (await parseOrThrow(res)) as { label_id?: string; name: string };
 }

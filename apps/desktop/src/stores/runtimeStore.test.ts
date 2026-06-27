@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 // zustand's persist middleware needs a Web Storage. Node/vitest has none, so we
 // install a minimal in-memory one and re-import the store fresh per test (the
@@ -28,9 +28,9 @@ vi.mock("../services/branchStatus", () => ({
 }));
 
 // Mocked Chief sync so the store-glue tests don't touch Tauri/Chief.
-const syncAgentMarkdown = vi.fn();
+const syncProjectMarkdown = vi.fn();
 vi.mock("../services/chiefSync", () => ({
-  syncAgentMarkdown: (...a: unknown[]) => syncAgentMarkdown(...a),
+  syncProjectMarkdown: (...a: unknown[]) => syncProjectMarkdown(...a),
   MARKDOWN_DIRS: ["PRD", "docs/superpowers/specs"],
 }));
 
@@ -41,7 +41,7 @@ async function freshStore() {
 }
 
 // Fresh runtime + settings + project stores from the SAME post-reset module graph, so state set
-// on these instances is the state `syncMarkdownToChief` reads.
+// on these instances is the state `runChiefSync` reads.
 async function freshModules() {
   vi.resetModules();
   const runtime = await import("./runtimeStore");
@@ -52,7 +52,7 @@ async function freshModules() {
 
 beforeEach(() => {
   agentBranchStatus.mockReset();
-  syncAgentMarkdown.mockReset();
+  syncProjectMarkdown.mockReset();
   (globalThis as unknown as { localStorage: Storage }).localStorage =
     new MemoryStorage() as unknown as Storage;
 });
@@ -129,93 +129,178 @@ describe("runtimeStore branch status", () => {
   });
 });
 
-describe("syncMarkdownToChief — store glue ()", () => {
-  // Seed a connected PAT + a project with one agent of the given kind; returns ids + handles.
-  async function setup(kind: "build" | "think") {
-    const { runtime, settings, projects } = await freshModules();
-    settings.useSettingsStore.getState().setChiefPat("pat_x");
-    const projectId = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
-    const agentId = projects.useProjectStore.getState().addAgent(projectId, { kind });
-    return { runtime, settings, projectId, agentId };
-  }
+// Seed a connected PAT + a project with one agent of the given kind; returns ids + handles.
+async function setup(kind: "build" | "think") {
+  const { runtime, settings, projects } = await freshModules();
+  settings.useSettingsStore.getState().setChiefPat("pat_x");
+  const projectId = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
+  const agentId = projects.useProjectStore.getState().addAgent(projectId, { kind });
+  return { runtime, settings, projectId, agentId };
+}
+
+describe("scheduleChiefSync — debounced per-project sync", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    syncProjectMarkdown.mockReset();
+    syncProjectMarkdown.mockResolvedValue({
+      chiefProjectId: "project_known",
+      docState: {},
+      uploaded: [],
+      deletedAssetIds: [],
+    });
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("coalesces rapid schedules into a single sync after the debounce window", async () => {
+    const { runtime: mod, projectId, agentId } = await setup("build");
+    mod.scheduleChiefSync(projectId, agentId);
+    mod.scheduleChiefSync(projectId, agentId);
+    mod.scheduleChiefSync(projectId, agentId);
+    expect(syncProjectMarkdown).not.toHaveBeenCalled(); // nothing yet — still within the window
+    await vi.advanceTimersByTimeAsync(mod.CHIEF_SYNC_DEBOUNCE_MS + 1);
+    expect(syncProjectMarkdown).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("runChiefSync — store glue ()", () => {
 
   it("skips Think agents (they have no worktree / commits)", async () => {
     const { runtime, projectId, agentId } = await setup("think");
-    await runtime.syncMarkdownToChief(projectId, agentId);
-    expect(syncAgentMarkdown).not.toHaveBeenCalled();
+    await runtime.runChiefSync(projectId, agentId);
+    expect(syncProjectMarkdown).not.toHaveBeenCalled();
   });
 
   it("does nothing without a connected PAT", async () => {
     const { runtime, settings, projectId, agentId } = await setup("build");
     settings.useSettingsStore.setState({ chiefPat: "" });
-    await runtime.syncMarkdownToChief(projectId, agentId);
-    expect(syncAgentMarkdown).not.toHaveBeenCalled();
+    await runtime.runChiefSync(projectId, agentId);
+    expect(syncProjectMarkdown).not.toHaveBeenCalled();
   });
 
-  it("persists a newly-created Chief project id and advances the agent's watermark", async () => {
+  it("persists a newly-created Chief project id and persists the project doc-state ledger", async () => {
     const { runtime, settings, projectId, agentId } = await setup("build");
-    syncAgentMarkdown.mockResolvedValue({
-      headSha: "head1",
-      uploaded: ["PRD/main.md @ head1"],
+    syncProjectMarkdown.mockResolvedValue({
       chiefProjectId: "project_created",
+      docState: { "PRD/main.md": { hash: "h1", assetId: "asset_1" } },
+      uploaded: ["PRD/main.md"],
+      deletedAssetIds: [],
     });
 
-    await runtime.syncMarkdownToChief(projectId, agentId);
+    await runtime.runChiefSync(projectId, agentId);
 
     // Passed the stored marker (none yet) + project name through to the sync service.
-    expect(syncAgentMarkdown).toHaveBeenCalledWith(
+    expect(syncProjectMarkdown).toHaveBeenCalledWith(
       expect.objectContaining({ pat: "pat_x", projectName: "Sparkle-Desktop", agentId }),
     );
     expect(settings.useSettingsStore.getState().chiefProjectByProject[projectId]).toBe(
       "project_created",
     );
-    expect(settings.useSettingsStore.getState().chiefSyncByAgent[agentId]).toBe("head1");
+    expect(settings.useSettingsStore.getState().chiefDocStateByProject["project_created"]).toEqual({
+      "PRD/main.md": { hash: "h1", assetId: "asset_1" },
+    });
   });
 
-  it("runs only one sync per agent at a time (no create-create race)", async () => {
+  it("runs only one sync per project at a time (no create-create race)", async () => {
     const { runtime, projectId, agentId } = await setup("build");
     let release!: () => void;
-    syncAgentMarkdown.mockReturnValue(
+    syncProjectMarkdown.mockReturnValue(
       new Promise((resolve) => {
-        release = () => resolve({ headSha: "h", uploaded: [], chiefProjectId: "p" });
+        release = () =>
+          resolve({ chiefProjectId: "p", docState: {}, uploaded: [], deletedAssetIds: [] });
       }),
     );
 
-    const first = runtime.syncMarkdownToChief(projectId, agentId); // takes the lock, awaits
-    await runtime.syncMarkdownToChief(projectId, agentId); // sees in-flight, returns immediately
+    const first = runtime.runChiefSync(projectId, agentId); // takes the lock, awaits
+    await runtime.runChiefSync(projectId, agentId); // sees in-flight, returns immediately
 
-    expect(syncAgentMarkdown).toHaveBeenCalledTimes(1);
+    expect(syncProjectMarkdown).toHaveBeenCalledTimes(1);
     release();
     await first;
   });
 
-  it("backs off a failing endpoint, then retries after the cooldown and resets on success ()", async () => {
+  it("backs off a failing endpoint per project, retries after cooldown, resets on success ()", async () => {
     const { runtime, projectId, agentId } = await setup("build");
     runtime.__resetChiefSyncBackoff();
     vi.useFakeTimers();
     try {
-      // First tick: the endpoint is unreachable → throws, arming the backoff (base 5s).
-      syncAgentMarkdown.mockRejectedValueOnce(new TypeError("Load failed"));
-      await runtime.syncMarkdownToChief(projectId, agentId);
-      expect(syncAgentMarkdown).toHaveBeenCalledTimes(1);
+      syncProjectMarkdown.mockRejectedValueOnce(new TypeError("Load failed"));
+      await runtime.runChiefSync(projectId, agentId);
+      expect(syncProjectMarkdown).toHaveBeenCalledTimes(1);
 
-      // A tick well within the cooldown is skipped entirely — no second fetch at the dead endpoint.
-      vi.advanceTimersByTime(1_000);
-      await runtime.syncMarkdownToChief(projectId, agentId);
-      expect(syncAgentMarkdown).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(1_000); // within the 5s base cooldown → skipped
+      await runtime.runChiefSync(projectId, agentId);
+      expect(syncProjectMarkdown).toHaveBeenCalledTimes(1);
 
-      // Past the cooldown the sync is attempted again; this time it succeeds and clears the backoff.
-      vi.advanceTimersByTime(5_000);
-      syncAgentMarkdown.mockResolvedValueOnce({ headSha: "h", uploaded: [], chiefProjectId: "p" });
-      await runtime.syncMarkdownToChief(projectId, agentId);
-      expect(syncAgentMarkdown).toHaveBeenCalledTimes(2);
+      vi.advanceTimersByTime(5_000); // past cooldown → retried, succeeds, clears backoff
+      syncProjectMarkdown.mockResolvedValueOnce({
+        chiefProjectId: "p",
+        docState: {},
+        uploaded: [],
+        deletedAssetIds: [],
+      });
+      await runtime.runChiefSync(projectId, agentId);
+      expect(syncProjectMarkdown).toHaveBeenCalledTimes(2);
 
-      // Backoff was reset by the success, so the very next tick runs immediately (no cooldown).
-      syncAgentMarkdown.mockResolvedValueOnce({ headSha: "h", uploaded: [], chiefProjectId: "p" });
-      await runtime.syncMarkdownToChief(projectId, agentId);
-      expect(syncAgentMarkdown).toHaveBeenCalledTimes(3);
+      // Success cleared the per-project backoff entry — next run executes immediately (no cooldown).
+      syncProjectMarkdown.mockResolvedValueOnce({
+        chiefProjectId: "p",
+        docState: {},
+        uploaded: [],
+        deletedAssetIds: [],
+      });
+      await runtime.runChiefSync(projectId, agentId);
+      expect(syncProjectMarkdown).toHaveBeenCalledTimes(3);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("falls back to a workflow agent's worktree when triggered via a Think or Shell agent's id", async () => {
+    const { runtime, settings, projects } = await freshModules();
+    settings.useSettingsStore.getState().setChiefPat("pat_x");
+    const projectId = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
+    const thinkAgentId = projects.useProjectStore.getState().addAgent(projectId, { kind: "think" });
+    // Shell also has no worktree — fallback must skip it and pick the Build agent.
+    projects.useProjectStore.getState().addAgent(projectId, { kind: "shell" });
+    const buildAgentId = projects.useProjectStore.getState().addAgent(projectId, { kind: "build" });
+    syncProjectMarkdown.mockResolvedValue({
+      chiefProjectId: "project_x",
+      docState: {},
+      uploaded: [],
+      deletedAssetIds: [],
+    });
+
+    await runtime.runChiefSync(projectId, thinkAgentId);
+
+    // Think + shell have no worktree; the Build agent's id must be used for the sync.
+    expect(syncProjectMarkdown).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: buildAgentId }),
+    );
+  });
+
+  it("skips the docState write when the tree is unchanged (no uploads or deletes)", async () => {
+    const { runtime, settings, projectId, agentId } = await setup("build");
+    settings.useSettingsStore.setState({
+      chiefProjectByProject: { [projectId]: "project_known" },
+      chiefDocStateByProject: {
+        project_known: { "PRD/main.md": { hash: "h1", assetId: "asset_1" } },
+      },
+    });
+    // Simulate a no-op run: nothing changed, sync returns the same (or empty) ledger.
+    syncProjectMarkdown.mockResolvedValue({
+      chiefProjectId: "project_known",
+      docState: { "PRD/main.md": { hash: "h1", assetId: "asset_1" } },
+      uploaded: [],
+      deletedAssetIds: [],
+    });
+
+    await runtime.runChiefSync(projectId, agentId);
+
+    // The ledger in the store must be UNCHANGED — no write triggered.
+    expect(settings.useSettingsStore.getState().chiefDocStateByProject["project_known"]).toEqual({
+      "PRD/main.md": { hash: "h1", assetId: "asset_1" },
+    });
+    // Confirm syncProjectMarkdown was called (so the run did execute).
+    expect(syncProjectMarkdown).toHaveBeenCalledTimes(1);
   });
 });

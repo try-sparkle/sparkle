@@ -1,0 +1,136 @@
+// apps/desktop/src/services/beads.ts
+// Frontend read path for beads (bd) issues. Wraps the Rust `list_beads` / `bead_show`
+// commands (which shell out to `bd list/show --json`), normalizes the tolerant/varying
+// bd JSON shape into a stable `Bead`, and buckets issues into the board's four columns.
+import { invoke } from "@tauri-apps/api/core";
+
+export type BeadStatus = "open" | "in_progress" | "closed";
+
+export interface Bead {
+  id: string;
+  title: string;
+  description: string;
+  status: BeadStatus;
+  type?: string;
+  priority?: number;
+  labels: string[];
+  parent?: string | null;
+}
+
+// bd's JSON is loosely typed and the key names vary by version (status vs state,
+// issue_type vs type, etc.), so we read from an index signature and pick whichever
+// key is present rather than trusting one schema.
+type RawBead = Record<string, unknown>;
+
+function asString(v: unknown): string | undefined {
+  return typeof v === "string" ? v : undefined;
+}
+
+function normalizeStatus(v: unknown): BeadStatus {
+  const s = asString(v)?.toLowerCase().trim();
+  if (s === "in_progress" || s === "in-progress" || s === "inprogress") return "in_progress";
+  if (s === "closed" || s === "done") return "closed";
+  return "open";
+}
+
+function normalizeLabels(v: unknown): string[] {
+  if (Array.isArray(v)) return v.filter((x): x is string => typeof x === "string");
+  return [];
+}
+
+/** Normalize one loosely-typed bd row into a Bead. Tolerant of missing/renamed keys. */
+function normalizeBead(raw: RawBead): Bead {
+  const id = asString(raw.id) ?? asString(raw.issue_id) ?? "";
+  const type = asString(raw.issue_type) ?? asString(raw.type);
+  const priorityRaw = raw.priority;
+  const priority = typeof priorityRaw === "number" ? priorityRaw : undefined;
+  const parent = asString(raw.parent) ?? asString(raw.parent_id) ?? null;
+  return {
+    id,
+    title: asString(raw.title) ?? "",
+    description: asString(raw.description) ?? "",
+    status: normalizeStatus(raw.status ?? raw.state),
+    type,
+    priority,
+    labels: normalizeLabels(raw.labels),
+    parent,
+  };
+}
+
+function parseBeadArray(raw: string, command: string): Bead[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`Failed to parse ${command} JSON output: ${raw.slice(0, 200)}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Expected ${command} to return a JSON array, got: ${raw.slice(0, 200)}`);
+  }
+  return parsed.map((row) => normalizeBead((row ?? {}) as RawBead));
+}
+
+/** Run `bd list --json` for a project and return normalized beads. Throws on parse failure. */
+export async function listBeads(projectPath: string): Promise<Bead[]> {
+  const raw = await invoke<string>("list_beads", { projectPath });
+  return parseBeadArray(raw, "list_beads");
+}
+
+/** Run `bd show <id> --json` and return the single bead, or null if not found. */
+export async function beadShow(projectPath: string, id: string): Promise<Bead | null> {
+  const raw = await invoke<string>("bead_show", { projectPath, id });
+  const beads = parseBeadArray(raw, "bead_show");
+  return beads[0] ?? null;
+}
+
+export type BoardColumn = "backlog" | "inProgress" | "done" | "delivered";
+
+/** A closed bead carrying this label lands in "delivered" instead of "done". */
+export const DELIVERED_LABEL = "delivered";
+
+/** Which board column a bead belongs in:
+ *  open -> backlog; in_progress -> inProgress; closed+delivered-label -> delivered;
+ *  closed (no label) -> done. */
+export function columnFor(bead: Bead): BoardColumn {
+  if (bead.status === "open") return "backlog";
+  if (bead.status === "in_progress") return "inProgress";
+  // closed
+  return bead.labels.includes(DELIVERED_LABEL) ? "delivered" : "done";
+}
+
+export interface Board {
+  backlog: Bead[];
+  inProgress: Bead[];
+  done: Bead[];
+  delivered: Bead[];
+}
+
+/** Group beads into board columns, preserving input order within each column. */
+export function bucketBeads(beads: Bead[]): Board {
+  const board: Board = { backlog: [], inProgress: [], done: [], delivered: [] };
+  for (const bead of beads) {
+    switch (columnFor(bead)) {
+      case "backlog":
+        board.backlog.push(bead);
+        break;
+      case "inProgress":
+        board.inProgress.push(bead);
+        break;
+      case "done":
+        board.done.push(bead);
+        break;
+      case "delivered":
+        board.delivered.push(bead);
+        break;
+    }
+  }
+  return board;
+}
+
+/** Filter to an epic's children — either an explicit parent link or an id prefixed by
+ *  the epic id (bd's hierarchical id convention, e.g. "sparkle-hiju.4"). The epic itself
+ *  is excluded. */
+export function childrenOf(beads: Bead[], epicId: string): Bead[] {
+  const prefix = `${epicId}.`;
+  return beads.filter((b) => b.id !== epicId && (b.parent === epicId || b.id.startsWith(prefix)));
+}

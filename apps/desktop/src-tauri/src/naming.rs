@@ -127,8 +127,9 @@ pub(crate) fn resolve_env_secret(keys: &[&str]) -> Option<String> {
     None
 }
 
-/// Best-effort BYOK key lookup. See module docs for the resolution order.
-fn resolve_anthropic_key() -> Option<String> {
+/// Best-effort BYOK key lookup. See module docs for the resolution order. `pub(crate)` so the
+/// generic chat command in `ai.rs` reuses the exact same resolver (env → `.env.local`).
+pub(crate) fn resolve_anthropic_key() -> Option<String> {
     resolve_env_secret(&["ANTHROPIC_API_KEY", "ANTHROPIC_API"])
 }
 

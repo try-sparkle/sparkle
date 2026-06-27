@@ -5,89 +5,109 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...
 
 const ensureChiefProject = vi.fn();
 const uploadAsset = vi.fn();
+const deleteAsset = vi.fn();
 vi.mock("./chief", () => ({
   ensureChiefProject: (...a: unknown[]) => ensureChiefProject(...a),
   uploadAsset: (...a: unknown[]) => uploadAsset(...a),
+  deleteAsset: (...a: unknown[]) => deleteAsset(...a),
 }));
 
-import { syncAgentMarkdown, MARKDOWN_DIRS } from "./chiefSync";
+import { syncProjectMarkdown, hashContent, MARKDOWN_DIRS } from "./chiefSync";
 
-const base = {
-  pat: "pat_test",
-  projectId: "p1",
-  projectName: "Sparkle-Desktop",
-  agentId: "a1",
-  chiefProjectId: "project_known",
-  sinceSha: "abc",
-};
-
-describe("syncAgentMarkdown", () => {
+describe("syncProjectMarkdown — current-state, content-hash, delete-and-replace", () => {
   beforeEach(() => {
     invoke.mockReset();
     ensureChiefProject.mockReset();
     uploadAsset.mockReset();
+    deleteAsset.mockReset();
   });
 
-  it("uploads each changed markdown file named with the commit short-sha, returns the new marker", async () => {
-    invoke.mockResolvedValue({
-      headSha: "deadbeef1234567",
-      files: [
-        { path: "PRD/main.md", content: "# v2" },
-        { path: "docs/superpowers/specs/x.md", content: "# spec" },
-      ],
-    });
+  const pbase = {
+    pat: "pat_test",
+    sparkleProjectId: "p1",
+    projectName: "Sparkle-Desktop",
+    agentId: "a1",
+    chiefProjectId: "project_known",
+  };
+
+  it("requests the full current tree (empty sinceSha) and names assets by path, no @sha", async () => {
+    invoke.mockResolvedValue({ headSha: "h", files: [{ path: "PRD/a.md", content: "# v1" }] });
     ensureChiefProject.mockResolvedValue("project_known");
     uploadAsset.mockResolvedValue({ assetId: "asset_1", alreadyExists: false });
 
-    const res = await syncAgentMarkdown(base);
+    const res = await syncProjectMarkdown({ ...pbase, docState: {} });
 
-    // Asked Rust for markdown since the stored marker, scoped to the two dirs.
     expect(invoke).toHaveBeenCalledWith("markdown_changed_since", {
       projectId: "p1",
       agentId: "a1",
-      sinceSha: "abc",
+      sinceSha: "",
       dirs: MARKDOWN_DIRS,
     });
-    // One asset per file, named "<path> @ <shortSha>".
-    expect(uploadAsset).toHaveBeenCalledTimes(2);
-    expect(uploadAsset).toHaveBeenCalledWith(
-      "pat_test",
-      "project_known",
-      "PRD/main.md @ deadbee",
-      "# v2",
-    );
+    expect(uploadAsset).toHaveBeenCalledWith("pat_test", "project_known", "PRD/a.md", "# v1");
+    expect(deleteAsset).not.toHaveBeenCalled();
     expect(res).toEqual({
-      headSha: "deadbeef1234567",
-      uploaded: ["PRD/main.md @ deadbee", "docs/superpowers/specs/x.md @ deadbee"],
       chiefProjectId: "project_known",
+      docState: { "PRD/a.md": { hash: hashContent("# v1"), assetId: "asset_1" } },
+      uploaded: ["PRD/a.md"],
+      deletedAssetIds: [],
     });
   });
 
-  it("advances the marker without creating a Chief project when nothing changed", async () => {
-    invoke.mockResolvedValue({ headSha: "newhead", files: [] });
-
-    const res = await syncAgentMarkdown(base);
-
-    expect(ensureChiefProject).not.toHaveBeenCalled();
+  it("skips upload when the content hash is unchanged", async () => {
+    invoke.mockResolvedValue({ headSha: "h", files: [{ path: "PRD/a.md", content: "same" }] });
+    const res = await syncProjectMarkdown({
+      ...pbase,
+      docState: { "PRD/a.md": { hash: hashContent("same"), assetId: "asset_old" } },
+    });
     expect(uploadAsset).not.toHaveBeenCalled();
-    expect(res).toEqual({ headSha: "newhead", uploaded: [], chiefProjectId: "project_known" });
+    expect(deleteAsset).not.toHaveBeenCalled();
+    expect(res?.docState).toEqual({ "PRD/a.md": { hash: hashContent("same"), assetId: "asset_old" } });
+    expect(res?.uploaded).toEqual([]);
   });
 
-  it("creates the Chief project on first synced markdown when none is linked yet", async () => {
-    invoke.mockResolvedValue({ headSha: "h", files: [{ path: "PRD/main.md", content: "x" }] });
-    ensureChiefProject.mockResolvedValue("project_created");
-    uploadAsset.mockResolvedValue({ assetId: "a", alreadyExists: false });
+  it("uploads new content then deletes the prior asset for the same path", async () => {
+    invoke.mockResolvedValue({ headSha: "h", files: [{ path: "PRD/a.md", content: "# v2" }] });
+    ensureChiefProject.mockResolvedValue("project_known");
+    uploadAsset.mockResolvedValue({ assetId: "asset_new", alreadyExists: false });
 
-    const res = await syncAgentMarkdown({ ...base, chiefProjectId: undefined });
+    const res = await syncProjectMarkdown({
+      ...pbase,
+      docState: { "PRD/a.md": { hash: hashContent("# v1"), assetId: "asset_old" } },
+    });
 
-    expect(ensureChiefProject).toHaveBeenCalledWith("pat_test", "Sparkle-Desktop", undefined);
-    expect(uploadAsset).toHaveBeenCalledWith("pat_test", "project_created", "PRD/main.md @ h", "x");
-    expect(res?.chiefProjectId).toBe("project_created");
+    expect(uploadAsset).toHaveBeenCalledWith("pat_test", "project_known", "PRD/a.md", "# v2");
+    expect(deleteAsset).toHaveBeenCalledWith("pat_test", "project_known", "asset_old");
+    expect(res?.deletedAssetIds).toEqual(["asset_old"]);
+    expect(res?.docState).toEqual({ "PRD/a.md": { hash: hashContent("# v2"), assetId: "asset_new" } });
   });
 
-  it("no-ops (returns null) without a PAT — never touches git or the network", async () => {
-    const res = await syncAgentMarkdown({ ...base, pat: "" });
+  it("deletes assets for docs that no longer exist in the tree", async () => {
+    invoke.mockResolvedValue({ headSha: "h", files: [{ path: "PRD/a.md", content: "keep" }] });
+    ensureChiefProject.mockResolvedValue("project_known");
+
+    const res = await syncProjectMarkdown({
+      ...pbase,
+      docState: {
+        "PRD/a.md": { hash: hashContent("keep"), assetId: "asset_a" },
+        "PRD/gone.md": { hash: "x", assetId: "asset_gone" },
+      },
+    });
+
+    expect(deleteAsset).toHaveBeenCalledWith("pat_test", "project_known", "asset_gone");
+    expect(res?.docState).toEqual({ "PRD/a.md": { hash: hashContent("keep"), assetId: "asset_a" } });
+    expect(res?.deletedAssetIds).toEqual(["asset_gone"]);
+  });
+
+  it("no-ops (returns null) without a PAT", async () => {
+    const res = await syncProjectMarkdown({ ...pbase, pat: "", docState: {} });
     expect(res).toBeNull();
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("returns empty ledger when there are no docs and none were tracked", async () => {
+    invoke.mockResolvedValue({ headSha: "h", files: [] });
+    const res = await syncProjectMarkdown({ ...pbase, docState: {} });
+    expect(ensureChiefProject).not.toHaveBeenCalled();
+    expect(res).toEqual({ chiefProjectId: "project_known", docState: {}, uploaded: [], deletedAssetIds: [] });
   });
 });

@@ -2,15 +2,26 @@ import { useEffect, useRef, useState } from "react";
 import { TbBulb } from "react-icons/tb";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Project } from "../types";
-import { useSettingsStore, effectiveChiefPat } from "../stores/settingsStore";
+import { useSettingsStore, effectiveChiefPat, aiFeatureMode } from "../stores/settingsStore";
 import { useHandoffStore } from "../stores/handoffStore";
 import {
   ensureChiefProject,
   startChat,
   sendMessage,
   pollForResponse,
+  ensureSkill,
+  createMemory,
   ChiefError,
+  wipeChiefLibrary,
+  type MemoryCategory,
 } from "../services/chief";
+import { chatOnce, structuredJson } from "../services/anthropic";
+import { createLibrarian, type Librarian } from "../services/librarian";
+import { useLibrarianStore } from "../stores/librarianStore";
+import { synthesizePrd, writePrd, type SynthesizeResult } from "../services/prd";
+import { generateTasks, createBeadFull, beadDepAdd } from "../services/tasks";
+import { sendToBuild } from "../services/sendToBuild";
+import { LibrarianRail } from "./LibrarianRail";
 import { registerThink } from "../services/thinkBridge";
 import { meteredAi } from "../services/sparkleApi";
 import { CHIEF_CALL_CENTS } from "../services/creditPricing";
@@ -24,11 +35,43 @@ interface ChatMsg {
   text: string;
 }
 
+// The interviewer persona. The conversation runs on Claude-direct (snappy), while Chief grounds it
+// in the background via the librarian (see services/librarian.ts) — its findings are folded into the
+// system prompt below so each turn is sharper without ever blocking on Chief.
+const INTERVIEWER_SYSTEM = [
+  "You are Sparkle's product-thinking interviewer. Help the user turn a raw idea into a crisp,",
+  "buildable spec by interviewing them — ONE sharp question at a time, never a wall of questions.",
+  "Prefer concrete multiple-choice when it helps them decide. Surface hidden assumptions, edge",
+  "cases, and scope boundaries. Be concise and warm. When a direction becomes clear, briefly",
+  "reflect it back before moving on. Do NOT write the final PRD yourself — when the user is ready",
+  "they will press “I'm done” to synthesize it from the whole conversation.",
+].join(" ");
+
+function buildTranscript(msgs: ChatMsg[]): string {
+  return msgs.map((m) => `${m.role === "user" ? "User" : "Interviewer"}: ${m.text}`).join("\n\n");
+}
+
+/** Fold the librarian's latest grounding/challenges into the interviewer's system prompt. Read from
+ *  the store at call time (not render) so the freshest background findings ground the next turn. */
+function buildInterviewSystem(agentId: string): string {
+  const lanes = useLibrarianStore.getState().byAgent[agentId];
+  const g = (lanes?.grounding ?? []).map((i) => `- ${i.text}`).join("\n");
+  const c = (lanes?.challenges ?? []).map((i) => `- ${i.text}`).join("\n");
+  let s = INTERVIEWER_SYSTEM;
+  if (g) {
+    s += `\n\nThe project librarian surfaced relevant prior context — use it to sharpen your questions, don't recite it verbatim:\n${g}`;
+  }
+  if (c) {
+    s += `\n\nThe skeptic raised these challenges — weave the important ones into your questioning:\n${c}`;
+  }
+  return s;
+}
+
 /**
- * The Think agent's surface: a chat with Chief (Storytell) scoped to a project whose
- * library mirrors this Sparkle project. On first use we auto-create/link a Chief project named
- * after the Sparkle project, then every turn chats over that project's content. No worktree,
- * no PTY — this is a knowledge conversation, not a build agent. (Epic , phase .)
+ * The Think agent's surface: a Claude-direct interview that turns an idea into a spec, grounded in
+ * real time by Chief's background "librarian + skeptic" (the side-rail). When the spec is ready the
+ * user synthesizes a cited PRD ("I'm done"), generates an epic + child beads ("Generate tasks"), and
+ * hands it to the Build orchestrator ("Send to Build"). No worktree, no PTY. (Epic sparkle-hiju.)
  */
 export function ThinkPanel({ project, agentId }: { project: Project; agentId: string }) {
   const chiefPatStored = useSettingsStore((s) => s.chiefPat);
@@ -46,18 +89,44 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [linking, setLinking] = useState(false);
+  const [resetState, setResetState] = useState<"idle" | "confirm" | "working">("idle");
+  // The closed-loop state: a synthesized PRD, then the epic it became.
+  const [prd, setPrd] = useState<SynthesizeResult | null>(null);
+  const [epicId, setEpicId] = useState<string | null>(null);
+  const [synthesizing, setSynthesizing] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const clearChiefDocState = useSettingsStore((s) => s.clearChiefDocState);
   const handoff = useHandoffStore((s) => s.pending);
   const clearHandoff = useHandoffStore((s) => s.clear);
 
-  const chatIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const librarianRef = useRef<Librarian | null>(null);
   // Attempt the auto-link at most ONCE per (project, pat) pair. Without this, a failed link
   // (Chief outage / bad PAT) would re-fire the effect via setLinking(false) and retry forever,
   // hammering the API. The key changes only when the user connects a new PAT or switches project,
   // which is exactly when a fresh attempt is wanted.
   const linkAttemptKey = useRef<string | null>(null);
+
+  // Spin up the background librarian once per Think agent; tear it down (and clear its lanes) on
+  // unmount. Wired to the real Chief client and the librarian store.
+  useEffect(() => {
+    const lib = createLibrarian({
+      startChat,
+      pollForResponse,
+      ensureSkill,
+      setLane: useLibrarianStore.getState().setLane,
+      setStatus: useLibrarianStore.getState().setStatus,
+    });
+    librarianRef.current = lib;
+    return () => {
+      lib.dispose();
+      useLibrarianStore.getState().clear(agentId);
+      librarianRef.current = null;
+    };
+  }, [agentId]);
 
   // Link (or create) the Chief project for this Sparkle project once a PAT is available.
   useEffect(() => {
@@ -86,9 +155,8 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages, sending]);
 
-  // Fire-and-forget capture of a brainstorm turn into the durable history store (Task D,
-  // bead ). This must NEVER break the chat: we guard against both a synchronous
-  // throw and a rejected promise here, on top of the store's own best-effort swallow.
+  // Fire-and-forget capture of a think turn into the durable history store. This must NEVER break
+  // the chat: we guard against both a synchronous throw and a rejected promise here.
   const recordTurn = (kind: HistoryKind, text: string) => {
     const entry: HistoryEntry = {
       id: crypto.randomUUID(),
@@ -108,11 +176,8 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
     }
   };
 
-  // Core send, given an explicit prompt. Used by the composer (the typed message), the
-  // terminal-handoff auto-send (Explain/Ask), and the connectivity re-query (a "status update"
-  // nudge delivered through the think bridge). `capture` gates brainstorm-history recording to
-  // genuine user turns — the synthetic bridge nudge passes `capture:false` so machine-generated
-  // status prompts don't pollute the durable history/search surface.
+  // Core send: the interview runs on Claude-direct (fast). After the user's turn we kick the
+  // background librarian so Chief grounds the NEXT exchange without ever blocking this one.
   const sendText = async (prompt: string, { capture = true }: { capture?: boolean } = {}) => {
     if (!prompt || sending) return;
     if (!pat) {
@@ -120,43 +185,38 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
       return;
     }
     setError("");
-    setMessages((m) => [...m, { role: "user", text: prompt }]);
+    const nextMessages: ChatMsg[] = [...messages, { role: "user", text: prompt }];
+    setMessages(nextMessages);
     if (capture) recordTurn("prompt", prompt);
+
+    // Kick the background librarian for the next turn (non-blocking; swallows its own errors).
+    // Gate it on the AI-features toggle so a disabled-AI session doesn't fire background Chief
+    // round-trips — mirroring how the interview turn below short-circuits via meteredAi.
+    if (chiefProjectId && aiFeatureMode(useSettingsStore.getState()) !== "off") {
+      librarianRef.current?.onUserTurn({
+        agentId,
+        pat,
+        chiefProjectId,
+        conversation: buildTranscript(nextMessages),
+      });
+    }
+
     setSending(true);
     try {
-      // Meter the think exchange against the user's AI credits (design spec §7): the gate
-      // short-circuits when AI is off and debits before the Chief round-trip runs.
+      // Meter the exchange against the user's AI credits / the AI-features toggle, then run the
+      // Claude-direct interview turn with the librarian's grounding folded into the system prompt.
       const text = await meteredAi(
         { estimateCents: CHIEF_CALL_CENTS, reason: "chief_debit", meta: { projectId: project.id } },
         async () => {
-          const pid = chiefProjectId ?? (await ensureChiefProject(pat, project.name, undefined));
-          if (!chiefProjectId) setChiefProject(project.id, pid);
-
-          let messageId: string;
-          if (chatIdRef.current) {
-            messageId = (await sendMessage(pat, pid, chatIdRef.current, prompt)).message_id;
-          } else {
-            const started = await startChat(pat, pid, prompt);
-            chatIdRef.current = started.chat_id;
-            messageId = started.message_id;
-          }
-          return pollForResponse(pat, pid, chatIdRef.current!, messageId);
+          const system = buildInterviewSystem(agentId);
+          const user = `${buildTranscript(nextMessages)}\n\nRespond as the interviewer with your next message.`;
+          return chatOnce(system, user);
         },
       );
       setMessages((m) => [...m, { role: "assistant", text }]);
       if (capture) recordTurn("response", text);
     } catch (e) {
-      const msg =
-        e instanceof AiDisabledError
-          ? "AI features are off — turn them on in the ⋯ menu."
-          : e instanceof OutOfCreditsError
-            ? "Out of AI credits. Add more to keep thinking."
-            : e instanceof ChiefError
-              ? e.message
-              : e instanceof Error
-                ? e.message
-                : String(e);
-      setError(msg);
+      setError(friendlyError(e));
     } finally {
       setSending(false);
       // Refresh the balance so the counter reflects the debit/refund.
@@ -172,15 +232,117 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
     void sendText(prompt);
   };
 
+  // "I'm done": synthesize a cited PRD from the whole conversation via Chief (research depth).
+  async function handleSynthesize() {
+    if (synthesizing || messages.length === 0) return;
+    if (!chiefProjectId) {
+      setError("Chief isn't linked yet — give it a moment and try again.");
+      return;
+    }
+    setSynthesizing(true);
+    setError("");
+    setNotice("Synthesizing the PRD from your whole library… this is the deep pass, it can take a minute.");
+    try {
+      const result = await synthesizePrd(
+        { startChat, pollForResponse, writePrd },
+        { pat, chiefProjectId, projectPath: project.rootPath, transcript: buildTranscript(messages) },
+      );
+      setPrd(result);
+      setEpicId(null);
+      setNotice(`PRD written to ${result.path}. Review it, then “Generate tasks”.`);
+    } catch (e) {
+      setNotice("");
+      setError(friendlyError(e));
+    } finally {
+      setSynthesizing(false);
+    }
+  }
+
+  // "Generate tasks": turn the PRD into an epic + dependency-aware child beads.
+  async function handleGenerateTasks() {
+    if (!prd || generating) return;
+    if (!chiefProjectId) return;
+    setGenerating(true);
+    setError("");
+    setNotice("Generating the epic and tasks…");
+    try {
+      const res = await generateTasks(
+        {
+          structuredJson,
+          createBeadFull,
+          beadDepAdd,
+          writePrd,
+          createMemory: (content, category) =>
+            createMemory(pat, chiefProjectId, { content, category: category as MemoryCategory }).then(
+              () => {},
+            ),
+        },
+        {
+          projectPath: project.rootPath,
+          prdFilename: prd.filename,
+          prdContent: prd.content,
+          prdRelPath: prd.path,
+        },
+      );
+      setEpicId(res.epicId);
+      setPrd({ ...prd, content: res.updatedPrdContent });
+      setNotice(
+        `Created epic ${res.epicId} with ${res.taskIds.length} task(s). Open Tasks to watch them, or “Send to Build”.`,
+      );
+    } catch (e) {
+      setNotice("");
+      setError(friendlyError(e));
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  // "Send to Build": spawn/seed the orchestrator with the epic + PRD; it drives the board from here.
+  function handleSendToBuild() {
+    if (!epicId || !prd) return;
+    try {
+      sendToBuild({ projectId: project.id, epicId, prdPath: prd.path });
+      setNotice("Sent to Build — the orchestrator is starting. Watch the Tasks board fill in.");
+    } catch (e) {
+      setError(friendlyError(e));
+    }
+  }
+
+  async function handleResetLibrary() {
+    if (!chiefProjectId) return;
+    if (resetState === "idle") {
+      setResetState("confirm");
+      return;
+    }
+    setResetState("working");
+    setError("");
+    setNotice("");
+    try {
+      const n = await wipeChiefLibrary(pat, chiefProjectId);
+      setNotice(`Reset Chief library — removed ${n} file(s). Current docs re-sync on the next commit.`);
+    } catch (e) {
+      setNotice("");
+      setError(e instanceof Error ? e.message : "Reset failed.");
+    } finally {
+      // Clear docState regardless of success or partial failure: any wipe attempt leaves
+      // the library in an unknown state, and clearing the ledger ensures the next sync
+      // does a full re-upload rather than skipping paths whose assets were already deleted.
+      clearChiefDocState(chiefProjectId);
+      setResetState("idle");
+    }
+  }
+
   // Register this panel so the connectivity re-query can deliver its "status update" nudge here.
-  // We keep the latest sendText in a ref (it closes over state that changes each render) and
-  // register a stable wrapper once per agent. The nudge only fires for an already-active
-  // conversation — there's nothing to "update" on a chat that never started.
+  // The nudge only "updates" an already-active conversation — firing it on an untouched, empty
+  // panel would inject an unsolicited synthetic turn (and a metered debit). Gate on a ref tracking
+  // whether the conversation has started (kept current to dodge a stale closure).
   const sendTextRef = useRef(sendText);
   sendTextRef.current = sendText;
+  const hasConversationRef = useRef(false);
+  hasConversationRef.current = messages.length > 0;
   useEffect(() => {
     return registerThink(agentId, (text) => {
-      if (!chatIdRef.current) return; // no conversation yet — skip
+      if (!hasConversationRef.current) return; // no conversation yet — nothing to "update"
       // A synthetic status-update nudge, not a user turn — don't capture it into history.
       void sendTextRef.current(text, { capture: false });
     });
@@ -188,8 +350,6 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
 
   // A terminal-selection action queued a prompt for this project's think agent. Prefill it
   // (and auto-send for Explain/Ask). Runs once per queued handoff, then clears it.
-  // Guard on `pat`: if Chief is not yet connected the composer isn't mounted, so deferring keeps
-  // the handoff alive until the user connects and the next render re-runs this effect.
   useEffect(() => {
     if (!handoff || handoff.projectId !== project.id || !pat) return;
     const { text, autoSend } = handoff;
@@ -200,8 +360,6 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
       setInput(text);
       inputRef.current?.focus();
     }
-    // `sendText` is stable enough for this one-shot; the deps are the intentional gates
-    // (handoff to consume, project.id to scope it, pat to defer until Chief is connected).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [handoff, project.id, pat]);
 
@@ -209,6 +367,8 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
   if (!pat) {
     return <ConnectChief onSave={setChiefPat} />;
   }
+
+  const canSynthesize = !synthesizing && messages.length > 0 && !!chiefProjectId;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: C.forest }}>
@@ -226,23 +386,98 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
       >
         <TbBulb size={20} style={{ flexShrink: 0 }} />
         <span>
-          Think about{" "}
+          Thinking about{" "}
           <span style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold }}>{project.name}</span>
-          {linking ? " — linking project…" : ""}
+          {linking ? " — linking Chief…" : chiefProjectId ? " — Chief is grounding you live" : ""}
         </span>
+        <div style={{ flex: 1 }} />
+        {chiefProjectId && (
+          <button
+            onClick={() => void handleResetLibrary()}
+            disabled={resetState === "working"}
+            title="Delete all files in this project's Chief library and re-sync the current docs"
+            style={{
+              background: "transparent",
+              color: resetState === "confirm" ? C.sienna : C.muted,
+              border: `1px solid ${resetState === "confirm" ? C.sienna : C.forest}`,
+              borderRadius: 6,
+              padding: "2px 8px",
+              fontSize: 11,
+              cursor: resetState === "working" ? "default" : "pointer",
+            }}
+            onBlur={() => setResetState((s) => (s === "confirm" ? "idle" : s))}
+          >
+            {resetState === "working"
+              ? "Resetting…"
+              : resetState === "confirm"
+                ? "Click to confirm reset"
+                : "Reset library"}
+          </button>
+        )}
       </div>
 
-      {/* Transcript */}
-      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: 16 }}>
-        {messages.map((m, i) => (
-          <Bubble key={i} role={m.role} text={m.text} />
-        ))}
-        {sending && <Bubble role="assistant" text="…" pending />}
+      {/* Transcript + live grounding rail */}
+      <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
+        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: 16 }}>
+          {messages.length === 0 && (
+            <div style={{ color: C.muted, fontSize: 13, lineHeight: 1.6, maxWidth: 560 }}>
+              Think out loud about <strong>{project.name}</strong>. I'll interview you to shape it into
+              a spec — one question at a time — while Chief grounds us in everything the project already
+              knows (see the rail on the right).
+              <br />
+              <br />
+              When it's sharp, press <em>“I'm done”</em> to synthesize a PRD, then{" "}
+              <em>“Generate tasks”</em> and <em>“Send to Build”</em>.
+            </div>
+          )}
+          {messages.map((m, i) => (
+            <Bubble key={i} role={m.role} text={m.text} />
+          ))}
+          {sending && <Bubble role="assistant" text="…" pending />}
+        </div>
+        <LibrarianRail
+          agentId={agentId}
+          onInject={(t) => {
+            setInput(t);
+            inputRef.current?.focus();
+          }}
+        />
       </div>
 
-      {error && (
-        <div style={{ padding: "8px 16px", color: C.sienna, fontSize: 12 }}>{error}</div>
+      {error && <div style={{ padding: "8px 16px", color: C.sienna, fontSize: 12 }}>{error}</div>}
+      {notice && !error && (
+        <div style={{ padding: "8px 16px", color: C.muted, fontSize: 12 }}>{notice}</div>
       )}
+
+      {/* The closed-loop actions */}
+      <div
+        style={{
+          display: "flex",
+          gap: 8,
+          padding: "8px 12px",
+          borderTop: `1px solid ${C.deepForest}`,
+          flexWrap: "wrap",
+        }}
+      >
+        <ActionButton
+          label={synthesizing ? "Synthesizing…" : "I'm done — write the PRD"}
+          onClick={() => void handleSynthesize()}
+          disabled={!canSynthesize}
+          primary
+        />
+        <ActionButton
+          label={generating ? "Generating…" : "Generate tasks"}
+          onClick={() => void handleGenerateTasks()}
+          disabled={!prd || generating}
+        />
+        <ActionButton label="Send to Build" onClick={handleSendToBuild} disabled={!epicId} />
+        {prd && (
+          <span style={{ alignSelf: "center", color: C.muted, fontSize: 11, fontFamily: "monospace" }}>
+            {prd.path}
+            {epicId ? ` · ${epicId}` : ""}
+          </span>
+        )}
+      </div>
 
       {/* Composer */}
       <div style={{ display: "flex", gap: 8, padding: 12, borderTop: `1px solid ${C.deepForest}` }}>
@@ -256,7 +491,7 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
               void send();
             }
           }}
-          placeholder={`Message Chief about ${project.name}…`}
+          placeholder={`Think out loud about ${project.name}…`}
           rows={2}
           style={{
             flex: 1,
@@ -289,6 +524,45 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
         </button>
       </div>
     </div>
+  );
+}
+
+function friendlyError(e: unknown): string {
+  if (e instanceof AiDisabledError) return "AI features are off — turn them on in the ⋯ menu.";
+  if (e instanceof OutOfCreditsError) return "Out of AI credits. Add more to keep thinking.";
+  if (e instanceof ChiefError) return e.message;
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
+function ActionButton({
+  label,
+  onClick,
+  disabled,
+  primary,
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  primary?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        background: disabled ? C.forest : primary ? C.teal : C.deepForest,
+        color: disabled ? C.muted : C.cream,
+        border: `1px solid ${disabled ? C.forest : primary ? C.teal : C.forest}`,
+        borderRadius: 8,
+        padding: "6px 14px",
+        fontSize: 12.5,
+        fontWeight: FONT_WEIGHT.semibold,
+        cursor: disabled ? "default" : "pointer",
+      }}
+    >
+      {label}
+    </button>
   );
 }
 
@@ -346,8 +620,8 @@ function ConnectChief({ onSave }: { onSave: (pat: string) => void }) {
         Connect Chief to think
       </div>
       <div style={{ color: C.muted, fontSize: 13, maxWidth: 420, lineHeight: 1.6 }}>
-        Paste a Chief Personal Access Token (starts with <code>pat_</code>). The Think agent
-        chats with Chief over this project's library.
+        Paste a Chief Personal Access Token (starts with <code>pat_</code>). The Think agent uses
+        Chief to ground your thinking in this project's library.
       </div>
       <input
         value={val}

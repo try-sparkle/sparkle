@@ -66,11 +66,12 @@ interface UiState {
   zoomIn: () => void;
   zoomOut: () => void;
   resetZoom: () => void;
-  // Which special (non-project) agent is in focus, if any. "sparkle" = the self-improvement
-  // agent pinned bottom-left. null = a normal project agent (or nothing) is active. Persisted so
-  // the active view survives relaunch. Selecting a normal agent clears this back to null.
-  activeSpecial: "sparkle" | null;
-  setActiveSpecial: (v: "sparkle" | null) => void;
+  // Which special (non-project) view is in focus, if any. "sparkle" = the self-improvement
+  // agent pinned bottom-left. "board" = the read-only Tasks Kanban for the current project.
+  // null = a normal project agent (or nothing) is active. Persisted so the active view survives
+  // relaunch. Selecting a normal agent clears this back to null.
+  activeSpecial: "sparkle" | "board" | null;
+  setActiveSpecial: (v: "sparkle" | "board" | null) => void;
   // App theme preference. "auto" follows the OS appearance; "light"/"dark" force it.
   // Persisted in the same `sparkle-ui` blob; read synchronously at boot (see theme/theme.ts)
   // to set <html data-theme> before first paint and avoid a flash of the wrong theme.

@@ -10,6 +10,7 @@ import { TopBar } from "./TopBar";
 import { OfflineBanner } from "./OfflineBanner";
 import { AgentPane } from "./AgentPane";
 import { SparkleAgentPane } from "./SparkleAgentPane";
+import { BoardView } from "./BoardView";
 import { ProjectModal } from "./ProjectModal";
 import { ClosePrompt } from "./ClosePrompt";
 import { SPARKLE_AGENT_ID } from "../services/sparkleAgent";
@@ -139,6 +140,10 @@ export function Workspace() {
   // never double-mounts across windows.
   const sparkleActive = isMainWindow && activeSpecial === "sparkle";
   const sparkleOpen = isMainWindow && openAgentIds.includes(SPARKLE_AGENT_ID);
+  // The read-only Tasks board (bead sparkle-hiju.10) is a project-scoped special view: it covers
+  // the agent panes for the current project, the same slot Sparkle uses. Only meaningful with a
+  // project open.
+  const boardActive = activeSpecial === "board" && !!project;
 
   const finishClose = async (mode: "keep" | "kill") => {
     // Dismiss the prompt immediately so a second click on Keep/Kill (the handler awaits below)
@@ -188,24 +193,27 @@ export function Workspace() {
               key={agent.id}
               project={p}
               agent={agent}
-              visible={!sparkleActive && agent.id === activeAgentId}
+              visible={!sparkleActive && !boardActive && agent.id === activeAgentId}
             />
           ))}
 
           {sparkleOpen && <SparkleAgentPane visible={sparkleActive} />}
 
-          {!sparkleActive && !project && (
+          {/* The Tasks board overlays the panes for the current project (sparkle-hiju.10). */}
+          {boardActive && project && <BoardView project={project} />}
+
+          {!sparkleActive && !boardActive && !project && (
             <Hint title="Welcome to Sparkle">
               Create a project (top bar) and choose a folder on your Mac to start building.
             </Hint>
           )}
-          {!sparkleActive && project && project.agents.length === 0 && (
+          {!sparkleActive && !boardActive && project && project.agents.length === 0 && (
             <Hint title={project.name}>Add an agent (left) to begin.</Hint>
           )}
-          {!sparkleActive && project && project.agents.length > 0 && !activeAgentId && (
+          {!sparkleActive && !boardActive && project && project.agents.length > 0 && !activeAgentId && (
             <Hint title={project.name}>Pick an agent on the left.</Hint>
           )}
-          {!sparkleActive && project && activeAgentId && !activeIsOpen && (
+          {!sparkleActive && !boardActive && project && activeAgentId && !activeIsOpen && (
             <Hint title={project.name}>
               <button
                 onClick={() => open(activeAgentId)}

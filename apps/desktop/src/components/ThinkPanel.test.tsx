@@ -8,20 +8,48 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Chief boundary: skip the network. ensureChiefProject is unused here (the project is
-// pre-linked), startChat seeds the conversation, pollForResponse yields the reply text.
-const startChat = vi.fn(() => Promise.resolve({ chat_id: "c1", message_id: "m1" }));
-const pollForResponse = vi.fn(() => Promise.resolve("Chief's reply"));
+// Chief boundary: skip the network. The interview itself now runs on Claude-direct (anthropic),
+// so the reply text comes from chatOnce below; Chief's startChat/pollForResponse remain mocked for
+// the (here-isolated) librarian + synthesis paths.
 vi.mock("../services/chief", () => ({
   ensureChiefProject: vi.fn(() => Promise.resolve("chief-proj")),
-  startChat: (...a: unknown[]) => startChat(...(a as [])),
+  startChat: vi.fn(() => Promise.resolve({ chat_id: "c1", message_id: "m1" })),
   sendMessage: vi.fn(() => Promise.resolve({ message_id: "m2" })),
-  pollForResponse: (...a: unknown[]) => pollForResponse(...(a as [])),
+  pollForResponse: vi.fn(() => Promise.resolve("…")),
+  ensureSkill: vi.fn(() => Promise.resolve("sparkle-skeptic")),
+  createMemory: vi.fn(() => Promise.resolve({})),
+  wipeChiefLibrary: vi.fn(() => Promise.resolve(0)),
   ChiefError: class ChiefError extends Error {},
+}));
+// The interview engine: Claude-direct. chatOnce yields the assistant reply text per turn.
+const chatOnce = vi.fn(() => Promise.resolve("Chief's reply"));
+vi.mock("../services/anthropic", () => ({
+  chatOnce: (...a: unknown[]) => chatOnce(...(a as [])),
+  structuredJson: vi.fn(() => Promise.resolve({})),
+}));
+// Isolate the background librarian — its own tests cover it; here it must not fire timers/network.
+vi.mock("../services/librarian", () => ({
+  createLibrarian: () => ({ onUserTurn: vi.fn(), dispose: vi.fn() }),
 }));
 // Metering wrapper: run the action straight through (no credit gate in this test).
 vi.mock("../services/sparkleApi", () => ({
   meteredAi: <T,>(_action: unknown, run: () => Promise<T>) => run(),
+}));
+// Closed-loop services — spied so the done→generate→build sequence can be driven + asserted.
+const synthesizePrd = vi.fn();
+const generateTasks = vi.fn();
+const sendToBuildSpy = vi.fn(() => "build-1");
+vi.mock("../services/prd", () => ({
+  synthesizePrd: (...a: unknown[]) => synthesizePrd(...(a as [])),
+  writePrd: vi.fn(),
+}));
+vi.mock("../services/tasks", () => ({
+  generateTasks: (...a: unknown[]) => generateTasks(...(a as [])),
+  createBeadFull: vi.fn(),
+  beadDepAdd: vi.fn(),
+}));
+vi.mock("../services/sendToBuild", () => ({
+  sendToBuild: (...a: unknown[]) => sendToBuildSpy(...(a as [])),
 }));
 // The think bridge registers a callback for the connectivity "status update" nudge; capture it
 // so a test can fire a synthetic nudge through the same sendText path the bridge uses.
@@ -50,8 +78,9 @@ Element.prototype.scrollTo = vi.fn() as unknown as typeof Element.prototype.scro
 let record: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
-  startChat.mockClear();
-  pollForResponse.mockClear();
+  // mockReset (not mockClear) so a prior test's queued mockResolvedValueOnce can't leak forward.
+  chatOnce.mockReset();
+  chatOnce.mockResolvedValue("Chief's reply");
   // Connected Chief + a pre-linked Chief project so the panel renders the composer and
   // the send path skips ensureChiefProject.
   useSettingsStore.setState({
@@ -63,6 +92,20 @@ beforeEach(() => {
   useAuthStore.setState({ refresh: vi.fn(() => Promise.resolve()) });
   record = vi.fn(() => Promise.resolve());
   useHistoryStore.setState({ record });
+  synthesizePrd.mockReset();
+  synthesizePrd.mockResolvedValue({
+    path: "PRD/2026-x.md",
+    filename: "2026-x.md",
+    title: "X",
+    content: "---\nepic: null\ntasks: []\n---\n\n# X",
+  });
+  generateTasks.mockReset();
+  generateTasks.mockResolvedValue({
+    epicId: "sparkle-ep",
+    taskIds: ["sparkle-ep.1", "sparkle-ep.2"],
+    updatedPrdContent: "---\nepic: \"sparkle-ep\"\n---\n\n# X",
+  });
+  sendToBuildSpy.mockClear();
 });
 afterEach(() => cleanup());
 
@@ -118,7 +161,7 @@ describe("ThinkPanel — brainstorm history capture", () => {
     const beforeNudge = record.mock.calls.length;
 
     // Fire the connectivity "status update" nudge through the same sendText path the bridge uses.
-    pollForResponse.mockResolvedValueOnce("nudge reply");
+    chatOnce.mockResolvedValueOnce("nudge reply");
     await act(async () => {
       nudge?.("status update: connectivity restored");
     });
@@ -144,5 +187,57 @@ describe("ThinkPanel — brainstorm history capture", () => {
     // Despite record() throwing synchronously, the user message and Chief's reply both render.
     await waitFor(() => expect(screen.getByText("still works?")).toBeTruthy());
     await waitFor(() => expect(screen.getByText("Chief's reply")).toBeTruthy());
+  });
+
+  it("ignores a connectivity nudge on an untouched (empty) panel", async () => {
+    const { act } = await import("@testing-library/react");
+    render(<ThinkPanel project={project} agentId="agent-1" />);
+
+    // Fire the nudge before the user has said anything — it must be a no-op (no synthetic turn).
+    await act(async () => {
+      nudge?.("status update: connectivity restored");
+    });
+
+    expect(chatOnce).not.toHaveBeenCalled();
+    expect(screen.queryByText("nudge reply")).toBeNull();
+    expect(screen.queryByText(/connectivity restored/)).toBeNull();
+  });
+});
+
+describe("ThinkPanel — closed-loop actions (done → generate → build)", () => {
+  it("gates each step on the prior result and calls the right service", async () => {
+    render(<ThinkPanel project={project} agentId="agent-1" />);
+
+    // Need a conversation before the PRD can be synthesized.
+    await submit("we want offline mode");
+    await waitFor(() => expect(screen.getByText("Chief's reply")).toBeTruthy());
+
+    const imDone = screen.getByRole("button", { name: /I'm done/ });
+    const genTasks = screen.getByRole("button", { name: /Generate tasks/ });
+    const sendBuild = screen.getByRole("button", { name: /Send to Build/ });
+
+    // Before synthesis: generate + send are disabled; done is enabled (conversation exists).
+    expect((imDone as HTMLButtonElement).disabled).toBe(false);
+    expect((genTasks as HTMLButtonElement).disabled).toBe(true);
+    expect((sendBuild as HTMLButtonElement).disabled).toBe(true);
+
+    // I'm done → synthesize PRD.
+    fireEvent.click(imDone);
+    await waitFor(() => expect(synthesizePrd).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect((genTasks as HTMLButtonElement).disabled).toBe(false));
+    expect((sendBuild as HTMLButtonElement).disabled).toBe(true);
+
+    // Generate tasks → epic + children; send becomes enabled.
+    fireEvent.click(genTasks);
+    await waitFor(() => expect(generateTasks).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect((sendBuild as HTMLButtonElement).disabled).toBe(false));
+
+    // Send to Build → orchestrator seeded with the epic + PRD path.
+    fireEvent.click(sendBuild);
+    expect(sendToBuildSpy).toHaveBeenCalledWith({
+      projectId: "proj-1",
+      epicId: "sparkle-ep",
+      prdPath: "PRD/2026-x.md",
+    });
   });
 });

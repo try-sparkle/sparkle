@@ -3,7 +3,21 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 
-import { ensureChiefProject, uploadAsset, resolveEnvChiefPat } from "./chief";
+import {
+  ensureChiefProject,
+  uploadAsset,
+  resolveEnvChiefPat,
+  listAssets,
+  listAllAssets,
+  deleteAsset,
+  wipeChiefLibrary,
+  startChat,
+  sendMessage,
+  createMemory,
+  listMemories,
+  ensureSkill,
+  attachLabel,
+} from "./chief";
 
 // A minimal Response stand-in for the bits chief.ts reads (ok/status/text).
 function jsonResponse(body: unknown, ok = true, status = 200): Response {
@@ -200,5 +214,303 @@ describe("uploadAsset — 3-step Chief asset upload", () => {
     await expect(
       uploadAsset("pat_test", "project_x", "PRD/main.md @ abc1234", "# hello"),
     ).rejects.toThrow(/upload url/i);
+  });
+});
+
+describe("listAssets / listAllAssets / deleteAsset", () => {
+  it("lists one page, mapping data[] to assets and surfacing the cursor", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("/v1/assets") && method === "GET") {
+        return jsonResponse({
+          data: [{ asset_id: "asset_1", filename: "PRD/a.md", status: "ready" }],
+          has_more: true,
+          last_id: "asset_1",
+        });
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    });
+
+    const page = await listAssets("pat_test", "project_x", { limit: 25 });
+    expect(page.assets).toEqual([{ asset_id: "asset_1", filename: "PRD/a.md", status: "ready" }]);
+    expect(page.hasMore).toBe(true);
+    expect(page.lastId).toBe("asset_1");
+  });
+
+  it("paginates listAllAssets until has_more is false", async () => {
+    const urls: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("after_id=asset_1")) {
+        return jsonResponse({ data: [{ asset_id: "asset_2", filename: "PRD/b.md" }], has_more: false });
+      }
+      return jsonResponse({ data: [{ asset_id: "asset_1", filename: "PRD/a.md" }], has_more: true, last_id: "asset_1" });
+    });
+
+    const all = await listAllAssets("pat_test", "project_x");
+    expect(all.map((a) => a.asset_id)).toEqual(["asset_1", "asset_2"]);
+    expect(urls[1]).toContain("after_id=asset_1");
+  });
+
+  it("deletes an asset by id (treats 204 as success)", async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      calls.push({ url, method });
+      return { ok: true, status: 204, text: async () => "" } as unknown as Response;
+    });
+
+    await expect(deleteAsset("pat_test", "project_x", "asset_9")).resolves.toBeUndefined();
+    expect(calls[0]?.method).toBe("DELETE");
+    expect(calls[0]?.url).toContain("/v1/assets/asset_9");
+  });
+});
+
+describe("wipeChiefLibrary", () => {
+  it("lists every asset and deletes each, returning the count", async () => {
+    const deleted: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("/v1/assets") && method === "GET") {
+        return jsonResponse({
+          data: [
+            { asset_id: "asset_1", filename: "PRD/a.md" },
+            { asset_id: "asset_2", filename: "PRD/b.md" },
+          ],
+          has_more: false,
+        });
+      }
+      if (method === "DELETE") {
+        deleted.push(url.split("/v1/assets/")[1] ?? "");
+        return { ok: true, status: 204, text: async () => "" } as unknown as Response;
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    });
+
+    const n = await wipeChiefLibrary("pat_test", "project_x");
+    expect(n).toBe(2);
+    expect(deleted).toEqual(["asset_1", "asset_2"]);
+  });
+
+  it("returns 0 and issues no DELETE when the library is empty", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("/v1/assets") && method === "GET") {
+        return jsonResponse({ data: [], has_more: false });
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    });
+
+    const n = await wipeChiefLibrary("pat_test", "project_x");
+    expect(n).toBe(0);
+  });
+
+  it("rejects when a mid-loop deleteAsset call fails", async () => {
+    let deleteCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("/v1/assets") && method === "GET") {
+        return jsonResponse({
+          data: [
+            { asset_id: "asset_1", filename: "PRD/a.md" },
+            { asset_id: "asset_2", filename: "PRD/b.md" },
+          ],
+          has_more: false,
+        });
+      }
+      if (method === "DELETE") {
+        deleteCount += 1;
+        if (deleteCount === 1) {
+          return { ok: true, status: 204, text: async () => "" } as unknown as Response;
+        }
+        return { ok: false, status: 500, text: async () => "server error" } as unknown as Response;
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    });
+
+    await expect(wipeChiefLibrary("pat_test", "project_x")).rejects.toThrow("server error");
+    expect(deleteCount).toBe(2); // loop reached the failing asset before throwing
+  });
+});
+
+describe("startChat / sendMessage — per-turn ChatOptions serialization", () => {
+  it("maps ChatOptions to snake_case body fields and omits undefined ones", async () => {
+    let body: Record<string, unknown> = {};
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.endsWith("/v1/chats") && method === "POST") {
+        body = JSON.parse(String(init?.body));
+        return jsonResponse({ chat_id: "chat_1", message_id: "msg_1" }, true, 201);
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    });
+
+    const res = await startChat("pat_test", "project_x", "hi", {
+      intelligence: "expert",
+      publicData: true,
+      skills: ["Reviewer"],
+      scope: { asset_ids: ["asset_1"] },
+      // provider intentionally omitted -> must NOT appear in the body
+    });
+
+    expect(res).toEqual({ chat_id: "chat_1", message_id: "msg_1" });
+    expect(body).toEqual({
+      prompt: "hi",
+      intelligence: "expert",
+      public_data: true,
+      skills: ["Reviewer"],
+      scope: { asset_ids: ["asset_1"] },
+    });
+    expect("provider" in body).toBe(false); // undefined option dropped, not sent as null
+    expect("publicData" in body).toBe(false); // camelCase key never leaks through
+  });
+
+  it("sends just { prompt } when no options are passed (existing callers unaffected)", async () => {
+    let body: Record<string, unknown> = {};
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.endsWith("/v1/chats") && method === "POST") {
+        body = JSON.parse(String(init?.body));
+        return jsonResponse({ chat_id: "chat_1", message_id: "msg_1" }, true, 201);
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    });
+
+    await startChat("pat_test", "project_x", "hello");
+    expect(body).toEqual({ prompt: "hello" });
+  });
+
+  it("sendMessage merges options into the follow-up turn body", async () => {
+    let url = "";
+    let body: Record<string, unknown> = {};
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("/v1/chats/chat_1/messages") && method === "POST") {
+        body = JSON.parse(String(init?.body));
+        return jsonResponse({ message_id: "msg_2" });
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    });
+
+    const res = await sendMessage("pat_test", "project_x", "chat_1", "again", {
+      provider: "anthropic",
+    });
+    expect(res).toEqual({ message_id: "msg_2" });
+    expect(url).toContain("/v1/chats/chat_1/messages");
+    expect(body).toEqual({ prompt: "again", provider: "anthropic" });
+  });
+});
+
+describe("createMemory / listMemories", () => {
+  it("posts content/category/importance and returns the created memory", async () => {
+    let body: Record<string, unknown> = {};
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.endsWith("/v1/memories") && method === "POST") {
+        body = JSON.parse(String(init?.body));
+        return jsonResponse(
+          { memory_id: "mem_1", content: "likes terse answers", category: "preference" },
+          true,
+          201,
+        );
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    });
+
+    const mem = await createMemory("pat_test", "project_x", {
+      content: "likes terse answers",
+      category: "preference",
+      importance: 3,
+    });
+    expect(mem).toMatchObject({ memory_id: "mem_1", category: "preference" });
+    expect(body).toEqual({
+      content: "likes terse answers",
+      category: "preference",
+      importance: 3,
+    });
+  });
+
+  it("lists memories tolerating the {memories} envelope", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.endsWith("/v1/memories") && method === "GET") {
+        return jsonResponse({ memories: [{ memory_id: "mem_1", content: "x" }] });
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    });
+
+    const mems = await listMemories("pat_test", "project_x");
+    expect(mems).toEqual([{ memory_id: "mem_1", content: "x" }]);
+  });
+});
+
+describe("ensureSkill — reuse-by-name / create-when-missing", () => {
+  it("returns the existing skill name without creating when one matches", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.endsWith("/v1/skills") && method === "GET") {
+        return jsonResponse({ data: [{ skill_id: "sk_1", name: "Reviewer" }] });
+      }
+      throw new Error(`unexpected ${method} ${url}`); // create must NOT be called
+    });
+
+    const name = await ensureSkill("pat_test", "project_x", "Reviewer", "be strict");
+    expect(name).toBe("Reviewer");
+    expect(fetchMock).toHaveBeenCalledTimes(1); // list only, no create
+  });
+
+  it("creates the skill and returns its name when no match exists", async () => {
+    let createBody: Record<string, unknown> = {};
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.endsWith("/v1/skills") && method === "GET") {
+        return jsonResponse({ data: [] }); // miss
+      }
+      if (url.endsWith("/v1/skills") && method === "POST") {
+        createBody = JSON.parse(String(init?.body));
+        return jsonResponse({ skill_id: "sk_new", name: createBody.name }, true, 201);
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    });
+
+    const name = await ensureSkill("pat_test", "project_x", "Summarizer", "be brief", "skill");
+    expect(name).toBe("Summarizer");
+    expect(createBody).toEqual({
+      name: "Summarizer",
+      instructions: "be brief",
+      category: "skill",
+    });
+  });
+});
+
+describe("attachLabel", () => {
+  it("POSTs { name } to the asset's labels endpoint and treats 2xx as success", async () => {
+    const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      calls.push({ url, method, body: init?.body });
+      return { ok: true, status: 204, text: async () => "" } as unknown as Response;
+    });
+
+    await expect(
+      attachLabel("pat_test", "project_x", "asset_9", "needs-review"),
+    ).resolves.toBeUndefined();
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.url).toContain("/v1/assets/asset_9/labels");
+    expect(JSON.parse(String(calls[0]?.body))).toEqual({ name: "needs-review" });
   });
 });

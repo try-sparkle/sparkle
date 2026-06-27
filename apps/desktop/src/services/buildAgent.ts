@@ -76,15 +76,45 @@ export function workerMission(task: string, taskId: string): string {
   return `Task ${taskId}:\n${task}`;
 }
 
+/** Persona addendum that binds the orchestrator to a specific beads epic as the source of truth
+ *  for WHAT to build. Appended to the orchestrator persona (and/or the "Send to Build" seed prompt)
+ *  so the build agent discovers the epic's child tasks via `bd`, claims each before spawning a
+ *  worker for it, closes it once the worker's branch is merged into the build branch, and labels it
+ *  `delivered` once the work lands on main. Tone/format mirror the orchestration persona. */
+export function beadsProtocol(opts: { epicId: string }): string {
+  return [
+    "BEADS PROTOCOL — THE WORK GRAPH IS THE SOURCE OF TRUTH",
+    `- Your work is defined by beads epic ${opts.epicId} and its child tasks. Do not invent scope`,
+    "  beyond what the epic and its children describe.",
+    `- Discover the children before doing anything else: \`bd show ${opts.epicId} --json\` for the`,
+    "  epic and its dependents, `bd list --json` to inspect the full graph, and `bd ready` to see",
+    "  which child tasks are unblocked and ready to start.",
+    "- TASK LIFECYCLE — keep the graph honest as you go:",
+    "  1. BEFORE you spawn a worker for a task, CLAIM it: `bd update <taskId> --claim` (moves it to",
+    "     in_progress so no one else picks it up). Spawn the worker only after the claim succeeds.",
+    "  2. AFTER that worker reports success AND you have merged its branch into your build branch,",
+    "     CLOSE the task: `bd close <taskId>`.",
+    "  3. Once the WHOLE epic's work has actually landed on `main` (not just your build branch),",
+    "     mark each shipped child delivered: `bd label add <taskId> delivered`.",
+    "- Respect dependencies: only claim/spawn tasks that `bd ready` reports as unblocked; let a",
+    "  blocked task wait until its blockers are closed.",
+    "- The integration rules above still hold: NEVER touch `main` directly, and merge each worker's",
+    "  branch into YOUR build branch sequentially, one at a time.",
+  ].join("\n");
+}
+
 /** System prompt that turns a plain `claude` session into the master ORCHESTRATOR (the Build
  *  agent). It fans durable code work out to isolated worker agents via the sparkle-orchestrator
  *  MCP tools, waits for their structured results, then SEQUENTIALLY merges each worker's branch
  *  into its own branch — never main, never concurrently (the direct mitigation of the
  *  2026-06-23 multi-agent merge mess). `ownBranch` is the build agent's own working branch (the
- *  single integration point); `maxConcurrentWorkers` is the live concurrency cap. */
+ *  single integration point); `maxConcurrentWorkers` is the live concurrency cap. When `epicId`
+ *  is supplied, the beads-protocol addendum is appended so the orchestrator is bound to that epic
+ *  as its work graph. */
 export function orchestrationPersona(opts: {
   ownBranch: string;
   maxConcurrentWorkers: number;
+  epicId?: string;
 }): string {
   return [
     "You are a Sparkle BUILD agent — the master ORCHESTRATOR.",
@@ -128,5 +158,7 @@ export function orchestrationPersona(opts: {
     "REPORTING",
     "- When all units are integrated, report the CONSOLIDATED outcome to the user: what each",
     "  worker did, what merged cleanly, and anything left for them to land to `main` themselves.",
+    // Bind the orchestrator to a specific beads epic when one was handed off (Send to Build).
+    ...(opts.epicId ? ["", beadsProtocol({ epicId: opts.epicId })] : []),
   ].join("\n");
 }

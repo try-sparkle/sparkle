@@ -36,6 +36,14 @@ const AI_FEATURE_FIELD: Record<AiFeatureKey, keyof AiFeatureFlags> = {
   composer: "aiComposer",
 };
 
+// --- Chief sync state (replacing the legacy markdown-sync watermark) -----------------------
+
+/** Per-path Chief sync state: a content hash + the asset id currently holding that content. */
+export interface ChiefDocState {
+  hash: string;
+  assetId: string;
+}
+
 /** Derive the master segment from the four flags: all on → "all", all off → "off", else "some". */
 export function aiFeatureMode(f: AiFeatureFlags): AiMode {
   const vals = [f.aiAutoRename, f.cloudDictation, f.aiBrainstorm, f.aiComposer];
@@ -89,8 +97,9 @@ interface SettingsState {
   runtimeChiefPat: string;
   /** sparkleProjectId -> chiefProjectId (the Chief project we created/linked for it). */
   chiefProjectByProject: Record<string, string>;
-  /** agentId -> last commit sha whose markdown we synced to Chief (the sync watermark). */
-  chiefSyncByAgent: Record<string, string>;
+  /** chiefProjectId -> (doc path -> { content hash, asset id }). The current-state sync ledger:
+   *  one entry per path, replaced wholesale each sync. */
+  chiefDocStateByProject: Record<string, Record<string, ChiefDocState>>;
   /** Maximum number of concurrent workers (floored at 1). */
   maxConcurrentWorkers: number;
   /** Use the cloud streaming STT (Deepgram Nova-3) for active dictation when available. Default
@@ -110,7 +119,8 @@ interface SettingsState {
   setChiefPat: (pat: string) => void;
   setRuntimeChiefPat: (pat: string) => void;
   setChiefProject: (sparkleProjectId: string, chiefProjectId: string) => void;
-  setChiefSync: (agentId: string, sha: string) => void;
+  setChiefProjectDocState: (chiefProjectId: string, map: Record<string, ChiefDocState>) => void;
+  clearChiefDocState: (chiefProjectId: string) => void;
   setMaxConcurrentWorkers: (n: number) => void;
   setCloudDictation: (on: boolean) => void;
   /** Toggle one AI feature; the master segment re-derives automatically (aiFeatureMode). */
@@ -125,7 +135,7 @@ export const useSettingsStore = create<SettingsState>()(
       chiefPat: "",
       runtimeChiefPat: "",
       chiefProjectByProject: {},
-      chiefSyncByAgent: {},
+      chiefDocStateByProject: {},
       maxConcurrentWorkers: 4,
       cloudDictation: true,
       aiAutoRename: true,
@@ -147,10 +157,16 @@ export const useSettingsStore = create<SettingsState>()(
           },
         })),
 
-      setChiefSync: (agentId, sha) =>
+      setChiefProjectDocState: (chiefProjectId, map) =>
         set((s) => ({
-          chiefSyncByAgent: { ...s.chiefSyncByAgent, [agentId]: sha },
+          chiefDocStateByProject: { ...s.chiefDocStateByProject, [chiefProjectId]: map },
         })),
+
+      clearChiefDocState: (chiefProjectId) =>
+        set((s) => {
+          const { [chiefProjectId]: _drop, ...rest } = s.chiefDocStateByProject;
+          return { chiefDocStateByProject: rest };
+        }),
 
       setMaxConcurrentWorkers: (n) => set({ maxConcurrentWorkers: Math.max(1, Math.floor(n)) }),
     }),
@@ -166,7 +182,7 @@ export const useSettingsStore = create<SettingsState>()(
       partialize: (s) => ({
         chiefPat: s.chiefPat,
         chiefProjectByProject: s.chiefProjectByProject,
-        chiefSyncByAgent: s.chiefSyncByAgent,
+        chiefDocStateByProject: s.chiefDocStateByProject,
         maxConcurrentWorkers: s.maxConcurrentWorkers,
         cloudDictation: s.cloudDictation,
         aiAutoRename: s.aiAutoRename,

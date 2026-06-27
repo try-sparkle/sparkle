@@ -1,12 +1,13 @@
-// chiefSync — push the markdown a Build agent commits into the matching Chief project's
-// library, so the Think agent (which chats over that library) stays current with what
-// the Build agents produce. The Rust `markdown_changed_since` command finds the files; this
-// uploads each as a per-commit asset (named with the commit short-sha) via the Chief client.
+// chiefSync — push the current markdown state from a project's worktree into the matching
+// Chief project's library, so the Think agent stays current. The Rust `markdown_changed_since`
+// command (invoked with an empty sinceSha) returns the full current tree; this uploads each path
+// as a named asset (keyed by path, not commit sha), replacing content only when it changes.
 //
-// `syncAgentMarkdown` is pure glue over invoke + the chief client (unit-tested). The
+// `syncProjectMarkdown` is pure glue over invoke + the chief client (unit-tested). The
 // store-reading wrapper that fires it from the branch-status poll lives in runtimeStore.
 import { invoke } from "@tauri-apps/api/core";
-import { ensureChiefProject, uploadAsset } from "./chief";
+import { ensureChiefProject, uploadAsset, deleteAsset } from "./chief";
+import type { ChiefDocState } from "../stores/settingsStore";
 
 /** Directory pathspecs synced to Chief. Scoped (not "all markdown") to avoid uploading
  *  READMEs/vendored docs; the Rust side filters these dirs down to `.md` files. */
@@ -21,58 +22,91 @@ interface MarkdownSince {
   files: MarkdownChange[];
 }
 
-export interface SyncResult {
-  /** The worktree HEAD just synced — store this as the agent's next sync marker. */
-  headSha: string;
-  /** Asset names uploaded this run (empty when nothing changed). */
-  uploaded: string[];
-  /** The Chief project the assets landed in (created here if it didn't exist). */
-  chiefProjectId: string;
+/** Fast, non-cryptographic content fingerprint (FNV-1a, 32-bit) for change detection. A hash
+ *  collision would at worst skip one update; the next real change re-syncs. */
+export function hashContent(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
 }
 
-export interface SyncParams {
+export interface ProjectSyncParams {
   pat: string;
-  projectId: string;
+  sparkleProjectId: string;
   projectName: string;
+  /** An agent whose worktree we read the current markdown from. */
   agentId: string;
-  /** Chief project already linked to this Sparkle project, if any. */
   chiefProjectId?: string;
-  /** Last commit synced for this agent, if any. */
-  sinceSha?: string;
+  /** Current per-path ledger for this Chief project (path -> {hash, assetId}). */
+  docState: Record<string, ChiefDocState>;
+}
+
+export interface ProjectSyncResult {
+  chiefProjectId: string;
+  /** The complete desired ledger after this run (current paths only) — persist it wholesale. */
+  docState: Record<string, ChiefDocState>;
+  uploaded: string[];
+  deletedAssetIds: string[];
 }
 
 /**
- * Sync one agent's newly-committed markdown to its Chief project. Returns the advanced marker
- * and what was uploaded, or `null` when there's no PAT (nothing to do). Best-effort by design:
- * callers swallow throws and retry on the next poll, leaving the marker un-advanced so the same
- * range is reattempted.
+ * Sync a project's CURRENT markdown into its Chief library: one asset per path, named by path,
+ * replaced only when content changes, with stale/removed docs deleted. A partial failure throws and
+ * leaves the ledger un-persisted; note that deletes are committed eagerly to Chief mid-loop, so a
+ * failed run is NOT a clean rollback — the next run reconciles rather than retries from scratch.
+ * Returns null with no PAT. Asset identity is keyed by (Chief project, path), so multiple agents
+ * converge on one asset.
  */
-export async function syncAgentMarkdown(params: SyncParams): Promise<SyncResult | null> {
-  const { pat, projectId, projectName, agentId, chiefProjectId, sinceSha } = params;
+export async function syncProjectMarkdown(params: ProjectSyncParams): Promise<ProjectSyncResult | null> {
+  const { pat, sparkleProjectId, projectName, agentId, chiefProjectId, docState } = params;
   if (!pat) return null;
 
   const change = await invoke<MarkdownSince>("markdown_changed_since", {
-    projectId,
+    projectId: sparkleProjectId,
     agentId,
-    sinceSha: sinceSha ?? "",
+    sinceSha: "", // empty marker → full current tree under the synced dirs
     dirs: MARKDOWN_DIRS,
   });
 
-  // Nothing changed: advance the marker to HEAD (so we don't re-diff this range) without
-  // creating a Chief project for an agent that hasn't produced any docs yet.
-  if (change.files.length === 0) {
-    return { headSha: change.headSha, uploaded: [], chiefProjectId: chiefProjectId ?? "" };
+  // Nothing to upload and nothing tracked to clean up: don't even ensure a project.
+  if (change.files.length === 0 && Object.keys(docState).length === 0) {
+    return { chiefProjectId: chiefProjectId ?? "", docState: {}, uploaded: [], deletedAssetIds: [] };
   }
 
-  // There ARE docs to upload — ensure the project exists (creating it if a Build agent
-  // committed before the Think panel was ever opened).
   const pid = await ensureChiefProject(pat, projectName, chiefProjectId);
-  const short = change.headSha.slice(0, 7);
+  const next: Record<string, ChiefDocState> = {};
   const uploaded: string[] = [];
+  const deletedAssetIds: string[] = [];
+  const currentPaths = new Set<string>();
+
   for (const f of change.files) {
-    const name = `${f.path} @ ${short}`;
-    await uploadAsset(pat, pid, name, f.content);
-    uploaded.push(name);
+    currentPaths.add(f.path);
+    const hash = hashContent(f.content);
+    const prev = docState[f.path];
+    if (prev && prev.hash === hash) {
+      next[f.path] = prev; // unchanged — keep the existing asset
+      continue;
+    }
+    // Upload first so retrieval always has a live copy, THEN delete the superseded asset.
+    const { assetId } = await uploadAsset(pat, pid, f.path, f.content);
+    if (prev && prev.assetId && prev.assetId !== assetId) {
+      await deleteAsset(pat, pid, prev.assetId);
+      deletedAssetIds.push(prev.assetId);
+    }
+    next[f.path] = { hash, assetId };
+    uploaded.push(f.path);
   }
-  return { headSha: change.headSha, uploaded, chiefProjectId: pid };
+
+  // Docs that vanished from the tree: drop their assets so Chief reflects current state.
+  for (const [path, st] of Object.entries(docState)) {
+    if (!currentPaths.has(path) && st.assetId) {
+      await deleteAsset(pat, pid, st.assetId);
+      deletedAssetIds.push(st.assetId);
+    }
+  }
+
+  return { chiefProjectId: pid, docState: next, uploaded, deletedAssetIds };
 }

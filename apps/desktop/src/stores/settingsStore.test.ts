@@ -125,3 +125,33 @@ describe("settingsStore — AI feature setters", () => {
     expect(aiFeatureMode(s)).toBe("all");
   });
 });
+
+describe("settingsStore — Chief doc state", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ chiefDocStateByProject: {} });
+  });
+
+  it("setChiefProjectDocState replaces the per-project doc-state map", () => {
+    const store = useSettingsStore;
+    store.getState().setChiefProjectDocState("project_x", {
+      "PRD/a.md": { hash: "h1", assetId: "asset_1" },
+    });
+    expect(store.getState().chiefDocStateByProject["project_x"]).toEqual({
+      "PRD/a.md": { hash: "h1", assetId: "asset_1" },
+    });
+    // Replace (not merge): the old path is gone.
+    store.getState().setChiefProjectDocState("project_x", {
+      "PRD/b.md": { hash: "h2", assetId: "asset_2" },
+    });
+    expect(store.getState().chiefDocStateByProject["project_x"]).toEqual({
+      "PRD/b.md": { hash: "h2", assetId: "asset_2" },
+    });
+  });
+
+  it("clearChiefDocState drops the per-project map", () => {
+    const store = useSettingsStore;
+    store.getState().setChiefProjectDocState("project_y", { "PRD/a.md": { hash: "h", assetId: "a" } });
+    store.getState().clearChiefDocState("project_y");
+    expect(store.getState().chiefDocStateByProject["project_y"]).toBeUndefined();
+  });
+});

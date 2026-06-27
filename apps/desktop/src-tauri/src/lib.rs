@@ -1,4 +1,5 @@
 mod accounts;
+mod ai;
 mod attachments;
 mod attention;
 mod audio;
@@ -145,6 +146,13 @@ pub fn run() {
             bridge::orchestrator_mcp_paths,
             notes::append_note,
             notes::create_bead,
+            notes::write_prd,
+            notes::list_beads,
+            notes::bead_show,
+            notes::create_bead_full,
+            notes::bead_dep_add,
+            notes::bead_label,
+            ai::anthropic_chat,
             history::history_record,
             history::history_search,
             history::history_prune,
