@@ -83,6 +83,17 @@ impl ParakeetTdt {
         Ok(Self { recognizer: Mutex::new(recognizer), vad: Mutex::new(vad), window: WindowBuffer::default() })
     }
 
+    /// Real-time "is the user speaking *right now*?" flag straight from the Silero VAD,
+    /// refreshed by the 512-sample windows fed in `accept()`. This is distinct from the
+    /// queued speech *segments* (`front`/`pop`), which only close after a ~250ms pause: the
+    /// detector flips this true within a window of speech onset and false shortly after it
+    /// stops. The waveform UI gates its animation on this so the meter only moves while you
+    /// actually talk — accurate where a raw-loudness threshold can't tell speech from noise.
+    /// Poison-tolerant lock (same rationale as `transcribe`).
+    pub fn speaking(&self) -> bool {
+        self.vad.lock().unwrap_or_else(|p| p.into_inner()).detected()
+    }
+
     fn transcribe(&self, samples: &[f32]) -> String {
         // Poison-tolerant lock (): a panic elsewhere on the audio thread must not
         // wedge dictation for the app's lifetime — recover the guard and carry on.

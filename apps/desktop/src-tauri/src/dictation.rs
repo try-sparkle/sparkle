@@ -119,6 +119,17 @@ pub(crate) fn choose_engine(setting_enabled: bool, key_present: bool, credits_ok
     }
 }
 
+/// The waveform's "is the user speaking right now?" signal for one captured frame — the source
+/// of the edge-triggered `dictation://speaking` events. On the on-device path it's the Silero
+/// VAD's real-time detection (`vad_detected`). While the cloud stream owns the audio the on-device
+/// VAD isn't fed, so we report speaking unconditionally: the user is actively dictating to the
+/// cloud by definition, so the meter should stay live. Pure so the cloud/local branch — and the
+/// rising/falling edges it produces, including the cloud→on-device transition — are unit-testable
+/// without a CoreAudio callback or a loaded VAD model.
+pub(crate) fn frame_speaking(cloud_active: bool, vad_detected: bool) -> bool {
+    cloud_active || vad_detected
+}
+
 /// Whether the cpal mic capture should currently be live. Two conditions, both required:
 ///   - `armed`: the frontend wants the mic on (the user hasn't muted it).
 ///   - `focused`: at least one Sparkle window is the focused/active OS window.
@@ -295,6 +306,10 @@ fn build_capture(
     cloud_active: Arc<AtomicBool>,
 ) -> Result<Capture, String> {
     let app_cb = app.clone();
+    // Last emitted speech-detection state, so we emit `dictation://speaking` only on the
+    // rising/falling EDGE rather than ~60×/sec. Fresh per capture (starts false), so a newly
+    // (re)built capture begins "silent" and the waveform stays flat until real speech lands.
+    let mut last_speaking = false;
     // NOTE: transcriber is locked on every CoreAudio callback frame. The lock must stay short-held
     // (accept() only, no I/O). finalize() is always called *after* Capture is dropped (stop_dictation),
     // so the slow finalize path never contends with a live callback frame.
@@ -310,18 +325,33 @@ fn build_capture(
         // cloud_active is still true but send_audio's channel is dead, so those frames are dropped
         // rather than transcribed on-device — until the cloud-ended event drives stop_cloud_stream
         // and flips cloud_active back. Accepted: the window is tens of ms on a rare disconnect.
-        if cloud_active.load(Ordering::Relaxed) {
+        //
+        // `speaking` drives the waveform animation (frontend `dictation://speaking` listener); see
+        // frame_speaking for how the cloud/on-device branch maps to it. On the on-device path we
+        // read the Silero VAD's real-time flag; on the cloud path the VAD isn't fed (frame_speaking
+        // ignores `vad_detected` there), so what we pass is moot.
+        let cloud = cloud_active.load(Ordering::Relaxed);
+        let vad_detected = if cloud {
             if let Some(s) = cloud_slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
                 s.send_audio(&frame);
             }
+            false // unused when cloud == true
         } else {
-            let segs = transcriber
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .accept(&frame);
+            let mut guard = transcriber.lock().unwrap_or_else(|p| p.into_inner());
+            let segs = guard.accept(&frame);
+            // Read the VAD flag while we still hold the transcriber lock (cheap, no I/O), then
+            // release before emitting the (possibly many) partials.
+            let spk = guard.speaking();
+            drop(guard);
             for seg in segs {
                 emit_partial(&app_cb, "accept", seg);
             }
+            spk
+        };
+        let speaking = frame_speaking(cloud, vad_detected);
+        if speaking != last_speaking {
+            last_speaking = speaking;
+            let _ = app_cb.emit("dictation://speaking", speaking);
         }
     })
     .map_err(|e| {
@@ -504,9 +534,23 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_should_be_live, choose_engine, segment_fingerprint, should_emit_blur,
-        should_install_cloud, DictationState, Engine,
+        capture_should_be_live, choose_engine, frame_speaking, segment_fingerprint,
+        should_emit_blur, should_install_cloud, DictationState, Engine,
     };
+
+    #[test]
+    fn frame_speaking_mirrors_vad_on_device_and_forces_true_on_cloud() {
+        // On-device path (cloud off): the waveform's speaking signal is exactly the VAD flag, so
+        // the meter freezes the instant the VAD stops hearing speech.
+        assert!(!frame_speaking(false, false), "on-device + VAD silent → not speaking");
+        assert!(frame_speaking(false, true), "on-device + VAD speech → speaking");
+        // Cloud path: the on-device VAD isn't fed, so we report speaking regardless (the user is
+        // actively dictating to the cloud). This also pins the edges around mode transitions: e.g.
+        // a cloud→on-device switch while silent yields true→false (a falling edge that freezes the
+        // meter), and on-device→cloud yields false→true (rising edge), via the != last_speaking diff.
+        assert!(frame_speaking(true, false), "cloud → speaking even when the (unfed) VAD reads false");
+        assert!(frame_speaking(true, true), "cloud → speaking");
+    }
 
     #[test]
     fn capture_is_live_only_when_armed_and_focused() {

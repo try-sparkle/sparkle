@@ -43,13 +43,17 @@ describe("LogoWaveform — honest listening", () => {
     useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
     render(<LogoWaveform />);
     expect(wakeHintButton()).not.toBeNull();
-    expect(screen.queryByText("Mic paused")).toBeNull();
+    expect(screen.queryByText(/Listening paused/)).toBeNull();
   });
 
-  it("armed but paused (not listening) → 'Mic paused', not the wake hint", () => {
+  it("armed but paused (not listening) → 'Listening paused' hint, not the wake hint", () => {
     useDictationStore.setState({ enabled: true, status: "idle", phase: "passive" });
     render(<LogoWaveform />);
-    expect(screen.getByText("Mic paused")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Listening paused: Will auto-resume when you re-focus on this project.",
+      ),
+    ).toBeTruthy();
     // The wake-hint caption must NOT render when paused.
     expect(wakeHintButton()).toBeNull();
   });
@@ -57,7 +61,7 @@ describe("LogoWaveform — honest listening", () => {
   it("muted → no caption at all, mic offers to unmute", () => {
     useDictationStore.setState({ enabled: false, status: "idle" });
     render(<LogoWaveform />);
-    expect(screen.queryByText("Mic paused")).toBeNull();
+    expect(screen.queryByText(/Listening paused/)).toBeNull();
     expect(wakeHintButton()).toBeNull();
     expect(screen.getByRole("button", { name: "Unmute microphone" })).toBeTruthy();
   });

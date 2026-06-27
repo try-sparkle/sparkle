@@ -32,11 +32,46 @@ export function barFraction(level: number): number {
 }
 
 /**
+ * Compute the next bar-history array for one animation frame. Pure (rAF passes the random
+ * `jitterFactor` in) so the gating is unit-testable.
+ *
+ * The meter animates ONLY while the user is actually speaking — `speaking` is the backend
+ * Silero VAD's real-time voice-activity flag (`dictation://speaking`), not a raw-loudness
+ * guess, so ambient noise never makes it wiggle:
+ *  - Not speaking → decay any residual wave toward a flat, static line. Once already flat we
+ *    return the SAME array reference so React bails out of re-rendering and the line is truly
+ *    still (no per-frame churn while you're silent).
+ *  - Speaking → scroll left one slot and append the current gain-curved level. `level` (raw
+ *    RMS loudness) still drives bar HEIGHT; `speaking` only gates the MOTION.
+ */
+export function nextBars(
+  prev: number[],
+  speaking: boolean,
+  level: number,
+  jitterFactor: number,
+): number[] {
+  if (!speaking) {
+    if (prev.every((h) => h === 0)) return prev; // already flat → stable ref, no re-render
+    // Snap small residuals to exactly 0 so the decay actually reaches (and holds) flat.
+    return prev.map((h) => (h < 0.02 ? 0 : h * 0.55));
+  }
+  // Per-bar DOWNWARD jitter scaled by the level: because `gained` saturates by ~0.1 (the
+  // punchy GAIN), an *additive* jitter would pin every bar to the ceiling during speech — a
+  // flat block. Pulling each bar down by a random fraction keeps loud frames spread out so
+  // neighboring bars spike apart and the meter visibly jumps the louder the user talks.
+  const gained = barFraction(level);
+  const next = prev.slice(1);
+  next.push(Math.min(1, gained * jitterFactor));
+  return next;
+}
+
+/**
  * The hint caption under the waveform.
  *  - Muted (mic released) → null.
  *  - Armed AND actually capturing → the passive/active wake hints.
- *  - Armed but NOT capturing (focus-paused) → an honest "Mic paused" — we must not
- *    claim "Just say Hey Sparkle…" when the backend isn't hearing anything.
+ *  - Armed but NOT capturing (focus-paused) → an honest "Listening paused…" that tells
+ *    the user it auto-resumes on re-focus — we must not claim "Just say Hey Sparkle…"
+ *    when the backend isn't hearing anything.
  */
 export function captionFor(
   phase: Phase,
@@ -44,7 +79,8 @@ export function captionFor(
   listening: boolean,
 ): string | null {
   if (!enabled) return null;
-  if (!listening) return "Mic paused";
+  if (!listening)
+    return "Listening paused: Will auto-resume when you re-focus on this project.";
   return phase === "passive"
     ? "Listening for wake word: Just say Hey Sparkle to talk to me"
     : "Just say Send It to stop";
@@ -57,6 +93,7 @@ export function captionFor(
  */
 export function LogoWaveform() {
   const level = useDictationStore((s) => s.level);
+  const speaking = useDictationStore((s) => s.speaking);
   const phase = useDictationStore((s) => s.phase);
   const enabled = useDictationStore((s) => s.enabled);
   const status = useDictationStore((s) => s.status);
@@ -75,10 +112,12 @@ export function LogoWaveform() {
   const [bars, setBars] = useState<number[]>(() => Array(BAR_COUNT).fill(0));
   const [micHover, setMicHover] = useState(false);
   const raf = useRef(0);
-  // Hold level in a ref so the rAF closure always reads the latest value without
+  // Hold level + speaking in refs so the rAF closure always reads the latest values without
   // restarting the loop on every store update.
   const levelRef = useRef(level);
   useEffect(() => { levelRef.current = level; }, [level]);
+  const speakingRef = useRef(speaking);
+  useEffect(() => { speakingRef.current = speaking; }, [speaking]);
 
   useEffect(() => {
     // Only run the animation loop while armed AND capture is actually live. When paused
@@ -91,22 +130,12 @@ export function LogoWaveform() {
       return;
     }
     const tick = () => {
-      setBars((prev) => {
-        // Gained, perceptual level for this frame (barFraction applied ONCE here so
-        // render can use the value verbatim — no double-application).
-        const gained = barFraction(levelRef.current);
-        // A faint idle shimmer so the meter reads as "listening closely" even in
-        // near-silence. Plus a per-bar DOWNWARD jitter scaled by the level: because
-        // `gained` saturates by ~0.1 (the punchy GAIN), an *additive* jitter would pin
-        // every bar to the ceiling during speech — a flat block. Pulling each bar down
-        // by a random fraction of `gained` keeps loud frames spread out so neighboring
-        // bars spike apart and the meter visibly jumps the louder the user talks.
-        const shimmer = 0.06 + Math.random() * 0.06;
-        const jitterFactor = 1 - Math.random() * 0.55;
-        const next = prev.slice(1);
-        next.push(Math.min(1, shimmer + gained * jitterFactor));
-        return next;
-      });
+      // Gate animation on the VAD `speaking` flag: scroll while the user talks, decay to a
+      // flat static line in silence (see nextBars). The random jitter is generated here so
+      // nextBars stays pure/testable.
+      setBars((prev) =>
+        nextBars(prev, speakingRef.current, levelRef.current, 1 - Math.random() * 0.55),
+      );
       raf.current = requestAnimationFrame(tick);
     };
     raf.current = requestAnimationFrame(tick);
@@ -126,8 +155,8 @@ export function LogoWaveform() {
   // Muted → gray, with a cyan hover affordance signalling "click to turn audio on".
   const micColor = !enabled ? (micHover ? C.accent : C.muted) : active ? C.accentInk : C.teal;
   const micBorder = !enabled ? (micHover ? C.accent : C.muted) : active ? C.accent : C.teal;
-  // Recent waveform energy (newest bars) drives the pulsating glow behind the mic. The idle
-  // shimmer keeps it faintly alive even in silence; it swells as the user gets louder.
+  // Recent waveform energy (newest bars) drives the pulsating glow behind the mic. It rests
+  // quietly in silence (bars are flat → energy 0) and swells as the user gets louder.
   const energy = enabled && listening ? Math.max(0, ...bars.slice(-12)) : 0;
 
   return (
@@ -136,8 +165,8 @@ export function LogoWaveform() {
           mic ring floats in the middle with the bars popping behind it. */}
       <div style={{ position: "relative", height: WAVE_HEIGHT }}>
         {/* Pulsating Siri-orb glow behind the mic: soft, amoeba-like blobs across the teal→blue
-            spectrum that swell with the live audio `energy` (and breathe gently in silence via the
-            idle shimmer baked into `energy`). Sits behind everything; the mic's translucent disc
+            spectrum that swell with the live audio `energy` (and rest quietly in silence, since
+            the bars sit flat then). Sits behind everything; the mic's translucent disc
             keeps the glyph legible over it. Only while actually listening. */}
         {enabled && listening && (
           <div

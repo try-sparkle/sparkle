@@ -16,6 +16,11 @@ interface ModelProgress {
 interface DictationState {
   status: Status;
   level: number;
+  /** Real-time "is the user speaking right now?" flag from the backend Silero VAD
+   *  (`dictation://speaking`). Drives the waveform animation: the meter only moves while
+   *  this is true, so it sits as a flat, static line in silence instead of wiggling on
+   *  ambient noise. Distinct from `level` (raw loudness, used only for bar HEIGHT). */
+  speaking: boolean;
   error: string | null;
   /** Non-null while the backend is downloading the whisper model (~482 MB). */
   modelProgress: ModelProgress | null;
@@ -36,6 +41,7 @@ interface DictationState {
 
   setStatus: (s: Status) => void;
   setLevel: (l: number) => void;
+  setSpeaking: (v: boolean) => void;
   /** Replace the live interim preview (cloud path). Pass "" to clear it. */
   setInterim: (text: string) => void;
   /** Setting a non-null value also transitions status to "error". Clearing with
@@ -56,6 +62,7 @@ export const useDictationStore = create<DictationState>()(
     (set, get) => ({
       status: "idle",
       level: 0,
+      speaking: false,
       error: null,
       modelProgress: null,
       interim: "",
@@ -66,6 +73,7 @@ export const useDictationStore = create<DictationState>()(
 
       setStatus: (status) => set({ status }),
       setLevel: (level) => set({ level }),
+      setSpeaking: (speaking) => set({ speaking }),
       setInterim: (interim) => set({ interim }),
       setError: (error) =>
         set((s) => ({

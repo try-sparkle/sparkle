@@ -60,7 +60,7 @@ export async function createDictationController(
   let onSegment = options.onSegment;
   const onResumeActive = options.onResumeActive;
 
-  const { setStatus, setLevel, setError, setModelProgress } =
+  const { setStatus, setLevel, setSpeaking, setError, setModelProgress } =
     useDictationStore.getState();
 
   // Register event listeners — each `listen()` returns an unsubscribe fn.
@@ -99,6 +99,13 @@ export async function createDictationController(
       setLevel(e.payload);
     }),
 
+    // Real-time voice-activity edge from the Silero VAD (rising/falling only, not per-frame).
+    // The waveform animates only while this is true, so the meter sits flat in silence instead
+    // of wiggling on ambient noise. `level` still drives bar HEIGHT; this gates the MOTION.
+    listen<boolean>("dictation://speaking", (e) => {
+      setSpeaking(e.payload);
+    }),
+
     listen<string>("dictation://error", (e) => {
       setModelProgress(null);
       setError(e.payload);
@@ -119,6 +126,9 @@ export async function createDictationController(
         invoke("stop_cloud_stream").catch(() => {});
         store.setInterim("");
         store.setLevel(0);
+        // Capture is paused — no more frames, so clear the VAD flag ourselves (the backend
+        // emits edges only while capturing) to freeze the waveform flat while unfocused.
+        store.setSpeaking(false);
         if (store.status !== "error") store.setStatus("idle");
       } else if (store.enabled && store.status !== "error") {
         store.setStatus("listening");
@@ -145,6 +155,7 @@ export async function createDictationController(
       state.setModelProgress(null);
       state.setStatus("idle");
       state.setLevel(0);
+      state.setSpeaking(false);
       state.setInterim("");
     } else {
       state.setError(null);
@@ -334,6 +345,7 @@ export function useAmbientVoice(): void {
       invoke("stop_dictation").catch(() => {});
       store.setStatus("idle");
       store.setLevel(0);
+      store.setSpeaking(false);
       store.setPhase("passive");
       store.setInterim("");
     }
