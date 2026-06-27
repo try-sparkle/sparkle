@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled, TbBulb } from "react-icons/tb";
+import { FaTasks } from "react-icons/fa";
 import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK } from "../theme/colors";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
@@ -31,17 +32,54 @@ import { CloseWorkerPrompt } from "./CloseWorkerPrompt";
  * to open the agent, double-click the agent name to rename it, ×
  * to close. "+ Agent" adds one.
  */
-// Shared style for the two create buttons (Think / Build): a solid gradient fill with
-// NO border/stroke, so the button reads as a button without an edge of a different shade on
-// its sides. The gradient runs left→right to reproduce the Sparkle logo's blue→cyan fade:
-// Think runs blue→mid, Build picks up mid→cyan. `fillText` is the per-button ink chosen
-// for contrast on that fill.
-function createBtnStyle(from: string, to: string, fillText: string): React.CSSProperties {
+// The three create buttons (Think / Plan / Build) form one continuous Sparkle blue→cyan
+// fade, split into thirds. These are the four fade boundaries: the cyan "S" accent on the far
+// left of Think, the primary brand blue on the far right of Build, and two interpolated stops
+// at 1/3 and 2/3 so each button paints exactly its slice of the SAME overall gradient.
+const FADE_0 = C.accent; // #34e0f0 — logo cyan, far-left edge of Think
+const FADE_1 = "#32b9f5"; // 1/3 stop (Think→Plan seam)
+const FADE_2 = "#3192fa"; // 2/3 stop (Plan→Build seam)
+const FADE_3 = C.teal; // #2f6bff — primary brand blue, far-right edge of Build
+
+// Depth (px) of the chevron point/notch carved into a button's vertical edge.
+const CHEVRON = 11;
+
+// Build the clip-path for a button in the chevron strip. The OUTER edges of the strip
+// (Think's left, Build's right) stay flat ("vertical button surfaces"); interior seams are
+// arrow-shaped: a button that isn't last grows a rightward point, a button that isn't first
+// gets a matching inward notch on its left so the previous button's point nests into it.
+function chevronClip(leftNotch: boolean, rightPoint: boolean): string {
+  const d = `${CHEVRON}px`;
+  const pts: string[] = ["0 0"];
+  if (rightPoint) {
+    pts.push(`calc(100% - ${d}) 0`, "100% 50%", `calc(100% - ${d}) 100%`);
+  } else {
+    pts.push("100% 0", "100% 100%");
+  }
+  pts.push("0 100%");
+  if (leftNotch) pts.push(`${d} 50%`);
+  return `polygon(${pts.join(", ")})`;
+}
+
+// Shared style for a create button: a solid gradient slice with NO border/stroke, clipped to
+// its chevron shape. `fillText` is the per-button ink chosen for contrast on that fill. The
+// strip's rounded outer corners come from the wrapper (overflow:hidden + borderRadius), so the
+// buttons themselves are square; `leftNotch` buttons overlap the previous one by CHEVRON px
+// (negative margin) so the point tessellates exactly into the notch.
+function createBtnStyle(
+  from: string,
+  to: string,
+  fillText: string,
+  leftNotch: boolean,
+  rightPoint: boolean,
+): React.CSSProperties {
   return {
     flex: 1,
     padding: "9px 10px",
     border: "none",
-    borderRadius: 8,
+    borderRadius: 0,
+    marginLeft: leftNotch ? -CHEVRON : 0,
+    clipPath: chevronClip(leftNotch, rightPoint),
     cursor: "pointer",
     fontFamily: '"IBM Plex Sans", sans-serif',
     fontSize: 13,
@@ -176,6 +214,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const id = existing ? existing.id : addAgent(project.id, { kind: "think" });
     selectAgent(project.id, id);
     open(id);
+  };
+  const onPlan = () => {
+    // Plan takes over what the old TopBar "Tasks" button did: open the project-scoped
+    // read-only Tasks Kanban. It sits between Think and Build in the create-button strip.
+    setActiveSpecial("board");
   };
   const onAddBuild = () => {
     if (!project) return;
@@ -364,23 +407,35 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       </div>
 
       {project && (
-        <div style={{ display: "flex", gap: 8, margin: "0 10px 8px" }}>
-          {/* AI feature-gated (the "Enable AI Thinking" toggle): off → the button disappears
-              (Build stays). main renamed Brainstorm → Think; the gate flag stays aiBrainstorm. */}
+        <div style={{ display: "flex", margin: "0 10px 8px", borderRadius: 8, overflow: "hidden" }}>
+          {/* Think / Plan / Build form one chevron strip painting a single blue→cyan fade.
+              Think is AI feature-gated (the "Enable AI Thinking" toggle): off → it disappears
+              and Plan becomes the strip's flat-left start. The gate flag stays aiBrainstorm. */}
           {aiBrainstorm && (
             <button
               onClick={onAddThink}
               title="Chat with Chief over this project's knowledge"
-              style={createBtnStyle(C.accent, C.accentMid, ON_BRAND_FILL_DARK)} // cyan (the "S" color) leads; black icon+text
+              // First in the strip: flat left, points right into Plan. Cyan ("S" color) leads; dark ink.
+              style={createBtnStyle(FADE_0, FADE_1, ON_BRAND_FILL_DARK, false, true)}
             >
               <TbBulb size={18} style={{ flexShrink: 0 }} />
               <span>Think</span>
             </button>
           )}
           <button
+            onClick={onPlan}
+            title="Open this project's read-only Tasks board"
+            // Full chevron when Think is present (notch left + point right); flat-left start when not.
+            style={createBtnStyle(FADE_1, FADE_2, ON_BRAND_FILL_DARK, aiBrainstorm, true)}
+          >
+            <FaTasks size={14} style={{ flexShrink: 0 }} />
+            <span>Plan</span>
+          </button>
+          <button
             onClick={onAddBuild}
             title="A master orchestrator that spawns worker agents to get work done"
-            style={createBtnStyle(C.accentMid, C.teal, ON_BRAND_FILL)} // blue leads (matches logo's right side); white icon+text
+            // Last in the strip: notched left (receives Plan's point), flat right. White ink.
+            style={createBtnStyle(FADE_2, FADE_3, ON_BRAND_FILL, true, false)}
           >
             <span style={{ fontSize: 26, lineHeight: 0, transform: "translateY(-3.5px)" }}>⚒</span>
             <span>Build</span>

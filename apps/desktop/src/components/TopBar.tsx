@@ -94,7 +94,6 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const replaceCurrent = useReplaceCurrentProject();
   const windowLabel = useCurrentWindowLabel();
   const statusMap = useRuntimeStore((s) => s.status);
-  const activeSpecial = useUiStore((s) => s.activeSpecial);
   const zoom = useUiStore((s) => s.zoom);
   const zoomIn = useUiStore((s) => s.zoomIn);
   const zoomOut = useUiStore((s) => s.zoomOut);
@@ -213,18 +212,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
               <StatusDot key={a.id} status={statusMap[a.id] ?? "stopped"} size={7} />
             ))}
           </div>
-          {/* Project-scoped read-only Tasks Kanban (bead sparkle-hiju.10). Highlighted when active. */}
-          <button
-            style={
-              activeSpecial === "board"
-                ? { ...btn, borderColor: C.teal, background: C.teal, color: ON_BRAND_FILL }
-                : btn
-            }
-            title="Tasks board (read-only)"
-            onClick={() => useUiStore.getState().setActiveSpecial("board")}
-          >
-            Tasks
-          </button>
+          {/* The Tasks board now opens from the "Plan" button in the agent strip (AgentSidebar). */}
         </>
       ) : (
         <span style={{ color: C.muted, fontSize: 14 }}>No project open</span>
