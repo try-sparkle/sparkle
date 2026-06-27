@@ -390,9 +390,16 @@ pub fn agent_branch_status_at(
     let behind: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let ahead: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    // Propagate a failed dirtiness read (e.g. missing worktree) rather than swallowing it to a
-    // misleading "clean" false-negative on the common UI-status path.
-    let dirty = !git(&wt_str, &["status", "--porcelain"])?.is_empty();
+    // Dirtiness needs the actual worktree. When it's GONE (a landed/cleaned-up agent whose tab
+    // stays open and keeps getting polled), a removed tree has no uncommitted changes — report
+    // dirty=false instead of erroring, so the 30s poll doesn't re-fail every tick forever and
+    // bury real errors in the log. When the tree EXISTS, still propagate a failed read rather than
+    // masking it as a misleading "clean" false-negative on the common UI-status path.
+    let dirty = if wt.exists() {
+        !git(&wt_str, &["status", "--porcelain"])?.is_empty()
+    } else {
+        false
+    };
 
     // numstat: sum insertions/deletions, count file lines.
     let numstat = git(root, &["diff", "--numstat", &format!("{base}...{branch}")]).unwrap_or_default();
@@ -1428,6 +1435,37 @@ mod tests {
         std::fs::write(Path::new(&info.path).join("uncommitted.txt"), "u").unwrap();
         let st2 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
         assert!(st2.dirty, "uncommitted file flips dirty");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn agent_branch_status_tolerates_a_removed_worktree() {
+        // Repro of the FATAL-log spam: a landed/cleaned-up agent's worktree is gone, but its tab
+        // stays open and the 30s poll keeps calling this. The in-worktree `git status` would fail
+        // with "cannot change to <path>: No such file or directory". We must still return Ok with
+        // dirty=false (a removed tree has no uncommitted changes) and keep ahead/behind correct.
+        let root = unique_root("status-gone");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("status-gone-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+
+        // One agent commit so ahead=1, then physically remove the worktree directory.
+        std::fs::write(Path::new(&info.path).join("a.txt"), "a\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+        std::fs::remove_dir_all(&info.path).unwrap();
+        assert!(!Path::new(&info.path).exists(), "worktree dir removed");
+
+        let st = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        assert_eq!(st.ahead, 1, "ahead/behind still computed from refs in root");
+        assert_eq!(st.behind, 0);
+        assert!(!st.dirty, "a removed worktree reports clean, not an error");
+        assert_eq!(st.files_changed, 1, "numstat runs against root refs, unaffected");
+
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
     }
