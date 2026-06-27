@@ -35,6 +35,22 @@ fn run_in_login_shell(script: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Run a login-shell script that references a runtime value as `"$1"`, passing `arg` as a real
+/// argv parameter instead of interpolating it into the script string. We still need the login
+/// shell (so `claude`'s `#!/usr/bin/env node` shebang resolves `node` off the user's PATH), but a
+/// path that contains a quote/space/`;`/`$(…)` must NOT be able to break out of the command — a
+/// quoted positional `"$1"` is substituted verbatim and never re-tokenized.
+fn run_in_login_shell_with_arg(script: &str, arg: &str) -> Option<String> {
+    Command::new(login_shell())
+        // The token after the script becomes $0; `arg` becomes $1.
+        .args(["-lc", script, "sparkle-preflight", arg])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Canonical absolute locations the official installers use, in priority order.
 /// Covers the native installer (`~/.local/bin`), the legacy local install
 /// (`~/.claude/local`), and homebrew/npm global prefixes.
@@ -105,7 +121,7 @@ pub fn claude_preflight() -> ClaudeStatus {
         .or_else(|| first_executable(&known_claude_paths()));
     let version = path
         .as_ref()
-        .and_then(|p| run_in_login_shell(&format!("'{p}' --version")));
+        .and_then(|p| run_in_login_shell_with_arg("\"$1\" --version", p));
     ClaudeStatus { installed: path.is_some(), path, version }
 }
 
@@ -162,5 +178,26 @@ mod tests {
         let paths = super::known_node_paths_for(None);
         // No home → no ~/.local entry, but the system locations are still present.
         assert!(paths.iter().any(|p| p.ends_with("opt/homebrew/bin/node")));
+    }
+
+    #[test]
+    fn version_probe_passes_path_as_arg_not_shell_interpolation() {
+        use std::os::unix::fs::PermissionsExt;
+        // A binary whose path contains a single quote AND a space — the exact shape that broke
+        // out of the old `format!("'{p}' --version")` interpolation. With "$1" arg-passing it must
+        // execute correctly (proving no breakout and that the real binary ran).
+        let dir = std::env::temp_dir().join(format!("sparkle-pf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("we'ird claude");
+        std::fs::write(&bin, "#!/bin/sh\necho SPARKLE-MARKER-9\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = run_in_login_shell_with_arg("\"$1\" --version", bin.to_str().unwrap());
+        // Contains (not equals): a dev/CI login profile may emit its own stdout noise.
+        assert!(
+            out.as_deref().map(|s| s.contains("SPARKLE-MARKER-9")).unwrap_or(false),
+            "expected the quoted-path binary to run; got {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

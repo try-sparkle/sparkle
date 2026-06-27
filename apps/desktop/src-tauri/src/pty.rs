@@ -114,12 +114,15 @@ pub fn pty_spawn(
     rows: u16,
 ) -> Result<(), String> {
     let validated_cwd = validate_spawn(&app, &command, cwd.as_deref())?;
-    // Log the command and arg COUNT at info, but keep the full args at debug only: the args
-    // carry the built `zsh -c '…'` script, which embeds the user's prompt/persona (and could
-    // in principle carry a secret passed as a flag) — not something to write to the shared
-    // daily log by default.
+    // Log the command and arg COUNT at info. The full args carry the built `zsh -c '…'` script,
+    // which embeds the user's prompt/persona (and could in principle carry a secret passed as a
+    // flag), so they're NEVER written to the shared daily log by default — even though our default
+    // filter is `sparkle_lib=debug`. Gate the full-args line behind an explicit opt-in env var so
+    // a developer can still get it when actively debugging spawn issues.
     tracing::info!(%id, %command, arg_count = args.len(), cwd = ?cwd, cols, rows, "pty_spawn");
-    tracing::debug!(%id, args = ?args, "pty_spawn args (may contain prompt text)");
+    if std::env::var_os("SPARKLE_LOG_PTY_ARGS").is_some() {
+        tracing::debug!(%id, args = ?args, "pty_spawn args (may contain prompt text)");
+    }
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })

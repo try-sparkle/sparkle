@@ -14,10 +14,46 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
+/// A frontend-supplied id component (project_id / agent_id / worker_id) that gets joined into a
+/// filesystem path AND embedded into a git branch name. These are UUIDs in practice, so we hold
+/// them to a strict allowlist: anything with `/`, `..`, a leading `-`, or other path/option
+/// metacharacters is rejected before it can escape `<app_data>/worktrees` or weaponize a git arg.
+fn validate_id(label: &str, id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 128 {
+        return Err(format!("invalid {label}: must be 1-128 chars"));
+    }
+    if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(format!("invalid {label}: only [A-Za-z0-9_-] allowed"));
+    }
+    Ok(())
+}
+
+/// Validate a frontend/agent-supplied git ref before it reaches `git` as an argument. Branch
+/// names legitimately contain `/` (e.g. `release/2026`), so we don't allowlist; we reject the
+/// shapes that turn a ref into a weaponized argument: a leading `-` (parsed as an option such as
+/// `--upload-pack=` on fetch or `--exec=` on rebase → command execution) and whitespace/control
+/// characters (which git forbids in ref names anyway).
+fn validate_ref(branch: &str) -> Result<(), String> {
+    let b = branch.trim();
+    if b.is_empty() {
+        return Err("empty git ref".into());
+    }
+    if b.starts_with('-') {
+        return Err(format!("refusing git ref starting with '-': {b:?}"));
+    }
+    if b.bytes().any(|c| c.is_ascii_control() || c == b' ') {
+        return Err(format!("git ref has whitespace/control chars: {b:?}"));
+    }
+    Ok(())
+}
+
 /// Absolute path to an agent's worktree, OUTSIDE the project tree, under Sparkle's app-data
-/// dir. Keyed by project_id (a UUID) so same-named project folders never collide.
-pub fn worktree_path(app_data: &Path, project_id: &str, agent_id: &str) -> PathBuf {
-    app_data.join("worktrees").join(project_id).join(agent_id)
+/// dir. Keyed by project_id (a UUID) so same-named project folders never collide. Validates both
+/// id components (Err on path-traversal / metacharacters) so a malicious id can't escape the dir.
+pub fn worktree_path(app_data: &Path, project_id: &str, agent_id: &str) -> Result<PathBuf, String> {
+    validate_id("project_id", project_id)?;
+    validate_id("agent_id", agent_id)?;
+    Ok(app_data.join("worktrees").join(project_id).join(agent_id))
 }
 
 /// Resolve Sparkle's per-user app-data dir (e.g. ~/Library/Application Support/ai.sparkle.desktop).
@@ -99,12 +135,19 @@ fn effective_base(root: &str, branch: &str, fetch: bool) -> String {
     // frontend. An empty ref would feed `git rebase ""` / `rev-list "...<branch>"` and break the
     // command; resolve the project's default branch instead of trusting the caller.
     let resolved;
-    let branch = if branch.trim().is_empty() {
+    let trimmed = branch.trim();
+    let branch = if trimmed.is_empty() || validate_ref(trimmed).is_err() {
+        // Empty (a legacy agent whose baseBranch was never persisted) OR a ref crafted to be
+        // parsed as a git option (leading '-' → --upload-pack=/--exec=) or carrying control
+        // chars: never hand it to git. Resolve the project's default branch instead. git forbids
+        // '-'-leading branch names, so no legitimate ref is lost by this fallback.
+        if !trimmed.is_empty() {
+            tracing::warn!(rejected = %trimmed, "effective_base: unsafe base ref, using default branch");
+        }
         resolved = resolve_default_branch(root);
         resolved.as_str()
     } else {
-        // Trim a whitespace-padded ref too so " main " can't reach git as an invalid ref.
-        branch.trim()
+        trimmed
     };
     let has_origin = git(root, &["remote", "get-url", "origin"]).is_ok();
     if has_origin {
@@ -201,7 +244,7 @@ pub fn create_worktree_at(
         let _ = git(root, &["worktree", "remove", "--force", &legacy_str]);
     }
 
-    let wt = worktree_path(app_data, project_id, agent_id);
+    let wt = worktree_path(app_data, project_id, agent_id)?;
     let wt_str = wt.to_string_lossy().to_string();
 
     // Idempotent: if the path already exists and is a valid worktree, return it.
@@ -247,12 +290,14 @@ pub fn create_worktree_from_local(
     if base.is_empty() {
         return Err("parent_branch is required".into());
     }
+    // Reject a ref shaped like a git option / with control chars before it reaches any git arg.
+    validate_ref(base)?;
     // The base must exist locally — workers descend from a sibling agent's local branch.
     git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{base}")])
         .map_err(|_| format!("parent branch '{base}' does not exist locally"))?;
 
     let branch = format!("sparkle/agent-{worker_id}");
-    let wt = worktree_path(app_data, project_id, worker_id);
+    let wt = worktree_path(app_data, project_id, worker_id)?;
     let wt_str = wt.to_string_lossy().to_string();
 
     // Idempotent: existing valid worktree → return it. This path is keyed by `worker_id`, which
@@ -335,7 +380,7 @@ pub fn agent_branch_status_at(
 ) -> Result<BranchStatus, String> {
     let branch = format!("sparkle/agent-{agent_id}");
     let base = effective_base(root, base_branch, false); // status never hits the network
-    let wt = worktree_path(app_data, project_id, agent_id);
+    let wt = worktree_path(app_data, project_id, agent_id)?;
     let wt_str = wt.to_string_lossy().to_string();
 
     // `--left-right --count A...B` emits "<left>\t<right>": left = base-only = behind,
@@ -556,7 +601,7 @@ pub fn markdown_changed_since_at(
     dirs: &[String],
     app_data: &Path,
 ) -> Result<MarkdownSync, String> {
-    let wt = worktree_path(app_data, project_id, agent_id);
+    let wt = worktree_path(app_data, project_id, agent_id)?;
     let wt_str = wt.to_string_lossy().to_string();
     let head = git(&wt_str, &["rev-parse", "HEAD"])?;
 
@@ -639,7 +684,7 @@ pub fn refresh_agent_branch_at(
     base_branch: &str,
     app_data: &Path,
 ) -> Result<RefreshOutcome, String> {
-    let wt = worktree_path(app_data, project_id, agent_id);
+    let wt = worktree_path(app_data, project_id, agent_id)?;
     let wt = wt.to_string_lossy().to_string();
 
     // Precondition: clean AND settled (no rebase/merge mid-flight — porcelain can be empty
@@ -804,7 +849,7 @@ pub fn remove_worktree_at(
     agent_id: &str,
     app_data: &Path,
 ) -> Result<(), String> {
-    let wt = worktree_path(app_data, project_id, agent_id);
+    let wt = worktree_path(app_data, project_id, agent_id)?;
     let wt_str = wt.to_string_lossy().to_string();
     match git(root, &["worktree", "remove", "--force", &wt_str]) {
         Ok(_) => Ok(()),
@@ -1100,7 +1145,7 @@ mod tests {
 
         // Removal is clean + idempotent.
         for (id, _) in &infos {
-            let wt = worktree_path(&app_data, "isoproj", id);
+            let wt = worktree_path(&app_data, "isoproj", id).unwrap();
             let _ = git(&root_str, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
         }
 
@@ -1113,10 +1158,41 @@ mod tests {
         use std::path::Path;
         let app_data = Path::new("/tmp/sparkle-appdata");
         let root = "/Users/dev/Projects/myrepo";
-        let p = worktree_path(app_data, "proj-123", "agent-abc");
+        let p = worktree_path(app_data, "proj-123", "agent-abc").unwrap();
         assert_eq!(p, Path::new("/tmp/sparkle-appdata/worktrees/proj-123/agent-abc"));
         // The crucial property: the worktree is NOT under the project root.
         assert!(!p.starts_with(root), "worktree must live outside the project tree");
+    }
+
+    #[test]
+    fn worktree_path_rejects_traversal_and_metacharacters() {
+        let app_data = Path::new("/tmp/sparkle-appdata");
+        // A UUID-shaped id (the real-world case) is accepted.
+        assert!(worktree_path(app_data, "proj-123_X", "08f7a420-ca27-4452-a1f8-4d27b6fc5a05").is_ok());
+        // Path traversal / separators / emptiness in either component are rejected, so a crafted
+        // id can never escape <app_data>/worktrees.
+        assert!(worktree_path(app_data, "../../etc", "agent").is_err());
+        assert!(worktree_path(app_data, "proj", "../../../tmp/evil").is_err());
+        assert!(worktree_path(app_data, "proj/sub", "agent").is_err());
+        assert!(worktree_path(app_data, "proj", "a b").is_err());
+        assert!(worktree_path(app_data, "", "agent").is_err());
+        assert!(worktree_path(app_data, "proj", "").is_err());
+    }
+
+    #[test]
+    fn validate_ref_blocks_option_injection_but_allows_slash_branches() {
+        // Legit branch names, including slashed ones, pass (after trimming).
+        assert!(validate_ref("main").is_ok());
+        assert!(validate_ref("release/2026").is_ok());
+        assert!(validate_ref("  develop  ").is_ok());
+        // A ref crafted to be parsed as a git option (the RCE vector via fetch/rebase) is rejected.
+        assert!(validate_ref("--upload-pack=touch /tmp/pwned").is_err());
+        assert!(validate_ref("-x").is_err());
+        // Empty / control / whitespace refs are rejected.
+        assert!(validate_ref("").is_err());
+        assert!(validate_ref("   ").is_err());
+        assert!(validate_ref("a b").is_err());
+        assert!(validate_ref("a\nb").is_err());
     }
 
     #[test]
@@ -1417,7 +1493,7 @@ mod tests {
         git(&root_str, &["branch", "-D", "remote-advance"]).unwrap();
 
         // A brand-new agent: branch cut from origin/main (as effective_base would), zero authored work.
-        let wt = worktree_path(&app_data, "p", "fresh");
+        let wt = worktree_path(&app_data, "p", "fresh").unwrap();
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         git(&root_str, &["worktree", "add", "-b", "sparkle/agent-fresh", &wt.to_string_lossy(), "origin/main"]).unwrap();
 

@@ -17,6 +17,20 @@ const CHAT_MODEL: &str = "claude-sonnet-4-6";
 /// usable reply rather than the API rejecting a zero budget.
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 
+/// Upper bound on `max_tokens`. This command proxies the user's BYOK Anthropic key, so an
+/// unclamped budget from a compromised renderer would be a costly-output amplifier. 8192 covers
+/// the interview/synthesis replies this drives with headroom; anything larger is clamped down.
+const MAX_MAX_TOKENS: u32 = 8192;
+
+/// Resolve the effective token budget: 0 (forgotten/unset) → default; otherwise the request,
+/// clamped to `MAX_MAX_TOKENS`.
+fn clamp_max_tokens(requested: u32) -> u32 {
+    match requested {
+        0 => DEFAULT_MAX_TOKENS,
+        n => n.min(MAX_MAX_TOKENS),
+    }
+}
+
 /// One-shot Anthropic chat: send `system` + `user`, return the model's first text block. Returns
 /// Err on any failure (no key, network, HTTP error, empty result) so the caller can degrade.
 #[tauri::command]
@@ -29,7 +43,8 @@ pub async fn anthropic_chat(
     if user.is_empty() {
         return Err("empty user message".into());
     }
-    let max_tokens = if max_tokens == 0 { DEFAULT_MAX_TOKENS } else { max_tokens };
+    // 0 → default; otherwise clamp so a hostile caller can't amplify BYOK spend.
+    let max_tokens = clamp_max_tokens(max_tokens);
 
     // ureq is blocking and so is key resolution (env / `.env.local` walk) — keep BOTH off the async
     // runtime's worker by resolving the key inside the blocking closure (mirrors `generate_agent_name`).
@@ -107,6 +122,14 @@ fn extract_text(json: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_max_tokens_defaults_zero_and_caps_large() {
+        assert_eq!(clamp_max_tokens(0), DEFAULT_MAX_TOKENS); // forgotten/unset → default
+        assert_eq!(clamp_max_tokens(512), 512); // in-range request passes through
+        assert_eq!(clamp_max_tokens(MAX_MAX_TOKENS), MAX_MAX_TOKENS);
+        assert_eq!(clamp_max_tokens(u32::MAX), MAX_MAX_TOKENS); // hostile budget is capped
+    }
 
     #[test]
     fn extract_text_pulls_first_text_block() {

@@ -1,6 +1,6 @@
 [package]
 name = "sparkle"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 description = "Sparkle desktop (macOS)"
 
@@ -51,3 +51,14 @@ tracing-appender = "0.2"
 [dev-dependencies]
 hound = "3.5"
 tempfile = "3"
+
+# Release tuning for a perf-sensitive native app. LTO + single codegen unit trade build time
+# for faster runtime on the git/audio/transcribe hot paths; strip removes symbols to shrink the
+# shipped binary. Deliberately NOT panic="abort": the app runs work on spawned threads (pty
+# readers, audio, transcribe, bridge) and relies on unwind isolation so one thread's panic
+# doesn't abort the whole process.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

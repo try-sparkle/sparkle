@@ -23,6 +23,7 @@ mod socket;
 mod sparkle_agent;
 mod transcript;
 mod trial;
+mod trial_remote;
 mod worktree;
 mod notes;
 
@@ -178,7 +179,9 @@ pub fn run() {
             accounts::accounts_usage,
             trial::trial_status,
             trial::trial_start,
-            trial::trial_increment
+            trial::trial_increment,
+            trial_remote::trial_remote_status,
+            trial_remote::trial_remote_consume
         ])
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")

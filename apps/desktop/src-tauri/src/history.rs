@@ -55,6 +55,13 @@ impl HistoryDb {
     pub fn new(app_data_dir: &std::path::Path) -> Result<Self, String> {
         let dir = app_data_dir.join("history");
         std::fs::create_dir_all(&dir).map_err(|e| format!("create history dir: {e}"))?;
+        // Owner-only: this DB stores prompt/response text in plaintext. Best-effort — a perms
+        // failure must not block opening history.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
         let conn = Connection::open(dir.join("history.db"))
             .map_err(|e| format!("open history.db: {e}"))?;
         // WAL for crash durability (a torn write can't corrupt the file). Note: all access is

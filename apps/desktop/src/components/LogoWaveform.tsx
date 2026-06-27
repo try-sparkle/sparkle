@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { TbMicrophone, TbMicrophoneOff } from "react-icons/tb";
 // Themed tokens (muted/forest/cream flip on data-theme); brand teal/accent pass through as
 // constants. Import from ../theme/colors — like Composer — so the waveform stays legible in
@@ -92,8 +92,6 @@ export function captionFor(
  * gradient sweep while ACTIVE. Click toggles phase; the mic icon mutes.
  */
 export function LogoWaveform() {
-  const level = useDictationStore((s) => s.level);
-  const speaking = useDictationStore((s) => s.speaking);
   const phase = useDictationStore((s) => s.phase);
   const enabled = useDictationStore((s) => s.enabled);
   const status = useDictationStore((s) => s.status);
@@ -108,38 +106,82 @@ export function LogoWaveform() {
   // never animate/claim "listening" when nothing is being heard.
   const listening = status === "listening";
 
-  // Rolling history of recent levels → bar heights (newest on the right).
-  const [bars, setBars] = useState<number[]>(() => Array(BAR_COUNT).fill(0));
   const [micHover, setMicHover] = useState(false);
   const raf = useRef(0);
-  // Hold level + speaking in refs so the rAF closure always reads the latest values without
-  // restarting the loop on every store update.
-  const levelRef = useRef(level);
-  useEffect(() => { levelRef.current = level; }, [level]);
-  const speakingRef = useRef(speaking);
-  useEffect(() => { speakingRef.current = speaking; }, [speaking]);
-
+  // Live audio level + the VAD `speaking` flag held in refs, fed by a TRANSIENT store
+  // subscription. The `dictation://level` stream emits once per audio frame; subscribing to it
+  // (and to `speaking`) as render state would re-render this whole component dozens of times a
+  // second purely to copy a number/bool. The rAF loop reads the refs directly instead.
+  const levelRef = useRef(0);
+  const speakingRef = useRef(false);
   useEffect(() => {
-    // Only run the animation loop while armed AND capture is actually live. When paused
-    // (armed but not capturing) or muted, reset bars to flat and bail — a frozen or
-    // animating snapshot would dishonestly read as "still listening", and it saves
-    // CPU/battery. Gating on `enabled` too (not just `listening`) avoids the transient
-    // where a just-muted mic dims to opacity 0.4 while `status` hasn't flipped off yet.
+    const s0 = useDictationStore.getState();
+    levelRef.current = s0.level;
+    speakingRef.current = s0.speaking;
+    return useDictationStore.subscribe((s) => {
+      levelRef.current = s.level;
+      speakingRef.current = s.speaking;
+    });
+  }, []);
+
+  // Bar heights (and the orb glow) are driven by DIRECT DOM writes from the rAF loop, NOT
+  // React state: at 140 bars, routing every frame through setState re-rendered the entire
+  // component (and re-diffed 140 <span>s) 60×/sec while merely focused. `heightsRef` is the
+  // rolling buffer (newest on the right); `barsRef` holds the span nodes; `orbRef` the glow.
+  const heightsRef = useRef<number[]>(Array(BAR_COUNT).fill(0));
+  const barsRef = useRef<(HTMLSpanElement | null)[]>([]);
+  const orbRef = useRef<HTMLDivElement | null>(null);
+
+  const paintBar = (i: number, h: number) => {
+    const el = barsRef.current[i];
+    if (el) el.style.height = `${Math.max(6, h * 100)}%`;
+  };
+  const paintOrb = (energy: number) => {
+    const el = orbRef.current;
+    if (!el) return;
+    el.style.transform = `translate(-50%, -50%) scale(${1 + energy * 0.95})`;
+    el.style.opacity = `${0.32 + energy * 0.55}`;
+  };
+
+  // useLayoutEffect (not useEffect): the initial flat paint must land BEFORE the browser paints,
+  // otherwise the height-less <span>s collapse to ~0 for one frame (a brief flash) on first mount.
+  useLayoutEffect(() => {
+    // Only animate while armed AND capture is actually live. When paused (armed but not
+    // capturing) or muted, flatten the bars and bail — a frozen or animating snapshot would
+    // dishonestly read as "still listening", and it saves CPU/battery. Gating on `enabled`
+    // too (not just `listening`) avoids the transient where a just-muted mic dims to opacity
+    // 0.4 while `status` hasn't flipped off yet. This branch also paints the initial flat
+    // state on mount (status starts idle), so the bars have a height before the loop runs.
     if (!(enabled && listening)) {
-      setBars(Array(BAR_COUNT).fill(0));
+      heightsRef.current = Array(BAR_COUNT).fill(0);
+      for (let i = 0; i < BAR_COUNT; i++) paintBar(i, 0);
+      paintOrb(0);
       return;
     }
     const tick = () => {
-      // Gate animation on the VAD `speaking` flag: scroll while the user talks, decay to a
-      // flat static line in silence (see nextBars). The random jitter is generated here so
-      // nextBars stays pure/testable.
-      setBars((prev) =>
-        nextBars(prev, speakingRef.current, levelRef.current, 1 - Math.random() * 0.55),
-      );
+      // VAD-gated animation (nextBars: scroll while the user talks, decay to a flat static line
+      // in silence) applied via DIRECT DOM writes, NOT setState. The random jitter is generated
+      // here so nextBars stays pure/testable. When silent and already flat, nextBars returns the
+      // SAME ref — skip the paint loop so the meter is genuinely idle (no per-frame DOM churn).
+      const prev = heightsRef.current;
+      const next = nextBars(prev, speakingRef.current, levelRef.current, 1 - Math.random() * 0.55);
+      if (next !== prev) {
+        heightsRef.current = next;
+        for (let i = 0; i < BAR_COUNT; i++) paintBar(i, next[i] ?? 0);
+        // Recent waveform energy (newest 12 bars) drives the pulsating glow behind the mic.
+        let energy = 0;
+        for (let i = BAR_COUNT - 12; i < BAR_COUNT; i++) {
+          const h = next[i] ?? 0;
+          if (h > energy) energy = h;
+        }
+        paintOrb(energy);
+      }
       raf.current = requestAnimationFrame(tick);
     };
     raf.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf.current);
+    // paintBar/paintOrb are stable for the component's life; only re-arm on gating change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, listening]);
 
   const caption = captionFor(phase, enabled, listening);
@@ -161,9 +203,8 @@ export function LogoWaveform() {
   // Show the slashed "mute" glyph whenever the click would turn the mic OFF on hover (enabled),
   // or when it's already muted. Only the resting, enabled mic shows the open-mic glyph.
   const showMutedIcon = micHover || !enabled;
-  // Recent waveform energy (newest bars) drives the pulsating glow behind the mic. It rests
-  // quietly in silence (bars are flat → energy 0) and swells as the user gets louder.
-  const energy = enabled && listening ? Math.max(0, ...bars.slice(-12)) : 0;
+  // The pulsating orb glow is driven directly by the rAF loop (paintOrb), so there's no
+  // render-time energy to compute here.
 
   return (
     <div style={{ padding: "0 14px 8px", userSelect: "none" }}>
@@ -176,6 +217,7 @@ export function LogoWaveform() {
             keeps the glyph legible over it. Only while actually listening. */}
         {enabled && listening && (
           <div
+            ref={orbRef}
             aria-hidden
             style={{
               position: "absolute",
@@ -183,9 +225,10 @@ export function LogoWaveform() {
               top: "50%",
               width: 132,
               height: 132,
-              transform: `translate(-50%, -50%) scale(${1 + energy * 0.95})`,
-              opacity: 0.32 + energy * 0.55,
-              transition: "transform 140ms ease-out, opacity 220ms ease-out",
+              // Initial values only; the rAF loop drives transform/opacity per frame via
+              // `paintOrb` (no CSS transition — it would smear against 60fps direct writes).
+              transform: "translate(-50%, -50%) scale(1)",
+              opacity: 0.32,
               pointerEvents: "none",
               borderRadius: "50%",
               filter: "blur(16px)",
@@ -220,15 +263,17 @@ export function LogoWaveform() {
               : "none",
           }}
         >
-          {bars.map((h, i) => (
+          {Array.from({ length: BAR_COUNT }, (_, i) => (
             <span
               key={i}
+              ref={(el) => {
+                barsRef.current[i] = el;
+              }}
               style={{
                 flex: 1,
-                // `h` is already gain-curved (barFraction applied in the rAF tick), so
-                // use it verbatim — no double-application. No CSS height transition: the
-                // rAF loop drives the heights directly so spikes snap instantly.
-                height: `${Math.max(6, h * 100)}%`,
+                // height is intentionally NOT set here — the rAF loop owns it via `paintBar`
+                // (direct DOM write). Omitting it from the inline style means a React re-render
+                // (e.g. a phase change flipping the gradient) never clobbers the live height.
                 borderRadius: 1,
                 // Gray when passive/paused; brand teal→blue fade across the row when live+active
                 // (cyan/teal on the LEFT, dark blue C.teal #2f6bff on the RIGHT).

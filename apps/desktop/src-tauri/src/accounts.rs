@@ -158,6 +158,12 @@ fn add_account_at(
     let mut accounts = read_accounts_at(accounts_path)?;
     let dir = account_config_dir(app_data, &id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create account dir: {e}"))?;
+    // Owner-only: `claude login` writes its OAuth tokens under this dir. Best-effort.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     let acct = Account {
         id,
         nickname,

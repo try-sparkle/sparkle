@@ -115,10 +115,37 @@ pub fn event_log_path(app: &AppHandle, worktree: &str) -> Result<PathBuf, String
         .join(format!("{}.jsonl", log_key(worktree))))
 }
 
+/// Confine a frontend-supplied worktree path to the app's managed worktrees dir before we write
+/// an executable hook config into it. `install_agent_hooks` writes `.claude/settings.local.json`,
+/// which Claude Code runs hook *commands* from — so an unconfined path is a write-anywhere →
+/// persistent-code-execution primitive (e.g. planting hooks in `$HOME`). Canonicalize BOTH sides
+/// (resolving symlinks and `..`) and require the worktree to live under `<app_data>/worktrees`.
+/// Fail-closed: a base that can't be resolved, or a non-existent worktree, is rejected. Pure core
+/// (no AppHandle) so it unit-tests. Mirrors `pty::validate_spawn_inner`.
+fn confine_to_worktrees(worktrees_base: &Path, worktree: &str) -> Result<PathBuf, String> {
+    let base = worktrees_base
+        .canonicalize()
+        .map_err(|e| format!("install_agent_hooks: worktrees dir unavailable: {e}"))?;
+    let real = std::fs::canonicalize(worktree)
+        .map_err(|e| format!("install_agent_hooks: invalid worktree path: {e}"))?;
+    if !real.starts_with(&base) {
+        return Err("install_agent_hooks: worktree is outside the managed worktrees directory".into());
+    }
+    Ok(real)
+}
+
 /// Write/merge the event emitter into `<worktree>/.claude/settings.local.json`. Returns the
 /// absolute event-log path so the frontend can start watching it.
 #[tauri::command]
 pub fn install_agent_hooks(app: AppHandle, worktree: String) -> Result<String, String> {
+    // Confine the write target to the managed worktrees dir — this file drives executable hooks.
+    let worktrees_base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?
+        .join("worktrees");
+    let worktree_dir = confine_to_worktrees(&worktrees_base, &worktree)?;
+
     let emitter = app
         .path()
         .resolve("resources/sparkle-hook.mjs", BaseDirectory::Resource)
@@ -133,7 +160,7 @@ pub fn install_agent_hooks(app: AppHandle, worktree: String) -> Result<String, S
         shell_quote(&log.to_string_lossy())
     );
 
-    let dir = Path::new(&worktree).join(".claude");
+    let dir = worktree_dir.join(".claude");
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir .claude: {e}"))?;
     let file = dir.join("settings.local.json");
     let existing = std::fs::read_to_string(&file).ok();
@@ -153,9 +180,49 @@ pub struct EventsChunk {
 /// `offset`. The frontend polls this while an agent pane is open. A partial trailing line (the
 /// emitter mid-write) is left unconsumed so it's read whole on the next poll; a shrunken file
 /// (rotated/cleared) restarts from 0. A missing file (no event yet) yields an empty batch.
+/// Confinement check for `read_events_since`, factored out for tests. `base` is the canonicalized
+/// `<app_data>/hook-events`. When the log file EXISTS we canonicalize it fully (following symlinks)
+/// and require the resolved path to be a regular file under `base` — so a symlink planted inside
+/// the dir can't redirect the read to `/etc/passwd` etc. When the file is absent (no events emitted
+/// yet) we fall back to validating that its existing PARENT directory resolves to `base`.
+fn log_path_within(base: &Path, log_path: &str) -> bool {
+    let p = Path::new(log_path);
+    if let Ok(canon) = p.canonicalize() {
+        // Existing file (symlink target resolved): must be a regular file that is a DIRECT child of
+        // base (the event-log layout is flat) — `parent() == base`, consistent with the branch below.
+        return canon.is_file() && canon.parent() == Some(base);
+    }
+    // File absent (no events yet). Reject if the final component is itself a (dangling) symlink — its
+    // target could be created later to redirect the read outside base — so only a genuinely-absent
+    // regular path that is a direct child of base is accepted.
+    if std::fs::symlink_metadata(p)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    p.parent()
+        .and_then(|par| par.canonicalize().ok())
+        .map(|par| par == base)
+        .unwrap_or(false)
+}
+
 #[tauri::command]
-pub fn read_events_since(log_path: String, offset: u64) -> Result<EventsChunk, String> {
-    read_events_since_impl(Path::new(&log_path), offset)
+pub fn read_events_since(app: AppHandle, log_path: String, offset: u64) -> Result<EventsChunk, String> {
+    // Confine reads to <app_data>/hook-events so a compromised renderer can't turn this into an
+    // arbitrary-file read oracle. The legit path is always <app_data>/hook-events/<agentId>.jsonl.
+    let base = match app.path().app_data_dir().map(|d| d.join("hook-events")) {
+        Ok(b) => b,
+        Err(_) => return Ok(EventsChunk { lines: vec![], offset }),
+    };
+    match base.canonicalize() {
+        // hook-events dir not created yet → no events are possible; report an empty batch.
+        Err(_) => Ok(EventsChunk { lines: vec![], offset }),
+        Ok(canon_base) if log_path_within(&canon_base, &log_path) => {
+            read_events_since_impl(Path::new(&log_path), offset)
+        }
+        Ok(_) => Err("read_events_since: log_path is outside the managed hook-events dir".into()),
+    }
 }
 
 pub fn read_events_since_impl(path: &Path, mut offset: u64) -> Result<EventsChunk, String> {
@@ -207,6 +274,64 @@ mod tests {
             .as_array()
             .map(|a| a.iter().any(|e| entry_has_marker(e, EMITTER_MARKER)))
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn log_path_within_confines_reads_to_hook_events_dir() {
+        let tmp = std::env::temp_dir().join(format!("sparkle-hooks-log-{}", std::process::id()));
+        let base = tmp.join("hook-events");
+        std::fs::create_dir_all(&base).unwrap();
+        let cbase = base.canonicalize().unwrap();
+
+        // A file in the hook-events dir passes even though it doesn't exist yet (no events).
+        assert!(log_path_within(&cbase, base.join("agent.jsonl").to_str().unwrap()));
+        // An arbitrary system file is rejected — closes the file-read oracle.
+        assert!(!log_path_within(&cbase, "/etc/passwd"));
+        // A sibling directory is rejected.
+        let sib = tmp.join("evil");
+        std::fs::create_dir_all(&sib).unwrap();
+        assert!(!log_path_within(&cbase, sib.join("x.jsonl").to_str().unwrap()));
+
+        // A symlink PLANTED INSIDE the managed dir but pointing OUTSIDE it is rejected — the full
+        // path is canonicalized (symlink followed) and must still resolve under base.
+        let outside_file = tmp.join("secret.txt");
+        std::fs::write(&outside_file, b"top secret").unwrap();
+        let planted = base.join("sneaky.jsonl");
+        std::os::unix::fs::symlink(&outside_file, &planted).unwrap();
+        assert!(!log_path_within(&cbase, planted.to_str().unwrap()));
+
+        // A DANGLING symlink in the managed dir (target doesn't exist yet) is also rejected — its
+        // target could be created later to redirect the read outside base.
+        let dangling = base.join("dangling.jsonl");
+        std::os::unix::fs::symlink(tmp.join("not-created-yet"), &dangling).unwrap();
+        assert!(!log_path_within(&cbase, dangling.to_str().unwrap()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn confine_to_worktrees_accepts_inside_rejects_outside_and_escape() {
+        // PID + a distinct prefix keep this test's temp root from colliding with the other
+        // hooks tests (PID isolates concurrent test *processes*; the prefix isolates within one).
+        let tmp = std::env::temp_dir().join(format!("sparkle-hooks-confine-{}", std::process::id()));
+        let base = tmp.join("worktrees");
+        let inside = base.join("proj").join("agent");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        // A real worktree under <base>/worktrees is accepted (returns the canonical path).
+        assert!(confine_to_worktrees(&base, inside.to_str().unwrap()).is_ok());
+
+        // A sibling directory OUTSIDE the worktrees dir (e.g. $HOME) is rejected — this is the
+        // write-anywhere → persistent-code-execution vector the confinement closes.
+        let outside = tmp.join("evil");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(confine_to_worktrees(&base, outside.to_str().unwrap()).is_err());
+
+        // A `..` escape is rejected because both sides are canonicalized before comparison.
+        let escape = format!("{}/../../evil", inside.to_str().unwrap());
+        assert!(confine_to_worktrees(&base, &escape).is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

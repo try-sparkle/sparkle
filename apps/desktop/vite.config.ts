@@ -29,7 +29,20 @@ function devChiefPat(mode: string): string {
 }
 
 // Tauri expects a fixed dev port and an un-cleared console.
-export default defineConfig(({ mode }) => ({
+export default defineConfig(({ mode, command }) => {
+  // Resolve the Chief PAT once so we can BOTH inject it (dev) and assert it's absent from any
+  // build. `command === "build"` is the export boundary (tauri build runs `vite build`); a packaged
+  // bundle must never embed the PAT, even if someone builds with `--mode development`. devChiefPat
+  // already returns "" outside development, but key the hard gate on the build command — not on
+  // mode — so a misconfigured mode/NODE_ENV can't slip a real dev PAT into the public artifact.
+  const chiefPat = devChiefPat(mode);
+  if (command === "build" && chiefPat) {
+    throw new Error(
+      "Refusing to build: VITE_CHIEF_PAT would be embedded in the shipped bundle. The Chief PAT " +
+        "is dev-serve only. Unset CHIEF_API / VITE_CHIEF_PAT (and don't build with --mode development).",
+    );
+  }
+  return {
   plugins: [react()],
   // Keep a single React/React-DOM instance. The monorepo legitimately holds two
   // React versions (mobile/Expo pins 19.2.3; web + desktop use 19.2.4); the root
@@ -39,7 +52,7 @@ export default defineConfig(({ mode }) => ({
   resolve: { dedupe: ["react", "react-dom"] },
   clearScreen: false,
   define: {
-    "import.meta.env.VITE_CHIEF_PAT": JSON.stringify(devChiefPat(mode)),
+    "import.meta.env.VITE_CHIEF_PAT": JSON.stringify(chiefPat),
     // App version baked in at build time (analytics super-property). Resolved
     // relative to THIS config file (not cwd) so a release script invoking the
     // build from the monorepo root still reads the desktop package's version.
@@ -80,4 +93,5 @@ export default defineConfig(({ mode }) => ({
       reporter: ["text-summary", "json-summary"],
     },
   },
-}));
+  };
+});

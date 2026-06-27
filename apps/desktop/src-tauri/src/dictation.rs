@@ -314,8 +314,20 @@ fn build_capture(
     // (accept() only, no I/O). finalize() is always called *after* Capture is dropped (stop_dictation),
     // so the slow finalize path never contends with a live callback frame.
     tracing::info!(target: "dictation", "build_capture: capture starting");
+    // Throttle the level meter to ~25 Hz. CoreAudio fires this callback far faster (one frame per
+    // buffer, tens of Hz), but the meter only feeds the waveform animation — emitting every frame
+    // is needless IPC + store churn. Start in the past so the very first frame emits.
+    const LEVEL_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+    // Start "in the past" so the first frame emits, via checked_sub (Instant - Duration panics on
+    // underflow; this can't underflow on macOS uptime clocks, but the idiom is the robust one).
+    let now0 = std::time::Instant::now();
+    let mut last_level_emit = now0.checked_sub(LEVEL_EMIT_INTERVAL).unwrap_or(now0);
     Capture::start(move |frame: Vec<f32>| {
-        let _ = app_cb.emit("dictation://level", rms_level(&frame));
+        let now = std::time::Instant::now();
+        if now.duration_since(last_level_emit) >= LEVEL_EMIT_INTERVAL {
+            last_level_emit = now;
+            let _ = app_cb.emit("dictation://level", rms_level(&frame));
+        }
         // While the cloud stream is open (user actively dictating), route frames to Deepgram and
         // skip the on-device model entirely. Otherwise the on-device model handles the frame —
         // this is the always-listening wake-word gate. Locks are poison-tolerant ():
