@@ -8,17 +8,22 @@ export interface Me {
   tokenVersion: number;
 }
 
-export type AuthView = "loading" | "unauthenticated" | "unpaid" | "entitled";
+export type AuthView = "loading" | "welcome" | "trial" | "unpaid" | "entitled";
 
-/** Derive which gate screen to show from the current auth state. */
+/** Derive which gate screen to show from the current auth + trial state.
+ *  Signed-in users (token present) keep the existing unpaid/entitled behavior; the
+ *  trial layer only governs token-less users. */
 export function deriveAuthView(input: {
   loading: boolean;
   hasToken: boolean;
   me: Me | null;
+  trialStarted: boolean;
+  trialLoading: boolean;
 }): AuthView {
-  if (input.loading) return "loading";
-  if (!input.hasToken || !input.me) return "unauthenticated";
-  return input.me.entitled ? "entitled" : "unpaid";
+  if (input.loading || input.trialLoading) return "loading";
+  if (input.hasToken && input.me) return input.me.entitled ? "entitled" : "unpaid";
+  // Token-less: either the first-run welcome or the active anonymous trial.
+  return input.trialStarted ? "trial" : "welcome";
 }
 
 /**

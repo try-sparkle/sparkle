@@ -22,6 +22,7 @@ mod screenshot;
 mod socket;
 mod sparkle_agent;
 mod transcript;
+mod trial;
 mod worktree;
 mod notes;
 
@@ -42,6 +43,7 @@ pub fn run() {
         .manage(auth::DeepLinkPending::default())
         .manage(attention::BadgeCounts::default())
         .manage(accounts::AccountsLock::default())
+        .manage(trial::TrialLock::default())
         // Gate mic capture on window focus (sparkle-9oz6): Sparkle must not capture audio while the
         // user is looking at another app. Every Focused event is handed to the dictation state, which
         // releases the OS mic when no Sparkle window is the active OS window and rebuilds it on return.
@@ -173,7 +175,10 @@ pub fn run() {
             accounts::accounts_remove,
             accounts::accounts_import_default,
             accounts::accounts_mark_exhausted,
-            accounts::accounts_usage
+            accounts::accounts_usage,
+            trial::trial_status,
+            trial::trial_start,
+            trial::trial_increment
         ])
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")

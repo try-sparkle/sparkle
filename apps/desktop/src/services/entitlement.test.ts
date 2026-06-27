@@ -9,23 +9,33 @@ const me = (over: Partial<Me> = {}): Me => ({
   ...over,
 });
 
+const base = { trialStarted: false, trialLoading: false };
+
 describe("deriveAuthView", () => {
-  it("is loading while loading regardless of token/me", () => {
-    expect(deriveAuthView({ loading: true, hasToken: true, me: me() })).toBe("loading");
-  });
-  it("is unauthenticated with no token", () => {
-    expect(deriveAuthView({ loading: false, hasToken: false, me: null })).toBe("unauthenticated");
-  });
-  it("is unauthenticated when token present but /me not yet loaded", () => {
-    expect(deriveAuthView({ loading: false, hasToken: true, me: null })).toBe("unauthenticated");
-  });
-  it("is unpaid when authenticated but not entitled", () => {
-    expect(deriveAuthView({ loading: false, hasToken: true, me: me({ entitled: false }) })).toBe(
-      "unpaid",
+  it("is loading while either auth or trial is still loading", () => {
+    expect(deriveAuthView({ ...base, loading: true, hasToken: true, me: me() })).toBe("loading");
+    expect(deriveAuthView({ ...base, loading: false, hasToken: false, me: null, trialLoading: true })).toBe(
+      "loading",
     );
   });
+  it("no token + trial not started -> welcome", () => {
+    expect(deriveAuthView({ ...base, loading: false, hasToken: false, me: null })).toBe("welcome");
+  });
+  it("no token + trial started -> trial", () => {
+    expect(
+      deriveAuthView({ ...base, loading: false, hasToken: false, me: null, trialStarted: true }),
+    ).toBe("trial");
+  });
+  it("token present but /me not yet loaded falls back to welcome", () => {
+    expect(deriveAuthView({ ...base, loading: false, hasToken: true, me: null })).toBe("welcome");
+  });
+  it("is unpaid when authenticated but not entitled (regardless of trial)", () => {
+    expect(
+      deriveAuthView({ ...base, loading: false, hasToken: true, me: me({ entitled: false }), trialStarted: true }),
+    ).toBe("unpaid");
+  });
   it("is entitled when paid", () => {
-    expect(deriveAuthView({ loading: false, hasToken: true, me: me({ entitled: true }) })).toBe(
+    expect(deriveAuthView({ ...base, loading: false, hasToken: true, me: me({ entitled: true }) })).toBe(
       "entitled",
     );
   });

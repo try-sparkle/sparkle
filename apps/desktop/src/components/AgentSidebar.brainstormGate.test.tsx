@@ -13,7 +13,10 @@ vi.mock("../services/workerSpawn", () => ({ spawnWorker: vi.fn() }));
 
 import { AgentSidebar } from "./AgentSidebar";
 import { useSettingsStore } from "../stores/settingsStore";
+import { useAuthStore } from "../stores/authStore";
 import type { Project } from "../types";
+
+const entitledMe = { clerkUserId: "u", entitled: true, balanceCents: 20000, tokenVersion: 1 };
 
 const project: Project = {
   id: "p1",
@@ -27,6 +30,9 @@ const project: Project = {
 
 beforeEach(() => {
   useSettingsStore.getState().setAllAiFeatures(true);
+  // AI extras now also require entitlement — default the suite to an entitled user so the
+  // feature-flag behavior is what's under test here.
+  useAuthStore.setState({ me: entitledMe, tokenPresent: true, loading: false });
 });
 afterEach(() => cleanup());
 
@@ -43,6 +49,18 @@ describe("AgentSidebar — AI Think (Chief) gate", () => {
     expect(screen.queryByRole("button", { name: "Think" })).toBeNull();
     // The empty-state hint must not advertise the hidden feature either.
     expect(screen.queryByText(/Think/)).toBeNull();
+    expect(screen.getByRole("button", { name: "⚒ Build" })).toBeTruthy();
+  });
+
+  it("hides the Think button when not entitled even if the flag is on (free trial)", () => {
+    useSettingsStore.getState().setAllAiFeatures(true);
+    useAuthStore.setState({
+      me: { ...entitledMe, entitled: false },
+      tokenPresent: true,
+      loading: false,
+    });
+    render(<AgentSidebar project={project} />);
+    expect(screen.queryByRole("button", { name: "Think" })).toBeNull();
     expect(screen.getByRole("button", { name: "⚒ Build" })).toBeTruthy();
   });
 });

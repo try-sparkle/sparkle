@@ -8,6 +8,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { useSettingsStore } from "../stores/settingsStore";
+import { useAiFeature } from "../services/aiGate";
 import { removeAgentWorkspace } from "../services/worktree";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
@@ -125,7 +126,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     return () => clearInterval(id);
   }, [projectId]);
   // AI Brainstorming feature gate (Use AI Features menu). Off → hide the ✦ Brainstorm button.
-  const aiBrainstorm = useSettingsStore((s) => s.aiBrainstorm);
+  const aiBrainstorm = useAiFeature("brainstorm");
   const [editing, setEditing] = useState<string | null>(null);
 
   // Draggable column width — persisted to localStorage so it survives relaunch. Clamped to

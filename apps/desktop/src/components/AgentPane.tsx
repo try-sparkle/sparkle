@@ -8,6 +8,7 @@ import {
   assertWorkspaceIntegrity,
 } from "../services/worktree";
 import { resolveDefaultBranch } from "../services/branchStatus";
+import { useAiFeature } from "../services/aiGate";
 import { checkClaude, claudeHasSession } from "../preflight";
 import { buildClaudeExec, SHELL } from "../services/claudeSpawn";
 import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult, orchestrationPersona } from "../services/buildAgent";
@@ -106,8 +107,8 @@ export function AgentPane({
   const composerMinimized = useUiStore((s) => s.composerMinimized);
   // AI feature gates (Use AI Features menu). When the composer feature is off, we render the bare
   // terminal instead of the composer overlay; when auto-rename is off, we skip the naming call.
-  const aiComposer = useSettingsStore((s) => s.aiComposer);
-  const aiAutoRename = useSettingsStore((s) => s.aiAutoRename);
+  const aiComposer = useAiFeature("composer");
+  const aiAutoRename = useAiFeature("autoRename");
   // Imperative bridge to the terminal: mark where each prompt was sent, scroll back to it on pick.
   const terminalApiRef = useRef<TerminalApi | null>(null);
   // Brief toast when a picked prompt's line has scrolled out of the terminal's history.

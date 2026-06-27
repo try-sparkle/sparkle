@@ -8,8 +8,11 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { C, ON_BRAND_FILL } from "../theme/colors";
+import { C, ON_BRAND_FILL, DANGER } from "../theme/colors";
 import { useAuthStore } from "../stores/authStore";
+import { useTrialStore } from "../stores/trialStore";
+import { WelcomeScreen } from "./WelcomeScreen";
+import { TrialChrome } from "./TrialChrome";
 import { deriveAuthView, parseAuthCode } from "../services/entitlement";
 import {
   exchangeCode,
@@ -75,7 +78,7 @@ function Screen({ children }: { children: ReactNode }) {
  *  them the URL to open manually (selectable so they can copy it) so they're never fully stuck. */
 function LaunchFallback({ url }: { url: string }) {
   return (
-    <p style={{ color: "#e5484d", fontSize: 13, margin: 0, maxWidth: 420 }} role="alert">
+    <p style={{ color: DANGER, fontSize: 13, margin: 0, maxWidth: 420 }} role="alert">
       Couldn&apos;t open your browser. Open this link manually:{" "}
       <span style={{ color: C.cream, userSelect: "text", wordBreak: "break-all" }}>{url}</span>
     </p>
@@ -137,13 +140,17 @@ export function PromoRedeem({ refresh }: { refresh: () => Promise<void> }) {
           {submitting ? "…" : "Redeem"}
         </button>
       </div>
-      {error && <p style={{ color: "#e5484d", fontSize: 12, margin: 0 }}>{error}</p>}
+      {error && <p style={{ color: DANGER, fontSize: 12, margin: 0 }}>{error}</p>}
     </div>
   );
 }
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const { me, tokenPresent, loading, refresh } = useAuthStore();
+  const trialStarted = useTrialStore((s) => s.started);
+  const trialLoading = useTrialStore((s) => s.loading);
+  const refreshTrial = useTrialStore((s) => s.refresh);
+  const startTrial = useTrialStore((s) => s.start);
   // De-dupe URLs across the two delivery paths (the live "deep-link" event and the
   // cold-launch pending-drain), so one link is never processed twice.
   const processedUrls = useRef<Set<string>>(new Set());
@@ -168,6 +175,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     };
 
     void refresh();
+    void refreshTrial();
     // Cold-launch: drain any link that arrived before this listener attached.
     void invoke<string | null>("desktop_take_pending_deeplink")
       .then((url) => {
@@ -190,7 +198,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
       void unlistenDeepLink.then((un) => un());
       window.removeEventListener("focus", onFocus);
     };
-  }, [refresh]);
+  }, [refresh, refreshTrial]);
 
   // When the system-browser hand-off can't launch (no default browser, opener-scope denial, …),
   // openSignIn/openPaywall resolve false instead of throwing. Remember which URL failed so we can
@@ -202,9 +210,20 @@ export function AuthGate({ children }: { children: ReactNode }) {
     if (!ok) setFailedUrl(url);
   };
 
-  const view = deriveAuthView({ loading, hasToken: tokenPresent, me });
+  const view = deriveAuthView({ loading, hasToken: tokenPresent, me, trialStarted, trialLoading });
 
   if (view === "entitled") return <>{children}</>;
+
+  if (view === "trial") {
+    // The Workspace runs in free mode; TrialChrome overlays the counter + Unlock, and the
+    // full-screen upsell once the 100 prompts are spent (Workspace stays mounted underneath).
+    return (
+      <>
+        {children}
+        <TrialChrome onUnlock={() => void handOff(openSignIn, SIGN_IN_URL)} signInFailedUrl={failedUrl} />
+      </>
+    );
+  }
 
   if (view === "loading") {
     return (
@@ -235,21 +254,12 @@ export function AuthGate({ children }: { children: ReactNode }) {
     );
   }
 
-  // unauthenticated
+  // welcome (token-less, trial not yet started)
   return (
-    <Screen>
-      <h1 style={{ fontSize: 28, margin: 0 }}>Welcome to Sparkle</h1>
-      <p style={{ color: C.muted, maxWidth: 420 }}>
-        Create an account or sign in to start building. We&apos;ll open your browser to finish
-        signing in, then bring you back here.
-      </p>
-      <button style={primaryBtn} onClick={() => void handOff(openSignIn, SIGN_IN_URL)}>
-        Sign in / Create account
-      </button>
-      {failedUrl && <LaunchFallback url={failedUrl} />}
-      <button style={linkBtn} onClick={() => void refresh()}>
-        Already signed in — refresh
-      </button>
-    </Screen>
+    <WelcomeScreen
+      onSignIn={() => void handOff(openSignIn, SIGN_IN_URL)}
+      onTryFree={() => void startTrial()}
+      signInFailedUrl={failedUrl}
+    />
   );
 }

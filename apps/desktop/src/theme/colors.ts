@@ -43,6 +43,11 @@ export const ON_BRAND_FILL = BRAND.cream;
 // where dark ink reads better than cream. Constant navy in both themes — the fill is constant too.
 export const ON_BRAND_FILL_DARK = BRAND.forest;
 
+// Error/alert text (failed browser hand-off, redeem errors). Constant across themes — small
+// alert strings on the dark forest/deepForest surfaces. One place so the error UX never drifts
+// between the gate, the welcome screen, and the trial pill.
+export const DANGER = "#e5484d";
+
 // xterm cannot use CSS var() — it needs concrete hex. Build its theme from THEME_HEX indexed
 // by the resolved theme (order-independent, unlike reading the live data-theme). `cursor` is
 // the brand accent (constant across themes), so it stays literal from BRAND.

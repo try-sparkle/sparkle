@@ -12,6 +12,7 @@ import {
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { submitPrompt } from "../pty";
+import { trialSendAllowed, recordTrialSend } from "../services/trialMeter";
 import { captureScreenRegion } from "../screenshot";
 import { AttachmentRow } from "./composer/AttachmentRow";
 import {
@@ -428,6 +429,11 @@ export function Composer({
     const atts = attachments;
     const blocks = textBlocks;
     if (!text && atts.length === 0 && blocks.length === 0) return;
+    // Free-trial cap (checked BEFORE delivery, consumed AFTER): block once the 100 are spent.
+    // Entitled users always pass. When blocked, AuthGate's TrialChrome overlay is already
+    // visible (it shows whenever promptsUsed ≥ limit), so this is defense-in-depth, not a
+    // silent dead-end.
+    if (!trialSendAllowed()) return;
     // What the CLI receives: attachment paths prefixed to the body (pasted-text pills
     // expanded inline + the typed text). A bare attachment/pill with no text is valid.
     const payload = buildSendPayload({ attachments: atts, textBlocks: blocks, typed: value });
@@ -452,6 +458,8 @@ export function Composer({
     });
     onSubmitPrompt(display);
     await submitPrompt(agentId, payload);
+    // Consume a trial prompt only now that it's actually delivered (no-op for entitled users).
+    void recordTrialSend();
   };
 
   // Accept the ghost completion: replace the input with the full past prompt and drop the

@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useDictationStore } from "./stores/dictationStore";
-import { useSettingsStore } from "./stores/settingsStore";
+import { useAiFeature, aiFeatureNow } from "./services/aiGate";
 import { useAuthStore } from "./stores/authStore";
 import { advance, type Advance } from "./voice/wakeMachine";
 import { creditDeps } from "./services/sparkleApi";
@@ -177,8 +177,8 @@ export async function createDictationController(
  */
 export function useAmbientVoice(): void {
   const enabled = useDictationStore((s) => s.enabled);
-  const cloudDictation = useSettingsStore((s) => s.cloudDictation);
-  const aiComposer = useSettingsStore((s) => s.aiComposer);
+  const cloudDictation = useAiFeature("voiceDictation");
+  const aiComposer = useAiFeature("composer");
 
   // If the user turns voice dictation OR the composer off WHILE a cloud stream is open, close it
   // immediately rather than waiting for the stop word — otherwise a billable Deepgram socket lingers
@@ -203,16 +203,15 @@ export function useAmbientVoice(): void {
   // no-op when off, so a key-less / composer-off user is never billed. CRITICAL ordering: open
   // FIRST, meter only on a confirmed open (handled inside openMeteredCloudWindow).
   const openMeteredCloud = useRef((now: number) => {
-    const s = useSettingsStore.getState();
-    if (!(s.aiComposer && s.cloudDictation)) return;
+    if (!(aiFeatureNow("composer") && aiFeatureNow("voiceDictation"))) return;
     const sessionId = `cd-${now}-${cloudSessionSeq.current++}`;
     void openMeteredCloudWindow({
       startCloudStream: () => invoke<boolean>("start_cloud_stream"),
       stopCloudStream: () => void invoke("stop_cloud_stream").catch(() => {}),
       isStillActive: () =>
         useDictationStore.getState().phase === "active" &&
-        useSettingsStore.getState().aiComposer &&
-        useSettingsStore.getState().cloudDictation,
+        aiFeatureNow("composer") &&
+        aiFeatureNow("voiceDictation"),
       createMeter: () => {
         const meter = createCloudDictationMeter({
           consume: creditDeps.consume,

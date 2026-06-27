@@ -28,8 +28,9 @@ export interface AiFeatureFlags {
   aiComposer: boolean;
 }
 
-/** Map a menu feature key to its settings-store field name. */
-const AI_FEATURE_FIELD: Record<AiFeatureKey, keyof AiFeatureFlags> = {
+/** Map a menu feature key to its settings-store field name. The single source of this
+ *  mapping — `aiGate` imports it so the key→field relationship is never duplicated. */
+export const AI_FEATURE_FIELD: Record<AiFeatureKey, keyof AiFeatureFlags> = {
   autoRename: "aiAutoRename",
   voiceDictation: "cloudDictation",
   brainstorm: "aiBrainstorm",
