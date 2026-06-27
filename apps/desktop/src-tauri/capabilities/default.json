@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core APIs (events for PTY streaming, window) + native folder dialog + open external URLs + scoped HTTP to the Chief API. Multi-window: project-* windows created at runtime.",
+  "description": "Core APIs (events for PTY streaming, window) + native folder dialog + open external URLs (any http(s) link, handed to the OS default browser — non-web schemes like file:// stay blocked) + scoped HTTP to the Chief API. Multi-window: project-* windows created at runtime.",
   "windows": ["main", "project-*"],
   "permissions": [
     "core:default",
@@ -17,10 +17,8 @@
     {
       "identifier": "opener:allow-open-url",
       "allow": [
-        { "url": "https://sparkle.ai/*" },
-        { "url": "https://*.sparkle.ai/*" },
-        { "url": "http://localhost:3000/*" },
-        { "url": "https://www.google.com/*" }
+        { "url": "https://**" },
+        { "url": "http://**" }
       ]
     },
     "opener:allow-reveal-item-in-dir",
