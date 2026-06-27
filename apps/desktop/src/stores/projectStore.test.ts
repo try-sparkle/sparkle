@@ -81,11 +81,10 @@ describe("projectStore auto-naming", () => {
   it("a manual rename clears the auto-name variants (pinned = name only)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
     const aid = useProjectStore.getState().addAgent(pid);
-    // Auto-name first so variants are populated, then rename by hand.
+    // Auto-name first so the title/description are populated, then rename by hand.
     useProjectStore.getState().autoRenameAgent(pid, aid, "Fix Login", "fix the login bug", {
-      short: "Fix Login",
-      medium: "Fix The Login Redirect",
-      long: "Fix The Login Redirect Loop On Mobile Safari",
+      title: "Fix Login Redirect",
+      description: "Stops the OAuth login page from looping after a token refresh",
     });
     let agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
     expect(agent.autoNameVariants).not.toBeNull();
@@ -93,7 +92,7 @@ describe("projectStore auto-naming", () => {
     useProjectStore.getState().renameAgent(pid, aid, "My Agent");
     agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
     expect(agent.name).toBe("My Agent");
-    // Variants must be wiped so the sidebar shows the chosen name, not the stale auto-name.
+    // The auto-name must be wiped so the sidebar shows the chosen name, not the stale auto-name.
     expect(agent.autoNameVariants).toBeNull();
   });
 
@@ -113,18 +112,17 @@ describe("projectStore applyAiTitle (Claude Code session title)", () => {
   const agentOf = (pid: string, aid: string) =>
     useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
 
-  it("applies Claude Code's title as the name, records aiTitle, and derives fitting variants", () => {
+  it("applies Claude Code's title as the name and records aiTitle (title with empty description)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
     const aid = useProjectStore.getState().addAgent(pid); // "Build 1" default
     useProjectStore.getState().applyAiTitle(pid, aid, "  Debug Merged Agent On New Pop Open  ");
     const a = agentOf(pid, aid);
     expect(a.name).toBe("Debug Merged Agent On New Pop Open"); // trimmed
     expect(a.aiTitle).toBe("Debug Merged Agent On New Pop Open");
-    // Width-fitting variants without a model call: caps at 4/6 words, long = full title.
+    // A session title has no separate description — it's wrapped as the title alone.
     expect(a.autoNameVariants).toEqual({
-      short: "Debug Merged Agent On",
-      medium: "Debug Merged Agent On New Pop",
-      long: "Debug Merged Agent On New Pop Open",
+      title: "Debug Merged Agent On New Pop Open",
+      description: "",
     });
   });
 

@@ -11,13 +11,13 @@ export type Runtime = "local" | "cloud";
 // terminal agent in its own worktree, shown indented under its build parent in the sidebar.
 export type AgentKind = "think" | "build" | "worker" | "shell";
 
-// Three length variants of an auto-generated name (spec: width-fitted agent names). The
-// sidebar renders the longest variant that fits the column and reveals `long` on hover. Word
-// budgets: short 2–4, medium 5–6, long 8–10. Produced together in one naming call.
-export interface AgentNameVariants {
-  short: string;
-  medium: string;
-  long: string;
+// An auto-generated agent name: a short `title` (3–5 words) for the sidebar plus a one-sentence
+// `description` of the work, produced together in one naming call. The sidebar shows the title
+// (truncated to fit the column) and reveals the title + description on hover. `description` may be
+// empty (a plain-title fallback, or a Claude Code session title, which has no description).
+export interface AgentName {
+  title: string;
+  description: string;
 }
 
 // One entry in an agent's prompt history (the dropdown under the pinned header). `id` is the
@@ -53,10 +53,10 @@ export interface AgentTab {
   // shifted enough to re-name. Null until the first auto-name lands.
   namePinned: boolean;
   autoNameBasis: string | null;
-  // The three length variants behind the current auto-name (spec: width-fitted names). Null
-  // until the first auto-name lands, and for pinned/manually-named agents (which use `name`
-  // only). `name` stays the canonical fallback — set to the medium variant when these exist.
-  autoNameVariants: AgentNameVariants | null;
+  // The title + description behind the current auto-name. Null until the first auto-name lands,
+  // and for pinned/manually-named agents (which use `name` only). `name` stays the canonical
+  // fallback — set to the title when this exists. (Field name kept for persisted-state stability.)
+  autoNameVariants: AgentName | null;
   // The last Claude Code session title (`ai-title`) applied to this agent. Claude Code derives it
   // from the FULL conversation (prompts + responses + images), so it's the authoritative auto-name
   // once present — it supersedes the prompt-derived Haiku name and suppresses further Haiku calls.

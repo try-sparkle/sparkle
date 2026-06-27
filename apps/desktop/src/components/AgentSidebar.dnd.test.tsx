@@ -1,9 +1,17 @@
 // @vitest-environment jsdom
 //
-// Drag-to-pin: dragging a top-level agent's grip and dropping it onto a row pins it at that
-// row's index. Heavy leaf components + the Tauri opener are mocked so the sidebar renders.
+// Drag-to-pin: dragging a top-level agent CARD (the whole row is the drag handle) and dropping it
+// onto a row pins it at that row's index. Heavy leaf components + the Tauri opener are mocked so
+// the sidebar renders.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// The whole card is the drag handle now (no separate grip element) — reorderable top-level rows
+// carry draggable=true; workers do not. Selecting by the attribute keeps the test honest about
+// which rows a user can actually grab. NOTE: dragProps is spread onto BOTH the in-flow row and the
+// hover overlay, so a hovered row exposes TWO draggable elements; these counts assume the at-rest
+// state (no row hovered), which holds for every test here.
+const draggableCards = () => Array.from(document.querySelectorAll<HTMLElement>('[draggable="true"]'));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(() => Promise.resolve()),
@@ -45,10 +53,10 @@ describe("AgentSidebar — drag to pin", () => {
   it("dropping an agent onto a row pins it at that index", () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
-    const grips = screen.getAllByTitle(/Drag to reorder/);
-    expect(grips).toHaveLength(3);
+    const cards = draggableCards();
+    expect(cards).toHaveLength(3);
     // Drag Gamma (a3, last) onto the first row (index 0).
-    fireEvent.dragStart(grips[2]!);
+    fireEvent.dragStart(cards[2]!);
     const targets = screen.getAllByTestId("agent-drop-target");
     fireEvent.dragOver(targets[0]!);
     fireEvent.drop(targets[0]!);
@@ -60,8 +68,8 @@ describe("AgentSidebar — drag to pin", () => {
   it("dropping an agent on its OWN row is a no-op (does not pin/freeze the name)", () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
-    const grips = screen.getAllByTitle(/Drag to reorder/);
-    fireEvent.dragStart(grips[2]!); // Gamma (a3) at row 2
+    const cards = draggableCards();
+    fireEvent.dragStart(cards[2]!); // Gamma (a3) at row 2
     const targets = screen.getAllByTestId("agent-drop-target");
     fireEvent.drop(targets[2]!); // released on its own row
     const a3 = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === "a3")!;
@@ -72,21 +80,21 @@ describe("AgentSidebar — drag to pin", () => {
   it("drag-end without a drop clears the drag state (no lingering drop targets)", () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
-    const grips = screen.getAllByTitle(/Drag to reorder/);
-    fireEvent.dragStart(grips[0]!);
+    const cards = draggableCards();
+    fireEvent.dragStart(cards[0]!);
     expect(screen.getAllByTestId("agent-drop-target")).toHaveLength(3);
-    fireEvent.dragEnd(grips[0]!);
+    fireEvent.dragEnd(cards[0]!);
     expect(screen.queryAllByTestId("agent-drop-target")).toHaveLength(0);
   });
 
-  it("a rendered nested worker exposes no drag grip (top-level only)", () => {
+  it("a rendered nested worker is not draggable (top-level only)", () => {
     const worker = { ...mkAgent("w1", "Worker"), kind: "worker" as const, parentId: "a1" };
     seed([mkAgent("a1", "Alpha"), worker]);
-    // Expand the orchestrator so the worker row actually renders — otherwise "no grip" would
+    // Expand the orchestrator so the worker row actually renders — otherwise "not draggable" would
     // pass vacuously because a collapsed worker isn't in the DOM at all (roborev 13178).
     useUiStore.setState({ collapsedOrchestrators: { a1: false } });
     render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
     expect(screen.getByText("Worker")).toBeTruthy(); // the worker row IS rendered…
-    expect(screen.getAllByTitle(/Drag to reorder/)).toHaveLength(1); // …yet only the top-level agent has a grip
+    expect(draggableCards()).toHaveLength(1); // …yet only the top-level agent's card is draggable
   });
 });

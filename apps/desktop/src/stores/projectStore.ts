@@ -3,7 +3,7 @@
 // restores everything. Live process/status state is NOT here (see runtimeStore).
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
-import type { AgentKind, AgentNameVariants, AgentTab, Project } from "../types";
+import type { AgentKind, AgentName, AgentTab, Project } from "../types";
 
 // Cap on how many prompts we keep per agent so the persisted localStorage record stays bounded.
 // The oldest entries fall off; the most recent PROMPT_HISTORY_LIMIT are kept.
@@ -57,14 +57,14 @@ interface ProjectState {
   renameAgent: (projectId: string, agentId: string, name: string, pinnedIndex?: number) => void;
   /** Auto-rename from the naming model. No-op if the user has pinned the name. Records the
    *  basis prompt so we can later detect when the work has shifted enough to re-name. Pass
-   *  `variants` (short/medium/long) to enable width-fitted display + hover; `name` is the
-   *  canonical fallback (callers set it to the medium variant). */
+   *  `autoName` (title + description) to enable the truncated title + hover description; `name` is
+   *  the canonical fallback (callers set it to the title). */
   autoRenameAgent: (
     projectId: string,
     agentId: string,
     name: string,
     basis: string,
-    variants?: AgentNameVariants | null,
+    autoName?: AgentName | null,
   ) => void;
   /** Apply Claude Code's session title (`ai-title`) as the authoritative auto-name. No-op if the
    *  user has pinned the name, the title is empty, or it's already applied. Supersedes any
@@ -91,14 +91,11 @@ function mapProject(
   return projects.map((p) => (p.id === id ? fn(p) : p));
 }
 
-/** Derive width-fitting short/medium/long variants from a single Claude Code title by word-count
- *  caps — so the sidebar can still shrink a long title to a narrow column (and reveal the full
- *  form on hover) without a model call. A title of ≤4 words collapses to the same string at every
- *  length, which renders identically to a variant-less name. Exported for unit testing. */
-export function titleVariants(title: string): AgentNameVariants {
-  const words = title.split(/\s+/).filter(Boolean);
-  const take = (n: number) => words.slice(0, n).join(" ");
-  return { short: take(4), medium: take(6), long: title };
+/** Wrap a single Claude Code session title as an {@link AgentName}. The session title has no
+ *  separate description (it's derived from the whole conversation, not a title+blurb pair), so the
+ *  description is empty — the hover card then shows just the title. Exported for unit testing. */
+export function nameFromTitle(title: string): AgentName {
+  return { title: title.trim(), description: "" };
 }
 
 /** Backfill the main-first-defaults fields on persisted state so legacy records rehydrate with
@@ -354,7 +351,7 @@ export const useProjectStore = create<ProjectState>()(
           ),
         })),
 
-      autoRenameAgent: (projectId, agentId, name, basis, variants) =>
+      autoRenameAgent: (projectId, agentId, name, basis, autoName) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) =>
@@ -364,7 +361,7 @@ export const useProjectStore = create<ProjectState>()(
               // the title poll applied one — without it, the stale guess would clobber the title.
               a.namePinned || a.aiTitle || !name.trim()
                 ? a
-                : { ...a, name: name.trim(), autoNameBasis: basis, autoNameVariants: variants ?? null },
+                : { ...a, name: name.trim(), autoNameBasis: basis, autoNameVariants: autoName ?? null },
             ),
           ),
         })),
@@ -387,7 +384,7 @@ export const useProjectStore = create<ProjectState>()(
                 ...a,
                 name: t,
                 aiTitle: t,
-                autoNameVariants: titleVariants(t),
+                autoNameVariants: nameFromTitle(t),
               })),
             ),
           };

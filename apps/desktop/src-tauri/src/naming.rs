@@ -1,9 +1,8 @@
-// Auto-naming: turn an agent's first (or meaningfully-changed) prompt into THREE length
-// variants of a label (short 2–4 / medium 5–6 / long 8–10 words) by asking the cheapest
-// Claude model (Haiku 4.5) for a terse summary in one call. The webview picks the longest
-// variant that fits the sidebar column and reveals the long form on hover. The call lives
-// in Rust — not the webview — so the BYOK Anthropic key never ships in the JS bundle and we
-// can read it from the user's `.env.local` on disk.
+// Auto-naming: turn an agent's first (or meaningfully-changed) prompt into a short TITLE plus a
+// one-sentence DESCRIPTION of the work, by asking the cheapest Claude model (Haiku 4.5) in one
+// call. The sidebar shows the title (truncated to fit the column) and reveals the title + the
+// description on hover. The call lives in Rust — not the webview — so the BYOK Anthropic key never
+// ships in the JS bundle and we can read it from the user's `.env.local` on disk.
 //
 // Key resolution (first hit wins): ANTHROPIC_API_KEY env, ANTHROPIC_API env, then `.env.local`
 // at EXACT paths only — the current dir (DEBUG builds only) and `$HOME/Projects/sparkle/.env.local`.
@@ -17,8 +16,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// Cheapest current Claude model — plenty for a four-word summary. (See the claude-api
-/// skill: claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.)
+/// Cheapest current Claude model — plenty for a short title + one-sentence summary. (See the
+/// claude-api skill: claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.)
 const NAMING_MODEL: &str = "claude-haiku-4-5";
 
 const SYSTEM_PROMPT: &str = "You name coding-agent sessions by the SUBSTANCE of the work — the \
@@ -30,25 +29,25 @@ operational/process command, an acknowledgement, or a greeting with NO subject o
 'thanks', 'hi'). When in doubt, do NOT skip — name it.\n\
 - Otherwise, name the subject of the work. A QUESTION, COMPLAINT, BUG REPORT, INVESTIGATION, or \
 DISCUSSION about a feature, component, or problem DOES have a subject and MUST be named by that \
-subject — never skipped just because it is not phrased as an imperative command. Summarize the \
-SAME work as three Title Case titles of increasing length. Reply with ONLY a JSON object — no \
-preamble, no markdown fences: \
-{\"short\": \"2-4 words\", \"medium\": \"5-6 words\", \"long\": \"8-10 words\"}. Each value is a \
-title (no surrounding quotes, no trailing punctuation). Name the subject of the work, e.g. \
-'Voice Dictation Pipeline', never a command like 'Push Code Changes'.\n\
+subject — never skipped just because it is not phrased as an imperative command. Reply with ONLY a \
+JSON object — no preamble, no markdown fences: \
+{\"title\": \"3-5 words\", \"description\": \"one short sentence\"}. The title is a 3–5 word Title \
+Case label of the work (no surrounding quotes, no trailing punctuation). The description is one \
+short plain sentence (≤ ~16 words) saying what the work is about. Name the subject of the work, \
+e.g. 'Voice Dictation Pipeline', never a command like 'Push Code Changes'.\n\
 Examples:\n\
-{\"short\": \"Fix Login Redirect\", \"medium\": \"Fix OAuth Login Redirect Loop\", \
-\"long\": \"Fix OAuth Login Redirect Loop After Token Refresh\"}\n\
-{\"short\": \"Deepgram Dictation Streaming\", \"medium\": \"Debug Deepgram Live Dictation Streaming\", \
-\"long\": \"Investigate Why Deepgram Cloud Dictation Is Not Streaming Live\"}";
+{\"title\": \"Fix OAuth Redirect Loop\", \"description\": \"Stops the login page from looping after \
+a token refresh\"}\n\
+{\"title\": \"Deepgram Dictation Streaming\", \"description\": \"Investigates why cloud dictation is \
+not streaming live transcripts\"}";
 
-/// The three length variants of an auto-name. Serialized to the webview as
-/// `{ short, medium, long }`; the UI renders the longest one that fits the column.
+/// An auto-generated agent name: a short `title` for the sidebar plus a one-sentence
+/// `description` revealed on hover. Serialized to the webview as `{ title, description }`.
+/// `description` may be empty (e.g. a plain-title fallback or a Claude Code session title).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AgentName {
-    pub short: String,
-    pub medium: String,
-    pub long: String,
+    pub title: String,
+    pub description: String,
 }
 
 /// Pull `KEY=value` out of a dotenv-style file body, honoring optional surrounding quotes.
@@ -157,52 +156,49 @@ fn sanitize_name(raw: &str, max_words: usize) -> String {
     words.join(" ").trim_end_matches(['.', ',']).to_string()
 }
 
-/// Parse the model's reply into the three length variants. The model is asked for a bare JSON
-/// object, but tolerate stray prose or ```json fences by slicing from the first `{` to the
-/// last `}`. Returns None if no usable object is found so the caller can fall back.
-fn parse_variants(text: &str) -> Option<AgentName> {
+/// Clean up the one-sentence description: strip surrounding quotes / a "Description:" label and
+/// collapse whitespace, then cap the length so a runaway reply can't blow out the hover card.
+/// Unlike the title we keep internal sentence punctuation but cap to `MAX_DESC_WORDS` words.
+fn sanitize_description(raw: &str) -> String {
+    const MAX_DESC_WORDS: usize = 30;
+    let mut s = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if let Some((lead, rest)) = s.split_once(':') {
+        let label = lead.trim().to_ascii_lowercase();
+        if matches!(label.as_str(), "description" | "desc" | "summary" | "about") {
+            s = rest.trim();
+        }
+    }
+    s.split_whitespace().take(MAX_DESC_WORDS).collect::<Vec<_>>().join(" ")
+}
+
+/// Parse the model's reply into a title + description. The model is asked for a bare JSON object,
+/// but tolerate stray prose or ```json fences by slicing from the first `{` to the last `}`.
+/// Returns None if no usable title is found so the caller can fall back.
+fn parse_name(text: &str) -> Option<AgentName> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
     let slice = text.get(start..=end)?;
     let v: serde_json::Value = serde_json::from_str(slice).ok()?;
-    let field = |k: &str, cap: usize| {
-        v.get(k)
-            .and_then(serde_json::Value::as_str)
-            .map(|s| sanitize_name(s, cap))
-            .unwrap_or_default()
-    };
-    let name = normalize(AgentName {
-        short: field("short", 4),
-        medium: field("medium", 6),
-        long: field("long", 10),
-    });
-    // At least one variant must have survived sanitizing.
-    if name.short.is_empty() {
-        None
-    } else {
-        Some(name)
+    let title = v
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| sanitize_name(s, 5))
+        .unwrap_or_default();
+    if title.is_empty() {
+        return None;
     }
+    let description = v
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_description)
+        .unwrap_or_default();
+    Some(AgentName { title, description })
 }
 
-/// Backfill any empty variant from a longer-then-shorter neighbor so the UI always has a
-/// non-empty string to show at every length (e.g. the model omitted "long" → reuse "medium").
-fn normalize(mut n: AgentName) -> AgentName {
-    if n.medium.is_empty() {
-        n.medium = if !n.long.is_empty() { n.long.clone() } else { n.short.clone() };
-    }
-    if n.long.is_empty() {
-        n.long = n.medium.clone();
-    }
-    if n.short.is_empty() {
-        n.short = n.medium.clone();
-    }
-    n
-}
-
-/// Interpret the model's reply text into the three name variants. Returns Err when the prompt
-/// was operational or too thin to describe work (the model replies with a bare `SKIP` token) or
-/// when no usable title can be derived — both flow through the caller's swallow-on-error path,
-/// leaving the agent's current name untouched.
+/// Interpret the model's reply text into a name. Returns Err when the prompt was operational or
+/// too thin to describe work (the model replies with a bare `SKIP` token) or when no usable title
+/// can be derived — both flow through the caller's swallow-on-error path, leaving the agent's
+/// current name untouched.
 fn interpret_reply(text: &str) -> Result<AgentName, String> {
     let trimmed = text.trim();
     // A reply containing `{` is an attempted JSON object (the format we asked for); one without is
@@ -215,26 +211,21 @@ fn interpret_reply(text: &str) -> Result<AgentName, String> {
             return Err("naming skipped (operational or low-content prompt)".into());
         }
         // Plain-title fallback: a model that ignored the JSON instruction and returned a bare
-        // title still yields a usable (if uniform) name derived from the whole reply.
-        let long = sanitize_name(text, 10);
-        if long.is_empty() {
+        // title still yields a usable title (with no description).
+        let title = sanitize_name(text, 5);
+        if title.is_empty() {
             return Err("model returned no usable name".into());
         }
-        return Ok(normalize(AgentName {
-            short: sanitize_name(text, 4),
-            medium: sanitize_name(text, 6),
-            long,
-        }));
+        return Ok(AgentName { title, description: String::new() });
     }
-    // Attempted JSON: parse the object. If it doesn't parse — e.g. the reply was truncated
-    // mid-object so there's no closing `}` — we must NOT fall back to stringifying the raw braces
-    // (that leaked names like `{"short": "…`). Fail instead, so the caller keeps the existing name.
-    parse_variants(text).ok_or_else(|| "naming reply was malformed or truncated JSON".to_string())
+    // Attempted JSON: parse the object. If it doesn't parse — e.g. the reply was truncated mid-
+    // object so there's no closing `}` — we must NOT fall back to stringifying the raw braces
+    // (that leaked names like `{"title": "…`). Fail instead, so the caller keeps the existing name.
+    parse_name(text).ok_or_else(|| "naming reply was malformed or truncated JSON".to_string())
 }
 
-/// Generate the three length variants of an agent name from a prompt. Returns Err on any
-/// failure (no key, network, HTTP error, empty result) so the caller can silently keep the
-/// existing name.
+/// Generate a title + description for an agent from a prompt. Returns Err on any failure (no key,
+/// network, HTTP error, empty result) so the caller can silently keep the existing name.
 #[tauri::command]
 pub async fn generate_agent_name(prompt: String) -> Result<AgentName, String> {
     let prompt = prompt.trim().to_string();
@@ -254,12 +245,11 @@ fn call_anthropic(key: &str, prompt: &str) -> Result<AgentName, String> {
     // Serialize/parse via serde_json directly so we don't depend on ureq's optional `json`
     // feature (the crate is pulled in without it).
     let body = serde_json::json!({
-        // Three titles (plus JSON braces/keys/quotes, and a ```json fence the model often adds)
-        // need real headroom: at 200 a slightly verbose reply truncated mid-JSON, leaving no
-        // closing `}` so parse_variants failed and the raw braces leaked into the name. 512 gives
-        // comfortable room for all three variants + fence and is still cheap on Haiku.
+        // A short title + one sentence (plus JSON braces/keys/quotes, and a ```json fence the
+        // model often adds) fits comfortably in 256 tokens; the prior three-variant schema needed
+        // 512, but this reply is much smaller.
         "model": NAMING_MODEL,
-        "max_tokens": 512,
+        "max_tokens": 256,
         "system": SYSTEM_PROMPT,
         "messages": [{ "role": "user", "content": prompt }],
     });
@@ -381,55 +371,70 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_three_variant_object() {
-        let reply = r#"{"short":"Fix Login Redirect","medium":"Fix OAuth Login Redirect Loop","long":"Fix OAuth Login Redirect Loop After Token Refresh"}"#;
-        let n = parse_variants(reply).expect("should parse");
-        assert_eq!(n.short, "Fix Login Redirect");
-        assert_eq!(n.medium, "Fix OAuth Login Redirect Loop");
-        assert_eq!(n.long, "Fix OAuth Login Redirect Loop After Token Refresh");
+    fn sanitize_description_strips_label_and_caps_length() {
+        assert_eq!(
+            sanitize_description("\"Stops the login loop after refresh\""),
+            "Stops the login loop after refresh"
+        );
+        assert_eq!(
+            sanitize_description("Description: Investigates the streaming bug"),
+            "Investigates the streaming bug"
+        );
+        // Runaway reply is capped to 30 words.
+        let long = (1..=40).map(|n| n.to_string()).collect::<Vec<_>>().join(" ");
+        assert_eq!(sanitize_description(&long).split_whitespace().count(), 30);
+    }
+
+    #[test]
+    fn sanitize_description_keeps_non_label_colons() {
+        // A colon that is NOT a known label prefix (a URL, or "Foo: bar" where Foo isn't a label
+        // word) must be preserved verbatim — only "Description:"/"Desc:"/"Summary:"/"About:" strip.
+        assert_eq!(
+            sanitize_description("Fixes the http://x.test redirect"),
+            "Fixes the http://x.test redirect"
+        );
+        assert_eq!(
+            sanitize_description("Adds a Status: ready badge to the header"),
+            "Adds a Status: ready badge to the header"
+        );
+    }
+
+    #[test]
+    fn parses_title_and_description() {
+        let reply = r#"{"title":"Fix Login Redirect","description":"Stops the OAuth login loop after a token refresh"}"#;
+        let n = parse_name(reply).expect("should parse");
+        assert_eq!(n.title, "Fix Login Redirect");
+        assert_eq!(n.description, "Stops the OAuth login loop after a token refresh");
     }
 
     #[test]
     fn parses_through_markdown_fences_and_prose() {
-        let reply = "Sure! Here you go:\n```json\n{\"short\": \"Add Dark Mode\", \"medium\": \"Add Dark Mode Toggle Setting\", \"long\": \"Add Dark Mode Toggle To Settings Page Header\"}\n```";
-        let n = parse_variants(reply).expect("should parse despite fences");
-        assert_eq!(n.short, "Add Dark Mode");
-        assert_eq!(n.medium, "Add Dark Mode Toggle Setting");
+        let reply = "Sure! Here you go:\n```json\n{\"title\": \"Add Dark Mode\", \"description\": \"Adds a dark mode toggle to the settings page\"}\n```";
+        let n = parse_name(reply).expect("should parse despite fences");
+        assert_eq!(n.title, "Add Dark Mode");
+        assert_eq!(n.description, "Adds a dark mode toggle to the settings page");
     }
 
     #[test]
-    fn parse_caps_each_variant_length() {
-        // Model ignores the word budgets — we still clamp to 4/6/10.
-        let reply = r#"{"short":"A B C D E F","medium":"A B C D E F G H","long":"A B C D E F G H I J K L"}"#;
-        let n = parse_variants(reply).expect("should parse");
-        assert_eq!(n.short.split_whitespace().count(), 4);
-        assert_eq!(n.medium.split_whitespace().count(), 6);
-        assert_eq!(n.long.split_whitespace().count(), 10);
+    fn parse_caps_the_title_length() {
+        // Model ignores the word budget — we still clamp the title to 5 words. Description is free.
+        let reply = r#"{"title":"A B C D E F G","description":"a b c d e"}"#;
+        let n = parse_name(reply).expect("should parse");
+        assert_eq!(n.title.split_whitespace().count(), 5);
     }
 
     #[test]
-    fn normalize_backfills_missing_variants() {
-        // Only "short" present → medium and long reuse it.
-        let n = normalize(AgentName {
-            short: "Fix Bug".into(),
-            medium: String::new(),
-            long: String::new(),
-        });
-        assert_eq!(n.medium, "Fix Bug");
-        assert_eq!(n.long, "Fix Bug");
-        // Only "long" present → short and medium reuse it.
-        let n = normalize(AgentName {
-            short: String::new(),
-            medium: String::new(),
-            long: "Fix The Login Redirect Loop Bug".into(),
-        });
-        assert_eq!(n.short, "Fix The Login Redirect Loop Bug");
-        assert_eq!(n.medium, "Fix The Login Redirect Loop Bug");
+    fn parse_name_rejects_a_missing_title() {
+        // A JSON object with no usable title is not a name.
+        assert!(parse_name(r#"{"description":"only a description"}"#).is_none());
+        assert!(parse_name("just a plain title, no json").is_none());
     }
 
     #[test]
-    fn parse_variants_rejects_non_object() {
-        assert!(parse_variants("just a plain title, no json").is_none());
+    fn parse_name_tolerates_a_missing_description() {
+        let n = parse_name(r#"{"title":"Voice Dictation Pipeline"}"#).expect("title alone is usable");
+        assert_eq!(n.title, "Voice Dictation Pipeline");
+        assert_eq!(n.description, "");
     }
 
     #[test]
@@ -446,24 +451,24 @@ mod tests {
     fn interpret_reply_keeps_a_real_title_containing_the_word_skip() {
         // A genuine title with "skip" in it arrives as a JSON object, NOT the bare sentinel —
         // it must be named normally, not dropped.
-        let reply = r#"{"short":"Skip Onboarding","medium":"Skip Onboarding Step Flow","long":"Add A Skip Button To The Onboarding Step Flow"}"#;
+        let reply = r#"{"title":"Skip Onboarding Step","description":"Adds a skip button to the onboarding flow"}"#;
         let n = interpret_reply(reply).expect("a titled object must not be treated as SKIP");
-        assert_eq!(n.short, "Skip Onboarding");
+        assert_eq!(n.title, "Skip Onboarding Step");
     }
 
     #[test]
-    fn interpret_reply_parses_the_variant_object() {
-        let reply = r#"{"short":"Fix Auth Bug","medium":"Fix OAuth Login Bug","long":"Fix OAuth Login Bug On Token Refresh"}"#;
+    fn interpret_reply_parses_the_object() {
+        let reply = r#"{"title":"Fix Auth Bug","description":"Fixes the OAuth login bug on token refresh"}"#;
         let n = interpret_reply(reply).expect("should parse");
-        assert_eq!(n.short, "Fix Auth Bug");
-        assert_eq!(n.medium, "Fix OAuth Login Bug");
+        assert_eq!(n.title, "Fix Auth Bug");
+        assert_eq!(n.description, "Fixes the OAuth login bug on token refresh");
     }
 
     #[test]
     fn interpret_reply_falls_back_to_a_plain_title() {
         let n = interpret_reply("Voice Dictation Pipeline").expect("plain title is usable");
-        assert_eq!(n.long, "Voice Dictation Pipeline");
-        assert_eq!(n.short, "Voice Dictation Pipeline"); // ≤4 words, so short == full
+        assert_eq!(n.title, "Voice Dictation Pipeline");
+        assert_eq!(n.description, ""); // no JSON → no description
     }
 
     #[test]
@@ -482,24 +487,24 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("QUESTION"), "prompt must name questions, not skip them");
         assert!(SYSTEM_PROMPT.contains("do NOT skip"), "prompt must bias toward naming when unsure");
         assert!(SYSTEM_PROMPT.contains("SKIP"), "prompt must still allow SKIP for operational commands");
+        assert!(SYSTEM_PROMPT.contains("description"), "prompt must ask for a description, not just a title");
     }
 
     #[test]
     fn interpret_reply_rejects_truncated_json_instead_of_leaking_braces() {
-        // The real bug from the field: too small a max_tokens cut the reply off mid-"medium", so
-        // there's no closing `}`. parse_variants can't parse it, and the OLD plain-title fallback
-        // stringified the raw braces into the name (e.g. `{"short": "URL Path…`). A reply that is
-        // an ATTEMPTED JSON object (contains `{`) but won't parse must now error, so the caller
+        // The real bug from the field: too small a max_tokens cut the reply off mid-object, so
+        // there's no closing `}`. parse_name can't parse it, and a naive plain-title fallback
+        // would stringify the raw braces into the name (e.g. `{"title": "URL Path…`). A reply that
+        // is an ATTEMPTED JSON object (contains `{`) but won't parse must error, so the caller
         // keeps the existing name rather than showing raw JSON.
-        let truncated =
-            "```json\n{ \"short\": \"URL Path Clickable File Navigation\", \"medium\": \"Make";
+        let truncated = "```json\n{ \"title\": \"URL Path Clickable Navigation\", \"description\": \"Make";
         let out = interpret_reply(truncated);
         assert!(out.is_err(), "truncated JSON must error, not become a name: {out:?}");
 
-        // And on the failure path nothing leaks: if it ever did return Ok, no variant may carry a
-        // stray brace or quote from the raw reply.
+        // And on the failure path nothing leaks: if it ever did return Ok, neither field may carry
+        // a stray brace or quote from the raw reply.
         if let Ok(n) = out {
-            for v in [&n.short, &n.medium, &n.long] {
+            for v in [&n.title, &n.description] {
                 assert!(!v.contains('{') && !v.contains('"'), "leaked raw JSON into a name: {v}");
             }
         }

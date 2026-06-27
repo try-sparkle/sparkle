@@ -1,15 +1,15 @@
 // Auto-naming bridge (spec: agents summarize their own work). On the first prompt, and again
 // whenever a later prompt represents meaningfully different work, we ask the Rust backend
-// (src-tauri/src/naming.rs → cheapest Claude) for THREE length variants of a title (short/
-// medium/long) and rename the agent. The sidebar renders the longest variant that fits the
-// column and reveals the long form on hover.
+// (src-tauri/src/naming.rs → cheapest Claude) for a short title + a one-sentence description and
+// rename the agent. The sidebar shows the title (truncated to fit the column) and reveals the
+// title + description on hover.
 //
 // Everything here is best-effort: a pinned name, a too-thin prompt, or any backend failure
 // (no API key, network) just leaves the current name as-is. The naming call must never block
 // or break the send path, so callers fire-and-forget.
 import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore } from "../stores/projectStore";
-import type { AgentNameVariants } from "../types";
+import type { AgentName } from "../types";
 
 // Common filler words ignored when comparing two prompts — so "please fix the test" and
 // "fix the test now" read as the same work.
@@ -112,13 +112,13 @@ export async function maybeAutoName(projectId: string, agentId: string, prompt: 
   if (inFlight.has(agentId)) return; // a naming call for this agent is already running
   inFlight.add(agentId);
   try {
-    const variants = await invoke<AgentNameVariants>("generate_agent_name", { prompt });
-    // The medium variant is the canonical `name` (a sensible middle length for places that
-    // show the bare name); the sidebar picks a longer/shorter variant to fit its column.
-    const canonical = variants?.medium?.trim();
+    const name = await invoke<AgentName>("generate_agent_name", { prompt });
+    // The title is the canonical `name`; the sidebar truncates it to fit and reveals the title +
+    // description on hover.
+    const canonical = name?.title?.trim();
     if (canonical) {
       // Re-check pinned state at apply time — the user may have renamed mid-flight.
-      useProjectStore.getState().autoRenameAgent(projectId, agentId, canonical, prompt, variants);
+      useProjectStore.getState().autoRenameAgent(projectId, agentId, canonical, prompt, name);
     }
   } catch (e) {
     // No API key, offline, or model hiccup — keep the existing name silently.

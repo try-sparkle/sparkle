@@ -31,16 +31,16 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { Project, AgentTab } from "../types";
 import type { BranchStatus } from "../services/branchStatus";
 
-// Collapsed rows render the MEDIUM variant (jsdom has no ResizeObserver, so the width-fit measure
-// never runs and FittedAgentName falls back to `medium`); the hover overlay renders the full LONG
-// name. Tests target whichever is on screen for the state under test.
-const LONG = "A Very Long Agent Name That Needs The Slide-Out";
-const MEDIUM = "Agent Name";
+// Both collapsed and hover render the same TITLE; the one-sentence DESCRIPTION (and the
+// Location/Status/Progress detail lines) appear ONLY in the hover overlay. Tests use the
+// overlay-only path/description as the "is the slide-out open?" marker.
+const TITLE = "Agent Name";
+const DESCRIPTION = "Refines the agent sidebar hover card";
 
 function mkAgent(over: Partial<AgentTab> = {}): AgentTab {
   return {
     id: "a1",
-    name: LONG,
+    name: TITLE,
     kind: "worker",
     parentId: null,
     runtime: "local",
@@ -51,7 +51,7 @@ function mkAgent(over: Partial<AgentTab> = {}): AgentTab {
     promptHistory: [],
     namePinned: false,
     autoNameBasis: null,
-    autoNameVariants: { short: "Agent", medium: "Agent Name", long: LONG },
+    autoNameVariants: { title: TITLE, description: DESCRIPTION },
     shellCommand: null,
     pinnedIndex: null,
     ...over,
@@ -93,16 +93,18 @@ describe("AgentRow — rename input is a single instance across hover", () => {
   it("keeps exactly one input while editing, regardless of hover changes", () => {
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
 
-    // Hover the collapsed row → the slide-out overlay mounts and reveals the full LONG name.
-    // (mouseOver is how React's onMouseEnter is triggered in jsdom.)
-    fireEvent.mouseOver(screen.getByText(MEDIUM));
-    expect(screen.getByText(LONG)).toBeTruthy();
+    // Hover the collapsed row → the slide-out overlay mounts and reveals the Location line (an
+    // overlay-only element). (mouseOver is how React's onMouseEnter is triggered in jsdom.)
+    fireEvent.mouseOver(screen.getByText(TITLE));
+    expect(screen.getByText("/tmp/demo/.worktrees/a1")).toBeTruthy();
 
-    // Double-click the overlay's full name to rename → the overlay is suppressed and the in-flow
-    // row owns the ONE input. The full name disappears (input stands in for it).
-    fireEvent.doubleClick(screen.getByText(LONG));
+    // Double-click the overlay's title to rename → the overlay is suppressed and the in-flow row
+    // owns the ONE input. The title text disappears (input stands in for it). After hover the title
+    // exists twice (hidden in-flow + overlay); the overlay copy is the last one.
+    const titles = screen.getAllByText(TITLE);
+    fireEvent.doubleClick(titles[titles.length - 1]!);
     expect(screen.getAllByRole("textbox")).toHaveLength(1);
-    expect(screen.queryByText(LONG)).toBeNull();
+    expect(screen.queryByText(TITLE)).toBeNull();
 
     // Toggling hover mid-rename must NOT spawn or swap a second input.
     const row = screen.getByRole("textbox").closest("div")!;
@@ -113,37 +115,43 @@ describe("AgentRow — rename input is a single instance across hover", () => {
 
   it("Escape cancels the rename without committing (no second input, edit dropped)", () => {
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    fireEvent.doubleClick(screen.getByText(MEDIUM));
+    fireEvent.doubleClick(screen.getByText(TITLE));
     const input = screen.getByRole("textbox") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "scratch-typing" } });
     fireEvent.keyDown(input, { key: "Escape" });
     // Edit dropped → back to the name, no lingering input.
     expect(screen.queryByRole("textbox")).toBeNull();
-    expect(screen.getByText(MEDIUM)).toBeTruthy();
+    expect(screen.getByText(TITLE)).toBeTruthy();
   });
 });
 
-describe("AgentRow — behind/ahead pill", () => {
-  it("renders the behind pill as a clickable rebase (catch-up) button", () => {
+describe("AgentRow — Status line behind/ahead pill", () => {
+  // The pill now lives on the hover card's "Status" line (not in the collapsed row), so each test
+  // opens the slide-out first. mouseOver triggers React's onMouseEnter in jsdom.
+  const openOverlay = () => fireEvent.mouseOver(screen.getByText(TITLE));
+
+  it("renders the behind pill as a clickable catch-up button", () => {
     seedBranch("a1", bs({ behind: 4 }));
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    const pill = screen.getByRole("button", { name: "-4" });
-    expect(pill.title).toMatch(/rebase/);
+    openOverlay();
+    const pill = screen.getByRole("button", { name: /behind main/i });
+    expect(pill.textContent).toMatch(/catch up/i);
   });
 
-  it("renders the ahead pill as a clickable land (merge-into-main) button", () => {
+  it("renders the ahead pill as a clickable land (merge) button", () => {
     seedBranch("a1", bs({ ahead: 2 }));
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    // The green "+2" is now interactive — clicking it lands (merges) the branch, not a rebase.
-    const pill = screen.getByRole("button", { name: "+2" });
-    expect(pill.title).toMatch(/merge/);
-    expect(pill.title).not.toMatch(/rebase/);
+    openOverlay();
+    const pill = screen.getByRole("button", { name: /ahead/i });
+    expect(pill.textContent).toMatch(/merge/i);
+    expect(pill.textContent).not.toMatch(/catch up/i);
   });
 
   it("clicking the green pill invokes the land flow (not a rebase)", () => {
     seedBranch("a1", bs({ ahead: 2 }));
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    fireEvent.click(screen.getByRole("button", { name: "+2" }));
+    openOverlay();
+    fireEvent.click(screen.getByRole("button", { name: /ahead/i }));
     expect(landAgentBranch).toHaveBeenCalledTimes(1);
     expect(refreshAgentBranch).not.toHaveBeenCalled();
   });
@@ -151,7 +159,8 @@ describe("AgentRow — behind/ahead pill", () => {
   it("clicking the red pill invokes the rebase flow (not a land)", () => {
     seedBranch("a1", bs({ behind: 3 }));
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    fireEvent.click(screen.getByRole("button", { name: "-3" }));
+    openOverlay();
+    fireEvent.click(screen.getByRole("button", { name: /behind main/i }));
     expect(refreshAgentBranch).toHaveBeenCalledTimes(1);
     expect(landAgentBranch).not.toHaveBeenCalled();
   });
@@ -161,8 +170,65 @@ describe("AgentRow — clickable path", () => {
   it("clicking the expanded path reveals the worktree folder in Finder", () => {
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
     // Path only shows in the hover-expanded overlay.
-    fireEvent.mouseOver(screen.getByText(MEDIUM));
+    fireEvent.mouseOver(screen.getByText(TITLE));
     fireEvent.click(screen.getByText("/tmp/demo/.worktrees/a1"));
     expect(revealItemInDir).toHaveBeenCalledWith("/tmp/demo/.worktrees/a1");
+  });
+});
+
+describe("AgentRow — hover card title + description and detail lines", () => {
+  it("reveals the one-sentence description on hover; collapsed shows only the title", () => {
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    // Collapsed: the title is shown, the description is NOT.
+    expect(screen.getByText(TITLE)).toBeTruthy();
+    expect(document.body.textContent).not.toContain(DESCRIPTION);
+    // Hover → the overlay reveals "Title:  description".
+    fireEvent.mouseOver(screen.getByText(TITLE));
+    expect(document.body.textContent).toContain(DESCRIPTION);
+  });
+
+  it("omits the description span entirely when the description is empty", () => {
+    render(<AgentSidebar project={mkProject([mkAgent({ autoNameVariants: { title: TITLE, description: "" } })])} />);
+    fireEvent.mouseOver(screen.getByText(TITLE));
+    expect(screen.getByText("/tmp/demo/.worktrees/a1")).toBeTruthy(); // overlay is open…
+    // …but with no description there is no leading "colon-space-space" run anywhere in the card.
+    expect(document.body.textContent).not.toContain(":  ");
+  });
+
+  it("Status line reads 'Up to date' when the branch is neither ahead nor behind", () => {
+    seedBranch("a1", bs({ ahead: 0, behind: 0 }));
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    fireEvent.mouseOver(screen.getByText(TITLE));
+    expect(document.body.textContent).toContain("Up to date with main");
+  });
+
+  it("Progress line shows percent-only (no worker count) for a leaf agent", () => {
+    seedBranch("a1", bs({ behind: 1 })); // behind copy avoids the word 'worker' in the Status line
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    fireEvent.mouseOver(screen.getByText(TITLE));
+    const body = document.body.textContent ?? "";
+    expect(body).toMatch(/% complete\./);
+    expect(body).not.toContain("% complete overall"); // leaf → no "overall"
+  });
+
+  it("Progress line counts workers and says 'overall' for an orchestrator", () => {
+    const build = mkAgent({
+      id: "b1",
+      name: "Orchestrator",
+      kind: "build",
+      autoNameVariants: { title: "Orchestrator", description: "" },
+    });
+    const worker = mkAgent({
+      id: "w1",
+      name: "Worker",
+      kind: "worker",
+      parentId: "b1",
+      autoNameVariants: { title: "Worker", description: "" },
+      worktreePath: "/tmp/demo/.worktrees/w1",
+    });
+    useRuntimeStore.setState({ branchStatus: { b1: bs({ behind: 1 }), w1: bs({ behind: 1 }) }, status: {} });
+    render(<AgentSidebar project={mkProject([build, worker])} />);
+    fireEvent.mouseOver(screen.getByText("Orchestrator"));
+    expect(document.body.textContent).toMatch(/1 worker\. \d+% complete overall\./);
   });
 });

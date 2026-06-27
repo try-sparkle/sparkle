@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type DragEvent as ReactDragEvent } from "react";
 import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled, TbBulb } from "react-icons/tb";
@@ -22,7 +22,7 @@ import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
 import { WorkflowLine } from "./WorkflowLine";
 import { HistorySearch } from "./HistorySearch";
-import { resolveStage, rollupStages, stageMeta } from "../engine/workflowStage";
+import { resolveStage, rollupStages, stageMeta, stageFraction } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { CloseWorkerPrompt } from "./CloseWorkerPrompt";
 
@@ -507,7 +507,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               statusColor={color}
               bs={bs}
               trackerStage={trackerStage}
-              labelPrefix={a.kind === "build" && workers.length > 0 ? "Overall: " : undefined}
+              workerCount={a.id === top.id ? workers.length : 0}
               orderedIndex={rowIndex}
               dragActive={dragId != null}
               onDragStartAgent={onAgentDragStart}
@@ -659,7 +659,7 @@ function AgentRow({
   statusColor,
   bs,
   trackerStage,
-  labelPrefix,
+  workerCount,
   orderedIndex,
   dragActive,
   onDragStartAgent,
@@ -679,7 +679,9 @@ function AgentRow({
   statusColor: string;
   bs?: BranchStatus;
   trackerStage: WorkflowStageId | null;
-  labelPrefix?: string;
+  // Number of workers under this row (orchestrators only; 0 for workers/leaf agents) — shown in
+  // the hover card's "Progress" line.
+  workerCount: number;
   // The agent's current row in the ordered top-level stack (undefined for nested workers).
   // Passed to renameAgent so a manual rename anchors the row there (the unified pin). Also the
   // drop index for drag-reorder. The drag props are only acted on for top-level rows.
@@ -753,7 +755,6 @@ function AgentRow({
   const showPill = !!bs && (behind > 0 || ahead > 0);
   const pillBehind = behind > 0;
   const pillColor = pillBehind ? C.sienna : C.success;
-  const pillText = pillBehind ? `-${behind}` : `+${ahead}`;
   const baseLabel = a.baseBranch ?? "main";
   // Shared pill geometry — squared off to roughly match the Land/old action pills (borderRadius 5),
   // not a fully-round chip. The behind/ahead variants layer color + action on top.
@@ -793,67 +794,72 @@ function AgentRow({
     else console.warn("refresh blocked:", r.reason, r.files ?? ""); // toast UI is a follow-up
   };
 
-  const fullName = a.autoNameVariants?.long || a.name;
+  // The auto-name title (shown truncated when collapsed) and its one-sentence description (revealed
+  // on hover). Legacy/manual agents have no title → fall back to the canonical `name`.
+  const autoTitle = a.autoNameVariants?.title?.trim() || null;
+  const fullTitle = autoTitle || a.name;
+  const description = a.autoNameVariants?.description?.trim() || "";
+  // Overall completion for the hover "Progress" line: the same fraction the thin line fills to.
+  const progressPct = trackerStage ? Math.round(stageFraction(trackerStage) * 100) : null;
+
+  // The leading glyph slot is a fixed height so the glyph AND the title beside it sit at the exact
+  // same spot whether the card is collapsed or expanded — on hover the card only grows DOWNWARD,
+  // so the eye never sees the pickaxe or title jump.
+  const GLYPH_SLOT_H = 20;
+
+  // The pin chip (manual pin: name frozen + row anchored). Click to release. Shared by both states.
+  const pinChip = a.namePinned ? (
+    <span
+      onClick={(e) => {
+        e.stopPropagation();
+        unpinAgent(project.id, a.id);
+      }}
+      title="Pinned — won't auto-rename or reorder. Click to unpin."
+      style={{ display: "inline-flex", flex: "0 0 auto", cursor: "pointer", lineHeight: 1, color: C.muted }}
+    >
+      <TbPinFilled size={11} />
+    </span>
+  ) : null;
 
   // The row's inner content, shared by the in-flow (collapsed) and overlay (expanded) renders.
-  // `expanded` reveals the path + status label and shows the full name; `ownsInput` renders the
-  // rename <input> here. Only the in-flow row ever passes ownsInput=true (the overlay is suppressed
-  // during a rename), so there is always exactly one input — see showOverlay below.
+  // `expanded` reveals the description + the Location/Status/Progress detail lines; `ownsInput`
+  // renders the rename <input> here. Only the in-flow row ever passes ownsInput=true (the overlay
+  // is suppressed during a rename), so there is always exactly one input — see showOverlay below.
   const RowBody = ({ expanded, ownsInput }: { expanded: boolean; ownsInput: boolean }) => (
     <>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-        {/* Drag grip — top-level rows only (workers keep insertion order). Dragging by the grip
-            and dropping on a row pins this agent at that row (manual-agent-reorder-pin). Hidden
-            until row hover so the rest stays clean. */}
-        {!expanded && orderedIndex != null && (
-          <span
-            draggable
-            role="button"
-            aria-label="Drag to reorder agent"
-            title="Drag to reorder"
-            onDragStart={(e) => {
-              e.stopPropagation();
-              onDragStartAgent(a.id);
-            }}
-            onDragEnd={onDragEndAgent}
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              flex: "0 0 auto",
-              cursor: "grab",
-              color: C.muted,
-              fontSize: 12,
-              lineHeight: 1,
-              opacity: hover ? 0.7 : 0,
-              userSelect: "none",
-            }}
-          >
-            ⠿
-          </span>
-        )}
-        {/* The kind glyph IS the status indicator now (no separate dot): it takes the agent's
-            status color — green (working), red (needs you), gray (idle/done). On hover (the
-            expanded overlay) it morphs into the × close control, occupying the same slot so the
-            name doesn't shift — there's no longer a separate close button in the right cluster. */}
-        {expanded ? (
-          <CloseAgentButton onClose={onClose} width={glyphWidth} />
-        ) : (
-          <span
-            title={`${a.kind} — ${AGENT_STATUS[st].label}`}
-            style={{
-              fontSize: a.kind === "build" ? 28.8 : a.kind === "think" ? 19.5 : 12,
-              color: statusColor,
-              flex: "0 0 auto",
-              width: glyphWidth,
-              textAlign: "center",
-              // line-height 0 lets the enlarged ⚒ overflow its line box (staying centered) so it
-              // doesn't drive the row's height.
-              lineHeight: 0,
-            }}
-          >
-            {kindGlyph}
-          </span>
-        )}
-        <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 1 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 8, minWidth: 0 }}>
+        {/* Leading glyph slot — a FIXED-height box so the glyph (and the title beside it) sit at the
+            same vertical spot collapsed or expanded; the card only grows downward on hover. The
+            glyph IS the status indicator (its color = the agent's status) and on hover it morphs
+            into the × close control in this same slot, so nothing shifts. */}
+        <div
+          style={{
+            flex: "0 0 auto",
+            width: glyphWidth,
+            height: GLYPH_SLOT_H,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          {expanded ? (
+            <CloseAgentButton onClose={onClose} width={glyphWidth} />
+          ) : (
+            <span
+              title={`${a.kind} — ${AGENT_STATUS[st].label}`}
+              style={{
+                fontSize: a.kind === "build" ? 28.8 : a.kind === "think" ? 19.5 : 12,
+                color: statusColor,
+                // line-height 0 lets the enlarged ⚒ overflow its line box (staying centered in the
+                // slot) without driving the row's height.
+                lineHeight: 0,
+              }}
+            >
+              {kindGlyph}
+            </span>
+          )}
+        </div>
+        <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
           {ownsInput ? (
             <input
               autoFocus
@@ -866,7 +872,7 @@ function AgentRow({
                   return;
                 }
                 // Only commit a real change. A no-op blur (double-click to edit, then click away
-                // without typing) must NOT pin the name or wipe the auto-name variants.
+                // without typing) must NOT pin the name or wipe the auto-name.
                 const next = e.target.value;
                 if (next.trim() && next !== a.name) renameAgent(project.id, a.id, next, orderedIndex);
                 setEditing(null);
@@ -893,115 +899,121 @@ function AgentRow({
                 boxSizing: "border-box",
               }}
             />
-          ) : (
-            <div style={{ display: "flex", alignItems: "center", gap: 4, minWidth: 0 }}>
-              {expanded ? (
-                // Expanded: the FULL name, no ellipsis — the overlay grows to fit it.
-                <span
-                  onDoubleClick={(e) => {
-                    e.stopPropagation();
-                    setEditing(a.id);
-                  }}
-                  title="Double-click to rename"
-                  style={{
-                    color: statusColor,
-                    fontSize: 13,
-                    fontWeight: isActive ? FONT_WEIGHT.medium : FONT_WEIGHT.regular,
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {fullName}
+          ) : expanded ? (
+            // Expanded: bold title + ": " + the regular-weight description, wrapping. The first
+            // line's height matches the glyph slot so the title stays aligned with the glyph as the
+            // card grows down to fit the description.
+            <div
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                setEditing(a.id);
+              }}
+              title="Double-click to rename"
+              style={{ minWidth: 0, lineHeight: `${GLYPH_SLOT_H}px` }}
+            >
+              <span
+                style={{
+                  color: statusColor,
+                  fontSize: 13,
+                  fontWeight: isActive ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
+                }}
+              >
+                {fullTitle}
+              </span>
+              {description && (
+                <span style={{ color: statusColor, fontSize: 13, fontWeight: FONT_WEIGHT.regular }}>
+                  {`:  ${description}`}
                 </span>
-              ) : (
-                // Collapsed: width-fitted name. Its own hover card is suppressed — the row's
-                // slide-out reveals the full name instead of a separate floating tooltip.
-                <FittedAgentName
-                  variants={a.autoNameVariants}
-                  name={a.name}
-                  color={statusColor}
-                  active={isActive}
-                  suppressTooltip
-                  onDoubleClick={(e) => {
-                    e.stopPropagation();
-                    setEditing(a.id);
-                  }}
-                />
               )}
-              {a.namePinned && (
-                // Pinned by hand (drag or rename): name frozen AND row anchored. Click to release both.
-                <span
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    unpinAgent(project.id, a.id);
-                  }}
-                  title="Pinned — won't auto-rename or reorder. Click to unpin."
-                  style={{ display: "inline-flex", flex: "0 0 auto", cursor: "pointer", lineHeight: 1, color: C.muted }}
-                >
-                  <TbPinFilled size={11} />
-                </span>
+              {pinChip}
+            </div>
+          ) : (
+            // Collapsed: the bold title, truncated with an ellipsis (the hover card reveals the
+            // full title + description). Fixed to the glyph-slot height so the title line aligns.
+            <div style={{ display: "flex", alignItems: "center", gap: 4, minWidth: 0, height: GLYPH_SLOT_H }}>
+              <FittedAgentName
+                title={autoTitle}
+                name={a.name}
+                color={statusColor}
+                active={isActive}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  setEditing(a.id);
+                }}
+              />
+              {pinChip}
+            </div>
+          )}
+          {/* Collapsed: a thin progress line under the title (no text). Hidden when expanded — the
+              "Progress" detail line below carries the same information in words there. */}
+          {!expanded && trackerStage && (
+            <div style={{ marginTop: 1 }}>
+              <WorkflowLine stage={trackerStage} expanded={false} />
+            </div>
+          )}
+          {/* Expanded: the structured detail lines — Location, Status, Progress. */}
+          {expanded && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 4 }}>
+              <DetailLine label="Location">
+                <PathReveal path={a.worktreePath ?? project.rootPath} />
+              </DetailLine>
+              <DetailLine label="Status">
+                {showPill ? (
+                  pillBehind ? (
+                    // BEHIND (red): click rebases this branch onto main — catches YOU up. Gated on
+                    // the agent not actively writing (a rebase under a live PTY would race).
+                    <button
+                      disabled={busy}
+                      onClick={handleRefresh}
+                      style={{
+                        ...pillBase,
+                        color: pillColor,
+                        background: `${pillColor}22`,
+                        border: `1px solid ${pillColor}`,
+                        cursor: busy ? "not-allowed" : "pointer",
+                        opacity: busy ? 0.6 : 1,
+                      }}
+                    >
+                      {busy
+                        ? `${behind} behind ${baseLabel} — pause the agent to catch up`
+                        : `${behind} commit${behind === 1 ? "" : "s"} behind ${baseLabel}. Click to catch up`}
+                    </button>
+                  ) : (
+                    // AHEAD (green): click merges this branch into main — catches MAIN up to you.
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onLand();
+                      }}
+                      style={{
+                        ...pillBase,
+                        color: pillColor,
+                        background: `${pillColor}22`,
+                        border: `1px solid ${pillColor}`,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {a.kind === "worker"
+                        ? `${ahead} ahead. Click to merge into this worker's orchestrator`
+                        : `${ahead} commit${ahead === 1 ? "" : "s"} ahead of ${baseLabel}. Click to merge`}
+                    </button>
+                  )
+                ) : (
+                  <span style={{ color: C.muted, fontSize: 11 }}>Up to date with {baseLabel}</span>
+                )}
+              </DetailLine>
+              {progressPct != null && (
+                <DetailLine label="Progress">
+                  <span style={{ color: C.muted, fontSize: 11 }}>
+                    {workerCount > 0 ? `${workerCount} worker${workerCount === 1 ? "" : "s"}. ` : ""}
+                    {progressPct}% complete{workerCount > 0 ? " overall" : ""}.
+                  </span>
+                </DetailLine>
               )}
             </div>
           )}
-          {/* The working directory — only on hover (expanded), below the name. Click it to reveal
-              the folder in Finder (underlines on hover to signal it's clickable). */}
-          {expanded && (
-            <PathReveal path={a.worktreePath ?? project.rootPath} />
-          )}
         </div>
-        {/* Right cluster: the behind/ahead pill (which also IS the catch-up / land action). The
-            old separate ⬆ Land button is gone — the green pill lands; the red pill rebases. The
-            close × no longer lives here either: on hover the leading kind glyph becomes it. */}
-        {showPill &&
-          (pillBehind ? (
-            // BEHIND (red): click rebases this branch onto main — catches YOU up to main. Gated on
-            // the agent not actively writing (a rebase under a live PTY would race).
-            <button
-              disabled={busy}
-              onClick={handleRefresh}
-              title={
-                busy
-                  ? `Pause the agent first — ${behind} behind ${baseLabel}`
-                  : `${behind} behind ${baseLabel} — click to rebase onto ${baseLabel} (catch up)`
-              }
-              style={{
-                ...pillBase,
-                color: pillColor,
-                background: `${pillColor}22`,
-                border: `1px solid ${pillColor}`,
-                cursor: busy ? "not-allowed" : "pointer",
-                opacity: busy ? 0.6 : 1,
-              }}
-            >
-              {pillText}
-            </button>
-          ) : (
-            // AHEAD (green): click merges this branch into main — catches MAIN up to you (the old
-            // Land action). A worker lands into its orchestrator; a build agent into the default.
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onLand();
-              }}
-              title={
-                a.kind === "worker"
-                  ? `${ahead} ahead — click to merge into this worker's orchestrator branch`
-                  : `${ahead} ahead of ${baseLabel} — click to merge into ${baseLabel} (catch main up)`
-              }
-              style={{
-                ...pillBase,
-                color: pillColor,
-                background: `${pillColor}22`,
-                border: `1px solid ${pillColor}`,
-                cursor: "pointer",
-              }}
-            >
-              {pillText}
-            </button>
-          ))}
       </div>
-      {/* Thin progress line across the bottom of the row — fills + warms cyan→blue as the work
-          advances Uncommitted → Merged. The status label only appears when expanded. */}
-      {trackerStage && <WorkflowLine stage={trackerStage} expanded={expanded} labelPrefix={labelPrefix} />}
     </>
   );
 
@@ -1011,10 +1023,31 @@ function AgentRow({
   // a hover change, so a trailing unmount-blur can't silently commit a half-typed name.
   const showOverlay = hover && !editing;
 
+  // The WHOLE card is the drag handle (top-level rows only; workers keep insertion order). Grab
+  // anywhere on the card and drop on another row to pin this agent at that row's position
+  // (manual-agent-reorder-pin). Suppressed while renaming so the <input> behaves normally. The
+  // same props go on both the in-flow row AND the hover overlay, since on hover the overlay is the
+  // card you actually grab (the in-flow row is visibility:hidden behind it).
+  const dragProps =
+    orderedIndex != null && !editing
+      ? {
+          draggable: true,
+          // Signal draggability to assistive tech without an aria-label (which would override the
+          // row's name). aria-roledescription supplements the announced content instead.
+          "aria-roledescription": "draggable agent card",
+          onDragStart: (e: ReactDragEvent) => {
+            e.stopPropagation();
+            onDragStartAgent(a.id);
+          },
+          onDragEnd: onDragEndAgent,
+        }
+      : {};
+
   return (
     <>
       <div
         ref={rowRef}
+        {...dragProps}
         onClick={onSelect}
         onMouseEnter={show}
         onMouseLeave={hide}
@@ -1027,6 +1060,10 @@ function AgentRow({
           marginLeft: depth * 16,
           borderRadius: 8,
           cursor: "pointer",
+          // The whole card is a drag handle for reorderable rows — suppress text selection so a
+          // drag grabs the card instead of highlighting the name underneath the cursor. Gated on
+          // !editing (like dragProps) so the rename <input> keeps normal text selection.
+          userSelect: orderedIndex != null && !editing ? "none" : undefined,
           background: isActive ? CHAT_USER_BUBBLE : "transparent",
           marginBottom: 2,
           // Hide the collapsed content while the overlay stands in for it, so the name underneath
@@ -1054,6 +1091,7 @@ function AgentRow({
         rect &&
         createPortal(
           <div
+            {...dragProps}
             onClick={onSelect}
             onMouseEnter={show}
             onMouseLeave={hide}
@@ -1072,6 +1110,9 @@ function AgentRow({
               padding: "8px 10px",
               borderRadius: 8,
               cursor: "pointer",
+              // Whole-card drag handle (see in-flow row) — the overlay is what you grab on hover.
+              // (The overlay only mounts when !editing, so the guard mirrors the in-flow row's.)
+              userSelect: orderedIndex != null && !editing ? "none" : undefined,
               background: isActive ? CHAT_USER_BUBBLE : C.deepForest,
               border: `1px solid ${C.forest}`,
               boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
@@ -1083,6 +1124,20 @@ function AgentRow({
           document.body,
         )}
     </>
+  );
+}
+
+/** One "Label: value" line in the hover card (Location / Status / Progress). The label is a muted
+ *  fixed-width-content prefix; the value flexes and is allowed to shrink (minWidth:0) so a long
+ *  path or status button can ellipsize/wrap instead of forcing the card wider. */
+function DetailLine({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+      <span style={{ flex: "0 0 auto", color: C.muted, fontSize: 11, fontWeight: FONT_WEIGHT.semibold }}>
+        {label}:
+      </span>
+      <span style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center" }}>{children}</span>
+    </div>
   );
 }
 
@@ -1104,10 +1159,13 @@ function PathReveal({ path }: { path: string }) {
         fontSize: 11,
         fontFamily: FONT.mono,
         whiteSpace: "nowrap",
-        marginTop: 1,
         cursor: "pointer",
         textDecoration: hover ? "underline" : "none",
-        width: "fit-content",
+        // Ellipsize a long path inside the DetailLine instead of forcing the card wider.
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        maxWidth: "100%",
+        display: "block",
       }}
     >
       {path}
