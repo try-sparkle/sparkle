@@ -35,7 +35,8 @@ describe("LogoWaveform — honest listening", () => {
     screen.queryByText(
       (_content, el) =>
         el?.tagName === "BUTTON" &&
-        el.textContent?.replace(/\s+/g, " ").trim() === "Just say Hey Sparkle to talk to me",
+        el.textContent?.replace(/\s+/g, " ").trim() ===
+          "Listening for wake word: Just say Hey Sparkle to talk to me",
     );
 
   it("armed + actually listening → shows the live wake hint, not 'Mic paused'", () => {

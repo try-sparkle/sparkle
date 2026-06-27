@@ -6,7 +6,9 @@ describe("captionFor", () => {
   // Sparkle window is focused). The two can disagree — armed but focus-paused — and
   // the caption must stay honest rather than claim we're hearing the user when we're not.
   it("passive + enabled + listening → wake hint", () =>
-    expect(captionFor("passive", true, true)).toBe("Just say Hey Sparkle to talk to me"));
+    expect(captionFor("passive", true, true)).toBe(
+      "Listening for wake word: Just say Hey Sparkle to talk to me",
+    ));
   it("active + enabled + listening → stop hint", () =>
     expect(captionFor("active", true, true)).toBe("Just say Send It to stop"));
   it("muted → no caption", () =>

@@ -46,7 +46,7 @@ export function captionFor(
   if (!enabled) return null;
   if (!listening) return "Mic paused";
   return phase === "passive"
-    ? "Just say Hey Sparkle to talk to me"
+    ? "Listening for wake word: Just say Hey Sparkle to talk to me"
     : "Just say Send It to stop";
 }
 
@@ -121,11 +121,46 @@ export function LogoWaveform() {
   // and takes effect once capture resumes.
   const active = phase === "active";
 
+  // Mic tint by mode: the DARK BLUE of the logo "eye" (C.teal = #2f6bff) while we're
+  // listening for the wake word (passive), the lighter teal/cyan while ACTIVELY dictating.
+  // Muted → gray, with a cyan hover affordance signalling "click to turn audio on".
+  const micColor = !enabled ? (micHover ? C.accent : C.muted) : active ? C.accentInk : C.teal;
+  const micBorder = !enabled ? (micHover ? C.accent : C.muted) : active ? C.accent : C.teal;
+  // Recent waveform energy (newest bars) drives the pulsating glow behind the mic. The idle
+  // shimmer keeps it faintly alive even in silence; it swells as the user gets louder.
+  const energy = enabled && listening ? Math.max(0, ...bars.slice(-12)) : 0;
+
   return (
     <div style={{ padding: "0 14px 8px", userSelect: "none" }}>
       {/* Waveform stage. Bars mirror about the vertical center (grow up + down); a
           mic ring floats in the middle with the bars popping behind it. */}
       <div style={{ position: "relative", height: WAVE_HEIGHT }}>
+        {/* Pulsating Siri-orb glow behind the mic: soft, amoeba-like blobs across the teal→blue
+            spectrum that swell with the live audio `energy` (and breathe gently in silence via the
+            idle shimmer baked into `energy`). Sits behind everything; the mic's translucent disc
+            keeps the glyph legible over it. Only while actually listening. */}
+        {enabled && listening && (
+          <div
+            aria-hidden
+            style={{
+              position: "absolute",
+              left: "50%",
+              top: "50%",
+              width: 132,
+              height: 132,
+              transform: `translate(-50%, -50%) scale(${1 + energy * 0.95})`,
+              opacity: 0.32 + energy * 0.55,
+              transition: "transform 140ms ease-out, opacity 220ms ease-out",
+              pointerEvents: "none",
+              borderRadius: "50%",
+              filter: "blur(16px)",
+              background:
+                `radial-gradient(40% 46% at 37% 41%, ${C.accent}, transparent 70%),` +
+                `radial-gradient(44% 40% at 67% 61%, ${C.teal}, transparent 70%),` +
+                `radial-gradient(30% 34% at 57% 31%, ${C.accent}, transparent 72%)`,
+            }}
+          />
+        )}
         {/* Waveform — clicking anywhere on the strip toggles phase (start/stop). */}
         <button
           type="button"
@@ -160,9 +195,10 @@ export function LogoWaveform() {
                 // rAF loop drives the heights directly so spikes snap instantly.
                 height: `${Math.max(6, h * 100)}%`,
                 borderRadius: 1,
-                // Gray when passive/paused; brand blue→cyan fade across the row when live+active.
+                // Gray when passive/paused; brand teal→blue fade across the row when live+active
+                // (cyan/teal on the LEFT, dark blue C.teal #2f6bff on the RIGHT).
                 background: liveActive
-                  ? `linear-gradient(90deg, ${C.teal}, ${C.accent})`
+                  ? `linear-gradient(90deg, ${C.accent}, ${C.teal})`
                   : C.muted,
                 backgroundSize: liveActive ? `${BAR_COUNT * 100}% 100%` : undefined,
                 backgroundPosition: liveActive ? `${(i / (BAR_COUNT - 1)) * 100}% 0` : undefined,
@@ -193,13 +229,13 @@ export function LogoWaveform() {
             background: `color-mix(in srgb, ${C.forest} 62%, transparent)`,
             backdropFilter: "blur(2px)",
             WebkitBackdropFilter: "blur(2px)",
-            // When ON, the mic is cyan (active). When OFF it sits GRAY by default but
-            // turns cyan on hover — a clear affordance that clicking it turns audio on.
-            border: `1.5px solid ${enabled || micHover ? C.accent : C.muted}`,
+            // Dark-blue while listening for the wake word, lighter teal while dictating; gray
+            // (cyan on hover) when muted. See micColor/micBorder above.
+            border: `1.5px solid ${micBorder}`,
             boxShadow:
               enabled && liveActive ? "0 0 12px rgba(52,224,240,0.6)" : "none",
             cursor: "pointer",
-            color: enabled || micHover ? C.accentInk : C.muted,
+            color: micColor,
             padding: 0,
             transition: "box-shadow 120ms ease, border-color 120ms ease, color 120ms ease",
           }}
@@ -243,11 +279,12 @@ export function LogoWaveform() {
             fontSize: 11,
           }}
         >
-          Just say{" "}
+          {phase === "passive" ? "Listening for wake word: Just say " : "Just say "}
           <span
             style={{
               fontWeight: 600,
-              background: `linear-gradient(90deg, ${C.teal}, ${C.accent})`,
+              // Teal/cyan on the left → dark blue on the right (matches the waveform).
+              background: `linear-gradient(90deg, ${C.accent}, ${C.teal})`,
               WebkitBackgroundClip: "text",
               WebkitTextFillColor: "transparent",
             }}

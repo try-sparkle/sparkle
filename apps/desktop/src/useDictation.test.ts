@@ -303,13 +303,14 @@ describe("dictation://focus (window-focus capture gate)", () => {
     expect(listeners["dictation://focus"]).toBeDefined();
   });
 
-  it("blur (false): stops the cloud stream, resets phase/level/interim, marks idle — without disarming", () => {
+  it("blur (false): tears down cloud stream/level/interim and marks idle, but KEEPS the active phase and stays armed", () => {
     invoke.mockClear();
     emit("dictation://focus", false);
     const s = useDictationStore.getState();
     // Billable cloud stream torn down so tabbing away mid-dictation can't keep billing.
     expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
-    expect(s.phase).toBe("passive");
+    // Phase PERSISTS across a focus blur — the user must not have to re-say "Hey Sparkle" on return.
+    expect(s.phase).toBe("active");
     expect(s.level).toBe(0);
     expect(s.interim).toBe("");
     expect(s.status).toBe("idle");
@@ -321,6 +322,27 @@ describe("dictation://focus (window-focus capture gate)", () => {
     useDictationStore.setState({ status: "idle", phase: "passive", enabled: true });
     emit("dictation://focus", true);
     expect(useDictationStore.getState().status).toBe("listening");
+  });
+
+  it("refocus (true) while still ACTIVE resumes the cloud stream without a wake word", async () => {
+    for (const k of Object.keys(listeners)) delete listeners[k];
+    const onResumeActive = vi.fn();
+    const c = await createDictationController({ onSegment: vi.fn(), onResumeActive });
+    useDictationStore.setState({ status: "idle", phase: "active", enabled: true });
+    emit("dictation://focus", true);
+    expect(useDictationStore.getState().status).toBe("listening");
+    expect(onResumeActive).toHaveBeenCalledTimes(1);
+    c.cleanup();
+  });
+
+  it("refocus (true) while PASSIVE does not resume a cloud stream", async () => {
+    for (const k of Object.keys(listeners)) delete listeners[k];
+    const onResumeActive = vi.fn();
+    const c = await createDictationController({ onSegment: vi.fn(), onResumeActive });
+    useDictationStore.setState({ status: "idle", phase: "passive", enabled: true });
+    emit("dictation://focus", true);
+    expect(onResumeActive).not.toHaveBeenCalled();
+    c.cleanup();
   });
 
   it("refocus (true) does NOT resume listening while muted", () => {

@@ -88,12 +88,13 @@ export interface ComposerHeightInput {
 //  • userSized → honor the dragged height exactly, clamped to [min, cap]; the textarea scrolls
 //    when the draft is taller. This is what makes the handle able to size the composer DOWN,
 //    not just up: content no longer forces the box open.
-//  • auto-grow → max(rest height, fit-to-content), capped to the viewport. Empty/short drafts
-//    rest small; a long draft pushes the box taller up to the cap, then it scrolls.
+//  • auto-grow → fit-to-content exactly, clamped to [min, cap]. The box hugs the draft: a short
+//    draft sits tight (no empty space below — NOT floored at the rest height), a long draft pushes
+//    taller up to the cap then scrolls, and after a send the now-empty draft collapses back to min.
 // Kept pure (no DOM) so the height policy is unit-tested alongside the drag geometry.
 export function resolveComposerRenderHeight(p: ComposerHeightInput): number {
   if (p.userSized) return clamp(p.height, p.min, p.cap);
-  return clamp(Math.max(p.height, Math.min(p.cap, p.desired)), p.min, p.cap);
+  return clamp(Math.min(p.cap, p.desired), p.min, p.cap);
 }
 
 // Should the composer snap back to its rest height (and drop manual sizing)? Called at the

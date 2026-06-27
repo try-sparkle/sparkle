@@ -120,6 +120,20 @@ describe("resolveComposerRenderHeight", () => {
     ).toBe(600);
   });
 
+  it("hugs a draft SHORTER than the rest height — no empty space floored at `height`", () => {
+    // The bug: a short/just-sent draft used to be floored at the persisted rest height (72),
+    // leaving empty space below the text. Auto-grow now fits the content (68) exactly.
+    expect(
+      resolveComposerRenderHeight({ height: 72, desired: 68, userSized: false, ...geo }),
+    ).toBe(68);
+  });
+
+  it("auto-grow never collapses below the min floor", () => {
+    expect(
+      resolveComposerRenderHeight({ height: 72, desired: 40, userSized: false, ...geo }),
+    ).toBe(64);
+  });
+
   it("honors a manually dragged height SHORTER than the draft (the draft scrolls)", () => {
     // The regression this fixes: dragging the handle DOWN used to have no visible effect —
     // the content's fit-height (250) always won over the dragged height. Now a user-sized 100

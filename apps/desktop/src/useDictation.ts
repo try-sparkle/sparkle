@@ -36,6 +36,9 @@ export function cloudStreamCommandFor(
 
 interface DictationOptions {
   onSegment: (text: string) => void;
+  /** Called on focus REGAIN when a dictation session is still ACTIVE (phase === "active"), so the
+   *  cloud stream resumes without the user re-saying the wake word. Optional (tests may omit it). */
+  onResumeActive?: () => void;
 }
 
 interface DictationController {
@@ -55,6 +58,7 @@ export async function createDictationController(
   // Keep a stable reference to the callback so callers can swap it out
   // without recreating the controller (mirrors the useRef pattern in the hook).
   let onSegment = options.onSegment;
+  const onResumeActive = options.onResumeActive;
 
   const { setStatus, setLevel, setError, setModelProgress } =
     useDictationStore.getState();
@@ -103,9 +107,11 @@ export async function createDictationController(
     // App-level window focus changed (sparkle-9oz6). The backend has already released or rebuilt the
     // OS mic; here we keep the frontend's billable/UI state consistent. `false` = no Sparkle window is
     // the active OS window (the user tabbed to another app): stop the per-minute cloud meter and close
-    // the Deepgram socket so tabbing away mid-dictation can't keep billing, reset the wake-phase, and
-    // clear the live preview/level. We deliberately DON'T touch `enabled` — the mic stays armed and
-    // the backend brings it back on refocus. `true` = focus returned: reflect listening again.
+    // the Deepgram socket so tabbing away mid-dictation can't keep billing, and clear the live
+    // preview/level. We deliberately DON'T touch `enabled` (the mic stays armed) NOR `phase`: an
+    // ACTIVE "Hey Sparkle" session must survive tabbing away and back so the user never has to
+    // re-say the wake word — it simply stops writing/billing while unfocused. `true` = focus
+    // returned: reflect listening again, and resume the cloud stream if we were mid-dictation.
     listen<boolean>("dictation://focus", (e) => {
       const store = useDictationStore.getState();
       if (!e.payload) {
@@ -113,10 +119,11 @@ export async function createDictationController(
         invoke("stop_cloud_stream").catch(() => {});
         store.setInterim("");
         store.setLevel(0);
-        store.setPhase("passive");
         if (store.status !== "error") store.setStatus("idle");
       } else if (store.enabled && store.status !== "error") {
         store.setStatus("listening");
+        // Mid-dictation when focus left → resume the cloud stream now, no wake word needed.
+        if (store.phase === "active") onResumeActive?.();
       }
     }),
 
@@ -190,6 +197,63 @@ export function useAmbientVoice(): void {
   // Monotonic id per metered cloud window, for debit idempotency keys.
   const cloudSessionSeq = useRef(0);
 
+  // Open the billing-safe metered cloud (Deepgram) window. Shared by BOTH the wake→active
+  // transition AND focus-regain resume, so a "Hey Sparkle" session stays active across tabbing
+  // away and back without re-saying the wake word. Gated on the live cloud-dictation prefs — a
+  // no-op when off, so a key-less / composer-off user is never billed. CRITICAL ordering: open
+  // FIRST, meter only on a confirmed open (handled inside openMeteredCloudWindow).
+  const openMeteredCloud = useRef((now: number) => {
+    const s = useSettingsStore.getState();
+    if (!(s.aiComposer && s.cloudDictation)) return;
+    const sessionId = `cd-${now}-${cloudSessionSeq.current++}`;
+    void openMeteredCloudWindow({
+      startCloudStream: () => invoke<boolean>("start_cloud_stream"),
+      stopCloudStream: () => void invoke("stop_cloud_stream").catch(() => {}),
+      isStillActive: () =>
+        useDictationStore.getState().phase === "active" &&
+        useSettingsStore.getState().aiComposer &&
+        useSettingsStore.getState().cloudDictation,
+      createMeter: () => {
+        const meter = createCloudDictationMeter({
+          consume: creditDeps.consume,
+          isAiEnabled: creditDeps.isAiEnabled,
+          setInterval: (fn, ms) => window.setInterval(fn, ms),
+          clearInterval: (h) => window.clearInterval(h),
+          onExhausted: () => {
+            // Out of credits mid-stream → clear the singleton, close the socket, clear preview.
+            stopActiveCloudMeter();
+            void invoke("stop_cloud_stream").catch(() => {});
+            useDictationStore.getState().setInterim("");
+            // Surface why dictation just dropped to on-device: refresh the balance so the
+            // credits pill reflects the now-depleted balance (the user's explicit ask).
+            void useAuthStore.getState().refresh();
+          },
+          onDebited: (balanceAfterCents, debitedCents) => {
+            // Each successful per-minute debit ticks the displayed balance down in real time.
+            // Prefer the server's post-debit balance; optimistically decrement when it's absent.
+            const { me } = useAuthStore.getState();
+            if (!me) return;
+            useAuthStore.setState({
+              me: {
+                ...me,
+                balanceCents: nextBalanceCents(me.balanceCents, balanceAfterCents, debitedCents),
+              },
+            });
+          },
+          sessionId,
+        });
+        setActiveCloudMeter(meter);
+        return meter;
+      },
+      clearInterim: () => useDictationStore.getState().setInterim(""),
+      clearActiveMeter: () => stopActiveCloudMeter(),
+      // Opened but the first debit failed (out of credits / server error) → refresh the
+      // balance so the credits pill shows the real (e.g. zero) balance instead of silently
+      // falling back to on-device with no signal.
+      onUnavailable: () => void useAuthStore.getState().refresh(),
+    });
+  });
+
   // Stable segment handler: runs the phase machine against the live store phase.
   const lastTransitionAt = useRef(0);
   const onSegment = useRef((seg: string) => {
@@ -207,62 +271,7 @@ export function useAmbientVoice(): void {
       // stop billing + close it and resume on-device wake-word listening.
       const cmd = cloudStreamCommandFor(r);
       if (cmd === "start_cloud_stream") {
-        const s = useSettingsStore.getState();
-        // Only attempt the billable cloud stream when the composer exists to receive the text AND
-        // voice dictation is on. CRITICAL ordering: open FIRST, meter only on a confirmed open.
-        // start_cloud_stream returns false when the backend stays on-device (no Deepgram key,
-        // handshake failure, race discard) — in those cases we must NOT bill (else a key-less user
-        // pays for cloud dictation they never received).
-        if (s.aiComposer && s.cloudDictation) {
-          const sessionId = `cd-${now}-${cloudSessionSeq.current++}`;
-          // Billing-critical open→meter sequence lives in openMeteredCloudWindow (tested in isolation).
-          void openMeteredCloudWindow({
-            startCloudStream: () => invoke<boolean>("start_cloud_stream"),
-            stopCloudStream: () => void invoke("stop_cloud_stream").catch(() => {}),
-            isStillActive: () =>
-              useDictationStore.getState().phase === "active" &&
-              useSettingsStore.getState().aiComposer &&
-              useSettingsStore.getState().cloudDictation,
-            createMeter: () => {
-              const meter = createCloudDictationMeter({
-                consume: creditDeps.consume,
-                isAiEnabled: creditDeps.isAiEnabled,
-                setInterval: (fn, ms) => window.setInterval(fn, ms),
-                clearInterval: (h) => window.clearInterval(h),
-                onExhausted: () => {
-                  // Out of credits mid-stream → clear the singleton, close the socket, clear preview.
-                  stopActiveCloudMeter();
-                  void invoke("stop_cloud_stream").catch(() => {});
-                  useDictationStore.getState().setInterim("");
-                  // Surface why dictation just dropped to on-device: refresh the balance so the
-                  // credits pill reflects the now-depleted balance (the user's explicit ask).
-                  void useAuthStore.getState().refresh();
-                },
-                onDebited: (balanceAfterCents, debitedCents) => {
-                  // Each successful per-minute debit ticks the displayed balance down in real time.
-                  // Prefer the server's post-debit balance; optimistically decrement when it's absent.
-                  const { me } = useAuthStore.getState();
-                  if (!me) return;
-                  useAuthStore.setState({
-                    me: {
-                      ...me,
-                      balanceCents: nextBalanceCents(me.balanceCents, balanceAfterCents, debitedCents),
-                    },
-                  });
-                },
-                sessionId,
-              });
-              setActiveCloudMeter(meter);
-              return meter;
-            },
-            clearInterim: () => useDictationStore.getState().setInterim(""),
-            clearActiveMeter: () => stopActiveCloudMeter(),
-            // Opened but the first debit failed (out of credits / server error) → refresh the
-            // balance so the credits pill shows the real (e.g. zero) balance instead of silently
-            // falling back to on-device with no signal.
-            onUnavailable: () => void useAuthStore.getState().refresh(),
-          });
-        }
+        openMeteredCloud.current(now);
       } else if (cmd === "stop_cloud_stream") {
         stopActiveCloudMeter();
         invoke("stop_cloud_stream").catch(() => {});
@@ -279,7 +288,10 @@ export function useAmbientVoice(): void {
   const controllerPromiseRef = useRef<Promise<DictationController> | null>(null);
   useEffect(() => {
     let cancelled = false;
-    const p = createDictationController({ onSegment: onSegment.current });
+    const p = createDictationController({
+      onSegment: onSegment.current,
+      onResumeActive: () => openMeteredCloud.current(Date.now()),
+    });
     controllerPromiseRef.current = p;
     p.then((ctrl) => {
       if (cancelled) ctrl.cleanup();
