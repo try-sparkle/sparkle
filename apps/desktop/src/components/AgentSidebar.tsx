@@ -328,7 +328,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         height: "100%",
       }}
     >
-      <div style={{ padding: "14px 14px 6px" }}>
+      {/* position:relative + zIndex keep the Sparkle.ai logo IN FRONT of the voice-orb glow
+          that the waveform paints below — the glow can bleed upward into this row, but the
+          logo must stay crisp on top of it, never washed out behind it. */}
+      <div style={{ padding: "14px 14px 6px", position: "relative", zIndex: 1 }}>
         {/* Anchor (not a bare clickable <img>) so the logo is focusable and announced as a
             link; the system browser is opened via the Tauri opener, so we preventDefault and
             surface any opener failure rather than swallowing the promise. */}

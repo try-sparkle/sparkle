@@ -55,6 +55,10 @@ import {
   MIC_HOT_PREFIX,
   MIC_HOT_SUFFIX,
   MIC_HOT_PLACEHOLDER,
+  WAKE_PHRASE,
+  WAKE_PREFIX,
+  WAKE_SUFFIX,
+  WAKE_PLACEHOLDER,
 } from "../voice/dictationCopy";
 import { log } from "../logger";
 
@@ -64,19 +68,11 @@ const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140)
 // the exact same wording (single source of truth). The overlay below paints STOP_PHRASE as a
 // gradient; the native-textarea fallback reuses MIC_HOT_PLACEHOLDER verbatim.
 
-/** The stop phrase ("Sparkle, stop") in the same teal→cyan gradient used for the caption. */
+/** The stop phrase ("Sparkle, stop") in solid brand blue (C.teal #2f6bff), matching the
+ *  "Hey Sparkle" phrase. (The cyan→blue gradient fade was dropped per design feedback.) */
 function StopPhrase() {
   return (
-    <span
-      style={{
-        fontWeight: FONT_WEIGHT.bold,
-        background: `linear-gradient(90deg, ${C.teal}, ${C.accent})`,
-        WebkitBackgroundClip: "text",
-        WebkitTextFillColor: "transparent",
-      }}
-    >
-      {STOP_PHRASE}
-    </span>
+    <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{STOP_PHRASE}</span>
   );
 }
 
@@ -156,6 +152,14 @@ export function Composer({
   // while capture is focus-paused, so keying off it falsely claims "I'm listening" when nothing
   // is being captured. When armed but not actually listening we fall back to the wake-word copy.
   const audioActive = useDictationStore((s) => s.status === "listening");
+  // Capture being live is NOT the same as actively dictating. Split the mic-hot copy by PHASE so
+  // the composer tells the truth: only the "active" phase (wake word heard) gets the "I'm
+  // listening, say Sparkle, stop" copy; the "passive" phase (still waiting for "Hey Sparkle")
+  // gets the wake-word copy that mirrors the sidebar. Bug fixed: previously ANY live capture
+  // showed the active copy, so a passive (wake-word) session falsely read as "I'm listening".
+  const phase = useDictationStore((s) => s.phase);
+  const liveActive = audioActive && phase === "active";
+  const livePassive = audioActive && phase === "passive";
 
   // Inline ghost-text autocomplete. `history` is the global list of past prompts; `caretAtEnd`
   // gates the suggestion so it only appears when the caret is at the very end of the text
@@ -822,8 +826,10 @@ export function Composer({
                   ? "" // the live dictation preview occupies the slot — no placeholder
                   : showRichPlaceholder
                   ? "" // the styled overlay below renders this state's placeholder
-                  : audioActive
+                  : liveActive
                   ? MIC_HOT_PLACEHOLDER
+                  : livePassive
+                  ? WAKE_PLACEHOLDER
                   : "Just say Hey Sparkle and I'll start listening as you talk."
               }
               spellCheck={false}
@@ -873,7 +879,7 @@ export function Composer({
                 lineHeight: 1.4,
               }}
             >
-              {audioActive ? (
+              {liveActive ? (
                 // The mic-hot copy intentionally subsumes the typing hint ("…or start typing
                 // here instead"), so it stays put on focus rather than swapping to the muted
                 // focused hint below — that hint remains live only when the mic is muted.
@@ -881,6 +887,15 @@ export function Composer({
                   {MIC_HOT_PREFIX}
                   <StopPhrase />
                   {MIC_HOT_SUFFIX}
+                </>
+              ) : livePassive ? (
+                // Capturing but waiting for the wake word: tell the truth (not "I'm listening").
+                // Mirrors the sidebar caption; the "(or you can type here instead)" tail subsumes
+                // the typing hint, so like the mic-hot copy it stays put on focus.
+                <>
+                  {WAKE_PREFIX}
+                  <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{WAKE_PHRASE}</span>
+                  {WAKE_SUFFIX}
                 </>
               ) : focused ? (
                 "…or type your command here (speaking is 3x faster)"

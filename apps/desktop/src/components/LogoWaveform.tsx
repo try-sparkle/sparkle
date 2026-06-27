@@ -139,8 +139,12 @@ export function LogoWaveform() {
   const paintOrb = (energy: number) => {
     const el = orbRef.current;
     if (!el) return;
-    el.style.transform = `translate(-50%, -50%) scale(${1 + energy * 0.95})`;
-    el.style.opacity = `${0.32 + energy * 0.55}`;
+    // The glow is purely audio-driven: at energy 0 (silence) opacity is exactly 0 — NO glow
+    // behind the mic without sound. The louder the audio, the brighter and larger it swells,
+    // so the orb "pops open" as you speak. (The blobs' cloud-drift motion is owned by CSS
+    // keyframes; this only scales/fades the whole composite.)
+    el.style.transform = `translate(-50%, -50%) scale(${0.85 + energy * 0.9})`;
+    el.style.opacity = `${Math.min(0.9, energy * 1.5)}`;
   };
 
   // useLayoutEffect (not useEffect): the initial flat paint must land BEFORE the browser paints,
@@ -205,16 +209,30 @@ export function LogoWaveform() {
   const showMutedIcon = micHover || !enabled;
   // The pulsating orb glow is driven directly by the rAF loop (paintOrb), so there's no
   // render-time energy to compute here.
+  // Orb blob colors track the WAVEFORM: brand cyan/blue while ACTIVELY dictating, but SHADES OF
+  // GRAY while merely listening for the wake word (passive) — matching the gray bars, so the glow
+  // doesn't imply "active" before the wake word is heard. The grays are derived from the themed
+  // muted token (the same color the bars use) so they flip correctly in light/dark mode.
+  const grayLight = `color-mix(in srgb, ${C.muted} 60%, white)`;
+  const grayDark = `color-mix(in srgb, ${C.muted} 70%, black)`;
+  const orbColors = active
+    ? [C.accent, C.teal, C.accent]
+    : [C.muted, grayLight, grayDark];
 
   return (
     <div style={{ padding: "0 14px 8px", userSelect: "none" }}>
       {/* Waveform stage. Bars mirror about the vertical center (grow up + down); a
           mic ring floats in the middle with the bars popping behind it. */}
       <div style={{ position: "relative", height: WAVE_HEIGHT }}>
-        {/* Pulsating Siri-orb glow behind the mic: soft, amoeba-like blobs across the teal→blue
-            spectrum that swell with the live audio `energy` (and rest quietly in silence, since
-            the bars sit flat then). Sits behind everything; the mic's translucent disc
-            keeps the glyph legible over it. Only while actually listening. */}
+        {/* Pulsating Siri-orb glow behind the mic: three soft, amoeba-like blobs across the
+            teal→cyan spectrum. Each blob slowly ORBITS the center on its own period/phase
+            (CSS keyframes below), so the mixed color wanders like slow clouds rather than
+            sitting in a fixed corner — and because the orbits are small and centered, the
+            glow stays even on all sides of the mic instead of pooling to one side. The whole
+            composite swells with live audio `energy` and is pinned to opacity 0 in silence by
+            the rAF loop (`paintOrb`), so there is NO glow without sound. zIndex 0 keeps it
+            behind the Sparkle.ai logo (which the sidebar lifts above it). Only while actually
+            listening. */}
         {enabled && listening && (
           <div
             ref={orbRef}
@@ -223,21 +241,51 @@ export function LogoWaveform() {
               position: "absolute",
               left: "50%",
               top: "50%",
-              width: 132,
+              width: 160,
               height: 132,
+              zIndex: 0,
               // Initial values only; the rAF loop drives transform/opacity per frame via
               // `paintOrb` (no CSS transition — it would smear against 60fps direct writes).
-              transform: "translate(-50%, -50%) scale(1)",
-              opacity: 0.32,
+              // Starts at opacity 0 so a freshly-mounted, still-silent orb shows no glow.
+              transform: "translate(-50%, -50%) scale(0.85)",
+              opacity: 0,
               pointerEvents: "none",
-              borderRadius: "50%",
-              filter: "blur(16px)",
-              background:
-                `radial-gradient(40% 46% at 37% 41%, ${C.accent}, transparent 70%),` +
-                `radial-gradient(44% 40% at 67% 61%, ${C.teal}, transparent 70%),` +
-                `radial-gradient(30% 34% at 57% 31%, ${C.accent}, transparent 72%)`,
+              filter: "blur(18px)",
             }}
-          />
+          >
+            {/* Each blob is a centered radial circle that the keyframes nudge around the
+                middle. closest-side keeps the colored core well inside the box as it drifts. */}
+            <span
+              aria-hidden
+              style={{
+                position: "absolute",
+                inset: 0,
+                borderRadius: "50%",
+                background: `radial-gradient(closest-side, ${orbColors[0]}, transparent 72%)`,
+                animation: "-drift-a 7.5s ease-in-out infinite",
+              }}
+            />
+            <span
+              aria-hidden
+              style={{
+                position: "absolute",
+                inset: 0,
+                borderRadius: "50%",
+                background: `radial-gradient(closest-side, ${orbColors[1]}, transparent 72%)`,
+                animation: "-drift-b 9.5s ease-in-out infinite",
+              }}
+            />
+            <span
+              aria-hidden
+              style={{
+                position: "absolute",
+                inset: 0,
+                borderRadius: "50%",
+                background: `radial-gradient(closest-side, ${orbColors[2]}, transparent 74%)`,
+                animation: "-drift-c 12s ease-in-out infinite",
+              }}
+            />
+          </div>
         )}
         {/* Waveform — clicking anywhere on the strip toggles phase (start/stop). */}
         <button
@@ -326,11 +374,11 @@ export function LogoWaveform() {
       </div>
 
       {error ? (
-        <div style={{ marginTop: 4, color: C.muted, fontSize: 10 }}>
+        <div style={{ marginTop: 4, color: C.muted, fontSize: 10, textAlign: "center" }}>
           Mic unavailable — check System Settings → Privacy → Microphone.
         </div>
       ) : enabled && modelProgress !== null ? (
-        <div style={{ marginTop: 4, color: C.muted, fontSize: 11 }}>
+        <div style={{ marginTop: 4, color: C.muted, fontSize: 11, textAlign: "center" }}>
           {(() => {
             const pct = modelProgress.total
               ? Math.round((modelProgress.done / modelProgress.total) * 100)
@@ -350,7 +398,7 @@ export function LogoWaveform() {
           style={{
             display: "block",
             width: "100%",
-            textAlign: "left",
+            textAlign: "center",
             marginTop: 4,
             padding: 0,
             background: "transparent",
@@ -370,10 +418,9 @@ export function LogoWaveform() {
             <span
               style={{
                 fontWeight: 600,
-                // Teal/cyan on the left → dark blue on the right (matches the waveform).
-                background: `linear-gradient(90deg, ${C.accent}, ${C.teal})`,
-                WebkitBackgroundClip: "text",
-                WebkitTextFillColor: "transparent",
+                // Solid brand blue (C.teal #2f6bff) — no gradient fade (matches the composer's
+                // "Hey Sparkle"). The cyan→blue fade was dropped per design feedback.
+                color: C.teal,
               }}
             >
               {phase === "passive" ? "Hey Sparkle" : "Sparkle, stop"}
@@ -384,7 +431,7 @@ export function LogoWaveform() {
       ) : caption ? (
         // Armed but paused (focus lost): show the honest caption as plain text — not a
         // wake hint, since saying "Hey Sparkle" right now wouldn't be heard.
-        <div style={{ marginTop: 4, color: C.muted, fontSize: 11 }}>{caption}</div>
+        <div style={{ marginTop: 4, color: C.muted, fontSize: 11, textAlign: "center" }}>{caption}</div>
       ) : null}
     </div>
   );

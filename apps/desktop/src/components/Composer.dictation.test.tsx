@@ -29,7 +29,13 @@ import { usePromptHistoryStore } from "../stores/promptHistoryStore";
 
 beforeEach(() => {
   submitPrompt.mockClear();
-  useDictationStore.setState({ insertTarget: null, enabled: true, status: "idle", interim: "" });
+  useDictationStore.setState({
+    insertTarget: null,
+    enabled: true,
+    status: "idle",
+    interim: "",
+    phase: "passive",
+  });
   useUiStore.getState().setComposerMinimized(false);
   usePromptHistoryStore.setState({ history: [] });
 });
@@ -132,20 +138,34 @@ describe("Composer — auto-grow sizing baseline", () => {
 });
 
 describe("Composer — placeholder reflects audio state", () => {
-  // The mic-hot copy keys off ACTUAL capture (status === "listening"), not the armed/mute
-  // intent (`enabled`) — see the audioActive regression test below.
-  it("invites the user to just start talking while capture is actually live", () => {
-    act(() => useDictationStore.setState({ enabled: true, status: "listening" }));
+  // The mic-hot copy keys off ACTUAL capture (status === "listening") AND the ACTIVE phase, not
+  // the armed/mute intent (`enabled`) — see the audioActive regression test below.
+  it("invites the user to just start talking while ACTIVELY dictating (listening + active)", () => {
+    act(() => useDictationStore.setState({ enabled: true, status: "listening", phase: "active" }));
     renderComposer();
     const body = document.body.textContent ?? "";
     expect(body).toContain("I'm listening, so just start talking.");
-    expect(body).toContain("Sparkle, stop"); // the teal→cyan gradient stop cue
+    expect(body).toContain("Sparkle, stop"); // the cyan→blue gradient stop cue
     expect(body).toContain("start typing here instead");
     expect(body).not.toContain("Hey Sparkle");
   });
 
+  // Bug fix (voice-status): capturing but still PASSIVE (waiting for the wake word) must NOT claim
+  // active dictation. It shows the honest wake-word copy that mirrors the sidebar caption.
+  it("shows the wake-word copy when capturing but still passive (not yet dictating)", () => {
+    act(() => useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" }));
+    renderComposer();
+    const body = document.body.textContent ?? "";
+    expect(body).toContain("Listening for the wake word.");
+    expect(body).toContain("Hey Sparkle");
+    expect(body).toContain("or you can type here instead");
+    // It must NOT read as active dictation.
+    expect(body).not.toContain("I'm listening, so just start talking.");
+    expect(body).not.toContain("Sparkle, stop");
+  });
+
   it("keeps the mic-hot copy on focus (it subsumes the typing hint)", () => {
-    act(() => useDictationStore.setState({ enabled: true, status: "listening" }));
+    act(() => useDictationStore.setState({ enabled: true, status: "listening", phase: "active" }));
     renderComposer();
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
     // Actually focus the box (mouseDown flips `focused`, focus moves activeElement) so the test

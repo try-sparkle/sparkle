@@ -5,7 +5,7 @@ import type { Project } from "../types";
 import { useSettingsStore, effectiveChiefPat, aiFeatureMode } from "../stores/settingsStore";
 import { useHandoffStore } from "../stores/handoffStore";
 import { useDictationStore } from "../stores/dictationStore";
-import { MIC_HOT_PLACEHOLDER } from "../voice/dictationCopy";
+import { MIC_HOT_PLACEHOLDER, WAKE_PLACEHOLDER } from "../voice/dictationCopy";
 import {
   ensureChiefProject,
   startChat,
@@ -387,6 +387,12 @@ export function ThinkPanel({
   // armed/mute intent — same rationale as Composer. Gated on `visible` like `interim` below so a
   // backgrounded (display:none) pane neither re-renders on status churn nor shows the hot placeholder.
   const audioActive = useDictationStore((s) => visible && s.status === "listening");
+  // Split by PHASE so the placeholder is honest (same fix as the build Composer): the active
+  // phase (wake word heard) gets "I'm listening, say Sparkle, stop"; the passive phase (still
+  // waiting for "Hey Sparkle") gets the wake-word copy rather than falsely claiming dictation.
+  const phase = useDictationStore((s) => s.phase);
+  const liveActive = audioActive && phase === "active";
+  const livePassive = audioActive && phase === "passive";
   // Live interim preview (Deepgram streaming). Gate the subscription on this being the visible pane
   // — the same scope that routes committed dictated text below — so interim churn never re-renders a
   // backgrounded Think pane and the preview never leaks across mounted composers.
@@ -538,9 +544,16 @@ export function ThinkPanel({
                 void send();
               }
             }}
-            // Mic hot → drop the wake-word/typing prompt and invite the user to just start talking,
-            // since Sparkle is already listening (mirrors the build Composer's MIC_HOT_PLACEHOLDER).
-            placeholder={audioActive ? MIC_HOT_PLACEHOLDER : `Think out loud about ${project.name}…`}
+            // Actively dictating → "just start talking"; passively listening → the honest
+            // wake-word copy; mic muted/paused → the default Think prompt. Mirrors the build
+            // Composer's phase-aware placeholder.
+            placeholder={
+              liveActive
+                ? MIC_HOT_PLACEHOLDER
+                : livePassive
+                ? WAKE_PLACEHOLDER
+                : `Think out loud about ${project.name}…`
+            }
             rows={2}
             style={{
               width: "100%",

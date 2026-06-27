@@ -55,7 +55,13 @@ const project = { id: "proj-1", name: "My Project" } as Project;
 Element.prototype.scrollTo = vi.fn() as unknown as typeof Element.prototype.scrollTo;
 
 beforeEach(() => {
-  useDictationStore.setState({ insertTarget: null, enabled: true, status: "idle", interim: "" });
+  useDictationStore.setState({
+    insertTarget: null,
+    enabled: true,
+    status: "idle",
+    interim: "",
+    phase: "passive",
+  });
   // Connected Chief + a pre-linked project so the panel renders the composer (not ConnectChief).
   useSettingsStore.setState({
     chiefPat: "pat_test",
@@ -145,12 +151,21 @@ describe("ThinkPanel — dictation wiring", () => {
     expect(useDictationStore.getState().insertTarget).toBe(owned);
   });
 
-  it("swaps the placeholder to the mic-hot copy while capture is live", () => {
-    act(() => useDictationStore.setState({ status: "listening" }));
+  it("swaps the placeholder to the mic-hot copy while ACTIVELY dictating", () => {
+    act(() => useDictationStore.setState({ status: "listening", phase: "active" }));
     render(<ThinkPanel project={project} agentId="a1" visible />);
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
     expect(ta.placeholder).toContain("I'm listening, so just start talking.");
     expect(ta.placeholder).toContain("Sparkle, stop");
+  });
+
+  it("shows the wake-word placeholder when capturing but still passive (not yet dictating)", () => {
+    act(() => useDictationStore.setState({ status: "listening", phase: "passive" }));
+    render(<ThinkPanel project={project} agentId="a1" visible />);
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(ta.placeholder).toContain("Listening for the wake word.");
+    expect(ta.placeholder).toContain("Hey Sparkle");
+    expect(ta.placeholder).not.toContain("I'm listening, so just start talking.");
   });
 
   it("falls back to the think-out-loud placeholder when the mic is idle", () => {
