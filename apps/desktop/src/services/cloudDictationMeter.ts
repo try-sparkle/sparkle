@@ -13,6 +13,23 @@ import { CLOUD_DICTATION_CENTS_PER_MIN } from "./creditPricing";
 
 const MINUTE_MS = 60_000;
 
+/**
+ * Integer cents to debit for `minuteIndex` (0-based) at a possibly-fractional per-minute `rate`,
+ * via a cumulative-rounding accumulator: `round(rate*(n+1)) - round(rate*n)`. This is the fix for
+ * the silent-cloud-dictation bug: the credit ledger's `/credits/consume` requires whole, positive
+ * cents (`cents: z.number().int().positive()`), so sending the raw 5.8¢/min rate was rejected with a
+ * 400 that tore the Deepgram socket down ~200ms after it opened, every time. Cumulative rounding
+ * keeps the running total within ½¢ of `rate * minutes` forever (no linear drift — long-run average
+ * is exactly `rate`) while making every debit an integer. A fractional rate can still yield a 0-cent
+ * tick on some minutes (e.g. a sub-1¢ rate); the caller skips the network debit for those and the
+ * accrued fraction is billed on a later non-zero tick.
+ *
+ * For 5.8¢/min the first minutes are [6,6,5,6,6, …] (each 5-min block sums to 29 = round(5*5.8)).
+ */
+export function minuteDebitCents(rate: number, minuteIndex: number): number {
+  return Math.round(rate * (minuteIndex + 1)) - Math.round(rate * minuteIndex);
+}
+
 export interface CloudMeterDeps {
   /** Debit the ledger; resolves {ok:false} when the user is out of credits. */
   consume: (
@@ -52,14 +69,32 @@ export function createCloudDictationMeter(deps: CloudMeterDeps): CloudDictationM
 
   const debitOneMinute = async (): Promise<boolean> => {
     if (!deps.isAiEnabled()) return false;
-    const key = `${deps.sessionId}:${minute}`; // idempotent per (session, minute)
+    const idx = minute;
+    const cents = minuteDebitCents(CLOUD_DICTATION_CENTS_PER_MIN, idx);
+    const key = `${deps.sessionId}:${idx}`; // idempotent per (session, minute)
     minute += 1;
+    // A fractional rate can round to a 0-cent tick; the ledger rejects `cents: 0`, so skip the
+    // network debit and carry the fraction — the cumulative accumulator bills it on a later minute.
+    if (cents <= 0) return true;
     try {
-      const res = await deps.consume(CLOUD_DICTATION_CENTS_PER_MIN, "cloud_dictation_minute", { minute: minute - 1 }, key);
+      const res = await deps.consume(cents, "cloud_dictation_minute", { minute: idx }, key);
+      if (!res.ok) {
+        // Out of credits — log it (don't fail silently) so the fall-back-to-on-device is explained.
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[cloud-dictation] minute ${idx} debit of ${cents}¢ declined — out of credits (balance ${res.balanceCents}¢); stopping cloud stream`,
+        );
+      }
       return res.ok;
-    } catch {
-      // A thrown debit (network/Rust error) is treated as "not charged" → caller stops + falls back.
-      // Returning (never throwing) keeps the interval's .then path live, so no unhandled rejection.
+    } catch (e) {
+      // A thrown debit (network/Rust error — e.g. the server rejecting the request) must NOT be
+      // silent: this is exactly the failure that made cloud dictation invisibly fall back to the
+      // on-device model. Log it; caller stops + falls back. Returning (never throwing) keeps the
+      // interval's .then path live, so no unhandled rejection.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[cloud-dictation] minute ${idx} debit of ${cents}¢ failed: ${String(e)}; stopping cloud stream`,
+      );
       return false;
     }
   };
@@ -128,6 +163,11 @@ export interface CloudWindowDeps {
   clearInterim: () => void;
   /** stopActiveCloudMeter(): clear the singleton so no stale meter reference lingers. */
   clearActiveMeter: () => void;
+  /** Optional: the socket opened but the first debit failed (out of credits, or a server/network
+   *  error) so cloud dictation can't run this window. The caller surfaces it — e.g. refresh the
+   *  credits pill so a zero balance becomes visible. NOT called on the stay-on-device path
+   *  (opened=false): that never opened a billable socket, so there's nothing to explain. */
+  onUnavailable?: () => void;
 }
 
 /**
@@ -159,5 +199,7 @@ export async function openMeteredCloudWindow(deps: CloudWindowDeps): Promise<voi
     deps.stopCloudStream();
     deps.clearInterim();
     deps.clearActiveMeter();
+    // Opened-but-not-charged: tell the caller so it can surface why (refresh the credits pill).
+    deps.onUnavailable?.();
   }
 }

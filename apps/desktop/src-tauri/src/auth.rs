@@ -130,7 +130,27 @@ pub fn desktop_consume(
             let bal = v.get("balanceCents").and_then(|b| b.as_i64()).unwrap_or(0);
             Ok(json!({ "ok": false, "balanceCents": bal }))
         }
-        Err(e) => Err(format!("consume failed: {e}")),
+        // Any NON-402 HTTP error (e.g. a 400 on a malformed debit) must not be silent: a swallowed
+        // 400 here — from sending a non-integer `cents` — is exactly what made cloud dictation
+        // invisibly fall back to the on-device model, tearing the Deepgram socket down ~200ms after
+        // it opened. Log it loud (with status + a short body snippet) so it's never invisible again.
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let snippet: String = text.chars().take(200).collect();
+            tracing::warn!(
+                target: "credits",
+                status = code,
+                reason = %reason,
+                cents,
+                body = %snippet,
+                "consume rejected by server",
+            );
+            Err(format!("consume failed: HTTP {code}: {snippet}"))
+        }
+        Err(e) => {
+            tracing::warn!(target: "credits", reason = %reason, cents, error = %e, "consume transport error");
+            Err(format!("consume failed: {e}"))
+        }
     }
 }
 

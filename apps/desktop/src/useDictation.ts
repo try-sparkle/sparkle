@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useDictationStore } from "./stores/dictationStore";
 import { useSettingsStore } from "./stores/settingsStore";
+import { useAuthStore } from "./stores/authStore";
 import { advance, type Advance } from "./voice/wakeMachine";
 import { creditDeps } from "./services/sparkleApi";
 import {
@@ -232,6 +233,9 @@ export function useAmbientVoice(): void {
                   stopActiveCloudMeter();
                   void invoke("stop_cloud_stream").catch(() => {});
                   useDictationStore.getState().setInterim("");
+                  // Surface why dictation just dropped to on-device: refresh the balance so the
+                  // credits pill reflects the now-depleted balance (the user's explicit ask).
+                  void useAuthStore.getState().refresh();
                 },
                 sessionId,
               });
@@ -240,6 +244,10 @@ export function useAmbientVoice(): void {
             },
             clearInterim: () => useDictationStore.getState().setInterim(""),
             clearActiveMeter: () => stopActiveCloudMeter(),
+            // Opened but the first debit failed (out of credits / server error) → refresh the
+            // balance so the credits pill shows the real (e.g. zero) balance instead of silently
+            // falling back to on-device with no signal.
+            onUnavailable: () => void useAuthStore.getState().refresh(),
           });
         }
       } else if (cmd === "stop_cloud_stream") {
