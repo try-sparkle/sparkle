@@ -7,10 +7,12 @@ describe("captionFor", () => {
   // the caption must stay honest rather than claim we're hearing the user when we're not.
   it("passive + enabled + listening → wake hint", () =>
     expect(captionFor("passive", true, true)).toBe(
-      "Listening for wake word: Just say Hey Sparkle to talk to me",
+      "Listening for the wake word: Just say Hey Sparkle to talk to me",
     ));
   it("active + enabled + listening → stop hint", () =>
-    expect(captionFor("active", true, true)).toBe("Just say Send It to stop"));
+    expect(captionFor("active", true, true)).toBe(
+      "Actively listening: Just say Sparkle, stop to finish",
+    ));
   it("muted → no caption", () =>
     expect(captionFor("passive", false, false)).toBeNull());
   it("muted stays null even if status briefly reads listening", () =>

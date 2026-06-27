@@ -18,12 +18,13 @@ const TIER2 = [
   "spark all", "spar call", "spar cool", "spar coal", "spar kill",
 ];
 
-// Stop variants (mishearings of "send it"). Bare "send" is deliberately absent.
-const STOP = [
-  "send it", "sendit", "sent it", "sentit", "send id", "sent id",
-  "send et", "send at", "fend it", "fendit", "fend at", "scent it",
-  "sand it", "spend it",
-];
+// Stop phrase: "sparkle stop" — REQUIRES the "sparkle" carrier token AND a
+// following "stop"-like token (a 2-gram). Bare "stop" is a common dictation word,
+// so it must never end capture on its own; bare "sparkle" is harmless mid-prompt.
+const STOP_WORD = "stop";
+// Curated mishearings of the "stop" token (the 2-gram's second half). Kept tight;
+// the "sparkle" carrier requirement is the primary false-stop guard.
+const STOP_VARIANTS = new Set(["stop", "stahp", "staap", "stope", "stawp", "stomp"]);
 
 const CANON = "sparkle";
 const CANON_MP = doubleMetaphone(CANON)[0]; // primary Double Metaphone code, computed at runtime
@@ -31,7 +32,6 @@ const CANON_MP = doubleMetaphone(CANON)[0]; // primary Double Metaphone code, co
 const despace = (s: string) => s.replace(/ /g, "");
 const TIER1_SET = new Set(TIER1.map(despace));
 const TIER2_SET = new Set(TIER2.map(despace));
-const STOP_SET = new Set(STOP.map(despace));
 // Single-word Tier-2 entries, with a trailing "s" stripped, for net-demotion checks.
 const stripTrailingS = (w: string) => w.replace(/s$/, "");
 const TIER2_SINGLE_BASES = new Set(
@@ -121,16 +121,21 @@ export function matchesWake(segment: string): boolean {
   return false;
 }
 
+/** True when a token is the "sparkle" carrier — reusing the wake matcher's trusted
+ *  phonetic (Double Metaphone) + Levenshtein(≤2) nets, so every "sparkle" mishearing
+ *  the wake path accepts (sparkly, sparkel, sparcle, …) also works as the stop carrier. */
+function isSparkleToken(tok: string): boolean {
+  return doubleMetaphone(tok)[0] === CANON_MP || lev(tok, CANON) <= 2;
+}
+
+/** True when a token is a "stop"-like word: a curated mishearing or a TIGHT
+ *  Levenshtein(≤1) near-miss of "stop". Kept narrow so the 2-gram doesn't widen. */
+function isStopToken(tok: string): boolean {
+  return STOP_VARIANTS.has(tok) || lev(tok, STOP_WORD, 1) <= 1;
+}
+
 export function matchesStop(segment: string): boolean {
-  const tokens = tokenize(segment);
-  for (const { gram } of grams(tokens)) {
-    const d = despace(gram);
-    if (STOP_SET.has(d)) return true;
-    // Scope the lev-net to s/f-initial grams so plausible dictation phrases like
-    // "bend it", "lend it", "end it" don't false-stop capture.
-    if ((d.startsWith("s") || d.startsWith("f")) && lev(d, "sendit", 1) <= 1) return true;
-  }
-  return false;
+  return stopStartIndex(tokenize(segment)) >= 0;
 }
 
 /** Index of the first token that begins a wake match (incl. a "hey" carrier), or -1. */
@@ -155,19 +160,15 @@ function wakeStartIndex(tokens: string[]): number {
   return -1;
 }
 
-/** Earliest token index of a stop match, or -1. */
+/** Index of the "sparkle" token that begins a "sparkle stop" match (a 2-gram), or -1.
+ *  Both tokens are required: bare "stop" (common dictation) and bare "sparkle" (a
+ *  normal mid-prompt word) must NOT match. */
 function stopStartIndex(tokens: string[]): number {
-  for (let i = 0; i < tokens.length; i++) {
+  for (let i = 0; i + 1 < tokens.length; i++) {
     const tok = tokens[i];
-    if (tok === undefined) continue;
-    // Check the 2-gram first (the canonical "send it"), then the single token.
     const next = tokens[i + 1];
-    if (next !== undefined) {
-      const d = despace(`${tok} ${next}`);
-      if (STOP_SET.has(d) || ((d.startsWith("s") || d.startsWith("f")) && lev(d, "sendit", 1) <= 1)) return i;
-    }
-    const d1 = despace(tok);
-    if (STOP_SET.has(d1) || ((d1.startsWith("s") || d1.startsWith("f")) && lev(d1, "sendit", 1) <= 1)) return i;
+    if (tok === undefined || next === undefined) continue;
+    if (isSparkleToken(tok) && isStopToken(next)) return i;
   }
   return -1;
 }

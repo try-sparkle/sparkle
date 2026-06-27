@@ -50,21 +50,22 @@ import {
 import { isComposerToggleKey } from "./composerToggle";
 import { arrowOverflowDirection } from "./composerArrowOverflow";
 import { useDictationStore } from "../stores/dictationStore";
+import {
+  STOP_PHRASE,
+  MIC_HOT_PREFIX,
+  MIC_HOT_SUFFIX,
+  MIC_HOT_PLACEHOLDER,
+} from "../voice/dictationCopy";
 import { log } from "../logger";
 
 const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140);
 
-// Mic-hot ("audio is active") placeholder, sourced from one place so the native-textarea
-// fallback and the styled overlay can't drift apart. The overlay paints SEND_IT as a gradient;
-// the native string (a narrow, near-dead path) reuses the same words verbatim.
-const SEND_IT = "Send it";
-const MIC_HOT_PREFIX = "I'm listening, so just start talking. Say ";
-const MIC_HOT_SUFFIX =
-  " to stop. (or if you want to be a slowpoke, start typing here instead.)";
-const MIC_HOT_PLACEHOLDER = `${MIC_HOT_PREFIX}${SEND_IT}${MIC_HOT_SUFFIX}`;
+// Mic-hot ("audio is active") copy lives in voice/dictationCopy.ts so the Think composer reads
+// the exact same wording (single source of truth). The overlay below paints STOP_PHRASE as a
+// gradient; the native-textarea fallback reuses MIC_HOT_PLACEHOLDER verbatim.
 
-/** "Send it" in the same teal→cyan gradient used for the caption under the waveform. */
-function SendIt() {
+/** The stop phrase ("Sparkle, stop") in the same teal→cyan gradient used for the caption. */
+function StopPhrase() {
   return (
     <span
       style={{
@@ -74,7 +75,7 @@ function SendIt() {
         WebkitTextFillColor: "transparent",
       }}
     >
-      {SEND_IT}
+      {STOP_PHRASE}
     </span>
   );
 }
@@ -878,7 +879,7 @@ export function Composer({
                 // focused hint below — that hint remains live only when the mic is muted.
                 <>
                   {MIC_HOT_PREFIX}
-                  <SendIt />
+                  <StopPhrase />
                   {MIC_HOT_SUFFIX}
                 </>
               ) : focused ? (

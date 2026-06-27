@@ -26,12 +26,12 @@ describe("advance — active", () => {
     });
   });
   it("stops and inserts the pre-stop remainder", () => {
-    expect(advance("active", "and ship the change send it")).toEqual({
+    expect(advance("active", "and ship the change sparkle stop")).toEqual({
       phase: "passive", insert: "and ship the change", transitioned: true,
     });
   });
   it("stops with no remainder → no insert", () => {
-    expect(advance("active", "send it")).toEqual({
+    expect(advance("active", "sparkle stop")).toEqual({
       phase: "passive", insert: null, transitioned: true,
     });
   });

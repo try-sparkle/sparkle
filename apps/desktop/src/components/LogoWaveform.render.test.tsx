@@ -4,11 +4,12 @@
 // logoWaveform.test.ts; this exercises the regression-prone render branch that the helpers
 // can't reach: the caption must switch on ACTUAL capture (`status === "listening"`), not on
 // the armed `enabled` flag, so an armed-but-focus-paused mic never claims to be hearing you.
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { LogoWaveform } from "./LogoWaveform";
 import { useDictationStore } from "../stores/dictationStore";
+import { DANGER } from "../theme/colors";
 
 // jsdom has no rAF by the time the effect runs in some setups; stub a no-op so the live
 // loop can schedule without throwing. We assert on the rendered caption, not animation frames.
@@ -28,16 +29,16 @@ afterEach(() => cleanup());
 
 describe("LogoWaveform — honest listening", () => {
   // The waveform strip button shares the "Activate Sparkle voice" aria-label, and the live
-  // caption splits its text across nodes ("Just say" / <span>Hey Sparkle</span> / "to talk to me").
-  // So we match the FULL caption phrase on the button's textContent — a stable signal that
-  // can't be fooled by the bare word "Sparkle" turning up elsewhere (an aria-label or title).
+  // caption now splits across TWO lines / many nodes ("Listening for the wake word" +
+  // "Just say" / <span>Hey Sparkle</span> / "to talk to me"). Match the BUTTON whose text carries
+  // both the status line and the wake phrase — a stable signal that can't be fooled by the bare
+  // word "Sparkle" turning up elsewhere (an aria-label or title).
   const wakeHintButton = () =>
-    screen.queryByText(
-      (_content, el) =>
-        el?.tagName === "BUTTON" &&
-        el.textContent?.replace(/\s+/g, " ").trim() ===
-          "Listening for wake word: Just say Hey Sparkle to talk to me",
-    );
+    screen.queryByText((_content, el) => {
+      if (el?.tagName !== "BUTTON") return false;
+      const t = el.textContent?.replace(/\s+/g, " ").trim() ?? "";
+      return /Listening for the wake word/.test(t) && /Hey Sparkle/.test(t);
+    });
 
   it("armed + actually listening → shows the live wake hint, not 'Mic paused'", () => {
     useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
@@ -56,6 +57,44 @@ describe("LogoWaveform — honest listening", () => {
     ).toBeTruthy();
     // The wake-hint caption must NOT render when paused.
     expect(wakeHintButton()).toBeNull();
+  });
+
+  it("active + listening → 'Actively listening' status with the Sparkle, stop command", () => {
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
+    render(<LogoWaveform />);
+    const activeCaption = screen.queryByText((_c, el) => {
+      if (el?.tagName !== "BUTTON") return false;
+      const t = el.textContent?.replace(/\s+/g, " ").trim() ?? "";
+      return /Actively listening/.test(t) && /Sparkle, stop/.test(t);
+    });
+    expect(activeCaption).not.toBeNull();
+    // The passive wake hint must NOT show while actively dictating.
+    expect(wakeHintButton()).toBeNull();
+  });
+
+  it("mic glyph goes red on hover in BOTH enabled and muted states (the mute / affordance cue)", () => {
+    // Probe jsdom's normalized form of the DANGER hex so the assertion is format-agnostic.
+    const probe = document.createElement("span");
+    probe.style.color = DANGER;
+    const RED = probe.style.color;
+
+    // Enabled (armed + capturing): rests on a non-red brand tint, turns RED on hover
+    // (telegraphing "click to mute"). Also swaps to the slashed glyph.
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
+    render(<LogoWaveform />);
+    const micOn = screen.getByRole("button", { name: "Mute microphone" });
+    expect(micOn.style.color).not.toBe(RED);
+    fireEvent.mouseEnter(micOn);
+    expect(micOn.style.color).toBe(RED);
+    cleanup();
+
+    // Muted: same RED on hover (per the requested muted→gray, red-on-hover affordance).
+    useDictationStore.setState({ enabled: false, status: "idle" });
+    render(<LogoWaveform />);
+    const micOff = screen.getByRole("button", { name: "Unmute microphone" });
+    expect(micOff.style.color).not.toBe(RED); // rests gray, proving the red is hover-driven
+    fireEvent.mouseEnter(micOff);
+    expect(micOff.style.color).toBe(RED);
   });
 
   it("muted → no caption at all, mic offers to unmute", () => {

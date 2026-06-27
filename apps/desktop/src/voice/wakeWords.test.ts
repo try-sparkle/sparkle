@@ -40,24 +40,39 @@ describe("matchesWake — phonetic/levenshtein nets, tier-gated", () => {
   });
 });
 
-describe("matchesStop", () => {
-  for (const s of ["send it", "send it.", "Send It", "fend it", "sentit", "spend it"]) {
+describe("matchesStop — requires 'sparkle' carrier + 'stop' (2-gram)", () => {
+  // Curated hits + ASR mishearings of BOTH tokens. "sparkle" reuses the wake
+  // matcher's phonetic/lev nets; "stop" matches a tight curated/lev net.
+  for (const s of [
+    "sparkle stop",
+    "sparkle stop.",
+    "Sparkle, stop",
+    "hey sparkle stop",
+    "sparkly stop",
+    "sparkel stop",
+    "sparkle stahp",
+    "sparkle staap",
+    "sparkle stawp",
+    "sparkle stope",
+  ]) {
     it(`stops on "${s}"`, () => expect(matchesStop(s)).toBe(true));
   }
-  it("does NOT stop on bare 'send'", () => expect(matchesStop("send")).toBe(false));
-  it("does NOT stop on 'send an email to bob'", () =>
-    expect(matchesStop("send an email to bob")).toBe(false));
 
-  // Regression: plausible dictation phrases that lev-match "sendit" but do NOT
-  // start with s/f must not false-stop capture (Fix: s/f-initial gate on lev-net).
-  it("does NOT stop on 'bend it'", () => expect(matchesStop("bend it")).toBe(false));
-  it("does NOT stop on 'lend it'", () => expect(matchesStop("lend it")).toBe(false));
-  it("does NOT stop on 'end it'", () => expect(matchesStop("end it")).toBe(false));
-  // s/f-initial variants must still stop.
-  it("still stops on 'fend it'", () => expect(matchesStop("fend it")).toBe(true));
-  it("still stops on 'sentit'", () => expect(matchesStop("sentit")).toBe(true));
-  it("still stops on 'spend it'", () => expect(matchesStop("spend it")).toBe(true));
-  it("still stops on 'send it'", () => expect(matchesStop("send it")).toBe(true));
+  // Bare "stop" is a common dictation word — it must NEVER stop on its own.
+  for (const s of [
+    "stop",
+    "please stop",
+    "I need to stop",
+    "I need to stop here",
+    "let's stop for coffee",
+  ]) {
+    it(`does NOT stop on "${s}"`, () => expect(matchesStop(s)).toBe(false));
+  }
+
+  // Bare "sparkle" (without "stop") is harmless mid-dictation — must NOT stop.
+  for (const s of ["sparkle", "sparkles are pretty", "sparkle and shine"]) {
+    it(`does NOT stop on "${s}"`, () => expect(matchesStop(s)).toBe(false));
+  }
 });
 
 describe("stripWakePrefix / stripStopSuffix — same-segment remainder", () => {
@@ -68,9 +83,9 @@ describe("stripWakePrefix / stripStopSuffix — same-segment remainder", () => {
   it("returns empty when the segment is only the wake phrase", () =>
     expect(stripWakePrefix("hey sparkle")).toBe(""));
   it("strips the stop suffix, keeps the remainder", () =>
-    expect(stripStopSuffix("and ship the change send it")).toBe("and ship the change"));
+    expect(stripStopSuffix("okay I'm done sparkle stop")).toBe("okay i m done"));
   it("returns empty when the segment is only the stop phrase", () =>
-    expect(stripStopSuffix("send it")).toBe(""));
+    expect(stripStopSuffix("sparkle stop")).toBe(""));
   // Tier-2 multi-word wake entries: both tokens must be consumed, not just the first.
   it("strips multi-word Tier-2 wake prefix (hey spar kill)", () =>
     expect(stripWakePrefix("hey spar kill add a button")).toBe("add a button"));
@@ -80,12 +95,12 @@ describe("stripWakePrefix / stripStopSuffix — same-segment remainder", () => {
 
 describe("cloud (Deepgram smart_format) finals normalize before matching", () => {
   // The cloud path routes Deepgram finals through the same matcher; smart_format capitalizes and
-  // punctuates (e.g. "Hey Sparkle." / "Send it."). normalize() lowercases + strips punctuation, so
-  // these must still match — otherwise wake/stop would break on the cloud engine.
+  // punctuates (e.g. "Hey Sparkle." / "Sparkle, stop."). normalize() lowercases + strips punctuation,
+  // so these must still match — otherwise wake/stop would break on the cloud engine.
   it("wakes on a capitalized, punctuated 'Hey Sparkle.'", () =>
     expect(matchesWake("Hey Sparkle.")).toBe(true));
-  it("stops on a capitalized, punctuated 'Send it.'", () =>
-    expect(matchesStop("Send it.")).toBe(true));
+  it("stops on a capitalized, punctuated 'Sparkle, stop.'", () =>
+    expect(matchesStop("Sparkle, stop.")).toBe(true));
   it("stops on a trailing stop phrase within a punctuated sentence", () =>
-    expect(matchesStop("Okay, that's the plan. Send it!")).toBe(true));
+    expect(matchesStop("Okay, that's the plan. Sparkle, stop!")).toBe(true));
 });

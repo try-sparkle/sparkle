@@ -449,7 +449,9 @@ export function AgentPane({
       }}
     >
       {/* Think agents render a Chief chat instead of a Claude terminal. */}
-      {agent.kind === "think" && <ThinkPanel project={project} agentId={agent.id} />}
+      {agent.kind === "think" && (
+        <ThinkPanel project={project} agentId={agent.id} visible={visible} />
+      )}
 
       {agent.kind !== "think" && (
         <>

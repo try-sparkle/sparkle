@@ -4,6 +4,8 @@ import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Project } from "../types";
 import { useSettingsStore, effectiveChiefPat, aiFeatureMode } from "../stores/settingsStore";
 import { useHandoffStore } from "../stores/handoffStore";
+import { useDictationStore } from "../stores/dictationStore";
+import { MIC_HOT_PLACEHOLDER } from "../voice/dictationCopy";
 import {
   ensureChiefProject,
   startChat,
@@ -73,7 +75,20 @@ function buildInterviewSystem(agentId: string): string {
  * user synthesizes a cited PRD ("I'm done"), generates an epic + child beads ("Generate tasks"), and
  * hands it to the Build orchestrator ("Send to Build"). No worktree, no PTY. (Epic sparkle-hiju.)
  */
-export function ThinkPanel({ project, agentId }: { project: Project; agentId: string }) {
+export function ThinkPanel({
+  project,
+  agentId,
+  // Panes stay mounted when their tab isn't active (AgentPane toggles display:none), so several
+  // ThinkPanels — and a ThinkPanel alongside a build Composer — can be mounted at once. Only the
+  // VISIBLE pane registers itself as the dictation insert target, exactly as the Composer gates on
+  // its `active` prop, so spoken text never leaks into a backgrounded composer. Defaults to true so
+  // standalone callers (and the unit tests) get a working composer without threading the flag.
+  visible = true,
+}: {
+  project: Project;
+  agentId: string;
+  visible?: boolean;
+}) {
   const chiefPatStored = useSettingsStore((s) => s.chiefPat);
   const runtimeChiefPat = useSettingsStore((s) => s.runtimeChiefPat);
   const setChiefPat = useSettingsStore((s) => s.setChiefPat);
@@ -363,6 +378,37 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [handoff, project.id, pat]);
 
+  // ---- Voice dictation wiring (mirrors the build Composer) ------------------------
+  // The always-on ambient pipeline (useAmbientVoice) pushes transcribed text into whichever
+  // composer has registered itself as the current insert target. Wire this Think composer in the
+  // SAME way the build Composer does, so "Hey Sparkle … Sparkle, stop" lands here too.
+  //
+  // Mic hot ("audio is active") keys off the ACTUAL capture state (status === "listening"), not the
+  // armed/mute intent — same rationale as Composer. Gated on `visible` like `interim` below so a
+  // backgrounded (display:none) pane neither re-renders on status churn nor shows the hot placeholder.
+  const audioActive = useDictationStore((s) => visible && s.status === "listening");
+  // Live interim preview (Deepgram streaming). Gate the subscription on this being the visible pane
+  // — the same scope that routes committed dictated text below — so interim churn never re-renders a
+  // backgrounded Think pane and the preview never leaks across mounted composers.
+  const interim = useDictationStore((s) => (visible ? s.interim : ""));
+
+  // Register THIS panel's textarea as the dictation insert target while it's the visible pane. Only
+  // the visible pane registers (one at a time), so dictation never leaks into a backgrounded Think
+  // panel or the build Composer. The cleanup only clears if we're still the registered target, so a
+  // newer pane's registration is never clobbered (same guard as Composer).
+  useEffect(() => {
+    if (!visible || !pat) return;
+    const append = (text: string) => {
+      setInput((v) => (v ? `${v} ${text}` : text));
+      inputRef.current?.focus();
+    };
+    useDictationStore.getState().registerInsert(append);
+    return () => {
+      const store = useDictationStore.getState();
+      if (store.insertTarget === append) store.registerInsert(null);
+    };
+  }, [visible, pat]);
+
   // ---- No PAT yet: connect state -------------------------------------------------
   if (!pat) {
     return <ConnectChief onSave={setChiefPat} />;
@@ -481,31 +527,54 @@ export function ThinkPanel({ project, agentId }: { project: Project; agentId: st
 
       {/* Composer */}
       <div style={{ display: "flex", gap: 8, padding: 12, borderTop: `1px solid ${C.deepForest}` }}>
-        <textarea
-          ref={inputRef}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void send();
-            }
-          }}
-          placeholder={`Think out loud about ${project.name}…`}
-          rows={2}
-          style={{
-            flex: 1,
-            resize: "none",
-            background: C.deepForest,
-            color: C.cream,
-            border: `1px solid ${C.forest}`,
-            borderRadius: 8,
-            padding: "8px 10px",
-            fontFamily: '"IBM Plex Sans", sans-serif',
-            fontSize: 14,
-            outline: "none",
-          }}
-        />
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+            // Mic hot → drop the wake-word/typing prompt and invite the user to just start talking,
+            // since Sparkle is already listening (mirrors the build Composer's MIC_HOT_PLACEHOLDER).
+            placeholder={audioActive ? MIC_HOT_PLACEHOLDER : `Think out loud about ${project.name}…`}
+            rows={2}
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              resize: "none",
+              background: C.deepForest,
+              color: C.cream,
+              border: `1px solid ${C.forest}`,
+              borderRadius: 8,
+              padding: "8px 10px",
+              fontFamily: '"IBM Plex Sans", sans-serif',
+              fontSize: 14,
+              outline: "none",
+            }}
+          />
+          {/* Live cloud-dictation preview: the in-progress phrase streams here word-by-word (muted,
+              italic) while speech is being transcribed, then clears when the segment finalizes and
+              the committed text lands in the box. Only shown while the mic is hot AND there's an
+              interim phrase, so it never occupies space at rest. */}
+          {audioActive && interim && (
+            <div
+              style={{
+                color: C.muted,
+                fontStyle: "italic",
+                fontSize: 13,
+                lineHeight: 1.4,
+                padding: "0 2px",
+                fontFamily: '"IBM Plex Sans", sans-serif',
+              }}
+            >
+              {interim}
+            </div>
+          )}
+        </div>
         <button
           onClick={() => void send()}
           disabled={sending || !input.trim()}

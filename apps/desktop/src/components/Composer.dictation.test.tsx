@@ -139,7 +139,7 @@ describe("Composer — placeholder reflects audio state", () => {
     renderComposer();
     const body = document.body.textContent ?? "";
     expect(body).toContain("I'm listening, so just start talking.");
-    expect(body).toContain("Send it"); // the teal→cyan gradient stop cue
+    expect(body).toContain("Sparkle, stop"); // the teal→cyan gradient stop cue
     expect(body).toContain("start typing here instead");
     expect(body).not.toContain("Hey Sparkle");
   });
@@ -165,7 +165,7 @@ describe("Composer — placeholder reflects audio state", () => {
     const body = document.body.textContent ?? "";
     expect(body).toContain("Hey Sparkle");
     expect(body).not.toContain("I'm listening, so just start talking.");
-    expect(body).not.toContain("Send it"); // the gradient cue is mic-hot-only
+    expect(body).not.toContain("Sparkle, stop"); // the gradient cue is mic-hot-only
   });
 
   // Regression (issue 2): armed but not actually capturing (focus-paused) keeps `enabled` true

@@ -3,7 +3,7 @@ import { TbMicrophone, TbMicrophoneOff } from "react-icons/tb";
 // Themed tokens (muted/forest/cream flip on data-theme); brand teal/accent pass through as
 // constants. Import from ../theme/colors — like Composer — so the waveform stays legible in
 // light mode (the @sparkle/ui C.muted is a dark-mode-only literal).
-import { C } from "../theme/colors";
+import { C, DANGER } from "../theme/colors";
 import type { Phase } from "../voice/wakeMachine";
 import { useDictationStore } from "../stores/dictationStore";
 
@@ -82,8 +82,8 @@ export function captionFor(
   if (!listening)
     return "Listening paused: Will auto-resume when you re-focus on this project.";
   return phase === "passive"
-    ? "Listening for wake word: Just say Hey Sparkle to talk to me"
-    : "Just say Send It to stop";
+    ? "Listening for the wake word: Just say Hey Sparkle to talk to me"
+    : "Actively listening: Just say Sparkle, stop to finish";
 }
 
 /**
@@ -152,9 +152,13 @@ export function LogoWaveform() {
 
   // Mic tint by mode: the DARK BLUE of the logo "eye" (C.teal = #2f6bff) while we're
   // listening for the wake word (passive), the lighter teal/cyan while ACTIVELY dictating.
-  // Muted → gray, with a cyan hover affordance signalling "click to turn audio on".
-  const micColor = !enabled ? (micHover ? C.accent : C.muted) : active ? C.accentInk : C.teal;
-  const micBorder = !enabled ? (micHover ? C.accent : C.muted) : active ? C.accent : C.teal;
+  // Muted → gray. HOVER (in any state) goes RED to telegraph the destructive "click to mute"
+  // action — no cyan stage anywhere in the mute interaction. Red ↔ gray/teal on enter/leave.
+  const micColor = micHover ? DANGER : !enabled ? C.muted : active ? C.accentInk : C.teal;
+  const micBorder = micHover ? DANGER : !enabled ? C.muted : active ? C.accent : C.teal;
+  // Show the slashed "mute" glyph whenever the click would turn the mic OFF on hover (enabled),
+  // or when it's already muted. Only the resting, enabled mic shows the open-mic glyph.
+  const showMutedIcon = micHover || !enabled;
   // Recent waveform energy (newest bars) drives the pulsating glow behind the mic. It rests
   // quietly in silence (bars are flat → energy 0) and swells as the user gets louder.
   const energy = enabled && listening ? Math.max(0, ...bars.slice(-12)) : 0;
@@ -259,7 +263,7 @@ export function LogoWaveform() {
             backdropFilter: "blur(2px)",
             WebkitBackdropFilter: "blur(2px)",
             // Dark-blue while listening for the wake word, lighter teal while dictating; gray
-            // (cyan on hover) when muted. See micColor/micBorder above.
+            // when muted. Hover (any state) → red, telegraphing "click to mute". See micColor above.
             border: `1.5px solid ${micBorder}`,
             boxShadow:
               enabled && liveActive ? "0 0 12px rgba(52,224,240,0.6)" : "none",
@@ -269,7 +273,7 @@ export function LogoWaveform() {
             transition: "box-shadow 120ms ease, border-color 120ms ease, color 120ms ease",
           }}
         >
-          {enabled ? <TbMicrophone size={20} /> : <TbMicrophoneOff size={20} />}
+          {showMutedIcon ? <TbMicrophoneOff size={20} /> : <TbMicrophone size={20} />}
         </button>
       </div>
 
@@ -308,19 +312,26 @@ export function LogoWaveform() {
             fontSize: 11,
           }}
         >
-          {phase === "passive" ? "Listening for wake word: Just say " : "Just say "}
-          <span
-            style={{
-              fontWeight: 600,
-              // Teal/cyan on the left → dark blue on the right (matches the waveform).
-              background: `linear-gradient(90deg, ${C.accent}, ${C.teal})`,
-              WebkitBackgroundClip: "text",
-              WebkitTextFillColor: "transparent",
-            }}
-          >
-            {phase === "passive" ? "Hey Sparkle" : "Send It"}
-          </span>{" "}
-          {phase === "passive" ? "to talk to me" : "to stop"}
+          {/* Line 1 — current status. Same slot/styling in both phases. */}
+          <span style={{ display: "block", fontWeight: 600 }}>
+            {phase === "passive" ? "Listening for the wake word" : "Actively listening"}
+          </span>
+          {/* Line 2 — the spoken command, with the key phrase in the waveform gradient. */}
+          <span style={{ display: "block" }}>
+            Just say{" "}
+            <span
+              style={{
+                fontWeight: 600,
+                // Teal/cyan on the left → dark blue on the right (matches the waveform).
+                background: `linear-gradient(90deg, ${C.accent}, ${C.teal})`,
+                WebkitBackgroundClip: "text",
+                WebkitTextFillColor: "transparent",
+              }}
+            >
+              {phase === "passive" ? "Hey Sparkle" : "Sparkle, stop"}
+            </span>{" "}
+            {phase === "passive" ? "to talk to me" : "to finish"}
+          </span>
         </button>
       ) : caption ? (
         // Armed but paused (focus lost): show the honest caption as plain text — not a
