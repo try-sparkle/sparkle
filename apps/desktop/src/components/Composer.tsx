@@ -137,8 +137,11 @@ export function Composer({
   // While focused, the placeholder switches from the "Hey Sparkle" voice prompt to a typing hint.
   const [focused, setFocused] = useState(false);
   // Mic hot ("audio is active") → the placeholder drops the wake-word prompt and invites the
-  // user to just start talking, since Sparkle is already listening.
-  const audioActive = useDictationStore((s) => s.enabled);
+  // user to just start talking, since Sparkle is already listening. Gate on the ACTUAL capture
+  // state (status === "listening"), not the armed/mute intent (`enabled`): `enabled` stays true
+  // while capture is focus-paused, so keying off it falsely claims "I'm listening" when nothing
+  // is being captured. When armed but not actually listening we fall back to the wake-word copy.
+  const audioActive = useDictationStore((s) => s.status === "listening");
 
   // Inline ghost-text autocomplete. `history` is the global list of past prompts; `caretAtEnd`
   // gates the suggestion so it only appears when the caret is at the very end of the text
@@ -606,8 +609,16 @@ export function Composer({
   // The default placeholder is rendered as a styled overlay (so "Hey Sparkle" can be bold +
   // blue, which a native textarea placeholder can't do). Only show it in the clean empty state
   // where the textarea sits at the top of its column, so the overlay lines up with row one.
+  // `!interimActive` is essential: a live cloud-dictation preview paints into the SAME top-left
+  // slot (via the ghost mirror) while `value` is still empty, so without this gate the overlay
+  // would render on top of the streaming words and the two would overlap into garbled text.
   const showRichPlaceholder =
-    !value && !disabled && !dropActive && attachments.length === 0 && textBlocks.length === 0;
+    !value &&
+    !interimActive &&
+    !disabled &&
+    !dropActive &&
+    attachments.length === 0 &&
+    textBlocks.length === 0;
 
   // The composer is one overlay in two states. Minimized → it collapses to the slim handle
   // bar, exposing the terminal input; otherwise the handle sits atop the full message box.
@@ -768,6 +779,8 @@ export function Composer({
                   ? "Drop the file here to attach it…"
                   : disabled
                   ? "Starting your agent…"
+                  : interimActive
+                  ? "" // the live dictation preview occupies the slot — no placeholder
                   : showRichPlaceholder
                   ? "" // the styled overlay below renders this state's placeholder
                   : audioActive

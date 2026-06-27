@@ -29,7 +29,7 @@ import { usePromptHistoryStore } from "../stores/promptHistoryStore";
 
 beforeEach(() => {
   submitPrompt.mockClear();
-  useDictationStore.setState({ insertTarget: null, enabled: true, interim: "" });
+  useDictationStore.setState({ insertTarget: null, enabled: true, status: "idle", interim: "" });
   useUiStore.getState().setComposerMinimized(false);
   usePromptHistoryStore.setState({ history: [] });
 });
@@ -132,8 +132,10 @@ describe("Composer — auto-grow sizing baseline", () => {
 });
 
 describe("Composer — placeholder reflects audio state", () => {
-  it("invites the user to just start talking while the mic is hot", () => {
-    act(() => useDictationStore.setState({ enabled: true }));
+  // The mic-hot copy keys off ACTUAL capture (status === "listening"), not the armed/mute
+  // intent (`enabled`) — see the audioActive regression test below.
+  it("invites the user to just start talking while capture is actually live", () => {
+    act(() => useDictationStore.setState({ enabled: true, status: "listening" }));
     renderComposer();
     const body = document.body.textContent ?? "";
     expect(body).toContain("I'm listening, so just start talking.");
@@ -143,7 +145,7 @@ describe("Composer — placeholder reflects audio state", () => {
   });
 
   it("keeps the mic-hot copy on focus (it subsumes the typing hint)", () => {
-    act(() => useDictationStore.setState({ enabled: true }));
+    act(() => useDictationStore.setState({ enabled: true, status: "listening" }));
     renderComposer();
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
     // Actually focus the box (mouseDown flips `focused`, focus moves activeElement) so the test
@@ -158,7 +160,7 @@ describe("Composer — placeholder reflects audio state", () => {
   });
 
   it("falls back to the wake-word prompt when the mic is muted", () => {
-    act(() => useDictationStore.setState({ enabled: false }));
+    act(() => useDictationStore.setState({ enabled: false, status: "idle" }));
     renderComposer();
     const body = document.body.textContent ?? "";
     expect(body).toContain("Hey Sparkle");
@@ -166,8 +168,19 @@ describe("Composer — placeholder reflects audio state", () => {
     expect(body).not.toContain("Send it"); // the gradient cue is mic-hot-only
   });
 
+  // Regression (issue 2): armed but not actually capturing (focus-paused) keeps `enabled` true
+  // while `status` is "idle". The composer must NOT claim "I'm listening" then — it falls back to
+  // the wake-word copy, since nothing is actually being captured.
+  it("does NOT claim it's listening when armed but capture is paused (enabled, status idle)", () => {
+    act(() => useDictationStore.setState({ enabled: true, status: "idle" }));
+    renderComposer();
+    const body = document.body.textContent ?? "";
+    expect(body).toContain("Hey Sparkle");
+    expect(body).not.toContain("I'm listening, so just start talking.");
+  });
+
   it("shows the muted focused typing hint only when the mic is muted", () => {
-    act(() => useDictationStore.setState({ enabled: false }));
+    act(() => useDictationStore.setState({ enabled: false, status: "idle" }));
     renderComposer();
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
     fireEvent.mouseDown(ta);
@@ -175,6 +188,21 @@ describe("Composer — placeholder reflects audio state", () => {
     expect(document.activeElement).toBe(ta);
     const body = document.body.textContent ?? "";
     expect(body).toContain("or type your command here");
+  });
+
+  // Regression (issue 1): a live cloud interim preview paints into the same top-left slot as the
+  // rich placeholder while `value` is still empty. The placeholder must be suppressed so the two
+  // never overlap into garbled, double-painted text.
+  it("hides the placeholder while a live interim preview is streaming", () => {
+    act(() => useDictationStore.setState({ enabled: true, status: "listening", interim: "" }));
+    renderComposer();
+    act(() => useDictationStore.getState().setInterim("hello world"));
+    const body = document.body.textContent ?? "";
+    // The streaming words show (in the ghost mirror)…
+    expect(screen.getByText("hello world")).toBeTruthy();
+    // …but neither placeholder co-renders on top of them.
+    expect(body).not.toContain("I'm listening, so just start talking.");
+    expect(body).not.toContain("Hey Sparkle");
   });
 });
 
