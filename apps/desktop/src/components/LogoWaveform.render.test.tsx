@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { LogoWaveform } from "./LogoWaveform";
 import { useDictationStore } from "../stores/dictationStore";
-import { DANGER } from "../theme/colors";
+import { C, DANGER } from "../theme/colors";
 
 // jsdom has no rAF by the time the effect runs in some setups; stub a no-op so the live
 // loop can schedule without throwing. We assert on the rendered caption, not animation frames.
@@ -72,14 +72,16 @@ describe("LogoWaveform — honest listening", () => {
     expect(wakeHintButton()).toBeNull();
   });
 
-  it("mic glyph goes red on hover in BOTH enabled and muted states (the mute / affordance cue)", () => {
-    // Probe jsdom's normalized form of the DANGER hex so the assertion is format-agnostic.
+  it("mic hover cue is direction-aware: RED to mute when enabled, TEAL to turn on when muted", () => {
+    // Probe jsdom's normalized form of each hex so the assertions are format-agnostic.
     const probe = document.createElement("span");
     probe.style.color = DANGER;
     const RED = probe.style.color;
+    probe.style.color = C.teal;
+    const TEAL = probe.style.color;
 
     // Enabled (armed + capturing): rests on a non-red brand tint, turns RED on hover
-    // (telegraphing "click to mute"). Also swaps to the slashed glyph.
+    // (telegraphing the destructive "click to mute"). Also swaps to the slashed glyph.
     useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
     render(<LogoWaveform />);
     const micOn = screen.getByRole("button", { name: "Mute microphone" });
@@ -88,13 +90,15 @@ describe("LogoWaveform — honest listening", () => {
     expect(micOn.style.color).toBe(RED);
     cleanup();
 
-    // Muted: same RED on hover (per the requested muted→gray, red-on-hover affordance).
+    // Muted: rests gray, turns TEAL (not red) on hover — the constructive "click to turn on" cue.
     useDictationStore.setState({ enabled: false, status: "idle" });
     render(<LogoWaveform />);
     const micOff = screen.getByRole("button", { name: "Unmute microphone" });
-    expect(micOff.style.color).not.toBe(RED); // rests gray, proving the red is hover-driven
+    const mutedRest = micOff.style.color;
+    expect(mutedRest).not.toBe(TEAL); // rests gray, proving the teal is hover-driven
     fireEvent.mouseEnter(micOff);
-    expect(micOff.style.color).toBe(RED);
+    expect(micOff.style.color).toBe(TEAL);
+    expect(micOff.style.color).not.toBe(RED);
   });
 
   it("muted → no caption at all, mic offers to unmute", () => {

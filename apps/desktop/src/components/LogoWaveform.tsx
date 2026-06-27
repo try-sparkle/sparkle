@@ -152,10 +152,12 @@ export function LogoWaveform() {
 
   // Mic tint by mode: the DARK BLUE of the logo "eye" (C.teal = #2f6bff) while we're
   // listening for the wake word (passive), the lighter teal/cyan while ACTIVELY dictating.
-  // Muted → gray. HOVER (in any state) goes RED to telegraph the destructive "click to mute"
-  // action — no cyan stage anywhere in the mute interaction. Red ↔ gray/teal on enter/leave.
-  const micColor = micHover ? DANGER : !enabled ? C.muted : active ? C.accentInk : C.teal;
-  const micBorder = micHover ? DANGER : !enabled ? C.muted : active ? C.accent : C.teal;
+  // Muted → gray. The HOVER cue is direction-aware: an ENABLED mic goes RED (destructive "click to
+  // mute"), a MUTED mic goes TEAL (constructive "click to turn on") — matching what the click does
+  // and the aria-label. Color animates back to gray/teal on leave.
+  const hoverColor = enabled ? DANGER : C.teal;
+  const micColor = micHover ? hoverColor : !enabled ? C.muted : active ? C.accentInk : C.teal;
+  const micBorder = micHover ? hoverColor : !enabled ? C.muted : active ? C.accent : C.teal;
   // Show the slashed "mute" glyph whenever the click would turn the mic OFF on hover (enabled),
   // or when it's already muted. Only the resting, enabled mic shows the open-mic glyph.
   const showMutedIcon = micHover || !enabled;
@@ -263,7 +265,8 @@ export function LogoWaveform() {
             backdropFilter: "blur(2px)",
             WebkitBackdropFilter: "blur(2px)",
             // Dark-blue while listening for the wake word, lighter teal while dictating; gray
-            // when muted. Hover (any state) → red, telegraphing "click to mute". See micColor above.
+            // when muted. Hover → red when enabled ("click to mute") or teal when muted ("click to
+            // turn on"). See micColor/hoverColor above.
             border: `1.5px solid ${micBorder}`,
             boxShadow:
               enabled && liveActive ? "0 0 12px rgba(52,224,240,0.6)" : "none",
