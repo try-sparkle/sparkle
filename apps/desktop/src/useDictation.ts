@@ -98,6 +98,26 @@ export async function createDictationController(
       setError(e.payload);
     }),
 
+    // App-level window focus changed (sparkle-9oz6). The backend has already released or rebuilt the
+    // OS mic; here we keep the frontend's billable/UI state consistent. `false` = no Sparkle window is
+    // the active OS window (the user tabbed to another app): stop the per-minute cloud meter and close
+    // the Deepgram socket so tabbing away mid-dictation can't keep billing, reset the wake-phase, and
+    // clear the live preview/level. We deliberately DON'T touch `enabled` — the mic stays armed and
+    // the backend brings it back on refocus. `true` = focus returned: reflect listening again.
+    listen<boolean>("dictation://focus", (e) => {
+      const store = useDictationStore.getState();
+      if (!e.payload) {
+        stopActiveCloudMeter();
+        invoke("stop_cloud_stream").catch(() => {});
+        store.setInterim("");
+        store.setLevel(0);
+        store.setPhase("passive");
+        if (store.status !== "error") store.setStatus("idle");
+      } else if (store.enabled && store.status !== "error") {
+        store.setStatus("listening");
+      }
+    }),
+
     // [doneBytes, totalBytesOrNull]
     listen<[number, number | null]>("dictation://model-progress", (e) => {
       const [done, total] = e.payload;

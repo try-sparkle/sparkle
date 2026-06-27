@@ -119,6 +119,16 @@ pub(crate) fn choose_engine(setting_enabled: bool, key_present: bool, credits_ok
     }
 }
 
+/// Whether the cpal mic capture should currently be live. Two conditions, both required:
+///   - `armed`: the frontend wants the mic on (the user hasn't muted it).
+///   - `focused`: at least one Sparkle window is the focused/active OS window.
+/// When the user tabs to another app every Sparkle window blurs, `focused` goes false, and we
+/// release the OS mic — so Sparkle never captures audio while you're looking at something else.
+/// Pure so the arm×focus matrix is unit-testable without an audio device or real windows.
+pub(crate) fn capture_should_be_live(armed: bool, focused: bool) -> bool {
+    armed && focused
+}
+
 #[derive(Default)]
 pub struct DictationSession {
     capture: Option<Capture>,
@@ -135,6 +145,14 @@ pub struct DictationSession {
     /// stop/again raced the handshake and the freshly-opened session must be discarded rather than
     /// installed. Guards the check-then-act that Arc::ptr_eq alone can't (a stop on the SAME session).
     cloud_epoch: Arc<AtomicU64>,
+    /// Frontend intent: the mic is "armed" (the user hasn't muted it). Set by start_dictation /
+    /// cleared by stop_dictation, and retained across focus-driven pauses — so a window losing focus
+    /// pauses capture WITHOUT reloading the on-device model when focus returns.
+    armed: bool,
+    /// Whether at least one Sparkle window is currently the focused/active OS window. Updated from
+    /// the window-focus event (lib.rs) and polled at arm time. The cpal capture is live only while
+    /// `armed && focused` — so we never capture audio while the user is looking at another app.
+    focused: bool,
 }
 
 pub struct DictationState(pub Arc<Mutex<DictationSession>>);
@@ -149,6 +167,109 @@ impl DictationState {
     pub fn stop_capture(&self) {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).capture = None;
     }
+
+    /// Build or release the cpal capture to match `armed && focused` (the only states that decide
+    /// it). Caller MUST hold the session lock. Resuming reuses the already-resident transcriber and
+    /// the same cloud Arcs (no model reload, same cloud generation), so a focus pause/resume cycle
+    /// is cheap and doesn't disturb an in-flight cloud epoch. Pausing drops `Capture`, which stops
+    /// CoreAudio invoking the callback and releases the OS mic (the macOS recording indicator goes
+    /// off) — true "not capturing", not merely discarded frames.
+    fn reconcile_locked(sess: &mut DictationSession, app: &AppHandle) {
+        let desired = capture_should_be_live(sess.armed, sess.focused);
+        if desired && sess.capture.is_none() {
+            // transcriber is always Some while armed; the guard is belt-and-suspenders.
+            if let Some(transcriber) = sess.transcriber.clone() {
+                match build_capture(
+                    app.clone(),
+                    transcriber,
+                    sess.cloud.clone(),
+                    sess.cloud_active.clone(),
+                ) {
+                    Ok(cap) => {
+                        sess.capture = Some(cap);
+                        tracing::info!(target: "dictation", "capture resumed (window focused)");
+                    }
+                    Err(e) => {
+                        let _ = app.emit("dictation://error", e);
+                    }
+                }
+            }
+        } else if !desired && sess.capture.is_some() {
+            sess.capture = None; // drop -> stops the cpal stream and releases the OS mic
+            tracing::info!(target: "dictation", "capture paused (window unfocused or muted)");
+        }
+    }
+
+    /// Record whether any Sparkle window is the focused OS window and reconcile the mic to match.
+    /// Called from the window-focus event (lib.rs). When the app-level focus actually flips we emit
+    /// `dictation://focus` so the frontend can pause/resume the billable cloud stream + per-minute
+    /// meter, reset the wake-phase, and update the listening UI. Moving focus between two Sparkle
+    /// windows keeps `focused` true, so no event fires and the mic stays live.
+    pub fn set_focused(&self, app: &AppHandle, focused: bool) {
+        let changed = {
+            let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            if sess.focused == focused {
+                false
+            } else {
+                sess.focused = focused;
+                Self::reconcile_locked(&mut sess, app);
+                true
+            }
+        }; // release the lock before emitting
+        if changed {
+            let _ = app.emit("dictation://focus", focused);
+        }
+    }
+}
+
+/// True if at least one Sparkle window is currently the focused/active OS window. Used to seed the
+/// focus state at arm time (the frontend calls start_dictation on mount, normally while focused),
+/// so the mic comes up without waiting for the first focus event.
+fn any_window_focused(app: &AppHandle) -> bool {
+    app.webview_windows()
+        .values()
+        .any(|w| w.is_focused().unwrap_or(false))
+}
+
+/// Build the cpal capture stream and wire its callback to the transcription pipeline. Shared by
+/// start_dictation (fresh arm) and the focus reconciler (resume), so the routing logic — cloud
+/// frames while actively dictating, else the on-device wake-word model — lives in exactly one place.
+fn build_capture(
+    app: AppHandle,
+    transcriber: Arc<Mutex<ParakeetTdt>>,
+    cloud_slot: Arc<Mutex<Option<DeepgramSession>>>,
+    cloud_active: Arc<AtomicBool>,
+) -> Result<Capture, String> {
+    let app_cb = app.clone();
+    // NOTE: transcriber is locked on every CoreAudio callback frame. The lock must stay short-held
+    // (accept() only, no I/O). finalize() is always called *after* Capture is dropped (stop_dictation),
+    // so the slow finalize path never contends with a live callback frame.
+    tracing::info!(target: "dictation", "build_capture: capture starting");
+    Capture::start(move |frame: Vec<f32>| {
+        let _ = app_cb.emit("dictation://level", rms_level(&frame));
+        // While the cloud stream is open (user actively dictating), route frames to Deepgram and
+        // skip the on-device model entirely. Otherwise the on-device model handles the frame —
+        // this is the always-listening wake-word gate. Locks are poison-tolerant ():
+        // a prior panicked frame must not wedge dictation; the audio.rs panic firewall already
+        // prevents such a panic from aborting the process.
+        if cloud_active.load(Ordering::Relaxed) {
+            if let Some(s) = cloud_slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                s.send_audio(&frame);
+            }
+        } else {
+            let segs = transcriber
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .accept(&frame);
+            for seg in segs {
+                emit_partial(&app_cb, "accept", seg);
+            }
+        }
+    })
+    .map_err(|e| {
+        let _ = app.emit("dictation://error", e.clone());
+        e
+    })
 }
 
 // SAFETY: cpal::Stream on CoreAudio is !Send, guarded behind a Mutex.
@@ -159,55 +280,46 @@ unsafe impl Sync for DictationState {}
 
 #[tauri::command]
 pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(), String> {
-    // Guard against double-start: if a session is active, return early.
-    // Without this, a second call would drop the first session's transcriber without
-    // calling finalize(), silently losing the trailing segment the first session buffered.
-    if state.0.lock().unwrap_or_else(|p| p.into_inner()).capture.is_some() { return Ok(()); }
+    // "Arm" the mic. The cpal capture itself is gated on focus by reconcile_locked: it comes up now
+    // only if a Sparkle window is the active OS window, and is (re)built later by the focus event.
+    //
+    // Fast path: already armed (e.g. a second window mounting, or a re-arm after this window was the
+    // first). Don't reload the model or swap the cloud Arcs — just refresh focus and reconcile so a
+    // capture paused while unfocused resumes. This also preserves the old double-start guarantee:
+    // we never drop a live transcriber without finalize().
+    {
+        let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+        if sess.armed {
+            sess.focused = any_window_focused(&app);
+            DictationState::reconcile_locked(&mut sess, &app);
+            return Ok(());
+        }
+    }
 
+    // Not yet armed: load the on-device model (slow, no lock held) before claiming the session.
     let root = app.path().app_data_dir().map_err(|e| e.to_string())?.join("models");
     let app_for_progress = app.clone();
     let paths = model::ensure(&root, move |done, total| { let _ = app_for_progress.emit("dictation://model-progress", (done, total)); })?;
     let transcriber = Arc::new(Mutex::new(ParakeetTdt::new(&paths)?));
-    let transcriber_cap = transcriber.clone();
-    // Shared cloud routing state, cloned into the callback so opening/closing the cloud stream
-    // (start/stop_cloud_stream) is visible to the live callback without rebuilding it.
-    let cloud_slot: Arc<Mutex<Option<DeepgramSession>>> = Arc::new(Mutex::new(None));
-    let cloud_active = Arc::new(AtomicBool::new(false));
-    let cloud_epoch = Arc::new(AtomicU64::new(0));
-    let cloud_slot_cb = cloud_slot.clone();
-    let cloud_active_cb = cloud_active.clone();
-    let app_cb = app.clone();
-    // NOTE: transcriber_cap is locked on every CoreAudio callback frame.
-    // The lock must stay short-held (accept() only, no I/O). finalize() is
-    // always called *after* Capture is dropped (in stop_dictation), so the
-    // slow finalize path never contends with a live callback frame.
-    tracing::info!(target: "dictation", "start_dictation: capture starting");
-    let capture = Capture::start(move |frame: Vec<f32>| {
-        let _ = app_cb.emit("dictation://level", rms_level(&frame));
-        // While the cloud stream is open (user actively dictating), route frames to Deepgram and
-        // skip the on-device model entirely. Otherwise the on-device model handles the frame —
-        // this is the always-listening wake-word gate. Locks are poison-tolerant ():
-        // a prior panicked frame must not wedge dictation; the audio.rs panic firewall already
-        // prevents such a panic from aborting the process.
-        // NOTE: on a mid-stream cloud failure there's a brief (~one event round-trip) window where
-        // cloud_active is still true but send_audio's channel is dead, so those frames are dropped
-        // rather than transcribed on-device — until the cloud-ended event drives stop_cloud_stream
-        // and flips cloud_active back. Accepted: the window is tens of ms on a rare disconnect.
-        if cloud_active_cb.load(Ordering::Relaxed) {
-            if let Some(s) = cloud_slot_cb.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                s.send_audio(&frame);
-            }
-        } else {
-            let segs = transcriber_cap.lock().unwrap_or_else(|p| p.into_inner()).accept(&frame);
-            for seg in segs { emit_partial(&app_cb, "accept", seg); }
-        }
-    }).map_err(|e| { let _ = app.emit("dictation://error", e.clone()); e })?;
+
     let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
-    sess.capture = Some(capture);
+    // A racing start_dictation may have armed while we loaded the model. If so, discard our freshly
+    // loaded transcriber (it drops here) rather than overwriting the live one without finalize().
+    if sess.armed {
+        sess.focused = any_window_focused(&app);
+        DictationState::reconcile_locked(&mut sess, &app);
+        return Ok(());
+    }
     sess.transcriber = Some(transcriber);
-    sess.cloud = cloud_slot;
-    sess.cloud_active = cloud_active;
-    sess.cloud_epoch = cloud_epoch;
+    // Fresh cloud generation for this arm — new Arcs so start_cloud_stream's ptr_eq/epoch guards
+    // correctly invalidate any stream that raced a prior stop+start.
+    sess.cloud = Arc::new(Mutex::new(None));
+    sess.cloud_active = Arc::new(AtomicBool::new(false));
+    sess.cloud_epoch = Arc::new(AtomicU64::new(0));
+    sess.armed = true;
+    sess.focused = any_window_focused(&app);
+    // Builds the capture now iff a window is focused; otherwise the focus event brings it up later.
+    DictationState::reconcile_locked(&mut sess, &app);
     Ok(())
 }
 
@@ -313,6 +425,7 @@ pub fn stop_cloud_stream(state: State<DictationState>) {
 pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
     let (transcriber, cloud_session) = {
         let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+        sess.armed = false;             // disarm so a later focus event can't resurrect the mic
         sess.capture = None;            // drop Capture -> stops the cpal stream (no more frames)
         sess.cloud_active.store(false, Ordering::Relaxed);
         sess.cloud_epoch.fetch_add(1, Ordering::Relaxed); // invalidate any in-flight start_cloud_stream
@@ -332,7 +445,20 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_engine, segment_fingerprint, should_install_cloud, DictationState, Engine};
+    use super::{
+        capture_should_be_live, choose_engine, segment_fingerprint, should_install_cloud,
+        DictationState, Engine,
+    };
+
+    #[test]
+    fn capture_is_live_only_when_armed_and_focused() {
+        // The mic captures only when the user hasn't muted (armed) AND a Sparkle window is the
+        // active OS window (focused). Tabbing to another app drops `focused` and releases the mic.
+        assert!(capture_should_be_live(true, true), "armed + focused → live");
+        assert!(!capture_should_be_live(true, false), "armed but unfocused → released");
+        assert!(!capture_should_be_live(false, true), "muted, even if focused → off");
+        assert!(!capture_should_be_live(false, false), "muted + unfocused → off");
+    }
 
     #[test]
     fn stop_capture_is_a_safe_idempotent_noop_without_an_active_capture() {
