@@ -12,6 +12,7 @@
   --c-chat-bubble: #1d3a7a;
   --c-accent-ink: #34e0f0;
   --c-agent-idle: #8aa0c4;
+  --c-success-ink: #34c759;
 }
 :root[data-theme="light"] {
   --c-forest: #ffffff;
@@ -21,6 +22,7 @@
   --c-chat-bubble: #d6e0f5;
   --c-accent-ink: #0a1a3f;
   --c-agent-idle: #3f4e6b;
+  --c-success-ink: #15803d;
 }
 
 * {

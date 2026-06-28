@@ -6,13 +6,15 @@
 // engine/workflowStage.ts; this is purely presentational.
 import { stageFraction, stageLineColor, stageMeta, LINE_FROM } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import { C } from "../theme/colors";
 
 // Unfilled track: a faint muted rail so the remaining path reads as "to do" without looking broken.
 const TRACK_BG = "rgba(138,160,196,0.22)";
 
-// The sticky "shipped" check is the path's end color — brand success green — so it reads as the same
-// "done" signal the full bar lands on, even when the bar itself has reset for a new cycle.
-const SHIPPED_COLOR = stageMeta("merged").color;
+// The sticky "shipped" check is the brand success green — the same "done" signal the full bar lands
+// on, even after the bar has reset for a new cycle. Uses the themed successInk so the ✓ stays
+// legible on the light-mode sidebar (darker green) instead of the too-light brand green as text.
+const SHIPPED_COLOR = C.successInk;
 
 export function WorkflowLine({
   stage,

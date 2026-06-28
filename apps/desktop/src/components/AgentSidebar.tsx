@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled, TbBulb } from "react-icons/tb";
 import { FaTasks } from "react-icons/fa";
-import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK } from "../theme/colors";
+import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK, statusInk } from "../theme/colors";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -565,13 +565,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               rowIndex?: number,
             ) => {
           const st = status[a.id] ?? "stopped";
-          // Idle/inactive agents (idle, blocked, done, stopped all share the brand GRAY) use a
-          // themed gray that's much darker in light mode for readability; active green/red
-          // statuses (working / waiting / approval / errored) keep their brand color. Compare to a
-          // known-gray status ("done") instead of enumerating, so this tracks the AGENT_STATUS
-          // taxonomy if it changes.
-          const color =
-            AGENT_STATUS[st].color === AGENT_STATUS.done.color ? C.agentIdle : AGENT_STATUS[st].color;
+          // Resolve the status color to a light-mode-legible TEXT ink: the brand gray (idle,
+          // blocked, done, stopped) and the brand green (working) are too light on the white
+          // light sidebar, so statusInk darkens both in light mode while keeping them brand-color
+          // in dark; red/amber pass through. (See statusInk — it tracks the AGENT_STATUS taxonomy.)
+          const color = statusInk(AGENT_STATUS[st].color);
           const isActive = !activeSpecial && project.selectedAgentId === a.id;
           const bs = branchStatus[a.id];
           // The ✓ on the head row reflects the whole build: itself OR any worker that has shipped.
@@ -749,22 +747,32 @@ export function formatElapsed(ms: number): string {
 }
 
 /**
- * A small self-contained ticking timer showing how long since `since` (epoch ms of the user's last
- * interaction with the agent — a composer Send or a terminal keystroke) — i.e. how long the agent
- * has run without the user touching it. Resets whenever `since` advances. Render it only when an
- * interaction timestamp exists. Ticks every 1s while under 100s (where each second shows), then
- * drops to a 5s beat once the display is in minutes/hours/days; clears its interval on unmount.
- * Takes the agent's status color so the counter matches the name (green / red / gray); tabular-nums
- * so it never jitters as digits change.
+ * One ticking clock per agent row. Returns a `now` (epoch ms) that advances every 1s while the
+ * agent has been idle under 100s (where each second matters) and relaxes to a 5s beat after that.
+ * Owned ONCE by the row and shared by BOTH the collapsed and the hover-overlay ElapsedTimer, so the
+ * elapsed count is identical in both — going on/off hover never swaps to a second timer with its own
+ * out-of-phase clock, which previously made the count visibly jump backward (read as a spurious
+ * "reset"). `since` is the user's last interaction; null means no timer, so the interval is skipped.
  */
-function ElapsedTimer({ since, color }: { since: number; color: string }) {
+function useRowClock(since: number | undefined): number {
   const [now, setNow] = useState(() => Date.now());
-  // Re-arm the interval when crossing the 100s boundary so the cadence relaxes from 1s to 5s.
-  const fast = now - since < 100_000;
+  const fast = since != null && now - since < 100_000;
   useEffect(() => {
+    if (since == null) return;
     const id = setInterval(() => setNow(Date.now()), fast ? 1000 : 5000);
     return () => clearInterval(id);
-  }, [fast]);
+  }, [fast, since]);
+  return now;
+}
+
+/**
+ * Presentational elapsed counter: shows how long since `since` (the user's last interaction with the
+ * agent — a composer Send or terminal keystroke) given the row's shared `now`. The value resets only
+ * when `since` advances (a new prompt/keystroke), never on hover. Takes the agent's status color so
+ * the counter matches the name (green / red / gray); tabular-nums so it never jitters as digits
+ * change. Stateless by design — the ticking clock lives in useRowClock so both render sites agree.
+ */
+function ElapsedTimer({ since, now, color }: { since: number; now: number; color: string }) {
   return (
     <div
       style={{
@@ -896,7 +904,11 @@ function AgentRow({
   // even with main.
   const showPill = !!bs && (behind > 0 || ahead > 0);
   const pillBehind = behind > 0;
+  // pillColor is the brand color used for the faint `${pillColor}22` alpha tint (must stay a
+  // concrete hex — a CSS var can't take a hex-alpha suffix). pillInk is the legible TEXT/border
+  // color: the green flips to a darker themed green in light mode (successInk); red is constant.
   const pillColor = pillBehind ? C.sienna : C.success;
+  const pillInk = pillBehind ? C.sienna : C.successInk;
   const baseLabel = a.baseBranch ?? "main";
   // Shared pill geometry — squared off to roughly match the Land/old action pills (borderRadius 5),
   // not a fully-round chip. The behind/ahead variants layer color + action on top.
@@ -953,6 +965,9 @@ function AgentRow({
   const lastPromptAt = a.promptHistory[a.promptHistory.length - 1]?.at;
   const lastTouchAt =
     Math.max(lastPromptAt ?? 0, lastInteractionAt ?? 0) || undefined;
+  // One clock for the row, shared by the collapsed timer AND the hover-overlay timer so the elapsed
+  // count is identical in both and never jumps when the cursor moves on/off the row (see useRowClock).
+  const clockNow = useRowClock(lastTouchAt);
 
   // The pin chip (manual pin: name frozen + row anchored). Click to release. Shared by both states.
   const pinChip = a.namePinned ? (
@@ -1047,32 +1062,39 @@ function AgentRow({
               }}
             />
           ) : expanded ? (
-            // Expanded: bold title + ": " + the regular-weight description, wrapping. The first
-            // line's height matches the glyph slot so the title stays aligned with the glyph as the
-            // card grows down to fit the description.
-            <div
-              onDoubleClick={(e) => {
-                e.stopPropagation();
-                setEditing(a.id);
-              }}
-              title="Double-click to rename"
-              style={{ minWidth: 0, lineHeight: `${GLYPH_SLOT_H}px` }}
-            >
-              <span
-                style={{
-                  color: statusColor,
-                  fontSize: 13,
-                  fontWeight: isActive ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
-                }}
-              >
-                {fullTitle}
-              </span>
-              {description && (
-                <span style={{ color: statusColor, fontSize: 13, fontWeight: FONT_WEIGHT.regular }}>
-                  {`:  ${description}`}
-                </span>
+            // Expanded: the SAME leading "elapsed since last prompt" timer as collapsed (kept
+            // visible on hover, not dropped), then the bold title + ": " + the regular-weight
+            // description, wrapping. The timer and the title's first line are both GLYPH_SLOT_H
+            // tall (top-aligned) so they stay level with the glyph as the card grows down to fit
+            // the description. gap:8 matches the collapsed row's timer↔name spacing.
+            <div style={{ display: "flex", alignItems: "flex-start", gap: 8, minWidth: 0 }}>
+              {lastTouchAt != null && (
+                <ElapsedTimer since={lastTouchAt} now={clockNow} color={statusColor} />
               )}
-              {pinChip}
+              <div
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  setEditing(a.id);
+                }}
+                title="Double-click to rename"
+                style={{ flex: 1, minWidth: 0, lineHeight: `${GLYPH_SLOT_H}px` }}
+              >
+                <span
+                  style={{
+                    color: statusColor,
+                    fontSize: 13,
+                    fontWeight: isActive ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
+                  }}
+                >
+                  {fullTitle}
+                </span>
+                {description && (
+                  <span style={{ color: statusColor, fontSize: 13, fontWeight: FONT_WEIGHT.regular }}>
+                    {`:  ${description}`}
+                  </span>
+                )}
+                {pinChip}
+              </div>
             </div>
           ) : (
             // Collapsed: the live "elapsed since last prompt" timer (once there's a prompt to time
@@ -1082,7 +1104,9 @@ function AgentRow({
             // gap:8 matches the glyph↔content spacing; the name+pin sub-row keeps its tighter gap:4.
             // Fixed to the glyph-slot height so the title line aligns with the glyph.
             <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, height: GLYPH_SLOT_H }}>
-              {lastTouchAt != null && <ElapsedTimer since={lastTouchAt} color={statusColor} />}
+              {lastTouchAt != null && (
+                <ElapsedTimer since={lastTouchAt} now={clockNow} color={statusColor} />
+              )}
               <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 4, minWidth: 0 }}>
                 <FittedAgentName
                   title={autoTitle}
@@ -1098,11 +1122,13 @@ function AgentRow({
               </div>
             </div>
           )}
-          {/* Collapsed: a thin progress line under the title (no text). Hidden when expanded — the
-              "Progress" detail line below carries the same information in words there. */}
-          {!expanded && trackerStage && (
+          {/* The thin progress line under the title. Collapsed it's just the line (no text);
+              expanded (on hover) it grows a status label to the RIGHT of the bar describing the
+              current stage — the same bar+readout in both states, so the hover card keeps the
+              visual progress bar, not only the worded "Progress" detail line below. */}
+          {trackerStage && (
             <div style={{ marginTop: 1 }}>
-              <WorkflowLine stage={trackerStage} expanded={false} shipped={shipped} />
+              <WorkflowLine stage={trackerStage} expanded={expanded} shipped={shipped} />
             </div>
           )}
           {/* Expanded: the structured detail lines — Location, Status, Progress. */}
@@ -1121,9 +1147,9 @@ function AgentRow({
                       onClick={handleRefresh}
                       style={{
                         ...pillBase,
-                        color: pillColor,
+                        color: pillInk,
                         background: `${pillColor}22`,
-                        border: `1px solid ${pillColor}`,
+                        border: `1px solid ${pillInk}`,
                         cursor: busy ? "not-allowed" : "pointer",
                         opacity: busy ? 0.6 : 1,
                       }}
@@ -1141,9 +1167,9 @@ function AgentRow({
                       }}
                       style={{
                         ...pillBase,
-                        color: pillColor,
+                        color: pillInk,
                         background: `${pillColor}22`,
-                        border: `1px solid ${pillColor}`,
+                        border: `1px solid ${pillInk}`,
                         cursor: "pointer",
                       }}
                     >
@@ -1164,7 +1190,7 @@ function AgentRow({
                     {/* Carry the sticky "landed" signal into the expanded card too, so the ✓ doesn't
                         vanish on hover — it persists even after the bar resets for a new cycle. */}
                     {shipped && (
-                      <span style={{ color: stageMeta("merged").color, fontWeight: 600 }}> ✓ Landed</span>
+                      <span style={{ color: C.successInk, fontWeight: 600 }}> ✓ Landed</span>
                     )}
                   </span>
                 </DetailLine>
@@ -1383,7 +1409,7 @@ function SparkleAgentRow({
   status: AgentTabStatus;
   onSelect: () => void;
 }) {
-  const color = AGENT_STATUS[status].color;
+  const color = statusInk(AGENT_STATUS[status].color);
   return (
     <div
       onClick={onSelect}

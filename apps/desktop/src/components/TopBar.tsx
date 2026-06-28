@@ -1,5 +1,5 @@
 import { useState, useEffect, type CSSProperties } from "react";
-import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
+import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, statusInk } from "../theme/colors";
 import type { AgentTabStatus, Project } from "../types";
 import { ThemeToggle } from "./ThemeToggle";
 import { AgentOrderToggle } from "./AgentOrderToggle";
@@ -201,7 +201,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
             <StatusDot status={majorityStatus(project, statusMap)} size={10} />
             <span
               style={{
-                color: AGENT_STATUS[majorityStatus(project, statusMap)].color,
+                color: statusInk(AGENT_STATUS[majorityStatus(project, statusMap)].color),
                 fontSize: 15,
                 fontWeight: FONT_WEIGHT.semibold,
               }}

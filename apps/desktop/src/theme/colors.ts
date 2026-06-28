@@ -5,11 +5,11 @@
 // THEME_HEX is the ONE place the light/dark hex values live. index.css mirrors these into
 // CSS variables (an enforced equality test guards the mirror — see theme.test / index.css),
 // and Terminal reads them directly via xtermTheme() because xterm needs concrete hex.
-import { C as BRAND } from "@sparkle/ui";
+import { C as BRAND, AGENT_STATUS } from "@sparkle/ui";
 
 export const THEME_HEX = {
-  dark: { forest: "#0a1a3f", deepForest: "#0f2350", cream: "#eaf1ff", muted: "#8aa0c4", chatBubble: "#1d3a7a", accentInk: "#34e0f0", agentIdle: "#8aa0c4" },
-  light: { forest: "#ffffff", deepForest: "#f1f4fa", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#d6e0f5", accentInk: "#0a1a3f", agentIdle: "#3f4e6b" },
+  dark: { forest: "#0a1a3f", deepForest: "#0f2350", cream: "#eaf1ff", muted: "#8aa0c4", chatBubble: "#1d3a7a", accentInk: "#34e0f0", agentIdle: "#8aa0c4", successInk: "#34c759" },
+  light: { forest: "#ffffff", deepForest: "#f1f4fa", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#d6e0f5", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d" },
 } as const;
 
 // Themed token object for component inline styles. The four theme-dependent tokens become
@@ -28,11 +28,28 @@ export const C = {
   accentInk: "var(--c-accent-ink)",
   // Inactive (done/stopped) agent name text. The brand "gray" (#8aa0c4) is too light to read
   // on the light sidebar, so this themed token keeps it in dark mode but goes much darker in
-  // light. (AGENT_STATUS green/red are brand-constant and fine in both themes.)
+  // light. (AGENT_STATUS red/amber stay brand-constant; the green flips via successInk below.)
   agentIdle: "var(--c-agent-idle)",
+  // Brand success GREEN as TEXT. #34c759 reads fine on dark navy but is too light on the white
+  // light-mode sidebar — so this themed token keeps the brand green in dark and goes to a darker,
+  // readable green (#15803d) in light. Use it for green text/glyphs (the "working" status name,
+  // the ✓ "Landed" mark, the ahead pill's label/border); keep BRAND.success (constant green) for
+  // fills, alpha tints, and status dots, the same split as accentInk vs accent.
+  successInk: "var(--c-success-ink)",
 };
 
 export const CHAT_USER_BUBBLE = "var(--c-chat-bubble)";
+
+// Map a raw AGENT_STATUS color to a light-mode-legible THEMED ink, for use as TEXT/glyph color.
+// The brand gray (idle/done/blocked/stopped) and brand green (working) are both too light to read
+// on the white light-mode sidebar, so they flip to darker themed tokens in light mode (and keep
+// their brand color in dark, via the var()s). Red/amber/violet are already legible in both themes
+// and pass through unchanged. For FILLS (status dots, badges) keep the raw brand color instead.
+export function statusInk(color: string): string {
+  if (color === AGENT_STATUS.done.color) return C.agentIdle; // brand gray
+  if (color === AGENT_STATUS.working.color) return C.successInk; // brand green
+  return color;
+}
 
 // Foreground for text/icons sitting ON a brand-colored fill (e.g. teal). The fill is constant
 // across themes, so this must stay light in BOTH — use the brand cream LITERAL, not the themed
