@@ -87,14 +87,13 @@ describe("AgentSidebar — drag to pin", () => {
     expect(screen.queryAllByTestId("agent-drop-target")).toHaveLength(0);
   });
 
-  it("a rendered nested worker is not draggable (top-level only)", () => {
+  it("a worker is not its own draggable card (it renders inline on the orchestrator)", () => {
     const worker = { ...mkAgent("w1", "Worker"), kind: "worker" as const, parentId: "a1" };
     seed([mkAgent("a1", "Alpha"), worker]);
-    // Expand the orchestrator so the worker row actually renders — otherwise "not draggable" would
-    // pass vacuously because a collapsed worker isn't in the DOM at all (roborev 13178).
-    useUiStore.setState({ collapsedOrchestrators: { a1: false } });
     render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
-    expect(screen.getByText("Worker")).toBeTruthy(); // the worker row IS rendered…
-    expect(draggableCards()).toHaveLength(1); // …yet only the top-level agent's card is draggable
+    // Workers are no longer standalone rows: each shows as a bare indented progress line under its
+    // orchestrator (no name/timer collapsed), so the worker's name isn't in the collapsed DOM…
+    expect(screen.queryByText("Worker")).toBeNull();
+    expect(draggableCards()).toHaveLength(1); // …and only the orchestrator's card is draggable
   });
 });

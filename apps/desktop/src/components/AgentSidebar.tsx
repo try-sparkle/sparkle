@@ -23,7 +23,7 @@ import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
 import { WorkflowLine } from "./WorkflowLine";
 import { HistorySearch } from "./HistorySearch";
-import { resolveStage, rollupStages, stageMeta, stageFraction, stageIndex } from "../engine/workflowStage";
+import { resolveStage, rollupStages, stageFraction, stageIndex } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { CloseWorkerPrompt } from "./CloseWorkerPrompt";
 
@@ -143,8 +143,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // and which agents the sidebar list shows. Defaults to Build; not persisted across launches.
   const [mode, setMode] = useState<"think" | "plan" | "build">("build");
   const agentOrdering = useUiStore((s) => s.agentOrdering);
-  const collapsedOrchestrators = useUiStore((s) => s.collapsedOrchestrators);
-  const toggleOrchestratorCollapsed = useUiStore((s) => s.toggleOrchestratorCollapsed);
   // The workflow stage an agent's own git state + any known override resolves to.
   const stageOf = (id: string): WorkflowStageId =>
     resolveStage(branchStatus[id], workflowStage[id]);
@@ -557,8 +555,30 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             // we simply don't render a tracker for it — see renderRow.)
             const workerStages = workers.map((w) => stageOf(w.id));
             const rollup = rollupStages(workerStages);
-            const collapsed =
-              top.kind === "build" && workers.length > 0 && (collapsedOrchestrators[top.id] ?? true);
+            // Each worker's collapsed bare line + expanded detail now live INSIDE the orchestrator's
+            // own AgentRow (workers are no longer their own selectable rows). Pre-compute the minimal
+            // per-worker view-model here, where stageOf/status/branchStatus/shippedOf are in scope.
+            const workerDetails = workers.map((w) => {
+              const wst = status[w.id] ?? "stopped";
+              const wcolor =
+                AGENT_STATUS[wst].color === AGENT_STATUS.done.color
+                  ? C.agentIdle
+                  : AGENT_STATUS[wst].color;
+              return {
+                id: w.id,
+                name: w.name,
+                autoTitle: w.autoNameVariants?.title?.trim() || null,
+                description: w.autoNameVariants?.description?.trim() || "",
+                stage: stageOf(w.id) as WorkflowStageId | null,
+                status: wst,
+                statusColor: wcolor,
+                branchStatus: branchStatus[w.id],
+                shipped: shippedOf(w.id),
+                worktreePath: w.worktreePath,
+                baseBranch: w.baseBranch,
+                onLand: () => onLand(w),
+              };
+            });
             const renderRow = (
               a: (typeof project.agents)[number],
               trackerStage: WorkflowStageId | null,
@@ -591,6 +611,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               trackerStage={trackerStage}
               shipped={rowShipped}
               workerCount={a.id === top.id ? workers.length : 0}
+              workers={a.id === top.id ? workerDetails : []}
               orderedIndex={rowIndex}
               dragActive={dragId != null}
               onDragStartAgent={onAgentDragStart}
@@ -613,55 +634,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                 : rollup
                   ? rollup.stage
                   : stageOf(top.id);
-            const dom = rollup ? stageMeta(rollup.dominant) : null;
-            return (
-              <div key={top.id}>
-                {renderRow(top, headStage, orderedIndex)}
-                {/* Collapsible worker roll-up. Workers start collapsed: a compact "N workers ·
-                    mostly X" bar the user clicks to expand into each worker's own tracker. */}
-                {top.kind === "build" && workers.length > 0 && (
-                  <div
-                    onClick={() => toggleOrchestratorCollapsed(top.id)}
-                    title={collapsed ? "Show worker agents" : "Hide worker agents"}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
-                      marginLeft: 16,
-                      padding: "2px 10px 4px",
-                      cursor: "pointer",
-                    }}
-                  >
-                    <span style={{ width: 12, textAlign: "center", color: C.muted, fontSize: 10 }}>
-                      {collapsed ? "▸" : "▾"}
-                    </span>
-                    <span style={{ color: C.muted, fontSize: 11, flex: "0 0 auto" }}>
-                      {workers.length} worker{workers.length === 1 ? "" : "s"}
-                    </span>
-                    {collapsed && dom && (
-                      <span
-                        style={{
-                          color: dom.color,
-                          fontSize: 10,
-                          fontWeight: 600,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        · mostly {dom.label}
-                      </span>
-                    )}
-                  </div>
-                )}
-                {/* Expanded: each worker's own row + tracker. Workers are spawned by the
-                    orchestrator agent (via the MCP bridge), not by hand — so there's no manual
-                    "+ worker" affordance here. */}
-                {top.kind === "build" &&
-                  !collapsed &&
-                  workers.map((w) => renderRow(w, stageOf(w.id)))}
-              </div>
-            );
+            // The orchestrator's head row now owns its workers: each worker renders as a bare
+            // indented progress line below the head (collapsed), and as a stacked detail block on
+            // the head's hover overlay (expanded) — see AgentRow's `workers` prop. The old
+            // collapse/expand roll-up bar and per-worker rows are gone.
+            return <div key={top.id}>{renderRow(top, headStage, orderedIndex)}</div>;
           });
         })()}
         {/* Per-mode empty hint: the dashed "+ New …" row above is the call to action. */}
@@ -790,12 +767,34 @@ function ElapsedTimer({ since, now, color }: { since: number; now: number; color
   );
 }
 
+// The minimal per-worker view-model an orchestrator row needs to render its workers itself: one
+// bare indented progress line per worker collapsed, and a stacked Location/Status/Progress block
+// per worker in the hover overlay. Computed in AgentSidebar (where stageOf/status/branchStatus are
+// in scope) and threaded down so workers share the orchestrator's single hover target. `onLand`
+// fires the same merge as a standalone worker row's green pill did. `[]` for non-orchestrator rows.
+type WorkerDetail = {
+  id: string;
+  name: string;
+  autoTitle: string | null;
+  description: string;
+  stage: WorkflowStageId | null;
+  status: AgentTabStatus;
+  statusColor: string;
+  branchStatus?: BranchStatus;
+  shipped: boolean;
+  worktreePath: string | null;
+  baseBranch: string | null;
+  onLand: () => void;
+};
+
 /**
  * One agent row. Collapsed (default) it shows: the kind glyph, the status dot, the width-fitted
  * name, a behind/ahead pill, and a thin progress line across the bottom. On hover the row "slides
  * out" to the right OVER the terminal (a fixed-position overlay, not a modal), revealing the full
  * name, the working-directory path, and the progress line's status label. The build glyph sits left
- * of the dot, the dot left of the name (per spec).
+ * of the dot, the dot left of the name (per spec). An orchestrator row additionally renders its
+ * `workers` inline: a bare indented progress line each (collapsed) and a stacked detail block each
+ * (expanded), so the whole build reads as one card and selecting any part opens the orchestrator.
  */
 function AgentRow({
   project,
@@ -808,6 +807,7 @@ function AgentRow({
   trackerStage,
   shipped,
   workerCount,
+  workers,
   orderedIndex,
   dragActive,
   onDragStartAgent,
@@ -832,6 +832,9 @@ function AgentRow({
   // Number of workers under this row (orchestrators only; 0 for workers/leaf agents) — shown in
   // the hover card's "Progress" line.
   workerCount: number;
+  // The orchestrator's workers, rendered inline on this row (collapsed lines + expanded detail).
+  // `[]` for every non-orchestrator row.
+  workers: WorkerDetail[];
   // The agent's current row in the ordered top-level stack (undefined for nested workers).
   // Passed to renameAgent so a manual rename anchors the row there (the unified pin). Also the
   // drop index for drag-reorder. The drag props are only acted on for top-level rows.
@@ -896,32 +899,8 @@ function AgentRow({
   }, [hover]);
 
   const busy = st === "working";
-  const behind = bs?.behind ?? 0;
-  const ahead = bs?.ahead ?? 0;
-  // The pill: RED "-N" when the branch is behind main (click rebases it onto main — catch YOU up),
-  // else GREEN "+N" when it's ahead (click merges it into main — catch MAIN up to you). Behind wins
-  // when both: rebase first, and once caught up the pill flips to green to offer the land. None when
-  // even with main.
-  const showPill = !!bs && (behind > 0 || ahead > 0);
-  const pillBehind = behind > 0;
-  // pillColor is the brand color used for the faint `${pillColor}22` alpha tint (must stay a
-  // concrete hex — a CSS var can't take a hex-alpha suffix). pillInk is the legible TEXT/border
-  // color: the green flips to a darker themed green in light mode (successInk); red is constant.
-  const pillColor = pillBehind ? C.sienna : C.success;
-  const pillInk = pillBehind ? C.sienna : C.successInk;
-  const baseLabel = a.baseBranch ?? "main";
-  // Shared pill geometry — squared off to roughly match the Land/old action pills (borderRadius 5),
-  // not a fully-round chip. The behind/ahead variants layer color + action on top.
-  const pillBase: React.CSSProperties = {
-    fontSize: 10,
-    fontWeight: 700,
-    lineHeight: 1,
-    fontFamily: FONT.ui,
-    padding: "2px 7px",
-    borderRadius: 5,
-    flex: "0 0 auto",
-    whiteSpace: "nowrap",
-  };
+  // The behind/ahead pill + its branch-status geometry now live in AgentDetailLines, which renders
+  // the Location/Status/Progress block for this row AND for each inline worker (same logic, no dupe).
 
   const kindGlyph =
     a.kind === "think" ? (
@@ -937,16 +916,18 @@ function AgentRow({
   // name never shifts horizontally when the row expands.
   const glyphWidth = a.kind === "build" ? 24 : a.kind === "think" ? 20 : 12;
 
-  const handleRefresh = async (e: React.MouseEvent) => {
+  // Rebase a branch (this row's, or one of its inline workers') onto its base. Parameterized by id +
+  // base so the orchestrator's own Status pill and each worker's Status pill share one code path.
+  const refreshBranch = async (id: string, base: string, e: React.MouseEvent) => {
     e.stopPropagation();
     // Re-read status at click time: the closed-over `busy` could be stale, and this gate is the
     // only thing stopping a rebase under a live agent.
-    const liveBusy = useRuntimeStore.getState().status[a.id] === "working";
-    const base = a.baseBranch ?? "";
-    const r = await refreshAgentBranch(project.rootPath, project.id, a.id, base, liveBusy);
-    if (r.ok) void pollBranchStatus(project.rootPath, project.id, a.id, base);
+    const liveBusy = useRuntimeStore.getState().status[id] === "working";
+    const r = await refreshAgentBranch(project.rootPath, project.id, id, base, liveBusy);
+    if (r.ok) void pollBranchStatus(project.rootPath, project.id, id, base);
     else console.warn("refresh blocked:", r.reason, r.files ?? ""); // toast UI is a follow-up
   };
+  const handleRefresh = (e: React.MouseEvent) => refreshBranch(a.id, a.baseBranch ?? "", e);
 
   // The auto-name title (shown truncated when collapsed) and its one-sentence description (revealed
   // on hover). Legacy/manual agents have no title → fall back to the canonical `name`.
@@ -1131,70 +1112,67 @@ function AgentRow({
               <WorkflowLine stage={trackerStage} expanded={expanded} shipped={shipped} />
             </div>
           )}
-          {/* Expanded: the structured detail lines — Location, Status, Progress. */}
-          {expanded && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 4 }}>
-              <DetailLine label="Location">
-                <PathReveal path={a.worktreePath ?? project.rootPath} />
-              </DetailLine>
-              <DetailLine label="Status">
-                {showPill ? (
-                  pillBehind ? (
-                    // BEHIND (red): click rebases this branch onto main — catches YOU up. Gated on
-                    // the agent not actively writing (a rebase under a live PTY would race).
-                    <button
-                      disabled={busy}
-                      onClick={handleRefresh}
-                      style={{
-                        ...pillBase,
-                        color: pillInk,
-                        background: `${pillColor}22`,
-                        border: `1px solid ${pillInk}`,
-                        cursor: busy ? "not-allowed" : "pointer",
-                        opacity: busy ? 0.6 : 1,
-                      }}
-                    >
-                      {busy
-                        ? `${behind} behind ${baseLabel} — pause the agent to catch up`
-                        : `${behind} commit${behind === 1 ? "" : "s"} behind ${baseLabel}. Click to catch up`}
-                    </button>
-                  ) : (
-                    // AHEAD (green): click merges this branch into main — catches MAIN up to you.
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onLand();
-                      }}
-                      style={{
-                        ...pillBase,
-                        color: pillInk,
-                        background: `${pillColor}22`,
-                        border: `1px solid ${pillInk}`,
-                        cursor: "pointer",
-                      }}
-                    >
-                      {a.kind === "worker"
-                        ? `${ahead} ahead. Click to merge into this worker's orchestrator`
-                        : `${ahead} commit${ahead === 1 ? "" : "s"} ahead of ${baseLabel}. Click to merge`}
-                    </button>
-                  )
-                ) : (
-                  <span style={{ color: C.muted, fontSize: 11 }}>Up to date with {baseLabel}</span>
-                )}
-              </DetailLine>
-              {progressPct != null && (
-                <DetailLine label="Progress">
-                  <span style={{ color: C.muted, fontSize: 11 }}>
-                    {workerCount > 0 ? `${workerCount} worker${workerCount === 1 ? "" : "s"}. ` : ""}
-                    {progressPct}% complete{workerCount > 0 ? " overall" : ""}.
-                    {/* Carry the sticky "landed" signal into the expanded card too, so the ✓ doesn't
-                        vanish on hover — it persists even after the bar resets for a new cycle. */}
-                    {shipped && (
-                      <span style={{ color: C.successInk, fontWeight: 600 }}> ✓ Landed</span>
-                    )}
-                  </span>
-                </DetailLine>
+          {/* Collapsed: one bare indented progress line per worker, directly under the
+              orchestrator's own line. No name / timer / "committed" text — each line's fill +
+              color alone says how far that worker has gotten. Indented an extra 16px past the
+              orchestrator's line so the head-vs-worker hierarchy reads at a glance. */}
+          {!expanded && workers.some((w) => w.stage) && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 3, marginLeft: 16 }}>
+              {workers.map((w) =>
+                w.stage ? (
+                  <WorkflowLine key={w.id} stage={w.stage} expanded={false} shipped={w.shipped} />
+                ) : null,
               )}
+            </div>
+          )}
+          {/* Expanded: this row's own Location / Status / Progress detail lines. */}
+          {expanded && (
+            <AgentDetailLines
+              worktreePath={a.worktreePath}
+              rootPath={project.rootPath}
+              bs={bs}
+              baseBranch={a.baseBranch}
+              isWorker={a.kind === "worker"}
+              busy={busy}
+              shipped={shipped}
+              progressPct={progressPct}
+              workerCount={workerCount}
+              onLand={onLand}
+              onRefresh={handleRefresh}
+            />
+          )}
+          {/* Expanded: one stacked detail block per worker — as if every worker had been expanded
+              onto this single orchestrator card. Each shows the worker's own title/description and
+              its own Location / Status / Progress. Indented 16px so they read as nested. */}
+          {expanded && workers.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8, marginLeft: 16 }}>
+              {workers.map((w) => (
+                <div key={w.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                  <div style={{ minWidth: 0, lineHeight: 1.3 }}>
+                    <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.semibold }}>
+                      {w.autoTitle || w.name}
+                    </span>
+                    {w.description && (
+                      <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.regular }}>
+                        {`:  ${w.description}`}
+                      </span>
+                    )}
+                  </div>
+                  <AgentDetailLines
+                    worktreePath={w.worktreePath}
+                    rootPath={project.rootPath}
+                    bs={w.branchStatus}
+                    baseBranch={w.baseBranch}
+                    isWorker
+                    busy={w.status === "working"}
+                    shipped={w.shipped}
+                    progressPct={w.stage ? Math.round(stageFraction(w.stage) * 100) : null}
+                    workerCount={0}
+                    onLand={w.onLand}
+                    onRefresh={(e) => refreshBranch(w.id, w.baseBranch ?? "", e)}
+                  />
+                </div>
+              ))}
             </div>
           )}
         </div>
@@ -1309,6 +1287,127 @@ function AgentRow({
           document.body,
         )}
     </>
+  );
+}
+
+/** The Location / Status / Progress detail block for ONE agent in the hover card. Shared by the
+ *  orchestrator's own detail and each of its inline workers, so the behind/ahead pill logic lives
+ *  in exactly one place. `onRefresh` rebases the branch onto its base (red "behind" pill, gated on
+ *  `busy`); `onLand` merges it forward (green "ahead" pill). `isWorker` only swaps the green pill's
+ *  wording (merge into the worker's orchestrator vs. into the base). */
+function AgentDetailLines({
+  worktreePath,
+  rootPath,
+  bs,
+  baseBranch,
+  isWorker,
+  busy,
+  shipped,
+  progressPct,
+  workerCount,
+  onLand,
+  onRefresh,
+}: {
+  worktreePath: string | null;
+  rootPath: string;
+  bs?: BranchStatus;
+  baseBranch: string | null;
+  isWorker: boolean;
+  busy: boolean;
+  shipped?: boolean;
+  progressPct: number | null;
+  workerCount: number;
+  onLand: () => void;
+  onRefresh: (e: React.MouseEvent) => void;
+}) {
+  const behind = bs?.behind ?? 0;
+  const ahead = bs?.ahead ?? 0;
+  // The pill: RED "-N" when the branch is behind its base (click rebases it — catch YOU up), else
+  // GREEN "+N" when it's ahead (click merges it — catch the base up to you). Behind wins when both.
+  const showPill = !!bs && (behind > 0 || ahead > 0);
+  const pillBehind = behind > 0;
+  // pillColor is the brand color used for the faint `${pillColor}22` alpha tint (must stay a
+  // concrete hex — a CSS var can't take a hex-alpha suffix). pillInk is the legible TEXT/border
+  // color: the green flips to a darker themed green in light mode (successInk); red is constant.
+  const pillColor = pillBehind ? C.sienna : C.success;
+  const pillInk = pillBehind ? C.sienna : C.successInk;
+  const baseLabel = baseBranch ?? "main";
+  // Shared pill geometry — squared off to roughly match the Land/old action pills (borderRadius 5),
+  // not a fully-round chip. The behind/ahead variants layer color + action on top.
+  const pillBase: React.CSSProperties = {
+    fontSize: 10,
+    fontWeight: 700,
+    lineHeight: 1,
+    fontFamily: FONT.ui,
+    padding: "2px 7px",
+    borderRadius: 5,
+    flex: "0 0 auto",
+    whiteSpace: "nowrap",
+  };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 4 }}>
+      <DetailLine label="Location">
+        <PathReveal path={worktreePath ?? rootPath} />
+      </DetailLine>
+      <DetailLine label="Status">
+        {showPill ? (
+          pillBehind ? (
+            // BEHIND (red): click rebases this branch onto its base — catches YOU up. Gated on the
+            // agent not actively writing (a rebase under a live PTY would race).
+            <button
+              disabled={busy}
+              onClick={onRefresh}
+              style={{
+                ...pillBase,
+                color: pillInk,
+                background: `${pillColor}22`,
+                border: `1px solid ${pillInk}`,
+                cursor: busy ? "not-allowed" : "pointer",
+                opacity: busy ? 0.6 : 1,
+              }}
+            >
+              {busy
+                ? `${behind} behind ${baseLabel} — pause the agent to catch up`
+                : `${behind} commit${behind === 1 ? "" : "s"} behind ${baseLabel}. Click to catch up`}
+            </button>
+          ) : (
+            // AHEAD (green): click merges this branch forward — catches the base up to you.
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onLand();
+              }}
+              style={{
+                ...pillBase,
+                color: pillInk,
+                background: `${pillColor}22`,
+                border: `1px solid ${pillInk}`,
+                cursor: "pointer",
+              }}
+            >
+              {isWorker
+                ? `${ahead} ahead. Click to merge into this worker's orchestrator`
+                : `${ahead} commit${ahead === 1 ? "" : "s"} ahead of ${baseLabel}. Click to merge`}
+            </button>
+          )
+        ) : (
+          <span style={{ color: C.muted, fontSize: 11 }}>Up to date with {baseLabel}</span>
+        )}
+      </DetailLine>
+      {progressPct != null && (
+        <DetailLine label="Progress">
+          <span style={{ color: C.muted, fontSize: 11 }}>
+            {workerCount > 0 ? `${workerCount} worker${workerCount === 1 ? "" : "s"}. ` : ""}
+            {progressPct}% complete{workerCount > 0 ? " overall" : ""}.
+            {/* Carry the sticky "landed" signal into the expanded card too, so the ✓ doesn't
+                vanish on hover — it persists even after the bar resets for a new cycle. */}
+            {shipped && (
+              <span style={{ color: C.successInk, fontWeight: 600 }}> ✓ Landed</span>
+            )}
+          </span>
+        </DetailLine>
+      )}
+    </div>
   );
 }
 
