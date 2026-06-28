@@ -39,5 +39,20 @@ fn main() {
         );
     }
 
+    // macOS only: compile the tiny ObjC category that forces Notification Center banners to
+    // present even when Sparkle is frontmost (see objc/force_present.m). Gate on the TARGET os
+    // (build.rs itself runs on the host) so a non-macOS target build skips it cleanly.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rerun-if-changed=objc/force_present.m");
+        // The NSUserNotification deprecation warning is silenced in-file via a #pragma in
+        // force_present.m (survives independent of these build flags), so no -Wno flag here.
+        cc::Build::new()
+            .file("objc/force_present.m")
+            .flag("-fobjc-arc")
+            .compile("sparkle_notify_present");
+        // Foundation is already linked transitively, but make the category's dependency explicit.
+        println!("cargo:rustc-link-lib=framework=Foundation");
+    }
+
     tauri_build::build()
 }

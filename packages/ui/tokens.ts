@@ -41,13 +41,19 @@ export const C = {
  * eight states for precise tooltips/legends, but they collapse to exactly THREE colors
  * so a glance tells you only what you need to act on:
  *   GREEN  — running                              (working)
- *   RED    — blocked on a specific answer from you (waiting, approval)
- *   GRAY   — done / not blocked / not active       (idle, blocked, errored, done, stopped)
- * RED is reserved for when the agent is genuinely waiting on YOUR input — a question or
- * an approval it drew on screen. A finished turn sitting at the idle prompt is GRAY (the
- * work is done; it isn't asking you anything), and a crashed/exited agent is GRAY too
- * (not running ≠ waiting on you). Never hardcode these — import AGENT_STATUS. `label` is
+ *   RED    — needs your attention                 (waiting, approval, errored)
+ *   GRAY   — done / not blocked / not active       (idle, blocked, done, stopped)
+ * RED means something is wrong or wants you: the agent is waiting on YOUR input (a question
+ * or an approval it drew on screen) OR it crashed/exited with an error. A finished turn
+ * sitting at the idle prompt is GRAY (the work is done; it isn't asking you anything) and a
+ * cleanly-exited agent is GRAY too. Never hardcode these — import AGENT_STATUS. `label` is
  * the human phrase shown on hover.
+ *
+ * NOTE: color, badge, and notifications are three SEPARATE concerns. Color is here. The dock
+ * badge counts only waiting/approval (attention.ts — "how many need an answer"). Notifications
+ * are user-configurable per status (settingsStore.notifyStatuses, default-on for the red +
+ * finished tiers incl. errored) — so an errored agent is red AND pings by default, but which
+ * statuses ping is the user's choice, independent of this color tier.
  */
 const GREEN = C.success; // #34c759 — running, leave it be
 const RED = C.sienna; //   #e0533f — needs your answer
@@ -58,7 +64,7 @@ export const AGENT_STATUS = {
   waiting: { color: RED, label: "Needs you" }, // asked a question (on-screen prompt)
   approval: { color: RED, label: "Approve?" }, // caution/dangerous action pending
   blocked: { color: GRAY, label: "Stalled" }, // quiet, no on-screen question — not blocking you
-  errored: { color: GRAY, label: "Exited" }, // process crashed/exited — not running
+  errored: { color: RED, label: "Errored" }, // process crashed/exited with an error — red so it stands out
   done: { color: GRAY, label: "Done" }, // finished cleanly, not active
   stopped: { color: GRAY, label: "Stopped" }, // not running (persisted tab)
 } as const;

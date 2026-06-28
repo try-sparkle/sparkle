@@ -112,11 +112,26 @@ pub fn notify_attention(app: AppHandle, project_id: String, agent_id: String, ti
     });
 }
 
+// Anchor symbol from objc/force_present.m. Referencing it forces the linker to retain that
+// object file so its ObjC category (which makes banners present even when Sparkle is frontmost)
+// is loaded — categories in a static lib are otherwise dead-stripped. See objc/force_present.m.
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn sparkle_force_present_anchor();
+}
+
 /// Best-effort: attribute notifications to Sparkle's bundle id so they read as "Sparkle" and
 /// are clickable. Without this `mac-notification-sys` falls back to com.apple.Finder. Call once
-/// at startup; the underlying setter is a no-op after the first success.
+/// at startup; the underlying setter is a no-op after the first success. Also pulls in the
+/// foreground-presentation category so banners show while Sparkle is the active app.
 pub fn init_application() {
     let _ = mac_notification_sys::set_application("ai.sparkle.desktop");
+    // SAFETY: empty C function with no args/return; the only purpose of the call is to keep the
+    // category's object file in the link (see the anchor's definition).
+    #[cfg(target_os = "macos")]
+    unsafe {
+        sparkle_force_present_anchor();
+    }
 }
 
 #[cfg(test)]

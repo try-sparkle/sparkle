@@ -5,16 +5,23 @@
 // Each window owns ONE project, so it only knows/reports the status of that project's agents:
 //  - badge: report this window's red count; the backend sums across windows (the macOS dock
 //    badge is app-global) — see attention.rs.
-//  - notification: fire once when an agent crosses INTO red (newlyNeedingAttention), not on
-//    every tick. Switching the window to a different project re-baselines silently so the
-//    switch itself doesn't ping you for agents that were already waiting.
+//  - notification: fire once when an agent crosses INTO a status the user has enabled for
+//    notifications (Settings ⋯ → Notifications; newlyEntered), not on every tick. Switching the
+//    window to a different project re-baselines silently so the switch itself doesn't ping you
+//    for agents that were already in a notifiable status.
 //  - click: the backend broadcasts attention://focus-agent to every window; the window that
 //    owns that project brings itself forward and selects the agent (main adopts an orphaned
 //    project no window is currently showing).
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { countAttention, newlyNeedingAttention, type StatusMap } from "./engine/attention";
+import {
+  countAttention,
+  newlyEntered,
+  notificationFor,
+  type StatusMap,
+} from "./engine/attention";
 import { useRuntimeStore } from "./stores/runtimeStore";
+import { useSettingsStore } from "./stores/settingsStore";
 import { useProjectStore } from "./stores/projectStore";
 import {
   useCurrentProjectId,
@@ -29,13 +36,7 @@ import {
   onFocusAgent,
   type FocusAgentPayload,
 } from "./services/attention";
-import type { AgentTab, AgentTabStatus } from "./types";
-
-/** Human phrasing for the banner body, by why the agent needs you. */
-function noticeBody(status: AgentTabStatus, projectName: string): string {
-  const ask = status === "approval" ? "Approve an action" : "Answer a question";
-  return `${ask} · ${projectName}`;
-}
+import type { AgentTab } from "./types";
 
 /** Bring this window to the foreground (notification click landed here). */
 async function bringToFront(): Promise<void> {
@@ -67,34 +68,42 @@ export function useAttentionNotifications(): void {
   const projectName = useProjectStore(
     (s) => s.projects.find((p) => p.id === projectId)?.name ?? "",
   );
+  // Which statuses the user wants notifications for (⋯ → Notifications). Built into a Set so the
+  // edge detector is a cheap membership test. Recomputed only when the prefs object changes.
+  const notifyStatuses = useSettingsStore((s) => s.notifyStatuses);
+  const enabled = useMemo(
+    () =>
+      new Set(
+        (Object.keys(notifyStatuses) as Array<keyof typeof notifyStatuses>).filter(
+          (k) => notifyStatuses[k],
+        ),
+      ),
+    [notifyStatuses],
+  );
 
   // Previous status snapshot + which project it was for, so a project switch re-baselines
-  // instead of firing a notification for every already-waiting agent in the new project.
+  // instead of firing a notification for every already-notifiable agent in the new project.
   const prevStatus = useRef<StatusMap>({});
   const prevProject = useRef<string | null>(null);
 
-  // Badge + notification side-effects, recomputed whenever status or the owned agent set changes.
+  // Badge + notification side-effects, recomputed whenever status, the owned agent set, or the
+  // notify prefs change. The badge stays strictly waiting/approval (countAttention); the banner
+  // fires for any newly-entered status the user enabled.
   useEffect(() => {
     const ownedIds = agents.map((a) => a.id);
     reportAttentionCount(label, countAttention(status, ownedIds));
 
     const sameProject = prevProject.current === projectId;
     if (sameProject) {
-      for (const id of newlyNeedingAttention(prevStatus.current, status, ownedIds)) {
+      for (const { id, status: st } of newlyEntered(prevStatus.current, status, ownedIds, enabled)) {
         const agent = agents.find((a) => a.id === id);
-        const st = status[id];
-        if (!agent || st === undefined || projectId == null) continue;
-        notifyAttention({
-          projectId,
-          agentId: id,
-          title: agent.name,
-          body: noticeBody(st, projectName),
-        });
+        if (!agent || projectId == null) continue;
+        notifyAttention({ projectId, agentId: id, ...notificationFor(st, agent.name, projectName) });
       }
     }
     prevStatus.current = status;
     prevProject.current = projectId;
-  }, [status, agents, projectId, label, projectName]);
+  }, [status, agents, projectId, label, projectName, enabled]);
 
   // Report 0 on unmount so a closed window stops contributing to the badge total.
   useEffect(() => () => reportAttentionCount(label, 0), [label]);

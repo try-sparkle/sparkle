@@ -5,6 +5,7 @@ import { ThemeToggle } from "./ThemeToggle";
 import { AgentOrderToggle } from "./AgentOrderToggle";
 import { BalanceBadge } from "./BalanceBadge";
 import { AiFeaturesMenu } from "./AiFeaturesMenu";
+import { NotificationsMenu } from "./NotificationsMenu";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -345,6 +346,8 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
             >
               <div style={menuLabel}>Use AI features</div>
               <AiFeaturesMenu />
+              <div style={{ ...menuLabel, paddingTop: 12 }}>Notifications</div>
+              <NotificationsMenu />
               <div style={{ ...menuLabel, paddingTop: 12 }}>Claude accounts</div>
               <button
                 style={{ ...btn, width: "100%", textAlign: "left" }}

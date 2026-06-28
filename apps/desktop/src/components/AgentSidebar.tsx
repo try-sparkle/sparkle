@@ -559,10 +559,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               rowIndex?: number,
             ) => {
           const st = status[a.id] ?? "stopped";
-          // Idle/inactive agents (idle, blocked, errored, done, stopped all share the brand
-          // GRAY) use a themed gray that's much darker in light mode for readability; active
-          // green/red statuses keep their brand color. Compare to a known-gray status ("done")
-          // instead of enumerating, so this tracks the AGENT_STATUS taxonomy if it changes.
+          // Idle/inactive agents (idle, blocked, done, stopped all share the brand GRAY) use a
+          // themed gray that's much darker in light mode for readability; active green/red
+          // statuses (working / waiting / approval / errored) keep their brand color. Compare to a
+          // known-gray status ("done") instead of enumerating, so this tracks the AGENT_STATUS
+          // taxonomy if it changes.
           const color =
             AGENT_STATUS[st].color === AGENT_STATUS.done.color ? C.agentIdle : AGENT_STATUS[st].color;
           const isActive = !activeSpecial && project.selectedAgentId === a.id;

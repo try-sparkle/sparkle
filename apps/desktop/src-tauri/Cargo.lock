@@ -4195,6 +4195,7 @@ version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "bzip2",
+ "cc",
  "cpal",
  "hound",
  "keyring",

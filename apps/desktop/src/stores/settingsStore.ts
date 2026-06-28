@@ -7,6 +7,29 @@
 // but a follow-up should move it into Tauri's secure store / OS keychain (tracked on the epic).
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
+import type { AgentTabStatus } from "../types";
+
+// --- Status-change notifications -------------------------------------------------------------
+// Which agent statuses fire a Notification Center banner when an agent crosses INTO them. The
+// user picks these via the "Notifications" section of the ⋯ menu. Defaults: the red tier
+// (waiting/approval/errored) plus the "finished" tier (idle = your turn, done) — i.e. tell me
+// when an agent needs me OR is done. The dock badge is separate (always waiting/approval).
+//
+// Why `idle` is ON but `working` is OFF, even though both can flip often for loop-style agents:
+// `idle` is the "I'm done, your turn" edge the user explicitly asked to be notified about (most
+// interactive agents finish a turn as idle, not done), so it earns a ping; `working` is pure
+// churn (start of every turn/tool) with no actionable signal. Both are one toggle away if the
+// default is wrong for a given workflow. blocked/stopped are passive and default OFF too.
+export const DEFAULT_NOTIFY_STATUSES: Record<AgentTabStatus, boolean> = {
+  waiting: true,
+  approval: true,
+  errored: true,
+  idle: true,
+  done: true,
+  working: false,
+  blocked: false,
+  stopped: false,
+};
 
 // --- AI features (gated by the "Use AI Features" control in the ⋯ menu) ----------------------
 // Four independent on/off feature flags plus a derived All|Some|Off mode. Each feature degrades
@@ -116,6 +139,10 @@ interface SettingsState {
   /** Use the AI-enhanced composer (ghost text, screenshot drop, dictation insert, Send). Off →
    *  the composer is replaced by the bare terminal input. */
   aiComposer: boolean;
+  /** Which agent statuses fire a Notification Center banner on the transition INTO them. See
+   *  DEFAULT_NOTIFY_STATUSES. Persisted; merged over the defaults on read so a status added later
+   *  inherits its default rather than reading undefined. */
+  notifyStatuses: Record<AgentTabStatus, boolean>;
 
   setChiefPat: (pat: string) => void;
   setRuntimeChiefPat: (pat: string) => void;
@@ -124,6 +151,8 @@ interface SettingsState {
   clearChiefDocState: (chiefProjectId: string) => void;
   setMaxConcurrentWorkers: (n: number) => void;
   setCloudDictation: (on: boolean) => void;
+  /** Toggle notifications for one agent status. */
+  setNotifyStatus: (status: AgentTabStatus, on: boolean) => void;
   /** Toggle one AI feature; the master segment re-derives automatically (aiFeatureMode). */
   setAiFeature: (key: AiFeatureKey, on: boolean) => void;
   /** Bulk-set every AI feature (the All / Off segments). */
@@ -142,10 +171,13 @@ export const useSettingsStore = create<SettingsState>()(
       aiAutoRename: true,
       aiBrainstorm: true,
       aiComposer: true,
+      notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
 
       setChiefPat: (pat) => set({ chiefPat: pat.trim() }),
       setRuntimeChiefPat: (pat) => set({ runtimeChiefPat: pat.trim() }),
       setCloudDictation: (on) => set({ cloudDictation: on }),
+      setNotifyStatus: (status, on) =>
+        set((s) => ({ notifyStatuses: { ...s.notifyStatuses, [status]: on } })),
       setAiFeature: (key, on) => set({ [AI_FEATURE_FIELD[key]]: on } as Partial<AiFeatureFlags>),
       setAllAiFeatures: (on) =>
         set({ aiAutoRename: on, cloudDictation: on, aiBrainstorm: on, aiComposer: on }),
@@ -178,6 +210,18 @@ export const useSettingsStore = create<SettingsState>()(
       // change so we never silently re-arm AI/credits on upgrade (see migrateSettings).
       version: 1,
       migrate: migrateSettings,
+      // Merge persisted state over the live defaults, but DEEP-merge notifyStatuses so a store
+      // saved before this field existed (or one missing a newly-added status) inherits the
+      // per-status defaults instead of dropping to undefined. Everything else is a shallow
+      // override, matching zustand's default merge.
+      merge: (persisted, current) => {
+        const p = (persisted ?? {}) as Partial<SettingsState>;
+        return {
+          ...current,
+          ...p,
+          notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES, ...(p.notifyStatuses ?? {}) },
+        };
+      },
       // Persist everything EXCEPT runtimeChiefPat — it's re-resolved from env at each launch, so
       // persisting it would let a removed/rotated env token linger stale until startup runs.
       partialize: (s) => ({
@@ -189,6 +233,7 @@ export const useSettingsStore = create<SettingsState>()(
         aiAutoRename: s.aiAutoRename,
         aiBrainstorm: s.aiBrainstorm,
         aiComposer: s.aiComposer,
+        notifyStatuses: s.notifyStatuses,
       }),
     },
   ),

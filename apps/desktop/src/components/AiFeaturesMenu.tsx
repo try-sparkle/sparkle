@@ -1,5 +1,6 @@
 import { type CSSProperties } from "react";
 import { C, ON_BRAND_FILL } from "../theme/colors";
+import { SettingCheckbox } from "./SettingCheckbox";
 import {
   useSettingsStore,
   aiFeatureMode,
@@ -34,21 +35,6 @@ const seg: CSSProperties = {
   padding: "6px 0",
   fontSize: 13,
   fontFamily: '"IBM Plex Sans", sans-serif',
-};
-
-const checkboxRow: CSSProperties = {
-  display: "flex",
-  alignItems: "flex-start",
-  gap: 8,
-  width: "100%",
-  background: "transparent",
-  border: "none",
-  padding: "6px 4px",
-  cursor: "pointer",
-  textAlign: "left",
-  fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
-  color: C.cream,
 };
 
 /** The All | Some | Off master segment. All/Off are actions; Some is a derived status only. */
@@ -94,43 +80,6 @@ function MasterSegment({ mode, onAll, onOff }: { mode: AiMode; onAll: () => void
   );
 }
 
-/** A single feature checkbox row. */
-function FeatureCheckbox({
-  label,
-  checked,
-  onToggle,
-}: {
-  label: string;
-  checked: boolean;
-  onToggle: () => void;
-}) {
-  return (
-    <button type="button" role="checkbox" aria-checked={checked} aria-label={label} onClick={onToggle} style={checkboxRow}>
-      <span
-        aria-hidden
-        style={{
-          flex: "0 0 auto",
-          width: 16,
-          height: 16,
-          marginTop: 1,
-          borderRadius: 4,
-          border: `1px solid ${checked ? C.teal : C.muted}`,
-          background: checked ? C.teal : "transparent",
-          color: ON_BRAND_FILL,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          fontSize: 12,
-          lineHeight: 1,
-        }}
-      >
-        {checked ? "✓" : ""}
-      </span>
-      <span style={{ color: checked ? C.cream : C.muted, lineHeight: 1.35 }}>{label}</span>
-    </button>
-  );
-}
-
 export function AiFeaturesMenu() {
   const aiAutoRename = useSettingsStore((s) => s.aiAutoRename);
   const cloudDictation = useSettingsStore((s) => s.cloudDictation);
@@ -157,7 +106,7 @@ export function AiFeaturesMenu() {
       />
       <div style={{ marginTop: 6 }}>
         {FEATURES.map(({ key, label }) => (
-          <FeatureCheckbox
+          <SettingCheckbox
             key={key}
             label={label}
             checked={valueByKey[key]}

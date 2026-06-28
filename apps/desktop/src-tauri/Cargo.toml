@@ -10,6 +10,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Compiles objc/force_present.m (the foreground-notification category) on macOS.
+cc = "1"
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -43,7 +45,11 @@ tauri-plugin-global-shortcut = "2"
 # than tauri-plugin-notification because on desktop the plugin discards click events — and we
 # need the click to route to the specific worker that asked. mac-notification-sys returns the
 # interaction (Click / ActionButton) so we can emit a focus-agent event. macOS-only app.
-mac-notification-sys = "0.6"
+# PINNED (=0.6.15): the foreground-banner fix (objc/force_present.m) adds a category to this
+# crate's `NotificationCenterDelegate` and depends on it posting via NSUserNotification. A bump
+# that renames the class fails loud at link, but one that switches to UNUserNotificationCenter
+# would silently turn the category into a dead no-op — so bumps must be a deliberate, reviewed step.
+mac-notification-sys = "=0.6.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
