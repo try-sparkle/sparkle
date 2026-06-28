@@ -136,7 +136,11 @@ export function Composer({
   inputRef?: RefObject<HTMLTextAreaElement | null>;
   // Imperative bridge so the parent can push text into the box (e.g. "Send to Composer").
   apiRef?: RefObject<ComposerApi | null>;
-  onSubmitPrompt: (text: string) => void;
+  // `display` is the transcript string (typed text + 📄/📷/📎 count markers) — recorded for
+  // prompt history. `namingBasis` is the user's typed text ONLY (no attachment markers): the
+  // basis for auto-naming. Empty when the message is attachments-only, in which case the parent
+  // must not auto-name (the emoji-count markers must never reach the naming model).
+  onSubmitPrompt: (display: string, namingBasis: string) => void;
   // Called when a vertical arrow runs off the edge of the text: Down off the last line, Up off
   // the first. Lets the parent hand focus (and the keypress) to the terminal so the user can
   // drive Claude's menus without clicking. Omit to keep arrows purely native.
@@ -502,7 +506,10 @@ export function Composer({
       attachments: atts.length,
       textBlocks: blocks.length,
     });
-    onSubmitPrompt(display);
+    // Pass the typed text (already trimmed into `text`) as the naming basis, separate from the
+    // marker-decorated `display`. Attachments-only sends carry an empty basis, so auto-naming is
+    // skipped rather than fed "📷 1 image".
+    onSubmitPrompt(display, text);
     await submitPrompt(agentId, payload);
     // Consume a trial prompt only now that it's actually delivered (no-op for entitled users).
     void recordTrialSend();

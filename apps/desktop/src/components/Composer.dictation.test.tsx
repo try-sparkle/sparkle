@@ -146,7 +146,7 @@ describe("Composer — placeholder reflects audio state", () => {
     const body = document.body.textContent ?? "";
     expect(body).toContain("I'm listening, so just start talking.");
     expect(body).toContain("Sparkle, stop"); // the cyan→blue gradient stop cue
-    expect(body).toContain("start typing here instead");
+    expect(body).toContain("to finish.");
     expect(body).not.toContain("Hey Sparkle");
   });
 
@@ -234,7 +234,8 @@ describe("Composer — send wiring", () => {
     fireEvent.change(ta, { target: { value: "do the thing" } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    await waitFor(() => expect(onSubmitPrompt).toHaveBeenCalledWith("do the thing"));
+    // Text-only send: display string and naming basis are both the typed text.
+    await waitFor(() => expect(onSubmitPrompt).toHaveBeenCalledWith("do the thing", "do the thing"));
     expect(submitPrompt).toHaveBeenCalledWith("a1", "do the thing");
     expect(ta.value).toBe("");
     expect(usePromptHistoryStore.getState().history).toContain("do the thing");

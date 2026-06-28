@@ -587,16 +587,20 @@ export function AgentPane({
               apiRef={composerApiRef}
               onArrowOverflow={(dir) => terminalApiRef.current?.arrowFromComposer(dir)}
               onEnterOverflow={() => terminalApiRef.current?.enterFromComposer()}
-              onSubmitPrompt={(t) => {
-                // Record the prompt for the pinned header + history dropdown, and drop a terminal
-                // marker under the same id so "jump to this prompt" (dropdown + history search)
-                // can scroll back here later this session.
-                const promptId = appendPrompt(project.id, agent.id, t);
+              onSubmitPrompt={(display, namingBasis) => {
+                // Record the DISPLAY string (typed text + 📄/📷/📎 markers) for the pinned header +
+                // history dropdown, and drop a terminal marker under the same id so "jump to this
+                // prompt" (dropdown + history search) can scroll back here later this session.
+                const promptId = appendPrompt(project.id, agent.id, display);
                 terminalApiRef.current?.markPrompt(promptId);
                 // Fire-and-forget: summarize the work into a short name (first prompt, or when
                 // the work shifts). No-ops if the name is pinned or no API key is configured.
-                // Gated on the auto-rename AI feature.
-                if (aiAutoRename) void maybeAutoName(project.id, agent.id, t);
+                // Gated on the auto-rename AI feature. Name from the user's TYPED text only —
+                // never the attachment emoji-count markers — and skip entirely when an
+                // attachments-only send leaves the basis empty (so the naming model never sees
+                // "📷 1 image" and replies with conversational refusal text).
+                const basis = namingBasis.trim();
+                if (aiAutoRename && basis) void maybeAutoName(project.id, agent.id, basis);
               }}
             />
           )}

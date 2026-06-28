@@ -54,6 +54,23 @@ export function newlyEntered(
   return out;
 }
 
+/**
+ * Whether to SUPPRESS the system notification for an agent that just changed status. We suppress
+ * exactly one case: the user is actively looking at THAT agent — this window is the OS-focused
+ * window (`windowFocused`, from document.hasFocus(), which is true only when this app+window is
+ * frontmost) AND the agent is the selected tab here. Every other case still notifies: a different
+ * agent in this same focused window (not selected), an agent in a background window/project (this
+ * window isn't focused), or another app entirely in front (also not focused). The row's recolor +
+ * move-to-top is independent of this and always happens. Pure.
+ */
+export function suppressNotification(args: {
+  windowFocused: boolean;
+  selectedAgentId: string | null;
+  agentId: string;
+}): boolean {
+  return args.windowFocused && args.selectedAgentId === args.agentId;
+}
+
 /** Notification copy (banner title + body) for an agent that entered `status`. Title is always
  *  the agent name; the body says WHY it's pinging, scoped to the project. Pure + exhaustive over
  *  the status taxonomy so a new status can't silently fall through to a blank banner. */

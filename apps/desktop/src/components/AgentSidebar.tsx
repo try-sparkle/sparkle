@@ -8,6 +8,7 @@ import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { useInteractionStore } from "../stores/interactionStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useAiFeature } from "../services/aiGate";
 import { removeAgentWorkspace } from "../services/worktree";
@@ -724,6 +725,63 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   );
 }
 
+// The leading glyph slot is a fixed height so the glyph AND the title beside it sit at the exact
+// same spot whether the card is collapsed or expanded — on hover the card only grows DOWNWARD,
+// so the eye never sees the pickaxe or title jump. Module-level so the elapsed timer can match it.
+const GLYPH_SLOT_H = 20;
+
+// Format an elapsed duration (ms) for the sidebar timer: integer seconds while under 100s (each
+// second is visible there), then minutes / hours / days each to one decimal with a trailing ".0"
+// stripped (so 2 minutes reads "2m", 1.5 reads "1.5m"). Pure + exported for testing.
+export function formatElapsed(ms: number): string {
+  const SEC = 1000;
+  const MIN = 60 * SEC;
+  const HOUR = 60 * MIN;
+  const DAY = 24 * HOUR;
+  if (ms < 100 * SEC) return `${Math.floor(ms / SEC)}s`;
+  const oneDp = (n: number) => {
+    const s = n.toFixed(1);
+    return s.endsWith(".0") ? s.slice(0, -2) : s;
+  };
+  if (ms < 100 * MIN) return `${oneDp(ms / MIN)}m`;
+  if (ms < 24 * HOUR) return `${oneDp(ms / HOUR)}h`;
+  return `${oneDp(ms / DAY)}d`;
+}
+
+/**
+ * A small self-contained ticking timer showing how long since `since` (epoch ms of the user's last
+ * interaction with the agent — a composer Send or a terminal keystroke) — i.e. how long the agent
+ * has run without the user touching it. Resets whenever `since` advances. Render it only when an
+ * interaction timestamp exists. Ticks every 1s while under 100s (where each second shows), then
+ * drops to a 5s beat once the display is in minutes/hours/days; clears its interval on unmount.
+ * Takes the agent's status color so the counter matches the name (green / red / gray); tabular-nums
+ * so it never jitters as digits change.
+ */
+function ElapsedTimer({ since, color }: { since: number; color: string }) {
+  const [now, setNow] = useState(() => Date.now());
+  // Re-arm the interval when crossing the 100s boundary so the cadence relaxes from 1s to 5s.
+  const fast = now - since < 100_000;
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), fast ? 1000 : 5000);
+    return () => clearInterval(id);
+  }, [fast]);
+  return (
+    <div
+      style={{
+        flex: "0 0 auto",
+        height: GLYPH_SLOT_H,
+        display: "flex",
+        alignItems: "center",
+        fontSize: 11,
+        color,
+        fontVariantNumeric: "tabular-nums",
+      }}
+    >
+      {formatElapsed(Math.max(0, now - since))}
+    </div>
+  );
+}
+
 /**
  * One agent row. Collapsed (default) it shows: the kind glyph, the status dot, the width-fitted
  * name, a behind/ahead pill, and a thin progress line across the bottom. On hover the row "slides
@@ -886,10 +944,15 @@ function AgentRow({
   // Overall completion for the hover "Progress" line: the same fraction the thin line fills to.
   const progressPct = trackerStage ? Math.round(stageFraction(trackerStage) * 100) : null;
 
-  // The leading glyph slot is a fixed height so the glyph AND the title beside it sit at the exact
-  // same spot whether the card is collapsed or expanded — on hover the card only grows DOWNWARD,
-  // so the eye never sees the pickaxe or title jump.
-  const GLYPH_SLOT_H = 20;
+  // Epoch ms of the user's last INTERACTION with this agent — the collapsed-row timer counts up
+  // from here and resets to 0 the instant the user touches the agent again. "Interaction" is the
+  // later of: the most recent composer Send (promptHistory) and the most recent terminal keystroke
+  // (interactionStore, throttled). Anchoring to interaction — not just composer prompts — is why a
+  // terminal-driven Send now resets the timer too. undefined until the first interaction (no timer).
+  const lastInteractionAt = useInteractionStore((s) => s.lastAt[a.id]);
+  const lastPromptAt = a.promptHistory[a.promptHistory.length - 1]?.at;
+  const lastTouchAt =
+    Math.max(lastPromptAt ?? 0, lastInteractionAt ?? 0) || undefined;
 
   // The pin chip (manual pin: name frozen + row anchored). Click to release. Shared by both states.
   const pinChip = a.namePinned ? (
@@ -1012,20 +1075,27 @@ function AgentRow({
               {pinChip}
             </div>
           ) : (
-            // Collapsed: the bold title, truncated with an ellipsis (the hover card reveals the
-            // full title + description). Fixed to the glyph-slot height so the title line aligns.
-            <div style={{ display: "flex", alignItems: "center", gap: 4, minWidth: 0, height: GLYPH_SLOT_H }}>
-              <FittedAgentName
-                title={autoTitle}
-                name={a.name}
-                color={statusColor}
-                active={isActive}
-                onDoubleClick={(e) => {
-                  e.stopPropagation();
-                  setEditing(a.id);
-                }}
-              />
-              {pinChip}
+            // Collapsed: the live "elapsed since last prompt" timer (once there's a prompt to time
+            // from), then the bold title truncated with an ellipsis (the hover card reveals the full
+            // title + description). The timer leads the row — rather than sitting outside this name
+            // column — so the thin progress line below spans under the timer too, not just the name.
+            // gap:8 matches the glyph↔content spacing; the name+pin sub-row keeps its tighter gap:4.
+            // Fixed to the glyph-slot height so the title line aligns with the glyph.
+            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, height: GLYPH_SLOT_H }}>
+              {lastTouchAt != null && <ElapsedTimer since={lastTouchAt} color={statusColor} />}
+              <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 4, minWidth: 0 }}>
+                <FittedAgentName
+                  title={autoTitle}
+                  name={a.name}
+                  color={statusColor}
+                  active={isActive}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    setEditing(a.id);
+                  }}
+                />
+                {pinChip}
+              </div>
             </div>
           )}
           {/* Collapsed: a thin progress line under the title (no text). Hidden when expanded — the

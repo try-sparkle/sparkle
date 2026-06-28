@@ -195,6 +195,33 @@ fn parse_name(text: &str) -> Option<AgentName> {
     Some(AgentName { title, description })
 }
 
+/// True when a non-JSON reply opens like a conversational message (a refusal, apology, or
+/// clarifying question) rather than a bare title — e.g. "I can see you've shared an image, but
+/// I'm unable…" or "I don't see any image attached. Could you…". The model emits these when the
+/// prompt has nothing nameable (it should have replied SKIP, but doesn't always). A real
+/// plain-title fallback is a Title-Case noun phrase ("Voice Dictation Pipeline") and never opens
+/// with first-person / apologetic / interrogative phrasing, so matching these leading markers
+/// can't swallow a genuine title. Defense-in-depth behind the frontend fix that stops sending
+/// attachment-only messages to the model at all.
+fn looks_conversational(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    // Each opener is followed by a space in real refusals/questions; generic single words
+    // ("sorry", "hmm") carry their trailing separator so they can't swallow a genuine Title-Case
+    // fallback like "Sorry State Of Logging". Broader phrases that are implausible title prefixes
+    // ("i can see", "could you") need no separator. "can you" is intentionally omitted (it's a
+    // plausible feature title, e.g. "Can You Hear Me Indicator"; the refusal form "could you" is
+    // covered).
+    const OPENERS: &[&str] = &[
+        "i can see", "i see", "i notice", "i don't", "i do not", "i can't", "i cannot",
+        "i'm sorry", "i am sorry", "i'm unable", "i am unable", "i'm not able", "i am not able",
+        "i'd be happy", "i would be happy", "i'd need", "i don’t", "i can’t", "i’m sorry",
+        "i’m unable", "sorry,", "sorry ", "unfortunately", "it looks like", "it seems", "could you",
+        "please provide", "please share", "to name", "there's no", "there is no",
+        "no image", "hmm,", "hmm ",
+    ];
+    OPENERS.iter().any(|o| lower.starts_with(o))
+}
+
 /// Interpret the model's reply text into a name. Returns Err when the prompt was operational or
 /// too thin to describe work (the model replies with a bare `SKIP` token) or when no usable title
 /// can be derived — both flow through the caller's swallow-on-error path, leaving the agent's
@@ -209,6 +236,11 @@ fn interpret_reply(text: &str) -> Result<AgentName, String> {
         let token = trimmed.trim_matches(|c: char| !c.is_alphanumeric());
         if token.eq_ignore_ascii_case("SKIP") {
             return Err("naming skipped (operational or low-content prompt)".into());
+        }
+        // A conversational reply (refusal/apology/clarifying question) is not a title — reject it
+        // so we never turn "I can see you've shared an image, but I'm unable…" into a 5-word name.
+        if looks_conversational(text) {
+            return Err("naming reply was conversational, not a title".into());
         }
         // Plain-title fallback: a model that ignored the JSON instruction and returned a bare
         // title still yields a usable title (with no description).
@@ -474,6 +506,32 @@ mod tests {
     #[test]
     fn interpret_reply_errors_on_empty() {
         assert!(interpret_reply("   ").is_err());
+    }
+
+    #[test]
+    fn interpret_reply_rejects_conversational_refusals() {
+        // The field bug: an attachment-only message fed the naming model emoji-count markers, so
+        // Haiku replied conversationally and that text became the agent name. The frontend now
+        // stops sending those, but as defense-in-depth a non-JSON reply that opens like a refusal/
+        // apology/clarifying question must be rejected, not turned into a 5-word title.
+        for reply in [
+            "I can see you've shared an image, but I'm unable to view its contents.",
+            "I don't see any image attached to your message. Could you re-send it?",
+            "I'm sorry, but I can't determine what work to name from this.",
+            "Unfortunately there isn't enough here to name a session.",
+            "Could you tell me what you'd like to work on?",
+        ] {
+            assert!(interpret_reply(reply).is_err(), "should reject conversational reply: {reply:?}");
+        }
+    }
+
+    #[test]
+    fn interpret_reply_still_keeps_a_genuine_plain_title() {
+        // The conversational guard must not swallow real Title-Case plain-title fallbacks.
+        for title in ["Voice Dictation Pipeline", "Fix OAuth Redirect Loop", "Image Upload Flow"] {
+            let n = interpret_reply(title).expect("a genuine plain title must survive");
+            assert_eq!(n.title, sanitize_name(title, 5));
+        }
     }
 
     #[test]

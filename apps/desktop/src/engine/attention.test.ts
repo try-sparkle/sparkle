@@ -4,6 +4,7 @@ import {
   countAttention,
   newlyEntered,
   notificationFor,
+  suppressNotification,
   type StatusMap,
 } from "./attention";
 import type { AgentTabStatus } from "../types";
@@ -142,5 +143,31 @@ describe("notificationFor", () => {
       "stopped",
     ];
     for (const s of all) expect(notificationFor(s, "A", "P").body).not.toBe(" · P");
+  });
+});
+
+describe("suppressNotification", () => {
+  it("suppresses only when this window is focused AND the agent is the selected tab", () => {
+    expect(
+      suppressNotification({ windowFocused: true, selectedAgentId: "a", agentId: "a" }),
+    ).toBe(true);
+  });
+
+  it("still notifies for a DIFFERENT agent in the same focused window", () => {
+    expect(
+      suppressNotification({ windowFocused: true, selectedAgentId: "a", agentId: "b" }),
+    ).toBe(false);
+  });
+
+  it("still notifies for the selected agent when this window is NOT focused (background window/project or another app)", () => {
+    expect(
+      suppressNotification({ windowFocused: false, selectedAgentId: "a", agentId: "a" }),
+    ).toBe(false);
+  });
+
+  it("notifies when nothing is selected, even if focused", () => {
+    expect(
+      suppressNotification({ windowFocused: true, selectedAgentId: null, agentId: "a" }),
+    ).toBe(false);
   });
 });

@@ -12,6 +12,7 @@ import { spawnPty, writePty, killPty, resizePty, onPtyOutput, onPtyExit, ignoreP
 import { StatusEngine } from "../engine/statusEngine";
 import { snapshotScreen } from "../engine/screenSnapshot";
 import { useUiStore } from "../stores/uiStore";
+import { useInteractionStore } from "../stores/interactionStore";
 import { isComposerToggleKey } from "./composerToggle";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
@@ -192,8 +193,11 @@ export function Terminal({
       getScreen: () => snapshotScreen(term.buffer.active, term.rows),
     });
 
-    // Forward keystrokes typed directly in the terminal to the PTY.
+    // Forward keystrokes typed directly in the terminal to the PTY. onData fires for USER input
+    // only (never programmatic agent output), so it's our signal that the user just interacted —
+    // record it (throttled) to reset the sidebar's "running without my interaction" timer.
     term.onData((d) => {
+      useInteractionStore.getState().touch(agentId);
       void writePty(agentId, d).catch(ignorePtyGone);
     });
 

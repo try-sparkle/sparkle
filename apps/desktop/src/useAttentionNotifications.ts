@@ -18,6 +18,7 @@ import {
   countAttention,
   newlyEntered,
   notificationFor,
+  suppressNotification,
   type StatusMap,
 } from "./engine/attention";
 import { useRuntimeStore } from "./stores/runtimeStore";
@@ -95,9 +96,17 @@ export function useAttentionNotifications(): void {
 
     const sameProject = prevProject.current === projectId;
     if (sameProject) {
+      // Read live at fire time (no extra deps / re-baselining): is THIS window the OS-focused
+      // window, and which of its agents is the selected tab. Together they let us suppress the
+      // single "you're already looking at this exact agent" case while still firing for a
+      // different agent, a background window/project, or another app in front.
+      const windowFocused = typeof document !== "undefined" && document.hasFocus();
+      const selectedAgentId =
+        useProjectStore.getState().projects.find((p) => p.id === projectId)?.selectedAgentId ?? null;
       for (const { id, status: st } of newlyEntered(prevStatus.current, status, ownedIds, enabled)) {
         const agent = agents.find((a) => a.id === id);
         if (!agent || projectId == null) continue;
+        if (suppressNotification({ windowFocused, selectedAgentId, agentId: id })) continue;
         notifyAttention({ projectId, agentId: id, ...notificationFor(st, agent.name, projectName) });
       }
     }

@@ -11,8 +11,7 @@ export const STOP_PHRASE = "Sparkle, stop";
 // BOTH capturing (status "listening") AND in the active phase — never while merely waiting for
 // the wake word, or the composer lies about being in dictation mode (sparkle voice-status bug).
 export const MIC_HOT_PREFIX = "I'm listening, so just start talking. Say ";
-export const MIC_HOT_SUFFIX =
-  " to finish. (or if you want to be a slowpoke, start typing here instead.)";
+export const MIC_HOT_SUFFIX = " to finish.";
 export const MIC_HOT_PLACEHOLDER = `${MIC_HOT_PREFIX}${STOP_PHRASE}${MIC_HOT_SUFFIX}`;
 
 // PASSIVE phase (capturing, but listening for the wake word — NOT yet dictating). Mirrors the
