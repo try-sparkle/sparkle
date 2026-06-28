@@ -1,5 +1,11 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, it, expect, vi } from "vitest";
-import { openProjectInWindow, type ProjectWindowDeps } from "./projectWindows";
+import {
+  openProjectInWindow,
+  WINDOW_LABEL_PREFIX,
+  type ProjectWindowDeps,
+} from "./projectWindows";
 
 function makeDeps(over: Partial<ProjectWindowDeps> = {}): ProjectWindowDeps {
   return {
@@ -63,5 +69,32 @@ describe("openProjectInWindow", () => {
     const r = await openProjectInWindow("p4", "new", deps);
     expect(r).toBe("created");
     expect(clear).toHaveBeenCalledWith("project-ghost");
+  });
+});
+
+describe("Tauri capability coverage for runtime windows", () => {
+  // Regression for the bug where secondary windows were created with `win-*` labels but the
+  // capability `windows` glob only listed `["main", "project-*"]`. In Tauri v2 a window matching
+  // no capability gets ZERO permissions, so invoke()/listen() silently failed → mic showed
+  // "unavailable" and the agent hung on "Starting your agent...". This guards the glob↔prefix sync.
+  const caps = JSON.parse(
+    readFileSync(
+      fileURLToPath(new URL("../../src-tauri/capabilities/default.json", import.meta.url)),
+      "utf8",
+    ),
+  ) as { windows: string[] };
+
+  // Minimal glob → RegExp (labels have no slashes; `*` = any run of chars), mirroring how Tauri
+  // matches a window label against a capability's `windows` patterns.
+  const globToRe = (g: string) =>
+    new RegExp("^" + g.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$");
+  const covered = (label: string) => caps.windows.some((g) => globToRe(g).test(label));
+
+  it("covers the initial 'main' window", () => {
+    expect(covered("main")).toBe(true);
+  });
+
+  it("covers runtime-created windows using the actual label prefix", () => {
+    expect(covered(`${WINDOW_LABEL_PREFIX}123e4567-e89b-12d3-a456-426614174000`)).toBe(true);
   });
 });

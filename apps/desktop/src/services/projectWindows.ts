@@ -7,6 +7,12 @@ import { clearWindowProject, findWindowForProject, setWindowProject } from "./wi
 
 export type OpenMode = "replace" | "new";
 
+/** Prefix for runtime-created (secondary) window labels. MUST stay covered by a glob in
+ *  src-tauri/capabilities/default.json's `windows` list — a window whose label matches no
+ *  capability gets ZERO permissions in Tauri v2, so invoke()/listen() silently fail (mic +
+ *  PTY/agent break). The label is otherwise opaque (decoupled from the project id). */
+export const WINDOW_LABEL_PREFIX = "win-";
+
 interface FocusableWindow {
   show(): Promise<void>;
   unminimize(): Promise<void>;
@@ -86,7 +92,7 @@ export function defaultDeps(
       // Opaque, collision-proof label (decoupled from the project id). Register it before/with
       // creation so a concurrent open finds it; on a creation failure ('tauri://error') evict the
       // entry so a later open doesn't focus a window that never came up.
-      const label = `win-${crypto.randomUUID()}`;
+      const label = `${WINDOW_LABEL_PREFIX}${crypto.randomUUID()}`;
       setWindowProject(label, projectId);
       const win = new WebviewWindow(label, {
         url: projectWindowUrl(projectId, label),
