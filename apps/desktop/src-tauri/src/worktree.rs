@@ -7,8 +7,11 @@
 //!
 //! Dependency-free: we shell out to the system `git` via std::process::Command.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -506,6 +509,121 @@ fn probe_pr(root: &str, branch: &str) -> (Option<String>, Option<u64>, Option<St
     (state, number, url)
 }
 
+/// Pure decoder for a GitHub `commits/<sha>/pulls` response array → (state, number, url). That
+/// endpoint reports `state` as only "open"/"closed" plus a separate `merged_at`; we fold
+/// `merged_at != null` into the "merged" state the rest of the pipeline expects, and it carries the
+/// PR link as `html_url` (not `url`). Takes the first row; empty array ⇒ all-None. Kept pure so the
+/// state-folding is unit-testable without spawning `gh`.
+fn decode_commit_pulls(rows: &[Value]) -> (Option<String>, Option<u64>, Option<String>) {
+    let none = (None, None, None);
+    // The endpoint can return SEVERAL PRs whose head contains the tip (a reused branch, cherry-picks,
+    // or an old + a new PR), and its ordering is not guaranteed "most relevant first". Prefer a merged
+    // PR (the tip shipped), then an open one (in review), else the first — so a stale closed PR can't
+    // shadow the one that actually reflects this tip's stage.
+    let merged_idx =
+        rows.iter().position(|pr| pr.get("merged_at").map(|v| !v.is_null()).unwrap_or(false));
+    let open_idx = rows.iter().position(|pr| pr.get("state").and_then(Value::as_str) == Some("open"));
+    let pick = merged_idx
+        .or(open_idx)
+        .map(|i| &rows[i])
+        .or_else(|| rows.first());
+    let Some(pr) = pick else {
+        return none;
+    };
+    let merged = pr.get("merged_at").map(|v| !v.is_null()).unwrap_or(false);
+    let state = if merged {
+        Some("merged".to_string())
+    } else {
+        pr.get("state").and_then(Value::as_str).map(str::to_ascii_lowercase)
+    };
+    let number = pr.get("number").and_then(Value::as_u64);
+    let url = pr.get("html_url").and_then(Value::as_str).map(str::to_string);
+    (state, number, url)
+}
+
+/// The tip-relative lookup is authoritative iff it actually identified a PR — i.e. it carries a PR
+/// NUMBER (a PR isn't actionable without one). Pure + tested so the "fall back to the branch-name
+/// probe" decision can't silently regress; kept as a predicate (not an eager 2-arg chooser) so the
+/// caller still short-circuits the second `gh` round-trip on the common success path.
+fn commit_pr_is_usable(by_commit: &(Option<String>, Option<u64>, Option<String>)) -> bool {
+    by_commit.1.is_some()
+}
+
+/// TIP-RELATIVE PR lookup: find the PR whose head contains commit `tip`, via the GitHub API, so a PR
+/// opened from a RENAMED branch (head ≠ `sparkle/agent-<id>`) is still detected — the branch-name
+/// probe (`probe_pr`) misses those. Being keyed on the current tip also means it stops reporting
+/// "merged" once new commits are stacked past a merge (the new tip isn't in that PR), which is what
+/// lets the tracker reset for a fresh work cycle. Best-effort: any failure yields all-None.
+fn probe_pr_by_commit(root: &str, tip: &str) -> (Option<String>, Option<u64>, Option<String>) {
+    let none = (None, None, None);
+    if tip.trim().is_empty() {
+        return none;
+    }
+    let mut cmd = Command::new("gh");
+    // gh substitutes {owner}/{repo} from the repo at `current_dir`. The endpoint returns the PRs
+    // whose head branch contains `tip`, regardless of that branch's name.
+    cmd.arg("api")
+        .arg(format!("repos/{{owner}}/{{repo}}/commits/{tip}/pulls"))
+        .arg("-H")
+        .arg("Accept: application/vnd.github+json")
+        .current_dir(root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    let Ok(output) = cmd.output() else {
+        return none; // gh not installed / failed to spawn
+    };
+    if !output.status.success() {
+        return none; // un-pushed tip (404), not authed, no network, …
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Ok(rows) = serde_json::from_str::<Vec<Value>>(&stdout) else {
+        return none;
+    };
+    decode_commit_pulls(&rows)
+}
+
+/// Per-repo cooldown between opportunistic `git fetch`es. Reachability into `origin/<default>` is
+/// only as fresh as the last fetch; when a PR is merged in ANOTHER worktree/session this repo's
+/// remote-tracking ref goes stale and the tracker understates "On Main"/"Merged" until something
+/// fetches. We refresh it ourselves on the slow (network-allowed) poll — but at most once per repo
+/// per cooldown, so N open agents don't trigger N fetches and we don't hammer the remote. The poll
+/// runs ~every 30s, so 20s makes it fire about once per poll cycle. (The gh PR probe is already
+/// authoritative for merged PRs; this self-heals the *reachability* path for merges with no PR, or
+/// when gh is unavailable.)
+const FETCH_COOLDOWN: Duration = Duration::from_secs(20);
+
+fn last_fetch() -> &'static Mutex<HashMap<String, Instant>> {
+    static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pure throttle decision (testable without a clock): fetch if we never have, or the cooldown has
+/// elapsed since the last one.
+fn fetch_due(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        Some(t) => now.duration_since(t) >= FETCH_COOLDOWN,
+        None => true,
+    }
+}
+
+/// Best-effort, throttled refresh of `origin/<default>` so a cross-worktree/session merge shows up
+/// without the user pulling. Any failure (offline, no auth, no remote) is ignored — `git` already
+/// runs non-interactive, so a missing credential fails fast rather than prompting.
+fn maybe_refresh_origin(root: &str, default_branch: &str) {
+    let now = Instant::now();
+    {
+        let Ok(mut map) = last_fetch().lock() else {
+            return; // a poisoned lock must never break the poll
+        };
+        if !fetch_due(map.get(root).copied(), now) {
+            return;
+        }
+        map.insert(root.to_string(), now);
+    }
+    let _ = git(root, &["fetch", "--quiet", "--no-tags", "origin", default_branch]);
+}
+
 /// Core (AppHandle-free, testable): the agent's land-to-green workflow state. `parent_branch` is
 /// the orchestrator's branch for workers (empty/None for others). `probe_pr_state` gates the gh
 /// network probe so a pure-local project (or a fast poll) can skip it entirely.
@@ -525,6 +643,14 @@ pub fn agent_workflow_state_at(
     };
 
     let default_branch = resolve_default_branch(root);
+    // On the network-allowed poll, opportunistically refresh origin/<default> FIRST so the
+    // reachability checks below see a merge that landed in another worktree/session (throttled per
+    // repo). Gated on `probe_pr_state` so the fast/local poll skips the `git remote` spawn entirely;
+    // computed once and reused for the PR-probe gate below (both uses are network-poll-only).
+    let has_origin = probe_pr_state && git(root, &["remote", "get-url", "origin"]).is_ok();
+    if has_origin {
+        maybe_refresh_origin(root, &default_branch);
+    }
     let in_local_main = ref_contains(root, &default_branch, &tip);
     let origin_ref = format!("origin/{default_branch}");
     let in_origin_main = ref_contains(root, &origin_ref, &tip);
@@ -547,9 +673,17 @@ pub fn agent_workflow_state_at(
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
 
-    // Only spend a network round-trip on the PR probe when asked AND a remote exists.
-    let (pr_state, pr_number, pr_url) = if probe_pr_state && git(root, &["remote", "get-url", "origin"]).is_ok() {
-        probe_pr(root, &branch)
+    // Only spend a network round-trip on the PR probe when asked AND a remote exists. Try the
+    // TIP-RELATIVE lookup first (finds the PR by commit, so a renamed head still resolves and a
+    // tip stacked past a merge stops reading as "merged"); fall back to the branch-name probe when
+    // the tip isn't associated with any PR (e.g. un-pushed, or a head gh can't map by commit).
+    let (pr_state, pr_number, pr_url) = if has_origin {
+        let by_commit = probe_pr_by_commit(root, &tip);
+        if commit_pr_is_usable(&by_commit) {
+            by_commit
+        } else {
+            probe_pr(root, &branch)
+        }
     } else {
         (None, None, None)
     };
@@ -1077,6 +1211,73 @@ mod tests {
         let status = child.wait().expect("pty child wait");
         assert!(status.success(), "pty child exited non-zero: {status:?}");
         out
+    }
+
+    #[test]
+    fn decode_commit_pulls_folds_state() {
+        // Open PR: state "open", no merge timestamp, link comes from `html_url`.
+        let open = json!([{ "number": 7, "state": "open", "merged_at": Value::Null, "html_url": "https://gh/7" }]);
+        let (s, n, u) = decode_commit_pulls(open.as_array().unwrap());
+        assert_eq!(s.as_deref(), Some("open"));
+        assert_eq!(n, Some(7));
+        assert_eq!(u.as_deref(), Some("https://gh/7"));
+
+        // Merged: the endpoint still says state "closed" — `merged_at` is what proves it merged.
+        let merged = json!([{ "number": 8, "state": "closed", "merged_at": "2026-01-01T00:00:00Z", "html_url": "https://gh/8" }]);
+        let (s, n, _) = decode_commit_pulls(merged.as_array().unwrap());
+        assert_eq!(s.as_deref(), Some("merged"));
+        assert_eq!(n, Some(8));
+
+        // Closed but not merged stays "closed".
+        let closed = json!([{ "number": 9, "state": "closed", "merged_at": Value::Null }]);
+        let (s, _, _) = decode_commit_pulls(closed.as_array().unwrap());
+        assert_eq!(s.as_deref(), Some("closed"));
+
+        // No PR associated with the commit ⇒ all-None.
+        let (s, n, u) = decode_commit_pulls(&[]);
+        assert!(s.is_none() && n.is_none() && u.is_none());
+    }
+
+    #[test]
+    fn decode_commit_pulls_disambiguates_multiple_prs() {
+        // Several PRs contain the tip and the order isn't relevance-sorted: a merged PR wins over
+        // anything else, so a trailing closed/open row can't shadow the ship.
+        let many = json!([
+            { "number": 1, "state": "closed", "merged_at": Value::Null },
+            { "number": 2, "state": "open", "merged_at": Value::Null },
+            { "number": 3, "state": "closed", "merged_at": "2026-01-01T00:00:00Z" },
+        ]);
+        let (s, n, _) = decode_commit_pulls(many.as_array().unwrap());
+        assert_eq!(s.as_deref(), Some("merged"));
+        assert_eq!(n, Some(3));
+
+        // No merged PR ⇒ an OPEN one is preferred over a leading closed row.
+        let no_merge = json!([
+            { "number": 4, "state": "closed", "merged_at": Value::Null },
+            { "number": 5, "state": "open", "merged_at": Value::Null },
+        ]);
+        let (s, n, _) = decode_commit_pulls(no_merge.as_array().unwrap());
+        assert_eq!(s.as_deref(), Some("open"));
+        assert_eq!(n, Some(5));
+    }
+
+    #[test]
+    fn fetch_due_respects_cooldown() {
+        let now = Instant::now();
+        assert!(fetch_due(None, now), "never fetched ⇒ due");
+        assert!(!fetch_due(Some(now), now), "just fetched ⇒ not due");
+        let long_ago = now.checked_sub(FETCH_COOLDOWN + Duration::from_secs(1)).unwrap();
+        assert!(fetch_due(Some(long_ago), now), "past the cooldown ⇒ due");
+        let recent = now.checked_sub(FETCH_COOLDOWN / 2).unwrap();
+        assert!(!fetch_due(Some(recent), now), "within the cooldown ⇒ not due");
+    }
+
+    #[test]
+    fn commit_pr_usability_gates_on_number() {
+        // A PR is only authoritative (skip the branch-name fallback) when it carries a number.
+        assert!(commit_pr_is_usable(&(Some("open".into()), Some(7), None)));
+        assert!(!commit_pr_is_usable(&(Some("open".into()), None, None))); // state but no number ⇒ fall back
+        assert!(!commit_pr_is_usable(&(None, None, None)));
     }
 
     #[test]

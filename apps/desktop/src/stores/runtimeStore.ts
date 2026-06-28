@@ -141,12 +141,18 @@ interface RuntimeState {
   // engine.deriveLiveStage), advanced monotonically. The sidebar overlays it on the git-derived
   // stage (resolveStage) and rolls workers up into their orchestrator. Live-only (never persisted).
   workflowStage: Record<string, WorkflowStageId>;
+  // agentId -> has this agent's OWN work EVER reached "main" or beyond. A sticky watermark (set once,
+  // never cleared until the agent closes) so the row keeps a "shipped ✓" even after the live stage
+  // RESETS to a new cycle (deriveLiveStage drops back to Committed when fresh work lands on a branch
+  // that already shipped). Live-only (never persisted), same as the maps above.
+  workflowShipped: Record<string, boolean>;
 
   open: (agentId: string) => void;
   close: (agentId: string) => void;
   setStatus: (agentId: string, status: AgentTabStatus) => void;
   setBranchStatus: (agentId: string, s: BranchStatus) => void;
   setWorkflowStage: (agentId: string, stage: WorkflowStageId) => void;
+  setWorkflowShipped: (agentId: string, shipped: boolean) => void;
   /** Fetch + store this agent's branch status. Best-effort: a transient git error is swallowed
    *  so the UI never breaks. */
   pollBranchStatus: (
@@ -172,6 +178,7 @@ export const useRuntimeStore = create<RuntimeState>()(
       openAgentIds: [],
       branchStatus: {},
       workflowStage: {},
+      workflowShipped: {},
 
       open: (agentId) =>
         set((s) =>
@@ -185,11 +192,13 @@ export const useRuntimeStore = create<RuntimeState>()(
           const { [agentId]: _removed, ...status } = s.status;
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
+          const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
           return {
             openAgentIds: s.openAgentIds.filter((id) => id !== agentId),
             status,
             branchStatus,
             workflowStage,
+            workflowShipped,
           };
         }),
 
@@ -201,6 +210,9 @@ export const useRuntimeStore = create<RuntimeState>()(
 
       setWorkflowStage: (agentId, stage) =>
         set((st) => ({ workflowStage: { ...st.workflowStage, [agentId]: stage } })),
+
+      setWorkflowShipped: (agentId, shipped) =>
+        set((st) => ({ workflowShipped: { ...st.workflowShipped, [agentId]: shipped } })),
 
       pollBranchStatus: async (root, projectId, agentId, baseBranch) => {
         try {
@@ -245,6 +257,12 @@ export const useRuntimeStore = create<RuntimeState>()(
             parentReachedMain,
           });
           if (next !== prev) get().setWorkflowStage(agentId, next);
+          // Sticky "shipped" watermark: latch true the first time work reaches On Main (or beyond).
+          // It survives a later cycle reset (deriveLiveStage dropping `next` back to Committed), so the
+          // row keeps its ✓ even while the bar re-climbs for new work.
+          if (stageIndex(next) >= stageIndex("main") && !get().workflowShipped[agentId]) {
+            get().setWorkflowShipped(agentId, true);
+          }
         } catch (e) {
           console.debug("refreshWorkflowStage failed for", agentId, e);
         }

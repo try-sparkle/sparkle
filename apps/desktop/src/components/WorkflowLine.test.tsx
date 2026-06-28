@@ -26,9 +26,13 @@ describe("WorkflowLine", () => {
     expect((label as HTMLElement).style.color).toBe(hexToRgbStyle(stageLineColor("merged")));
   });
 
-  it("prefixes the detail when asked (orchestrator roll-up)", () => {
-    render(<WorkflowLine stage="committed" expanded labelPrefix="Overall: " />);
-    expect(screen.getByText(`Overall: ${stageMeta("committed").detail}`)).toBeTruthy();
+  it("shows a sticky ✓ once shipped — even when the bar has reset to an earlier stage", () => {
+    // A new cycle resets the live stage back to Committed, but a prior ship keeps the ✓.
+    const { rerender } = render(<WorkflowLine stage="committed" shipped />);
+    expect(screen.getByLabelText("Landed at least once").textContent).toBe("✓");
+    // Not shipped → no ✓.
+    rerender(<WorkflowLine stage="committed" />);
+    expect(screen.queryByLabelText("Landed at least once")).toBeNull();
   });
 });
 

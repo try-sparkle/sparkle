@@ -23,8 +23,10 @@ const STORE_KEY = "sparkle-runtime";
 
 // Mocked branch-status backend so pollBranchStatus tests don't touch Tauri/git.
 const agentBranchStatus = vi.fn();
+const agentWorkflowState = vi.fn();
 vi.mock("../services/branchStatus", () => ({
   agentBranchStatus: (...a: unknown[]) => agentBranchStatus(...a),
+  agentWorkflowState: (...a: unknown[]) => agentWorkflowState(...a),
 }));
 
 // Mocked Chief sync so the store-glue tests don't touch Tauri/Chief.
@@ -52,6 +54,7 @@ async function freshModules() {
 
 beforeEach(() => {
   agentBranchStatus.mockReset();
+  agentWorkflowState.mockReset();
   syncProjectMarkdown.mockReset();
   (globalThis as unknown as { localStorage: Storage }).localStorage =
     new MemoryStorage() as unknown as Storage;
@@ -126,6 +129,55 @@ describe("runtimeStore branch status", () => {
     agentBranchStatus.mockRejectedValue(new Error("git boom"));
     await useRuntimeStore.getState().pollBranchStatus("/root", "p1", "a1", "main");
     expect(useRuntimeStore.getState().branchStatus["a1"]).toEqual(old);
+  });
+});
+
+describe("runtimeStore — workflowShipped sticky latch (review #13591)", () => {
+  const wsState = (p: Record<string, unknown>) => ({
+    inLocalMain: false,
+    inOriginMain: false,
+    inParent: false,
+    aheadOfBase: 0,
+    prState: null,
+    prNumber: null,
+    prUrl: null,
+    ...p,
+  });
+  const bsStatus = (ahead: number) => ({
+    ahead,
+    behind: 0,
+    dirty: false,
+    filesChanged: 1,
+    insertions: 1,
+    deletions: 0,
+  });
+
+  it("latches on first reach of main and stays true after the bar resets to a new cycle", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+
+    // Ship: committed work whose tip is in local main → stage advances to "main".
+    store.getState().setBranchStatus(agentId, bsStatus(1));
+    agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(store.getState().workflowStage[agentId]).toBe("main");
+    expect(store.getState().workflowShipped[agentId]).toBe(true);
+
+    // New cycle: fresh un-landed commits, tip-relative signals fallen back → the bar resets…
+    store.getState().setBranchStatus(agentId, bsStatus(2));
+    agentWorkflowState.mockResolvedValue(wsState({}));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(store.getState().workflowStage[agentId]).toBe("committed");
+    // …but the sticky ✓ latch survives — that's the whole point of the separate flag.
+    expect(store.getState().workflowShipped[agentId]).toBe(true);
+  });
+
+  it("close() clears the sticky latch so a reused id doesn't inherit a stale ✓", async () => {
+    const { runtime, agentId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    store.getState().setWorkflowShipped(agentId, true);
+    store.getState().close(agentId);
+    expect(store.getState().workflowShipped[agentId]).toBeUndefined();
   });
 });
 

@@ -180,6 +180,45 @@ describe("deriveLiveStage", () => {
     expect(deriveLiveStage({ kind: "build", bs: bs({ dirty: true }), prev: "merged" })).toBe("merged");
   });
 
+  it("resets to a new cycle when fresh commits land after the work already shipped", () => {
+    // Prior work merged (prev=merged); now new, un-landed commits exist (ahead>0) and the tip-relative
+    // signals have fallen back (no merged PR for this tip). The bar should track the NEW cycle, not
+    // stay pinned green.
+    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 2 }), prev: "merged" })).toBe("committed");
+  });
+
+  it("resets from On Main too (landed locally, not yet origin) when fresh commits land", () => {
+    // `landedBefore` includes "main" — the more common real-world trigger, since local-main landing
+    // precedes the origin merge.
+    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 2 }), prev: "main" })).toBe("committed");
+  });
+
+  it("resets on non-default-base work where ahead==0 but aheadOfBase>0, flooring at committed", () => {
+    // A worker synced to its baseBranch (bs.ahead 0) but with fresh authored commits vs the cut ref:
+    // the same evidence-of-work `committedSeen` trusts triggers the reset — and since that evidence
+    // IS a commit signal, the floor is "committed", not "uncommitted" (no understating real commits).
+    expect(
+      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfBase: 1 }), prev: "merged" }),
+    ).toBe("committed");
+    // Same off-base reset from the On Main watermark (local-main landing precedes the origin merge).
+    expect(
+      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfBase: 1 }), prev: "main" }),
+    ).toBe("committed");
+  });
+
+  it("a dirty edit after a merge is noise — it does NOT reset (still clamps to the watermark)", () => {
+    // ahead 0 (nothing committed), just an uncommitted edit on a shipped branch → stays merged.
+    expect(deriveLiveStage({ kind: "build", bs: bs({ dirty: true, ahead: 0 }), prev: "merged" })).toBe(
+      "merged",
+    );
+  });
+
+  it("the new cycle climbs again — an open PR on the fresh commits reaches Pull Request", () => {
+    expect(
+      deriveLiveStage({ kind: "build", bs: bs({ ahead: 1 }), ws: ws({ prState: "open" }), prev: "merged" }),
+    ).toBe("pull_request");
+  });
+
   it("aheadOfBase satisfies the committed gate when bs.ahead is measured against a non-default base", () => {
     // bs.ahead == 0 (synced to its baseBranch) but the branch IS ahead of project main → work
     // exists, so reachability into the parent should be believed even without a prev watermark.

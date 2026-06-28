@@ -139,7 +139,27 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
     }
   }
 
-  idx = Math.max(idx, prevIdx, 0); // monotonic within a session
+  // `idx` now reflects the CURRENT poll's true stage — prState and reachability (inLocalMain/
+  // inOriginMain/inParent) are tip-relative, so they fall back on their own once the tip advances
+  // past a merge. Apply the monotonic watermark to absorb the post-merge `ahead→0` dip… EXCEPT when
+  // a NEW work cycle has begun: prior work already landed (prev ≥ On Main) but the live signals have
+  // fallen back AND there are fresh UN-landed commits (ahead > 0). That's the user committing more on
+  // a branch whose earlier work already shipped — the bar should track the new cycle, not stay pinned
+  // green. A merely dirty tree (ahead 0) is noise and still clamps to the watermark, so a stray edit
+  // on a merged branch doesn't reset it.
+  const landedBefore = prevIdx >= stageIndex("main");
+  // "Fresh un-landed work exists" — mirror `committedSeen`'s two git angles so a branch cut from a
+  // non-default base (bs.ahead can read 0 while ws.aheadOfBase counts the authored commits) still
+  // resets. The watermark itself is NOT an angle here: it's `prev`, the very thing we're deciding to
+  // release.
+  const freshWork = (bs?.ahead ?? 0) > 0 || (ws?.aheadOfBase ?? 0) > 0;
+  const newCycle = landedBefore && idx < prevIdx && freshWork;
+  // A new cycle floors at Committed, never Uncommitted: `freshWork` is itself a commit signal
+  // (ahead OR aheadOfBase), so by the time we reset there ARE authored commits. Without this floor a
+  // non-default-base branch (bs.ahead 0 but ws.aheadOfBase > 0, so gitDerivedStage reads Uncommitted)
+  // would show committed work as "Uncommitted" — the same trigger/floor asymmetry the freshWork fix
+  // closed on the trigger side.
+  idx = newCycle ? Math.max(idx, stageIndex("committed")) : Math.max(idx, prevIdx, 0);
   return stageAt(idx).id;
 }
 

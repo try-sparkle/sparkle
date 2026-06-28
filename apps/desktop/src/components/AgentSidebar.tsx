@@ -22,7 +22,7 @@ import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
 import { WorkflowLine } from "./WorkflowLine";
 import { HistorySearch } from "./HistorySearch";
-import { resolveStage, rollupStages, stageMeta, stageFraction } from "../engine/workflowStage";
+import { resolveStage, rollupStages, stageMeta, stageFraction, stageIndex } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { CloseWorkerPrompt } from "./CloseWorkerPrompt";
 
@@ -134,6 +134,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const status = useRuntimeStore((s) => s.status);
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
+  const workflowShipped = useRuntimeStore((s) => s.workflowShipped);
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
@@ -146,6 +147,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // The workflow stage an agent's own git state + any known override resolves to.
   const stageOf = (id: string): WorkflowStageId =>
     resolveStage(branchStatus[id], workflowStage[id]);
+  // Has this agent ever shipped (reached On Main+)? Sticky flag set by refreshWorkflowStage, OR'd
+  // with the current resolved stage so the ✓ shows even on the first tick that lands it.
+  const shippedOf = (id: string): boolean =>
+    (workflowShipped[id] ?? false) || stageIndex(stageOf(id)) >= stageIndex("main");
 
   // Keep the workflow trackers live: re-poll branch + workflow state on a modest cadence (and once
   // immediately on project switch), so the chevrons advance toward green as work is committed, PR'd,
@@ -568,6 +573,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             AGENT_STATUS[st].color === AGENT_STATUS.done.color ? C.agentIdle : AGENT_STATUS[st].color;
           const isActive = !activeSpecial && project.selectedAgentId === a.id;
           const bs = branchStatus[a.id];
+          // The ✓ on the head row reflects the whole build: itself OR any worker that has shipped.
+          const rowShipped =
+            shippedOf(a.id) || (a.id === top.id && workers.some((w) => shippedOf(w.id)));
           // Indent by tree position, not by parentId: the group head (top) sits at depth 0 — so
           // an orphaned worker surfaced as its own head isn't mis-indented — and real children at 1.
           const depth = a.id === top.id ? 0 : 1;
@@ -582,6 +590,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               statusColor={color}
               bs={bs}
               trackerStage={trackerStage}
+              shipped={rowShipped}
               workerCount={a.id === top.id ? workers.length : 0}
               orderedIndex={rowIndex}
               dragActive={dragId != null}
@@ -731,6 +740,7 @@ function AgentRow({
   statusColor,
   bs,
   trackerStage,
+  shipped,
   workerCount,
   orderedIndex,
   dragActive,
@@ -751,6 +761,8 @@ function AgentRow({
   statusColor: string;
   bs?: BranchStatus;
   trackerStage: WorkflowStageId | null;
+  /** This agent has reached On Main at least once → render a sticky ✓ on the progress line. */
+  shipped?: boolean;
   // Number of workers under this row (orchestrators only; 0 for workers/leaf agents) — shown in
   // the hover card's "Progress" line.
   workerCount: number;
@@ -1020,7 +1032,7 @@ function AgentRow({
               "Progress" detail line below carries the same information in words there. */}
           {!expanded && trackerStage && (
             <div style={{ marginTop: 1 }}>
-              <WorkflowLine stage={trackerStage} expanded={false} />
+              <WorkflowLine stage={trackerStage} expanded={false} shipped={shipped} />
             </div>
           )}
           {/* Expanded: the structured detail lines — Location, Status, Progress. */}
@@ -1079,6 +1091,11 @@ function AgentRow({
                   <span style={{ color: C.muted, fontSize: 11 }}>
                     {workerCount > 0 ? `${workerCount} worker${workerCount === 1 ? "" : "s"}. ` : ""}
                     {progressPct}% complete{workerCount > 0 ? " overall" : ""}.
+                    {/* Carry the sticky "landed" signal into the expanded card too, so the ✓ doesn't
+                        vanish on hover — it persists even after the bar resets for a new cycle. */}
+                    {shipped && (
+                      <span style={{ color: stageMeta("merged").color, fontWeight: 600 }}> ✓ Landed</span>
+                    )}
                   </span>
                 </DetailLine>
               )}

@@ -10,17 +10,22 @@ import type { WorkflowStageId } from "../engine/workflowStage";
 // Unfilled track: a faint muted rail so the remaining path reads as "to do" without looking broken.
 const TRACK_BG = "rgba(138,160,196,0.22)";
 
+// The sticky "shipped" check is the path's end color — brand success green — so it reads as the same
+// "done" signal the full bar lands on, even when the bar itself has reset for a new cycle.
+const SHIPPED_COLOR = stageMeta("merged").color;
+
 export function WorkflowLine({
   stage,
   expanded = false,
-  labelPrefix,
+  shipped = false,
   height = 2,
 }: {
   stage: WorkflowStageId;
   /** Row is hovered/expanded → reveal the status label to the right of the line. */
   expanded?: boolean;
-  /** Optional text before the stage name, e.g. "Overall: " for an orchestrator roll-up. */
-  labelPrefix?: string;
+  /** This agent's work has reached main at least once — show a persistent ✓ even if the live
+   *  stage has since reset to a new cycle. */
+  shipped?: boolean;
   height?: number;
 }) {
   const frac = stageFraction(stage);
@@ -28,6 +33,24 @@ export function WorkflowLine({
   const meta = stageMeta(stage);
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", minWidth: 0 }}>
+      {shipped && (
+        <span
+          // "Landed", not "shipped to main": stage "main" means merged into the integration branch —
+          // local main for a build agent, the orchestrator's branch for a worker — which only implies
+          // real origin/main at the "merged" stage. Base-relative wording stays honest for both.
+          aria-label="Landed at least once"
+          title="Landed at least once"
+          style={{
+            flex: "0 0 auto",
+            fontSize: 11,
+            lineHeight: 1,
+            fontWeight: 700,
+            color: SHIPPED_COLOR,
+          }}
+        >
+          ✓
+        </span>
+      )}
       <div
         role="img"
         aria-label={`Workflow stage: ${meta.label}`}
@@ -67,7 +90,6 @@ export function WorkflowLine({
             whiteSpace: "nowrap",
           }}
         >
-          {labelPrefix}
           {meta.detail}
         </span>
       )}
