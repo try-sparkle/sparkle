@@ -294,16 +294,21 @@ export function Composer({
       const container = containerRef.current;
       if (!ta || !container) return;
       // Overhead = everything that isn't the textarea (handle, padding, attachment thumbs,
-      // status rows, the send/mic/camera buttons). The textarea is the only flexible
-      // element, so this difference is invariant to the textarea's own height.
-      const overhead = container.offsetHeight - ta.offsetHeight;
-      const borderY = ta.offsetHeight - ta.clientHeight; // textarea border (client excludes it)
-      // Read the natural content height free of the flex stretch, then restore. The textarea is a
-      // child of a `display:flex` wrapper whose direction is the default `row`, so the textarea's
-      // CROSS axis (the one pinned by `align-items: stretch`) is VERTICAL and its MAIN axis is
-      // HORIZONTAL (width). To collapse the height to content we must opt out of the cross-axis
-      // stretch — `align-self:flex-start` + `height:"auto"` — which is what lets scrollHeight report
-      // the real content height instead of the stretched height.
+      // status rows, the send/mic/camera buttons). We read it by DIFFERENCE (container minus
+      // textarea), which is only valid when the container is sized to its content — but the
+      // container is rendered at a FIXED `height: autoHeight`. So when a tall attachment row is
+      // added it squeezes the (flex:1, minHeight:0) textarea inside that fixed box, and reading
+      // container.offsetHeight here would report the stale pre-grow height instead of the chrome
+      // the content now needs — the box then fails to grow and the thumbnail overlaps the input
+      // (the reported drop-a-screenshot bug). Drop the fixed height for the measurement so the
+      // container lays out to its natural content height, making the difference the true chrome.
+      //
+      // Read the natural content height free of the flex stretch too. The textarea is a child of a
+      // `display:flex` wrapper whose direction is the default `row`, so the textarea's CROSS axis
+      // (the one pinned by `align-items: stretch`) is VERTICAL and its MAIN axis is HORIZONTAL
+      // (width). To collapse the height to content we opt out of the cross-axis stretch —
+      // `align-self:flex-start` + `height:"auto"` — which lets scrollHeight report the real content
+      // height instead of the stretched height, and lets the container (now height:auto) shrink-wrap.
       //
       // We must NOT touch `flex` here. `flex` sizes the MAIN (horizontal) axis: setting
       // `flex:"0 0 auto"` collapses the textarea's WIDTH to its intrinsic `cols`-based width (~20
@@ -311,13 +316,24 @@ export function Composer({
       // grew to multiples of the real text, worst on dictation (long appended runs). An empty/1-row
       // draft hid this (one line measures the same at any width), so it only bit once text wrapped.
       // Leaving `flex:1` keeps the measured width equal to the rendered width, so wrapping matches.
+      const prevContainerHeight = container.style.height;
       const prevHeight = ta.style.height;
       const prevAlignSelf = ta.style.alignSelf;
+      container.style.height = "auto";
       ta.style.alignSelf = "flex-start";
       ta.style.height = "auto";
+      // LOAD-BEARING ORDER: this scrollHeight read is the reflow trigger that flushes the three
+      // style writes above, so the offsetHeight reads that follow see the shrink-wrapped layout
+      // (not a stale one). Keep it first — moving a style write below this read would silently
+      // reintroduce a stale-layout measurement.
       const contentH = ta.scrollHeight; // content + vertical padding (no border)
+      const borderY = ta.offsetHeight - ta.clientHeight; // textarea border (client excludes it)
+      // True chrome: with the container shrink-wrapped and the textarea at one row, everything
+      // that isn't the textarea is the overhead — independent of any prior squeeze.
+      const overhead = container.offsetHeight - ta.offsetHeight;
       ta.style.height = prevHeight;
       ta.style.alignSelf = prevAlignSelf;
+      container.style.height = prevContainerHeight;
       const desired = overhead + contentH + borderY;
       // Attachment thumbnails eat a fixed row above the textarea; raise the height floor so they
       // can't squeeze the input to a sliver (overhead already includes the thumb row). Without

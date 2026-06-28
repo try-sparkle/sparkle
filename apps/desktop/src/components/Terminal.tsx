@@ -302,12 +302,32 @@ export function Terminal({
       }
     };
 
+    // Force a full repaint shortly after output stops arriving. The WebGL renderer only
+    // repaints cells it tracks as dirty, so rows that were revealed at the TOP of the viewport
+    // when it grew — or that a full-screen redraw (alternate-buffer TUI) rewrote — can stay
+    // blank until a scroll marks them dirty (the recurring "top half of the terminal is blank
+    // until I scroll" bug). The resize/become-active paths already refresh, but a settled turn
+    // with no resize was uncovered. Debounce so streaming output pays one repaint after it
+    // settles, not one per chunk; refresh() only marks rows dirty (cheap, no scroll change).
+    let settleRepaintTimer: number | null = null;
+    const scheduleSettleRepaint = () => {
+      if (settleRepaintTimer) window.clearTimeout(settleRepaintTimer);
+      settleRepaintTimer = window.setTimeout(() => {
+        try {
+          term.refresh(0, term.rows - 1);
+        } catch {
+          /* terminal disposed mid-timer — ignore */
+        }
+      }, 80);
+    };
+
     void (async () => {
       const offOut = await onPtyOutput((e) => {
         if (e.id !== agentId) return;
         term.write(e.chunk);
         engine.ingest(e.chunk);
         watchRateLimit(e.chunk);
+        scheduleSettleRepaint();
       });
       const offExit = await onPtyExit((e) => {
         if (e.id !== agentId) return;
@@ -370,6 +390,7 @@ export function Terminal({
       ro.disconnect();
       container.removeEventListener("mouseup", onMouseUp);
       container.removeEventListener("mousedown", onMouseDown);
+      if (settleRepaintTimer) window.clearTimeout(settleRepaintTimer);
       if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
       for (const off of unlistens) off();
       void killPty(agentId).catch(ignorePtyGone);
