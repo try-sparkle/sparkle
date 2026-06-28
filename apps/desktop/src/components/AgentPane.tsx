@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT, AGENT_STATUS } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import {
   prepareAgentWorkspace,
@@ -88,6 +88,18 @@ export function AgentPane({
   const setAgentWorktree = useProjectStore((s) => s.setAgentWorktree);
   const appendPrompt = useProjectStore((s) => s.appendPrompt);
   const setStatus = useRuntimeStore((s) => s.setStatus);
+  // This agent's live status, used to tint the terminal "window bounds" frame: RED when it's
+  // waiting on you (a question/approval on screen), GREEN while working, themed gray otherwise —
+  // the same color the sidebar dot shows, so the frame around the terminal echoes it. Mirrors
+  // AgentSidebar's gray-collapsing (compare to a known-gray status rather than enumerating).
+  const status = useRuntimeStore((s) => s.status[agent.id]);
+  // Default to a neutral gray frame until the first real status arrives, rather than green —
+  // so the bounds never flash "working" before the agent has actually started.
+  const boundsStatus = status ?? "idle";
+  const boundsColor =
+    AGENT_STATUS[boundsStatus].color === AGENT_STATUS.done.color
+      ? C.agentIdle
+      : AGENT_STATUS[boundsStatus].color;
   // Pending "scroll to this prompt" for this agent (set by history-search navigation), consumed
   // once the terminal is the visible, ready pane.
   const scrollIntent = useScrollIntentStore((s) => s.intents[agent.id]);
@@ -505,7 +517,18 @@ export function AgentPane({
         // Relative stage: the terminal fills it; the composer floats over the bottom as an
         // overlay (so dragging the composer never resizes/reflows the terminal beneath it).
         <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
-          <div style={{ position: "absolute", inset: 0, padding: 6 }}>
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              padding: 6,
+              boxSizing: "border-box",
+              // The "terminal window bounds": a status-colored frame so a glance at the terminal
+              // (not just the sidebar dot) tells you whether it's working, waiting on you, or idle.
+              border: `2px solid ${boundsColor}`,
+              borderRadius: 10,
+            }}
+          >
             <Terminal
               agentId={agent.id}
               projectId={project.id}
@@ -563,6 +586,7 @@ export function AgentPane({
               inputRef={composerInputRef}
               apiRef={composerApiRef}
               onArrowOverflow={(dir) => terminalApiRef.current?.arrowFromComposer(dir)}
+              onEnterOverflow={() => terminalApiRef.current?.enterFromComposer()}
               onSubmitPrompt={(t) => {
                 // Record the prompt for the pinned header + history dropdown, and drop a terminal
                 // marker under the same id so "jump to this prompt" (dropdown + history search)

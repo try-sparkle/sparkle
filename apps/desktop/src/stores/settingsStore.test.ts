@@ -24,15 +24,19 @@ describe("effectiveChiefPat — PAT resolution order", () => {
 });
 
 describe("maxConcurrentWorkers", () => {
-  beforeEach(() => useSettingsStore.setState({ maxConcurrentWorkers: 4 }));
-  it("defaults to 4", () => {
-    expect(useSettingsStore.getState().maxConcurrentWorkers).toBe(4);
+  beforeEach(() => useSettingsStore.setState({ maxConcurrentWorkers: 20 }));
+  it("defaults to 20", () => {
+    expect(useSettingsStore.getState().maxConcurrentWorkers).toBe(20);
   });
   it("can be set, flooring at 1", () => {
     useSettingsStore.getState().setMaxConcurrentWorkers(8);
     expect(useSettingsStore.getState().maxConcurrentWorkers).toBe(8);
     useSettingsStore.getState().setMaxConcurrentWorkers(0);
     expect(useSettingsStore.getState().maxConcurrentWorkers).toBe(1); // never < 1
+  });
+  it("has no upper cap (unbounded above)", () => {
+    useSettingsStore.getState().setMaxConcurrentWorkers(999);
+    expect(useSettingsStore.getState().maxConcurrentWorkers).toBe(999);
   });
 });
 

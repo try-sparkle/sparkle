@@ -124,7 +124,9 @@ interface SettingsState {
   /** chiefProjectId -> (doc path -> { content hash, asset id }). The current-state sync ledger:
    *  one entry per path, replaced wholesale each sync. */
   chiefDocStateByProject: Record<string, Record<string, ChiefDocState>>;
-  /** Maximum number of concurrent workers (floored at 1). */
+  /** Maximum number of concurrent workers an orchestrator may run at once, per build agent
+   *  (floored at 1, otherwise unbounded). Adjustable via the slider in the ⋯ menu; the
+   *  orchestration persona reads this same value so the cap it's told about always matches. */
   maxConcurrentWorkers: number;
   /** Use the cloud streaming STT (Deepgram Nova-3) for active dictation when available. Default
    *  on — the gold-standard path. Falls back to the on-device model automatically when off, when
@@ -166,7 +168,7 @@ export const useSettingsStore = create<SettingsState>()(
       runtimeChiefPat: "",
       chiefProjectByProject: {},
       chiefDocStateByProject: {},
-      maxConcurrentWorkers: 4,
+      maxConcurrentWorkers: 20,
       cloudDictation: true,
       aiAutoRename: true,
       aiBrainstorm: true,

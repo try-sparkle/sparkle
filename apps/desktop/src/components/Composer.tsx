@@ -127,6 +127,7 @@ export function Composer({
   apiRef,
   onSubmitPrompt,
   onArrowOverflow,
+  onEnterOverflow,
 }: {
   agentId: string;
   // Only the visible pane's composer reacts to native file drops (panes stay mounted).
@@ -140,6 +141,10 @@ export function Composer({
   // the first. Lets the parent hand focus (and the keypress) to the terminal so the user can
   // drive Claude's menus without clicking. Omit to keep arrows purely native.
   onArrowOverflow?: (dir: "up" | "down") => void;
+  // Called when Enter is pressed while the composer is EMPTY: there's nothing to send, so hand
+  // focus + a carriage return to the terminal to confirm whatever's highlighted there (e.g. the
+  // menu option the user just arrowed to). Omit to keep Enter purely a (no-op) send.
+  onEnterOverflow?: () => void;
 }) {
   const [value, setValue] = useState("");
   // True while a native file (e.g. a log) is dragged over the window — drives the drop hint.
@@ -459,12 +464,17 @@ export function Composer({
     inputRef?.current?.focus();
   };
 
+  // Single source of truth for "is there nothing to send?" — used by both send()'s own gate and
+  // the Enter hand-off below, so the two definitions of "empty" can never drift apart.
+  const isComposerEmpty = () =>
+    !value.trim() && attachments.length === 0 && textBlocks.length === 0;
+
   const send = async () => {
     if (disabled) return; // PTY not spawned yet — don't drop the prompt
     const text = value.trim();
     const atts = attachments;
     const blocks = textBlocks;
-    if (!text && atts.length === 0 && blocks.length === 0) return;
+    if (isComposerEmpty()) return;
     // Free-trial cap (checked BEFORE delivery, consumed AFTER): block once the 100 are spent.
     // Entitled users always pass. When blocked, AuthGate's TrialChrome overlay is already
     // visible (it shows whenever promptsUsed ≥ limit), so this is defense-in-depth, not a
@@ -533,6 +543,14 @@ export function Composer({
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      // Empty composer → there's nothing to send. Instead of a dead keypress, forward Enter to the
+      // terminal so it confirms the highlighted choice in Claude's menu (mirrors onArrowOverflow:
+      // arrows move the highlight, Enter picks it). Skip while an IME composition is committing.
+      // Emptiness matches send()'s own gate via the shared isComposerEmpty() helper.
+      if (isComposerEmpty() && onEnterOverflow && !e.nativeEvent.isComposing) {
+        onEnterOverflow();
+        return;
+      }
       void send();
       return;
     }

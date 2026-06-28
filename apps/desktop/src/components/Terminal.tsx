@@ -37,6 +37,11 @@ export interface TerminalApi {
   // moves focus here and drives whatever's waiting — e.g. Claude's permission menu. The escape
   // sequence honors the app's cursor-key mode (DECCKM) so it lands the same as a real keypress.
   arrowFromComposer: (dir: "up" | "down") => void;
+  // Hand an Enter off from the composer: focus the terminal AND inject a carriage return, so that
+  // pressing Enter in an EMPTY composer confirms whatever's highlighted in the terminal (e.g. the
+  // option the user just moved to with the arrow keys in Claude's menu) without clicking into it.
+  // CR (\r) is exactly what a real Enter keypress sends to a PTY.
+  enterFromComposer: () => void;
   // Drop an xterm marker at the current line under `promptId`, so a later scrollToPrompt can jump
   // the viewport back to where this prompt was sent. No-op on the ALTERNATE buffer (a full-screen
   // TUI has no scrollback to mark). Markers are session-only: they live with this xterm instance
@@ -238,6 +243,13 @@ export function Terminal({
           // see arrowKeySequence. `term.modes` reflects whatever the running TUI last requested.
           const seq = arrowKeySequence(dir, term.modes.applicationCursorKeysMode);
           void writePty(agentId, seq).catch(ignorePtyGone);
+        },
+        enterFromComposer: () => {
+          term.focus();
+          // \r is the byte a real Enter sends to a PTY (the running TUI translates it per its
+          // input mode, exactly as it would a keyboard Enter). This confirms the highlighted menu
+          // choice when the user presses Enter in an empty composer.
+          void writePty(agentId, "\r").catch(ignorePtyGone);
         },
         markPrompt: (promptId) => {
           // Scrollback lives on the normal buffer only; a full-screen TUI (alternate buffer) has

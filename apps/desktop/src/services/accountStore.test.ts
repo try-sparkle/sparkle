@@ -43,6 +43,18 @@ describe("pickAccount", () => {
     expect(pickAccount(accounts, u, { now: NOW })?.id).toBe("b");
   });
 
+  it("ranks by lowest usage even when both accounts dwarf the old static caps (no fallback-to-default)", () => {
+    // Real-world: heavy cache-read usage puts both accounts far above the former 5M/30M guess. With
+    // the default cap neutralized, the near-cap filter no longer excludes everyone (which used to
+    // collapse to the default account); selection picks the genuinely-lower account.
+    const accounts = [acct("a", { isDefault: true }), acct("b")];
+    const u = [
+      usage("a", { tokens7d: 9_000_000_000 }), // the default, but the heavier one
+      usage("b", { tokens7d: 2_000_000_000 }),
+    ];
+    expect(pickAccount(accounts, u, { now: NOW })?.id).toBe("b");
+  });
+
   it("tie-breaks equal 7d on the lowest 5h", () => {
     const accounts = [acct("a"), acct("b")];
     const u = [

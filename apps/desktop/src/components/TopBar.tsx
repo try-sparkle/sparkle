@@ -5,6 +5,7 @@ import { ThemeToggle } from "./ThemeToggle";
 import { AgentOrderToggle } from "./AgentOrderToggle";
 import { BalanceBadge } from "./BalanceBadge";
 import { AiFeaturesMenu } from "./AiFeaturesMenu";
+import { WorkerLimitControl } from "./WorkerLimitControl";
 import { NotificationsMenu } from "./NotificationsMenu";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -362,6 +363,8 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
               <ThemeToggle />
               <div style={{ ...menuLabel, paddingTop: 12 }}>Agent order</div>
               <AgentOrderToggle />
+              <div style={{ ...menuLabel, paddingTop: 12 }}>Max concurrent workers</div>
+              <WorkerLimitControl />
               <div style={{ ...menuLabel, paddingTop: 12 }}>Text size</div>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <button style={zbtn} onClick={zoomOut} title="Zoom out (⌘−)">

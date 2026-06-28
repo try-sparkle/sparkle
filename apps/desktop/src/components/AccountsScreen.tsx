@@ -6,7 +6,6 @@ import {
   addAccount,
   setNickname,
   removeAccount,
-  DEFAULT_NEAR_CAP,
   type Account,
   type Usage,
 } from "../services/accountStore";
@@ -84,26 +83,35 @@ const inputStyle: CSSProperties = {
   padding: "4px 8px",
 };
 
-/** Human-readable token count (e.g. 1.2M, 34k). */
+/** Human-readable token count (e.g. 9.3B, 1.2M, 34k). */
 function fmtTokens(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
   return `${n}`;
 }
 
-/** A labelled usage bar filled relative to the soft near-cap ceiling for its window. There's no
- *  real Anthropic cap to read (spec), so the ceiling is the same threshold pickAccount uses; the
- *  bar turns amber as it approaches it. */
-function UsageBar({ label, tokens, ceiling }: { label: string; tokens: number; ceiling: number }) {
-  const pct = Math.min(100, ceiling > 0 ? (tokens / ceiling) * 100 : 0);
-  const hot = pct >= 100;
+/** A labelled usage bar showing this account's token usage for a window, filled RELATIVE to the
+ *  busiest account (`peakTokens`) — there's no real Anthropic cap to read, so the comparison is
+ *  cross-account: the heaviest-used account fills the bar and the emptiest reads shortest, making
+ *  "which account has the most headroom" (where new jobs go) obvious at a glance. The raw count is
+ *  shown alongside. A lone account (peak == its own usage) reads full — there's nothing to compare
+ *  it against. */
+function UsageBar({
+  label,
+  tokens,
+  peakTokens,
+}: {
+  label: string;
+  tokens: number;
+  peakTokens: number;
+}) {
+  const pct = peakTokens > 0 ? Math.min(100, (tokens / peakTokens) * 100) : 0;
   return (
     <div style={{ marginTop: 6 }}>
       <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.muted }}>
         <span>{label}</span>
-        <span>
-          {fmtTokens(tokens)} / {fmtTokens(ceiling)}
-        </span>
+        <span>{fmtTokens(tokens)}</span>
       </div>
       <div
         role="progressbar"
@@ -120,7 +128,7 @@ function UsageBar({ label, tokens, ceiling }: { label: string; tokens: number; c
           overflow: "hidden",
         }}
       >
-        <div style={{ width: `${pct}%`, height: "100%", background: hot ? C.amber : C.teal }} />
+        <div style={{ width: `${pct}%`, height: "100%", background: C.teal }} />
       </div>
     </div>
   );
@@ -173,6 +181,10 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
 
   const usageFor = (id: string) => usage.find((u) => u.id === id);
   const now = Date.now();
+  // Each window's bar fills RELATIVE to the busiest account, so the emptiest account reads shortest
+  // (= most headroom). Floor at 1 so an all-zero set divides cleanly to empty bars, not NaN.
+  const peak5h = Math.max(1, ...usage.map((u) => u.tokens5h));
+  const peak7d = Math.max(1, ...usage.map((u) => u.tokens7d));
 
   async function handleAdd() {
     const nickname = newName.trim();
@@ -247,8 +259,9 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
       </div>
 
       <p style={{ fontSize: 12, color: C.muted, marginTop: 0, lineHeight: 1.4 }}>
-        Each account is a separate Claude login. New jobs run under the account with the most
-        headroom. Sparkle never sees your Claude credentials.
+        Each account is a separate Claude login. New jobs run under the least-used account. Bars
+        show each account&apos;s usage relative to your busiest one. Sparkle never sees your Claude
+        credentials.
       </p>
 
       {adding && (
@@ -346,8 +359,8 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
               <div style={{ marginTop: 6, fontSize: 12, color: C.amber }}>⚠ {exhausted}</div>
             )}
 
-            <UsageBar label="5-hour window" tokens={u?.tokens5h ?? 0} ceiling={DEFAULT_NEAR_CAP.tokens5h} />
-            <UsageBar label="7-day window" tokens={u?.tokens7d ?? 0} ceiling={DEFAULT_NEAR_CAP.tokens7d} />
+            <UsageBar label="5-hour window" tokens={u?.tokens5h ?? 0} peakTokens={peak5h} />
+            <UsageBar label="7-day window" tokens={u?.tokens7d ?? 0} peakTokens={peak7d} />
           </div>
         );
       })}

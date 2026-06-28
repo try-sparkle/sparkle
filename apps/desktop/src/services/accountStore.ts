@@ -101,9 +101,16 @@ export interface NearCap {
   tokens7d: number;
 }
 
+// No static cap by default. Anthropic's real Max limits aren't readable, and any fixed guess (the
+// old 5M/30M) is wrong by orders of magnitude once cache-read tokens are counted — it marked every
+// real account "near cap" and collapsed auto-pick to the fallback (always the default account)
+// instead of routing to the least-used one. So default to effectively no ceiling: pickAccount then
+// ranks purely by LOWEST usage, with each account's `exhaustedUntil` (set when a real rate-limit
+// message is observed) as the reactive backstop. Phase 2 can learn per-account ceilings from real
+// rate-limit failures and pass them via PickOptions.nearCap.
 export const DEFAULT_NEAR_CAP: NearCap = {
-  tokens5h: 5_000_000,
-  tokens7d: 30_000_000,
+  tokens5h: Number.MAX_SAFE_INTEGER,
+  tokens7d: Number.MAX_SAFE_INTEGER,
 };
 
 export interface PickOptions {
