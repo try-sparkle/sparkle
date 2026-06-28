@@ -44,6 +44,11 @@ const FADE_3 = C.teal; // #2f6bff — primary brand blue, far-right edge of Buil
 // Depth (px) of the chevron point/notch carved into a button's vertical edge.
 const CHEVRON = 11;
 
+// Width (px) of the hairline left between adjacent chevrons. We underlap the tessellation by this
+// much (overlap = CHEVRON - SEAM) so a thin diagonal sliver of the wrapper's background shows
+// through at each Think→Plan / Plan→Build seam.
+const SEAM = 1;
+
 // Build the clip-path for a button in the chevron strip. The OUTER edges of the strip
 // (Think's left, Build's right) stay flat ("vertical button surfaces"); interior seams are
 // arrow-shaped: a button that isn't last grows a rightward point, a button that isn't first
@@ -61,24 +66,26 @@ function chevronClip(leftNotch: boolean, rightPoint: boolean): string {
   return `polygon(${pts.join(", ")})`;
 }
 
-// Shared style for a create button: a solid gradient slice with NO border/stroke, clipped to
-// its chevron shape. `fillText` is the per-button ink chosen for contrast on that fill. The
-// strip's rounded outer corners come from the wrapper (overflow:hidden + borderRadius), so the
-// buttons themselves are square; `leftNotch` buttons overlap the previous one by CHEVRON px
-// (negative margin) so the point tessellates exactly into the notch.
+// Shared style for a chevron in the mode strip: a solid gradient slice with NO border/stroke,
+// clipped to its chevron shape. `fillText` is the per-chevron ink chosen for contrast on that fill.
+// The strip's rounded outer corners come from the wrapper (overflow:hidden + borderRadius), so the
+// chevrons themselves are square; `leftNotch` chevrons overlap the previous one by CHEVRON px
+// (negative margin) so the point tessellates exactly into the notch. `active` is the currently
+// selected mode: the active chevron keeps its brand color; the other two render grayscale.
 function createBtnStyle(
   from: string,
   to: string,
   fillText: string,
   leftNotch: boolean,
   rightPoint: boolean,
+  active: boolean,
 ): React.CSSProperties {
   return {
     flex: 1,
     padding: "9px 10px",
     border: "none",
     borderRadius: 0,
-    marginLeft: leftNotch ? -CHEVRON : 0,
+    marginLeft: leftNotch ? -(CHEVRON - SEAM) : 0,
     clipPath: chevronClip(leftNotch, rightPoint),
     cursor: "pointer",
     fontFamily: '"IBM Plex Sans", sans-serif',
@@ -86,6 +93,10 @@ function createBtnStyle(
     whiteSpace: "nowrap",
     background: `linear-gradient(90deg, ${from}, ${to})`,
     color: fillText,
+    // The active mode shows its brand color; the inactive two desaturate to grayscale.
+    filter: active ? "none" : "grayscale(1)",
+    opacity: active ? 1 : 0.9,
+    transition: "filter 120ms ease, opacity 120ms ease",
     // Flex-center the (enlarged, line-height-0) glyph against the label so the
     // icon sits on the label's vertical center rather than its text baseline.
     display: "flex",
@@ -94,6 +105,25 @@ function createBtnStyle(
     gap: 7,
   };
 }
+
+// A dashed-outline "+ New <kind> Agent" row — the per-mode affordance for creating an agent,
+// shown at the top of the sidebar list (under Search history) for the active Build/Think mode.
+const DASHED_ROW_STYLE: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  width: "100%",
+  margin: "2px 0 8px",
+  padding: "9px 10px",
+  border: `1px dashed ${C.muted}`,
+  borderRadius: 8,
+  background: "transparent",
+  color: C.muted,
+  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontSize: 13,
+  fontWeight: FONT_WEIGHT.semibold,
+  cursor: "pointer",
+};
 
 export function AgentSidebar({ project }: { project: Project | null }) {
   const selectAgent = useProjectStore((s) => s.selectAgent);
@@ -107,6 +137,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
+  // Which chevron is selected. Drives both the strip's coloring (active = brand, others grayscale)
+  // and which agents the sidebar list shows. Defaults to Build; not persisted across launches.
+  const [mode, setMode] = useState<"think" | "plan" | "build">("build");
   const agentOrdering = useUiStore((s) => s.agentOrdering);
   const collapsedOrchestrators = useUiStore((s) => s.collapsedOrchestrators);
   const toggleOrchestratorCollapsed = useUiStore((s) => s.toggleOrchestratorCollapsed);
@@ -209,16 +242,25 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const onAddThink = () => {
     if (!project) return;
     setActiveSpecial(null); // creating an agent leaves the special (Sparkle) view
-    // One think agent per project by convention — reuse it if it already exists.
-    const existing = project.agents.find((a) => a.kind === "think");
-    const id = existing ? existing.id : addAgent(project.id, { kind: "think" });
+    // Think now allows multiple agents per project: always create a fresh one (parallels Build).
+    const id = addAgent(project.id, { kind: "think" });
     selectAgent(project.id, id);
     open(id);
   };
-  const onPlan = () => {
-    // Plan takes over what the old TopBar "Tasks" button did: open the project-scoped
-    // read-only Tasks Kanban. It sits between Think and Build in the create-button strip.
+  // The chevron strip is a MODE SELECTOR (no longer create buttons). Clicking a chevron makes it the
+  // active (colored) mode and filters the sidebar list by kind. Plan additionally opens the
+  // read-only Tasks board in the main pane; Think/Build just switch the sidebar's agent list.
+  const onPickThink = () => {
+    setMode("think");
+    setActiveSpecial(null);
+  };
+  const onPickPlan = () => {
+    setMode("plan");
     setActiveSpecial("board");
+  };
+  const onPickBuild = () => {
+    setMode("build");
+    setActiveSpecial(null);
   };
   const onAddBuild = () => {
     if (!project) return;
@@ -357,6 +399,21 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     if (id) onClose(id);
   };
   const onMergePromptKeep = () => setMergePromptId(null);
+  // Think is AI-feature-gated. If the gate turns off while Think mode is selected, the Think chevron
+  // disappears — fall back to Build so we're never stuck on a hidden mode with an empty sidebar.
+  useEffect(() => {
+    if (!aiBrainstorm && mode === "think") setMode("build");
+  }, [aiBrainstorm, mode]);
+  // Top-level agents (group heads + orphaned workers), matching the list's isTopLevel logic. Used so
+  // the per-mode empty hints key off the SAME set the list renders — never "No X agents" beside rows.
+  const topLevelAgents = project
+    ? (() => {
+        const buildIds = new Set(
+          project.agents.filter((a) => a.kind === "build").map((a) => a.id),
+        );
+        return project.agents.filter((a) => !a.parentId || !buildIds.has(a.parentId));
+      })()
+    : [];
 
   return (
     <div
@@ -393,49 +450,47 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         </a>
       </div>
       <LogoWaveform />
-      <div
-        style={{
-          padding: "6px 14px",
-          color: C.muted,
-          fontSize: 11,
-          textTransform: "uppercase",
-          letterSpacing: 1,
-          fontWeight: FONT_WEIGHT.semibold,
-        }}
-      >
-        Agents
-      </div>
 
       {project && (
-        <div style={{ display: "flex", margin: "0 10px 8px", borderRadius: 8, overflow: "hidden" }}>
-          {/* Think / Plan / Build form one chevron strip painting a single blue→cyan fade.
+        <div
+          style={{
+            display: "flex",
+            margin: "0 10px 8px",
+            borderRadius: 8,
+            overflow: "hidden",
+            // Seam between chevrons = the sidebar background (light gray, theme-aware), not white.
+            background: C.deepForest,
+          }}
+        >
+          {/* Think / Plan / Build form one chevron strip painting a single blue→cyan fade. It's a
+              MODE SELECTOR: the active chevron keeps its color, the other two go grayscale.
               Think is AI feature-gated (the "Enable AI Thinking" toggle): off → it disappears
               and Plan becomes the strip's flat-left start. The gate flag stays aiBrainstorm. */}
           {aiBrainstorm && (
             <button
-              onClick={onAddThink}
-              title="Chat with Chief over this project's knowledge"
+              onClick={onPickThink}
+              title="Think mode — your Think agents"
               // First in the strip: flat left, points right into Plan. Cyan ("S" color) leads; dark ink.
-              style={createBtnStyle(FADE_0, FADE_1, ON_BRAND_FILL_DARK, false, true)}
+              style={createBtnStyle(FADE_0, FADE_1, ON_BRAND_FILL_DARK, false, true, mode === "think")}
             >
               <TbBulb size={18} style={{ flexShrink: 0 }} />
               <span>Think</span>
             </button>
           )}
           <button
-            onClick={onPlan}
-            title="Open this project's read-only Tasks board"
+            onClick={onPickPlan}
+            title="Plan mode — this project's read-only Tasks board"
             // Full chevron when Think is present (notch left + point right); flat-left start when not.
-            style={createBtnStyle(FADE_1, FADE_2, ON_BRAND_FILL_DARK, aiBrainstorm, true)}
+            style={createBtnStyle(FADE_1, FADE_2, ON_BRAND_FILL_DARK, aiBrainstorm, true, mode === "plan")}
           >
             <FaTasks size={14} style={{ flexShrink: 0 }} />
             <span>Plan</span>
           </button>
           <button
-            onClick={onAddBuild}
-            title="A master orchestrator that spawns worker agents to get work done"
+            onClick={onPickBuild}
+            title="Build mode — your Build orchestrator agents"
             // Last in the strip: notched left (receives Plan's point), flat right. White ink.
-            style={createBtnStyle(FADE_2, FADE_3, ON_BRAND_FILL, true, false)}
+            style={createBtnStyle(FADE_2, FADE_3, ON_BRAND_FILL, true, false, mode === "build")}
           >
             <span style={{ fontSize: 26, lineHeight: 0, transform: "translateY(-3.5px)" }}>⚒</span>
             <span>Build</span>
@@ -444,12 +499,27 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       )}
 
       {/* Full-text search across all projects' prompts & responses. Lives directly under the
-          Brainstorm/Build buttons (design §Search UX); only shown with a project open. */}
-      {project && <HistorySearch />}
+          chevron strip; hidden in Plan mode (the sidebar is kept clear for the board). */}
+      {project && mode !== "plan" && <HistorySearch />}
 
       <div style={{ flex: 1, overflowY: "auto", padding: "0 8px" }}>
+        {/* Per-mode "+ New … Agent" affordance — the only way to create agents now that the chevrons
+            are a selector. Sits above the (mode-filtered) list. Plan has none (no agents in Plan). */}
+        {project && mode === "build" && (
+          <button onClick={onAddBuild} title="Create a new Build orchestrator agent" style={DASHED_ROW_STYLE}>
+            <span style={{ fontSize: 20, lineHeight: 0 }}>⚒</span>
+            <span>+ New Build Agent</span>
+          </button>
+        )}
+        {project && mode === "think" && aiBrainstorm && (
+          <button onClick={onAddThink} title="Create a new Think agent" style={DASHED_ROW_STYLE}>
+            <TbBulb size={16} style={{ flexShrink: 0 }} />
+            <span>+ New Think Agent</span>
+          </button>
+        )}
         {(() => {
           if (!project) return null;
+          if (mode === "plan") return null; // Plan: sidebar list stays clear (board shows in main pane)
           // A worker is "orphaned" if its parentId doesn't resolve to a present build agent
           // (e.g. a corrupted/partially-migrated record). Surface those at the top level so they
           // stay visible and closable rather than vanishing from the UI while still in the store.
@@ -461,7 +531,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           // Only the top-level stack reorders; nested workers stay under their parent in
           // insertion order. Selection is tracked by id (project.selectedAgentId), so re-sorting
           // never changes which agent is open. "manual" keeps insertion order, as before.
-          const topLevel = project.agents.filter(isTopLevel);
+          // The active chevron filters the list by kind: Think shows think agents; Build shows
+          // everything else (build agents + any orphaned workers surfaced at top level).
+          const topLevel = project.agents
+            .filter(isTopLevel)
+            .filter((a) => (mode === "think" ? a.kind === "think" : a.kind !== "think"));
           const ordered =
             agentOrdering === "attention"
               ? orderAgents(topLevel, status)
@@ -581,25 +655,22 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             );
           });
         })()}
-        {project && project.agents.length === 0 && (
-          <div style={{ color: C.muted, fontSize: 12, padding: 10, lineHeight: 1.5 }}>
-            <div>No agents are running.</div>
-            {/* Don't point at the Think button when the AI feature is gated off. */}
-            {aiBrainstorm && (
-              <div style={{ marginTop: 8 }}>
-                • Start a{" "}
-                <strong>
-                  <TbBulb size={12} style={{ verticalAlign: "-2px" }} /> Think
-                </strong>{" "}
-                agent to define what you want to build
-              </div>
-            )}
-            <div style={{ marginTop: 8 }}>
-              • Start a <strong>⚒ Build</strong> agent to orchestrate workers and get started
-              building
+        {/* Per-mode empty hint: the dashed "+ New …" row above is the call to action. */}
+        {project &&
+          mode === "build" &&
+          topLevelAgents.filter((a) => a.kind !== "think").length === 0 && (
+            <div style={{ color: C.muted, fontSize: 12, padding: "2px 10px 10px", lineHeight: 1.5 }}>
+              No Build agents yet — use <strong>+ New Build Agent</strong> above to start one.
             </div>
-          </div>
-        )}
+          )}
+        {project &&
+          mode === "think" &&
+          aiBrainstorm &&
+          topLevelAgents.filter((a) => a.kind === "think").length === 0 && (
+            <div style={{ color: C.muted, fontSize: 12, padding: "2px 10px 10px", lineHeight: 1.5 }}>
+              No Think agents yet — use <strong>+ New Think Agent</strong> above to start one.
+            </div>
+          )}
         {!project && (
           <div style={{ color: C.muted, fontSize: 12, padding: 10, lineHeight: 1.5 }}>
             Create a project to add agents.
