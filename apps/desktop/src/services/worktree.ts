@@ -51,6 +51,15 @@ export function installAgentHooks(worktree: string): Promise<string> {
   return invoke<string>("install_agent_hooks", { worktree });
 }
 
+/** Self-heal stale Claude Code hook script paths across all existing agent worktrees. The emitter
+ *  and write-guard script paths are baked into each worktree's settings.local.json; if the app
+ *  bundle that wrote them was renamed/replaced/removed, those paths dangle and every hook errors
+ *  (MODULE_NOT_FOUND) — and the lost write-guard silently un-confines that worktree. Re-points them
+ *  at a stable app-data copy. Idempotent. Resolves to the number of worktrees healed. */
+export function healAgentHooks(): Promise<number> {
+  return invoke<number>("heal_agent_hooks");
+}
+
 /** Move/rename a project folder on disk and repair its worktree links. Stop the
  * project's agents before calling (their PTYs hold the old working directory). */
 export function moveProjectFolder(oldPath: string, newPath: string): Promise<void> {

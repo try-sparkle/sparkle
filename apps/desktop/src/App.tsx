@@ -5,6 +5,7 @@ import { useAmbientVoice } from "./useDictation";
 import { useApplyTheme } from "./theme/theme";
 import { useConnectionMonitor } from "./connectionMonitor";
 import { resolveEnvChiefPat } from "./services/chief";
+import { healAgentHooks } from "./services/worktree";
 import { importDefault } from "./services/accountStore";
 import { useSettingsStore } from "./stores/settingsStore";
 import { CurrentProjectProvider } from "./windowContext";
@@ -38,6 +39,18 @@ export function App() {
   // selection has a default to fall back to. Idempotent on the Rust side — a no-op once imported.
   useEffect(() => {
     void importDefault().catch((e) => console.warn("importDefault failed", e));
+  }, []);
+
+  // Self-heal agent worktrees whose Claude Code hook scripts (status emitter + write-guard) point
+  // at an old/renamed/removed app bundle — otherwise every hook for those agents errors with
+  // MODULE_NOT_FOUND and the lost write-guard silently un-confines the worktree. Re-points them at
+  // a stable app-data copy. Idempotent: a no-op once everything already points there.
+  useEffect(() => {
+    void healAgentHooks()
+      .then((n) => {
+        if (n > 0) console.info(`healed stale hook paths in ${n} worktree(s)`);
+      })
+      .catch((e) => console.warn("healAgentHooks failed", e));
   }, []);
 
   return (

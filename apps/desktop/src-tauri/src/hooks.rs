@@ -11,6 +11,7 @@
 //! `worktree-guard.mjs`, the emitter by `sparkle-hook.mjs`).
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Value};
 use tauri::path::BaseDirectory;
@@ -18,6 +19,9 @@ use tauri::{AppHandle, Manager};
 
 /// Substring identifying a Sparkle emitter hook entry, for idempotent reinstall.
 const EMITTER_MARKER: &str = "sparkle-hook.mjs";
+/// Substring identifying the worktree write-guard hook entry (installed by `worktree.rs`). Healed
+/// here too, since it has the same baked-absolute-path fragility as the emitter.
+const GUARD_MARKER: &str = "worktree-guard.mjs";
 /// Tool-scoped events carry a `matcher`; we want every tool, so `*`.
 const TOOL_EVENTS: &[&str] = &["PreToolUse", "PostToolUse"];
 /// Lifecycle events with no tool matcher.
@@ -33,6 +37,71 @@ const PLAIN_EVENTS: &[&str] = &[
 /// Minimal POSIX single-quote escaping for embedding a path in a hook command string.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// A hook command: `node '<script>' '<arg>'`. Both the emitter (arg = event-log path) and the
+/// write-guard (arg = worktree path) share this shape.
+fn hook_command(script: &Path, arg: &Path) -> String {
+    format!(
+        "node {} {}",
+        shell_quote(&script.to_string_lossy()),
+        shell_quote(&arg.to_string_lossy())
+    )
+}
+
+/// Per-process counter so concurrent stages (several agents opening at once) never collide on the
+/// same temp filename before the atomic rename below.
+static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Copy a bundled resource script (`resources/<name>`) into a STABLE app-data location
+/// (`<app_data>/bin/<name>`) and return that stable path.
+///
+/// Why: the absolute script path is baked into each worktree's `.claude/settings.local.json` hook
+/// commands. If we pointed those at the app *bundle* (`<App>.app/Contents/Resources/...`), then
+/// renaming/replacing/deleting the bundle (e.g. running "Sparkle 2.app", then swapping in a new
+/// build) orphans every hook the old bundle ever wrote — Claude then fails to run them with
+/// `MODULE_NOT_FOUND`. The app-data dir is independent of the bundle's name/location and lives
+/// next to the worktrees themselves, so a path under it survives app rename/reinstall.
+///
+/// Published atomically (copy to a temp sibling, then rename) so a hook firing in parallel never
+/// reads a half-written script.
+pub fn stage_resource_script(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+    let src = app
+        .path()
+        .resolve(format!("resources/{name}"), BaseDirectory::Resource)
+        .map_err(|e| format!("{name} missing in bundle: {e}"))?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?
+        .join("bin");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir bin: {e}"))?;
+    let dst = dir.join(name);
+    let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+    std::fs::copy(&src, &tmp).map_err(|e| format!("stage {name}: {e}"))?;
+    std::fs::rename(&tmp, &dst).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("publish {name}: {e}")
+    })?;
+    Ok(dst)
+}
+
+/// Replace a file atomically: write a temp sibling in the SAME dir, then rename over the target.
+/// `settings.local.json` drives executable hooks and may be read by a running Claude (e.g. the
+/// launch-time heal sweep races already-open agents), so a reader must never observe a
+/// truncated/partial write. Same dir keeps the rename atomic (one filesystem).
+fn atomic_write_settings(path: &Path, contents: &str) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| "atomic_write_settings: no parent dir".to_string())?;
+    let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".settings.{}.{seq}.tmp", std::process::id()));
+    std::fs::write(&tmp, contents).map_err(|e| format!("atomic_write tmp: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("atomic_write rename: {e}")
+    })
 }
 
 /// True if this settings entry's `hooks[].command` contains `marker`.
@@ -146,19 +215,14 @@ pub fn install_agent_hooks(app: AppHandle, worktree: String) -> Result<String, S
         .join("worktrees");
     let worktree_dir = confine_to_worktrees(&worktrees_base, &worktree)?;
 
-    let emitter = app
-        .path()
-        .resolve("resources/sparkle-hook.mjs", BaseDirectory::Resource)
-        .map_err(|e| format!("emitter script missing: {e}"))?;
+    // Stage the emitter to a stable app-data path (not the app bundle) so the command baked into
+    // settings.local.json survives the bundle being renamed/replaced/removed (see stage_resource_script).
+    let emitter = stage_resource_script(&app, "sparkle-hook.mjs")?;
     let log = event_log_path(&app, &worktree)?;
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir hook-events: {e}"))?;
     }
-    let emitter_cmd = format!(
-        "node {} {}",
-        shell_quote(&emitter.to_string_lossy()),
-        shell_quote(&log.to_string_lossy())
-    );
+    let emitter_cmd = hook_command(&emitter, &log);
 
     let dir = worktree_dir.join(".claude");
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir .claude: {e}"))?;
@@ -167,6 +231,90 @@ pub fn install_agent_hooks(app: AppHandle, worktree: String) -> Result<String, S
     let merged = merge_event_hooks(existing.as_deref(), &emitter_cmd);
     std::fs::write(&file, merged).map_err(|e| format!("write settings.local.json: {e}"))?;
     Ok(log.to_string_lossy().into_owned())
+}
+
+/// A settings file needs healing for `marker` when it still registers that hook but the command
+/// does NOT reference the current stable script path — i.e. it points at an old/renamed bundle.
+/// Pure (string-only) so it's unit-testable. A file that never had the hook is left untouched.
+fn needs_heal(settings: &str, marker: &str, stable_path: &str) -> bool {
+    settings.contains(marker) && !settings.contains(stable_path)
+}
+
+/// Rewrite stale emitter/guard hook commands in one settings file to the current stable paths,
+/// preserving everything else (user keys, the other hook, ordering). Returns the updated JSON only
+/// if something actually changed — so an already-stable (or hook-free) file is left byte-for-byte
+/// intact and isn't needlessly rewritten. Pure, so the heal policy is unit-tested.
+fn heal_settings(settings: &str, emitter: &Path, emitter_cmd: &str, guard: &Path, guard_cmd: &str) -> Option<String> {
+    let mut out: Option<String> = None;
+    if needs_heal(settings, EMITTER_MARKER, &emitter.to_string_lossy()) {
+        out = Some(merge_event_hooks(Some(out.as_deref().unwrap_or(settings)), emitter_cmd));
+    }
+    if needs_heal(out.as_deref().unwrap_or(settings), GUARD_MARKER, &guard.to_string_lossy()) {
+        out = Some(crate::worktree::merge_guard_settings(
+            Some(out.as_deref().unwrap_or(settings)),
+            guard_cmd,
+        ));
+    }
+    out
+}
+
+/// Walk every managed worktree (`<worktrees_base>/<project>/<agent>`) and re-point any stale
+/// emitter/guard hook in its `settings.local.json` at the stable script paths. Returns how many
+/// worktrees were healed. Takes resolved paths (no AppHandle) so it unit-tests with temp dirs.
+fn scan_and_heal(
+    worktrees_base: &Path,
+    hook_events_base: &Path,
+    emitter: &Path,
+    guard: &Path,
+) -> Result<u32, String> {
+    let mut healed = 0u32;
+    let projects = match std::fs::read_dir(worktrees_base) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(0), // no worktrees dir yet — nothing to heal
+    };
+    for project in projects.flatten() {
+        let agents = match std::fs::read_dir(project.path()) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for agent in agents.flatten() {
+            let worktree = agent.path();
+            let settings_path = worktree.join(".claude").join("settings.local.json");
+            let existing = match std::fs::read_to_string(&settings_path) {
+                Ok(s) => s,
+                Err(_) => continue, // no hooks installed for this worktree
+            };
+            let log = hook_events_base.join(format!("{}.jsonl", log_key(&worktree.to_string_lossy())));
+            let emitter_cmd = hook_command(emitter, &log);
+            let guard_cmd = hook_command(guard, &worktree);
+            if let Some(updated) = heal_settings(&existing, emitter, &emitter_cmd, guard, &guard_cmd) {
+                atomic_write_settings(&settings_path, &updated)
+                    .map_err(|e| format!("heal {}: {e}", settings_path.to_string_lossy()))?;
+                healed += 1;
+            }
+        }
+    }
+    Ok(healed)
+}
+
+/// Self-heal stale hook script paths across every existing agent worktree. Called at app launch:
+/// re-stages the emitter + write-guard to the stable app-data location, then re-points any
+/// worktree whose baked hook paths reference an old/renamed/removed bundle. Idempotent — a no-op
+/// once everything already points at the stable path. Returns the number of worktrees healed.
+#[tauri::command]
+pub fn heal_agent_hooks(app: AppHandle) -> Result<u32, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    let emitter = stage_resource_script(&app, "sparkle-hook.mjs")?;
+    let guard = stage_resource_script(&app, "worktree-guard.mjs")?;
+    scan_and_heal(
+        &app_data.join("worktrees"),
+        &app_data.join("hook-events"),
+        &emitter,
+        &guard,
+    )
 }
 
 /// A batch of newly-appended event-log lines plus the byte offset to resume from.
@@ -466,5 +614,115 @@ mod tests {
         let chunk = read_events_since_impl(&p, 9999).unwrap();
         assert_eq!(chunk.lines, vec!["{\"event\":\"Stop\"}".to_string()]);
         let _ = std::fs::remove_file(&p);
+    }
+
+    const OLD_EMITTER: &str = "/Applications/Old.app/Contents/Resources/resources/sparkle-hook.mjs";
+    const OLD_GUARD: &str = "/Applications/Old.app/Contents/Resources/resources/worktree-guard.mjs";
+
+    #[test]
+    fn needs_heal_detects_stale_marker_present_without_stable_path() {
+        let stale = format!(
+            r#"{{"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"node '{OLD_EMITTER}' '/log'"}}]}}]}}}}"#
+        );
+        // Marker present but the stable path isn't → stale.
+        assert!(needs_heal(&stale, EMITTER_MARKER, "/data/bin/sparkle-hook.mjs"));
+        // Already references the stable path → not stale.
+        let fresh = stale.replace(OLD_EMITTER, "/data/bin/sparkle-hook.mjs");
+        assert!(!needs_heal(&fresh, EMITTER_MARKER, "/data/bin/sparkle-hook.mjs"));
+        // Marker absent → never heal (don't graft a hook that was never installed).
+        assert!(!needs_heal("{}", EMITTER_MARKER, "/data/bin/sparkle-hook.mjs"));
+    }
+
+    #[test]
+    fn heal_settings_repoints_both_hooks_then_noops() {
+        let e_new = Path::new("/data/bin/sparkle-hook.mjs");
+        let g_new = Path::new("/data/bin/worktree-guard.mjs");
+        // A worktree with BOTH hooks pointing at an old bundle.
+        let with_emitter =
+            merge_event_hooks(None, &hook_command(Path::new(OLD_EMITTER), Path::new("/log")));
+        let stale = crate::worktree::merge_guard_settings(
+            Some(&with_emitter),
+            &hook_command(Path::new(OLD_GUARD), Path::new("/wt")),
+        );
+
+        let e_cmd = hook_command(e_new, Path::new("/log"));
+        let g_cmd = hook_command(g_new, Path::new("/wt"));
+        let healed = heal_settings(&stale, e_new, &e_cmd, g_new, &g_cmd).expect("stale → healed");
+        assert!(healed.contains("/data/bin/sparkle-hook.mjs"));
+        assert!(healed.contains("/data/bin/worktree-guard.mjs"));
+        assert!(!healed.contains("/Applications/Old.app"));
+        // Both hooks survive (rewritten, not dropped).
+        let v: Value = serde_json::from_str(&healed).unwrap();
+        assert!(emitter_present(&v, "Stop"));
+        assert!(v["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| entry_has_marker(e, GUARD_MARKER)));
+        // Re-running on the now-stable file is a no-op (no needless rewrite).
+        assert!(heal_settings(&healed, e_new, &e_cmd, g_new, &g_cmd).is_none());
+    }
+
+    #[test]
+    fn scan_and_heal_rewrites_only_stale_worktrees() {
+        let tmp = std::env::temp_dir().join(format!("sparkle-heal-{}", std::process::id()));
+        let worktrees = tmp.join("worktrees");
+        let hook_events = tmp.join("hook-events");
+        let e_new = tmp.join("bin").join("sparkle-hook.mjs");
+        let g_new = tmp.join("bin").join("worktree-guard.mjs");
+
+        // A: stale emitter from an old bundle → healed, log path recomputed from the agent basename.
+        let a = worktrees.join("proj").join("agent-a").join(".claude");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(
+            a.join("settings.local.json"),
+            merge_event_hooks(None, &hook_command(Path::new(OLD_EMITTER), Path::new("/old/log"))),
+        )
+        .unwrap();
+
+        // B: already points at the stable emitter → must be left byte-for-byte intact.
+        let b = worktrees.join("proj").join("agent-b").join(".claude");
+        std::fs::create_dir_all(&b).unwrap();
+        let fresh =
+            merge_event_hooks(None, &hook_command(&e_new, &hook_events.join("agent-b.jsonl")));
+        std::fs::write(b.join("settings.local.json"), &fresh).unwrap();
+
+        // C: a worktree dir with no settings file → skipped, nothing created.
+        std::fs::create_dir_all(worktrees.join("proj").join("agent-c")).unwrap();
+
+        let n = scan_and_heal(&worktrees, &hook_events, &e_new, &g_new).unwrap();
+        assert_eq!(n, 1, "only the stale worktree is healed");
+
+        let a_after = std::fs::read_to_string(a.join("settings.local.json")).unwrap();
+        assert!(a_after.contains(&*e_new.to_string_lossy()));
+        assert!(!a_after.contains("/Applications/Old.app"));
+        assert!(a_after.contains("agent-a.jsonl"), "log path recomputed per agent");
+
+        assert_eq!(
+            std::fs::read_to_string(b.join("settings.local.json")).unwrap(),
+            fresh,
+            "already-stable worktree left untouched"
+        );
+        assert!(!worktrees
+            .join("proj")
+            .join("agent-c")
+            .join(".claude")
+            .join("settings.local.json")
+            .exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_and_heal_missing_worktrees_dir_is_ok() {
+        let missing = std::env::temp_dir().join(format!("sparkle-heal-missing-{}", std::process::id()));
+        let n = scan_and_heal(
+            &missing.join("worktrees"),
+            &missing.join("hook-events"),
+            Path::new("/bin/e.mjs"),
+            Path::new("/bin/g.mjs"),
+        )
+        .unwrap();
+        assert_eq!(n, 0);
     }
 }

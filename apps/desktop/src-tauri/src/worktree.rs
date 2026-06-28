@@ -1138,10 +1138,10 @@ pub fn merge_guard_settings(existing: Option<&str>, guard_cmd: &str) -> String {
 /// Write/merge the guard into `<worktree>/.claude/settings.local.json` (the gitignored variant).
 #[tauri::command]
 pub fn install_worktree_guard(app: AppHandle, worktree: String) -> Result<(), String> {
-    let guard = app
-        .path()
-        .resolve("resources/worktree-guard.mjs", tauri::path::BaseDirectory::Resource)
-        .map_err(|e| format!("guard script missing: {e}"))?;
+    // Stage the guard to a stable app-data path (not the app bundle) so the command baked into
+    // settings.local.json survives the bundle being renamed/replaced/removed. See
+    // hooks::stage_resource_script; hooks::heal_agent_hooks re-points stale copies at launch.
+    let guard = crate::hooks::stage_resource_script(&app, "worktree-guard.mjs")?;
     let guard_cmd = format!(
         "node {} {}",
         shell_quote(&guard.to_string_lossy()),
