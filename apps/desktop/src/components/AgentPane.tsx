@@ -31,6 +31,7 @@ import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { useScrollIntentStore, applyScrollIntent } from "../stores/scrollIntentStore";
 import { PinnedPrompt } from "./PinnedPrompt";
 import { Terminal, type TerminalApi } from "./Terminal";
 import { Composer, type ComposerApi } from "./Composer";
@@ -87,6 +88,10 @@ export function AgentPane({
   const setAgentWorktree = useProjectStore((s) => s.setAgentWorktree);
   const appendPrompt = useProjectStore((s) => s.appendPrompt);
   const setStatus = useRuntimeStore((s) => s.setStatus);
+  // Pending "scroll to this prompt" for this agent (set by history-search navigation), consumed
+  // once the terminal is the visible, ready pane.
+  const scrollIntent = useScrollIntentStore((s) => s.intents[agent.id]);
+  const consumeScrollIntent = useScrollIntentStore((s) => s.consume);
   // Tracks whether the last spawn was a fresh session (not a --continue resume). Used in the
   // worker exit handler to skip stale result re-reads on resumed sessions.
   const wasFreshLaunchRef = useRef(false);
@@ -438,6 +443,22 @@ export function AgentPane({
     return () => cancelAnimationFrame(raf);
   }, [composerMinimized, visible, ptyReady, aiComposer]);
 
+  // Consume a pending "scroll to this prompt" intent (set by history-search navigation) once this
+  // agent's terminal is the visible, ready pane. Runs when the intent appears or the pane becomes
+  // ready, so a click on an already-open agent and a click that first brings it forward both land.
+  // Best-effort + intentionally silent on a miss: unlike the pinned-prompt Jump (a pure scroll
+  // action that surfaces "Scrolled out"), a history click's primary act is navigating to the agent,
+  // which succeeded — a marker that's scrolled out / from a prior session just doesn't scroll.
+  useEffect(() => {
+    applyScrollIntent({
+      intent: scrollIntent,
+      visible,
+      ready: ptyReady,
+      scrollToPrompt: (id) => terminalApiRef.current?.scrollToPrompt(id),
+      consume: () => consumeScrollIntent(agent.id),
+    });
+  }, [scrollIntent, visible, ptyReady, agent.id, consumeScrollIntent]);
+
   return (
     <div
       style={{
@@ -462,6 +483,9 @@ export function AgentPane({
         onSendToComposer={
           aiComposer ? (text) => composerApiRef.current?.insertPrompt(text) : undefined
         }
+        // Jump the terminal back to where a prompt was sent. "missing" → the row reports it's
+        // scrolled out of this session (marker trimmed or from a prior session).
+        onJumpToPrompt={(id) => terminalApiRef.current?.scrollToPrompt(id) ?? "missing"}
       />
 
       {phase === "preparing" && (
@@ -540,8 +564,11 @@ export function AgentPane({
               apiRef={composerApiRef}
               onArrowOverflow={(dir) => terminalApiRef.current?.arrowFromComposer(dir)}
               onSubmitPrompt={(t) => {
-                // Record the prompt for the pinned header + history dropdown.
-                appendPrompt(project.id, agent.id, t);
+                // Record the prompt for the pinned header + history dropdown, and drop a terminal
+                // marker under the same id so "jump to this prompt" (dropdown + history search)
+                // can scroll back here later this session.
+                const promptId = appendPrompt(project.id, agent.id, t);
+                terminalApiRef.current?.markPrompt(promptId);
                 // Fire-and-forget: summarize the work into a short name (first prompt, or when
                 // the work shifts). No-ops if the name is pinned or no API key is configured.
                 // Gated on the auto-rename AI feature.

@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 //
-// Component-wiring tests for the pinned-prompt history dropdown (PinnedPrompt). Covers the
-// row interaction added when scroll-to-prompt was dropped: click selects + reveals the
-// Copy / Send to Composer actions, a second click expands the full selectable prompt, and
-// rows carry no `title` tooltip. The clipboard boundary is mocked.
+// Component-wiring tests for the pinned-prompt history dropdown (PinnedPrompt). Covers row
+// interaction: click selects + reveals the Copy / Send to Composer / Jump actions, a second
+// click expands the full selectable prompt, and rows carry no `title` tooltip. Jump scrolls the
+// terminal to where a prompt was sent (or reports "scrolled out"). The clipboard boundary is
+// mocked.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -125,5 +126,32 @@ describe("PinnedPrompt — row actions", () => {
     fireEvent.click(rowB()); // select
     fireEvent.click(rowB()); // expand
     expect(rowB().getAttribute("title")).toBeNull();
+  });
+});
+
+describe("PinnedPrompt — Jump action", () => {
+  it("offers Jump only when an onJumpToPrompt handler is provided", () => {
+    setup(); // no onJumpToPrompt
+    fireEvent.click(rowA());
+    expect(screen.queryByRole("button", { name: "Jump" })).toBeNull();
+  });
+
+  it("Jump scrolls to the row's prompt id and closes when the marker is live", () => {
+    const onJumpToPrompt = vi.fn(() => "scrolled" as const);
+    setup({ onJumpToPrompt });
+    fireEvent.click(rowB());
+    fireEvent.click(screen.getByRole("button", { name: "Jump" }));
+    expect(onJumpToPrompt).toHaveBeenCalledWith("b"); // newest row = entry b
+    expect(screen.queryByRole("button", { name: "first prompt" })).toBeNull(); // closed
+  });
+
+  it("Jump reports 'scrolled out' and keeps the menu open when the marker is gone", () => {
+    const onJumpToPrompt = vi.fn(() => "missing" as const);
+    setup({ onJumpToPrompt });
+    fireEvent.click(rowB());
+    fireEvent.click(screen.getByRole("button", { name: "Jump" }));
+    expect(screen.getByRole("alert").textContent).toMatch(/scrolled out/i);
+    // Menu stays open so the note is visible (the listbox is still mounted).
+    expect(screen.getByRole("listbox", { name: "Prompt history" })).toBeTruthy();
   });
 });

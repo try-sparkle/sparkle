@@ -25,7 +25,26 @@ vi.mock("../services/history", async (orig) => {
 
 import { HistorySearch, renderSnippet, relativeTime } from "./HistorySearch";
 import { useHistoryStore } from "../stores/historyStore";
+import { useProjectStore } from "../stores/projectStore";
 import type { HistoryHit } from "../services/history";
+import type { AgentTab, Project } from "../types";
+
+// Minimal agent/project builders for the default-path tests, which exercise the REAL (non-injected)
+// agentExists lookup against the shared projectStore (which holds ALL projects, every window).
+function mkAgent(id: string): AgentTab {
+  return {
+    id, name: id, kind: "build", parentId: null, runtime: "local",
+    worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
+    promptHistory: [], namePinned: false, autoNameBasis: null,
+    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
+  };
+}
+function mkProject(id: string, agents: AgentTab[]): Project {
+  return {
+    id, name: id, rootPath: `/tmp/${id}`, defaultBranch: null,
+    createdAt: new Date(0).toISOString(), selectedAgentId: null, agents,
+  };
+}
 
 const hit = (over: Partial<HistoryHit> = {}): HistoryHit => ({
   id: "h1",
@@ -43,6 +62,7 @@ const hit = (over: Partial<HistoryHit> = {}): HistoryHit => ({
 beforeEach(() => {
   h.seeded = [hit()];
   useHistoryStore.setState({ query: "", results: [], entitlement: "24h", searching: false });
+  useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
 });
 afterEach(() => cleanup());
 
@@ -72,19 +92,145 @@ describe("HistorySearch", () => {
     expect(screen.queryByTestId("history-result")).toBeNull();
   });
 
-  it("opens a DIFFERENT project's hit in a new window", () => {
+  it("opens a DIFFERENT project's hit in a new window when no window owns it", () => {
     useHistoryStore.setState({ query: "rust", results: [hit({ projectId: "other" })] });
     const openInWindow = vi.fn();
-    render(<HistorySearch currentProjectId="p1" openInWindow={openInWindow} />);
+    render(
+      <HistorySearch
+        currentProjectId="p1"
+        openInWindow={openInWindow}
+        agentExists={() => true}
+        projectHasWindow={() => false}
+      />,
+    );
     fireEvent.click(screen.getByTestId("history-result"));
-    expect(openInWindow).toHaveBeenCalledWith("other", "new");
+    expect(openInWindow).toHaveBeenCalledWith("other", "new", "a1");
   });
 
-  it("does NOT open a new window for a hit in the CURRENT project", () => {
-    useHistoryStore.setState({ query: "rust", results: [hit({ projectId: "p1" })] });
+  it("focuses the OWNING window's agent for a DIFFERENT project that's already open", () => {
+    useHistoryStore.setState({ query: "rust", results: [hit({ projectId: "other", agentId: "a9" })] });
     const openInWindow = vi.fn();
-    render(<HistorySearch currentProjectId="p1" openInWindow={openInWindow} />);
+    const focusAgentElsewhere = vi.fn();
+    render(
+      <HistorySearch
+        currentProjectId="p1"
+        openInWindow={openInWindow}
+        agentExists={() => true}
+        projectHasWindow={() => true}
+        focusAgentElsewhere={focusAgentElsewhere}
+      />,
+    );
     fireEvent.click(screen.getByTestId("history-result"));
+    expect(focusAgentElsewhere).toHaveBeenCalledWith("other", "a9");
+    expect(openInWindow).not.toHaveBeenCalled();
+  });
+
+  it("selects the agent in place for a hit in the CURRENT project", () => {
+    useHistoryStore.setState({ query: "rust", results: [hit({ projectId: "p1", agentId: "a1" })] });
+    const openInWindow = vi.fn();
+    const selectAgentHere = vi.fn();
+    render(
+      <HistorySearch
+        currentProjectId="p1"
+        openInWindow={openInWindow}
+        agentExists={() => true}
+        selectAgentHere={selectAgentHere}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("history-result"));
+    expect(selectAgentHere).toHaveBeenCalledWith("p1", "a1");
+    expect(openInWindow).not.toHaveBeenCalled();
+  });
+
+  it("queues a scroll to the correlated prompt for a CURRENT-project hit", () => {
+    const at = Date.now() - 60_000;
+    useHistoryStore.setState({
+      query: "rust",
+      results: [hit({ projectId: "p1", agentId: "a1", kind: "prompt", createdAt: at })],
+    });
+    const requestScroll = vi.fn();
+    render(
+      <HistorySearch
+        currentProjectId="p1"
+        openInWindow={vi.fn()}
+        agentExists={() => true}
+        selectAgentHere={vi.fn()}
+        promptHistoryFor={() => [{ id: "pm1", text: "loving rust", at }]}
+        requestScroll={requestScroll}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("history-result"));
+    expect(requestScroll).toHaveBeenCalledWith("a1", "pm1");
+  });
+
+  it("does not queue a scroll when no prompt correlates", () => {
+    useHistoryStore.setState({ query: "rust", results: [hit({ projectId: "p1", agentId: "a1" })] });
+    const requestScroll = vi.fn();
+    render(
+      <HistorySearch
+        currentProjectId="p1"
+        openInWindow={vi.fn()}
+        agentExists={() => true}
+        selectAgentHere={vi.fn()}
+        promptHistoryFor={() => []}
+        requestScroll={requestScroll}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("history-result"));
+    expect(requestScroll).not.toHaveBeenCalled();
+  });
+
+  // The default (non-injected) agentExists consults the shared projectStore, which holds ALL
+  // projects in every window — so a cross-project hit resolves correctly without injection. These
+  // two cases lock that in (a regression here would falsely report cross-project agents "closed").
+  it("resolves a CROSS-project hit against the shared projectStore (default agentExists)", () => {
+    useProjectStore.setState({ projects: [mkProject("other", [mkAgent("a9")])] } as never);
+    useHistoryStore.setState({ query: "rust", results: [hit({ projectId: "other", agentId: "a9" })] });
+    const focusAgentElsewhere = vi.fn();
+    render(
+      <HistorySearch
+        currentProjectId="p1"
+        openInWindow={vi.fn()}
+        projectHasWindow={() => true}
+        focusAgentElsewhere={focusAgentElsewhere}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("history-result"));
+    expect(focusAgentElsewhere).toHaveBeenCalledWith("other", "a9");
+  });
+
+  it("reports 'closed' for a CROSS-project hit whose agent is gone (default agentExists)", () => {
+    useProjectStore.setState({ projects: [mkProject("other", [])] } as never);
+    useHistoryStore.setState({ query: "rust", results: [hit({ projectId: "other", agentId: "a9" })] });
+    const focusAgentElsewhere = vi.fn();
+    render(
+      <HistorySearch
+        currentProjectId="p1"
+        openInWindow={vi.fn()}
+        projectHasWindow={() => true}
+        focusAgentElsewhere={focusAgentElsewhere}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("history-result"));
+    expect(screen.getByRole("alert").textContent).toMatch(/was closed/i);
+    expect(focusAgentElsewhere).not.toHaveBeenCalled();
+  });
+
+  it("reports 'agent has been closed' and does not navigate when the agent is gone", () => {
+    useHistoryStore.setState({ query: "rust", results: [hit({ projectId: "p1", agentId: "a1" })] });
+    const openInWindow = vi.fn();
+    const selectAgentHere = vi.fn();
+    render(
+      <HistorySearch
+        currentProjectId="p1"
+        openInWindow={openInWindow}
+        agentExists={() => false}
+        selectAgentHere={selectAgentHere}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("history-result"));
+    expect(screen.getByRole("alert").textContent).toMatch(/was closed/i);
+    expect(selectAgentHere).not.toHaveBeenCalled();
     expect(openInWindow).not.toHaveBeenCalled();
   });
 

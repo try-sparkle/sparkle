@@ -1,9 +1,11 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   computeInitialProjectId,
+  parseAgentIdFromSearch,
   parseWindowLabelFromSearch,
 } from "./services/projectWindows.url";
 import { useProjectStore } from "./stores/projectStore";
+import { useRuntimeStore } from "./stores/runtimeStore";
 import {
   setWindowProject,
   clearWindowProject,
@@ -57,6 +59,20 @@ export function CurrentProjectProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const [projectId, setProjectId] = useState<string | null>(initial);
+
+  // Deep-link: a window opened from a history-search "jump to agent" carries `?agent=`. Once on
+  // its project, select + mount that agent so the window lands directly on it. Runs once on mount
+  // (the param is fixed for this window's life). A closed/unknown agent is silently ignored — the
+  // window just shows the project's default tab (the search row itself reports "closed").
+  useEffect(() => {
+    const agentId = parseAgentIdFromSearch(search);
+    if (!agentId || !initial) return;
+    const project = useProjectStore.getState().projects.find((p) => p.id === initial);
+    if (!project?.agents.some((a) => a.id === agentId)) return;
+    useRuntimeStore.getState().open(agentId);
+    useProjectStore.getState().selectAgent(initial, agentId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Register this window's current project so other windows can focus it. In an effect —
   // never write to localStorage during render.

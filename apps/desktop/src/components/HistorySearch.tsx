@@ -1,11 +1,20 @@
 // HistorySearch — the full-text search box under the Brainstorm/Build buttons in AgentSidebar.
 // Presentational: it binds the input to the historyStore (which owns the debounce + the Tauri
-// `history_search` call) and renders the ranked results. Clicking a result opens its source —
-// in place when it's the current window's project, in a new Sparkle window otherwise.
-import type { CSSProperties, ReactNode } from "react";
-import { C, FONT_WEIGHT } from "../theme/colors";
+// `history_search` call) and renders the ranked results. Clicking a result jumps to the AGENT that
+// produced it: selecting it in place when it lives in this window's project, asking the window that
+// owns its project to focus it when that window is open, or opening that project in a new window
+// otherwise. If the agent has since been closed (deleted), the row reports "That agent has been
+// closed" instead of navigating.
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { C, DANGER, FONT_WEIGHT } from "../theme/colors";
 import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
+import { useRuntimeStore } from "../stores/runtimeStore";
+import { useScrollIntentStore } from "../stores/scrollIntentStore";
+import { emitFocusAgent } from "../services/attention";
+import { findWindowForProject } from "../services/windowRegistry";
+import { correlatePromptId } from "./promptCorrelate";
+import type { PromptHistoryEntry } from "../types";
 import type { HistoryHit, RetentionTier } from "../services/history";
 import { purchaseRetention } from "../services/credits";
 import {
@@ -14,12 +23,36 @@ import {
   type OpenMode,
 } from "../services/projectWindows";
 
+/** Shown on a row whose source agent no longer exists. Closing an agent deletes its worktree from
+ *  disk (see AgentSidebar.onClose), so there's nothing left to reopen — say so honestly. */
+const AGENT_CLOSED_MESSAGE = "This agent was closed — its workspace no longer exists.";
+/** How long the "agent closed" notice lingers before it auto-dismisses. */
+const NOTICE_TIMEOUT_MS = 4000;
+
 interface HistorySearchProps {
-  /** Route a hit's project into a window. Injected in tests; defaults to the real Tauri wiring.
-   *  Only ever called with mode `"new"` (a result in a DIFFERENT project than this window's). */
-  openInWindow?: (projectId: string, mode: OpenMode) => void;
+  /** Route a hit's project into a window, deep-linking to its agent. Injected in tests; defaults
+   *  to the real Tauri wiring. Only ever called with mode `"new"` (a DIFFERENT project than this
+   *  window's, with no window currently showing it). */
+  openInWindow?: (projectId: string, mode: OpenMode, agentId?: string) => void;
   /** This window's current project id. Injected in tests; defaults to the store's selection. */
   currentProjectId?: string | null;
+  /** Does the hit's source agent still exist (i.e. hasn't been closed)? Injected in tests;
+   *  defaults to a projectStore lookup. */
+  agentExists?: (projectId: string, agentId: string | null) => boolean;
+  /** Select + mount an agent that lives in THIS window's project. Injected in tests; defaults to
+   *  the open + selectAgent store pair (mirrors notification-click routing). */
+  selectAgentHere?: (projectId: string, agentId: string) => void;
+  /** Ask the window that owns the hit's project to bring itself forward and focus the agent.
+   *  Injected in tests; defaults to the focus-agent broadcast. */
+  focusAgentElsewhere?: (projectId: string, agentId: string) => void;
+  /** Is some window currently showing this project? Injected in tests; defaults to the registry. */
+  projectHasWindow?: (projectId: string) => boolean;
+  /** This agent's recorded prompts, for correlating a hit to a terminal marker. Injected in
+   *  tests; defaults to a projectStore lookup. */
+  promptHistoryFor?: (projectId: string, agentId: string) => PromptHistoryEntry[];
+  /** Queue a "scroll this agent's terminal to a prompt" intent. Injected in tests; defaults to
+   *  the scrollIntent store. */
+  requestScroll?: (agentId: string, promptId: string) => void;
 }
 
 /** Human label for the active retention window, shown in the results caption. */
@@ -95,7 +128,16 @@ const badgeStyle = (kind: HistoryHit["kind"]): CSSProperties => ({
   background: kind === "prompt" ? C.accentMid : C.teal,
 });
 
-export function HistorySearch({ openInWindow, currentProjectId }: HistorySearchProps = {}) {
+export function HistorySearch({
+  openInWindow,
+  currentProjectId,
+  agentExists,
+  selectAgentHere,
+  focusAgentElsewhere,
+  projectHasWindow,
+  promptHistoryFor,
+  requestScroll,
+}: HistorySearchProps = {}) {
   const query = useHistoryStore((s) => s.query);
   const results = useHistoryStore((s) => s.results);
   const entitlement = useHistoryStore((s) => s.entitlement);
@@ -103,8 +145,66 @@ export function HistorySearch({ openInWindow, currentProjectId }: HistorySearchP
   const storeSelectedProjectId = useProjectStore((s) => s.selectedProjectId);
   const touchProjectOpened = useProjectStore((s) => s.touchProjectOpened);
 
+  // A transient "that agent has been closed" notice, keyed by the row that triggered it so it can
+  // render inline on that row. Cleared when it times out or the query changes (see below).
+  const [closedHitId, setClosedHitId] = useState<string | null>(null);
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (noticeTimer.current) clearTimeout(noticeTimer.current);
+  }, []);
+  // A new search invalidates any stale "closed" notice from the previous result set.
+  useEffect(() => {
+    setClosedHitId(null);
+  }, [query]);
+
   // Prefer the injected current project id (tests); otherwise this window's store selection.
   const currentId = currentProjectId !== undefined ? currentProjectId : storeSelectedProjectId;
+
+  // Does the hit's source agent still exist? A closed agent is removed from projectStore, so a
+  // missing lookup is exactly the "agent has been closed" case.
+  const agentStillExists =
+    agentExists ??
+    ((projectId: string, agentId: string | null) => {
+      if (!agentId) return false;
+      const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
+      return !!project?.agents.some((a) => a.id === agentId);
+    });
+
+  // Select + mount an agent in THIS window — the same open + selectAgent pair a notification
+  // click uses (see useAttentionNotifications.selectAndOpen).
+  const focusHere =
+    selectAgentHere ??
+    ((projectId: string, agentId: string) => {
+      useRuntimeStore.getState().open(agentId);
+      useProjectStore.getState().selectAgent(projectId, agentId);
+    });
+
+  // Cross-project, window already open: let that window bring itself forward and select the agent.
+  const focusElsewhere = focusAgentElsewhere ?? ((projectId, agentId) =>
+    emitFocusAgent({ projectId, agentId }));
+
+  const hasWindow = projectHasWindow ?? ((projectId: string) => findWindowForProject(projectId) != null);
+
+  // The agent's recorded prompts (for hit -> terminal-marker correlation).
+  const lookupPromptHistory =
+    promptHistoryFor ??
+    ((projectId: string, agentId: string) => {
+      const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
+      return project?.agents.find((a) => a.id === agentId)?.promptHistory ?? [];
+    });
+
+  const queueScroll = requestScroll ?? ((agentId, promptId) =>
+    useScrollIntentStore.getState().request(agentId, promptId));
+
+  // Best-effort: correlate the hit to one of the agent's prompts and queue a scroll to its
+  // terminal marker. Only meaningful in THIS window (the scroll-intent store is per-window, and
+  // the marker only exists in a continuously-mounted terminal from this session); cross-window
+  // navigations skip it. A miss (no correlation / no marker) simply doesn't scroll.
+  const queueScrollToHit = (h: HistoryHit) => {
+    if (!h.projectId || !h.agentId) return;
+    const promptId = correlatePromptId(h, lookupPromptHistory(h.projectId, h.agentId));
+    if (promptId) queueScroll(h.agentId, promptId);
+  };
 
   // Real cross-project router. The "new" path of openProjectInWindow never touches
   // replaceCurrent/currentLabel (only the in-place "replace" path does), so the dummies below are
@@ -112,7 +212,7 @@ export function HistorySearch({ openInWindow, currentProjectId }: HistorySearchP
   // tests) because it depends on no window context.
   const routeToWindow =
     openInWindow ??
-    ((projectId: string, mode: OpenMode) => {
+    ((projectId: string, mode: OpenMode, agentId?: string) => {
       void openProjectInWindow(
         projectId,
         mode,
@@ -121,17 +221,41 @@ export function HistorySearch({ openInWindow, currentProjectId }: HistorySearchP
           touchProjectOpened,
           "main", // currentLabel — unused on the "new" path
         ),
+        agentId,
       );
     });
 
+  /** Flash the "agent has been closed" notice on a row, auto-dismissing after a beat. */
+  const flashClosed = (hitId: string) => {
+    setClosedHitId(hitId);
+    if (noticeTimer.current) clearTimeout(noticeTimer.current);
+    noticeTimer.current = setTimeout(() => setClosedHitId(null), NOTICE_TIMEOUT_MS);
+  };
+
   const onResultClick = (h: HistoryHit) => {
     if (!h.projectId) return; // unknown/deleted project — row is disabled
-    if (h.projectId === currentId) {
-      // Already this window's project — it's on screen. Deep-linking to the specific agent is a
-      // v1 non-goal (the source agent may no longer exist), so there's nothing to route.
+    // The source agent may have been closed since this row was recorded. If it's gone, say so
+    // rather than navigating to an empty project.
+    if (!h.agentId || !agentStillExists(h.projectId, h.agentId)) {
+      flashClosed(h.id);
       return;
     }
-    routeToWindow(h.projectId, "new");
+    setClosedHitId(null);
+    if (h.projectId === currentId) {
+      // The agent lives in this window's project — select + mount it in place, then (best-effort)
+      // scroll its terminal to the matching turn.
+      focusHere(h.projectId, h.agentId);
+      queueScrollToHit(h);
+      return;
+    }
+    // A different project. If a window is already showing it, that window focuses the agent;
+    // otherwise open the project in a new window deep-linked to the agent (?agent= → the new
+    // window selects it on mount, see windowContext).
+    if (hasWindow(h.projectId)) {
+      focusElsewhere(h.projectId, h.agentId);
+    } else {
+      routeToWindow(h.projectId, "new", h.agentId);
+    }
   };
 
   const open = query.trim().length > 0;
@@ -185,8 +309,8 @@ export function HistorySearch({ openInWindow, currentProjectId }: HistorySearchP
                       disabled
                         ? "This project is no longer available"
                         : h.projectId === currentId
-                          ? "Open in this window"
-                          : "Open in a new window"
+                          ? "Jump to this agent"
+                          : "Jump to this agent in its window"
                     }
                     style={{
                       display: "block",
@@ -235,6 +359,19 @@ export function HistorySearch({ openInWindow, currentProjectId }: HistorySearchP
                     >
                       {renderSnippet(h.snippet)}
                     </div>
+                    {closedHitId === h.id && (
+                      <div
+                        role="alert"
+                        style={{
+                          marginTop: 4,
+                          color: DANGER,
+                          fontSize: 11,
+                          fontWeight: FONT_WEIGHT.semibold,
+                        }}
+                      >
+                        {AGENT_CLOSED_MESSAGE}
+                      </div>
+                    )}
                   </button>
                 );
               })}

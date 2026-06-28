@@ -3,6 +3,7 @@ import {
   projectWindowUrl,
   parseProjectIdFromSearch,
   parseWindowLabelFromSearch,
+  parseAgentIdFromSearch,
   computeInitialProjectId,
 } from "./projectWindows.url";
 
@@ -12,6 +13,21 @@ describe("projectWindows.url", () => {
     const search = url.slice(url.indexOf("?"));
     expect(parseProjectIdFromSearch(search)).toBe("abc-123");
     expect(parseWindowLabelFromSearch(search)).toBe("win-xyz");
+    // No agent param unless one is passed (so existing non-deep-link opens stay clean).
+    expect(parseAgentIdFromSearch(search)).toBeNull();
+  });
+
+  it("carries an optional deep-link agent id, round-tripping it", () => {
+    const url = projectWindowUrl("abc-123", "win-xyz", "agent-7");
+    const search = url.slice(url.indexOf("?"));
+    expect(parseProjectIdFromSearch(search)).toBe("abc-123");
+    expect(parseAgentIdFromSearch(search)).toBe("agent-7");
+  });
+
+  it("parses the agent id, null when absent or empty", () => {
+    expect(parseAgentIdFromSearch("?project=p&agent=a1")).toBe("a1");
+    expect(parseAgentIdFromSearch("?project=p")).toBeNull();
+    expect(parseAgentIdFromSearch("?agent=")).toBeNull();
   });
 
   it("parses the project id from a search string", () => {

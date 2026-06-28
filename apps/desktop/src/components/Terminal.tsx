@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
-import { Terminal as XTerm } from "@xterm/xterm";
+import { Terminal as XTerm, type IMarker } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -24,6 +24,10 @@ import { PH_NO_CAPTURE_CLASS } from "@sparkle/core";
 // this by the `zoom` factor, so it scales the terminal text only — not the UI chrome.
 const BASE_FONT_SIZE = 13;
 
+// When jumping to a prompt's marker, scroll a few rows above it so the matched turn has lead-in
+// context rather than sitting flush at the viewport top.
+const SCROLL_LEAD_IN_ROWS = 2;
+
 /**
  * Imperative handle the parent uses to drive this terminal without the user clicking it.
  */
@@ -33,6 +37,14 @@ export interface TerminalApi {
   // moves focus here and drives whatever's waiting — e.g. Claude's permission menu. The escape
   // sequence honors the app's cursor-key mode (DECCKM) so it lands the same as a real keypress.
   arrowFromComposer: (dir: "up" | "down") => void;
+  // Drop an xterm marker at the current line under `promptId`, so a later scrollToPrompt can jump
+  // the viewport back to where this prompt was sent. No-op on the ALTERNATE buffer (a full-screen
+  // TUI has no scrollback to mark). Markers are session-only: they live with this xterm instance
+  // and are trimmed once their line falls off the 8000-line scrollback.
+  markPrompt: (promptId: string) => void;
+  // Scroll the viewport to a prompt's marker. "scrolled" on success; "missing" when the marker is
+  // unknown or has been trimmed out (a different session, or scrolled out of scrollback).
+  scrollToPrompt: (promptId: string) => "scrolled" | "missing";
 }
 
 /**
@@ -82,6 +94,9 @@ export function Terminal({
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  // promptHistory entry id -> the xterm marker at the line where that prompt was sent. Drives
+  // "jump to this prompt" (pinned-prompt dropdown + history search). Session-only.
+  const markersRef = useRef<Map<string, IMarker>>(new Map());
   // The WebGL renderer (when available) caches colored glyphs in a texture atlas — kept so the
   // live re-theme effect can clear it and force already-painted cells to repaint.
   const webglRef = useRef<WebglAddon | null>(null);
@@ -224,6 +239,30 @@ export function Terminal({
           const seq = arrowKeySequence(dir, term.modes.applicationCursorKeysMode);
           void writePty(agentId, seq).catch(ignorePtyGone);
         },
+        markPrompt: (promptId) => {
+          // Scrollback lives on the normal buffer only; a full-screen TUI (alternate buffer) has
+          // nothing to mark, so skip — the prompt simply won't be jump-to-able.
+          if (term.buffer.active.type !== "normal") return;
+          const marker = term.registerMarker(0);
+          if (!marker) return;
+          markersRef.current.get(promptId)?.dispose(); // replace a re-run prompt's stale marker
+          markersRef.current.set(promptId, marker);
+          // Drop markers trimmed out of scrollback so the map can't grow unbounded over a session.
+          for (const [id, m] of markersRef.current) {
+            if (m.isDisposed) markersRef.current.delete(id);
+          }
+        },
+        scrollToPrompt: (promptId) => {
+          const marker = markersRef.current.get(promptId);
+          if (!marker || marker.isDisposed) {
+            markersRef.current.delete(promptId); // drop a trimmed marker as we discover it
+            return "missing";
+          }
+          // Land the turn a couple rows below the top edge so there's a little lead-in context
+          // instead of the prompt sitting flush against the viewport top.
+          term.scrollToLine(Math.max(0, marker.line - SCROLL_LEAD_IN_ROWS));
+          return "scrolled";
+        },
       };
     }
 
@@ -319,6 +358,7 @@ export function Terminal({
       for (const off of unlistens) off();
       void killPty(agentId).catch(ignorePtyGone);
       engine.dispose();
+      markersRef.current.clear(); // term.dispose() drops the markers; clear our handles too
       term.dispose();
       webglRef.current = null;
     };

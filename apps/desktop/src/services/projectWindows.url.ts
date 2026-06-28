@@ -3,16 +3,26 @@
 // project↔window lookup goes through the registry, not the label. Kept free of any Tauri import
 // so they unit-test without a webview.
 
-/** Entry URL for a new project window — carries both the initial project and the window's own
- *  opaque label so the app can read them synchronously on mount. */
-export function projectWindowUrl(projectId: string, label: string): string {
-  const qs = new URLSearchParams({ project: projectId, label });
+/** Entry URL for a new project window — carries the initial project, the window's own opaque
+ *  label, and (optionally) the agent to deep-link to on mount, so the app can read them
+ *  synchronously when it boots. */
+export function projectWindowUrl(projectId: string, label: string, agentId?: string): string {
+  const params: Record<string, string> = { project: projectId, label };
+  if (agentId) params.agent = agentId;
+  const qs = new URLSearchParams(params);
   return `index.html?${qs.toString()}`;
 }
 
 /** Extract the project id a window was opened for, or null. */
 export function parseProjectIdFromSearch(search: string): string | null {
   const id = new URLSearchParams(search).get("project");
+  return id && id.trim() ? id : null;
+}
+
+/** Extract the agent id a window should deep-link to on open (history-search "jump to agent"
+ *  into a fresh window), or null. */
+export function parseAgentIdFromSearch(search: string): string | null {
+  const id = new URLSearchParams(search).get("agent");
   return id && id.trim() ? id : null;
 }
 

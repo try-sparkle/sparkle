@@ -22,8 +22,9 @@ interface FocusableWindow {
 export interface ProjectWindowDeps {
   getByLabel(label: string): Promise<FocusableWindow | null>;
   /** Create a fresh window for the project. Owns generating the window's opaque label and
-   *  registering it (labels are decoupled from project ids — see projectWindows.url). */
-  createWindow(projectId: string): void;
+   *  registering it (labels are decoupled from project ids — see projectWindows.url). When
+   *  `agentId` is given, the new window deep-links to that agent on mount. */
+  createWindow(projectId: string, agentId?: string): void;
   currentLabel(): string;
   registry: {
     find(projectId: string): string | null;
@@ -38,6 +39,7 @@ export async function openProjectInWindow(
   projectId: string,
   mode: OpenMode,
   deps: ProjectWindowDeps,
+  agentId?: string,
 ): Promise<"focused" | "replaced" | "created"> {
   // 1) Already open somewhere? Focus that window regardless of mode.
   const existingLabel = deps.registry.find(projectId);
@@ -63,7 +65,7 @@ export async function openProjectInWindow(
   // 2) New window. createWindow owns the opaque label + registry.set, so the "new" path can
   // never collide with an existing label (a window's label is independent of its project).
   if (mode === "new") {
-    deps.createWindow(projectId);
+    deps.createWindow(projectId, agentId);
     // Opening in a new window is still opening it — bump recency like the focus/replace paths.
     // (Recency is intentionally NOT broadcast cross-window — see crossWindowSync's signature():
     // lastOpenedAt is excluded, so other windows' Recent ordering stays put until their next
@@ -88,14 +90,14 @@ export function defaultDeps(
 ): ProjectWindowDeps {
   return {
     getByLabel: (label) => WebviewWindow.getByLabel(label),
-    createWindow: (projectId) => {
+    createWindow: (projectId, agentId) => {
       // Opaque, collision-proof label (decoupled from the project id). Register it before/with
       // creation so a concurrent open finds it; on a creation failure ('tauri://error') evict the
       // entry so a later open doesn't focus a window that never came up.
       const label = `${WINDOW_LABEL_PREFIX}${crypto.randomUUID()}`;
       setWindowProject(label, projectId);
       const win = new WebviewWindow(label, {
-        url: projectWindowUrl(projectId, label),
+        url: projectWindowUrl(projectId, label, agentId),
         title: "Sparkle",
         width: 1200,
         height: 800,

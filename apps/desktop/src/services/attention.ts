@@ -1,7 +1,7 @@
 // Frontend bindings for the dock-badge + notification backend (src-tauri/src/attention.rs).
 // Every call is a no-op outside Tauri (tests, SSR) so the UI code can call them unconditionally.
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -43,4 +43,15 @@ export interface FocusAgentPayload {
 export function onFocusAgent(cb: (p: FocusAgentPayload) => void): Promise<UnlistenFn> {
   if (!hasTauri) return Promise.resolve(() => {});
   return listen<FocusAgentPayload>("attention://focus-agent", (e) => cb(e.payload));
+}
+
+/** Ask whichever window owns this agent's project to bring itself forward and select the agent —
+ *  the same path a notification click takes, but driven from the UI (e.g. a history-search hit in
+ *  a project this window doesn't own). Broadcasts to every window; the owning window handles it
+ *  (and the main window adopts an orphaned project). No-op outside Tauri. */
+export function emitFocusAgent(p: FocusAgentPayload): void {
+  if (!hasTauri) return;
+  void emit("attention://focus-agent", p).catch((e) =>
+    console.debug("emit focus-agent failed", e),
+  );
 }

@@ -44,10 +44,18 @@ describe("openProjectInWindow", () => {
     const deps = makeDeps();
     const r = await openProjectInWindow("p2", "new", deps);
     expect(r).toBe("created");
-    // createWindow owns label generation + registry.set; it's invoked with just the project id.
-    expect(deps.createWindow).toHaveBeenCalledWith("p2");
+    // createWindow owns label generation + registry.set; it's invoked with the project id and
+    // (here) no agent to deep-link.
+    expect(deps.createWindow).toHaveBeenCalledWith("p2", undefined);
     // New-window open bumps recency like focus/replace.
     expect(deps.touchOpened).toHaveBeenCalledWith("p2");
+  });
+
+  it("threads the deep-link agent id into a freshly created window", async () => {
+    const deps = makeDeps();
+    const r = await openProjectInWindow("p2", "new", deps, "a7");
+    expect(r).toBe("created");
+    expect(deps.createWindow).toHaveBeenCalledWith("p2", "a7");
   });
 
   it("replaces the current window in replace mode", async () => {

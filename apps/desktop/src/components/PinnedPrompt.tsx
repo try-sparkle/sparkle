@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { copyToClipboard } from "../clipboard";
-import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../theme/colors";
+import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, DANGER } from "../theme/colors";
 import type { PromptHistoryEntry } from "../types";
 import { formatAgo, oneLine } from "./promptHistory";
+
+/** Outcome of a jump attempt: the terminal scrolled, or the prompt's marker is gone (a prior
+ *  session, or trimmed out of scrollback) so there's nothing to scroll to. */
+export type JumpResult = "scrolled" | "missing";
 
 /**
  * Always-visible header showing the agent's most recent prompt (spec §7) — so you never have
@@ -22,12 +26,18 @@ export function PinnedPrompt({
   prompt,
   history = [],
   onSendToComposer,
+  onJumpToPrompt,
 }: {
   prompt: string;
   history?: PromptHistoryEntry[];
   onSendToComposer?: (text: string) => void;
+  /** Scroll the terminal to where a prompt was sent. Returns whether it could (see JumpResult).
+   *  When omitted, the Jump action isn't offered. */
+  onJumpToPrompt?: (id: string) => JumpResult;
 }) {
   const [open, setOpen] = useState(false);
+  // The row whose last Jump attempt found no marker — shows an inline "scrolled out" note.
+  const [scrolledOutId, setScrolledOutId] = useState<string | null>(null);
   // The selected (clicked / keyboard-active) row, and whether it's expanded to its full text.
   // -1 means nothing is selected yet. Only the selected row shows actions, and only it can expand.
   const [selectedIndex, setSelectedIndex] = useState(-1);
@@ -83,6 +93,7 @@ export function PinnedPrompt({
     if (!open) return;
     setSelectedIndex(-1);
     setExpanded(false);
+    setScrolledOutId(null);
     const raf = requestAnimationFrame(() => listRef.current?.focus());
     return () => cancelAnimationFrame(raf);
   }, [open]);
@@ -139,6 +150,15 @@ export function PinnedPrompt({
   };
   const doSend = (entry: PromptHistoryEntry) => {
     onSendToComposer?.(entry.text);
+    close();
+  };
+  const doJump = (entry: PromptHistoryEntry) => {
+    const result = onJumpToPrompt?.(entry.id);
+    if (result === "missing") {
+      // Nothing to scroll to — flag this row and leave the menu open so the note is visible.
+      setScrolledOutId(entry.id);
+      return;
+    }
     close();
   };
 
@@ -244,9 +264,12 @@ export function PinnedPrompt({
               selected={i === selectedIndex}
               expanded={i === selectedIndex && expanded}
               showSend={!!onSendToComposer}
+              showJump={!!onJumpToPrompt}
+              scrolledOut={scrolledOutId === entry.id}
               onClick={() => onRowClick(i)}
               onCopy={() => doCopy(entry)}
               onSend={() => doSend(entry)}
+              onJump={() => doJump(entry)}
             />
           ))}
         </ul>
@@ -260,17 +283,23 @@ function HistoryRow({
   selected,
   expanded,
   showSend,
+  showJump,
+  scrolledOut,
   onClick,
   onCopy,
   onSend,
+  onJump,
 }: {
   entry: PromptHistoryEntry;
   selected: boolean;
   expanded: boolean;
   showSend: boolean;
+  showJump: boolean;
+  scrolledOut: boolean;
   onClick: () => void;
   onCopy: () => void;
   onSend: () => void;
+  onJump: () => void;
 }) {
   const ref = useRef<HTMLLIElement>(null);
   const collapsed = oneLine(entry.text) || "(empty prompt)";
@@ -357,12 +386,22 @@ function HistoryRow({
           style={{
             flex: "0 0 auto",
             display: "flex",
-            gap: 6,
+            flexDirection: "column",
+            gap: 4,
+            alignItems: "flex-end",
             alignSelf: expanded ? "flex-start" : "center",
           }}
         >
-          <RowButton label="Copy" onClick={onCopy} />
-          {showSend && <RowButton label="Send to Composer" onClick={onSend} />}
+          <div style={{ display: "flex", gap: 6 }}>
+            {showJump && <RowButton label="Jump" onClick={onJump} />}
+            <RowButton label="Copy" onClick={onCopy} />
+            {showSend && <RowButton label="Send to Composer" onClick={onSend} />}
+          </div>
+          {scrolledOut && (
+            <span role="alert" style={{ fontSize: 10, color: DANGER, whiteSpace: "nowrap" }}>
+              Scrolled out — not from this session
+            </span>
+          )}
         </div>
       ) : (
         <span style={{ flex: "0 0 auto", fontSize: 11, color: C.muted }}>
