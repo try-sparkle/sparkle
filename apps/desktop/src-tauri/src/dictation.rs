@@ -442,6 +442,22 @@ pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool 
         if sess.cloud_active.load(Ordering::Relaxed) {
             return false; // idempotent — a repeated wake transition shouldn't open a second socket
         }
+        // Warm reuse: a socket paused into standby by a recent stop-word stop is still open. If its
+        // worker is alive, resume on it — no TLS+WS handshake, so dictation starts instantly. Done
+        // entirely under the lock (resume() is just a non-blocking channel send). A lost liveness
+        // race is safe: resuming a just-dead worker drops frames and its cloud-ended emit drives the
+        // frontend back to on-device — the same recovery as any mid-stream death.
+        {
+            let cloud = sess.cloud.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(s) = cloud.as_ref() {
+                if s.is_alive() {
+                    s.resume();
+                    sess.cloud_active.store(true, Ordering::Relaxed);
+                    tracing::info!(target: "dictation", "reusing warm deepgram socket");
+                    return true; // caller starts metering, exactly as for a fresh open
+                }
+            }
+        }
         (
             sess.cloud.clone(),
             sess.cloud_active.clone(),
@@ -509,14 +525,24 @@ pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool 
 /// back to the on-device model for continued wake-word listening.
 #[tauri::command]
 pub fn stop_cloud_stream(state: State<DictationState>) {
-    let session = {
+    let to_finish = {
         let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
-        sess.cloud_active.store(false, Ordering::Relaxed); // callback routes to on-device again
+        let was_active = sess.cloud_active.swap(false, Ordering::Relaxed); // callback routes on-device again
         sess.cloud_epoch.fetch_add(1, Ordering::Relaxed); // invalidate any in-flight start_cloud_stream
-        let s = sess.cloud.lock().unwrap_or_else(|p| p.into_inner()).take();
-        s
+        let mut cloud = sess.cloud.lock().unwrap_or_else(|p| p.into_inner());
+        // Warm standby: a genuine stop-word stop of a LIVE stream pauses the socket and KEEPS it for
+        // ~WARM_STANDBY so the next utterance reuses it (no handshake). The session stays in the slot;
+        // start_cloud_stream resumes it. Any other case (already inactive — e.g. a cloud-ended cleanup
+        // after warm expiry — or a worker that already died) takes + finishes the leftover instead.
+        let keep_warm = was_active && cloud.as_ref().map(|s| s.is_alive()).unwrap_or(false);
+        if keep_warm {
+            cloud.as_ref().unwrap().pause();
+            None
+        } else {
+            cloud.take()
+        }
     }; // release locks before the (slower) finish()/join
-    if let Some(s) = session {
+    if let Some(s) = to_finish {
         s.finish();
     }
 }

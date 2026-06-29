@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
@@ -52,6 +52,21 @@ const DRAIN_TICKS_AFTER_CLOSE: u32 = 50;
 /// Deepgram control message: "no more audio is coming; finalize and send remaining results."
 const CLOSE_STREAM_MSG: &str = "{\"type\":\"CloseStream\"}";
 
+/// Deepgram control message: flush + finalize the audio sent so far and emit the trailing final,
+/// but KEEP the socket open (unlike CloseStream). Used when pausing into warm standby so the last
+/// utterance still commits while the connection stays reusable for the next one.
+const FINALIZE_MSG: &str = "{\"type\":\"Finalize\"}";
+
+/// How long an idle (paused) Deepgram socket is kept open for instant reuse by the next utterance,
+/// instead of being torn down. The per-utterance TLS+WS handshake (~hundreds of ms — see `connect`)
+/// is the dominant cold-start latency the user feels; reusing a warm socket eliminates it for
+/// back-to-back dictation. Deliberately kept UNDER Deepgram's ~10 s server-side idle-close window so
+/// we never need to send KeepAlive frames: if the user resumes within it we reuse the socket, and if
+/// they don't the worker closes it cleanly (well before Deepgram would). Billing is unaffected — the
+/// per-minute meter is tied to the ACTIVE phase on the frontend, not to socket lifetime, so a warm
+/// idle socket is never billed.
+const WARM_STANDBY: Duration = Duration::from_secs(8);
+
 /// What the worker thread receives from the audio callback.
 enum AudioMsg {
     /// One frame of PCM16 little-endian bytes. The f32→PCM16 conversion runs in `send_audio` on the
@@ -60,6 +75,13 @@ enum AudioMsg {
     Frame(Vec<u8>),
     /// The user stopped dictating — flush Deepgram and wind the worker down.
     Close,
+    /// The user stopped this utterance but may dictate again shortly: Finalize the current segment
+    /// and drop into warm standby (keep the socket, stop expecting audio). After `WARM_STANDBY` with
+    /// no `Resume` the worker closes the socket itself.
+    Pause,
+    /// A new utterance started while the socket was warm: leave standby and resume forwarding audio
+    /// on the SAME connection — no new handshake.
+    Resume,
 }
 
 /// A live Deepgram streaming session. Holds the channel the audio callback feeds and the worker
@@ -71,6 +93,12 @@ pub struct DeepgramSession {
     /// so a session rejected by the post-handshake race guard doesn't fire an event that would tear
     /// down the *current* (healthy) session — the event carries no generation identity.
     suppress_ended: Arc<AtomicBool>,
+    /// True while the worker thread is running. Cleared the instant the worker exits (clean close,
+    /// warm-standby expiry, or socket death). Lets the reuse path (`start_cloud_stream`) check, under
+    /// the state lock, whether a warm session is still usable before resuming it. A lost race here is
+    /// SAFE: resuming a just-dead session simply drops frames, and the worker's `cloud-ended` emit on
+    /// exit drives the frontend back to on-device — the same recovery as any mid-stream death.
+    alive: Arc<AtomicBool>,
 }
 
 impl DeepgramSession {
@@ -82,18 +110,38 @@ impl DeepgramSession {
         let (tx, rx) = std::sync::mpsc::channel::<AudioMsg>();
         let suppress_ended = Arc::new(AtomicBool::new(false));
         let suppress_cb = suppress_ended.clone();
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_cb = alive.clone();
         let worker = std::thread::Builder::new()
             .name("deepgram-stream".into())
-            .spawn(move || run_session(app, socket, rx, suppress_cb))
+            .spawn(move || run_session(app, socket, rx, suppress_cb, alive_cb))
             .map_err(|e| format!("spawn deepgram worker: {e}"))?;
         tracing::info!(target: "dictation", "deepgram stream opened");
-        Ok(DeepgramSession { audio_tx: tx, worker: Some(worker), suppress_ended })
+        Ok(DeepgramSession { audio_tx: tx, worker: Some(worker), suppress_ended, alive })
     }
 
     /// Push one 16 kHz mono frame to Deepgram. Converts to PCM16 here (cheap) so the caller's
     /// audio callback stays minimal. Silently no-ops if the worker has already exited.
     pub fn send_audio(&self, frame: &[f32]) {
         let _ = self.audio_tx.send(AudioMsg::Frame(f32_to_pcm16le(frame)));
+    }
+
+    /// Drop into warm standby: Finalize the current utterance (so its trailing text still commits)
+    /// and keep the socket open for `WARM_STANDBY` so the next utterance can reuse it. No-ops if the
+    /// worker already exited. Called instead of `finish()` on a normal stop-word stop.
+    pub fn pause(&self) {
+        let _ = self.audio_tx.send(AudioMsg::Pause);
+    }
+
+    /// Leave warm standby and resume forwarding audio on the same connection (no handshake).
+    pub fn resume(&self) {
+        let _ = self.audio_tx.send(AudioMsg::Resume);
+    }
+
+    /// Whether the worker thread is still running (socket usable). Checked before reusing a warm
+    /// session; see the `alive` field for why a lost race is safe.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 
     /// End the stream: tell Deepgram to finalize, then join the worker. The shutdown path itself is
@@ -293,24 +341,49 @@ fn is_timeout(e: &std::io::Error) -> bool {
 /// (SPARKLE_DG_LIVE=1). This loop's timeout/`closing`-drain state machine is NOT exercised
 /// hermetically — doing so would require abstracting the socket behind a transport trait, which we
 /// judged not worth the indirection for this single call site (the live test is the real check).
+/// Whether a warm-standby socket has idled past its reuse window and should be closed. Pure so the
+/// boundary is unit-testable without a real clock.
+fn warm_expired(elapsed: Duration, window: Duration) -> bool {
+    elapsed >= window
+}
+
 fn run_session(
     app: AppHandle,
     mut socket: WebSocket<MaybeTlsStream<TcpStream>>,
     audio_rx: Receiver<AudioMsg>,
     suppress_ended: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 ) {
     set_socket_timeouts(&mut socket, READ_TIMEOUT, WRITE_TIMEOUT);
     let mut closing = false;
     let mut drain_ticks = 0u32;
+    // Warm standby: set on Pause, cleared on Resume. While paused the worker sends no audio and just
+    // keeps the socket open until the user resumes (instant reuse) or `WARM_STANDBY` elapses.
+    let mut paused = false;
+    let mut warm_since: Option<Instant> = None;
 
     'session: loop {
+        // 0) Warm-standby expiry: paused with no resume for the whole window → close cleanly (well
+        // before Deepgram's own idle timeout). Falls into the normal `closing` drain/exit below.
+        if paused {
+            if let Some(since) = warm_since {
+                if warm_expired(since.elapsed(), WARM_STANDBY) {
+                    let _ = socket.write(Message::text(CLOSE_STREAM_MSG));
+                    set_socket_timeouts(&mut socket, READ_TIMEOUT, READ_TIMEOUT);
+                    closing = true;
+                    paused = false;
+                    warm_since = None;
+                }
+            }
+        }
+
         // 1) Drain and send all currently-queued audio (non-blocking).
         loop {
             match audio_rx.try_recv() {
-                // Once we've told Deepgram the stream is closing, drop any late frames rather than
-                // sending audio after the CloseStream control message (which contradicts the
-                // "no more audio is coming" contract).
-                Ok(AudioMsg::Frame(_)) if closing => {}
+                // Drop frames once closing (post-CloseStream) OR while paused (warm standby sends no
+                // audio). In practice none arrive while paused — the capture callback routes frames
+                // on-device when cloud_active is false — but guard defensively.
+                Ok(AudioMsg::Frame(_)) if closing || paused => {}
                 Ok(AudioMsg::Frame(bytes)) => {
                     match socket.write(Message::binary(bytes)) {
                         Ok(()) => {}
@@ -325,6 +398,22 @@ fn run_session(
                         // strand dictation (cloud_active stuck true, no on-device resume).
                         Err(_) => break 'session,
                     }
+                }
+                // Pause: Finalize the current utterance (trailing text still commits) and enter warm
+                // standby — keep the socket for instant reuse. Ignored once closing (teardown wins).
+                Ok(AudioMsg::Pause) if !closing => {
+                    if !paused {
+                        let _ = socket.write(Message::text(FINALIZE_MSG));
+                        paused = true;
+                        warm_since = Some(Instant::now());
+                    }
+                    break; // go read the trailing final(s) Finalize will produce
+                }
+                Ok(AudioMsg::Pause) => {} // already closing — nothing to warm
+                // Resume: a new utterance reuses this warm socket — leave standby, keep draining.
+                Ok(AudioMsg::Resume) => {
+                    paused = false;
+                    warm_since = None;
                 }
                 Ok(AudioMsg::Close) | Err(TryRecvError::Disconnected) => {
                     // Begin shutdown — but exactly once. A dropped sender (Drop-without-finish())
@@ -380,6 +469,8 @@ fn run_session(
             }
         }
     }
+    // Mark dead BEFORE the cloud-ended emit so any concurrent reuse check (is_alive) sees the truth.
+    alive.store(false, Ordering::Relaxed);
     tracing::info!(target: "dictation", "deepgram stream closed");
     // Tell the frontend the cloud stream is gone (clean close OR mid-stream failure) so it clears
     // the interim preview and calls stop_cloud_stream — resuming on-device routing/fallback. Skipped
@@ -392,6 +483,23 @@ fn run_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_expires_only_at_or_past_the_window() {
+        let window = Duration::from_secs(8);
+        assert!(!warm_expired(Duration::from_secs(0), window), "fresh pause is not expired");
+        assert!(!warm_expired(Duration::from_millis(7_999), window), "just under the window stays warm");
+        assert!(warm_expired(Duration::from_secs(8), window), "exactly at the window expires");
+        assert!(warm_expired(Duration::from_secs(20), window), "well past the window expires");
+    }
+
+    #[test]
+    fn warm_standby_is_under_deepgrams_idle_close_so_no_keepalive_is_needed() {
+        // The whole no-KeepAlive design hinges on closing the warm socket ourselves BEFORE Deepgram's
+        // ~10 s server-side idle timeout would. Guard that margin so a future bump can't silently
+        // cross it (which would let Deepgram drop the socket mid-standby).
+        assert!(WARM_STANDBY < Duration::from_secs(10), "warm window must stay under Deepgram's idle close");
+    }
 
     #[test]
     fn url_carries_the_streaming_params() {
