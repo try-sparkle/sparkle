@@ -75,9 +75,9 @@ beforeEach(() => {
 const DIALOG_COPY = /Replace the project in this window/i;
 
 describe("TopBar Open/New flow", () => {
-  it("Open Project asks replace-vs-new-window BEFORE the folder picker", async () => {
+  it("Open asks replace-vs-new-window BEFORE the folder picker", async () => {
     render(<TopBar onOpenSettings={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Open Project" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
 
     // The choice dialog must appear, and the native picker must NOT have fired yet.
     expect(screen.getByText(DIALOG_COPY)).toBeTruthy();

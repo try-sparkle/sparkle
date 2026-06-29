@@ -26,6 +26,7 @@ import { HistorySearch } from "./HistorySearch";
 import { resolveStage, rollupStages, stageFraction, stageIndex } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { CloseWorkerPrompt } from "./CloseWorkerPrompt";
+import { BalanceBadge } from "./BalanceBadge";
 
 /**
  * Left column: the current project's agents as a vertical list (spec layout, revised).
@@ -435,7 +436,17 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       {/* position:relative + zIndex keep the Sparkle.ai logo IN FRONT of the voice-orb glow
           that the waveform paints below — the glow can bleed upward into this row, but the
           logo must stay crisp on top of it, never washed out behind it. */}
-      <div style={{ padding: "14px 14px 6px", position: "relative", zIndex: 1 }}>
+      <div
+        style={{
+          padding: "14px 14px 6px",
+          position: "relative",
+          zIndex: 1,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 8,
+        }}
+      >
         {/* Anchor (not a bare clickable <img>) so the logo is focusable and announced as a
             link; the system browser is opened via the Tauri opener, so we preventDefault and
             surface any opener failure rather than swallowing the promise. */}
@@ -452,6 +463,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         >
           <img src="/sparkle-logo.svg" alt="Sparkle" style={{ height: 25 }} />
         </a>
+        {/* Remaining AI-credit balance, top-right of the left column beside the wordmark. */}
+        <BalanceBadge />
       </div>
       <LogoWaveform />
 

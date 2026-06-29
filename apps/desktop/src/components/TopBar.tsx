@@ -3,7 +3,6 @@ import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, statusInk } from "../theme
 import type { AgentTabStatus, Project } from "../types";
 import { ThemeToggle } from "./ThemeToggle";
 import { AgentOrderToggle } from "./AgentOrderToggle";
-import { BalanceBadge } from "./BalanceBadge";
 import { AiFeaturesMenu } from "./AiFeaturesMenu";
 import { WorkerLimitControl } from "./WorkerLimitControl";
 import { NotificationsMenu } from "./NotificationsMenu";
@@ -12,6 +11,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { pickProjectFolder, basename } from "../services/dialog";
 import { openProjectInWindow, defaultDeps, type OpenMode } from "../services/projectWindows";
+import { findWindowForProject } from "../services/windowRegistry";
 import { resolveOpenTarget, type OpenTarget } from "../services/openTarget";
 import { OpenTargetDialog } from "./OpenTargetDialog";
 import { ModalShell } from "./ModalShell";
@@ -223,10 +223,6 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       {/* Push the actions to the right. */}
       <div style={{ flex: 1 }} />
 
-      <button style={btn} onClick={() => startOpen("Open a project — choose its folder")}>
-        Open Project
-      </button>
-
       <div style={{ position: "relative" }}>
         <button
           style={{ ...btn, position: "relative", zIndex: 42 }}
@@ -262,42 +258,82 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
                   No projects yet.
                 </div>
               )}
-              {recent.map((p) => (
-                <div
-                  key={p.id}
-                  onClick={() => {
-                    setRecentOpen(false);
-                    openOrAsk({ kind: "existing", id: p.id });
-                  }}
-                  title={p.rootPath}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    padding: "8px 10px",
-                    borderRadius: 6,
-                    cursor: "pointer",
-                    background: p.id === currentProjectId ? C.forest : "transparent",
-                  }}
-                >
-                  <StatusDot status={majorityStatus(p, statusMap)} size={8} />
-                  <span
+              {recent.map((p) => {
+                // Is this project already showing in some OTHER window? (A live registry entry
+                // whose label isn't this window's.) If so, offer a "Switch" affordance that just
+                // raises that window instead of replacing/reopening anything.
+                const openLabel = findWindowForProject(p.id);
+                const openElsewhere = openLabel != null && openLabel !== windowLabel;
+                return (
+                  <div
+                    key={p.id}
+                    onClick={() => {
+                      setRecentOpen(false);
+                      openOrAsk({ kind: "existing", id: p.id });
+                    }}
+                    title={p.rootPath}
                     style={{
-                      color: C.cream,
-                      fontSize: 13,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      padding: "8px 10px",
+                      borderRadius: 6,
+                      cursor: "pointer",
+                      background: p.id === currentProjectId ? C.forest : "transparent",
                     }}
                   >
-                    {p.name}
-                  </span>
-                </div>
-              ))}
+                    <StatusDot status={majorityStatus(p, statusMap)} size={8} />
+                    <span
+                      style={{
+                        flex: 1,
+                        minWidth: 0,
+                        color: C.cream,
+                        fontSize: 13,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {p.name}
+                    </span>
+                    {openElsewhere && (
+                      <button
+                        onClick={(e) => {
+                          // Don't let the row's open-handler fire too — Switch only raises the
+                          // existing window. openProjectInWindow focuses an already-open project
+                          // regardless of mode, so this never spawns a duplicate.
+                          e.stopPropagation();
+                          setRecentOpen(false);
+                          route(p.id, "new");
+                        }}
+                        title="Bring the window already showing this project to the front"
+                        style={{
+                          flex: "0 0 auto",
+                          background: "transparent",
+                          color: C.teal,
+                          border: `1px solid ${C.teal}`,
+                          borderRadius: 6,
+                          padding: "2px 8px",
+                          fontSize: 12,
+                          cursor: "pointer",
+                          fontFamily: '"IBM Plex Sans", sans-serif',
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        Switch
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </>
         )}
       </div>
+
+      <button style={btn} onClick={() => startOpen("Open a project — choose its folder")}>
+        Open
+      </button>
 
       <button
         style={{ ...btn, borderColor: C.teal, background: C.teal, color: ON_BRAND_FILL }}
@@ -305,9 +341,6 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       >
         New
       </button>
-
-      {/* Remaining AI-credit balance. */}
-      <BalanceBadge />
 
       {/* ⋯ menu: app text-size (zoom) controls — mirrors Cmd +/- / Cmd 0. */}
       <div style={{ position: "relative" }}>

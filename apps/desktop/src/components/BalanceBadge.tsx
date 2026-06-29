@@ -3,15 +3,17 @@ import { C } from "../theme/colors";
 import { useAuthStore } from "../stores/authStore";
 import { formatBalance } from "../services/creditPricing";
 
-// Shows the user's remaining AI-credit balance in the TopBar (design spec §7.3). Reads the
-// entitlement that AuthGate already loaded; refreshes on mount so it's current after a top-up.
+// Shows the user's remaining AI-credit balance in the sidebar header — top-right of the left
+// column, beside the Sparkle.ai wordmark (design spec §7.3). Reads the entitlement that
+// AuthGate already loaded; refreshes on mount so it's current after a top-up.
+// No outline and no ⚡ icon — just the dollar amount in a filled pill whose corner radius
+// matches the "Open" pill in the TopBar (8px, not a fully-rounded 999 capsule).
 const badge: CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
-  gap: 4,
   padding: "3px 9px",
-  borderRadius: 999,
-  border: `1px solid ${C.muted}`,
+  borderRadius: 8,
+  background: C.forest,
   color: C.cream,
   fontSize: 12,
   fontVariantNumeric: "tabular-nums",
@@ -30,7 +32,7 @@ export function BalanceBadge() {
   if (!me) return null;
   return (
     <span style={badge} title="Remaining AI credits" aria-label="Remaining AI credits">
-      ⚡ {formatBalance(me.balanceCents)}
+      {formatBalance(me.balanceCents)}
     </span>
   );
 }
