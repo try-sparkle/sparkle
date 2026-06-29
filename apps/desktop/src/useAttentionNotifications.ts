@@ -37,7 +37,12 @@ import {
   onFocusAgent,
   type FocusAgentPayload,
 } from "./services/attention";
-import type { AgentTab } from "./types";
+import { emitAttention, emitResolved } from "./services/relayClient";
+import type { AgentTab, AgentTabStatus } from "./types";
+
+/** The two "needs you" statuses (mirrors engine/attention's red set) — relayed to the phone. */
+const isRed = (s: AgentTabStatus | undefined): boolean =>
+  s === "approval" || s === "waiting";
 
 /** Bring this window to the foreground (notification click landed here). */
 async function bringToFront(): Promise<void> {
@@ -86,6 +91,8 @@ export function useAttentionNotifications(): void {
   // instead of firing a notification for every already-notifiable agent in the new project.
   const prevStatus = useRef<StatusMap>({});
   const prevProject = useRef<string | null>(null);
+  // agentId -> the attention_id we sent the phone, so we can resolve it when it clears.
+  const attentionIds = useRef<Record<string, string>>({});
 
   // Badge + notification side-effects, recomputed whenever status, the owned agent set, or the
   // notify prefs change. The badge stays strictly waiting/approval (countAttention); the banner
@@ -106,8 +113,40 @@ export function useAttentionNotifications(): void {
       for (const { id, status: st } of newlyEntered(prevStatus.current, status, ownedIds, enabled)) {
         const agent = agents.find((a) => a.id === id);
         if (!agent || projectId == null) continue;
+        // Mirror a "needs you" (red) attention to the paired phone — regardless of local
+        // suppression (the phone is a separate device).
+        if (isRed(st)) {
+          const attentionId = crypto.randomUUID();
+          attentionIds.current[id] = attentionId;
+          const approval = st === "approval";
+          emitAttention({
+            attention_id: attentionId,
+            agent_id: id,
+            agent_name: agent.name,
+            project_name: projectName,
+            kind: approval ? "approval" : "question",
+            question: approval
+              ? `${agent.name} needs you to approve an action in ${projectName}.`
+              : `${agent.name} is waiting on your answer in ${projectName}.`,
+            suggested_replies: approval
+              ? [
+                  { label: "Approve", value: "y\n" },
+                  { label: "Deny", value: "n\n" },
+                ]
+              : [],
+            created_at: new Date().toISOString(),
+          });
+        }
         if (suppressNotification({ windowFocused, selectedAgentId, agentId: id })) continue;
         notifyAttention({ projectId, agentId: id, ...notificationFor(st, agent.name, projectName) });
+      }
+    }
+    // Clear the phone's card for any agent we raised that is no longer red — including agents
+    // that left the owned set entirely (project switch / removed), which the loop above misses.
+    for (const [id, attentionId] of Object.entries(attentionIds.current)) {
+      if (!isRed(status[id])) {
+        emitResolved(attentionId);
+        delete attentionIds.current[id];
       }
     }
     prevStatus.current = status;

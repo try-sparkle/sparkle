@@ -55,6 +55,14 @@ pub fn desktop_has_token() -> bool {
     read_token().is_some()
 }
 
+/// The stored desktop bearer (or null if signed out). Exposed ONLY to the trusted local
+/// webview so the in-app Socket.IO relay client can authenticate to the orchestration relay
+/// as this user's Mac (role "host"). The token never leaves the device beyond that TLS socket.
+#[tauri::command]
+pub fn desktop_bearer_token() -> Option<String> {
+    read_token()
+}
+
 /// Clear the stored token (local sign-out). Missing entry is treated as success.
 #[tauri::command]
 pub fn desktop_sign_out() -> Result<(), String> {
@@ -83,6 +91,25 @@ pub fn desktop_exchange_code(code: String) -> Result<(), String> {
         .ok_or_else(|| "exchange response missing token".to_string())?;
     entry()?.set_password(token).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Mint a short 6-char pairing code to sign a phone in (POST /pair/code, authed). Returns the
+/// code string for display ("Pair phone"). The phone types it to get its own bearer.
+#[tauri::command]
+pub fn desktop_pair_code() -> Result<String, String> {
+    let token = read_token().ok_or_else(|| "not signed in".to_string())?;
+    let url = format!("{}/pair/code", base_url());
+    let resp = ureq::post(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json")
+        .send_string("{}")
+        .map_err(|e| format!("pair code failed: {e}"))?;
+    let text = resp.into_string().map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    v.get("code")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "pair response missing code".to_string())
 }
 
 /// Entitlement + balance for the signed-in user.

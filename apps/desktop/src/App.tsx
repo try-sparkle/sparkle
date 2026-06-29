@@ -7,9 +7,11 @@ import { useConnectionMonitor } from "./connectionMonitor";
 import { resolveEnvChiefPat } from "./services/chief";
 import { healAgentHooks } from "./services/worktree";
 import { importDefault } from "./services/accountStore";
+import { startRelayHost, stopRelayHost } from "./services/relayClient";
 import { useSettingsStore } from "./stores/settingsStore";
 import { CurrentProjectProvider } from "./windowContext";
 import { useAttentionNotifications } from "./useAttentionNotifications";
+import { useRosterPublisher } from "./useRosterPublisher";
 
 // Owns the dock badge + Notification Center banners + click-to-worker routing. Rendered inside
 // the provider (it reads this window's current project) and paints no UI of its own.
@@ -25,6 +27,15 @@ export function App() {
   useConnectionMonitor();
   // App-level always-listening voice controller (mounted once).
   useAmbientVoice();
+  // Publish the live agent roster to the paired phone (the mobile dashboard mirror).
+  useRosterPublisher();
+
+  // Phone approvals remote: open the relay host connection (no-op if signed out) so a local
+  // agent's "needs you" can reach the paired phone, and a phone decision can drive the PTY.
+  useEffect(() => {
+    void startRelayHost().catch((e) => console.warn("startRelayHost failed", e));
+    return () => stopRelayHost();
+  }, []);
 
   // Seed the Chief PAT from the user's environment (.env.local) at launch so the Think
   // agent works without pasting a token. Resolved in Rust (never baked into the bundle); set

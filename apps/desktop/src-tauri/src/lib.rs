@@ -162,6 +162,8 @@ pub fn run() {
             history::history_prune,
             transcript::read_transcript_last_assistant,
             auth::desktop_has_token,
+            auth::desktop_bearer_token,
+            auth::desktop_pair_code,
             auth::desktop_sign_out,
             auth::desktop_exchange_code,
             auth::desktop_me,
