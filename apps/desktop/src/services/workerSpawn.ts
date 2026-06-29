@@ -5,6 +5,8 @@ import { useProjectStore } from "../stores/projectStore";
 import { createWorkerWorktree, type WorktreeInfo, killPty } from "../pty";
 import { removeAgentWorktree } from "./worktree";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { maybeAutoName } from "./agentNaming";
+import { aiFeatureNow } from "./aiGate";
 
 export async function spawnWorker(args: {
   projectId: string;
@@ -49,6 +51,17 @@ export async function spawnWorker(args: {
     throw e;
   }
   useProjectStore.getState().setAgentWorktree(args.projectId, workerId, info.path, info.branch);
+
+  // Auto-name the worker from its assigned task, the same way a build/orchestrator agent is named
+  // from its first typed prompt. A worker's task never flows through the Composer's onSubmitPrompt
+  // handler (it's injected as the PTY's initialPrompt at launch), so without this it would keep its
+  // default "Worker N" name until Claude Code eventually writes a session title. Fire-and-forget,
+  // gated on the same autoRename AI feature; no-ops if pinned, thin, or no API key. Claude Code's
+  // later ai-title still supersedes (maybeAutoName bails once aiTitle is set).
+  if (aiFeatureNow("autoRename") && args.task.trim()) {
+    void maybeAutoName(args.projectId, workerId, args.task);
+  }
+
   return workerId;
 }
 

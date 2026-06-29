@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { useAuthStore } from "../stores/authStore";
+import { useSettingsStore } from "../stores/settingsStore";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
@@ -26,6 +28,9 @@ describe("spawnWorker", () => {
   beforeEach(() => {
     useProjectStore.setState({ projects: [], selectedProjectId: null });
     invokeMock.mockReset();
+    // Default: AI enhancements locked (anonymous) so the auto-name path stays dormant and these
+    // tests assert spawn mechanics without a second (generate_agent_name) invoke.
+    useAuthStore.setState({ me: null });
   });
 
   it("creates a worker tab under the parent, cuts a worktree from the parent branch, and persists it", async () => {
@@ -53,6 +58,58 @@ describe("spawnWorker", () => {
     expect(worker.branch).toBe("sparkle/agent-w");
     // Successful spawn selects the new worker tab (drives PTY launch in AgentPane).
     expect(proj.selectedAgentId).toBe(workerId);
+  });
+
+  it("auto-names the worker from its task when the autoRename feature is unlocked", async () => {
+    // Entitled + setting on → the same auto-name path that names build agents from their first
+    // typed prompt now names a worker from its injected task (it never flows through the Composer).
+    useAuthStore.setState({ me: { clerkUserId: "u", entitled: true, balanceCents: 0, tokenVersion: 0 } });
+    useSettingsStore.setState({ aiAutoRename: true });
+
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" });
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+
+    // Key the mock on the command name (not call order): maybeAutoName fires unawaited (void), so
+    // a queued mockResolvedValueOnce would be brittle to any incidental invoke landing between the
+    // worktree cut and the naming call.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "create_worker_worktree") return Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" });
+      if (cmd === "generate_agent_name") return Promise.resolve({ title: "Login flow", description: "Build the login flow" });
+      return Promise.resolve(undefined);
+    });
+
+    const workerId = await spawnWorker({ projectId, parentAgentId: buildId, task: "Build the login flow" });
+
+    // The naming backend was called with the worker's task as the basis.
+    await vi.waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("generate_agent_name", { prompt: "Build the login flow" }),
+    );
+    await vi.waitFor(() => {
+      const worker = useProjectStore.getState().projects.find((p) => p.id === projectId)!
+        .agents.find((a) => a.id === workerId)!;
+      expect(worker.name).toBe("Login flow");
+      expect(worker.autoNameVariants?.title).toBe("Login flow");
+    });
+  });
+
+  it("does NOT auto-name the worker when AI enhancements are locked (anonymous trial)", async () => {
+    useAuthStore.setState({ me: null }); // not entitled
+    useSettingsStore.setState({ aiAutoRename: true });
+
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" });
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+
+    invokeMock.mockResolvedValueOnce({ path: "/wt/worker", branch: "sparkle/agent-w" });
+
+    await spawnWorker({ projectId, parentAgentId: buildId, task: "Build the login flow" });
+
+    // Only the worktree call — no billed naming call when the feature is gated off.
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).not.toHaveBeenCalledWith("generate_agent_name", expect.anything());
   });
 
   it("throws if the parent has no branch yet", async () => {
