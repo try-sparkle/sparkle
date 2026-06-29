@@ -14,6 +14,24 @@ import { CLOUD_DICTATION_CENTS_PER_MIN } from "./creditPricing";
 const MINUTE_MS = 60_000;
 
 /**
+ * How many CONSECUTIVE transient debit failures (a thrown `consume` — network/TLS blip, server
+ * 5xx) we ride out before tearing the cloud stream down. A genuine "out of credits" decline
+ * (`{ok:false}`) is NOT transient and still stops on the first occurrence — this tolerance applies
+ * only to thrown errors. A single hiccup (the observed `tls connection init failed: unexpected end
+ * of file`) no longer drops the premium stream the user explicitly enabled; a real outage still
+ * falls back after this many minutes. Each tolerated minute went un-billed (the debit never
+ * landed), so the exposure is bounded to ~this many free minutes per outage. A successful debit
+ * resets the counter.
+ */
+export const MAX_CONSECUTIVE_TRANSIENT_DEBIT_FAILS = 2;
+
+/** Outcome of a single per-minute debit attempt.
+ *  - `charged`:  the minute was billed (or was a 0-cent tick) — keep streaming.
+ *  - `declined`: a definitive refusal (out of credits, or AI turned off) — stop now, no retry.
+ *  - `error`:    a transient throw (network/TLS/server) — the caller tolerates a bounded run. */
+type DebitOutcome = "charged" | "declined" | "error";
+
+/**
  * Integer cents to debit for `minuteIndex` (0-based) at a possibly-fractional per-minute `rate`,
  * via a cumulative-rounding accumulator: `round(rate*(n+1)) - round(rate*n)`. This is the fix for
  * the silent-cloud-dictation bug: the credit ledger's `/credits/consume` requires whole, positive
@@ -86,39 +104,37 @@ export function createCloudDictationMeter(deps: CloudMeterDeps): CloudDictationM
   // meter never starts ticking (we create a fresh meter per active-dictation window).
   let stopped = false;
 
-  const debitOneMinute = async (): Promise<boolean> => {
-    if (!deps.isAiEnabled()) return false;
+  const debitOneMinute = async (): Promise<DebitOutcome> => {
+    if (!deps.isAiEnabled()) return "declined"; // AI off ⇒ no charge, no stream
     const idx = minute;
     const cents = minuteDebitCents(CLOUD_DICTATION_CENTS_PER_MIN, idx);
     const key = `${deps.sessionId}:${idx}`; // idempotent per (session, minute)
     minute += 1;
     // A fractional rate can round to a 0-cent tick; the ledger rejects `cents: 0`, so skip the
     // network debit and carry the fraction — the cumulative accumulator bills it on a later minute.
-    if (cents <= 0) return true;
+    if (cents <= 0) return "charged";
     try {
       const res = await deps.consume(cents, "cloud_dictation_minute", { minute: idx }, key);
       if (!res.ok) {
-        // Out of credits — log it (don't fail silently) so the fall-back-to-on-device is explained.
+        // Out of credits — a DEFINITIVE refusal (not a blip): log it and stop now, no tolerance.
         // eslint-disable-next-line no-console
         console.warn(
           `[cloud-dictation] minute ${idx} debit of ${cents}¢ declined — out of credits (balance ${res.balanceCents}¢); stopping cloud stream`,
         );
-        return false;
+        return "declined";
       }
       // Successful debit → tick the displayed balance down in real time. Prefer the server's
       // post-debit balance; pass null when absent so the caller can optimistically decrement.
       deps.onDebited?.(res.balanceAfterCents ?? null, cents);
-      return true;
+      return "charged";
     } catch (e) {
-      // A thrown debit (network/Rust error — e.g. the server rejecting the request) must NOT be
-      // silent: this is exactly the failure that made cloud dictation invisibly fall back to the
-      // on-device model. Log it; caller stops + falls back. Returning (never throwing) keeps the
+      // A THROWN debit (network/TLS/server error) is transient: a single blip shouldn't drop a
+      // premium stream the user explicitly enabled. Log it (never silent) but return "error" so the
+      // caller can ride out a bounded run before falling back. Returning (never throwing) keeps the
       // interval's .then path live, so no unhandled rejection.
       // eslint-disable-next-line no-console
-      console.warn(
-        `[cloud-dictation] minute ${idx} debit of ${cents}¢ failed: ${String(e)}; stopping cloud stream`,
-      );
-      return false;
+      console.warn(`[cloud-dictation] minute ${idx} debit of ${cents}¢ failed (transient): ${String(e)}`);
+      return "error";
     }
   };
 
@@ -133,20 +149,44 @@ export function createCloudDictationMeter(deps: CloudMeterDeps): CloudDictationM
   return {
     async start() {
       minute = 0;
-      if (!(await debitOneMinute())) return false; // AI off or out of credits → don't open the socket
+      // Minute 0 gates whether we open a billable socket at all: anything but a clean charge (AI off,
+      // out of credits, OR a transient error reaching the ledger) means stay on-device — we never
+      // open a stream we couldn't bill for its very first minute.
+      if ((await debitOneMinute()) !== "charged") return false;
       if (stopped) return false; // stop() landed during the first debit → never install the interval
       let inFlight = false;
+      // Consecutive transient (thrown) failures since the last successful debit. Tolerated up to
+      // MAX_CONSECUTIVE_TRANSIENT_DEBIT_FAILS so a momentary network blip doesn't drop the stream;
+      // reset to 0 on any successful debit.
+      let consecutiveTransientFails = 0;
       timer = deps.setInterval(() => {
         // Don't overlap debits: if the previous minute's debit is still resolving (e.g. a slow
         // server-backed consume took >60s), skip this tick rather than fire a concurrent debit.
         if (inFlight) return;
         inFlight = true;
-        void debitOneMinute().then((charged) => {
+        void debitOneMinute().then((outcome) => {
           inFlight = false;
-          if (!charged) {
+          if (outcome === "charged") {
+            consecutiveTransientFails = 0; // healthy round-trip → forget any prior blips
+            return;
+          }
+          if (outcome === "declined") {
+            // Definitive (out of credits / AI off): stop immediately, no tolerance.
+            stop();
+            deps.onExhausted();
+            return;
+          }
+          // Transient throw: ride out a bounded run, then give up and fall back to on-device.
+          consecutiveTransientFails += 1;
+          if (consecutiveTransientFails > MAX_CONSECUTIVE_TRANSIENT_DEBIT_FAILS) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[cloud-dictation] ${consecutiveTransientFails} consecutive transient debit failures; stopping cloud stream, falling back to on-device`,
+            );
             stop();
             deps.onExhausted();
           }
+          // else: keep streaming across the blip (this minute went un-billed — bounded grace).
         });
       }, MINUTE_MS);
       return true;

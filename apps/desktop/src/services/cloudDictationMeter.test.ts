@@ -4,6 +4,7 @@ import {
   openMeteredCloudWindow,
   minuteDebitCents,
   nextBalanceCents,
+  MAX_CONSECUTIVE_TRANSIENT_DEBIT_FAILS,
   type CloudMeterDeps,
   type CloudDictationMeter,
 } from "./cloudDictationMeter";
@@ -12,6 +13,12 @@ import type { ConsumeResult } from "./credits";
 
 const okResult: ConsumeResult = { ok: true, balanceAfterCents: 100, ledgerId: "l1" };
 const brokeResult: ConsumeResult = { ok: false, balanceCents: 0 };
+
+/** Flush enough microtasks for one debit to fully settle (consume reject → debitOneMinute resume →
+ *  the interval's `.then`), so the `inFlight` guard releases before the next fake tick fires. */
+const settleDebit = async () => {
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+};
 
 /** A controllable fake interval: capture the tick callback so the test can fire minutes by hand. */
 function fakeTimer() {
@@ -243,6 +250,123 @@ describe("createCloudDictationMeter", () => {
     // Idempotency keys advanced per minute; cents is the whole-cent accumulator value for minute 2
     // (round(3*5.8)-round(2*5.8) = 17-12 = 5).
     expect(consume).toHaveBeenNthCalledWith(3, minuteDebitCents(CLOUD_DICTATION_CENTS_PER_MIN, 2), "cloud_dictation_minute", { minute: 2 }, "s1:2");
+  });
+
+  it("tolerates a bounded run of transient (thrown) debit errors without dropping the stream", async () => {
+    // A momentary network/TLS blip throws from consume(). The stream must survive up to
+    // MAX_CONSECUTIVE_TRANSIENT_DEBIT_FAILS such hiccups in a row and recover on the next success —
+    // not fall back to on-device the way a real out-of-credits decline does.
+    let calls = 0;
+    const consume = vi.fn(async (): Promise<ConsumeResult> => {
+      calls += 1;
+      // minute 0 ok; minutes 1..MAX throw; the next minute succeeds again.
+      if (calls === 1) return okResult;
+      if (calls <= 1 + MAX_CONSECUTIVE_TRANSIENT_DEBIT_FAILS) throw new Error("tls blip");
+      return okResult;
+    });
+    const t = fakeTimer();
+    const onExhausted = vi.fn();
+    const meter = createCloudDictationMeter({
+      consume,
+      isAiEnabled: () => true,
+      setInterval: t.setInterval,
+      clearInterval: t.clearInterval,
+      onExhausted,
+      sessionId: "s1",
+    });
+    await meter.start(); // minute 0 ok
+    for (let i = 0; i < MAX_CONSECUTIVE_TRANSIENT_DEBIT_FAILS; i++) {
+      t.tick(); // each throws — tolerated
+      await settleDebit();
+    }
+    expect(onExhausted).not.toHaveBeenCalled(); // rode out every blip
+    expect(t.cleared).toBe(false); // stream still open
+    t.tick(); // recovers
+    await settleDebit();
+    expect(onExhausted).not.toHaveBeenCalled();
+    expect(t.cleared).toBe(false);
+    // Each tick actually fired a debit (1 start + MAX throws + 1 recovery) — proves no tick was
+    // silently swallowed by the inFlight guard.
+    expect(consume).toHaveBeenCalledTimes(1 + MAX_CONSECUTIVE_TRANSIENT_DEBIT_FAILS + 1);
+  });
+
+  it("gives up after one too many consecutive transient errors → stop + onExhausted", async () => {
+    // One more consecutive throw than we tolerate ⇒ a genuine outage ⇒ fall back to on-device.
+    let calls = 0;
+    const consume = vi.fn(async (): Promise<ConsumeResult> => {
+      calls += 1;
+      return calls === 1 ? okResult : Promise.reject(new Error("server down"));
+    });
+    const t = fakeTimer();
+    const onExhausted = vi.fn();
+    const meter = createCloudDictationMeter({
+      consume,
+      isAiEnabled: () => true,
+      setInterval: t.setInterval,
+      clearInterval: t.clearInterval,
+      onExhausted,
+      sessionId: "s1",
+    });
+    await meter.start(); // minute 0 ok
+    for (let i = 0; i <= MAX_CONSECUTIVE_TRANSIENT_DEBIT_FAILS; i++) {
+      t.tick(); // MAX tolerated, then one more → give up
+      await settleDebit();
+    }
+    expect(onExhausted).toHaveBeenCalledTimes(1);
+    expect(t.cleared).toBe(true);
+  });
+
+  it("a successful debit resets the transient-failure counter (blips never accumulate to a give-up)", async () => {
+    // Alternating throw/success forever: because each success resets the run, we never reach the
+    // give-up threshold even across many total failures.
+    let calls = 0;
+    const consume = vi.fn(async (): Promise<ConsumeResult> => {
+      calls += 1;
+      // ok, throw, ok, throw, ok, … (every even call throws)
+      if (calls % 2 === 0) throw new Error("intermittent blip");
+      return okResult;
+    });
+    const t = fakeTimer();
+    const onExhausted = vi.fn();
+    const meter = createCloudDictationMeter({
+      consume,
+      isAiEnabled: () => true,
+      setInterval: t.setInterval,
+      clearInterval: t.clearInterval,
+      onExhausted,
+      sessionId: "s1",
+    });
+    await meter.start();
+    for (let i = 0; i < 10; i++) {
+      t.tick();
+      await settleDebit();
+    }
+    expect(onExhausted).not.toHaveBeenCalled();
+    expect(t.cleared).toBe(false);
+  });
+
+  it("an out-of-credits decline still stops on the FIRST occurrence (no transient tolerance)", async () => {
+    // Regression guard: tolerance must apply ONLY to thrown errors, never to a definitive {ok:false}.
+    let calls = 0;
+    const consume = vi.fn(async () => {
+      calls += 1;
+      return calls === 1 ? okResult : brokeResult; // minute 0 ok, minute 1 out of credits
+    });
+    const t = fakeTimer();
+    const onExhausted = vi.fn();
+    const meter = createCloudDictationMeter({
+      consume,
+      isAiEnabled: () => true,
+      setInterval: t.setInterval,
+      clearInterval: t.clearInterval,
+      onExhausted,
+      sessionId: "s1",
+    });
+    await meter.start(); // minute 0 ok
+    await t.tick(); // minute 1 declined → immediate stop
+    await Promise.resolve();
+    expect(onExhausted).toHaveBeenCalledTimes(1);
+    expect(t.cleared).toBe(true);
   });
 
   it("stop() during the first debit never installs the interval (no orphaned billing timer)", async () => {
