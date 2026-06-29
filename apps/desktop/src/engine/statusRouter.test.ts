@@ -142,6 +142,93 @@ describe("createStatusRouter", () => {
     expect(emit.mock.calls.map((c) => c[0])).toEqual(["idle", "waiting"]);
   });
 
+  it("lets the followup judge escalate a hook-idle turn to red (idle, then judge)", () => {
+    // The hook log only shows Stop→idle, but the async judge read the finished turn and decided
+    // the agent is blocked on the user ("want me to land it?"). That's a real "answer me" (red).
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("idle"); // hook says the turn ended
+    r.fromJudge("waiting"); // ...but the judge says it's blocked on you
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["idle", "waiting"]);
+  });
+
+  it("does NOT let the judge override a hook 'working' (escalation is idle-only)", () => {
+    // A late judge verdict that lands after the user already resumed the agent must not pull a
+    // live, working turn back to red.
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("working");
+    r.fromJudge("waiting");
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["working"]);
+  });
+
+  it("clears the judge escalation once the hook reports working again", () => {
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("idle");
+    r.fromJudge("waiting"); // → red
+    r.fromHook("working"); // user answered; Claude resumed → green wins again
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["idle", "waiting", "working"]);
+  });
+
+  it("a judge verdict from a prior turn does not re-red the next genuinely-done turn", () => {
+    // The stale-verdict risk: working (turn 2 opens) must drop the prior verdict so turn 2's
+    // idle stays gray. (AgentPane additionally guards against applying a stale verdict at all.)
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("idle"); // turn 1 ends
+    r.fromJudge("waiting"); // ...blocked on you → red
+    r.fromHook("working"); // turn 2 runs (verdict dropped)
+    r.fromHook("idle"); // turn 2 ends DONE → must stay gray
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["idle", "waiting", "working", "idle"]);
+  });
+
+  it("does not escalate a hook 'done' via a stale judge verdict", () => {
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromJudge("waiting");
+    r.fromHook("done");
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["done"]);
+  });
+
+  it("reset() clears a remembered judge verdict so it can't escalate the next run", () => {
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromJudge("waiting");
+    r.reset();
+    r.activate();
+    r.fromHook("idle"); // new run: no live verdict → stays idle
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["idle"]);
+  });
+
+  it("screen and judge both escalate the same idle to red without double-emitting", () => {
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("idle");
+    r.fromScreen("waiting"); // screen prompt → red
+    r.fromJudge("waiting"); // judge agrees → already red, no redundant emit
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["idle", "waiting"]);
+  });
+
+  it("a judge verdict keeps the turn red across a later scraper idle tick", () => {
+    // Once the judge reds an idle turn, a benign scraper 'idle' re-resolve must not drop it back
+    // to gray — the verdict is sticky until the turn reopens.
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("idle");
+    r.fromJudge("waiting"); // → red
+    r.fromScreen("idle"); // scraper tick (no on-screen prompt) → must stay red
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["idle", "waiting"]);
+  });
+
   it("activate() is idempotent and does not itself emit", () => {
     const emit = vi.fn();
     const r = createStatusRouter(emit);

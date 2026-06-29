@@ -23,6 +23,7 @@ import { setPin, markExhausted, type Account } from "../services/accountStore";
 import { chooseAccountForAgent, invalidateAccountState } from "../services/accountSelection";
 import { readWorkerResult } from "../pty";
 import { maybeAutoName } from "../services/agentNaming";
+import { judgeNeedsFollowup } from "../services/turnFollowup";
 import { invoke } from "@tauri-apps/api/core";
 import { HookStatusEngine, type HookEvent } from "../engine/hookEvents";
 import { createStatusRouter, type StatusRouter } from "../engine/statusRouter";
@@ -132,6 +133,32 @@ export function AgentPane({
   // submission, so deduping prompts would wrongly swallow a genuine consecutive re-run of the same
   // prompt (roborev 8261ded / 10135).
   const lastResponseRef = useRef<string | undefined>(undefined);
+  // Turn counter (tune-coloring): bumped on every UserPromptSubmit so the async followup judge can
+  // tell whether the turn it was asked about is still the current one. A verdict that resolves after
+  // the user already sent a new prompt (turn moved on) must NOT escalate the now-stale turn to red.
+  const turnSeqRef = useRef(0);
+
+  // Followup judge (tune-coloring): decide whether a finished turn is blocked on the user and, if
+  // so, escalate the hook's gray `idle` to red `waiting` via the router. Reuses the same transcript
+  // text already read for history capture. Best-effort: any failure leaves the turn gray. Gated by
+  // the turn token so a verdict that resolves after the user moved on can't re-red a stale turn.
+  const maybeJudgeFollowup = async (response: string, turn: number): Promise<void> => {
+    try {
+      const fresh = useProjectStore
+        .getState()
+        .projects.find((p) => p.id === project.id)
+        ?.agents.find((a) => a.id === agent.id);
+      // The "work at hand" the judge weighs a closeout-vs-new-work ask against: the prompt that
+      // defined this agent's work, falling back to its name.
+      const task = (fresh?.autoNameBasis ?? fresh?.name ?? agent.name ?? "").trim();
+      const needs = await judgeNeedsFollowup({ task, response });
+      if (needs && turnSeqRef.current === turn) {
+        routerRef.current?.fromJudge("waiting");
+      }
+    } catch {
+      // Judge is advisory — never let it disturb status handling.
+    }
+  };
 
   // History capture (): persist this Build agent's prompts and responses to the
   // searchable history store, reusing the hook pipeline rather than scraping the PTY. Only for
@@ -151,10 +178,17 @@ export function AgentPane({
         agentName: agent.name,
         createdAt: Date.now(),
       });
+      // A new user prompt opens a fresh turn — bump the counter the judge guards against (see
+      // turnSeqRef). Done before the kind/text checks so EVERY submit advances the turn.
+      if (ev.event === "UserPromptSubmit") turnSeqRef.current++;
       if (ev.event === "UserPromptSubmit" && ev.prompt && ev.prompt.trim()) {
         void record({ ...base(), kind: "prompt", text: ev.prompt });
       } else if (ev.event === "Stop" && ev.transcriptPath) {
         const path = ev.transcriptPath;
+        // Snapshot the turn this Stop belongs to, so a judge verdict that resolves after the user
+        // has moved on (new prompt → turnSeqRef bumped) is discarded rather than re-redding a turn
+        // that's no longer current.
+        const turn = turnSeqRef.current;
         // Read the last assistant turn out-of-band so the status update isn't blocked on disk I/O.
         void (async () => {
           try {
@@ -163,6 +197,10 @@ export function AgentPane({
             if (text === lastResponseRef.current) return; // dup Stop for the same turn — already recorded
             lastResponseRef.current = text;
             void record({ ...base(), kind: "response", text });
+            // Followup judge (tune-coloring): the hook fired Stop→idle (gray); decide whether this
+            // finished turn is actually blocked on the user (a closeout ask) and, if so, escalate to
+            // red. Best-effort and gated: only the freshest agent state, only the still-current turn.
+            await maybeJudgeFollowup(text, turn);
           } catch {
             // best-effort capture — a missing/partial transcript just yields no response entry.
           }

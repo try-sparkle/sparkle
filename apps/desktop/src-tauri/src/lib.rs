@@ -12,6 +12,7 @@ mod connectivity;
 mod dictation;
 mod history;
 mod hooks;
+mod judge;
 mod logging;
 mod model;
 mod naming;
@@ -162,6 +163,7 @@ pub fn run() {
             notes::bead_dep_add,
             notes::bead_label,
             ai::anthropic_chat,
+            judge::judge_turn_followup,
             history::history_record,
             history::history_search,
             history::history_prune,

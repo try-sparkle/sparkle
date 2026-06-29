@@ -105,7 +105,7 @@ fn call_anthropic_chat(
 /// `tool_use`) and empty/whitespace-only text blocks, so neither a leading tool block nor an empty
 /// text block masks real text. Returns None when there is no usable text — the module's contract is
 /// that an empty reply degrades through the caller's Err path, not a silent `Ok("")`.
-fn extract_text(json: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_text(json: &serde_json::Value) -> Option<String> {
     let blocks = json.get("content")?.as_array()?;
     for block in blocks {
         if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {

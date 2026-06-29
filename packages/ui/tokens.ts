@@ -44,10 +44,13 @@ export const C = {
  *   RED    — needs your attention                 (waiting, approval, errored)
  *   GRAY   — done / not blocked / not active       (idle, blocked, done, stopped)
  * RED means something is wrong or wants you: the agent is waiting on YOUR input (a question
- * or an approval it drew on screen) OR it crashed/exited with an error. A finished turn
- * sitting at the idle prompt is GRAY (the work is done; it isn't asking you anything) and a
- * cleanly-exited agent is GRAY too. Never hardcode these — import AGENT_STATUS. `label` is
- * the human phrase shown on hover.
+ * or an approval it drew on screen, OR a finished-turn ask the followup judge flagged as
+ * blocked on you — see turnFollowup.ts / statusRouter.ts) OR it crashed/exited with an error.
+ * A finished turn that's truly done — or only offering optional/new work — is GRAY (`idle`);
+ * a cleanly-exited agent is GRAY too. The distinction between a done turn and a blocked-on-you
+ * turn is made by the judge, which escalates the latter from `idle` to `waiting`; the `idle`
+ * tier itself stays gray. Never hardcode these — import AGENT_STATUS. `label` is the human
+ * phrase shown on hover.
  *
  * NOTE: color, badge, and notifications are three SEPARATE concerns. Color is here. The dock
  * badge counts only waiting/approval (attention.ts — "how many need an answer"). Notifications

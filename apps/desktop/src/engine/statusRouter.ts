@@ -18,13 +18,24 @@ export interface StatusRouter {
   fromHook: (s: AgentTabStatus) => void;
   /** Screen-scraped status — the fallback, suppressed once hooks are active. */
   fromScreen: (s: AgentTabStatus) => void;
+  /** Followup-judge verdict — like the screen, escalates a hook-`idle` turn to red (`waiting`)
+   *  when the agent finished but is blocked on the user. See `fromJudge` in the factory. */
+  fromJudge: (s: AgentTabStatus) => void;
 }
 
 export function createStatusRouter(emit: (s: AgentTabStatus) => void): StatusRouter {
   let hooksLive = false;
-  // Remember the latest of each source so the screen can ESCALATE a hook-idle turn to red.
+  // Remember the latest of each source so the screen OR the followup judge can ESCALATE a
+  // hook-idle turn to red.
   let lastHook: AgentTabStatus | null = null;
   let lastScreen: AgentTabStatus | null = null;
+  // The async followup judge's verdict for the CURRENT finished turn: `waiting` when it decided
+  // the agent is blocked on the user (a finished-turn ask like "want me to land it?"), else null.
+  // Unlike the screen, the judge can't self-clear (it only fires once per Stop), so a new turn
+  // opening — any non-idle hook status — drops it (see fromHook). AgentPane additionally tags each
+  // judge dispatch with a turn token and won't apply a verdict that arrives after the turn moved
+  // on, so a late verdict never lands here against the wrong turn.
+  let lastJudge: AgentTabStatus | null = null;
 
   // The one case the hook stream genuinely can't see: Claude fires the same `Stop` (→ idle)
   // whether a turn ended *done* or ended sitting at its own interactive selection menu
@@ -35,11 +46,18 @@ export function createStatusRouter(emit: (s: AgentTabStatus) => void): StatusRou
   // hook `working`/`done`/etc., so the deterministic hook signal still owns every other state and
   // the prose-question false-red the hook migration killed stays dead.
   const screenAwaits = () => lastScreen === "waiting" || lastScreen === "approval";
-  // Fold the two sources into one status: hooks own it, but a live on-screen prompt escalates a
-  // hook-`idle` turn to red. Always computed from the LATEST of each source, so it re-resolves
-  // cleanly whenever either side changes.
-  const resolve = (hook: AgentTabStatus): AgentTabStatus =>
-    hook === "idle" && screenAwaits() ? lastScreen! : hook;
+  const judgeAwaits = () => lastJudge === "waiting" || lastJudge === "approval";
+  // Fold the sources into one status: hooks own it, but a live on-screen prompt OR a followup-judge
+  // verdict escalates a hook-`idle` turn to red. Both escalations are idle-only — they never
+  // override a hook `working`/`done`/etc. — so the deterministic hook signal still owns every other
+  // state. Always computed from the LATEST of each source, so it re-resolves cleanly whenever any
+  // side changes. (The two reds are interchangeable; screen wins ties, arbitrarily.)
+  const resolve = (hook: AgentTabStatus): AgentTabStatus => {
+    if (hook !== "idle") return hook;
+    if (screenAwaits()) return lastScreen!;
+    if (judgeAwaits()) return lastJudge!;
+    return hook;
+  };
 
   // Dedup: only forward a genuine change. The router re-resolves on every event from either
   // source, so without this an unchanged value (e.g. a repeat idle hook during an active
@@ -60,10 +78,15 @@ export function createStatusRouter(emit: (s: AgentTabStatus) => void): StatusRou
       hooksLive = false;
       lastHook = null;
       lastScreen = null;
+      lastJudge = null;
       lastEmitted = null;
     },
     fromHook: (s) => {
       lastHook = s;
+      // Any non-idle hook status means the turn the judge spoke about is over — the agent is
+      // working again, exited, etc. Drop the verdict so it can't escalate a LATER idle (a stale
+      // verdict re-redding the next genuinely-done turn). The judge re-runs on each new Stop.
+      if (s !== "idle") lastJudge = null;
       if (hooksLive) out(resolve(s));
     },
     fromScreen: (s) => {
@@ -80,6 +103,15 @@ export function createStatusRouter(emit: (s: AgentTabStatus) => void): StatusRou
       // a terminal non-prompt status to clear, which it does. `resolve` keeps the screen from ever
       // overriding a hook working/done, so this never regresses hook authority.
       if (lastHook !== null) out(resolve(lastHook));
+    },
+    fromJudge: (s) => {
+      // Symmetric to fromScreen's escalation: record the verdict and re-resolve against the current
+      // hook. resolve() only lifts a hook-`idle` to red, so a verdict that lands while the agent is
+      // working/done is remembered but has no effect until (and unless) the hook is idle. Suppressed
+      // entirely before hooks are live (a judge can only run off a real Stop event, so this is
+      // defensive).
+      lastJudge = s;
+      if (hooksLive && lastHook !== null) out(resolve(lastHook));
     },
   };
 }
