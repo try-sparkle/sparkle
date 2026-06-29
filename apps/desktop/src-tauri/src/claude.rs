@@ -227,6 +227,36 @@ pub fn agent_session_title(worktree_path: String) -> Option<String> {
     agent_session_title_in(config_dir.as_deref(), home.as_deref(), &worktree_path)
 }
 
+/// Pure form of [`claude_latest_session_id`]: the newest transcript's session id (its filename
+/// STEM — Claude names transcripts `<sessionId>.jsonl`) for the worktree under the given
+/// config/home, or None when there is no transcript. This is the SAME session `--continue`
+/// resumes; spawning `--resume <id>` instead makes Claude redraw the conversation on reopen.
+fn claude_latest_session_id_in(
+    config_dir: Option<&Path>,
+    home: Option<&Path>,
+    worktree_path: &str,
+) -> Option<String> {
+    let root = claude_projects_root(config_dir, home)?;
+    let file = latest_session_file(&claude_session_dir_for(&root, worktree_path))?;
+    file.file_stem().map(|s| s.to_string_lossy().into_owned())
+}
+
+/// The agent worktree's most-recent Claude session id, for spawning `claude --resume <id>` so the
+/// prior conversation is visibly redrawn on app reopen (vs `--continue`, which resumes context but
+/// drops you at a blank prompt). Returns None for a fresh worktree with no transcript — the caller
+/// then falls back to `--continue`. Mirrors [`claude_has_session`]'s config/home resolution: an
+/// explicit account `config_dir` wins over Sparkle's process `CLAUDE_CONFIG_DIR` (empty treated as
+/// unset), else `$HOME/.claude`.
+#[tauri::command]
+pub fn claude_latest_session_id(worktree_path: String, config_dir: Option<String>) -> Option<String> {
+    let env = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let config_dir = resolve_session_config_dir(config_dir.as_deref(), env);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    claude_latest_session_id_in(config_dir.as_deref(), home.as_deref(), &worktree_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +517,81 @@ mod tests {
             Some("Current Title".to_string())
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn latest_session_id_returns_stem_of_newest_transcript() {
+        // Mirror of `session_title_reads_from_the_newest_transcript`: when a worktree has multiple
+        // transcripts (a fresh start + each `--continue` resume), the id we resume by must be the
+        // NEWEST file's stem — and it must drop the `.jsonl` extension.
+        let home = unique_home("latest-id");
+        let worktree = "/tmp/proj/.sparkle/worktrees/latest-id";
+        let dir = claude_session_dir_for(&home_root(&home), worktree);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let old = dir.join("11111111-aaaa.jsonl");
+        std::fs::write(&old, b"{}\n").unwrap();
+        let new = dir.join("22222222-bbbb.jsonl");
+        std::fs::write(&new, b"{}\n").unwrap();
+        // Force `old` strictly older so mtime ordering is unambiguous on fast filesystems.
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+
+        assert_eq!(
+            claude_latest_session_id_in(None, Some(&home), worktree),
+            Some("22222222-bbbb".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn latest_session_id_is_none_when_no_transcript_or_no_dir() {
+        let home = unique_home("latest-id-none");
+        // A session dir that exists but holds no `.jsonl` (only cruft) → None.
+        let worktree = "/tmp/proj/.sparkle/worktrees/latest-id-none";
+        let dir = claude_session_dir_for(&home_root(&home), worktree);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".DS_Store"), b"\0").unwrap();
+        assert_eq!(claude_latest_session_id_in(None, Some(&home), worktree), None);
+        // A worktree with no session dir at all → None.
+        assert_eq!(
+            claude_latest_session_id_in(None, Some(&home), "/tmp/proj/.sparkle/worktrees/absent"),
+            None
+        );
+        // No config and no home → None (can't resolve a projects root).
+        assert_eq!(claude_latest_session_id_in(None, None, worktree), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn latest_session_id_resolves_config_dir_over_home() {
+        // When CLAUDE_CONFIG_DIR is set, the transcript lives under it — not $HOME/.claude — and the
+        // id lookup must follow the same account, exactly like `claude_has_session`.
+        let base = unique_home("latest-id-cfg");
+        let config_dir = base.join("custom-claude");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let worktree = "/tmp/proj/.sparkle/worktrees/latest-id-cfg";
+
+        let dir = claude_session_dir_for(
+            &claude_projects_root(Some(&config_dir), None).unwrap(),
+            worktree,
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("deadbeef-1234.jsonl"), b"{}\n").unwrap();
+
+        assert_eq!(
+            claude_latest_session_id_in(Some(&config_dir), Some(&home), worktree),
+            Some("deadbeef-1234".to_string())
+        );
+        // Without the config dir, the same lookup against $HOME finds nothing.
+        assert_eq!(claude_latest_session_id_in(None, Some(&home), worktree), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

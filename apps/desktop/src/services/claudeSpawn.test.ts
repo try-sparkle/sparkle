@@ -102,6 +102,52 @@ describe("buildClaudeExec ()", () => {
     expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --continue --append-system-prompt 'persona'`);
     expect(cmd).not.toContain("start now");
   });
+
+  // Resume-by-id so the prior conversation is visibly REDRAWN on reopen (bead sparkle-wwg7).
+  it("uses --resume <id> instead of --continue when a session id is present", () => {
+    const cmd = buildClaudeExec("/bin/claude", true, {
+      resumeSessionId: "4b2a247c-ed39-4abc-9f01-deadbeef0000",
+    });
+    expect(cmd).toBe(
+      `${PATH_PREFIX}exec '/bin/claude' --resume '4b2a247c-ed39-4abc-9f01-deadbeef0000'`,
+    );
+    expect(cmd).not.toContain("--continue");
+  });
+
+  it("falls back to --continue when resume is true but no session id is available", () => {
+    const cmd = buildClaudeExec("/bin/claude", true, { resumeSessionId: undefined });
+    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --continue`);
+    // An empty-string id is treated as absent (falsy) → still --continue, never `--resume ''`.
+    expect(buildClaudeExec("/bin/claude", true, { resumeSessionId: "" })).toBe(
+      `${PATH_PREFIX}exec '/bin/claude' --continue`,
+    );
+  });
+
+  it("ignores resumeSessionId on a FRESH session (no --resume, plain claude + prompt)", () => {
+    const cmd = buildClaudeExec("/bin/claude", false, {
+      resumeSessionId: "should-be-ignored",
+      initialPrompt: "start now",
+    });
+    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' -- 'start now'`);
+    expect(cmd).not.toContain("--resume");
+  });
+
+  it("still suppresses the initial mission prompt when resuming by id", () => {
+    const cmd = buildClaudeExec("/bin/claude", true, {
+      resumeSessionId: "sess-123",
+      appendSystemPrompt: "persona",
+      initialPrompt: "start now",
+    });
+    expect(cmd).toBe(
+      `${PATH_PREFIX}exec '/bin/claude' --resume 'sess-123' --append-system-prompt 'persona'`,
+    );
+    expect(cmd).not.toContain("start now");
+  });
+
+  it("shell-quotes a session id (defense in depth, though ids are uuids)", () => {
+    const cmd = buildClaudeExec("/bin/claude", true, { resumeSessionId: "a'b" });
+    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --resume 'a'\\''b'`);
+  });
 });
 
 describe("buildClaudeExec --mcp-config (orchestrator launch)", () => {

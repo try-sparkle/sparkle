@@ -9,7 +9,7 @@ import {
 } from "../services/worktree";
 import { resolveDefaultBranch } from "../services/branchStatus";
 import { useAiFeature } from "../services/aiGate";
-import { checkClaude, claudeHasSession } from "../preflight";
+import { checkClaude, claudeHasSession, claudeLatestSessionId } from "../preflight";
 import { buildClaudeExec, SHELL } from "../services/claudeSpawn";
 import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult, orchestrationPersona } from "../services/buildAgent";
 import {
@@ -327,6 +327,13 @@ export function AgentPane({
       // spawn will use (CLAUDE_CONFIG_DIR is set on the child only — see the spec's integration
       // subtlety). Undefined configDir → Rust falls back to Sparkle's process env (prior behavior).
       const resume = await claudeHasSession(wt.path, configDir).catch(() => false);
+      // Resume by session id so Claude visibly REDRAWS the prior conversation on reopen, rather than
+      // `--continue`'s blank prompt (bead sparkle-wwg7). Only look it up when resuming; null on any
+      // failure → buildClaudeExec falls back to `--continue`. Use the SAME configDir as the session
+      // check so the id is read from the chosen account.
+      const resumeSessionId = resume
+        ? (await claudeLatestSessionId(wt.path, configDir).catch(() => null)) ?? undefined
+        : undefined;
       // Record whether this is a fresh launch so the worker exit handler can
       // distinguish a first-run (which should produce result.json) from a
       // reopened/resumed session (where result.json was already consumed earlier).
@@ -355,6 +362,7 @@ export function AgentPane({
           appendSystemPrompt: workerPersona({ parentBranch, resultPath }),
           initialPrompt: workerMission(agent.task ?? "", agent.id),
           configDir,
+          resumeSessionId,
         });
       } else if (agent.kind === "build") {
         // Autonomous orchestrator launch (Plan 2c): start the per-build-agent bridge FIRST (claude's
@@ -398,6 +406,7 @@ export function AgentPane({
               bridge,
               paths,
               configDir,
+              resumeSessionId,
             }),
           );
           setPhase("ready");
@@ -411,7 +420,7 @@ export function AgentPane({
           throw e;
         }
       } else {
-        exec = buildClaudeExec(claude.path, resume, { configDir });
+        exec = buildClaudeExec(claude.path, resume, { configDir, resumeSessionId });
       }
       setSpawn({
         command: SHELL,

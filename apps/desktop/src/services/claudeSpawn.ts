@@ -23,6 +23,12 @@ export interface ClaudeExecOpts {
   /** A one-shot prompt submitted on launch so the agent starts working immediately. Only
    *  passed on a FRESH session — on `--continue` the prior conversation resumes instead. */
   initialPrompt?: string;
+  /** The worktree's most-recent Claude session id. When `resume` is true and this is set, we spawn
+   *  `--resume <id>` instead of `--continue` so Claude visibly REDRAWS the prior conversation on
+   *  reopen (bead sparkle-wwg7). Same session `--continue` would resume — just invoked so the
+   *  transcript is painted. Empty/absent → fall back to `--continue` (e.g. the lookup failed or the
+   *  transcript was cleaned up after a long gap). */
+  resumeSessionId?: string;
   /** Inline JSON passed to `claude --mcp-config` (an MCP servers config). Variadic flag, so it is
    *  always followed by `--strict-mcp-config` (a flag) before any positional prompt. */
   mcpConfig?: string;
@@ -51,7 +57,15 @@ export function buildClaudeExec(
   opts: ClaudeExecOpts = {},
 ): string {
   let cmd = `exec ${shellQuote(claudePath)}`;
-  if (resume) cmd += " --continue";
+  // Resume the prior conversation. Prefer `--resume <id>` so Claude REDRAWS the transcript on
+  // reopen (the visible-history goal, bead sparkle-wwg7); fall back to `--continue` (resumes
+  // context but lands on a blank prompt) when no session id is available — e.g. the lookup failed
+  // or the transcript aged out. Both resume the same session; only the redraw differs.
+  if (resume) {
+    cmd += opts.resumeSessionId
+      ? ` --resume ${shellQuote(opts.resumeSessionId)}`
+      : " --continue";
+  }
   if (opts.mcpConfig) {
     cmd += ` --mcp-config ${shellQuote(opts.mcpConfig)}`;
     // --mcp-config is variadic (like --add-dir); a following flag terminates it. We always pair it

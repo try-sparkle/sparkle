@@ -22,3 +22,16 @@ export function checkClaude(): Promise<ClaudeStatus> {
 export function claudeHasSession(worktreePath: string, configDir?: string): Promise<boolean> {
   return invoke<boolean>("claude_has_session", { worktreePath, configDir });
 }
+
+/** The worktree's most-recent Claude session id (newest `<id>.jsonl` transcript stem), or null when
+ * there is none. Used to spawn `claude --resume <id>` so the prior conversation is visibly redrawn
+ * on app reopen instead of `--continue`'s blank prompt (bead sparkle-wwg7).
+ *
+ * `configDir` resolves the account exactly like {@link claudeHasSession} — pass the SAME value used
+ * for the session check so the id is read from the right account's config dir. */
+export function claudeLatestSessionId(
+  worktreePath: string,
+  configDir?: string,
+): Promise<string | null> {
+  return invoke<string | null>("claude_latest_session_id", { worktreePath, configDir });
+}

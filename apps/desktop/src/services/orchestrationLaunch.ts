@@ -48,6 +48,9 @@ export function assembleBuildSpawn(opts: {
    *  buildClaudeExec so build/orchestrator agents honor the selected account too. Undefined →
    *  default behavior (no per-spawn config dir). */
   configDir?: string;
+  /** Newest Claude session id for this worktree. With `resume` true, spawns `--resume <id>` so the
+   *  prior conversation is redrawn on reopen (bead sparkle-wwg7); undefined → `--continue`. */
+  resumeSessionId?: string;
 }): { command: string; args: string[]; cwd: string } {
   const mcpConfig = buildOrchestratorMcpConfig({
     nodePath: opts.paths.nodePath,
@@ -60,6 +63,7 @@ export function assembleBuildSpawn(opts: {
     strictMcpConfig: true,
     appendSystemPrompt: opts.persona,
     configDir: opts.configDir,
+    resumeSessionId: opts.resumeSessionId,
   });
   return { command: SHELL, args: ["-l", "-c", exec], cwd: opts.cwd };
 }
