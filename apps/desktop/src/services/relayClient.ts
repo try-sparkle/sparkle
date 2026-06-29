@@ -10,6 +10,12 @@
 import { io, type Socket } from "socket.io-client";
 import { invoke } from "@tauri-apps/api/core";
 import { onPtyOutput, writePty } from "../pty";
+import {
+  authorizeAgentInput,
+  authorizeDecision,
+  type AgentInputPayload,
+  type DecisionPayload,
+} from "./relayGate";
 
 const RELAY_URL =
   (import.meta.env?.VITE_ORCHESTRATION_URL as string | undefined) ??
@@ -30,13 +36,6 @@ export interface AttentionPayload {
   suggested_replies: SuggestedReply[];
   created_at: string;
 }
-interface DecisionPayload {
-  attention_id: string;
-  agent_id: string;
-  reply: string;
-  submit: boolean;
-}
-
 export interface RosterAgentPayload {
   id: string;
   name: string;
@@ -118,30 +117,24 @@ export async function startRelayHost(): Promise<void> {
     else ptyUnlisten = un;
   });
 
-  // The phone typed free text into a watched agent — inject it into that agent's PTY, but ONLY
-  // if we're currently streaming it (the phone is actively viewing it). Never an unwatched agent.
-  // Submit it (trailing newline) for parity with the decision path's submit semantics.
-  socket.on("agent_input", (i: { agent_id?: string; text?: string }) => {
-    if (!i || typeof i.agent_id !== "string" || !watched.has(i.agent_id)) return;
-    if (typeof i.text !== "string" || i.text.length > 4000) return;
-    const text = i.text.endsWith("\n") ? i.text : `${i.text}\n`;
-    void writePty(i.agent_id, text).catch((e) =>
-      console.debug("relay agent_input writePty failed", e),
-    );
+  // The phone typed free text into a watched agent — authorize + inject (gate: relayGate).
+  socket.on("agent_input", (i: AgentInputPayload) => {
+    const w = authorizeAgentInput(watched, i);
+    if (w) {
+      void writePty(w.agentId, w.text).catch((e) =>
+        console.debug("relay agent_input writePty failed", e),
+      );
+    }
   });
 
-  // The phone answered: inject the reply into that agent's live terminal — but ONLY for an
-  // agent we actually raised an attention for (never an arbitrary agent_id from the wire).
+  // The phone answered an attention — authorize + inject into that agent's PTY (gate: relayGate).
   socket.on("decision", (d: DecisionPayload) => {
-    if (!d || typeof d.attention_id !== "string") return;
-    const agentId = liveAttentions.get(d.attention_id);
-    if (!agentId) return; // not an attention we raised — ignore (no arbitrary PTY injection)
-    if (typeof d.reply !== "string" || d.reply.length > 4000) return;
-    const reply = d.submit && !d.reply.endsWith("\n") ? `${d.reply}\n` : d.reply;
-    liveAttentions.delete(d.attention_id); // one decision per raised attention
-    void writePty(agentId, reply).catch((e) =>
-      console.debug("relay decision writePty failed", e),
-    );
+    const w = authorizeDecision(liveAttentions, d);
+    if (w) {
+      void writePty(w.agentId, w.text).catch((e) =>
+        console.debug("relay decision writePty failed", e),
+      );
+    }
   });
 }
 
