@@ -94,18 +94,36 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
     expect(landAgentBranch).toHaveBeenCalledWith("/tmp/demo", "w1", "sparkle/agent-a1", false);
   });
 
-  it("the worker's red 'behind' pill rebases THAT worker on its own id + base branch", () => {
+  it("the worker's 'behind' pill rebases THAT worker on its own id + base branch", () => {
     const project = seedOrchestratorWithWorker({ ahead: 0, behind: 3 } as BranchStatus);
     render(<AgentSidebar project={project} />);
     hoverOrchestrator();
 
-    const pill = screen.getByRole("button", { name: /behind main\. click to catch up/i });
+    // The behind pill is the calm, informational "Update available …" control (no longer alarm-red).
+    const pill = screen.getByRole("button", { name: /update available · 3 behind main — click to catch up/i });
     fireEvent.click(pill);
 
     // refreshAgentBranch(rootPath, projectId, id, base, busy) — id "w1" + base "main", the worker's,
     // not the orchestrator's.
     expect(refreshAgentBranch).toHaveBeenCalledTimes(1);
     expect(refreshAgentBranch).toHaveBeenCalledWith("/tmp/demo", "p1", "w1", "main", false);
+  });
+
+  it("keeps the in-flow column row visible on hover (detail pops out, it doesn't replace the row)", () => {
+    const project = seedOrchestratorWithWorker({ ahead: 0, behind: 0 } as BranchStatus);
+    render(<AgentSidebar project={project} />);
+    const row = document.querySelector<HTMLElement>('[draggable="true"]');
+    if (!row) throw new Error("orchestrator row not found");
+    expect(row.style.visibility).not.toBe("hidden");
+
+    // On hover the column row must STAY visible — the expanded detail now pops out to the RIGHT over
+    // the terminal area rather than expanding in place and covering the rows below. (Pre-change this
+    // row was set visibility:hidden while the overlay stood in for it in the column.)
+    fireEvent.mouseEnter(row);
+    expect(row.style.visibility).not.toBe("hidden");
+    // And the detail still renders (in the pop-out portal) — the Status line is present (the
+    // orchestrator's own + the worker's both read "Up to date with main").
+    expect(screen.getAllByText(/up to date with main/i).length).toBeGreaterThan(0);
   });
 
   it("renders one bare line per worker collapsed, and one detail block per worker on hover", () => {

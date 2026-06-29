@@ -1180,17 +1180,23 @@ function AgentRow({
     </>
   );
 
-  const maxW = rect ? Math.max(220, window.innerWidth - rect.left - 12) : 480;
+  // The hover detail pops out OVER THE TERMINAL AREA, not down the column: anchor its left edge just
+  // past the row's right edge (≈ the sidebar's right border) so the column row stays put and the rows
+  // below it are never covered. Top-aligned with the row; grows downward, height-capped to the
+  // viewport so a tall card (many inline workers) scrolls instead of running off the bottom.
+  const panelLeft = rect ? rect.left + rect.width + 8 : 0;
+  const maxW = rect ? Math.min(480, Math.max(240, window.innerWidth - panelLeft - 16)) : 480;
+  const maxH = rect ? window.innerHeight - rect.top - 16 : undefined;
   // Show the slide-out only while hovering AND not renaming. Suppressing it during a rename means
   // the in-flow row is the SOLE owner of the rename <input> — the field never swaps mount points on
   // a hover change, so a trailing unmount-blur can't silently commit a half-typed name.
   const showOverlay = hover && !editing;
 
-  // The WHOLE card is the drag handle (top-level rows only; workers keep insertion order). Grab
-  // anywhere on the card and drop on another row to pin this agent at that row's position
-  // (manual-agent-reorder-pin). Suppressed while renaming so the <input> behaves normally. The
-  // same props go on both the in-flow row AND the hover overlay, since on hover the overlay is the
-  // card you actually grab (the in-flow row is visibility:hidden behind it).
+  // The WHOLE in-flow row is the drag handle (top-level rows only; workers keep insertion order).
+  // Grab anywhere on the row and drop on another row to pin this agent at that row's position
+  // (manual-agent-reorder-pin). Suppressed while renaming so the <input> behaves normally. The row
+  // now stays visible on hover (the detail pops out to the right), so it remains the sole drag grab —
+  // the pop-out panel is not draggable.
   const dragProps =
     orderedIndex != null && !editing
       ? {
@@ -1229,10 +1235,9 @@ function AgentRow({
           userSelect: orderedIndex != null && !editing ? "none" : undefined,
           background: isActive ? CHAT_USER_BUBBLE : "transparent",
           marginBottom: 2,
-          // Hide the collapsed content while the overlay stands in for it, so the name underneath
-          // doesn't "show through" the slide-out at the row's left edge. While renaming the overlay
-          // is suppressed, so the in-flow row (and its input) stays visible.
-          visibility: showOverlay ? "hidden" : "visible",
+          // The in-flow row stays fully visible on hover now — the expanded detail pops out to the
+          // RIGHT over the terminal area (see the portal below), so the column row keeps its size and
+          // never covers the rows beneath it.
         }}
       >
         {RowBody({ expanded: false, ownsInput: editing })}
@@ -1254,17 +1259,18 @@ function AgentRow({
         rect &&
         createPortal(
           <div
-            {...dragProps}
             onClick={onSelect}
             onMouseEnter={show}
             onMouseLeave={hide}
             style={{
               position: "fixed",
-              left: rect.left,
+              left: panelLeft,
               top: rect.top,
               zIndex: 50,
-              minWidth: rect.width,
+              minWidth: Math.min(280, maxW),
               maxWidth: maxW,
+              maxHeight: maxH,
+              overflowY: "auto",
               width: "max-content",
               boxSizing: "border-box",
               display: "flex",
@@ -1273,9 +1279,6 @@ function AgentRow({
               padding: "8px 10px",
               borderRadius: 8,
               cursor: "pointer",
-              // Whole-card drag handle (see in-flow row) — the overlay is what you grab on hover.
-              // (The overlay only mounts when !editing, so the guard mirrors the in-flow row's.)
-              userSelect: orderedIndex != null && !editing ? "none" : undefined,
               background: isActive ? CHAT_USER_BUBBLE : C.deepForest,
               border: `1px solid ${C.forest}`,
               boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
@@ -1326,11 +1329,12 @@ function AgentDetailLines({
   // GREEN "+N" when it's ahead (click merges it — catch the base up to you). Behind wins when both.
   const showPill = !!bs && (behind > 0 || ahead > 0);
   const pillBehind = behind > 0;
-  // pillColor is the brand color used for the faint `${pillColor}22` alpha tint (must stay a
-  // concrete hex — a CSS var can't take a hex-alpha suffix). pillInk is the legible TEXT/border
-  // color: the green flips to a darker themed green in light mode (successInk); red is constant.
-  const pillColor = pillBehind ? C.sienna : C.success;
-  const pillInk = pillBehind ? C.sienna : C.successInk;
+  // Behind is INFORMATIONAL, not an alarm: a branch trailing its base is normal (the base moves) and
+  // says nothing about whether the work shipped — so it reads as a calm, muted OUTLINE pill (no red,
+  // no fill). Red is reserved for genuine errors. Ahead stays the green actionable "land" pill with
+  // the faint `${C.success}22` alpha tint — which is why the green path uses the BRAND-literal hex
+  // C.success (a CSS var can't take a hex-alpha suffix); the muted path is a var() and uses no tint.
+  const pillInk = pillBehind ? C.muted : C.successInk;
   const baseLabel = baseBranch ?? "main";
   // Shared pill geometry — squared off to roughly match the Land/old action pills (borderRadius 5),
   // not a fully-round chip. The behind/ahead variants layer color + action on top.
@@ -1360,15 +1364,15 @@ function AgentDetailLines({
               style={{
                 ...pillBase,
                 color: pillInk,
-                background: `${pillColor}22`,
+                background: "transparent",
                 border: `1px solid ${pillInk}`,
                 cursor: busy ? "not-allowed" : "pointer",
                 opacity: busy ? 0.6 : 1,
               }}
             >
               {busy
-                ? `${behind} behind ${baseLabel} — pause the agent to catch up`
-                : `${behind} commit${behind === 1 ? "" : "s"} behind ${baseLabel}. Click to catch up`}
+                ? `Update available · ${behind} behind ${baseLabel} — pause the agent to catch up`
+                : `Update available · ${behind} behind ${baseLabel} — click to catch up`}
             </button>
           ) : (
             // AHEAD (green): click merges this branch forward — catches the base up to you.
@@ -1380,7 +1384,7 @@ function AgentDetailLines({
               style={{
                 ...pillBase,
                 color: pillInk,
-                background: `${pillColor}22`,
+                background: `${C.success}22`,
                 border: `1px solid ${pillInk}`,
                 cursor: "pointer",
               }}
