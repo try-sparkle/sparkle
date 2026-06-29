@@ -255,20 +255,33 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     selectAgent(project.id, id);
     open(id);
   };
-  // The chevron strip is a MODE SELECTOR (no longer create buttons). Clicking a chevron makes it the
-  // active (colored) mode and filters the sidebar list by kind. Plan additionally opens the
-  // read-only Tasks board in the main pane; Think/Build just switch the sidebar's agent list.
+  // The chevron strip switches the active (colored) mode and filters the sidebar list by kind. Think
+  // and Build are two-stage: the FIRST click (when that mode isn't already the active section) just
+  // switches into the section; clicking the SAME chevron AGAIN while already in that section spawns a
+  // fresh agent of that kind (same as the "+ New Think/Build Agent" buttons). Plan stays a pure mode
+  // switch: it has no agent concept and only opens the read-only Tasks board in the main pane.
   const onPickThink = () => {
+    // "Already in the Think section" = Think mode AND not parked in a special (Sparkle/board) view.
+    const alreadyHere = mode === "think" && activeSpecial === null;
     setMode("think");
     setActiveSpecial(null);
+    if (!alreadyHere || !project) return;
+    const id = addAgent(project.id, { kind: "think" });
+    selectAgent(project.id, id);
+    open(id);
   };
   const onPickPlan = () => {
     setMode("plan");
     setActiveSpecial("board");
   };
   const onPickBuild = () => {
+    const alreadyHere = mode === "build" && activeSpecial === null;
     setMode("build");
     setActiveSpecial(null);
+    if (!alreadyHere || !project) return;
+    const id = addAgent(project.id, { kind: "build" });
+    selectAgent(project.id, id);
+    open(id);
   };
   const onAddBuild = () => {
     if (!project) return;

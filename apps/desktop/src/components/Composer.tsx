@@ -201,9 +201,52 @@ export function Composer({
   useEffect(() => {
     if (!active || disabled) return;
     const append = (text: string) => {
-      setValue((v) => (v ? `${v} ${text}` : text));
+      // Insert the transcribed text at the live caret, not the end. Read the caret offsets
+      // straight off the DOM (the controlled textarea's value mirrors React state, so ta.value
+      // is the current text) BEFORE we change anything.
+      //
+      // Caret-usability gate: a <textarea> ALWAYS reports a NUMBER for selectionStart/End — never
+      // null — including 0 when it is blurred or has never been focused. So "is it a number" can't
+      // tell a real caret from a blurred default. Require the textarea to actually HAVE FOCUS;
+      // otherwise (the common flow of dictating without clicking into the box) fall back to
+      // end-append, so we never prepend at offset 0 (the prior behavior was always-append).
+      const ta = taRef.current;
+      const hasCaret = ta != null && document.activeElement === ta;
+      const s = ta?.selectionStart ?? 0;
+      const e = ta?.selectionEnd ?? 0;
+
+      // Compute the new caret offset as a side effect of the functional updater (so the fallback
+      // path splices into the freshest value, never a stale closure capture).
+      let caret = 0;
+      setValue((v) => {
+        if (!hasCaret) {
+          const next = v ? `${v} ${text}` : text;
+          caret = next.length;
+          return next;
+        }
+        const before = v.slice(0, s);
+        const after = v.slice(e);
+        // Keep the existing one-space separation, but applied at the caret rather than the end —
+        // and only where it's actually needed, so we never produce a double space or a leading one.
+        const lead = before.length > 0 && !before.endsWith(" ") ? " " : "";
+        const trail = after.length > 0 && !after.startsWith(" ") ? " " : "";
+        const inserted = `${lead}${text}${trail}`;
+        // Drop the caret at the END of the just-inserted text (before any trailing space).
+        caret = before.length + lead.length + text.length;
+        return `${before}${inserted}${after}`;
+      });
       setMinimized(false); // dictated text lands in the box — make sure it's visible
       inputRef?.current?.focus();
+      // Selection must be set after React commits the new value, or it snaps back. Mirror the
+      // exact rAF pattern acceptGhost uses (and re-sync the ghost mirror's scrollTop, since moving
+      // the caret can scroll the textarea programmatically without firing onScroll).
+      requestAnimationFrame(() => {
+        const t = taRef.current;
+        if (t) {
+          t.selectionStart = t.selectionEnd = caret;
+          if (ghostRef.current) ghostRef.current.scrollTop = t.scrollTop;
+        }
+      });
     };
     useDictationStore.getState().registerInsert(append);
     return () => {

@@ -14,6 +14,7 @@ import { snapshotScreen } from "../engine/screenSnapshot";
 import { useUiStore } from "../stores/uiStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { isComposerToggleKey } from "./composerToggle";
+import { isCopySelectionKey } from "./copySelectionKey";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
 import { isMeasuredSize, spawnSize } from "./terminalSize";
@@ -157,6 +158,11 @@ export function Terminal({
       customGlyphs: true,
       cursorBlink: true,
       scrollback: 8000,
+      // Let ⌥-drag force a text selection even while a TUI (Claude Code) has mouse tracking on.
+      // With mouse tracking active xterm disables its SelectionService and forwards drags to the
+      // PTY, so a plain drag can't select — and copy-on-select + the selection popup never fire.
+      // ⌥-drag is the standard terminal escape hatch (matches iTerm) for selecting over a TUI.
+      macOptionClickForcesSelection: true,
       // Concrete hex (xterm can't read CSS var()); the effect below keeps it in sync when the
       // resolved theme changes. Initial value captured at mount.
       theme: xtermTheme(resolvedTheme),
@@ -219,10 +225,31 @@ export function Terminal({
       void writePty(agentId, d).catch(ignorePtyGone);
     });
 
+    // Copy the current xterm selection to the clipboard and flash the "Copied" confirmation.
+    // Returns the selected text (so callers can also act on it, e.g. open the actions popup), or
+    // null when there's no non-empty selection. xterm paints its selection on a canvas/WebGL layer
+    // rather than as a native DOM selection, so the browser's own Cmd+C finds nothing to copy and
+    // macOS just beeps — every copy path (mouse-select and ⌘C) has to go through this explicitly.
+    const copySelectionToClipboard = (): string | null => {
+      const sel = term.getSelection();
+      if (!sel || sel.trim().length === 0) return null;
+      void copyToClipboard(sel).then((ok) => {
+        // The async clipboard write can resolve after this terminal unmounts (e.g. the user
+        // switched agents mid-copy); don't touch state or schedule a timer if so.
+        if (disposed || !ok) return;
+        setCopied(true);
+        if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
+        copiedTimer.current = window.setTimeout(() => setCopied(false), 1100);
+      });
+      return sel;
+    };
+
     // The terminal is a real terminal: every keystroke reaches the PTY, so Claude's menus
-    // (number picks, arrows, Enter, Esc) and mouse-select + Cmd+C copy all work directly.
-    // The one exception is ⌘J — it bounces focus back to the composer (and restores it if
-    // minimized) instead of going to the PTY, so the user can hop back to the prompt box.
+    // (number picks, arrows, Enter, Esc) all work directly. Two chords are intercepted here:
+    //   • ⌘J bounces focus back to the composer (restoring it if minimized) instead of the PTY.
+    //   • ⌘C copies the current selection ourselves — xterm's selection isn't a native DOM
+    //     selection, so without this the OS native copy finds nothing and just beeps. With no
+    //     selection we pass ⌘C through unchanged.
     term.attachCustomKeyEventHandler((e) => {
       if (isComposerToggleKey(e)) {
         useUiStore.getState().setComposerMinimized(false);
@@ -231,6 +258,16 @@ export function Terminal({
       }
       // Swallow the whole ⌘J chord (incl. the keyup) so no stray sequence reaches the PTY.
       if (e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === "j") return false;
+      // ⌘C copies the selection ourselves. ⌘C is never a PTY control (that's Ctrl+C, which carries
+      // ctrlKey and still SIGINTs), so we always handle it AND call preventDefault() — otherwise
+      // xterm returns from _keyDown without preventing the event, WebKit runs its native Copy, finds
+      // no DOM selection (xterm paints selection on canvas), and macOS beeps. copySelectionToClipboard
+      // copies + flashes when there's a selection and is a harmless no-op otherwise.
+      if (isCopySelectionKey(e)) {
+        e.preventDefault();
+        copySelectionToClipboard();
+        return false;
+      }
       return true;
     });
 
@@ -404,16 +441,8 @@ export function Terminal({
     // and flash a confirmation so the (otherwise invisible) copy is obvious. A plain click
     // leaves an empty selection — nothing is copied and no toast shows.
     const onMouseUp = (e: MouseEvent) => {
-      const sel = term.getSelection();
-      if (!sel || sel.trim().length === 0) return;
-      void copyToClipboard(sel).then((ok) => {
-        // The async clipboard write can resolve after this terminal unmounts (e.g. the
-        // user switched agents mid-copy); don't touch state or schedule a timer if so.
-        if (disposed || !ok) return;
-        setCopied(true);
-        if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
-        copiedTimer.current = window.setTimeout(() => setCopied(false), 1100);
-      });
+      const sel = copySelectionToClipboard();
+      if (!sel) return;
       // Open the action popup at the cursor regardless of clipboard timing.
       setPopup({ x: e.clientX, y: e.clientY, text: sel });
     };

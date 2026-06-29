@@ -23,13 +23,15 @@ const NAMING_MODEL: &str = "claude-haiku-4-5";
 const SYSTEM_PROMPT: &str = "You name coding-agent sessions by the SUBSTANCE of the work — the \
 feature, component, or problem being worked on — NOT by restating an operational command. \
 Given the user's prompt, do EXACTLY ONE of these:\n\
-- Reply with EXACTLY the single word SKIP (and nothing else) ONLY when the prompt is purely an \
-operational/process command, an acknowledgement, or a greeting with NO subject of work to name \
-(e.g. 'push to production', 'commit and push', 'run the tests', 'continue', 'retry', 'looks good', \
-'thanks', 'hi'). When in doubt, do NOT skip — name it.\n\
-- Otherwise, name the subject of the work. A QUESTION, COMPLAINT, BUG REPORT, INVESTIGATION, or \
-DISCUSSION about a feature, component, or problem DOES have a subject and MUST be named by that \
-subject — never skipped just because it is not phrased as an imperative command. Reply with ONLY a \
+- Reply with EXACTLY the single word SKIP (and nothing else) ONLY when the prompt is a bare \
+operational/process command or acknowledgement with literally nothing else to name (e.g. 'push to \
+production', 'commit and push', 'run the tests', 'continue', 'retry', 'looks good', 'thanks'). A \
+greeting, a question about your capabilities, or any conversational/meta prompt is NOT a skip — give \
+it a short topical name (e.g. 'Capabilities Overview', 'Getting Started'). Strongly prefer naming: \
+when in any doubt, do NOT skip.\n\
+- Otherwise, name the topic. A QUESTION, COMPLAINT, BUG REPORT, INVESTIGATION, DISCUSSION, GREETING, \
+or META/CONVERSATIONAL prompt (including asking what you can do) all have a topic and MUST be named \
+by it — never skipped just because it is not phrased as an imperative command. Reply with ONLY a \
 JSON object — no preamble, no markdown fences: \
 {\"title\": \"3-5 words\", \"description\": \"one short sentence\"}. The title is a 3–5 word Title \
 Case label of the work (no surrounding quotes, no trailing punctuation). The description is one \
@@ -39,7 +41,8 @@ Examples:\n\
 {\"title\": \"Fix OAuth Redirect Loop\", \"description\": \"Stops the login page from looping after \
 a token refresh\"}\n\
 {\"title\": \"Deepgram Dictation Streaming\", \"description\": \"Investigates why cloud dictation is \
-not streaming live transcripts\"}";
+not streaming live transcripts\"}\n\
+{\"title\": \"Agent Capabilities Overview\", \"description\": \"User asks what the agent can do\"}";
 
 /// An auto-generated agent name: a short `title` for the sidebar plus a one-sentence
 /// `description` revealed on hover. Serialized to the webview as `{ title, description }`.

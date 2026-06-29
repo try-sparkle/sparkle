@@ -73,7 +73,7 @@ describe("Composer — dictation wiring", () => {
     expect(useDictationStore.getState().insertTarget).toBeNull();
   });
 
-  it("appends dictated text into the box and restores it from minimized", () => {
+  it("inserts dictated text into the box and restores it from minimized", () => {
     renderComposer();
     act(() => useUiStore.getState().setComposerMinimized(true));
 
@@ -83,9 +83,71 @@ describe("Composer — dictation wiring", () => {
     // Dictated text must be visible — a minimized composer pops back open.
     expect(useUiStore.getState().composerMinimized).toBe(false);
 
-    // A second utterance appends with a separating space (not a clobber).
+    // A second utterance with the caret at the end appends with a separating space (not a clobber).
+    ta.selectionStart = ta.selectionEnd = ta.value.length;
     act(() => useDictationStore.getState().insert("again"));
     expect(ta.value).toBe("hello world again");
+  });
+
+  it("inserts dictated text at the caret (middle of existing text), not the end", () => {
+    // Capture rAF callbacks and flush them AFTER React commits the new value — mirroring the real
+    // browser frame ordering (a synchronous rAF would run before the controlled value is written,
+    // which resets the caret to the end and would mask the reposition we're asserting).
+    const rafCbs: FrameRequestCallback[] = [];
+    const raf = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((cb: FrameRequestCallback) => {
+        rafCbs.push(cb);
+        return 0;
+      });
+    try {
+      renderComposer();
+      const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(ta, { target: { value: "hello world" } });
+      // Caret-splice only applies when the box actually has focus (see the blurred case below).
+      ta.focus();
+      // Caret right after "hello" (before " world").
+      ta.selectionStart = ta.selectionEnd = 5;
+
+      act(() => useDictationStore.getState().insert("there"));
+
+      // The segment lands AT the caret, with a single separating space on each side.
+      expect(ta.value).toBe("hello there world");
+      // The post-commit rAF now drops the caret immediately after the inserted text ("there").
+      act(() => rafCbs.forEach((cb) => cb(0)));
+      expect(ta.selectionStart).toBe("hello there".length);
+      expect(ta.selectionEnd).toBe("hello there".length);
+    } finally {
+      raf.mockRestore();
+    }
+  });
+
+  it("appends at the end when the focused caret is already at the end", () => {
+    renderComposer();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "hello" } });
+    ta.focus();
+    ta.selectionStart = ta.selectionEnd = ta.value.length; // caret at the very end
+
+    act(() => useDictationStore.getState().insert("world"));
+    // End caret ⇒ same one-space append as before (no double space, no clobber).
+    expect(ta.value).toBe("hello world");
+  });
+
+  it("appends (does NOT prepend) when dictating into a blurred box with existing content", () => {
+    // Regression: a <textarea> reports selectionStart === 0 when blurred, so a naive
+    // "is it a number" caret check would splice at offset 0 and PREPEND. The common voice flow
+    // is dictating without clicking into the box; that must append at the end like it used to.
+    renderComposer();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "existing text" } });
+    ta.blur(); // not focused → selectionStart defaults to 0
+    ta.selectionStart = ta.selectionEnd = 0;
+    expect(document.activeElement).not.toBe(ta);
+
+    act(() => useDictationStore.getState().insert("dictated"));
+    // Appended at the end, not prepended at offset 0.
+    expect(ta.value).toBe("existing text dictated");
   });
 
   it("shows the live cloud interim transcript as a muted preview, then clears it", () => {

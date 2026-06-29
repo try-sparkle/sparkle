@@ -6,6 +6,17 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { TbBulb } from "react-icons/tb";
+import {
+  FiHelpCircle,
+  FiMessageCircle,
+  FiTool,
+  FiCornerUpRight,
+  FiPlay,
+  FiSearch,
+  FiBookmark,
+  FiCheckSquare,
+  FiCheck,
+} from "react-icons/fi";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import { popupPosition } from "./selectionPopupPosition";
 import {
@@ -82,15 +93,23 @@ export function SelectionPopup({
     const onDocDown = (e: MouseEvent) => {
       if (cardRef.current && !cardRef.current.contains(e.target as Node)) onCloseRef.current();
     };
-    const onScroll = () => onCloseRef.current();
+    // Dismiss when the USER scrolls away — but NOT on the terminal's own programmatic auto-scroll
+    // as output streams in. xterm's `.xterm-viewport` fires a capture-phase `scroll` on every line
+    // of output, so a plain window scroll listener would destroy the popup the instant it opened
+    // over a busy terminal (the "the menu never appears" bug). A `wheel` event only fires on real
+    // user scroll input, cleanly distinguishing the two. Ignore wheels inside the card itself.
+    const onWheel = (e: WheelEvent) => {
+      if (cardRef.current?.contains(e.target as Node)) return;
+      onCloseRef.current();
+    };
     window.addEventListener("keydown", onKey);
     // Capture phase so a click anywhere closes before it does anything else.
     document.addEventListener("mousedown", onDocDown, true);
-    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("wheel", onWheel, true);
     return () => {
       window.removeEventListener("keydown", onKey);
       document.removeEventListener("mousedown", onDocDown, true);
-      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("wheel", onWheel, true);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps -- intentionally empty; reads via refs
 
@@ -127,19 +146,19 @@ export function SelectionPopup({
   const aiActions: Action[] = [
     ...(projectExists ? [
       { icon: <TbBulb size={15} />, label: "Think", primary: true, run: () => act(() => thinkWith(projectId, text)) },
-      { icon: "💡", label: "Explain", run: () => act(() => explain(projectId, text)) },
-      { icon: "💬", label: "Ask…", run: () => setMode("ask") },
+      { icon: <FiHelpCircle size={15} />, label: "Explain", run: () => act(() => explain(projectId, text)) },
+      { icon: <FiMessageCircle size={15} />, label: "Ask…", run: () => setMode("ask") },
     ] : []),
-    { icon: "🔧", label: "Fix it", run: () => act(() => fixInAgent(agentId, text)) },
+    { icon: <FiTool size={15} />, label: "Fix it", run: () => act(() => fixInAgent(agentId, text)) },
   ];
   const doActions: Action[] = [
-    { icon: "➦", label: "Send to agent", run: () => act(() => sendToAgent(agentId, text)) },
+    { icon: <FiCornerUpRight size={15} />, label: "Send to agent", run: () => act(() => sendToAgent(agentId, text)) },
     ...(projectExists ? [
-      { icon: "▶", label: "Run as cmd", run: () => act(() => runAsCommand(projectId, text)) },
+      { icon: <FiPlay size={15} />, label: "Run as cmd", run: () => act(() => runAsCommand(projectId, text)) },
     ] : []),
-    { icon: "🔎", label: "Search web", run: () => act(() => searchWeb(text)) },
-    { icon: "🔖", label: "Save note", run: () => act(() => saveNote(projectRootPath, text, new Date().toISOString()), "Saved to NOTES.md") },
-    { icon: "☑", label: "New task", run: () => act(async () => `Created ${await createTaskFromText(projectRootPath, text)}`) },
+    { icon: <FiSearch size={15} />, label: "Search web", run: () => act(() => searchWeb(text)) },
+    { icon: <FiBookmark size={15} />, label: "Save note", run: () => act(() => saveNote(projectRootPath, text, new Date().toISOString()), "Saved to NOTES.md") },
+    { icon: <FiCheckSquare size={15} />, label: "New task", run: () => act(async () => `Created ${await createTaskFromText(projectRootPath, text)}`) },
   ];
 
   return createPortal(
@@ -163,8 +182,8 @@ export function SelectionPopup({
         animation: "sparkle-tooltip-in 90ms ease-out",
       }}
     >
-      <div style={{ color: C.teal, fontSize: 11.5, fontWeight: FONT_WEIGHT.semibold, margin: "2px 12px" }}>
-        ✓ Copied to clipboard
+      <div style={{ color: C.teal, fontSize: 11.5, fontWeight: FONT_WEIGHT.semibold, margin: "2px 12px", display: "flex", alignItems: "center", gap: 4 }}>
+        <FiCheck size={13} /> Copied to clipboard
       </div>
       <div
         style={{
