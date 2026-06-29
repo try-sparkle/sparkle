@@ -396,8 +396,15 @@ export function Terminal({
       void killPty(agentId).catch(ignorePtyGone);
       engine.dispose();
       markersRef.current.clear(); // term.dispose() drops the markers; clear our handles too
-      term.dispose();
+      // Dispose the WebGL renderer BEFORE the terminal. Its render loop runs on
+      // requestAnimationFrame; if we let term.dispose() tear down the core render service first, an
+      // already-scheduled frame can still fire and read `this._renderer.value.dimensions` after it's
+      // gone — the uncaught "undefined is not an object (this._renderer.value.dimensions)" TypeError
+      // seen in the logs. Disposing the addon first stops its loop before the core disappears.
+      // (dispose() is idempotent, so term.dispose()'s own addon teardown is a safe no-op after this.)
+      webglRef.current?.dispose();
       webglRef.current = null;
+      term.dispose();
     };
     // agentId is stable for the life of this component.
     // eslint-disable-next-line react-hooks/exhaustive-deps
