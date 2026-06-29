@@ -77,22 +77,33 @@ export function aiFeatureMode(f: AiFeatureFlags): AiMode {
 }
 
 /**
- * Persist migration v0 → v1: the binary `aiEnabled` master became four per-feature flags (all
- * default on). Without this, a user who set `aiEnabled=false` (to stop AI work and avoid consuming
- * credits) would silently get every AI feature — including the billable cloud-dictation path —
- * re-enabled on upgrade. Map a stored `aiEnabled===false` to all four flags off; absent/true lets
- * the on-by-default values win. Pure + exported for testing.
+ * Persist migrations, applied in order against the stored `version`:
+ *  - v0 → v1: the binary `aiEnabled` master became four per-feature flags (all default on).
+ *    Without this, a user who set `aiEnabled=false` (to stop AI work and avoid consuming credits)
+ *    would silently get every AI feature — including the billable cloud-dictation path — re-enabled
+ *    on upgrade. Map a stored `aiEnabled===false` to all four flags off; absent/true lets the
+ *    on-by-default values win.
+ *  - v1 → v2: `autoApplyUpdates` was added (default on). An existing install has no stored value,
+ *    so set it to `true` explicitly here — the same default a fresh install gets — rather than
+ *    relying on merge alone, so the migrated shape is self-describing.
+ * Pure + exported for testing.
  */
 export function migrateSettings(persisted: unknown, version: number): unknown {
-  const prev = persisted as (Partial<AiFeatureFlags> & { aiEnabled?: boolean }) | null | undefined;
+  let prev = persisted as
+    | (Partial<AiFeatureFlags> & { aiEnabled?: boolean; autoApplyUpdates?: boolean })
+    | null
+    | undefined;
   if (version < 1 && prev && prev.aiEnabled === false) {
-    return {
+    prev = {
       ...prev,
       aiAutoRename: false,
       cloudDictation: false,
       aiBrainstorm: false,
       aiComposer: false,
     };
+  }
+  if (version < 2 && prev && prev.autoApplyUpdates === undefined) {
+    prev = { ...prev, autoApplyUpdates: true };
   }
   return prev;
 }
@@ -141,6 +152,11 @@ interface SettingsState {
   /** Use the AI-enhanced composer (ghost text, screenshot drop, dictation insert, Send). Off →
    *  the composer is replaced by the bare terminal input. */
   aiComposer: boolean;
+  /** Auto-apply desktop updates: when on (default), a found update downloads + installs silently
+   *  and applies on the next restart, with a quiet "ready" affordance. When off, the user gets a
+   *  "Restart to apply / Later" prompt instead and nothing is installed until they choose. Read by
+   *  updaterService. */
+  autoApplyUpdates: boolean;
   /** Which agent statuses fire a Notification Center banner on the transition INTO them. See
    *  DEFAULT_NOTIFY_STATUSES. Persisted; merged over the defaults on read so a status added later
    *  inherits its default rather than reading undefined. */
@@ -153,6 +169,8 @@ interface SettingsState {
   clearChiefDocState: (chiefProjectId: string) => void;
   setMaxConcurrentWorkers: (n: number) => void;
   setCloudDictation: (on: boolean) => void;
+  /** Toggle auto-apply of desktop updates (the "Automatically apply updates" checkbox). */
+  setAutoApplyUpdates: (on: boolean) => void;
   /** Toggle notifications for one agent status. */
   setNotifyStatus: (status: AgentTabStatus, on: boolean) => void;
   /** Toggle one AI feature; the master segment re-derives automatically (aiFeatureMode). */
@@ -173,11 +191,13 @@ export const useSettingsStore = create<SettingsState>()(
       aiAutoRename: true,
       aiBrainstorm: true,
       aiComposer: true,
+      autoApplyUpdates: true,
       notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
 
       setChiefPat: (pat) => set({ chiefPat: pat.trim() }),
       setRuntimeChiefPat: (pat) => set({ runtimeChiefPat: pat.trim() }),
       setCloudDictation: (on) => set({ cloudDictation: on }),
+      setAutoApplyUpdates: (on) => set({ autoApplyUpdates: on }),
       setNotifyStatus: (status, on) =>
         set((s) => ({ notifyStatuses: { ...s.notifyStatuses, [status]: on } })),
       setAiFeature: (key, on) => set({ [AI_FEATURE_FIELD[key]]: on } as Partial<AiFeatureFlags>),
@@ -209,8 +229,9 @@ export const useSettingsStore = create<SettingsState>()(
       name: "sparkle-settings",
       storage: createJSONStorage(() => localStorage),
       // v0 → v1: preserve a prior `aiEnabled=false` opt-out across the binary→four-flag schema
-      // change so we never silently re-arm AI/credits on upgrade (see migrateSettings).
-      version: 1,
+      // change so we never silently re-arm AI/credits on upgrade. v1 → v2: seed autoApplyUpdates
+      // (default on) for existing installs. See migrateSettings.
+      version: 2,
       migrate: migrateSettings,
       // Merge persisted state over the live defaults, but DEEP-merge notifyStatuses so a store
       // saved before this field existed (or one missing a newly-added status) inherits the
@@ -235,6 +256,7 @@ export const useSettingsStore = create<SettingsState>()(
         aiAutoRename: s.aiAutoRename,
         aiBrainstorm: s.aiBrainstorm,
         aiComposer: s.aiComposer,
+        autoApplyUpdates: s.autoApplyUpdates,
         notifyStatuses: s.notifyStatuses,
       }),
     },

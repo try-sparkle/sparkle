@@ -31,7 +31,10 @@ vi.mock("../stores/beadsStore", () => {
   return { useBeadsStore };
 });
 
+vi.mock("../services/sendToBuild", () => ({ sendToBuild: vi.fn() }));
+
 import { BoardView } from "./BoardView";
+import { sendToBuild } from "../services/sendToBuild";
 
 const project: Project = {
   id: "p1",
@@ -71,6 +74,7 @@ afterEach(() => {
   error = undefined;
   startPolling.mockClear();
   stopPolling.mockClear();
+  vi.mocked(sendToBuild).mockClear();
 });
 
 beforeEach(() => {
@@ -180,5 +184,42 @@ describe("BoardView", () => {
     // Backlog header lives in a row that also shows its count (2). Scope the lookup to that header.
     const backlogHeader = screen.getByText("Backlog").parentElement as HTMLElement;
     expect(within(backlogHeader).getByText("2")).toBeTruthy();
+  });
+});
+
+describe("BoardView — Build It (epic handoff)", () => {
+  function epicSnapshot(description: string) {
+    return {
+      beads: [],
+      board: {
+        backlog: [bead({ id: "p1-e1", title: "Build the app", type: "epic", description })],
+        inProgress: [],
+        done: [],
+        delivered: [],
+      },
+      loadedAt: Date.now(),
+    };
+  }
+
+  it("shows the status pill + Build It on an epic and hands off with the parsed PRD path", () => {
+    snapshot = epicSnapshot("Ship the app.\n\nPRD file: PRD/2026-06-27-build-the-app.md");
+    render(<BoardView project={project} />);
+    fireEvent.click(screen.getByText("Build the app")); // open the epic's detail overlay
+    expect(screen.getByText("not started")).toBeTruthy(); // rollup of an epic with no children
+    fireEvent.click(screen.getByText("Build It"));
+    expect(sendToBuild).toHaveBeenCalledWith({
+      projectId: "p1",
+      epicId: "p1-e1",
+      prdPath: "PRD/2026-06-27-build-the-app.md",
+    });
+  });
+
+  it("blocks Build It with an error when the epic has no linked PRD", () => {
+    snapshot = epicSnapshot("no PRD link in this body");
+    render(<BoardView project={project} />);
+    fireEvent.click(screen.getByText("Build the app"));
+    fireEvent.click(screen.getByText("Build It"));
+    expect(sendToBuild).not.toHaveBeenCalled();
+    expect(screen.getByText(/no linked PRD/i)).toBeTruthy();
   });
 });

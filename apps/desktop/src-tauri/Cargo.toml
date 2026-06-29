@@ -1,6 +1,6 @@
 [package]
 name = "sparkle"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Sparkle desktop (macOS)"
 
@@ -23,6 +23,12 @@ keyring = { version = "3", features = ["apple-native"] }
 # Lets the webview reach the Chief API (api.storytell.ai) from Rust, bypassing the
 # webview's CSP and the API's lack of CORS — see chief.ts / bead .
 tauri-plugin-http = "2"
+# Auto-updater: poll a signed GitHub Releases manifest, download + install signed update
+# artifacts, and relaunch into the new build. Public-key verification is configured in
+# tauri.conf.json (plugins.updater.pubkey); see apps/desktop/UPDATER-SETUP.md.
+tauri-plugin-updater = "2"
+# Relaunch the app after an update is staged (used by the frontend updaterService).
+tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: keep the user's settings.local.json keys in their original order when we merge
 # hooks into it (default serde_json is BTreeMap-backed and would alphabetize them on every write).

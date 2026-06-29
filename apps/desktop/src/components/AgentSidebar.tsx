@@ -16,6 +16,9 @@ import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
 import { refreshAgentTitle } from "../services/sessionTitle";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
+import { useBeadsStore } from "../stores/beadsStore";
+import { beadLabel, epicForBuild } from "../services/planView";
+import type { Bead } from "../services/beads";
 import { orderAgents } from "../engine/agentOrdering";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
@@ -809,6 +812,10 @@ type WorkerDetail = {
  * `workers` inline: a bare indented progress line each (collapsed) and a stacked detail block each
  * (expanded), so the whole build reads as one card and selecting any part opens the orchestrator.
  */
+// Stable empty fallback for the beads selector — a `?? []` literal in a zustand selector returns a
+// fresh reference every render and loops the store. Reuse one array.
+const NO_BEADS: Bead[] = [];
+
 function AgentRow({
   project,
   a,
@@ -865,6 +872,11 @@ function AgentRow({
   const renameAgent = useProjectStore((s) => s.renameAgent);
   const unpinAgent = useProjectStore((s) => s.unpinAgent);
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
+  // Beads for this project (stable fallback to avoid a re-render loop). Drives the Build-tab
+  // linkage hovers: a worker shows the bead it's on; an orchestrator shows its epic.
+  const beads = useBeadsStore((s) => s.byProject[project.id]?.beads ?? NO_BEADS);
+  const beadHover = a.kind === "worker" ? beadLabel(beads, a.beadId) : null;
+  const epicHover = a.kind === "build" ? epicForBuild(beads, project.agents, a.id) : null;
 
   const rowRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<number | null>(null);
@@ -1135,6 +1147,16 @@ function AgentRow({
                 w.stage ? (
                   <WorkflowLine key={w.id} stage={w.stage} expanded={false} shipped={w.shipped} />
                 ) : null,
+              )}
+              {beadHover && (
+                <DetailLine label="Bead">
+                  <span style={{ color: C.muted, fontSize: 11 }}>{beadHover}</span>
+                </DetailLine>
+              )}
+              {epicHover && (
+                <DetailLine label="Epic">
+                  <span style={{ color: C.muted, fontSize: 11 }}>{epicHover}</span>
+                </DetailLine>
               )}
             </div>
           )}

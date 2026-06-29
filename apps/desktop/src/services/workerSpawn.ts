@@ -12,6 +12,7 @@ export async function spawnWorker(args: {
   projectId: string;
   parentAgentId: string;
   task: string;
+  beadId?: string;
 }): Promise<string> {
   const store = useProjectStore.getState();
   const project = store.projects.find((p) => p.id === args.projectId);
@@ -29,6 +30,7 @@ export async function spawnWorker(args: {
     parentId: args.parentAgentId,
     task: args.task,
     parentBranch: parent.branch,
+    beadId: args.beadId,
   });
 
   let info: WorktreeInfo;

@@ -21,7 +21,7 @@ export interface OrchestrationRequest {
   op: "spawn_worker" | "list_workers" | "spin_down";
   buildAgentId: string;
   projectId: string;
-  payload: { task?: string; workerId?: string };
+  payload: { task?: string; workerId?: string; beadId?: string };
 }
 
 let unlisten: UnlistenFn | undefined;
@@ -100,6 +100,7 @@ async function runSpawn(req: OrchestrationRequest): Promise<void> {
       projectId: req.projectId,
       parentAgentId: req.buildAgentId,
       task: req.payload.task ?? "",
+      beadId: req.payload.beadId,
     });
     const project = useProjectStore.getState().projects.find((p) => p.id === req.projectId);
     const worker = project?.agents.find((a) => a.id === workerId);

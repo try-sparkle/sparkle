@@ -360,7 +360,12 @@ fn handle_frontend_op(
             if task.is_empty() {
                 return json!({ "id": id, "ok": false, "error": "missing task" }).to_string();
             }
-            json!({ "task": task })
+            // Forward an optional beadId so the frontend can link the worker to the bead it
+            // implements (Think→Plan→Build). Identity fields stay bridge-injected; this is data.
+            match req.get("beadId").and_then(|b| b.as_str()) {
+                Some(bead_id) => json!({ "task": task, "beadId": bead_id }),
+                None => json!({ "task": task }),
+            }
         }
         "spin_down" => {
             let worker_id = req.get("workerId").and_then(|w| w.as_str()).unwrap_or("");

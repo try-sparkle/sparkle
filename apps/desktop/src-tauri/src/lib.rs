@@ -37,6 +37,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_http::init())
+        // Auto-updater (poll signed GitHub Releases manifest + install) and process (relaunch into
+        // the staged update). The frontend updaterService drives both; pubkey/endpoints live in
+        // tauri.conf.json. See apps/desktop/UPDATER-SETUP.md for the signing-key/CI setup.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(PtyManager::default())
         .manage(dictation::DictationState::default())

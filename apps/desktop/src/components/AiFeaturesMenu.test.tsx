@@ -14,12 +14,22 @@ afterEach(() => cleanup());
 
 const mode = () => aiFeatureMode(useSettingsStore.getState());
 
+// The four AI-feature checkboxes, addressed by label — distinct from the independent
+// "Automatically apply updates" toggle that also renders in this menu (see updaterService).
+const AI_LABELS = [
+  "Auto-rename workers based on the work they're doing",
+  "Use AI-enhanced voice dictation for much better accuracy",
+  "Enable the AI Think agent (chat with Chief)",
+  "Use AI-enhanced composer",
+];
+const aiBoxes = () => AI_LABELS.map((l) => screen.getByRole("checkbox", { name: l }));
+
 describe("AiFeaturesMenu", () => {
   it("starts with all features on and the master on 'All'", () => {
     render(<AiFeaturesMenu />);
     expect(mode()).toBe("all");
-    // The four checkboxes are all checked.
-    const boxes = screen.getAllByRole("checkbox");
+    // The four AI-feature checkboxes are all checked.
+    const boxes = aiBoxes();
     expect(boxes).toHaveLength(4);
     expect(boxes.every((b) => b.getAttribute("aria-checked") === "true")).toBe(true);
     expect(screen.getByText("All").getAttribute("aria-pressed")).toBe("true");
@@ -29,10 +39,23 @@ describe("AiFeaturesMenu", () => {
     render(<AiFeaturesMenu />);
     fireEvent.click(screen.getByText("Off"));
     expect(mode()).toBe("off");
-    expect(screen.getAllByRole("checkbox").every((b) => b.getAttribute("aria-checked") === "false")).toBe(true);
+    expect(aiBoxes().every((b) => b.getAttribute("aria-checked") === "false")).toBe(true);
     fireEvent.click(screen.getByText("All"));
     expect(mode()).toBe("all");
-    expect(screen.getAllByRole("checkbox").every((b) => b.getAttribute("aria-checked") === "true")).toBe(true);
+    expect(aiBoxes().every((b) => b.getAttribute("aria-checked") === "true")).toBe(true);
+  });
+
+  it("the 'Automatically apply updates' toggle is independent of the AI master", () => {
+    useSettingsStore.getState().setAutoApplyUpdates(true);
+    render(<AiFeaturesMenu />);
+    const box = screen.getByRole("checkbox", { name: "Automatically apply updates" });
+    expect(box.getAttribute("aria-checked")).toBe("true");
+    // Off bulk-sets the AI features but must NOT touch auto-apply.
+    fireEvent.click(screen.getByText("Off"));
+    expect(useSettingsStore.getState().autoApplyUpdates).toBe(true);
+    // Toggling it flips only autoApplyUpdates.
+    fireEvent.click(box);
+    expect(useSettingsStore.getState().autoApplyUpdates).toBe(false);
   });
 
   it("unchecking one feature drops the master to 'Some'", () => {

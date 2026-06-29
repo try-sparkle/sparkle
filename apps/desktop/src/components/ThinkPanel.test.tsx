@@ -19,6 +19,8 @@ vi.mock("../services/chief", () => ({
   ensureSkill: vi.fn(() => Promise.resolve("sparkle-skeptic")),
   createMemory: vi.fn(() => Promise.resolve({})),
   wipeChiefLibrary: vi.fn(() => Promise.resolve(0)),
+  listSkills: vi.fn(() => Promise.resolve([])),
+  listAllAssets: vi.fn(() => Promise.resolve([])),
   ChiefError: class ChiefError extends Error {},
 }));
 // The interview engine: Claude-direct. chatOnce yields the assistant reply text per turn.

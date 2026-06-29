@@ -14,6 +14,8 @@
     "core:window:allow-destroy",
     "dialog:default",
     "deep-link:default",
+    "updater:default",
+    "process:default",
     {
       "identifier": "opener:allow-open-url",
       "allow": [

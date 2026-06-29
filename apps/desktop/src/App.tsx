@@ -12,6 +12,8 @@ import { useSettingsStore } from "./stores/settingsStore";
 import { CurrentProjectProvider } from "./windowContext";
 import { useAttentionNotifications } from "./useAttentionNotifications";
 import { useRosterPublisher } from "./useRosterPublisher";
+import { UpdateBanner } from "./components/UpdateBanner";
+import { startUpdater } from "./services/updaterService";
 
 // Owns the dock badge + Notification Center banners + click-to-worker routing. Rendered inside
 // the provider (it reads this window's current project) and paints no UI of its own.
@@ -64,10 +66,15 @@ export function App() {
       .catch((e) => console.warn("healAgentHooks failed", e));
   }, []);
 
+  // Auto-updater: poll the signed GitHub Releases manifest at launch + every 6h. No-ops in dev /
+  // the browser preview / when unpackaged (the plugin + manifest only exist in a real build).
+  useEffect(() => startUpdater(), []);
+
   return (
     <CurrentProjectProvider>
       <AuthGate>
         <AttentionController />
+        <UpdateBanner />
         <Workspace />
       </AuthGate>
     </CurrentProjectProvider>

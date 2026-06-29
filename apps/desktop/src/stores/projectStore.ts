@@ -18,6 +18,7 @@ export interface AddAgentOpts {
   task?: string;
   parentBranch?: string;
   shellCommand?: string;
+  beadId?: string;
 }
 
 // Default display name for a freshly created agent, numbered within its kind so you get
@@ -301,6 +302,7 @@ export const useProjectStore = create<ProjectState>()(
               promptHistory: [],
               task: opts?.task,
               parentBranch: opts?.parentBranch,
+              beadId: opts?.beadId,
               // Pin only an explicit caller-supplied name (opts.name — e.g. an import): that's a
               // deliberate choice auto-naming must not overwrite. Agents created without opts.name —
               // including the kind-based "Build 1"/"Worker 2"/"Think" defaults — stay unpinned

@@ -15,14 +15,27 @@ import {
   createMemory,
   ChiefError,
   wipeChiefLibrary,
+  listAllAssets,
+  listSkills,
   type MemoryCategory,
 } from "../services/chief";
 import { chatOnce, structuredJson } from "../services/anthropic";
+import { generateVoices, type VoiceDef } from "../services/voices";
+import {
+  detectChiefMention,
+  stripChiefMention,
+  summarizeCorpus,
+  instructionsOneLiner,
+} from "../services/expertVoices";
+import { ExpertVoicesRail, type VoicesStatus } from "./ExpertVoicesRail";
 import { createLibrarian, type Librarian } from "../services/librarian";
 import { useLibrarianStore } from "../stores/librarianStore";
 import { synthesizePrd, writePrd, type SynthesizeResult } from "../services/prd";
 import { generateTasks, createBeadFull, beadDepAdd } from "../services/tasks";
 import { sendToBuild } from "../services/sendToBuild";
+import { turnIntoPlan } from "../services/turnIntoPlan";
+import { maybeAutoName } from "../services/agentNaming";
+import { useProjectStore } from "../stores/projectStore";
 import { LibrarianRail } from "./LibrarianRail";
 import { registerThink } from "../services/thinkBridge";
 import { meteredAi } from "../services/sparkleApi";
@@ -112,6 +125,11 @@ export function ThinkPanel({
   const [epicId, setEpicId] = useState<string | null>(null);
   const [synthesizing, setSynthesizing] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const [planning, setPlanning] = useState(false);
+  // Expert voices: the persona slate Chief spins up when the user @mentions @chief.
+  const [voices, setVoices] = useState<VoiceDef[]>([]);
+  const [voicesStatus, setVoicesStatus] = useState<VoicesStatus>("idle");
+  const [voicesError, setVoicesError] = useState("");
   const clearChiefDocState = useSettingsStore((s) => s.clearChiefDocState);
   const handoff = useHandoffStore((s) => s.pending);
   const clearHandoff = useHandoffStore((s) => s.clear);
@@ -170,6 +188,29 @@ export function ThinkPanel({
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages, sending]);
 
+  // Surface any expert voices Chief already spun up for this project (persona skills) so they
+  // persist across sessions. Best-effort; a failure just leaves the rail empty.
+  useEffect(() => {
+    if (!pat || !chiefProjectId) return;
+    let cancelled = false;
+    void listSkills(pat, chiefProjectId)
+      .then((skills) => {
+        if (cancelled) return;
+        const personas = skills
+          .filter((s) => s.category === "persona")
+          .map<VoiceDef>((s) => ({
+            name: s.name,
+            oneLiner: instructionsOneLiner(s.instructions ?? ""),
+            instructions: s.instructions ?? "",
+          }));
+        if (personas.length) setVoices(personas);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [pat, chiefProjectId]);
+
   // Fire-and-forget capture of a think turn into the durable history store. This must NEVER break
   // the chat: we guard against both a synchronous throw and a rejected promise here.
   const recordTurn = (kind: HistoryKind, text: string) => {
@@ -203,6 +244,10 @@ export function ThinkPanel({
     const nextMessages: ChatMsg[] = [...messages, { role: "user", text: prompt }];
     setMessages(nextMessages);
     if (capture) recordTurn("prompt", prompt);
+    // Auto-name the Think agent from its substantive turns, exactly like Build agents (fire-and-
+    // forget; maybeAutoName skips pinned names, acks, and operational prompts). "Turn this into a
+    // Plan" later overrides this with the epic title.
+    if (capture) void maybeAutoName(project.id, agentId, prompt);
 
     // Kick the background librarian for the next turn (non-blocking; swallows its own errors).
     // Gate it on the AI-features toggle so a disabled-AI session doesn't fire background Chief
@@ -239,11 +284,80 @@ export function ThinkPanel({
     }
   };
 
-  // The composer's send: take the typed input, clear it, and dispatch.
+  // "@chief …": spin up a slate of expert-voice personas grounded in the project library +
+  // conversation, register each as a Chief persona skill, and surface them in the rail. The
+  // generation logic lives in the (DI'd, unit-tested) voices service; this wires the real
+  // Claude + Chief backends and owns the UI state.
+  const spinUpVoices = async (prompt: string) => {
+    if (!pat) {
+      setError("Connect Chief first.");
+      return;
+    }
+    if (!chiefProjectId) {
+      setError("Chief isn't linked yet — give it a moment and try again.");
+      return;
+    }
+    const ask = stripChiefMention(prompt);
+    const nextMessages: ChatMsg[] = [...messages, { role: "user", text: prompt }];
+    setMessages(nextMessages);
+    recordTurn("prompt", prompt);
+    setVoicesStatus("generating");
+    setVoicesError("");
+    setError("");
+    try {
+      // Best-effort: ground the slate in the project's library; fall back to the project name.
+      let corpusSummary = project.name;
+      try {
+        corpusSummary = summarizeCorpus(await listAllAssets(pat, chiefProjectId)) || project.name;
+      } catch {
+        // listing is best-effort — generate from the conversation alone if it fails.
+      }
+      const slate = await generateVoices(
+        {
+          structuredJson,
+          ensureVoice: (name, instructions) =>
+            ensureSkill(pat, chiefProjectId, name, instructions, "persona"),
+        },
+        { corpusSummary, conversation: `${buildTranscript(nextMessages)}\n\n${ask}`.trim() },
+      );
+      setVoices(slate);
+      setVoicesStatus("idle");
+      setMessages((m) => [
+        ...m,
+        {
+          role: "assistant",
+          text: slate.length
+            ? `Spun up ${slate.length} expert voice${slate.length > 1 ? "s" : ""}: ${slate
+                .map((v) => v.name)
+                .join(", ")}. @mention any of them in your next message to bring their lens in.`
+            : "I couldn't draft any expert voices for that — give Chief a bit more to go on and try again.",
+        },
+      ]);
+    } catch (e) {
+      const msg = friendlyError(e);
+      setVoicesStatus("error");
+      setVoicesError(msg);
+      // Also reflect the failure inline in the chat thread so the user's @chief turn doesn't
+      // sit there with no visible response (mirrors the sendText error path).
+      setMessages((m) => [
+        ...m,
+        { role: "assistant", text: `I couldn't spin up expert voices — ${msg}` },
+      ]);
+    }
+  };
+
+  // The composer's send: take the typed input, clear it, and dispatch. An @chief mention
+  // routes to the expert-voices spin-up; everything else is a normal interview turn.
   const send = () => {
     const prompt = input.trim();
     if (!prompt || sending) return; // don't clear the box if a turn is already in flight
     setInput("");
+    if (detectChiefMention(prompt)) {
+      // Re-entrancy guard: spinUpVoices tracks voicesStatus, not `sending`, so without this a
+      // rapid double @chief submit would fire concurrent generations + duplicate registrations.
+      if (voicesStatus !== "generating") void spinUpVoices(prompt);
+      return;
+    }
     void sendText(prompt);
   };
 
@@ -309,6 +423,58 @@ export function ThinkPanel({
       setError(friendlyError(e));
     } finally {
       setGenerating(false);
+    }
+  }
+
+  // "Turn this into a Plan": the single Think→Plan action — synthesize the PRD, then decompose it
+  // into a beads epic + child tasks in one step (composes via the turnIntoPlan service). The epic +
+  // its children land in the Plan tab; "Build It" there hands the epic to the orchestrator.
+  async function handleTurnIntoPlan() {
+    if (planning || messages.length === 0) return;
+    if (!chiefProjectId) {
+      setError("Chief isn't linked yet — give it a moment and try again.");
+      return;
+    }
+    setPlanning(true);
+    setError("");
+    setNotice("Turning your conversation into a plan — synthesizing the PRD, then decomposing it into beads…");
+    try {
+      const res = await turnIntoPlan(
+        {
+          synthesize: (a) => synthesizePrd({ startChat, pollForResponse, writePrd }, a),
+          generate: (a) =>
+            generateTasks(
+              {
+                structuredJson,
+                createBeadFull,
+                beadDepAdd,
+                writePrd,
+                createMemory: (content, category) =>
+                  createMemory(pat, chiefProjectId, {
+                    content,
+                    category: category as MemoryCategory,
+                  }).then(() => {}),
+              },
+              a,
+            ),
+        },
+        { pat, chiefProjectId, projectPath: project.rootPath, transcript: buildTranscript(messages) },
+      );
+      setEpicId(res.epicId);
+      // Keep Send-to-Build working after this one-step path: it only needs the PRD path + epic.
+      setPrd({ path: res.prdPath, filename: res.prdFilename, title: res.epicTitle, content: "" });
+      // The Think agent's name becomes the epic title — the through-line from Think to Plan to
+      // Build. Use renameAgent (which PINS) so a late-resolving maybeAutoName from an earlier turn
+      // can't clobber the epic title, and so it sticks as the canonical name.
+      useProjectStore.getState().renameAgent(project.id, agentId, res.epicTitle);
+      setNotice(
+        `Plan ready — epic ${res.epicId} with ${res.taskIds.length} task(s). Open the Plan tab to see it, then “Build It”.`,
+      );
+    } catch (e) {
+      setNotice("");
+      setError(friendlyError(e));
+    } finally {
+      setPlanning(false);
     }
   }
 
@@ -494,6 +660,15 @@ export function ThinkPanel({
             inputRef.current?.focus();
           }}
         />
+        <ExpertVoicesRail
+          voices={voices}
+          status={voicesStatus}
+          error={voicesError}
+          onMention={(name) => {
+            setInput((prev) => `${prev}${prev && !prev.endsWith(" ") ? " " : ""}@${name} `);
+            inputRef.current?.focus();
+          }}
+        />
       </div>
 
       {error && <div style={{ padding: "8px 16px", color: C.sienna, fontSize: 12 }}>{error}</div>}
@@ -512,10 +687,15 @@ export function ThinkPanel({
         }}
       >
         <ActionButton
+          label={planning ? "Turning into a plan…" : "Turn this into a Plan"}
+          onClick={() => void handleTurnIntoPlan()}
+          disabled={planning || messages.length === 0 || !chiefProjectId}
+          primary
+        />
+        <ActionButton
           label={synthesizing ? "Synthesizing…" : "I'm done — write the PRD"}
           onClick={() => void handleSynthesize()}
           disabled={!canSynthesize}
-          primary
         />
         <ActionButton
           label={generating ? "Generating…" : "Generate tasks"}

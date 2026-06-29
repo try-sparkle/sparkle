@@ -68,7 +68,7 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
   });
 });
 
-describe("migrateSettings — v0→v1 preserves a prior AI opt-out", () => {
+describe("migrateSettings — v0→v1 AI opt-out + v1→v2 autoApplyUpdates default", () => {
   it("maps a stored aiEnabled:false to all four feature flags off (no silent re-arm)", () => {
     const out = migrateSettings({ aiEnabled: false, chiefPat: "x" }, 0) as Record<string, unknown>;
     expect(out.aiAutoRename).toBe(false);
@@ -77,13 +77,23 @@ describe("migrateSettings — v0→v1 preserves a prior AI opt-out", () => {
     expect(out.aiComposer).toBe(false);
     expect(out.chiefPat).toBe("x"); // other persisted fields preserved
   });
-  it("leaves aiEnabled:true / absent alone (on-by-default values win)", () => {
-    expect(migrateSettings({ aiEnabled: true }, 0)).toEqual({ aiEnabled: true });
-    expect(migrateSettings({ chiefPat: "x" }, 0)).toEqual({ chiefPat: "x" });
+  it("leaves aiEnabled:true / absent alone, but seeds autoApplyUpdates:true (v1→v2)", () => {
+    // From a pre-v2 store (version 0), the autoApplyUpdates default is added on upgrade.
+    expect(migrateSettings({ aiEnabled: true }, 0)).toEqual({
+      aiEnabled: true,
+      autoApplyUpdates: true,
+    });
+    expect(migrateSettings({ chiefPat: "x" }, 0)).toEqual({
+      chiefPat: "x",
+      autoApplyUpdates: true,
+    });
+  });
+  it("does not clobber an existing autoApplyUpdates value on migration", () => {
+    expect(migrateSettings({ autoApplyUpdates: false }, 1)).toEqual({ autoApplyUpdates: false });
   });
   it("is a no-op at the current version", () => {
-    const blob = { aiEnabled: false };
-    expect(migrateSettings(blob, 1)).toBe(blob);
+    const blob = { aiEnabled: false, autoApplyUpdates: true };
+    expect(migrateSettings(blob, 2)).toBe(blob);
   });
 });
 

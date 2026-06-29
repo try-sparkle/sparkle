@@ -47,6 +47,7 @@ export interface AgentTab {
   promptHistory: PromptHistoryEntry[];
   task?: string; // for workers: the one-shot task the build agent assigned; drives the worker persona
   parentBranch?: string; // for workers: the parent build agent's branch at spawn time (stable, not re-resolved)
+  beadId?: string; // for workers: the bead this worker implements, when spawned from a Plan epic (Think→Plan→Build linkage)
   // Auto-naming (spec: agents summarize their own work). `namePinned` is set when the user
   // renames by hand — it freezes the name (pin icon) and stops auto-renaming. `autoNameBasis`
   // is the prompt the current auto-name was derived from, used to decide when the work has

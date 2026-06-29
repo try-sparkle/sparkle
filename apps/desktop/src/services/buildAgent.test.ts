@@ -4,6 +4,7 @@ import {
   workerPersona,
   workerMission,
   orchestrationPersona,
+  beadsProtocol,
   WORKER_RESULT_RELPATH,
 } from "./buildAgent";
 
@@ -136,5 +137,23 @@ describe("orchestrationPersona", () => {
 
   it("reflects a different cap value", () => {
     expect(orchestrationPersona({ ownBranch: "b", maxConcurrentWorkers: 2 })).toContain("2");
+  });
+});
+
+describe("beadsProtocol", () => {
+  const p = beadsProtocol({ epicId: "epic-42" });
+
+  it("binds the orchestrator to the epic and its child tasks", () => {
+    expect(p).toContain("epic-42");
+    expect(p).toContain("bd show epic-42 --json");
+    expect(p).toMatch(/claim/i);
+    expect(p).toContain("bd close");
+    expect(p).toContain("delivered");
+  });
+
+  it("instructs exactly one worker per task, linked to its bead via the beadId argument", () => {
+    expect(p).toMatch(/one worker/i);
+    expect(p).toContain("beadId"); // the worker↔bead linkage argument
+    expect(p).toContain("spawn_worker");
   });
 });

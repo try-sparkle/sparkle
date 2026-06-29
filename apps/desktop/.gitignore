@@ -1,0 +1,5 @@
+# Tauri updater signing keys must NEVER be committed. The PUBLIC key lives in
+# src-tauri/tauri.conf.json (plugins.updater.pubkey); the PRIVATE key + password go into CI
+# secrets only. See UPDATER-SETUP.md.
+*.key
+*.key.pub

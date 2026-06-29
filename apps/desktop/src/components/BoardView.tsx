@@ -3,6 +3,10 @@ import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Project } from "../types";
 import type { Bead } from "../services/beads";
 import { useBeadsStore } from "../stores/beadsStore";
+import { useProjectStore } from "../stores/projectStore";
+import { sendToBuild } from "../services/sendToBuild";
+import { workersForBead, epicStatus, type EpicStatus } from "../services/planView";
+import type { AgentTab } from "../types";
 
 // The four board columns, in display order, paired with the Board snapshot key each reads.
 const COLUMNS: { key: "backlog" | "inProgress" | "done" | "delivered"; label: string }[] = [
@@ -13,6 +17,10 @@ const COLUMNS: { key: "backlog" | "inProgress" | "done" | "delivered"; label: st
 ];
 
 const DESC_PREVIEW = 120;
+
+// Stable empty fallback: a `?? []` literal inside a zustand selector returns a NEW reference every
+// render, which makes the store re-render in a loop. Reuse one frozen array instead.
+const NO_AGENTS: AgentTab[] = [];
 
 /**
  * Read-only Tasks Kanban for a project (bead sparkle-hiju.10). A window, NOT a control panel:
@@ -34,6 +42,9 @@ export function BoardView({ project }: { project: Project }) {
   }, [project.id, project.rootPath]);
 
   const board = snapshot?.board;
+  const allBeads = snapshot?.beads ?? [];
+  // Workers live in the agent store; the Plan view reads them to show who's building each bead.
+  const agents = useProjectStore((s) => s.projects.find((p) => p.id === project.id)?.agents ?? NO_AGENTS);
 
   return (
     <div
@@ -86,13 +97,22 @@ export function BoardView({ project }: { project: Project }) {
               key={key}
               label={label}
               beads={board[key]}
+              agents={agents}
               onOpen={(b) => setSelected(b)}
             />
           ))}
         </div>
       )}
 
-      {selected && <DetailOverlay bead={selected} onClose={() => setSelected(null)} />}
+      {selected && (
+        <DetailOverlay
+          bead={selected}
+          projectId={project.id}
+          allBeads={allBeads}
+          agents={agents}
+          onClose={() => setSelected(null)}
+        />
+      )}
     </div>
   );
 }
@@ -100,10 +120,12 @@ export function BoardView({ project }: { project: Project }) {
 function Column({
   label,
   beads,
+  agents,
   onOpen,
 }: {
   label: string;
   beads: Bead[];
+  agents: AgentTab[];
   onOpen: (b: Bead) => void;
 }) {
   return (
@@ -150,18 +172,19 @@ function Column({
             Nothing here yet
           </div>
         ) : (
-          beads.map((b) => <Card key={b.id} bead={b} onOpen={onOpen} />)
+          beads.map((b) => <Card key={b.id} bead={b} agents={agents} onOpen={onOpen} />)
         )}
       </div>
     </div>
   );
 }
 
-function Card({ bead, onOpen }: { bead: Bead; onOpen: (b: Bead) => void }) {
+function Card({ bead, agents, onOpen }: { bead: Bead; agents: AgentTab[]; onOpen: (b: Bead) => void }) {
   const preview =
     bead.description.length > DESC_PREVIEW
       ? `${bead.description.slice(0, DESC_PREVIEW)}…`
       : bead.description;
+  const workers = workersForBead(agents, bead.id);
   return (
     <button
       onClick={() => onOpen(bead)}
@@ -194,11 +217,52 @@ function Card({ bead, onOpen }: { bead: Bead; onOpen: (b: Bead) => void }) {
       >
         {bead.id}
       </div>
+      {workers.length > 0 && (
+        <div style={{ color: C.teal, fontSize: 11, lineHeight: 1.4 }}>
+          ⚙ {workers.length === 1 ? "1 worker" : `${workers.length} workers`}: {workers.join(", ")}
+        </div>
+      )}
     </button>
   );
 }
 
-function DetailOverlay({ bead, onClose }: { bead: Bead; onClose: () => void }) {
+function DetailOverlay({
+  bead,
+  projectId,
+  allBeads,
+  agents,
+  onClose,
+}: {
+  bead: Bead;
+  projectId: string;
+  allBeads: Bead[];
+  agents: AgentTab[];
+  onClose: () => void;
+}) {
+  const [buildErr, setBuildErr] = useState("");
+  const isEpic = bead.type === "epic";
+  const status: EpicStatus | null = isEpic ? epicStatus(allBeads, bead.id) : null;
+  const workers = workersForBead(agents, bead.id);
+  // The epic body carries "PRD file: <path>" (see tasks.ts); pull it back out for the handoff.
+  const prdPath = /PRD file:\s*(\S+)/.exec(bead.description)?.[1] ?? "";
+
+  // "Build It": hand this epic to the Build orchestrator, which spawns one worker per child bead.
+  function handleBuildIt() {
+    setBuildErr("");
+    // Guard a missing PRD link: without it sendToBuild would seed the orchestrator with an empty
+    // "read the PRD at  …" path and silently succeed. Surface it instead of a broken handoff.
+    if (!prdPath) {
+      setBuildErr("This epic has no linked PRD — regenerate it from Think first.");
+      return;
+    }
+    try {
+      sendToBuild({ projectId, epicId: bead.id, prdPath });
+      onClose();
+    } catch (e) {
+      setBuildErr(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   const meta: { label: string; value: string }[] = [];
   if (bead.type) meta.push({ label: "Type", value: bead.type });
   if (bead.priority !== undefined) meta.push({ label: "Priority", value: String(bead.priority) });
@@ -272,6 +336,42 @@ function DetailOverlay({ bead, onClose }: { bead: Bead; onClose: () => void }) {
           {bead.id}
         </div>
 
+        {isEpic && (
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <span
+              style={{
+                fontSize: 11,
+                textTransform: "uppercase",
+                letterSpacing: 0.5,
+                color: status === "done" ? C.teal : status === "in_progress" ? C.cream : C.muted,
+                border: `1px solid ${C.forest}`,
+                borderRadius: 999,
+                padding: "2px 10px",
+              }}
+            >
+              {status === "in_progress" ? "in progress" : status === "done" ? "done" : "not started"}
+            </span>
+            <button
+              onClick={handleBuildIt}
+              title="Hand this epic to the Build orchestrator — it spawns one worker per task"
+              style={{
+                background: C.teal,
+                color: C.cream,
+                border: "none",
+                borderRadius: 8,
+                padding: "6px 16px",
+                fontSize: 13,
+                fontWeight: FONT_WEIGHT.semibold,
+                cursor: "pointer",
+                fontFamily: '"IBM Plex Sans", sans-serif',
+              }}
+            >
+              Build It
+            </button>
+            {buildErr && <span style={{ color: C.sienna, fontSize: 12 }}>{buildErr}</span>}
+          </div>
+        )}
+
         {bead.description && (
           <div
             style={{
@@ -293,6 +393,13 @@ function DetailOverlay({ bead, onClose }: { bead: Bead; onClose: () => void }) {
                 <span style={{ color: C.cream }}>{m.value}</span>
               </div>
             ))}
+          </div>
+        )}
+
+        {workers.length > 0 && (
+          <div style={{ display: "flex", gap: 8, fontSize: 13 }}>
+            <span style={{ color: C.muted, minWidth: 90 }}>Workers</span>
+            <span style={{ color: C.teal }}>{workers.join(", ")}</span>
           </div>
         )}
       </div>
