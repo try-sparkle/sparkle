@@ -16,8 +16,9 @@ import { useInteractionStore } from "../stores/interactionStore";
 import { isComposerToggleKey } from "./composerToggle";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
+import { isMeasuredSize, spawnSize } from "./terminalSize";
 import { SelectionPopup } from "./SelectionPopup";
-import { recoverFromWebglContextLoss } from "./terminalWebgl";
+import { recoverFromWebglContextLoss, forceFullRepaint, settleRepaintPlan } from "./terminalWebgl";
 import { detectRateLimitReset } from "../services/rateLimitWatch";
 import { PH_NO_CAPTURE_CLASS } from "@sparkle/core";
 
@@ -28,6 +29,17 @@ const BASE_FONT_SIZE = 13;
 // When jumping to a prompt's marker, scroll a few rows above it so the matched turn has lead-in
 // context rather than sitting flush at the viewport top.
 const SCROLL_LEAD_IN_ROWS = 2;
+
+// Push the live xterm size to the PTY — but ONLY when it came from a genuinely laid-out
+// container. fit() on a display:none / pre-layout pane collapses to a tiny size (cols≈12), and
+// sending that to the PTY makes the agent CLI hard-wrap its output into a thin column that no
+// later resize can un-wrap. See terminalSize.ts. term.element exists once term.open() has run;
+// its clientWidth is 0 while the pane is hidden.
+function syncPtySize(agentId: string, term: XTerm): void {
+  const laidOut = !!term.element && term.element.clientWidth > 0;
+  if (!isMeasuredSize(laidOut, term)) return;
+  void resizePty(agentId, term.cols, term.rows).catch(ignorePtyGone);
+}
 
 /**
  * Imperative handle the parent uses to drive this terminal without the user clicking it.
@@ -106,6 +118,12 @@ export function Terminal({
   // The WebGL renderer (when available) caches colored glyphs in a texture atlas — kept so the
   // live re-theme effect can clear it and force already-painted cells to repaint.
   const webglRef = useRef<WebglAddon | null>(null);
+  // Set when a PTY chunk is written while this pane can't paint (hidden / 0-sized canvas): those
+  // cells get cached as "drawn" by the WebGL renderer but never reach the GPU, so a bare refresh()
+  // can't recover them (see forceFullRepaint). The next settle that lands while the pane IS
+  // paintable consumes this with a full repaint — so we pay the (cold-repaint) cost once per
+  // poisoning episode instead of on every settle. Become-active also clears it on reveal.
+  const poisonedRef = useRef(false);
   // Latest onRequestFocus, read by the (agentId-keyed) effect without re-subscribing.
   const onRequestFocusRef = useRef(onRequestFocus);
   onRequestFocusRef.current = onRequestFocus;
@@ -302,19 +320,31 @@ export function Terminal({
       }
     };
 
-    // Force a full repaint shortly after output stops arriving. The WebGL renderer only
-    // repaints cells it tracks as dirty, so rows that were revealed at the TOP of the viewport
-    // when it grew — or that a full-screen redraw (alternate-buffer TUI) rewrote — can stay
-    // blank until a scroll marks them dirty (the recurring "top half of the terminal is blank
-    // until I scroll" bug). The resize/become-active paths already refresh, but a settled turn
-    // with no resize was uncovered. Debounce so streaming output pays one repaint after it
-    // settles, not one per chunk; refresh() only marks rows dirty (cheap, no scroll change).
+    // Whether this terminal's canvas can actually paint right now (it's laid out and visible).
+    // A display:none pane has a 0-width element; output written then is cache-poisoned (see
+    // poisonedRef / forceFullRepaint).
+    const isPaintable = () => !!term.element && term.element.clientWidth > 0;
+
+    // Apply the settle/resize repaint plan: a full forceFullRepaint to drain cache-poisoned cells
+    // (once, when poisoned AND paintable), else a cheap refresh that marks rows dirty. Shared by
+    // the output-settle timer AND the ResizeObserver — so a pane revealed by a *resize* (not the
+    // active toggle) and with no further output still gets drained. settleRepaintPlan keeps the
+    // expensive cold repaint to once per poisoning episode (see terminalWebgl.ts).
+    const applyRepaintPlan = () => {
+      const plan = settleRepaintPlan(poisonedRef.current, isPaintable());
+      if (plan.action === "full") forceFullRepaint(webglRef.current, term);
+      else term.refresh(0, term.rows - 1);
+      poisonedRef.current = plan.poisoned;
+    };
+
+    // Repaint shortly after output stops arriving (debounced: streaming pays one repaint after it
+    // settles, not one per chunk).
     let settleRepaintTimer: number | null = null;
     const scheduleSettleRepaint = () => {
       if (settleRepaintTimer) window.clearTimeout(settleRepaintTimer);
       settleRepaintTimer = window.setTimeout(() => {
         try {
-          term.refresh(0, term.rows - 1);
+          applyRepaintPlan();
         } catch {
           /* terminal disposed mid-timer — ignore */
         }
@@ -327,6 +357,9 @@ export function Terminal({
         term.write(e.chunk);
         engine.ingest(e.chunk);
         watchRateLimit(e.chunk);
+        // Remember output that streamed in while we couldn't paint, so the next paintable settle
+        // (or the become-active reveal) repaints it instead of leaving the top half blank.
+        if (!isPaintable()) poisonedRef.current = true;
         scheduleSettleRepaint();
       });
       const offExit = await onPtyExit((e) => {
@@ -340,8 +373,31 @@ export function Terminal({
         return;
       }
       unlistens.push(offOut, offExit);
-      await spawnPty({ id: agentId, command, args, cwd, cols: term.cols, rows: term.rows });
-      if (!disposed) onReady?.();
+      // Re-fit right before spawning to capture the freshest measurement, then guard it: a pane
+      // that's still display:none / pre-layout fits to a tiny size (cols≈12), which would make
+      // the CLI hard-wrap into a thin column. spawnSize() falls back to safe defaults in that
+      // case; the true size is synced below (and by the ResizeObserver / become-active effect)
+      // once the container is laid out.
+      try {
+        fit.fit();
+      } catch {
+        /* container not laid out yet */
+      }
+      const laidOut = !!term.element && term.element.clientWidth > 0;
+      const { cols, rows } = spawnSize(laidOut, term);
+      await spawnPty({ id: agentId, command, args, cwd, cols, rows });
+      // Layout may have settled — or a ResizeObserver resize may have been dropped because the
+      // PTY didn't exist yet — during the async spawn. Now that the PTY exists, sync the true
+      // size (no-op while still hidden; the become-active effect covers that).
+      if (!disposed) {
+        try {
+          fit.fit();
+        } catch {
+          /* still not laid out */
+        }
+        syncPtySize(agentId, term);
+        onReady?.();
+      }
     })();
 
     // Copy-on-select: when the user finishes a mouse selection, copy it to the clipboard
@@ -369,14 +425,15 @@ export function Terminal({
     const ro = new ResizeObserver(() => {
       try {
         fit.fit();
-        void resizePty(agentId, term.cols, term.rows).catch(ignorePtyGone);
-        // Force a full repaint of the viewport. When the container grows (the pane becoming
-        // visible after display:none, or the window enlarging), the rows newly brought into
-        // view can stay blank — xterm only repaints on resize when fit() actually changed the
-        // dimensions, and the WebGL renderer in particular leaves the freshly-revealed rows
-        // unpainted. Without this, buffered history shows blank until a scroll marks the rows
-        // dirty (the reported bug). Same remedy as the theme/WebGL-recovery paths below.
-        term.refresh(0, term.rows - 1);
+        // Guard the push: a hide transition fires the observer with a 0×0 box, which fit()
+        // collapses to a tiny size — sending that to the PTY re-creates the thin-column bug.
+        syncPtySize(agentId, term);
+        // Repaint the viewport. When the container grows (the pane becoming visible after
+        // display:none, or the window enlarging), rows newly brought into view can stay blank —
+        // xterm only repaints on resize when fit() actually changed the dimensions. applyRepaintPlan
+        // does a cheap refresh normally, OR drains a poisoned pane revealed by this very resize
+        // (no active toggle, no further output) with a full forceFullRepaint.
+        applyRepaintPlan();
       } catch {
         /* ignore transient fit errors while hidden */
       }
@@ -421,16 +478,22 @@ export function Terminal({
       try {
         fit.fit();
         onRequestFocusRef.current?.();
-        void resizePty(agentId, term.cols, term.rows).catch(ignorePtyGone);
-        // The ResizeObserver may have already fit this terminal to the right size while it was
-        // hidden, making the fit() above a no-op — so xterm never repaints and the buffered
-        // history stays blank until the user scrolls. Force a full repaint of the now-visible
-        // viewport. (Repaint is cheap and idempotent; doing it here guarantees the becoming-
-        // active transition is covered regardless of which path won the resize race.)
-        term.refresh(0, term.rows - 1);
+        syncPtySize(agentId, term);
       } catch {
         /* ignore */
       }
+      // Force a full repaint of the now-visible viewport — the fix for the recurring "top half
+      // blank until I scroll" bug. While this pane was display:none its output streamed into the
+      // buffer, and any cells the WebGL renderer cached as "drawn" (with the canvas at 0 size)
+      // are SKIPPED by a bare term.refresh() — so refresh() alone left the top blank until a
+      // scroll. forceFullRepaint clears the renderer's model+atlas so every cell genuinely
+      // redraws. Deferred one more frame so the just-revealed canvas has been laid out and its
+      // char dimensions measured; otherwise the WebGL renderer bails (no valid dims) and wastes
+      // the clear. See forceFullRepaint in terminalWebgl.ts.
+      requestAnimationFrame(() => {
+        forceFullRepaint(webglRef.current, term);
+        poisonedRef.current = false; // the reveal repaint cleared any cache-poisoned cells
+      });
     });
   }, [active, agentId]);
 
@@ -445,7 +508,7 @@ export function Terminal({
     const raf = requestAnimationFrame(() => {
       try {
         fit.fit();
-        void resizePty(agentId, term.cols, term.rows).catch(ignorePtyGone);
+        syncPtySize(agentId, term);
       } catch {
         /* ignore transient fit errors */
       }

@@ -3,3 +3,7 @@
 # secrets only. See UPDATER-SETUP.md.
 *.key
 *.key.pub
+
+# Playwright/e2e build output (not source).
+test-results/
+playwright-report/
