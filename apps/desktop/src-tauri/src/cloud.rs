@@ -125,17 +125,24 @@ impl Drop for DeepgramSession {
     }
 }
 
+/// Silence (ms) Deepgram waits before finalizing a segment — i.e. how long the live italic interim
+/// lingers before it commits to non-italic text. Lower = snappier perceived dictation (the words
+/// "lock in" sooner); too low fragments a sentence on natural mid-thought pauses (premature periods
+/// / split utterances). 200 ms trims the felt latency from the prior 300 ms while staying above the
+/// ~breath-pause range, so real sentence boundaries still drive the cut, not every micro-pause.
+const DEEPGRAM_ENDPOINTING_MS: u32 = 200;
+
 /// Build the Deepgram streaming URL. `nova-3` + `language=multi` selects Nova-3 **Multilingual**
 /// (code-switching across languages) — the variant our credit pricing is based on
 /// (creditPricing.ts, $0.0058/min). `smart_format` + `punctuate` give sentence-aware punctuation
 /// (the fix for spurious per-pause periods); `interim_results` drives the live word-by-word preview;
-/// `endpointing=300` finalizes a segment after ~300 ms of silence (real-sentence boundaries, not
-/// every micro-pause).
+/// `endpointing` finalizes a segment after `DEEPGRAM_ENDPOINTING_MS` of silence (real-sentence
+/// boundaries, not every micro-pause).
 pub(crate) fn deepgram_ws_url(sample_rate: u32) -> String {
     format!(
         "wss://api.deepgram.com/v1/listen?model=nova-3&language=multi&encoding=linear16\
          &sample_rate={sample_rate}&channels=1&interim_results=true\
-         &smart_format=true&punctuate=true&endpointing=300"
+         &smart_format=true&punctuate=true&endpointing={DEEPGRAM_ENDPOINTING_MS}"
     )
 }
 
@@ -399,7 +406,7 @@ mod tests {
             "interim_results=true",
             "smart_format=true",
             "punctuate=true",
-            "endpointing=300",
+            "endpointing=200",
         ] {
             assert!(url.contains(needle), "url missing {needle}: {url}");
         }
