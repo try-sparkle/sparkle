@@ -39,6 +39,13 @@ interface DictationOptions {
   /** Called on focus REGAIN when a dictation session is still ACTIVE (phase === "active"), so the
    *  cloud stream resumes without the user re-saying the wake word. Optional (tests may omit it). */
   onResumeActive?: () => void;
+  /** True when THIS window is the active/focused OS window. The backend broadcasts every
+   *  `dictation://*` event to ALL Sparkle windows (focus is tracked app-globally — see
+   *  dictation.rs), so without this gate the same dictated phrase types into every open window's
+   *  composer at once. Each Tauri window is its own webview, so `document.hasFocus()` is true in
+   *  exactly the focused one. Injected so the multi-window routing is unit-testable; defaults to a
+   *  real `document.hasFocus()` check (and `true` in the document-less test/node env). */
+  isWindowActive?: () => boolean;
 }
 
 interface DictationController {
@@ -59,6 +66,10 @@ export async function createDictationController(
   // without recreating the controller (mirrors the useRef pattern in the hook).
   let onSegment = options.onSegment;
   const onResumeActive = options.onResumeActive;
+  // Only the focused window should consume the (app-broadcast) committed text + live preview, so a
+  // phrase doesn't land in every open window at once. Default to a real per-window focus check.
+  const isWindowActive =
+    options.isWindowActive ?? (() => typeof document === "undefined" || document.hasFocus());
 
   const { setStatus, setLevel, setSpeaking, setError, setModelProgress } =
     useDictationStore.getState();
@@ -66,6 +77,10 @@ export async function createDictationController(
   // Register event listeners — each `listen()` returns an unsubscribe fn.
   const unsubscribes = await Promise.all([
     listen<string>("dictation://partial", (e) => {
+      // Multi-window: this event is broadcast to EVERY Sparkle window, but committed text must land
+      // in only the focused one — otherwise the same phrase types into every open window's composer
+      // (and each would run the wake machine / open its own cloud stream). Background windows bail.
+      if (!isWindowActive()) return;
       // Capture started — clear any lingering model-download progress.
       useDictationStore.getState().setModelProgress(null);
       // A committed (final) segment supersedes the live preview — clear it so the interim text
@@ -77,6 +92,12 @@ export async function createDictationController(
     // Cloud-only: Deepgram interim results — the live, word-by-word preview. Volatile; replaced in
     // place and never routed through the wake machine (that only acts on committed segments).
     listen<string>("dictation://interim", (e) => {
+      // Same multi-window gate as the partial path: only the focused window paints the live ghost.
+      // A background window clears any stale preview it might still be showing and ignores the rest.
+      if (!isWindowActive()) {
+        useDictationStore.getState().setInterim("");
+        return;
+      }
       useDictationStore.getState().setInterim(e.payload);
     }),
 

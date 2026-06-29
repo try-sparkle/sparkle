@@ -280,6 +280,62 @@ describe("createDictationController (hook logic without renderHook)", () => {
   });
 });
 
+describe("multi-window routing (isWindowActive gate)", () => {
+  // The backend broadcasts dictation://* to EVERY window; only the focused one should consume the
+  // text. We model two windows by registering two controllers with opposite focus predicates and
+  // asserting the broadcast (emit fans out to both listeners) lands in only the active one.
+  beforeEach(() => {
+    for (const k of Object.keys(listeners)) delete listeners[k];
+    useDictationStore.setState({ interim: "", modelProgress: null });
+  });
+
+  it("an inactive (background) window ignores a broadcast committed partial", async () => {
+    const onSegment = vi.fn();
+    const ctrl = await createDictationController({ onSegment, isWindowActive: () => false });
+    emit("dictation://partial", "hello from the other window");
+    expect(onSegment).not.toHaveBeenCalled();
+    ctrl.cleanup();
+  });
+
+  it("the active window still receives the committed partial", async () => {
+    const onSegment = vi.fn();
+    const ctrl = await createDictationController({ onSegment, isWindowActive: () => true });
+    emit("dictation://partial", "hello world");
+    expect(onSegment).toHaveBeenCalledWith("hello world");
+    ctrl.cleanup();
+  });
+
+  it("a single broadcast lands in ONLY the focused window when two are open", async () => {
+    const activeSeg = vi.fn();
+    const bgSeg = vi.fn();
+    const active = await createDictationController({ onSegment: activeSeg, isWindowActive: () => true });
+    const background = await createDictationController({ onSegment: bgSeg, isWindowActive: () => false });
+    // One backend emission fans out to both windows' listeners (real Tauri behavior).
+    emit("dictation://partial", "type me once");
+    expect(activeSeg).toHaveBeenCalledTimes(1);
+    expect(activeSeg).toHaveBeenCalledWith("type me once");
+    expect(bgSeg).not.toHaveBeenCalled(); // the fix: no duplicate into the background window
+    active.cleanup();
+    background.cleanup();
+  });
+
+  it("an inactive window does not paint the live interim ghost (and clears any stale one)", async () => {
+    const ctrl = await createDictationController({ onSegment: vi.fn(), isWindowActive: () => false });
+    useDictationStore.setState({ interim: "stale ghost" });
+    emit("dictation://interim", "live words");
+    // Background window neither shows the new preview nor keeps a stale one.
+    expect(useDictationStore.getState().interim).toBe("");
+    ctrl.cleanup();
+  });
+
+  it("the active window paints the live interim ghost as usual", async () => {
+    const ctrl = await createDictationController({ onSegment: vi.fn(), isWindowActive: () => true });
+    emit("dictation://interim", "live words");
+    expect(useDictationStore.getState().interim).toBe("live words");
+    ctrl.cleanup();
+  });
+});
+
 describe("dictation://focus (window-focus capture gate)", () => {
   let ctrl: Awaited<ReturnType<typeof createDictationController>>;
 
