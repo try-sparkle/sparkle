@@ -10,6 +10,7 @@
   --c-cream: #eaf1ff;
   --c-muted: #8aa0c4;
   --c-chat-bubble: #1d3a7a;
+  --c-chat-bubble-active: #2c57b0;
   --c-accent-ink: #34e0f0;
   --c-agent-idle: #8aa0c4;
   --c-success-ink: #34c759;
@@ -20,6 +21,7 @@
   --c-cream: #0a1a3f;
   --c-muted: #5b6b8c;
   --c-chat-bubble: #d6e0f5;
+  --c-chat-bubble-active: #bccdf2;
   --c-accent-ink: #0a1a3f;
   --c-agent-idle: #3f4e6b;
   --c-success-ink: #15803d;

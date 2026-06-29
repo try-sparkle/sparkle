@@ -8,9 +8,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The whole card is the drag handle now (no separate grip element) — reorderable top-level rows
 // carry draggable=true; workers do not. Selecting by the attribute keeps the test honest about
-// which rows a user can actually grab. NOTE: dragProps is spread onto BOTH the in-flow row and the
-// hover overlay, so a hovered row exposes TWO draggable elements; these counts assume the at-rest
-// state (no row hovered), which holds for every test here.
+// which rows a user can actually grab. NOTE: dragProps is spread onto the in-flow row AND both
+// halves of the unified hover card (strip + detail), so a hovered row exposes MULTIPLE draggable
+// elements; these counts assume the at-rest state (no row hovered), which holds for every test here.
 const draggableCards = () => Array.from(document.querySelectorAll<HTMLElement>('[draggable="true"]'));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -85,6 +85,60 @@ describe("AgentSidebar — drag to pin", () => {
     expect(screen.getAllByTestId("agent-drop-target")).toHaveLength(3);
     fireEvent.dragEnd(cards[0]!);
     expect(screen.queryAllByTestId("agent-drop-target")).toHaveLength(0);
+  });
+
+  it("keeps a grabbable drag handle on hover — the unified card's strip carries dragProps", () => {
+    // Regression guard: the in-flow row goes visibility:hidden on hover (the unified L-card stands
+    // in over it). If only the row were draggable, hovering — the very state you'd start a drag
+    // from — would leave nothing grabbable and silently kill drag-to-reorder. So dragProps is on the
+    // card strip too. Here: hover a row, then start a drag from the NEW draggable (the portal strip)
+    // and confirm it initiates a reorder (drop targets appear).
+    const project = seed();
+    render(<AgentSidebar project={project} />);
+    const before = draggableCards();
+    expect(before).toHaveLength(3);
+
+    fireEvent.mouseEnter(before[0]!); // open the unified card over the first row
+    const after = draggableCards();
+    expect(after.length).toBeGreaterThan(before.length); // the card strip adds a grab on hover
+    const strip = after.find((el) => !before.includes(el))!;
+    expect(strip).toBeTruthy();
+
+    fireEvent.dragStart(strip); // grab the card on hover → must start a reorder
+    expect(screen.getAllByTestId("agent-drop-target")).toHaveLength(3);
+  });
+
+  it("anchors the hover card upward for a bottom-of-viewport row (stays on-screen, stays grabbable)", () => {
+    // A row sitting low in a short viewport must not let the non-shrinking strip overflow the card's
+    // maxH cap and collapse the detail. The card shifts UP so ≥ MIN_CARD_H (180px) of room remains.
+    // And because that shift can move the strip off the row, the WHOLE card is draggable — so a drag
+    // can still start from where the cursor actually is (over the detail).
+    const project = seed();
+    const origH = window.innerHeight;
+    Object.defineProperty(window, "innerHeight", { value: 400, configurable: true });
+    // Every element reports a low position: row top 380 in a 400px viewport.
+    const spy = vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+      left: 10, top: 380, width: 200, height: 40, right: 210, bottom: 420, x: 10, y: 380, toJSON: () => ({}),
+    } as DOMRect);
+    try {
+      render(<AgentSidebar project={project} />);
+      const row = draggableCards()[0]!;
+      fireEvent.mouseEnter(row);
+      const card = document.querySelector<HTMLElement>('[data-testid="agent-hover-card"]')!;
+      expect(card).toBeTruthy();
+      // Shifted up: top ≤ innerHeight - 16 - MIN_CARD_H = 400 - 16 - 180 = 204 (well above the row's 380).
+      expect(parseFloat(card.style.top)).toBeLessThanOrEqual(204);
+      // And ≥ MIN_CARD_H of vertical room is reserved.
+      expect(parseFloat(card.style.maxHeight)).toBeGreaterThanOrEqual(180);
+      // The detail half is draggable too, so the whole card is a grab handle even when shifted.
+      const drags = draggableCards();
+      expect(drags.length).toBeGreaterThanOrEqual(3); // in-flow row + strip + detail
+      fireEvent.dragStart(drags[drags.length - 1]!);
+      expect(screen.getAllByTestId("agent-drop-target")).toHaveLength(3);
+    } finally {
+      spy.mockRestore();
+      Object.defineProperty(window, "innerHeight", { value: origH, configurable: true });
+    }
   });
 
   it("a worker is not its own draggable card (it renders inline on the orchestrator)", () => {

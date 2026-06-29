@@ -109,20 +109,20 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
     expect(refreshAgentBranch).toHaveBeenCalledWith("/tmp/demo", "p1", "w1", "main", false);
   });
 
-  it("keeps the in-flow column row visible on hover (detail pops out, it doesn't replace the row)", () => {
+  it("hides the in-flow column row on hover so the unified card stands in for it (no duplicate)", () => {
     const project = seedOrchestratorWithWorker({ ahead: 0, behind: 0 } as BranchStatus);
     render(<AgentSidebar project={project} />);
     const row = document.querySelector<HTMLElement>('[draggable="true"]');
     if (!row) throw new Error("orchestrator row not found");
     expect(row.style.visibility).not.toBe("hidden");
 
-    // On hover the column row must STAY visible — the expanded detail now pops out to the RIGHT over
-    // the terminal area rather than expanding in place and covering the rows below. (Pre-change this
-    // row was set visibility:hidden while the overlay stood in for it in the column.)
+    // On hover the column row is HIDDEN (visibility:hidden — keeps its layout slot so rows below
+    // don't jump) while the single unified card, anchored at the same spot and widening into the
+    // terminal area, stands in for it. This is what keeps the name + progress bar from duplicating.
     fireEvent.mouseEnter(row);
-    expect(row.style.visibility).not.toBe("hidden");
-    // And the detail still renders (in the pop-out portal) — the Status line is present (the
-    // orchestrator's own + the worker's both read "Up to date with main").
+    expect(row.style.visibility).toBe("hidden");
+    // And the detail renders in the card — the Status line is present (the orchestrator's own + the
+    // worker's both read "Up to date with main").
     expect(screen.getAllByText(/up to date with main/i).length).toBeGreaterThan(0);
   });
 
@@ -153,5 +153,19 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
     hoverOrchestrator();
     expect(screen.getByText("WorkerOne")).toBeTruthy();
     expect(screen.getByText("WorkerTwo")).toBeTruthy();
+  });
+
+  it("shows each worker's progress bar (with stage label) in its detail block on hover", () => {
+    const project = seedOrchestratorWithWorker({ ahead: 0, behind: 0 } as BranchStatus);
+    render(<AgentSidebar project={project} />);
+    // Collapsed bars render the line only — NO worded status label (that's hover-only). So the
+    // "Uncommitted…" stage detail is absent until hover, for both the orchestrator and the worker.
+    expect(screen.queryAllByText(/uncommitted/i)).toHaveLength(0);
+
+    hoverOrchestrator();
+    // On hover the worker's bar moves DOWN into its detail block (below the worker name) and is
+    // EXPANDED — so it now carries the stage status label, the same hover readout the orchestrator's
+    // own strip bar gets. The "Uncommitted…" detail therefore appears twice: orchestrator + worker.
+    expect(screen.getAllByText(/uncommitted/i).length).toBeGreaterThanOrEqual(2);
   });
 });

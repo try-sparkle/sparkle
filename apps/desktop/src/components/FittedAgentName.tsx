@@ -29,9 +29,9 @@ export function FittedAgentName({
     <span style={{ flex: 1, minWidth: 0, display: "block", overflow: "hidden" }}>
       <span
         // Double-click to rename. A single click must NOT enter edit mode — it just selects the
-        // agent (the row's onClick), so clicking a tab never accidentally renames it.
+        // agent (the row's onClick), so clicking a tab never accidentally renames it. No title
+        // tooltip — the hover-to-rename hint was distracting on every row.
         onDoubleClick={onDoubleClick}
-        title="Double-click to rename"
         style={{
           display: "block",
           color, // the whole name takes its status color

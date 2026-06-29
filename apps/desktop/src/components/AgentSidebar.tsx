@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled, TbBulb } from "react-icons/tb";
 import { FaTasks } from "react-icons/fa";
-import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK, statusInk } from "../theme/colors";
+import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ROW_ACTIVE_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK, statusInk } from "../theme/colors";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -989,11 +989,15 @@ function AgentRow({
     </span>
   ) : null;
 
-  // The row's inner content, shared by the in-flow (collapsed) and overlay (expanded) renders.
-  // `expanded` reveals the description + the Location/Status/Progress detail lines; `ownsInput`
-  // renders the rename <input> here. Only the in-flow row ever passes ownsInput=true (the overlay
-  // is suppressed during a rename), so there is always exactly one input — see showOverlay below.
-  const RowBody = ({ expanded, ownsInput }: { expanded: boolean; ownsInput: boolean }) => (
+  // The card's TOP STRIP: glyph/× + timer + name (or rename input) + the progress bar. It's the
+  // SAME element collapsed (in the column) and expanded (the unified hover card's top strip, which
+  // spans the column into the terminal area) — `expanded` only swaps the glyph for the × close,
+  // reveals the full title + description, and widens the progress bar's status label. The detail
+  // (Location/Status/Progress + per-worker blocks) is NOT here — it lives in CardDetail so the card
+  // can be L-shaped (strip full width, detail dropping only on the terminal side). `ownsInput`
+  // renders the rename <input>; only the collapsed column row ever owns it (the card is suppressed
+  // during a rename), so there is always exactly one input.
+  const CardHeader = ({ expanded, ownsInput }: { expanded: boolean; ownsInput: boolean }) => (
     <>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 8, minWidth: 0 }}>
         {/* Leading glyph slot — a FIXED-height box so the glyph (and the title beside it) sit at the
@@ -1082,7 +1086,6 @@ function AgentRow({
                   e.stopPropagation();
                   setEditing(a.id);
                 }}
-                title="Double-click to rename"
                 style={{ flex: 1, minWidth: 0, lineHeight: `${GLYPH_SLOT_H}px` }}
               >
                 <span
@@ -1160,78 +1163,112 @@ function AgentRow({
               )}
             </div>
           )}
-          {/* Expanded: this row's own Location / Status / Progress detail lines. */}
-          {expanded && (
-            <AgentDetailLines
-              worktreePath={a.worktreePath}
-              rootPath={project.rootPath}
-              bs={bs}
-              baseBranch={a.baseBranch}
-              isWorker={a.kind === "worker"}
-              busy={busy}
-              shipped={shipped}
-              progressPct={progressPct}
-              workerCount={workerCount}
-              onLand={onLand}
-              onRefresh={handleRefresh}
-            />
-          )}
-          {/* Expanded: one stacked detail block per worker — as if every worker had been expanded
-              onto this single orchestrator card. Each shows the worker's own title/description and
-              its own Location / Status / Progress. Indented 16px so they read as nested. */}
-          {expanded && workers.length > 0 && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8, marginLeft: 16 }}>
-              {workers.map((w) => (
-                <div key={w.id} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                  <div style={{ minWidth: 0, lineHeight: 1.3 }}>
-                    <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.semibold }}>
-                      {w.autoTitle || w.name}
-                    </span>
-                    {w.description && (
-                      <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.regular }}>
-                        {`:  ${w.description}`}
-                      </span>
-                    )}
-                  </div>
-                  <AgentDetailLines
-                    worktreePath={w.worktreePath}
-                    rootPath={project.rootPath}
-                    bs={w.branchStatus}
-                    baseBranch={w.baseBranch}
-                    isWorker
-                    busy={w.status === "working"}
-                    shipped={w.shipped}
-                    progressPct={w.stage ? Math.round(stageFraction(w.stage) * 100) : null}
-                    workerCount={0}
-                    onLand={w.onLand}
-                    onRefresh={(e) => refreshBranch(w.id, w.baseBranch ?? "", e)}
-                  />
-                </div>
-              ))}
-            </div>
-          )}
         </div>
       </div>
     </>
   );
 
-  // The hover detail pops out OVER THE TERMINAL AREA, not down the column: anchor its left edge just
-  // past the row's right edge (≈ the sidebar's right border) so the column row stays put and the rows
-  // below it are never covered. Top-aligned with the row; grows downward, height-capped to the
-  // viewport so a tall card (many inline workers) scrolls instead of running off the bottom.
-  const panelLeft = rect ? rect.left + rect.width + 8 : 0;
-  const maxW = rect ? Math.min(480, Math.max(240, window.innerWidth - panelLeft - 16)) : 480;
-  const maxH = rect ? window.innerHeight - rect.top - 16 : undefined;
+  // The card's DETAIL region — this row's Location / Status / Progress, then one stacked block per
+  // inline worker. Rendered ONLY in the unified hover card, offset to the terminal side so it drops
+  // below the strip without covering the column rows beneath it (the L-shape). Collapsed, none of
+  // this shows; the column row keeps just the bare per-worker progress lines (in CardHeader above).
+  const CardDetail = () => (
+    <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
+      <AgentDetailLines
+        worktreePath={a.worktreePath}
+        rootPath={project.rootPath}
+        bs={bs}
+        baseBranch={a.baseBranch}
+        isWorker={a.kind === "worker"}
+        busy={busy}
+        shipped={shipped}
+        progressPct={progressPct}
+        workerCount={workerCount}
+        onLand={onLand}
+        onRefresh={handleRefresh}
+      />
+      {/* One stacked detail block per worker — as if every worker had been expanded onto this single
+          orchestrator card. Each shows the worker's own title/description, its OWN progress bar (with
+          the stage status label, just like the orchestrator's), then its Location / Status / Progress.
+          Indented 16px so they read as nested. */}
+      {workers.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8, marginLeft: 16 }}>
+          {workers.map((w) => (
+            <div key={w.id} style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+              <div style={{ minWidth: 0, lineHeight: 1.3 }}>
+                <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.semibold }}>
+                  {w.autoTitle || w.name}
+                </span>
+                {w.description && (
+                  <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.regular }}>
+                    {`:  ${w.description}`}
+                  </span>
+                )}
+              </div>
+              {/* The worker's progress bar moves DOWN to here on hover (collapsed it's the bare
+                  indented line under the orchestrator in the column). Expanded, so it carries the same
+                  stage status label the orchestrator's bar gets. */}
+              {w.stage && (
+                <div style={{ marginTop: 2 }}>
+                  <WorkflowLine stage={w.stage} expanded shipped={w.shipped} />
+                </div>
+              )}
+              <AgentDetailLines
+                worktreePath={w.worktreePath}
+                rootPath={project.rootPath}
+                bs={w.branchStatus}
+                baseBranch={w.baseBranch}
+                isWorker
+                busy={w.status === "working"}
+                shipped={w.shipped}
+                progressPct={w.stage ? Math.round(stageFraction(w.stage) * 100) : null}
+                workerCount={0}
+                onLand={w.onLand}
+                onRefresh={(e) => refreshBranch(w.id, w.baseBranch ?? "", e)}
+              />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  // The unified hover card is ONE L-shaped card pinned to the row's OWN position (not a separate
+  // pop-out to the side). Its top strip starts at the row's left edge and WIDENS right into the
+  // terminal area (so the single progress bar just gets wider); the detail drops down only on the
+  // terminal side. The in-flow column row is hidden while it's open (the card stands in for it), so
+  // the name + progress bar never duplicate.
+  //  • cardLeft/cardTop — pinned to the captured rect so the strip sits exactly over the row.
+  //  • colW             — the column row's width; the detail is offset by this so it lands past the
+  //                       sidebar's right edge (terminal area) and never covers the rows below.
+  //  • ext              — terminal-side room added to the right (≥220, capped to the viewport).
+  //  • maxH             — height cap for the detail so a tall card (many workers) scrolls.
+  const cardLeft = rect ? rect.left : 0;
+  const colW = rect ? rect.width : 0;
+  const ext = rect ? Math.max(220, Math.min(360, window.innerWidth - (rect.left + colW) - 16)) : 320;
+  const totalW = colW + ext;
+  // Anchor the card at the row's top — but if the row sits so low that the remaining room can't hold
+  // a reasonable card, shift the anchor UP so there's always room for the strip (which doesn't shrink)
+  // plus some detail (standard popover viewport-flip). For the common case cardTop === rect.top, so
+  // the strip sits exactly over the row; only a bottom-of-viewport row nudges upward.
+  const MIN_CARD_H = 180;
+  const cardTop = rect ? Math.max(8, Math.min(rect.top, window.innerHeight - 16 - MIN_CARD_H)) : 0;
+  const maxH = rect ? window.innerHeight - cardTop - 16 : undefined;
+  // Three shading states read at a glance: the row you're IN is the starker ROW_ACTIVE_BUBBLE; a row
+  // you're hovering (its unified card) is CHAT_USER_BUBBLE; idle rows are transparent.
+  const cardBg = isActive ? ROW_ACTIVE_BUBBLE : CHAT_USER_BUBBLE;
   // Show the slide-out only while hovering AND not renaming. Suppressing it during a rename means
   // the in-flow row is the SOLE owner of the rename <input> — the field never swaps mount points on
   // a hover change, so a trailing unmount-blur can't silently commit a half-typed name.
   const showOverlay = hover && !editing;
 
-  // The WHOLE in-flow row is the drag handle (top-level rows only; workers keep insertion order).
-  // Grab anywhere on the row and drop on another row to pin this agent at that row's position
-  // (manual-agent-reorder-pin). Suppressed while renaming so the <input> behaves normally. The row
-  // now stays visible on hover (the detail pops out to the right), so it remains the sole drag grab —
-  // the pop-out panel is not draggable.
+  // The drag handle for reorder (top-level rows only; workers keep insertion order). Grab and drop
+  // on another row to pin this agent at that row's position (manual-agent-reorder-pin). Suppressed
+  // while renaming so the <input> behaves normally. These props go on the in-flow row AND on BOTH
+  // halves of the unified card (strip + detail): on hover the row is visibility:hidden and the card
+  // stands in over it, so the card must carry the drag grab — and because the card can shift up for a
+  // bottom-of-viewport row, the cursor may sit over the detail (not the strip) when it opens, so the
+  // whole card is grabbable rather than the strip alone.
   const dragProps =
     orderedIndex != null && !editing
       ? {
@@ -1268,14 +1305,17 @@ function AgentRow({
           // drag grabs the card instead of highlighting the name underneath the cursor. Gated on
           // !editing (like dragProps) so the rename <input> keeps normal text selection.
           userSelect: orderedIndex != null && !editing ? "none" : undefined,
-          background: isActive ? CHAT_USER_BUBBLE : "transparent",
+          // Active row is the starker ROW_ACTIVE_BUBBLE (one of three shading states); idle is
+          // transparent. The hover state's CHAT_USER_BUBBLE lives on the unified card, not here.
+          background: isActive ? ROW_ACTIVE_BUBBLE : "transparent",
           marginBottom: 2,
-          // The in-flow row stays fully visible on hover now — the expanded detail pops out to the
-          // RIGHT over the terminal area (see the portal below), so the column row keeps its size and
-          // never covers the rows beneath it.
+          // Hidden while the unified card is open: the card stands in for the row (anchored at the
+          // same spot) and widens into the terminal area, so the name + progress bar render exactly
+          // once. visibility:hidden keeps the row's layout slot, so the rows below never jump.
+          visibility: showOverlay ? "hidden" : "visible",
         }}
       >
-        {RowBody({ expanded: false, ownsInput: editing })}
+        {CardHeader({ expanded: false, ownsInput: editing })}
         {/* Drop target — only while a drag is in flight and only on top-level rows. Dropping here
             pins the dragged agent at THIS row's index (manual-agent-reorder-pin). */}
         {orderedIndex != null && dragActive && (
@@ -1293,34 +1333,90 @@ function AgentRow({
       {showOverlay &&
         rect &&
         createPortal(
+          // Outer wrapper is pure positioning and NON-interactive (pointerEvents:none): its
+          // transparent lower-left quadrant — under the column, beside the dropped-down detail —
+          // passes hover/clicks straight through to the rows beneath, which is what keeps them live.
+          // The two children below re-enable pointer events and carry the hover/click handlers. One
+          // drop-shadow on the wrapper traces the L outline (the lower-left is transparent). It's a
+          // flex column capped to maxH (the room from the row's top to the viewport bottom): the
+          // strip takes its natural height and the detail flex-shrinks + scrolls within the rest, so
+          // a tall card can't run past the viewport (the cap is on the whole card, not just detail).
           <div
-            onClick={onSelect}
-            onMouseEnter={show}
-            onMouseLeave={hide}
+            data-testid="agent-hover-card"
             style={{
               position: "fixed",
-              left: panelLeft,
-              top: rect.top,
-              zIndex: 50,
-              minWidth: Math.min(280, maxW),
-              maxWidth: maxW,
+              left: cardLeft,
+              top: cardTop,
+              width: totalW,
               maxHeight: maxH,
-              overflowY: "auto",
-              width: "max-content",
-              boxSizing: "border-box",
+              zIndex: 50,
+              pointerEvents: "none",
               display: "flex",
               flexDirection: "column",
-              gap: 4,
-              padding: "8px 10px",
-              borderRadius: 8,
-              cursor: "pointer",
-              background: isActive ? CHAT_USER_BUBBLE : C.deepForest,
-              border: `1px solid ${C.forest}`,
-              boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+              filter: "drop-shadow(0 8px 16px rgba(0,0,0,0.45))",
               animation: "-slide 140ms ease-out",
             }}
           >
-            {RowBody({ expanded: true, ownsInput: false })}
+            {/* TOP STRIP — full width, spanning the column into the terminal area; the single progress
+                bar widens with it. Rounded except the bottom-RIGHT inner corner, where the detail
+                steps down to form the L. A drag grab on hover (see dragProps) — BOTH the strip and
+                the detail carry it, so the WHOLE card is grabbable: the cursor lands over the detail
+                when the card is shifted up for a bottom-of-viewport row, so the strip alone wouldn't
+                be reachable to start a drag there. */}
+            <div
+              {...dragProps}
+              onClick={onSelect}
+              onMouseEnter={show}
+              onMouseLeave={hide}
+              style={{
+                pointerEvents: "auto",
+                boxSizing: "border-box",
+                flex: "0 0 auto",
+                display: "flex",
+                flexDirection: "column",
+                gap: 4,
+                padding: "8px 10px",
+                cursor: "pointer",
+                userSelect: orderedIndex != null && !editing ? "none" : undefined,
+                background: cardBg,
+                border: `1px solid ${C.forest}`,
+                borderRadius: "8px 8px 0 8px",
+              }}
+            >
+              {CardHeader({ expanded: true, ownsInput: false })}
+            </div>
+            {/* DETAIL — offset right by the column width so it drops ONLY on the terminal side (column
+                rows below stay visible). marginTop:-1 laps the strip's bottom border so the two read
+                as one card; the strip's bottom border then shows only in the column-width "step". Also
+                carries dragProps (see the strip) so the whole card is a drag handle. */}
+            <div
+              {...dragProps}
+              onClick={onSelect}
+              onMouseEnter={show}
+              onMouseLeave={hide}
+              style={{
+                pointerEvents: "auto",
+                boxSizing: "border-box",
+                marginLeft: colW,
+                marginTop: -1,
+                width: ext,
+                userSelect: orderedIndex != null && !editing ? "none" : undefined,
+                // flex-shrink + scroll within the wrapper's maxH budget (minus the strip), so the
+                // detail's scroll boundary lands inside the viewport even for a tall card.
+                flex: "1 1 auto",
+                minHeight: 0,
+                overflowY: "auto",
+                padding: "2px 10px 8px",
+                cursor: "pointer",
+                background: cardBg,
+                borderLeft: `1px solid ${C.forest}`,
+                borderRight: `1px solid ${C.forest}`,
+                borderBottom: `1px solid ${C.forest}`,
+                borderRadius: "0 0 8px 8px",
+              }}
+            >
+              {CardDetail()}
+            </div>
           </div>,
           document.body,
         )}

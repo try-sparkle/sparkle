@@ -8,8 +8,8 @@
 import { C as BRAND, AGENT_STATUS } from "@sparkle/ui";
 
 export const THEME_HEX = {
-  dark: { forest: "#0a1a3f", deepForest: "#0f2350", cream: "#eaf1ff", muted: "#8aa0c4", chatBubble: "#1d3a7a", accentInk: "#34e0f0", agentIdle: "#8aa0c4", successInk: "#34c759" },
-  light: { forest: "#ffffff", deepForest: "#f1f4fa", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#d6e0f5", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d" },
+  dark: { forest: "#0a1a3f", deepForest: "#0f2350", cream: "#eaf1ff", muted: "#8aa0c4", chatBubble: "#1d3a7a", chatBubbleActive: "#2c57b0", accentInk: "#34e0f0", agentIdle: "#8aa0c4", successInk: "#34c759" },
+  light: { forest: "#ffffff", deepForest: "#f1f4fa", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#d6e0f5", chatBubbleActive: "#bccdf2", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d" },
 } as const;
 
 // Themed token object for component inline styles. The four theme-dependent tokens become
@@ -39,6 +39,11 @@ export const C = {
 };
 
 export const CHAT_USER_BUBBLE = "var(--c-chat-bubble)";
+
+// The starker active-row fill — one notch more contrast than CHAT_USER_BUBBLE so three states read
+// at a glance: idle (transparent), hovered/expanded card (CHAT_USER_BUBBLE), and the row you're
+// actually IN (this). Brighter/more-saturated blue in dark, darker blue in light.
+export const ROW_ACTIVE_BUBBLE = "var(--c-chat-bubble-active)";
 
 // Map a raw AGENT_STATUS color to a light-mode-legible THEMED ink, for use as TEXT/glyph color.
 // The brand gray (idle/done/blocked/stopped) and brand green (working) are both too light to read
