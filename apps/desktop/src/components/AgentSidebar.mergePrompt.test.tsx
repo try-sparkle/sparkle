@@ -63,7 +63,7 @@ describe("AgentSidebar — merged worker close nudge", () => {
   it("pops when a worker transitions to Merged", () => {
     render(<AgentSidebar project={projectWith(worker("w1"))} />);
     // First real datum is a non-merged stage (worker mid-flight) → seeds silently, no modal.
-    act(() => useRuntimeStore.getState().setWorkflowStage("w1", "committed"));
+    act(() => useRuntimeStore.getState().setWorkflowStage("w1", "building_saved"));
     expect(screen.queryByText(PROMPT)).toBeNull();
     // Then it crosses the edge into Merged → nudge appears.
     act(() => useRuntimeStore.getState().setWorkflowStage("w1", "merged"));
@@ -93,7 +93,7 @@ describe("AgentSidebar — merged worker close nudge", () => {
     render(<AgentSidebar project={projectWith(worker("w1"), worker("w2"))} />);
     expect(screen.queryByText(PROMPT)).toBeNull();
     // An unrelated worker's status update re-runs the effect…
-    act(() => useRuntimeStore.getState().setWorkflowStage("w2", "committed"));
+    act(() => useRuntimeStore.getState().setWorkflowStage("w2", "building_saved"));
     expect(screen.queryByText(PROMPT)).toBeNull();
     // …and a poll re-confirming w1 is still Merged is not an edge either.
     act(() => useRuntimeStore.getState().setWorkflowStage("w1", "merged"));
@@ -104,8 +104,8 @@ describe("AgentSidebar — merged worker close nudge", () => {
     render(<AgentSidebar project={projectWith(worker("w1"), worker("w2"))} />);
     // Both observed non-merged first (real data), so the later merges are genuine edges.
     act(() => {
-      useRuntimeStore.getState().setWorkflowStage("w1", "committed");
-      useRuntimeStore.getState().setWorkflowStage("w2", "committed");
+      useRuntimeStore.getState().setWorkflowStage("w1", "building_saved");
+      useRuntimeStore.getState().setWorkflowStage("w2", "building_saved");
     });
     act(() => useRuntimeStore.getState().setWorkflowStage("w1", "merged"));
     expect(screen.getAllByText(PROMPT)).toHaveLength(1); // exactly one modal
@@ -123,8 +123,8 @@ describe("AgentSidebar — merged worker close nudge", () => {
   it("queues two workers that cross the edge in the same effect run", () => {
     render(<AgentSidebar project={projectWith(worker("w1"), worker("w2"))} />);
     act(() => {
-      useRuntimeStore.getState().setWorkflowStage("w1", "committed");
-      useRuntimeStore.getState().setWorkflowStage("w2", "committed");
+      useRuntimeStore.getState().setWorkflowStage("w1", "building_saved");
+      useRuntimeStore.getState().setWorkflowStage("w2", "building_saved");
     });
     // Both reach Merged inside ONE act → a single effect run queues both before either shows.
     act(() => {
@@ -140,7 +140,7 @@ describe("AgentSidebar — merged worker close nudge", () => {
 
   it("'keep it open' dismisses and does not re-nag", () => {
     render(<AgentSidebar project={projectWith(worker("w1"))} />);
-    act(() => useRuntimeStore.getState().setWorkflowStage("w1", "committed"));
+    act(() => useRuntimeStore.getState().setWorkflowStage("w1", "building_saved"));
     act(() => useRuntimeStore.getState().setWorkflowStage("w1", "merged"));
     fireEvent.click(screen.getByRole("button", { name: "keep it open" }));
     expect(screen.queryByText(PROMPT)).toBeNull();

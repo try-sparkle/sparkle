@@ -247,7 +247,7 @@ export const useRuntimeStore = create<RuntimeState>()(
           let parentReachedMain = false;
           if (agent.kind === "worker" && agent.parentId) {
             const ps = get().workflowStage[agent.parentId];
-            parentReachedMain = ps ? stageIndex(ps) >= stageIndex("main") : false;
+            parentReachedMain = ps ? stageIndex(ps) >= stageIndex("merged") : false;
           }
           const next = deriveLiveStage({
             kind: agent.kind,
@@ -255,12 +255,15 @@ export const useRuntimeStore = create<RuntimeState>()(
             ws,
             prev,
             parentReachedMain,
+            // A bead-bound agent floors at Planned before any code work exists, so its row reads as
+            // part of the Think→Plan→Build path rather than jumping straight to "building".
+            hasBead: !!agent.beadId,
           });
           if (next !== prev) get().setWorkflowStage(agentId, next);
           // Sticky "shipped" watermark: latch true the first time work reaches On Main (or beyond).
           // It survives a later cycle reset (deriveLiveStage dropping `next` back to Committed), so the
           // row keeps its ✓ even while the bar re-climbs for new work.
-          if (stageIndex(next) >= stageIndex("main") && !get().workflowShipped[agentId]) {
+          if (stageIndex(next) >= stageIndex("merged") && !get().workflowShipped[agentId]) {
             get().setWorkflowShipped(agentId, true);
           }
         } catch (e) {

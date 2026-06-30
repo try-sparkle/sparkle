@@ -64,7 +64,7 @@ const board: Board = {
   inProgress: [bead({ id: "p1-b1", title: "Doing now", status: "in_progress" })],
   done: [bead({ id: "p1-c1", title: "Finished", status: "closed" })],
   delivered: [
-    bead({ id: "p1-d1", title: "Shipped", status: "closed", labels: ["delivered"] }),
+    bead({ id: "p1-d1", title: "Delivered task", status: "closed", labels: ["delivered"] }),
   ],
 };
 
@@ -102,9 +102,18 @@ describe("BoardView", () => {
     expect(screen.getByText("Backlog two")).toBeTruthy();
     expect(screen.getByText("Doing now")).toBeTruthy();
     expect(screen.getByText("Finished")).toBeTruthy();
-    expect(screen.getByText("Shipped")).toBeTruthy();
+    expect(screen.getByText("Delivered task")).toBeTruthy();
     // Bead ids show on the cards.
     expect(screen.getByText("p1-a1")).toBeTruthy();
+  });
+
+  it("renders each card's unified progress stage label (mapped from bead status)", () => {
+    render(<BoardView project={project} />);
+    // short stage labels: open→Planned, in_progress→Unsaved, closed→Merged, delivered→Shipped.
+    expect(screen.getAllByText("Planned").length).toBeGreaterThanOrEqual(2); // two backlog beads
+    expect(screen.getByText("Unsaved")).toBeTruthy(); // the in-progress bead
+    expect(screen.getByText("Merged")).toBeTruthy(); // the done bead
+    expect(screen.getByText("Shipped")).toBeTruthy(); // the delivered bead
   });
 
   it("shows the loading state when there is no snapshot yet", () => {

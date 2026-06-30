@@ -27,13 +27,13 @@ describe("statusInk (raw AGENT_STATUS color → themed text ink)", () => {
   });
 });
 
-// Guards that switching the shipped ✓ / "Merged" green to successInk is a LIGHT-mode-only change:
-// successInk's DARK value must equal the brand green the "merged" stage already used, so the
+// Guards that switching the shipped ✓ green to successInk is a LIGHT-mode-only change:
+// successInk's DARK value must equal the brand green the final "shipped" stage uses, so the
 // dark-mode ✓ color is byte-for-byte unchanged.
-describe("successInk dark value preserves the existing 'merged' green", () => {
-  it("THEME_HEX.dark.successInk equals the merged stage color and BRAND.success", () => {
+describe("successInk dark value preserves the final-stage green", () => {
+  it("THEME_HEX.dark.successInk equals the shipped stage color and BRAND.success", () => {
     expect(THEME_HEX.dark.successInk).toBe(BRAND.success);
-    expect(stageMeta("merged").color).toBe(BRAND.success);
+    expect(stageMeta("shipped").color).toBe(BRAND.success);
   });
 
   it("light successInk is darker than the brand green (the legibility fix)", () => {

@@ -1,11 +1,15 @@
 import { useEffect, useState } from "react";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Project } from "../types";
-import type { Bead } from "../services/beads";
+import { DELIVERED_LABEL, type Bead } from "../services/beads";
 import { useBeadsStore } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
+import { useRuntimeStore } from "../stores/runtimeStore";
+import { useShallow } from "zustand/react/shallow";
 import { sendToBuild } from "../services/sendToBuild";
-import { workersForBead, epicStatus, type EpicStatus } from "../services/planView";
+import { workersForBead, epicStatus, beadStage, type EpicStatus } from "../services/planView";
+import { WorkflowLine } from "./WorkflowLine";
+import { stageMeta, stageLineColor, type WorkflowStageId } from "../engine/workflowStage";
 import type { AgentTab } from "../types";
 
 // The four board columns, in display order, paired with the Board snapshot key each reads.
@@ -185,6 +189,19 @@ function Card({ bead, agents, onOpen }: { bead: Bead; agents: AgentTab[]; onOpen
       ? `${bead.description.slice(0, DESC_PREVIEW)}…`
       : bead.description;
   const workers = workersForBead(agents, bead.id);
+  // The unified 9-stage progress for this unit of work: prefer the live build progress of any
+  // worker(s) on the bead, else map the bead's own status. Shown as the blue logo-gradient line.
+  const workerIds = agents
+    .filter((a) => a.kind === "worker" && a.beadId === bead.id)
+    .map((a) => a.id);
+  // Subscribe to ONLY this bead's workers' stages (shallow-compared) so a stage tick on an
+  // unrelated agent doesn't re-render every card on the board.
+  const workerStages = useRuntimeStore(
+    useShallow(
+      (s) => workerIds.map((id) => s.workflowStage[id]).filter(Boolean) as WorkflowStageId[],
+    ),
+  );
+  const stage = beadStage(bead.status, bead.labels.includes(DELIVERED_LABEL), workerStages);
   return (
     <button
       onClick={() => onOpen(bead)}
@@ -222,6 +239,23 @@ function Card({ bead, agents, onOpen }: { bead: Bead; agents: AgentTab[]; onOpen
           ⚙ {workers.length === 1 ? "1 worker" : `${workers.length} workers`}: {workers.join(", ")}
         </div>
       )}
+      {/* Unified Think→Plan→Build progress: the blue logo-gradient line + its stage label. */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <WorkflowLine stage={stage} height={3} />
+        </div>
+        <span
+          style={{
+            flex: "0 0 auto",
+            fontSize: 10,
+            fontWeight: 600,
+            color: stageLineColor(stage),
+            whiteSpace: "nowrap",
+          }}
+        >
+          {stageMeta(stage).short}
+        </span>
+      </div>
     </button>
   );
 }

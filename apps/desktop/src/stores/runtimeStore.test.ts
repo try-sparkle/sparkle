@@ -156,18 +156,18 @@ describe("runtimeStore — workflowShipped sticky latch (review #13591)", () => 
     const { runtime, projectId, agentId } = await setup("build");
     const store = runtime.useRuntimeStore;
 
-    // Ship: committed work whose tip is in local main → stage advances to "main".
+    // Ship: committed work whose tip is in local main → stage advances to "merged".
     store.getState().setBranchStatus(agentId, bsStatus(1));
     agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true }));
     await store.getState().refreshWorkflowStage("/root", projectId, agentId);
-    expect(store.getState().workflowStage[agentId]).toBe("main");
+    expect(store.getState().workflowStage[agentId]).toBe("merged");
     expect(store.getState().workflowShipped[agentId]).toBe(true);
 
     // New cycle: fresh un-landed commits, tip-relative signals fallen back → the bar resets…
     store.getState().setBranchStatus(agentId, bsStatus(2));
     agentWorkflowState.mockResolvedValue(wsState({}));
     await store.getState().refreshWorkflowStage("/root", projectId, agentId);
-    expect(store.getState().workflowStage[agentId]).toBe("committed");
+    expect(store.getState().workflowStage[agentId]).toBe("building_saved");
     // …but the sticky ✓ latch survives — that's the whole point of the separate flag.
     expect(store.getState().workflowShipped[agentId]).toBe(true);
   });

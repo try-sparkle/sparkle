@@ -9,9 +9,11 @@ afterEach(cleanup);
 describe("WorkflowLine", () => {
   it("announces the current stage and fills proportionally", () => {
     const { container } = render(<WorkflowLine stage="pull_request" />);
-    expect(screen.getByLabelText("Workflow stage: Pull Request")).toBeTruthy();
+    expect(
+      screen.getByLabelText(`Workflow stage: ${stageMeta("pull_request").label}`),
+    ).toBeTruthy();
     // The fill div (the only element painted with the logo gradient) is the stage fraction wide
-    // (3/5 = 60%).
+    // (pull_request = 7/9 of the 9-stage path).
     const fill = container.querySelector('div[style*="gradient"]') as HTMLElement;
     expect(fill.style.width).toBe(`${stageFraction("pull_request") * 100}%`);
   });
@@ -28,10 +30,10 @@ describe("WorkflowLine", () => {
 
   it("shows a sticky ✓ once shipped — even when the bar has reset to an earlier stage", () => {
     // A new cycle resets the live stage back to Committed, but a prior ship keeps the ✓.
-    const { rerender } = render(<WorkflowLine stage="committed" shipped />);
+    const { rerender } = render(<WorkflowLine stage="building_saved" shipped />);
     expect(screen.getByLabelText("Landed at least once").textContent).toBe("✓");
     // Not shipped → no ✓.
-    rerender(<WorkflowLine stage="committed" />);
+    rerender(<WorkflowLine stage="building_saved" />);
     expect(screen.queryByLabelText("Landed at least once")).toBeNull();
   });
 });

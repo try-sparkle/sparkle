@@ -153,7 +153,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // Has this agent ever shipped (reached On Main+)? Sticky flag set by refreshWorkflowStage, OR'd
   // with the current resolved stage so the ✓ shows even on the first tick that lands it.
   const shippedOf = (id: string): boolean =>
-    (workflowShipped[id] ?? false) || stageIndex(stageOf(id)) >= stageIndex("main");
+    (workflowShipped[id] ?? false) || stageIndex(stageOf(id)) >= stageIndex("merged");
 
   // Keep the workflow trackers live: re-poll branch + workflow state on a modest cadence (and once
   // immediately on project switch), so the chevrons advance toward green as work is committed, PR'd,

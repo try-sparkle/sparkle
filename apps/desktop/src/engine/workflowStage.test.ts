@@ -1,245 +1,194 @@
 import { describe, it, expect } from "vitest";
 import {
   WORKFLOW_STAGES,
+  type WorkflowStageId,
   stageIndex,
   stageMeta,
   gitDerivedStage,
   resolveStage,
+  deriveLiveStage,
   rollupStages,
   dominantStage,
-  deriveLiveStage,
-  type WorkflowStageId,
+  stageFraction,
+  lineColorAt,
+  stageLineColor,
+  LINE_FROM,
+  LINE_TO,
 } from "./workflowStage";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
 
-const bs = (p: Partial<BranchStatus>): BranchStatus => ({
-  ahead: 0,
+const bs = (ahead: number, dirty = false): BranchStatus => ({
+  ahead,
   behind: 0,
-  dirty: false,
-  filesChanged: 0,
+  dirty,
+  filesChanged: dirty ? 1 : 0,
   insertions: 0,
   deletions: 0,
-  ...p,
+});
+const ws = (o: Partial<WorkflowState> = {}): WorkflowState =>
+  ({
+    inLocalMain: false,
+    inOriginMain: false,
+    inParent: false,
+    aheadOfBase: 0,
+    prState: null,
+    ...(o as object),
+  }) as WorkflowState;
+
+const ORDER: WorkflowStageId[] = [
+  "thought",
+  "specd",
+  "planned",
+  "building_unsaved",
+  "building_saved",
+  "pushed",
+  "pull_request",
+  "merged",
+  "shipped",
+];
+
+describe("the 9-stage model", () => {
+  it("has the nine stages in the canonical order", () => {
+    expect(WORKFLOW_STAGES.map((s) => s.id)).toEqual(ORDER);
+  });
+  it("every stage has friendly label + detail + color", () => {
+    for (const s of WORKFLOW_STAGES) {
+      expect(s.label.length).toBeGreaterThan(0);
+      expect(s.detail.length).toBeGreaterThan(0);
+      expect(s.color).toMatch(/^#|^var\(/);
+    }
+  });
+  it("stageIndex + stageMeta round-trip", () => {
+    ORDER.forEach((id, i) => {
+      expect(stageIndex(id)).toBe(i);
+      expect(stageMeta(id).id).toBe(id);
+    });
+  });
 });
 
-const ws = (p: Partial<WorkflowState>): WorkflowState => ({
-  inLocalMain: false,
-  inOriginMain: false,
-  inParent: false,
-  aheadOfBase: 0,
-  prState: null,
-  prNumber: null,
-  prUrl: null,
-  ...p,
+describe("gitDerivedStage / resolveStage", () => {
+  it("no branch or no commits → building_unsaved; commits → building_saved", () => {
+    expect(gitDerivedStage(null)).toBe("building_unsaved");
+    expect(gitDerivedStage(bs(0, true))).toBe("building_unsaved");
+    expect(gitDerivedStage(bs(2))).toBe("building_saved");
+  });
+  it("resolveStage takes the furthest of git and an override, never regressing", () => {
+    expect(resolveStage(bs(2), null)).toBe("building_saved");
+    expect(resolveStage(bs(0), "pull_request")).toBe("pull_request");
+    expect(resolveStage(bs(2), "thought")).toBe("building_saved"); // override never drags down
+  });
 });
 
-describe("WORKFLOW_STAGES ordering", () => {
-  it("is the canonical earliest→final order", () => {
-    expect(WORKFLOW_STAGES.map((s) => s.id)).toEqual([
-      "uncommitted",
-      "committed",
+describe("deriveLiveStage — planning floors (Think/Plan)", () => {
+  it("a planned-but-unstarted bead floors at Planned (no git work)", () => {
+    expect(deriveLiveStage({ kind: "build", hasBead: true })).toBe("planned");
+  });
+  it("spec'd floors at Spec'd, thought at Thought", () => {
+    expect(deriveLiveStage({ kind: "think", hasSpec: true })).toBe("specd");
+    expect(deriveLiveStage({ kind: "think", hasThinkDoc: true })).toBe("thought");
+  });
+  it("a planning floor never drags real git progress backwards", () => {
+    expect(deriveLiveStage({ kind: "build", hasBead: true, bs: bs(2) })).toBe("building_saved");
+  });
+});
+
+describe("deriveLiveStage — build signals", () => {
+  it("uncommitted → committed via git ahead", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs(0, true) })).toBe("building_unsaved");
+    expect(deriveLiveStage({ kind: "build", bs: bs(1) })).toBe("building_saved");
+  });
+  it("pushed via explicit signal", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs(1), pushed: true })).toBe("pushed");
+  });
+  it("PR open → pull_request; PR merged → merged", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs(1), ws: ws({ prState: "open" }) })).toBe(
       "pull_request",
-      "main",
+    );
+    expect(deriveLiveStage({ kind: "build", bs: bs(1), ws: ws({ prState: "merged" }) })).toBe(
       "merged",
-    ]);
+    );
   });
-
-  it("stageIndex / stageMeta agree with the array", () => {
-    expect(stageIndex("uncommitted")).toBe(0);
-    expect(stageIndex("merged")).toBe(4);
-    expect(stageMeta("pull_request").label).toBe("Pull Request");
+  it("reachability into main → merged, but only once real work is seen", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs(0), ws: ws({ inLocalMain: true }) })).toBe(
+      "building_unsaved",
+    );
+    expect(deriveLiveStage({ kind: "build", bs: bs(1), ws: ws({ inLocalMain: true }) })).toBe(
+      "merged",
+    );
   });
-
-  it("ends on green and every stage has a distinct color", () => {
-    const merged = stageMeta("merged");
-    expect(merged.color).toBe("#34c759"); // brand success green — the path's end
-    const colors = WORKFLOW_STAGES.map((s) => s.color);
-    expect(new Set(colors).size).toBe(WORKFLOW_STAGES.length);
-  });
-});
-
-describe("gitDerivedStage", () => {
-  it("no status yet → uncommitted (start line)", () => {
-    expect(gitDerivedStage(undefined)).toBe("uncommitted");
-    expect(gitDerivedStage(null)).toBe("uncommitted");
-  });
-
-  it("clean tree, no commits → uncommitted", () => {
-    expect(gitDerivedStage(bs({}))).toBe("uncommitted");
-  });
-
-  it("dirty / changed files but no commits → uncommitted", () => {
-    expect(gitDerivedStage(bs({ dirty: true, filesChanged: 2 }))).toBe("uncommitted");
-    expect(gitDerivedStage(bs({ filesChanged: 1 }))).toBe("uncommitted");
-  });
-
-  it("commits ahead → committed", () => {
-    expect(gitDerivedStage(bs({ ahead: 1 }))).toBe("committed");
-  });
-
-  it("committed work wins even with a fresh dirty edit on top (no backwards regress)", () => {
-    expect(gitDerivedStage(bs({ ahead: 3, dirty: true, filesChanged: 1 }))).toBe("committed");
+  it("shipped is the top, gated on real work", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs(1), shipped: true })).toBe("shipped");
+    expect(deriveLiveStage({ kind: "build", bs: bs(0), shipped: true })).toBe("building_unsaved");
   });
 });
 
-describe("resolveStage (git + override)", () => {
-  it("uses git when there is no override", () => {
-    expect(resolveStage(bs({ ahead: 1 }), null)).toBe("committed");
+describe("deriveLiveStage — monotonic watermark + new cycle", () => {
+  it("never regresses below prev", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs(0, true), prev: "merged" })).toBe("merged");
   });
-
-  it("an override pulls the stage forward to PR/main/merged", () => {
-    expect(resolveStage(bs({ ahead: 1 }), "pull_request")).toBe("pull_request");
-    expect(resolveStage(bs({ ahead: 1 }), "merged")).toBe("merged");
-  });
-
-  it("never regresses below what git proves", () => {
-    // git says committed; a stale "uncommitted" override must not drag it back
-    expect(resolveStage(bs({ ahead: 2 }), "uncommitted")).toBe("committed");
+  it("a new cycle (landed before + fresh un-landed commits) resets to building_saved", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs(2), prev: "merged", ws: ws({}) })).toBe(
+      "building_saved",
+    );
   });
 });
 
-describe("rollupStages", () => {
-  it("returns null for no workers", () => {
+describe("rollup + dominant", () => {
+  it("rollup headline = least-advanced; counts cover all 9 ids", () => {
+    const r = rollupStages(["merged", "building_saved", "pushed"]);
+    expect(r?.stage).toBe("building_saved"); // slowest unit
+    expect(r?.total).toBe(3);
+    expect(Object.keys(r!.counts).sort()).toEqual([...ORDER].sort());
+  });
+  it("dominant breaks ties to the earliest stage", () => {
+    const counts = rollupStages(["building_saved", "building_saved", "merged", "merged"])!.counts;
+    expect(dominantStage(counts)).toBe("building_saved");
+  });
+  it("empty rollup is null", () => {
     expect(rollupStages([])).toBeNull();
   });
+});
 
-  it("headline stage is the least-advanced worker", () => {
-    const r = rollupStages(["merged", "committed", "main"])!;
-    expect(r.stage).toBe("committed");
-    expect(r.total).toBe(3);
+describe("progress-line fill + color", () => {
+  it("fraction climbs 1/9 … 9/9 across the stages", () => {
+    expect(stageFraction("thought")).toBeCloseTo(1 / 9);
+    expect(stageFraction("building_saved")).toBeCloseTo(5 / 9);
+    expect(stageFraction("shipped")).toBeCloseTo(1);
   });
-
-  it("counts every stage", () => {
-    const r = rollupStages(["committed", "committed", "merged"])!;
-    expect(r.counts.committed).toBe(2);
-    expect(r.counts.merged).toBe(1);
-    expect(r.counts.uncommitted).toBe(0);
+  it("line color interpolates the logo gradient teal→blue", () => {
+    expect(lineColorAt(0)).toBe(LINE_FROM);
+    expect(lineColorAt(1)).toBe(LINE_TO);
+    expect(stageLineColor("thought")).not.toBe(stageLineColor("shipped"));
   });
 });
 
-describe("deriveLiveStage", () => {
-  it("falls back to local git when there are no workflow signals", () => {
-    expect(deriveLiveStage({ kind: "build", bs: bs({ dirty: true }) })).toBe("uncommitted");
-    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 2 }) })).toBe("committed");
+describe("deriveLiveStage — worker path", () => {
+  it("reaches Merged only once the orchestrator's work reached main", () => {
+    expect(deriveLiveStage({ kind: "worker", bs: bs(1), parentReachedMain: true })).toBe("merged");
   });
-
-  it("an open PR advances to Pull Request", () => {
-    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 1 }), ws: ws({ prState: "open" }) })).toBe(
-      "pull_request",
+  it("does NOT reach Merged with no committed work, even if the parent reached main (committedSeen gate)", () => {
+    expect(deriveLiveStage({ kind: "worker", bs: bs(0), parentReachedMain: true })).toBe(
+      "building_unsaved",
     );
   });
-
-  it("a merged PR is Merged (authoritative)", () => {
-    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 1 }), ws: ws({ prState: "merged" }) })).toBe(
-      "merged",
+  it("merged into the orchestrator branch alone (inParent, parent not on main) is NOT Merged with Main", () => {
+    expect(deriveLiveStage({ kind: "worker", bs: bs(1), ws: ws({ inParent: true }) })).toBe(
+      "building_saved",
     );
   });
-
-  it("build agent: reachable into local main → On Main, into origin → Merged (gated on real work)", () => {
-    // ahead>0 this poll proves work exists, so reachability is believed.
-    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 1 }), ws: ws({ inLocalMain: true }) })).toBe(
-      "main",
+  it("ignores local-main reachability (that's a build-agent signal, not a worker's)", () => {
+    expect(deriveLiveStage({ kind: "worker", bs: bs(1), ws: ws({ inLocalMain: true }) })).toBe(
+      "building_saved",
     );
+  });
+  it("off-base authored work (aheadOfBase) still gates landing when the parent reaches main", () => {
     expect(
-      deriveLiveStage({ kind: "build", bs: bs({ ahead: 1 }), ws: ws({ inLocalMain: true, inOriginMain: true }) }),
+      deriveLiveStage({
+        kind: "worker",
+        bs: bs(0),
+        ws: ws({ aheadOfBase: 1 }),
+        parentReachedMain: true,
+      }),
     ).toBe("merged");
-  });
-
-  it("does NOT believe reachability for a no-work branch (fresh tip is trivially in main)", () => {
-    // No commits ever (bs ahead 0, no prev watermark): a fresh branch's tip sits in main, but that
-    // must NOT read as On Main.
-    expect(deriveLiveStage({ kind: "build", bs: bs({}), ws: ws({ inLocalMain: true }) })).toBe(
-      "uncommitted",
-    );
-  });
-
-  it("remembers work via the watermark after a merge drops ahead to 0", () => {
-    // The merge landed the work (ahead now 0, tip in main). prev=Committed proves work existed.
-    expect(
-      deriveLiveStage({ kind: "build", bs: bs({ ahead: 0 }), ws: ws({ inLocalMain: true }), prev: "committed" }),
-    ).toBe("main");
-  });
-
-  it("worker: inParent → On Main; parentReachedMain → Merged", () => {
-    expect(deriveLiveStage({ kind: "worker", bs: bs({ ahead: 1 }), ws: ws({ inParent: true }) })).toBe(
-      "main",
-    );
-    expect(
-      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 1 }), ws: ws({ inParent: true }), parentReachedMain: true }),
-    ).toBe("merged");
-  });
-
-  it("worker does not use local-main reachability (only its orchestrator branch)", () => {
-    // A worker's tip being in main shouldn't matter — its integration target is the orchestrator.
-    expect(deriveLiveStage({ kind: "worker", bs: bs({ ahead: 1 }), ws: ws({ inLocalMain: true }) })).toBe(
-      "committed",
-    );
-  });
-
-  it("never regresses below the previous stage", () => {
-    expect(deriveLiveStage({ kind: "build", bs: bs({ dirty: true }), prev: "merged" })).toBe("merged");
-  });
-
-  it("resets to a new cycle when fresh commits land after the work already shipped", () => {
-    // Prior work merged (prev=merged); now new, un-landed commits exist (ahead>0) and the tip-relative
-    // signals have fallen back (no merged PR for this tip). The bar should track the NEW cycle, not
-    // stay pinned green.
-    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 2 }), prev: "merged" })).toBe("committed");
-  });
-
-  it("resets from On Main too (landed locally, not yet origin) when fresh commits land", () => {
-    // `landedBefore` includes "main" — the more common real-world trigger, since local-main landing
-    // precedes the origin merge.
-    expect(deriveLiveStage({ kind: "build", bs: bs({ ahead: 2 }), prev: "main" })).toBe("committed");
-  });
-
-  it("resets on non-default-base work where ahead==0 but aheadOfBase>0, flooring at committed", () => {
-    // A worker synced to its baseBranch (bs.ahead 0) but with fresh authored commits vs the cut ref:
-    // the same evidence-of-work `committedSeen` trusts triggers the reset — and since that evidence
-    // IS a commit signal, the floor is "committed", not "uncommitted" (no understating real commits).
-    expect(
-      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfBase: 1 }), prev: "merged" }),
-    ).toBe("committed");
-    // Same off-base reset from the On Main watermark (local-main landing precedes the origin merge).
-    expect(
-      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfBase: 1 }), prev: "main" }),
-    ).toBe("committed");
-  });
-
-  it("a dirty edit after a merge is noise — it does NOT reset (still clamps to the watermark)", () => {
-    // ahead 0 (nothing committed), just an uncommitted edit on a shipped branch → stays merged.
-    expect(deriveLiveStage({ kind: "build", bs: bs({ dirty: true, ahead: 0 }), prev: "merged" })).toBe(
-      "merged",
-    );
-  });
-
-  it("the new cycle climbs again — an open PR on the fresh commits reaches Pull Request", () => {
-    expect(
-      deriveLiveStage({ kind: "build", bs: bs({ ahead: 1 }), ws: ws({ prState: "open" }), prev: "merged" }),
-    ).toBe("pull_request");
-  });
-
-  it("aheadOfBase satisfies the committed gate when bs.ahead is measured against a non-default base", () => {
-    // bs.ahead == 0 (synced to its baseBranch) but the branch IS ahead of project main → work
-    // exists, so reachability into the parent should be believed even without a prev watermark.
-    expect(
-      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfBase: 1, inParent: true }) }),
-    ).toBe("main");
-    // Without that signal (and no commits anywhere), the same reachability is NOT believed.
-    expect(
-      deriveLiveStage({ kind: "worker", bs: bs({ ahead: 0 }), ws: ws({ aheadOfBase: 0, inParent: true }) }),
-    ).toBe("uncommitted");
-  });
-});
-
-describe("dominantStage", () => {
-  const count = (stages: WorkflowStageId[]) => rollupStages(stages)!.counts;
-
-  it("picks the most common stage", () => {
-    expect(dominantStage(count(["committed", "committed", "merged"]))).toBe("committed");
-  });
-
-  it("breaks ties toward the earliest (more cautious) stage", () => {
-    expect(dominantStage(count(["committed", "merged"]))).toBe("committed");
   });
 });

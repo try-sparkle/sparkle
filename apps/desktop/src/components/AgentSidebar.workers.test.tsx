@@ -159,13 +159,13 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
     const project = seedOrchestratorWithWorker({ ahead: 0, behind: 0 } as BranchStatus);
     render(<AgentSidebar project={project} />);
     // Collapsed bars render the line only — NO worded status label (that's hover-only). So the
-    // "Uncommitted…" stage detail is absent until hover, for both the orchestrator and the worker.
-    expect(screen.queryAllByText(/uncommitted/i)).toHaveLength(0);
+    // "Building locally (Unsaved)…" stage detail is absent until hover, for orchestrator + worker.
+    expect(screen.queryAllByText(/unsaved/i)).toHaveLength(0);
 
     hoverOrchestrator();
     // On hover the worker's bar moves DOWN into its detail block (below the worker name) and is
     // EXPANDED — so it now carries the stage status label, the same hover readout the orchestrator's
-    // own strip bar gets. The "Uncommitted…" detail therefore appears twice: orchestrator + worker.
-    expect(screen.getAllByText(/uncommitted/i).length).toBeGreaterThanOrEqual(2);
+    // own strip bar gets. The "…Unsaved…" detail therefore appears twice: orchestrator + worker.
+    expect(screen.getAllByText(/unsaved/i).length).toBeGreaterThanOrEqual(2);
   });
 });

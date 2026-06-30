@@ -3,6 +3,34 @@
 // Kept pure so the linkage logic is unit-testable without a GUI.
 import { childrenOf, type Bead } from "./beads";
 import type { AgentTab } from "../types";
+import { rollupStages, type WorkflowStageId } from "../engine/workflowStage";
+
+/**
+ * The unified 9-stage progress stage to show for a bead card. Prefers LIVE build progress (the
+ * least-advanced stage among the bead's worker agents) so the card reflects reality, then falls
+ * back to mapping the bead's own status:
+ *   - delivered (closed + delivered label)        → Shipped to Production
+ *   - any worker building it                      → that work's rolled-up stage
+ *   - closed                                      → Merged with Main
+ *   - in_progress (claimed, no live worker stage) → Building Locally (Unsaved)
+ *   - open                                        → Planned
+ */
+export function beadStage(
+  status: Bead["status"],
+  delivered: boolean,
+  workerStages: WorkflowStageId[],
+): WorkflowStageId {
+  // A finished bead reflects its resolved status, NOT a lingering worker's live stage — a closed
+  // unit shouldn't read as "Building" just because a stale worker tab is still around.
+  if (status === "closed") return delivered ? "shipped" : "merged";
+  // Otherwise prefer the live build progress (least-advanced worker), then the status mapping.
+  if (workerStages.length > 0) {
+    const r = rollupStages(workerStages);
+    if (r) return r.stage;
+  }
+  if (status === "in_progress") return "building_unsaved";
+  return "planned";
+}
 
 /** How an epic reads at a glance, rolled up from its child beads. */
 export type EpicStatus = "not_started" | "in_progress" | "done";

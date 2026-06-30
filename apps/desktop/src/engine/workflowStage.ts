@@ -1,37 +1,48 @@
-// The "Domino's-tracker" workflow model: the five stages a unit of work passes through on its
-// way from a scratch edit to landed-on-main, plus the pure logic that decides which stage an
-// agent is in and how a build agent rolls up its workers. Kept free of React so it's unit-tested
-// in isolation — the chevron UI lives in components/WorkflowTracker.tsx.
+// The unified Think→Plan→Build lifecycle: the NINE stages a unit of work passes through, from a
+// first thought to shipped-to-production, plus the pure logic that decides which stage a unit is in
+// and how a build agent rolls up its workers. Kept free of React so it's unit-tested in isolation —
+// the progress-line UI lives in components/WorkflowLine.tsx.
+//
+// Stages 1-3 (Thought/Spec'd/Planned) live in the Think + Plan tabs and are driven by what exists
+// (a think doc, a spec/PRD, a bead). Stages 4-9 live in the Build tab and are derived from git/PR
+// state (the proven model) plus a release "shipped" signal. A unit that's only planned (no code yet)
+// sits at Planned; opening a Build agent starts there and the bar fills as work advances.
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
 import { C } from "../theme/colors";
 
 // Ordered earliest → final. Order is load-bearing: stageIndex/rollup/dominant all rely on it.
 export type WorkflowStageId =
-  | "uncommitted"
-  | "committed"
-  | "pull_request"
-  | "main"
-  | "merged";
+  | "thought" //          1 — a Think agent exists (Think tab)
+  | "specd" //            2 — a PRD/spec has been written (Think tab)
+  | "planned" //          3 — decomposed into a bead (Plan tab)
+  | "building_unsaved" // 4 — uncommitted changes in the tree (Build tab)
+  | "building_saved" //   5 — committed to the branch (Build tab)
+  | "pushed" //           6 — pushed to the remote branch (Build tab)
+  | "pull_request" //     7 — a PR is open / requesting merge (Build tab)
+  | "merged" //           8 — merged with main (Build tab)
+  | "shipped"; //         9 — shipped to production / in a published release (Build tab)
 
 export interface WorkflowStageMeta {
   id: WorkflowStageId;
-  label: string; // full readout, e.g. "Pull Request"
+  label: string; // full, friendly readout (non-technical wording)
   short: string; // compact label for tight columns
   color: string; // the stage's lit color once reached
   detail: string; // one-line explainer shown in the expanded (hovered) row
 }
 
-// The path to green. Colors are chosen so the bar visibly "warms up" toward done: amber while
-// the work is loose in the tree, brand cyan once it's committed, violet in review, brand blue
-// when it lands on the integration branch, and success green when it's merged. Stages NOT yet
-// reached render grayed out (see WorkflowTracker); reached stages light up in their own color.
-// (These are literal brand hex from @sparkle/ui — safe to read in tests, no CSS var() here.)
+// The path to shipped. Friendly, non-technical labels (this is a platform for people who aren't
+// git-savvy). Colors warm from teal → blue along the sparkle.ai logo gradient; un-reached stages
+// render grayed out (see WorkflowLine). Literal brand hex (no CSS var()) so tests can read them.
 export const WORKFLOW_STAGES: readonly WorkflowStageMeta[] = [
-  { id: "uncommitted", label: "Uncommitted", short: "Uncommitted", color: C.amber, detail: "Uncommitted: if you close this agent now, you'll lose this work." }, // orange — edits in the tree, not yet saved
-  { id: "committed", label: "Committed", short: "Committed", color: C.accent, detail: "Committed: saved to this agent's branch — closing keeps the branch." }, //       cyan — commits exist on the branch
-  { id: "pull_request", label: "Pull Request", short: "PR", color: C.violet, detail: "Pull Request: a PR is open for review on GitHub." }, //        violet — a PR is open for review
-  { id: "main", label: "On Main", short: "Main", color: C.teal, detail: "On Main: merged into the integration branch (main)." }, //                     blue — landed on the integration branch
-  { id: "merged", label: "Merged", short: "Merged", color: C.success, detail: "Merged: done — this work has shipped to main." }, //               green — done, the end of the path
+  { id: "thought", label: "Thought", short: "Thought", color: C.accent, detail: "Thought: an idea being explored in the Think tab." },
+  { id: "specd", label: "Spec'd", short: "Spec'd", color: C.accent, detail: "Spec'd: a spec/PRD has been written for this idea." },
+  { id: "planned", label: "Planned", short: "Planned", color: C.accent, detail: "Planned: broken into a tracked task on the Plan board." },
+  { id: "building_unsaved", label: "Building Locally (Unsaved)", short: "Unsaved", color: C.amber, detail: "Building locally: unsaved changes — closing now loses this work." },
+  { id: "building_saved", label: "Building Locally (Committed & Saved)", short: "Saved", color: C.accent, detail: "Saved: committed to this task's branch — closing keeps the branch." },
+  { id: "pushed", label: "Pushed to Remote Branch", short: "Pushed", color: C.accent, detail: "Pushed: the branch is backed up on the remote." },
+  { id: "pull_request", label: "Requesting to be merged (Pull Request Issued)", short: "In PR", color: C.violet, detail: "Pull Request: requesting to be merged into main, under review." },
+  { id: "merged", label: "Merged with Main", short: "Merged", color: C.teal, detail: "Merged: this work has landed on main." },
+  { id: "shipped", label: "Shipped to Production", short: "Shipped", color: C.success, detail: "Shipped: included in a published release / deployed to production." },
 ] as const;
 
 export function stageIndex(id: WorkflowStageId): number {
@@ -50,24 +61,20 @@ export function stageMeta(id: WorkflowStageId): WorkflowStageMeta {
 }
 
 // What we can prove from local git state ALONE (no network, no PR/merge knowledge):
-//   - the branch has commits ahead of its base                       → Committed
-//   - no commits yet, but there are changes in the tree              → Uncommitted
-//   - nothing at all yet                                             → Uncommitted (the start line)
-// Pull Request / On Main / Merged can't be inferred from ahead/behind/dirty — those are advanced
-// explicitly via an override (see resolveStage), wired later to PR detection / the orchestration
-// bridge. Committed wins over a dirty tree on purpose: once a branch HAS commits, the bar reflects
-// how far the branch has gotten, and a fresh uncommitted edit on top shouldn't drag it backwards.
+//   - the branch has commits ahead of its base      → Building (Committed & Saved)
+//   - no commits yet, but there are changes / clean  → Building (Unsaved) — the build start line
+// Pushed / PR / Merged / Shipped can't be inferred from ahead/behind/dirty — those come from
+// explicit signals (see deriveLiveStage). Committed wins over a dirty tree on purpose: once a
+// branch HAS commits, the bar reflects how far it's gotten; a fresh edit on top shouldn't regress.
 export function gitDerivedStage(bs?: BranchStatus | null): WorkflowStageId {
-  if (!bs) return "uncommitted";
-  if (bs.ahead > 0) return "committed";
-  // No commits yet — a clean OR a dirty/changed tree both sit at the start line (Uncommitted).
-  // There's no earlier stage to fall to, so this is the floor for any pre-commit branch.
-  return "uncommitted";
+  if (!bs) return "building_unsaved";
+  if (bs.ahead > 0) return "building_saved";
+  return "building_unsaved";
 }
 
 // The stage to actually show: the furthest-along of (what git proves) and (any explicit override).
-// `override` is how PR/main/merged get represented before we can derive them — null/undefined means
-// "no signal, trust git". We never regress below what git proves, and never below the start line.
+// `override` is how pushed/PR/merged/shipped get represented before/independently of git derivation —
+// null/undefined means "no signal, trust git". We never regress below what git proves.
 export function resolveStage(
   bs?: BranchStatus | null,
   override?: WorkflowStageId | null,
@@ -77,107 +84,118 @@ export function resolveStage(
   return stageAt(Math.max(derived, ovr, 0)).id;
 }
 
-// Everything we know about an agent at poll time, fed into the live stage derivation below.
+// Everything we know about a unit of work at poll time, fed into the live stage derivation below.
 export interface LiveStageInputs {
-  // "build" | "worker" | etc. Only "worker" uses the parent-branch / parent-reached-main signals;
-  // every other worktree-bearing kind lands relative to the project's own main.
+  // "build" | "worker" | etc. Only "worker" uses the parent-branch / parent-reached-main signals.
   kind: string;
-  bs?: BranchStatus | null; // ahead/behind/dirty (drives Uncommitted/Committed)
-  ws?: WorkflowState | null; // reachability + PR probe (drives Pull Request/On Main/Merged)
+  bs?: BranchStatus | null; // ahead/behind/dirty (drives Unsaved/Saved)
+  ws?: WorkflowState | null; // reachability + PR probe (drives PR/Merged)
   prev?: WorkflowStageId | null; // the stage already recorded — derivation never regresses below it
-  // For a worker: has its parent orchestrator's OWN work reached main? That's the worker's "Merged"
-  // under worktree-relative semantics (its work shipped once the orchestrator's branch landed).
-  parentReachedMain?: boolean;
+  parentReachedMain?: boolean; // worker: has the parent orchestrator's own work reached main?
+  // ── Planning floors (Think/Plan tabs) — a unit sits at the highest of these until code work
+  //    raises it. A planned-but-unstarted bead floors at Planned even with no git work.
+  hasThinkDoc?: boolean; // a Think agent/conversation exists  → floor Thought
+  hasSpec?: boolean; //     a PRD/spec has been written         → floor Spec'd
+  hasBead?: boolean; //     a bead exists for this unit         → floor Planned
+  // ── Build signals not derivable from ahead/behind/dirty:
+  pushed?: boolean; //  the branch is pushed to its remote      → at least Pushed
+  shipped?: boolean; // included in a published release/deploy  → Shipped
 }
 
-// Derive the live stage from all available signals, monotonically (never below `prev`). The order
-// of precedence, strongest first:
-//   • GitHub PR merged                      → Merged      (authoritative)
-//   • reachability into main/origin/parent  → On Main / Merged  (best-effort, GATED on real work)
-//   • GitHub PR open                        → Pull Request
-//   • local git ahead/dirty                 → Committed / Uncommitted
-// The reachability gate ("did this agent actually do work?") is `committedSeen`: a fresh branch's
-// tip trivially sits in main, so we only believe "landed" once we've observed commits. We take that
-// from three angles so the gate matches its intent regardless of which base `bs.ahead` was measured
-// against: `bs.ahead>0` (ahead of the agent's baseBranch), `ws.aheadOfBase>0` (commits the agent
-// authored vs the ref it was cut from — origin/<default> when present; matters when baseBranch ≠
-// default, and counts only authored work so a stale local default can't read as landed), or the
-// in-session watermark `prev ≥
-// Committed`. The watermark is why `prev` matters beyond monotonicity: it remembers work existed
-// after a merge drops `ahead` to 0. KNOWN false-positive: if an agent commits, then hard-RESETS its
-// branch back to main HEAD (work discarded, not merged), the watermark still believes it landed and
-// shows "On Main". That's a rare, deliberate user action; we accept it rather than persisting a
-// per-commit merge proof.
+// The floor stage implied by the planning signals (Think/Plan), independent of any git work.
+function planningFloor(input: LiveStageInputs): number {
+  if (input.hasBead) return stageIndex("planned");
+  if (input.hasSpec) return stageIndex("specd");
+  if (input.hasThinkDoc) return stageIndex("thought");
+  return -1;
+}
+
+// Derive the live stage from all available signals, monotonically (never below `prev`). Precedence,
+// strongest first: shipped → PR-merged → reachability-into-main → PR-open → pushed → git committed/
+// unsaved → planning floor. The reachability gate (`committedSeen`) avoids a fresh no-op branch
+// reading as "landed" (its tip is just main's HEAD). The monotonic watermark (`prev`) absorbs the
+// post-merge `ahead→0` dip, except when a NEW work cycle starts (prior work landed, but fresh
+// un-landed commits exist) — then the bar tracks the new cycle rather than staying pinned green.
 export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
   const { kind, bs, ws, prev, parentReachedMain } = input;
-  let idx = stageIndex(gitDerivedStage(bs));
+  // Git floor only when a worktree/branch exists (bs present). With no worktree yet there is no
+  // build signal, so the planning floor (Thought/Spec'd/Planned) decides where the unit sits.
+  let idx = bs ? stageIndex(gitDerivedStage(bs)) : -1;
   const prevIdx = prev ? stageIndex(prev) : -1;
   const committedSeen =
-    idx >= stageIndex("committed") ||
-    prevIdx >= stageIndex("committed") ||
+    idx >= stageIndex("building_saved") ||
+    prevIdx >= stageIndex("building_saved") ||
     (ws?.aheadOfBase ?? 0) > 0;
 
   const bump = (id: WorkflowStageId) => {
     idx = Math.max(idx, stageIndex(id));
   };
 
+  // A pushed branch is at least Pushed (a PR implies the branch was pushed).
+  if (input.pushed || ws?.prState != null) bump("pushed");
+
   if (ws) {
-    // PR probe — authoritative where present.
     if (ws.prState === "merged") bump("merged");
     else if (ws.prState === "open") bump("pull_request");
 
-    // Reachability — only trusted once we know real work exists (else a no-op branch reads as
-    // landed, since its tip is just main's HEAD).
-    if (committedSeen) {
-      if (kind === "worker") {
-        if (ws.inParent) bump("main"); // merged into the orchestrator's branch
-        if (parentReachedMain) bump("merged"); // …and the orchestrator's work reached main
-      } else {
-        if (ws.inLocalMain) bump("main"); // merged into local main
-        if (ws.inOriginMain) bump("merged"); // …and pushed/landed on origin/main
-      }
-    }
+    // Build agent: reaching local OR origin main is "Merged with Main" (local-first), once real
+    // work exists (else a no-op branch's tip trivially sits in main and would read as landed).
+    if (committedSeen && kind !== "worker" && (ws.inLocalMain || ws.inOriginMain)) bump("merged");
   }
 
-  // `idx` now reflects the CURRENT poll's true stage — prState and reachability (inLocalMain/
-  // inOriginMain/inParent) are tip-relative, so they fall back on their own once the tip advances
-  // past a merge. Apply the monotonic watermark to absorb the post-merge `ahead→0` dip… EXCEPT when
-  // a NEW work cycle has begun: prior work already landed (prev ≥ On Main) but the live signals have
-  // fallen back AND there are fresh UN-landed commits (ahead > 0). That's the user committing more on
-  // a branch whose earlier work already shipped — the bar should track the new cycle, not stay pinned
-  // green. A merely dirty tree (ahead 0) is noise and still clamps to the watermark, so a stray edit
-  // on a merged branch doesn't reset it.
-  const landedBefore = prevIdx >= stageIndex("main");
-  // "Fresh un-landed work exists" — mirror `committedSeen`'s two git angles so a branch cut from a
-  // non-default base (bs.ahead can read 0 while ws.aheadOfBase counts the authored commits) still
-  // resets. The watermark itself is NOT an angle here: it's `prev`, the very thing we're deciding to
-  // release.
+  // A worker is "Merged with Main" ONLY once the orchestrator's work (which carries this worker's,
+  // via the orchestrator branch) has actually reached main — independent of the worker's own PR
+  // probe (`ws`). Being merged into the orchestrator's branch alone (orchestrator not yet on main)
+  // is NOT yet on main, so it must not claim "Merged with Main". The gate is committedSeen, NOT bs:
+  // committedSeen is true only when authored work actually exists (bs.ahead, ws.aheadOfBase, or the
+  // prior watermark), so a no-worktree/no-op worker never skips the build stages to read as landed.
+  if (kind === "worker" && committedSeen && parentReachedMain) bump("merged");
+
+  // Shipped is the authoritative top — only meaningful once real work landed.
+  if (input.shipped && committedSeen) bump("shipped");
+
+  // New-cycle detection: prior work already landed (prev ≥ Merged) but live signals fell back AND
+  // there are fresh un-landed commits — track the new cycle instead of staying pinned at Merged.
+  const landedBefore = prevIdx >= stageIndex("merged");
   const freshWork = (bs?.ahead ?? 0) > 0 || (ws?.aheadOfBase ?? 0) > 0;
   const newCycle = landedBefore && idx < prevIdx && freshWork;
-  // A new cycle floors at Committed, never Uncommitted: `freshWork` is itself a commit signal
-  // (ahead OR aheadOfBase), so by the time we reset there ARE authored commits. Without this floor a
-  // non-default-base branch (bs.ahead 0 but ws.aheadOfBase > 0, so gitDerivedStage reads Uncommitted)
-  // would show committed work as "Uncommitted" — the same trigger/floor asymmetry the freshWork fix
-  // closed on the trigger side.
-  idx = newCycle ? Math.max(idx, stageIndex("committed")) : Math.max(idx, prevIdx, 0);
+  idx = newCycle
+    ? Math.max(idx, stageIndex("building_saved"))
+    : Math.max(idx, prevIdx);
+
+  // Apply the planning floor (Think/Plan): raises a planning-only unit to Thought/Spec'd/Planned,
+  // but never drags a unit with real git/PR progress backwards (floor only raises a lower idx).
+  idx = Math.max(idx, planningFloor(input));
+  // No signal at all (no git, no planning, no PR) → the build start line. In production
+  // deriveLiveStage is only called for build/worker agents (runtimeStore skips think/shell), so
+  // this is their floor; a planning-only unit always carries a planning floor and never reaches here.
+  if (idx < 0) idx = stageIndex("building_unsaved");
   return stageAt(idx).id;
 }
 
 export type StageCounts = Record<WorkflowStageId, number>;
 
 export interface WorkflowRollup {
-  // Overall stage for the build agent's own chevron = the LEAST-advanced worker. The whole build
-  // isn't "merged" until every worker is, so the headline tracks the slowest unit — that's the
-  // honest "how far along is the whole thing" the user asked for.
+  // Overall stage for the build agent's own line = the LEAST-advanced worker (the whole thing
+  // isn't done until every unit is), so the headline tracks the slowest unit.
   stage: WorkflowStageId;
-  // The most common stage among workers (ties resolve to the earliest), for the "mostly X" summary.
-  dominant: WorkflowStageId;
+  dominant: WorkflowStageId; // most common stage among workers (ties → earliest)
   total: number;
   counts: StageCounts;
 }
 
 function emptyCounts(): StageCounts {
-  return { uncommitted: 0, committed: 0, pull_request: 0, main: 0, merged: 0 };
+  return {
+    thought: 0,
+    specd: 0,
+    planned: 0,
+    building_unsaved: 0,
+    building_saved: 0,
+    pushed: 0,
+    pull_request: 0,
+    merged: 0,
+    shipped: 0,
+  };
 }
 
 export function rollupStages(stages: WorkflowStageId[]): WorkflowRollup | null {
@@ -196,17 +214,16 @@ export function rollupStages(stages: WorkflowStageId[]): WorkflowRollup | null {
   };
 }
 
-// ── Progress-line palette (the thin line that replaced the chevrons) ─────────────────────────
-// The line reproduces the sparkle.ai wordmark's gradient: the cyan of the "S" on the left
-// (#34E0F0) warming to the blue of the "i" (its dotted "eye") on the right (#3E7BFF). It fills
-// left→right as work advances through the five stages, so a glance reads "how far toward merged"
-// from BOTH the fill length and its color deepening from cyan to blue. These two endpoints are the
-// literal stops of the logo's `linearGradient` (see public/sparkle-logo.svg).
-export const LINE_FROM = "#34e0f0"; // the "S" — cyan, left end of the logo gradient
-export const LINE_TO = "#3e7bff"; //   the "i"/eye — blue, right end of the logo gradient
+// ── Progress-line palette ────────────────────────────────────────────────────────────────────
+// The line reproduces the sparkle.ai wordmark's gradient: the teal of the "S" on the left warming
+// to the deep blue of the "i" (its dotted eye) on the right. It fills left→right as work advances
+// through the nine stages, so a glance reads "how far toward shipped" from BOTH the fill length and
+// its color deepening from teal to blue. These are the literal stops of the logo's linearGradient.
+export const LINE_FROM = "#34e0f0"; // the "S" — teal/cyan, left end of the logo gradient
+export const LINE_TO = "#2f6bff"; //   the "i"/eye — deepest blue, right end of the logo gradient
 
-// Fraction of the bar filled at a given stage. Uncommitted already shows a short cyan stub (1/5)
-// so a brand-new branch reads as "started", and Merged fills the whole bar (5/5).
+// Fraction of the bar filled at a given stage. Stage 1 (Thought) shows a short stub (1/9) so a
+// brand-new idea reads as "started", and Shipped fills the whole bar (9/9).
 export function stageFraction(stage: WorkflowStageId): number {
   return (stageIndex(stage) + 1) / WORKFLOW_STAGES.length;
 }
@@ -229,15 +246,14 @@ export function lineColorAt(t: number): string {
   return rgbToHex(mix(from.r, to.r), mix(from.g, to.g), mix(from.b, to.b));
 }
 
-// The color the line has reached at a given stage (its rightmost filled pixel): Uncommitted sits
-// near the cyan "S"; Merged lands on the blue "i".
+// The color the line has reached at a given stage (its rightmost filled pixel): Thought sits near
+// the teal "S"; Shipped lands on the deep blue "i".
 export function stageLineColor(stage: WorkflowStageId): string {
   return lineColorAt(stageFraction(stage));
 }
 
-// Most-represented stage; ties break to the EARLIEST stage (we only replace on a strictly greater
-// count while scanning in stage order), so "3 committed, 3 merged" reads as the more cautious
-// "mostly committed".
+// Most-represented stage; ties break to the EARLIEST stage, so "3 saved, 3 merged" reads as the
+// more cautious "mostly saved".
 export function dominantStage(counts: StageCounts): WorkflowStageId {
   let best: WorkflowStageId = stageAt(0).id;
   let bestN = -1;

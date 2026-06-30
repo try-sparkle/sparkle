@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { rollupEpicStatus, epicStatus, workersForBead, beadLabel, epicForBuild } from "./planView";
+import {
+  rollupEpicStatus,
+  epicStatus,
+  workersForBead,
+  beadLabel,
+  epicForBuild,
+  beadStage,
+} from "./planView";
 import type { Bead, BeadStatus } from "./beads";
 import type { AgentTab } from "../types";
 
@@ -104,5 +111,31 @@ describe("beadLabel", () => {
   it("is null when the worker has no bead", () => {
     expect(beadLabel(beads, null)).toBeNull();
     expect(beadLabel(beads, undefined)).toBeNull();
+  });
+});
+
+describe("beadStage — unified stage for a Plan card", () => {
+  it("delivered closed → Shipped to Production", () => {
+    expect(beadStage("closed", true, [])).toBe("shipped");
+  });
+  it("closed (not delivered) → Merged with Main", () => {
+    expect(beadStage("closed", false, [])).toBe("merged");
+  });
+  it("open → Planned", () => {
+    expect(beadStage("open", false, [])).toBe("planned");
+  });
+  it("in_progress with no live worker stage → Building (Unsaved)", () => {
+    expect(beadStage("in_progress", false, [])).toBe("building_unsaved");
+  });
+  it("prefers live worker progress (least-advanced) over the status mapping", () => {
+    expect(beadStage("in_progress", false, ["building_saved", "pull_request"])).toBe(
+      "building_saved",
+    );
+  });
+  it("delivered wins even over a live worker stage", () => {
+    expect(beadStage("closed", true, ["merged"])).toBe("shipped");
+  });
+  it("a closed bead reads Merged even if a stale worker still reports an earlier stage", () => {
+    expect(beadStage("closed", false, ["building_saved"])).toBe("merged");
   });
 });
