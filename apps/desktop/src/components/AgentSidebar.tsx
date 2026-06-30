@@ -1,4 +1,14 @@
-import { useState, useEffect, useRef, type DragEvent as ReactDragEvent } from "react";
+import {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useMemo,
+  useContext,
+  createContext,
+  type RefObject,
+  type DragEvent as ReactDragEvent,
+} from "react";
 import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled, TbBulb } from "react-icons/tb";
@@ -143,6 +153,33 @@ const DASHED_ROW_STYLE: React.CSSProperties = {
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",
 };
+
+// Coordinates the gentle auto-scroll of the agent list when a near-the-bottom row's hover card
+// would otherwise be clipped by the viewport. A hovered row asks the column to `scrollToReveal`
+// just enough room below it for its full card; on un-hover it `restore`s the column to where the
+// user had it. `isAutoScrolling` lets a row tell OUR programmatic smooth-scroll apart from a
+// user's own scroll: during ours the card glides along glued to its row; on a user scroll the
+// card closes (the original behavior). All three only touch refs, so the value identity is stable.
+type SidebarScrollApi = {
+  containerRef: RefObject<HTMLDivElement | null>;
+  // Scroll the list so `overflowPx` more of the hovered card fits below its row, remembering the
+  // pre-scroll position as the baseline to return to. Capped at the list's own max scroll, so a
+  // row near the natural bottom reveals as much as physically possible (the card's internal
+  // max-height scroll covers any remainder).
+  scrollToReveal: (overflowPx: number) => void;
+  // Smoothly return the list to the baseline captured before auto-scrolling. Debounced so gliding
+  // the cursor straight from one bottom row to the next keeps the same baseline instead of bouncing.
+  restore: () => void;
+  // Cancel a pending ease-back WITHOUT discarding the baseline — called when a card opens, so a
+  // re-hover during the debounce window doesn't bounce the column back and re-clip.
+  cancelRestore: () => void;
+  // The user took over the scroll (their own wheel/drag closed the card): drop the baseline and any
+  // pending ease-back so we never yank the list away from where they just put it.
+  abandonReveal: () => void;
+  // True while our own smooth scroll (reveal or restore) is in flight toward its target.
+  isAutoScrolling: () => boolean;
+};
+const SidebarScrollContext = createContext<SidebarScrollApi | null>(null);
 
 // The "+ New <kind> Agent" button. On hover the dotted outline becomes a solid stroke and the
 // icon + label light up in the mode's brand color — the same blue/cyan as that mode's chevron
@@ -532,6 +569,98 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   };
   const seenStageRef = useRef<Record<string, WorkflowStageId>>({});
   const pendingRef = useRef<string[]>([]);
+
+  // Gentle auto-scroll of the agent list so a bottom row's hover card is never clipped. The list's
+  // scroll container is `listScrollRef` (attached to the overflow:auto div below). `baselineRef`
+  // remembers where the user had the list before we auto-scrolled, so we can ease back on un-hover.
+  // `autoTargetRef` (non-null while our own smooth scroll is settling) is how rows tell our scroll
+  // apart from a user's. `restoreTimerRef` debounces the ease-back so cursor travel between adjacent
+  // bottom rows doesn't bounce the column.
+  const listScrollRef = useRef<HTMLDivElement | null>(null);
+  const baselineRef = useRef<number | null>(null);
+  const autoTargetRef = useRef<number | null>(null);
+  const autoClearTimerRef = useRef<number | null>(null);
+  const restoreTimerRef = useRef<number | null>(null);
+  // Our smooth scroll fires a stream of scroll events; clear the "auto" flag once the container
+  // actually reaches the target (or close enough), which also flips rows back to close-on-scroll.
+  useEffect(() => {
+    const sc = listScrollRef.current;
+    if (!sc) return;
+    const onScroll = () => {
+      if (autoTargetRef.current != null && Math.abs(sc.scrollTop - autoTargetRef.current) <= 1) {
+        autoTargetRef.current = null;
+        if (autoClearTimerRef.current) {
+          clearTimeout(autoClearTimerRef.current);
+          autoClearTimerRef.current = null;
+        }
+      }
+    };
+    sc.addEventListener("scroll", onScroll, { passive: true });
+    return () => sc.removeEventListener("scroll", onScroll);
+  }, []);
+  useEffect(
+    () => () => {
+      if (restoreTimerRef.current) clearTimeout(restoreTimerRef.current);
+      if (autoClearTimerRef.current) clearTimeout(autoClearTimerRef.current);
+    },
+    [],
+  );
+  const sidebarScroll = useMemo<SidebarScrollApi>(() => {
+    // Start a programmatic smooth scroll to `target`, marking it "ours" until the container reaches
+    // it. A fallback timer drops the flag even if the animation is interrupted or never lands within
+    // 1px, so a stuck flag can't misclassify the user's NEXT scroll as ours (roborev).
+    const smoothScrollTo = (sc: HTMLDivElement, target: number) => {
+      autoTargetRef.current = target;
+      if (autoClearTimerRef.current) clearTimeout(autoClearTimerRef.current);
+      autoClearTimerRef.current = window.setTimeout(() => {
+        autoTargetRef.current = null;
+        autoClearTimerRef.current = null;
+      }, 700);
+      sc.scrollTo({ top: target, behavior: "smooth" });
+    };
+    const clearRestoreTimer = () => {
+      if (restoreTimerRef.current) {
+        clearTimeout(restoreTimerRef.current);
+        restoreTimerRef.current = null;
+      }
+    };
+    return {
+      containerRef: listScrollRef,
+      scrollToReveal: (overflowPx: number) => {
+        const sc = listScrollRef.current;
+        if (!sc || overflowPx <= 0) return;
+        clearRestoreTimer(); // a new reveal cancels a pending ease-back → one baseline across rows
+        if (baselineRef.current == null) {
+          // If an ease-back is still ANIMATING (its debounce already fired, so baseline was nulled),
+          // the live scrollTop is a transient mid-animation value — capture the ease-back's TARGET
+          // (autoTargetRef) instead, which is the user's true resting position.
+          baselineRef.current = autoTargetRef.current ?? sc.scrollTop;
+        }
+        const maxScroll = Math.max(0, sc.scrollHeight - sc.clientHeight);
+        const target = Math.min(sc.scrollTop + overflowPx, maxScroll);
+        if (target <= sc.scrollTop) return; // already as far up as the list can go
+        smoothScrollTo(sc, target);
+      },
+      restore: () => {
+        clearRestoreTimer();
+        restoreTimerRef.current = window.setTimeout(() => {
+          restoreTimerRef.current = null;
+          const sc = listScrollRef.current;
+          const baseline = baselineRef.current;
+          baselineRef.current = null;
+          if (sc && baseline != null && Math.abs(sc.scrollTop - baseline) > 1) {
+            smoothScrollTo(sc, baseline);
+          }
+        }, 90);
+      },
+      cancelRestore: clearRestoreTimer,
+      abandonReveal: () => {
+        clearRestoreTimer();
+        baselineRef.current = null;
+      },
+      isAutoScrolling: () => autoTargetRef.current != null,
+    };
+  }, []);
   useEffect(() => {
     if (!project) return;
     const seen = seenStageRef.current;
@@ -603,6 +732,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     : [];
 
   return (
+    <SidebarScrollContext.Provider value={sidebarScroll}>
     <div
       style={{
         width,
@@ -701,7 +831,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           chevron strip; hidden in Plan mode (the sidebar is kept clear for the board). */}
       {project && mode !== "plan" && <HistorySearch />}
 
-      <div style={{ flex: 1, overflowY: "auto", padding: "0 8px" }}>
+      <div
+        ref={listScrollRef}
+        data-testid="agent-list-scroll"
+        style={{ flex: 1, overflowY: "auto", padding: "0 8px" }}
+      >
         {/* Per-mode "+ New … Agent" affordance — the only way to create agents now that the chevrons
             are a selector. Sits above the (mode-filtered) list. Plan has none (no agents in Plan). */}
         {project && mode === "build" && (
@@ -913,6 +1047,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         }}
       />
     </div>
+    </SidebarScrollContext.Provider>
   );
 }
 
@@ -1120,6 +1255,14 @@ function AgentRow({
   const cancelNextBlur = useRef(false);
   const [hover, setHover] = useState(false);
   const [rect, setRect] = useState<{ left: number; top: number; width: number } | null>(null);
+  // The list's auto-scroll coordinator (see SidebarScrollContext): lets this row nudge the column up
+  // so its full hover card fits, then ease back when the cursor leaves.
+  const sidebarScroll = useContext(SidebarScrollContext);
+  // The two halves of the rendered card — measured to decide whether (and how far) to auto-scroll.
+  const stripRef = useRef<HTMLDivElement>(null);
+  const detailRef = useRef<HTMLDivElement>(null);
+  // One-shot guard so the reveal fires once per hover-open, not on every reposition during the scroll.
+  const didReveal = useRef(false);
 
   // Hover open/close with a short close delay, so moving the cursor from the in-flow row onto the
   // overlay sitting on top of it (which fires the row's mouseleave) doesn't flicker it shut.
@@ -1128,6 +1271,9 @@ function AgentRow({
       clearTimeout(hideTimer.current);
       hideTimer.current = null;
     }
+    // Re-hovering (this row or, mid-travel, a neighbor) cancels any pending ease-back so the column
+    // doesn't bounce back to baseline and re-clip while a card is open.
+    sidebarScroll?.cancelRestore();
     const el = rowRef.current;
     if (el) {
       const r = el.getBoundingClientRect();
@@ -1145,18 +1291,62 @@ function AgentRow({
     },
     [],
   );
-  // The overlay is pinned to the row's rect captured at hover time; if the sidebar scrolls (or the
-  // window resizes) while it's open it would detach from its row, so just close it on either.
+  // The overlay is pinned to the row's rect captured at hover time. On a USER scroll it would detach
+  // from its row, so we close it (the original behavior). But during OUR OWN auto-scroll-to-fit
+  // (sidebarScroll.isAutoScrolling) we instead re-pin to the row's live position each event, so the
+  // card glides smoothly upward glued to its row instead of vanishing. A resize still just closes.
   useEffect(() => {
     if (!hover) return;
-    const close = () => setHover(false);
-    window.addEventListener("scroll", close, true); // capture: catch the sidebar's inner scroll too
-    window.addEventListener("resize", close);
-    return () => {
-      window.removeEventListener("scroll", close, true);
-      window.removeEventListener("resize", close);
+    const onScroll = () => {
+      if (sidebarScroll?.isAutoScrolling()) {
+        const el = rowRef.current;
+        if (el) {
+          const r = el.getBoundingClientRect();
+          setRect({ left: r.left, top: r.top, width: r.width });
+        }
+        return;
+      }
+      // A USER scroll closes the card — and since they've taken the list where they want it, drop
+      // our reveal so the un-hover ease-back can't override their position. didReveal=false also
+      // stops the un-hover effect below from calling restore().
+      didReveal.current = false;
+      sidebarScroll?.abandonReveal();
+      setHover(false);
     };
-  }, [hover]);
+    const onResize = () => setHover(false);
+    window.addEventListener("scroll", onScroll, true); // capture: catch the sidebar's inner scroll too
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onResize);
+    };
+  }, [hover, sidebarScroll]);
+  // When the card opens, measure its full natural height; if it would spill past the viewport bottom,
+  // ask the column to gently scroll up by exactly the overflow so the whole card fits. Fires once per
+  // open (didReveal). The detail's own scrollHeight is used (not its clipped offsetHeight) so the
+  // measurement reflects the full content even before any room is made.
+  useLayoutEffect(() => {
+    if (!hover || !rect || didReveal.current || !sidebarScroll) return;
+    const strip = stripRef.current;
+    const detail = detailRef.current;
+    if (!strip || !detail) return;
+    const neededH = strip.offsetHeight + detail.scrollHeight;
+    const REVEAL_MARGIN = 16; // breathing room kept below the card
+    const overflow = rect.top + neededH + REVEAL_MARGIN - window.innerHeight;
+    if (overflow > 1) {
+      didReveal.current = true;
+      sidebarScroll.scrollToReveal(overflow);
+    }
+  }, [hover, rect, sidebarScroll]);
+  // On un-hover, if we had auto-scrolled to reveal this card, ease the column back to where the user
+  // had it. Guarded by didReveal so a row that never scrolled doesn't disturb the column.
+  useEffect(() => {
+    if (hover) return;
+    if (didReveal.current) {
+      didReveal.current = false;
+      sidebarScroll?.restore();
+    }
+  }, [hover, sidebarScroll]);
 
   const busy = st === "working";
   // The behind/ahead pill + its branch-status geometry now live in AgentDetailLines, which renders
@@ -1657,6 +1847,7 @@ function AgentRow({
                 when the card is shifted up for a bottom-of-viewport row, so the strip alone wouldn't
                 be reachable to start a drag there. */}
             <div
+              ref={stripRef}
               {...dragProps}
               onClick={onSelect}
               onMouseEnter={show}
@@ -1688,6 +1879,7 @@ function AgentRow({
                 as one card; the strip's bottom border then shows only in the column-width "step". Also
                 carries dragProps (see the strip) so the whole card is a drag handle. */}
             <div
+              ref={detailRef}
               {...dragProps}
               onClick={onSelect}
               onMouseEnter={show}

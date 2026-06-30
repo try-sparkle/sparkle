@@ -274,3 +274,130 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     expect(document.body.textContent).toMatch(/1 worker\. \d+% complete overall\./);
   });
 });
+
+// The hover card on a row near the bottom of the column would otherwise be clipped by the viewport.
+// On hover we GENTLY scroll the list up by just enough to fit the whole card, and ease it back on
+// un-hover — but ONLY when the card actually overflows. jsdom has no layout, so we stub the few
+// measurements the logic reads: the row's rect (getBoundingClientRect), the card halves' heights
+// (offsetHeight / scrollHeight), the scroll container's metrics, and window.innerHeight.
+describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover card isn't clipped", () => {
+  const NEEDED = 200; // strip.offsetHeight (80) + detail.scrollHeight (120)
+  let savedInnerHeight: number;
+
+  const stubLayout = (innerHeight: number) => {
+    savedInnerHeight = window.innerHeight;
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: innerHeight });
+    // Every element reports a low row (top: 380) so the captured rect.top sits near the bottom.
+    HTMLElement.prototype.getBoundingClientRect = () =>
+      ({ left: 10, top: 380, width: 200, right: 210, bottom: 420, height: 40, x: 10, y: 380, toJSON: () => {} }) as DOMRect;
+    // The scroll container reports a tall, scrollable list; the card halves report fixed heights.
+    const isList = (el: HTMLElement) => el.getAttribute?.("data-testid") === "agent-list-scroll";
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return isList(this) ? 1000 : 120; // list room vs. detail content
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return isList(this) ? 300 : 0;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, "offsetHeight", { configurable: true, get: () => 80 });
+  };
+
+  afterEach(() => {
+    // stubLayout assigns getBoundingClientRect as an OWN prop on HTMLElement.prototype (the real one
+    // lives on Element.prototype); deleting it unconditionally restores the inherited impl. The other
+    // three are defined props, also deleted, so none of these stubs leak into later test files.
+    Reflect.deleteProperty(HTMLElement.prototype, "getBoundingClientRect");
+    Reflect.deleteProperty(HTMLElement.prototype, "scrollHeight");
+    Reflect.deleteProperty(HTMLElement.prototype, "clientHeight");
+    Reflect.deleteProperty(HTMLElement.prototype, "offsetHeight");
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: savedInnerHeight });
+  });
+
+  it("gently scrolls the list up (smooth) so the full card fits when it would overflow the bottom", () => {
+    // innerHeight 400, card needs 380 (rect.top) + 200 + 16 margin → overflows by 196px.
+    stubLayout(400);
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    const list = screen.getByTestId("agent-list-scroll");
+    const scrollTo = vi.fn((opts: ScrollToOptions) => {
+      list.scrollTop = opts.top ?? 0; // reflect the scroll so the baseline/restore math is real
+    });
+    list.scrollTo = scrollTo as typeof list.scrollTo;
+
+    fireEvent.mouseOver(screen.getByText(TITLE));
+
+    expect(scrollTo).toHaveBeenCalledTimes(1);
+    const opts = scrollTo.mock.calls[0]![0]!;
+    expect(opts.behavior).toBe("smooth"); // slow, not jarring
+    expect(opts.top).toBeGreaterThan(0); // scrolled the top rows up out of view
+    expect(opts.top).toBe(380 + NEEDED + 16 - 400); // exactly the overflow
+  });
+
+  it("does NOT move the column when the card already fits", () => {
+    stubLayout(2000); // tall viewport → 380 + 200 + 16 well within → no overflow
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    const list = screen.getByTestId("agent-list-scroll");
+    const scrollTo = vi.fn();
+    list.scrollTo = scrollTo as typeof list.scrollTo;
+
+    fireEvent.mouseOver(screen.getByText(TITLE));
+
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("eases the column back to its prior position after the cursor leaves", async () => {
+    stubLayout(400);
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    const list = screen.getByTestId("agent-list-scroll");
+    const scrollTo = vi.fn((opts: ScrollToOptions) => {
+      list.scrollTop = opts.top ?? 0;
+    });
+    list.scrollTo = scrollTo as typeof list.scrollTo;
+
+    const row = screen.getByText(TITLE);
+    fireEvent.mouseOver(row); // reveal → scrolls up to 196 (baseline captured as 0)
+    expect(scrollTo).toHaveBeenCalledTimes(1);
+
+    fireEvent.mouseOut(row); // un-hover → after the close + restore debounce, ease back to baseline 0
+    await vi.waitFor(
+      () => {
+        const last = scrollTo.mock.calls.at(-1)![0]!;
+        expect(scrollTo.mock.calls.length).toBeGreaterThanOrEqual(2);
+        expect(last.top).toBe(0);
+        expect(last.behavior).toBe("smooth");
+      },
+      { timeout: 1000 },
+    );
+  });
+
+  it("does NOT yank the list back when the user's OWN scroll closes the card", async () => {
+    // Regression: a user scroll closes the card (setHover false), which used to fire restore() and
+    // undo the user's deliberate scroll. Now the reveal is abandoned, so no ease-back happens.
+    stubLayout(400);
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    const list = screen.getByTestId("agent-list-scroll");
+    const scrollTo = vi.fn((opts: ScrollToOptions) => {
+      list.scrollTop = opts.top ?? 0;
+    });
+    list.scrollTo = scrollTo as typeof list.scrollTo;
+
+    fireEvent.mouseOver(screen.getByText(TITLE)); // reveal → scrolls up to 196
+    expect(screen.getByText("/tmp/demo/.worktrees/a1")).toBeTruthy(); // card open
+    expect(scrollTo).toHaveBeenCalledTimes(1);
+
+    // The reveal's scrollTo already put scrollTop on its target; the first scroll event merely
+    // DETECTS that landing and clears the "auto" flag (during our animation the card re-pins rather
+    // than closing). The SECOND scroll is therefore treated as a genuine user scroll → it closes.
+    fireEvent.scroll(list);
+    fireEvent.scroll(list);
+
+    // The card closed and the list was NOT eased back (no further scrollTo calls after a beat).
+    expect(screen.queryByText("/tmp/demo/.worktrees/a1")).toBeNull();
+    await new Promise((r) => setTimeout(r, 150)); // past the 90ms restore debounce
+    expect(scrollTo).toHaveBeenCalledTimes(1); // still just the reveal — no restore
+  });
+});
