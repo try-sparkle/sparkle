@@ -11,6 +11,7 @@ import {
   clearWindowProject,
   resetWindowRegistry,
 } from "./services/windowRegistry";
+import { resetWindowStatus } from "./services/windowStatus";
 
 interface Ctx {
   projectId: string | null;
@@ -39,7 +40,12 @@ export function CurrentProjectProvider({ children }: { children: ReactNode }) {
   // start (multi-window session restore is deferred, bead ) — clears it before
   // registering itself, so stale `win-*` labels can't mis-route a focus-existing lookup.
   useEffect(() => {
-    if (isMain) resetWindowRegistry();
+    if (isMain) {
+      resetWindowRegistry();
+      // Same cold-start reasoning for the cross-window status map: its entries outlive the process,
+      // so a hard crash that skipped unload cleanup can leave ghost red-agent rows. Wipe them too.
+      resetWindowStatus();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

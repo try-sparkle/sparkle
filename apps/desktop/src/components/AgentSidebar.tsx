@@ -26,6 +26,12 @@ import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
 import { WorkflowLine } from "./WorkflowLine";
 import { HistorySearch } from "./HistorySearch";
+import { OtherWindowAgentRow } from "./OtherWindowAgentRow";
+import { useOtherWindowsRedAgents } from "../useOtherWindowsRedAgents";
+import type { OtherWindowAgent } from "../services/windowStatus";
+import { emitFocusAgent } from "../services/attention";
+import { findWindowForProject } from "../services/windowRegistry";
+import { openProjectInWindow, defaultDeps } from "../services/projectWindows";
 import { resolveStage, rollupStages, stageFraction, stageIndex } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { createBeadFull } from "../services/tasks";
@@ -134,6 +140,7 @@ const DASHED_ROW_STYLE: React.CSSProperties = {
 
 export function AgentSidebar({ project }: { project: Project | null }) {
   const selectAgent = useProjectStore((s) => s.selectAgent);
+  const touchProjectOpened = useProjectStore((s) => s.touchProjectOpened);
   const addAgent = useProjectStore((s) => s.addAgent);
   const setAgentBeadId = useProjectStore((s) => s.setAgentBeadId);
   const removeAgent = useProjectStore((s) => s.removeAgent);
@@ -146,6 +153,31 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
+
+  // Red agents in OTHER open windows — surfaced as a block at the top of the sidebar.
+  const otherWindowRedAgents = useOtherWindowsRedAgents();
+  // Clicking such a row raises the owning window and selects the agent. Same three-way router as
+  // HistorySearch.onResultClick: same project → focus in place; another OPEN window → emitFocusAgent
+  // (the live path, since these only come from open windows); no window → open one (covers the rare
+  // race where that window closed between render and click).
+  const onOtherWindowAgentClick = (a: OtherWindowAgent) => {
+    if (project && a.projectId === project.id) {
+      open(a.agentId);
+      selectAgent(a.projectId, a.agentId);
+      return;
+    }
+    if (findWindowForProject(a.projectId) != null) {
+      emitFocusAgent({ projectId: a.projectId, agentId: a.agentId });
+    } else {
+      void openProjectInWindow(
+        a.projectId,
+        "new",
+        defaultDeps(() => {}, touchProjectOpened, "main"),
+        a.agentId,
+      );
+    }
+  };
+
   // Which chevron is selected. Drives both the strip's coloring (active = brand, others grayscale)
   // and which agents the sidebar list shows. Defaults to Build; not persisted across launches.
   const [mode, setMode] = useState<"think" | "plan" | "build">("build");
@@ -604,6 +636,20 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       {project && mode !== "plan" && <HistorySearch />}
 
       <div style={{ flex: 1, overflowY: "auto", padding: "0 8px" }}>
+        {/* Cross-window attention block: red agents from OTHER open windows, each tagged with a
+            project pill. Its own section above this window's own agents; hidden when there are none.
+            Click raises the owning window and selects the agent (onOtherWindowAgentClick). */}
+        {otherWindowRedAgents.length > 0 && (
+          <div style={{ paddingBottom: 6, marginBottom: 4, borderBottom: `1px solid ${CHAT_USER_BUBBLE}` }}>
+            {otherWindowRedAgents.map((a) => (
+              <OtherWindowAgentRow
+                key={`${a.windowLabel}:${a.agentId}`}
+                agent={a}
+                onClick={() => onOtherWindowAgentClick(a)}
+              />
+            ))}
+          </div>
+        )}
         {/* Per-mode "+ New … Agent" affordance — the only way to create agents now that the chevrons
             are a selector. Sits above the (mode-filtered) list. Plan has none (no agents in Plan). */}
         {project && mode === "build" && (

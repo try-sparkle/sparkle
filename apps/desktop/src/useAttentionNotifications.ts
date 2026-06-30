@@ -38,11 +38,23 @@ import {
   type FocusAgentPayload,
 } from "./services/attention";
 import { emitAttention, emitResolved } from "./services/relayClient";
+import {
+  publishWindowRedAgents,
+  clearWindowStatus,
+  isRedStatus,
+} from "./services/windowStatus";
 import type { AgentTab, AgentTabStatus } from "./types";
 
-/** The two "needs you" statuses (mirrors engine/attention's red set) — relayed to the phone. */
-const isRed = (s: AgentTabStatus | undefined): boolean =>
+/** The two "needs you" statuses (mirrors engine/attention's red set) — relayed to the phone. Named
+ *  distinctly from windowStatus.isRedStatus (the broader red-COLOR tier, incl. errored) so the two
+ *  red notions aren't confused. */
+const isRelayRed = (s: AgentTabStatus | undefined): boolean =>
   s === "approval" || s === "waiting";
+
+/** The name other windows should show — Claude Code's title if known, else the auto-name, else the
+ *  fallback. Mirrors useRosterPublisher.displayName. */
+const displayName = (a: AgentTab): string =>
+  a.aiTitle || a.autoNameVariants?.title || a.name;
 
 /** Bring this window to the foreground (notification click landed here). */
 async function bringToFront(): Promise<void> {
@@ -101,6 +113,19 @@ export function useAttentionNotifications(): void {
     const ownedIds = agents.map((a) => a.id);
     reportAttentionCount(label, countAttention(status, ownedIds));
 
+    // Publish THIS window's red (needs-attention) agents to the cross-window status channel so other
+    // windows can surface them at the top of their sidebar. Uses the broader red-color set
+    // (waiting|approval|errored) — not the narrower badge `isRed` above. Empty set deletes our entry.
+    publishWindowRedAgents(
+      label,
+      projectId ?? "",
+      projectName,
+      agents.flatMap((a) => {
+        const st = status[a.id];
+        return isRedStatus(st) ? [{ id: a.id, name: displayName(a), status: st }] : [];
+      }),
+    );
+
     const sameProject = prevProject.current === projectId;
     if (sameProject) {
       // Read live at fire time (no extra deps / re-baselining): is THIS window the OS-focused
@@ -115,7 +140,7 @@ export function useAttentionNotifications(): void {
         if (!agent || projectId == null) continue;
         // Mirror a "needs you" (red) attention to the paired phone — regardless of local
         // suppression (the phone is a separate device).
-        if (isRed(st)) {
+        if (isRelayRed(st)) {
           const attentionId = crypto.randomUUID();
           attentionIds.current[id] = attentionId;
           const approval = st === "approval";
@@ -144,7 +169,7 @@ export function useAttentionNotifications(): void {
     // Clear the phone's card for any agent we raised that is no longer red — including agents
     // that left the owned set entirely (project switch / removed), which the loop above misses.
     for (const [id, attentionId] of Object.entries(attentionIds.current)) {
-      if (!isRed(status[id])) {
+      if (!isRelayRed(status[id])) {
         emitResolved(attentionId);
         delete attentionIds.current[id];
       }
@@ -153,8 +178,15 @@ export function useAttentionNotifications(): void {
     prevProject.current = projectId;
   }, [status, agents, projectId, label, projectName, enabled]);
 
-  // Report 0 on unmount so a closed window stops contributing to the badge total.
-  useEffect(() => () => reportAttentionCount(label, 0), [label]);
+  // Report 0 + drop our cross-window status entry on unmount so a closed window stops contributing
+  // to the badge total and stops surfacing its (now-gone) red agents in other windows' sidebars.
+  useEffect(
+    () => () => {
+      reportAttentionCount(label, 0);
+      clearWindowStatus(label);
+    },
+    [label],
+  );
 
   // Notification-click routing. Registered once; reads live window/project via refs.
   const ctx = useRef({ projectId, label, isMain, replace });

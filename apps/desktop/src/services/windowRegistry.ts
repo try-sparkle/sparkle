@@ -10,8 +10,9 @@ export type KV = {
   setItem(k: string, v: string): void;
 };
 
-function defaultStore(): KV {
-  // Guard for non-browser (test) environments without localStorage.
+/** The localStorage-backed KV, with a no-op fallback for non-browser (test/SSR) environments.
+ *  Shared by the sibling windowStatus channel so the two key off the same storage. */
+export function defaultStore(): KV {
   return typeof localStorage !== "undefined"
     ? localStorage
     : { getItem: () => null, setItem: () => {} };
@@ -48,6 +49,13 @@ export function clearWindowProject(label: string, store: KV = defaultStore()): v
  *  entries (the blob outlives the process, but windows don't). */
 export function resetWindowRegistry(store: KV = defaultStore()): void {
   store.setItem(WINDOW_REGISTRY_KEY, "{}");
+}
+
+/** Is the window with this exact label currently registered (open)? Label-keyed — the symmetric
+ *  counterpart to setWindowProject/clearWindowProject — so a stale entry for a project another
+ *  window now shows (after a crash + "Replace") isn't mistaken for this label still being open. */
+export function isWindowOpen(label: string, store: KV = defaultStore()): boolean {
+  return label in read(store);
 }
 
 export function findWindowForProject(projectId: string, store: KV = defaultStore()): string | null {
