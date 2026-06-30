@@ -7,6 +7,9 @@ import {
   type AiFeatureKey,
   type AiMode,
 } from "../stores/settingsStore";
+// Toggles write to config.toml (the source of truth) via these actions, which also update the
+// store optimistically; the resulting config-changed event re-hydrates the store.
+import { setAiFeature, setAllAiFeatures } from "../services/configActions";
 
 // "Use AI Features" control for the TopBar ⋯ menu. A segmented All | Some | Off master plus a
 // checkbox per feature. The master is DERIVED from the four feature flags (aiFeatureMode):
@@ -85,8 +88,6 @@ export function AiFeaturesMenu() {
   const cloudDictation = useSettingsStore((s) => s.cloudDictation);
   const aiBrainstorm = useSettingsStore((s) => s.aiBrainstorm);
   const aiComposer = useSettingsStore((s) => s.aiComposer);
-  const setAiFeature = useSettingsStore((s) => s.setAiFeature);
-  const setAllAiFeatures = useSettingsStore((s) => s.setAllAiFeatures);
   const autoApplyUpdates = useSettingsStore((s) => s.autoApplyUpdates);
   const setAutoApplyUpdates = useSettingsStore((s) => s.setAutoApplyUpdates);
 

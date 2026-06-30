@@ -109,9 +109,16 @@ fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Resolve the project's logical integration branch name. Order: origin/HEAD symref →
-/// local `main` → local `master` → the branch currently checked out at `root`.
+/// Resolve the project's logical integration branch name. An explicit `[workflow].default_branch`
+/// from the editable config (per-project file beats global) wins; otherwise auto-detect in order:
+/// origin/HEAD symref → local `main` → local `master` → the branch currently checked out at `root`.
 pub fn resolve_default_branch(root: &str) -> String {
+    // Config override: a non-empty default_branch pins the base; empty means "auto-detect" below.
+    let configured = crate::config::for_project(root).config.workflow.default_branch;
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
     if let Ok(symref) = git(root, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
         // e.g. "refs/remotes/origin/main" -> "main"; preserve slashes in names like
         // "release/2026" by stripping the fixed prefix rather than splitting on the last '/'.
@@ -2225,6 +2232,29 @@ mod tests {
         // Create a `main` branch even if the repo initialized on `master`.
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         assert_eq!(resolve_default_branch(&root_str), "main");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_default_branch_honors_config_override() {
+        // A non-empty [workflow].default_branch from the per-project config must win over git
+        // auto-detection; a whitespace-only value falls through to auto-detect.
+        let root = unique_root("rdb-config");
+        let root_str = root.to_string_lossy().to_string();
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        assert_eq!(resolve_default_branch(&root_str), "main");
+
+        let sparkle = root.join(".sparkle");
+        std::fs::create_dir_all(&sparkle).unwrap();
+        let cfg = sparkle.join("config.toml");
+
+        std::fs::write(&cfg, "[workflow]\ndefault_branch = \"release/x\"\n").unwrap();
+        assert_eq!(resolve_default_branch(&root_str), "release/x");
+
+        std::fs::write(&cfg, "[workflow]\ndefault_branch = \"   \"\n").unwrap();
+        assert_eq!(resolve_default_branch(&root_str), "main");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

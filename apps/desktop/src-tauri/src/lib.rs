@@ -8,6 +8,7 @@ mod bridge;
 mod chief;
 mod claude;
 mod cloud;
+mod config;
 mod connectivity;
 mod dictation;
 mod history;
@@ -106,6 +107,12 @@ pub fn run() {
                 },
                 Err(e) => tracing::error!("app_data_dir for history: {e}"),
             }
+            // Editable TOML config: load the global config.toml and watch it for live reload.
+            // Best-effort — a failure here must not stop the app; the engine falls back to
+            // built-in defaults (config::current_effective() returns defaults when never loaded).
+            if let Err(e) = config::init_and_watch(&app.handle()) {
+                tracing::error!("config init/watch failed: {e}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -198,7 +205,14 @@ pub fn run() {
             trial::trial_start,
             trial::trial_increment,
             trial_remote::trial_remote_status,
-            trial_remote::trial_remote_consume
+            trial_remote::trial_remote_consume,
+            config::get_config,
+            config::config_file_paths,
+            config::set_config_value,
+            config::set_config_values,
+            config::write_config_text,
+            config::reset_config,
+            config::read_config_text
         ])
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")

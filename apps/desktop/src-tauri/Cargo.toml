@@ -30,6 +30,12 @@ tauri-plugin-updater = "2"
 # Relaunch the app after an update is staged (used by the frontend updaterService).
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
+# Editable TOML config file (config.rs): `toml` reads layers into typed structs; `toml_edit`
+# does comment/format-preserving writes so a hand-edited config survives in-app changes;
+# `notify` watches the global config.toml for live reload. See the editable-config design spec.
+toml = "0.8"
+toml_edit = "0.22"
+notify = "6"
 # preserve_order: keep the user's settings.local.json keys in their original order when we merge
 # hooks into it (default serde_json is BTreeMap-backed and would alphabetize them on every write).
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -9,6 +9,7 @@ import { healAgentHooks } from "./services/worktree";
 import { importDefault } from "./services/accountStore";
 import { startRelayHost, stopRelayHost } from "./services/relayClient";
 import { useSettingsStore } from "./stores/settingsStore";
+import { getConfig, onConfigChanged } from "./services/config";
 import { CurrentProjectProvider } from "./windowContext";
 import { useAttentionNotifications } from "./useAttentionNotifications";
 import { useRosterPublisher } from "./useRosterPublisher";
@@ -69,6 +70,32 @@ export function App() {
   // Auto-updater: poll the signed GitHub Releases manifest at launch + every 6h. No-ops in dev /
   // the browser preview / when unpackaged (the plugin + manifest only exist in a real build).
   useEffect(() => startUpdater(), []);
+
+  // Editable config file: hydrate the settings store from config.toml at launch and on every
+  // live-reload (hand-edit / in-app write / reset). The file is the source of truth; this is the
+  // read side. Handler is idempotent (re-pulls), so the expected double config-changed emit on an
+  // in-app write is harmless.
+  // SCOPE: the UI mirror reflects the GLOBAL layer (no project root passed). That's correct — the
+  // mirrored controls are [workers]/[ai], which are global-only by design; per-project [workflow]
+  // overrides are honored by the Rust engine directly (config::for_project), not via this mirror.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    const hydrate = useSettingsStore.getState().hydrateFromConfig;
+    void getConfig()
+      .then((eff) => {
+        if (!cancelled) hydrate(eff);
+      })
+      .catch((e) => console.warn("getConfig failed", e));
+    void onConfigChanged(hydrate).then((u) => {
+      if (cancelled) u();
+      else unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   return (
     <CurrentProjectProvider>

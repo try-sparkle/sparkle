@@ -169,3 +169,43 @@ describe("settingsStore — Chief doc state", () => {
     expect(store.getState().chiefDocStateByProject["project_y"]).toBeUndefined();
   });
 });
+
+describe("hydrateFromConfig — reflect config.toml into the store", () => {
+  it("maps every effective-config field into the store and clamps max workers", () => {
+    useSettingsStore.getState().hydrateFromConfig({
+      config: {
+        workflow: {
+          require_pr: false,
+          worktree_isolation: false,
+          default_branch: "develop",
+          born_fresh_from_base: false,
+          drift: { behind_nudge: 3, ahead_nudge: 4, changed_lines: 5 },
+        },
+        workers: { max_concurrent: 0 }, // out of range → clamped to 1
+        ai: { auto_rename: false, voice_dictation: false, brainstorm: false, composer: true },
+        freshness: {
+          staleness_warn_commits: 25,
+          stale_build_block_commits: 25,
+          require_fresh_branch: true,
+        },
+      },
+      warnings: ["w1", "w2"],
+    });
+    const s = useSettingsStore.getState();
+    expect(s.maxConcurrentWorkers).toBe(1); // Math.max(1, floor(0))
+    expect(s.requirePr).toBe(false);
+    expect(s.worktreeIsolation).toBe(false);
+    expect(s.defaultBranch).toBe("develop");
+    expect(s.bornFreshFromBase).toBe(false);
+    expect(s.driftBehindNudge).toBe(3);
+    expect(s.driftAheadNudge).toBe(4);
+    expect(s.driftChangedLines).toBe(5);
+    expect([s.aiAutoRename, s.cloudDictation, s.aiBrainstorm, s.aiComposer]).toEqual([
+      false,
+      false,
+      false,
+      true,
+    ]);
+    expect(s.configWarnings).toEqual(["w1", "w2"]);
+  });
+});

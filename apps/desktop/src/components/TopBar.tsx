@@ -6,6 +6,7 @@ import { AgentOrderToggle } from "./AgentOrderToggle";
 import { AiFeaturesMenu } from "./AiFeaturesMenu";
 import { WorkerLimitControl } from "./WorkerLimitControl";
 import { NotificationsMenu } from "./NotificationsMenu";
+import { AdvancedConfigMenu } from "./AdvancedConfigMenu";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -414,6 +415,8 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
                   +
                 </button>
               </div>
+              <div style={{ ...menuLabel, paddingTop: 12 }}>Advanced configuration</div>
+              <AdvancedConfigMenu />
             </div>
           </>
         )}

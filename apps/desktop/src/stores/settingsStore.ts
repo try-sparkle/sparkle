@@ -8,6 +8,9 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import type { AgentTabStatus } from "../types";
+// Type-only import: erased at compile time, so the store stays free of the Tauri runtime dep
+// (services/config pulls in @tauri-apps) and remains testable under jsdom.
+import type { EffectiveConfig } from "../services/config";
 
 // --- Status-change notifications -------------------------------------------------------------
 // Which agent statuses fire a Notification Center banner when an agent crosses INTO them. The
@@ -162,6 +165,24 @@ interface SettingsState {
    *  inherits its default rather than reading undefined. */
   notifyStatuses: Record<AgentTabStatus, boolean>;
 
+  // --- Editable config-file mirror (reflections of config.toml; the file is the source of truth) ---
+  // Hydrated from the TOML config via `hydrateFromConfig` at startup and on every config-changed
+  // event. NOT persisted to localStorage — re-read from the file each launch.
+  /** true = open a PR & merge; false = allow pushing to the base branch directly. */
+  requirePr: boolean;
+  /** Each agent runs in its own isolated git worktree. */
+  worktreeIsolation: boolean;
+  /** Explicit base-branch override ("" = auto-detect from git). */
+  defaultBranch: string;
+  /** Cut each agent branch from a freshly-fetched base. */
+  bornFreshFromBase: boolean;
+  /** Drift-nudge thresholds: commits behind / ahead / changed lines. */
+  driftBehindNudge: number;
+  driftAheadNudge: number;
+  driftChangedLines: number;
+  /** Non-fatal warnings from the last config load (malformed layer, ignored per-project keys). */
+  configWarnings: string[];
+
   setChiefPat: (pat: string) => void;
   setRuntimeChiefPat: (pat: string) => void;
   setChiefProject: (sparkleProjectId: string, chiefProjectId: string) => void;
@@ -177,6 +198,9 @@ interface SettingsState {
   setAiFeature: (key: AiFeatureKey, on: boolean) => void;
   /** Bulk-set every AI feature (the All / Off segments). */
   setAllAiFeatures: (on: boolean) => void;
+  /** Reflect the effective config (from config.toml) into the mirrored store fields. Called at
+   *  startup and whenever the file changes. The file is the source of truth — this is the read side. */
+  hydrateFromConfig: (eff: EffectiveConfig) => void;
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -193,6 +217,16 @@ export const useSettingsStore = create<SettingsState>()(
       aiComposer: true,
       autoApplyUpdates: true,
       notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
+
+      // Config-file mirror defaults (match SparkleConfig::default() in config.rs; overwritten by hydrate).
+      requirePr: true,
+      worktreeIsolation: true,
+      defaultBranch: "",
+      bornFreshFromBase: true,
+      driftBehindNudge: 10,
+      driftAheadNudge: 15,
+      driftChangedLines: 1000,
+      configWarnings: [],
 
       setChiefPat: (pat) => set({ chiefPat: pat.trim() }),
       setRuntimeChiefPat: (pat) => set({ runtimeChiefPat: pat.trim() }),
@@ -224,6 +258,27 @@ export const useSettingsStore = create<SettingsState>()(
         }),
 
       setMaxConcurrentWorkers: (n) => set({ maxConcurrentWorkers: Math.max(1, Math.floor(n)) }),
+
+      hydrateFromConfig: (eff) => {
+        const { config, warnings } = eff;
+        set({
+          // Concurrency + AI flags (also surfaced in the ⋯ menu controls).
+          maxConcurrentWorkers: Math.max(1, Math.floor(config.workers.max_concurrent)),
+          aiAutoRename: config.ai.auto_rename,
+          cloudDictation: config.ai.voice_dictation,
+          aiBrainstorm: config.ai.brainstorm,
+          aiComposer: config.ai.composer,
+          // Workflow rules (display / advanced).
+          requirePr: config.workflow.require_pr,
+          worktreeIsolation: config.workflow.worktree_isolation,
+          defaultBranch: config.workflow.default_branch,
+          bornFreshFromBase: config.workflow.born_fresh_from_base,
+          driftBehindNudge: config.workflow.drift.behind_nudge,
+          driftAheadNudge: config.workflow.drift.ahead_nudge,
+          driftChangedLines: config.workflow.drift.changed_lines,
+          configWarnings: warnings,
+        });
+      },
     }),
     {
       name: "sparkle-settings",
@@ -247,6 +302,14 @@ export const useSettingsStore = create<SettingsState>()(
       },
       // Persist everything EXCEPT runtimeChiefPat — it's re-resolved from env at each launch, so
       // persisting it would let a removed/rotated env token linger stale until startup runs.
+      // NOTE on the config-mirrored fields: config.toml is the source of truth (hydrateFromConfig
+      // overwrites these at startup + on every change). The NEW workflow-mirror fields (requirePr,
+      // drift*, etc.) are intentionally NOT persisted here — re-read from the file each launch. But
+      // maxConcurrentWorkers + the four AI flags STAY persisted as a migration-safe fallback: on a
+      // first upgrade config.toml does not exist yet, and these localStorage values are the only
+      // record of a user's prior AI opt-out (the v0→v1 migration that guards against silently
+      // re-arming billable AI/credits). They stay in lockstep with the file because every UI write
+      // goes through both (configActions: optimistic store update → file write → hydrate).
       partialize: (s) => ({
         chiefPat: s.chiefPat,
         chiefProjectByProject: s.chiefProjectByProject,
