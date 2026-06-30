@@ -42,6 +42,32 @@ export function __resetChiefSyncBackoff(): void {
   syncBackoff.clear();
 }
 
+// : once an agent's worktree is removed (agent cleanup), the 30s branch-status poll
+// keeps shelling out `git status` against the deleted directory — failing every tick with
+// "cannot change to <dir>: No such file or directory" / "not a git repository". That wastes a
+// subprocess per tick and floods the log for the app's lifetime (~150 failed polls across a few
+// days in real session logs). A removed worktree never comes back for the same agent id (ids are
+// unique, worktrees are torn down for good), so we latch the agent into a session-scoped skip-set
+// on the first such failure and never re-poll it. The set resets on relaunch (the store boots
+// clean), which is correct — a stale id simply isn't polled again.
+const deadWorktrees = new Set<string>();
+
+/** Does this git error mean the agent's worktree directory is gone (vs. a transient hiccup)? The
+ *  latch is terminal (no re-poll until relaunch), so we match ONLY the structural signatures git
+ *  emits when its CWD is gone — `cannot change to <dir>` (git's chdir-to-CWD failure) or `not a git
+ *  repository` — and deliberately NOT a bare "no such file or directory", which an unrelated missing
+ *  pathspec/config could trip. A false negative costs one more failed poll; a false positive would
+ *  silently stop polling for the app's lifetime. */
+export function isWorktreeGoneError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /cannot change to/i.test(msg) || /not a git repository/i.test(msg);
+}
+
+/** Test-only: clear the removed-worktree skip-set between cases. */
+export function __resetDeadWorktrees(): void {
+  deadWorktrees.clear();
+}
+
 interface PendingSync {
   timer: ReturnType<typeof setTimeout>;
   agentId: string;
@@ -215,6 +241,8 @@ export const useRuntimeStore = create<RuntimeState>()(
         set((st) => ({ workflowShipped: { ...st.workflowShipped, [agentId]: shipped } })),
 
       pollBranchStatus: async (root, projectId, agentId, baseBranch) => {
+        // A removed worktree never returns for the same agent id — skip it permanently ().
+        if (deadWorktrees.has(agentId)) return;
         try {
           const s = await agentBranchStatus(root, projectId, agentId, baseBranch);
           get().setBranchStatus(agentId, s);
@@ -225,8 +253,13 @@ export const useRuntimeStore = create<RuntimeState>()(
           // after setBranchStatus so deriveLiveStage sees this tick's fresh ahead/dirty counts.
           void get().refreshWorkflowStage(root, projectId, agentId);
         } catch (e) {
-          // Best-effort: a transient git error must not break the UI. Log at debug level so a
-          // persistent (structural) failure — e.g. a bad baseBranch — is still diagnosable.
+          // A gone worktree is terminal — latch it so we stop re-polling a deleted directory every
+          // tick (). Anything else is a transient git error: log at debug level (so a
+          // persistent structural failure — e.g. a bad baseBranch — is still diagnosable) and retry.
+          if (isWorktreeGoneError(e)) {
+            deadWorktrees.add(agentId);
+            return;
+          }
           console.debug("pollBranchStatus failed for", agentId, e);
         }
       },

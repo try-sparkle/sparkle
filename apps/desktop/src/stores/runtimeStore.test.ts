@@ -130,6 +130,39 @@ describe("runtimeStore branch status", () => {
     await useRuntimeStore.getState().pollBranchStatus("/root", "p1", "a1", "main");
     expect(useRuntimeStore.getState().branchStatus["a1"]).toEqual(old);
   });
+
+  // : a removed worktree must stop being polled, while transient errors keep retrying.
+  it("pollBranchStatus stops re-polling once the worktree is gone", async () => {
+    const useRuntimeStore = await freshStore();
+    agentBranchStatus.mockRejectedValue(
+      new Error("git status --porcelain failed: fatal: cannot change to '/gone': No such file or directory"),
+    );
+    await useRuntimeStore.getState().pollBranchStatus("/root", "p1", "a1", "main");
+    expect(agentBranchStatus).toHaveBeenCalledTimes(1);
+    // A second poll for the same agent must early-return without touching the backend again.
+    await useRuntimeStore.getState().pollBranchStatus("/root", "p1", "a1", "main");
+    expect(agentBranchStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("pollBranchStatus keeps retrying after a transient (non-fatal) git error", async () => {
+    const useRuntimeStore = await freshStore();
+    agentBranchStatus.mockRejectedValue(new Error("git boom"));
+    await useRuntimeStore.getState().pollBranchStatus("/root", "p1", "a1", "main");
+    await useRuntimeStore.getState().pollBranchStatus("/root", "p1", "a1", "main");
+    expect(agentBranchStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("isWorktreeGoneError matches only the structural gone-worktree signatures", async () => {
+    const { isWorktreeGoneError } = await import("./runtimeStore");
+    // git's chdir-to-CWD failure (deleted worktree dir) and the structural not-a-repo case latch…
+    expect(isWorktreeGoneError(new Error("fatal: cannot change to '/x': No such file or directory"))).toBe(true);
+    expect(isWorktreeGoneError(new Error("fatal: not a git repository"))).toBe(true);
+    // …but a bare "no such file or directory" (e.g. a missing pathspec/config) must NOT latch, nor
+    // any other transient error — a false positive would silently stop polling for the app's life.
+    expect(isWorktreeGoneError(new Error("error: pathspec 'x' did not match; No such file or directory"))).toBe(false);
+    expect(isWorktreeGoneError(new Error("git boom"))).toBe(false);
+    expect(isWorktreeGoneError("plain string")).toBe(false);
+  });
 });
 
 describe("runtimeStore — workflowShipped sticky latch (review #13591)", () => {
