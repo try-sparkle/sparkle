@@ -28,8 +28,11 @@ import { clearWindowProject } from "../services/windowRegistry";
  * the active agent's pane filling the rest. Each window renders only its current project's
  * open agents; within that project they stay mounted across agent-tab switches (only the
  * active one is visible). Switching the window to another project ("Replace") unmounts the
- * displaced project's panes — their PTYs stay alive in Rust, and the panes reattach (replaying
- * scrollback) when that project is opened again, the same way a fresh window mounts them. */
+ * displaced project's panes — and a Terminal unmount KILLS its PTY and disposes the xterm
+ * (Terminal.tsx cleanup). There is NO scrollback replay: the only copy of the output lived in
+ * the now-disposed xterm. Reopening the project remounts fresh panes that re-spawn and restore
+ * the *visible conversation* via `claude --resume <id>` (AgentPane.prepare, bead sparkle-wwg7) —
+ * Claude repaints the transcript; we do not replay raw PTY bytes. */
 export function Workspace() {
   const projects = useProjectStore((s) => s.projects);
   const currentProjectId = useCurrentProjectId();

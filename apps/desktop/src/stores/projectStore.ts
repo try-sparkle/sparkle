@@ -74,6 +74,12 @@ interface ProjectState {
    *  prompt-derived name and records `aiTitle` so later changes are detected and further Haiku
    *  naming is suppressed. */
   applyAiTitle: (projectId: string, agentId: string, title: string) => void;
+  /** Reset an agent's name back to the kind default and drop all auto-name metadata
+   *  (`autoNameBasis`/`autoNameVariants`/`aiTitle`). Called when a slot starts a FRESH Claude
+   *  session (nothing to `claude --resume`) so a reused worktree slot doesn't keep showing the
+   *  PRIOR occupant's auto-name. No-op when the name is pinned — a manual rename is the user's
+   *  choice and survives a fresh start. */
+  resetAutoName: (projectId: string, agentId: string) => void;
   /** Drag-pin a top-level agent at `index`: freeze the name AND anchor the row there. */
   pinAgentAt: (projectId: string, agentId: string, index: number) => void;
   /** Release a pin: clear the name freeze AND the row anchor (re-enables auto-naming + sort). */
@@ -401,6 +407,35 @@ export const useProjectStore = create<ProjectState>()(
             ),
           };
         }),
+
+      resetAutoName: (projectId, agentId) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) =>
+              // A manual rename is the user's choice — never auto-reset it on a fresh start. Also
+              // bail (return the SAME reference) when there's no auto-name to clear — the common
+              // first-launch case — so subscribers don't re-render for a no-op.
+              a.namePinned ||
+              (a.autoNameBasis === null && a.autoNameVariants === null && a.aiTitle === undefined)
+                ? a
+                : {
+                    ...a,
+                    // Recompute the kind default against the OTHER agents so a lone "Build" slot
+                    // reverts to "Build 1" (not "Build 2" — defaultAgentName counts inclusively).
+                    // The number is positional-best-effort and not guaranteed unique with multiple
+                    // same-kind agents — intentionally the SAME semantics as creation
+                    // (defaultAgentName at addAgent), so we don't special-case dedup here.
+                    name: defaultAgentName(
+                      { ...p, agents: p.agents.filter((x) => x.id !== agentId) },
+                      a.kind,
+                    ),
+                    autoNameBasis: null,
+                    autoNameVariants: null,
+                    aiTitle: undefined,
+                  },
+            ),
+          ),
+        })),
 
       pinAgentAt: (projectId, agentId, index) =>
         set((s) => ({

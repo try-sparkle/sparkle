@@ -26,6 +26,9 @@ interface SpawnCmd {
   args: string[];
   cwd: string;
   projectRootPath: string;
+  // Whether this spawn resumes a prior Claude session (`claude --resume`) vs starts fresh — drives
+  // the Terminal's loading affordance ("Resuming conversation…" vs "Starting Claude…").
+  resuming: boolean;
 }
 
 /**
@@ -86,6 +89,7 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
         ],
         cwd: wt.path,
         projectRootPath: ws.repoPath,
+        resuming: resume,
       });
       setPhase("ready");
     } catch (e) {
@@ -142,6 +146,7 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
               command={spawn.command}
               args={spawn.args}
               cwd={spawn.cwd}
+              resuming={spawn.resuming}
               active={visible}
               onStatus={(s) => setStatus(SPARKLE_AGENT_ID, s)}
               onReady={() => setPtyReady(true)}

@@ -177,6 +177,11 @@ interface RuntimeState {
 
   open: (agentId: string) => void;
   close: (agentId: string) => void;
+  /** Clear an agent's live status + branch status + workflow stage/shipped watermark WITHOUT
+   *  removing it from the open set. Called when a slot starts a FRESH run (nothing to resume) so a
+   *  reused worktree doesn't inherit the prior occupant's progress (incl. the sticky "shipped ✓").
+   *  Unlike `close`, the pane stays mounted; the new session repopulates status from its own hooks. */
+  resetProgress: (agentId: string) => void;
   setStatus: (agentId: string, status: AgentTabStatus) => void;
   setBranchStatus: (agentId: string, s: BranchStatus) => void;
   setWorkflowStage: (agentId: string, stage: WorkflowStageId) => void;
@@ -228,6 +233,16 @@ export const useRuntimeStore = create<RuntimeState>()(
             workflowStage,
             workflowShipped,
           };
+        }),
+
+      resetProgress: (agentId) =>
+        set((s) => {
+          const { [agentId]: _st, ...status } = s.status;
+          const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
+          const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
+          const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
+          // Note: openAgentIds is intentionally untouched — the pane stays mounted for the new run.
+          return { status, branchStatus, workflowStage, workflowShipped };
         }),
 
       setStatus: (agentId, status) =>

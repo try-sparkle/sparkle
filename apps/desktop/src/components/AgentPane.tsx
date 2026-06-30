@@ -11,6 +11,7 @@ import { resolveDefaultBranch } from "../services/branchStatus";
 import { useAiFeature } from "../services/aiGate";
 import { checkClaude, claudeHasSession, claudeLatestSessionId } from "../preflight";
 import { buildClaudeExec, SHELL } from "../services/claudeSpawn";
+import { shouldResetReusedSlotIdentity } from "../services/slotIdentity";
 import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult, orchestrationPersona } from "../services/buildAgent";
 import {
   startOrchestrationBridge,
@@ -64,6 +65,9 @@ interface SpawnCmd {
   command: string;
   args: string[];
   cwd: string;
+  // Whether this spawn resumes a prior Claude session (`claude --resume`) vs starts fresh. Passed to
+  // the Terminal so its loading affordance reads "Resuming conversation…" vs "Starting Claude…".
+  resuming: boolean;
 }
 
 export function AgentPane({
@@ -235,6 +239,7 @@ export function AgentPane({
         command: SHELL,
         args: buildShellSpawnArgs(SHELL, cmd),
         cwd: project.rootPath,
+        resuming: false, // a raw command run, never a Claude session resume
       });
       setPhase("ready");
       return;
@@ -326,7 +331,16 @@ export function AgentPane({
       // Pass the chosen account's config dir so resume detection looks under the SAME account the
       // spawn will use (CLAUDE_CONFIG_DIR is set on the child only — see the spec's integration
       // subtlety). Undefined configDir → Rust falls back to Sparkle's process env (prior behavior).
-      const resume = await claudeHasSession(wt.path, configDir).catch(() => false);
+      // Distinguish a CONFIDENT "no session" from a probe that threw: both leave `resume` false (so
+      // the spawn still falls back to a fresh `claude`), but only the confident case may trigger the
+      // identity reset below — a transient failure must not wipe a historied slot (roborev 16238).
+      let resume = false;
+      let sessionDetectionConfident = true;
+      try {
+        resume = await claudeHasSession(wt.path, configDir);
+      } catch {
+        sessionDetectionConfident = false;
+      }
       // Resume by session id so Claude visibly REDRAWS the prior conversation on reopen, rather than
       // `--continue`'s blank prompt (bead sparkle-wwg7). Only look it up when resuming; null on any
       // failure → buildClaudeExec falls back to `--continue`. Use the SAME configDir as the session
@@ -343,6 +357,16 @@ export function AgentPane({
       // newer `false` and skip the result log. This only loses a console line on an
       // improbable reopen-while-running race; per-result tracking is deferred to Plan 2.
       wasFreshLaunchRef.current = !resume;
+      // Fresh start (confidently nothing to `claude --resume`) in this slot: if the worktree was
+      // wiped+recreated and reused, the persisted auto-name and the sticky workflow progress belong
+      // to the PRIOR occupant. Clear them so the new session doesn't come up wearing a stale identity
+      // (the "named, working agent next to an empty terminal" report). Gated on a CONFIDENT
+      // no-session result (never a probe failure), and no-op on a true first launch (nothing to
+      // reset) and on a resume.
+      if (shouldResetReusedSlotIdentity(resume, sessionDetectionConfident)) {
+        useProjectStore.getState().resetAutoName(project.id, agent.id);
+        useRuntimeStore.getState().resetProgress(agent.id);
+      }
       let exec: string;
       if (agent.kind === "worker") {
         // The persona's parentBranch is the PARENT build agent's branch (what the worker was cut
@@ -397,8 +421,8 @@ export function AgentPane({
             ownBranch: wt.branch,
             maxConcurrentWorkers: useSettingsStore.getState().maxConcurrentWorkers,
           });
-          setSpawn(
-            assembleBuildSpawn({
+          setSpawn({
+            ...assembleBuildSpawn({
               claudePath: claude.path,
               resume,
               cwd: wt.path,
@@ -408,7 +432,8 @@ export function AgentPane({
               configDir,
               resumeSessionId,
             }),
-          );
+            resuming: resume,
+          });
           setPhase("ready");
           return;
         } catch (e) {
@@ -426,6 +451,7 @@ export function AgentPane({
         command: SHELL,
         args: ["-l", "-c", exec],
         cwd: wt.path,
+        resuming: resume,
       });
       setPhase("ready");
     } catch (e) {
@@ -567,6 +593,7 @@ export function AgentPane({
               command={spawn.command}
               args={spawn.args}
               cwd={spawn.cwd}
+              resuming={spawn.resuming}
               active={visible}
               onStatus={(s) => routerRef.current!.fromScreen(s)}
               onReady={() => setPtyReady(true)}

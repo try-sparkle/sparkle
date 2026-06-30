@@ -87,6 +87,7 @@ export function Terminal({
   onRequestFocus,
   focusRef,
   apiRef,
+  resuming = false,
 }: {
   agentId: string;
   projectId: string;
@@ -95,6 +96,11 @@ export function Terminal({
   args: string[];
   cwd: string;
   active: boolean;
+  // Whether this spawn resumes a prior Claude session (`claude --resume`) vs starts fresh. Drives
+  // the loading affordance shown until the first PTY byte: a `--resume` redraw of a large transcript
+  // (or a fresh Claude's banner load) leaves the pane blank for seconds, which — next to a sidebar
+  // already showing a named, working agent — reads as broken. Defaults false (fresh).
+  resuming?: boolean;
   onStatus: (s: AgentTabStatus) => void;
   onReady?: () => void;
   onExit?: () => void;
@@ -138,6 +144,11 @@ export function Terminal({
   const copiedTimer = useRef<number | null>(null);
   // Floating actions for the current selection — anchored at the mouse-up point.
   const [popup, setPopup] = useState<{ x: number; y: number; text: string } | null>(null);
+  // False until the first PTY byte lands for this agent. While false we overlay a "Resuming…/
+  // Starting…" affordance so the unavoidable blank between spawn and Claude's first output (a
+  // `--resume` transcript redraw can take seconds) reads as loading, not broken. agentId is stable
+  // for this component's life, so this flips once and stays.
+  const [firstOutput, setFirstOutput] = useState(false);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -391,6 +402,9 @@ export function Terminal({
     void (async () => {
       const offOut = await onPtyOutput((e) => {
         if (e.id !== agentId) return;
+        // First byte for this agent — drop the loading overlay. setState bails on an unchanged
+        // value, so calling this on every subsequent chunk costs nothing.
+        setFirstOutput(true);
         term.write(e.chunk);
         engine.ingest(e.chunk);
         watchRateLimit(e.chunk);
@@ -401,6 +415,10 @@ export function Terminal({
       });
       const offExit = await onPtyExit((e) => {
         if (e.id !== agentId) return;
+        // Drop the loading overlay even if the process exited WITHOUT ever emitting output (e.g. a
+        // silent raw-command shell agent) — otherwise "Starting…" would linger forever over a
+        // finished, blank terminal.
+        setFirstOutput(true);
         engine.exit();
         onExit?.();
       });
@@ -567,6 +585,30 @@ export function Terminal({
       style={{ position: "relative", width: "100%", height: "100%" }}
     >
       <div ref={containerRef} style={{ width: "100%", height: "100%", overflow: "hidden" }} />
+      {/* Loading affordance over the still-blank terminal, from spawn until the first PTY byte.
+          A `claude --resume` redraw (or a fresh Claude's banner load) leaves the pane empty for a
+          few seconds; with the sidebar already showing a named, working agent, that blank reads as
+          broken (the empty-cloud-code report). pointer-events:none so it never blocks; it's gone the
+          instant output streams. */}
+      {!firstOutput && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: C.cream,
+            fontFamily: '"IBM Plex Sans", sans-serif',
+            fontSize: 13,
+            opacity: 0.6,
+            pointerEvents: "none",
+            zIndex: 5,
+          }}
+        >
+          {resuming ? "Resuming conversation…" : "Starting…"}
+        </div>
+      )}
       {/* Copy-to-clipboard flash. Fades out via opacity; pointer-events:none so it never
           intercepts a selection drag underneath it. */}
       <div
