@@ -251,6 +251,20 @@ export function Terminal({
     }
     termRef.current = term;
     fitRef.current = fit;
+    // The terminal opens — and starts writing PTY output — BEFORE the async webfont (Source Code
+    // Pro, loaded from Google Fonts with display=swap) necessarily finishes downloading; on a cold
+    // launch a lot of output can stream in that window. The WebGL renderer rasterizes those glyphs
+    // with the FALLBACK font into its texture atlas and never rebuilds it when the real font swaps
+    // in (xterm doesn't invalidate the atlas on font load), so they render with wrong metrics or
+    // drop out entirely. Force one full repaint (clears the atlas → every cell re-rasterizes with
+    // the now-loaded font) once fonts are ready. Guarded so a late resolve can't paint into a
+    // disposed terminal. document.fonts is absent in some test/headless envs — skip there.
+    if (typeof document !== "undefined" && document.fonts?.ready) {
+      void document.fonts.ready.then(() => {
+        if (disposedRef.current) return;
+        forceFullRepaint(webglRef.current, termRef.current);
+      });
+    }
     // Expose this agent's terminal history so the relay can send it to a watching phone.
     const unregisterScrollback = registerScrollback(agentId, () =>
       serializeScrollback(term.buffer.active),
@@ -336,6 +350,19 @@ export function Terminal({
     // lives) we take the wheel back and scroll xterm ourselves; on the ALTERNATE
     // buffer (full-screen TUIs with no scrollback) we let the app keep the wheel so
     // its own mouse handling still works.
+    // A scrollback scroll can leave stale glyph fragments behind under the WebGL renderer (its
+    // per-cell model cache + glyph atlas aren't fully invalidated by scrollLines/scrollToLine),
+    // showing as leftover characters in the margins. Force a full repaint shortly after scrolling
+    // settles — debounced so a flick of the wheel pays one repaint, not one per tick. The
+    // disposedRef guard + forceFullRepaint's own try/catch keep a late timer off a torn-down term.
+    let scrollRepaintTimer: number | null = null;
+    const scheduleScrollRepaint = () => {
+      if (scrollRepaintTimer) window.clearTimeout(scrollRepaintTimer);
+      scrollRepaintTimer = window.setTimeout(() => {
+        if (disposedRef.current) return;
+        forceFullRepaint(webglRef.current, termRef.current);
+      }, 80);
+    };
     let wheelCarry = 0;
     term.attachCustomWheelEventHandler((e) => {
       if (term.buffer.active.type !== "normal") {
@@ -348,7 +375,10 @@ export function Terminal({
       const cellHeight = term.element ? term.element.clientHeight / term.rows : 0;
       const { lines, carry } = wheelToScrollLines(e, cellHeight, term.rows, wheelCarry);
       wheelCarry = carry;
-      if (lines !== 0) term.scrollLines(lines);
+      if (lines !== 0) {
+        term.scrollLines(lines);
+        scheduleScrollRepaint();
+      }
       return false; // handled here — don't forward the wheel to the app
     });
 
@@ -391,6 +421,7 @@ export function Terminal({
           // Land the turn a couple rows below the top edge so there's a little lead-in context
           // instead of the prompt sitting flush against the viewport top.
           term.scrollToLine(Math.max(0, marker.line - SCROLL_LEAD_IN_ROWS));
+          scheduleScrollRepaint(); // clear any stale cells the jump leaves behind (WebGL)
           return "scrolled";
         },
       };
@@ -556,6 +587,7 @@ export function Terminal({
       container.removeEventListener("mouseup", onMouseUp);
       container.removeEventListener("mousedown", onMouseDown);
       if (settleRepaintTimer) window.clearTimeout(settleRepaintTimer);
+      if (scrollRepaintTimer) window.clearTimeout(scrollRepaintTimer);
       if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
       for (const off of unlistens) void safeUnlisten(off);
       void killPty(agentId).catch(ignorePtyGone);
