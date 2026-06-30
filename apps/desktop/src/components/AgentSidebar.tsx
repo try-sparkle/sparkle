@@ -1641,10 +1641,11 @@ function AgentRow({
                 userSelect: orderedIndex != null && !editing ? "none" : undefined,
                 background: cardBg,
                 // The card fill is the terminal's own color so it reads as part of the terminal; a
-                // 2px border in the SIDEBAR color (C.deepForest, lighter than C.forest) then outlines
+                // 4px border in the SIDEBAR color (C.deepForest, lighter than C.forest) then outlines
                 // the card shape so its text is distinguishable from the terminal text behind it.
-                // Hover-only (non-active) cards keep the thin forest border on their bubble fill.
-                border: `${mergeIntoTerminal ? "2px" : "1px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
+                // (Doubled from 2px so the card is easier to tell apart from the terminal content.)
+                // Hover-only (non-active) cards keep the thinner forest border on their bubble fill.
+                border: `${mergeIntoTerminal ? "4px" : "2px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
                 borderRadius: "8px 8px 0 8px",
               }}
             >
@@ -1662,11 +1663,19 @@ function AgentRow({
               style={{
                 pointerEvents: "auto",
                 boxSizing: "border-box",
-                marginLeft: colW,
-                // Lap the strip's bottom border (2px when active, else 1px) so the two halves read
+                // Offset right by the column width so the detail drops on the terminal side — but lap
+                // 8px back over the column when active, so the active card overlaps the first column
+                // by the same ~8px the inactive (hover-only) card already does. (The active in-flow
+                // row's marginRight:-8 widens its measured colW by 8px, so without this it would land
+                // flush at the sidebar edge with no overlap, unlike the inactive card.)
+                marginLeft: mergeIntoTerminal ? colW - 8 : colW,
+                // Lap the strip's bottom border (4px when active, else 2px) so the two halves read
                 // as one continuous outline.
-                marginTop: mergeIntoTerminal ? -2 : -1,
-                width: ext,
+                marginTop: mergeIntoTerminal ? -4 : -2,
+                // When the active card laps 8px back over the column (marginLeft above), widen by the
+                // same 8px so its RIGHT edge stays anchored at the terminal edge — the card grows into
+                // the column rather than sliding left and pulling short on the right.
+                width: mergeIntoTerminal ? ext + 8 : ext,
                 userSelect: orderedIndex != null && !editing ? "none" : undefined,
                 // flex-shrink + scroll within the wrapper's maxH budget (minus the strip), so the
                 // detail's scroll boundary lands inside the viewport even for a tall card.
@@ -1676,11 +1685,11 @@ function AgentRow({
                 padding: "2px 10px 8px",
                 cursor: "pointer",
                 background: cardBg,
-                // Same outline as the strip (2px sidebar color when active) continues down the L's
+                // Same outline as the strip (4px sidebar color when active) continues down the L's
                 // left/right/bottom so the whole card is encapsulated against the terminal behind it.
-                borderLeft: `${mergeIntoTerminal ? "2px" : "1px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
-                borderRight: `${mergeIntoTerminal ? "2px" : "1px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
-                borderBottom: `${mergeIntoTerminal ? "2px" : "1px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
+                borderLeft: `${mergeIntoTerminal ? "4px" : "2px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
+                borderRight: `${mergeIntoTerminal ? "4px" : "2px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
+                borderBottom: `${mergeIntoTerminal ? "4px" : "2px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
                 borderRadius: "0 0 8px 8px",
               }}
             >
