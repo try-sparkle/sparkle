@@ -61,6 +61,32 @@ describe("mightNeedFollowup (local fast-path)", () => {
     expect(mightNeedFollowup(lead + body + tail)).toBe(false);
   });
 
+  it("flags a sign-off ask buried above a long forward-looking tail (real screenshot-2: 'for your sign-off' / 'Once you confirm…')", () => {
+    // The Menu-Bar Agent Monitor design: the ask sits near the TOP ("present it in sections for
+    // your sign-off", "Does this overall shape look right…?"), then a long tail enumerates the
+    // work still to come, pushing the question out of TAIL_CHARS. The whole-message GATING scan
+    // ("for your sign-off" / "Once you confirm…") must still take this red. (tune-coloring)
+    const msg =
+      "I have everything I need to design this. Let me present it in sections for your sign-off.\n\n" +
+      "Design — Sparkle Menu-Bar Agent Monitor\n\n" +
+      "A new macOS menu-bar extra plus a borderless popover window that mirrors the mobile " +
+      "Dashboard. " +
+      "Does this overall shape look right before I detail the pieces?\n\n" +
+      "Once you confirm, the remaining sections I'll lay out are: (2) the menu-bar image rendering " +
+      "+ counts, (3) the popover window (positioning, show/hide-on-blur, capabilities), (4) the " +
+      "mobile-faithful panel UI reusing the existing desktop StatusDot/workflow/elapsed pieces, " +
+      "and (5) the cross-window aggregation + click-to-open flow and how I'll test each layer.";
+    expect(mightNeedFollowup(msg)).toBe(true);
+  });
+
+  it("flags a gated hand-back even when the tail is a pure work-to-come list with no '?'", () => {
+    const lead = "Here's the architecture. ";
+    const body = "It merges every window's roster slice into one global roster. ".repeat(30);
+    // Tail has NO question mark and NO tail proposal phrase — only the gating phrase up top saves it.
+    const tail = "Once you approve, I'll detail sections two through five and write the spec.";
+    expect(mightNeedFollowup("It looks ready for your sign-off. " + lead + body + tail)).toBe(true);
+  });
+
   it("returns false for empty / whitespace", () => {
     expect(mightNeedFollowup("")).toBe(false);
     expect(mightNeedFollowup("   \n  ")).toBe(false);

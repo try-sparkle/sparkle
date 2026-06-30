@@ -47,6 +47,31 @@ const PROPOSAL_PHRASES = [
   "waiting for your",
 ];
 
+// High-signal "the next step is GATED on you" phrases — the agent has explicitly parked the work
+// behind your sign-off, confirmation, or approval. Unlike PROPOSAL_PHRASES these are scanned over
+// the WHOLE message, not just the tail (tune-coloring): a long, genuinely-blocked turn routinely
+// buries the ask ("…present it in sections for your sign-off." / "Once you confirm, I'll lay out
+// the rest…") ABOVE a forward-looking tail that enumerates the work still to come — pushing both
+// the ask and its '?' out of the TAIL_CHARS window, so the tail scan misses it and the turn wrongly
+// stays gray. (Real screenshot: a design handed back "for your sign-off" with the question above a
+// ~450-char "Once you confirm…" tail read gray instead of red.) These phrases carry almost no
+// false-positive risk in a plain completion report — a DONE turn doesn't say "for your sign-off" —
+// so a whole-message match is safe even on the keyless fail-closed-to-red path.
+const GATING_PHRASES = [
+  "your sign-off",
+  "your signoff",
+  "for sign-off",
+  "for signoff",
+  "for your approval",
+  "pending your",
+  "once you confirm",
+  "once you've confirmed",
+  "once you sign off",
+  "once you've signed off",
+  "once you approve",
+  "once you've approved",
+];
+
 /**
  * LOCAL fast-path: could this finished turn plausibly be blocked on the user — i.e. is it worth a
  * judge call? True when the tail contains a question mark OR a proposal/hand-back phrase. False for
@@ -59,7 +84,12 @@ const PROPOSAL_PHRASES = [
 export function mightNeedFollowup(response: string): boolean {
   const text = response.trim();
   if (!text) return false;
-  const tail = text.slice(-TAIL_CHARS).toLowerCase();
+  const lower = text.toLowerCase();
+  // Whole-message scan first: a high-signal "gated on your sign-off/confirm/approve" phrase can
+  // sit far above the tail in a long, blocked turn, so it must NOT be limited to TAIL_CHARS.
+  if (GATING_PHRASES.some((p) => lower.includes(p))) return true;
+  // Tail scan: a closing '?' or a proposal/hand-back phrase in the last lines of the turn.
+  const tail = lower.slice(-TAIL_CHARS);
   if (tail.includes("?")) return true;
   return PROPOSAL_PHRASES.some((p) => tail.includes(p));
 }
