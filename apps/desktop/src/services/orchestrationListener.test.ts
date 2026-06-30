@@ -96,6 +96,71 @@ describe("orchestrationListener", () => {
     expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
   });
 
+  it("self-heals: a materialized worker that isn't open is auto-opened on a store change", async () => {
+    // Simulate a worker that was spawned + had its worktree cut but never made it into openAgentIds
+    // (the reconcile/remount eviction strand) — the listener's subscription must re-open it. The
+    // orchestrator must be live for the heal to apply (a worker is live iff its orchestrator is).
+    useRuntimeStore.getState().open(buildId);
+    const ps = useProjectStore.getState();
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId });
+    ps.setAgentWorktree(projectId, workerId, "/wt/heal", "sparkle/agent-heal");
+    await flush();
+    expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
+  });
+
+  it("self-heals after an EVICTION: re-opens a worker removed from openAgentIds", async () => {
+    useRuntimeStore.getState().open(buildId);
+    const ps = useProjectStore.getState();
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId });
+    ps.setAgentWorktree(projectId, workerId, "/wt/evict", "sparkle/agent-evict");
+    await flush();
+    expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
+    // A reconcile() race strips the worker from the cross-window-shared open set (the orchestrator
+    // stays open)…
+    useRuntimeStore.setState({ openAgentIds: [buildId] });
+    await flush();
+    // …and the runtimeStore subscription heals it back.
+    expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
+  });
+
+  it("does NOT re-open a worker mid-teardown (spin_down close()→removeAgent() leaves no ghost id)", async () => {
+    // The heal is deferred to a microtask so it sees the END of a synchronous mutation batch. A
+    // teardown closes the worker then removes it from `agents` in the same tick; by the time the
+    // microtask runs the worker is gone, so it must NOT be re-opened (which would leak a stale id
+    // into openAgentIds, since removeAgent doesn't touch the open set).
+    const rt = useRuntimeStore.getState();
+    rt.open(buildId);
+    const ps = useProjectStore.getState();
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId });
+    ps.setAgentWorktree(projectId, workerId, "/wt/td", "sparkle/agent-td");
+    await flush();
+    expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
+    // Mirror spinDownWorker's synchronous close()-then-removeAgent() teardown.
+    useRuntimeStore.getState().close(workerId);
+    useProjectStore.getState().removeAgent(projectId, workerId);
+    await flush();
+    expect(useRuntimeStore.getState().openAgentIds).not.toContain(workerId);
+  });
+
+  it("does NOT auto-open a worker whose orchestrator is closed (e.g. relocating the project)", async () => {
+    // buildId is NOT opened: the worker is materialized but its orchestrator isn't live, so the
+    // self-heal must leave it alone instead of fighting a deliberate teardown.
+    const ps = useProjectStore.getState();
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId });
+    ps.setAgentWorktree(projectId, workerId, "/wt/closed", "sparkle/agent-closed");
+    await flush();
+    expect(useRuntimeStore.getState().openAgentIds).not.toContain(workerId);
+  });
+
+  it("does NOT auto-open a worker whose worktree was never cut (mid-spawn / queued)", async () => {
+    useRuntimeStore.getState().open(buildId);
+    const ps = useProjectStore.getState();
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId }); // no worktree
+    ps.selectAgent(projectId, buildId); // force a store change to run the heal
+    await flush();
+    expect(useRuntimeStore.getState().openAgentIds).not.toContain(workerId);
+  });
+
   it("list_workers → replies with this build agent's workers only", async () => {
     fire({ reqId: "s1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "a" } });
     await flush();

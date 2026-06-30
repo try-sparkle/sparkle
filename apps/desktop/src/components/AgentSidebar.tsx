@@ -32,6 +32,7 @@ import { useBeadsStore } from "../stores/beadsStore";
 import { beadLabel, epicForBuild } from "../services/planView";
 import { type Bead } from "../services/beads";
 import { orderedTopLevelAgents } from "../engine/agentOrdering";
+import { withUnstartedWorkerAttention } from "../engine/workerAttention";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
 import { LogoWaveform } from "./LogoWaveform";
@@ -222,7 +223,19 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const removeAgent = useProjectStore((s) => s.removeAgent);
   const open = useRuntimeStore((s) => s.open);
   const close = useRuntimeStore((s) => s.close);
-  const status = useRuntimeStore((s) => s.status);
+  const liveStatus = useRuntimeStore((s) => s.status);
+  const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
+  // A spawned-but-never-started worker has no live status, so it (and the orchestrator it's
+  // blocking) would render GRAY. Overlay RED ("Approve?") on the strand and bubble it to the parent
+  // so the orchestrator row goes red — matching the TopBar dot cluster. No-op (same ref) when
+  // nothing is stranded.
+  const status = useMemo(
+    () =>
+      project
+        ? withUnstartedWorkerAttention(project.agents, liveStatus, new Set(openAgentIds))
+        : liveStatus,
+    [project, liveStatus, openAgentIds],
+  );
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
   const workflowShipped = useRuntimeStore((s) => s.workflowShipped);

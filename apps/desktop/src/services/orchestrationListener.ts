@@ -14,6 +14,7 @@ import { spawnWorker, spinDownWorker } from "./workerSpawn";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore } from "../stores/settingsStore";
+import { workersNeedingOpen } from "../engine/workerAttention";
 
 const EVENT = "orchestration:request";
 
@@ -27,6 +28,7 @@ export interface OrchestrationRequest {
 
 let unlisten: UnlistenFn | undefined;
 let unsubStore: (() => void) | undefined;
+let unsubRuntime: (() => void) | undefined;
 // Single-flight start guard: a promise shared by every caller so two concurrent first-callers can't
 // both register a listener (which would double-dispatch every event → doubled spawns). Reset by
 // cleanup so a later start (e.g. after HMR) can re-arm.
@@ -195,6 +197,46 @@ async function drainQueue(): Promise<void> {
   }
 }
 
+/** Self-healing invariant: re-open any worker that was spawned + had its worktree cut but is no
+ *  longer live (not in openAgentIds, no PTY status). runSpawn open()s a worker exactly once at spawn;
+ *  if a reconcile()/remount race then evicts it from the cross-window-shared openAgentIds before its
+ *  pane mounts, that one-shot is silently undone and the worker strands behind "Start this agent",
+ *  blocking its orchestrator with no signal. Re-asserting open() converges the system back to "every
+ *  materialized worker is live", regardless of which race evicted it. Opening is idempotent and
+ *  bounded — once re-opened the worker has a status entry, so it isn't re-opened again (and the
+ *  per-build-agent cap already counts these workers, so this can't exceed it). */
+function ensureWorkersOpen(): void {
+  const { projects } = useProjectStore.getState();
+  const rt = useRuntimeStore.getState();
+  const openIds = new Set(rt.openAgentIds);
+  for (const project of projects) {
+    for (const worker of workersNeedingOpen(project.agents, rt.status, openIds)) {
+      console.debug("[orchestration] re-opening stranded worker", worker.id);
+      rt.open(worker.id);
+      openIds.add(worker.id); // keep the local view current so a strand isn't opened twice
+    }
+  }
+}
+
+// True while the listener is started; a heal microtask scheduled just before teardown bails on it.
+let listenerLive = false;
+let healPending = false;
+/** Run ensureWorkersOpen on a microtask, coalescing a burst of store changes into one pass. The
+ *  deferral is load-bearing: it observes the END of the current synchronous store-mutation batch, so
+ *  it can tell a reconcile EVICTION (the worker stays in `agents` → re-open it) apart from a TEARDOWN
+ *  (spin_down / project relocation call close() THEN removeAgent() synchronously → by the microtask
+ *  the worker is gone from `agents` → leave it alone). A synchronous heal would instead race the
+ *  close() notification and re-open a worker that's being removed, leaking a ghost id into
+ *  openAgentIds on every spin-down. The deferral also removes the open()→notify→heal re-entrancy. */
+function scheduleEnsureWorkersOpen(): void {
+  if (healPending) return;
+  healPending = true;
+  queueMicrotask(() => {
+    healPending = false;
+    if (listenerLive) ensureWorkersOpen();
+  });
+}
+
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -220,10 +262,13 @@ function dispatch(req: OrchestrationRequest): void {
 function teardown(): void {
   // safeUnlisten swallows the Tauri teardown race (window close / HMR tearing down the listeners
   // map) so cleanup can't surface as an unhandled rejection.
+  listenerLive = false; // a heal microtask already queued will see this and bail
   void safeUnlisten(unlisten);
   unlisten = undefined;
   unsubStore?.();
   unsubStore = undefined;
+  unsubRuntime?.();
+  unsubRuntime = undefined;
   for (const req of spawnQueue) {
     void respond(req.reqId, { error: "orchestration listener stopped" });
   }
@@ -234,8 +279,23 @@ function teardown(): void {
 
 async function doStart(): Promise<() => void> {
   unlisten = await listen<OrchestrationRequest>(EVENT, (event) => dispatch(event.payload));
-  // A worker leaving the store (spin_down, or a human closing a tab) may free a capped slot.
-  unsubStore = useProjectStore.subscribe(() => void drainQueue());
+  // A projectStore change can mean a worker left (spin_down → free a capped slot → drainQueue) or a
+  // worker's worktree just got cut (→ ensure it's open). Both run on every change.
+  listenerLive = true;
+  unsubStore = useProjectStore.subscribe(() => {
+    void drainQueue();
+    scheduleEnsureWorkersOpen();
+  });
+  // The eviction that strands a worker mutates runtimeStore.openAgentIds, NOT projectStore — so the
+  // projectStore subscription alone would miss it. Re-assert the self-healing invariant whenever the
+  // open set changes (gated to that slice so frequent status/branch ticks don't trigger a re-scan).
+  let prevOpen = useRuntimeStore.getState().openAgentIds;
+  unsubRuntime = useRuntimeStore.subscribe((s) => {
+    if (s.openAgentIds === prevOpen) return;
+    prevOpen = s.openAgentIds;
+    scheduleEnsureWorkersOpen();
+  });
+  scheduleEnsureWorkersOpen(); // heal anything already stranded when the listener (re)starts
   return teardown;
 }
 

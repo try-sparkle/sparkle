@@ -1,4 +1,4 @@
-import { useState, useEffect, type CSSProperties } from "react";
+import { useState, useEffect, useMemo, type CSSProperties } from "react";
 import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, statusInk } from "../theme/colors";
 import type { AgentTabStatus, Project } from "../types";
 import { SettingsDialog } from "./SettingsDialog";
@@ -6,6 +6,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { orderedTopLevelAgents } from "../engine/agentOrdering";
+import { withUnstartedWorkerAttention } from "../engine/workerAttention";
 import { pickProjectFolder, basename } from "../services/dialog";
 import { openProjectInWindow, defaultDeps, type OpenMode } from "../services/projectWindows";
 import { findWindowForProject } from "../services/windowRegistry";
@@ -100,6 +101,13 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const replaceCurrent = useReplaceCurrentProject();
   const windowLabel = useCurrentWindowLabel();
   const statusMap = useRuntimeStore((s) => s.status);
+  const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
+  // A spawned-but-never-started worker has no live status, so it would render GRAY and hide the
+  // fact that it's blocking its orchestrator. Overlay RED on it and its parent before computing any
+  // dot/summary color, so the block surfaces at the top. Per-project (openAgentIds is global).
+  const openSet = useMemo(() => new Set(openAgentIds), [openAgentIds]);
+  const effStatus = (p: Project): Record<string, AgentTabStatus> =>
+    withUnstartedWorkerAttention(p.agents, statusMap, openSet);
   const workMode = useUiStore((s) => s.workMode);
   const agentOrdering = useUiStore((s) => s.agentOrdering);
   const [recentOpen, setRecentOpen] = useState(false);
@@ -130,6 +138,14 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   >(null);
 
   const project = projects.find((p) => p.id === currentProjectId) ?? null;
+  // The current project's dot, label, and cluster all read this — compute the overlay once instead
+  // of re-spreading the status map on each call (the recent-project rows use effStatus directly; they
+  // only render while the menu is open).
+  const currentEff = useMemo(
+    () => (project ? effStatus(project) : {}),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [project, statusMap, openSet],
+  );
   // Recent first (most recently opened), so the "Recent Projects" label is honest.
   const recent = [...projects].sort((a, b) =>
     (b.lastOpenedAt ?? b.createdAt).localeCompare(a.lastOpenedAt ?? a.createdAt),
@@ -200,10 +216,10 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
               padding: "2px 4px",
             }}
           >
-            <StatusDot status={majorityStatus(project, statusMap)} size={10} />
+            <StatusDot status={majorityStatus(project, currentEff)} size={10} />
             <span
               style={{
-                color: statusInk(AGENT_STATUS[majorityStatus(project, statusMap)].color),
+                color: statusInk(AGENT_STATUS[majorityStatus(project, currentEff)].color),
                 fontSize: 15,
                 fontWeight: FONT_WEIGHT.semibold,
               }}
@@ -212,7 +228,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
             </span>
           </button>
           <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            {agentDots(project, statusMap, workMode, agentOrdering === "attention").map((d) => (
+            {agentDots(project, currentEff, workMode, agentOrdering === "attention").map((d) => (
               <StatusDot key={d.id} status={d.status} size={7} shape={d.shape} />
             ))}
           </div>
@@ -284,7 +300,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
                       background: p.id === currentProjectId ? C.forest : "transparent",
                     }}
                   >
-                    <StatusDot status={majorityStatus(p, statusMap)} size={8} />
+                    <StatusDot status={majorityStatus(p, effStatus(p))} size={8} />
                     <span
                       style={{
                         flex: 1,
