@@ -39,9 +39,20 @@ const SYNC_GIVE_UP_FAILS = 10; // ~20 min of escalating retries (incl. a few at 
 const SYNC_GIVEUP_COOLDOWN_MS = 60 * 60_000; // …then back off to a quiet hourly re-probe.
 const syncBackoff = new Map<string, { until: number; fails: number }>();
 
+// :  bounded a CONSECUTIVE-failure streak (give up after 10 in a row). But an
+// intermittently flapping endpoint (fail → success → fail …) resets `fails` to 0 on every success
+// (syncBackoff is deleted), so the give-up transition is never reached and the `fails === 1`
+// first-failure line re-fires on every flap — real logs show this dribbling out for the app's
+// lifetime. We gate that line on a per-project quiet window that, unlike syncBackoff, is NOT cleared
+// by success, so a flapping endpoint logs at most once per window (you still get the unhealthy
+// signal, just not once per flap).
+const SYNC_FAIL_RELOG_QUIET_MS = 60 * 60_000;
+const syncFailLoggedAt = new Map<string, number>();
+
 /** Test-only: clear the Chief-sync backoff state between cases. */
 export function __resetChiefSyncBackoff(): void {
   syncBackoff.clear();
+  syncFailLoggedAt.clear();
 }
 
 // : once an agent's worktree is removed (agent cleanup), the 30s branch-status poll
@@ -145,9 +156,17 @@ export async function runChiefSync(projectId: string, agentId: string): Promise<
         : Math.min(SYNC_BACKOFF_BASE_MS * 2 ** (fails - 1), SYNC_BACKOFF_CAP_MS);
     syncBackoff.set(projectId, { until: Date.now() + delay, fails });
     // Bound the log: emit only on the first failure (the signal) and the give-up transition, not on
-    // every silent retry in between — that per-run flood is the whole bug ().
+    // every silent retry in between — that per-run flood is the whole bug (). The
+    // first-failure line is ALSO gated on a per-project quiet window (): an intermittent
+    // flap resets `fails` to 0 on each success, so without this the first-failure line re-fired on
+    // every flap and the give-up transition was never reached. The window is NOT cleared by success,
+    // so a flapping endpoint logs at most once per SYNC_FAIL_RELOG_QUIET_MS.
     if (fails === 1) {
-      console.debug("chief project sync failed for", projectId, "— backing off", e);
+      const lastLogged = syncFailLoggedAt.get(projectId) ?? 0;
+      if (Date.now() - lastLogged >= SYNC_FAIL_RELOG_QUIET_MS) {
+        syncFailLoggedAt.set(projectId, Date.now());
+        console.debug("chief project sync failed for", projectId, "— backing off", e);
+      }
     } else if (fails === SYNC_GIVE_UP_FAILS) {
       console.debug(
         "chief project sync giving up for",

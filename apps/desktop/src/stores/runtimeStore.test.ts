@@ -391,6 +391,46 @@ describe("runChiefSync — store glue ()", () => {
     }
   });
 
+  it("does not re-log the first-failure line on an intermittently flapping endpoint ()", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    runtime.__resetChiefSyncBackoff();
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    vi.useFakeTimers();
+    const syncLogCount = () =>
+      debug.mock.calls.filter(
+        (c) => typeof c[0] === "string" && c[0].includes("chief project sync"),
+      ).length;
+    try {
+      // Flap pattern: each failure is followed by a success, which clears the backoff and resets the
+      // consecutive-failure counter — so every failure is a fresh fails===1. 's give-up
+      // (10 in a row) is therefore never reached. Pre- this logged on every single flap.
+      for (let i = 0; i < 5; i++) {
+        syncProjectMarkdown.mockRejectedValueOnce(new TypeError("Load failed"));
+        await runtime.runChiefSync(projectId, agentId);
+        vi.advanceTimersByTime(10_000); // past the 5s base cooldown, far under the 1h relog window
+        syncProjectMarkdown.mockResolvedValueOnce({
+          chiefProjectId: "p",
+          docState: {},
+          uploaded: [],
+          deletedAssetIds: [],
+        });
+        await runtime.runChiefSync(projectId, agentId);
+        vi.advanceTimersByTime(10_000);
+      }
+      // Only the first flap's failure logged; the rest inside the quiet window are suppressed.
+      expect(syncLogCount()).toBe(1);
+
+      // Once the quiet window elapses, a fresh failure logs again — the unhealthy signal is preserved.
+      vi.advanceTimersByTime(60 * 60_000);
+      syncProjectMarkdown.mockRejectedValueOnce(new TypeError("Load failed"));
+      await runtime.runChiefSync(projectId, agentId);
+      expect(syncLogCount()).toBe(2);
+    } finally {
+      vi.useRealTimers();
+      debug.mockRestore();
+    }
+  });
+
   it("falls back to a workflow agent's worktree when triggered via a Think or Shell agent's id", async () => {
     const { runtime, settings, projects } = await freshModules();
     settings.useSettingsStore.getState().setChiefPat("pat_x");
