@@ -31,8 +31,9 @@ import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 import { useBeadsStore } from "../stores/beadsStore";
 import { beadLabel, epicForBuild } from "../services/planView";
 import { type Bead } from "../services/beads";
-import { orderedTopLevelAgents } from "../engine/agentOrdering";
+import { orderedTopLevelAgents, firstVisibleAgentId } from "../engine/agentOrdering";
 import { withUnstartedWorkerAttention } from "../engine/workerAttention";
+import { reconcileWorkMode } from "../engine/workMode";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
 import { LogoWaveform } from "./LogoWaveform";
@@ -394,10 +395,20 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const alreadyHere = mode === "think" && activeSpecial === null;
     setMode("think");
     setActiveSpecial(null);
-    if (!alreadyHere || !project) return;
-    const id = addAgent(project.id, { kind: "think" });
-    selectAgent(project.id, id);
-    open(id);
+    if (!project) return;
+    if (alreadyHere) {
+      // Second click on the active chevron: spawn a fresh agent of this kind (≡ the + button).
+      const id = addAgent(project.id, { kind: "think" });
+      selectAgent(project.id, id);
+      open(id);
+      return;
+    }
+    // Switching INTO Think: move selection to the first Think row so the pane matches the chevron
+    // (or clear it → the empty Think state). Without this the pane keeps rendering the previously
+    // selected build agent under a Think chevron.
+    const next = firstVisibleAgentId(project.agents, "think", agentOrdering, status);
+    selectAgent(project.id, next);
+    if (next) open(next);
   };
   const onPickPlan = () => {
     setMode("plan");
@@ -431,8 +442,17 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const alreadyHere = mode === "build" && activeSpecial === null;
     setMode("build");
     setActiveSpecial(null);
-    if (!alreadyHere || !project) return;
-    spawnBuildAgent();
+    if (!project) return;
+    if (alreadyHere) {
+      // Second click on the active chevron: spawn a fresh build agent (≡ the + button).
+      spawnBuildAgent();
+      return;
+    }
+    // Switching INTO Build: move selection to the first Build row so the pane matches the chevron
+    // (or clear it → the empty Build state with "+ New Build Agent").
+    const next = firstVisibleAgentId(project.agents, "build", agentOrdering, status);
+    selectAgent(project.id, next);
+    if (next) open(next);
   };
   const onAddBuild = () => {
     setActiveSpecial(null);
@@ -750,11 +770,18 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     if (id) teardownAgent(id); // a merged worker is safe to close outright
   };
   const onMergePromptKeep = () => setMergePromptId(null);
-  // Think is AI-feature-gated. If the gate turns off while Think mode is selected, the Think chevron
-  // disappears — fall back to Build so we're never stuck on a hidden mode with an empty sidebar.
+  // Keep the chevron coherent with what the main pane shows. The pane renders the SELECTED agent by
+  // its kind (think → ThinkPanel, else terminal), so the active mode must match the selected agent's
+  // kind — otherwise a cross-kind select (Ask-Sparkle from a build terminal, a notification/history
+  // jump, or a selection restored on boot) leaves the chevron pointing at the wrong section while
+  // that agent's pane is showing. reconcileWorkMode also subsumes the old brainstorm-gate fallback
+  // (never sit on a hidden Think chevron). It leaves Plan/Sparkle (activeSpecial) and the empty pane
+  // untouched. The chevron handlers move selection in the other direction, so the two converge.
   useEffect(() => {
-    if (!aiBrainstorm && mode === "think") setMode("build");
-  }, [aiBrainstorm, mode]);
+    const selKind = project?.agents.find((a) => a.id === project.selectedAgentId)?.kind;
+    const next = reconcileWorkMode(selKind, mode, activeSpecial !== null, aiBrainstorm);
+    if (next) setMode(next);
+  }, [project, aiBrainstorm, mode, activeSpecial, setMode]);
   // Top-level agents (group heads + orphaned workers), matching the list's isTopLevel logic. Used so
   // the per-mode empty hints key off the SAME set the list renders — never "No X agents" beside rows.
   const topLevelAgents = project
