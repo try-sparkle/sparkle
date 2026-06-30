@@ -411,3 +411,16 @@ describe("projectStore migration — brainstorm→think rename (v7)", () => {
     expect(out.projects[0]!.agents[1]!.kind).toBe("build");
   });
 });
+
+describe("setAgentBeadId", () => {
+  beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
+  it("attaches a bead id to an existing agent without disturbing others", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const a1 = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const a2 = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    useProjectStore.getState().setAgentBeadId(pid, a1, "bd-42");
+    const agents = useProjectStore.getState().projects[0]!.agents;
+    expect(agents.find((a) => a.id === a1)!.beadId).toBe("bd-42");
+    expect(agents.find((a) => a.id === a2)!.beadId).toBeUndefined();
+  });
+});

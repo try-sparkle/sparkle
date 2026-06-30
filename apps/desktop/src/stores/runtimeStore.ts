@@ -10,6 +10,8 @@ import type { BranchStatus } from "../services/branchStatus";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { agentBranchStatus, agentWorkflowState } from "../services/branchStatus";
 import { deriveLiveStage, stageIndex } from "../engine/workflowStage";
+import { claimBead, closeBead, labelBead, DELIVERED_LABEL } from "../services/beads";
+import { beadActionForStage } from "../services/planView";
 import { syncProjectMarkdown } from "../services/chiefSync";
 import { useSettingsStore, effectiveChiefPat } from "./settingsStore";
 import { useProjectStore } from "./projectStore";
@@ -292,7 +294,28 @@ export const useRuntimeStore = create<RuntimeState>()(
             // part of the Think→Plan→Build path rather than jumping straight to "building".
             hasBead: !!agent.beadId,
           });
-          if (next !== prev) get().setWorkflowStage(agentId, next);
+          if (next !== prev) {
+            get().setWorkflowStage(agentId, next);
+            // Programmatic bead status — advance the bead from this REAL stage transition, but ONLY
+            // on FORWARD motion. deriveLiveStage can drop `next` back to a building stage on a cycle
+            // reset; firing on that backward transition would re-`claim` (reopen) an already
+            // closed/delivered bead. Forward-only prevents the flip-flop (mirrors the sticky
+            // workflowShipped watermark below). Edge-triggered + idempotent + best-effort: a bead
+            // write must never break the poll.
+            const beadId = agent.beadId;
+            const prevIdx = prev ? stageIndex(prev) : -1;
+            if (beadId && stageIndex(next) > prevIdx) {
+              const action = beadActionForStage(next);
+              if (action === "claim") void claimBead(root, beadId).catch(() => {});
+              else if (action === "close") void closeBead(root, beadId).catch(() => {});
+              else if (action === "deliver") {
+                // Label FIRST (so a closed+delivered bead always carries the label), and fire both
+                // independently + best-effort so a transient failure of one doesn't skip the other.
+                void labelBead(root, "add", beadId, DELIVERED_LABEL).catch(() => {});
+                void closeBead(root, beadId).catch(() => {});
+              }
+            }
+          }
           // Sticky "shipped" watermark: latch true the first time work reaches On Main (or beyond).
           // It survives a later cycle reset (deriveLiveStage dropping `next` back to Committed), so the
           // row keeps its ✓ even while the bar re-climbs for new work.

@@ -6,6 +6,8 @@ import {
   beadLabel,
   epicForBuild,
   beadStage,
+  beadActionForStage,
+  needsClosePrompt,
 } from "./planView";
 import type { Bead, BeadStatus } from "./beads";
 import type { AgentTab } from "../types";
@@ -137,5 +139,37 @@ describe("beadStage — unified stage for a Plan card", () => {
   });
   it("a closed bead reads Merged even if a stale worker still reports an earlier stage", () => {
     expect(beadStage("closed", false, ["building_saved"])).toBe("merged");
+  });
+});
+
+describe("beadActionForStage — programmatic status from a stage transition", () => {
+  it("building/pushed/PR stages → claim (in_progress)", () => {
+    for (const s of ["building_unsaved", "building_saved", "pushed", "pull_request"] as const) {
+      expect(beadActionForStage(s)).toBe("claim");
+    }
+  });
+  it("merged → close, shipped → deliver", () => {
+    expect(beadActionForStage("merged")).toBe("close");
+    expect(beadActionForStage("shipped")).toBe("deliver");
+  });
+  it("planning stages → no write", () => {
+    for (const s of ["thought", "specd", "planned"] as const) {
+      expect(beadActionForStage(s)).toBeNull();
+    }
+  });
+});
+
+describe("needsClosePrompt — Ship/Save/Discard gating", () => {
+  it("prompts when there is unmerged build work", () => {
+    for (const s of ["building_unsaved", "building_saved", "pushed", "pull_request"] as const) {
+      expect(needsClosePrompt(s)).toBe(true);
+    }
+  });
+  it("closes silently for empty/planning or already merged/shipped work", () => {
+    for (const s of ["thought", "specd", "planned", "merged", "shipped"] as const) {
+      expect(needsClosePrompt(s)).toBe(false);
+    }
+    expect(needsClosePrompt(undefined)).toBe(false);
+    expect(needsClosePrompt(null)).toBe(false);
   });
 });

@@ -17,8 +17,8 @@ import type { BranchStatus } from "../services/branchStatus";
 import { refreshAgentTitle } from "../services/sessionTitle";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 import { useBeadsStore } from "../stores/beadsStore";
-import { beadLabel, epicForBuild } from "../services/planView";
-import type { Bead } from "../services/beads";
+import { beadLabel, epicForBuild, needsClosePrompt } from "../services/planView";
+import { closeBead, type Bead } from "../services/beads";
 import { orderAgents } from "../engine/agentOrdering";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
@@ -28,7 +28,9 @@ import { WorkflowLine } from "./WorkflowLine";
 import { HistorySearch } from "./HistorySearch";
 import { resolveStage, rollupStages, stageFraction, stageIndex } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import { createBeadFull } from "../services/tasks";
 import { CloseWorkerPrompt } from "./CloseWorkerPrompt";
+import { CloseAgentPrompt } from "./CloseAgentPrompt";
 import { BalanceBadge } from "./BalanceBadge";
 
 /**
@@ -133,6 +135,7 @@ const DASHED_ROW_STYLE: React.CSSProperties = {
 export function AgentSidebar({ project }: { project: Project | null }) {
   const selectAgent = useProjectStore((s) => s.selectAgent);
   const addAgent = useProjectStore((s) => s.addAgent);
+  const setAgentBeadId = useProjectStore((s) => s.setAgentBeadId);
   const removeAgent = useProjectStore((s) => s.removeAgent);
   const open = useRuntimeStore((s) => s.open);
   const close = useRuntimeStore((s) => s.close);
@@ -207,6 +210,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // AI Brainstorming feature gate (Use AI Features menu). Off → hide the ✦ Brainstorm button.
   const aiBrainstorm = useAiFeature("brainstorm");
   const [editing, setEditing] = useState<string | null>(null);
+  // Which agent the Ship/Save/Discard close prompt is asking about (null = no prompt).
+  const [closePromptId, setClosePromptId] = useState<string | null>(null);
 
   // Draggable column width — persisted to localStorage so it survives relaunch. Clamped to
   // a sane range so the column can't be dragged to nothing or take over the window.
@@ -274,21 +279,40 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     setMode("plan");
     setActiveSpecial("board");
   };
+  // Spawn a build agent AND auto-create a bead for it, so every piece of build work is tracked
+  // from the start (it floors at "Planned" until code work begins). The agent is created
+  // synchronously (immediately usable); the bead is created async + best-effort and attached when
+  // `bd` returns — a build agent without a bead is still fine if bd is unavailable.
+  const spawnBuildAgent = () => {
+    if (!project) return;
+    const proj = project;
+    const id = addAgent(proj.id, { kind: "build" });
+    selectAgent(proj.id, id);
+    open(id);
+    // Title the bead with the agent's (default) name so beads stay distinguishable on the board
+    // rather than a row of identical placeholders. (Syncing the title when the agent auto-renames
+    // from its first prompt is a follow-up.) Note: if the user removes the agent within the sub-
+    // second `bd create` window, the bead is orphaned — an accepted best-effort tradeoff that the
+    // Discard/prune flows mop up.
+    const title =
+      useProjectStore
+        .getState()
+        .projects.find((p) => p.id === proj.id)
+        ?.agents.find((a) => a.id === id)?.name ?? "Build task";
+    void createBeadFull(proj.rootPath, title, "", "task", "", "", "")
+      .then((beadId) => setAgentBeadId(proj.id, id, beadId))
+      .catch((e) => console.warn("auto-bead creation failed (bd unavailable?):", e));
+  };
   const onPickBuild = () => {
     const alreadyHere = mode === "build" && activeSpecial === null;
     setMode("build");
     setActiveSpecial(null);
     if (!alreadyHere || !project) return;
-    const id = addAgent(project.id, { kind: "build" });
-    selectAgent(project.id, id);
-    open(id);
+    spawnBuildAgent();
   };
   const onAddBuild = () => {
-    if (!project) return;
     setActiveSpecial(null);
-    const id = addAgent(project.id, { kind: "build" });
-    selectAgent(project.id, id);
-    open(id);
+    spawnBuildAgent();
   };
   const onSelectSparkle = () => {
     setActiveSpecial("sparkle");
@@ -298,8 +322,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // agent → the project's default branch. A local --no-ff merge (see Rust land_agent_branch); the
   // tracker then advances to On Main on the next poll. Best-effort feedback via console for now
   // (dirty/conflict/etc.) — a full toast is a follow-up, matching the refresh button's pattern.
-  const onLand = async (a: AgentTab) => {
-    if (!project) return;
+  const onLand = async (a: AgentTab): Promise<boolean> => {
+    if (!project) return false;
     // Build agents ALWAYS integrate into the project's default branch — regardless of the base they
     // were spawned from — because that's the ref "On Main"/"Merged" reachability is measured against
     // (Rust resolve_default_branch), so a successful Land actually advances the chevron to green. The
@@ -326,19 +350,63 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         const parent = project.agents.find((p) => p.id === a.parentId);
         void pollBranchStatus(project.rootPath, project.id, a.parentId, parent?.baseBranch ?? "");
       }
+      return true;
     } else {
       console.warn("land blocked:", r.reason, r.files ?? "");
+      return false;
     }
   };
-  const onClose = (id: string) => {
+  // The raw teardown: stop the PTYs + remove each worktree (the branch is KEPT), then remove the
+  // agent (cascades to its workers). This is "Keep it for later" / a silent close of empty work.
+  const doClose = (id: string) => {
     if (!project) return;
-    // Closing a build agent cascades to its workers in the store; clean up each one's worktree.
     const childIds = project.agents.filter((a) => a.parentId === id).map((a) => a.id);
     for (const cid of [id, ...childIds]) {
       close(cid);
       void removeAgentWorkspace(project.rootPath, project.id, cid).catch(() => {});
     }
     removeAgent(project.id, id);
+  };
+  const onClose = (id: string) => {
+    if (!project) return;
+    // If this agent has UNMERGED work, never silently destroy it — ask Ship / Save / Discard.
+    if (needsClosePrompt(stageOf(id))) {
+      setClosePromptId(id);
+      return;
+    }
+    doClose(id);
+  };
+  // Ship / Save / Discard handlers for the close prompt.
+  const closingAgent = project?.agents.find((a) => a.id === closePromptId) ?? null;
+  const onShipClose = async () => {
+    const a = closingAgent;
+    if (!a || !project) {
+      setClosePromptId(null);
+      return;
+    }
+    const landed = await onLand(a); // merge to main (logs the reason if blocked)
+    if (!landed) return; // land blocked (conflict/dirty/busy) — LEAVE the prompt open so the
+    // failure is visible and the user can resolve, or pick Keep-for-later / Discard instead.
+    setClosePromptId(null);
+    if (a.beadId)
+      void closeBead(project.rootPath, a.beadId).catch((e) => console.warn("bead close failed:", e));
+    doClose(a.id);
+  };
+  const onSaveClose = () => {
+    const a = closingAgent;
+    setClosePromptId(null);
+    if (a) doClose(a.id); // keeps the branch + leaves the bead on the Plan board at its stage
+  };
+  const onDiscardClose = () => {
+    const a = closingAgent;
+    setClosePromptId(null);
+    if (!a || !project) return;
+    // Stop tracking + discard unsaved changes: closeBead so it's not left tracked as open; the
+    // worktree --force in doClose discards uncommitted work. Committed work on the branch remains
+    // and is tidied up by the branch-prune flow (true branch-deletion on discard is a follow-up).
+    if (a.beadId)
+      void closeBead(project.rootPath, a.beadId).catch((e) => console.warn("bead close failed:", e));
+    doClose(a.id);
   };
 
   // "Close this worker?" nudge. When a worker's branch reaches Merged, its work is in main and the
@@ -707,6 +775,16 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       {/* "Close this worker?" nudge, shown when a worker's branch reaches Merged. */}
       {mergePromptId && (
         <CloseWorkerPrompt onClose={onMergePromptClose} onKeep={onMergePromptKeep} />
+      )}
+
+      {/* Ship / Save / Discard, shown when closing an agent that has unmerged work. */}
+      {closingAgent && (
+        <CloseAgentPrompt
+          onShip={onShipClose}
+          onSave={onSaveClose}
+          onDiscard={onDiscardClose}
+          onCancel={() => setClosePromptId(null)}
+        />
       )}
 
       {/* Drag handle on the right edge — resize the column wider/narrower. */}

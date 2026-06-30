@@ -272,6 +272,41 @@ pub fn bead_dep_add(
     select_bd_action(output.status.success(), &stdout, &stderr)
 }
 
+/// Claim a bead — mark it in_progress. `bd update <id> --claim`. Idempotent server-side, so the
+/// app can fire it on every entry into a "building" stage without churn.
+#[tauri::command]
+pub fn bead_claim(project_path: String, id: String) -> Result<String, String> {
+    let output = Command::new("/bin/zsh")
+        .arg("-l")
+        .arg("-c")
+        .arg(r#"cd "$2" && bd update "$1" --claim"#)
+        .arg("sparkle") // $0
+        .arg(&id) // $1
+        .arg(&project_path) // $2
+        .output()
+        .map_err(|e| format!("failed to run bd: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    select_bd_action(output.status.success(), &stdout, &stderr)
+}
+
+/// Close a bead (mark done). `bd close <id>`. Idempotent server-side.
+#[tauri::command]
+pub fn bead_close(project_path: String, id: String) -> Result<String, String> {
+    let output = Command::new("/bin/zsh")
+        .arg("-l")
+        .arg("-c")
+        .arg(r#"cd "$2" && bd close "$1""#)
+        .arg("sparkle") // $0
+        .arg(&id) // $1
+        .arg(&project_path) // $2
+        .output()
+        .map_err(|e| format!("failed to run bd: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    select_bd_action(output.status.success(), &stdout, &stderr)
+}
+
 /// Add or remove a label on a bead: `bd label add|remove "$2" "$3"`. `action` is validated to be
 /// exactly "add" or "remove"; id and label are positional args, never interpolated.
 #[tauri::command]

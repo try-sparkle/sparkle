@@ -29,6 +29,21 @@ vi.mock("../services/branchStatus", () => ({
   agentWorkflowState: (...a: unknown[]) => agentWorkflowState(...a),
 }));
 
+// Spy the bead-write wrappers (keep the rest of beads.ts real) so the programmatic-status tests
+// assert which write fires per transition without touching Tauri/`bd`.
+const claimBead = vi.fn();
+const closeBead = vi.fn();
+const labelBead = vi.fn();
+vi.mock("../services/beads", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/beads")>();
+  return {
+    ...actual,
+    claimBead: (...a: unknown[]) => claimBead(...a),
+    closeBead: (...a: unknown[]) => closeBead(...a),
+    labelBead: (...a: unknown[]) => labelBead(...a),
+  };
+});
+
 // Mocked Chief sync so the store-glue tests don't touch Tauri/Chief.
 const syncProjectMarkdown = vi.fn();
 vi.mock("../services/chiefSync", () => ({
@@ -220,7 +235,7 @@ async function setup(kind: "build" | "think") {
   settings.useSettingsStore.getState().setChiefPat("pat_x");
   const projectId = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
   const agentId = projects.useProjectStore.getState().addAgent(projectId, { kind });
-  return { runtime, settings, projectId, agentId };
+  return { runtime, settings, projects, projectId, agentId };
 }
 
 describe("scheduleChiefSync — debounced per-project sync", () => {
@@ -423,5 +438,67 @@ describe("runChiefSync — store glue ()", () => {
     });
     // Confirm syncProjectMarkdown was called (so the run did execute).
     expect(syncProjectMarkdown).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("runtimeStore — programmatic bead writes on stage transitions (review #16104/16105)", () => {
+  const wsState = (p: Record<string, unknown> = {}) => ({
+    inLocalMain: false,
+    inOriginMain: false,
+    inParent: false,
+    aheadOfBase: 0,
+    prState: null,
+    ...p,
+  });
+  const bsStatus = (ahead: number) => ({
+    ahead,
+    behind: 0,
+    dirty: false,
+    filesChanged: 0,
+    insertions: 0,
+    deletions: 0,
+  });
+  beforeEach(() => {
+    // The wrappers return Promises in real life — the hook does `.catch()` on the result.
+    claimBead.mockReset().mockResolvedValue(undefined);
+    closeBead.mockReset().mockResolvedValue(undefined);
+    labelBead.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("claims a bead-bound agent on a forward transition into a building stage", async () => {
+    const { runtime, projects, projectId, agentId } = await setup("build");
+    projects.useProjectStore.getState().setAgentBeadId(projectId, agentId, "bd-1");
+    const store = runtime.useRuntimeStore;
+    store.getState().setBranchStatus(agentId, bsStatus(1)); // → building_saved
+    agentWorkflowState.mockResolvedValue(wsState({}));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(claimBead).toHaveBeenCalledWith("/root", "bd-1");
+  });
+
+  it("does NOT reopen a closed bead on a backward (cycle-reset) transition", async () => {
+    const { runtime, projects, projectId, agentId } = await setup("build");
+    projects.useProjectStore.getState().setAgentBeadId(projectId, agentId, "bd-2");
+    const store = runtime.useRuntimeStore;
+    // First reach Merged → close.
+    store.getState().setBranchStatus(agentId, bsStatus(1));
+    agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(closeBead).toHaveBeenCalledWith("/root", "bd-2");
+    claimBead.mockReset();
+    // New cycle: fresh commits, signals fallen back → the bar resets BACKWARD to a building stage.
+    store.getState().setBranchStatus(agentId, bsStatus(2));
+    agentWorkflowState.mockResolvedValue(wsState({}));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(claimBead).not.toHaveBeenCalled(); // forward-only guard: no reopen
+  });
+
+  it("fires no bead write for an agent with no bead", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    store.getState().setBranchStatus(agentId, bsStatus(1));
+    agentWorkflowState.mockResolvedValue(wsState({}));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(claimBead).not.toHaveBeenCalled();
+    expect(closeBead).not.toHaveBeenCalled();
   });
 });

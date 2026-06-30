@@ -163,6 +163,8 @@ pub fn run() {
             notes::create_bead_full,
             notes::bead_dep_add,
             notes::bead_label,
+            notes::bead_claim,
+            notes::bead_close,
             ai::anthropic_chat,
             judge::judge_turn_followup,
             history::history_record,

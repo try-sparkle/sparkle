@@ -51,6 +51,8 @@ interface ProjectState {
   setDefaultBranch: (projectId: string, branch: string) => void;
 
   addAgent: (projectId: string, opts?: AddAgentOpts) => string;
+  /** Attach a bead id to an existing agent (e.g. after async bead creation on build-agent spawn). */
+  setAgentBeadId: (projectId: string, agentId: string, beadId: string) => void;
   removeAgent: (projectId: string, agentId: string) => void;
   /** Manual rename: sets the name AND pins it (freezes auto-naming, shows the pin icon). When
    *  the caller passes `pinnedIndex` (the agent's current displayed slot), also anchor the row
@@ -318,6 +320,14 @@ export const useProjectStore = create<ProjectState>()(
         }));
         return id;
       },
+
+      setAgentBeadId: (projectId, agentId, beadId) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) => ({
+            ...p,
+            agents: p.agents.map((a) => (a.id === agentId ? { ...a, beadId } : a)),
+          })),
+        })),
 
       removeAgent: (projectId, agentId) =>
         set((s) => ({

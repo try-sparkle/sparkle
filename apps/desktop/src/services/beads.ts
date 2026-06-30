@@ -83,6 +83,30 @@ export async function beadShow(projectPath: string, id: string): Promise<Bead | 
   return beads[0] ?? null;
 }
 
+// ── Write path: programmatic status, so the app advances a bead from real events instead of
+//    relying on the agent running `bd` itself. All idempotent server-side. Callers fire these
+//    best-effort (a bead write must never break the agent flow) — swallow rejections.
+
+/** `bd update <id> --claim` — mark a bead in_progress. */
+export async function claimBead(projectPath: string, id: string): Promise<void> {
+  await invoke("bead_claim", { projectPath, id });
+}
+
+/** `bd close <id>` — mark a bead done. */
+export async function closeBead(projectPath: string, id: string): Promise<void> {
+  await invoke("bead_close", { projectPath, id });
+}
+
+/** `bd label add|remove <id> <label>` — e.g. the `delivered` label once shipped. */
+export async function labelBead(
+  projectPath: string,
+  action: "add" | "remove",
+  id: string,
+  label: string,
+): Promise<void> {
+  await invoke("bead_label", { projectPath, action, id, label });
+}
+
 export type BoardColumn = "backlog" | "inProgress" | "done" | "delivered";
 
 /** A closed bead carrying this label lands in "delivered" instead of "done". */
