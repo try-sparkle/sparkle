@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { shouldForwardConsole } from "./logger";
+import { isBenignTauriRejection, shouldForwardConsole } from "./logger";
 
 // The console patch forwards captured console.* lines to the persistent log. Tauri's own
 // JS runtime emits "[TAURI] Couldn't find callback id N" on every in-flight IPC callback
@@ -23,5 +23,30 @@ describe("shouldForwardConsole", () => {
     expect(shouldForwardConsole("refresh blocked: conflict")).toBe(true);
     expect(shouldForwardConsole("Failed to spawn agent: ENOENT")).toBe(true);
     expect(shouldForwardConsole("")).toBe(true);
+  });
+});
+
+// The global unhandledrejection handler forwards every rejection at ERROR. Tauri's OWN injected
+// event-dispatch script rejects during webview-reload/teardown races — the backend emits to a
+// listener slot the frontend already tore down, so it evaluates `listeners[eventId].handlerId`
+// on undefined. We never hold that promise, so we can't .catch it at the source; it's benign
+// teardown noise that recovers on its own. isBenignTauriRejection downgrades it to debug so the
+// ERROR stream stays meaningful, while every genuine rejection still logs at ERROR.
+describe("isBenignTauriRejection", () => {
+  it("matches the Tauri event-dispatch teardown race (WebKit message form)", () => {
+    expect(
+      isBenignTauriRejection(
+        "Unhandled rejection: TypeError: undefined is not an object (evaluating 'listeners[eventId].handlerId')",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not downgrade genuine rejections", () => {
+    expect(isBenignTauriRejection("Unhandled rejection: TypeError: Load failed")).toBe(false);
+    expect(
+      isBenignTauriRejection("Unhandled rejection: pty_spawn: cwd is outside the managed worktrees directory"),
+    ).toBe(false);
+    expect(isBenignTauriRejection("Unhandled rejection: Error: something genuinely broke")).toBe(false);
+    expect(isBenignTauriRejection("")).toBe(false);
   });
 });

@@ -41,6 +41,21 @@ export function shouldForwardConsole(message: string): boolean {
   return !LOG_FORWARD_DENYLIST.some((needle) => message.includes(needle));
 }
 
+// Rejection signatures that originate INSIDE Tauri's own injected runtime, not our code, and
+// that we cannot .catch at the source because we never hold the promise. The event-dispatch
+// script reads `listeners[eventId].handlerId` to route a backend-emitted event; during a
+// webview-reload/teardown race the listener slot is already gone, so it throws on undefined and
+// surfaces on the global unhandledrejection handler. It's benign (the listener is simply gone /
+// Tauri recovers), so it's logged at debug instead of ERROR to keep the error stream meaningful.
+// Match on a stable substring of the source expression. Deliberately narrow — generic failures
+// like "Load failed" can be real app bugs and must keep logging at ERROR.
+const BENIGN_REJECTION_SIGNATURES = ["listeners[eventId].handlerId"];
+
+/** Whether an unhandled rejection is known-benign Tauri-internal teardown noise (→ debug, not error). */
+export function isBenignTauriRejection(message: string): boolean {
+  return BENIGN_REJECTION_SIGNATURES.some((needle) => message.includes(needle));
+}
+
 function forward(level: Level, scope: string, message: string) {
   if (forwarding) return;
   forwarding = true;
@@ -109,7 +124,10 @@ export function initLogger() {
     forward("error", "window", e.error ? render([e.error]) : `${e.message} (${e.filename}:${e.lineno})`);
   });
   window.addEventListener("unhandledrejection", (e) => {
-    forward("error", "promise", `Unhandled rejection: ${render([e.reason])}`);
+    const message = `Unhandled rejection: ${render([e.reason])}`;
+    // Known-benign Tauri-internal teardown races can't be .catch'd at the source; log them at
+    // debug so they stay out of the ERROR stream (still captured for investigation).
+    forward(isBenignTauriRejection(message) ? "debug" : "error", "promise", message);
   });
 
   log.info("app", "frontend logger initialized");
