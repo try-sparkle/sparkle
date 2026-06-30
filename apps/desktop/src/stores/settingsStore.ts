@@ -127,6 +127,20 @@ export function effectiveChiefPat(stored: string, runtime = ""): string {
   return stored.trim() || runtime.trim() || BUILD_ENV_CHIEF_PAT;
 }
 
+// --- Sparkle self-improvement consent --------------------------------------------------------
+// How the built-in Sparkle improvement agent may act on the user's anonymous logs. This gates the
+// hourly log evaluation and whether improvement PRs are auto-submitted to the OSS project:
+//   - "always"       → evaluate hourly AND auto-submit scrubbed PRs (only if the privacy scan passes).
+//   - "case_by_case" → evaluate hourly and craft PRs, but the user reviews + approves each before submit.
+//   - "never"        → do not evaluate logs at all.
+// Default is the privacy-conservative "case_by_case": nothing leaves the machine without explicit
+// per-PR approval. The default lives here (not behind a migration) — the store's `merge` makes any
+// pre-existing persisted blob that lacks this field inherit this default on read.
+export type SparkleImprovementConsent = "always" | "case_by_case" | "never";
+
+/** The default consent mode for a fresh install: review-and-approve each PR. */
+export const DEFAULT_SPARKLE_CONSENT: SparkleImprovementConsent = "case_by_case";
+
 interface SettingsState {
   /** Chief / Storytell Personal Access Token (begins with `pat_`). Empty until the user connects. */
   chiefPat: string;
@@ -164,6 +178,9 @@ interface SettingsState {
    *  DEFAULT_NOTIFY_STATUSES. Persisted; merged over the defaults on read so a status added later
    *  inherits its default rather than reading undefined. */
   notifyStatuses: Record<AgentTabStatus, boolean>;
+  /** Consent for the Sparkle self-improvement agent to use the user's anonymous logs. See
+   *  SparkleImprovementConsent. Persisted; defaults to "case_by_case". */
+  sparkleImprovementConsent: SparkleImprovementConsent;
 
   // --- Editable config-file mirror (reflections of config.toml; the file is the source of truth) ---
   // Hydrated from the TOML config via `hydrateFromConfig` at startup and on every config-changed
@@ -198,6 +215,8 @@ interface SettingsState {
   setAiFeature: (key: AiFeatureKey, on: boolean) => void;
   /** Bulk-set every AI feature (the All / Off segments). */
   setAllAiFeatures: (on: boolean) => void;
+  /** Set the Sparkle self-improvement consent mode (the banner's Always/Case by case/Never control). */
+  setSparkleImprovementConsent: (mode: SparkleImprovementConsent) => void;
   /** Reflect the effective config (from config.toml) into the mirrored store fields. Called at
    *  startup and whenever the file changes. The file is the source of truth — this is the read side. */
   hydrateFromConfig: (eff: EffectiveConfig) => void;
@@ -217,6 +236,7 @@ export const useSettingsStore = create<SettingsState>()(
       aiComposer: true,
       autoApplyUpdates: true,
       notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
+      sparkleImprovementConsent: DEFAULT_SPARKLE_CONSENT,
 
       // Config-file mirror defaults (match SparkleConfig::default() in config.rs; overwritten by hydrate).
       requirePr: true,
@@ -237,6 +257,7 @@ export const useSettingsStore = create<SettingsState>()(
       setAiFeature: (key, on) => set({ [AI_FEATURE_FIELD[key]]: on } as Partial<AiFeatureFlags>),
       setAllAiFeatures: (on) =>
         set({ aiAutoRename: on, cloudDictation: on, aiBrainstorm: on, aiComposer: on }),
+      setSparkleImprovementConsent: (mode) => set({ sparkleImprovementConsent: mode }),
 
       setChiefProject: (sparkleProjectId, chiefProjectId) =>
         set((s) => ({
@@ -321,6 +342,7 @@ export const useSettingsStore = create<SettingsState>()(
         aiComposer: s.aiComposer,
         autoApplyUpdates: s.autoApplyUpdates,
         notifyStatuses: s.notifyStatuses,
+        sparkleImprovementConsent: s.sparkleImprovementConsent,
       }),
     },
   ),

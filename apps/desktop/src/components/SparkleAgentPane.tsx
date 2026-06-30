@@ -13,6 +13,7 @@ import {
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { PinnedPrompt } from "./PinnedPrompt";
+import { SparkleConsentBanner } from "./SparkleConsentBanner";
 import { Terminal } from "./Terminal";
 import { Composer } from "./Composer";
 import { Onboarding } from "./Onboarding";
@@ -129,6 +130,7 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
       }}
     >
       <PinnedPrompt prompt={lastPrompt || "Sparkle Improvement Agent — making Sparkle better from your usage"} />
+      <SparkleConsentBanner />
 
       {phase === "preparing" && <Centered>Preparing the Sparkle improvement workspace…</Centered>}
       {phase === "error" && (

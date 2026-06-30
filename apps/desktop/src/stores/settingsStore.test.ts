@@ -140,6 +140,22 @@ describe("settingsStore — AI feature setters", () => {
   });
 });
 
+describe("settingsStore — Sparkle improvement consent", () => {
+  it("defaults to case_by_case (privacy-conservative: per-PR approval)", () => {
+    // The live store default — what a fresh install gets before any user choice.
+    expect(useSettingsStore.getInitialState().sparkleImprovementConsent).toBe("case_by_case");
+  });
+
+  it("setSparkleImprovementConsent updates the mode through all three values", () => {
+    useSettingsStore.getState().setSparkleImprovementConsent("always");
+    expect(useSettingsStore.getState().sparkleImprovementConsent).toBe("always");
+    useSettingsStore.getState().setSparkleImprovementConsent("never");
+    expect(useSettingsStore.getState().sparkleImprovementConsent).toBe("never");
+    useSettingsStore.getState().setSparkleImprovementConsent("case_by_case");
+    expect(useSettingsStore.getState().sparkleImprovementConsent).toBe("case_by_case");
+  });
+});
+
 describe("settingsStore — Chief doc state", () => {
   beforeEach(() => {
     useSettingsStore.setState({ chiefDocStateByProject: {} });
