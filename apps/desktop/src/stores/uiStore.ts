@@ -45,6 +45,12 @@ export type ThemePref = "auto" | "light" | "dark";
 // feature. Default is "attention" — reordering is the out-of-the-box behavior.
 export type AgentOrdering = "attention" | "manual";
 
+// Sidebar workflow mode — which of the Think / Plan / Build chevrons is active. Lifted out of
+// AgentSidebar's local state into the store so other components (e.g. ThinkPanel's "Make a Plan"
+// button) can switch tabs by calling setWorkMode. Deliberately NOT persisted (see partialize) so
+// it defaults to "build" on every launch, exactly as the old local useState default did.
+export type WorkMode = "think" | "plan" | "build";
+
 interface UiState {
   composerHeight: number;
   setComposerHeight: (h: number) => void;
@@ -80,6 +86,10 @@ interface UiState {
   // Sidebar agent ordering preference (see AgentOrdering). Persisted in `sparkle-ui`.
   agentOrdering: AgentOrdering;
   setAgentOrdering: (v: AgentOrdering) => void;
+  // Active sidebar workflow mode (Think/Plan/Build chevrons). Shared so non-sidebar components can
+  // switch tabs. NOT persisted (see partialize) — resets to "build" each launch like the old local state.
+  workMode: WorkMode;
+  setWorkMode: (m: WorkMode) => void;
   // Per build-agent: whether its worker subtree is collapsed in the sidebar. A build agent's
   // workers start COLLAPSED (a missing entry reads as collapsed) so a busy orchestrator shows a
   // compact "N workers" roll-up by default; the user expands to see each worker's own tracker.
@@ -109,6 +119,8 @@ export const useUiStore = create<UiState>()(
       setThemePref: (v) => set({ themePref: v }),
       agentOrdering: "attention",
       setAgentOrdering: (v) => set({ agentOrdering: v }),
+      workMode: "build",
+      setWorkMode: (m) => set({ workMode: m }),
       collapsedOrchestrators: {},
       // Absent → collapsed (workers start hidden behind the roll-up).
       isOrchestratorCollapsed: (id) => get().collapsedOrchestrators[id] ?? true,
@@ -121,6 +133,10 @@ export const useUiStore = create<UiState>()(
     {
       name: "sparkle-ui",
       storage: createJSONStorage(() => localStorage),
+      // Persist everything EXCEPT workMode, so the active sidebar tab resets to "build" on each
+      // launch (matching the prior local-useState default) while every other UI preference still
+      // sticks. Spreading `rest` keeps all existing persisted keys — only workMode is dropped.
+      partialize: ({ workMode: _workMode, ...rest }) => rest,
       // v1: the rest height shrank from 128 to the compact COMPOSER_SNAP. The pure
       // migratePersistedUi resets only users still parked on the OLD default, preserving a
       // height anyone deliberately dragged to. (composerMinimized hydrates from its default

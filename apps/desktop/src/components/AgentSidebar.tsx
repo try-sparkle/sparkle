@@ -182,7 +182,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
 
   // Which chevron is selected. Drives both the strip's coloring (active = brand, others grayscale)
   // and which agents the sidebar list shows. Defaults to Build; not persisted across launches.
-  const [mode, setMode] = useState<"think" | "plan" | "build">("build");
+  // Lifted into uiStore (workMode/setWorkMode) so other components — e.g. ThinkPanel's "Make a
+  // Plan" button — can switch tabs. Behavior is identical to the old local useState.
+  const mode = useUiStore((s) => s.workMode);
+  const setMode = useUiStore((s) => s.setWorkMode);
   const agentOrdering = useUiStore((s) => s.agentOrdering);
   // The workflow stage an agent's own git state + any known override resolves to.
   const stageOf = (id: string): WorkflowStageId =>

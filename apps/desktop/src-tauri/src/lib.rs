@@ -7,6 +7,7 @@ mod auth;
 mod bridge;
 mod chief;
 mod claude;
+mod claude_chat;
 mod cloud;
 mod config;
 mod connectivity;
@@ -46,6 +47,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(PtyManager::default())
+        .manage(claude_chat::ClaudeChatManager::default())
         .manage(dictation::DictationState::default())
         .manage(bridge::BridgeManager::default())
         .manage(auth::DeepLinkPending::default())
@@ -121,6 +123,8 @@ pub fn run() {
             pty::pty_resize,
             pty::pty_kill,
             preflight::claude_preflight,
+            claude_chat::claude_chat_send,
+            claude_chat::claude_chat_cancel,
             claude::claude_has_session,
             claude::claude_latest_session_id,
             claude::agent_session_title,

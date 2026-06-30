@@ -71,6 +71,37 @@ describe("uiStore agentOrdering", () => {
   });
 });
 
+describe("uiStore workMode", () => {
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({ workMode: "build", themePref: "auto" });
+  });
+
+  it("defaults workMode to 'build' (Build tab on launch)", () => {
+    expect(useUiStore.getState().workMode).toBe("build");
+  });
+
+  it("setWorkMode switches between think/plan/build", () => {
+    useUiStore.getState().setWorkMode("plan");
+    expect(useUiStore.getState().workMode).toBe("plan");
+    useUiStore.getState().setWorkMode("think");
+    expect(useUiStore.getState().workMode).toBe("think");
+    useUiStore.getState().setWorkMode("build");
+    expect(useUiStore.getState().workMode).toBe("build");
+  });
+
+  // Not persisted (partialize drops it): switching the tab must never write workMode into the
+  // `sparkle-ui` blob, so the next launch hydrates the "build" default. Other prefs still persist.
+  it("never writes workMode to the persisted blob", () => {
+    useUiStore.getState().setWorkMode("plan");
+    useUiStore.getState().setThemePref("dark");
+    const blob = JSON.parse(localStorage.getItem("sparkle-ui") ?? "{}");
+    expect(blob.state).not.toHaveProperty("workMode");
+    // Sanity: a genuinely-persisted field from the same write did land in the blob.
+    expect(blob.state.themePref).toBe("dark");
+  });
+});
+
 describe("uiStore orchestrator collapse", () => {
   afterEach(() => {
     localStorage.clear();

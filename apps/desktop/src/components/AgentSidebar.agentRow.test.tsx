@@ -86,6 +86,9 @@ const bs = (over: Partial<BranchStatus> = {}): BranchStatus => ({
 
 beforeEach(() => {
   useRuntimeStore.setState({ branchStatus: {}, status: {} });
+  // Mode lives in the singleton uiStore now; reset to the Build default so the worker/build
+  // agents under test are listed (Think mode would filter them out).
+  useUiStore.setState({ workMode: "build" });
   vi.clearAllMocks();
 });
 afterEach(() => cleanup());

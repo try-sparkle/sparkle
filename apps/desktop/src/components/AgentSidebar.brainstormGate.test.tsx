@@ -14,6 +14,7 @@ vi.mock("../services/workerSpawn", () => ({ spawnWorker: vi.fn() }));
 import { AgentSidebar } from "./AgentSidebar";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useAuthStore } from "../stores/authStore";
+import { useUiStore } from "../stores/uiStore";
 import type { Project } from "../types";
 
 const entitledMe = { clerkUserId: "u", entitled: true, balanceCents: 20000, tokenVersion: 1 };
@@ -33,6 +34,9 @@ beforeEach(() => {
   // AI extras now also require entitlement — default the suite to an entitled user so the
   // feature-flag behavior is what's under test here.
   useAuthStore.setState({ me: entitledMe, tokenPresent: true, loading: false });
+  // Mode now lives in the (singleton) uiStore — reset it to the launch default so these
+  // assertions see the Build section, independent of any prior test's tab switch.
+  useUiStore.setState({ workMode: "build" });
 });
 afterEach(() => cleanup());
 

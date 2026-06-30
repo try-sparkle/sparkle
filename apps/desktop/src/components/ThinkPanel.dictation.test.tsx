@@ -27,12 +27,14 @@ vi.mock("../services/anthropic", () => ({
   chatOnce: vi.fn(() => Promise.resolve("reply")),
   structuredJson: vi.fn(() => Promise.resolve({})),
 }));
-vi.mock("../services/librarian", () => ({
-  createLibrarian: () => ({ onUserTurn: vi.fn(), dispose: vi.fn() }),
+// The headless Claude Code engine — never touch a real PTY/tauri invoke in tests.
+vi.mock("../services/claudeChat", () => ({
+  resolveClaudePath: vi.fn(() => Promise.resolve("/usr/local/bin/claude")),
+  sendClaudeChat: vi.fn(() => Promise.resolve(() => {})),
+  cancelClaudeChat: vi.fn(() => Promise.resolve()),
 }));
-vi.mock("../services/sparkleApi", () => ({
-  meteredAi: <T,>(_action: unknown, run: () => Promise<T>) => run(),
-}));
+vi.mock("../services/chiefParticipant", () => ({ chiefInterject: vi.fn(() => Promise.resolve(null)) }));
+vi.mock("../services/voiceAnswer", () => ({ answerAsVoice: vi.fn(() => Promise.resolve("ok")) }));
 vi.mock("../services/prd", () => ({ synthesizePrd: vi.fn(), writePrd: vi.fn() }));
 vi.mock("../services/tasks", () => ({
   generateTasks: vi.fn(),
@@ -86,10 +88,13 @@ describe("ThinkPanel — dictation wiring", () => {
     expect(useDictationStore.getState().insertTarget).toBeNull();
   });
 
-  it("does NOT register before Chief is connected (no PAT → ConnectChief screen)", () => {
+  it("registers even without Chief — Claude Code chat works without a PAT", () => {
+    // The redesign drops the hard ConnectChief gate: you can talk to Claude Code with no Chief
+    // connected (only Chief participation / @chief / Make-a-Plan need a PAT). So the composer — and
+    // its dictation registration — is live regardless of the PAT.
     useSettingsStore.setState({ chiefPat: "", runtimeChiefPat: "" });
     render(<ThinkPanel project={project} agentId="a1" visible />);
-    expect(useDictationStore.getState().insertTarget).toBeNull();
+    expect(typeof useDictationStore.getState().insertTarget).toBe("function");
   });
 
   it("appends dictated text into the box (space-separated, not clobbered)", () => {
@@ -173,7 +178,7 @@ describe("ThinkPanel — dictation wiring", () => {
   it("falls back to the think-out-loud placeholder when the mic is idle", () => {
     render(<ThinkPanel project={project} agentId="a1" visible />);
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
-    expect(ta.placeholder).toContain("Think out loud about My Project");
+    expect(ta.placeholder).toContain("Talk to Claude Code about My Project");
     expect(ta.placeholder).not.toContain("I'm listening");
   });
 });

@@ -549,7 +549,11 @@ export interface ChiefSkill {
   scope?: "project" | "user";
 }
 
-/** Create a skill. `name` + `instructions` are required; category/scope default server-side. */
+/** Create a skill. `name` + `instructions` are required; category passes through. `scope` MUST be
+ *  one of Chief's accepted values — sending it unset (or null) trips `publicapi.skills.create`'s
+ *  `scope.invalid: scope must be one of: project, user`, which silently broke every persona/voice
+ *  spin-up. Default to `"project"` when the caller doesn't specify one (project-scoped is the right
+ *  home for a per-project persona) so the POST always carries a valid scope. */
 export async function createSkill(
   pat: string,
   projectId: string,
@@ -567,7 +571,7 @@ export async function createSkill(
       name: skill.name,
       instructions: skill.instructions,
       category: skill.category,
-      scope: skill.scope,
+      scope: skill.scope ?? "project",
     }),
   });
   return (await parseOrThrow(res)) as ChiefSkill;
@@ -593,7 +597,9 @@ const inflightEnsureSkill = new Map<string, Promise<string>>();
  * Ensure a skill named `name` exists in the project, returning the NAME to feed into
  * `ChatOptions.skills` (chat references skills by name, not id). Reuses an existing skill with
  * the same name, else creates it. Mirrors `ensureChiefProject`: best-effort list-then-create
- * with in-flight dedup so simultaneous callers don't race to create duplicates.
+ * with in-flight dedup so simultaneous callers don't race to create duplicates. `scope` is
+ * threaded into the create so callers can pin a persona to the project (vs. the user); when
+ * omitted, `createSkill` defaults it to `"project"`.
  */
 export async function ensureSkill(
   pat: string,
@@ -601,6 +607,7 @@ export async function ensureSkill(
   name: string,
   instructions: string,
   category?: "skill" | "persona",
+  scope?: "project" | "user",
 ): Promise<string> {
   const key = `${pat} ${projectId} ${name}`;
   const pending = inflightEnsureSkill.get(key);
@@ -614,7 +621,7 @@ export async function ensureSkill(
     } catch {
       // listing is best-effort; fall through to create
     }
-    const created = await createSkill(pat, projectId, { name, instructions, category });
+    const created = await createSkill(pat, projectId, { name, instructions, category, scope });
     return created.name ?? name;
   })();
   inflightEnsureSkill.set(key, run);
