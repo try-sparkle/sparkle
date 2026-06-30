@@ -1,15 +1,9 @@
 import { useState, useEffect, type CSSProperties } from "react";
 import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, statusInk } from "../theme/colors";
 import type { AgentTabStatus, Project } from "../types";
-import { ThemeToggle } from "./ThemeToggle";
-import { AgentOrderToggle } from "./AgentOrderToggle";
-import { AiFeaturesMenu } from "./AiFeaturesMenu";
-import { WorkerLimitControl } from "./WorkerLimitControl";
-import { NotificationsMenu } from "./NotificationsMenu";
-import { AdvancedConfigMenu } from "./AdvancedConfigMenu";
+import { SettingsDialog } from "./SettingsDialog";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useUiStore } from "../stores/uiStore";
 import { pickProjectFolder, basename } from "../services/dialog";
 import { openProjectInWindow, defaultDeps, type OpenMode } from "../services/projectWindows";
 import { findWindowForProject } from "../services/windowRegistry";
@@ -61,29 +55,6 @@ const btn: CSSProperties = {
   whiteSpace: "nowrap",
 };
 
-const zbtn: CSSProperties = {
-  background: "transparent",
-  color: C.cream,
-  border: `1px solid ${C.muted}`,
-  borderRadius: 6,
-  padding: "6px 0",
-  minWidth: 34,
-  cursor: "pointer",
-  fontSize: 14,
-  fontFamily: '"IBM Plex Sans", sans-serif',
-  textAlign: "center",
-};
-
-// Section heading inside the ⋯ menu ("Theme", "Text size").
-const menuLabel: CSSProperties = {
-  color: C.muted,
-  fontSize: 12,
-  textTransform: "uppercase",
-  letterSpacing: 1,
-  fontWeight: FONT_WEIGHT.semibold,
-  padding: "2px 4px 8px",
-};
-
 /**
  * Top bar: the current project (name colored by the majority of its agents' statuses, with
  * a per-agent dot cluster, click to open settings) plus the Open / Recent / New project
@@ -97,10 +68,6 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const replaceCurrent = useReplaceCurrentProject();
   const windowLabel = useCurrentWindowLabel();
   const statusMap = useRuntimeStore((s) => s.status);
-  const zoom = useUiStore((s) => s.zoom);
-  const zoomIn = useUiStore((s) => s.zoomIn);
-  const zoomOut = useUiStore((s) => s.zoomOut);
-  const resetZoom = useUiStore((s) => s.resetZoom);
   const [recentOpen, setRecentOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   // The settings modal is a true centered dialog now, so Escape should dismiss it (backdrop click
@@ -343,7 +310,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
         New
       </button>
 
-      {/* ⋯ menu: app text-size (zoom) controls — mirrors Cmd +/- / Cmd 0. */}
+      {/* ⋯ menu: opens the categorized settings dialog (SettingsDialog). */}
       <div style={{ position: "relative" }}>
         <button
           aria-label="More options"
@@ -354,71 +321,13 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
           ⋯
         </button>
         {menuOpen && (
-          <>
-            <div
-              onClick={() => setMenuOpen(false)}
-              style={{ position: "fixed", inset: 0, zIndex: 40, background: "rgba(0,0,0,0.55)" }}
-            />
-            <div
-              role="dialog"
-              aria-modal="true"
-              aria-label="Settings"
-              style={{
-                position: "fixed",
-                top: "50%",
-                left: "50%",
-                transform: "translate(-50%, -50%)",
-                width: "80vw",
-                height: "80vh",
-                background: C.deepForest,
-                border: `1px solid ${C.forest}`,
-                borderRadius: 8,
-                boxShadow: "0 12px 32px rgba(0,0,0,0.45)",
-                padding: 16,
-                zIndex: 41,
-                overflowY: "auto",
-              }}
-            >
-              <div style={menuLabel}>Use AI features</div>
-              <AiFeaturesMenu />
-              <div style={{ ...menuLabel, paddingTop: 12 }}>Notifications</div>
-              <NotificationsMenu />
-              <div style={{ ...menuLabel, paddingTop: 12 }}>Claude accounts</div>
-              <button
-                style={{ ...btn, width: "100%", textAlign: "left" }}
-                onClick={() => {
-                  setMenuOpen(false);
-                  setAccountsOpen(true);
-                }}
-              >
-                Manage accounts…
-              </button>
-              <div style={{ ...menuLabel, paddingTop: 12 }}>Theme</div>
-              <ThemeToggle />
-              <div style={{ ...menuLabel, paddingTop: 12 }}>Agent order</div>
-              <AgentOrderToggle />
-              <div style={{ ...menuLabel, paddingTop: 12 }}>Max concurrent workers</div>
-              <WorkerLimitControl />
-              <div style={{ ...menuLabel, paddingTop: 12 }}>Text size</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <button style={zbtn} onClick={zoomOut} title="Zoom out (⌘−)">
-                  −
-                </button>
-                <button
-                  style={{ ...zbtn, flex: 1, fontVariantNumeric: "tabular-nums" }}
-                  onClick={resetZoom}
-                  title="Reset to 100% (⌘0)"
-                >
-                  {Math.round(zoom * 100)}%
-                </button>
-                <button style={zbtn} onClick={zoomIn} title="Zoom in (⌘+)">
-                  +
-                </button>
-              </div>
-              <div style={{ ...menuLabel, paddingTop: 12 }}>Advanced configuration</div>
-              <AdvancedConfigMenu />
-            </div>
-          </>
+          <SettingsDialog
+            onClose={() => setMenuOpen(false)}
+            onManageAccounts={() => {
+              setMenuOpen(false);
+              setAccountsOpen(true);
+            }}
+          />
         )}
       </div>
 
