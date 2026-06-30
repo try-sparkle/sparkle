@@ -36,7 +36,13 @@ const LOCAL_CHANGE_EVENT = "sparkle:window-registry";
 
 function write(store: KV, map: Record<string, string>): void {
   store.setItem(WINDOW_REGISTRY_KEY, JSON.stringify(map));
-  if (typeof window !== "undefined") window.dispatchEvent(new Event(LOCAL_CHANGE_EVENT));
+  // Guard the METHOD, not just `window`: a partial/non-DOM `window` (SSR-ish or test shims that
+  // provide addEventListener but not dispatchEvent) would otherwise throw here and break an
+  // otherwise-successful registry write. The broadcast is best-effort — a missing dispatchEvent
+  // just means same-window listeners don't get the instant nudge (cross-window `storage` still fires).
+  if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+    window.dispatchEvent(new Event(LOCAL_CHANGE_EVENT));
+  }
 }
 
 /** Subscribe to registry changes from THIS window (local event) and OTHER windows (storage). */
