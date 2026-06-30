@@ -9,18 +9,19 @@ import { formatAgo, oneLine } from "./promptHistory";
 export type JumpResult = "scrolled" | "missing";
 
 /**
- * Always-visible header showing the agent's most recent prompt (spec §7) — so you never have
- * to scroll up through terminal output to find what you last asked.
+ * Header showing the agent's most recent prompt (spec §7) — so you never have to scroll up
+ * through terminal output to find what you last asked. Until the agent has its first prompt the
+ * header renders nothing at all (no placeholder).
  *
- * With history, the header becomes a button that pulls down a dropdown of every prompt sent to
- * this agent (newest first). Each row is a select → act → expand control:
- *   - first click selects the row, revealing [Copy] and (when a composer is wired)
- *     [Send to Composer] on the right;
- *   - clicking the selected row again expands it to the full, selectable prompt text so you can
- *     drag-copy just part of it; clicking again collapses it.
+ * With history, the header pulls down a dropdown of every prompt sent to this agent (newest
+ * first) on hover — moving the pointer over the bar opens it; leaving it closes it (clicking and
+ * keyboard still work too). Each row reveals its actions on hover:
+ *   - hovering a row shows [Copy], [Jump], and (when a composer is wired) [Send to Composer] on
+ *     the right, without needing a click;
+ *   - clicking a row selects it; clicking the selected row expands it to the full, selectable
+ *     prompt text so you can drag-copy just part of it; clicking again collapses it.
  * Copy puts the whole prompt on the clipboard; Send to Composer hands it to the parent. Both
- * close the menu. Up/Down/Home/End move the selection, Enter/Space expand, Esc closes. There is
- * deliberately no hover tooltip — reading the full prompt is the expand interaction.
+ * close the menu. Up/Down/Home/End move the selection, Enter/Space expand, Esc closes.
  */
 export function PinnedPrompt({
   prompt,
@@ -166,9 +167,23 @@ export function PinnedPrompt({
   // reader announces selection as arrow keys move it (focus stays on the <ul>; rows aren't tab stops).
   const activeId = selectedIndex >= 0 ? items[selectedIndex]?.id : undefined;
 
+  // Nothing to show until there's a current prompt — render nothing (no placeholder header) so the
+  // bar simply doesn't exist yet. Gating on `prompt` alone (not also `!interactive`) avoids a blank
+  // bar in the degenerate case where history exists but the current prompt is empty.
+  if (!prompt) return null;
+
   return (
     // position/zIndex so the dropdown overlays the terminal (a later sibling) below the header.
-    <div ref={rootRef} style={{ position: "relative", zIndex: 20, flex: "0 0 auto" }}>
+    // Hover anywhere over the header+dropdown opens it; leaving the whole control closes it. The
+    // handlers live on the root (not the header) so sliding the pointer from header into the list
+    // doesn't cross a gap that would close the menu.
+    <div
+      ref={rootRef}
+      data-testid="pinned-prompt-root"
+      onMouseEnter={interactive ? () => setOpen(true) : undefined}
+      onMouseLeave={interactive ? () => setOpen(false) : undefined}
+      style={{ position: "relative", zIndex: 20, flex: "0 0 auto" }}
+    >
       <div
         ref={headerRef}
         role={interactive ? "button" : undefined}
@@ -176,7 +191,7 @@ export function PinnedPrompt({
         aria-haspopup={interactive ? "listbox" : undefined}
         aria-expanded={interactive ? open : undefined}
         aria-label={interactive ? "Show prompt history" : undefined}
-        onClick={interactive ? () => setOpen((v) => !v) : undefined}
+        onClick={interactive ? () => setOpen(true) : undefined}
         onKeyDown={
           interactive
             ? (e) => {
@@ -212,7 +227,7 @@ export function PinnedPrompt({
             minWidth: 0,
           }}
         >
-          {prompt || "No prompt yet — type below to start your agent"}
+          {prompt}
         </span>
         {interactive && (
           // Caret rotates to point up while the menu is open.
@@ -303,6 +318,10 @@ function HistoryRow({
 }) {
   const ref = useRef<HTMLLIElement>(null);
   const collapsed = oneLine(entry.text) || "(empty prompt)";
+  // Hovering a row reveals its actions (Jump / Copy / Send) without requiring a click to select it.
+  const [hovered, setHovered] = useState(false);
+  // The row shows its actions when either the keyboard selection is on it or the pointer is over it.
+  const showActions = selected || hovered;
 
   // Keep the selected row in view as Up/Down move past the visible window.
   useEffect(() => {
@@ -336,11 +355,13 @@ function HistoryRow({
       data-testid={`ph-row-${entry.id}`}
       data-expanded={selected ? expanded : undefined}
       onClick={handleClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       style={{
         display: "flex",
         gap: 10,
         alignItems: expanded ? "flex-start" : "baseline",
-        background: selected ? CHAT_USER_BUBBLE : "transparent",
+        background: showActions ? CHAT_USER_BUBBLE : "transparent",
         color: C.cream,
         borderRadius: 6,
         padding: "7px 9px",
@@ -381,7 +402,7 @@ function HistoryRow({
         </span>
       )}
 
-      {selected ? (
+      {showActions ? (
         <div
           style={{
             flex: "0 0 auto",

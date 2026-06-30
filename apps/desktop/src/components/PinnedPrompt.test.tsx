@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 //
 // Component-wiring tests for the pinned-prompt history dropdown (PinnedPrompt). Covers row
-// interaction: click selects + reveals the Copy / Send to Composer / Jump actions, a second
-// click expands the full selectable prompt, and rows carry no `title` tooltip. Jump scrolls the
-// terminal to where a prompt was sent (or reports "scrolled out"). The clipboard boundary is
-// mocked.
+// interaction: hovering a row (or selecting it) reveals the Copy / Send to Composer / Jump
+// actions, clicking selects, a second click expands the full selectable prompt, and rows carry
+// no `title` tooltip. The dropdown also opens on hover over the header. With no prompt yet the
+// component renders nothing. Jump scrolls the terminal to where a prompt was sent (or reports
+// "scrolled out"). The clipboard boundary is mocked.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -40,6 +41,50 @@ const rowB = () => screen.getByTestId("ph-row-b");
 
 beforeEach(() => copyToClipboard.mockClear());
 afterEach(() => cleanup());
+
+describe("PinnedPrompt — empty state", () => {
+  it("renders nothing (no placeholder header) until there is a prompt", () => {
+    const { container } = render(<PinnedPrompt prompt="" history={[]} />);
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByText(/no prompt yet/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show prompt history" })).toBeNull();
+  });
+});
+
+describe("PinnedPrompt — hover", () => {
+  it("opens the dropdown on hover over the header, without a click", () => {
+    render(<PinnedPrompt prompt="second prompt" history={HISTORY} />);
+    expect(screen.queryByRole("listbox", { name: "Prompt history" })).toBeNull();
+    const root = screen.getByTestId("pinned-prompt-root");
+    fireEvent.mouseEnter(root);
+    expect(screen.getByRole("listbox", { name: "Prompt history" })).toBeTruthy();
+    fireEvent.mouseLeave(root);
+    expect(screen.queryByRole("listbox", { name: "Prompt history" })).toBeNull();
+  });
+
+  it("reveals a row's Copy action on hover, without selecting it, and hides it on leave", () => {
+    setup();
+    expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+    fireEvent.mouseEnter(rowA());
+    expect(screen.getByRole("button", { name: "Copy" })).toBeTruthy();
+    expect(rowA().getAttribute("aria-selected")).toBe("false"); // hover reveals, doesn't select
+    fireEvent.mouseLeave(rowA());
+    expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+  });
+
+  it("keeps a selected row's actions visible after the pointer leaves it (still in menu)", () => {
+    setup();
+    fireEvent.click(rowA()); // select via click
+    fireEvent.mouseEnter(rowA());
+    // Pointer moves off the row but stays within the dropdown (relatedTarget inside the root), so
+    // the menu doesn't close — only this row's hover ends. The row stays selected, so its actions
+    // remain via the `selected` half of `showActions`.
+    const list = screen.getByRole("listbox", { name: "Prompt history" });
+    fireEvent.mouseLeave(rowA(), { relatedTarget: list });
+    expect(rowA().getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("button", { name: "Copy" })).toBeTruthy(); // shown via `selected`
+  });
+});
 
 describe("PinnedPrompt — row actions", () => {
   it("reveals Copy / Send to Composer only after a row is selected", () => {
