@@ -39,6 +39,7 @@ import { Terminal, type TerminalApi } from "./Terminal";
 import { Composer, type ComposerApi } from "./Composer";
 import { Onboarding } from "./Onboarding";
 import { ThinkPanel } from "./ThinkPanel";
+import { paneVisibilityStyle } from "./paneVisibility";
 
 type Phase = "preparing" | "ready" | "no-claude" | "error";
 
@@ -537,7 +538,9 @@ export function AgentPane({
       style={{
         position: "absolute",
         inset: 0,
-        display: visible ? "flex" : "none",
+        // Hide an inactive pane WITHOUT collapsing its box (no `display: none`) so its terminal
+        // stays measured and never re-renders into a thin column on reveal. See paneVisibility.ts.
+        ...paneVisibilityStyle(visible),
         flexDirection: "column",
         background: C.forest,
       }}
