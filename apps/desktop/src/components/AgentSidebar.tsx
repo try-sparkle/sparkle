@@ -24,7 +24,7 @@ import { useAiFeature } from "../services/aiGate";
 import { removeAgentWorkspace } from "../services/worktree";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
-import { shouldPromptOnClose } from "../engine/closeAgent";
+import { shouldPromptOnClose, selectionAfterClose } from "../engine/closeAgent";
 import { shipAgent, saveAgent, discardAgentGit } from "../services/closeAgentActions";
 import { refreshAgentTitle } from "../services/sessionTitle";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
@@ -467,6 +467,26 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       return false;
     }
   };
+  // After a close removes an agent (and its workers), keep selection coherent with the sidebar:
+  // when the OPEN agent got torn down, re-point selection at the first visible row of the current
+  // mode (or null → blank first-load state). Decision logic is the pure selectionAfterClose; here
+  // we just feed it the pre-removal snapshot (`project`) + the fresh post-removal list and apply
+  // the result. Mirrors the workerSpawn re-select precedent.
+  const reselectAfterClose = (removedRootId: string) => {
+    if (!project) return;
+    const fresh = useProjectStore.getState().projects.find((p) => p.id === project.id);
+    if (!fresh) return;
+    const decision = selectionAfterClose(
+      removedRootId,
+      project.selectedAgentId,
+      project.agents,
+      fresh.agents,
+      mode,
+      agentOrdering,
+      status,
+    );
+    if (decision.reselect) selectAgent(project.id, decision.next);
+  };
   // Tear an agent down: drop it (and its workers) from the stores and remove their worktrees. The
   // BRANCH is intentionally kept (remove_worktree_at), so this is the "Save" outcome — Discard adds
   // an explicit branch+bead delete on top (onDiscardClose).
@@ -478,6 +498,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       void removeAgentWorkspace(project.rootPath, project.id, cid).catch(() => {});
     }
     removeAgent(project.id, id);
+    reselectAfterClose(id);
   };
   // The × button. A Build agent with unmerged work at risk gets the Ship/Save/Discard choice; every
   // other case (already merged, no real work, workers/think/shell) closes silently. See
@@ -542,6 +563,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     for (const cid of ids) close(cid);
     await discardAgentGit({ root: project.rootPath, projectId: project.id, ids, beadIds });
     removeAgent(project.id, id);
+    reselectAfterClose(id);
   };
 
   // "Close this worker?" nudge. When a worker's branch reaches Merged, its work is in main and the

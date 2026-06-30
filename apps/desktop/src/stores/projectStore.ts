@@ -84,7 +84,8 @@ interface ProjectState {
   pinAgentAt: (projectId: string, agentId: string, index: number) => void;
   /** Release a pin: clear the name freeze AND the row anchor (re-enables auto-naming + sort). */
   unpinAgent: (projectId: string, agentId: string) => void;
-  selectAgent: (projectId: string, agentId: string) => void;
+  /** Select an agent, or pass `null` to clear selection (routes the main pane to the blank state). */
+  selectAgent: (projectId: string, agentId: string | null) => void;
   setAgentWorktree: (projectId: string, agentId: string, path: string, branch: string) => void;
   /** Record a submitted prompt: updates `lastPrompt` (pinned header) AND appends to
    *  `promptHistory` (capped). Returns the new entry's id so the caller can register the matching

@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { sortAgentsByAttention, orderAgents, STATUS_RANK } from "./agentOrdering";
-import type { AgentTabStatus } from "../types";
+import {
+  sortAgentsByAttention,
+  orderAgents,
+  firstVisibleAgentId,
+  STATUS_RANK,
+} from "./agentOrdering";
+import type { AgentKind, AgentTabStatus } from "../types";
 
 // Minimal agent shape — the helper only needs `id`.
 const a = (id: string) => ({ id });
@@ -152,5 +157,61 @@ describe("orderAgents — anchored pins among attention-sorted agents", () => {
     // splices at 0 ahead of it → final order b, a, then the unanchored c.
     const rows = [mk("a", 0), mk("b", 0), mk("c")];
     expect(orderAgents(rows, allWorking(["a", "b", "c"])).map((r) => r.id)).toEqual(["b", "a", "c"]);
+  });
+});
+
+describe("firstVisibleAgentId", () => {
+  // Minimal AgentTab shape the helper actually reads.
+  type Ag = { id: string; kind: AgentKind; parentId: string | null; pinnedIndex: number | null };
+  const ag = (
+    id: string,
+    kind: AgentKind,
+    parentId: string | null = null,
+    pinnedIndex: number | null = null,
+  ): Ag => ({ id, kind, parentId, pinnedIndex });
+
+  it("Build mode skips think agents even when one is first in insertion order", () => {
+    // The original bug: agents[0] is a think agent, so removeAgent's raw fallback strands the
+    // Build sidebar on the Think pane. Build mode must land on the first BUILD row instead.
+    const agents = [ag("t1", "think"), ag("b1", "build"), ag("b2", "build")];
+    expect(firstVisibleAgentId(agents, "build", "manual", {})).toBe("b1");
+  });
+
+  it("Think mode lands on the first think agent", () => {
+    const agents = [ag("b1", "build"), ag("t1", "think"), ag("t2", "think")];
+    expect(firstVisibleAgentId(agents, "think", "manual", {})).toBe("t1");
+  });
+
+  it("Plan mode is treated like Build for selection (plan sidebar paints no rows)", () => {
+    // Selection still matters in plan mode (it persists for the switch back to Build), so the
+    // helper deliberately picks the first build-side row rather than null.
+    const agents = [ag("t1", "think"), ag("b1", "build")];
+    expect(firstVisibleAgentId(agents, "plan", "manual", {})).toBe("b1");
+  });
+
+  it("returns null when the active mode has no rows (→ blank first-load state)", () => {
+    const agents = [ag("t1", "think"), ag("t2", "think")];
+    expect(firstVisibleAgentId(agents, "build", "manual", {})).toBeNull();
+    expect(firstVisibleAgentId([], "build", "manual", {})).toBeNull();
+  });
+
+  it("excludes a build agent's nested workers but keeps orphaned workers visible", () => {
+    const agents = [
+      ag("b1", "build"),
+      ag("w1", "worker", "b1"), // nested under present build → hidden
+      ag("w2", "worker", "gone"), // orphaned (parent absent) → surfaces at top level
+    ];
+    // Manual order keeps insertion order, so the build agent is first.
+    expect(firstVisibleAgentId(agents, "build", "manual", {})).toBe("b1");
+    // With only the orphan present, it's the first visible Build-mode row.
+    expect(firstVisibleAgentId([ag("w2", "worker", "gone")], "build", "manual", {})).toBe("w2");
+  });
+
+  it("respects attention ordering — a waiting build agent floats above a working one", () => {
+    const agents = [ag("b1", "build"), ag("b2", "build")];
+    const status: Record<string, AgentTabStatus> = { b1: "working", b2: "waiting" };
+    expect(firstVisibleAgentId(agents, "build", "attention", status)).toBe("b2");
+    // Manual ordering ignores status and keeps insertion order.
+    expect(firstVisibleAgentId(agents, "build", "manual", status)).toBe("b1");
   });
 });

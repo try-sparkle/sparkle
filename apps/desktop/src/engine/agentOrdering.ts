@@ -102,3 +102,30 @@ export function orderedTopLevelAgents<
     .filter((a) => (workMode === "think" ? a.kind === "think" : a.kind !== "think"));
   return attentionOrder ? orderAgents(topLevel, statusMap) : topLevel;
 }
+
+/**
+ * The agent to land selection on for a given work mode: the FIRST row of
+ * `orderedTopLevelAgents` (the same stack the sidebar + TopBar render), or `null` when that
+ * mode has no such row.
+ *
+ * `"plan"` is treated like `"build"` here ON PURPOSE: the plan-mode sidebar renders no rows
+ * (it shows a board in the main pane), but selection still persists for when the user switches
+ * back to Build, so we pick the first build-side row rather than clearing it. This is a
+ * selection helper, not a 1:1 mirror of which rows the plan sidebar paints.
+ *
+ * Used to keep selection coherent after a close: `removeAgent`'s own fallback is raw
+ * `agents[0]` (insertion order, any kind), which can strand a Build-mode sidebar on a hidden
+ * Think agent's pane. Picking the first VISIBLE row (or `null` → blank first-load state) instead
+ * keeps the main pane and the sidebar in agreement.
+ */
+export function firstVisibleAgentId<
+  T extends { id: string; kind: AgentKind; parentId: string | null; pinnedIndex: number | null },
+>(
+  agents: readonly T[],
+  mode: "think" | "plan" | "build",
+  agentOrdering: "attention" | "manual",
+  statusMap: Record<string, AgentTabStatus>,
+): string | null {
+  const ordered = orderedTopLevelAgents(agents, statusMap, mode, agentOrdering === "attention");
+  return ordered[0]?.id ?? null;
+}
