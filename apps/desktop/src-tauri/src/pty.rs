@@ -100,6 +100,56 @@ fn validate_spawn_inner(
 /// rejection, so keep the two in sync if you ever rephrase it.
 const NO_SUCH_PTY: &str = "no such pty";
 
+// ── Thin-column backstop ────────────────────────────────────────────────────────────────────
+// The "compressed terminal" bug: a PTY opened with an implausibly small size makes the child CLI
+// (claude's TUI) hard-wrap its output into a thin column, and because the wraps are baked into the
+// emitted bytes, no later resize can un-wrap them — the pane stays compressed until a full redraw.
+// The frontend (terminalSize.ts `spawnSize`) is the PRIMARY guard, refusing to send a size from an
+// unmeasured/collapsed pane. These constants + clamps are the LAST-LINE backstop at the one
+// boundary every size must cross (openpty / resize), so NO path — a frontend regression, the
+// orchestrator/login-modal mounts, or future code — can ever open a thin-column PTY. The warn logs
+// make the (otherwise invisible) leak diagnosable: if one fires, the frontend guard was bypassed.
+// Keep MIN_* in sync with MIN_PLAUSIBLE_COLS/ROWS in terminalSize.ts; the spawn fallback matches
+// SPAWN_FALLBACK_* there (and pty.ts).
+const MIN_PTY_COLS: u16 = 20;
+const MIN_PTY_ROWS: u16 = 5;
+const SPAWN_FALLBACK_COLS: u16 = 120;
+const SPAWN_FALLBACK_ROWS: u16 = 30;
+
+/// SPAWN backstop: an implausibly small requested size is replaced WHOLESALE with the comfortable
+/// default (a CLI started at 120×30 reflows cleanly once the real visible size is synced on
+/// reveal). Returns the size to actually open the PTY with.
+fn guard_spawn_size(id: &str, cols: u16, rows: u16) -> (u16, u16) {
+    if cols < MIN_PTY_COLS || rows < MIN_PTY_ROWS {
+        tracing::warn!(
+            %id, requested_cols = cols, requested_rows = rows,
+            "pty_spawn size implausibly small (frontend guard bypassed?) — using {SPAWN_FALLBACK_COLS}x{SPAWN_FALLBACK_ROWS} to avoid thin-column wrap"
+        );
+        return (SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS);
+    }
+    (cols, rows)
+}
+
+/// RESIZE backstop: never shrink a live PTY below the plausible floor (that would re-introduce the
+/// thin-column wrap on an already-running CLI). Floors each dimension rather than substituting a
+/// default, so a genuine resize to a slightly-small pane is honored as closely as is safe.
+fn guard_resize_size(id: &str, cols: u16, rows: u16) -> (u16, u16) {
+    let c = cols.max(MIN_PTY_COLS);
+    let r = rows.max(MIN_PTY_ROWS);
+    if c != cols || r != rows {
+        // debug, not warn: resize is the high-frequency path (a window/drag resize fires many
+        // events), and a sub-floor resize is far less catastrophic than a sub-floor SPAWN (the
+        // running CLI reflows on the next plausible resize). debug keeps it diagnosable under the
+        // default `sparkle_lib=debug` filter without warn-level spam. The spawn warn stays the
+        // high-signal "frontend guard bypassed" alarm.
+        tracing::debug!(
+            %id, requested_cols = cols, requested_rows = rows, clamped_cols = c, clamped_rows = r,
+            "pty_resize size below floor — clamped to avoid thin-column wrap"
+        );
+    }
+    (c, r)
+}
+
 /// Spawn `command` in a PTY. Output streams to the frontend via the `pty:output`
 /// event; `pty:exit` fires when the process ends.
 #[tauri::command]
@@ -123,6 +173,9 @@ pub fn pty_spawn(
     if std::env::var_os("SPARKLE_LOG_PTY_ARGS").is_some() {
         tracing::debug!(%id, args = ?args, "pty_spawn args (may contain prompt text)");
     }
+    // Backstop against the thin-column bug (see guard_spawn_size): never open a PTY at an
+    // implausibly small size, whatever the frontend sent.
+    let (cols, rows) = guard_spawn_size(&id, cols, rows);
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -242,6 +295,9 @@ pub fn pty_resize(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
+    // Backstop against the thin-column bug (see guard_resize_size): never shrink a live PTY below
+    // the plausible floor, whatever the frontend sent.
+    let (cols, rows) = guard_resize_size(&id, cols, rows);
     let sessions = manager.sessions.lock().unwrap();
     let session = sessions.get(&id).ok_or(NO_SUCH_PTY)?;
     session
@@ -262,12 +318,70 @@ pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_spawn_inner;
+    use super::{
+        guard_resize_size, guard_spawn_size, validate_spawn_inner, MIN_PTY_COLS, MIN_PTY_ROWS,
+        SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    // ── thin-column backstop ──────────────────────────────────────────────────────────────
+    #[test]
+    fn spawn_size_passes_a_plausible_size_through() {
+        assert_eq!(guard_spawn_size("a", 132, 44), (132, 44));
+        // Exactly at the floor is plausible.
+        assert_eq!(guard_spawn_size("a", MIN_PTY_COLS, MIN_PTY_ROWS), (MIN_PTY_COLS, MIN_PTY_ROWS));
+    }
+
+    #[test]
+    fn spawn_size_replaces_a_thin_size_with_the_fallback() {
+        // The exact sizes seen in the wild (cols=11/12, rows=5/7) that produced the compressed
+        // terminal: a too-small COLS or too-small ROWS each trigger the wholesale fallback.
+        assert_eq!(guard_spawn_size("a", 11, 5), (SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS));
+        assert_eq!(guard_spawn_size("a", 12, 7), (SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS));
+        assert_eq!(guard_spawn_size("a", 200, 2), (SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS));
+        assert_eq!(guard_spawn_size("a", 0, 0), (SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS));
+    }
+
+    #[test]
+    fn resize_size_floors_each_dimension_without_resetting() {
+        // A plausible resize is honored exactly.
+        assert_eq!(guard_resize_size("a", 100, 40), (100, 40));
+        // A thin resize is floored per-dimension (NOT reset to a default), so a genuine
+        // resize to a slightly-small pane is honored as closely as is safe.
+        assert_eq!(guard_resize_size("a", 11, 40), (MIN_PTY_COLS, 40));
+        assert_eq!(guard_resize_size("a", 100, 2), (100, MIN_PTY_ROWS));
+        assert_eq!(guard_resize_size("a", 11, 5), (MIN_PTY_COLS, MIN_PTY_ROWS));
+    }
+
+    /// The thin-column floor + spawn fallback are duplicated in the frontend guard
+    /// (terminalSize.ts) and kept in sync only by a comment. If the two layers drift, a thin
+    /// size can slip through one of them — the exact failure this backstop exists to prevent.
+    /// This test reads terminalSize.ts and fails if the values diverge (roborev 17540).
+    #[test]
+    fn backstop_constants_match_the_frontend_guard() {
+        // cargo test runs with CWD = the crate dir (apps/desktop/src-tauri).
+        let ts = std::fs::read_to_string("../src/components/terminalSize.ts")
+            .expect("read terminalSize.ts");
+        // Pull `export const NAME = <int>;` out of the TS source.
+        let val = |name: &str| -> u16 {
+            let pat = format!("{name} = ");
+            let after = ts.split(&pat).nth(1).unwrap_or_else(|| panic!("{name} not found in terminalSize.ts"));
+            after
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is not an integer in terminalSize.ts"))
+        };
+        assert_eq!(val("MIN_PLAUSIBLE_COLS"), MIN_PTY_COLS, "cols floor drifted from terminalSize.ts");
+        assert_eq!(val("MIN_PLAUSIBLE_ROWS"), MIN_PTY_ROWS, "rows floor drifted from terminalSize.ts");
+        assert_eq!(val("SPAWN_FALLBACK_COLS"), SPAWN_FALLBACK_COLS, "spawn-fallback cols drifted");
+        assert_eq!(val("SPAWN_FALLBACK_ROWS"), SPAWN_FALLBACK_ROWS, "spawn-fallback rows drifted");
+    }
 
     /// Create a unique `<tmp>/-test-<pid>-<n>` with a real `worktrees/proj/agent`
     /// inside, and return the `worktrees` base.
