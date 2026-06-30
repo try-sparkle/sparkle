@@ -436,7 +436,7 @@ export function Terminal({
       }, 80);
     };
 
-    void (async () => {
+    (async () => {
       const offOut = await onPtyOutput((e) => {
         if (e.id !== agentId) return;
         // First byte for this agent — drop the loading overlay. setState bails on an unchanged
@@ -490,7 +490,13 @@ export function Terminal({
         syncPtySize(agentId, term);
         onReady?.();
       }
-    })();
+    })().catch((e) => {
+      // A rejected spawn chain (e.g. pty_spawn's worktree-scope guard, or a teardown race on the
+      // listener registrations) must not surface as an uncaught rejection. Swallow + debug-log:
+      // the loading overlay self-clears on exit/output and the agent simply never starts —
+      // acceptable degradation, far better than an unhandled rejection in the renderer.
+      console.debug("terminal spawn chain failed", agentId, e);
+    });
 
     // Copy-on-select: when the user finishes a mouse selection, copy it to the clipboard
     // and flash a confirmation so the (otherwise invisible) copy is obvious. A plain click

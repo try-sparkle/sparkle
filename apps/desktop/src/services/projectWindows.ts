@@ -104,10 +104,15 @@ export function defaultDeps(
         minWidth: 900,
         minHeight: 600,
       });
-      void win.once("tauri://error", (e) => {
-        console.error("Failed to create project window", label, e.payload);
-        clearWindowProject(label);
-      });
+      win
+        .once("tauri://error", (e) => {
+          console.error("Failed to create project window", label, e.payload);
+          clearWindowProject(label);
+        })
+        // A rejected once() registration (ACL/teardown race) must not surface as an uncaught
+        // rejection. Swallow + debug-log: worst case we miss the creation-failure eviction for
+        // this label, which a later open self-heals — far better than an unhandled rejection.
+        .catch((err) => console.debug("project-window error-listener registration failed", label, err));
     },
     currentLabel: () => currentLabel,
     registry: {
