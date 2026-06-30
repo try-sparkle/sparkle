@@ -636,20 +636,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       {project && mode !== "plan" && <HistorySearch />}
 
       <div style={{ flex: 1, overflowY: "auto", padding: "0 8px" }}>
-        {/* Cross-window attention block: red agents from OTHER open windows, each tagged with a
-            project pill. Its own section above this window's own agents; hidden when there are none.
-            Click raises the owning window and selects the agent (onOtherWindowAgentClick). */}
-        {otherWindowRedAgents.length > 0 && (
-          <div style={{ paddingBottom: 6, marginBottom: 4, borderBottom: `1px solid ${CHAT_USER_BUBBLE}` }}>
-            {otherWindowRedAgents.map((a) => (
-              <OtherWindowAgentRow
-                key={`${a.windowLabel}:${a.agentId}`}
-                agent={a}
-                onClick={() => onOtherWindowAgentClick(a)}
-              />
-            ))}
-          </div>
-        )}
         {/* Per-mode "+ New … Agent" affordance — the only way to create agents now that the chevrons
             are a selector. Sits above the (mode-filtered) list. Plan has none (no agents in Plan). */}
         {project && mode === "build" && (
@@ -663,6 +649,20 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             <TbBulb size={16} style={{ flexShrink: 0 }} />
             <span>+ New Think Agent</span>
           </button>
+        )}
+        {/* Cross-window attention block: red agents from OTHER open windows, each tagged with a
+            project pill. Sits BELOW the "+ New … Agent" button and ABOVE this window's own agents;
+            hidden when there are none. Click raises the owning window and selects the agent. */}
+        {otherWindowRedAgents.length > 0 && (
+          <div style={{ paddingTop: 2, paddingBottom: 6, marginBottom: 4, borderBottom: `1px solid ${CHAT_USER_BUBBLE}` }}>
+            {otherWindowRedAgents.map((a) => (
+              <OtherWindowAgentRow
+                key={`${a.windowLabel}:${a.agentId}`}
+                agent={a}
+                onClick={() => onOtherWindowAgentClick(a)}
+              />
+            ))}
+          </div>
         )}
         {(() => {
           if (!project) return null;

@@ -4,14 +4,16 @@
 // rows a touch taller than normal agent rows. Clicking routes to the owning window (see AgentSidebar).
 import { useState } from "react";
 import { StatusDot } from "./StatusDot";
-import { C, CHAT_USER_BUBBLE, ROW_ACTIVE_BUBBLE, FONT, FONT_WEIGHT } from "../theme/colors";
+import { C, ROW_ACTIVE_BUBBLE, ON_BRAND_FILL, statusInk, AGENT_STATUS, FONT, FONT_WEIGHT } from "../theme/colors";
 import type { OtherWindowAgent } from "../services/windowStatus";
 
-// Pill shades — VISUALLY TUNABLE. Founder's intent: the pill background is a blue DARKER than the
-// active-row shading (the "darker blue behind the shading"), and the pill TEXT is the active-row
-// shading color itself. Kept as named constants so they're easy to adjust after a look in the app.
-const PILL_BG = CHAT_USER_BUBBLE; // darker blue (#1d3a7a dark / light-mode mirror)
-const PILL_TEXT = ROW_ACTIVE_BUBBLE; // active-row shading (#2c57b0 dark / #bccdf2 light)
+// Pill shades — VISUALLY TUNABLE. The earlier "two close blues" pairing was unreadable in both
+// themes, so this uses the app's sanctioned high-contrast combo: the vivid brand blue as the fill
+// and the on-brand cream as the text (ON_BRAND_FILL is purpose-built for text sitting on a brand
+// fill, and both are theme-constant so contrast holds in light AND dark).
+const PILL_BG = C.teal; // brand blue #2f6bff (constant both themes)
+const PILL_TEXT = ON_BRAND_FILL; // cream #eaf1ff (constant) — high contrast on the blue fill
+const PILL_RADIUS = 4; // a squared-off tag, not a full pill (founder: "less rounded")
 
 // Left padding of the row; the pill's left edge and the StatusDot's left edge both anchor here so
 // the pill sits flush above the leading glyph slot.
@@ -52,12 +54,12 @@ export function OtherWindowAgentRow({
           maxWidth: "100%",
           boxSizing: "border-box",
           padding: "1px 7px",
-          borderRadius: 999,
+          borderRadius: PILL_RADIUS,
           background: PILL_BG,
           color: PILL_TEXT,
           fontFamily: FONT.ui,
           fontSize: 10,
-          fontWeight: FONT_WEIGHT.semibold,
+          fontWeight: FONT_WEIGHT.bold,
           lineHeight: 1.5,
           letterSpacing: 0.2,
           whiteSpace: "nowrap",
@@ -78,10 +80,12 @@ export function OtherWindowAgentRow({
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
-            color: C.cream,
+            // Match the red status dot — the name reads as red too (statusInk passes red through
+            // unchanged in both themes; it only re-inks the gray/green tiers for legibility).
+            color: statusInk(AGENT_STATUS[agent.status].color),
             fontFamily: FONT.ui,
             fontSize: 13,
-            fontWeight: FONT_WEIGHT.medium,
+            fontWeight: FONT_WEIGHT.semibold,
           }}
         >
           {agent.agentName}
