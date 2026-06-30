@@ -96,6 +96,13 @@ export function deleteAgentBranch(root: string, agentId: string): Promise<void> 
   return invoke<void>("delete_agent_branch", { root, agentId });
 }
 
+/** SAFELY delete an agent's merged branch (close a shipped agent). Uses `git branch -d`, which
+ *  refuses to delete a branch that isn't actually merged, so this can never lose unmerged work —
+ *  an unmerged branch is simply kept. Idempotent; remove the worktree first. */
+export function deleteAgentBranchIfMerged(root: string, agentId: string): Promise<void> {
+  return invoke<void>("delete_agent_branch_if_merged", { root, agentId });
+}
+
 /** Open a GitHub PR for an agent's branch (close-agent Ship). Resolves the PR URL; rejects when gh
  *  is missing/unauthed, there's no remote, or a PR already exists. Push first. */
 export function openAgentPr(

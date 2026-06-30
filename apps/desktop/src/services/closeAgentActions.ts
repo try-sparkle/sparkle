@@ -2,7 +2,13 @@
 // AgentSidebar component so the branching (push vs no-remote land, conditional bead close/deliver,
 // worktree-before-branch delete ordering) is unit-testable by mocking these service imports. None of
 // these touch the zustand stores — the caller does store teardown (close/removeAgent) around them.
-import { landAgentBranch, pushAgentBranch, openAgentPr, deleteAgentBranch } from "./branchStatus";
+import {
+  landAgentBranch,
+  pushAgentBranch,
+  openAgentPr,
+  deleteAgentBranch,
+  deleteAgentBranchIfMerged,
+} from "./branchStatus";
 import { closeBead, markBeadDelivered, deleteBead } from "./beads";
 import { removeAgentWorkspace } from "./worktree";
 
@@ -64,4 +70,23 @@ export async function discardAgentGit(p: DiscardParams): Promise<void> {
     await deleteAgentBranch(p.root, cid).catch(() => {});
   }
   for (const bid of p.beadIds) await deleteBead(p.root, bid).catch(() => {});
+}
+
+export interface SpinDownGitParams {
+  root: string;
+  projectId: string;
+  ids: string[]; // the build agent + its workers — every worktree to remove
+  deleteBranch: boolean; // safe-delete each merged branch after its worktree is gone
+}
+
+/** Git teardown for closing a shipped build agent: remove each worktree, and (when configured)
+ *  SAFELY delete each now-merged branch — `deleteAgentBranchIfMerged` uses `git branch -d`, which
+ *  refuses to delete an unmerged branch, so this can never lose work. Worktree-then-branch ordering
+ *  matters (git refuses to delete a checked-out branch). Each step is best-effort; does NOT touch
+ *  the stores — the caller removes the agents. */
+export async function spinDownAgentGit(p: SpinDownGitParams): Promise<void> {
+  for (const cid of p.ids) {
+    await removeAgentWorkspace(p.root, p.projectId, cid).catch(() => {});
+    if (p.deleteBranch) await deleteAgentBranchIfMerged(p.root, cid).catch(() => {});
+  }
 }

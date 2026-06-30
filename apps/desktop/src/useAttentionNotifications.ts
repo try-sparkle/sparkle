@@ -39,6 +39,8 @@ import {
   type FocusAgentPayload,
 } from "./services/attention";
 import { emitAttention, emitResolved } from "./services/relayClient";
+import { getAgentScrollback } from "./services/terminalScrollback";
+import { suggestedRepliesFor } from "./services/suggestions/attentionReplies";
 import { safeUnlisten } from "./services/safeUnlisten";
 import {
   publishWindowRedAgents,
@@ -195,19 +197,19 @@ export function useAttentionNotifications(): void {
                   : errored
                     ? `${agentName} hit an error / stalled in ${projectName} and needs you.`
                     : `${agentName} is waiting on your answer in ${projectName}.`),
-              suggested_replies: approval
-                ? [
-                    { label: "Approve", value: "y\n" },
-                    { label: "Deny", value: "n\n" },
-                  ]
-                : [],
+              // Real heuristic-detected direct-answers (y/n, numbered menu) when present, else a
+              // generic Approve/Deny for approvals. See suggestedRepliesFor.
+              suggested_replies: suggestedRepliesFor(getAgentScrollback(id) ?? "", approval),
               created_at: new Date().toISOString(),
             });
           }
 
           // Native macOS banner — emoji'd title from notificationFor, body = the SAME summary the
           // phone got (or its generic reason fallback). Skipped only when you're already looking at
-          // this exact agent (suppressNotification).
+          // this exact agent (suppressNotification). Unlike the phone relay above, the banner does
+          // NOT re-check live status after the await: a banner is a transient OS notification (it
+          // appears and auto-dismisses), so a slightly-stale one is low-harm — whereas a phone card
+          // persists until resolved, which is why only the relay re-validates. Intentional asymmetry.
           if (!suppressed) {
             const banner = notificationFor(st, agentName, projectName);
             notifyAttention({

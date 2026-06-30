@@ -41,6 +41,10 @@ pub struct WorkflowConfig {
     pub worktree_isolation: bool,
     pub default_branch: String,
     pub born_fresh_from_base: bool,
+    /// After an agent's branch lands on the integration branch, delete the now-merged branch on
+    /// close (a SAFE `git branch -d`, which refuses to delete a branch that isn't actually merged).
+    /// Default true = keep things tidy; false = keep merged branches around.
+    pub delete_merged_branch: bool,
     pub drift: DriftConfig,
 }
 
@@ -57,6 +61,7 @@ pub struct AiConfig {
     pub voice_dictation: bool,
     pub brainstorm: bool,
     pub composer: bool,
+    pub suggested_actions: bool,
 }
 
 /// Branch/build freshness rules — guardrails against doing work on (or shipping a DMG from) a
@@ -96,6 +101,7 @@ impl Default for SparkleConfig {
                 // `master`/`develop` repo work with no config while still allowing a pin.
                 default_branch: String::new(),
                 born_fresh_from_base: true,
+                delete_merged_branch: true,
                 drift: DriftConfig {
                     behind_nudge: 10,
                     ahead_nudge: 15,
@@ -109,6 +115,7 @@ impl Default for SparkleConfig {
                 voice_dictation: true,
                 brainstorm: true,
                 composer: true,
+                suggested_actions: true,
             },
             freshness: FreshnessConfig {
                 // Keep these in sync with the bash fallback in scripts/lib/sparkle-config.sh.
@@ -144,6 +151,7 @@ struct PartialWorkflow {
     worktree_isolation: Option<bool>,
     default_branch: Option<String>,
     born_fresh_from_base: Option<bool>,
+    delete_merged_branch: Option<bool>,
     drift: Option<PartialDrift>,
 }
 
@@ -158,6 +166,7 @@ struct PartialAi {
     voice_dictation: Option<bool>,
     brainstorm: Option<bool>,
     composer: Option<bool>,
+    suggested_actions: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -197,6 +206,9 @@ fn apply_workflow(into: &mut WorkflowConfig, p: Option<PartialWorkflow>) {
     }
     if let Some(v) = p.born_fresh_from_base {
         into.born_fresh_from_base = v;
+    }
+    if let Some(v) = p.delete_merged_branch {
+        into.delete_merged_branch = v;
     }
     if let Some(d) = p.drift {
         if let Some(v) = d.behind_nudge {
@@ -243,6 +255,9 @@ fn apply_ai(into: &mut AiConfig, p: Option<PartialAi>) {
     }
     if let Some(v) = p.composer {
         into.composer = v;
+    }
+    if let Some(v) = p.suggested_actions {
+        into.suggested_actions = v;
     }
 }
 
@@ -437,6 +452,10 @@ worktree_isolation   = true
 # true = cut each agent's branch from a FRESH copy of the base (fetched first), so agents
 # start from the latest work rather than a stale local copy.
 born_fresh_from_base = true
+# true = when you close a build agent whose branch has landed on the integration branch, delete
+# the now-merged branch (a SAFE delete that refuses if the branch isn't actually merged). false =
+# keep merged branches around.
+delete_merged_branch = true
 
 # --- When to nudge you that an agent's branch has drifted from its base ----------------
 [workflow.drift]
@@ -456,6 +475,7 @@ auto_rename     = true   # auto-name worker agents from the work they're doing
 voice_dictation = true   # use the cloud (Deepgram) STT for dictation; off = on-device model
 brainstorm      = true   # show the Think agent (chat with Chief)
 composer        = true   # use the AI-enhanced composer; off = a plain terminal input
+# suggested_actions = true   # show one-click suggested action buttons in the composer
 
 # --- Branch/build freshness guardrails (repo-scoped; overridable in a project file) ----
 # These stop work from being done on — or a DMG from being shipped from — a branch that has

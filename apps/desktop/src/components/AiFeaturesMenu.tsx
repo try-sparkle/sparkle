@@ -24,6 +24,7 @@ const FEATURES: Array<{ key: AiFeatureKey; label: string }> = [
   { key: "voiceDictation", label: "Use AI-enhanced voice dictation for much better accuracy" },
   { key: "brainstorm", label: "Enable the AI Think agent (chat with Chief)" },
   { key: "composer", label: "Use AI-enhanced composer" },
+  { key: "suggestedActions", label: "Suggested actions" },
 ];
 
 const row: CSSProperties = { display: "flex", alignItems: "center", gap: 6 };
@@ -88,16 +89,18 @@ export function AiFeaturesMenu() {
   const cloudDictation = useSettingsStore((s) => s.cloudDictation);
   const aiBrainstorm = useSettingsStore((s) => s.aiBrainstorm);
   const aiComposer = useSettingsStore((s) => s.aiComposer);
+  const aiSuggestedActions = useSettingsStore((s) => s.aiSuggestedActions);
   const autoApplyUpdates = useSettingsStore((s) => s.autoApplyUpdates);
   const setAutoApplyUpdates = useSettingsStore((s) => s.setAutoApplyUpdates);
 
-  const flags = { aiAutoRename, cloudDictation, aiBrainstorm, aiComposer };
+  const flags = { aiAutoRename, cloudDictation, aiBrainstorm, aiComposer, aiSuggestedActions };
   const mode = aiFeatureMode(flags);
   const valueByKey: Record<AiFeatureKey, boolean> = {
     autoRename: aiAutoRename,
     voiceDictation: cloudDictation,
     brainstorm: aiBrainstorm,
     composer: aiComposer,
+    suggestedActions: aiSuggestedActions,
   };
 
   return (

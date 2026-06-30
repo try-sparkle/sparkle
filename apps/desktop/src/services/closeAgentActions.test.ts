@@ -5,6 +5,7 @@ vi.mock("./branchStatus", () => ({
   pushAgentBranch: vi.fn(),
   openAgentPr: vi.fn(),
   deleteAgentBranch: vi.fn(),
+  deleteAgentBranchIfMerged: vi.fn(),
 }));
 vi.mock("./beads", () => ({
   closeBead: vi.fn(),
@@ -13,7 +14,7 @@ vi.mock("./beads", () => ({
 }));
 vi.mock("./worktree", () => ({ removeAgentWorkspace: vi.fn() }));
 
-import { shipAgent, saveAgent, discardAgentGit } from "./closeAgentActions";
+import { shipAgent, saveAgent, discardAgentGit, spinDownAgentGit } from "./closeAgentActions";
 import * as branch from "./branchStatus";
 import * as beads from "./beads";
 import * as worktree from "./worktree";
@@ -94,5 +95,26 @@ describe("discardAgentGit", () => {
     expect(order).toEqual(["rm:parent", "del:parent", "rm:w1", "del:w1"]);
     expect(beads.deleteBead).toHaveBeenCalledWith("/r", "bd-parent");
     expect(beads.deleteBead).toHaveBeenCalledWith("/r", "bd-w1");
+  });
+});
+
+describe("spinDownAgentGit (close a shipped build agent)", () => {
+  it("removes each worktree then SAFE-deletes each branch when deleteBranch=true", async () => {
+    const order: string[] = [];
+    vi.mocked(worktree.removeAgentWorkspace).mockImplementation(async (_r, _p, id) => {
+      order.push(`rm:${id}`);
+    });
+    vi.mocked(branch.deleteAgentBranchIfMerged).mockImplementation(async (_r, id) => {
+      order.push(`del:${id}`);
+    });
+    await spinDownAgentGit({ root: "/r", projectId: "p1", ids: ["parent", "w1"], deleteBranch: true });
+    expect(order).toEqual(["rm:parent", "del:parent", "rm:w1", "del:w1"]);
+    expect(branch.deleteAgentBranch).not.toHaveBeenCalled(); // never the FORCE delete
+  });
+
+  it("removes worktrees but keeps branches when deleteBranch=false", async () => {
+    await spinDownAgentGit({ root: "/r", projectId: "p1", ids: ["parent"], deleteBranch: false });
+    expect(worktree.removeAgentWorkspace).toHaveBeenCalledWith("/r", "p1", "parent");
+    expect(branch.deleteAgentBranchIfMerged).not.toHaveBeenCalled();
   });
 });

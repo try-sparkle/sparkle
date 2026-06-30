@@ -11,12 +11,17 @@ import { io, type Socket } from "socket.io-client";
 import { invoke } from "@tauri-apps/api/core";
 import { onPtyOutput, writePty } from "../pty";
 import { getAgentScrollback } from "./terminalScrollback";
+import { closeBuildAgent } from "./closeBuildAgent";
+import { parseControlAction, CLOSE_AGENT_ACTION } from "./suggestions/controlButtons";
 import { safeUnlisten } from "./safeUnlisten";
 import {
   authorizeAgentInput,
   authorizeDecision,
+  resolveSuggestionClick,
+  frameSubmit,
   type AgentInputPayload,
   type DecisionPayload,
+  type SuggestionClickPayload,
 } from "./relayGate";
 
 const RELAY_URL =
@@ -26,6 +31,15 @@ const RELAY_URL =
 export interface SuggestedReply {
   label: string;
   value: string;
+}
+export interface SuggestionButtonWire {
+  id: string;
+  label: string;
+  value: string;
+}
+export interface Suggestions {
+  agent_id: string;
+  buttons: SuggestionButtonWire[];
 }
 export interface AttentionPayload {
   attention_id: string;
@@ -65,6 +79,14 @@ let ptyUnlisten: (() => void) | null = null;
 // keystrokes into an arbitrary PTY, and resolving an OLD attention can't drop authorization for
 // a newer one on the same agent (the bug a per-agent set had).
 const liveAttentions = new Map<string, string>();
+// agentId -> (buttonId -> value) for suggestion buttons we pushed to the phone. A suggestion_click
+// is resolved back to its value here, so the phone can only trigger a button the desktop actually
+// offered for an agent the phone is watching (never inject arbitrary text).
+const suggestionsByAgent = new Map<string, Map<string, string>>();
+/** Resolve a phone-clicked button id back to the value the desktop pushed. Exported for tests. */
+export function lookupSuggestionValue(agentId: string, buttonId: string): string | null {
+  return suggestionsByAgent.get(agentId)?.get(buttonId) ?? null;
+}
 
 /** Start (idempotent) the relay host connection. No-op if not signed in. */
 export async function startRelayHost(): Promise<void> {
@@ -135,6 +157,29 @@ export async function startRelayHost(): Promise<void> {
     }
   });
 
+  // The phone tapped a suggestion button — resolve it back to the exact value WE pushed for that
+  // (watched) agent and inject it (gate: relayGate). The phone never sends raw text on this path.
+  // Like the agent_input / decision phone paths, this intentionally bypasses the desktop trial
+  // meter: phone input is direct PTY injection, not a composer "send" (the trial cap is a
+  // desktop-composer concept). A trial-gated remote would be a separate, deliberate policy.
+  socket.on("suggestion_click", (c: SuggestionClickPayload) => {
+    // ONE gate for both paths (resolveSuggestionClick: watched agent + desktop-pushed button id).
+    // A "control:" value is an app action (e.g. close the build agent), not a PTY write — branch on
+    // the resolved raw value. The phone can only reach this for a watched agent where the desktop
+    // actually offered the control button (i.e. a shipped agent), so it can't close an arbitrary one.
+    const r = resolveSuggestionClick(watched, c, lookupSuggestionValue);
+    if (!r) return;
+    if (parseControlAction(r.value) === CLOSE_AGENT_ACTION) {
+      void closeBuildAgent(r.agentId).catch((e) =>
+        console.debug("relay suggestion_click closeAgent failed", e),
+      );
+      return;
+    }
+    void writePty(r.agentId, frameSubmit(r.value)).catch((e) =>
+      console.debug("relay suggestion_click writePty failed", e),
+    );
+  });
+
   // The phone answered an attention — authorize + inject into that agent's PTY (gate: relayGate).
   socket.on("decision", (d: DecisionPayload) => {
     const w = authorizeDecision(liveAttentions, d);
@@ -169,12 +214,33 @@ export function pushRoster(roster: RosterPayload): void {
   socket.emit("roster", roster);
 }
 
+/**
+ * Push the current suggestion buttons for an agent to the phone(s), and remember the id→value map
+ * so a later suggestion_click can be resolved + authorized. Safe to call before connect (the phone
+ * just won't see it until the next push after connect).
+ */
+export function pushSuggestions(payload: Suggestions): void {
+  // An empty set RETIRES the agent's buttons: drop the id→value map so a phone can no longer
+  // resolve (and inject) a button the desktop has stopped showing, and tell the phone to clear its
+  // row. Callers push an empty set whenever suggestions are locally cleared/hidden.
+  if (payload.buttons.length === 0) {
+    suggestionsByAgent.delete(payload.agent_id);
+  } else {
+    const map = new Map<string, string>();
+    for (const b of payload.buttons) map.set(b.id, b.value);
+    suggestionsByAgent.set(payload.agent_id, map);
+  }
+  if (!socket || !registered) return;
+  socket.emit("suggestions", payload);
+}
+
 export function stopRelayHost(): void {
   socket?.close();
   socket = null;
   registered = false;
   connecting = false;
   liveAttentions.clear();
+  suggestionsByAgent.clear();
   watched.clear();
   void safeUnlisten(ptyUnlisten);
   ptyUnlisten = null;

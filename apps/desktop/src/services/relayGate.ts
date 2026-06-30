@@ -12,6 +12,10 @@ export interface AgentInputPayload {
   agent_id?: string;
   text?: string;
 }
+export interface SuggestionClickPayload {
+  agent_id?: string;
+  button_id?: string;
+}
 export interface PtyWrite {
   agentId: string;
   text: string;
@@ -51,4 +55,28 @@ export function authorizeAgentInput(
   if (typeof i.text !== "string" || i.text.length > MAX) return null;
   const text = i.text.endsWith("\n") ? i.text : `${i.text}\n`;
   return { agentId: i.agent_id, text };
+}
+
+/**
+ * The single authorization gate for a phone suggestion click: allowed ONLY for a watched agent and
+ * a button id the desktop actually pushed (resolved via `lookup`). Returns the target agent + the
+ * RAW pushed value (un-framed), or null. Both the PTY-write path and the control-action path branch
+ * off this one result, so the gate can never diverge.
+ */
+export function resolveSuggestionClick(
+  watched: Set<string>,
+  c: SuggestionClickPayload,
+  lookup: (agentId: string, buttonId: string) => string | null,
+): { agentId: string; value: string } | null {
+  if (!c || typeof c.agent_id !== "string" || !watched.has(c.agent_id)) return null;
+  if (typeof c.button_id !== "string") return null;
+  const value = lookup(c.agent_id, c.button_id);
+  if (value == null || value.length > MAX) return null;
+  return { agentId: c.agent_id, value };
+}
+
+/** Frame a value for SUBMISSION into the PTY: ensure exactly one trailing newline so a prompt is
+ *  actually entered (terminal keystroke values like "2\n" already have it). */
+export function frameSubmit(value: string): string {
+  return value.endsWith("\n") ? value : `${value}\n`;
 }

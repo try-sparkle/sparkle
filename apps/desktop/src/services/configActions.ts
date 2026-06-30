@@ -15,6 +15,7 @@ const AI_CONFIG_PATH: Record<AiFeatureKey, string> = {
   voiceDictation: "ai.voice_dictation",
   brainstorm: "ai.brainstorm",
   composer: "ai.composer",
+  suggestedActions: "ai.suggested_actions",
 };
 
 /** Toggle one AI feature: optimistic store update, then persist to config.toml. */
@@ -39,6 +40,16 @@ export async function setAllAiFeatures(on: boolean): Promise<void> {
     await setConfigValues(values);
   } catch (e) {
     console.warn("config write failed (ai bulk)", e);
+  }
+}
+
+/** Toggle "delete merged branch on close": optimistic store update, then persist to config.toml. */
+export async function setDeleteMergedBranch(on: boolean): Promise<void> {
+  useSettingsStore.getState().setDeleteMergedBranch(on);
+  try {
+    await setConfigValue("workflow.delete_merged_branch", on);
+  } catch (e) {
+    console.warn("config write failed (delete merged branch)", e);
   }
 }
 

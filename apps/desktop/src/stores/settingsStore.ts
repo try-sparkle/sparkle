@@ -40,7 +40,12 @@ export const DEFAULT_NOTIFY_STATUSES: Record<AgentTabStatus, boolean> = {
 // terminal instead of the composer). Default ON so the app is fully featured out of the box.
 
 /** Stable identifiers for the AI features, used by the menu + the generic setter. */
-export type AiFeatureKey = "autoRename" | "voiceDictation" | "brainstorm" | "composer";
+export type AiFeatureKey =
+  | "autoRename"
+  | "voiceDictation"
+  | "brainstorm"
+  | "composer"
+  | "suggestedActions";
 
 /** Derived state of the master segment: every feature on / off / a mix. */
 export type AiMode = "all" | "some" | "off";
@@ -52,6 +57,7 @@ export interface AiFeatureFlags {
   cloudDictation: boolean;
   aiBrainstorm: boolean;
   aiComposer: boolean;
+  aiSuggestedActions: boolean;
 }
 
 /** Map a menu feature key to its settings-store field name. The single source of this
@@ -61,6 +67,7 @@ export const AI_FEATURE_FIELD: Record<AiFeatureKey, keyof AiFeatureFlags> = {
   voiceDictation: "cloudDictation",
   brainstorm: "aiBrainstorm",
   composer: "aiComposer",
+  suggestedActions: "aiSuggestedActions",
 };
 
 // --- Chief sync state (replacing the legacy markdown-sync watermark) -----------------------
@@ -73,7 +80,13 @@ export interface ChiefDocState {
 
 /** Derive the master segment from the four flags: all on → "all", all off → "off", else "some". */
 export function aiFeatureMode(f: AiFeatureFlags): AiMode {
-  const vals = [f.aiAutoRename, f.cloudDictation, f.aiBrainstorm, f.aiComposer];
+  const vals = [
+    f.aiAutoRename,
+    f.cloudDictation,
+    f.aiBrainstorm,
+    f.aiComposer,
+    f.aiSuggestedActions,
+  ];
   if (vals.every(Boolean)) return "all";
   if (vals.every((v) => !v)) return "off";
   return "some";
@@ -169,6 +182,8 @@ interface SettingsState {
   /** Use the AI-enhanced composer (ghost text, screenshot drop, dictation insert, Send). Off →
    *  the composer is replaced by the bare terminal input. */
   aiComposer: boolean;
+  /** Show one-click suggested action buttons in the composer (Haiku-learned actions). Off → only the free heuristic direct-answer buttons remain. */
+  aiSuggestedActions: boolean;
   /** Auto-apply desktop updates: when on (default), a found update downloads + installs silently
    *  and applies on the next restart, with a quiet "ready" affordance. When off, the user gets a
    *  "Restart to apply / Later" prompt instead and nothing is installed until they choose. Read by
@@ -193,6 +208,8 @@ interface SettingsState {
   defaultBranch: string;
   /** Cut each agent branch from a freshly-fetched base. */
   bornFreshFromBase: boolean;
+  /** On closing a shipped build agent, safe-delete its now-merged branch (true) or keep it. */
+  deleteMergedBranch: boolean;
   /** Drift-nudge thresholds: commits behind / ahead / changed lines. */
   driftBehindNudge: number;
   driftAheadNudge: number;
@@ -209,6 +226,8 @@ interface SettingsState {
   setCloudDictation: (on: boolean) => void;
   /** Toggle auto-apply of desktop updates (the "Automatically apply updates" checkbox). */
   setAutoApplyUpdates: (on: boolean) => void;
+  /** Toggle deleting a shipped agent's merged branch on close (optimistic; configActions persists). */
+  setDeleteMergedBranch: (on: boolean) => void;
   /** Toggle notifications for one agent status. */
   setNotifyStatus: (status: AgentTabStatus, on: boolean) => void;
   /** Toggle one AI feature; the master segment re-derives automatically (aiFeatureMode). */
@@ -234,6 +253,7 @@ export const useSettingsStore = create<SettingsState>()(
       aiAutoRename: true,
       aiBrainstorm: true,
       aiComposer: true,
+      aiSuggestedActions: true,
       autoApplyUpdates: true,
       notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
       sparkleImprovementConsent: DEFAULT_SPARKLE_CONSENT,
@@ -243,6 +263,7 @@ export const useSettingsStore = create<SettingsState>()(
       worktreeIsolation: true,
       defaultBranch: "",
       bornFreshFromBase: true,
+      deleteMergedBranch: true,
       driftBehindNudge: 10,
       driftAheadNudge: 15,
       driftChangedLines: 1000,
@@ -252,11 +273,18 @@ export const useSettingsStore = create<SettingsState>()(
       setRuntimeChiefPat: (pat) => set({ runtimeChiefPat: pat.trim() }),
       setCloudDictation: (on) => set({ cloudDictation: on }),
       setAutoApplyUpdates: (on) => set({ autoApplyUpdates: on }),
+      setDeleteMergedBranch: (on) => set({ deleteMergedBranch: on }),
       setNotifyStatus: (status, on) =>
         set((s) => ({ notifyStatuses: { ...s.notifyStatuses, [status]: on } })),
       setAiFeature: (key, on) => set({ [AI_FEATURE_FIELD[key]]: on } as Partial<AiFeatureFlags>),
       setAllAiFeatures: (on) =>
-        set({ aiAutoRename: on, cloudDictation: on, aiBrainstorm: on, aiComposer: on }),
+        set({
+          aiAutoRename: on,
+          cloudDictation: on,
+          aiBrainstorm: on,
+          aiComposer: on,
+          aiSuggestedActions: on,
+        }),
       setSparkleImprovementConsent: (mode) => set({ sparkleImprovementConsent: mode }),
 
       setChiefProject: (sparkleProjectId, chiefProjectId) =>
@@ -289,11 +317,13 @@ export const useSettingsStore = create<SettingsState>()(
           cloudDictation: config.ai.voice_dictation,
           aiBrainstorm: config.ai.brainstorm,
           aiComposer: config.ai.composer,
+          aiSuggestedActions: config.ai.suggested_actions,
           // Workflow rules (display / advanced).
           requirePr: config.workflow.require_pr,
           worktreeIsolation: config.workflow.worktree_isolation,
           defaultBranch: config.workflow.default_branch,
           bornFreshFromBase: config.workflow.born_fresh_from_base,
+          deleteMergedBranch: config.workflow.delete_merged_branch,
           driftBehindNudge: config.workflow.drift.behind_nudge,
           driftAheadNudge: config.workflow.drift.ahead_nudge,
           driftChangedLines: config.workflow.drift.changed_lines,
@@ -340,6 +370,7 @@ export const useSettingsStore = create<SettingsState>()(
         aiAutoRename: s.aiAutoRename,
         aiBrainstorm: s.aiBrainstorm,
         aiComposer: s.aiComposer,
+        aiSuggestedActions: s.aiSuggestedActions,
         autoApplyUpdates: s.autoApplyUpdates,
         notifyStatuses: s.notifyStatuses,
         sparkleImprovementConsent: s.sparkleImprovementConsent,

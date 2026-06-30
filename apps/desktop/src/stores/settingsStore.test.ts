@@ -4,6 +4,7 @@ import {
   aiFeatureMode,
   migrateSettings,
   useSettingsStore,
+  AI_FEATURE_FIELD,
   type AiFeatureFlags,
 } from "./settingsStore";
 
@@ -46,6 +47,7 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
     cloudDictation: true,
     aiBrainstorm: true,
     aiComposer: true,
+    aiSuggestedActions: true,
     ...over,
   });
 
@@ -55,7 +57,13 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
 
   it("is 'off' when every feature is off", () => {
     expect(
-      aiFeatureMode({ aiAutoRename: false, cloudDictation: false, aiBrainstorm: false, aiComposer: false }),
+      aiFeatureMode({
+        aiAutoRename: false,
+        cloudDictation: false,
+        aiBrainstorm: false,
+        aiComposer: false,
+        aiSuggestedActions: false,
+      }),
     ).toBe("off");
   });
 
@@ -63,8 +71,32 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
     expect(aiFeatureMode(flags({ aiComposer: false }))).toBe("some");
     expect(aiFeatureMode(flags({ cloudDictation: false }))).toBe("some");
     expect(
-      aiFeatureMode({ aiAutoRename: true, cloudDictation: false, aiBrainstorm: false, aiComposer: false }),
+      aiFeatureMode({
+        aiAutoRename: true,
+        cloudDictation: false,
+        aiBrainstorm: false,
+        aiComposer: false,
+        aiSuggestedActions: false,
+      }),
     ).toBe("some");
+  });
+});
+
+describe("suggestedActions AI flag", () => {
+  const allOn: AiFeatureFlags = {
+    aiAutoRename: true,
+    cloudDictation: true,
+    aiBrainstorm: true,
+    aiComposer: true,
+    aiSuggestedActions: true,
+  };
+
+  it("maps the menu key to its store field", () => {
+    expect(AI_FEATURE_FIELD.suggestedActions).toBe("aiSuggestedActions");
+  });
+  it("counts toward the All/Some/Off master", () => {
+    expect(aiFeatureMode(allOn)).toBe("all");
+    expect(aiFeatureMode({ ...allOn, aiSuggestedActions: false })).toBe("some");
   });
 });
 
@@ -129,13 +161,15 @@ describe("settingsStore — AI feature setters", () => {
     useSettingsStore.getState().setAiFeature("voiceDictation", true);
     useSettingsStore.getState().setAiFeature("brainstorm", true);
     useSettingsStore.getState().setAiFeature("composer", true);
+    useSettingsStore.getState().setAiFeature("suggestedActions", true);
     const s = useSettingsStore.getState();
-    expect([s.aiAutoRename, s.cloudDictation, s.aiBrainstorm, s.aiComposer]).toEqual([
-      true,
-      true,
-      true,
-      true,
-    ]);
+    expect([
+      s.aiAutoRename,
+      s.cloudDictation,
+      s.aiBrainstorm,
+      s.aiComposer,
+      s.aiSuggestedActions,
+    ]).toEqual([true, true, true, true, true]);
     expect(aiFeatureMode(s)).toBe("all");
   });
 });
@@ -195,10 +229,17 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
           worktree_isolation: false,
           default_branch: "develop",
           born_fresh_from_base: false,
+          delete_merged_branch: false,
           drift: { behind_nudge: 3, ahead_nudge: 4, changed_lines: 5 },
         },
         workers: { max_concurrent: 0 }, // out of range → clamped to 1
-        ai: { auto_rename: false, voice_dictation: false, brainstorm: false, composer: true },
+        ai: {
+          auto_rename: false,
+          voice_dictation: false,
+          brainstorm: false,
+          composer: true,
+          suggested_actions: true,
+        },
         freshness: {
           staleness_warn_commits: 25,
           stale_build_block_commits: 25,
@@ -213,6 +254,7 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
     expect(s.worktreeIsolation).toBe(false);
     expect(s.defaultBranch).toBe("develop");
     expect(s.bornFreshFromBase).toBe(false);
+    expect(s.deleteMergedBranch).toBe(false);
     expect(s.driftBehindNudge).toBe(3);
     expect(s.driftAheadNudge).toBe(4);
     expect(s.driftChangedLines).toBe(5);

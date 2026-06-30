@@ -11,7 +11,15 @@ import {
 } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
-import { submitPrompt } from "../pty";
+import { submitPrompt, writePty } from "../pty";
+import { SuggestionRow } from "./composer/SuggestionRow";
+import { useSuggestions } from "../services/suggestions/useSuggestions";
+import { deriveContextTags } from "../services/suggestions/contextTags";
+import { getAgentScrollback } from "../services/terminalScrollback";
+import { useSuggestionStore } from "../stores/suggestionStore";
+import { closeBuildAgent } from "../services/closeBuildAgent";
+import { parseControlAction, CLOSE_AGENT_ACTION } from "../services/suggestions/controlButtons";
+import type { SuggestionButton } from "../services/suggestions/types";
 import { trialSendAllowed, recordTrialSend } from "../services/trialMeter";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { captureScreenRegion } from "../screenshot";
@@ -272,6 +280,14 @@ export function Composer({
   // Large pastes collapsed into clickable pills (rather than flooding the textarea).
   // Their full text is expanded inline into the payload on send.
   const [textBlocks, setTextBlocks] = useState<TextBlock[]>([]);
+  // Suggested action buttons (heuristic direct-answers + Haiku-learned next-actions). The row is
+  // only shown when the box is empty and the user isn't typing or dictating — see suggestionsVisible.
+  const composerEmptyNow = !value.trim() && attachments.length === 0 && textBlocks.length === 0;
+  const {
+    buttons: suggestionButtons,
+    dismiss: dismissSuggestion,
+    clear: clearSuggestions,
+  } = useSuggestions(agentId, composerEmptyNow);
   const [capturing, setCapturing] = useState(false);
   const height = useUiStore((s) => s.composerHeight);
   const setComposerHeight = useUiStore((s) => s.setComposerHeight);
@@ -545,8 +561,28 @@ export function Composer({
   const isComposerEmpty = () =>
     !value.trim() && attachments.length === 0 && textBlocks.length === 0;
 
+  // Shared delivery for both typed sends and prompt-kind suggestion clicks, so the trial/delivery
+  // bookkeeping (payload/display build → parent callback → PTY → ghost-history → trial meter) can
+  // never drift between the two paths. `typed` is the raw (untrimmed) text; naming/history use the
+  // trimmed form. Callers are responsible for the trial-cap gate + clearing the box.
+  const deliverPrompt = async (typed: string, atts: Attachment[], blocks: TextBlock[]) => {
+    const payload = buildSendPayload({ attachments: atts, textBlocks: blocks, typed });
+    const display = buildDisplay({ attachments: atts, textBlocks: blocks, typed });
+    const naming = typed.trim();
+    // Remember the typed text (not the attachment-annotated display) so it can be offered as a
+    // ghost-text suggestion next time — clicked prompts feed this exactly like typed ones.
+    if (naming) recordPrompt(naming);
+    // Pass the typed text as the naming basis, separate from the marker-decorated `display`.
+    // Attachments-only sends carry an empty basis, so auto-naming is skipped.
+    onSubmitPrompt(display, naming);
+    await submitPrompt(agentId, payload);
+    // Consume a trial prompt only now that it's actually delivered (no-op for entitled users).
+    void recordTrialSend();
+  };
+
   const send = async () => {
     if (disabled) return; // PTY not spawned yet — don't drop the prompt
+    const typed = value;
     const text = value.trim();
     const atts = attachments;
     const blocks = textBlocks;
@@ -556,12 +592,6 @@ export function Composer({
     // visible (it shows whenever promptsUsed ≥ limit), so this is defense-in-depth, not a
     // silent dead-end.
     if (!trialSendAllowed()) return;
-    // What the CLI receives: attachment paths prefixed to the body (pasted-text pills
-    // expanded inline + the typed text). A bare attachment/pill with no text is valid.
-    const payload = buildSendPayload({ attachments: atts, textBlocks: blocks, typed: value });
-    // What the transcript shows: the typed text plus compact counts — never raw temp-file
-    // paths (an ugly leak) and never a wall of pasted text.
-    const display = buildDisplay({ attachments: atts, textBlocks: blocks, typed: value });
     setValue("");
     setAttachments([]);
     setTextBlocks([]);
@@ -569,22 +599,56 @@ export function Composer({
     // leave it sitting tall (clears any manual sizing too). Send is unreachable while minimized,
     // so this never fights the keep-minimized exception.
     resetComposerSize();
-    // Remember the typed text (not the attachment-annotated display string) so it can be
-    // offered as a ghost-text suggestion next time the user types its prefix.
-    if (text) recordPrompt(text);
     log.info("composer", "send prompt", {
       agentId,
       chars: text.length,
       attachments: atts.length,
       textBlocks: blocks.length,
     });
-    // Pass the typed text (already trimmed into `text`) as the naming basis, separate from the
-    // marker-decorated `display`. Attachments-only sends carry an empty basis, so auto-naming is
-    // skipped rather than fed "📷 1 image".
-    onSubmitPrompt(display, text);
-    await submitPrompt(agentId, payload);
-    // Consume a trial prompt only now that it's actually delivered (no-op for entitled users).
-    void recordTrialSend();
+    await deliverPrompt(typed, atts, blocks);
+    // Learn from a real typed action so the suggestion history reflects what the user actually
+    // does in this terminal state. Only log when suggestions were on offer (the agent is waiting
+    // on the user) so ordinary mid-turn messages don't pollute the history.
+    if (text && suggestionButtons.length > 0) {
+      useSuggestionStore.getState().recordEvent({
+        contextTags: deriveContextTags(getAgentScrollback(agentId) ?? ""),
+        label: text.slice(0, 40),
+        value: text,
+        kind: "prompt",
+      });
+    }
+  };
+
+  // Send a suggestion button's action immediately (one click). Terminal-kind buttons inject raw
+  // keystrokes straight into the PTY (y/n, numbered choices); prompt-kind buttons go through the
+  // normal message path as if the user had typed and sent them; control-kind buttons run an app
+  // action (e.g. close this build agent). Then learn from the action and clear the row.
+  const onSuggestionClick = async (b: SuggestionButton) => {
+    if (b.kind === "control") {
+      // Control buttons touch nothing in the PTY and aren't a learnable "action", so they don't
+      // record to history and aren't gated by `disabled` (PTY not spawned). Route by action id.
+      const action = parseControlAction(b.value);
+      if (action === CLOSE_AGENT_ACTION) await closeBuildAgent(agentId);
+      clearSuggestions();
+      return;
+    }
+    if (disabled) return;
+    if (b.kind === "terminal") {
+      // Terminal-kind buttons come ONLY from the local heuristic detector and carry a bare control
+      // keystroke (y/n, a menu digit) — interactive terminal input, not a metered "send". So they
+      // intentionally bypass the trial-cap gate, exactly like typing into the terminal directly.
+      await writePty(agentId, b.value);
+    } else {
+      if (!trialSendAllowed()) return;
+      await deliverPrompt(b.value, [], []);
+    }
+    useSuggestionStore.getState().recordEvent({
+      contextTags: deriveContextTags(getAgentScrollback(agentId) ?? ""),
+      label: b.label,
+      value: b.value,
+      kind: b.kind,
+    });
+    clearSuggestions();
   };
 
   // Accept the ghost completion: replace the input with the full past prompt and drop the
@@ -1012,6 +1076,12 @@ export function Composer({
             </div>
           )}
         </div>
+        <SuggestionRow
+          buttons={suggestionButtons}
+          visible={composerEmptyNow && !interimActive && !liveActive}
+          onClick={(b) => void onSuggestionClick(b)}
+          onDismiss={dismissSuggestion}
+        />
         <button
           onClick={() => void capture()}
           disabled={disabled || capturing}

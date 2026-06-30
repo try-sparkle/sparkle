@@ -14,6 +14,7 @@ export interface WorkflowConfig {
   worktree_isolation: boolean;
   default_branch: string;
   born_fresh_from_base: boolean;
+  delete_merged_branch: boolean;
   drift: DriftConfig;
 }
 export interface WorkersConfig {
@@ -24,6 +25,7 @@ export interface AiConfig {
   voice_dictation: boolean;
   brainstorm: boolean;
   composer: boolean;
+  suggested_actions: boolean;
 }
 /** Branch/build freshness guardrails (read by the build script + session-start staleness hook). */
 export interface FreshnessConfig {

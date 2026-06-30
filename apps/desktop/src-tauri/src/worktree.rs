@@ -513,6 +513,20 @@ fn merge_adds_nothing(root: &str, target: &str, branch: &str) -> bool {
     }
 }
 
+/// Is `branch` effectively landed on the integration branch? The single source of the "landed"
+/// rule, used by BOTH the workflow-state signal and the close-agent safe branch delete so they can
+/// never disagree. Checks fast-forward ancestry into LOCAL or ORIGIN `<target>`, OR a merge-tree
+/// no-op against either (which catches squash/rebase merges — where the work lands on the remote as
+/// a NEW commit and the branch tip is not an ancestor — and survives an advancing target). `tip` is
+/// the branch's resolved SHA ("" = no tip). Callers wanting the freshest remote state refresh origin
+/// first; `||` short-circuits so the merge-tree probes only run for not-already-reachable branches.
+fn branch_landed(root: &str, target: &str, branch: &str, tip: &str) -> bool {
+    let origin_ref = format!("origin/{target}");
+    (!tip.is_empty() && (ref_contains(root, target, tip) || ref_contains(root, &origin_ref, tip)))
+        || merge_adds_nothing(root, target, branch)
+        || merge_adds_nothing(root, &origin_ref, branch)
+}
+
 /// Best-effort GitHub PR lookup for `branch` via the `gh` CLI. Returns (state, number, url) where
 /// state is lowercased ("open"/"merged"/"closed"). Any failure — gh not installed, not authed, no
 /// network, no remote, no matching PR, unparsable output — yields all-None and never errors. Fast
@@ -697,14 +711,9 @@ pub fn agent_workflow_state_at(
     let in_parent = ref_contains(root, parent_branch, &tip);
 
     // Squash/rebase merges create a NEW commit on the integration branch, so the agent tip is not an
-    // ancestor and the reachability checks above miss it. Detect it by asking whether merging the
-    // branch into local/origin <default> would add nothing (its work is already there) — which also
-    // survives an advancing <default>. `||` short-circuits, so the merge-tree probe only runs for
-    // branches that AREN'T already reachable.
-    let landed = in_local_main
-        || in_origin_main
-        || merge_adds_nothing(root, &default_branch, &branch)
-        || merge_adds_nothing(root, &origin_ref, &branch);
+    // ancestor and the reachability checks above miss it. `branch_landed` folds local/origin ancestry
+    // with a merge-tree no-op probe (shared with the close-agent safe delete so both agree).
+    let landed = branch_landed(root, &default_branch, &branch, &tip);
 
     // Commits the agent AUTHORED that aren't yet landed (0 once merged into the integration ref).
     // Measured against the ref the branch was actually CUT FROM — `origin/<default>` when a
@@ -1070,6 +1079,48 @@ pub fn delete_agent_branch(root: String, agent_id: String) -> Result<(), String>
     delete_agent_branch_at(&root, &agent_id)
 }
 
+/// Core (testable): delete an agent's local branch on close, ONLY when it's effectively landed on
+/// the integration branch; otherwise KEEP it. Uses the SAME robust detection as the workflow
+/// "landed" signal — `ref_contains` (fast-forward ancestry) OR `merge_adds_nothing` (merge-tree,
+/// which catches squash/rebase merges where the branch tip isn't an ancestor of the target). A plain
+/// `git branch -d` would refuse the squash/rebase case and silently no-op the user's "delete"
+/// setting on the common GitHub path.
+///
+/// PRECONDITION: invoked only for a SHIPPED agent (the caller — closeBuildAgent / the Close button —
+/// gates on `workflowShipped`). Note `merge_adds_nothing` means "adds nothing to the target", which
+/// is true of a genuinely merged branch but ALSO of a zero-diff branch (never committed, or
+/// net-reverted) — so this is "effectively landed", not a strict merge proof. That's safe under the
+/// shipped gate (a zero-work branch never ships); a future caller without that gate must not reuse
+/// this assuming it strictly means "merged". Idempotent (already-gone is Ok); the caller MUST remove
+/// the worktree first (git refuses to delete a checked-out branch).
+pub fn delete_agent_branch_if_merged_at(root: &str, agent_id: &str) -> Result<(), String> {
+    let branch = format!("sparkle/agent-{agent_id}");
+    if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_err() {
+        return Ok(()); // already gone — idempotent
+    }
+    let target = resolve_default_branch(root);
+    // Refresh origin first when there's a remote: a squash/rebase PR merge lands on origin/<target>,
+    // and local <target> is typically NOT fast-forwarded in the desktop flow, so without this the
+    // delete would miss the common GitHub path. Throttled per repo (maybe_refresh_origin).
+    if git(root, &["remote", "get-url", "origin"]).is_ok() {
+        maybe_refresh_origin(root, &target);
+    }
+    let tip = git(root, &["rev-parse", &branch]).unwrap_or_default();
+    if branch_landed(root, &target, &branch, tip.trim()) {
+        // Confirmed landed on local OR origin <target> → safe to remove (force, since a squash/rebase
+        // merge means `-d`'s ancestry check would refuse a branch that IS effectively landed).
+        let _ = git(root, &["branch", "-D", &branch]);
+    }
+    Ok(()) // not landed → keep the branch (no-op, no error)
+}
+
+/// SAFELY delete an agent's merged branch (close a shipped agent). See
+/// `delete_agent_branch_if_merged_at`.
+#[tauri::command]
+pub fn delete_agent_branch_if_merged(root: String, agent_id: String) -> Result<(), String> {
+    delete_agent_branch_if_merged_at(&root, &agent_id)
+}
+
 /// Build the `gh pr create` argv for an agent branch. Pure + tested so the guard/defaulting logic is
 /// exercised without invoking `gh`: rejects a blank `target` (else `--base ""` yields an opaque gh
 /// error) and falls back to the branch name when `title` is blank.
@@ -1355,6 +1406,111 @@ mod tests {
         let status = child.wait().expect("pty child wait");
         assert!(status.success(), "pty child exited non-zero: {status:?}");
         out
+    }
+
+    /// Minimal git repo on `main` with one commit, for branch-delete tests.
+    fn init_repo(tag: &str) -> String {
+        let root = unique_root(tag);
+        let r = root.to_str().unwrap().to_string();
+        git(&r, &["init", "-q"]).unwrap();
+        git(&r, &["config", "user.email", "t@t"]).unwrap();
+        git(&r, &["config", "user.name", "t"]).unwrap();
+        git(&r, &["commit", "--allow-empty", "-m", "init"]).unwrap();
+        git(&r, &["branch", "-M", "main"]).unwrap();
+        r
+    }
+
+    fn branch_exists(root: &str, branch: &str) -> bool {
+        git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+    }
+
+    #[test]
+    fn safe_delete_removes_a_merged_branch() {
+        let r = init_repo("safedel-merged");
+        // A merged agent branch: branch off main, commit, merge back into main.
+        git(&r, &["checkout", "-q", "-b", "sparkle/agent-m1"]).unwrap();
+        git(&r, &["commit", "--allow-empty", "-m", "work"]).unwrap();
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        git(&r, &["merge", "--no-ff", "-m", "merge", "sparkle/agent-m1"]).unwrap();
+        assert!(branch_exists(&r, "sparkle/agent-m1"));
+
+        delete_agent_branch_if_merged_at(&r, "m1").unwrap();
+        assert!(!branch_exists(&r, "sparkle/agent-m1"), "merged branch should be deleted");
+    }
+
+    #[test]
+    fn safe_delete_keeps_an_unmerged_branch() {
+        let r = init_repo("safedel-unmerged");
+        // An UNMERGED agent branch with a REAL change (a file main doesn't have), so merging it into
+        // main would genuinely add something — neither an ancestor nor a net-noop. (An empty commit
+        // would net-add-nothing and correctly read as landed, so it must carry actual content here.)
+        git(&r, &["checkout", "-q", "-b", "sparkle/agent-u1"]).unwrap();
+        std::fs::write(format!("{r}/u.txt"), "unmerged work").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-m", "work"]).unwrap();
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        assert!(branch_exists(&r, "sparkle/agent-u1"));
+
+        delete_agent_branch_if_merged_at(&r, "u1").unwrap();
+        assert!(branch_exists(&r, "sparkle/agent-u1"), "unmerged branch must be kept");
+    }
+
+    #[test]
+    fn safe_delete_removes_a_squash_merged_branch() {
+        let r = init_repo("safedel-squash");
+        // A squash-merged agent branch: its changes land on main as a NEW commit, so the branch tip
+        // is NOT an ancestor of main (plain `git branch -d` would wrongly refuse). The merge-tree
+        // check (merge_adds_nothing) still recognizes it as landed.
+        git(&r, &["checkout", "-q", "-b", "sparkle/agent-s1"]).unwrap();
+        std::fs::write(format!("{r}/f.txt"), "hello").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-m", "work"]).unwrap();
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        git(&r, &["merge", "--squash", "sparkle/agent-s1"]).unwrap();
+        git(&r, &["commit", "-m", "squash work"]).unwrap();
+        assert!(branch_exists(&r, "sparkle/agent-s1"));
+
+        delete_agent_branch_if_merged_at(&r, "s1").unwrap();
+        assert!(!branch_exists(&r, "sparkle/agent-s1"), "squash-merged branch should be deleted");
+    }
+
+    #[test]
+    fn safe_delete_removes_a_branch_merged_only_on_origin() {
+        // The REAL GitHub path: the squash commit lands on origin/main, NOT local main. The delete
+        // must still recognize it (the prior local-only check would wrongly keep the branch).
+        let r = init_repo("safedel-origin");
+        let origin = unique_root("safedel-origin-remote");
+        let o = origin.to_str().unwrap();
+        git(o, &["init", "--bare", "-q"]).unwrap();
+        git(&r, &["remote", "add", "origin", o]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+
+        git(&r, &["checkout", "-q", "-b", "sparkle/agent-o1"]).unwrap();
+        std::fs::write(format!("{r}/f.txt"), "hi").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-m", "work"]).unwrap();
+
+        // Squash-merge onto main, push to origin, then REWIND local main so the merge exists ONLY on
+        // origin/main (mirroring the desktop flow where local main isn't fast-forwarded after a PR).
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        git(&r, &["merge", "--squash", "sparkle/agent-o1"]).unwrap();
+        git(&r, &["commit", "-m", "squash"]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+        git(&r, &["reset", "-q", "--hard", "HEAD~1"]).unwrap();
+        git(&r, &["fetch", "-q", "origin"]).unwrap();
+        assert!(branch_exists(&r, "sparkle/agent-o1"));
+
+        delete_agent_branch_if_merged_at(&r, "o1").unwrap();
+        assert!(
+            !branch_exists(&r, "sparkle/agent-o1"),
+            "branch merged only on origin/main should be deleted"
+        );
+    }
+
+    #[test]
+    fn safe_delete_is_idempotent_for_a_missing_branch() {
+        let r = init_repo("safedel-missing");
+        delete_agent_branch_if_merged_at(&r, "nope").unwrap(); // no such branch → Ok
     }
 
     #[test]

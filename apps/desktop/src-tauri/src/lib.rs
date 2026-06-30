@@ -156,6 +156,7 @@ pub fn run() {
             worktree::land_agent_branch,
             worktree::push_agent_branch,
             worktree::delete_agent_branch,
+            worktree::delete_agent_branch_if_merged,
             worktree::open_agent_pr,
             worktree::markdown_changed_since,
             worktree::refresh_agent_branch,
