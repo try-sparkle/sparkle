@@ -23,6 +23,7 @@ import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { startOrchestrationListener } from "../services/orchestrationListener";
 import { killProjectAgents, planWindowClose } from "../services/windowClose";
 import { clearWindowProject } from "../services/windowRegistry";
+import { clearWindowRoster } from "../services/attention";
 import { safeUnlisten } from "../services/safeUnlisten";
 
 /** Top-level layout (revised): agents in the left column, the project in the top bar, and
@@ -167,7 +168,10 @@ export function Workspace() {
     if (plan.killAgents && project) await killProjectAgents(project);
     // Keep the registry mapping when only hiding, so a later open can find and reveal the hidden
     // window (the Rust RunEvent::Reopen handler re-shows it on Dock click).
-    if (plan.clearRegistry) clearWindowProject(currentWindowLabel);
+    if (plan.clearRegistry) {
+      clearWindowProject(currentWindowLabel);
+      clearWindowRoster(currentWindowLabel);
+    }
     if (plan.hide) await win.hide();
     else await win.destroy();
   };

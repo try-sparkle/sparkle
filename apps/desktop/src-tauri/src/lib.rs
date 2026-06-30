@@ -26,6 +26,7 @@ mod screenshot;
 mod socket;
 mod sparkle_agent;
 mod transcript;
+mod tray;
 mod trial;
 mod trial_remote;
 mod worktree;
@@ -47,6 +48,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_positioner::init())
         .manage(PtyManager::default())
         .manage(claude_chat::ClaudeChatManager::default())
         .manage(dictation::DictationState::default())
@@ -55,6 +57,7 @@ pub fn run() {
         .manage(attention::BadgeCounts::default())
         .manage(accounts::AccountsLock::default())
         .manage(trial::TrialLock::default())
+        .manage(tray::TrayState::default())
         // Gate mic capture on window focus (sparkle-9oz6): Sparkle must not capture audio while the
         // user is looking at another app. Every Focused event is handed to the dictation state, which
         // releases the OS mic when no Sparkle window is the active OS window and rebuilds it on return.
@@ -115,6 +118,9 @@ pub fn run() {
             // built-in defaults (config::current_effective() returns defaults when never loaded).
             if let Err(e) = config::init_and_watch(&app.handle()) {
                 tracing::error!("config init/watch failed: {e}");
+            }
+            if let Err(e) = tray::init_tray(&app.handle()) {
+                tracing::error!("tray init failed: {e}");
             }
             Ok(())
         })
@@ -218,7 +224,11 @@ pub fn run() {
             config::set_config_values,
             config::write_config_text,
             config::reset_config,
-            config::read_config_text
+            config::read_config_text,
+            tray::publish_window_roster,
+            tray::clear_window_roster,
+            tray::get_tray_roster,
+            tray::set_tray_image
         ])
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")

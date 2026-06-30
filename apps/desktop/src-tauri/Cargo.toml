@@ -14,7 +14,7 @@ tauri-build = { version = "2", features = [] }
 cc = "1"
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"
@@ -53,6 +53,9 @@ tungstenite = { version = "0.24", default-features = false, features = ["rustls-
 bzip2 = "0.4"
 tar = "0.4"
 tauri-plugin-global-shortcut = "2"
+# Position the menu-bar popover under the tray icon (TrayCenter). tray-icon feature wires the
+# tray-event hook used in lib.rs.
+tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 # Native macOS Notification Center integration. We use mac-notification-sys directly rather
 # than tauri-plugin-notification because on desktop the plugin discards click events — and we
 # need the click to route to the specific worker that asked. mac-notification-sys returns the

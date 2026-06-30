@@ -8,10 +8,12 @@
 import { useEffect, useState } from "react";
 import { AGENT_STATUS, type AgentTabStatus } from "@sparkle/ui";
 import { pushRoster, type RosterPayload } from "./services/relayClient";
+import { publishWindowRoster } from "./services/attention";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useInteractionStore } from "./stores/interactionStore";
 import { findWindowForProject, onWindowRegistryChange } from "./services/windowRegistry";
+import { useCurrentWindowLabel } from "./windowContext";
 import type { AgentTab, Project } from "./types";
 
 const DEFAULT_STATUS: AgentTabStatus = "stopped";
@@ -29,7 +31,12 @@ function lastActivityAt(a: AgentTab, interaction: Record<string, number>): numbe
   return touch > 0 ? touch : null;
 }
 
-function buildRoster(
+/** Projects open in the given window label. Exported so tests can call the real predicate. */
+export function windowProjects(projects: Project[], label: string): Project[] {
+  return projects.filter((p) => findWindowForProject(p.id) === label);
+}
+
+export function buildRoster(
   projects: Project[],
   status: Record<string, AgentTabStatus>,
   workflowStage: Record<string, string>,
@@ -63,6 +70,7 @@ export function useRosterPublisher(): void {
   const status = useRuntimeStore((s) => s.status);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
   const interaction = useInteractionStore((s) => s.lastAt);
+  const label = useCurrentWindowLabel();
 
   // The window registry isn't reactive (it's localStorage), so bump a tick whenever a window opens
   // or closes a project, to re-evaluate the open set and re-push.
@@ -72,9 +80,16 @@ export function useRosterPublisher(): void {
   useEffect(() => {
     // Coalesce rapid changes into one push.
     const t = setTimeout(() => {
+      // Build once over all open projects — used for the phone relay (full picture).
+      // Then filter the already-built projects to this window's slice for the Rust tray
+      // aggregator. Each window only holds live status for agents it's running; publishing
+      // another window's agents would use DEFAULT_STATUS ("stopped") and corrupt the
+      // last-writer-wins merge in tray.rs.
       const open = projects.filter((p) => findWindowForProject(p.id) != null);
-      pushRoster(buildRoster(open, status, workflowStage, interaction));
+      const full = buildRoster(open, status, workflowStage, interaction);
+      pushRoster(full);
+      publishWindowRoster(label, full.projects.filter((p) => findWindowForProject(p.id) === label));
     }, 250);
     return () => clearTimeout(t);
-  }, [projects, status, workflowStage, interaction, registryTick]);
+  }, [projects, status, workflowStage, interaction, registryTick, label]);
 }
