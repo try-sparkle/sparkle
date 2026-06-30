@@ -18,7 +18,7 @@ import { isComposerToggleKey } from "./composerToggle";
 import { isCopySelectionKey } from "./copySelectionKey";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
-import { isMeasuredSize, spawnSize } from "./terminalSize";
+import { isMeasuredSize, spawnSize, convergeStep, CONVERGE_MAX_FRAMES } from "./terminalSize";
 import { SelectionPopup } from "./SelectionPopup";
 import { recoverFromWebglContextLoss, forceFullRepaint, settleRepaintPlan } from "./terminalWebgl";
 import { detectRateLimitReset } from "../services/rateLimitWatch";
@@ -565,48 +565,67 @@ export function Terminal({
 
   // Re-fit when this tab becomes the active one (was display:none). Focus goes to the
   // composer, not the terminal — all input lives in the composer overlay.
+  //
+  // A backgrounded pane is display:none, so on reveal the browser may take a FRAME OR TWO to lay
+  // out its box. The old code fit + synced exactly once, on the next frame — when that frame
+  // hadn't laid out yet, syncPtySize early-returned (0-width), the PTY kept its stale/fallback
+  // size while xterm later fit to the real width, and the CLI's baked wraps landed at the wrong
+  // column: the "renders, then stays wonky for multiple seconds until it fixes itself" report.
+  // So we now RETRY across frames (convergeStep) until the container is genuinely measured, then
+  // sync the true size once and force the reveal repaint. CONVERGE_MAX_FRAMES bounds the loop; the
+  // ResizeObserver remains the long-term backstop if a pane never lays out within the budget.
   useEffect(() => {
     if (!active) return;
     const fit = fitRef.current;
     const term = termRef.current;
     if (!fit || !term) return;
-    // Cancel these rAFs on cleanup. fit.fit()/forceFullRepaint schedule an xterm-INTERNAL
-    // RenderService frame; if the component unmounts (agent closed, webview reload) in the
-    // window between scheduling and the frame firing, term.dispose() runs first and xterm's own
-    // queued frame then reads `this._renderer.value.dimensions` on a torn-down core — the
-    // uncaught "undefined is not an object (this._renderer.value.dimensions)" TypeError still in
-    // the logs after the #231 dispose-ordering fix. Cancelling here (plus the `cancelled` guard)
-    // means we never queue a paint inside the teardown window. The nested frame is the dangerous
-    // one (it runs forceFullRepaint a frame later), so guard its body too.
+    // Cancel any pending rAF on cleanup. fit.fit()/forceFullRepaint schedule an xterm-INTERNAL
+    // RenderService frame; if the component unmounts (agent closed, webview reload) in the window
+    // between scheduling and the frame firing, term.dispose() runs first and xterm's own queued
+    // frame then reads `this._renderer.value.dimensions` on a torn-down core — the uncaught
+    // "undefined is not an object (this._renderer.value.dimensions)" TypeError still in the logs
+    // after the #231 dispose-ordering fix. The `cancelled` guard + cancelAnimationFrame mean we
+    // never queue a paint inside the teardown window.
     let cancelled = false;
-    let inner = 0;
-    const outer = requestAnimationFrame(() => {
+    let handle = 0;
+    let framesLeft = CONVERGE_MAX_FRAMES;
+    let focused = false;
+    const tick = () => {
       if (cancelled || disposedRef.current) return;
-      try {
-        safeFit();
+      // safeFit() bails if disposed and swallows the not-laid-out / torn-down-core throw itself.
+      safeFit();
+      // Focus the composer once on reveal (independent of whether the box has laid out yet).
+      if (!focused) {
+        focused = true;
         onRequestFocusRef.current?.();
-        syncPtySize(agentId, term);
-      } catch {
-        /* ignore */
       }
-      // Force a full repaint of the now-visible viewport — the fix for the recurring "top half
-      // blank until I scroll" bug. While this pane was display:none its output streamed into the
-      // buffer, and any cells the WebGL renderer cached as "drawn" (with the canvas at 0 size)
-      // are SKIPPED by a bare term.refresh() — so refresh() alone left the top blank until a
-      // scroll. forceFullRepaint clears the renderer's model+atlas so every cell genuinely
-      // redraws. Deferred one more frame so the just-revealed canvas has been laid out and its
-      // char dimensions measured; otherwise the WebGL renderer bails (no valid dims) and wastes
-      // the clear. See forceFullRepaint in terminalWebgl.ts.
-      inner = requestAnimationFrame(() => {
+      const laidOut = !!term.element && term.element.clientWidth > 0;
+      const action = convergeStep(laidOut, isMeasuredSize(laidOut, term), framesLeft);
+      if (action === "wait") {
+        framesLeft -= 1;
+        handle = requestAnimationFrame(tick);
+        return;
+      }
+      if (action === "give-up") return;
+      // action === "sync": the pane is genuinely laid out — push the true size to the PTY so its
+      // wrap column matches xterm, then force a full repaint of the now-visible viewport.
+      syncPtySize(agentId, term);
+      // Defer the repaint one frame so the just-resized canvas has valid char dimensions before we
+      // clear the WebGL model; otherwise the renderer bails (no valid dims) and wastes the clear.
+      // While this pane was display:none its output streamed into the buffer, and cells the WebGL
+      // renderer cached as "drawn" (canvas at 0 size) are SKIPPED by a bare term.refresh() — so
+      // forceFullRepaint (clearTextureAtlas) is the only thing that genuinely redraws them. See
+      // forceFullRepaint in terminalWebgl.ts. disposedRef guards the deferred frame (#231/#258).
+      handle = requestAnimationFrame(() => {
         if (cancelled || disposedRef.current) return;
         forceFullRepaint(webglRef.current, term);
         poisonedRef.current = false; // the reveal repaint cleared any cache-poisoned cells
       });
-    });
+    };
+    handle = requestAnimationFrame(tick);
     return () => {
       cancelled = true;
-      cancelAnimationFrame(outer);
-      if (inner) cancelAnimationFrame(inner);
+      if (handle) cancelAnimationFrame(handle);
     };
   }, [active, agentId, safeFit]);
 
