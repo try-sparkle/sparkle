@@ -3,7 +3,7 @@
 // Agents that need YOUR support float to the top; agents happily building sink down.
 // This is a pure reordering — same agents in, same agents out — so the caller's
 // selection (tracked by agent id, not position) is never disturbed.
-import type { AgentTabStatus } from "../types";
+import type { AgentKind, AgentTabStatus } from "../types";
 
 // Lower rank = higher in the stack. Grouped into tiers; ties keep insertion order
 // (the sort below is stable). Tune the taxonomy → tier mapping here, nothing else
@@ -77,4 +77,28 @@ export function orderAgents<T extends { id: string; pinnedIndex: number | null }
     result.splice(at, 0, agent);
   }
   return result;
+}
+
+/**
+ * The single source of truth for the agent stack BOTH the sidebar list and the TopBar dot
+ * cluster render: top-level agents (a build agent, or a worker orphaned by a missing parent),
+ * filtered by the active work mode (Think → think agents; otherwise everything non-think, i.e.
+ * build agents + orphaned workers), then attention-ordered the same way. Keeping both consumers
+ * on this one helper is what stops the header dots from drifting out of sync with the rows —
+ * the bug this was extracted to prevent. Pure and id-preserving (workers are NOT spliced here;
+ * each consumer nests its own per-parent workers afterward).
+ */
+export function orderedTopLevelAgents<
+  T extends { id: string; kind: AgentKind; parentId: string | null; pinnedIndex: number | null },
+>(
+  agents: readonly T[],
+  statusMap: Record<string, AgentTabStatus>,
+  workMode: "think" | "plan" | "build",
+  attentionOrder: boolean,
+): T[] {
+  const buildIds = new Set(agents.filter((a) => a.kind === "build").map((a) => a.id));
+  const topLevel = agents
+    .filter((a) => !a.parentId || !buildIds.has(a.parentId))
+    .filter((a) => (workMode === "think" ? a.kind === "think" : a.kind !== "think"));
+  return attentionOrder ? orderAgents(topLevel, statusMap) : topLevel;
 }

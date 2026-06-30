@@ -4,6 +4,8 @@ import type { AgentTabStatus, Project } from "../types";
 import { SettingsDialog } from "./SettingsDialog";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useUiStore } from "../stores/uiStore";
+import { orderedTopLevelAgents } from "../engine/agentOrdering";
 import { pickProjectFolder, basename } from "../services/dialog";
 import { openProjectInWindow, defaultDeps, type OpenMode } from "../services/projectWindows";
 import { findWindowForProject } from "../services/windowRegistry";
@@ -43,6 +45,36 @@ function majorityStatus(
   return best;
 }
 
+/** One mark in the TopBar cluster: a top-level agent ("dot") or one of its workers ("half"). */
+export type AgentDot = { id: string; status: AgentTabStatus; shape: "dot" | "half" };
+
+/**
+ * The TopBar dot cluster must TRACK the sidebar rows, not the raw `project.agents` array.
+ * So both consume the SAME `orderedTopLevelAgents` (top-level agents, mode-filtered, attention-
+ * ordered); here we then splice each build agent's workers in right after it — workers as
+ * half-discs ("D"), so a sub-agent reads as nested under the full dot it follows. (Plan mode
+ * lists no agents in the sidebar, so we fall back to the Build set to keep the header
+ * status glanceable.)
+ */
+export function agentDots(
+  project: Project,
+  statusMap: Record<string, AgentTabStatus>,
+  workMode: "think" | "plan" | "build",
+  attentionOrder: boolean,
+): AgentDot[] {
+  const ordered = orderedTopLevelAgents(project.agents, statusMap, workMode, attentionOrder);
+  const dots: AgentDot[] = [];
+  for (const top of ordered) {
+    dots.push({ id: top.id, status: statusMap[top.id] ?? "stopped", shape: "dot" });
+    if (top.kind === "build") {
+      for (const w of project.agents.filter((a) => a.parentId === top.id)) {
+        dots.push({ id: w.id, status: statusMap[w.id] ?? "stopped", shape: "half" });
+      }
+    }
+  }
+  return dots;
+}
+
 const btn: CSSProperties = {
   background: "transparent",
   color: C.cream,
@@ -68,6 +100,8 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const replaceCurrent = useReplaceCurrentProject();
   const windowLabel = useCurrentWindowLabel();
   const statusMap = useRuntimeStore((s) => s.status);
+  const workMode = useUiStore((s) => s.workMode);
+  const agentOrdering = useUiStore((s) => s.agentOrdering);
   const [recentOpen, setRecentOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   // The settings modal is a true centered dialog now, so Escape should dismiss it (backdrop click
@@ -178,8 +212,8 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
             </span>
           </button>
           <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            {project.agents.map((a) => (
-              <StatusDot key={a.id} status={statusMap[a.id] ?? "stopped"} size={7} />
+            {agentDots(project, statusMap, workMode, agentOrdering === "attention").map((d) => (
+              <StatusDot key={d.id} status={d.status} size={7} shape={d.shape} />
             ))}
           </div>
           {/* The Tasks board now opens from the "Plan" button in the agent strip (AgentSidebar). */}

@@ -21,7 +21,7 @@ import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 import { useBeadsStore } from "../stores/beadsStore";
 import { beadLabel, epicForBuild } from "../services/planView";
 import { type Bead } from "../services/beads";
-import { orderAgents } from "../engine/agentOrdering";
+import { orderedTopLevelAgents } from "../engine/agentOrdering";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
 import { LogoWaveform } from "./LogoWaveform";
@@ -696,26 +696,17 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         {(() => {
           if (!project) return null;
           if (mode === "plan") return null; // Plan: sidebar list stays clear (board shows in main pane)
-          // A worker is "orphaned" if its parentId doesn't resolve to a present build agent
-          // (e.g. a corrupted/partially-migrated record). Surface those at the top level so they
-          // stay visible and closable rather than vanishing from the UI while still in the store.
-          const buildIds = new Set(
-            project.agents.filter((a) => a.kind === "build").map((a) => a.id),
+          // Top-level agents (build agents + workers orphaned by a missing parent), mode-filtered
+          // and attention-ordered. Shared with the TopBar dot cluster via orderedTopLevelAgents so
+          // the header dots can't drift out of sync with these rows. Only the top-level stack
+          // reorders; nested workers stay under their parent in insertion order. Selection is
+          // tracked by id (project.selectedAgentId), so re-sorting never changes which agent is open.
+          const ordered = orderedTopLevelAgents(
+            project.agents,
+            status,
+            mode,
+            agentOrdering === "attention",
           );
-          const isTopLevel = (a: (typeof project.agents)[number]) =>
-            !a.parentId || !buildIds.has(a.parentId);
-          // Only the top-level stack reorders; nested workers stay under their parent in
-          // insertion order. Selection is tracked by id (project.selectedAgentId), so re-sorting
-          // never changes which agent is open. "manual" keeps insertion order, as before.
-          // The active chevron filters the list by kind: Think shows think agents; Build shows
-          // everything else (build agents + any orphaned workers surfaced at top level).
-          const topLevel = project.agents
-            .filter(isTopLevel)
-            .filter((a) => (mode === "think" ? a.kind === "think" : a.kind !== "think"));
-          const ordered =
-            agentOrdering === "attention"
-              ? orderAgents(topLevel, status)
-              : topLevel;
           return ordered.map((top, orderedIndex) => {
             const workers =
               top.kind === "build"
