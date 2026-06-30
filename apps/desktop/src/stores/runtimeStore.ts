@@ -10,8 +10,8 @@ import type { BranchStatus } from "../services/branchStatus";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { agentBranchStatus, agentWorkflowState } from "../services/branchStatus";
 import { deriveLiveStage, stageIndex } from "../engine/workflowStage";
-import { claimBead, closeBead, labelBead, DELIVERED_LABEL } from "../services/beads";
-import { beadActionForStage } from "../services/planView";
+import { beadLifecycleActions, levelAfter, BEAD_LEVEL } from "../engine/beadLifecycle";
+import { createBead, claimBead, closeBead, markBeadDelivered } from "../services/beads";
 import { syncProjectMarkdown } from "../services/chiefSync";
 import { useSettingsStore, effectiveChiefPat } from "./settingsStore";
 import { useProjectStore } from "./projectStore";
@@ -179,6 +179,100 @@ export async function runChiefSync(projectId: string, agentId: string): Promise<
   }
 }
 
+// In-flight bead-create guard: createBead is async, so two rapid polls could both see a build agent
+// with no beadId and create duplicate beads. Latch the agent id while a create is in flight.
+const creatingBeadFor = new Set<string>();
+// Agents whose auto-create returned null (bd ran but we couldn't parse an id). Without this we'd
+// re-enter the create branch every poll and spawn ORPHAN beads. Back off (no retry until relaunch)
+// rather than accrete duplicates.
+const beadCreateFailed = new Set<string>();
+// agentId -> highest bead lifecycle level (BEAD_LEVEL) we've successfully written. Makes the writes
+// MONOTONIC: no double in_progress, and a re-climbing "new cycle" can't re-close/re-deliver a bead.
+// In-memory (resets on relaunch); the persisted `workflowShipped` ✓ re-seeds it on first observation
+// (see syncBeadLifecycle) so a relaunch can't REOPEN an already-shipped bead by writing in_progress
+// onto a re-climbing cycle.
+const beadLevelFor = new Map<string, number>();
+
+/** Forget an agent's bead-lifecycle bookkeeping when it's closed/removed, so these module maps don't
+ *  grow unbounded over a long session (and a recycled id can't inherit a stale watermark/latch). */
+function forgetBeadLifecycle(agentId: string): void {
+  beadLevelFor.delete(agentId);
+  beadCreateFailed.delete(agentId);
+  creatingBeadFor.delete(agentId);
+}
+
+/** Test-only: reset the module-level lifecycle bookkeeping between cases. */
+export function __resetBeadLifecycleForTest(): void {
+  beadLevelFor.clear();
+  beadCreateFailed.clear();
+  creatingBeadFor.clear();
+}
+
+/** Advance a deliverable agent's bead from its current workflow STAGE, monotonically and best-effort
+ *  (fire-and-forget; never blocks or breaks the poll). Decision logic is the pure, unit-tested
+ *  `beadLifecycleActions`; this wrapper performs the chosen actions' shell-outs and only advances the
+ *  per-agent watermark AFTER each write succeeds (so a partial failure — e.g. the delivered label —
+ *  is retried on the next poll). */
+export async function syncBeadLifecycle(
+  projectId: string,
+  projectPath: string,
+  agent: { id: string; kind: string; beadId?: string; name?: string },
+  stage: WorkflowStageId,
+  bs: BranchStatus | undefined,
+  shippedLatched: boolean,
+): Promise<void> {
+  const hasRealWork = !!bs && (bs.ahead > 0 || bs.dirty);
+  // Seed the watermark from the persisted shipped ✓: if this agent's work ever reached main, its bead
+  // is at least closed — so a relaunch that sees a re-climbing cycle (stage back at building) never
+  // writes in_progress onto it and reopens it. In-memory progress still wins when it's further along.
+  const seeded = Math.max(beadLevelFor.get(agent.id) ?? 0, shippedLatched ? BEAD_LEVEL.closed : 0);
+  const actions = beadLifecycleActions({
+    kind: agent.kind,
+    hasBead: !!agent.beadId,
+    hasRealWork,
+    stage,
+    writtenLevel: seeded,
+  });
+  if (actions.length === 0) return;
+  try {
+    let beadId = agent.beadId;
+    for (const action of actions) {
+      if (action === "create") {
+        if (beadId || beadCreateFailed.has(agent.id) || creatingBeadFor.has(agent.id)) return;
+        creatingBeadFor.add(agent.id);
+        try {
+          const title = agent.name?.trim() || "Build agent";
+          const newId = await createBead(
+            projectPath,
+            title,
+            "Auto-created by Sparkle for a deliverable Build agent.",
+          );
+          if (!newId) {
+            // bd ran but its output didn't yield an id — don't retry (would orphan a bead per poll).
+            beadCreateFailed.add(agent.id);
+            return;
+          }
+          beadId = newId;
+          useProjectStore.getState().setAgentBeadId(projectId, agent.id, newId);
+        } finally {
+          creatingBeadFor.delete(agent.id);
+        }
+        continue;
+      }
+      if (!beadId) return;
+      // Map the engine's monotonic actions to bd's canonical verbs (claim=in_progress+assignee,
+      // close, label-then-close=delivered).
+      if (action === "in_progress") await claimBead(projectPath, beadId);
+      else if (action === "closed") await closeBead(projectPath, beadId);
+      else if (action === "delivered") await markBeadDelivered(projectPath, beadId);
+      // Advance the watermark only after the write resolved, so a throw retries it next poll.
+      beadLevelFor.set(agent.id, Math.max(beadLevelFor.get(agent.id) ?? 0, levelAfter(action)));
+    }
+  } catch (e) {
+    console.debug("syncBeadLifecycle failed for", agent.id, e);
+  }
+}
+
 interface RuntimeState {
   status: Record<string, AgentTabStatus>; // agentId -> status (live-only, never persisted)
   openAgentIds: string[]; // agents whose pane is mounted + PTY alive (persisted)
@@ -186,12 +280,15 @@ interface RuntimeState {
   // agentId -> the furthest workflow stage we KNOW this agent's OWN work has reached. Derived each
   // poll from local-ref reachability + an opportunistic GitHub PR probe (see refreshWorkflowStage /
   // engine.deriveLiveStage), advanced monotonically. The sidebar overlays it on the git-derived
-  // stage (resolveStage) and rolls workers up into their orchestrator. Live-only (never persisted).
+  // stage (resolveStage) and rolls workers up into their orchestrator. PERSISTED: this is the
+  // `prev` watermark deriveLiveStage relies on to absorb the post-merge `ahead→0` dip — without it,
+  // a NORMAL-merged branch reads back as building_unsaved on the next launch (committedSeen=false
+  // once ahead/aheadOfBase are 0 and prev is gone). Pruned to live agents on reconcile().
   workflowStage: Record<string, WorkflowStageId>;
   // agentId -> has this agent's OWN work EVER reached "main" or beyond. A sticky watermark (set once,
   // never cleared until the agent closes) so the row keeps a "shipped ✓" even after the live stage
   // RESETS to a new cycle (deriveLiveStage drops back to Committed when fresh work lands on a branch
-  // that already shipped). Live-only (never persisted), same as the maps above.
+  // that already shipped). PERSISTED alongside workflowStage so the ✓ survives a relaunch.
   workflowShipped: Record<string, boolean>;
 
   open: (agentId: string) => void;
@@ -241,6 +338,7 @@ export const useRuntimeStore = create<RuntimeState>()(
 
       close: (agentId) =>
         set((s) => {
+          forgetBeadLifecycle(agentId); // drop module-level bead bookkeeping for this agent
           const { [agentId]: _removed, ...status } = s.status;
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
@@ -256,6 +354,9 @@ export const useRuntimeStore = create<RuntimeState>()(
 
       resetProgress: (agentId) =>
         set((s) => {
+          // Also forget the module-level bead watermark/latches so a reused slot doesn't inherit the
+          // prior occupant's lifecycle state (esp. now that workflowShipped is persisted).
+          forgetBeadLifecycle(agentId);
           const { [agentId]: _st, ...status } = s.status;
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
@@ -305,7 +406,7 @@ export const useRuntimeStore = create<RuntimeState>()(
           const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
           const agent = project?.agents.find((a) => a.id === agentId);
           // No worktree / no git workflow → nothing to track.
-          if (!agent || agent.kind === "think" || agent.kind === "shell") return;
+          if (!project || !agent || agent.kind === "think" || agent.kind === "shell") return;
           // A worker integrates into its orchestrator's branch; everyone else, into project main.
           const parentBranch =
             agent.kind === "worker" && agent.parentId ? `sparkle/agent-${agent.parentId}` : "";
@@ -328,28 +429,19 @@ export const useRuntimeStore = create<RuntimeState>()(
             // part of the Think→Plan→Build path rather than jumping straight to "building".
             hasBead: !!agent.beadId,
           });
-          if (next !== prev) {
-            get().setWorkflowStage(agentId, next);
-            // Programmatic bead status — advance the bead from this REAL stage transition, but ONLY
-            // on FORWARD motion. deriveLiveStage can drop `next` back to a building stage on a cycle
-            // reset; firing on that backward transition would re-`claim` (reopen) an already
-            // closed/delivered bead. Forward-only prevents the flip-flop (mirrors the sticky
-            // workflowShipped watermark below). Edge-triggered + idempotent + best-effort: a bead
-            // write must never break the poll.
-            const beadId = agent.beadId;
-            const prevIdx = prev ? stageIndex(prev) : -1;
-            if (beadId && stageIndex(next) > prevIdx) {
-              const action = beadActionForStage(next);
-              if (action === "claim") void claimBead(root, beadId).catch(() => {});
-              else if (action === "close") void closeBead(root, beadId).catch(() => {});
-              else if (action === "deliver") {
-                // Label FIRST (so a closed+delivered bead always carries the label), and fire both
-                // independently + best-effort so a transient failure of one doesn't skip the other.
-                void labelBead(root, "add", beadId, DELIVERED_LABEL).catch(() => {});
-                void closeBead(root, beadId).catch(() => {});
-              }
-            }
-          }
+          if (next !== prev) get().setWorkflowStage(agentId, next);
+          // Drive the agent's bead from its current stage (auto-create on first work; monotonic
+          // claim/close/deliver). Fire-and-forget so a slow/failed `bd` shell-out never stalls the
+          // poll; the pure beadLifecycleActions + per-agent watermark keep it idempotent and prevent
+          // a cycle-reset from reopening an already-closed/delivered bead.
+          void syncBeadLifecycle(
+            projectId,
+            project.rootPath,
+            agent,
+            next,
+            get().branchStatus[agentId],
+            !!get().workflowShipped[agentId],
+          );
           // Sticky "shipped" watermark: latch true the first time work reaches On Main (or beyond).
           // It survives a later cycle reset (deriveLiveStage dropping `next` back to Committed), so the
           // row keeps its ✓ even while the bar re-climbs for new work.
@@ -366,15 +458,44 @@ export const useRuntimeStore = create<RuntimeState>()(
       reconcile: (validIds) =>
         set((s) => {
           const valid = new Set(validIds);
+          // Sweep module-level bead bookkeeping for agents that no longer exist (bounds growth).
+          // Union of BOTH maps: a build agent whose create returned null is in beadCreateFailed but
+          // never gets a beadLevelFor entry, so iterating beadLevelFor alone would leak it.
+          for (const id of new Set([...beadLevelFor.keys(), ...beadCreateFailed.keys()])) {
+            if (!valid.has(id)) forgetBeadLifecycle(id);
+          }
           const openAgentIds = s.openAgentIds.filter((id) => valid.has(id));
-          return openAgentIds.length === s.openAgentIds.length ? s : { openAgentIds };
+          // Prune the now-PERSISTED workflow maps to agents that still exist, so a deleted agent's
+          // stale stage/shipped ✓ can't linger forever in localStorage (and can't resurface if its
+          // id is ever reused). Live-only maps (status/branchStatus) boot empty so need no pruning.
+          const pruneMap = <V>(m: Record<string, V>): Record<string, V> => {
+            const out: Record<string, V> = {};
+            for (const id of Object.keys(m)) if (valid.has(id)) out[id] = m[id] as V;
+            return out;
+          };
+          const stagePruned = Object.keys(s.workflowStage).some((id) => !valid.has(id));
+          const shipPruned = Object.keys(s.workflowShipped).some((id) => !valid.has(id));
+          const openChanged = openAgentIds.length !== s.openAgentIds.length;
+          if (!openChanged && !stagePruned && !shipPruned) return s;
+          return {
+            ...(openChanged ? { openAgentIds } : {}),
+            ...(stagePruned ? { workflowStage: pruneMap(s.workflowStage) } : {}),
+            ...(shipPruned ? { workflowShipped: pruneMap(s.workflowShipped) } : {}),
+          };
         }),
     }),
     {
       name: "sparkle-runtime",
       storage: createJSONStorage(() => localStorage),
-      // Only the open set survives a relaunch; live status/branchStatus always boot clean.
-      partialize: (s) => ({ openAgentIds: s.openAgentIds }),
+      // The open set, the workflow-stage watermark, and the sticky shipped ✓ survive a relaunch.
+      // Persisting the watermark is what lets a merged/shipped agent read back as Merged instead of
+      // collapsing to building_unsaved after the post-merge `ahead→0` dip (see workflowStage above /
+      // deriveLiveStage `prev`). Live status/branchStatus deliberately boot clean and are excluded.
+      partialize: (s) => ({
+        openAgentIds: s.openAgentIds,
+        workflowStage: s.workflowStage,
+        workflowShipped: s.workflowShipped,
+      }),
     },
   ),
 );

@@ -32,6 +32,20 @@ describe("screenAwaitsInput", () => {
     expect(screenAwaitsInput(screen)).toBe(true);
   });
 
+  it("flags an AskUserQuestion menu (same ❯ numbered shape as the permission box) — sparkle-blpf", () => {
+    // AskUserQuestion / ExitPlanMode are not intercepted by Sparkle — they render as Claude Code's
+    // standard bordered ❯ numbered selection menu in the PTY, so the selection-cursor marker catches
+    // them deterministically (no LLM needed). This pins that the question-tool shape stays red.
+    const screen = [
+      "╭─ Which date library should we use? ─────────────────╮",
+      "│ ❯ 1. date-fns                                       │",
+      "│   2. luxon                                          │",
+      "│   3. dayjs                                          │",
+      "╰─────────────────────────────────────────────────────╯",
+    ].join("\n");
+    expect(screenAwaitsInput(screen)).toBe(true);
+  });
+
   it("flags a shell (y/n) prompt", () => {
     expect(screenAwaitsInput("Overwrite existing file? (y/n)")).toBe(true);
     expect(screenAwaitsInput("Continue? [Y/n]")).toBe(true);

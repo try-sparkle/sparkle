@@ -276,6 +276,9 @@ pub fn bead_dep_add(
 /// app can fire it on every entry into a "building" stage without churn.
 #[tauri::command]
 pub fn bead_claim(project_path: String, id: String) -> Result<String, String> {
+    if !valid_bead_id(&id) {
+        return Err(format!("invalid bead id: {id}"));
+    }
     let output = Command::new("/bin/zsh")
         .arg("-l")
         .arg("-c")
@@ -293,6 +296,9 @@ pub fn bead_claim(project_path: String, id: String) -> Result<String, String> {
 /// Close a bead (mark done). `bd close <id>`. Idempotent server-side.
 #[tauri::command]
 pub fn bead_close(project_path: String, id: String) -> Result<String, String> {
+    if !valid_bead_id(&id) {
+        return Err(format!("invalid bead id: {id}"));
+    }
     let output = Command::new("/bin/zsh")
         .arg("-l")
         .arg("-c")
@@ -319,6 +325,9 @@ pub fn bead_label(
     if action != "add" && action != "remove" {
         return Err(format!("invalid label action: {action} (expected \"add\" or \"remove\")"));
     }
+    if !valid_bead_id(&id) {
+        return Err(format!("invalid bead id: {id}"));
+    }
     let output = Command::new("/bin/zsh")
         .arg("-l")
         .arg("-c")
@@ -336,9 +345,55 @@ pub fn bead_label(
     select_bd_action(output.status.success(), &stdout, &stderr)
 }
 
+/// A bead id is safe to pass as a positional operand only if it can't be mistaken for a flag. Even
+/// though it's already an argv arg (not shell-interpolated), an id beginning with `-` would be parsed
+/// by `bd` as an OPTION, not an issue id. Restrict to bd's id charset and forbid a leading dash.
+fn valid_bead_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('-')
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Permanently delete a bead via `bd delete "$1" --force` — used by the close-agent Discard path.
+/// Destructive and irreversible; the caller MUST gate it behind an explicit user confirmation. `id`
+/// is a positional arg ($1), never interpolated into the script.
+#[tauri::command]
+pub fn delete_bead(project_path: String, id: String) -> Result<String, String> {
+    if !valid_bead_id(&id) {
+        return Err(format!("invalid bead id: {id}"));
+    }
+    let output = Command::new("/bin/zsh")
+        .arg("-l")
+        .arg("-c")
+        .arg(r#"cd "$2" && bd delete "$1" --force"#)
+        .arg("sparkle") // $0
+        .arg(&id) // $1
+        .arg(&project_path) // $2
+        .output()
+        .map_err(|e| format!("failed to run bd: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    select_bd_action(output.status.success(), &stdout, &stderr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_bead_id_forbids_flag_like_and_exotic_ids() {
+        assert!(valid_bead_id(""));
+        assert!(valid_bead_id("bd-1.2_x"));
+        assert!(!valid_bead_id("")); // empty
+        assert!(!valid_bead_id("-s")); // would be parsed by bd as a flag
+        assert!(!valid_bead_id("--force"));
+        assert!(!valid_bead_id("a b")); // space
+        assert!(!valid_bead_id("a;b")); // metachar
+        // The id-taking commands reject a flag-like id before shelling out.
+        assert!(bead_claim("/tmp".into(), "-s".into()).is_err());
+        assert!(delete_bead("/tmp".into(), "--force".into()).is_err());
+    }
 
     #[test]
     fn append_note_creates_and_appends() {

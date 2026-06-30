@@ -83,11 +83,34 @@ export async function beadShow(projectPath: string, id: string): Promise<Bead | 
   return beads[0] ?? null;
 }
 
-// ── Write path: programmatic status, so the app advances a bead from real events instead of
-//    relying on the agent running `bd` itself. All idempotent server-side. Callers fire these
-//    best-effort (a bead write must never break the agent flow) — swallow rejections.
+// ── Programmatic write path ────────────────────────────────────────────────────────────────────
+// Drive bead lifecycle from real app events (agent starts work / merges / ships / is discarded),
+// replacing the LLM-advisory `bd` prose. Status uses bd's canonical verbs (claim/close/label);
+// callers fire them best-effort (a bead write must never break the agent flow). All injection-safe.
 
-/** `bd update <id> --claim` — mark a bead in_progress. */
+/** Extract the created bead's id from `create_bead`'s raw bd `--json` (the issue object, or an
+ *  `{"error":…}` blob). Returns null on a bd error or unparseable output. Pure (exported for tests). */
+export function parseCreatedBeadId(raw: string): string | null {
+  try {
+    const obj = JSON.parse(raw) as RawBead;
+    if (!obj || typeof obj !== "object" || "error" in obj) return null;
+    return asString(obj.id) ?? asString(obj.issue_id) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Create a bead for a deliverable agent and return its new id, or null if bd failed. */
+export async function createBead(
+  projectPath: string,
+  title: string,
+  body: string,
+): Promise<string | null> {
+  const raw = await invoke<string>("create_bead", { projectPath, title, body });
+  return parseCreatedBeadId(raw);
+}
+
+/** `bd update <id> --claim` — mark a bead in_progress (also assigns it). */
 export async function claimBead(projectPath: string, id: string): Promise<void> {
   await invoke("bead_claim", { projectPath, id });
 }
@@ -105,6 +128,23 @@ export async function labelBead(
   label: string,
 ): Promise<void> {
   await invoke("bead_label", { projectPath, action, id, label });
+}
+
+/** Mark a bead delivered: add the `delivered` label AND close it (so it lands in the delivered
+ *  column — see columnFor). Both are ATTEMPTED independently (a closed bead must still get the
+ *  label, and vice-versa); throws if either fails so a monotonic caller retries — both idempotent. */
+export async function markBeadDelivered(projectPath: string, id: string): Promise<void> {
+  const results = await Promise.allSettled([
+    labelBead(projectPath, "add", id, DELIVERED_LABEL),
+    closeBead(projectPath, id),
+  ]);
+  const failed = results.find((r) => r.status === "rejected");
+  if (failed && failed.status === "rejected") throw failed.reason;
+}
+
+/** Permanently delete a bead — the close-agent Discard path. Wraps `bd delete --force`. */
+export async function deleteBead(projectPath: string, id: string): Promise<void> {
+  await invoke<string>("delete_bead", { projectPath, id });
 }
 
 export type BoardColumn = "backlog" | "inProgress" | "done" | "delivered";

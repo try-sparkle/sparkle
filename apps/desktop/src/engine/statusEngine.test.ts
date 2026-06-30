@@ -204,6 +204,135 @@ describe("StatusEngine", () => {
     expect(last()).toBe("waiting");
   });
 
+  // --- Mid-stream failure / stall detection (sparkle-pqxh): RED while the process stays alive ---
+
+  it("goes errored when a mid-stream API error prints, OVERRIDING the still-ticking spinner", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    expect(last()).toBe("working");
+    // The agent prints the API banner (its own line) but keeps its PTY alive (no exit) and the
+    // spinner keeps ticking — the exact case that used to read green forever.
+    engine.ingest(
+      "\nAPI Error: Server is temporarily limiting requests (not your usage limit) · Rate limited\n",
+    );
+    expect(last()).toBe("errored");
+    // A later spinner tick must NOT pull it back to green — the failure is sticky until real progress.
+    engine.ingest(SPINNER);
+    expect(last()).toBe("errored");
+  });
+
+  it("catches an API banner fused onto a spinner carriage-return redraw", () => {
+    const { engine, last } = makeEngine();
+    // The spinner redraws with \r (no newline); the banner streams onto the tail of the same line.
+    engine.ingest(SPINNER + "\rAPI Error: Rate limited\n");
+    expect(last()).toBe("errored");
+  });
+
+  it("goes errored on a self-prompt loop instead of staying working forever", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    expect(last()).toBe("working");
+    // The wedged agent pings itself; the spinner keeps redrawing so the old logic stayed `working`.
+    engine.ingest("Are you there? Hey, Sparkler. Are you there?\n");
+    expect(last()).toBe("errored");
+    engine.ingest(SPINNER);
+    expect(last()).toBe("errored");
+  });
+
+  it("goes errored on an identical-short-line churn loop", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    // A newline ends the in-place spinner redraw, then the same short line repeats with no progress
+    // (>= STALL_REPEAT_THRESHOLD identical short lines).
+    engine.ingest("\n…\n…\n…\n…\n…\n");
+    expect(last()).toBe("errored");
+  });
+
+  it("recovers to working when real tool activity resumes after a stream failure", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest("API Error: Rate limited\n");
+    expect(last()).toBe("errored");
+    // The retry succeeds and the agent does real work again (a classified file event + spinner).
+    engine.ingest("Reading file src/foo.ts\n" + SPINNER);
+    expect(last()).toBe("working");
+  });
+
+  it("catches a banner that sits in the unterminated partial (no trailing newline yet)", () => {
+    // The banner streams in but its line hasn't been flushed by a '\n' — detection must still fire
+    // off the partial buffer (roborev 16152).
+    const { engine, last } = makeEngine();
+    engine.ingest("API Error: Rate limited"); // no newline
+    expect(last()).toBe("errored");
+  });
+
+  it("catches a self-prompt ping that sits in the unterminated partial (roborev 16176)", () => {
+    // Covers the isSelfPromptLine(partial) branch of the partial-buffer check.
+    const { engine, last } = makeEngine();
+    engine.ingest("Are you there?"); // no newline
+    expect(last()).toBe("errored");
+  });
+
+  it("does NOT flag line-initial 'API Error' narration sitting in the partial (roborev 16177)", () => {
+    // An in-progress heading that begins with "API Error" but isn't the colon-framed banner must
+    // not strand the tab red while it's still streaming.
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    engine.ingest("\nAPI Error handling: returns 500 when"); // no newline, no banner colon
+    expect(last()).toBe("working");
+  });
+
+  it("exits gray 'done' after a stream failure has RECOVERED (roborev 16177)", () => {
+    // exit() reads errored only while still wedged; once a tool event cleared the flag, a clean
+    // exit must settle to done, not errored.
+    const { engine, last } = makeEngine();
+    engine.ingest("API Error: Rate limited\n");
+    expect(last()).toBe("errored");
+    engine.ingest("Reading file src/foo.ts\n" + SPINNER); // real progress clears the failure
+    expect(last()).toBe("working");
+    engine.exit();
+    expect(last()).toBe("done");
+  });
+
+  it("exits errored (not gray done) when the process dies still mid-stream-failed", () => {
+    // A wedged agent (API error / self-prompt) that's then killed must read errored, not done —
+    // even though no ERROR_PATTERNS line matched (roborev 16152).
+    const { engine, last } = makeEngine();
+    engine.ingest("API Error: Rate limited\n");
+    expect(last()).toBe("errored");
+    engine.exit();
+    expect(last()).toBe("errored");
+  });
+
+  it("recovers to waiting when a real prompt follows a stream failure", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest("API Error: overloaded\n");
+    expect(last()).toBe("errored");
+    // The agent recovered and is now genuinely asking the user (a real ❯ selection menu).
+    engine.ingest("❯ 1. Yes\n");
+    expect(last()).toBe("waiting");
+  });
+
+  it("does NOT flag agent narration that merely mentions API errors/overload (roborev 16153)", () => {
+    // The banner matcher is anchored to the start of the visible line, so a healthy turn that simply
+    // WRITES about these topics mid-sentence stays green — no false RED that would stick until the
+    // next tool event.
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    engine.ingest("\nI'll add handling for the API Error case; the model can be overloaded.\n");
+    expect(last()).toBe("working");
+  });
+
+  it("does NOT flag a benign short line repeated only a few times (roborev 16153)", () => {
+    // A tool that echoes the same short progress line a handful of times (under the churn threshold)
+    // must not paint red — especially since it then makes real progress.
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    engine.ingest("\n.\n.\n.\n"); // 3 repeats — under STALL_REPEAT_THRESHOLD (5)
+    expect(last()).toBe("working");
+    engine.ingest("Reading file src/foo.ts\n" + SPINNER);
+    expect(last()).toBe("working");
+  });
+
   it("bounds the unterminated-line buffer instead of growing it all turn", () => {
     const { engine, last } = makeEngine();
     // The spinner redraws in place with no trailing newline. Simulate a long turn:

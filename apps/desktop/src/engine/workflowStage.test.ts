@@ -120,6 +120,32 @@ describe("deriveLiveStage — build signals", () => {
     expect(deriveLiveStage({ kind: "build", bs: bs(1), shipped: true })).toBe("shipped");
     expect(deriveLiveStage({ kind: "build", bs: bs(0), shipped: true })).toBe("building_unsaved");
   });
+  it("squash-merge: tip not an ancestor (landed) but work present → merged", () => {
+    // The branch's commits still exist on its ref post-squash, so aheadOfBase stays >0 (committedSeen)
+    // while inLocalMain/inOriginMain are false. `landed` (tree-identical to main) is the squash signal.
+    expect(
+      deriveLiveStage({ kind: "build", bs: bs(0), ws: ws({ landed: true, aheadOfBase: 2 }) }),
+    ).toBe("merged");
+    // committedSeen can also come from this tick's own commits.
+    expect(deriveLiveStage({ kind: "build", bs: bs(1), ws: ws({ landed: true }) })).toBe("merged");
+  });
+  it("a no-op branch is trivially tree-identical (landed) but stays unsaved (committedSeen gate)", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs(0), ws: ws({ landed: true }) })).toBe(
+      "building_unsaved",
+    );
+  });
+  it("normal merge after relaunch: persisted watermark keeps committedSeen → merged, not unsaved", () => {
+    // Post-merge ahead→0 and aheadOfBase→0; without a persisted `prev` this collapsed to unsaved.
+    // The persisted watermark (building_saved) restores committedSeen so inLocalMain → merged.
+    expect(
+      deriveLiveStage({
+        kind: "build",
+        bs: bs(0),
+        ws: ws({ inLocalMain: true }),
+        prev: "building_saved",
+      }),
+    ).toBe("merged");
+  });
 });
 
 describe("deriveLiveStage — monotonic watermark + new cycle", () => {
@@ -178,6 +204,11 @@ describe("deriveLiveStage — worker path", () => {
   });
   it("ignores local-main reachability (that's a build-agent signal, not a worker's)", () => {
     expect(deriveLiveStage({ kind: "worker", bs: bs(1), ws: ws({ inLocalMain: true }) })).toBe(
+      "building_saved",
+    );
+  });
+  it("ignores the squash `landed` signal too (a build-agent signal, not a worker's)", () => {
+    expect(deriveLiveStage({ kind: "worker", bs: bs(1), ws: ws({ landed: true }) })).toBe(
       "building_saved",
     );
   });

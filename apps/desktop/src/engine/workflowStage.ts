@@ -140,7 +140,11 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
 
     // Build agent: reaching local OR origin main is "Merged with Main" (local-first), once real
     // work exists (else a no-op branch's tip trivially sits in main and would read as landed).
-    if (committedSeen && kind !== "worker" && (ws.inLocalMain || ws.inOriginMain)) bump("merged");
+    // `ws.landed` is the SQUASH/REBASE case — the tip isn't an ancestor (so inLocalMain/inOriginMain
+    // are false) but its tree already matches main. The committedSeen gate is what keeps a no-op
+    // branch (also tree-identical, hence landed) from falsely reading as merged.
+    if (committedSeen && kind !== "worker" && (ws.inLocalMain || ws.inOriginMain || ws.landed))
+      bump("merged");
   }
 
   // A worker is "Merged with Main" ONLY once the orchestrator's work (which carries this worker's,

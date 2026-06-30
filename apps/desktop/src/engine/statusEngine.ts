@@ -26,6 +26,7 @@
 import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
 import { screenAwaitsInput } from "./screenClassifier";
+import { StreamFailureDetector, isApiErrorLine, isSelfPromptLine } from "./streamFailure";
 
 // Strip ANSI/control sequences before classifying (xterm still renders the raw bytes).
 // Built from a string with \u escapes so the source stays paste-safe (no literal ESC).
@@ -89,6 +90,13 @@ export class StatusEngine {
   private sawRecentError = false;
   // Sticky: once we've seen Claude's spinner we trust it over the time heuristic.
   private sawSpinner = false;
+  // Sticky (sparkle-pqxh): the stream is mid-stream FAILED/STALLED — an API-error banner the agent
+  // kept churning under, or a self-prompt loop. Unlike `sawRecentError` (a one-shot flag consumed at
+  // exit/settle), this drives a live RED `errored` WHILE the process is alive, and it OVERRIDES the
+  // spinner: the bug is precisely that the spinner keeps ticking while the agent is wedged. Cleared
+  // only by real forward progress (a classified tool/file event) or a real interactive prompt.
+  private sawStreamFailure = false;
+  private readonly failure = new StreamFailureDetector();
 
   constructor(private readonly opts: StatusEngineOpts) {
     this.opts.onStatus(this.status);
@@ -154,11 +162,36 @@ export class StatusEngine {
       if (!line) continue;
       if (ERROR_PATTERNS.some((re) => re.test(line))) this.sawRecentError = true;
       const ev = classifyLine(line, { sessionId: this.opts.agentId });
+      if (ev) {
+        // A classified tool/file event is genuine forward progress — the agent is doing real work
+        // again, not churning on a dead API call. Clear any sticky mid-stream failure (sparkle-pqxh)
+        // and reset the churn counter so post-recovery output starts fresh.
+        this.sawStreamFailure = false;
+        this.failure.reset();
+      }
       if (ev?.event_type === "approval_needed") this.sawRecentRisk = true;
+      // Mid-stream failure/stall while the process is alive (sparkle-pqxh). Only observed when this
+      // line did NOT classify as a tool/file event — a classified line is unambiguous progress, and
+      // `if (ev)` above just reset the detector, so re-observing it (a tool arg/path that happens to
+      // contain "api error") must not re-trip the failure (roborev 16153). The detector keys off the
+      // visible \r-frame, so a banner fused onto a spinner redraw is still caught. Sticky once
+      // tripped; only the recovery paths (a real tool event above, a real prompt below) clear it.
+      else if (!ev && this.failure.observe(line)) {
+        this.sawStreamFailure = true;
+      }
       if (screenAwaitsInput(line)) prompt = true;
     }
     // Claude prints its input prompt without a trailing newline — check the partial too.
     if (screenAwaitsInput(this.partial)) prompt = true;
+
+    // A banner / self-prompt can also sit in the still-unterminated partial: the spinner redraws
+    // without a newline, so a fused banner may not have flushed as a completed line yet. Mirror the
+    // partial prompt-check above so detection isn't one missing '\n' away from silently not firing
+    // (roborev 16152). Only the phrase signals (which key off the visible \r-frame), NOT the churn
+    // counter — that needs discrete completed lines. Set-only (never clears), keeping it sticky.
+    if (!this.sawStreamFailure && (isApiErrorLine(this.partial) || isSelfPromptLine(this.partial))) {
+      this.sawStreamFailure = true;
+    }
 
     // The spinner status line is re-drawn in place (often no trailing newline), so test
     // the whole cleaned chunk rather than only completed lines.
@@ -170,8 +203,21 @@ export class StatusEngine {
       this.clearTimers();
       this.set(this.sawRecentRisk ? "approval" : "waiting");
       this.sawRecentRisk = false;
-      // A calm prompt means the agent recovered and is awaiting you — not a crash.
+      // A calm prompt means the agent recovered and is awaiting you — not a crash or a stall.
       this.sawRecentError = false;
+      this.sawStreamFailure = false;
+      this.failure.reset();
+      return;
+    }
+
+    // 1b. Mid-stream failure/stall (sparkle-pqxh): the agent printed an API-error banner and kept
+    //     churning, or fell into a self-prompt loop, all while its process stays alive. Fail CLOSED
+    //     to red `errored` and OVERRIDE the spinner below — the whole bug is that the spinner keeps
+    //     ticking (so it looked "working") while the agent is wedged. The router lifts this to red
+    //     even over a hook `working`. Recovery clears it above (a real tool event / a real prompt).
+    if (this.sawStreamFailure) {
+      this.clearTimers();
+      this.set("errored");
       return;
     }
 
@@ -200,7 +246,10 @@ export class StatusEngine {
   /** Call when the PTY exits. */
   exit(): void {
     this.clearTimers();
-    this.set(this.sawRecentError ? "errored" : "done");
+    // A process that dies mid-stream-failure (an API error / self-prompt wedge that never recovered)
+    // must read `errored`, not gray `done`: sawStreamFailure counts the same as a pre-exit error
+    // marker here, so a wedged-then-killed agent doesn't settle green-gray (roborev 16152).
+    this.set(this.sawRecentError || this.sawStreamFailure ? "errored" : "done");
   }
 
   dispose(): void {

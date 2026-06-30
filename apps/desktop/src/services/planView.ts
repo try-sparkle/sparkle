@@ -32,48 +32,6 @@ export function beadStage(
   return "planned";
 }
 
-/**
- * The programmatic bead write a unit's CURRENT stage implies, so the app can advance the bead from
- * real events instead of the agent running `bd`. Edge-triggered by the caller (only on a stage
- * change) and idempotent:
- *   - any "building"/pushed/PR stage → claim (in_progress)
- *   - merged                        → close (done)
- *   - shipped                       → deliver (close + `delivered` label)
- *   - thought/spec'd/planned        → null (no write; the bead is already open/planned)
- */
-export function beadActionForStage(
-  stage: WorkflowStageId,
-): "claim" | "close" | "deliver" | null {
-  switch (stage) {
-    case "building_unsaved":
-    case "building_saved":
-    case "pushed":
-    case "pull_request":
-      return "claim";
-    case "merged":
-      return "close";
-    case "shipped":
-      return "deliver";
-    default:
-      return null;
-  }
-}
-
-/**
- * Whether closing an agent at this stage should PROMPT (Ship / Save / Discard) rather than close
- * silently. True only when there's UNMERGED work that could be lost or stranded — the build stages
- * before "Merged with Main". An empty/planning agent (nothing built yet) or one already merged/
- * shipped (work is safe on main) closes silently.
- */
-export function needsClosePrompt(stage: WorkflowStageId | undefined | null): boolean {
-  if (!stage) return false;
-  return (
-    stage === "building_unsaved" ||
-    stage === "building_saved" ||
-    stage === "pushed" ||
-    stage === "pull_request"
-  );
-}
 
 /** How an epic reads at a glance, rolled up from its child beads. */
 export type EpicStatus = "not_started" | "in_progress" | "done";

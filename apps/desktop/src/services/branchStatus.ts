@@ -20,6 +20,13 @@ export interface WorkflowState {
   inOriginMain: boolean; // …in origin/<default> as of the last fetch
   inParent: boolean; // …in the parent/orchestrator branch (workers only)
   aheadOfBase: number; // commits the agent authored, vs the ref it was cut from — origin/<default> when present, else local (>0 ⇒ real unlanded work)
+  // The branch's WORK has landed via a SQUASH/REBASE merge: its tip commit isn't an ancestor of the
+  // integration branch (so inLocalMain/inOriginMain are both false), but merging it in would add
+  // nothing — its work is already there. Squash-merge defeats ancestor reachability; this catches it
+  // and survives an advancing default (see Rust `merge_adds_nothing`). Gated by committedSeen
+  // downstream so a no-op branch (also trivially adds nothing) can't claim it landed. Optional in the
+  // type so a Rust build that predates the field deserializes to falsy.
+  landed?: boolean;
   prState: "open" | "merged" | "closed" | null; // GitHub PR state for the branch, if any
   prNumber: number | null;
   prUrl: string | null;
@@ -75,6 +82,29 @@ export async function landAgentBranch(
 ): Promise<LandResult> {
   if (isBusy) return { ok: false, reason: "busy", files: [] };
   return invoke<LandResult>("land_agent_branch", { root, agentId, targetBranch });
+}
+
+/** Push an agent's branch to origin (close-agent Ship/Save). Resolves "pushed" | "no-remote";
+ *  rejects with git's message on auth/network failure. */
+export function pushAgentBranch(root: string, agentId: string): Promise<string> {
+  return invoke<string>("push_agent_branch", { root, agentId });
+}
+
+/** Delete an agent's local branch (close-agent Discard). Idempotent. The worktree must be removed
+ *  first (git refuses to delete a checked-out branch). */
+export function deleteAgentBranch(root: string, agentId: string): Promise<void> {
+  return invoke<void>("delete_agent_branch", { root, agentId });
+}
+
+/** Open a GitHub PR for an agent's branch (close-agent Ship). Resolves the PR URL; rejects when gh
+ *  is missing/unauthed, there's no remote, or a PR already exists. Push first. */
+export function openAgentPr(
+  root: string,
+  agentId: string,
+  targetBranch: string,
+  title: string,
+): Promise<string> {
+  return invoke<string>("open_agent_pr", { root, agentId, targetBranch, title });
 }
 
 export type RefreshResult =

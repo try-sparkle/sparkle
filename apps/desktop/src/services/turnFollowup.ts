@@ -11,8 +11,10 @@
 //
 // Hybrid, to keep it ~free: a pure LOCAL fast-path first skips the obvious "Done." turns with no
 // question/proposal at all (no model call), and the Haiku judge runs only on the ambiguous
-// remainder. Everything is best-effort — any failure (no API key, offline, model hiccup) degrades
-// to "not a followup" (gray), exactly the pre-change behavior, never a spurious red.
+// remainder. The judge is a PRECISION filter over the fast-path, not a gate that can silently fail
+// open: when it can't run (no API key — the norm without a BYOK key —, offline, model hiccup) we
+// FALL BACK to the fast-path's own verdict (→ `waiting`) rather than swallow a real ask to gray
+// (sparkle-blpf). Only a judge that actually RAN and said DONE pulls an ambiguous turn back to gray.
 import { invoke } from "@tauri-apps/api/core";
 
 // Only the TAIL of a turn carries the ask — agents put "Want me to…?" in the last line(s), after a
@@ -79,8 +81,19 @@ export function interpretVerdict(raw: string): boolean {
 
 /**
  * Decide whether a finished turn is blocked on the user. Runs the local fast-path, then (only if it
- * might be an ask) the Haiku judge with the agent's task as context for "the work at hand". Returns
- * true ONLY for a confident followup; every failure path returns false (degrade to gray).
+ * might be an ask) the Haiku judge with the agent's task as context for "the work at hand".
+ *
+ * FAILS CLOSED (sparkle-blpf): the deterministic fast-path is the floor, not the judge. We reach the
+ * judge only because `mightNeedFollowup` already matched — the tail had a '?' or a proposal/hand-back
+ * phrase — so this turn *looks* blocked on the user. We must distinguish two outcomes the old code
+ * conflated:
+ *   - the judge RAN and said DONE  → trust it, return false (gray). A real verdict overrides the
+ *     fast-path's bias-toward-ask.
+ *   - the judge COULD NOT RUN (no API key — the case for every user without a BYOK key today —, or
+ *     offline / model hiccup) → we have NO verdict, so we fall back to the fast-path's own answer
+ *     (true → `waiting`) rather than swallowing a genuine "needs you" to gray. This is what makes the
+ *     prose-question case go red WITHOUT a judge key. The previous behavior (catch → false) made the
+ *     whole red-on-prose path silently dead for everyone but the one user with a key.
  *
  * @param task     What the agent was asked to do (its naming basis / name) — lets the judge tell a
  *                 closeout ask (land/verify THIS work → red) from an offer of new work (gray).
@@ -91,15 +104,21 @@ export async function judgeNeedsFollowup(args: {
   response: string;
 }): Promise<boolean> {
   if (!mightNeedFollowup(args.response)) return false;
+  // Scope the try to ONLY the judge call, so the catch strictly means "the judge could not run"
+  // (never a genuine verdict re-interpreted as an availability failure).
+  let raw: string;
   try {
-    const raw = await invoke<string>("judge_turn_followup", {
+    raw = await invoke<string>("judge_turn_followup", {
       task: args.task,
       response: args.response,
     });
-    return interpretVerdict(raw);
   } catch (e) {
-    // No API key, offline, or model hiccup — stay gray (the pre-change behavior), never a false red.
-    console.debug("followup judge skipped:", e);
-    return false;
+    // The judge could not run (no API key, offline, model hiccup). We can't distinguish done from
+    // blocked, so FAIL CLOSED to the deterministic fast-path verdict: mightNeedFollowup already
+    // matched (we're past its early return), so escalate to `waiting` rather than swallow it to gray.
+    console.debug("followup judge unavailable; failing closed to the fast-path verdict:", e);
+    return true;
   }
+  // The judge RAN — trust its verdict. A real DONE pulls the ambiguous turn back to gray.
+  return interpretVerdict(raw);
 }

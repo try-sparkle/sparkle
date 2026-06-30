@@ -70,6 +70,38 @@ describe("createStatusRouter", () => {
     expect(emit.mock.calls.map((c) => c[0])).toEqual(["working"]);
   });
 
+  it("lets a screen mid-stream failure (errored) override even a hook 'working' (fail closed)", () => {
+    // sparkle-pqxh: the agent printed an API error / fell into a self-prompt loop with its process
+    // alive, so the hook stream is stuck on `working` (no Stop ever fires). The scraper's `errored`
+    // must pierce that — this is the one escalation that overrides a hook `working`.
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("working");
+    r.fromScreen("errored");
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["working", "errored"]);
+  });
+
+  it("a stuck hook 'idle' does not clear a live screen 'errored'", () => {
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("working");
+    r.fromScreen("errored"); // wedged → red
+    r.fromHook("idle"); // a stray/stuck idle hook can't see the stall — screen failure still wins
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["working", "errored"]);
+  });
+
+  it("clears the screen 'errored' override when the scraper reports progress again", () => {
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("working");
+    r.fromScreen("errored"); // wedged → red
+    r.fromScreen("working"); // real progress resumed → scraper lifts the failure
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["working", "errored", "working"]);
+  });
+
   it("clears the escalation once the hook reports working again", () => {
     const emit = vi.fn();
     const r = createStatusRouter(emit);

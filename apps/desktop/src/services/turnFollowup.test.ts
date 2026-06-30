@@ -127,12 +127,25 @@ describe("judgeNeedsFollowup (orchestration)", () => {
     expect(result).toBe(false);
   });
 
-  it("degrades to gray (false) when the backend throws — never a false red", async () => {
-    invokeMock.mockRejectedValueOnce(new Error("no API key"));
+  it("FAILS CLOSED to waiting when the judge can't run (no key/offline) on an ask (sparkle-blpf)", async () => {
+    // The norm for every user without a BYOK judge key: the judge throws, but the fast-path matched
+    // (the turn ends with a '?'), so we escalate to red rather than silently swallow the ask to gray.
+    invokeMock.mockRejectedValueOnce(new Error("no Anthropic API key"));
     const result = await judgeNeedsFollowup({
       task: "Ship the release",
       response: "Want me to land it now?",
     });
+    expect(result).toBe(true);
+  });
+
+  it("still stays gray when the judge can't run on a turn the fast-path did NOT flag", async () => {
+    // No '?' / proposal in the tail → mightNeedFollowup is false → we never call (or trust) the
+    // judge, so a plain completion report stays gray even with no key.
+    const result = await judgeNeedsFollowup({
+      task: "Ship the release",
+      response: "Done. Shipped and verified the suite passes.",
+    });
     expect(result).toBe(false);
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });

@@ -53,6 +53,13 @@ export function createStatusRouter(emit: (s: AgentTabStatus) => void): StatusRou
   // state. Always computed from the LATEST of each source, so it re-resolves cleanly whenever any
   // side changes. (The two reds are interchangeable; screen wins ties, arbitrarily.)
   const resolve = (hook: AgentTabStatus): AgentTabStatus => {
+    // FAIL-CLOSED override (sparkle-pqxh): a screen-detected mid-stream failure/stall (`errored`)
+    // wins over EVERY hook status, including a hook `working`. This is the one escalation that must
+    // pierce hook authority, because the bug is precisely that the hook stream stays stuck on
+    // `working`/`idle` while the agent is wedged on an API error or self-prompt loop with its
+    // process alive (so no Stop/SessionEnd ever fires). The scraper clears this the instant real
+    // progress resumes — it emits a non-errored screen status — so it can't outlive recovery.
+    if (lastScreen === "errored") return "errored";
     if (hook !== "idle") return hook;
     if (screenAwaits()) return lastScreen!;
     if (judgeAwaits()) return lastJudge!;

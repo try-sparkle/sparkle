@@ -10,6 +10,7 @@ import {
   columnFor,
   bucketBeads,
   childrenOf,
+  parseCreatedBeadId,
   DELIVERED_LABEL,
   type Bead,
 } from "./beads";
@@ -131,6 +132,19 @@ describe("bucketBeads", () => {
     expect(board.inProgress.map((b) => b.id)).toEqual(["ip1"]);
     expect(board.done.map((b) => b.id)).toEqual(["d1", "d2"]);
     expect(board.delivered.map((b) => b.id)).toEqual(["del1"]);
+  });
+});
+
+describe("parseCreatedBeadId", () => {
+  it("extracts the id from bd's created-issue JSON", () => {
+    expect(parseCreatedBeadId('{"id":"","title":"x"}')).toBe("");
+    expect(parseCreatedBeadId('{"issue_id":""}')).toBe("");
+  });
+  it("returns null on a bd error blob or unparseable output", () => {
+    expect(parseCreatedBeadId('{"error":"boom"}')).toBeNull();
+    expect(parseCreatedBeadId("not json")).toBeNull();
+    expect(parseCreatedBeadId("")).toBeNull();
+    expect(parseCreatedBeadId("{}")).toBeNull();
   });
 });
 

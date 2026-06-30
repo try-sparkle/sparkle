@@ -1,19 +1,25 @@
 // Pure attention logic shared by the dock badge and the system-notification trigger.
-// "Attention" = an agent genuinely waiting on YOUR answer or approval (waiting / approval).
-// This is a SUBSET of the red statuses: `errored` is also red (a crashed agent stands out) but
-// does NOT count as attention — it's a passive "this one died" cue, not a live question, so it
-// must not ping you. The badge shows the *level* (how many need you right now); the notification
-// fires on the *edge* (the moment an agent crosses INTO needing you), so you're pinged once per
-// ask, not on every status tick.
+// "Attention" = an agent that needs YOU before it can make progress: it's waiting on your answer
+// or approval (waiting / approval), OR it has errored/stalled and is stuck until you step in
+// (errored). All three are RED. `errored` is included by design (sparkle-pqxh/sparkle-blpf): a
+// crash OR a mid-stream API-error/self-prompt stall both mean the agent has stopped getting
+// anything done and you're losing time until you look — exactly what the badge + ping exist to
+// surface ("never lose time"). The badge shows the *level* (how many need you right now); the
+// notification fires on the *edge* (the moment an agent crosses INTO needing you), so you're pinged
+// once per transition, not on every status tick.
 import type { AgentTabStatus } from "../types";
 
 /** Agent id → its current live status. Mirrors runtimeStore.status. */
 export type StatusMap = Record<string, AgentTabStatus>;
 
-// The attention statuses — the agent is asking YOU something. A strict subset of the red tier
-// (errored is red but not here, by design — see header). Kept in sync with STATUS_RANK tier 0 in
-// agentOrdering.ts (waiting = "Needs you", approval = "Approve?").
-const ATTENTION: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>(["waiting", "approval"]);
+// The attention statuses — the agent needs YOU before it can continue. The full red tier:
+// waiting ("Needs you") and approval ("Approve?") are live questions; errored ("Errored / stalled")
+// is a stuck agent that's lost time until you intervene. Mirrors agentOrdering.ts's red intent.
+const ATTENTION: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>([
+  "waiting",
+  "approval",
+  "errored",
+]);
 
 /** True when a status means the agent is waiting on the user's answer/approval. */
 export function needsAttention(status: AgentTabStatus | undefined): boolean {
@@ -82,7 +88,7 @@ export function notificationFor(
   const reason: Record<AgentTabStatus, string> = {
     waiting: "Needs your answer",
     approval: "Wants your approval",
-    errored: "Errored — it crashed",
+    errored: "Errored or stalled — needs you",
     idle: "Finished — your turn",
     done: "Done",
     working: "Started working",

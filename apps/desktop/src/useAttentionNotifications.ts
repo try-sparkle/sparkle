@@ -45,11 +45,12 @@ import {
 } from "./services/windowStatus";
 import type { AgentTab, AgentTabStatus } from "./types";
 
-/** The two "needs you" statuses (mirrors engine/attention's red set) — relayed to the phone. Named
- *  distinctly from windowStatus.isRedStatus (the broader red-COLOR tier, incl. errored) so the two
- *  red notions aren't confused. */
+/** The "needs you" red statuses relayed to the phone (mirrors engine/attention's ATTENTION set).
+ *  Includes `errored`: a crashed or mid-stream-stalled agent is stuck until you step in (the
+ *  "never lose time" intent). Now set-equal to windowStatus.isRedStatus — both cover
+ *  waiting|approval|errored — so the badge, the phone relay, and the cross-window red tier agree. */
 const isRelayRed = (s: AgentTabStatus | undefined): boolean =>
-  s === "approval" || s === "waiting";
+  s === "approval" || s === "waiting" || s === "errored";
 
 /** The name other windows should show — Claude Code's title if known, else the auto-name, else the
  *  fallback. Mirrors useRosterPublisher.displayName. */
@@ -114,8 +115,8 @@ export function useAttentionNotifications(): void {
     reportAttentionCount(label, countAttention(status, ownedIds));
 
     // Publish THIS window's red (needs-attention) agents to the cross-window status channel so other
-    // windows can surface them at the top of their sidebar. Uses the broader red-color set
-    // (waiting|approval|errored) — not the narrower badge `isRed` above. Empty set deletes our entry.
+    // windows can surface them at the top of their sidebar. Uses the red-color set
+    // (waiting|approval|errored), same tier as the relay. Empty set deletes our entry.
     publishWindowRedAgents(
       label,
       projectId ?? "",
@@ -144,6 +145,9 @@ export function useAttentionNotifications(): void {
           const attentionId = crypto.randomUUID();
           attentionIds.current[id] = attentionId;
           const approval = st === "approval";
+          // `errored` covers both a crash and a mid-stream API-error/self-prompt stall — the agent
+          // is stuck until you look, so it relays as a (reply-less) "needs you" with its own copy.
+          const errored = st === "errored";
           emitAttention({
             attention_id: attentionId,
             agent_id: id,
@@ -152,7 +156,9 @@ export function useAttentionNotifications(): void {
             kind: approval ? "approval" : "question",
             question: approval
               ? `${agent.name} needs you to approve an action in ${projectName}.`
-              : `${agent.name} is waiting on your answer in ${projectName}.`,
+              : errored
+                ? `${agent.name} hit an error / stalled in ${projectName} and needs you.`
+                : `${agent.name} is waiting on your answer in ${projectName}.`,
             suggested_replies: approval
               ? [
                   { label: "Approve", value: "y\n" },

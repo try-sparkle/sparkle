@@ -43,6 +43,7 @@ beforeEach(() => {
   (globalThis as unknown as { window: unknown }).window = {
     addEventListener: () => {},
     removeEventListener: () => {},
+    dispatchEvent: () => false, // windowRegistry.write broadcasts a local change event on write
     __TAURI_INTERNALS__: {},
   };
 });

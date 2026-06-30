@@ -14,11 +14,13 @@ import { useAiFeature } from "../services/aiGate";
 import { removeAgentWorkspace } from "../services/worktree";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
+import { shouldPromptOnClose } from "../engine/closeAgent";
+import { shipAgent, saveAgent, discardAgentGit } from "../services/closeAgentActions";
 import { refreshAgentTitle } from "../services/sessionTitle";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
 import { useBeadsStore } from "../stores/beadsStore";
-import { beadLabel, epicForBuild, needsClosePrompt } from "../services/planView";
-import { closeBead, type Bead } from "../services/beads";
+import { beadLabel, epicForBuild } from "../services/planView";
+import { type Bead } from "../services/beads";
 import { orderAgents } from "../engine/agentOrdering";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
@@ -388,9 +390,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       return false;
     }
   };
-  // The raw teardown: stop the PTYs + remove each worktree (the branch is KEPT), then remove the
-  // agent (cascades to its workers). This is "Keep it for later" / a silent close of empty work.
-  const doClose = (id: string) => {
+  // Tear an agent down: drop it (and its workers) from the stores and remove their worktrees. The
+  // BRANCH is intentionally kept (remove_worktree_at), so this is the "Save" outcome — Discard adds
+  // an explicit branch+bead delete on top (onDiscardClose).
+  const teardownAgent = (id: string) => {
     if (!project) return;
     const childIds = project.agents.filter((a) => a.parentId === id).map((a) => a.id);
     for (const cid of [id, ...childIds]) {
@@ -399,46 +402,69 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     }
     removeAgent(project.id, id);
   };
-  const onClose = (id: string) => {
-    if (!project) return;
-    // If this agent has UNMERGED work, never silently destroy it — ask Ship / Save / Discard.
-    if (needsClosePrompt(stageOf(id))) {
-      setClosePromptId(id);
-      return;
-    }
-    doClose(id);
+  // The × button. A Build agent with unmerged work at risk gets the Ship/Save/Discard choice; every
+  // other case (already merged, no real work, workers/think/shell) closes silently. See
+  // engine/closeAgent.shouldPromptOnClose.
+  const requestClose = (id: string) => {
+    if (!project) return teardownAgent(id);
+    const agent = project.agents.find((a) => a.id === id);
+    if (!agent) return;
+    const stage = resolveStage(branchStatus[id], workflowStage[id]);
+    if (shouldPromptOnClose(agent.kind, stage, branchStatus[id])) setClosePromptId(id);
+    else teardownAgent(id);
   };
-  // Ship / Save / Discard handlers for the close prompt.
+
+  // ── Close-agent Ship / Save / Discard (sparkle-o341) ───────────────────────────────────────────
   const closingAgent = project?.agents.find((a) => a.id === closePromptId) ?? null;
+
+  // Ship it: push + open a PR (review, not straight to main); local-land fallback when remoteless.
+  // Orchestration (incl. the bead close/deliver + land-failure handling) lives in shipAgent so it's
+  // unit-tested; here we just resolve the target and tear down after.
   const onShipClose = async () => {
-    const a = closingAgent;
-    if (!a || !project) {
-      setClosePromptId(null);
-      return;
+    const id = closePromptId;
+    setClosePromptId(null);
+    if (!id || !project) return;
+    const agent = project.agents.find((a) => a.id === id);
+    const target = project.defaultBranch ?? agent?.baseBranch ?? "main";
+    try {
+      await shipAgent({
+        root: project.rootPath,
+        agentId: id,
+        targetBranch: target,
+        prTitle: agent?.name ?? "",
+        beadId: agent?.beadId,
+      });
+    } catch (e) {
+      console.warn("ship-on-close failed (agent kept):", e);
     }
-    const landed = await onLand(a); // merge to main (logs the reason if blocked)
-    if (!landed) return; // land blocked (conflict/dirty/busy) — LEAVE the prompt open so the
-    // failure is visible and the user can resolve, or pick Keep-for-later / Discard instead.
-    setClosePromptId(null);
-    if (a.beadId)
-      void closeBead(project.rootPath, a.beadId).catch((e) => console.warn("bead close failed:", e));
-    doClose(a.id);
+    teardownAgent(id);
   };
-  const onSaveClose = () => {
-    const a = closingAgent;
+
+  // Save for later: back the branch up to the remote (best-effort), keep the bead; teardownAgent
+  // removes the worktree but KEEPS the branch — exactly "save".
+  const onSaveClose = async () => {
+    const id = closePromptId;
     setClosePromptId(null);
-    if (a) doClose(a.id); // keeps the branch + leaves the bead on the Plan board at its stage
+    if (!id || !project) return;
+    await saveAgent(project.rootPath, id);
+    teardownAgent(id);
   };
-  const onDiscardClose = () => {
-    const a = closingAgent;
+
+  // Discard: drop the agent + its workers from the store, delete their worktrees + branches and ALL
+  // their beads (workers carry their own). Behind an explicit confirm. Irreversible — never merged.
+  const onDiscardClose = async () => {
+    const id = closePromptId;
     setClosePromptId(null);
-    if (!a || !project) return;
-    // Stop tracking + discard unsaved changes: closeBead so it's not left tracked as open; the
-    // worktree --force in doClose discards uncommitted work. Committed work on the branch remains
-    // and is tidied up by the branch-prune flow (true branch-deletion on discard is a follow-up).
-    if (a.beadId)
-      void closeBead(project.rootPath, a.beadId).catch((e) => console.warn("bead close failed:", e));
-    doClose(a.id);
+    if (!id || !project) return;
+    const children = project.agents.filter((a) => a.parentId === id);
+    const ids = [id, ...children.map((a) => a.id)];
+    const beadIds = [
+      project.agents.find((a) => a.id === id)?.beadId,
+      ...children.map((a) => a.beadId),
+    ].filter((b): b is string => !!b);
+    for (const cid of ids) close(cid);
+    await discardAgentGit({ root: project.rootPath, projectId: project.id, ids, beadIds });
+    removeAgent(project.id, id);
   };
 
   // "Close this worker?" nudge. When a worker's branch reaches Merged, its work is in main and the
@@ -517,7 +543,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const onMergePromptClose = () => {
     const id = mergePromptId;
     setMergePromptId(null);
-    if (id) onClose(id);
+    if (id) teardownAgent(id); // a merged worker is safe to close outright
   };
   const onMergePromptKeep = () => setMergePromptId(null);
   // Think is AI-feature-gated. If the gate turns off while Think mode is selected, the Think chevron
@@ -764,7 +790,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               setEditing={setEditing}
               onSelect={() => onSelect(a.id)}
               onLand={() => onLand(a)}
-              onClose={() => onClose(a.id)}
+              onClose={() => requestClose(a.id)}
             />
           );
             }; // end renderRow
@@ -823,9 +849,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         <CloseWorkerPrompt onClose={onMergePromptClose} onKeep={onMergePromptKeep} />
       )}
 
-      {/* Ship / Save / Discard, shown when closing an agent that has unmerged work. */}
+      {/* Ship / Save / Discard, shown when closing a Build agent with unmerged work at risk. */}
       {closingAgent && (
         <CloseAgentPrompt
+          agentName={closingAgent.name || "this agent"}
+          unsaved={!!branchStatus[closingAgent.id]?.dirty}
           onShip={onShipClose}
           onSave={onSaveClose}
           onDiscard={onDiscardClose}

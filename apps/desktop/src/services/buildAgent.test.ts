@@ -146,14 +146,19 @@ describe("beadsProtocol", () => {
   it("binds the orchestrator to the epic and its child tasks", () => {
     expect(p).toContain("epic-42");
     expect(p).toContain("bd show epic-42 --json");
-    expect(p).toMatch(/claim/i);
-    expect(p).toContain("bd close");
-    expect(p).toContain("delivered");
+    expect(p).toContain("spawn_worker");
   });
 
   it("instructs exactly one worker per task, linked to its bead via the beadId argument", () => {
     expect(p).toMatch(/one worker/i);
     expect(p).toContain("beadId"); // the worker↔bead linkage argument
     expect(p).toContain("spawn_worker");
+  });
+
+  it("leaves status transitions to the app, not manual bd commands", () => {
+    // in_progress/closed/delivered are now written programmatically (syncBeadLifecycle); the
+    // orchestrator is explicitly told NOT to run them by hand so the board can't drift.
+    expect(p).toMatch(/do not run/i);
+    expect(p).toMatch(/automatically/i);
   });
 });

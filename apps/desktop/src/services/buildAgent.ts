@@ -78,9 +78,10 @@ export function workerMission(task: string, taskId: string): string {
 
 /** Persona addendum that binds the orchestrator to a specific beads epic as the source of truth
  *  for WHAT to build. Appended to the orchestrator persona (and/or the "Send to Build" seed prompt)
- *  so the build agent discovers the epic's child tasks via `bd`, claims each before spawning a
- *  worker for it, closes it once the worker's branch is merged into the build branch, and labels it
- *  `delivered` once the work lands on main. Tone/format mirror the orchestration persona. */
+ *  so the build agent discovers the epic's child tasks via `bd` and spawns one worker per ready task,
+ *  linked by `beadId`. Status transitions (in_progress / closed / delivered) are written
+ *  PROGRAMMATICALLY by the app from real lifecycle events (see runtimeStore.syncBeadLifecycle), so
+ *  the agent no longer runs them by hand. Tone/format mirror the orchestration persona. */
 export function beadsProtocol(opts: { epicId: string }): string {
   return [
     "BEADS PROTOCOL — THE WORK GRAPH IS THE SOURCE OF TRUTH",
@@ -89,17 +90,15 @@ export function beadsProtocol(opts: { epicId: string }): string {
     `- Discover the children before doing anything else: \`bd show ${opts.epicId} --json\` for the`,
     "  epic and its dependents, `bd list --json` to inspect the full graph, and `bd ready` to see",
     "  which child tasks are unblocked and ready to start.",
-    "- TASK LIFECYCLE — keep the graph honest as you go:",
-    "  1. BEFORE you spawn a worker for a task, CLAIM it: `bd update <taskId> --claim` (moves it to",
-    "     in_progress so no one else picks it up). Then spawn exactly ONE worker for that one task,",
-    "     passing that same `<taskId>` as the `beadId` argument to `spawn_worker` so the worker is",
-    "     linked to its bead in the Plan and Build views. Spawn the worker only after the claim succeeds.",
-    "  2. AFTER that worker reports success AND you have merged its branch into your build branch,",
-    "     CLOSE the task: `bd close <taskId>`.",
-    "  3. Once the WHOLE epic's work has actually landed on `main` (not just your build branch),",
-    "     mark each shipped child delivered: `bd label add <taskId> delivered`.",
-    "- Respect dependencies: only claim/spawn tasks that `bd ready` reports as unblocked; let a",
-    "  blocked task wait until its blockers are closed.",
+    "- For each READY child task, spawn exactly ONE worker for that one task, passing that `<taskId>`",
+    "  as the `beadId` argument to `spawn_worker` so the worker is linked to its bead in the Plan and",
+    "  Build views.",
+    "- Sparkle keeps the graph honest FOR you: it advances each linked task's status automatically —",
+    "  in_progress when the worker starts real work, closed when its branch merges, delivered once it",
+    "  ships. Do NOT run `bd update --claim` / `bd close` / `bd label add delivered` by hand; let the",
+    "  app own those transitions so the board can't drift from reality.",
+    "- Respect dependencies: only spawn tasks that `bd ready` reports as unblocked; let a blocked task",
+    "  wait until its blockers are closed.",
     "- The integration rules above still hold: NEVER touch `main` directly, and merge each worker's",
     "  branch into YOUR build branch sequentially, one at a time.",
   ].join("\n");

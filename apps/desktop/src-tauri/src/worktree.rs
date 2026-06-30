@@ -451,6 +451,13 @@ pub struct WorkflowState {
     /// against the cut ref (not strictly local main) so a fresh branch off an ahead-of-local
     /// `origin/<default>` reads 0 rather than counting inherited, un-pulled commits as its own.
     ahead_of_base: u32,
+    /// The branch's WORK is already in the integration branch via a SQUASH or REBASE merge — its tip
+    /// COMMIT isn't an ancestor (squash makes a new commit, so `in_local_main`/`in_origin_main` are
+    /// both false), but merging it into `<default>` would add nothing (see `merge_adds_nothing`,
+    /// which survives an advancing `<default>`). Kept a strict superset of reachability (true whenever
+    /// those are). The frontend gates this on `committedSeen` so a no-op branch — which also trivially
+    /// adds nothing — can't claim it landed.
+    landed: bool,
     /// Best-effort GitHub PR state for this branch via `gh`, if one is found: "open" | "merged" |
     /// "closed". None when gh is absent/unauthed, there's no remote, or no PR matches the branch.
     pr_state: Option<String>,
@@ -471,6 +478,32 @@ fn ref_contains(root: &str, target: &str, commit: &str) -> bool {
     cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     apply_noninteractive(&mut cmd);
     matches!(cmd.status(), Ok(s) if s.success())
+}
+
+/// True iff merging `branch` into `target` would change NOTHING — i.e. `target` already contains all
+/// of `branch`'s work. Catches a SQUASH/REBASE merge (the tip isn't an ancestor, so `ref_contains`
+/// misses it) AND survives an ADVANCING `target` (other commits landing after the squash), because
+/// it asks the three-way question "does this branch still contribute anything?" rather than comparing
+/// whole tip trees — important here, where many agents land onto one shared `main`. Uses
+/// `git merge-tree --write-tree` (git ≥2.38): on a clean merge it prints the merged tree's OID, which
+/// we compare to `target`'s own tree. A conflict (non-zero exit) or any git error reads as "not
+/// landed" — a branch that conflicts with `target` plainly hasn't landed.
+/// KNOWN EDGE: a branch that authored commits and then net-reverted them merges as a no-op too, so it
+/// reads as landed; tolerated (a degenerate case) and gated upstream only by committedSeen.
+fn merge_adds_nothing(root: &str, target: &str, branch: &str) -> bool {
+    if target.trim().is_empty() || branch.trim().is_empty() {
+        return false;
+    }
+    let Ok(merged) = git(root, &["merge-tree", "--write-tree", target, branch]) else {
+        return false; // merge conflict (non-zero exit) or git error ⇒ not cleanly landed
+    };
+    if merged.is_empty() {
+        return false;
+    }
+    match git(root, &["rev-parse", &format!("{target}^{{tree}}")]) {
+        Ok(tree) => !tree.is_empty() && tree == merged,
+        Err(_) => false,
+    }
 }
 
 /// Best-effort GitHub PR lookup for `branch` via the `gh` CLI. Returns (state, number, url) where
@@ -656,6 +689,16 @@ pub fn agent_workflow_state_at(
     let in_origin_main = ref_contains(root, &origin_ref, &tip);
     let in_parent = ref_contains(root, parent_branch, &tip);
 
+    // Squash/rebase merges create a NEW commit on the integration branch, so the agent tip is not an
+    // ancestor and the reachability checks above miss it. Detect it by asking whether merging the
+    // branch into local/origin <default> would add nothing (its work is already there) — which also
+    // survives an advancing <default>. `||` short-circuits, so the merge-tree probe only runs for
+    // branches that AREN'T already reachable.
+    let landed = in_local_main
+        || in_origin_main
+        || merge_adds_nothing(root, &default_branch, &branch)
+        || merge_adds_nothing(root, &origin_ref, &branch);
+
     // Commits the agent AUTHORED that aren't yet landed (0 once merged into the integration ref).
     // Measured against the ref the branch was actually CUT FROM — `origin/<default>` when a
     // remote-tracking ref exists (see `effective_base`, which cuts new branches from origin),
@@ -693,6 +736,7 @@ pub fn agent_workflow_state_at(
         in_origin_main,
         in_parent,
         ahead_of_base,
+        landed,
         pr_state,
         pr_number,
         pr_url,
@@ -979,6 +1023,99 @@ pub fn land_agent_branch(
     target_branch: String,
 ) -> Result<LandOutcome, String> {
     land_agent_branch_at(&root, &agent_id, &target_branch)
+}
+
+/// Core (testable): push an agent's branch to `origin`. Returns "pushed" on success, or "no-remote"
+/// when the project has no `origin` (the caller then falls back to a local land or keeps the branch
+/// locally). A git failure (auth/network) surfaces as Err so the UI can report it.
+pub fn push_agent_branch_at(root: &str, agent_id: &str) -> Result<String, String> {
+    if git(root, &["remote", "get-url", "origin"]).is_err() {
+        return Ok("no-remote".to_string());
+    }
+    let branch = format!("sparkle/agent-{agent_id}");
+    if git(root, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_err() {
+        return Err("no-branch".to_string());
+    }
+    git(root, &["push", "-u", "origin", &branch]).map(|_| "pushed".to_string())
+}
+
+/// Push an agent's branch to `origin` for the close-agent Ship/Save paths. "pushed" | "no-remote".
+#[tauri::command]
+pub fn push_agent_branch(root: String, agent_id: String) -> Result<String, String> {
+    push_agent_branch_at(&root, &agent_id)
+}
+
+/// Core (testable): delete an agent's local branch — the Discard path. Force (`-D`) because the
+/// branch is intentionally unmerged here; that's what Discard means. Idempotent: an already-gone
+/// branch is Ok. The caller MUST remove the worktree first (git refuses to delete a checked-out
+/// branch) and gate this behind an explicit confirmation.
+pub fn delete_agent_branch_at(root: &str, agent_id: &str) -> Result<(), String> {
+    let branch = format!("sparkle/agent-{agent_id}");
+    if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_err() {
+        return Ok(()); // already gone — Discard is idempotent
+    }
+    git(root, &["branch", "-D", &branch]).map(|_| ())
+}
+
+/// Delete an agent's local branch (Discard). See `delete_agent_branch_at`.
+#[tauri::command]
+pub fn delete_agent_branch(root: String, agent_id: String) -> Result<(), String> {
+    delete_agent_branch_at(&root, &agent_id)
+}
+
+/// Build the `gh pr create` argv for an agent branch. Pure + tested so the guard/defaulting logic is
+/// exercised without invoking `gh`: rejects a blank `target` (else `--base ""` yields an opaque gh
+/// error) and falls back to the branch name when `title` is blank.
+fn pr_create_args(branch: &str, target: &str, title: &str) -> Result<Vec<String>, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("no target branch".to_string());
+    }
+    let title = if title.trim().is_empty() { branch } else { title.trim() };
+    Ok(vec![
+        "pr".into(),
+        "create".into(),
+        "--head".into(),
+        branch.to_string(),
+        "--base".into(),
+        target.to_string(),
+        "--title".into(),
+        title.to_string(),
+        "--body".into(),
+        "Opened by Sparkle (close-agent → Ship).".into(),
+    ])
+}
+
+/// Open a GitHub PR for an agent's branch via `gh pr create` (best-effort: needs `gh`, auth, and an
+/// `origin`). Returns the PR URL on success. The caller pushes FIRST. This is the close-agent Ship
+/// path's default so work goes through review (roborev) rather than merging straight to main.
+/// Pre-checks the branch exists and the target is non-empty so a missing branch / blank base surface
+/// as clear errors instead of opaque `gh` stderr; other failures (no gh / PR already exists / no
+/// remote) surface as Err for the caller to handle.
+#[tauri::command]
+pub fn open_agent_pr(
+    root: String,
+    agent_id: String,
+    target_branch: String,
+    title: String,
+) -> Result<String, String> {
+    let branch = format!("sparkle/agent-{agent_id}");
+    if git(&root, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_err() {
+        return Err("no-branch".to_string());
+    }
+    let args = pr_create_args(&branch, &target_branch, &title)?;
+    let mut cmd = Command::new("gh");
+    cmd.args(&args)
+        .current_dir(&root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    let out = cmd.output().map_err(|e| format!("failed to run gh: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
 }
 
 /// Core (AppHandle-free, testable): remove an agent's external worktree (force, to discard
@@ -1702,6 +1839,123 @@ mod tests {
         assert_eq!(s2.ahead_of_base, 0, "no commits remain unique to the branch");
         assert!(!s2.in_origin_main, "no origin remote in this fixture → not Merged");
         assert!(s2.pr_state.is_none(), "no PR probe requested / no remote");
+        assert!(s2.landed, "a normal --no-ff merge is reachable, so landed is trivially true too");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn pr_create_args_guards_blank_target_and_defaults_title() {
+        // Blank base would become `gh pr create --base ""` (opaque error) — reject early.
+        assert!(pr_create_args("sparkle/agent-x", "  ", "t").is_err());
+        // Title falls back to the branch name when blank.
+        let a = pr_create_args("sparkle/agent-x", "main", "  ").unwrap();
+        let joined = a.join(" ");
+        assert!(joined.contains("--base main"));
+        assert!(joined.contains("--head sparkle/agent-x"));
+        assert!(joined.contains("--title sparkle/agent-x"), "blank title → branch name");
+        // A real title is preserved (trimmed).
+        let b = pr_create_args("sparkle/agent-x", "main", " Ship it ").unwrap();
+        assert!(b.join(" ").contains("--title Ship it"));
+    }
+
+    #[test]
+    fn delete_agent_branch_removes_the_ref_and_is_idempotent() {
+        let root = unique_root("del-branch");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("del-branch-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "d1", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info.path).join("w.txt"), "work\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "unmerged work"]).unwrap();
+        assert!(git(&root_str, &["rev-parse", "--verify", "--quiet", "refs/heads/sparkle/agent-d1"]).is_ok());
+
+        // The branch is checked out in the worktree → must remove the worktree before deleting.
+        git(&root_str, &["worktree", "remove", "--force", &info.path]).unwrap();
+        delete_agent_branch_at(&root_str, "d1").unwrap();
+        assert!(
+            git(&root_str, &["rev-parse", "--verify", "--quiet", "refs/heads/sparkle/agent-d1"]).is_err(),
+            "branch ref is gone after Discard"
+        );
+        // Idempotent: deleting an already-gone branch is Ok, not an error.
+        delete_agent_branch_at(&root_str, "d1").unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn push_agent_branch_reports_no_remote_when_origin_is_absent() {
+        let root = unique_root("push-noremote");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("push-noremote-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        create_worktree_at(&root_str, "p", "pp", "main", &app_data).unwrap();
+        // No `origin` in this fixture → Ship/Save must learn to fall back, not error.
+        assert_eq!(push_agent_branch_at(&root_str, "pp").unwrap(), "no-remote");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // A SQUASH merge creates a NEW commit on main, so the agent tip is NOT an ancestor — ancestor
+    // reachability (`in_local_main`) misses it. The `landed` tree-identity signal catches it, while
+    // the branch still carries its original commit so `ahead_of_base > 0` keeps committedSeen true.
+    #[test]
+    fn workflow_state_detects_a_squash_merge_even_as_main_advances() {
+        let root = unique_root("wf-squash");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("wf-squash-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "sq", "main", &app_data).unwrap();
+
+        // Agent authors real work on its branch.
+        std::fs::write(Path::new(&info.path).join("w.txt"), "work\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+
+        // Squash-land it: stage the branch's net change as a fresh commit on main (no merge parent).
+        git(&root_str, &["merge", "--squash", "sparkle/agent-sq"]).unwrap();
+        git(&root_str, &["commit", "-m", "squash land sq"]).unwrap();
+
+        let s = agent_workflow_state_at(&root_str, "sq", "", false).unwrap();
+        assert!(!s.in_local_main, "squash made a new commit → tip is not an ancestor of main");
+        assert!(s.landed, "merging the branch into main now adds nothing → landed (the squash signal)");
+        assert!(s.ahead_of_base > 0, "branch still carries its original commit → committedSeen holds");
+
+        // Main ADVANCES with unrelated work after the squash (the shared-main reality). Whole-tree
+        // equality would now read false; the merge-tree "adds nothing" check must still see it landed.
+        std::fs::write(root.join("unrelated.txt"), "other agent's work\n").unwrap();
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "unrelated work on main"]).unwrap();
+        let s2 = agent_workflow_state_at(&root_str, "sq", "", false).unwrap();
+        assert!(!s2.in_local_main, "still not an ancestor");
+        assert!(s2.landed, "merging adds nothing even though main moved on → landed survives advancing main");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // A no-op branch (no authored commits) is trivially tree-identical to an unchanged default, so
+    // `landed` is true — but `ahead_of_base == 0`, so the frontend committedSeen gate keeps it from
+    // ever reading as Merged. This pins that `landed` alone never implies "merged".
+    #[test]
+    fn workflow_state_landed_is_gated_by_authored_work_for_a_noop_branch() {
+        let root = unique_root("wf-noop");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("wf-noop-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        create_worktree_at(&root_str, "p", "noop", "main", &app_data).unwrap();
+
+        let s = agent_workflow_state_at(&root_str, "noop", "", false).unwrap();
+        assert!(s.landed, "no changes ⇒ tip tree == main tree ⇒ trivially landed");
+        assert_eq!(s.ahead_of_base, 0, "no authored work ⇒ committedSeen gate stays closed");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
     }

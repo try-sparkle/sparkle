@@ -14,15 +14,16 @@ import type { AgentTabStatus } from "../types";
 const ENABLED = new Set<AgentTabStatus>(["waiting", "approval", "errored", "idle", "done"]);
 
 describe("needsAttention", () => {
-  it("is true only for the red statuses (waiting, approval)", () => {
+  it("is true for every red status (waiting, approval, errored)", () => {
     expect(needsAttention("waiting")).toBe(true);
     expect(needsAttention("approval")).toBe(true);
+    // sparkle-pqxh/sparkle-blpf: errored (a crash OR a mid-stream API-error/self-prompt stall) is
+    // a stuck agent that's losing you time — it now fires the badge/ping, not just a visual cue.
+    expect(needsAttention("errored")).toBe(true);
   });
 
-  // errored is RED but deliberately NOT an attention status — a crashed agent stands out
-  // visually but must not fire the dock badge/notification (it's not asking you anything).
-  it("is false for every non-attention status (incl. red 'errored') and for undefined", () => {
-    for (const s of ["working", "idle", "blocked", "errored", "done", "stopped"] as const) {
+  it("is false for every non-red status and for undefined", () => {
+    for (const s of ["working", "idle", "blocked", "done", "stopped"] as const) {
       expect(needsAttention(s)).toBe(false);
     }
     expect(needsAttention(undefined)).toBe(false);
@@ -53,6 +54,10 @@ describe("countAttention", () => {
 
   it("counts a missing-status id as not needing attention", () => {
     expect(countAttention(status, ["a", "zzz"])).toBe(1);
+  });
+
+  it("counts an errored agent toward the badge (sparkle-pqxh)", () => {
+    expect(countAttention({ a: "errored", b: "working", c: "waiting" }, ["a", "b", "c"])).toBe(2);
   });
 });
 
@@ -116,7 +121,7 @@ describe("notificationFor", () => {
     });
     expect(notificationFor("errored", "Builder", "web")).toEqual({
       title: "Builder",
-      body: "Errored — it crashed · web",
+      body: "Errored or stalled — needs you · web",
     });
     expect(notificationFor("done", "Cleanup", "web")).toEqual({
       title: "Cleanup",

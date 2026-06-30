@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
-// Regression coverage for the close-agent Ship/Save/Discard flow — specifically that "Ship it"
-// keeps the agent when the land is BLOCKED (onLand → false) and tears it down on success. This is
-// the central reason onLand was changed to return a boolean.
+// Integration coverage for the close-agent Ship / Save / Discard wiring (× → requestClose → modal →
+// handler). Ship = push + open a PR (review, not straight-to-main); Save = keep the branch; Discard =
+// delete worktree + branch + bead behind an explicit confirm.
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -13,17 +13,35 @@ vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 vi.mock("../services/worktree", () => ({ removeAgentWorkspace: vi.fn(() => Promise.resolve()) }));
-const { refreshAgentBranch, landAgentBranch } = vi.hoisted(() => ({
-  refreshAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
-  landAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
+import { removeAgentWorkspace } from "../services/worktree";
+
+const { refreshAgentBranch, landAgentBranch, pushAgentBranch, openAgentPr, deleteAgentBranch } =
+  vi.hoisted(() => ({
+    refreshAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
+    landAgentBranch: vi.fn(() => Promise.resolve({ ok: true, target: "main" })),
+    pushAgentBranch: vi.fn(() => Promise.resolve("pushed")),
+    openAgentPr: vi.fn(() => Promise.resolve("https://pr/1")),
+    deleteAgentBranch: vi.fn(() => Promise.resolve()),
+  }));
+vi.mock("../services/branchStatus", () => ({
+  refreshAgentBranch,
+  landAgentBranch,
+  pushAgentBranch,
+  openAgentPr,
+  deleteAgentBranch,
 }));
-vi.mock("../services/branchStatus", () => ({ refreshAgentBranch, landAgentBranch }));
-// Spy closeBead (Ship + Discard call it to resolve the agent's bead) while keeping every other beads
-// export real — planView/runtimeStore import from here too, so a full mock would break them.
-const { closeBead } = vi.hoisted(() => ({ closeBead: vi.fn(() => Promise.resolve()) }));
+// Spy the bead writes Ship/Discard use, keeping every other beads export real (planView/runtimeStore
+// import from here too, so a full mock would break them).
+const { closeBead, deleteBead, markBeadDelivered } = vi.hoisted(() => ({
+  closeBead: vi.fn(() => Promise.resolve()),
+  deleteBead: vi.fn(() => Promise.resolve()),
+  markBeadDelivered: vi.fn(() => Promise.resolve()),
+}));
 vi.mock("../services/beads", async (orig) => ({
   ...(await orig<typeof import("../services/beads")>()),
   closeBead,
+  deleteBead,
+  markBeadDelivered,
 }));
 
 import { AgentSidebar } from "./AgentSidebar";
@@ -44,7 +62,7 @@ function buildAgentProject(beadId?: string): Project {
     createdAt: new Date(0).toISOString(), selectedAgentId: null, agents: [agent],
   };
   useProjectStore.setState({ projects: [project] } as never);
-  // ahead:1 → resolveStage → building_saved → needsClosePrompt() is true → close PROMPTS.
+  // ahead:1 → resolveStage → building_saved → shouldPromptOnClose() is true → close PROMPTS.
   useRuntimeStore.setState({
     branchStatus: { a1: { ahead: 1, behind: 0, dirty: false, filesChanged: 1, insertions: 1, deletions: 0 } },
     status: {},
@@ -56,7 +74,6 @@ function buildAgentProject(beadId?: string): Project {
 
 function openClosePrompt() {
   render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
-  // The × close control mounts when the row is hovered/expanded.
   const card = document.querySelector<HTMLElement>('[draggable="true"]');
   if (!card) throw new Error("agent card not found");
   fireEvent.mouseEnter(card);
@@ -67,11 +84,14 @@ const agentsNow = () => useProjectStore.getState().projects[0]!.agents.map((a) =
 
 beforeEach(() => {
   useUiStore.setState({ collapsedOrchestrators: {} } as never);
-  // Reset BOTH branch mocks symmetrically and re-establish their default resolved values — mockReset
-  // wipes the hoisted default, so onLand's `if (r.ok)` would throw on undefined without this.
-  landAgentBranch.mockReset().mockResolvedValue({ ok: true });
+  landAgentBranch.mockReset().mockResolvedValue({ ok: true, target: "main" });
   refreshAgentBranch.mockReset().mockResolvedValue({ ok: true });
+  pushAgentBranch.mockReset().mockResolvedValue("pushed");
+  openAgentPr.mockReset().mockResolvedValue("https://pr/1");
+  deleteAgentBranch.mockReset().mockResolvedValue(undefined);
+  vi.mocked(removeAgentWorkspace).mockReset().mockResolvedValue(undefined);
   closeBead.mockClear();
+  deleteBead.mockClear();
 });
 afterEach(cleanup);
 
@@ -83,40 +103,37 @@ describe("AgentSidebar — close → Ship/Save/Discard", () => {
     expect(agentsNow()).toContain("a1"); // not torn down yet
   });
 
-  it("Ship: a BLOCKED land keeps the agent (prompt stays, nothing torn down)", async () => {
+  it("Ship: pushes the branch + opens a PR (not a straight-to-main land), then tears down", async () => {
     buildAgentProject();
-    landAgentBranch.mockResolvedValue({ ok: false });
     openClosePrompt();
     fireEvent.click(screen.getByText("Ship it"));
-    await waitFor(() => expect(landAgentBranch).toHaveBeenCalled());
-    expect(agentsNow()).toContain("a1"); // agent survives a blocked land
-    expect(screen.getByText("Ship it")).toBeTruthy(); // prompt stays open
-  });
-
-  it("Ship: a SUCCESSFUL land tears the agent down", async () => {
-    buildAgentProject();
-    landAgentBranch.mockResolvedValue({ ok: true });
-    openClosePrompt();
-    fireEvent.click(screen.getByText("Ship it"));
+    await waitFor(() => expect(openAgentPr).toHaveBeenCalled());
+    expect(pushAgentBranch).toHaveBeenCalledWith("/tmp/demo", "a1");
+    expect(landAgentBranch).not.toHaveBeenCalled(); // remote present → PR, never a local merge
     await waitFor(() => expect(agentsNow()).not.toContain("a1"));
   });
 
-  it("Keep it for later closes the agent (keeps the branch — teardown only)", () => {
+  it("Save for later closes the agent, keeps the branch (best-effort push, no land/PR)", async () => {
     buildAgentProject();
     openClosePrompt();
-    fireEvent.click(screen.getByText("Keep it for later"));
-    expect(agentsNow()).not.toContain("a1");
-    expect(landAgentBranch).not.toHaveBeenCalled(); // no merge on Save
+    fireEvent.click(screen.getByText("Save for later"));
+    await waitFor(() => expect(agentsNow()).not.toContain("a1"));
+    expect(pushAgentBranch).toHaveBeenCalledWith("/tmp/demo", "a1"); // remote backup
+    expect(landAgentBranch).not.toHaveBeenCalled();
+    expect(openAgentPr).not.toHaveBeenCalled();
   });
 
-  it("Discard tears the agent down, closes its bead, and never lands", async () => {
-    buildAgentProject("bd-1"); // a beadId so the closeBead branch of onDiscardClose is exercised
+  it("Discard requires a confirm, then deletes worktree + branch + bead and never lands", async () => {
+    buildAgentProject("bd-1");
     openClosePrompt();
-    fireEvent.click(screen.getByText("Discard it"));
-    expect(agentsNow()).not.toContain("a1"); // torn down
-    expect(landAgentBranch).not.toHaveBeenCalled(); // discard never merges
-    await waitFor(() =>
-      expect(closeBead).toHaveBeenCalledWith("/tmp/demo", "bd-1"), // bead resolved, not left open
-    );
+    fireEvent.click(screen.getByText("Discard")); // opens the confirm step — nothing destroyed yet
+    expect(agentsNow()).toContain("a1");
+    fireEvent.click(screen.getByText("Delete permanently"));
+    await waitFor(() => expect(agentsNow()).not.toContain("a1"));
+    expect(removeAgentWorkspace).toHaveBeenCalled();
+    expect(deleteAgentBranch).toHaveBeenCalledWith("/tmp/demo", "a1");
+    await waitFor(() => expect(deleteBead).toHaveBeenCalledWith("/tmp/demo", "bd-1"));
+    expect(landAgentBranch).not.toHaveBeenCalled();
+    expect(openAgentPr).not.toHaveBeenCalled();
   });
 });
