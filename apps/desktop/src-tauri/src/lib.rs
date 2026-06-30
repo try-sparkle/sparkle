@@ -2,6 +2,7 @@ mod accounts;
 mod ai;
 mod attachments;
 mod attention;
+mod attention_summary;
 mod audio;
 mod auth;
 mod bridge;
@@ -198,6 +199,7 @@ pub fn run() {
             auth::desktop_take_pending_deeplink,
             attention::set_window_attention,
             attention::notify_attention,
+            attention_summary::summarize_attention,
             accounts::accounts_list,
             accounts::accounts_add,
             accounts::accounts_set_nickname,

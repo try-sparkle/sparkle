@@ -114,24 +114,42 @@ describe("newlyEntered", () => {
 });
 
 describe("notificationFor", () => {
-  it("uses the agent name as the title and a reason + project in the body", () => {
+  it("prefixes the title with a status-colored circle and keeps the reason + project body", () => {
+    // RED tier (waiting/approval/errored) → 🔴.
     expect(notificationFor("waiting", "Fixer", "sparkle")).toEqual({
-      title: "Fixer",
+      title: "🔴 Fixer",
       body: "Needs your answer · sparkle",
     });
     expect(notificationFor("errored", "Builder", "web")).toEqual({
-      title: "Builder",
+      title: "🔴 Builder",
       body: "Errored or stalled — needs you · web",
     });
+    // GRAY tier (idle/blocked/done/stopped) → 🔘 (the radio-button ring).
     expect(notificationFor("done", "Cleanup", "web")).toEqual({
-      title: "Cleanup",
+      title: "🔘 Cleanup",
       body: "Done · web",
     });
   });
 
-  it("omits the ' · project' suffix when there's no project name", () => {
+  it("uses 🔴 for every red status", () => {
+    for (const s of ["waiting", "approval", "errored"] as const) {
+      expect(notificationFor(s, "A", "P").title).toBe("🔴 A");
+    }
+  });
+
+  it("uses 🔘 for every gray status", () => {
+    for (const s of ["idle", "blocked", "done", "stopped"] as const) {
+      expect(notificationFor(s, "A", "P").title).toBe("🔘 A");
+    }
+  });
+
+  it("uses NO glyph for the green status (working) — title is the bare name", () => {
+    expect(notificationFor("working", "A", "P").title).toBe("A");
+  });
+
+  it("omits the ' · project' suffix when there's no project name (body unchanged by the glyph)", () => {
     expect(notificationFor("idle", "Worker", "")).toEqual({
-      title: "Worker",
+      title: "🔘 Worker",
       body: "Finished — your turn",
     });
   });

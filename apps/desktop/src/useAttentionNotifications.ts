@@ -34,6 +34,7 @@ import { findWindowForProject } from "./services/windowRegistry";
 import {
   reportAttentionCount,
   notifyAttention,
+  summarizeAttention,
   onFocusAgent,
   type FocusAgentPayload,
 } from "./services/attention";
@@ -137,40 +138,86 @@ export function useAttentionNotifications(): void {
       const windowFocused = typeof document !== "undefined" && document.hasFocus();
       const selectedAgentId =
         useProjectStore.getState().projects.find((p) => p.id === projectId)?.selectedAgentId ?? null;
+      // For each agent that just crossed into a notifiable status, dispatch ONE independent
+      // fire-and-forget task. The task computes the Haiku "what is it asking" summary ONCE (for the
+      // waiting/approval ask statuses) and feeds it to BOTH channels — the paired phone (emitAttention
+      // → the iOS push body) and the native macOS banner (notifyAttention body) — so the Mac and the
+      // phone read identically. Tasks are independent (not serialized behind one another's await) so a
+      // slow/hung summary (the Haiku call can take up to ~40s before its timeout falls back) never
+      // delays an unrelated notice. The effect can't be async, so each task has its own catch.
+      const pid = projectId;
       for (const { id, status: st } of newlyEntered(prevStatus.current, status, ownedIds, enabled)) {
         const agent = agents.find((a) => a.id === id);
-        if (!agent || projectId == null) continue;
-        // Mirror a "needs you" (red) attention to the paired phone — regardless of local
-        // suppression (the phone is a separate device).
-        if (isRelayRed(st)) {
-          const attentionId = crypto.randomUUID();
-          attentionIds.current[id] = attentionId;
-          const approval = st === "approval";
-          // `errored` covers both a crash and a mid-stream API-error/self-prompt stall — the agent
-          // is stuck until you look, so it relays as a (reply-less) "needs you" with its own copy.
-          const errored = st === "errored";
-          emitAttention({
-            attention_id: attentionId,
-            agent_id: id,
-            agent_name: agent.name,
-            project_name: projectName,
-            kind: approval ? "approval" : "question",
-            question: approval
-              ? `${agent.name} needs you to approve an action in ${projectName}.`
-              : errored
-                ? `${agent.name} hit an error / stalled in ${projectName} and needs you.`
-                : `${agent.name} is waiting on your answer in ${projectName}.`,
-            suggested_replies: approval
-              ? [
-                  { label: "Approve", value: "y\n" },
-                  { label: "Deny", value: "n\n" },
-                ]
-              : [],
-            created_at: new Date().toISOString(),
-          });
-        }
-        if (suppressNotification({ windowFocused, selectedAgentId, agentId: id })) continue;
-        notifyAttention({ projectId, agentId: id, ...notificationFor(st, agent.name, projectName) });
+        if (!agent || pid == null) continue;
+        const agentName = agent.name;
+        const relay = isRelayRed(st); // mirrored to the phone regardless of local suppression
+        const suppressed = suppressNotification({ windowFocused, selectedAgentId, agentId: id });
+        if (!relay && suppressed) continue; // not relayed and locally suppressed — nothing to send
+        void (async () => {
+          // The agent's ask, summarized once and shared by phone + banner. Only the two "ask"
+          // statuses are summarized (cost control); any miss/empty/throw → null → generic copy below.
+          // `awaited` records whether we actually yielded on the Haiku call — it gates the live
+          // status re-check below so the synchronous path doesn't second-guess the just-validated `st`.
+          let summary: string | null = null;
+          let awaited = false;
+          if (st === "waiting" || st === "approval") {
+            const screenText = useRuntimeStore.getState().attentionScreen[id];
+            if (screenText) {
+              awaited = true;
+              const trimmed = (await summarizeAttention(screenText))?.trim();
+              if (trimmed) summary = trimmed;
+            }
+          }
+
+          // Phone relay (separate device — fires regardless of local suppression). Only when we
+          // actually awaited the summary do we re-check that the agent is STILL red: that await is the
+          // gap in which the user could have answered/cleared it, and emitting after the fact would
+          // race the resolve-cleanup below and leave a stale card on the phone. With no await we run
+          // synchronously in the same tick `newlyEntered` validated `st`, so the captured status holds
+          // and no re-check is needed (it would only re-read the same snapshot).
+          if (relay && (!awaited || isRelayRed(useRuntimeStore.getState().status[id]))) {
+            const attentionId = crypto.randomUUID();
+            attentionIds.current[id] = attentionId;
+            const approval = st === "approval";
+            // `errored` covers both a crash and a mid-stream API-error/self-prompt stall — the agent
+            // is stuck until you look, so it relays as a (reply-less) "needs you" with its own copy.
+            const errored = st === "errored";
+            emitAttention({
+              attention_id: attentionId,
+              agent_id: id,
+              agent_name: agentName, // plain — the relay server prefixes the 🔴 in the push title
+              project_name: projectName,
+              kind: approval ? "approval" : "question",
+              question:
+                summary ??
+                (approval
+                  ? `${agentName} needs you to approve an action in ${projectName}.`
+                  : errored
+                    ? `${agentName} hit an error / stalled in ${projectName} and needs you.`
+                    : `${agentName} is waiting on your answer in ${projectName}.`),
+              suggested_replies: approval
+                ? [
+                    { label: "Approve", value: "y\n" },
+                    { label: "Deny", value: "n\n" },
+                  ]
+                : [],
+              created_at: new Date().toISOString(),
+            });
+          }
+
+          // Native macOS banner — emoji'd title from notificationFor, body = the SAME summary the
+          // phone got (or its generic reason fallback). Skipped only when you're already looking at
+          // this exact agent (suppressNotification).
+          if (!suppressed) {
+            const banner = notificationFor(st, agentName, projectName);
+            notifyAttention({
+              projectId: pid,
+              agentId: id,
+              title: banner.title,
+              body: summary ?? banner.body,
+            });
+          }
+        })().catch((e) => console.debug("attention notify dispatch failed", e));
       }
     }
     // Clear the phone's card for any agent we raised that is no longer red — including agents

@@ -7,7 +7,23 @@
 // surface ("never lose time"). The badge shows the *level* (how many need you right now); the
 // notification fires on the *edge* (the moment an agent crosses INTO needing you), so you're pinged
 // once per transition, not on every status tick.
+import { AGENT_STATUS } from "@sparkle/ui";
 import type { AgentTabStatus } from "../types";
+
+// Status-colored circle glyph prefixed to the notification title, derived from the SOURCE-OF-TRUTH
+// color tier in AGENT_STATUS (packages/ui/tokens.ts) so it can't drift from the dot/badge colors.
+// RED tier (waiting, approval, errored) → filled red circle; GRAY tier (idle, blocked, done,
+// stopped) → the radio-button ring; GREEN (working) → no glyph. We compare each status's `.color`
+// against a known red status (waiting) and a known gray status (idle) rather than re-listing the
+// tiers here.
+const RED_CIRCLE = "🔴";
+const GRAY_CIRCLE = "🔘"; // radio-button RING glyph
+function statusGlyph(status: AgentTabStatus): string {
+  const color = AGENT_STATUS[status].color;
+  if (color === AGENT_STATUS.waiting.color) return RED_CIRCLE;
+  if (color === AGENT_STATUS.idle.color) return GRAY_CIRCLE;
+  return ""; // green (working) — no glyph
+}
 
 /** Agent id → its current live status. Mirrors runtimeStore.status. */
 export type StatusMap = Record<string, AgentTabStatus>;
@@ -77,8 +93,9 @@ export function suppressNotification(args: {
   return args.windowFocused && args.selectedAgentId === args.agentId;
 }
 
-/** Notification copy (banner title + body) for an agent that entered `status`. Title is always
- *  the agent name; the body says WHY it's pinging, scoped to the project. Pure + exhaustive over
+/** Notification copy (banner title + body) for an agent that entered `status`. Title is the agent
+ *  name prefixed with a status-colored circle glyph (🔴 red tier / 🔘 gray tier / none for green —
+ *  see statusGlyph); the body says WHY it's pinging, scoped to the project. Pure + exhaustive over
  *  the status taxonomy so a new status can't silently fall through to a blank banner. */
 export function notificationFor(
   status: AgentTabStatus,
@@ -95,6 +112,8 @@ export function notificationFor(
     blocked: "Stalled",
     stopped: "Stopped",
   };
+  const glyph = statusGlyph(status);
+  const title = glyph ? `${glyph} ${agentName}` : agentName;
   const suffix = projectName ? ` · ${projectName}` : "";
-  return { title: agentName, body: `${reason[status]}${suffix}` };
+  return { title, body: `${reason[status]}${suffix}` };
 }

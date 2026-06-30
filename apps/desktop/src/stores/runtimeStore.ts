@@ -276,6 +276,10 @@ export async function syncBeadLifecycle(
 
 interface RuntimeState {
   status: Record<string, AgentTabStatus>; // agentId -> status (live-only, never persisted)
+  // agentId -> the terminal screen text captured the moment the agent entered an "ask" status
+  // (waiting/approval), so the notification path can summarize WHAT it's asking. Live-only (never
+  // persisted, like `status`); cleared whenever `status` is cleared for an agent.
+  attentionScreen: Record<string, string>;
   openAgentIds: string[]; // agents whose pane is mounted + PTY alive (persisted)
   branchStatus: Record<string, BranchStatus>; // agentId -> live ahead/behind/dirty/size (live-only)
   // agentId -> the furthest workflow stage we KNOW this agent's OWN work has reached. Derived each
@@ -300,6 +304,9 @@ interface RuntimeState {
    *  Unlike `close`, the pane stays mounted; the new session repopulates status from its own hooks. */
   resetProgress: (agentId: string) => void;
   setStatus: (agentId: string, status: AgentTabStatus) => void;
+  /** Store the terminal screen captured when an agent entered an "ask" status, for the notification
+   *  summarizer. Live-only (mirrors `status`). */
+  setAttentionScreen: (agentId: string, text: string) => void;
   setBranchStatus: (agentId: string, s: BranchStatus) => void;
   setWorkflowStage: (agentId: string, stage: WorkflowStageId) => void;
   setWorkflowShipped: (agentId: string, shipped: boolean) => void;
@@ -325,6 +332,7 @@ export const useRuntimeStore = create<RuntimeState>()(
   persist(
     (set, get) => ({
       status: {},
+      attentionScreen: {},
       openAgentIds: [],
       branchStatus: {},
       workflowStage: {},
@@ -342,12 +350,14 @@ export const useRuntimeStore = create<RuntimeState>()(
           forgetBeadLifecycle(agentId); // drop module-level bead bookkeeping for this agent
           useInteractionStore.getState().forget(agentId); // …and its last-interaction timestamp
           const { [agentId]: _removed, ...status } = s.status;
+          const { [agentId]: _scr, ...attentionScreen } = s.attentionScreen;
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
           return {
             openAgentIds: s.openAgentIds.filter((id) => id !== agentId),
             status,
+            attentionScreen,
             branchStatus,
             workflowStage,
             workflowShipped,
@@ -360,15 +370,19 @@ export const useRuntimeStore = create<RuntimeState>()(
           // prior occupant's lifecycle state (esp. now that workflowShipped is persisted).
           forgetBeadLifecycle(agentId);
           const { [agentId]: _st, ...status } = s.status;
+          const { [agentId]: _scr, ...attentionScreen } = s.attentionScreen;
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
           // Note: openAgentIds is intentionally untouched — the pane stays mounted for the new run.
-          return { status, branchStatus, workflowStage, workflowShipped };
+          return { status, attentionScreen, branchStatus, workflowStage, workflowShipped };
         }),
 
       setStatus: (agentId, status) =>
         set((s) => ({ status: { ...s.status, [agentId]: status } })),
+
+      setAttentionScreen: (agentId, text) =>
+        set((s) => ({ attentionScreen: { ...s.attentionScreen, [agentId]: text } })),
 
       setBranchStatus: (agentId, s) =>
         set((st) => ({ branchStatus: { ...st.branchStatus, [agentId]: s } })),

@@ -33,6 +33,21 @@ export function notifyAttention(n: AttentionNotice): void {
   }).catch((e) => console.debug("notify_attention failed", e));
 }
 
+/** Ask the backend (Haiku 4.5) for a short, notification-friendly summary of WHAT an agent is
+ *  asking, derived from the tail of its terminal `screen`. Used as the banner body for the
+ *  waiting/approval "ask" cases. Returns null outside Tauri and on any failure (no key, network,
+ *  empty) — never throws — so the caller falls back to the generic body. */
+export async function summarizeAttention(screen: string): Promise<string | null> {
+  if (!hasTauri) return null;
+  try {
+    const summary = await invoke<string>("summarize_attention", { screen });
+    return typeof summary === "string" ? summary : null;
+  } catch (e) {
+    console.debug("summarize_attention failed", e);
+    return null;
+  }
+}
+
 export interface FocusAgentPayload {
   projectId: string;
   agentId: string;

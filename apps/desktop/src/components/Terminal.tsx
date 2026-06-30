@@ -14,6 +14,7 @@ import { snapshotScreen } from "../engine/screenSnapshot";
 import { registerScrollback, serializeScrollback } from "../services/terminalScrollback";
 import { useUiStore } from "../stores/uiStore";
 import { useInteractionStore } from "../stores/interactionStore";
+import { useRuntimeStore } from "../stores/runtimeStore";
 import { isComposerToggleKey } from "./composerToggle";
 import { isCopySelectionKey } from "./copySelectionKey";
 import { arrowKeySequence } from "./composerArrowOverflow";
@@ -259,9 +260,19 @@ export function Terminal({
 
     // Engine owns the tab status. It reads the rendered screen on settle (via getScreen)
     // to decide red-vs-gray, so it must be created after the terminal exists.
+    // For the two "ask" statuses (waiting/approval), capture the current screen FIRST so the
+    // notification path can summarize WHAT the agent is asking; then forward to the real onStatus.
+    const onStatusWithCapture = (s: AgentTabStatus): void => {
+      if (s === "waiting" || s === "approval") {
+        useRuntimeStore
+          .getState()
+          .setAttentionScreen(agentId, snapshotScreen(term.buffer.active, term.rows));
+      }
+      onStatus(s);
+    };
     const engine = new StatusEngine({
       agentId,
-      onStatus,
+      onStatus: onStatusWithCapture,
       getScreen: () => snapshotScreen(term.buffer.active, term.rows),
     });
 
