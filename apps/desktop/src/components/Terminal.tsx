@@ -527,7 +527,18 @@ export function Terminal({
     const fit = fitRef.current;
     const term = termRef.current;
     if (!fit || !term) return;
-    requestAnimationFrame(() => {
+    // Cancel these rAFs on cleanup. fit.fit()/forceFullRepaint schedule an xterm-INTERNAL
+    // RenderService frame; if the component unmounts (agent closed, webview reload) in the
+    // window between scheduling and the frame firing, term.dispose() runs first and xterm's own
+    // queued frame then reads `this._renderer.value.dimensions` on a torn-down core — the
+    // uncaught "undefined is not an object (this._renderer.value.dimensions)" TypeError still in
+    // the logs after the #231 dispose-ordering fix. Cancelling here (plus the `cancelled` guard)
+    // means we never queue a paint inside the teardown window. The nested frame is the dangerous
+    // one (it runs forceFullRepaint a frame later), so guard its body too.
+    let cancelled = false;
+    let inner = 0;
+    const outer = requestAnimationFrame(() => {
+      if (cancelled) return;
       try {
         fit.fit();
         onRequestFocusRef.current?.();
@@ -543,11 +554,17 @@ export function Terminal({
       // redraws. Deferred one more frame so the just-revealed canvas has been laid out and its
       // char dimensions measured; otherwise the WebGL renderer bails (no valid dims) and wastes
       // the clear. See forceFullRepaint in terminalWebgl.ts.
-      requestAnimationFrame(() => {
+      inner = requestAnimationFrame(() => {
+        if (cancelled) return;
         forceFullRepaint(webglRef.current, term);
         poisonedRef.current = false; // the reveal repaint cleared any cache-poisoned cells
       });
     });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(outer);
+      if (inner) cancelAnimationFrame(inner);
+    };
   }, [active, agentId]);
 
   // "Text size" scales the terminal font only (not the UI chrome). Update the live font

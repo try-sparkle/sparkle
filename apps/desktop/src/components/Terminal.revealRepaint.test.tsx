@@ -159,4 +159,43 @@ describe("Terminal reveal repaint", () => {
     // No active flip → no reveal repaint.
     expect(clearTextureAtlas).not.toHaveBeenCalled();
   });
+
+  it("cancels the pending reveal rAFs on unmount so no paint reaches a disposed terminal", () => {
+    // The reveal repaint runs across two requestAnimationFrame hops. If the pane is unmounted
+    // (agent closed / webview reload) in that window, the leftover frame would call fit.fit()/
+    // forceFullRepaint against a torn-down xterm core, which schedules an internal RenderService
+    // frame that reads `this._renderer.value.dimensions` after dispose() → the uncaught TypeError
+    // still seen in logs after the #231 dispose-ordering fix. The effect cleanup must cancel both
+    // rAFs so nothing is queued in the teardown window. We drive rAF manually here (the global
+    // beforeEach runs them synchronously, which can't model the unmount-before-frame race).
+    const queue: Array<{ id: number; cb: FrameRequestCallback }> = [];
+    let nextId = 1;
+    const cancelled = new Set<number>();
+    const flush = () => {
+      while (queue.length) {
+        const { id, cb } = queue.shift()!;
+        if (!cancelled.has(id)) cb(0);
+      }
+    };
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      const id = nextId++;
+      queue.push({ id, cb });
+      return id;
+    });
+    const cancelSpy = vi.fn((id: number) => cancelled.add(id));
+    vi.stubGlobal("cancelAnimationFrame", cancelSpy);
+
+    const { rerender, unmount } = render(<Terminal {...baseProps} active={false} />);
+    flush(); // drain mount-time frames
+    clearTextureAtlas.mockClear();
+
+    rerender(<Terminal {...baseProps} active={true} />); // schedules the reveal rAF (queued, not run)
+    unmount(); // effect cleanup must cancel the pending reveal rAF
+    flush(); // run any rAF that was NOT cancelled
+
+    expect(cancelSpy).toHaveBeenCalled();
+    // The reveal repaint must never fire after unmount — cancellation (and the `cancelled` guard)
+    // keeps clearTextureAtlas from touching the disposed terminal.
+    expect(clearTextureAtlas).not.toHaveBeenCalled();
+  });
 });
