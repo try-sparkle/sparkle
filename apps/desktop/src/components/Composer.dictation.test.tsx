@@ -150,6 +150,26 @@ describe("Composer — dictation wiring", () => {
     expect(ta.value).toBe("existing text dictated");
   });
 
+  it("inserts at the LAST placed caret even after the box has lost focus (mic took focus)", () => {
+    // The reported flow: click into the box to position the caret, THEN start talking — by which
+    // point the mic/voice UI holds focus, so the textarea is no longer activeElement. The caret
+    // the user placed while focused must still be honored (insert there), not fall back to the end.
+    renderComposer();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "hello world" } });
+    // Place the caret after "hello" WHILE focused, and let syncCaret record it.
+    ta.focus();
+    ta.selectionStart = ta.selectionEnd = 5;
+    fireEvent.select(ta);
+    // Focus then leaves the box (the mic UI takes it).
+    ta.blur();
+    expect(document.activeElement).not.toBe(ta);
+
+    act(() => useDictationStore.getState().insert("there"));
+    // Lands at the remembered caret, not appended at the end.
+    expect(ta.value).toBe("hello there world");
+  });
+
   it("shows the live cloud interim transcript as a muted preview, then clears it", () => {
     renderComposer();
     act(() => useDictationStore.getState().setInterim("hello wor"));

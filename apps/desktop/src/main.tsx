@@ -3,6 +3,7 @@ import { App } from "./App";
 import { TrayApp } from "./tray/TrayApp";
 import { initLogger } from "./logger";
 import { initAnalytics } from "./analytics";
+import { disableNativeTooltips } from "./disableNativeTooltips";
 import { resolveThemeFromStorage } from "./theme/theme";
 import { useHistoryStore } from "./stores/historyStore";
 import "@xterm/xterm/css/xterm.css";
@@ -12,6 +13,10 @@ import "./index.css";
 // otherwise a user who chose Light would see a flash of the default dark theme on launch.
 // resolveThemeFromStorage parses the same zustand `sparkle-ui` envelope the store hydrates.
 document.documentElement.dataset.theme = resolveThemeFromStorage(localStorage.getItem("sparkle-ui"));
+
+// Turn off native `title=` tooltips app-wide (see disableNativeTooltips). The styled <Tooltip>
+// hover card is disabled separately in its own component.
+disableNativeTooltips();
 
 // Stand up unified logging first so console.* calls and errors during render are captured.
 initLogger();

@@ -202,29 +202,33 @@ export function Composer({
   useEffect(() => {
     if (!active || disabled) return;
     const append = (text: string) => {
-      // Insert the transcribed text at the live caret, not the end. Read the caret offsets
-      // straight off the DOM (the controlled textarea's value mirrors React state, so ta.value
-      // is the current text) BEFORE we change anything.
-      //
-      // Caret-usability gate: a <textarea> ALWAYS reports a NUMBER for selectionStart/End — never
-      // null — including 0 when it is blurred or has never been focused. So "is it a number" can't
-      // tell a real caret from a blurred default. Require the textarea to actually HAVE FOCUS;
-      // otherwise (the common flow of dictating without clicking into the box) fall back to
-      // end-append, so we never prepend at offset 0 (the prior behavior was always-append).
+      // Insert the transcribed text at the user's caret, not the end. Resolve which caret to use:
+      //  1. If the textarea is focused right now, use its live selection.
+      //  2. Otherwise use the last caret the user placed while it WAS focused (lastCaretRef) — the
+      //     common flow is to click into the box to position the caret, then talk, by which point
+      //     the mic/voice UI has taken focus. The previous code required CURRENT focus and so fell
+      //     back to end-append here, which is why dictation kept landing at the bottom.
+      //  3. Only when no caret has ever been placed (never clicked in) do we append at the end, so
+      //     we never silently prepend at offset 0.
       const ta = taRef.current;
-      const hasCaret = ta != null && document.activeElement === ta;
-      const s = ta?.selectionStart ?? 0;
-      const e = ta?.selectionEnd ?? 0;
+      const focused = ta != null && document.activeElement === ta;
+      const stored = lastCaretRef.current;
+      const useCaret = focused || stored != null;
+      const rawS = focused ? ta?.selectionStart ?? 0 : stored?.start ?? 0;
+      const rawE = focused ? ta?.selectionEnd ?? 0 : stored?.end ?? 0;
 
       // Compute the new caret offset as a side effect of the functional updater (so the fallback
       // path splices into the freshest value, never a stale closure capture).
       let caret = 0;
       setValue((v) => {
-        if (!hasCaret) {
+        if (!useCaret) {
           const next = v ? `${v} ${text}` : text;
           caret = next.length;
           return next;
         }
+        // A stored caret was measured against an earlier value — clamp it to the current length.
+        const s = Math.min(rawS, v.length);
+        const e = Math.min(rawE, v.length);
         const before = v.slice(0, s);
         const after = v.slice(e);
         // Keep the existing one-space separation, but applied at the caret rather than the end —
@@ -247,6 +251,10 @@ export function Composer({
           t.selectionStart = t.selectionEnd = caret;
           if (ghostRef.current) ghostRef.current.scrollTop = t.scrollTop;
         }
+        // Advance the remembered caret to just past this insert, so a follow-on dictation chunk
+        // continues forward (rather than re-inserting at the same spot and reversing the words)
+        // even if focus never returns to the box.
+        lastCaretRef.current = { start: caret, end: caret };
       });
     };
     useDictationStore.getState().registerInsert(append);
@@ -326,6 +334,11 @@ export function Composer({
     taRef.current = el;
     if (inputRef) inputRef.current = el;
   };
+  // The last caret position the user placed in the textarea WHILE it was focused. Kept so
+  // wake-word dictation can insert at that spot even after focus has since left the box (the
+  // common flow: click to place the caret, then talk — by which point the mic/voice UI may
+  // hold focus). `null` = the user has never placed a caret, so dictation appends at the end.
+  const lastCaretRef = useRef<{ start: number; end: number } | null>(null);
 
   // Measure the textarea's intrinsic content height and size the composer to fit it,
   // clamped to [drag-set floor, viewport cap]. Held in a ref so the resize listener
@@ -598,6 +611,11 @@ export function Composer({
     const ta = taRef.current;
     if (!ta) return;
     setCaretAtEnd(ta.selectionStart === ta.value.length && ta.selectionEnd === ta.value.length);
+    // Remember where the caret is while the box is focused, so dictation that arrives after focus
+    // has moved away (mic/voice UI) still inserts at the user's last position rather than the end.
+    if (document.activeElement === ta) {
+      lastCaretRef.current = { start: ta.selectionStart, end: ta.selectionEnd };
+    }
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {

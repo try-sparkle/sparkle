@@ -123,6 +123,8 @@ function createBtnStyle(
 
 // A dashed-outline "+ New <kind> Agent" row — the per-mode affordance for creating an agent,
 // shown at the top of the sidebar list (under Search history) for the active Build/Think mode.
+// Border is split into longhand props (width/style/color) so NewAgentRow's hover state can flip
+// just the style (dashed → solid) and color without fighting a `border` shorthand.
 const DASHED_ROW_STYLE: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
@@ -130,7 +132,9 @@ const DASHED_ROW_STYLE: React.CSSProperties = {
   width: "100%",
   margin: "2px 0 8px",
   padding: "9px 10px",
-  border: `1px dashed ${C.muted}`,
+  borderWidth: 1,
+  borderStyle: "dashed",
+  borderColor: C.muted,
   borderRadius: 8,
   background: "transparent",
   color: C.muted,
@@ -139,6 +143,39 @@ const DASHED_ROW_STYLE: React.CSSProperties = {
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",
 };
+
+// The "+ New <kind> Agent" button. On hover the dotted outline becomes a solid stroke and the
+// icon + label light up in the mode's brand color — the same blue/cyan as that mode's chevron
+// (Build → FADE_3 brand blue, Think → FADE_0 logo cyan). The background is left unchanged.
+function NewAgentRow({
+  icon,
+  label,
+  hoverColor,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  hoverColor: string;
+  onClick: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        ...DASHED_ROW_STYLE,
+        borderStyle: hover ? "solid" : "dashed",
+        borderColor: hover ? hoverColor : C.muted,
+        color: hover ? hoverColor : C.muted,
+      }}
+    >
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
+}
 
 export function AgentSidebar({ project }: { project: Project | null }) {
   const selectAgent = useProjectStore((s) => s.selectAgent);
@@ -668,16 +705,20 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         {/* Per-mode "+ New … Agent" affordance — the only way to create agents now that the chevrons
             are a selector. Sits above the (mode-filtered) list. Plan has none (no agents in Plan). */}
         {project && mode === "build" && (
-          <button onClick={onAddBuild} title="Create a new Build orchestrator agent" style={DASHED_ROW_STYLE}>
-            <span style={{ fontSize: 20, lineHeight: 0 }}>⚒</span>
-            <span>+ New Build Agent</span>
-          </button>
+          <NewAgentRow
+            icon={<span style={{ fontSize: 20, lineHeight: 0 }}>⚒</span>}
+            label="+ New Build Agent"
+            hoverColor={FADE_3}
+            onClick={onAddBuild}
+          />
         )}
         {project && mode === "think" && aiBrainstorm && (
-          <button onClick={onAddThink} title="Create a new Think agent" style={DASHED_ROW_STYLE}>
-            <TbBulb size={16} style={{ flexShrink: 0 }} />
-            <span>+ New Think Agent</span>
-          </button>
+          <NewAgentRow
+            icon={<TbBulb size={16} style={{ flexShrink: 0 }} />}
+            label="+ New Think Agent"
+            hoverColor={FADE_0}
+            onClick={onAddThink}
+          />
         )}
         {/* Cross-window attention block: red agents from OTHER open windows, each tagged with a
             project pill. Sits BELOW the "+ New … Agent" button and ABOVE this window's own agents;
