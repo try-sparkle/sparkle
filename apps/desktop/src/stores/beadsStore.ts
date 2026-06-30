@@ -31,6 +31,26 @@ interface BeadsState {
 
 // One interval per project, kept out of store state so timers never serialize / re-render.
 const timers = new Map<string, ReturnType<typeof setInterval>>();
+// Per-project one-shot `visibilitychange` listener, armed when a poll tick is skipped because the
+// window is hidden. It re-syncs the board the instant the window is shown again, then removes
+// itself. Kept out of store state for the same reason as `timers`. Torn down by stopPolling.
+const visibilityListeners = new Map<string, () => void>();
+
+/** Arm a one-shot listener that refreshes the board the moment the window becomes visible again,
+ *  so a poll skipped while hidden doesn't leave the board stale on return. Idempotent: at most one
+ *  armed listener per project. No-op when `document` is unavailable (non-DOM test env). */
+function armVisibilityRefresh(projectId: string, projectPath: string): void {
+  if (typeof document === "undefined") return;
+  if (visibilityListeners.has(projectId)) return; // already armed
+  const onVisible = () => {
+    if (document.visibilityState !== "visible") return; // also fires on visible→hidden; ignore
+    document.removeEventListener("visibilitychange", onVisible);
+    visibilityListeners.delete(projectId);
+    void useBeadsStore.getState().refresh(projectId, projectPath);
+  };
+  visibilityListeners.set(projectId, onVisible);
+  document.addEventListener("visibilitychange", onVisible);
+}
 
 export const useBeadsStore = create<BeadsState>()((set) => ({
   byProject: {},
@@ -62,6 +82,13 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     // Fire immediately so the board isn't empty for a full interval, then on a cadence.
     void useBeadsStore.getState().refresh(projectId, projectPath);
     const timer = setInterval(() => {
+      // Don't shell out to `bd` for a window nobody's looking at — a backgrounded Tasks tab would
+      // otherwise spawn a subprocess every interval for hours doing work no one sees. Skip the
+      // spawn and arm a one-shot listener that re-syncs the board the moment it's visible again.
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        armVisibilityRefresh(projectId, projectPath);
+        return;
+      }
       void useBeadsStore.getState().refresh(projectId, projectPath);
     }, intervalMs);
     timers.set(projectId, timer);
@@ -72,6 +99,12 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     if (timer !== undefined) {
       clearInterval(timer);
       timers.delete(projectId);
+    }
+    // Tear down any armed visibility listener so it can't fire a refresh after the board unmounts.
+    const onVisible = visibilityListeners.get(projectId);
+    if (onVisible !== undefined) {
+      if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisible);
+      visibilityListeners.delete(projectId);
     }
   },
 }));

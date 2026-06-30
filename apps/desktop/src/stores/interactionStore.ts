@@ -27,6 +27,12 @@ interface InteractionState {
   lastAt: Record<string, number>;
   /** Record an interaction now (throttled). Pass an explicit `now` only in tests. */
   touch: (agentId: string, now?: number) => void;
+  /** Drop a single agent's entry when it's closed, so a long session's closed agents don't linger
+   *  in the map forever. No-op if absent. Hooked into runtimeStore.close (mirrors forgetBeadLifecycle). */
+  forget: (agentId: string) => void;
+  /** Prune the map to the still-valid agent ids (boot/reconcile sweep), dropping any stale entries
+   *  for agents that no longer exist. Hooked into runtimeStore.reconcile. */
+  reconcile: (validIds: string[]) => void;
 }
 
 export const useInteractionStore = create<InteractionState>((set, get) => ({
@@ -35,4 +41,19 @@ export const useInteractionStore = create<InteractionState>((set, get) => ({
     if (!shouldRecordTouch(get().lastAt[agentId], now)) return;
     set((s) => ({ lastAt: { ...s.lastAt, [agentId]: now } }));
   },
+  forget: (agentId) =>
+    set((s) => {
+      if (!(agentId in s.lastAt)) return s; // nothing to drop — avoid a needless state write
+      const { [agentId]: _removed, ...lastAt } = s.lastAt;
+      return { lastAt };
+    }),
+  reconcile: (validIds) =>
+    set((s) => {
+      const valid = new Set(validIds);
+      const keys = Object.keys(s.lastAt);
+      if (keys.every((id) => valid.has(id))) return s; // nothing stale — no-op
+      const lastAt: Record<string, number> = {};
+      for (const id of keys) if (valid.has(id)) lastAt[id] = s.lastAt[id] as number;
+      return { lastAt };
+    }),
 }));

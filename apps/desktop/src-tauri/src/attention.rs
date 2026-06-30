@@ -76,7 +76,9 @@ fn apply_badge(app: &AppHandle, counts: &HashMap<String, i64>) {
 #[tauri::command]
 pub fn set_window_attention(app: AppHandle, label: String, count: i64) {
     let counts = app.state::<BadgeCounts>();
-    let mut map = counts.0.lock().unwrap();
+    // Poison-tolerant: a panic in a prior holder must not permanently wedge the dock badge.
+    // Recover the inner guard (matches accounts.rs / transcribe.rs / dictation.rs).
+    let mut map = counts.0.lock().unwrap_or_else(|e| e.into_inner());
     if count > 0 {
         map.insert(label, count);
     } else {

@@ -14,6 +14,7 @@ import { useTrialStore } from "../stores/trialStore";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { TrialChrome } from "./TrialChrome";
 import { deriveAuthView, parseAuthCode } from "../services/entitlement";
+import { safeUnlisten } from "../services/safeUnlisten";
 import {
   exchangeCode,
   openPaywall,
@@ -195,7 +196,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     window.addEventListener("focus", onFocus);
 
     return () => {
-      void unlistenDeepLink.then((un) => un());
+      void safeUnlisten(unlistenDeepLink);
       window.removeEventListener("focus", onFocus);
     };
   }, [refresh, refreshTrial]);

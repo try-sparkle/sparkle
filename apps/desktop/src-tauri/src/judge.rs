@@ -10,12 +10,21 @@
 // the caller treats any failure as "not a followup" (gray), so the feature is a no-op until a key
 // exists rather than a hard error or a false red.
 
+use std::time::Duration;
+
 use crate::ai::extract_text;
 use crate::naming::resolve_anthropic_key;
 
 /// Cheapest current Claude model — a one-word classification needs nothing more. (claude-api skill:
 /// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.)
 const JUDGE_MODEL: &str = "claude-haiku-4-5";
+
+/// Bound the Anthropic call so a stalled api.anthropic.com can't pin a spawn_blocking thread
+/// forever and exhaust the blocking pool. ureq has no default timeout; a hung endpoint then hits
+/// the existing Err path (which the caller degrades to gray). A one-word verdict returns fast, so
+/// the read budget is modest. Mirrors connectivity.rs's AgentBuilder shape.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One word out, so a tiny budget is plenty (a couple tokens of headroom over "FOLLOWUP").
 const JUDGE_MAX_TOKENS: u32 = 8;
@@ -98,7 +107,12 @@ fn call_judge(key: &str, task: &str, response: &str) -> Result<String, String> {
     });
     let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {e}"))?;
 
-    let resp = ureq::post("https://api.anthropic.com/v1/messages")
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(READ_TIMEOUT)
+        .build();
+    let resp = agent
+        .post("https://api.anthropic.com/v1/messages")
         .set("x-api-key", key)
         .set("anthropic-version", "2023-06-01")
         .set("content-type", "application/json")

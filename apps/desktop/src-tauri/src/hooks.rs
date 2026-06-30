@@ -91,7 +91,13 @@ pub fn stage_resource_script(app: &AppHandle, name: &str) -> Result<PathBuf, Str
 /// `settings.local.json` drives executable hooks and may be read by a running Claude (e.g. the
 /// launch-time heal sweep races already-open agents), so a reader must never observe a
 /// truncated/partial write. Same dir keeps the rename atomic (one filesystem).
+///
+/// Refuses to clobber the target with invalid JSON: `contents` is parsed first, so a bug upstream
+/// can never replace a good settings file with garbage Claude would fail to load. Our merge/heal
+/// producers always emit valid JSON, so this is belt-and-suspenders that also documents the invariant.
 fn atomic_write_settings(path: &Path, contents: &str) -> Result<(), String> {
+    serde_json::from_str::<Value>(contents)
+        .map_err(|e| format!("atomic_write_settings: refusing to write invalid JSON: {e}"))?;
     let dir = path
         .parent()
         .ok_or_else(|| "atomic_write_settings: no parent dir".to_string())?;
@@ -229,7 +235,9 @@ pub fn install_agent_hooks(app: AppHandle, worktree: String) -> Result<String, S
     let file = dir.join("settings.local.json");
     let existing = std::fs::read_to_string(&file).ok();
     let merged = merge_event_hooks(existing.as_deref(), &emitter_cmd);
-    std::fs::write(&file, merged).map_err(|e| format!("write settings.local.json: {e}"))?;
+    // Atomic + JSON-validated: a concurrently-running Claude (this file drives its executable hooks)
+    // must never read a truncated/partial write, and we refuse to clobber with invalid JSON.
+    atomic_write_settings(&file, &merged)?;
     Ok(log.to_string_lossy().into_owned())
 }
 
@@ -480,6 +488,39 @@ mod tests {
         assert!(confine_to_worktrees(&base, &escape).is_err());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn atomic_write_settings_writes_valid_and_refuses_invalid_json() {
+        // FIX 3: settings.local.json must be replaced atomically and never clobbered with invalid
+        // JSON (a concurrently-running Claude reads this to drive its executable hooks).
+        let dir = std::env::temp_dir().join(format!("sparkle-hooks-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.local.json");
+
+        // Valid JSON is written.
+        atomic_write_settings(&file, r#"{"hooks":{}}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"hooks":{}}"#);
+
+        // Invalid JSON is refused and the prior good file is left byte-for-byte intact.
+        let before = std::fs::read_to_string(&file).unwrap();
+        assert!(atomic_write_settings(&file, "{not valid json").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            before,
+            "file must be untouched after a rejected write"
+        );
+
+        // No temp residue is left in the dir (rename consumed it; the rejected write never made one).
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp-file residue after writes");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

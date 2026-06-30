@@ -13,6 +13,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { submitPrompt } from "../pty";
 import { trialSendAllowed, recordTrialSend } from "../services/trialMeter";
+import { safeUnlisten } from "../services/safeUnlisten";
 import { captureScreenRegion } from "../screenshot";
 import { AttachmentRow } from "./composer/AttachmentRow";
 import {
@@ -440,9 +441,7 @@ export function Composer({
   // sandboxed webview does not. Only the visible pane listens (others stay mounted).
   useEffect(() => {
     if (!active) return;
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    void getCurrentWebview()
+    const unlistenPromise = getCurrentWebview()
       .onDragDropEvent((event) => {
         const p = event.payload;
         if (p.type === "enter" || p.type === "over") {
@@ -472,15 +471,16 @@ export function Composer({
           });
         }
       })
-      .then((fn) => {
-        if (cancelled) fn();
-        else unlisten = fn;
-      })
-      .catch((e) => log.error("composer", "drag-drop listen failed", e));
+      .catch((e) => {
+        // A failed listen has no unlisten fn to return; log and let cleanup no-op.
+        log.error("composer", "drag-drop listen failed", e);
+        return undefined;
+      });
     return () => {
-      cancelled = true;
       setDropActive(false);
-      unlisten?.();
+      // safeUnlisten awaits the listen() promise so a handler that resolves AFTER unmount is still
+      // torn down (and the Tauri teardown race is swallowed).
+      void safeUnlisten(unlistenPromise);
     };
   }, [active, inputRef, setMinimized]);
 

@@ -363,7 +363,10 @@ pub fn reload_global(app_data: &Path) -> EffectiveConfig {
     let (cfg, warnings, hard_error) =
         build_effective(SparkleConfig::default(), text.as_deref(), None);
     let lock = cell();
-    let mut guard = lock.write().expect("config lock poisoned");
+    // Poison-tolerant: a panic in a prior writer must not permanently wedge config reloads for the
+    // rest of the process. Recover the inner guard and carry on; the last-good cached config is
+    // preserved on a hard parse error below. Matches accounts.rs / transcribe.rs / dictation.rs.
+    let mut guard = lock.write().unwrap_or_else(|e| e.into_inner());
     if hard_error {
         // Keep the last-good config; only update the warning list.
         guard.warnings = warnings;
@@ -375,7 +378,8 @@ pub fn reload_global(app_data: &Path) -> EffectiveConfig {
 
 /// The cached global EffectiveConfig (config + warnings), for `get_config` with no project.
 pub fn current_effective() -> EffectiveConfig {
-    cell().read().expect("config lock poisoned").clone()
+    // Poison-tolerant read: a panicking writer must not brick every future config read.
+    cell().read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Effective config for a specific project: the cached global layer with that project's
@@ -981,5 +985,35 @@ mod tests {
         );
         assert!(err.is_err());
         assert_eq!(before, std::fs::read_to_string(global_path(ad)).unwrap());
+    }
+
+    #[test]
+    fn load_document_falls_back_to_template_on_unparseable_toml() {
+        // FIX 2 regression: a corrupt on-disk config.toml must not panic load_document — it falls
+        // back to the (valid) default template so the in-app editor still opens with something sane.
+        let dir = tempfile::tempdir().unwrap();
+        let ad = dir.path();
+        std::fs::write(global_path(ad), "this is = = not valid toml [[[").unwrap();
+        let doc = load_document(ad); // must not panic
+        // The fallback document is itself valid and parses to the built-in defaults.
+        let (cfg, _, hard) = effective(Some(&doc.to_string()), None);
+        assert!(!hard, "fallback document must be valid TOML");
+        assert_eq!(cfg, SparkleConfig::default());
+    }
+
+    #[test]
+    fn config_lock_recovers_after_poison() {
+        // Poison the process-wide config RwLock by panicking while holding the write guard, then
+        // assert the poison-tolerant accessors still function. Without the recovery, every future
+        // get_config/reload would panic for the rest of the process (a permanently wedged command).
+        let _ = std::panic::catch_unwind(|| {
+            let _g = cell().write().unwrap();
+            panic!("simulated panic while holding the config write lock");
+        });
+        // Reader path must not propagate the poison.
+        let _ = current_effective();
+        // Writer path (reload) must not propagate the poison either.
+        let dir = tempfile::tempdir().unwrap();
+        let _ = reload_global(dir.path());
     }
 }

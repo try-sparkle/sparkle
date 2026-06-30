@@ -8,10 +8,19 @@
 // is identical to the naming path. ureq is pulled WITHOUT its optional `json` feature, so we
 // serialize/parse with serde_json directly (send_string / into_string), never send_json/into_json.
 
+use std::time::Duration;
+
 use crate::naming::resolve_anthropic_key;
 
 /// Sonnet for interview/synthesis quality (vs. Haiku for naming). Bare alias, no date suffix.
 const CHAT_MODEL: &str = "claude-sonnet-4-6";
+
+/// Bound the Anthropic call so a stalled api.anthropic.com can't pin a spawn_blocking thread
+/// forever (which would eventually exhaust the blocking pool). ureq has no default timeout. A
+/// hung endpoint then hits the existing Err/degrade path. Connect is short; read is generous so a
+/// slow-but-progressing generation isn't cut off. Mirrors connectivity.rs's AgentBuilder shape.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default token budget when the caller passes 0, so a forgotten/zero `max_tokens` still yields a
 /// usable reply rather than the API rejecting a zero budget.
@@ -75,7 +84,12 @@ fn call_anthropic_chat(
     }
     let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {e}"))?;
 
-    let resp = ureq::post("https://api.anthropic.com/v1/messages")
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(READ_TIMEOUT)
+        .build();
+    let resp = agent
+        .post("https://api.anthropic.com/v1/messages")
         .set("x-api-key", key)
         .set("anthropic-version", "2023-06-01")
         .set("content-type", "application/json")

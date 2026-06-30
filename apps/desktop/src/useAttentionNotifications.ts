@@ -38,6 +38,7 @@ import {
   type FocusAgentPayload,
 } from "./services/attention";
 import { emitAttention, emitResolved } from "./services/relayClient";
+import { safeUnlisten } from "./services/safeUnlisten";
 import {
   publishWindowRedAgents,
   clearWindowStatus,
@@ -198,10 +199,6 @@ export function useAttentionNotifications(): void {
   const ctx = useRef({ projectId, label, isMain, replace });
   ctx.current = { projectId, label, isMain, replace };
   useEffect(() => {
-    // `onFocusAgent` resolves async; if we unmount before it does, mark cancelled so the
-    // late-arriving unlisten tears down immediately instead of leaking the listener.
-    let cancelled = false;
-    let unlisten: undefined | (() => void);
     const handle = (p: FocusAgentPayload) => {
       const { projectId: mine, isMain: main, replace: setProject } = ctx.current;
       if (p.projectId === mine) {
@@ -217,13 +214,11 @@ export function useAttentionNotifications(): void {
         void bringToFront();
       }
     };
-    void onFocusAgent(handle).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
+    // Keep the listen() promise; safeUnlisten awaits it on cleanup so a listener that resolves
+    // AFTER unmount is still torn down (and the Tauri teardown race is swallowed).
+    const unlistenPromise = onFocusAgent(handle);
     return () => {
-      cancelled = true;
-      unlisten?.();
+      void safeUnlisten(unlistenPromise);
     };
   }, []);
 }

@@ -207,7 +207,9 @@ fn fts_query(query: &str) -> Option<String> {
 
 #[tauri::command]
 pub fn history_record(db: State<HistoryDb>, entry: EntryInput) -> Result<(), String> {
-    let conn = db.conn.lock().map_err(|e| format!("lock: {e}"))?;
+    // Poison-tolerant: a panic mid-query poisons the Mutex<Connection>; the recovered guard still
+    // points at a valid SQLite connection, so don't permanently brick history on it.
+    let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
     record_into(&conn, &entry).map_err(|e| format!("record: {e}"))
 }
 
@@ -217,13 +219,13 @@ pub fn history_search(
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<Hit>, String> {
-    let conn = db.conn.lock().map_err(|e| format!("lock: {e}"))?;
+    let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
     search_in(&conn, &query, limit.unwrap_or(50)).map_err(|e| format!("search: {e}"))
 }
 
 #[tauri::command]
 pub fn history_prune(db: State<HistoryDb>, cutoff_ms: Option<i64>) -> Result<usize, String> {
-    let conn = db.conn.lock().map_err(|e| format!("lock: {e}"))?;
+    let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
     prune_in(&conn, cutoff_ms).map_err(|e| format!("prune: {e}"))
 }
 

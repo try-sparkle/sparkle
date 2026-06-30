@@ -86,9 +86,9 @@ pub fn run() {
                         // Stash it for the cold-launch case (webview listener not yet attached),
                         // then emit for the warm (already-running) case.
                         if let Some(pending) = handle.try_state::<auth::DeepLinkPending>() {
-                            if let Ok(mut g) = pending.0.lock() {
-                                *g = Some(s.clone());
-                            }
+                            // Poison-tolerant: a panic elsewhere must not silently drop the
+                            // cold-launch auth code (which would make sign-in impossible).
+                            *pending.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(s.clone());
                         }
                         let _ = handle.emit("deep-link", s);
                     }

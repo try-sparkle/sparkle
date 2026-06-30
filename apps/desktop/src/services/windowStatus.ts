@@ -8,6 +8,7 @@
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AGENT_STATUS } from "@sparkle/ui";
 import { isWindowOpen, defaultStore, WINDOW_REGISTRY_KEY, type KV } from "./windowRegistry";
+import { safeUnlisten } from "./safeUnlisten";
 import type { AgentTabStatus } from "../types";
 
 export const WINDOW_STATUS_KEY = "sparkle-window-status";
@@ -188,18 +189,14 @@ export function subscribeWindowStatus(onChange: () => void): () => void {
     if (e.key === WINDOW_STATUS_KEY || e.key === WINDOW_REGISTRY_KEY || e.key === null) onChange();
   };
   window.addEventListener("storage", onStorage);
-  let unlisten: UnlistenFn | undefined;
-  let cancelled = false;
-  if (inTauri()) {
-    void listen(STATUS_CHANGED_EVENT, () => onChange()).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
-  }
+  // Keep the listen() promise; safeUnlisten awaits it on cleanup so a listener that resolves AFTER
+  // unsubscribe is still torn down (and the Tauri teardown race is swallowed).
+  const unlistenPromise: Promise<UnlistenFn> | undefined = inTauri()
+    ? listen(STATUS_CHANGED_EVENT, () => onChange())
+    : undefined;
   return () => {
-    cancelled = true;
     window.removeEventListener("storage", onStorage);
-    unlisten?.();
+    void safeUnlisten(unlistenPromise);
   };
 }
 

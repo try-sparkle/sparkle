@@ -915,13 +915,45 @@ export function formatElapsed(ms: number): string {
  * out-of-phase clock, which previously made the count visibly jump backward (read as a spurious
  * "reset"). `since` is the user's last interaction; null means no timer, so the interval is skipped.
  */
-function useRowClock(since: number | undefined): number {
+export function useRowClock(since: number | undefined): number {
   const [now, setNow] = useState(() => Date.now());
   const fast = since != null && now - since < 100_000;
   useEffect(() => {
     if (since == null) return;
-    const id = setInterval(() => setNow(Date.now()), fast ? 1000 : 5000);
-    return () => clearInterval(id);
+    // Only tick while the window is actually visible. A hidden/backgrounded window has no one
+    // watching the elapsed counter, so a per-second (or 5s) re-render there is pure wasted work and
+    // wakeups — with many rows it adds up. The interval pauses when the document is hidden and
+    // resumes (catching the clock up immediately) on the visibilitychange back to visible.
+    const visible = () =>
+      typeof document === "undefined" || document.visibilityState === "visible";
+    let id: ReturnType<typeof setInterval> | undefined;
+    const startTicking = () => {
+      if (id == null) id = setInterval(() => setNow(Date.now()), fast ? 1000 : 5000);
+    };
+    const stopTicking = () => {
+      if (id != null) {
+        clearInterval(id);
+        id = undefined;
+      }
+    };
+    const onVisibility = () => {
+      if (visible()) {
+        setNow(Date.now()); // catch up the (frozen-while-hidden) clock the instant we're shown
+        startTicking();
+      } else {
+        stopTicking();
+      }
+    };
+    if (visible()) startTicking();
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibility);
+    }
+    return () => {
+      stopTicking();
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibility);
+      }
+    };
   }, [fast, since]);
   return now;
 }

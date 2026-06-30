@@ -23,6 +23,7 @@ import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { startOrchestrationListener } from "../services/orchestrationListener";
 import { killProjectAgents, planWindowClose } from "../services/windowClose";
 import { clearWindowProject } from "../services/windowRegistry";
+import { safeUnlisten } from "../services/safeUnlisten";
 
 /** Top-level layout (revised): agents in the left column, the project in the top bar, and
  * the active agent's pane filling the rest. Each window renders only its current project's
@@ -96,14 +97,13 @@ export function Workspace() {
   // Intercept the window's close (red traffic light) so we can ask keep-vs-kill before closing.
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
-    let unlisten: undefined | (() => void);
-    void getCurrentWindow()
-      .onCloseRequested((event) => {
-        event.preventDefault();
-        setClosing(true);
-      })
-      .then((u) => (unlisten = u));
-    return () => unlisten?.();
+    // safeUnlisten awaits the listen() promise on cleanup so a handler that resolves AFTER unmount
+    // is still torn down (and the Tauri teardown race is swallowed).
+    const unlistenPromise = getCurrentWindow().onCloseRequested((event) => {
+      event.preventDefault();
+      setClosing(true);
+    });
+    return () => void safeUnlisten(unlistenPromise);
   }, []);
 
   // Cmd +/- to resize the terminal text, Cmd 0 to reset (matches browser/editor

@@ -43,3 +43,36 @@ describe("useInteractionStore.touch", () => {
     expect(useInteractionStore.getState().lastAt).toEqual({ a: 5000, b: 6000 });
   });
 });
+
+describe("useInteractionStore pruning (unbounded-growth fix)", () => {
+  beforeEach(() => useInteractionStore.setState({ lastAt: {} }));
+
+  it("forget drops a single closed agent's entry, leaving others intact", () => {
+    useInteractionStore.getState().touch("a", 5000);
+    useInteractionStore.getState().touch("b", 6000);
+    useInteractionStore.getState().forget("a");
+    expect(useInteractionStore.getState().lastAt).toEqual({ b: 6000 });
+  });
+
+  it("forget is a no-op (same object) for an absent agent", () => {
+    useInteractionStore.getState().touch("a", 5000);
+    const before = useInteractionStore.getState().lastAt;
+    useInteractionStore.getState().forget("missing");
+    expect(useInteractionStore.getState().lastAt).toBe(before);
+  });
+
+  it("reconcile prunes entries for agents that no longer exist", () => {
+    useInteractionStore.getState().touch("a", 5000);
+    useInteractionStore.getState().touch("b", 6000);
+    useInteractionStore.getState().touch("c", 7000);
+    useInteractionStore.getState().reconcile(["a", "c"]);
+    expect(useInteractionStore.getState().lastAt).toEqual({ a: 5000, c: 7000 });
+  });
+
+  it("reconcile is a no-op (same object) when all entries are still valid", () => {
+    useInteractionStore.getState().touch("a", 5000);
+    const before = useInteractionStore.getState().lastAt;
+    useInteractionStore.getState().reconcile(["a", "b"]);
+    expect(useInteractionStore.getState().lastAt).toBe(before);
+  });
+});

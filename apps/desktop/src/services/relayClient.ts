@@ -11,6 +11,7 @@ import { io, type Socket } from "socket.io-client";
 import { invoke } from "@tauri-apps/api/core";
 import { onPtyOutput, writePty } from "../pty";
 import { getAgentScrollback } from "./terminalScrollback";
+import { safeUnlisten } from "./safeUnlisten";
 import {
   authorizeAgentInput,
   authorizeDecision,
@@ -118,8 +119,9 @@ export async function startRelayHost(): Promise<void> {
     mySocket.emit("agent_output", { agent_id: e.id, chunk: e.chunk });
   }).then((un) => {
     // If this run is no longer the active socket (teardown, or a remount installed a new one),
-    // unlisten immediately so we don't leak a listener / double-emit.
-    if (socket !== mySocket) un();
+    // unlisten immediately so we don't leak a listener / double-emit. safeUnlisten swallows the
+    // Tauri teardown race if the listeners map is already gone.
+    if (socket !== mySocket) void safeUnlisten(un);
     else ptyUnlisten = un;
   });
 
@@ -174,6 +176,6 @@ export function stopRelayHost(): void {
   connecting = false;
   liveAttentions.clear();
   watched.clear();
-  ptyUnlisten?.();
+  void safeUnlisten(ptyUnlisten);
   ptyUnlisten = null;
 }

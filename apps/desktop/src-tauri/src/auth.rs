@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// Holds a deep-link URL that arrived before the webview attached its listener (e.g. a cold
 /// launch BY the sparkle:// link). AuthGate drains it on mount so the hand-off isn't lost.
@@ -15,12 +16,19 @@ pub struct DeepLinkPending(pub Mutex<Option<String>>);
 /// Take (and clear) any pending deep-link URL captured at launch.
 #[tauri::command]
 pub fn desktop_take_pending_deeplink(state: tauri::State<DeepLinkPending>) -> Option<String> {
-    state.0.lock().ok().and_then(|mut g| g.take())
+    // Poison-tolerant: a panic elsewhere must not strand a captured cold-launch auth code here
+    // (which would make sign-in impossible). The recovered guard still holds the pending URL.
+    state.0.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 const KEYCHAIN_SERVICE: &str = "ai.sparkle.desktop";
 const KEYCHAIN_USER: &str = "desktop-token";
 const DEFAULT_ORCHESTRATION_URL: &str = "http://localhost:3001";
+/// Bound every auth/credit HTTP call so a black-holed orchestration host can't freeze the calling
+/// thread indefinitely — ureq has no default request timeout. These commands run on app load
+/// (desktop_me) and on every credit spend (desktop_consume), so an unbounded hang is user-visible.
+/// Mirrors trial_remote.rs.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Orchestration base URL. Override with ORCHESTRATION_URL for local dev (http://localhost:3001).
 fn base_url() -> String {
@@ -80,6 +88,7 @@ pub fn desktop_exchange_code(code: String) -> Result<(), String> {
     let url = format!("{}/auth/desktop/exchange", base_url());
     let body = json!({ "code": code }).to_string();
     let resp = ureq::post(&url)
+        .timeout(HTTP_TIMEOUT)
         .set("Content-Type", "application/json")
         .send_string(&body)
         .map_err(|e| format!("exchange failed: {e}"))?;
@@ -100,6 +109,7 @@ pub fn desktop_pair_code() -> Result<String, String> {
     let token = read_token().ok_or_else(|| "not signed in".to_string())?;
     let url = format!("{}/pair/code", base_url());
     let resp = ureq::post(&url)
+        .timeout(HTTP_TIMEOUT)
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
         .send_string("{}")
@@ -118,6 +128,7 @@ pub fn desktop_me() -> Result<Me, String> {
     let token = read_token().ok_or_else(|| "not signed in".to_string())?;
     let url = format!("{}/me", base_url());
     let resp = ureq::get(&url)
+        .timeout(HTTP_TIMEOUT)
         .set("Authorization", &format!("Bearer {token}"))
         .call()
         .map_err(|e| format!("me failed: {e}"))?;
@@ -144,6 +155,7 @@ pub fn desktop_consume(
     })
     .to_string();
     let req = ureq::post(&url)
+        .timeout(HTTP_TIMEOUT)
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json");
     match req.send_string(&body) {
@@ -189,6 +201,7 @@ pub fn desktop_refund(ledger_id: String) -> Result<(), String> {
     let url = format!("{}/credits/refund", base_url());
     let body = json!({ "ledgerId": ledger_id }).to_string();
     ureq::post(&url)
+        .timeout(HTTP_TIMEOUT)
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
         .send_string(&body)
@@ -205,6 +218,7 @@ pub fn desktop_redeem_promo(code: String) -> Result<(), String> {
     let url = format!("{}/billing/promo", base_url());
     let body = json!({ "code": code }).to_string();
     let req = ureq::post(&url)
+        .timeout(HTTP_TIMEOUT)
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json");
     match req.send_string(&body) {

@@ -10,6 +10,7 @@ import { importDefault } from "./services/accountStore";
 import { startRelayHost, stopRelayHost } from "./services/relayClient";
 import { useSettingsStore } from "./stores/settingsStore";
 import { getConfig, onConfigChanged } from "./services/config";
+import { safeUnlisten } from "./services/safeUnlisten";
 import { CurrentProjectProvider } from "./windowContext";
 import { useAttentionNotifications } from "./useAttentionNotifications";
 import { useRosterPublisher } from "./useRosterPublisher";
@@ -79,7 +80,6 @@ export function App() {
   // mirrored controls are [workers]/[ai], which are global-only by design; per-project [workflow]
   // overrides are honored by the Rust engine directly (config::for_project), not via this mirror.
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
     let cancelled = false;
     const hydrate = useSettingsStore.getState().hydrateFromConfig;
     void getConfig()
@@ -87,13 +87,12 @@ export function App() {
         if (!cancelled) hydrate(eff);
       })
       .catch((e) => console.warn("getConfig failed", e));
-    void onConfigChanged(hydrate).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
+    // Keep the listen() promise; safeUnlisten awaits it on cleanup so a listener that resolves
+    // AFTER unmount is still torn down (and the Tauri teardown race is swallowed).
+    const unlistenPromise = onConfigChanged(hydrate);
     return () => {
       cancelled = true;
-      unlisten?.();
+      void safeUnlisten(unlistenPromise);
     };
   }, []);
 

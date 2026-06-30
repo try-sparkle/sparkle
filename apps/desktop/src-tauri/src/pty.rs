@@ -26,7 +26,10 @@ pub struct PtyManager {
 
 impl PtyManager {
     fn remove(&self, id: &str) {
-        self.sessions.lock().unwrap().remove(id);
+        // Poison-tolerant: a panic while another thread held this lock must not wedge every
+        // later pty_spawn/write/resize/kill app-wide. The recovered guard still points at a
+        // valid HashMap (mirrors accounts.rs / trial.rs).
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
 }
 
@@ -200,10 +203,27 @@ pub fn pty_spawn(
     // Drop the slave so the master sees EOF when the child exits.
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    // The child is already running. If wiring up its reader/writer fails here, nothing downstream
+    // will reap it (no session is inserted, no reaper thread is spawned), so it would orphan/zombie.
+    // Kill + wait it on these error paths before bubbling the error up.
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e.to_string());
+        }
+    };
+    let writer = match pair.master.take_writer() {
+        Ok(w) => w,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e.to_string());
+        }
+    };
 
-    manager.sessions.lock().unwrap().insert(
+    manager.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(
         id.clone(),
         PtySession { writer, master: pair.master, killer },
     );
@@ -281,7 +301,7 @@ pub fn pty_spawn(
 /// Write to a PTY's stdin — e.g. an approval decision ("y\n" / "n\n") or user input.
 #[tauri::command]
 pub fn pty_write(manager: State<PtyManager>, id: String, data: String) -> Result<(), String> {
-    let mut sessions = manager.sessions.lock().unwrap();
+    let mut sessions = manager.sessions.lock().unwrap_or_else(|e| e.into_inner());
     let session = sessions.get_mut(&id).ok_or(NO_SUCH_PTY)?;
     session.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
     session.writer.flush().map_err(|e| e.to_string())?;
@@ -298,7 +318,7 @@ pub fn pty_resize(
     // Backstop against the thin-column bug (see guard_resize_size): never shrink a live PTY below
     // the plausible floor, whatever the frontend sent.
     let (cols, rows) = guard_resize_size(&id, cols, rows);
-    let sessions = manager.sessions.lock().unwrap();
+    let sessions = manager.sessions.lock().unwrap_or_else(|e| e.into_inner());
     let session = sessions.get(&id).ok_or(NO_SUCH_PTY)?;
     session
         .master
@@ -310,7 +330,7 @@ pub fn pty_resize(
 #[tauri::command]
 pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
     tracing::info!(%id, "pty_kill");
-    if let Some(mut session) = manager.sessions.lock().unwrap().remove(&id) {
+    if let Some(mut session) = manager.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
         let _ = session.killer.kill();
     }
     Ok(())
@@ -319,14 +339,35 @@ pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        guard_resize_size, guard_spawn_size, validate_spawn_inner, MIN_PTY_COLS, MIN_PTY_ROWS,
-        SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
+        guard_resize_size, guard_spawn_size, validate_spawn_inner, PtyManager, MIN_PTY_COLS,
+        MIN_PTY_ROWS, SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
     };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    /// A panic while the `sessions` mutex is held poisons it. The poison-tolerant locks
+    /// (`unwrap_or_else(|e| e.into_inner())`) must recover the guard so later PTY operations keep
+    /// working rather than panicking forever and wedging every terminal app-wide.
+    #[test]
+    fn sessions_lock_recovers_after_poison() {
+        let manager = std::sync::Arc::new(PtyManager::default());
+        // Poison the mutex: panic while holding the lock on a separate thread.
+        let m = manager.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = m.sessions.lock().unwrap();
+            panic!("poison the sessions mutex");
+        })
+        .join();
+        assert!(manager.sessions.is_poisoned(), "mutex should be poisoned by the panic");
+        // remove() goes through the poison-tolerant lock and must not panic.
+        manager.remove("nonexistent");
+        // And the recovered guard still points at a usable HashMap.
+        let len = manager.sessions.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(len, 0);
+    }
 
     // ── thin-column backstop ──────────────────────────────────────────────────────────────
     #[test]

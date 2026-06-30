@@ -9,6 +9,7 @@
 // for wait_for_workers (see bridge.rs + apps/mcp-orchestrator).
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { safeUnlisten } from "./safeUnlisten";
 import { spawnWorker, spinDownWorker } from "./workerSpawn";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -217,7 +218,9 @@ function dispatch(req: OrchestrationRequest): void {
 /** Tear down the listener: unsubscribe, unblock every still-queued request (so mid-session cleanup
  *  / HMR doesn't strand them for the bridge's 600s timeout), and reset all module state. */
 function teardown(): void {
-  unlisten?.();
+  // safeUnlisten swallows the Tauri teardown race (window close / HMR tearing down the listeners
+  // map) so cleanup can't surface as an unhandled rejection.
+  void safeUnlisten(unlisten);
   unlisten = undefined;
   unsubStore?.();
   unsubStore = undefined;

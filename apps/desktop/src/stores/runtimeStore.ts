@@ -15,6 +15,7 @@ import { createBead, claimBead, closeBead, markBeadDelivered } from "../services
 import { syncProjectMarkdown } from "../services/chiefSync";
 import { useSettingsStore, effectiveChiefPat } from "./settingsStore";
 import { useProjectStore } from "./projectStore";
+import { useInteractionStore } from "./interactionStore";
 
 /** Trailing-debounce window per project. The branch-status poll fires often (mount + the ~30s
  *  connectivity probe); we coalesce those into one sync after a quiet window so a burst of commits
@@ -339,6 +340,7 @@ export const useRuntimeStore = create<RuntimeState>()(
       close: (agentId) =>
         set((s) => {
           forgetBeadLifecycle(agentId); // drop module-level bead bookkeeping for this agent
+          useInteractionStore.getState().forget(agentId); // …and its last-interaction timestamp
           const { [agentId]: _removed, ...status } = s.status;
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
@@ -464,6 +466,9 @@ export const useRuntimeStore = create<RuntimeState>()(
           for (const id of new Set([...beadLevelFor.keys(), ...beadCreateFailed.keys()])) {
             if (!valid.has(id)) forgetBeadLifecycle(id);
           }
+          // Prune the per-agent last-interaction map to live agents too (same unbounded-growth
+          // concern as the bead maps; the map only ever grew before).
+          useInteractionStore.getState().reconcile(validIds);
           const openAgentIds = s.openAgentIds.filter((id) => valid.has(id));
           // Prune the now-PERSISTED workflow maps to agents that still exist, so a deleted agent's
           // stale stage/shipped ✓ can't linger forever in localStorage (and can't resurface if its

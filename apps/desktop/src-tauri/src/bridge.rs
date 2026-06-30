@@ -27,14 +27,15 @@ pub type PendingMap = Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>;
 #[allow(dead_code)]
 pub fn register_pending(pending: &PendingMap, req_id: &str) -> mpsc::Receiver<Value> {
     let (tx, rx) = mpsc::channel();
-    pending.lock().unwrap().insert(req_id.to_string(), tx);
+    // Poison-tolerant: a panic in a prior holder must not permanently wedge the bridge.
+    pending.lock().unwrap_or_else(|e| e.into_inner()).insert(req_id.to_string(), tx);
     rx
 }
 
 /// Deliver `value` to the op awaiting `req_id` (if any), removing the entry. No-op if absent or
 /// the receiver was already dropped (e.g. the op timed out).
 pub fn resolve_pending(pending: &PendingMap, req_id: &str, value: Value) {
-    if let Some(tx) = pending.lock().unwrap().remove(req_id) {
+    if let Some(tx) = pending.lock().unwrap_or_else(|e| e.into_inner()).remove(req_id) {
         let _ = tx.send(value);
     }
 }
@@ -74,7 +75,8 @@ pub fn start_bridge_at(
     // build_agent_id can't both bind (the loser would orphan a thread whose shutdown flag
     // stop_bridge could never signal). The accept thread we spawn doesn't take this lock,
     // so holding it here can't deadlock.
-    let mut map = manager.bridges.lock().unwrap();
+    // Poison-tolerant: a panic in a prior holder must not permanently wedge bridge start/stop.
+    let mut map = manager.bridges.lock().unwrap_or_else(|e| e.into_inner());
     // FIX 2: idempotency check — only return the existing handle if its accept loop is still alive.
     // If the loop died (fatal error branch), treat as stale: tear down and fall through to rebind.
     if let Some(h) = map.get(build_agent_id) {
@@ -194,7 +196,7 @@ fn serve_conn(
 
 /// Signal shutdown, remove the socket file and the map entry.
 pub fn stop_bridge(manager: &BridgeManager, build_agent_id: &str) {
-    if let Some(h) = manager.bridges.lock().unwrap().remove(build_agent_id) {
+    if let Some(h) = manager.bridges.lock().unwrap_or_else(|e| e.into_inner()).remove(build_agent_id) {
         h.shutdown.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_file(&h.socket_path);
     }
@@ -647,6 +649,24 @@ mod tests {
 
         // Resolving an unknown id is a no-op (does not panic).
         resolve_pending(&pending, "nonexistent", serde_json::json!(null));
+    }
+
+    #[test]
+    fn pending_map_recovers_after_poison() {
+        // Poison the pending map by panicking while holding its lock, then assert register/resolve
+        // still work. Without poison-tolerant acquisition, every later bridge op would panic for the
+        // rest of the process (the permanently-wedged-command bug this hardening closes).
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let p2 = pending.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = p2.lock().unwrap();
+            panic!("simulated panic while holding the pending lock");
+        }));
+        // Lock is now poisoned; the poison-tolerant register/resolve must still function.
+        let rx = register_pending(&pending, "after-poison");
+        resolve_pending(&pending, "after-poison", serde_json::json!({ "ok": true }));
+        let got = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(got["ok"], true);
     }
 
     #[test]

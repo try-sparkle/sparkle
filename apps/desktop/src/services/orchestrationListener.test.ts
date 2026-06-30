@@ -248,4 +248,15 @@ describe("orchestrationListener", () => {
     const k2 = invokeMock.mock.calls.find(([, a]) => (a as { reqId: string }).reqId === "k2");
     expect((k2![1] as { result: { error?: string } }).result.error).toMatch(/stopped/i);
   });
+
+  it("cleanup swallows the Tauri unlisten teardown race instead of throwing", () => {
+    // The window closing tears down Tauri's listeners map; the unlisten fn then throws the
+    // "handlerId" race. teardown routes it through safeUnlisten, so cleanup must not throw.
+    unlistenMock.mockImplementationOnce(() => {
+      throw new Error("Cannot read properties of undefined (reading 'handlerId')");
+    });
+    expect(() => cleanup?.()).not.toThrow();
+    expect(unlistenMock).toHaveBeenCalled();
+    cleanup = undefined;
+  });
 });

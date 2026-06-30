@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { Terminal as XTerm, type IMarker } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -22,6 +22,7 @@ import { isMeasuredSize, spawnSize } from "./terminalSize";
 import { SelectionPopup } from "./SelectionPopup";
 import { recoverFromWebglContextLoss, forceFullRepaint, settleRepaintPlan } from "./terminalWebgl";
 import { detectRateLimitReset } from "../services/rateLimitWatch";
+import { safeUnlisten } from "../services/safeUnlisten";
 import { PH_NO_CAPTURE_CLASS } from "@sparkle/core";
 
 // Terminal font size at 100%. The ⋯-menu "Text size" control (and Cmd +/-) multiplies
@@ -151,9 +152,40 @@ export function Terminal({
   // for this component's life, so this flips once and stays.
   const [firstOutput, setFirstOutput] = useState(false);
 
+  // Set true the instant the terminal is disposed (in the mount effect's cleanup). The mount effect
+  // nulls termRef/fitRef/webglRef right after, so any LATE callback — a queued ResizeObserver tick,
+  // a theme re-render, an already-scheduled rAF in another effect — sees disposed and freed refs and
+  // bails instead of calling fit()/refresh() on a torn-down xterm core. That post-dispose path is
+  // the source of the uncaught "undefined is not an object (this._renderer.value.dimensions)" crash.
+  const disposedRef = useRef(false);
+
+  // Guarded terminal ops: no-op once disposed or the refs are freed. Stable identity (reads refs, so
+  // no deps) so effects can use them without re-subscribing. Both swallow the torn-down-core throw.
+  const safeFit = useCallback(() => {
+    if (disposedRef.current) return;
+    const fit = fitRef.current;
+    if (!fit) return;
+    try {
+      fit.fit();
+    } catch {
+      /* container not laid out yet / terminal torn down — the next observer/effect retries */
+    }
+  }, []);
+  const safeRefresh = useCallback(() => {
+    if (disposedRef.current) return;
+    const term = termRef.current;
+    if (!term) return;
+    try {
+      term.refresh(0, term.rows - 1);
+    } catch {
+      /* terminal torn down mid-callback — nothing to repaint */
+    }
+  }, []);
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    disposedRef.current = false;
     let disposed = false;
     const unlistens: Array<() => void> = [];
 
@@ -428,8 +460,8 @@ export function Terminal({
         onExit?.();
       });
       if (disposed) {
-        offOut();
-        offExit();
+        void safeUnlisten(offOut);
+        void safeUnlisten(offExit);
         return;
       }
       unlistens.push(offOut, offExit);
@@ -475,6 +507,9 @@ export function Terminal({
     container.addEventListener("mousedown", onMouseDown);
 
     const ro = new ResizeObserver(() => {
+      // A ResizeObserver tick can still be queued when the component unmounts (ro.disconnect()
+      // doesn't un-queue an already-dispatched callback); bail before touching the freed renderer.
+      if (disposed) return;
       try {
         fit.fit();
         // Guard the push: a hide transition fires the observer with a 0×0 box, which fit()
@@ -494,6 +529,9 @@ export function Terminal({
 
     return () => {
       disposed = true;
+      // Flip the shared sentinel BEFORE disposing so any late callback in another effect (theme
+      // re-render, a queued rAF/ResizeObserver tick) sees it and no-ops via safeFit/safeRefresh.
+      disposedRef.current = true;
       unregisterScrollback();
       if (focusRef) focusRef.current = null;
       if (apiRef) apiRef.current = null;
@@ -502,7 +540,7 @@ export function Terminal({
       container.removeEventListener("mousedown", onMouseDown);
       if (settleRepaintTimer) window.clearTimeout(settleRepaintTimer);
       if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
-      for (const off of unlistens) off();
+      for (const off of unlistens) void safeUnlisten(off);
       void killPty(agentId).catch(ignorePtyGone);
       engine.dispose();
       markersRef.current.clear(); // term.dispose() drops the markers; clear our handles too
@@ -515,6 +553,11 @@ export function Terminal({
       webglRef.current?.dispose();
       webglRef.current = null;
       term.dispose();
+      // Null the refs so a late callback that slipped past the sentinel still hits a null guard
+      // (safeFit/safeRefresh and the active/zoom/theme effects all bail on a null ref) rather than
+      // dereferencing the freed renderer.
+      termRef.current = null;
+      fitRef.current = null;
     };
     // agentId is stable for the life of this component.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -538,9 +581,9 @@ export function Terminal({
     let cancelled = false;
     let inner = 0;
     const outer = requestAnimationFrame(() => {
-      if (cancelled) return;
+      if (cancelled || disposedRef.current) return;
       try {
-        fit.fit();
+        safeFit();
         onRequestFocusRef.current?.();
         syncPtySize(agentId, term);
       } catch {
@@ -555,7 +598,7 @@ export function Terminal({
       // char dimensions measured; otherwise the WebGL renderer bails (no valid dims) and wastes
       // the clear. See forceFullRepaint in terminalWebgl.ts.
       inner = requestAnimationFrame(() => {
-        if (cancelled) return;
+        if (cancelled || disposedRef.current) return;
         forceFullRepaint(webglRef.current, term);
         poisonedRef.current = false; // the reveal repaint cleared any cache-poisoned cells
       });
@@ -565,7 +608,7 @@ export function Terminal({
       cancelAnimationFrame(outer);
       if (inner) cancelAnimationFrame(inner);
     };
-  }, [active, agentId]);
+  }, [active, agentId, safeFit]);
 
   // "Text size" scales the terminal font only (not the UI chrome). Update the live font
   // size, then re-fit so the terminal's cols/rows and PTY size track the new cell
@@ -576,29 +619,31 @@ export function Terminal({
     if (!fit || !term) return;
     term.options.fontSize = Math.round(BASE_FONT_SIZE * zoom);
     const raf = requestAnimationFrame(() => {
+      if (disposedRef.current) return;
       try {
-        fit.fit();
+        safeFit();
         syncPtySize(agentId, term);
       } catch {
         /* ignore transient fit errors */
       }
     });
     return () => cancelAnimationFrame(raf);
-  }, [zoom, agentId]);
+  }, [zoom, agentId, safeFit]);
 
   // Re-theme the live terminal when the resolved theme changes (Light/Dark/Auto toggle or an
   // OS appearance change while on Auto). xterm needs concrete hex, so it can't follow the CSS
   // var() flip the rest of the app rides on — we push a fresh theme object instead.
   useEffect(() => {
     const term = termRef.current;
-    if (!term) return;
+    if (disposedRef.current || !term) return;
     term.options.theme = xtermTheme(resolvedTheme);
     // The WebGL renderer caches colored glyphs in a texture atlas; a bare options.theme set
     // can leave already-painted cells with stale colors until the next reflow. Clear the atlas
     // and force a full repaint so the live toggle is instantaneous like the rest of the app.
+    // safeRefresh no-ops if a dispose raced in between the null check and here.
     webglRef.current?.clearTextureAtlas();
-    term.refresh(0, term.rows - 1);
-  }, [resolvedTheme]);
+    safeRefresh();
+  }, [resolvedTheme, safeRefresh]);
 
   return (
     // ph-no-capture: terminal panes render source code, command output, and
