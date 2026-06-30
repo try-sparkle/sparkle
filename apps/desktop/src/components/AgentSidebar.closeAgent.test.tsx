@@ -18,6 +18,13 @@ const { refreshAgentBranch, landAgentBranch } = vi.hoisted(() => ({
   landAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
 }));
 vi.mock("../services/branchStatus", () => ({ refreshAgentBranch, landAgentBranch }));
+// Spy closeBead (Ship + Discard call it to resolve the agent's bead) while keeping every other beads
+// export real — planView/runtimeStore import from here too, so a full mock would break them.
+const { closeBead } = vi.hoisted(() => ({ closeBead: vi.fn(() => Promise.resolve()) }));
+vi.mock("../services/beads", async (orig) => ({
+  ...(await orig<typeof import("../services/beads")>()),
+  closeBead,
+}));
 
 import { AgentSidebar } from "./AgentSidebar";
 import { useProjectStore } from "../stores/projectStore";
@@ -25,12 +32,12 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, Project } from "../types";
 
-function buildAgentProject(): Project {
+function buildAgentProject(beadId?: string): Project {
   const agent: AgentTab = {
     id: "a1", name: "Build 1", kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: "main", lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null, autoNameVariants: null,
-    shellCommand: null, pinnedIndex: null,
+    shellCommand: null, pinnedIndex: null, beadId,
   };
   const project: Project = {
     id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
@@ -60,7 +67,11 @@ const agentsNow = () => useProjectStore.getState().projects[0]!.agents.map((a) =
 
 beforeEach(() => {
   useUiStore.setState({ collapsedOrchestrators: {} } as never);
-  landAgentBranch.mockReset();
+  // Reset BOTH branch mocks symmetrically and re-establish their default resolved values — mockReset
+  // wipes the hoisted default, so onLand's `if (r.ok)` would throw on undefined without this.
+  landAgentBranch.mockReset().mockResolvedValue({ ok: true });
+  refreshAgentBranch.mockReset().mockResolvedValue({ ok: true });
+  closeBead.mockClear();
 });
 afterEach(cleanup);
 
@@ -96,5 +107,16 @@ describe("AgentSidebar — close → Ship/Save/Discard", () => {
     fireEvent.click(screen.getByText("Keep it for later"));
     expect(agentsNow()).not.toContain("a1");
     expect(landAgentBranch).not.toHaveBeenCalled(); // no merge on Save
+  });
+
+  it("Discard tears the agent down, closes its bead, and never lands", async () => {
+    buildAgentProject("bd-1"); // a beadId so the closeBead branch of onDiscardClose is exercised
+    openClosePrompt();
+    fireEvent.click(screen.getByText("Discard it"));
+    expect(agentsNow()).not.toContain("a1"); // torn down
+    expect(landAgentBranch).not.toHaveBeenCalled(); // discard never merges
+    await waitFor(() =>
+      expect(closeBead).toHaveBeenCalledWith("/tmp/demo", "bd-1"), // bead resolved, not left open
+    );
   });
 });

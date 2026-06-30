@@ -4,7 +4,7 @@
 // instance across hover changes (so a hover-driven unmount can't commit a half-typed name), and the
 // behind/ahead pill must be a clickable rebase button ONLY when behind (the green ahead pill is
 // purely informational). Heavy leaf components + the Tauri opener are mocked so the sidebar renders.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -26,6 +26,7 @@ vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 
 import { AgentSidebar } from "./AgentSidebar";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useUiStore } from "../stores/uiStore";
 import { landAgentBranch, refreshAgentBranch } from "../services/branchStatus";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { Project, AgentTab } from "../types";
@@ -185,6 +186,44 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     // Hover → the overlay reveals "Title:  description".
     fireEvent.mouseOver(screen.getByText(TITLE));
     expect(document.body.textContent).toContain(DESCRIPTION);
+  });
+
+  it("shows 'Title: description' inline on a single non-wrapping line in the strip", () => {
+    // The expanded strip shows the title AND the description inline on ONE line. The line is
+    // nowrap + ellipsis, so a long description truncates instead of wrapping and growing the strip
+    // taller over the column rows beneath it. (Earlier the description lived in the drop-down; the
+    // single-line-ellipsis approach lets it sit beside the title without the column-growth bug.)
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    fireEvent.mouseOver(screen.getByText(TITLE));
+    const card = screen.getByTestId("agent-hover-card");
+    const strip = (Array.from(card.children) as HTMLElement[])[0]!;
+    expect(strip.textContent).toContain(TITLE);
+    expect(strip.textContent).toContain(DESCRIPTION);
+    // The title+description share one nowrap container (the title span's parent), so it can't wrap.
+    const lineEl = within(strip).getByText(TITLE).parentElement as HTMLElement;
+    expect(lineEl.style.whiteSpace).toBe("nowrap");
+    expect(lineEl.style.textOverflow).toBe("ellipsis");
+  });
+
+  it("active agent: the in-flow row AND its card take the terminal color and merge into it", () => {
+    useUiStore.setState({ activeSpecial: null } as never);
+    const project = mkProject([mkAgent()]);
+    project.selectedAgentId = "a1"; // → isActive
+    render(<AgentSidebar project={project} />);
+    // Resting active row: the terminal color (var(--c-forest)), square right edge, pulled 8px right
+    // (past the list padding) so it meets the sidebar border / terminal with no seam.
+    const row = document.querySelector('[draggable="true"]') as HTMLElement;
+    expect(row.style.background).toBe("var(--c-forest)");
+    expect(row.style.marginRight).toBe("-8px");
+    // Hover → the card is the terminal color with NO drop-shadow (it merges into the terminal).
+    fireEvent.mouseEnter(row);
+    const card = screen.getByTestId("agent-hover-card");
+    expect(["none", ""]).toContain(card.style.filter);
+    const strip = (Array.from(card.children) as HTMLElement[])[0]!;
+    expect(strip.style.background).toBe("var(--c-forest)");
+    // A thin border in the SIDEBAR color (deep-forest) outlines the card over the terminal so its
+    // text stays distinguishable from the terminal text behind it.
+    expect(strip.style.border).toContain("var(--c-deep-forest)");
   });
 
   it("omits the description span entirely when the description is empty", () => {

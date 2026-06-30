@@ -60,7 +60,10 @@ export function WorkflowLine({
         style={{
           position: "relative",
           flex: 1,
-          minWidth: 0,
+          // A floor so the bar stays visible even when a long nowrap status label (expanded) shares
+          // the flex row in a narrow container — without it the flex:1 bar collapses to ~0 and the
+          // progress bar vanishes behind the label (the bug where expanded workers showed no bar).
+          minWidth: 48,
           height,
           borderRadius: 999,
           background: TRACK_BG,

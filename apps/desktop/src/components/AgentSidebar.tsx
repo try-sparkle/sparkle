@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled, TbBulb } from "react-icons/tb";
 import { FaTasks } from "react-icons/fa";
-import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ROW_ACTIVE_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK, statusInk } from "../theme/colors";
+import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK, statusInk } from "../theme/colors";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -858,6 +858,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
 // so the eye never sees the pickaxe or title jump. Module-level so the elapsed timer can match it.
 const GLYPH_SLOT_H = 20;
 
+// Radius of the concave fillets that flare the active row's right edge open into the terminal.
+const ACTIVE_FILLET = 8;
+
 // Format an elapsed duration (ms) for the sidebar timer: integer seconds while under 100s (each
 // second is visible there), then minutes / hours / days each to one decimal with a trailing ".0"
 // stripped (so 2 minutes reads "2m", 1.5 reads "1.5m"). Pure + exported for testing.
@@ -1209,36 +1212,46 @@ function AgentRow({
               }}
             />
           ) : expanded ? (
-            // Expanded: the SAME leading "elapsed since last prompt" timer as collapsed (kept
-            // visible on hover, not dropped), then the bold title + ": " + the regular-weight
-            // description, wrapping. The timer and the title's first line are both GLYPH_SLOT_H
-            // tall (top-aligned) so they stay level with the glyph as the card grows down to fit
-            // the description. gap:8 matches the collapsed row's timer↔name spacing.
-            <div style={{ display: "flex", alignItems: "flex-start", gap: 8, minWidth: 0 }}>
+            // Expanded: the SAME leading "elapsed since last prompt" timer as collapsed, then
+            // "Title:  description" on ONE row-height line — the bold title followed by the
+            // regular-weight description. The whole line is nowrap + ellipsis, so a long
+            // description truncates ("…") rather than wrapping and growing the strip over the column
+            // rows beneath it. Double-click the line to edit (rename) — same affordance as collapsed.
+            // No title tooltip (the user finds it noise). gap:8 matches the collapsed row.
+            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, height: GLYPH_SLOT_H }}>
               {lastTouchAt != null && (
                 <ElapsedTimer since={lastTouchAt} now={clockNow} color={statusColor} />
               )}
-              <div
-                onDoubleClick={(e) => {
-                  e.stopPropagation();
-                  setEditing(a.id);
-                }}
-                style={{ flex: 1, minWidth: 0, lineHeight: `${GLYPH_SLOT_H}px` }}
-              >
-                <span
+              <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 4 }}>
+                <div
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    setEditing(a.id);
+                  }}
                   style={{
-                    color: statusColor,
-                    fontSize: 13,
-                    fontWeight: isActive ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
+                    flex: "0 1 auto",
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    lineHeight: `${GLYPH_SLOT_H}px`,
                   }}
                 >
-                  {fullTitle}
-                </span>
-                {description && (
-                  <span style={{ color: statusColor, fontSize: 13, fontWeight: FONT_WEIGHT.regular }}>
-                    {`:  ${description}`}
+                  <span
+                    style={{
+                      color: statusColor,
+                      fontSize: 13,
+                      fontWeight: isActive ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
+                    }}
+                  >
+                    {fullTitle}
                   </span>
-                )}
+                  {description && (
+                    <span style={{ color: statusColor, fontSize: 13, fontWeight: FONT_WEIGHT.regular }}>
+                      {`:  ${description}`}
+                    </span>
+                  )}
+                </div>
                 {pinChip}
               </div>
             </div>
@@ -1378,11 +1391,14 @@ function AgentRow({
   //  • cardLeft/cardTop — pinned to the captured rect so the strip sits exactly over the row.
   //  • colW             — the column row's width; the detail is offset by this so it lands past the
   //                       sidebar's right edge (terminal area) and never covers the rows below.
-  //  • ext              — terminal-side room added to the right (≥220, capped to the viewport).
+  //  • ext              — terminal-side room added to the right. The card stretches almost the full
+  //                       terminal width — from the sidebar's right edge to 50px shy of the viewport
+  //                       edge — so the inline "Title: description" line and the per-worker detail
+  //                       blocks have room to breathe (≥280 floor for a narrow window).
   //  • maxH             — height cap for the detail so a tall card (many workers) scrolls.
   const cardLeft = rect ? rect.left : 0;
   const colW = rect ? rect.width : 0;
-  const ext = rect ? Math.max(220, Math.min(360, window.innerWidth - (rect.left + colW) - 16)) : 320;
+  const ext = rect ? Math.max(280, window.innerWidth - (rect.left + colW) - 50) : 320;
   const totalW = colW + ext;
   // Anchor the card at the row's top — but if the row sits so low that the remaining room can't hold
   // a reasonable card, shift the anchor UP so there's always room for the strip (which doesn't shrink)
@@ -1391,9 +1407,13 @@ function AgentRow({
   const MIN_CARD_H = 180;
   const cardTop = rect ? Math.max(8, Math.min(rect.top, window.innerHeight - 16 - MIN_CARD_H)) : 0;
   const maxH = rect ? window.innerHeight - cardTop - 16 : undefined;
-  // Three shading states read at a glance: the row you're IN is the starker ROW_ACTIVE_BUBBLE; a row
-  // you're hovering (its unified card) is CHAT_USER_BUBBLE; idle rows are transparent.
-  const cardBg = isActive ? ROW_ACTIVE_BUBBLE : CHAT_USER_BUBBLE;
+  // Three shading states read at a glance: the row you're IN is the TERMINAL color (C.forest) so the
+  // active card reads as an extension of the terminal it opens over; a row you're merely hovering
+  // (not selected) is CHAT_USER_BUBBLE; idle rows are transparent. When active, the card "merges"
+  // into the terminal — no right border, no drop-shadow — so there's no seam between the column and
+  // the terminal window (mergeIntoTerminal below drives that).
+  const mergeIntoTerminal = isActive;
+  const cardBg = isActive ? C.forest : CHAT_USER_BUBBLE;
   // Show the slide-out only while hovering AND not renaming. Suppressing it during a rename means
   // the in-flow row is the SOLE owner of the rename <input> — the field never swaps mount points on
   // a hover change, so a trailing unmount-blur can't silently commit a half-typed name.
@@ -1436,15 +1456,21 @@ function AgentRow({
           gap: 4,
           padding: "8px 10px",
           marginLeft: depth * 16,
-          borderRadius: 8,
+          // Active row is the TERMINAL color, extending past the list's 8px right padding
+          // (marginRight:-8) to the sidebar's right border — which is also C.forest, as is the
+          // terminal beyond it — so the row flows into the terminal window. Left corners round into
+          // the sidebar (8px); the right edge is square here, with CONCAVE fillets (below) flaring it
+          // open into the terminal rather than a convex "button" corner. Idle rows are fully rounded.
+          borderRadius: isActive ? "8px 0 0 8px" : 8,
+          marginRight: isActive ? -8 : 0,
           cursor: "pointer",
           // The whole card is a drag handle for reorderable rows — suppress text selection so a
           // drag grabs the card instead of highlighting the name underneath the cursor. Gated on
           // !editing (like dragProps) so the rename <input> keeps normal text selection.
           userSelect: orderedIndex != null && !editing ? "none" : undefined,
-          // Active row is the starker ROW_ACTIVE_BUBBLE (one of three shading states); idle is
-          // transparent. The hover state's CHAT_USER_BUBBLE lives on the unified card, not here.
-          background: isActive ? ROW_ACTIVE_BUBBLE : "transparent",
+          // Active = the terminal's own color (merges into it); the hover state's CHAT_USER_BUBBLE
+          // lives on the unified card, not here.
+          background: isActive ? C.forest : "transparent",
           marginBottom: 2,
           // Hidden while the unified card is open: the card stands in for the row (anchored at the
           // same spot) and widens into the terminal area, so the name + progress bar render exactly
@@ -1453,6 +1479,39 @@ function AgentRow({
         }}
       >
         {CardHeader({ expanded: false, ownsInput: editing })}
+        {/* CONCAVE corner fillets where the active tab opens into the terminal. Each is a small box
+            just above / below the tab's right edge; a radial-gradient paints the terminal color
+            (C.forest) everywhere EXCEPT a quarter-disc cut from the corner nearest the sidebar, so
+            the forest flares outward into the terminal with a smooth inward (concave) curve — an
+            "opening", not a convex button corner. pointerEvents:none so they never eat clicks. */}
+        {isActive && (
+          <>
+            <div
+              aria-hidden
+              style={{
+                position: "absolute",
+                top: -ACTIVE_FILLET,
+                right: 0,
+                width: ACTIVE_FILLET,
+                height: ACTIVE_FILLET,
+                background: `radial-gradient(circle at top left, transparent ${ACTIVE_FILLET}px, ${C.forest} ${ACTIVE_FILLET}px)`,
+                pointerEvents: "none",
+              }}
+            />
+            <div
+              aria-hidden
+              style={{
+                position: "absolute",
+                bottom: -ACTIVE_FILLET,
+                right: 0,
+                width: ACTIVE_FILLET,
+                height: ACTIVE_FILLET,
+                background: `radial-gradient(circle at bottom left, transparent ${ACTIVE_FILLET}px, ${C.forest} ${ACTIVE_FILLET}px)`,
+                pointerEvents: "none",
+              }}
+            />
+          </>
+        )}
         {/* Drop target — only while a drag is in flight and only on top-level rows. Dropping here
             pins the dragged agent at THIS row's index (manual-agent-reorder-pin). */}
         {orderedIndex != null && dragActive && (
@@ -1490,7 +1549,9 @@ function AgentRow({
               pointerEvents: "none",
               display: "flex",
               flexDirection: "column",
-              filter: "drop-shadow(0 8px 16px rgba(0,0,0,0.45))",
+              // No shadow when active: the card is the terminal's own color and merges into it — a
+              // drop-shadow would draw the very seam we're removing. Hover-only cards keep the lift.
+              filter: mergeIntoTerminal ? "none" : "drop-shadow(0 8px 16px rgba(0,0,0,0.45))",
               animation: "-slide 140ms ease-out",
             }}
           >
@@ -1516,7 +1577,11 @@ function AgentRow({
                 cursor: "pointer",
                 userSelect: orderedIndex != null && !editing ? "none" : undefined,
                 background: cardBg,
-                border: `1px solid ${C.forest}`,
+                // The card fill is the terminal's own color so it reads as part of the terminal; a
+                // 2px border in the SIDEBAR color (C.deepForest, lighter than C.forest) then outlines
+                // the card shape so its text is distinguishable from the terminal text behind it.
+                // Hover-only (non-active) cards keep the thin forest border on their bubble fill.
+                border: `${mergeIntoTerminal ? "2px" : "1px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
                 borderRadius: "8px 8px 0 8px",
               }}
             >
@@ -1535,7 +1600,9 @@ function AgentRow({
                 pointerEvents: "auto",
                 boxSizing: "border-box",
                 marginLeft: colW,
-                marginTop: -1,
+                // Lap the strip's bottom border (2px when active, else 1px) so the two halves read
+                // as one continuous outline.
+                marginTop: mergeIntoTerminal ? -2 : -1,
                 width: ext,
                 userSelect: orderedIndex != null && !editing ? "none" : undefined,
                 // flex-shrink + scroll within the wrapper's maxH budget (minus the strip), so the
@@ -1546,9 +1613,11 @@ function AgentRow({
                 padding: "2px 10px 8px",
                 cursor: "pointer",
                 background: cardBg,
-                borderLeft: `1px solid ${C.forest}`,
-                borderRight: `1px solid ${C.forest}`,
-                borderBottom: `1px solid ${C.forest}`,
+                // Same outline as the strip (2px sidebar color when active) continues down the L's
+                // left/right/bottom so the whole card is encapsulated against the terminal behind it.
+                borderLeft: `${mergeIntoTerminal ? "2px" : "1px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
+                borderRight: `${mergeIntoTerminal ? "2px" : "1px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
+                borderBottom: `${mergeIntoTerminal ? "2px" : "1px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
                 borderRadius: "0 0 8px 8px",
               }}
             >

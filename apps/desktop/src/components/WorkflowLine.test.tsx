@@ -28,6 +28,16 @@ describe("WorkflowLine", () => {
     expect((label as HTMLElement).style.color).toBe(hexToRgbStyle(stageLineColor("merged")));
   });
 
+  it("keeps a minWidth floor on the bar so a long expanded label can't squash it to zero", () => {
+    // Regression: in a narrow flex container the expanded nowrap status label ate all the width and
+    // collapsed the flex:1 bar to ~0 (workers showed no progress bar). The track carries a minWidth
+    // floor so the bar stays visible regardless of the label's length. jsdom does no layout, so we
+    // assert the floor style is present on the track element itself.
+    const { container } = render(<WorkflowLine stage="building_saved" expanded />);
+    const track = container.querySelector('div[role="img"]') as HTMLElement;
+    expect(parseInt(track.style.minWidth, 10)).toBeGreaterThan(0);
+  });
+
   it("shows a sticky ✓ once shipped — even when the bar has reset to an earlier stage", () => {
     // A new cycle resets the live stage back to Committed, but a prior ship keeps the ✓.
     const { rerender } = render(<WorkflowLine stage="building_saved" shipped />);
