@@ -1,8 +1,11 @@
-import { describe, it, expect } from "vitest";
+// @vitest-environment jsdom
+import { describe, it, expect, vi } from "vitest";
 import {
   setWindowProject,
   clearWindowProject,
   findWindowForProject,
+  onWindowRegistryChange,
+  resetWindowRegistry,
 } from "./windowRegistry";
 
 function fakeStore() {
@@ -44,5 +47,19 @@ describe("windowRegistry", () => {
     expect(findWindowForProject("p1", s)).toBeNull();
     setWindowProject("main", "p1", s); // must not throw
     expect(findWindowForProject("p1", s)).toBe("main");
+  });
+
+  // The roster publisher relies on same-window writes broadcasting a local event (the `storage`
+  // event only fires in OTHER windows) so it re-pushes the open set immediately.
+  it("notifies same-window subscribers on every mutation, incl. reset", () => {
+    const cb = vi.fn();
+    const off = onWindowRegistryChange(cb);
+    setWindowProject("main", "p1"); // default store = jsdom localStorage
+    clearWindowProject("main");
+    resetWindowRegistry();
+    expect(cb).toHaveBeenCalledTimes(3);
+    off();
+    setWindowProject("main", "p2");
+    expect(cb).toHaveBeenCalledTimes(3); // no calls after unsubscribe
   });
 });

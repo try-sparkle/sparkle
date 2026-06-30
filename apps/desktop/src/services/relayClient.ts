@@ -10,6 +10,7 @@
 import { io, type Socket } from "socket.io-client";
 import { invoke } from "@tauri-apps/api/core";
 import { onPtyOutput, writePty } from "../pty";
+import { getAgentScrollback } from "./terminalScrollback";
 import {
   authorizeAgentInput,
   authorizeDecision,
@@ -45,6 +46,7 @@ export interface RosterAgentPayload {
   status_label: string;
   parent_id: string | null;
   workflow_stage?: string | null;
+  last_activity_at?: number | null; // epoch ms of the user's last touch; drives the elapsed timer
 }
 export interface RosterPayload {
   projects: Array<{ id: string; name: string; agents: RosterAgentPayload[] }>;
@@ -96,9 +98,13 @@ export async function startRelayHost(): Promise<void> {
     registered = false;
   });
 
-  // The phone drilled into an agent — start/stop streaming that agent's terminal.
+  // The phone drilled into an agent — start streaming that agent's terminal, and immediately send
+  // a snapshot of its existing history so the phone shows where the agent IS, not just new bytes.
   socket.on("watch", (w: { agent_id?: string }) => {
-    if (w && typeof w.agent_id === "string") watched.add(w.agent_id);
+    if (!w || typeof w.agent_id !== "string") return;
+    watched.add(w.agent_id);
+    const history = getAgentScrollback(w.agent_id);
+    if (history && registered) socket?.emit("agent_output", { agent_id: w.agent_id, chunk: history });
   });
   socket.on("unwatch", (w: { agent_id?: string }) => {
     if (w && typeof w.agent_id === "string") watched.delete(w.agent_id);

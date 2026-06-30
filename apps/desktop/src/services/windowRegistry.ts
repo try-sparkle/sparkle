@@ -29,8 +29,28 @@ function read(store: KV): Record<string, string> {
   }
 }
 
+// Same-window listeners don't get the `storage` event (that only fires in OTHER windows), so we
+// also broadcast a local event on every write. Lets the roster publisher re-push the open-project
+// set the instant a window opens/closes a project — see onWindowRegistryChange.
+const LOCAL_CHANGE_EVENT = "sparkle:window-registry";
+
 function write(store: KV, map: Record<string, string>): void {
   store.setItem(WINDOW_REGISTRY_KEY, JSON.stringify(map));
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(LOCAL_CHANGE_EVENT));
+}
+
+/** Subscribe to registry changes from THIS window (local event) and OTHER windows (storage). */
+export function onWindowRegistryChange(cb: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  const onStorage = (e: StorageEvent) => {
+    if (e.key === null || e.key === WINDOW_REGISTRY_KEY) cb();
+  };
+  window.addEventListener(LOCAL_CHANGE_EVENT, cb);
+  window.addEventListener("storage", onStorage);
+  return () => {
+    window.removeEventListener(LOCAL_CHANGE_EVENT, cb);
+    window.removeEventListener("storage", onStorage);
+  };
 }
 
 export function setWindowProject(label: string, projectId: string, store: KV = defaultStore()): void {
@@ -48,7 +68,7 @@ export function clearWindowProject(label: string, store: KV = defaultStore()): v
 /** Wipe the whole registry. Used by the main window at cold start to drop stale cross-session
  *  entries (the blob outlives the process, but windows don't). */
 export function resetWindowRegistry(store: KV = defaultStore()): void {
-  store.setItem(WINDOW_REGISTRY_KEY, "{}");
+  write(store, {}); // via write() so same-window subscribers (onWindowRegistryChange) are notified
 }
 
 /** Is the window with this exact label currently registered (open)? Label-keyed — the symmetric

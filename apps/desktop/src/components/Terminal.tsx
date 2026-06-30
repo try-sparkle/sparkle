@@ -11,6 +11,7 @@ import type { AgentTabStatus } from "../types";
 import { spawnPty, writePty, killPty, resizePty, onPtyOutput, onPtyExit, ignorePtyGone } from "../pty";
 import { StatusEngine } from "../engine/statusEngine";
 import { snapshotScreen } from "../engine/screenSnapshot";
+import { registerScrollback, serializeScrollback } from "../services/terminalScrollback";
 import { useUiStore } from "../stores/uiStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { isComposerToggleKey } from "./composerToggle";
@@ -217,6 +218,10 @@ export function Terminal({
     }
     termRef.current = term;
     fitRef.current = fit;
+    // Expose this agent's terminal history so the relay can send it to a watching phone.
+    const unregisterScrollback = registerScrollback(agentId, () =>
+      serializeScrollback(term.buffer.active),
+    );
     // Let the parent move focus into the terminal imperatively (⌘J / composer minimize).
     if (focusRef) focusRef.current = () => term.focus();
 
@@ -489,6 +494,7 @@ export function Terminal({
 
     return () => {
       disposed = true;
+      unregisterScrollback();
       if (focusRef) focusRef.current = null;
       if (apiRef) apiRef.current = null;
       ro.disconnect();
