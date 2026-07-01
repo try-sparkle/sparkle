@@ -1508,7 +1508,10 @@ function AgentRow({
             justifyContent: "center",
           }}
         >
-          {expanded ? (
+          {/* The × close control lives in this slot on hover (expanded) — AND persistently on the
+              ACTIVE row, whose output fills the main pane, so the agent you're looking at always has
+              a visible way to close it (the status stays legible via the status-colored title). */}
+          {expanded || isActive ? (
             <CloseAgentButton onClose={onClose} width={glyphWidth} />
           ) : (
             <span

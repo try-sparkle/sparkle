@@ -95,6 +95,26 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+describe("AgentSidebar — persistent close on the active row", () => {
+  it("shows the Close button on the ACTIVE (selected) row WITHOUT hovering", () => {
+    const project = buildAgentProject();
+    // The row the user is looking at — its output fills the main pane — is the selected/active one.
+    useProjectStore.setState({ projects: [{ ...project, selectedAgentId: "a1" }] } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
+    // No mouseEnter: the active row must expose a persistent close affordance, not a hover-only one.
+    expect(screen.getByLabelText("Close agent")).toBeTruthy();
+  });
+
+  it("does NOT show the Close button on a non-active row until hovered", () => {
+    const project = buildAgentProject();
+    useProjectStore.setState({ projects: [{ ...project, selectedAgentId: null }] } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
+    expect(screen.queryByLabelText("Close agent")).toBeNull(); // hover-gated for inactive rows
+  });
+});
+
 describe("AgentSidebar — close → Ship/Save/Discard", () => {
   it("prompts (does not silently close) when the agent has unmerged work", () => {
     buildAgentProject();
