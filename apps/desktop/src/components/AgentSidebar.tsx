@@ -34,6 +34,7 @@ import { type Bead } from "../services/beads";
 import { orderedTopLevelAgents, firstVisibleAgentId } from "../engine/agentOrdering";
 import { withUnstartedWorkerAttention } from "../engine/workerAttention";
 import { reconcileWorkMode } from "../engine/workMode";
+import { selectAndOpen } from "../useAttentionNotifications";
 import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
 import { LogoWaveform } from "./LogoWaveform";
@@ -252,8 +253,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // race where that window closed between render and click).
   const onOtherWindowAgentClick = (a: OtherWindowAgent) => {
     if (project && a.projectId === project.id) {
-      open(a.agentId);
-      selectAgent(a.projectId, a.agentId);
+      // Same project shown here too: focus in place via the shared reveal (leaves any Sparkle/board
+      // overlay AND switches the chevron to the agent's kind, so it's surfaced even from Plan mode —
+      // where the reconcile effect alone wouldn't switch). Same path a cross-WINDOW jump takes.
+      selectAndOpen(a.projectId, a.agentId);
       return;
     }
     if (findWindowForProject(a.projectId) != null) {

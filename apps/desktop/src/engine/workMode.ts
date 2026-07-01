@@ -11,6 +11,17 @@ import type { AgentKind } from "../types";
 
 export type WorkMode = "think" | "plan" | "build";
 
+/** The work mode whose sidebar surfaces an agent of this kind: Think for think agents, Build for
+ *  everything else (build / worker / shell). Used when we need to REVEAL a specific agent (e.g. a
+ *  cross-window "needs attention" jump) — switching to this mode un-hides an agent the current mode
+ *  filter was dropping. Gate-aware: a `think` agent maps to Build when the AI/brainstorm feature is
+ *  OFF (there's no Think chevron then), so we never ask for a mode that can't be shown — and so a
+ *  reveal can't fight `reconcileWorkMode` (which also refuses gated-off Think). This is the single
+ *  kind→mode mapping `reconcileWorkMode` uses too, so the two can't drift. */
+export function revealModeForKind(kind: AgentKind, aiBrainstorm: boolean): WorkMode {
+  return kind === "think" && aiBrainstorm ? "think" : "build";
+}
+
 /**
  * The work mode that should be active given what the pane is showing, or `null` when no change is
  * warranted. Rules, in order:
@@ -33,11 +44,9 @@ export function reconcileWorkMode(
   // Never strand the user on the Think chevron when the feature is gated off.
   if (mode === "think" && !aiBrainstorm) return "build";
   if (!selectedKind) return null;
-  const desired: WorkMode = selectedKind === "think" ? "think" : "build";
-  // Gated-off Think: a think agent can still be the selection (the gate flipped off, or a restored
-  // boot selection points at one), but we refuse to switch the chevron INTO a hidden Think section.
-  // The pane will show that think agent under a Build chevron — an accepted, obscure drift we leave
-  // un-reconciled rather than force-enable a gated feature. ("never enable Think when gated" wins.)
-  if (desired === "think" && !aiBrainstorm) return null;
+  // revealModeForKind maps a gated-off think agent to Build, so `desired` is never a hidden mode:
+  // a selected think agent while gated stays under the Build chevron (its pane still shows by kind)
+  // rather than force-enabling a gated feature — an accepted, obscure drift.
+  const desired = revealModeForKind(selectedKind, aiBrainstorm);
   return desired === mode ? null : desired;
 }

@@ -24,6 +24,9 @@ import {
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useSettingsStore } from "./stores/settingsStore";
 import { useProjectStore } from "./stores/projectStore";
+import { useUiStore } from "./stores/uiStore";
+import { revealModeForKind } from "./engine/workMode";
+import { aiFeatureNow } from "./services/aiGate";
 import {
   useCurrentProjectId,
   useCurrentWindowLabel,
@@ -73,8 +76,24 @@ async function bringToFront(): Promise<void> {
   }
 }
 
-/** Mount the agent (so its pane exists) and make it the selected tab. */
-function selectAndOpen(projectId: string, agentId: string): void {
+/** Mount the agent (so its pane exists) and make it the selected tab — and crucially REVEAL it.
+ *  A cross-window "needs attention" jump lands here in the owning window, but that window may be
+ *  showing a special overlay (Sparkle/Plan board) or sitting on a chevron whose mode filter HIDES
+ *  this agent (the publish side advertises every red agent regardless of kind/mode, while the
+ *  sidebar only paints the current mode's rows). Selecting alone would leave the agent filtered out
+ *  of view — the "it's red somewhere but I can't find it" report. So leave any special overlay and
+ *  switch the chevron to the agent's kind first, so the agent is actually surfaced and shown. */
+export function selectAndOpen(projectId: string, agentId: string): void {
+  const agent = useProjectStore
+    .getState()
+    .projects.find((p) => p.id === projectId)
+    ?.agents.find((a) => a.id === agentId);
+  useUiStore.getState().setActiveSpecial(null);
+  // Gate-aware so this can't fight reconcileWorkMode: a gated-off think agent maps to Build (its
+  // ThinkPanel pane still shows by kind; only the chevron/row stays on Build).
+  if (agent) {
+    useUiStore.getState().setWorkMode(revealModeForKind(agent.kind, aiFeatureNow("brainstorm")));
+  }
   useRuntimeStore.getState().open(agentId);
   useProjectStore.getState().selectAgent(projectId, agentId);
 }

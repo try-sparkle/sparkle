@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { reconcileWorkMode } from "./workMode";
+import { reconcileWorkMode, revealModeForKind } from "./workMode";
 
 describe("reconcileWorkMode", () => {
   it("syncs the chevron to the selected agent's kind", () => {
@@ -49,5 +49,28 @@ describe("reconcileWorkMode", () => {
       expect(reconcileWorkMode("build", "build", false, false)).toBeNull();
       expect(reconcileWorkMode("worker", "build", false, false)).toBeNull();
     });
+  });
+});
+
+describe("revealModeForKind", () => {
+  it("maps think → Think (gate on) and everything else → Build", () => {
+    expect(revealModeForKind("think", true)).toBe("think");
+    expect(revealModeForKind("build", true)).toBe("build");
+    expect(revealModeForKind("worker", true)).toBe("build");
+    expect(revealModeForKind("shell", true)).toBe("build");
+  });
+
+  it("maps a think agent to Build when the gate is OFF (no Think chevron to reveal into)", () => {
+    expect(revealModeForKind("think", false)).toBe("build");
+    expect(revealModeForKind("build", false)).toBe("build");
+  });
+
+  it("agrees with reconcileWorkMode so a reveal can't be undone by the reconcile effect", () => {
+    // Reveal a gated-off think agent → Build; reconcile then keeps Build (no ping-pong).
+    const revealed = revealModeForKind("think", false); // "build"
+    expect(reconcileWorkMode("think", revealed, false, false)).toBeNull();
+    // Reveal a gate-on think agent → Think; reconcile keeps Think.
+    const revealedOn = revealModeForKind("think", true); // "think"
+    expect(reconcileWorkMode("think", revealedOn, false, true)).toBeNull();
   });
 });
