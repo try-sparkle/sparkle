@@ -15,15 +15,19 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Encode an absolute directory path into Claude Code's `projects` slug: every
-/// `/` and `.` becomes `-`.
+/// character that is NOT an ASCII alphanumeric becomes `-`, applied 1:1 per
+/// character (consecutive separators are NOT collapsed — e.g. `/.sparkle`
+/// yields `--sparkle`).
 ///
-/// NOTE: this mirrors Claude Code's scheme for the paths we actually feed it —
-/// agent worktree paths, which only contain `/`, `.`, `-`, and alphanumerics.
-/// Claude's full encoding transforms additional characters (spaces, `~`, …); we
-/// don't reproduce those because our worktree paths never contain them.
+/// This mirrors Claude Code's real encoding. It matters on macOS, where agent
+/// worktrees live under `~/Library/Application Support/ai.sparkle.desktop/…`:
+/// the SPACE in "Application Support" (and the `.` in `ai.sparkle.desktop`) must
+/// map to `-` so the computed slug matches Claude's actual transcript directory.
+/// A prior version replaced only `/` and `.`, leaving the space intact — so
+/// `claude_has_session` never matched and agents never resumed.
 fn encode_project_slug(path: &str) -> String {
     path.chars()
-        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
 }
 
@@ -290,6 +294,50 @@ mod tests {
             ),
             "-Users-drodio-Projects-sparkle-desktop--sparkle-worktrees-d9c408cc-b15d"
         );
+    }
+
+    #[test]
+    fn encode_project_slug_replaces_spaces_like_claude() {
+        // macOS agent worktrees live under `~/Library/Application Support/...`.
+        // The SPACE in "Application Support" must become `-`, exactly as Claude
+        // Code encodes it — every non-alphanumeric char maps to `-`, 1:1 (no
+        // collapsing of consecutive separators).
+        assert_eq!(
+            encode_project_slug("/Users/x/Application Support/wt"),
+            "-Users-x-Application-Support-wt"
+        );
+    }
+
+    #[test]
+    fn has_session_resolves_space_path_to_dash_dir() {
+        // End-to-end proof of the macOS crisis fix: a worktree path containing a
+        // space must resolve to Claude's real transcript dir (space→dash). We seed
+        // a `<uuid>.jsonl` under the correctly-encoded name and assert has_session
+        // sees it — while the OLD space-PRESERVING name would miss entirely.
+        let home = unique_home("space-path");
+        let worktree = "/Users/x/Library/Application Support/ai.sparkle.desktop/worktrees/wt";
+
+        // The correctly-encoded dir Claude Code actually uses.
+        seed_session(&claude_session_dir_for(&home_root(&home), worktree));
+        assert!(claude_has_session_in(None, Some(&home), worktree));
+
+        // Prove the seeded dir's name has NO space (it was dashed), so the old
+        // space-preserving encoder — which left "Application Support" intact —
+        // would have looked in a directory that does not exist.
+        let old_slug: String = worktree
+            .chars()
+            .map(|c| if c == '/' || c == '.' { '-' } else { c })
+            .collect();
+        assert!(
+            old_slug.contains(' '),
+            "old encoder leaves the space intact"
+        );
+        assert!(
+            !home_root(&home).join(&old_slug).exists(),
+            "old space-preserving slug points at a nonexistent dir → has_session would miss"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
