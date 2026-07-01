@@ -226,6 +226,7 @@ describe("ThinkPanel — routing + wiring", () => {
       cloudDictation: false,
       aiBrainstorm: false,
       aiComposer: false,
+      aiSuggestedActions: false,
     } as never);
     render(<ThinkPanel project={project} agentId="a1" visible />);
     typeAndSend("@chief what's the risk?");
@@ -241,6 +242,7 @@ describe("ThinkPanel — routing + wiring", () => {
       cloudDictation: false,
       aiBrainstorm: false,
       aiComposer: false,
+      aiSuggestedActions: false,
     } as never);
     render(<ThinkPanel project={project} agentId="a1" visible />);
     typeAndSend("@architect is this scalable?");
@@ -258,6 +260,7 @@ describe("ThinkPanel — routing + wiring", () => {
       cloudDictation: false,
       aiBrainstorm: false,
       aiComposer: false,
+      aiSuggestedActions: false,
     } as never);
     fireEvent.click(screen.getByText("Make a Plan"));
     await waitFor(() => expect(screen.getByText(/AI features are off/)).toBeTruthy());
@@ -305,6 +308,7 @@ describe("ThinkPanel — routing + wiring", () => {
       cloudDictation: false,
       aiBrainstorm: false,
       aiComposer: false,
+      aiSuggestedActions: false,
     } as never);
     render(<ThinkPanel project={project} agentId="a1" visible />);
     typeAndSend("@chief blocked but visible");

@@ -30,13 +30,14 @@ describe("configActions", () => {
   it("setAllAiFeatures updates all flags and writes them in ONE atomic call", async () => {
     await setAllAiFeatures(false);
     const s = useSettingsStore.getState();
-    expect([s.aiAutoRename, s.cloudDictation, s.aiBrainstorm, s.aiComposer]).toEqual([
-      false,
-      false,
-      false,
-      false,
-    ]);
-    // A single batched write — not four separate ones (the anti-flicker fix).
+    expect([
+      s.aiAutoRename,
+      s.cloudDictation,
+      s.aiBrainstorm,
+      s.aiComposer,
+      s.aiSuggestedActions,
+    ]).toEqual([false, false, false, false, false]);
+    // A single batched write — not separate ones (the anti-flicker fix).
     expect(setConfigValues).toHaveBeenCalledTimes(1);
     expect(setConfigValue).not.toHaveBeenCalled();
     expect(setConfigValues).toHaveBeenCalledWith({
@@ -44,6 +45,7 @@ describe("configActions", () => {
       "ai.voice_dictation": false,
       "ai.brainstorm": false,
       "ai.composer": false,
+      "ai.suggested_actions": false,
     });
   });
 
