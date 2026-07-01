@@ -1,6 +1,6 @@
 [package]
 name = "sparkle"
-version = "0.7.1"
+version = "0.9.0"
 edition = "2021"
 description = "Sparkle desktop (macOS)"
 

@@ -90,6 +90,11 @@ interface UiState {
   // switch tabs. NOT persisted (see partialize) — resets to "build" each launch like the old local state.
   workMode: WorkMode;
   setWorkMode: (m: WorkMode) => void;
+  // Whether ANY "+ New Build Agent" button is currently hovered. Shared so hovering the empty-state
+  // start button on the Workspace also lights up the sidebar's button blue (and vice versa),
+  // pointing the user at where that affordance normally lives. Transient — NOT persisted.
+  buildAgentHover: boolean;
+  setBuildAgentHover: (v: boolean) => void;
   // Per build-agent: whether its worker subtree is collapsed in the sidebar. A build agent's
   // workers start COLLAPSED (a missing entry reads as collapsed) so a busy orchestrator shows a
   // compact "N workers" roll-up by default; the user expands to see each worker's own tracker.
@@ -121,6 +126,8 @@ export const useUiStore = create<UiState>()(
       setAgentOrdering: (v) => set({ agentOrdering: v }),
       workMode: "build",
       setWorkMode: (m) => set({ workMode: m }),
+      buildAgentHover: false,
+      setBuildAgentHover: (v) => set({ buildAgentHover: v }),
       collapsedOrchestrators: {},
       // Absent → collapsed (workers start hidden behind the roll-up).
       isOrchestratorCollapsed: (id) => get().collapsedOrchestrators[id] ?? true,
@@ -133,10 +140,11 @@ export const useUiStore = create<UiState>()(
     {
       name: "sparkle-ui",
       storage: createJSONStorage(() => localStorage),
-      // Persist everything EXCEPT workMode, so the active sidebar tab resets to "build" on each
-      // launch (matching the prior local-useState default) while every other UI preference still
-      // sticks. Spreading `rest` keeps all existing persisted keys — only workMode is dropped.
-      partialize: ({ workMode: _workMode, ...rest }) => rest,
+      // Persist everything EXCEPT workMode and buildAgentHover, so the active sidebar tab resets to
+      // "build" on each launch (matching the prior local-useState default) and the transient hover
+      // flag never persists, while every other UI preference still sticks. Spreading `rest` keeps
+      // all existing persisted keys.
+      partialize: ({ workMode: _workMode, buildAgentHover: _buildAgentHover, ...rest }) => rest,
       // v1: the rest height shrank from 128 to the compact COMPOSER_SNAP. The pure
       // migratePersistedUi resets only users still parked on the OLD default, preserving a
       // height anyone deliberately dragged to. (composerMinimized hydrates from its default

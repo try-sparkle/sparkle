@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow, getAllWindows } from "@tauri-apps/api/window";
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT, FONT_WEIGHT, ON_BRAND_FILL_DARK } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
-import { AgentSidebar } from "./AgentSidebar";
+import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
+import { AgentSidebar, NewBuildAgentButton } from "./AgentSidebar";
 import { TopBar } from "./TopBar";
 import { OfflineBanner } from "./OfflineBanner";
 import { AgentPane } from "./AgentPane";
@@ -130,6 +131,9 @@ export function Workspace() {
 
   const project = projects.find((p) => p.id === currentProjectId) ?? null;
   const activeAgentId = project?.selectedAgentId ?? null;
+  // Lets the empty-state start button create a build agent exactly like the sidebar's "+ New Build
+  // Agent" row does (same hook → same behavior).
+  const spawnBuild = useSpawnBuildAgent(project);
 
   // Only mount THIS window's project's agents. Each window owns one project; mounting every
   // project's agents in every window would attach two xterms to the same PTY.
@@ -215,7 +219,26 @@ export function Workspace() {
             </Hint>
           )}
           {!sparkleActive && !boardActive && project && project.agents.length === 0 && (
-            <Hint title={project.name}>Add an agent (left) to begin.</Hint>
+            <Hint title={project.name}>
+              {/* The same "+ New Build Agent" button as the sidebar, so the user can start a build
+                  agent right here. Hovering it also lights up the sidebar's copy blue (shared
+                  buildAgentHover flag), pointing at where the affordance normally lives. */}
+              <div style={{ width: 240, margin: "0 auto" }}>
+                <NewBuildAgentButton onClick={spawnBuild} />
+              </div>
+              {/* ~3 blank rows of breathing room before the tour line. */}
+              <div style={{ height: 60 }} />
+              <div
+                style={{
+                  fontSize: 24,
+                  fontWeight: FONT_WEIGHT.semibold,
+                  color: C.cream,
+                  lineHeight: 1.5,
+                }}
+              >
+                Press <KbdKey>⌃ Ctrl</KbdKey> key to take a tour. Happy tokenmaxxing!
+              </div>
+            </Hint>
           )}
           {!sparkleActive && !boardActive && project && project.agents.length > 0 && !activeAgentId && (
             <Hint title={project.name}>Pick an agent on the left.</Hint>
@@ -280,5 +303,30 @@ function Hint({ title, children }: { title: string; children: React.ReactNode })
       <div style={{ fontSize: 18, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>{title}</div>
       <div style={{ color: C.muted, maxWidth: 420, lineHeight: 1.5 }}>{children}</div>
     </div>
+  );
+}
+
+// A keycap "chiclet" — the same gold pill the keyboard-hint overlay uses (HintOverlay.tsx), reused
+// inline in copy to render a physical key (e.g. the ⌃ Ctrl key). Sits on the text baseline center.
+function KbdKey({ children }: { children: React.ReactNode }) {
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        verticalAlign: "middle",
+        margin: "0 3px",
+        background: C.amber, // gold #e0982f
+        color: ON_BRAND_FILL_DARK, // dark navy, constant across themes
+        font: `700 15px/1 ${FONT.mono}`,
+        letterSpacing: 0.5,
+        padding: "3px 8px",
+        borderRadius: 5,
+        border: `1px solid ${ON_BRAND_FILL_DARK}`,
+        boxShadow: "0 1px 3px rgba(0,0,0,0.4)",
+        textTransform: "uppercase",
+      }}
+    >
+      {children}
+    </span>
   );
 }

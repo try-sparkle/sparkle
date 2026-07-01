@@ -50,7 +50,7 @@ import { findWindowForProject } from "../services/windowRegistry";
 import { openProjectInWindow, defaultDeps } from "../services/projectWindows";
 import { resolveStage, rollupStages, stageFraction, stageIndex, LINE_FROM, LINE_TO } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
-import { createBeadFull } from "../services/tasks";
+import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
 import { CloseWorkerPrompt } from "./CloseWorkerPrompt";
 import { CloseAgentPrompt } from "./CloseAgentPrompt";
 import { BalanceBadge } from "./BalanceBadge";
@@ -188,28 +188,41 @@ const SidebarScrollContext = createContext<SidebarScrollApi | null>(null);
 // The "+ New <kind> Agent" button. On hover the dotted outline becomes a solid stroke and the
 // icon + label light up in the mode's brand color — the same blue/cyan as that mode's chevron
 // (Build → FADE_3 brand blue, Think → FADE_0 logo cyan). The background is left unchanged.
+// `sharedHover`/`onHoverChange` let a SECOND instance of the button elsewhere (the Workspace
+// empty-state start button) drive this one blue too, so hovering either lights up both.
 function NewAgentRow({
   icon,
   label,
   hoverColor,
   onClick,
+  sharedHover,
+  onHoverChange,
 }: {
   icon: React.ReactNode;
   label: string;
   hoverColor: string;
   onClick: () => void;
+  sharedHover?: boolean;
+  onHoverChange?: (v: boolean) => void;
 }) {
   const [hover, setHover] = useState(false);
+  const lit = hover || !!sharedHover;
   return (
     <button
       onClick={onClick}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
+      onMouseEnter={() => {
+        setHover(true);
+        onHoverChange?.(true);
+      }}
+      onMouseLeave={() => {
+        setHover(false);
+        onHoverChange?.(false);
+      }}
       style={{
         ...DASHED_ROW_STYLE,
-        borderStyle: hover ? "solid" : "dashed",
-        borderColor: hover ? hoverColor : C.muted,
-        color: hover ? hoverColor : C.muted,
+        borderStyle: lit ? "solid" : "dashed",
+        borderColor: lit ? hoverColor : C.muted,
+        color: lit ? hoverColor : C.muted,
       }}
     >
       {icon}
@@ -218,11 +231,32 @@ function NewAgentRow({
   );
 }
 
+// The Build variant of NewAgentRow, wired to the shared `buildAgentHover` flag so every instance
+// (the sidebar's row AND the Workspace empty-state start button) highlights in sync. Exported so
+// the Workspace can drop the exact same button in place of its old "Add an agent" hint text.
+export function NewBuildAgentButton({ onClick }: { onClick: () => void }) {
+  const buildAgentHover = useUiStore((s) => s.buildAgentHover);
+  const setBuildAgentHover = useUiStore((s) => s.setBuildAgentHover);
+  // Clear the shared flag if this button unmounts while hovered — clicking the empty-state instance
+  // spawns an agent, which unmounts it before onMouseLeave can fire, otherwise leaving the sidebar's
+  // copy stuck blue. Any still-hovered sibling re-lights itself via its own local hover state.
+  useEffect(() => () => setBuildAgentHover(false), [setBuildAgentHover]);
+  return (
+    <NewAgentRow
+      icon={<span style={{ fontSize: 20, lineHeight: 0 }}>⚒</span>}
+      label="+ New Build Agent"
+      hoverColor={FADE_3}
+      onClick={onClick}
+      sharedHover={buildAgentHover}
+      onHoverChange={setBuildAgentHover}
+    />
+  );
+}
+
 export function AgentSidebar({ project }: { project: Project | null }) {
   const selectAgent = useProjectStore((s) => s.selectAgent);
   const touchProjectOpened = useProjectStore((s) => s.touchProjectOpened);
   const addAgent = useProjectStore((s) => s.addAgent);
-  const setAgentBeadId = useProjectStore((s) => s.setAgentBeadId);
   const removeAgent = useProjectStore((s) => s.removeAgent);
   const open = useRuntimeStore((s) => s.open);
   const close = useRuntimeStore((s) => s.close);
@@ -419,29 +453,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     setActiveSpecial("board");
   };
   // Spawn a build agent AND auto-create a bead for it, so every piece of build work is tracked
-  // from the start (it floors at "Planned" until code work begins). The agent is created
-  // synchronously (immediately usable); the bead is created async + best-effort and attached when
-  // `bd` returns — a build agent without a bead is still fine if bd is unavailable.
-  const spawnBuildAgent = () => {
-    if (!project) return;
-    const proj = project;
-    const id = addAgent(proj.id, { kind: "build" });
-    selectAgent(proj.id, id);
-    open(id);
-    // Title the bead with the agent's (default) name so beads stay distinguishable on the board
-    // rather than a row of identical placeholders. (Syncing the title when the agent auto-renames
-    // from its first prompt is a follow-up.) Note: if the user removes the agent within the sub-
-    // second `bd create` window, the bead is orphaned — an accepted best-effort tradeoff that the
-    // Discard/prune flows mop up.
-    const title =
-      useProjectStore
-        .getState()
-        .projects.find((p) => p.id === proj.id)
-        ?.agents.find((a) => a.id === id)?.name ?? "Build task";
-    void createBeadFull(proj.rootPath, title, "", "task", "", "", "")
-      .then((beadId) => setAgentBeadId(proj.id, id, beadId))
-      .catch((e) => console.warn("auto-bead creation failed (bd unavailable?):", e));
-  };
+  // from the start (it floors at "Planned" until code work begins). Shared with the Workspace
+  // empty-state start button via the useSpawnBuildAgent hook so both create agents identically.
+  const spawnBuildAgent = useSpawnBuildAgent(project);
   const onPickBuild = () => {
     const alreadyHere = mode === "build" && activeSpecial === null;
     setMode("build");
@@ -457,10 +471,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const next = firstVisibleAgentId(project.agents, "build", agentOrdering, status);
     selectAgent(project.id, next);
     if (next) open(next);
-  };
-  const onAddBuild = () => {
-    setActiveSpecial(null);
-    spawnBuildAgent();
   };
   const onSelectSparkle = () => {
     setActiveSpecial("sparkle");
@@ -907,14 +917,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       >
         {/* Per-mode "+ New … Agent" affordance — the only way to create agents now that the chevrons
             are a selector. Sits above the (mode-filtered) list. Plan has none (no agents in Plan). */}
-        {project && mode === "build" && (
-          <NewAgentRow
-            icon={<span style={{ fontSize: 20, lineHeight: 0 }}>⚒</span>}
-            label="+ New Build Agent"
-            hoverColor={FADE_3}
-            onClick={onAddBuild}
-          />
-        )}
+        {project && mode === "build" && <NewBuildAgentButton onClick={spawnBuildAgent} />}
         {project && mode === "think" && aiBrainstorm && (
           <NewAgentRow
             icon={<TbBulb size={16} style={{ flexShrink: 0 }} />}
