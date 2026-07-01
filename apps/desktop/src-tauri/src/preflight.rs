@@ -21,10 +21,12 @@ pub struct ClaudeStatus {
     version: Option<String>,
 }
 
+#[cfg(unix)]
 fn login_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
+#[cfg(unix)]
 fn run_in_login_shell(script: &str) -> Option<String> {
     Command::new(login_shell())
         .args(["-lc", script])
@@ -40,6 +42,7 @@ fn run_in_login_shell(script: &str) -> Option<String> {
 /// shell (so `claude`'s `#!/usr/bin/env node` shebang resolves `node` off the user's PATH), but a
 /// path that contains a quote/space/`;`/`$(…)` must NOT be able to break out of the command — a
 /// quoted positional `"$1"` is substituted verbatim and never re-tokenized.
+#[cfg(unix)]
 fn run_in_login_shell_with_arg(script: &str, arg: &str) -> Option<String> {
     Command::new(login_shell())
         // The token after the script becomes $0; `arg` becomes $1.
@@ -51,9 +54,36 @@ fn run_in_login_shell_with_arg(script: &str, arg: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Windows: resolve a binary by name via `where`. Unlike macOS, a Windows GUI app inherits the
+/// user's PATH, so there's no login-shell dance — `where` returns the same matches a terminal
+/// would. Returns the first hit as an absolute path.
+#[cfg(not(unix))]
+fn resolve_on_path(bin: &str) -> Option<String> {
+    Command::new("where")
+        .arg(bin)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .find(|l| !l.is_empty())
+        })
+}
+
+/// Windows home directory (`%USERPROFILE%`, falling back to `HOME` for MSYS/Git-Bash setups).
+#[cfg(not(unix))]
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
 /// Canonical absolute locations the official installers use, in priority order.
 /// Covers the native installer (`~/.local/bin`), the legacy local install
 /// (`~/.claude/local`), and homebrew/npm global prefixes.
+#[cfg(unix)]
 fn known_claude_paths() -> Vec<PathBuf> {
     known_claude_paths_for(std::env::var_os("HOME").map(PathBuf::from))
 }
@@ -72,6 +102,7 @@ pub fn known_node_paths_for(home: Option<PathBuf>) -> Vec<PathBuf> {
 /// Resolve an absolute `node` path: prefer the login-shell `command -v node` (covers nvm/asdf and
 /// any PATH the user set up), then fall back to the canonical install locations. Returns None if
 /// node can't be found at all.
+#[cfg(unix)]
 pub fn resolve_node_path() -> Option<String> {
     run_in_login_shell("command -v node")
         .filter(|p| Path::new(p).is_absolute() && is_executable(Path::new(p)))
@@ -80,6 +111,12 @@ pub fn resolve_node_path() -> Option<String> {
                 std::env::var_os("HOME").map(PathBuf::from),
             ))
         })
+}
+
+/// Windows: prefer `where node`, then the canonical install locations.
+#[cfg(not(unix))]
+pub fn resolve_node_path() -> Option<String> {
+    resolve_on_path("node").or_else(|| first_executable(&known_node_paths_for(home_dir())))
 }
 
 /// Pure form of [`known_claude_paths`]: takes the home dir explicitly so it can be
@@ -96,11 +133,19 @@ fn known_claude_paths_for(home: Option<PathBuf>) -> Vec<PathBuf> {
 }
 
 /// True if `p` resolves to an existing, executable file (symlinks are followed).
+#[cfg(unix)]
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+/// Windows has no executable bit; treat any existing regular file as runnable. The candidate
+/// lists are absolute install paths, and the primary resolver on Windows is `where` anyway.
+#[cfg(not(unix))]
+fn is_executable(p: &Path) -> bool {
+    std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
 }
 
 /// First candidate that exists and is executable, as an absolute path string.
@@ -111,6 +156,7 @@ fn first_executable(candidates: &[PathBuf]) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+#[cfg(unix)]
 #[tauri::command]
 pub fn claude_preflight() -> ClaudeStatus {
     // 1. Login-shell PATH probe — handles npm/homebrew and any install whose dir
@@ -122,6 +168,26 @@ pub fn claude_preflight() -> ClaudeStatus {
     let version = path
         .as_ref()
         .and_then(|p| run_in_login_shell_with_arg("\"$1\" --version", p));
+    ClaudeStatus { installed: path.is_some(), path, version }
+}
+
+/// Windows: `where claude` (PATH is inherited by GUI apps), then the canonical install paths.
+/// The version probe runs through `cmd /c` so a `claude.cmd`/`.bat` shim is invoked correctly;
+/// a failure there just leaves `version: None` (detection of the binary is what matters).
+#[cfg(not(unix))]
+#[tauri::command]
+pub fn claude_preflight() -> ClaudeStatus {
+    let path =
+        resolve_on_path("claude").or_else(|| first_executable(&known_claude_paths_for(home_dir())));
+    let version = path.as_ref().and_then(|p| {
+        Command::new("cmd")
+            .args(["/c", p, "--version"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
     ClaudeStatus { installed: path.is_some(), path, version }
 }
 
@@ -180,6 +246,8 @@ mod tests {
         assert!(paths.iter().any(|p| p.ends_with("opt/homebrew/bin/node")));
     }
 
+    // Exercises the Unix login-shell arg-passing path; the helper it calls is Unix-only.
+    #[cfg(unix)]
     #[test]
     fn version_probe_passes_path_as_arg_not_shell_interpolation() {
         use std::os::unix::fs::PermissionsExt;

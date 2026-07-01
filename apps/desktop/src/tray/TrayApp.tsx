@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { C } from "@sparkle/ui";
 import { TrayDashboard } from "./TrayDashboard";
+import { TrayHeader, TrayFooter } from "./TrayChrome";
 import { bucketCounts, drawTrayIcon } from "./trayIcon";
 import type { TrayRoster } from "./trayRoster";
 import { getTrayRoster, onTrayRosterChanged, setTrayImage, emitFocusAgent } from "../services/attention";
@@ -51,16 +53,25 @@ export function TrayApp() {
     return () => { void safeUnlisten(p); };
   }, []);
 
+  const hide = () => void getCurrentWindow().hide();
+
+  // Pinned header (logo + balance + Recent/Open/New) and footer (Quit), with the agent dashboard
+  // scrolling between them. background on the root so the (deepForest) chrome and (forest) list
+  // share one surface with no gaps.
   return (
-    <div style={{ height: "100vh", overflowY: "auto" }}>
-      <TrayDashboard
-        roster={roster}
-        now={now}
-        onOpen={(projectId, agentId) => {
-          emitFocusAgent({ projectId, agentId });
-          void getCurrentWindow().hide();
-        }}
-      />
+    <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: C.forest }}>
+      <TrayHeader onAction={hide} />
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        <TrayDashboard
+          roster={roster}
+          now={now}
+          onOpen={(projectId, agentId) => {
+            emitFocusAgent({ projectId, agentId });
+            hide();
+          }}
+        />
+      </div>
+      <TrayFooter />
     </div>
   );
 }

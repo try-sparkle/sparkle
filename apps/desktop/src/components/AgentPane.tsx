@@ -729,6 +729,7 @@ function AccountBadge({
     <div style={{ position: "absolute", top: 12, right: 12, zIndex: 20 }}>
       <button
         type="button"
+        data-hint="account"
         title={tooltip}
         onClick={onToggle}
         style={{

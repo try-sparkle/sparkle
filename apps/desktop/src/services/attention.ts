@@ -107,3 +107,10 @@ export function setTrayImage(pngBase64: string): void {
   if (!hasTauri) return;
   void invoke("set_tray_image", { pngBase64 }).catch((e) => console.debug("set_tray_image failed", e));
 }
+
+/** Fully exit the app (the tray popover's "Quit Sparkle" button). Closing the main window only
+ *  hides it behind the tray; this is the real quit. No-op outside Tauri. */
+export function quitApp(): void {
+  if (!hasTauri) return;
+  void invoke("quit_app").catch((e) => console.debug("quit_app failed", e));
+}

@@ -862,6 +862,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               and Plan becomes the strip's flat-left start. The gate flag stays aiBrainstorm. */}
           {aiBrainstorm && (
             <button
+              data-hint="think"
               onClick={onPickThink}
               title="Think mode — your Think agents"
               // First in the strip: flat left, points right into Plan. Cyan ("S" color) leads; dark ink.
@@ -872,6 +873,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             </button>
           )}
           <button
+            data-hint="plan"
             onClick={onPickPlan}
             title="Plan mode — this project's read-only Tasks board"
             // Full chevron when Think is present (notch left + point right); flat-left start when not.
@@ -881,6 +883,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             <span>Plan</span>
           </button>
           <button
+            data-hint="build"
             onClick={onPickBuild}
             title="Build mode — your Build orchestrator agents"
             // Last in the strip: notched left (receives Plan's point), flat right. White ink.
@@ -1795,6 +1798,7 @@ function AgentRow({
     <>
       <div
         ref={rowRef}
+        data-hint="agent"
         {...dragProps}
         onClick={onSelect}
         onMouseEnter={show}
@@ -2213,6 +2217,7 @@ function SparkleAgentRow({
   const color = statusInk(AGENT_STATUS[status].color);
   return (
     <div
+      data-hint="improve"
       onClick={onSelect}
       title="Sparkle Improvement Agent — reviews your usage to make Sparkle better"
       style={{

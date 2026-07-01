@@ -57,6 +57,7 @@ import {
   shouldRestoreFromBar,
 } from "./composerDrag";
 import { isComposerToggleKey } from "./composerToggle";
+import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { arrowOverflowDirection } from "./composerArrowOverflow";
 import { useDictationStore } from "../stores/dictationStore";
 import {
@@ -683,7 +684,7 @@ export function Composer({
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (isComposerToggleKey(e)) {
+    if (isComposerToggleKey(e, useKeybindingsStore.getState().bindings.toggleComposer)) {
       // ⌘J: tuck the composer away and hand focus to the terminal (AgentPane moves it).
       e.preventDefault();
       setMinimized(true);
@@ -1083,6 +1084,7 @@ export function Composer({
           onDismiss={dismissSuggestion}
         />
         <button
+          data-hint="screenshot"
           onClick={() => void capture()}
           disabled={disabled || capturing}
           title="Capture a region of your screen"

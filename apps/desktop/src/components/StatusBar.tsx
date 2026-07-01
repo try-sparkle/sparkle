@@ -132,6 +132,7 @@ export function StatusBar() {
       </div>
       <span aria-hidden>·</span>
       <button
+        data-hint="changelog"
         onClick={onChangelog}
         title="Open the Sparkle changelog"
         style={{

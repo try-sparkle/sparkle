@@ -1,18 +1,14 @@
-// Pure decision: is this keystroke the composer⇄terminal focus toggle (⌘J)? Shared by the
-// composer textarea and the terminal so both surfaces recognize the same shortcut. ⌘J in the
+// Composer⇄terminal focus toggle: a thin semantic wrapper over the configurable shortcut matcher.
+// The binding (default ⌘J) is supplied by the caller from the keybindings store, so both the
+// composer textarea and the terminal recognize the SAME, user-rebindable shortcut. ⌘J in the
 // composer minimizes it and drops focus to the terminal (to answer a Claude menu); ⌘J in the
-// terminal restores the composer and focuses it. Ctrl/Alt are excluded so app/terminal combos
-// stay free. (Terminals send Ctrl+J as LF — Cmd+J is never forwarded to the PTY.)
-export interface ToggleKeyEvent {
-  type: string;
-  key: string;
-  metaKey: boolean;
-  ctrlKey: boolean;
-  altKey: boolean;
-}
+// terminal restores the composer and focuses it. (Terminals send Ctrl+J as LF — the default
+// Cmd+J is never forwarded to the PTY.)
+import { matchesChord, type KeyBinding, type KeyEventLike } from "../keyboardHints/keybindings";
 
-export function isComposerToggleKey(e: ToggleKeyEvent): boolean {
-  if (e.type !== "keydown") return false;
-  if (!e.metaKey || e.ctrlKey || e.altKey) return false;
-  return e.key.toLowerCase() === "j";
+export type ToggleKeyEvent = KeyEventLike;
+
+/** True when this keystroke is the configured composer⇄terminal toggle (a chord binding). */
+export function isComposerToggleKey(e: ToggleKeyEvent, binding: KeyBinding): boolean {
+  return matchesChord(e, binding);
 }

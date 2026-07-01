@@ -98,21 +98,39 @@ pub fn notify_attention(app: AppHandle, project_id: String, agent_id: String, ti
         return;
     }
     std::thread::spawn(move || {
-        // Releases the reserved slot on drop, even if n.send() panics on an ObjC error path.
+        // Releases the reserved slot on drop, even if delivery panics on an ObjC error path.
         let _slot = NotificationSlot;
-        let mut n = mac_notification_sys::Notification::new();
-        n.title(&title).message(&body).wait_for_click(true);
-        match n.send() {
-            // A tap on the banner body (Click) or its action button routes to the worker.
-            Ok(mac_notification_sys::NotificationResponse::Click)
-            | Ok(mac_notification_sys::NotificationResponse::ActionButton(_)) => {
-                let _ = app.emit("attention://focus-agent", FocusAgent { project_id, agent_id });
-            }
-            // Dismissed, ignored, or failed to deliver (e.g. unsigned dev binary): nothing to do.
-            _ => {}
-        }
+        deliver_attention_banner(&app, &project_id, &agent_id, &title, &body);
     });
 }
+
+/// Deliver the native attention banner. On macOS we use `mac-notification-sys` directly so a tap
+/// on the banner returns `Click`/`ActionButton`, which we turn into an `attention://focus-agent`
+/// event that jumps the UI to the worker that asked. `send()` blocks until the banner is clicked
+/// or dismissed, which is why the caller runs us on a detached thread.
+#[cfg(target_os = "macos")]
+fn deliver_attention_banner(app: &AppHandle, project_id: &str, agent_id: &str, title: &str, body: &str) {
+    let mut n = mac_notification_sys::Notification::new();
+    n.title(title).message(body).wait_for_click(true);
+    match n.send() {
+        // A tap on the banner body (Click) or its action button routes to the worker.
+        Ok(mac_notification_sys::NotificationResponse::Click)
+        | Ok(mac_notification_sys::NotificationResponse::ActionButton(_)) => {
+            let _ = app.emit(
+                "attention://focus-agent",
+                FocusAgent { project_id: project_id.to_string(), agent_id: agent_id.to_string() },
+            );
+        }
+        // Dismissed, ignored, or failed to deliver (e.g. unsigned dev binary): nothing to do.
+        _ => {}
+    }
+}
+
+/// Non-macOS fallback: no native banner yet. The dock/taskbar attention count
+/// (`set_window_attention`) still reflects every waiting agent, so nothing is silently lost. A
+/// clickable Windows toast that routes to the worker is tracked as a Phase-2 follow-up.
+#[cfg(not(target_os = "macos"))]
+fn deliver_attention_banner(_app: &AppHandle, _project_id: &str, _agent_id: &str, _title: &str, _body: &str) {}
 
 // Anchor symbol from objc/force_present.m. Referencing it forces the linker to retain that
 // object file so its ObjC category (which makes banners present even when Sparkle is frontmost)
@@ -127,12 +145,14 @@ extern "C" {
 /// at startup; the underlying setter is a no-op after the first success. Also pulls in the
 /// foreground-presentation category so banners show while Sparkle is the active app.
 pub fn init_application() {
-    let _ = mac_notification_sys::set_application("ai.sparkle.desktop");
-    // SAFETY: empty C function with no args/return; the only purpose of the call is to keep the
-    // category's object file in the link (see the anchor's definition).
     #[cfg(target_os = "macos")]
-    unsafe {
-        sparkle_force_present_anchor();
+    {
+        let _ = mac_notification_sys::set_application("ai.sparkle.desktop");
+        // SAFETY: empty C function with no args/return; the only purpose of the call is to keep
+        // the category's object file in the link (see the anchor's definition).
+        unsafe {
+            sparkle_force_present_anchor();
+        }
     }
 }
 

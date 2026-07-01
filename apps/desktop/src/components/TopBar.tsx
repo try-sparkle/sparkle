@@ -243,6 +243,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
 
       <div style={{ position: "relative" }}>
         <button
+          data-hint="recent"
           style={{ ...btn, position: "relative", zIndex: 42 }}
           onClick={() => setRecentOpen((v) => !v)}
         >
@@ -349,11 +350,12 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
         )}
       </div>
 
-      <button style={btn} onClick={() => startOpen("Open a project — choose its folder")}>
+      <button data-hint="open" style={btn} onClick={() => startOpen("Open a project — choose its folder")}>
         Open
       </button>
 
       <button
+        data-hint="new"
         style={{ ...btn, borderColor: C.teal, background: C.teal, color: ON_BRAND_FILL }}
         onClick={() => startOpen("New project — choose or create its folder")}
       >
@@ -363,6 +365,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       {/* ⋯ menu: opens the categorized settings dialog (SettingsDialog). */}
       <div style={{ position: "relative" }}>
         <button
+          data-hint="menu"
           aria-label="More options"
           title="More options"
           style={{ ...btn, position: "relative", zIndex: 42, padding: "4px 10px", fontSize: 18, lineHeight: 1 }}

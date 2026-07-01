@@ -5,6 +5,15 @@ mod attention;
 mod attention_summary;
 mod audio;
 mod auth;
+// The orchestration bridge is built on a Unix-domain socket (std::os::unix::net), so the real
+// implementation is Unix-only. On Windows we compile a stub with the same public surface
+// (BridgeManager + the four tauri commands) that reports the feature as unavailable; porting the
+// transport to a Windows named pipe / localhost TCP is a Phase-2 follow-up (see the Windows port
+// design doc). lib.rs and every caller stay platform-agnostic.
+#[cfg(unix)]
+mod bridge;
+#[cfg(not(unix))]
+#[path = "bridge_windows.rs"]
 mod bridge;
 mod chief;
 mod claude;
@@ -230,7 +239,8 @@ pub fn run() {
             tray::publish_window_roster,
             tray::clear_window_roster,
             tray::get_tray_roster,
-            tray::set_tray_image
+            tray::set_tray_image,
+            tray::quit_app
         ])
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")
@@ -238,6 +248,9 @@ pub fn run() {
             // macOS: clicking the Dock icon when all windows are hidden/closed ("Reopen") must
             // bring a window back — otherwise a last-window "keep agents running" hide is
             // unreachable except via Cmd+Q (see multi-window design, decision #4).
+            // `RunEvent::Reopen` is a macOS-only variant (no Dock on Windows/Linux), so the arm is
+            // gated — without the cfg it's a hard compile error (E0599) off macOS.
+            #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { has_visible_windows, .. } => {
                 if !has_visible_windows {
                     // Prefer the canonical "main" window; fall back to any window. Our close path

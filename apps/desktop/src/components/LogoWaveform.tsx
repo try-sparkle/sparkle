@@ -338,6 +338,7 @@ export function LogoWaveform() {
         {/* Mic ring — floats over the center of the waveform. Click = mute toggle. */}
         <button
           type="button"
+          data-hint="mic"
           onClick={() => setEnabled(!enabled)}
           onMouseEnter={() => setMicHover(true)}
           onMouseLeave={() => setMicHover(false)}

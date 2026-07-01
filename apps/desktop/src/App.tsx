@@ -15,12 +15,23 @@ import { CurrentProjectProvider } from "./windowContext";
 import { useAttentionNotifications } from "./useAttentionNotifications";
 import { useRosterPublisher } from "./useRosterPublisher";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { HintOverlay } from "./components/HintOverlay";
 import { startUpdater } from "./services/updaterService";
 
 // Owns the dock badge + Notification Center banners + click-to-worker routing. Rendered inside
 // the provider (it reads this window's current project) and paints no UI of its own.
 function AttentionController() {
   useAttentionNotifications();
+  return null;
+}
+
+// Publishes the live agent roster to the paired phone + the tray aggregator. MUST be rendered
+// INSIDE CurrentProjectProvider: useRosterPublisher → useCurrentWindowLabel → useCtx(), which
+// throws "must be used within CurrentProjectProvider" if run in App's body (App renders the
+// provider as a child, so the body is outside it). Mounted as a sibling of AuthGate so it runs
+// regardless of auth/loading state, matching its prior always-on behavior. Paints no UI.
+function RosterPublisher() {
+  useRosterPublisher();
   return null;
 }
 
@@ -31,8 +42,8 @@ export function App() {
   useConnectionMonitor();
   // App-level always-listening voice controller (mounted once).
   useAmbientVoice();
-  // Publish the live agent roster to the paired phone (the mobile dashboard mirror).
-  useRosterPublisher();
+  // NOTE: roster publishing moved into <RosterPublisher/> (inside the provider) — it depends on
+  // useCurrentWindowLabel(), which throws if called here in App's body (outside the provider).
 
   // Phone approvals remote: open the relay host connection (no-op if signed out) so a local
   // agent's "needs you" can reach the paired phone, and a phone decision can drive the PTY.
@@ -98,10 +109,14 @@ export function App() {
 
   return (
     <CurrentProjectProvider>
+      <RosterPublisher />
       <AuthGate>
         <AttentionController />
         <UpdateBanner />
         <Workspace />
+        {/* Vimium-style keyboard hints: a clean ⌘ tap overlays gold chiclets on the primary
+            controls. Mounted last so its portal sits above the whole UI. */}
+        <HintOverlay />
       </AuthGate>
     </CurrentProjectProvider>
   );

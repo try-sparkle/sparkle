@@ -19,6 +19,8 @@ import { isComposerToggleKey } from "./composerToggle";
 import { isCopySelectionKey } from "./copySelectionKey";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
+import { resolveTerminalOverlay } from "./terminalOverlay";
+import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { isMeasuredSize, spawnSize, convergeStep, CONVERGE_MAX_FRAMES } from "./terminalSize";
 import { SelectionPopup } from "./SelectionPopup";
 import { recoverFromWebglContextLoss, forceFullRepaint, settleRepaintPlan } from "./terminalWebgl";
@@ -152,6 +154,21 @@ export function Terminal({
   // `--resume` transcript redraw can take seconds) reads as loading, not broken. agentId is stable
   // for this component's life, so this flips once and stays.
   const [firstOutput, setFirstOutput] = useState(false);
+  // Whether ANY output streamed for this attempt, read synchronously inside the exit handler (the
+  // firstOutput STATE there would be the stale mount-time `false`). Reset per attempt.
+  const gotOutputRef = useRef(false);
+  // When the spawn never produces a running terminal we surface an explicit state instead of a
+  // silent blank pane: "failed" = the spawn chain threw (e.g. claude/shell not found, worktree
+  // guard); "exited" = the PTY exited before emitting any output. Both offer "Start again".
+  const [spawnFail, setSpawnFail] = useState<null | "failed" | "exited">(null);
+  // Bumped by "Start again"; in the mount effect's deps so a retry tears down and re-spawns cleanly.
+  const [attempt, setAttempt] = useState(0);
+  const retry = useCallback(() => {
+    gotOutputRef.current = false;
+    setSpawnFail(null);
+    setFirstOutput(false);
+    setAttempt((a) => a + 1);
+  }, []);
 
   // Set true the instant the terminal is disposed (in the mount effect's cleanup). The mount effect
   // nulls termRef/fitRef/webglRef right after, so any LATE callback — a queued ResizeObserver tick,
@@ -324,13 +341,25 @@ export function Terminal({
     //     selection, so without this the OS native copy finds nothing and just beeps. With no
     //     selection we pass ⌘C through unchanged.
     term.attachCustomKeyEventHandler((e) => {
-      if (isComposerToggleKey(e)) {
+      // Read the binding live (getState, not a captured value) so a rebind in Settings takes
+      // effect without remounting the terminal.
+      const toggle = useKeybindingsStore.getState().bindings.toggleComposer;
+      if (isComposerToggleKey(e, toggle)) {
         useUiStore.getState().setComposerMinimized(false);
         onRequestFocusRef.current?.();
         return false;
       }
-      // Swallow the whole ⌘J chord (incl. the keyup) so no stray sequence reaches the PTY.
-      if (e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === "j") return false;
+      // Swallow the whole toggle chord (incl. the keyup) so no stray sequence reaches the PTY.
+      if (
+        toggle.kind === "chord" &&
+        e.key.toLowerCase() === toggle.key &&
+        e.metaKey === toggle.meta &&
+        e.ctrlKey === toggle.ctrl &&
+        e.altKey === toggle.alt &&
+        e.shiftKey === toggle.shift
+      ) {
+        return false;
+      }
       // ⌘C copies the selection ourselves. ⌘C is never a PTY control (that's Ctrl+C, which carries
       // ctrlKey and still SIGINTs), so we always handle it AND call preventDefault() — otherwise
       // xterm returns from _keyDown without preventing the event, WebKit runs its native Copy, finds
@@ -483,7 +512,12 @@ export function Terminal({
         if (e.id !== agentId) return;
         // First byte for this agent — drop the loading overlay. setState bails on an unchanged
         // value, so calling this on every subsequent chunk costs nothing.
+        // Load-bearing ordering: set gotOutputRef SYNCHRONOUSLY here, before any exit can be
+        // observed, so the exit handler's `!gotOutputRef.current` check correctly distinguishes
+        // "exited after output" (normal end) from "exited with no output" (show the retry state).
+        gotOutputRef.current = true;
         setFirstOutput(true);
+        setSpawnFail(null); // output means it's alive — clear any prior failed/exited state
         term.write(e.chunk);
         engine.ingest(e.chunk);
         watchRateLimit(e.chunk);
@@ -494,12 +528,13 @@ export function Terminal({
       });
       const offExit = await onPtyExit((e) => {
         if (e.id !== agentId) return;
-        // Drop the loading overlay even if the process exited WITHOUT ever emitting output (e.g. a
-        // silent raw-command shell agent) — otherwise "Starting…" would linger forever over a
-        // finished, blank terminal.
-        setFirstOutput(true);
         engine.exit();
         onExit?.();
+        // If the process exited WITHOUT ever emitting output, don't leave a silent blank pane:
+        // show an explicit "Agent exited — Start again" affordance (the spawnFail overlay) instead
+        // of the lingering "Starting…". (If output streamed first, firstOutput already cleared the
+        // overlay and this is a normal end-of-session — nothing to show.)
+        if (!gotOutputRef.current) setSpawnFail("exited");
       });
       if (disposed) {
         void safeUnlisten(offOut);
@@ -533,11 +568,13 @@ export function Terminal({
         onReady?.();
       }
     })().catch((e) => {
-      // A rejected spawn chain (e.g. pty_spawn's worktree-scope guard, or a teardown race on the
-      // listener registrations) must not surface as an uncaught rejection. Swallow + debug-log:
-      // the loading overlay self-clears on exit/output and the agent simply never starts —
-      // acceptable degradation, far better than an unhandled rejection in the renderer.
+      // A rejected spawn chain (e.g. pty_spawn's worktree-scope guard, claude/shell not found, or a
+      // teardown race on the listener registrations) must not surface as an uncaught rejection.
+      // Swallow the rejection, but surface it to the user as an explicit "Couldn't start the agent —
+      // Start again" state rather than a silent blank pane. (Guarded by `disposed` so a teardown-race
+      // rejection on an unmounting terminal doesn't set state on a dead component.)
       console.debug("terminal spawn chain failed", agentId, e);
+      if (!disposed) setSpawnFail("failed");
     });
 
     // Copy-on-select: when the user finishes a mouse selection, copy it to the clipboard
@@ -608,9 +645,10 @@ export function Terminal({
       termRef.current = null;
       fitRef.current = null;
     };
-    // agentId is stable for the life of this component.
+    // agentId is stable for the life of this component; `attempt` bumps on "Start again" to tear
+    // down and re-spawn the terminal from scratch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId]);
+  }, [agentId, attempt]);
 
   // Re-fit when this tab becomes the active one (was display:none). Focus goes to the
   // composer, not the terminal — all input lives in the composer overlay.
@@ -713,6 +751,10 @@ export function Terminal({
     safeRefresh();
   }, [resolvedTheme, safeRefresh]);
 
+  // What to paint over the blank xterm: a fail/exited affordance, a loading hint, or nothing once
+  // output streams. Pure (see terminalOverlay.ts) so the "never a silent blank pane" rule is tested.
+  const overlay = resolveTerminalOverlay(spawnFail, firstOutput, resuming);
+
   return (
     // ph-no-capture: terminal panes render source code, command output, and
     // secrets — never include them in PostHog session replay.
@@ -721,12 +763,45 @@ export function Terminal({
       style={{ position: "relative", width: "100%", height: "100%" }}
     >
       <div ref={containerRef} style={{ width: "100%", height: "100%", overflow: "hidden" }} />
-      {/* Loading affordance over the still-blank terminal, from spawn until the first PTY byte.
-          A `claude --resume` redraw (or a fresh Claude's banner load) leaves the pane empty for a
-          few seconds; with the sidebar already showing a named, working agent, that blank reads as
-          broken (the empty-cloud-code report). pointer-events:none so it never blocks; it's gone the
-          instant output streams. */}
-      {!firstOutput && (
+      {/* Affordance over the still-blank terminal. Loading: from spawn until the first PTY byte
+          (a `claude --resume` redraw or a fresh banner leaves the pane empty for a few seconds;
+          with the sidebar already showing a named, working agent, that blank reads as broken).
+          Fail/exited: an explicit, retryable state instead of a silent blank. */}
+      {overlay.kind === "fail" ? (
+        // Explicit failed/exited state — never a silent blank pane. Pointer events ON so the
+        // "Start again" button is clickable (unlike the loading overlay below).
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 12,
+            color: C.cream,
+            fontFamily: '"IBM Plex Sans", sans-serif',
+            fontSize: 13,
+            zIndex: 5,
+          }}
+        >
+          <span style={{ opacity: 0.8 }}>{overlay.message}</span>
+          <button
+            onClick={retry}
+            style={{
+              all: "unset",
+              cursor: "pointer",
+              fontSize: 13,
+              color: C.cream,
+              border: `1px solid ${C.muted}`,
+              borderRadius: 8,
+              padding: "6px 16px",
+            }}
+          >
+            ▶ Start again
+          </button>
+        </div>
+      ) : overlay.kind === "loading" ? (
         <div
           style={{
             position: "absolute",
@@ -742,9 +817,9 @@ export function Terminal({
             zIndex: 5,
           }}
         >
-          {resuming ? "Resuming conversation…" : "Starting…"}
+          {overlay.message}
         </div>
-      )}
+      ) : null}
       {/* Copy-to-clipboard flash. Fades out via opacity; pointer-events:none so it never
           intercepts a selection drag underneath it. */}
       <div

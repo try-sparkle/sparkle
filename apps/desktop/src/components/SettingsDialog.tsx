@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties, type ComponentType } from "react";
-import { FiZap, FiBell, FiEye, FiCpu, FiUsers, FiSliders, FiX } from "react-icons/fi";
+import { FiZap, FiBell, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand } from "react-icons/fi";
 import { C, ROW_ACTIVE_BUBBLE } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { useUiStore } from "../stores/uiStore";
@@ -10,6 +10,7 @@ import { AgentOrderToggle } from "./AgentOrderToggle";
 import { BranchCleanupToggle } from "./BranchCleanupToggle";
 import { WorkerLimitControl } from "./WorkerLimitControl";
 import { AdvancedConfigMenu } from "./AdvancedConfigMenu";
+import { KeyboardShortcutsMenu } from "./KeyboardShortcutsMenu";
 
 // The ⋯ settings dialog. A focused, centered dialog with a left rail of categories driving a
 // single right pane (the "macOS System Settings" pattern), replacing the old 80vw×80vh stack
@@ -17,7 +18,7 @@ import { AdvancedConfigMenu } from "./AdvancedConfigMenu";
 // same component reading/writing the same stores; this file only re-parents them into panes and
 // owns the shell (backdrop, box, rail, close). Escape-to-close is still wired by the caller.
 
-type CategoryId = "ai" | "notifications" | "appearance" | "workers" | "accounts" | "advanced";
+type CategoryId = "ai" | "notifications" | "appearance" | "shortcuts" | "workers" | "accounts" | "advanced";
 
 interface Category {
   id: CategoryId;
@@ -31,6 +32,7 @@ const CATEGORIES: Category[] = [
   { id: "ai", label: "AI features", Icon: FiZap, blurb: "Each feature degrades to a non-AI baseline when off." },
   { id: "notifications", label: "Notifications", Icon: FiBell, blurb: "Which agent transitions raise a desktop banner." },
   { id: "appearance", label: "Appearance", Icon: FiEye, blurb: "Theme, text size, and how agents are ordered." },
+  { id: "shortcuts", label: "Shortcuts", Icon: FiCommand, blurb: "Rebind keyboard shortcuts. Tap a modifier or press a combo." },
   { id: "workers", label: "Workers", Icon: FiCpu, blurb: "How many agents an orchestrator runs in parallel." },
   { id: "accounts", label: "Accounts", Icon: FiUsers, blurb: "Your Claude accounts." },
   { id: "advanced", label: "Advanced", Icon: FiSliders, blurb: "Edit the configuration file directly." },
@@ -117,6 +119,8 @@ function PaneBody({
       return <NotificationsMenu />;
     case "appearance":
       return <AppearancePane />;
+    case "shortcuts":
+      return <KeyboardShortcutsMenu />;
     case "workers":
       return <WorkerLimitControl />;
     case "accounts":

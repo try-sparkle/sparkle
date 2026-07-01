@@ -18,8 +18,9 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"
-# Store the desktop bearer token in the macOS keychain (Security framework).
-keyring = { version = "3", features = ["apple-native"] }
+# Secret storage for the desktop bearer token (macOS Keychain / Windows Credential Manager).
+# Declared per-target below in `[target.'cfg(...)'.dependencies]` because the backend feature
+# differs by OS; the `keyring::Entry` API is identical, so auth.rs / trial_remote.rs need no cfg.
 # Lets the webview reach the Chief API (api.storytell.ai) from Rust, bypassing the
 # webview's CSP and the API's lack of CORS — see chief.ts / bead .
 tauri-plugin-http = "2"
@@ -54,20 +55,30 @@ bzip2 = "0.4"
 tar = "0.4"
 tauri-plugin-global-shortcut = "2"
 # Position the menu-bar popover under the tray icon (TrayCenter). tray-icon feature wires the
-# tray-event hook used in lib.rs.
+# tray-event hook used in lib.rs. Cross-platform crate, so it stays in the common deps.
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
-# Native macOS Notification Center integration. We use mac-notification-sys directly rather
-# than tauri-plugin-notification because on desktop the plugin discards click events — and we
-# need the click to route to the specific worker that asked. mac-notification-sys returns the
-# interaction (Click / ActionButton) so we can emit a focus-agent event. macOS-only app.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# ── Platform-specific dependencies ──────────────────────────────────────────────────────────
+# macOS: native Keychain backend for `keyring`, plus mac-notification-sys for clickable
+# Notification Center banners (see attention.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+# We use mac-notification-sys directly rather than tauri-plugin-notification because on desktop
+# the plugin discards click events — and we need the click to route to the specific worker that
+# asked. It returns the interaction (Click / ActionButton) so we can emit a focus-agent event.
 # PINNED (=0.6.15): the foreground-banner fix (objc/force_present.m) adds a category to this
 # crate's `NotificationCenterDelegate` and depends on it posting via NSUserNotification. A bump
 # that renames the class fails loud at link, but one that switches to UNUserNotificationCenter
 # would silently turn the category into a dead no-op — so bumps must be a deliberate, reviewed step.
 mac-notification-sys = "=0.6.15"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
+
+# Windows: native Credential Manager backend for `keyring`. Notifications are handled without an
+# extra crate in attention.rs (see the #[cfg(not(target_os = "macos"))] path).
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
 
 [dev-dependencies]
 hound = "3.5"

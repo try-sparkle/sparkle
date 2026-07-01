@@ -171,9 +171,12 @@ pub fn get_tray_roster(state: State<TrayState>) -> TrayRosterOut {
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tauri::{
     image::Image,
+    menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     WebviewUrl, WebviewWindowBuilder,
 };
+
+const QUIT_MENU_ID: &str = "quit-sparkle";
 
 const TRAY_LABEL: &str = "tray";
 const POPOVER_W: f64 = 380.0;
@@ -197,13 +200,28 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     .visible(false)
     .build()?;
 
-    // A neutral starting icon (the bundled app png) until the first roster paints the dots.
+    // Right-click menu: a single "Quit Sparkle" item (the only true way to fully exit the app).
+    // show_menu_on_left_click(false) keeps LEFT-click toggling the popover while RIGHT-click
+    // raises this menu — without it the menu would steal the left click and the popover would
+    // never open.
+    let quit_item = MenuItem::with_id(app, QUIT_MENU_ID, "Quit Sparkle", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&quit_item])?;
+
+    // A neutral starting icon (the bundled app png) until the first roster paints the numbers.
     let icon = app.default_window_icon().cloned();
-    let mut builder = TrayIconBuilder::with_id("sparkle-tray").icon_as_template(false);
+    let mut builder = TrayIconBuilder::with_id("sparkle-tray")
+        .icon_as_template(false)
+        .menu(&menu)
+        .show_menu_on_left_click(false);
     if let Some(icon) = icon {
         builder = builder.icon(icon);
     }
     builder
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == QUIT_MENU_ID {
+                app.exit(0);
+            }
+        })
         .on_tray_icon_event(|tray, event| {
             // Let the positioner remember the icon rect for TrayCenter placement.
             tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
@@ -218,6 +236,14 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
         })
         .build(app)?;
     Ok(())
+}
+
+/// Fully exit the app (used by the tray popover's "Quit Sparkle" button). The only in-app quit
+/// path besides the tray's right-click menu and OS Cmd+Q — without it, closing the main window
+/// just leaves the hidden tray window alive and the process running with no way out.
+#[tauri::command]
+pub fn quit_app(app: AppHandle) {
+    app.exit(0);
 }
 
 fn toggle_popover(app: &AppHandle) {

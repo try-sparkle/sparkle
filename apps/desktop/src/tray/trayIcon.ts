@@ -21,9 +21,12 @@ export function bucketCounts(roster: TrayRoster): Counts {
 }
 
 // Menu-bar geometry, in logical px (multiplied by `scale` for retina). Tuned to the ~22pt bar.
-const H = 22, DOT = 7, GAP = 3, PAD = 4, SEG_GAP = 9, FONT_PX = 12;
+// No dots anymore — just three colored numbers — so the glyph is the count itself; a touch
+// larger than before (the dot used to carry the color) and spaced so the three read as a group.
+const H = 22, PAD = 5, SEG_GAP = 8, FONT_PX = 13;
 
-/** Draw "● n  ● n  ● n" in the brand palette into ctx. Returns the logical pixel size used. */
+/** Draw the three counts as colored numbers ("n n n", red/grey/green, no dots) into ctx.
+ *  Returns the logical pixel size used. Zero counts are dimmed so a live count stands out. */
 export function drawTrayIcon(
   ctx: CanvasRenderingContext2D,
   counts: Counts,
@@ -36,10 +39,10 @@ export function drawTrayIcon(
   ];
   const FONT = `600 ${FONT_PX * scale}px "IBM Plex Sans", sans-serif`;
   ctx.font = FONT;
-  // First pass: measure total width.
+  // First pass: measure total width (logical px). measureText returns device px, so /scale.
   let w = PAD;
   for (const s of segs) {
-    w += DOT + GAP + ctx.measureText(String(s.n)).width / scale + SEG_GAP;
+    w += ctx.measureText(String(s.n)).width / scale + SEG_GAP;
   }
   w = w - SEG_GAP + PAD;
   ctx.canvas.width = Math.ceil(w * scale);
@@ -51,12 +54,8 @@ export function drawTrayIcon(
   const cy = (H / 2) * scale;
   let x = PAD * scale;
   for (const s of segs) {
-    ctx.globalAlpha = s.n === 0 ? 0.3 : 1;
-    ctx.beginPath();
+    ctx.globalAlpha = s.n === 0 ? 0.35 : 1;
     ctx.fillStyle = s.color;
-    ctx.arc(x + (DOT / 2) * scale, cy, (DOT / 2) * scale, 0, Math.PI * 2);
-    ctx.fill();
-    x += (DOT + GAP) * scale;
     const label = String(s.n);
     ctx.fillText(label, x, cy);
     x += ctx.measureText(label).width + SEG_GAP * scale;
