@@ -61,9 +61,9 @@ describe("spawnWorker", () => {
   });
 
   it("auto-names the worker from its task when the autoRename feature is unlocked", async () => {
-    // Entitled + setting on → the same auto-name path that names build agents from their first
+    // Has credits + setting on → the same auto-name path that names build agents from their first
     // typed prompt now names a worker from its injected task (it never flows through the Composer).
-    useAuthStore.setState({ me: { clerkUserId: "u", entitled: true, balanceCents: 0, tokenVersion: 0 } });
+    useAuthStore.setState({ me: { clerkUserId: "u", entitled: true, balanceCents: 20000, tokenVersion: 0 } });
     useSettingsStore.setState({ aiAutoRename: true });
 
     const store = useProjectStore.getState();

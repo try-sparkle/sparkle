@@ -31,8 +31,8 @@ const project: Project = {
 
 beforeEach(() => {
   useSettingsStore.getState().setAllAiFeatures(true);
-  // AI extras now also require entitlement — default the suite to an entitled user so the
-  // feature-flag behavior is what's under test here.
+  // AI extras now require CREDITS (a positive balance) — default the suite to a funded user
+  // (entitledMe has balanceCents: 20000) so the feature-flag behavior is what's under test here.
   useAuthStore.setState({ me: entitledMe, tokenPresent: true, loading: false });
   // Mode now lives in the (singleton) uiStore — reset it to the launch default so these
   // assertions see the Build section, independent of any prior test's tab switch.
@@ -56,10 +56,10 @@ describe("AgentSidebar — AI Think (Chief) gate", () => {
     expect(screen.getByRole("button", { name: "⚒ Build" })).toBeTruthy();
   });
 
-  it("hides the Think button when not entitled even if the flag is on (free trial)", () => {
+  it("hides the Think button when out of credits even if the flag is on", () => {
     useSettingsStore.getState().setAllAiFeatures(true);
     useAuthStore.setState({
-      me: { ...entitledMe, entitled: false },
+      me: { ...entitledMe, balanceCents: 0 },
       tokenPresent: true,
       loading: false,
     });
