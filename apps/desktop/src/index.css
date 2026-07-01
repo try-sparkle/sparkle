@@ -208,3 +208,14 @@ body {
   background: var(--c-chat-bubble); /* token: CHAT_USER_BUBBLE */
   border-radius: 5px;
 }
+
+/* Think composer: the textarea is transparent-text over a mention-highlight overlay. Hide its
+   scrollbar so a scrollbar's width can never narrow the text and drift it out from under the
+   overlay (which has no scrollbar). Scroll position is mirrored to the overlay in JS. */
+.think-composer-input {
+  scrollbar-width: none; /* Firefox */
+}
+.think-composer-input::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}

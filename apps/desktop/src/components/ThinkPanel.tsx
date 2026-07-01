@@ -63,41 +63,138 @@ function buildTranscript(msgs: ChatMsg[]): string {
 }
 
 // --- @mention routing -----------------------------------------------------------------------
-// A typed message is routed by its FIRST recognized @mention: @chief → Chief only; @<voice> → that
-// expert voice only (Claude Code stays silent for both); otherwise → Claude Code (and Chief may
-// interject afterward). The mention token is stripped from the question handed to Chief/the voice.
-type Route =
-  | { kind: "claude"; question: string }
-  | { kind: "chief"; question: string }
-  | { kind: "voice"; handle: string; question: string };
+// A message can be answered by MORE THAN ONE responder. The rule (confirmed with the founder):
+//   • A mention at the VERY START of the message is a *directed* message — ONLY that entity answers
+//     (Sparkle stays silent). "@chief what's the risk?" → Chief alone.
+//   • A mention that appears LATER is *additive* — Sparkle answers the message AND every @mentioned
+//     entity chimes in, like a group chat. "…make a PRD. And @chief thoughts?" → Sparkle + Chief.
+//   • Plain text → Sparkle alone (Chief may still interject afterward).
+// Recognized @mentions (@chief + known expert voices) are stripped from the question handed to every
+// responder; unknown @tokens (emails, a stray @) are left intact and don't route.
+export type Responder =
+  | { kind: "claude" }
+  | { kind: "chief" }
+  | { kind: "voice"; handle: string };
+
+export interface RouteResult {
+  /** The question with recognized @mention tokens stripped — handed to every responder. */
+  question: string;
+  /** Ordered, de-duplicated responders. When additive, Sparkle ("claude") leads. */
+  responders: Responder[];
+}
 
 const MENTION_RE = /(^|\s)@([a-z0-9][a-z0-9-]*)\b/gi;
 
-export function routeMessage(text: string): Route {
-  const t = text ?? "";
+export function routeMessage(text: string): RouteResult {
+  const t = (text ?? "").trim();
+  const question = stripAllMentions(t);
+
+  const mentions: Responder[] = [];
+  const seen = new Set<string>();
+  let leadingMention: Responder | null = null;
   let m: RegExpExecArray | null;
   MENTION_RE.lastIndex = 0;
   while ((m = MENTION_RE.exec(t))) {
     const handle = (m[2] ?? "").toLowerCase();
     if (!handle) continue;
-    if (handle === "chief") {
-      return { kind: "chief", question: stripMention(t, "chief") };
+    const responder: Responder | null =
+      handle === "chief"
+        ? { kind: "chief" }
+        : findVoice(handle)
+        ? { kind: "voice", handle }
+        : null;
+    if (!responder) continue; // unknown @token — ignore, keep scanning
+    // Position of the "@": m.index points at the (^|\s) boundary; add its width (0 at start, else 1).
+    const atIndex = m.index + (m[1] ? m[1].length : 0);
+    if (leadingMention === null && mentions.length === 0 && atIndex === 0) {
+      leadingMention = responder; // the message OPENS with this recognized mention → directed
     }
-    if (findVoice(handle)) {
-      return { kind: "voice", handle, question: stripMention(t, handle) };
+    const key = responder.kind === "chief" ? "chief" : `voice:${responder.handle}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      mentions.push(responder);
     }
-    // An unknown @token (e.g. an email or a stray @) doesn't route — keep scanning, then fall back.
   }
-  return { kind: "claude", question: t.trim() };
+
+  if (mentions.length === 0) return { question, responders: [{ kind: "claude" }] };
+  if (leadingMention) return { question, responders: [leadingMention] }; // directed: solo
+  return { question, responders: [{ kind: "claude" }, ...mentions] }; // additive: Sparkle + mentions
 }
 
-function stripMention(text: string, handle: string): string {
-  const re = new RegExp(`(^|\\s)@${handle}\\b`, "gi");
+// Strip every RECOGNIZED @mention (@chief + known voices), preserving the boundary char before it;
+// unknown @tokens (e.g. an email) are left untouched.
+function stripAllMentions(text: string): string {
   return (text ?? "")
-    .replace(re, "$1")
+    .replace(MENTION_RE, (full: string, boundary: string, handle: string) =>
+      (handle ?? "").toLowerCase() === "chief" || findVoice((handle ?? "").toLowerCase())
+        ? boundary
+        : full,
+    )
     .replace(/\s{2,}/g, " ")
     .trim();
 }
+
+// --- @mention emphasis (composer overlay + sent bubble) -------------------------------------
+export interface MentionSeg {
+  text: string;
+  /** Set when this segment is a RECOGNIZED @mention token; `text` still includes the leading "@". */
+  handle?: string;
+}
+
+// Split `text` into plain + recognized-mention segments. Mention `text` keeps the leading "@" so the
+// composer overlay preserves character-for-character width under the transparent textarea (caret
+// alignment); the sent bubble strips it at render time. Unknown @tokens stay inline as plain text.
+export function splitMentions(text: string): MentionSeg[] {
+  const src = text ?? "";
+  const segs: MentionSeg[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  MENTION_RE.lastIndex = 0;
+  while ((m = MENTION_RE.exec(src))) {
+    const handle = (m[2] ?? "").toLowerCase();
+    if (handle !== "chief" && !findVoice(handle)) continue; // unknown @token — leave inline
+    const at = m.index + (m[1] ? m[1].length : 0); // index of the "@"
+    if (at > last) segs.push({ text: src.slice(last, at) });
+    const end = at + 1 + handle.length;
+    segs.push({ text: src.slice(at, end), handle });
+    last = end;
+  }
+  if (last < src.length) segs.push({ text: src.slice(last) });
+  return segs;
+}
+
+// Shared mention emphasis: teal (accent ink) + semibold. `stripAt` drops the leading "@" — used in
+// the STATIC sent bubble (no caret to keep aligned); the live composer keeps it.
+function MentionText({ text, stripAt }: { text: string; stripAt: boolean }) {
+  return (
+    <>
+      {splitMentions(text).map((seg, i) =>
+        seg.handle ? (
+          <span key={i} style={{ color: C.accentInk, fontWeight: FONT_WEIGHT.semibold }}>
+            {stripAt ? seg.text.slice(1) : seg.text}
+          </span>
+        ) : (
+          <span key={i}>{seg.text}</span>
+        ),
+      )}
+    </>
+  );
+}
+
+// One shared typography spec so the composer's highlight overlay lines up character-for-character
+// with the transparent-text <textarea> on top of it — any drift misaligns the caret. The wrap keys
+// (`overflowWrap`/`wordBreak`) live HERE so both layers pick identical break points for a long
+// unbroken token (a pasted URL, a long @handle); splitting them across the two inline styles is
+// exactly the drift this spec exists to prevent.
+const COMPOSER_TYPO = {
+  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontSize: 14,
+  lineHeight: 1.4,
+  padding: "8px 10px",
+  boxSizing: "border-box" as const,
+  overflowWrap: "break-word" as const,
+  wordBreak: "break-word" as const,
+};
 
 // --- @-token parsing for the live picker ----------------------------------------------------
 // Find an in-progress mention token immediately before the caret: an `@` that starts the line or
@@ -161,6 +258,8 @@ export function ThinkPanel({
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // The mention-highlight layer behind the composer textarea; kept scroll-synced with the textarea.
+  const overlayRef = useRef<HTMLDivElement>(null);
   const linkAttemptKey = useRef<string | null>(null);
   // Active claude-chat listener cleanup, so we can tear a turn down on unmount.
   const claudeCleanup = useRef<(() => void) | null>(null);
@@ -248,6 +347,12 @@ export function ThinkPanel({
   // the Chief/voice polls that have no abort wired through.
   const turnSeqRef = useRef(0);
 
+  // Monotonic plan token — the Make-a-Plan analogue of `turnSeqRef`. Bumped by `cancelPlan` so a
+  // synthesis/generation that resolves AFTER the user backed out neither switches tabs nor clears the
+  // (already reset) planning state. Gives the founder an escape hatch even if the network is slow —
+  // the per-request timeout in chief.ts prevents the true infinite hang, this covers the wait.
+  const planSeqRef = useRef(0);
+
   // Append a message; returns its id so streaming callbacks can target it.
   const pushMsg = (m: Omit<ChatMsg, "id"> & { id?: string }): string => {
     const id = m.id ?? crypto.randomUUID();
@@ -260,50 +365,57 @@ export function ThinkPanel({
     );
   };
 
-  // --- Claude Code turn (the default, fast path) ------------------------------------------
-  const sendToClaude = async (question: string, transcriptBefore: ChatMsg[], { capture = true } = {}) => {
-    if (!claudePath) {
-      setError("Claude Code isn't available yet — give it a moment, or install the `claude` binary.");
-      setSending(false);
-      return;
-    }
-    const replyId = pushMsg({ author: "claude", text: "", pending: true });
-    let acc = ""; // full reply text committed to state so far
-    // Coalesce streamed deltas: a fast stream fires onDelta many times per frame. Buffering the
-    // unflushed text and committing it to React state once per animation frame (instead of a state
-    // write + re-render per delta) turns O(deltas) re-renders into O(frames), and moves the string
-    // growth off the per-delta hot path. onDone/onError commit the authoritative final text directly
-    // and cancel any pending frame, so the last partial buffer is never lost or left marked pending.
-    let buf = "";
-    let rafId: number | null = null;
-    const flushDelta = () => {
-      rafId = null;
-      if (!buf) return;
-      acc += buf;
-      buf = "";
-      patchMsg(replyId, { text: acc, pending: true });
-    };
-    const scheduleFlush = () => {
-      if (rafId == null) rafId = requestAnimationFrame(flushDelta);
-    };
-    const cancelFlush = () => {
-      if (rafId != null) {
-        cancelAnimationFrame(rafId);
-        rafId = null;
+  // --- Sparkle turn (the default, fast path — the user's own headless Claude Code) --------
+  // Returns a promise that RESOLVES when the turn settles (done/error), so `dispatch` can await it
+  // alongside any concurrent @chief/@voice responders and clear `sending` only once all are done.
+  // `interject` is suppressed when Chief is already an explicit responder this turn (no double reply).
+  const sendToClaude = (
+    question: string,
+    transcriptBefore: ChatMsg[],
+    { capture = true, interject = true }: { capture?: boolean; interject?: boolean } = {},
+  ): Promise<void> => {
+    return new Promise<void>((resolve) => {
+      if (!claudePath) {
+        setError("Sparkle isn't available yet — give it a moment, or install the `claude` binary.");
+        resolve();
+        return;
       }
-    };
-    // A turn can settle (done/error) BEFORE `sendClaudeChat` resolves its cleanup — most visibly when
-    // a backend completes synchronously. `handleSettle` tears down whatever listeners are already
-    // wired; the post-await assignment below tears them down immediately if we settled first, so the
-    // cleanup is never left dangling and the next turn can't inherit a stale one.
-    let settled = false;
-    const handleSettle = () => {
-      settled = true;
-      claudeCleanup.current?.();
-      claudeCleanup.current = null;
-    };
-    try {
-      const cleanup = await sendClaudeChat({
+      const replyId = pushMsg({ author: "claude", text: "", pending: true });
+      let acc = ""; // full reply text committed to state so far
+      // Coalesce streamed deltas: a fast stream fires onDelta many times per frame. Buffering the
+      // unflushed text and committing it to React state once per animation frame (instead of a state
+      // write + re-render per delta) turns O(deltas) re-renders into O(frames), and moves the string
+      // growth off the per-delta hot path. onDone/onError commit the authoritative final text directly
+      // and cancel any pending frame, so the last partial buffer is never lost or left marked pending.
+      let buf = "";
+      let rafId: number | null = null;
+      const flushDelta = () => {
+        rafId = null;
+        if (!buf) return;
+        acc += buf;
+        buf = "";
+        patchMsg(replyId, { text: acc, pending: true });
+      };
+      const scheduleFlush = () => {
+        if (rafId == null) rafId = requestAnimationFrame(flushDelta);
+      };
+      const cancelFlush = () => {
+        if (rafId != null) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+      };
+      // A turn can settle (done/error) BEFORE `sendClaudeChat` resolves its cleanup — most visibly
+      // when a backend completes synchronously. `handleSettle` tears down whatever listeners are
+      // already wired; the post-await assignment below tears them down immediately if we settled
+      // first, so the cleanup is never left dangling and the next turn can't inherit a stale one.
+      let settled = false;
+      const handleSettle = () => {
+        settled = true;
+        claudeCleanup.current?.();
+        claudeCleanup.current = null;
+      };
+      sendClaudeChat({
         id: agentId,
         prompt: question,
         cwd: project.rootPath,
@@ -320,34 +432,40 @@ export function ThinkPanel({
           buf = "";
           patchMsg(replyId, { text: finalText, pending: false });
           if (capture && finalText.trim()) recordTurn("response", finalText);
-          setSending(false);
           handleSettle();
-          // After Claude answers, let Chief decide whether to pop in (background, best-effort).
-          maybeChiefInterject([...transcriptBefore, { id: replyId, author: "claude", text: finalText }]);
+          // After Sparkle answers, let Chief decide whether to pop in (background, best-effort) —
+          // unless Chief is already answering this turn explicitly.
+          if (interject) {
+            maybeChiefInterject([...transcriptBefore, { id: replyId, author: "claude", text: finalText }]);
+          }
+          resolve();
         },
         onError: (message) => {
           cancelFlush();
-          patchMsg(replyId, { text: `_Claude Code error: ${message}_`, pending: false });
+          patchMsg(replyId, { text: `_Sparkle error: ${message}_`, pending: false });
           setError(message);
-          setSending(false);
           handleSettle();
+          resolve();
         },
-      });
-      // Compose cancelFlush into the stored cleanup so EVERY teardown path — unmount, Stop, a
-      // superseding turn — also cancels a pending delta frame. Without this, a turn abandoned
-      // without a done/error event could still fire its last rAF and re-mark the message pending.
-      const teardown = () => {
-        cancelFlush();
-        cleanup();
-      };
-      if (settled) teardown();
-      else claudeCleanup.current = teardown;
-    } catch (e) {
-      cancelFlush();
-      patchMsg(replyId, { text: `_Claude Code error: ${friendlyError(e)}_`, pending: false });
-      setError(friendlyError(e));
-      setSending(false);
-    }
+      })
+        .then((cleanup) => {
+          // Compose cancelFlush into the stored cleanup so EVERY teardown path — unmount, Stop, a
+          // superseding turn — also cancels a pending delta frame. Without this, a turn abandoned
+          // without a done/error event could still fire its last rAF and re-mark the message pending.
+          const teardown = () => {
+            cancelFlush();
+            cleanup();
+          };
+          if (settled) teardown();
+          else claudeCleanup.current = teardown;
+        })
+        .catch((e) => {
+          cancelFlush();
+          patchMsg(replyId, { text: `_Sparkle error: ${friendlyError(e)}_`, pending: false });
+          setError(friendlyError(e));
+          resolve();
+        });
+    });
   };
 
   // Fire Chief's optional interjection after a Claude turn. Gated on Chief being connected + AI on.
@@ -376,7 +494,6 @@ export function ThinkPanel({
   ) => {
     if (!chiefEnabled) {
       setError("Connect Chief to talk to it directly.");
-      setSending(false);
       return;
     }
     const replyId = pushMsg({ author: "chief", text: "", pending: true });
@@ -393,9 +510,8 @@ export function ThinkPanel({
       if (turnSeqRef.current !== turn) return;
       patchMsg(replyId, { text: `_Chief error: ${friendlyError(e)}_`, pending: false });
       setError(friendlyError(e));
-    } finally {
-      if (turnSeqRef.current === turn) setSending(false);
     }
+    // `sending` is cleared by `dispatch` once every responder this turn has settled.
   };
 
   // --- @voice turn (the expert voice answers via a Chief persona; Claude Code stays silent) -
@@ -408,12 +524,10 @@ export function ThinkPanel({
     const voice = findVoice(handle);
     if (!voice) {
       setError(`Unknown expert voice @${handle}.`);
-      setSending(false);
       return;
     }
     if (!chiefEnabled) {
       setError("Connect Chief to bring in expert voices.");
-      setSending(false);
       return;
     }
     const replyId = pushMsg({ author: "voice", voiceHandle: handle, text: "", pending: true });
@@ -436,17 +550,16 @@ export function ThinkPanel({
       if (turnSeqRef.current !== turn) return;
       patchMsg(replyId, { text: `_@${handle} couldn't answer: ${friendlyError(e)}_`, pending: false });
       setError(friendlyError(e));
-    } finally {
-      if (turnSeqRef.current === turn) setSending(false);
     }
+    // `sending` is cleared by `dispatch` once every responder this turn has settled.
   };
 
-  // Core dispatch: route by @mention, then push the user's message + run the turn.
+  // Core dispatch: route by @mention, then push the user's message + run every responder this turn.
   const dispatch = async (raw: string, { capture = true } = {}) => {
     const prompt = raw.trim();
     if (!prompt || sending) return;
     setError("");
-    const route = routeMessage(prompt);
+    const { question, responders } = routeMessage(prompt);
 
     // Always echo the user's message into the thread first (send() has already cleared the
     // composer, so otherwise a blocked turn would make their text vanish).
@@ -454,11 +567,17 @@ export function ThinkPanel({
     const before = [...messages, userMsg];
     setMessages(before);
 
-    // Gate the Chief-backed routes on the AI toggle AFTER echoing but BEFORE recording/sending, so
-    // the bubble shows yet no unpaired prompt is persisted and no backend fires.
-    if ((route.kind === "chief" || route.kind === "voice") && aiOff()) {
-      setError(AI_OFF_MSG);
-      return;
+    // Talking to your own Sparkle (Claude Code) is always allowed; only the Chief-backed responders
+    // (@chief, @voice) are gated on the AI toggle. So when AI is off, drop those responders rather
+    // than blocking the whole turn — Sparkle can still answer. Gate AFTER echoing but BEFORE
+    // recording/sending, so the bubble shows yet no unpaired prompt is persisted and no backend fires.
+    let active = responders;
+    if (aiOff()) {
+      active = responders.filter((r) => r.kind === "claude");
+      if (active.length === 0) {
+        setError(AI_OFF_MSG); // e.g. a directed "@chief …" with AI off — nothing left to run
+        return;
+      }
     }
 
     if (capture) {
@@ -468,16 +587,26 @@ export function ThinkPanel({
     setSending(true);
     const turn = ++turnSeqRef.current;
 
-    if (route.kind === "chief") {
-      // A bare "@chief" (no following text) → ask Chief for its read on the thread, not the literal token.
-      const q = route.question || "What's your take on the conversation so far?";
-      await sendToChief(q, before, { capture, turn });
-    } else if (route.kind === "voice") {
-      const q = route.question || "What's your perspective on the conversation so far?";
-      await sendToVoice(route.handle, q, before, { capture, turn });
-    } else {
-      await sendToClaude(route.question, before, { capture });
-    }
+    // Suppress Chief's automatic post-Sparkle interjection when Chief is already answering explicitly.
+    const chiefExplicit = active.some((r) => r.kind === "chief");
+    const jobs = active.map((r) => {
+      if (r.kind === "chief") {
+        // A bare "@chief" (no other text) → ask Chief for its read on the thread, not the literal token.
+        return sendToChief(question || "What's your take on the conversation so far?", before, {
+          capture,
+          turn,
+        });
+      }
+      if (r.kind === "voice") {
+        return sendToVoice(r.handle, question || "What's your perspective on the conversation so far?", before, {
+          capture,
+          turn,
+        });
+      }
+      return sendToClaude(question, before, { capture, interject: !chiefExplicit });
+    });
+    await Promise.allSettled(jobs);
+    if (turnSeqRef.current === turn) setSending(false);
   };
 
   // --- composer send + key handling -------------------------------------------------------
@@ -605,6 +734,7 @@ export function ThinkPanel({
     setPlanning(true);
     setError("");
     setNotice("Making a plan — synthesizing your conversation into a PRD, then breaking it into tasks…");
+    const seq = ++planSeqRef.current;
     try {
       const res = await turnIntoPlan(
         {
@@ -627,6 +757,7 @@ export function ThinkPanel({
         },
         { pat, chiefProjectId: chiefProjectId!, projectPath: project.rootPath, transcript: buildTranscript(messages) },
       );
+      if (planSeqRef.current !== seq) return; // user cancelled while we were working — drop the result
       // The Think agent becomes the epic — the through-line into Plan and Build.
       useProjectStore.getState().renameAgent(project.id, agentId, res.epicTitle);
       setNotice(
@@ -635,11 +766,21 @@ export function ThinkPanel({
       // Hand off: take the user to the Plan tab where the epic + beads are waiting.
       useUiStore.getState().setWorkMode("plan");
     } catch (e) {
+      if (planSeqRef.current !== seq) return; // cancelled — a late failure shouldn't clobber the UI
       setNotice("");
       setError(friendlyError(e));
     } finally {
-      setPlanning(false);
+      if (planSeqRef.current === seq) setPlanning(false);
     }
+  }
+
+  // Back out of an in-flight "Make a Plan": bump the token (so the pending synthesis/generation is
+  // ignored when it resolves) and reset the UI immediately. The founder was left stuck on
+  // "Making a plan…" with no way out; this is the escape hatch.
+  function cancelPlan() {
+    planSeqRef.current++;
+    setPlanning(false);
+    setNotice("");
   }
 
   // The connectivity re-query nudge: route a synthetic status-update through Claude (no capture).
@@ -709,11 +850,11 @@ export function ThinkPanel({
           {" — "}
           {claudeReady === "ok"
             ? chiefEnabled
-              ? "Claude Code, with Chief in the room"
-              : "Claude Code"
+              ? "Sparkle, with Chief in the room"
+              : "Sparkle"
             : claudeReady === "checking"
-            ? "starting Claude Code…"
-            : "Claude Code not found"}
+            ? "starting Sparkle…"
+            : "Sparkle not found"}
         </span>
       </div>
 
@@ -722,7 +863,7 @@ export function ThinkPanel({
         <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: 16 }}>
           {messages.length === 0 && (
             <div style={{ color: C.muted, fontSize: 13, lineHeight: 1.6, maxWidth: 580 }}>
-              Talk to <strong>Claude Code</strong> about <strong>{project.name}</strong> — ask
+              Talk to <strong>Sparkle</strong> about <strong>{project.name}</strong> — ask
               anything, invoke skills, think out loud. Chief sits in the room and pops in with
               observations grounded in your project library.
               <br />
@@ -751,27 +892,37 @@ export function ThinkPanel({
           borderTop: `1px solid ${C.deepForest}`,
         }}
       >
-        <button
-          onClick={() => void handleMakeAPlan()}
-          disabled={planning || messages.length === 0 || !chiefEnabled}
-          title={
-            chiefEnabled
-              ? "Synthesize this conversation into an epic + tasks and open the Plan tab"
-              : "Connect Chief to make a plan"
-          }
-          style={{
-            background: planning || messages.length === 0 || !chiefEnabled ? C.forest : C.teal,
-            color: planning || messages.length === 0 || !chiefEnabled ? C.muted : C.cream,
-            border: `1px solid ${planning || messages.length === 0 || !chiefEnabled ? C.forest : C.teal}`,
-            borderRadius: 8,
-            padding: "6px 16px",
-            fontSize: 13,
-            fontWeight: FONT_WEIGHT.semibold,
-            cursor: planning || messages.length === 0 || !chiefEnabled ? "default" : "pointer",
-          }}
-        >
-          {planning ? "Making a plan…" : "Make a Plan"}
-        </button>
+        {(() => {
+          // While planning, the button becomes a Cancel (the notice line above carries the progress
+          // text), so a slow synthesis can never leave the founder stuck with no way out.
+          const idleDisabled = messages.length === 0 || !chiefEnabled;
+          const disabled = !planning && idleDisabled;
+          return (
+            <button
+              onClick={() => (planning ? cancelPlan() : void handleMakeAPlan())}
+              disabled={disabled}
+              title={
+                planning
+                  ? "Cancel making the plan"
+                  : chiefEnabled
+                  ? "Synthesize this conversation into an epic + tasks and open the Plan tab"
+                  : "Connect Chief to make a plan"
+              }
+              style={{
+                background: planning ? C.sienna : idleDisabled ? C.forest : C.teal,
+                color: disabled ? C.muted : C.cream,
+                border: `1px solid ${planning ? C.sienna : idleDisabled ? C.forest : C.teal}`,
+                borderRadius: 8,
+                padding: "6px 16px",
+                fontSize: 13,
+                fontWeight: FONT_WEIGHT.semibold,
+                cursor: disabled ? "default" : "pointer",
+              }}
+            >
+              {planning ? "Cancel" : "Make a Plan"}
+            </button>
+          );
+        })()}
       </div>
 
       {/* Composer (with the @-mention picker floating above it) */}
@@ -789,36 +940,69 @@ export function ThinkPanel({
         )}
         <div style={{ display: "flex", gap: 8 }}>
           <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
-            <textarea
-              ref={inputRef}
-              value={input}
-              onChange={onComposerChange}
-              onKeyDown={onComposerKeyDown}
-              onClick={(e) =>
-                refreshPicker(e.currentTarget.value, e.currentTarget.selectionStart ?? 0)
-              }
-              placeholder={
-                liveActive
-                  ? MIC_HOT_PLACEHOLDER
-                  : livePassive
-                  ? WAKE_PLACEHOLDER
-                  : `Talk to Claude Code about ${project.name}…  (type @ for voices)`
-              }
-              rows={2}
+            {/* Composer: a transparent-text <textarea> over a styled highlight overlay, so @mentions
+                render teal + bold as you type. The textarea still owns the raw text (incl. the "@")
+                and the caret; the overlay just paints. Empty → textarea shows its own text/placeholder
+                (no overlay needed), so the native placeholder color isn't clobbered by transparency. */}
+            <div
               style={{
-                width: "100%",
-                boxSizing: "border-box",
-                resize: "none",
+                position: "relative",
                 background: C.deepForest,
-                color: C.cream,
                 border: `1px solid ${C.forest}`,
                 borderRadius: 8,
-                padding: "8px 10px",
-                fontFamily: '"IBM Plex Sans", sans-serif',
-                fontSize: 14,
-                outline: "none",
               }}
-            />
+            >
+              <div
+                ref={overlayRef}
+                aria-hidden
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  overflow: "hidden",
+                  pointerEvents: "none",
+                  whiteSpace: "pre-wrap",
+                  color: C.cream,
+                  ...COMPOSER_TYPO,
+                }}
+              >
+                <MentionText text={input} stripAt={false} />
+                {"\u200b" /* trailing zero-width space keeps a final newline's line height */}
+              </div>
+              <textarea
+                ref={inputRef}
+                className="think-composer-input"
+                value={input}
+                onChange={onComposerChange}
+                onKeyDown={onComposerKeyDown}
+                onClick={(e) =>
+                  refreshPicker(e.currentTarget.value, e.currentTarget.selectionStart ?? 0)
+                }
+                onScroll={(e) => {
+                  if (overlayRef.current) overlayRef.current.scrollTop = e.currentTarget.scrollTop;
+                }}
+                placeholder={
+                  liveActive
+                    ? MIC_HOT_PLACEHOLDER
+                    : livePassive
+                    ? WAKE_PLACEHOLDER
+                    : `Talk to Sparkle about ${project.name}…  (type @ for voices)`
+                }
+                rows={2}
+                style={{
+                  position: "relative",
+                  display: "block",
+                  width: "100%",
+                  resize: "none",
+                  background: "transparent",
+                  // Hide the raw text (the overlay paints it) but keep the caret + placeholder visible.
+                  color: input ? "transparent" : C.cream,
+                  caretColor: C.cream,
+                  border: "none",
+                  outline: "none",
+                  ...COMPOSER_TYPO,
+                }}
+              />
+            </div>
             {audioActive && interim && (
               <div
                 style={{
@@ -869,7 +1053,7 @@ function friendlyError(e: unknown): string {
 function authorLabel(m: ChatMsg): string {
   if (m.author === "chief") return "Chief";
   if (m.author === "voice") return `@${m.voiceHandle}`;
-  return "Claude Code";
+  return "Sparkle";
 }
 
 function Bubble({ msg }: { msg: ChatMsg }) {
@@ -899,7 +1083,9 @@ function Bubble({ msg }: { msg: ChatMsg }) {
           {msg.pending && !msg.text ? (
             <span style={{ color: C.cream, fontSize: 14 }}>…</span>
           ) : mine ? (
-            <span style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>{msg.text}</span>
+            <span style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
+              <MentionText text={msg.text} stripAt />
+            </span>
           ) : (
             <Markdown text={msg.text} />
           )}

@@ -19,8 +19,27 @@ const BASE = import.meta.env.DEV ? "/chief-api" : "https://api.storytell.ai";
 // in the packaged app we go through the Tauri HTTP plugin. Same web-standard signature either way.
 // Dispatch per-call (not a captured reference) so tests that spy on `globalThis.fetch` after this
 // module loads still take effect.
-const httpFetch: typeof fetch = (...args) =>
-  (import.meta.env.DEV ? fetch : (tauriFetch as typeof fetch))(...args);
+//
+// Every Chief request is bounded by a per-request timeout. Without one, a single stalled poll (a
+// dead socket that opens but never sends bytes) wedges `pollForResponse` forever: its inter-request
+// wall-clock check only runs BETWEEN requests, so a hung `getMessage` fetch never lets the loop
+// reach it — the exact defect that left "Make a Plan" stuck on "Making a plan…" with no way out.
+// We inject an AbortController-driven timeout (NOT `AbortSignal.timeout`, which the macOS 11
+// WKWebView floor lacks) whenever the caller hasn't wired its own signal.
+const REQUEST_TIMEOUT_MS = 45_000;
+const httpFetch: typeof fetch = (input, init) => {
+  const base = import.meta.env.DEV ? fetch : (tauriFetch as typeof fetch);
+  if (init?.signal) return base(input, init); // caller owns cancellation — don't double up
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  return base(input, { ...init, signal: controller.signal })
+    .catch((e) => {
+      // Our own timeout fired — surface it as a friendly ChiefError, not a raw DOMException.
+      if (controller.signal.aborted) throw new ChiefError("Chief request timed out. Please try again.", 408);
+      throw e;
+    })
+    .finally(() => clearTimeout(timer));
+};
 
 /**
  * Ask the Rust backend for a Chief PAT resolved from the environment / `.env.local` at runtime
@@ -64,10 +83,26 @@ async function parseOrThrow(res: Response): Promise<unknown> {
     // non-JSON error body — fall through with the raw text
   }
   if (!res.ok) {
-    const msg =
-      (body as { error?: { message?: string } } | undefined)?.error?.message ??
-      (text || `Chief request failed (${res.status})`);
-    throw new ChiefError(msg, res.status);
+    // Storytell error bodies vary: sometimes `{ error: { message } }`, sometimes a top-level
+    // `{ humane, code, statusCode }` envelope, and — for some validation failures — an opaque
+    // `{ code: "", statusCode: 400 }` with NO human text at all. Prefer any real message; a parsed
+    // JSON error envelope with no usable field must NEVER leak back as raw JSON (that's how
+    // `{"code":"","statusCode":400}` ended up verbatim in a chat bubble). Only fall back to the raw
+    // text when the body wasn't JSON to begin with; otherwise a bare status line is the floor.
+    const b = body as
+      | { error?: { message?: string }; humane?: string; message?: string; code?: string }
+      | undefined;
+    const fromEnvelope =
+      b?.error?.message || b?.humane || b?.message || (b?.code ? `Chief error: ${b.code}` : "");
+    // A bare-string JSON body (`"quota exceeded"`) IS a real message — keep it. Only a parsed JSON
+    // *object* with no usable field falls through to the status line; raw non-JSON text is preserved.
+    const fallback =
+      typeof body === "string" && body.trim()
+        ? body
+        : body === undefined && text
+        ? text
+        : `Chief request failed (${res.status})`;
+    throw new ChiefError(fromEnvelope || fallback, res.status);
   }
   return body;
 }
@@ -549,11 +584,19 @@ export interface ChiefSkill {
   scope?: "project" | "user";
 }
 
-/** Create a skill. `name` + `instructions` are required; category passes through. `scope` MUST be
- *  one of Chief's accepted values — sending it unset (or null) trips `publicapi.skills.create`'s
- *  `scope.invalid: scope must be one of: project, user`, which silently broke every persona/voice
- *  spin-up. Default to `"project"` when the caller doesn't specify one (project-scoped is the right
- *  home for a per-project persona) so the POST always carries a valid scope. */
+/** Create a skill. `name` + `instructions` are required; category passes through.
+ *
+ *  Two server-side validation traps this call has to satisfy, both of which historically surfaced
+ *  as bare 400s that silently broke every persona/voice spin-up:
+ *   1. `scope` MUST be one of Chief's accepted values — sending it unset (or null) trips
+ *      `publicapi.skills.create`'s `scope.invalid: scope must be one of: project, user`. We default
+ *      to `"project"` when the caller doesn't specify one (the right home for a per-project persona)
+ *      so the POST always carries a valid scope.
+ *   2. The skill body field is `content`, NOT `instructions`. Storytell once accepted `instructions`;
+ *      it now ignores it, so a body with `instructions` and no `content` fails an opaque
+ *      `{"code":"","statusCode":400}` (empty code, no `humane`). We map our `instructions` param onto
+ *      `content` on the wire. (Verified against api.storytell.ai: `content` → 201, `instructions` → 400.)
+ */
 export async function createSkill(
   pat: string,
   projectId: string,
@@ -569,6 +612,10 @@ export async function createSkill(
     headers: headers(pat, projectId),
     body: JSON.stringify({
       name: skill.name,
+      // The wire field is `content` (see the note above) — our `instructions` param maps onto it. We
+      // ALSO keep sending `instructions` (the old field name) so an older/alternate Storytell build
+      // that still keys off it won't hard-break; the current API just ignores the extra field.
+      content: skill.instructions,
       instructions: skill.instructions,
       category: skill.category,
       scope: skill.scope ?? "project",

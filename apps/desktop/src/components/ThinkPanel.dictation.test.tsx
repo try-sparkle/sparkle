@@ -178,7 +178,7 @@ describe("ThinkPanel — dictation wiring", () => {
   it("falls back to the think-out-loud placeholder when the mic is idle", () => {
     render(<ThinkPanel project={project} agentId="a1" visible />);
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
-    expect(ta.placeholder).toContain("Talk to Claude Code about My Project");
+    expect(ta.placeholder).toContain("Talk to Sparkle about My Project");
     expect(ta.placeholder).not.toContain("I'm listening");
   });
 });

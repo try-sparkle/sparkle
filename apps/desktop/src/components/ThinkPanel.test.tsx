@@ -62,7 +62,7 @@ vi.mock("../services/tasks", () => ({
 vi.mock("../services/agentNaming", () => ({ maybeAutoName: vi.fn() }));
 vi.mock("../services/thinkBridge", () => ({ registerThink: () => () => {} }));
 
-import { ThinkPanel, routeMessage, activeMentionToken } from "./ThinkPanel";
+import { ThinkPanel, routeMessage, activeMentionToken, splitMentions } from "./ThinkPanel";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useHandoffStore } from "../stores/handoffStore";
 import { useHistoryStore } from "../stores/historyStore";
@@ -108,28 +108,56 @@ async function waitReady() {
 }
 
 describe("routeMessage", () => {
-  it("routes plain text to Claude Code", () => {
+  it("routes plain text to Sparkle alone", () => {
     expect(routeMessage("how should I ship this?")).toEqual({
-      kind: "claude",
       question: "how should I ship this?",
+      responders: [{ kind: "claude" }],
     });
   });
-  it("routes @chief to Chief only and strips the mention", () => {
+  it("a LEADING @chief is directed — Chief only, mention stripped", () => {
     expect(routeMessage("@chief what do you think?")).toEqual({
-      kind: "chief",
       question: "what do you think?",
+      responders: [{ kind: "chief" }],
     });
   });
-  it("routes a known @voice to that voice and strips the mention", () => {
+  it("a LEADING @voice is directed — that voice only", () => {
     const r = routeMessage("@architect review this design");
-    expect(r.kind).toBe("voice");
-    if (r.kind === "voice") {
-      expect(r.handle).toBe("architect");
-      expect(r.question).toBe("review this design");
-    }
+    expect(r.question).toBe("review this design");
+    expect(r.responders).toEqual([{ kind: "voice", handle: "architect" }]);
   });
-  it("ignores an unknown @token and falls back to Claude", () => {
-    expect(routeMessage("email me @ bob about it").kind).toBe("claude");
+  it("a mention LATER in the message is additive — Sparkle + the mentioned entity", () => {
+    const r = routeMessage("make a PRD for this. And @chief any suggestions?");
+    expect(r.responders).toEqual([{ kind: "claude" }, { kind: "chief" }]);
+    expect(r.question).toBe("make a PRD for this. And any suggestions?");
+  });
+  it("multiple non-leading mentions all chime in after Sparkle, de-duped in first-seen order", () => {
+    const r = routeMessage("thoughts? @architect and @chief and @architect again");
+    expect(r.responders).toEqual([
+      { kind: "claude" },
+      { kind: "voice", handle: "architect" },
+      { kind: "chief" },
+    ]);
+  });
+  it("ignores an unknown @token and falls back to Sparkle alone", () => {
+    expect(routeMessage("email me @ bob about it").responders).toEqual([{ kind: "claude" }]);
+  });
+});
+
+describe("splitMentions", () => {
+  it("keeps the leading @ on recognized mentions and splits around them", () => {
+    expect(splitMentions("hey @chief and @architect ok")).toEqual([
+      { text: "hey " },
+      { text: "@chief", handle: "chief" },
+      { text: " and " },
+      { text: "@architect", handle: "architect" },
+      { text: " ok" },
+    ]);
+  });
+  it("leaves unknown @tokens inline as plain text", () => {
+    expect(splitMentions("mail @ bob and @nope")).toEqual([{ text: "mail @ bob and @nope" }]);
+  });
+  it("returns a single plain segment when there are no mentions", () => {
+    expect(splitMentions("just text")).toEqual([{ text: "just text" }]);
   });
 });
 
@@ -190,6 +218,23 @@ describe("ThinkPanel — routing + wiring", () => {
     expect(sendClaudeChat).not.toHaveBeenCalled();
     const args = (answerAsVoice.mock.calls[0] as any[])[1];
     expect(args.voiceName).toBe("architect");
+  });
+
+  it("a non-leading @chief is additive — Sparkle answers AND Chief chimes in (no double Chief)", async () => {
+    render(<ThinkPanel project={project} agentId="a1" visible />);
+    await waitReady();
+    typeAndSend("build a billing system. and @chief any suggestions?");
+    await waitFor(() => {
+      expect(sendClaudeChat).toHaveBeenCalledTimes(1); // Sparkle
+      expect(startChat).toHaveBeenCalledTimes(1); // Chief, explicitly
+      expect(screen.getByText("Hello world")).toBeTruthy();
+      expect(screen.getByText("Chief says hi")).toBeTruthy();
+    });
+    // Chief answered explicitly, so its automatic post-Sparkle interjection must be suppressed.
+    expect(chiefInterject).not.toHaveBeenCalled();
+    // The mention token is stripped from what Sparkle receives.
+    const claudeArgs = (sendClaudeChat.mock.calls[0] as any[])[0];
+    expect(claudeArgs.prompt).toBe("build a billing system. and any suggestions?");
   });
 
   it("typing @ opens the mention picker", async () => {
@@ -313,7 +358,12 @@ describe("ThinkPanel — routing + wiring", () => {
     render(<ThinkPanel project={project} agentId="a1" visible />);
     typeAndSend("@chief blocked but visible");
     // The typed message still shows in the thread (not silently discarded), with the error banner.
-    await waitFor(() => expect(screen.getByText("@chief blocked but visible")).toBeTruthy());
+    // In the sent bubble the mention renders as a styled chip WITHOUT the "@" ("chief"), and the
+    // rest of the text follows in its own segment.
+    await waitFor(() => {
+      expect(screen.getByText("chief")).toBeTruthy(); // the @-stripped, emphasized mention
+      expect(screen.getByText(/blocked but visible/)).toBeTruthy();
+    });
     expect(screen.getByText(/AI features are off/)).toBeTruthy();
   });
 });
