@@ -31,8 +31,10 @@ interface DictationState {
   interim: string;
 
   // --- ambient always-listening ---
-  /** Mic hot (master mute). Default true (on by default at launch). Persisted and synced across
-   *  all windows — toggling it off in one window keeps audio off everywhere and across relaunch. */
+  /** Mic hot (master mute). Default FALSE — the ambient mic is opt-in, so a fresh install doesn't
+   *  fire the OS mic-permission prompt or load the VAD/wake-word model during cold start. Persisted
+   *  and synced across all windows, so a user who turns it on stays on across windows and relaunch
+   *  (only the DEFAULT changed — existing persisted `enabled: true` preferences are untouched). */
   enabled: boolean;
   /** passive = hearing but not typing; active = routing speech to the box. */
   phase: Phase;
@@ -67,7 +69,7 @@ export const useDictationStore = create<DictationState>()(
       modelProgress: null,
       interim: "",
 
-      enabled: true,
+      enabled: false, // opt-in: no mic-permission prompt / model load on a fresh cold start
       phase: "passive",
       insertTarget: null,
 

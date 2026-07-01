@@ -6,9 +6,9 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import type { AgentTabStatus } from "../types";
-import type { BranchStatus } from "../services/branchStatus";
+import type { BranchStatus, WorkflowState, AgentStatusResult } from "../services/branchStatus";
 import type { WorkflowStageId } from "../engine/workflowStage";
-import { agentBranchStatus, agentWorkflowState } from "../services/branchStatus";
+import { agentBranchStatus, agentWorkflowState, projectAgentsStatus } from "../services/branchStatus";
 import { deriveLiveStage, stageIndex } from "../engine/workflowStage";
 import { beadLifecycleActions, levelAfter, BEAD_LEVEL } from "../engine/beadLifecycle";
 import { createBead, claimBead, closeBead, markBeadDelivered } from "../services/beads";
@@ -65,6 +65,16 @@ export function __resetChiefSyncBackoff(): void {
 // on the first such failure and never re-poll it. The set resets on relaunch (the store boots
 // clean), which is correct — a stale id simply isn't polled again.
 const deadWorktrees = new Set<string>();
+
+// The batched status command (project_agents_status) skips fingerprint-unchanged idle agents and
+// returns `changed:false` for them, relying on the JS store keeping its prior branchStatus. But the
+// Rust fingerprint cache is a process-lifetime static while `branchStatus` is live-only and boots
+// EMPTY when this module re-executes (a webview reload/HMR that doesn't restart the Rust process).
+// Without this, the first post-reload poll would skip every idle agent and leave branchStatus empty
+// until some ref moves. So we FORCE a full recompute on the first poll after (re)init, which
+// repopulates branchStatus (and refreshes the Rust cache) exactly once; steady-state polls then skip
+// normally. The module-level flag resets whenever the module re-executes, matching the store reset.
+let firstProjectStatusPollDone = false;
 
 /** Does this git error mean the agent's worktree directory is gone (vs. a transient hiccup)? The
  *  latch is terminal (no re-poll until relaunch), so we match ONLY the structural signatures git
@@ -274,6 +284,53 @@ export async function syncBeadLifecycle(
   }
 }
 
+/** Apply a freshly-fetched WorkflowState to an agent: derive its live stage, advance the stored stage
+ *  if it moved forward, drive its bead lifecycle (create/claim/close/deliver), and latch the sticky
+ *  shipped ✓. Extracted so the per-agent `refreshWorkflowStage` and the batched `pollProjectStatus`
+ *  share ONE code path — the only difference between them is how `ws` is fetched (sparkle-zlic). */
+async function applyWorkflowState(
+  projectId: string,
+  rootPath: string,
+  agent: { id: string; kind: string; beadId?: string; name?: string; parentId?: string | null },
+  ws: WorkflowState,
+): Promise<void> {
+  const store = useRuntimeStore;
+  const prev = store.getState().workflowStage[agent.id] ?? null;
+  // A worker's "Merged" = its orchestrator's OWN work has reached main. Read the parent's stored
+  // stage (set by its own poll — orchestrators are applied first each tick); eventually consistent.
+  let parentReachedMain = false;
+  if (agent.kind === "worker" && agent.parentId) {
+    const ps = store.getState().workflowStage[agent.parentId];
+    parentReachedMain = ps ? stageIndex(ps) >= stageIndex("merged") : false;
+  }
+  const next = deriveLiveStage({
+    kind: agent.kind,
+    bs: store.getState().branchStatus[agent.id],
+    ws,
+    prev,
+    parentReachedMain,
+    // A bead-bound agent floors at Planned before any code work exists.
+    hasBead: !!agent.beadId,
+  });
+  if (next !== prev) store.getState().setWorkflowStage(agent.id, next);
+  // Drive the agent's bead from its current stage (fire-and-forget; monotonic + idempotent).
+  void syncBeadLifecycle(
+    projectId,
+    rootPath,
+    agent,
+    next,
+    store.getState().branchStatus[agent.id],
+    !!store.getState().workflowShipped[agent.id],
+  );
+  // Sticky "shipped" watermark: latch true the first time work reaches On Main (or beyond).
+  if (
+    stageIndex(next) >= stageIndex("merged") &&
+    !store.getState().workflowShipped[agent.id]
+  ) {
+    store.getState().setWorkflowShipped(agent.id, true);
+  }
+}
+
 interface RuntimeState {
   status: Record<string, AgentTabStatus>; // agentId -> status (live-only, never persisted)
   // agentId -> the terminal screen text captured the moment the agent entered an "ask" status
@@ -322,6 +379,26 @@ interface RuntimeState {
    *  PR probe, and advance the stored stage if it moved forward. Best-effort: swallows git/gh
    *  errors. Skips think/shell agents (no git workflow). */
   refreshWorkflowStage: (root: string, projectId: string, agentId: string) => Promise<void>;
+  /** Poll branch + workflow status for MANY of a project's agents in ONE batched Rust call
+   *  (sparkle-zlic), instead of fanning out ~3-4 subprocesses per agent every tick. Applies each
+   *  changed agent's branch status + workflow/bead lifecycle (orchestrators first, so a worker's
+   *  derive reads its parent's fresh stage), skips unchanged ones, and schedules ONE Chief sync for
+   *  the project. `probePrState` gates the origin fetch + gh PR probe. Best-effort: swallows errors. */
+  pollProjectStatus: (
+    root: string,
+    projectId: string,
+    agents: Array<{
+      id: string;
+      kind: string;
+      baseBranch: string;
+      parentBranch: string;
+      beadId?: string;
+      name?: string;
+      parentId?: string | null;
+      force: boolean;
+    }>,
+    probePrState: boolean,
+  ) => Promise<void>;
   isOpen: (agentId: string) => boolean;
   /** Drop any open ids whose agent no longer exists (e.g. deleted between
    * launches). Call once on boot with the ids of all agents in projectStore. */
@@ -427,46 +504,64 @@ export const useRuntimeStore = create<RuntimeState>()(
           const parentBranch =
             agent.kind === "worker" && agent.parentId ? `sparkle/agent-${agent.parentId}` : "";
           const ws = await agentWorkflowState(root, agentId, parentBranch, true);
-          const prev = get().workflowStage[agentId] ?? null;
-          // A worker's "Merged" = its orchestrator's OWN work has reached main. Read the parent's
-          // stored stage (set by its own poll); eventually-consistent across ticks.
-          let parentReachedMain = false;
-          if (agent.kind === "worker" && agent.parentId) {
-            const ps = get().workflowStage[agent.parentId];
-            parentReachedMain = ps ? stageIndex(ps) >= stageIndex("merged") : false;
-          }
-          const next = deriveLiveStage({
-            kind: agent.kind,
-            bs: get().branchStatus[agentId],
-            ws,
-            prev,
-            parentReachedMain,
-            // A bead-bound agent floors at Planned before any code work exists, so its row reads as
-            // part of the Think→Plan→Build path rather than jumping straight to "building".
-            hasBead: !!agent.beadId,
-          });
-          if (next !== prev) get().setWorkflowStage(agentId, next);
-          // Drive the agent's bead from its current stage (auto-create on first work; monotonic
-          // claim/close/deliver). Fire-and-forget so a slow/failed `bd` shell-out never stalls the
-          // poll; the pure beadLifecycleActions + per-agent watermark keep it idempotent and prevent
-          // a cycle-reset from reopening an already-closed/delivered bead.
-          void syncBeadLifecycle(
-            projectId,
-            project.rootPath,
-            agent,
-            next,
-            get().branchStatus[agentId],
-            !!get().workflowShipped[agentId],
-          );
-          // Sticky "shipped" watermark: latch true the first time work reaches On Main (or beyond).
-          // It survives a later cycle reset (deriveLiveStage dropping `next` back to Committed), so the
-          // row keeps its ✓ even while the bar re-climbs for new work.
-          if (stageIndex(next) >= stageIndex("merged") && !get().workflowShipped[agentId]) {
-            get().setWorkflowShipped(agentId, true);
-          }
+          // Derive stage + drive bead lifecycle + latch shipped ✓ (shared with pollProjectStatus).
+          await applyWorkflowState(projectId, project.rootPath, agent, ws);
         } catch (e) {
           console.debug("refreshWorkflowStage failed for", agentId, e);
         }
+      },
+
+      pollProjectStatus: async (root, projectId, agents, probePrState) => {
+        // Drop agents already latched as gone () so a removed worktree isn't re-polled.
+        const live = agents.filter((a) => !deadWorktrees.has(a.id));
+        if (live.length === 0) return;
+        const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
+        if (!project) return;
+        // Force every agent to recompute on the FIRST poll after (re)init so the live-only, boots-empty
+        // branchStatus map is repopulated even when the Rust fingerprint cache survived a reload (see
+        // firstProjectStatusPollDone). Steady-state polls honor each agent's own `force`.
+        const forceAll = !firstProjectStatusPollDone;
+        let results: AgentStatusResult[];
+        try {
+          results = await projectAgentsStatus(
+            root,
+            projectId,
+            live.map((a) => ({
+              agentId: a.id,
+              baseBranch: a.baseBranch,
+              parentBranch: a.parentBranch,
+              kind: a.kind,
+              force: a.force || forceAll,
+            })),
+            probePrState,
+          );
+        } catch (e) {
+          console.debug("pollProjectStatus failed for", projectId, e);
+          return;
+        }
+        firstProjectStatusPollDone = true;
+        const infoById = new Map(live.map((a) => [a.id, a]));
+        // Apply orchestrators (build) BEFORE workers so a worker's deriveLiveStage reads its parent's
+        // fresh stage this same tick — matching the old parents-first-then-rest poll ordering.
+        const rank = (id: string) => (infoById.get(id)?.kind === "build" ? 0 : 1);
+        const ordered = [...results].sort((x, y) => rank(x.agentId) - rank(y.agentId));
+        for (const r of ordered) {
+          if (!r.changed) continue; // unchanged since last tick → keep prior store values
+          if (r.branch) get().setBranchStatus(r.agentId, r.branch);
+          const info = infoById.get(r.agentId);
+          if (r.workflow && info) {
+            await applyWorkflowState(
+              projectId,
+              project.rootPath,
+              { id: info.id, kind: info.kind, beadId: info.beadId, name: info.name, parentId: info.parentId },
+              r.workflow,
+            );
+          }
+        }
+        // ONE debounced Chief sync for the whole project (the same signal a commit would refresh),
+        // rather than one per agent as the old per-agent pollBranchStatus fan-out did.
+        const syncAgent = live.find((a) => a.kind !== "think" && a.kind !== "shell");
+        if (syncAgent) scheduleChiefSync(projectId, syncAgent.id);
       },
 
       isOpen: (agentId) => get().openAgentIds.includes(agentId),

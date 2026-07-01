@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
@@ -118,6 +119,32 @@ const MIN_PTY_COLS: u16 = 20;
 const MIN_PTY_ROWS: u16 = 5;
 const SPAWN_FALLBACK_COLS: u16 = 120;
 const SPAWN_FALLBACK_ROWS: u16 = 30;
+
+// ── pty:output coalescing ─────────────────────────────────────────────────────────────────────
+// The reader thread used to emit a `pty:output` Tauri event on EVERY read() (and once per decoded
+// sub-slice). During a burst — `claude --resume` redrawing a large transcript, or any full-screen
+// TUI repaint — that fires hundreds-to-thousands of tiny events/sec, each paying a full IPC
+// crossing + JSON serialization, and the frontend runs term.write + engine.ingest + watchRateLimit
+// synchronously per event. Instead we accumulate decoded text in a shared buffer and let a
+// dedicated flusher thread emit far fewer, larger events: it waits for the first byte (so idle
+// costs nothing), then coalesces a short window before emitting. Ordering is preserved (a single
+// buffer, appended in read order, drained in order) and a final flush on EOF/close guarantees no
+// trailing output is lost (see the flusher + reader join below).
+//
+// FLUSH_INTERVAL is the coalescing window: short enough that interactive typing echo stays
+// imperceptible, long enough that a repaint burst collapses into a handful of events. SIZE_THRESHOLD
+// bounds how much a sustained flood accumulates before an early flush, so per-event size (and the
+// buffer's peak memory) stay bounded rather than growing for the whole interval.
+const PTY_FLUSH_INTERVAL_MS: u64 = 12;
+const PTY_FLUSH_SIZE_THRESHOLD: usize = 64 * 1024;
+
+/// Shared buffer between the PTY reader thread (producer) and the flusher thread (consumer).
+/// `done` is set once by the reader on EOF/close to trigger the flusher's final flush + exit.
+#[derive(Default)]
+struct FlushBuf {
+    text: String,
+    done: bool,
+}
 
 /// SPAWN backstop: an implausibly small requested size is replaced WHOLESALE with the comfortable
 /// default (a CLI started at 120×30 reflows cleanly once the real visible size is synced on
@@ -233,29 +260,82 @@ pub fn pty_spawn(
         let _ = child.wait();
     });
 
-    // Reader thread → emit output. Buffer partial multi-byte UTF-8 across chunk
-    // boundaries (Claude Code's TUI emits box-drawing/emoji).
+    // Reader thread → shared buffer; a flusher thread coalesces + emits `pty:output`. Buffer partial
+    // multi-byte UTF-8 across chunk boundaries (Claude Code's TUI emits box-drawing/emoji).
+    let shared = Arc::new((Mutex::new(FlushBuf::default()), Condvar::new()));
+
+    // Flusher thread: drain the shared buffer into coalesced `pty:output` events. Ordering is
+    // preserved because it's a single buffer drained front-to-back. It waits for the first byte
+    // (idle costs nothing), then coalesces up to PTY_FLUSH_INTERVAL_MS — or flushes early once the
+    // buffer reaches PTY_FLUSH_SIZE_THRESHOLD — before emitting. On `done` it drains whatever remains
+    // and exits, so trailing output on EOF/close is never dropped.
+    let flush_app = app.clone();
+    let flush_id = id.clone();
+    let flush_shared = shared.clone();
+    let flusher = std::thread::spawn(move || {
+        let (lock, cvar) = &*flush_shared;
+        loop {
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            // Block until there's something to flush or the stream ended (no busy-wait while idle).
+            while guard.text.is_empty() && !guard.done {
+                guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+            }
+            // We have data (or we're done). If more may still arrive, give the reader a brief
+            // window to pile a burst into the same buffer — but return early if the stream ends or
+            // the buffer hits the size cap, so a flood flushes promptly and bounds per-event size.
+            if !guard.done && guard.text.len() < PTY_FLUSH_SIZE_THRESHOLD {
+                let (g, _timed_out) = cvar
+                    .wait_timeout_while(
+                        guard,
+                        Duration::from_millis(PTY_FLUSH_INTERVAL_MS),
+                        |b| !b.done && b.text.len() < PTY_FLUSH_SIZE_THRESHOLD,
+                    )
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = g;
+            }
+            let chunk = std::mem::take(&mut guard.text);
+            let done = guard.done;
+            drop(guard);
+            if !chunk.is_empty() {
+                let _ = flush_app.emit("pty:output", PtyOutput { id: flush_id.clone(), chunk });
+            }
+            if done {
+                break;
+            }
+        }
+    });
+
     let read_app = app.clone();
     let read_id = id.clone();
+    let read_shared = shared;
     std::thread::spawn(move || {
+        let (lock, cvar) = &*read_shared;
         let mut pending: Vec<u8> = Vec::new();
         let mut buf = [0u8; 4096];
-        let emit = |chunk: String| {
-            let _ = read_app.emit("pty:output", PtyOutput { id: read_id.clone(), chunk });
+        // Append this read()'s decoded text to the shared buffer and wake the flusher.
+        let push = |out: String| {
+            if out.is_empty() {
+                return;
+            }
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            guard.text.push_str(&out);
+            cvar.notify_one();
         };
         'read: loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     pending.extend_from_slice(&buf[..n]);
-                    // Drain every decodable byte. Emit valid text, SKIP genuinely
-                    // invalid sequences (replacement char) so we never stall, and
-                    // keep an incomplete trailing multibyte for the next read.
+                    // Drain every decodable byte into `out`. Keep valid text, SKIP genuinely
+                    // invalid sequences (replacement char) so we never stall, and keep an
+                    // incomplete trailing multibyte for the next read. Coalesce this read's output
+                    // into one shared-buffer append (one lock/notify per read, not per sub-slice).
+                    let mut out = String::new();
                     loop {
                         match std::str::from_utf8(&pending) {
                             Ok(s) => {
                                 if !s.is_empty() {
-                                    emit(s.to_owned());
+                                    out.push_str(s);
                                     pending.clear();
                                 }
                                 break;
@@ -263,20 +343,18 @@ pub fn pty_spawn(
                             Err(e) => {
                                 let valid = e.valid_up_to();
                                 match e.error_len() {
-                                    // Invalid bytes: emit valid prefix + U+FFFD, consume them.
+                                    // Invalid bytes: keep valid prefix + U+FFFD, consume them.
                                     Some(bad) => {
-                                        emit(
-                                            String::from_utf8_lossy(&pending[..valid + bad])
-                                                .into_owned(),
+                                        out.push_str(
+                                            &String::from_utf8_lossy(&pending[..valid + bad]),
                                         );
                                         pending.drain(..valid + bad);
                                     }
-                                    // Incomplete tail: emit valid prefix, keep the rest.
+                                    // Incomplete tail: keep valid prefix, hold the rest.
                                     None => {
                                         if valid > 0 {
-                                            emit(
-                                                String::from_utf8_lossy(&pending[..valid])
-                                                    .into_owned(),
+                                            out.push_str(
+                                                &String::from_utf8_lossy(&pending[..valid]),
                                             );
                                             pending.drain(..valid);
                                         }
@@ -286,10 +364,20 @@ pub fn pty_spawn(
                             }
                         }
                     }
+                    push(out);
                 }
                 Err(_) => break 'read,
             }
         }
+        // Signal EOF/close so the flusher drains any remaining buffer, then WAIT for it: this
+        // guarantees the final `pty:output` is emitted before `pty:exit` below, so no trailing
+        // output is lost or reordered past the exit event.
+        {
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            guard.done = true;
+            cvar.notify_one();
+        }
+        let _ = flusher.join();
         // Reap the session on natural exit (pty_kill also removes it).
         read_app.state::<PtyManager>().remove(&read_id);
         let _ = read_app.emit("pty:exit", PtyEnd { id: read_id.clone() });

@@ -254,7 +254,7 @@ pub struct McpPaths {
 /// Resolve the node binary + the bundled mcp-orchestrator server.js (Tauri command).
 #[tauri::command]
 pub fn orchestrator_mcp_paths(app: AppHandle) -> Result<McpPaths, String> {
-    let node_path = crate::preflight::resolve_node_path()
+    let node_path = crate::preflight::resolve_node_path_cached()
         .ok_or_else(|| "node not found (install Node.js; needed to run the orchestrator)".to_string())?;
     let server = app
         .path()

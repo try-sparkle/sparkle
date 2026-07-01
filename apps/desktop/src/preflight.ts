@@ -7,9 +7,39 @@ export interface ClaudeStatus {
   version: string | null;
 }
 
-/** Check whether the user's own Claude Code is installed (resolved via login shell). */
+/** Check whether the user's own Claude Code is installed (resolved via login shell). The path is
+ *  cached per app session and resolved off the main thread. `version` is intentionally null on this
+ *  hot path — use {@link claudeVersion} where a version is actually needed. */
 export function checkClaude(): Promise<ClaudeStatus> {
   return invoke<ClaudeStatus>("claude_preflight");
+}
+
+/** Resolve the installed Claude Code version lazily (kept off the spawn hot path because it
+ *  cold-boots node just to print a version). Null when not installed or the probe fails. */
+export function claudeVersion(): Promise<string | null> {
+  return invoke<string | null>("claude_version");
+}
+
+/** Clear the cached claude/node paths so the next preflight re-probes — e.g. after the user
+ *  installs Claude Code (or Node) while the app is running. */
+export function refreshPreflight(): Promise<void> {
+  return invoke("refresh_preflight");
+}
+
+export interface ClaudeSessionInfo {
+  hasSession: boolean;
+  latestSessionId: string | null;
+}
+
+/** Combined session probe (single round-trip, off the main thread): whether this worktree already
+ *  has a resumable `claude` conversation AND its newest session id. Both share ONE transcript-dir
+ *  scan — this replaces awaiting {@link claudeHasSession} then {@link claudeLatestSessionId}
+ *  serially on the spawn path. `configDir` resolves the account exactly like {@link claudeHasSession}. */
+export function claudeSessionInfo(
+  worktreePath: string,
+  configDir?: string,
+): Promise<ClaudeSessionInfo> {
+  return invoke<ClaudeSessionInfo>("claude_session_info", { worktreePath, configDir });
 }
 
 /** True if this worktree already has a prior `claude` conversation we can resume

@@ -44,6 +44,48 @@ export default defineConfig(({ mode, command }) => {
   }
   return {
   plugins: [react()],
+  build: {
+    // The app only ever runs inside a system WebView — WKWebView on macOS (bundle
+    // minimumSystemVersion 11.0 ⇒ Safari 14) and evergreen WebView2 on Windows. Target that
+    // baseline explicitly (Safari 14 is the binding floor) so esbuild stops downleveling to the
+    // older browsers in Vite's default matrix, shrinking the shipped bundle. NOT 'esnext': Safari
+    // 14 can't run every latest-syntax feature, so an unbounded target risks a blank WebView on
+    // macOS 11. Minify stays at Vite's default (esbuild).
+    target: "safari14",
+    rollupOptions: {
+      output: {
+        // Peel the heaviest third-party libraries into their own async vendor chunks (bead
+        // sparkle-alrm.5, #9). Function form (not object) so React's multiple entry points —
+        // react, react-dom AND react/jsx-runtime — are matched precisely by path: react-markdown
+        // depends on React, so if jsx-runtime isn't pinned to vendor-react, Rollup folds it into
+        // vendor-markdown, and because the eager shell also needs React that drags the whole
+        // markdown chunk into the initial load. Pinning React FIRST keeps it shared/eager and
+        // leaves react-markdown/remark-gfm genuinely async (reachable only via the lazy AgentPane →
+        // ThinkPanel). xterm/posthog/socket.io are split for parallel download + long-lived caching
+        // even where an eager module still references them. Their transitive deps that fall through
+        // here are only reachable from already-async chunks, so Rollup keeps them async too.
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          // Segment after the LAST node_modules/ — robust to pnpm's nested .pnpm store paths.
+          const pkg = id.split("node_modules/").pop() ?? "";
+          // Trailing-slash boundaries so "react/" never captures "react-markdown/".
+          if (/^(react|react-dom|scheduler)\//.test(pkg)) return "vendor-react";
+          if (pkg.startsWith("posthog-js/")) return "vendor-posthog";
+          if (pkg.startsWith("@xterm/")) return "vendor-xterm";
+          if (
+            pkg.startsWith("socket.io-client/") ||
+            pkg.startsWith("socket.io-parser/") ||
+            pkg.startsWith("engine.io-client/") ||
+            pkg.startsWith("engine.io-parser/")
+          )
+            return "vendor-socketio";
+          if (pkg.startsWith("react-markdown/") || pkg.startsWith("remark-gfm/"))
+            return "vendor-markdown";
+          return undefined;
+        },
+      },
+    },
+  },
   // Keep a single React/React-DOM instance. The monorepo legitimately holds two
   // React versions (mobile/Expo pins 19.2.3; web + desktop use 19.2.4); the root
   // package.json pins 19.2.4 so @testing-library/react resolves the same copy

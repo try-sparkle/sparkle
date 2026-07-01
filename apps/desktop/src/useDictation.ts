@@ -115,8 +115,13 @@ export async function createDictationController(
     }),
 
     listen<number>("dictation://level", (e) => {
-      // Capture started — clear any lingering model-download progress.
-      useDictationStore.getState().setModelProgress(null);
+      // Capture started — clear any lingering model-download progress. This fires ~25×/sec, so
+      // only write when there's actually progress to clear; an unconditional set(null) would churn
+      // the store (and every subscriber) 25 times a second for a no-op.
+      const dict = useDictationStore.getState();
+      if (dict.modelProgress !== null) {
+        dict.setModelProgress(null);
+      }
       setLevel(e.payload);
     }),
 

@@ -133,6 +133,45 @@ export function agentBranchStatus(
   return invoke<BranchStatus>("agent_branch_status", { root, projectId, agentId, baseBranch });
 }
 
+/** One agent's inputs for the batched project poll (sparkle-zlic). `parentBranch` is the
+ *  orchestrator branch for a worker (empty otherwise); `force` tells Rust to always recompute this
+ *  agent (set true while it's actively working so dirty/ahead stay fresh) rather than skip it. */
+export interface AgentStatusInput {
+  agentId: string;
+  baseBranch: string;
+  parentBranch: string;
+  kind: string;
+  force: boolean;
+}
+
+/** One agent's result from the batched poll. `changed === false` means nothing moved since the last
+ *  tick and the caller should keep its prior store values (branch/workflow are then null). */
+export interface AgentStatusResult {
+  agentId: string;
+  changed: boolean;
+  branch: BranchStatus | null;
+  workflow: WorkflowState | null;
+}
+
+/** Branch + workflow status for ALL of a project's agents in ONE Rust call (sparkle-zlic): shared
+ *  repo discovery, memoized base resolution, and fingerprint-skip of unchanged idle agents, instead
+ *  of fanning out ~3-4 subprocesses per agent every tick. `probePrState` gates the origin fetch + gh
+ *  PR probe (pass false on a fast/local poll). Never throws on a per-agent git error — that agent is
+ *  reported `changed:false`. */
+export function projectAgentsStatus(
+  root: string,
+  projectId: string,
+  agents: AgentStatusInput[],
+  probePrState: boolean,
+): Promise<AgentStatusResult[]> {
+  return invoke<AgentStatusResult[]>("project_agents_status", {
+    root,
+    projectId,
+    agents,
+    probePrState,
+  });
+}
+
 /** Rebase the agent branch onto its fresh base. Refuses when the agent is busy (frontend gate). */
 export async function refreshAgentBranch(
   root: string,

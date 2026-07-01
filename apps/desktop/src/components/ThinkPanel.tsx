@@ -268,7 +268,30 @@ export function ThinkPanel({
       return;
     }
     const replyId = pushMsg({ author: "claude", text: "", pending: true });
-    let acc = "";
+    let acc = ""; // full reply text committed to state so far
+    // Coalesce streamed deltas: a fast stream fires onDelta many times per frame. Buffering the
+    // unflushed text and committing it to React state once per animation frame (instead of a state
+    // write + re-render per delta) turns O(deltas) re-renders into O(frames), and moves the string
+    // growth off the per-delta hot path. onDone/onError commit the authoritative final text directly
+    // and cancel any pending frame, so the last partial buffer is never lost or left marked pending.
+    let buf = "";
+    let rafId: number | null = null;
+    const flushDelta = () => {
+      rafId = null;
+      if (!buf) return;
+      acc += buf;
+      buf = "";
+      patchMsg(replyId, { text: acc, pending: true });
+    };
+    const scheduleFlush = () => {
+      if (rafId == null) rafId = requestAnimationFrame(flushDelta);
+    };
+    const cancelFlush = () => {
+      if (rafId != null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+    };
     // A turn can settle (done/error) BEFORE `sendClaudeChat` resolves its cleanup — most visibly when
     // a backend completes synchronously. `handleSettle` tears down whatever listeners are already
     // wired; the post-await assignment below tears them down immediately if we settled first, so the
@@ -287,12 +310,14 @@ export function ThinkPanel({
         claudePath,
         resumeSessionId: sessionIdRef.current,
         onDelta: (text) => {
-          acc += text;
-          patchMsg(replyId, { text: acc, pending: true });
+          buf += text;
+          scheduleFlush();
         },
         onDone: ({ sessionId, text }) => {
+          cancelFlush();
           sessionIdRef.current = sessionId || sessionIdRef.current;
-          const finalText = (text && text.trim()) || acc;
+          const finalText = (text && text.trim()) || acc + buf;
+          buf = "";
           patchMsg(replyId, { text: finalText, pending: false });
           if (capture && finalText.trim()) recordTurn("response", finalText);
           setSending(false);
@@ -301,15 +326,24 @@ export function ThinkPanel({
           maybeChiefInterject([...transcriptBefore, { id: replyId, author: "claude", text: finalText }]);
         },
         onError: (message) => {
+          cancelFlush();
           patchMsg(replyId, { text: `_Claude Code error: ${message}_`, pending: false });
           setError(message);
           setSending(false);
           handleSettle();
         },
       });
-      if (settled) cleanup();
-      else claudeCleanup.current = cleanup;
+      // Compose cancelFlush into the stored cleanup so EVERY teardown path — unmount, Stop, a
+      // superseding turn — also cancels a pending delta frame. Without this, a turn abandoned
+      // without a done/error event could still fire its last rAF and re-mark the message pending.
+      const teardown = () => {
+        cancelFlush();
+        cleanup();
+      };
+      if (settled) teardown();
+      else claudeCleanup.current = teardown;
     } catch (e) {
+      cancelFlush();
       patchMsg(replyId, { text: `_Claude Code error: ${friendlyError(e)}_`, pending: false });
       setError(friendlyError(e));
       setSending(false);

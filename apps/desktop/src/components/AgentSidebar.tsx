@@ -4,8 +4,10 @@ import {
   useLayoutEffect,
   useRef,
   useMemo,
+  useCallback,
   useContext,
   createContext,
+  memo,
   type RefObject,
   type DragEvent as ReactDragEvent,
 } from "react";
@@ -340,7 +342,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       try {
         const proj = useProjectStore.getState().projects.find((p) => p.id === projectId);
         if (!proj) return;
-        const { openAgentIds, pollBranchStatus: poll } = useRuntimeStore.getState();
+        const { openAgentIds, status, pollProjectStatus } = useRuntimeStore.getState();
         const hasWorkflow = (a: (typeof proj.agents)[number]) =>
           a.kind !== "think" && a.kind !== "shell"; // those have no git workflow
         // Targets: every OPEN agent, PLUS the orchestrator parent of each open worker — even when
@@ -358,14 +360,28 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         const all = [...targets.values()];
         // Auto-name each agent from Claude Code's own session title (ai-title in the transcript) —
         // the authoritative name once the first turn has summarized. Fire-and-forget, independent
-        // of the branch-status polls below; the store action respects pins + de-dupes.
+        // of the branch-status poll below; the store action respects pins + de-dupes.
         for (const a of all) void refreshAgentTitle(proj.id, a.id, a.worktreePath);
-        // Poll orchestrators (worker parents) first and await them, so a worker's derive in this
-        // same round reads its parent's fresh stage rather than lagging a tick behind.
-        const parents = all.filter((a) => a.kind === "build");
-        const rest = all.filter((a) => a.kind !== "build");
-        await Promise.all(parents.map((a) => poll(proj.rootPath, proj.id, a.id, a.baseBranch ?? "")));
-        await Promise.all(rest.map((a) => poll(proj.rootPath, proj.id, a.id, a.baseBranch ?? "")));
+        // ONE batched Rust call for the whole project (sparkle-zlic) instead of the old ~3-4
+        // subprocesses PER agent: shared repo discovery + skip of fingerprint-unchanged idle agents.
+        // `force` recomputes actively-working agents so their dirty/ahead counts stay fresh; the
+        // batch applies orchestrators before workers internally so a worker's "Merged" derive still
+        // reads its parent's fresh stage this same tick.
+        await pollProjectStatus(
+          proj.rootPath,
+          proj.id,
+          all.map((a) => ({
+            id: a.id,
+            kind: a.kind,
+            baseBranch: a.baseBranch ?? "",
+            parentBranch: a.kind === "worker" && a.parentId ? `sparkle/agent-${a.parentId}` : "",
+            beadId: a.beadId,
+            name: a.name,
+            parentId: a.parentId,
+            force: status[a.id] === "working",
+          })),
+          true,
+        );
       } finally {
         inFlight = false;
       }
@@ -476,10 +492,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     selectAgent(project.id, next);
     if (next) open(next);
   };
-  const onSelectSparkle = () => {
+  // Stable so the memoized SparkleAgentRow doesn't re-render on unrelated status flips (sparkle-alrm.3).
+  const onSelectSparkle = useCallback(() => {
     setActiveSpecial("sparkle");
     open(SPARKLE_AGENT_ID);
-  };
+  }, [setActiveSpecial, open]);
   // Land an agent's work into its integration target: a worker → its orchestrator's branch; a build
   // agent → the project's default branch. A local --no-ff merge (see Rust land_agent_branch); the
   // tracker then advances to On Main on the next poll. Best-effort feedback via console for now
@@ -527,14 +544,26 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     if (!project) return;
     const fresh = useProjectStore.getState().projects.find((p) => p.id === project.id);
     if (!fresh) return;
+    // Read ALL inputs FRESH (not the render-scope `status`/`mode`/`agentOrdering`): now that AgentRow
+    // is memoized, the `onClose` closure that reaches here may have been captured a few renders ago.
+    // `agentOrdering` in particular is reachable-stale — toggling attention-ordering keeps a row whose
+    // orderedIndex didn't change mounted, so its captured closure would otherwise pick the next
+    // selection against the old ordering (sparkle-alrm.3).
+    const rt = useRuntimeStore.getState();
+    const { workMode: freshMode, agentOrdering: freshOrdering } = useUiStore.getState();
+    const freshStatus = withUnstartedWorkerAttention(
+      fresh.agents,
+      rt.status,
+      new Set(rt.openAgentIds),
+    );
     const decision = selectionAfterClose(
       removedRootId,
       project.selectedAgentId,
       project.agents,
       fresh.agents,
-      mode,
-      agentOrdering,
-      status,
+      freshMode,
+      freshOrdering,
+      freshStatus,
     );
     if (decision.reselect) selectAgent(project.id, decision.next);
   };
@@ -558,8 +587,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     if (!project) return teardownAgent(id);
     const agent = project.agents.find((a) => a.id === id);
     if (!agent) return;
-    const stage = resolveStage(branchStatus[id], workflowStage[id]);
-    if (shouldPromptOnClose(agent.kind, stage, branchStatus[id])) setClosePromptId(id);
+    // Read branch/workflow FRESH from the store rather than the render-scope maps: AgentRow is now
+    // memoized, so its `onClose` closure can be a few renders stale — the close-prompt decision must
+    // reflect the live git state, not a snapshot (sparkle-alrm.3).
+    const rt = useRuntimeStore.getState();
+    const stage = resolveStage(rt.branchStatus[id], rt.workflowStage[id]);
+    if (shouldPromptOnClose(agent.kind, stage, rt.branchStatus[id])) setClosePromptId(id);
     else teardownAgent(id);
   };
 
@@ -811,6 +844,15 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       })()
     : [];
 
+  // The ordered top-level stack the list renders. Memoized (sparkle-alrm.3) so it only re-sorts when
+  // the agent set, overlaid status, mode, or ordering actually change — not on every unrelated
+  // re-render. Shared with the TopBar dot cluster via orderedTopLevelAgents so the two never drift.
+  const ordered = useMemo(
+    () =>
+      project ? orderedTopLevelAgents(project.agents, status, mode, agentOrdering === "attention") : [],
+    [project, status, mode, agentOrdering],
+  );
+
   return (
     <SidebarScrollContext.Provider value={sidebarScroll}>
     <div
@@ -952,12 +994,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           // the header dots can't drift out of sync with these rows. Only the top-level stack
           // reorders; nested workers stay under their parent in insertion order. Selection is
           // tracked by id (project.selectedAgentId), so re-sorting never changes which agent is open.
-          const ordered = orderedTopLevelAgents(
-            project.agents,
-            status,
-            mode,
-            agentOrdering === "attention",
-          );
+          // `ordered` is memoized in the component body above (sparkle-alrm.3).
           return ordered.map((top, orderedIndex) => {
             const workers =
               top.kind === "build"
@@ -1291,29 +1328,7 @@ type WorkerDetail = {
 // fresh reference every render and loops the store. Reuse one array.
 const NO_BEADS: Bead[] = [];
 
-function AgentRow({
-  project,
-  a,
-  depth,
-  isActive,
-  st,
-  statusColor,
-  bs,
-  trackerStage,
-  shipped,
-  workerCount,
-  workers,
-  orderedIndex,
-  dragActive,
-  onDragStartAgent,
-  onDragEndAgent,
-  onDropAgent,
-  editing,
-  setEditing,
-  onSelect,
-  onLand,
-  onClose,
-}: {
+type AgentRowProps = {
   project: Project;
   a: AgentTab;
   depth: number;
@@ -1343,7 +1358,88 @@ function AgentRow({
   onSelect: () => void;
   onLand: () => void;
   onClose: () => void;
-}) {
+};
+
+// Do two orchestrator worker view-models render identically? Compared field-by-field (the closures
+// are excluded — see agentRowPropsEqual) so a fresh `workers` array built each parent render doesn't
+// force the orchestrator row to re-render when none of its workers' DISPLAY data actually changed.
+function workerDetailsEqual(a: WorkerDetail[], b: WorkerDetail[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]!;
+    const y = b[i]!;
+    if (
+      x.id !== y.id ||
+      x.name !== y.name ||
+      x.autoTitle !== y.autoTitle ||
+      x.description !== y.description ||
+      x.stage !== y.stage ||
+      x.status !== y.status ||
+      x.statusColor !== y.statusColor ||
+      x.branchStatus !== y.branchStatus || // branchStatus[id] ref is stable unless that agent polled
+      x.shipped !== y.shipped ||
+      x.worktreePath !== y.worktreePath ||
+      x.baseBranch !== y.baseBranch
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Memo comparator for AgentRow (sparkle-alrm.3). A row re-renders ONLY when its OWN display data
+ * changes — so one agent's frequent status flip re-paints just that agent's row instead of the whole
+ * sidebar subtree. Every data prop is compared here; the callback props (onSelect/onLand/onClose/
+ * drag handlers/setEditing) are deliberately EXCLUDED: `project` is compared (any project mutation
+ * re-renders the row with fresh closures), and the close/reselect paths read live store state via
+ * getState(), so a slightly-stale callback closure can never act on stale data. This list MUST stay
+ * exhaustive: omitting a DATA prop that changed makes this return `true`, which SKIPS the re-render
+ * and leaves the row painting stale data (a visual/correctness bug, not merely an extra render).
+ */
+function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
+  return (
+    prev.project === next.project &&
+    prev.a === next.a &&
+    prev.depth === next.depth &&
+    prev.isActive === next.isActive &&
+    prev.st === next.st &&
+    prev.statusColor === next.statusColor &&
+    prev.bs === next.bs &&
+    prev.trackerStage === next.trackerStage &&
+    prev.shipped === next.shipped &&
+    prev.workerCount === next.workerCount &&
+    prev.orderedIndex === next.orderedIndex &&
+    prev.dragActive === next.dragActive &&
+    prev.editing === next.editing &&
+    workerDetailsEqual(prev.workers, next.workers)
+  );
+}
+
+const AgentRow = memo(function AgentRow({
+  project,
+  a,
+  depth,
+  isActive,
+  st,
+  statusColor,
+  bs,
+  trackerStage,
+  shipped,
+  workerCount,
+  workers,
+  orderedIndex,
+  dragActive,
+  onDragStartAgent,
+  onDragEndAgent,
+  onDropAgent,
+  editing,
+  setEditing,
+  onSelect,
+  onLand,
+  onClose,
+}: AgentRowProps) {
   const renameAgent = useProjectStore((s) => s.renameAgent);
   const unpinAgent = useProjectStore((s) => s.unpinAgent);
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
@@ -2033,7 +2129,7 @@ function AgentRow({
         )}
     </>
   );
-}
+}, agentRowPropsEqual);
 
 /** The Location / Status / Progress detail block for ONE agent in the hover card. Shared by the
  *  orchestrator's own detail and each of its inline workers, so the behind/ahead pill logic lives
@@ -2245,8 +2341,10 @@ function CloseAgentButton({ onClose, width }: { onClose: () => void; width: numb
 
 /** The pinned, always-present Sparkle self-improvement agent row. Distinct from project agents:
  *  no emoji and no close button — it reads "Improve Sparkle" + a consent pill (Always | Manual |
- *  Off) and a status-driven progress bar, and works on Sparkle itself, not the user's project. */
-function SparkleAgentRow({
+ *  Off) and a status-driven progress bar, and works on Sparkle itself, not the user's project.
+ *  `React.memo`'d (sparkle-alrm.3) with primitive props + a stable `onSelect`, so a project agent's
+ *  status flip re-renders only that agent's row, never this pinned footer row. */
+const SparkleAgentRow = memo(function SparkleAgentRow({
   active,
   status,
   onSelect,
@@ -2299,7 +2397,7 @@ function SparkleAgentRow({
       </div>
     </div>
   );
-}
+});
 
 /** The Always / Manual / Off badge on the Improve Sparkle row — reflects the consent mode. */
 function SparkleConsentPill({ label }: { label: string }) {

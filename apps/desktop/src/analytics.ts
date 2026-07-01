@@ -7,7 +7,11 @@
 //
 // No-ops cleanly when VITE_PUBLIC_POSTHOG_KEY is absent (dev/CI/offline), so the
 // app always runs whether or not analytics is configured.
-import posthog from "posthog-js";
+// posthog-js (and the session-replay recorder it lazily pulls in) is NOT imported at module load.
+// It's a heavy dependency that has no business competing with first paint, so we dynamic-import it
+// and call posthog.init() from an idle callback after the UI has rendered (see initAnalytics). The
+// type is imported type-only (erased at build) so signatures stay typed with zero runtime cost.
+import type { PostHog } from "posthog-js";
 import {
   ANALYTICS_EVENTS,
   posthogBrowserCommonConfig,
@@ -15,6 +19,28 @@ import {
   sniffPlatform,
   type AnalyticsEvent,
 } from "@sparkle/core";
+
+// The live client, assigned once the dynamic import + init completes. Null until then, so every
+// capture/identify call no-ops safely during the pre-init window (and forever if no key/replay).
+let posthog: PostHog | null = null;
+
+/**
+ * Run `cb` once the main thread is idle, after first paint. Uses requestIdleCallback where the
+ * runtime has it; falls back to a short setTimeout for WKWebView/Safari, which historically lack
+ * requestIdleCallback. Either way the work lands after the initial render, not during it.
+ */
+function onIdle(cb: () => void): void {
+  const w = window as Window &
+    typeof globalThis & { requestIdleCallback?: (cb: () => void) => number };
+  if (typeof w.requestIdleCallback === "function") {
+    w.requestIdleCallback(cb);
+    return;
+  }
+  // WKWebView/Safari fallback: a bare setTimeout(cb, 1) can fire BEFORE first paint, defeating the
+  // whole point of deferring past render on the platform this most needs to help. rAF + a 0ms
+  // timeout lands the callback after a frame has actually been committed.
+  requestAnimationFrame(() => setTimeout(cb, 0));
+}
 
 // Injected at build time from apps/desktop/package.json via vite `define`.
 declare const __SPARKLE_APP_VERSION__: string;
@@ -29,6 +55,7 @@ const HOST =
 const LAST_VERSION_KEY = "sparkle-analytics:last-version";
 
 let ready = false;
+let scheduled = false;
 
 function appVersion(): string {
   return typeof __SPARKLE_APP_VERSION__ === "string"
@@ -36,21 +63,46 @@ function appVersion(): string {
     : "0.0.0";
 }
 
-/** Stand up PostHog once, at launch. Safe to call more than once. */
+/**
+ * Schedule PostHog to stand up once, at launch — but OFF the critical path. Returns immediately;
+ * the actual dynamic import + posthog.init() runs from an idle callback after first paint, so the
+ * heavy analytics bundle and its session-replay recorder never delay the initial render. Safe to
+ * call more than once (guarded by `scheduled`). No-ops with no key / outside a browser.
+ */
 export function initAnalytics(): void {
-  if (ready) return;
+  if (scheduled || ready) return;
   if (!KEY || typeof window === "undefined") return;
+  scheduled = true;
+  onIdle(() => {
+    void loadAndInit();
+  });
+}
+
+/** Dynamic-import posthog-js and initialize it. Runs post-paint from initAnalytics's idle callback. */
+async function loadAndInit(): Promise<void> {
+  if (ready || !KEY) return;
+
+  let mod: typeof import("posthog-js");
+  try {
+    mod = await import("posthog-js");
+  } catch (e) {
+    // Couldn't load the analytics bundle (offline/CI) — capture calls keep no-oping. Never fatal.
+    console.warn("analytics: failed to load posthog-js", e);
+    return;
+  }
+  const client = mod.default;
 
   const version = appVersion();
   const { os, arch } = sniffPlatform(window.navigator);
 
-  posthog.init(KEY, {
+  client.init(KEY, {
     api_host: HOST,
     // Mask autocaptured element text/attributes too — the desktop UI renders
     // repo/agent names, file paths, prompts and diffs outside the terminal.
     ...posthogBrowserCommonConfig({ maskAutocaptureText: true }),
   });
-  posthog.register({ surface: "desktop", app_version: version, os, arch });
+  client.register({ surface: "desktop", app_version: version, os, arch });
+  posthog = client;
   ready = true;
 
   // Install / update lifecycle, derived from the last version seen on this
@@ -58,13 +110,13 @@ export function initAnalytics(): void {
   try {
     const last = window.localStorage.getItem(LAST_VERSION_KEY);
     const lifecycle = resolveLifecycleEvent(last, version);
-    if (lifecycle) posthog.capture(lifecycle);
+    if (lifecycle) client.capture(lifecycle);
     window.localStorage.setItem(LAST_VERSION_KEY, version);
   } catch {
     /* localStorage unavailable — skip lifecycle, keep going. */
   }
 
-  posthog.capture(ANALYTICS_EVENTS.APP_OPENED);
+  client.capture(ANALYTICS_EVENTS.APP_OPENED);
 }
 
 /** Capture a typed Sparkle event. No-ops until analytics is initialized. */
@@ -72,7 +124,7 @@ export function capture(
   event: AnalyticsEvent,
   props?: Record<string, unknown>,
 ): void {
-  if (!ready) return;
+  if (!ready || !posthog) return;
   posthog.capture(event, props);
 }
 
@@ -81,6 +133,6 @@ export function identifyUser(
   distinctId: string,
   props?: Record<string, unknown>,
 ): void {
-  if (!ready) return;
+  if (!ready || !posthog) return;
   posthog.identify(distinctId, props);
 }

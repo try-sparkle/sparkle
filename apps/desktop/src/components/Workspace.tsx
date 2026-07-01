@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { getCurrentWindow, getAllWindows } from "@tauri-apps/api/window";
 import { C, FONT, FONT_WEIGHT, ON_BRAND_FILL_DARK } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
@@ -9,10 +9,6 @@ import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
 import { AgentSidebar, NewBuildAgentButton } from "./AgentSidebar";
 import { TopBar } from "./TopBar";
 import { OfflineBanner } from "./OfflineBanner";
-import { AgentPane } from "./AgentPane";
-import { SparkleAgentPane } from "./SparkleAgentPane";
-import { BoardView } from "./BoardView";
-import { ProjectModal } from "./ProjectModal";
 import { ClosePrompt } from "./ClosePrompt";
 import { SPARKLE_AGENT_ID } from "../services/sparkleAgent";
 import {
@@ -26,6 +22,26 @@ import { killProjectAgents, planWindowClose } from "../services/windowClose";
 import { clearWindowProject } from "../services/windowRegistry";
 import { clearWindowRoster } from "../services/attention";
 import { safeUnlisten } from "../services/safeUnlisten";
+
+// Code-split the heavy, not-always-visible surfaces so a cold start doesn't ship them in the
+// initial chunk (bead sparkle-alrm.5, #9). AgentPane pulls the terminal (xterm + webgl), the
+// Composer, Onboarding and the Markdown renderer (via ThinkPanel → react-markdown/remark-gfm);
+// none of it is needed until an agent pane actually opens. BoardView, the Sparkle pane and the
+// settings modal are likewise on-demand. The always-visible shell (sidebar, top bar, banners,
+// close prompt) stays eager above. These are named exports, so map each to `default` for lazy().
+// (Declared below all imports so no non-import statement precedes an `import`.)
+const AgentPane = lazy(() => import("./AgentPane").then((m) => ({ default: m.AgentPane })));
+const SparkleAgentPane = lazy(() =>
+  import("./SparkleAgentPane").then((m) => ({ default: m.SparkleAgentPane })),
+);
+const BoardView = lazy(() => import("./BoardView").then((m) => ({ default: m.BoardView })));
+const ProjectModal = lazy(() => import("./ProjectModal").then((m) => ({ default: m.ProjectModal })));
+
+/** Fills the pane slot with the app background while a lazy surface's chunk loads, so on-demand
+ * loading never flashes a blank/white frame under the (eager) shell. */
+function PaneFallback() {
+  return <div style={{ position: "absolute", inset: 0, background: C.forest }} />;
+}
 
 /** Top-level layout (revised): agents in the left column, the project in the top bar, and
  * the active agent's pane filling the rest. Each window renders only its current project's
@@ -199,19 +215,32 @@ export function Workspace() {
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
           <TopBar onOpenSettings={setSettingsProject} />
         <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
-          {live.map(({ project: p, agent }) => (
-            <AgentPane
-              key={agent.id}
-              project={p}
-              agent={agent}
-              visible={!sparkleActive && !boardActive && agent.id === activeAgentId}
-            />
-          ))}
+          {/* Each lazy surface gets its own Suspense so loading one (e.g. first board open) never
+              blanks a sibling that's already mounted (the live agent panes keep their PTYs). The
+              agent panes share one chunk, so a single boundary around the list is enough. */}
+          <Suspense fallback={<PaneFallback />}>
+            {live.map(({ project: p, agent }) => (
+              <AgentPane
+                key={agent.id}
+                project={p}
+                agent={agent}
+                visible={!sparkleActive && !boardActive && agent.id === activeAgentId}
+              />
+            ))}
+          </Suspense>
 
-          {sparkleOpen && <SparkleAgentPane visible={sparkleActive} />}
+          {sparkleOpen && (
+            <Suspense fallback={<PaneFallback />}>
+              <SparkleAgentPane visible={sparkleActive} />
+            </Suspense>
+          )}
 
           {/* The Tasks board overlays the panes for the current project (sparkle-hiju.10). */}
-          {boardActive && project && <BoardView project={project} />}
+          {boardActive && project && (
+            <Suspense fallback={<PaneFallback />}>
+              <BoardView project={project} />
+            </Suspense>
+          )}
 
           {!sparkleActive && !boardActive && !project && (
             <Hint title="Welcome to Sparkle">
@@ -267,10 +296,12 @@ export function Workspace() {
       </div>
 
       {settingsProject && (
-        <ProjectModal
-          project={projects.find((p) => p.id === settingsProject.id) ?? settingsProject}
-          onClose={() => setSettingsProject(null)}
-        />
+        <Suspense fallback={null}>
+          <ProjectModal
+            project={projects.find((p) => p.id === settingsProject.id) ?? settingsProject}
+            onClose={() => setSettingsProject(null)}
+          />
+        </Suspense>
       )}
 
       {closing && (

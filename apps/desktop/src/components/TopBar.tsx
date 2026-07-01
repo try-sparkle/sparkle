@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, type CSSProperties } from "react";
+import { useState, useEffect, useMemo, memo, type CSSProperties } from "react";
 import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, statusInk } from "../theme/colors";
 import type { AgentTabStatus, Project } from "../types";
 import { SettingsDialog } from "./SettingsDialog";
@@ -76,6 +76,23 @@ export function agentDots(
   return dots;
 }
 
+/**
+ * The per-agent status-dot cluster in the TopBar. Extracted + `React.memo`'d (sparkle-alrm.3) so
+ * that when unrelated TopBar state changes (Recent/settings menus opening, a pending open dialog),
+ * the dot list doesn't re-render at all; and because each `StatusDot` is itself memoized, a single
+ * agent's status flip only re-paints that one dot rather than the whole cluster. `dots` is memoized
+ * by the caller so this bails out whenever the derived cluster is unchanged.
+ */
+const AgentDotCluster = memo(function AgentDotCluster({ dots }: { dots: AgentDot[] }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      {dots.map((d) => (
+        <StatusDot key={d.id} status={d.status} size={7} shape={d.shape} />
+      ))}
+    </div>
+  );
+});
+
 const btn: CSSProperties = {
   background: "transparent",
   color: C.cream,
@@ -145,6 +162,14 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
     () => (project ? effStatus(project) : {}),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [project, statusMap, openSet],
+  );
+  // The header dot cluster, derived once per (project, status, mode, ordering) change. Memoized so
+  // opening the Recent/settings menus (which re-render TopBar without touching status) doesn't
+  // recompute or re-render the dots (sparkle-alrm.3).
+  const dots = useMemo(
+    () =>
+      project ? agentDots(project, currentEff, workMode, agentOrdering === "attention") : [],
+    [project, currentEff, workMode, agentOrdering],
   );
   // Recent first (most recently opened), so the "Recent Projects" label is honest.
   const recent = [...projects].sort((a, b) =>
@@ -227,11 +252,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
               {project.name}
             </span>
           </button>
-          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            {agentDots(project, currentEff, workMode, agentOrdering === "attention").map((d) => (
-              <StatusDot key={d.id} status={d.status} size={7} shape={d.shape} />
-            ))}
-          </div>
+          <AgentDotCluster dots={dots} />
           {/* The Tasks board now opens from the "Plan" button in the agent strip (AgentSidebar). */}
         </>
       ) : (

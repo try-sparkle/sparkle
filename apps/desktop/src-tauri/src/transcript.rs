@@ -9,23 +9,85 @@
 //! Tolerant by design: a missing/unreadable file returns `Err`, and partial/malformed lines are
 //! skipped rather than panicking (the file may be mid-write when Stop fires).
 
-use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 
 use serde_json::Value;
+
+/// How far back from EOF we read on the first pass. Transcripts are appended, so the last
+/// assistant record is almost always within the final few KB; a single 64 KB tail read covers
+/// even long final turns without loading the whole (potentially many-MB) JSONL into memory.
+const TAIL_CHUNK: u64 = 64 * 1024;
+/// Hard cap on how much of the tail we're willing to buffer while searching backward. If no
+/// assistant record is found within this window we give up rather than reading the entire file
+/// (bounds worst-case memory/latency on a pathological transcript with a huge trailing turn).
+const MAX_TAIL: u64 = 4 * 1024 * 1024;
 
 /// Read the transcript at `path` and return the joined text of its LAST assistant message.
 /// `Err` if the file can't be read; an empty string if it has no assistant text.
 #[tauri::command]
 pub fn read_transcript_last_assistant(path: String) -> Result<String, String> {
-    let contents = fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
-    Ok(last_assistant_text(&contents))
+    let mut file = File::open(&path).map_err(|e| format!("read {path}: {e}"))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("read {path}: {e}"))?
+        .len();
+    read_last_assistant_from_tail(&mut file, len).map_err(|e| format!("read {path}: {e}"))
 }
 
-/// Pure core: given the full JSONL transcript text, return the joined text of the last assistant
-/// record. Scans lines from the end so we stop at the first (newest) assistant turn. Text blocks
-/// are joined with blank lines; tool-use (and any non-text) blocks are skipped. Returns "" when
-/// there is no assistant record with text.
-fn last_assistant_text(jsonl: &str) -> String {
+/// Read the tail of `file` backward in growing chunks, returning the joined text of the last
+/// assistant record. Only the final window (up to `MAX_TAIL`) is ever loaded, so a huge transcript
+/// costs one bounded read instead of a full slurp. We grow the window (64 KB → … → `MAX_TAIL`)
+/// until the buffer starts at a line boundary AND contains an assistant record, guaranteeing we
+/// never parse a partial first line as if it were complete.
+fn read_last_assistant_from_tail(
+    file: &mut (impl Read + Seek),
+    len: u64,
+) -> std::io::Result<String> {
+    let mut window = TAIL_CHUNK.min(len.max(1));
+    loop {
+        let start = len.saturating_sub(window);
+        file.seek(SeekFrom::Start(start))?;
+        // Read raw bytes and decode lossily. When `start > 0` the window can begin in the middle
+        // of a multi-byte UTF-8 sequence; `read_to_string` would fail with `InvalidData` on any
+        // transcript whose non-ASCII char (smart quotes, emoji, CJK, accents) straddles the
+        // boundary, failing this hot-path command intermittently. The broken leading bytes always
+        // fall inside the partial first line we drop below, so lossy replacement is safe here.
+        let mut bytes = Vec::new();
+        file.take(len - start).read_to_end(&mut bytes)?;
+        let buf = String::from_utf8_lossy(&bytes);
+
+        // If `start > 0` the first line is (probably) truncated — it began before our window. Drop
+        // it so we never treat a partial record as complete. When `start == 0` we have the whole
+        // file and the first line is genuine, so keep it.
+        let slice = if start > 0 {
+            match buf.find('\n') {
+                Some(i) => &buf[i + 1..],
+                None => "", // window landed mid-line with no boundary — force a wider read
+            }
+        } else {
+            &buf[..]
+        };
+
+        if let Some(text) = last_assistant_text_opt(slice) {
+            return Ok(text);
+        }
+
+        // Not found (or no line boundary yet). Grow the window and retry; stop once we've covered
+        // the whole file or hit the cap.
+        if start == 0 || window >= MAX_TAIL {
+            return Ok(String::new());
+        }
+        window = (window.saturating_mul(2)).min(MAX_TAIL).min(len);
+    }
+}
+
+/// Pure core: given a chunk of JSONL transcript text, return the joined text of the last assistant
+/// record, or `None` if the chunk contains no (parseable) assistant record. Scans lines from the
+/// end so we stop at the first (newest) assistant turn. Text blocks are joined with blank lines;
+/// tool-use (and any non-text) blocks are skipped. The `None` vs `Some("")` distinction lets the
+/// tail reader tell "assistant not in this window, read more" apart from "assistant with no text".
+fn last_assistant_text_opt(jsonl: &str) -> Option<String> {
     for line in jsonl.lines().rev() {
         let line = line.trim();
         if line.is_empty() {
@@ -36,10 +98,17 @@ fn last_assistant_text(jsonl: &str) -> String {
             continue;
         };
         if is_assistant(&v) {
-            return join_text_blocks(&v);
+            return Some(join_text_blocks(&v));
         }
     }
-    String::new()
+    None
+}
+
+/// Convenience wrapper over [`last_assistant_text_opt`] that flattens "no assistant record" to the
+/// empty string. Used by the tests (which pass whole transcripts).
+#[cfg(test)]
+fn last_assistant_text(jsonl: &str) -> String {
+    last_assistant_text_opt(jsonl).unwrap_or_default()
 }
 
 /// True when a record is an assistant turn. Checks both the top-level `type` and the nested
@@ -134,5 +203,118 @@ mod tests {
         assert_eq!(out, "Part one.\n\nPart two.");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    use std::io::Cursor;
+
+    // Build a transcript whose bulk (many large user turns) sits far before the final assistant
+    // record, so the answer lives well past the first 64 KB tail window — exercising the
+    // grow-the-window path of `read_last_assistant_from_tail`.
+    fn big_transcript(pad_bytes: usize) -> String {
+        let filler = "x".repeat(1024);
+        let mut s = String::new();
+        s.push_str(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"OLD — must not be returned."}]}}"#,
+        );
+        s.push('\n');
+        let mut written = 0usize;
+        while written < pad_bytes {
+            let line = format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","content":"{filler}"}}]}}}}"#
+            );
+            written += line.len() + 1;
+            s.push_str(&line);
+            s.push('\n');
+        }
+        s.push_str(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"FINAL ANSWER."}]}}"#,
+        );
+        s.push('\n');
+        s
+    }
+
+    #[test]
+    fn tail_reader_finds_last_assistant_within_first_chunk() {
+        // Small transcript (< TAIL_CHUNK): the very first read covers the whole file.
+        let mut cur = Cursor::new(FIXTURE.as_bytes().to_vec());
+        let len = FIXTURE.len() as u64;
+        let out = read_last_assistant_from_tail(&mut cur, len).unwrap();
+        assert_eq!(out, "Part one.\n\nPart two.");
+    }
+
+    #[test]
+    fn tail_reader_finds_answer_beyond_first_window() {
+        // ~200 KB of padding sits between the final answer and everything before it, so the answer
+        // is inside the last window but the OLD record is far outside it. The window must grow past
+        // 64 KB to keep scanning, and must never surface the OLD record.
+        let data = big_transcript(200 * 1024);
+        let len = data.len() as u64;
+        let mut cur = Cursor::new(data.into_bytes());
+        let out = read_last_assistant_from_tail(&mut cur, len).unwrap();
+        assert_eq!(out, "FINAL ANSWER.");
+        assert!(!out.contains("OLD"));
+    }
+
+    #[test]
+    fn tail_reader_never_parses_a_truncated_first_line() {
+        // Force a mid-line window start: > TAIL_CHUNK of filler precedes the final answer, so the
+        // very first 64 KB tail read begins in the middle of a preceding line. Dropping that partial
+        // first line must not corrupt the result, and the answer (within the first window) is found
+        // without needing to grow.
+        let data = big_transcript(TAIL_CHUNK as usize + 8 * 1024);
+        let len = data.len() as u64;
+        let mut cur = Cursor::new(data.into_bytes());
+        let out = read_last_assistant_from_tail(&mut cur, len).unwrap();
+        assert_eq!(out, "FINAL ANSWER.");
+    }
+
+    #[test]
+    fn tail_reader_survives_multibyte_utf8_window_boundary() {
+        // Padding is 4-byte UTF-8 (emoji), so the 64 KB window start almost certainly lands in the
+        // middle of a character. Regression guard: an arbitrary-offset `read_to_string` errored
+        // with InvalidData on a split char, failing this hot-path command on any non-ASCII
+        // transcript. The read must succeed AND the final answer (itself non-ASCII) come back whole.
+        let filler = "😀".repeat(256); // 1024 bytes of 4-byte chars
+        let mut data = String::new();
+        data.push_str(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"OLD"}]}}"#,
+        );
+        data.push('\n');
+        let mut written = 0usize;
+        while written < TAIL_CHUNK as usize + 8 * 1024 {
+            let line = format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","content":"{filler}"}}]}}}}"#
+            );
+            written += line.len() + 1;
+            data.push_str(&line);
+            data.push('\n');
+        }
+        data.push_str(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"FÍNAL — café ☕ 完了"}]}}"#,
+        );
+        data.push('\n');
+        let len = data.len() as u64;
+        let mut cur = Cursor::new(data.into_bytes());
+        let out = read_last_assistant_from_tail(&mut cur, len).unwrap();
+        assert_eq!(out, "FÍNAL — café ☕ 完了");
+    }
+
+    #[test]
+    fn tail_reader_empty_when_no_assistant() {
+        let data = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"summary"}"#,
+            "\n",
+        );
+        let len = data.len() as u64;
+        let mut cur = Cursor::new(data.as_bytes().to_vec());
+        assert_eq!(read_last_assistant_from_tail(&mut cur, len).unwrap(), "");
+    }
+
+    #[test]
+    fn tail_reader_handles_empty_file() {
+        let mut cur = Cursor::new(Vec::<u8>::new());
+        assert_eq!(read_last_assistant_from_tail(&mut cur, 0).unwrap(), "");
     }
 }

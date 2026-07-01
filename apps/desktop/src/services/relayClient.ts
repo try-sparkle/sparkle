@@ -7,7 +7,11 @@
 //
 // Contracts match the DEPLOYED relay (verified end-to-end): register{clerk_token,role},
 // registered ack, attention_needed, decision, attention_resolved.
-import { io, type Socket } from "socket.io-client";
+// socket.io-client (with its engine.io transport) is a heavy dep pulled in ONLY when a signed-in
+// host actually opens the relay. Import the type eagerly (erased at build, zero runtime cost) but
+// load the `io` runtime lazily inside startRelayHost so it never lands in the initial boot chunk —
+// an unauthenticated first-run user never downloads or parses it.
+import type { Socket } from "socket.io-client";
 import { invoke } from "@tauri-apps/api/core";
 import { onPtyOutput, writePty } from "../pty";
 import { getAgentScrollback } from "./terminalScrollback";
@@ -100,6 +104,17 @@ export async function startRelayHost(): Promise<void> {
   if (socket) {
     connecting = false;
     return; // a concurrent call won the race
+  }
+
+  // Lazy-load the socket.io client only now (signed in + connecting). `connecting` stays true
+  // across this await, so the serialize-guard above still bails concurrent callers.
+  let io: typeof import("socket.io-client").io;
+  try {
+    ({ io } = await import("socket.io-client"));
+  } catch (e) {
+    connecting = false; // failed to load the client — leave the host closed, don't wedge start
+    console.warn("relay: failed to load socket.io-client", e);
+    return;
   }
 
   try {

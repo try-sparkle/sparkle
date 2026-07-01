@@ -44,6 +44,18 @@ mod notes;
 use pty::PtyManager;
 use tauri::{Emitter, Manager};
 
+/// Set once the frontend has completed its first `show()` on first paint (see main.tsx). The
+/// show-on-ready backstop thread reads this to distinguish "frontend never booted" (show it) from
+/// "frontend showed it, then the user hid it to the tray" (leave it hidden). See the setup hook.
+static FRONTEND_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Invoked by the frontend right after it reveals the main window on first paint. Marks the
+/// show-on-ready handshake complete so the Rust last-resort backstop stands down.
+#[tauri::command]
+fn notify_frontend_shown() {
+    FRONTEND_SHOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -131,14 +143,37 @@ pub fn run() {
             if let Err(e) = tray::init_tray(&app.handle()) {
                 tracing::error!("tray init failed: {e}");
             }
+            // Show-on-ready backstop (bead sparkle-alrm.5, #10). The main window is created hidden
+            // ("visible": false) so no blank frame flashes before React paints; the frontend calls
+            // show() on first paint (see main.tsx) and then invokes `notify_frontend_shown`. This
+            // thread is the last-resort net for the case the frontend NEVER boots (a fatal bundle/JS
+            // error): reveal the window anyway after a grace period so a launch can never leave an
+            // invisible, unreachable process. We gate on the frontend-shown FLAG, not instantaneous
+            // is_visible(): a user can legitimately hide the main window to the tray within the grace
+            // period (Workspace close → win.hide()), and keying off visibility would forcibly
+            // re-reveal a window they deliberately hid. If the frontend ever completed its show, the
+            // flag is set and we stand down.
+            if let Some(win) = app.get_webview_window("main") {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(8));
+                    if !FRONTEND_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            notify_frontend_shown,
             pty::pty_spawn,
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
             preflight::claude_preflight,
+            preflight::claude_version,
+            preflight::claude_session_info,
+            preflight::refresh_preflight,
             claude_chat::claude_chat_send,
             claude_chat::claude_chat_cancel,
             claude::claude_has_session,
@@ -150,6 +185,7 @@ pub fn run() {
             attachments::copy_file_to,
             attachments::copy_files_to_dir,
             worktree::ensure_project_repo,
+            worktree::prewarm_spawn,
             worktree::create_agent_worktree,
             worktree::create_worker_worktree,
             worktree::remove_agent_worktree,
@@ -162,6 +198,7 @@ pub fn run() {
             worktree::project_default_branch,
             worktree::agent_branch_status,
             worktree::agent_workflow_state,
+            worktree::project_agents_status,
             worktree::land_agent_branch,
             worktree::push_agent_branch,
             worktree::delete_agent_branch,

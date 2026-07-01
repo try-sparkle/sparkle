@@ -7,13 +7,13 @@
 //!
 //! Dependency-free: we shell out to the system `git` via std::process::Command.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
@@ -179,10 +179,24 @@ pub fn project_default_branch(root: String) -> Result<String, String> {
     Ok(resolve_default_branch(&root))
 }
 
+/// Roots whose repo has already been ensured this session. `ensure_project_repo` is idempotent but
+/// runs 3-4 git subprocesses; caching "ready" means only the FIRST agent per project pays that cost
+/// (subsequent concurrent opens hit the fast path instead of re-running init/config/commit checks).
+fn ready_repos() -> &'static Mutex<HashSet<String>> {
+    static READY: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    READY.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 /// Ensure `<path>` is a git repo with a committable identity, at least one commit,
-/// and `.sparkle/` ignored. Idempotent.
+/// and `.sparkle/` ignored. Idempotent. Cached per root for the session (see [`ready_repos`]).
 #[tauri::command]
 pub fn ensure_project_repo(path: String) -> Result<(), String> {
+    // Fast path: already ensured this session. The underlying work is idempotent, so this only
+    // skips redundant git subprocesses — the first successful call is what seeds the set.
+    if ready_repos().lock().map(|s| s.contains(&path)).unwrap_or(false) {
+        return Ok(());
+    }
+
     // 1. Make it a repo if it isn't one yet.
     if git(&path, &["rev-parse", "--git-dir"]).is_err() {
         git(&path, &["init"])?;
@@ -203,6 +217,10 @@ pub fn ensure_project_repo(path: String) -> Result<(), String> {
     // 4. Make sure the hidden worktrees dir is never tracked.
     ensure_gitignore(&path)?;
 
+    // Mark ready so subsequent agents on this root skip the checks above.
+    if let Ok(mut set) = ready_repos().lock() {
+        set.insert(path);
+    }
     Ok(())
 }
 
@@ -278,9 +296,13 @@ pub fn create_worktree_at(
     if branch_exists {
         git(root, &["worktree", "add", &wt_str, &branch])?;
     } else {
-        // Cut from the FRESH integration branch (effective base), never arbitrary HEAD.
-        let base = effective_base(root, base_branch, true);
+        // Cut IMMEDIATELY from the last-known integration base (no blocking network fetch on the
+        // spawn critical path — an unreachable remote must never stall opening an agent). A
+        // background, throttled fetch then refreshes `origin/<base>` so the NEXT agent's cut and
+        // this branch's later refresh see a fresh tip.
+        let base = effective_base(root, base_branch, false);
         git(root, &["worktree", "add", "-b", &branch, &wt_str, &base])?;
+        spawn_background_origin_refresh(root, base_branch);
     }
 
     Ok(WorktreeInfo { path: wt_str, branch })
@@ -355,7 +377,7 @@ pub fn create_worker_worktree(
 /// Idempotent: re-running for an existing worktree returns its info without error.
 /// `base_branch` is the logical integration branch (e.g. `main`) the new branch is cut from.
 #[tauri::command]
-pub fn create_agent_worktree(
+pub async fn create_agent_worktree(
     app: AppHandle,
     root: String,
     project_id: String,
@@ -364,11 +386,18 @@ pub fn create_agent_worktree(
 ) -> Result<WorktreeInfo, String> {
     tracing::info!(%root, %project_id, %agent_id, %base_branch, "create_agent_worktree");
     let app_data = app_data_dir(&app)?;
-    create_worktree_at(&root, &project_id, &agent_id, &base_branch, &app_data)
-        .inspect_err(|e| tracing::error!(%agent_id, error = %e, "create_agent_worktree failed"))
+    // Run the git worktree mechanics off the main thread so the subprocess work (and any residual
+    // git I/O) can't freeze the UI. The network fetch is now backgrounded inside `create_worktree_at`,
+    // so this task is bounded by local git only.
+    tauri::async_runtime::spawn_blocking(move || {
+        create_worktree_at(&root, &project_id, &agent_id, &base_branch, &app_data)
+            .inspect_err(|e| tracing::error!(%agent_id, error = %e, "create_agent_worktree failed"))
+    })
+    .await
+    .map_err(|e| format!("create_agent_worktree task failed: {e}"))?
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchStatus {
     ahead: u32,
@@ -442,7 +471,7 @@ pub fn agent_branch_status(
 /// landed there. Computed entirely from LOCAL refs (no fetch), so it's fast and offline-safe;
 /// `in_origin_main` reflects the last-fetched `origin/<default>`. The optional GitHub PR probe is
 /// the only network touch and is strictly best-effort (absent `gh`/remote/PR ⇒ all-None).
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowState {
     /// Agent branch tip is contained in the LOCAL default branch (e.g. work merged into `main`).
@@ -678,6 +707,41 @@ fn maybe_refresh_origin(root: &str, default_branch: &str) {
     let _ = git(root, &["fetch", "--quiet", "--no-tags", "origin", default_branch]);
 }
 
+/// Kick a background, throttled refresh of `origin/<base>` off the worktree-create critical path.
+/// Resolves the logical base (falling back to the project default for an empty/unsafe ref) on the
+/// spawned thread, then reuses [`maybe_refresh_origin`] so N agents opening at once don't each fetch,
+/// and an unreachable remote never stalls the spawn — the fetch just fails quietly in the background.
+fn spawn_background_origin_refresh(root: &str, base_branch: &str) {
+    let root = root.to_string();
+    let base = base_branch.trim().to_string();
+    std::thread::spawn(move || {
+        let logical = if base.is_empty() || validate_ref(&base).is_err() {
+            resolve_default_branch(&root)
+        } else {
+            base
+        };
+        maybe_refresh_origin(&root, &logical);
+    });
+}
+
+/// Prewarm what the first agent spawn needs so it's already hot: the claude + node path caches, and
+/// a throttled background `origin/<default>` fetch. Runs off the main thread; every step is
+/// best-effort (a warm miss just means the spawn resolves it itself). Safe to call on project open
+/// or before the first spawn — the fetch is throttled so repeated calls don't hammer the remote.
+#[tauri::command]
+pub async fn prewarm_spawn(root: String) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = crate::preflight::cached_claude_path();
+        let _ = crate::preflight::resolve_node_path_cached();
+        // Fetch the project's default branch so the first real worktree cut sees a fresh origin tip
+        // without paying the fetch synchronously. Throttled + offline-safe via maybe_refresh_origin.
+        let default = resolve_default_branch(&root);
+        maybe_refresh_origin(&root, &default);
+    })
+    .await
+    .ok();
+}
+
 /// Core (AppHandle-free, testable): the agent's land-to-green workflow state. `parent_branch` is
 /// the orchestrator's branch for workers (empty/None for others). `probe_pr_state` gates the gh
 /// network probe so a pure-local project (or a fast poll) can skip it entirely.
@@ -770,6 +834,307 @@ pub fn agent_workflow_state(
     probe_pr_state: bool,
 ) -> Result<WorkflowState, String> {
     agent_workflow_state_at(&root, &agent_id, &parent_branch, probe_pr_state)
+}
+
+// ── Batched per-project status (sparkle-zlic) ────────────────────────────────────────────────────
+// The 30s sidebar poll used to fan out ~3-4 git/bd subprocesses PER open agent (branch status +
+// workflow reachability + an opportunistic origin fetch + a `gh` PR probe), i.e. N agents ⇒ a burst
+// of ~3-4N processes every tick. `project_agents_status` collapses that into ONE call per project:
+// shared repo discovery (default branch, origin presence, one throttled origin fetch, the
+// git-common-dir) is done ONCE, `effective_base` resolution is memoized per distinct base, and an
+// idle agent whose FINGERPRINT — its branch tip + its base tip + the integration-branch tip + its
+// worktree's index mtime — is unchanged since the last tick is SKIPPED entirely (its prior result is
+// reused). Runs on the blocking pool via `spawn_blocking` so it never stalls the UI thread.
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStatusInput {
+    agent_id: String,
+    /// The logical branch this agent's branch is compared against for ahead/behind (its own base).
+    base_branch: String,
+    /// The orchestrator branch for a worker (empty otherwise) — drives `in_parent`.
+    parent_branch: String,
+    /// "build" | "worker" | "think" | "shell". think/shell have no git workflow and are skipped.
+    kind: String,
+    /// The frontend sets this when the agent is actively working (PTY live): never skip it, so its
+    /// dirty/ahead counts stay fresh while Claude edits/commits. Idle agents can be skipped.
+    force: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStatusResult {
+    agent_id: String,
+    /// false ⇒ nothing changed since the last tick; the frontend keeps its prior store values.
+    changed: bool,
+    branch: Option<BranchStatus>,
+    workflow: Option<WorkflowState>,
+}
+
+/// The cheap change-detection key for one agent. When every component is unchanged since the last
+/// tick the agent's git state can't have moved (own tip, its base, the integration branch, and its
+/// worktree's index are all identical), so the cached result is reused instead of recomputing.
+#[derive(Clone, PartialEq)]
+struct StatusFingerprint {
+    tip: String,
+    base_tip: String,
+    default_tip: String,
+    index_mtime_ms: u128,
+}
+
+/// Per-worktree-path cache of the last-seen fingerprint (sparkle-zlic). Keyed by worktree path
+/// (stable per agent). We store only the fingerprint (not the result): on a skip the frontend keeps
+/// its prior store values, so there's nothing to hand back. Session-scoped: boots empty so the first
+/// tick always computes.
+fn status_cache() -> &'static Mutex<HashMap<String, StatusFingerprint>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, StatusFingerprint>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// mtime (ms since epoch) of a linked worktree's private git index, or 0 when it can't be read. The
+/// index lives under the shared repo at `<git-common-dir>/worktrees/<name>/index`; our worktree leaf
+/// name IS the agent id (a UUID, never deduped by git), so we stat it without spawning a subprocess.
+fn worktree_index_mtime_ms(git_common_dir: &Path, agent_id: &str) -> u128 {
+    let index = git_common_dir.join("worktrees").join(agent_id).join("index");
+    std::fs::metadata(&index)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Resolve a git ref to its commit sha (empty when it doesn't resolve). For the fingerprint tips.
+fn rev_parse_tip(root: &str, refname: &str) -> String {
+    if refname.trim().is_empty() {
+        return String::new();
+    }
+    git(root, &["rev-parse", "--verify", "--quiet", &format!("{refname}^{{commit}}")])
+        .unwrap_or_default()
+}
+
+/// Live ahead/behind + dirty + size for an agent branch vs an ALREADY-RESOLVED base ref. Mirrors
+/// `agent_branch_status_at` but takes the base ref precomputed, so a batch resolves `effective_base`
+/// once per distinct base instead of once per agent.
+fn branch_status_with_base(
+    root: &str,
+    agent_id: &str,
+    base_ref: &str,
+    wt: &Path,
+) -> Result<BranchStatus, String> {
+    let branch = format!("sparkle/agent-{agent_id}");
+    let wt_str = wt.to_string_lossy().to_string();
+    let counts = git(root, &["rev-list", "--left-right", "--count", &format!("{base_ref}...{branch}")])?;
+    let mut it = counts.split_whitespace();
+    let behind: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ahead: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    // `--no-optional-locks`: a plain `git status` refreshes and REWRITES the worktree index (to
+    // update its stat cache), which would bump the index mtime our fingerprint keys on and defeat the
+    // skip on the very next tick. This top-level flag tells git not to take the index lock / write it,
+    // so the mtime stays stable and an idle, unchanged agent is actually skipped (sparkle-zlic).
+    let dirty = if wt.exists() {
+        !git(&wt_str, &["--no-optional-locks", "status", "--porcelain"])?.is_empty()
+    } else {
+        false
+    };
+    let numstat = git(root, &["diff", "--numstat", &format!("{base_ref}...{branch}")]).unwrap_or_default();
+    let (mut files_changed, mut insertions, mut deletions) = (0u32, 0u32, 0u32);
+    for line in numstat.lines().filter(|l| !l.trim().is_empty()) {
+        files_changed += 1;
+        let mut cols = line.split_whitespace();
+        insertions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        deletions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    }
+    Ok(BranchStatus { ahead, behind, dirty, files_changed, insertions, deletions })
+}
+
+/// The agent's workflow state given ALREADY-RESOLVED shared inputs (default branch, origin presence)
+/// and its precomputed branch `tip`. Mirrors `agent_workflow_state_at` minus the per-call
+/// resolve_default_branch + origin refresh, which the batch does ONCE up front. `has_origin` already
+/// folds in the caller's PR-probe gate (as in `agent_workflow_state_at`): a remote exists AND the
+/// caller asked to probe — so the `gh` lookup runs iff `has_origin`.
+fn workflow_state_shared(
+    root: &str,
+    agent_id: &str,
+    parent_branch: &str,
+    default_branch: &str,
+    has_origin: bool,
+    tip: &str,
+) -> WorkflowState {
+    if tip.trim().is_empty() {
+        return WorkflowState::default();
+    }
+    let branch = format!("sparkle/agent-{agent_id}");
+    let in_local_main = ref_contains(root, default_branch, tip);
+    let origin_ref = format!("origin/{default_branch}");
+    let in_origin_main = ref_contains(root, &origin_ref, tip);
+    let in_parent = ref_contains(root, parent_branch, tip);
+    let landed = branch_landed(root, default_branch, &branch, tip);
+    let base_for_ahead = if git(root, &["rev-parse", "--verify", "--quiet", &origin_ref]).is_ok() {
+        origin_ref.clone()
+    } else {
+        default_branch.to_string()
+    };
+    let ahead_of_base = git(root, &["rev-list", "--count", &format!("{base_for_ahead}..{branch}")])
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let (pr_state, pr_number, pr_url) = if has_origin {
+        let by_commit = probe_pr_by_commit(root, tip);
+        if commit_pr_is_usable(&by_commit) {
+            by_commit
+        } else {
+            probe_pr(root, &branch)
+        }
+    } else {
+        (None, None, None)
+    };
+    WorkflowState {
+        in_local_main,
+        in_origin_main,
+        in_parent,
+        ahead_of_base,
+        landed,
+        pr_state,
+        pr_number,
+        pr_url,
+    }
+}
+
+/// Core (AppHandle-free, testable): compute branch + workflow status for EVERY agent of a project in
+/// one pass, sharing repo discovery and skipping fingerprint-unchanged idle agents (sparkle-zlic).
+pub fn project_agents_status_at(
+    root: &str,
+    project_id: &str,
+    agents: &[AgentStatusInput],
+    probe_pr_state: bool,
+    app_data: &Path,
+) -> Vec<AgentStatusResult> {
+    // ── Shared repo discovery, done ONCE for the whole batch ──
+    let default_branch = resolve_default_branch(root);
+    // `has_origin` folds in the PR-probe gate exactly as agent_workflow_state_at does: the network
+    // touches (origin fetch + gh probe) only happen on a probe-enabled poll against a repo with a
+    // remote. Reachability into origin/<default> still runs regardless (it's a local ref read).
+    let has_origin = probe_pr_state && git(root, &["remote", "get-url", "origin"]).is_ok();
+    if has_origin {
+        maybe_refresh_origin(root, &default_branch);
+    }
+    // git-common-dir for locating each worktree's private index (fingerprint input). Best-effort.
+    let git_common_dir: Option<PathBuf> = git(root, &["rev-parse", "--git-common-dir"]).ok().map(|d| {
+        let p = PathBuf::from(&d);
+        if p.is_absolute() { p } else { Path::new(root).join(p) }
+    });
+    // The integration-branch tips — BOTH local <default> and origin/<default> — folded into EVERY
+    // agent's fingerprint so ANY advance of main re-evaluates everyone. This matters for reachability
+    // ("On Main"/"Merged") that moves without the agent's OWN tip changing: a LOCAL merge advances
+    // local main only (origin unchanged), a fetched remote merge advances origin only — capturing
+    // both means the background tick still picks up an orchestrator reaching main (and, in turn, its
+    // workers' "Merged", which tracks the parent) instead of waiting for the agent to commit again.
+    let origin_default_ref = format!("origin/{default_branch}");
+    let default_tip = format!(
+        "{}:{}",
+        rev_parse_tip(root, &default_branch),
+        rev_parse_tip(root, &origin_default_ref),
+    );
+
+    // Memoize effective base ref + its tip per distinct logical base (avoid re-resolving per agent).
+    let mut base_ref_memo: HashMap<String, String> = HashMap::new();
+    let mut base_tip_memo: HashMap<String, String> = HashMap::new();
+
+    let mut out = Vec::with_capacity(agents.len());
+    let skipped = |id: &str| AgentStatusResult {
+        agent_id: id.to_string(),
+        changed: false,
+        branch: None,
+        workflow: None,
+    };
+    for a in agents {
+        // think/shell have no git workflow — report unchanged so the frontend leaves them alone.
+        if a.kind == "think" || a.kind == "shell" {
+            out.push(skipped(&a.agent_id));
+            continue;
+        }
+        let wt = match worktree_path(app_data, project_id, &a.agent_id) {
+            Ok(p) => p,
+            Err(_) => {
+                out.push(skipped(&a.agent_id));
+                continue;
+            }
+        };
+        let branch = format!("sparkle/agent-{}", a.agent_id);
+        let tip = rev_parse_tip(root, &branch);
+        let base_ref = base_ref_memo
+            .entry(a.base_branch.clone())
+            .or_insert_with(|| effective_base(root, &a.base_branch, false))
+            .clone();
+        let base_tip = base_tip_memo
+            .entry(base_ref.clone())
+            .or_insert_with(|| rev_parse_tip(root, &base_ref))
+            .clone();
+        let index_mtime_ms = git_common_dir
+            .as_deref()
+            .map(|d| worktree_index_mtime_ms(d, &a.agent_id))
+            .unwrap_or(0);
+        let fp = StatusFingerprint {
+            tip: tip.clone(),
+            base_tip,
+            default_tip: default_tip.clone(),
+            index_mtime_ms,
+        };
+        let wt_key = wt.to_string_lossy().to_string();
+
+        // Skip an idle agent whose fingerprint matches the cache — reuse the prior result.
+        if !a.force {
+            if let Ok(cache) = status_cache().lock() {
+                if cache.get(&wt_key).map(|prev| *prev == fp).unwrap_or(false) {
+                    out.push(skipped(&a.agent_id));
+                    continue;
+                }
+            }
+        }
+
+        // Compute fresh. A per-agent branch-status error (e.g. a missing branch) is non-fatal: report
+        // unchanged so one bad agent can't fail the whole batch (mirrors pollBranchStatus swallowing).
+        let branch_status = match branch_status_with_base(root, &a.agent_id, &base_ref, &wt) {
+            Ok(bs) => bs,
+            Err(e) => {
+                tracing::debug!(agent = %a.agent_id, error = %e, "batch branch status failed");
+                out.push(skipped(&a.agent_id));
+                continue;
+            }
+        };
+        let workflow =
+            workflow_state_shared(root, &a.agent_id, &a.parent_branch, &default_branch, has_origin, &tip);
+
+        if let Ok(mut cache) = status_cache().lock() {
+            cache.insert(wt_key, fp);
+        }
+        out.push(AgentStatusResult {
+            agent_id: a.agent_id.clone(),
+            changed: true,
+            branch: Some(branch_status),
+            workflow: Some(workflow),
+        });
+    }
+    out
+}
+
+/// Branch + workflow status for ALL of a project's agents in ONE call (sparkle-zlic). Async +
+/// `spawn_blocking` so the (possibly many) git/gh subprocesses never block the UI thread.
+#[tauri::command]
+pub async fn project_agents_status(
+    app: AppHandle,
+    root: String,
+    project_id: String,
+    agents: Vec<AgentStatusInput>,
+    probe_pr_state: bool,
+) -> Result<Vec<AgentStatusResult>, String> {
+    let app_data = app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        project_agents_status_at(&root, &project_id, &agents, probe_pr_state, &app_data)
+    })
+    .await
+    .map_err(|e| format!("project_agents_status task failed: {e}"))
 }
 
 #[derive(Serialize)]
@@ -1422,6 +1787,52 @@ mod tests {
 
     fn branch_exists(root: &str, branch: &str) -> bool {
         git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+    }
+
+    // sparkle-zlic: the batched status command computes every agent in one pass and, crucially,
+    // SKIPS an idle agent whose fingerprint (tip + base + default + index mtime) is unchanged since
+    // the last tick — while `force` always recomputes and a new commit re-evaluates.
+    #[test]
+    fn batch_status_skips_unchanged_and_recomputes_on_change() {
+        let r = init_repo("batch-skip");
+        let app_data = unique_root("batch-skip-appdata");
+        let info = create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let wt = info.path;
+        // One commit in the worktree → the branch is 1 ahead of main.
+        std::fs::write(format!("{wt}/w.txt"), "work").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "work"]).unwrap();
+
+        let input = |force: bool| AgentStatusInput {
+            agent_id: "a1".into(),
+            base_branch: "main".into(),
+            parent_branch: String::new(),
+            kind: "build".into(),
+            force,
+        };
+        // probe_pr_state=false ⇒ no origin fetch / gh probe, purely local + offline-safe.
+        let first = project_agents_status_at(&r, "p1", &[input(false)], false, &app_data);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].changed, "first tick computes");
+        assert_eq!(first[0].branch.as_ref().unwrap().ahead, 1);
+
+        // Nothing changed → skipped (no payload; the frontend keeps its prior values).
+        let second = project_agents_status_at(&r, "p1", &[input(false)], false, &app_data);
+        assert!(!second[0].changed, "unchanged idle agent is skipped");
+        assert!(second[0].branch.is_none());
+
+        // force=true recomputes even when the fingerprint is unchanged.
+        let forced = project_agents_status_at(&r, "p1", &[input(true)], false, &app_data);
+        assert!(forced[0].changed, "force always recomputes");
+        assert_eq!(forced[0].branch.as_ref().unwrap().ahead, 1);
+
+        // A new commit moves the tip → fingerprint changes → recompute picks up ahead=2.
+        std::fs::write(format!("{wt}/w2.txt"), "more").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "more"]).unwrap();
+        let after = project_agents_status_at(&r, "p1", &[input(false)], false, &app_data);
+        assert!(after[0].changed, "a new commit re-evaluates");
+        assert_eq!(after[0].branch.as_ref().unwrap().ahead, 2);
     }
 
     #[test]

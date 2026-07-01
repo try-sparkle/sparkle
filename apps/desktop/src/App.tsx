@@ -1,5 +1,4 @@
-import { useEffect } from "react";
-import { Workspace } from "./components/Workspace";
+import { lazy, Suspense, useEffect } from "react";
 import { AuthGate } from "./components/AuthGate";
 import { useAmbientVoice } from "./useDictation";
 import { useApplyTheme } from "./theme/theme";
@@ -17,6 +16,31 @@ import { useRosterPublisher } from "./useRosterPublisher";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { HintOverlay } from "./components/HintOverlay";
 import { startUpdater } from "./services/updaterService";
+
+// The Workspace subtree pulls in the heavy authenticated UI — xterm, markdown rendering, modals,
+// the agent panes. Lazy-load it (code-split) so an unauthenticated / unpaid first-run user, who
+// only ever sees AuthGate's sign-in / paywall, downloads and parses almost none of it. AuthGate and
+// the sign-in/paywall path stay eager (imported directly) so the first screen paints immediately.
+const Workspace = lazy(() =>
+  import("./components/Workspace").then((m) => ({ default: m.Workspace })),
+);
+
+// Run non-critical launch work after first paint, when the main thread is idle. requestIdleCallback
+// where available; setTimeout shim for WKWebView/Safari, which lack it. Keeps the boot-effect burst
+// (relay socket, env resolution, default-account import, updater poll, worktree self-heal) off the
+// critical path so config hydrate + first render aren't fighting all of them firing synchronously.
+function onIdle(cb: () => void): void {
+  const w = window as Window &
+    typeof globalThis & { requestIdleCallback?: (cb: () => void) => number };
+  if (typeof w.requestIdleCallback === "function") {
+    w.requestIdleCallback(cb);
+    return;
+  }
+  // WKWebView/Safari fallback: a bare setTimeout(cb, 1) can fire BEFORE first paint, so the deferred
+  // boot burst would still race the initial render on the platform this most needs to help. rAF + a
+  // 0ms timeout lands the callback after a frame has actually been committed.
+  requestAnimationFrame(() => setTimeout(cb, 0));
+}
 
 // Owns the dock badge + Notification Center banners + click-to-worker routing. Rendered inside
 // the provider (it reads this window's current project) and paints no UI of its own.
@@ -47,41 +71,88 @@ export function App() {
 
   // Phone approvals remote: open the relay host connection (no-op if signed out) so a local
   // agent's "needs you" can reach the paired phone, and a phone decision can drive the PTY.
+  // Deferred to idle — it opens a socket.io WebSocket (and now lazy-loads the socket.io client),
+  // which the first paint doesn't need. `cancelled` guards an unmount before the idle callback runs.
   useEffect(() => {
-    void startRelayHost().catch((e) => console.warn("startRelayHost failed", e));
-    return () => stopRelayHost();
+    let cancelled = false;
+    onIdle(() => {
+      if (cancelled) return;
+      void startRelayHost().catch((e) => console.warn("startRelayHost failed", e));
+    });
+    return () => {
+      cancelled = true;
+      stopRelayHost();
+    };
   }, []);
 
   // Seed the Chief PAT from the user's environment (.env.local) at launch so the Think
   // agent works without pasting a token. Resolved in Rust (never baked into the bundle); set
   // unconditionally — including "" — so a removed env token doesn't leave a stale value.
+  // Deferred to idle: nothing on the first screen needs the Chief token.
   useEffect(() => {
-    void resolveEnvChiefPat().then((pat) =>
-      useSettingsStore.getState().setRuntimeChiefPat(pat),
-    );
+    let cancelled = false;
+    onIdle(() => {
+      if (cancelled) return;
+      void resolveEnvChiefPat().then((pat) =>
+        useSettingsStore.getState().setRuntimeChiefPat(pat),
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Multi Claude Max account support: ensure account #1 (the existing ~/.claude) always exists, so
   // selection has a default to fall back to. Idempotent on the Rust side — a no-op once imported.
+  // Deferred to idle — account selection isn't touched during first paint.
   useEffect(() => {
-    void importDefault().catch((e) => console.warn("importDefault failed", e));
+    let cancelled = false;
+    onIdle(() => {
+      if (cancelled) return;
+      void importDefault().catch((e) => console.warn("importDefault failed", e));
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Self-heal agent worktrees whose Claude Code hook scripts (status emitter + write-guard) point
   // at an old/renamed/removed app bundle — otherwise every hook for those agents errors with
   // MODULE_NOT_FOUND and the lost write-guard silently un-confines the worktree. Re-points them at
   // a stable app-data copy. Idempotent: a no-op once everything already points there.
+  // Pure self-heal maintenance — walks every agent worktree on disk — so it runs fully off the
+  // critical path, deferred to idle after first paint.
   useEffect(() => {
-    void healAgentHooks()
-      .then((n) => {
-        if (n > 0) console.info(`healed stale hook paths in ${n} worktree(s)`);
-      })
-      .catch((e) => console.warn("healAgentHooks failed", e));
+    let cancelled = false;
+    onIdle(() => {
+      if (cancelled) return;
+      void healAgentHooks()
+        .then((n) => {
+          if (n > 0) console.info(`healed stale hook paths in ${n} worktree(s)`);
+        })
+        .catch((e) => console.warn("healAgentHooks failed", e));
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Auto-updater: poll the signed GitHub Releases manifest at launch + every 6h. No-ops in dev /
   // the browser preview / when unpackaged (the plugin + manifest only exist in a real build).
-  useEffect(() => startUpdater(), []);
+  // Deferred to idle — the update check is background work, not needed for first paint. `stop`
+  // captures startUpdater's teardown so cleanup still tears down the poll if the effect unmounts.
+  useEffect(() => {
+    let cancelled = false;
+    let stop: (() => void) | undefined;
+    onIdle(() => {
+      if (cancelled) return;
+      stop = startUpdater();
+    });
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, []);
 
   // Editable config file: hydrate the settings store from config.toml at launch and on every
   // live-reload (hand-edit / in-app write / reset). The file is the source of truth; this is the
@@ -113,7 +184,12 @@ export function App() {
       <AuthGate>
         <AttentionController />
         <UpdateBanner />
-        <Workspace />
+        {/* Workspace is code-split (React.lazy); Suspense holds the first frame while its chunk
+            loads. fallback={null} keeps the transition invisible — the authed UI paints its own
+            skeleton, and this only ever shows for the brief chunk fetch right after sign-in. */}
+        <Suspense fallback={null}>
+          <Workspace />
+        </Suspense>
         {/* Vimium-style keyboard hints: a clean ⌘ tap overlays gold chiclets on the primary
             controls. Mounted last so its portal sits above the whole UI. */}
         <HintOverlay />

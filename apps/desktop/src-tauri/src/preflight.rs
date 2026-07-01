@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
 
@@ -119,6 +120,92 @@ pub fn resolve_node_path() -> Option<String> {
     resolve_on_path("node").or_else(|| first_executable(&known_node_paths_for(home_dir())))
 }
 
+// ---------------------------------------------------------------------------
+// Session-lifetime path caches
+//
+// Both `claude` and `node` are resolved by shelling out to a LOGIN shell (`command -v …`), which is
+// slow on a cold node (hundreds of ms) — and their absolute paths effectively never change for the
+// life of the app process. The spawn path used to re-resolve on every "new agent". We cache the
+// resolved path once per session so only the first spawn pays.
+//
+// We cache ONLY a positive hit (`Some(path)` = cached, `None` = not yet resolved / re-probe). A
+// "not installed" result is intentionally NOT cached, so a user who installs Claude Code (or Node)
+// while the app is running is picked up on the next probe rather than being stuck on "not installed"
+// for the session. Re-probing the miss is cheap and rare — a not-installed result routes to the
+// no-claude screen, not a spawn. `invalidate_preflight_caches` additionally forces a re-probe of a
+// cached hit (e.g. after a toolchain move/reinstall).
+// ---------------------------------------------------------------------------
+
+fn claude_path_cache() -> &'static Mutex<Option<String>> {
+    static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn node_path_cache() -> &'static Mutex<Option<String>> {
+    static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Resolve the absolute `claude` path WITHOUT the version probe (login-shell PATH probe, then the
+/// canonical absolute install locations). Unix form.
+#[cfg(unix)]
+fn resolve_claude_uncached() -> Option<String> {
+    run_in_login_shell("command -v claude").or_else(|| first_executable(&known_claude_paths()))
+}
+
+/// Windows form: `where claude` (GUI apps inherit PATH), then canonical install paths.
+#[cfg(not(unix))]
+fn resolve_claude_uncached() -> Option<String> {
+    resolve_on_path("claude").or_else(|| first_executable(&known_claude_paths_for(home_dir())))
+}
+
+/// Resolved absolute `claude` path, cached for the app session. Only a positive hit is cached (a
+/// miss re-probes next time — see the cache note above). Concurrent callers may both resolve on a
+/// cold cache (idempotent); a poisoned lock falls back to an uncached resolve.
+pub fn cached_claude_path() -> Option<String> {
+    if let Ok(guard) = claude_path_cache().lock() {
+        if let Some(path) = guard.as_ref() {
+            return Some(path.clone());
+        }
+    }
+    let resolved = resolve_claude_uncached();
+    if let Some(path) = resolved.as_ref() {
+        if let Ok(mut guard) = claude_path_cache().lock() {
+            *guard = Some(path.clone());
+        }
+    }
+    resolved
+}
+
+/// Resolved absolute `node` path, cached for the app session (resolution per [`resolve_node_path`]).
+/// Only a positive hit is cached — see the cache note above.
+pub fn resolve_node_path_cached() -> Option<String> {
+    if let Ok(guard) = node_path_cache().lock() {
+        if let Some(path) = guard.as_ref() {
+            return Some(path.clone());
+        }
+    }
+    let resolved = resolve_node_path();
+    if let Some(path) = resolved.as_ref() {
+        if let Ok(mut guard) = node_path_cache().lock() {
+            *guard = Some(path.clone());
+        }
+    }
+    resolved
+}
+
+/// Clear the cached claude/node paths so the next resolve re-probes (e.g. the user moved/reinstalled
+/// a toolchain while the app was running). Note that a "not installed" result is never cached in the
+/// first place, so a fresh install is already picked up without calling this.
+pub fn invalidate_preflight_caches() {
+    if let Ok(mut g) = claude_path_cache().lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = node_path_cache().lock() {
+        *g = None;
+    }
+}
+
 /// Pure form of [`known_claude_paths`]: takes the home dir explicitly so it can be
 /// unit-tested without mutating the process-global `HOME` env var.
 fn known_claude_paths_for(home: Option<PathBuf>) -> Vec<PathBuf> {
@@ -156,39 +243,94 @@ fn first_executable(candidates: &[PathBuf]) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-#[cfg(unix)]
+/// Detect whether the user's own `claude` (Claude Code) is installed, resolving its absolute path
+/// via the login shell (see module docs). The result is cached for the session and resolved OFF the
+/// main thread so a cold-node login shell can't freeze the UI on the "new agent" hot path.
+///
+/// `version` is intentionally NOT populated here: resolving it cold-boots node purely to print a
+/// string, and nothing on the spawn path reads it. Call [`claude_version`] lazily where a version is
+/// actually needed (onboarding, diagnostics).
 #[tauri::command]
-pub fn claude_preflight() -> ClaudeStatus {
-    // 1. Login-shell PATH probe — handles npm/homebrew and any install whose dir
-    //    is exported from `.zprofile`/`.zshenv`/`path_helper`.
-    // 2. Fallback to canonical absolute paths — handles the native installer
-    //    (`~/.local/bin`), whose PATH entry lives in the interactive-only `.zshrc`.
-    let path = run_in_login_shell("command -v claude")
-        .or_else(|| first_executable(&known_claude_paths()));
-    let version = path
-        .as_ref()
-        .and_then(|p| run_in_login_shell_with_arg("\"$1\" --version", p));
-    ClaudeStatus { installed: path.is_some(), path, version }
+pub async fn claude_preflight() -> ClaudeStatus {
+    tauri::async_runtime::spawn_blocking(|| {
+        let path = cached_claude_path();
+        ClaudeStatus { installed: path.is_some(), path, version: None }
+    })
+    .await
+    .unwrap_or(ClaudeStatus { installed: false, path: None, version: None })
 }
 
-/// Windows: `where claude` (PATH is inherited by GUI apps), then the canonical install paths.
-/// The version probe runs through `cmd /c` so a `claude.cmd`/`.bat` shim is invoked correctly;
-/// a failure there just leaves `version: None` (detection of the binary is what matters).
+/// Resolve the installed Claude Code version string, LAZILY and off the main thread. Kept off the
+/// spawn hot path because it cold-boots node just to print a version. Returns None when claude isn't
+/// installed or the probe fails. Uses the cached path so it doesn't re-run the (slow) PATH probe.
+#[cfg(unix)]
+#[tauri::command]
+pub async fn claude_version() -> Option<String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let path = cached_claude_path()?;
+        // Pass the path as a positional `$1` (never interpolated) so a quoted/space-y path can't
+        // break out of the command — same invariant the detection path relies on.
+        run_in_login_shell_with_arg("\"$1\" --version", &path)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Windows: the version probe runs through `cmd /c` so a `claude.cmd`/`.bat` shim is invoked
+/// correctly. Lazy + off the main thread, mirroring the Unix form.
 #[cfg(not(unix))]
 #[tauri::command]
-pub fn claude_preflight() -> ClaudeStatus {
-    let path =
-        resolve_on_path("claude").or_else(|| first_executable(&known_claude_paths_for(home_dir())));
-    let version = path.as_ref().and_then(|p| {
+pub async fn claude_version() -> Option<String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let path = cached_claude_path()?;
         Command::new("cmd")
-            .args(["/c", p, "--version"])
+            .args(["/c", &path, "--version"])
             .output()
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty())
-    });
-    ClaudeStatus { installed: path.is_some(), path, version }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Combined session probe for the spawn path. `has_session` (is there a resumable `claude`
+/// conversation for this worktree?) and `latest_session_id` (its newest transcript stem) are
+/// returned together in ONE IPC round-trip — and off the main thread. (The two underlying helpers
+/// still each scan the transcript dir; the win here is collapsing two serial IPC commands into one,
+/// not a shared directory scan.) Replaces the two separate SYNC commands (`claude_has_session` +
+/// `claude_latest_session_id`) the spawn path used to await serially on the main thread.
+/// Best-effort: a task failure yields the empty result, so the caller falls back to a fresh `claude`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeSessionInfo {
+    has_session: bool,
+    latest_session_id: Option<String>,
+}
+
+#[tauri::command]
+pub async fn claude_session_info(
+    worktree_path: String,
+    config_dir: Option<String>,
+) -> ClaudeSessionInfo {
+    tauri::async_runtime::spawn_blocking(move || {
+        let latest =
+            crate::claude::claude_latest_session_id(worktree_path.clone(), config_dir.clone());
+        let has_session = crate::claude::claude_has_session(worktree_path, config_dir);
+        ClaudeSessionInfo { has_session, latest_session_id: latest }
+    })
+    .await
+    .unwrap_or(ClaudeSessionInfo { has_session: false, latest_session_id: None })
+}
+
+/// Clear the cached claude/node paths (e.g. the user just installed Claude Code); the next preflight
+/// re-probes. Exposed so onboarding/login flows can force a re-detect after an install.
+#[tauri::command]
+pub fn refresh_preflight() {
+    invalidate_preflight_caches();
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type ClipboardEvent,
@@ -48,7 +49,7 @@ import {
   COMPOSER_MINIMIZE_THRESHOLD,
   COMPOSER_RESTORE_THRESHOLD,
 } from "../stores/uiStore";
-import { usePromptHistoryStore, computeGhost } from "../stores/promptHistoryStore";
+import { usePromptHistoryStore, computeGhost, lowerHistory } from "../stores/promptHistoryStore";
 import {
   resolveComposerDrag,
   resolveComposerFloor,
@@ -199,7 +200,18 @@ export function Composer({
   // never re-renders other mounted/hidden panes, and the preview never leaks into them.
   const interim = useDictationStore((s) => (active && !disabled ? s.interim : ""));
   const interimActive = !!interim;
-  const ghost = caretAtEnd && !ghostDismissed && !interimActive ? computeGhost(value, history) : "";
+  // Lowercase the whole history ONCE per history change (i.e. on send, not per keystroke) so the
+  // per-keystroke ghost scan below never re-lowercases up to 500 entries. See lowerHistory().
+  const historyLower = useMemo(() => lowerHistory(history), [history]);
+  // The ghost scan is O(history) per keystroke, so memoize it: it only needs to re-run when the
+  // typed value, the history, or one of the suppression gates changes. Short-circuit to no-ghost
+  // while suppressed (caret not at end / dismissed / live dictation in the slot) so the scan never
+  // runs while gated — the common case where a ghost isn't even visible.
+  const ghost = useMemo(
+    () =>
+      caretAtEnd && !ghostDismissed && !interimActive ? computeGhost(value, history, historyLower) : "",
+    [value, history, historyLower, caretAtEnd, ghostDismissed, interimActive],
+  );
   // The interim phrase is the whole thing being spoken now; render it after the committed text.
   const interimSuffix = interimActive ? `${value && !value.endsWith(" ") ? " " : ""}${interim}` : "";
   // Backing mirror behind the textarea, used to paint the ghost suffix (see render).
@@ -361,12 +373,52 @@ export function Composer({
   // clamped to [drag-set floor, viewport cap]. Held in a ref so the resize listener
   // (registered once below) always calls the latest measurement closure.
   const recomputeHeightRef = useRef<() => void>(() => {});
+  // Fast-path cache for the measurement below. The full measurement forces a synchronous layout
+  // reflow (write height:auto → read scrollHeight → restore) on EVERY keystroke, whose cost
+  // scales with draft length — the #1 composer typing-lag cause (bead sparkle-alrm.2). We cache
+  // the last measured content height alongside the "chrome key" (every input that isn't the typed
+  // text: attachments/textBlocks/minimized/floor/userSized/viewport). When only the text changed
+  // (chrome key identical) and the box is already hugging its content, a single naked scrollHeight
+  // read tells us whether the content height moved — if it didn't, the height can't change, so we
+  // skip the un-stretch reflow entirely (typing within one line, the common case).
+  const measureCacheRef = useRef<{
+    chromeKey: string;
+    contentH: number;
+    textLen: number;
+    newlines: number;
+  } | null>(null);
   // Runs before paint (no flicker) on every change that affects the content or chrome.
   useLayoutEffect(() => {
     recomputeHeightRef.current = () => {
       const ta = taRef.current;
       const container = containerRef.current;
       if (!ta || !container) return;
+      // FAST PATH: skip the reflow-inducing un-stretch measurement when nothing that could move
+      // the height has changed. The chrome key captures every non-text input to the height math;
+      // when it's identical to the last full measurement, only the typed text can have changed. In
+      // that case the box is already hugging its content, so a single naked scrollHeight read is the
+      // true content height (no un-stretch needed) — if it matches the cached height, the layout is
+      // unchanged and there's nothing to do. This is the hot keystroke path (typing within a line).
+      const chromeKey = `${attachments.length}|${textBlocks.length}|${minimized}|${height}|${userSized}|${window.innerHeight}`;
+      const cached = measureCacheRef.current;
+      // Text metrics for the shrink guard below. In the hugging (auto-grow) steady state the
+      // textarea is flex-stretched (`flex:1`, wrapper `align-items:stretch`), so a naked
+      // `ta.scrollHeight` is CLAMPED up to clientHeight: it rises when content grows (breaking the
+      // equality → full measure) but stays at the old, taller value when the user DELETES lines, so
+      // it cannot detect shrink. Only skip the reflow when the text can't have gotten shorter —
+      // neither its length nor its line count decreased since the last full measurement. Deleting
+      // text falls through to the full un-stretch measurement, which shrinks the box correctly.
+      const textLen = ta.value.length;
+      let newlines = 0;
+      for (let i = 0; i < textLen; i++) if (ta.value.charCodeAt(i) === 10) newlines++;
+      if (
+        cached &&
+        cached.chromeKey === chromeKey &&
+        textLen >= cached.textLen &&
+        newlines >= cached.newlines &&
+        ta.scrollHeight === cached.contentH
+      )
+        return;
       // Overhead = everything that isn't the textarea (handle, padding, attachment thumbs,
       // status rows, the send/mic/camera buttons). We read it by DIFFERENCE (container minus
       // textarea), which is only valid when the container is sized to its content — but the
@@ -401,6 +453,13 @@ export function Composer({
       // (not a stale one). Keep it first — moving a style write below this read would silently
       // reintroduce a stale-layout measurement.
       const contentH = ta.scrollHeight; // content + vertical padding (no border)
+      // Cache the un-stretched content height against this chrome key so the fast path above can
+      // skip the next keystroke's reflow when neither the content height nor the chrome moved. In
+      // the hugging state (auto-grow, and userSized-shorter/at-cap where the box scrolls) a naked
+      // scrollHeight equals this value; when the box is stretched taller than content (userSized
+      // taller) it won't, so the fast path simply falls through to a full measurement — correct,
+      // since in that mode the height is content-independent anyway.
+      measureCacheRef.current = { chromeKey, contentH, textLen, newlines };
       const borderY = ta.offsetHeight - ta.clientHeight; // textarea border (client excludes it)
       // True chrome: with the container shrink-wrapped and the textarea at one row, everything
       // that isn't the textarea is the overhead — independent of any prior squeeze.
@@ -675,7 +734,12 @@ export function Composer({
   const syncCaret = () => {
     const ta = taRef.current;
     if (!ta) return;
-    setCaretAtEnd(ta.selectionStart === ta.value.length && ta.selectionEnd === ta.value.length);
+    // syncCaret fires on keyUp/select/click/change — typing a character leaves the caret at the
+    // end every time, so this would otherwise re-set caretAtEnd to the same value on every
+    // keystroke. Only write when it actually flips (syncCaret is recreated each render, so
+    // caretAtEnd is current) to avoid the redundant state-update churn.
+    const atEnd = ta.selectionStart === ta.value.length && ta.selectionEnd === ta.value.length;
+    if (atEnd !== caretAtEnd) setCaretAtEnd(atEnd);
     // Remember where the caret is while the box is focused, so dictation that arrives after focus
     // has moved away (mic/voice UI) still inserts at the user's last position rather than the end.
     if (document.activeElement === ta) {

@@ -3,10 +3,33 @@
 // mechanics stay hidden from the user. Tauri converts camelCase JS keys → snake_case
 // Rust params automatically.
 import { invoke } from "@tauri-apps/api/core";
+import { loadAccountState } from "./accountSelection";
 
 export interface WorktreeInfo {
   path: string;
   branch: string;
+}
+
+/** Backend prewarm for a project root: warm the claude + node path caches and kick a throttled
+ *  background origin fetch, so the first real agent spawn is already hot. Fire-and-forget. */
+export function prewarmSpawn(root: string): Promise<void> {
+  return invoke("prewarm_spawn", { root });
+}
+
+// Roots we've already prewarmed this session. The caches this warms are process-global (Rust path
+// caches, the throttled fetch) or module-global (the account cache), so warming a root ONCE benefits
+// every later spawn on it — and this guard keeps a mount storm from firing N prewarms.
+const prewarmed = new Set<string>();
+
+/** Conservatively warm the caches an agent spawn needs (claude/node paths + background origin fetch
+ *  in the backend, and the account-selection cache in the frontend) the first time we touch a
+ *  project root, so subsequent spawns skip the cold-resolve latency. Idempotent per root and fully
+ *  fire-and-forget — never throws, never blocks. Intended for project-open / first agent mount. */
+export function prewarmProjectCaches(root: string): void {
+  if (!root || prewarmed.has(root)) return;
+  prewarmed.add(root);
+  void prewarmSpawn(root).catch(() => {});
+  void loadAccountState().catch(() => {});
 }
 
 /** Make sure the project folder is a git repo with at least one commit (idempotent). */

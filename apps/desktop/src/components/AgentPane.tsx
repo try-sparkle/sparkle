@@ -6,10 +6,11 @@ import {
   installWorktreeGuard,
   installAgentHooks,
   assertWorkspaceIntegrity,
+  prewarmProjectCaches,
 } from "../services/worktree";
 import { resolveDefaultBranch } from "../services/branchStatus";
 import { useAiFeature } from "../services/aiGate";
-import { checkClaude, claudeHasSession, claudeLatestSessionId } from "../preflight";
+import { checkClaude, claudeSessionInfo } from "../preflight";
 import { buildClaudeExec, SHELL } from "../services/claudeSpawn";
 import { shouldResetReusedSlotIdentity } from "../services/slotIdentity";
 import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult, orchestrationPersona } from "../services/buildAgent";
@@ -254,6 +255,9 @@ export function AgentPane({
     // post-bridge guard (myRun !== prepareRunRef.current). Placing it after the early non-async
     // returns (think/shell) means it only runs when we're about to do async work.
     const myRun = ++prepareRunRef.current;
+    // Warm the spawn caches for this project (claude/node paths, account state, background origin
+    // fetch) once per root — fire-and-forget, so later agents on this project skip the cold resolves.
+    prewarmProjectCaches(project.rootPath);
     setPhase("preparing");
     setErrorMsg("");
     setPtyReady(false);
@@ -261,6 +265,19 @@ export function AgentPane({
     // hooks for the new run start clean.
     stopHookWatch();
     try {
+      // Kick off work that does NOT depend on the worktree right away, so it overlaps worktree
+      // creation instead of running serially after it: whether Claude is installed, and which Max
+      // account this job runs under. Both are cached and best-effort. We attach a no-op catch so an
+      // earlier await throwing before these are consumed can't surface as an unhandled rejection —
+      // the real `await claudeP` below still observes (and rethrows) a genuine failure.
+      const claudeP = checkClaude();
+      claudeP.catch(() => {});
+      const accountP = chooseAccountForAgent(agent.id);
+      // chooseAccountForAgent is documented never to throw, but guard symmetrically anyway so a
+      // future regression there can't leak an unhandled rejection when an earlier await throws
+      // before accountP is consumed. The real `await accountP` below still observes any result.
+      accountP.catch(() => {});
+
       // Resolve + persist the project's integration branch once, then base this agent off it.
       // Normalize a possibly-empty resolver result the same way the store does, so the worktree
       // and poll layers don't see a value the store guard would have nulled.
@@ -275,7 +292,12 @@ export function AgentPane({
       const agentBase = agent.baseBranch ?? base ?? "";
       const wt = await prepareAgentWorkspace(project.rootPath, project.id, agent.id, agentBase);
       setAgentWorktree(project.id, agent.id, wt.path, wt.branch);
+
       // Defense in depth: install the write-guard, then refuse to spawn a broken sandbox.
+      // NOTE: guard + hooks both read-modify-write the SAME `.claude/settings.local.json`, so they
+      // MUST stay sequential — running them concurrently would race and clobber one hook (dropping
+      // either the write-guard or the event emitter). The parallelism win comes from checkClaude /
+      // account selection overlapping this whole block, not from splitting these two apart.
       try {
         await installWorktreeGuard(wt.path);
       } catch (e) {
@@ -314,7 +336,7 @@ export function AgentPane({
       void useRuntimeStore
         .getState()
         .pollBranchStatus(project.rootPath, project.id, agent.id, agentBase);
-      const claude = await checkClaude();
+      const claude = await claudeP;
       if (!claude.installed || !claude.path) {
         setPhase("no-claude");
         return;
@@ -322,7 +344,7 @@ export function AgentPane({
       // Multi Claude Max: pick the account this job runs under (lowest-usage, honoring a manual pin).
       // No accounts configured → chosen is null → configDir undefined → spawn exactly as before.
       // Best-effort: chooseAccountForAgent never throws (it swallows IPC errors to empty state).
-      const { chosen, state } = await chooseAccountForAgent(agent.id);
+      const { chosen, state } = await accountP;
       setAccounts(state.accounts);
       setIdentities(state.identities);
       setChosenAccount(chosen);
@@ -339,20 +361,21 @@ export function AgentPane({
       // Distinguish a CONFIDENT "no session" from a probe that threw: both leave `resume` false (so
       // the spawn still falls back to a fresh `claude`), but only the confident case may trigger the
       // identity reset below — a transient failure must not wipe a historied slot (roborev 16238).
+      //
+      // hasSession + the resume session id come back in ONE round-trip (they share the same worktree
+      // transcript scan). Resume by session id so Claude visibly REDRAWS the prior conversation on
+      // reopen rather than `--continue`'s blank prompt (bead sparkle-wwg7); a null id → buildClaudeExec
+      // falls back to `--continue`.
       let resume = false;
       let sessionDetectionConfident = true;
+      let resumeSessionId: string | undefined = undefined;
       try {
-        resume = await claudeHasSession(wt.path, configDir);
+        const info = await claudeSessionInfo(wt.path, configDir);
+        resume = info.hasSession;
+        resumeSessionId = resume ? (info.latestSessionId ?? undefined) : undefined;
       } catch {
         sessionDetectionConfident = false;
       }
-      // Resume by session id so Claude visibly REDRAWS the prior conversation on reopen, rather than
-      // `--continue`'s blank prompt (bead sparkle-wwg7). Only look it up when resuming; null on any
-      // failure → buildClaudeExec falls back to `--continue`. Use the SAME configDir as the session
-      // check so the id is read from the chosen account.
-      const resumeSessionId = resume
-        ? (await claudeLatestSessionId(wt.path, configDir).catch(() => null)) ?? undefined
-        : undefined;
       // Record whether this is a fresh launch so the worker exit handler can
       // distinguish a first-run (which should produce result.json) from a
       // reopened/resumed session (where result.json was already consumed earlier).

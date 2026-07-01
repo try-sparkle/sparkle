@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { AGENT_STATUS } from "@sparkle/ui";
 import type { AgentTabStatus } from "../types";
 
@@ -8,8 +9,11 @@ import type { AgentTabStatus } from "../types";
  * half-disc — a straight vertical left edge with the right side rounded into a semicircle,
  * i.e. a capital "D" — used to mark a sub-agent (worker) in the TopBar dot cluster so it
  * reads as nested under the full dot that precedes it.
+ *
+ * `React.memo`'d (sparkle-alrm.3): the dot's props are all primitives, so one agent's status
+ * flip re-renders only its own dot rather than every dot in the sidebar/TopBar cluster.
  */
-export function StatusDot({
+export const StatusDot = memo(function StatusDot({
   status,
   size = 9,
   shape = "dot",
@@ -35,4 +39,4 @@ export function StatusDot({
       }}
     />
   );
-}
+});
