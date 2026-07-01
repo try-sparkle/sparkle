@@ -8,6 +8,7 @@ import {
   isUnstartedWorker,
   workersNeedingOpen,
   withUnstartedWorkerAttention,
+  withRedWorkerAttention,
 } from "./workerAttention";
 
 // Minimal factory — workerAttention only reads id/kind/parentId/worktreePath.
@@ -98,5 +99,44 @@ describe("withUnstartedWorkerAttention", () => {
     const eff = withUnstartedWorkerAttention(agents, status, parentOpen);
     expect(eff.w1).toBe("approval");
     expect(eff.build1).toBe("errored"); // keep the more specific red
+  });
+});
+
+describe("withRedWorkerAttention", () => {
+  const agents = [
+    agent({ id: "build1", kind: "build", parentId: null }),
+    agent({ id: "w1" }),
+    agent({ id: "w2" }),
+  ];
+
+  it("bubbles a started worker's RED status to its orchestrator (parent floats up + turns red)", () => {
+    const status: Record<string, AgentTabStatus> = { build1: "working", w1: "errored" };
+    const eff = withRedWorkerAttention(agents, status);
+    expect(eff.build1).toBe("errored");
+    expect(eff.w1).toBe("errored"); // worker's own status is untouched
+  });
+
+  it.each(["waiting", "approval", "errored"] as const)(
+    "bubbles the %s red status specifically",
+    (redStatus) => {
+      const status: Record<string, AgentTabStatus> = { build1: "working", w1: redStatus };
+      expect(withRedWorkerAttention(agents, status).build1).toBe(redStatus);
+    },
+  );
+
+  it("leaves a non-red (working/idle) worker's parent alone", () => {
+    const status: Record<string, AgentTabStatus> = { build1: "idle", w1: "working" };
+    expect(withRedWorkerAttention(agents, status)).toBe(status); // same ref → no change
+  });
+
+  it("does not downgrade a parent already red for its own reason (or another worker)", () => {
+    const status: Record<string, AgentTabStatus> = { build1: "approval", w1: "errored" };
+    expect(withRedWorkerAttention(agents, status).build1).toBe("approval");
+  });
+
+  it("does not mutate the input status map", () => {
+    const status: Record<string, AgentTabStatus> = { build1: "working", w1: "errored" };
+    withRedWorkerAttention(agents, status);
+    expect(status).toEqual({ build1: "working", w1: "errored" });
   });
 });

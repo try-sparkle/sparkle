@@ -392,6 +392,9 @@ export function AgentPane({
           initialPrompt: workerMission(agent.task ?? "", agent.id),
           configDir,
           resumeSessionId,
+          // Workers run unattended in an isolated worktree: auto-approve every tool call so an
+          // approval prompt can't silently deadlock the worker (and its waiting orchestrator).
+          dangerouslySkipPermissions: true,
         });
       } else if (agent.kind === "build") {
         // Autonomous orchestrator launch (Plan 2c): start the per-build-agent bridge FIRST (claude's

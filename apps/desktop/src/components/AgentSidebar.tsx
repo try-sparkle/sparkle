@@ -33,7 +33,9 @@ import { useBeadsStore } from "../stores/beadsStore";
 import { beadLabel, epicForBuild } from "../services/planView";
 import { type Bead } from "../services/beads";
 import { orderedTopLevelAgents, firstVisibleAgentId } from "../engine/agentOrdering";
-import { withUnstartedWorkerAttention } from "../engine/workerAttention";
+import { withUnstartedWorkerAttention, withRedWorkerAttention } from "../engine/workerAttention";
+import { needsAttention } from "../engine/attention";
+import { RedWorkerRow } from "./RedWorkerRow";
 import { reconcileWorkMode } from "../engine/workMode";
 import { selectAndOpen } from "../useAttentionNotifications";
 import { StatusDot } from "./StatusDot";
@@ -266,13 +268,15 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // blocking) would render GRAY. Overlay RED ("Approve?") on the strand and bubble it to the parent
   // so the orchestrator row goes red — matching the TopBar dot cluster. No-op (same ref) when
   // nothing is stranded.
-  const status = useMemo(
-    () =>
-      project
-        ? withUnstartedWorkerAttention(project.agents, liveStatus, new Set(openAgentIds))
-        : liveStatus,
-    [project, liveStatus, openAgentIds],
-  );
+  const status = useMemo(() => {
+    if (!project) return liveStatus;
+    // Two attention overlays, composed: (1) an unstarted worker gets a synthetic red + bubbles to
+    // its orchestrator; (2) a started-then-red worker (waiting/approval/errored) bubbles its own red
+    // to its orchestrator so the orchestrator floats up and shows red. Order matters — run (2) after
+    // (1) so a strand's synthetic red also bubbles.
+    const s1 = withUnstartedWorkerAttention(project.agents, liveStatus, new Set(openAgentIds));
+    return withRedWorkerAttention(project.agents, s1);
+  }, [project, liveStatus, openAgentIds]);
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
   const workflowShipped = useRuntimeStore((s) => s.workflowShipped);
@@ -965,10 +969,25 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             // we simply don't render a tracker for it — see renderRow.)
             const workerStages = workers.map((w) => stageOf(w.id));
             const rollup = rollupStages(workerStages);
-            // Each worker's collapsed bare line + expanded detail now live INSIDE the orchestrator's
-            // own AgentRow (workers are no longer their own selectable rows). Pre-compute the minimal
-            // per-worker view-model here, where stageOf/status/branchStatus/shippedOf are in scope.
-            const workerDetails = workers.map((w) => {
+            // A worker that has gone RED (waiting / approval / errored) is pulled OUT of the inline
+            // roll-up and promoted to its own selectable row below the head (see the return below),
+            // so the human can reach it and unblock it. It collapses back into the roll-up once it's
+            // no longer red. Everything else (the rollup chevron, workerCount) still counts all
+            // workers — only the inline detail lines below exclude the promoted ones (no duplicate).
+            //
+            // Keyed on the worker's OWN LIVE status (liveStatus), NOT the composed `status`: the
+            // composite paints a synthetic "approval" onto an UNSTARTED/stranded worker (one whose
+            // pane never mounted), but that worker needs "Start", not "open + answer" — and the
+            // self-healing auto-open (workersNeedingOpen) already re-launches it. So a strand stays
+            // in the roll-up; only a worker with a genuine red PTY status pops out here.
+            const redWorkers = workers.filter((w) => needsAttention(liveStatus[w.id]));
+            const redWorkerIds = new Set(redWorkers.map((w) => w.id));
+            // Each non-red worker's collapsed bare line + expanded detail live INSIDE the
+            // orchestrator's own AgentRow. Pre-compute the minimal per-worker view-model here, where
+            // stageOf/status/branchStatus/shippedOf are in scope.
+            const workerDetails = workers
+              .filter((w) => !redWorkerIds.has(w.id))
+              .map((w) => {
               const wst = status[w.id] ?? "stopped";
               const wcolor =
                 AGENT_STATUS[wst].color === AGENT_STATUS.done.color
@@ -1044,11 +1063,25 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                 : rollup
                   ? rollup.stage
                   : stageOf(top.id);
-            // The orchestrator's head row now owns its workers: each worker renders as a bare
-            // indented progress line below the head (collapsed), and as a stacked detail block on
-            // the head's hover overlay (expanded) — see AgentRow's `workers` prop. The old
-            // collapse/expand roll-up bar and per-worker rows are gone.
-            return <div key={top.id}>{renderRow(top, headStage, orderedIndex)}</div>;
+            // The orchestrator's head row owns its NON-red workers: each renders as a bare indented
+            // progress line below the head (collapsed), and as a stacked detail block on the head's
+            // hover overlay (expanded) — see AgentRow's `workers` prop. A red worker is instead
+            // promoted to its own selectable RedWorkerRow beneath the head, so it can be opened and
+            // unblocked; it rejoins the roll-up once it's no longer red.
+            return (
+              <div key={top.id}>
+                {renderRow(top, headStage, orderedIndex)}
+                {redWorkers.map((w) => (
+                  <RedWorkerRow
+                    key={w.id}
+                    name={w.autoNameVariants?.title?.trim() || w.name}
+                    status={status[w.id] ?? "stopped"}
+                    active={!activeSpecial && project.selectedAgentId === w.id}
+                    onSelect={() => onSelect(w.id)}
+                  />
+                ))}
+              </div>
+            );
           });
         })()}
         {/* Per-mode empty hint: the dashed "+ New …" row above is the call to action. */}

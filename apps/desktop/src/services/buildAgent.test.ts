@@ -71,6 +71,13 @@ describe("workerPersona", () => {
     expect(p).toMatch(/exactly ONE task/i);
     expect(p).toMatch(/do not.*spawn/i);
   });
+  it("tells the worker it is unattended: don't ask questions, assume-and-report instead", () => {
+    // No human is watching a worker, so a clarifying question or approval wait is a silent stall.
+    expect(p).toMatch(/unattended|no one is watching|no human/i);
+    expect(p).toMatch(/do not ask/i);
+    expect(p).toMatch(/assumption/i);
+    expect(p).toMatch(/notes/i);
+  });
 });
 
 describe("workerMission", () => {
@@ -137,6 +144,14 @@ describe("orchestrationPersona", () => {
 
   it("reflects a different cap value", () => {
     expect(orchestrationPersona({ ownBranch: "b", maxConcurrentWorkers: 2 })).toContain("2");
+  });
+
+  it("tells it to handle an `errored` worker (decide: respawn / redirect / escalate) and not merge it", () => {
+    expect(p).toMatch(/errored/);
+    expect(p).toMatch(/respawn|re-?spawn/i);
+    expect(p).toMatch(/escalate|report/i);
+    // An errored worker must not be merged as if it succeeded.
+    expect(p).toMatch(/do not merge|not.*merge/i);
   });
 });
 

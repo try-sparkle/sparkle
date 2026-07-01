@@ -34,6 +34,12 @@ export interface ClaudeExecOpts {
   mcpConfig?: string;
   /** Emit `--strict-mcp-config` so ONLY the --mcp-config servers load (ignore user/global MCP). */
   strictMcpConfig?: boolean;
+  /** Emit `--dangerously-skip-permissions` so the agent auto-approves every tool call instead of
+   *  pausing on a permission prompt. Used for WORKER agents: they run unattended in a throwaway
+   *  worktree with no human watching, so an approval prompt is a silent deadlock (the worker blocks
+   *  RED, its orchestrator blocks in wait_for_workers). We deliberately do NOT set this for Think or
+   *  orchestrator/Build agents — those are interactive and a human is present to approve. */
+  dangerouslySkipPermissions?: boolean;
   /** Per-spawn `CLAUDE_CONFIG_DIR` for multi Claude Max account support (design spec
    *  docs/superpowers/specs/2026-06-26-multi-max-account-design.md). When set, the exec exports it
    *  so the child `claude` authenticates from that account's isolated config dir — confined to the
@@ -65,6 +71,11 @@ export function buildClaudeExec(
     cmd += opts.resumeSessionId
       ? ` --resume ${shellQuote(opts.resumeSessionId)}`
       : " --continue";
+  }
+  // Auto-approve mode for unattended workers — placed right after resume so it applies whether the
+  // worker is fresh or resumed. A flag (no argument), so it can sit anywhere in the option list.
+  if (opts.dangerouslySkipPermissions) {
+    cmd += " --dangerously-skip-permissions";
   }
   if (opts.mcpConfig) {
     cmd += ` --mcp-config ${shellQuote(opts.mcpConfig)}`;

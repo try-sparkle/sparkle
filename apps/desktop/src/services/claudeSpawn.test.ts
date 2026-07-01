@@ -59,6 +59,24 @@ describe("buildClaudeExec ()", () => {
     expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' -- '-oops looks like a flag'`);
   });
 
+  // Unattended workers auto-approve tool calls so an approval prompt can't silently deadlock them.
+  it("emits --dangerously-skip-permissions when dangerouslySkipPermissions is set (worker auto-approve)", () => {
+    const cmd = buildClaudeExec("/bin/claude", false, { dangerouslySkipPermissions: true });
+    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions`);
+  });
+
+  it("omits --dangerously-skip-permissions by default (Think/Build agents keep permission prompts)", () => {
+    expect(buildClaudeExec("/bin/claude", false)).not.toContain("--dangerously-skip-permissions");
+    expect(buildClaudeExec("/bin/claude", false, { dangerouslySkipPermissions: false })).not.toContain(
+      "--dangerously-skip-permissions",
+    );
+  });
+
+  it("keeps auto-approve on a resumed worker (after --continue, before the prompt)", () => {
+    const cmd = buildClaudeExec("/bin/claude", true, { dangerouslySkipPermissions: true });
+    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --continue --dangerously-skip-permissions`);
+  });
+
   // CLAUDE_CONFIG_DIR injection for multi Claude Max account support (design spec
   // 2026-06-26-multi-max-account-design). The chosen account's config dir must be exported into the
   // child's env, never leak when no account is chosen, and be safely shell-quoted.

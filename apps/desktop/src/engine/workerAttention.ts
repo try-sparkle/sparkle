@@ -77,3 +77,33 @@ export function withUnstartedWorkerAttention(
   }
   return out ?? statusMap;
 }
+
+/** Bubble a RED worker's attention up to its orchestrator so the orchestrator floats to the top of
+ *  the fleet and shows red — the signal that "a worker under this build needs you". Unlike
+ *  withUnstartedWorkerAttention (which invents an `approval` status for a worker with NO status),
+ *  this reads each worker's EXISTING status: a worker that started and then went waiting/approval/
+ *  errored already carries its own red, so we don't touch the worker — we only paint its parent.
+ *
+ *  The worker's own red status is what promotes it to a selectable pop-out row in the sidebar (see
+ *  AgentSidebar); this function is purely the parent-bubble half so the block is visible from the
+ *  collapsed top-level stack too. An orchestrator already red for its own reason is left as-is (we
+ *  never downgrade one red to another). Returns a NEW map only when something changed; otherwise the
+ *  SAME reference, so a no-op can't churn renders. Compose AFTER withUnstartedWorkerAttention. */
+export function withRedWorkerAttention(
+  agents: readonly AgentTab[],
+  statusMap: StatusMap,
+): StatusMap {
+  let out: StatusMap | null = null;
+  const ensure = (): StatusMap => (out ??= { ...statusMap });
+  for (const a of agents) {
+    if (a.kind !== "worker" || a.parentId === null) continue;
+    // Read from the working copy so a bubble from an earlier worker in this loop isn't clobbered.
+    const src = out ?? statusMap;
+    const ws = src[a.id];
+    if (ws === undefined || !needsAttention(ws)) continue; // only RED workers bubble
+    if (!needsAttention(src[a.parentId])) {
+      ensure()[a.parentId] = ws;
+    }
+  }
+  return out ?? statusMap;
+}
