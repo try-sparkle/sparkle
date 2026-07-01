@@ -64,6 +64,22 @@ body {
   animation: sparkle-pulse 1.1s ease-in-out infinite;
 }
 
+/* "Improve Sparkle" row progress bar — an indeterminate "building" sweep shown while the agent is
+   actively working. The Sparkle improvement agent has no Uncommitted→Merged tracker (it issues PRs
+   and, for most users, never merges to main itself), so its bar conveys ongoing work via a partial
+   fill that sweeps left→right and repeats, rather than a determinate stage fraction. */
+@keyframes sparkle-build {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+.sparkle-build {
+  animation: sparkle-build 1.25s ease-in-out infinite;
+}
+
 /* agent row hover-expand (AgentSidebar) — the row slides out to the right over the terminal,
    revealing the full name + path. clip-path reveals left→right so it reads as "sliding out". */
 @keyframes -slide {

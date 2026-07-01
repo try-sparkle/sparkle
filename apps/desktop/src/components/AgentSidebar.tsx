@@ -27,7 +27,8 @@ import type { BranchStatus } from "../services/branchStatus";
 import { shouldPromptOnClose, selectionAfterClose } from "../engine/closeAgent";
 import { shipAgent, saveAgent, discardAgentGit } from "../services/closeAgentActions";
 import { refreshAgentTitle } from "../services/sessionTitle";
-import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
+import { SPARKLE_AGENT_ID } from "../services/sparkleAgent";
+import { consentPillLabel, sparkleBarState, type SparkleBarState } from "./sparkleRowStatus";
 import { useBeadsStore } from "../stores/beadsStore";
 import { beadLabel, epicForBuild } from "../services/planView";
 import { type Bead } from "../services/beads";
@@ -47,7 +48,7 @@ import type { OtherWindowAgent } from "../services/windowStatus";
 import { emitFocusAgent } from "../services/attention";
 import { findWindowForProject } from "../services/windowRegistry";
 import { openProjectInWindow, defaultDeps } from "../services/projectWindows";
-import { resolveStage, rollupStages, stageFraction, stageIndex } from "../engine/workflowStage";
+import { resolveStage, rollupStages, stageFraction, stageIndex, LINE_FROM, LINE_TO } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { createBeadFull } from "../services/tasks";
 import { CloseWorkerPrompt } from "./CloseWorkerPrompt";
@@ -2204,7 +2205,8 @@ function CloseAgentButton({ onClose, width }: { onClose: () => void; width: numb
 }
 
 /** The pinned, always-present Sparkle self-improvement agent row. Distinct from project agents:
- *  a ✨ glyph, a subtitle, no close button — it works on Sparkle itself, not the user's project. */
+ *  no emoji and no close button — it reads "Improve Sparkle" + a consent pill (Always | Manual |
+ *  Off) and a status-driven progress bar, and works on Sparkle itself, not the user's project. */
 function SparkleAgentRow({
   active,
   status,
@@ -2215,11 +2217,14 @@ function SparkleAgentRow({
   onSelect: () => void;
 }) {
   const color = statusInk(AGENT_STATUS[status].color);
+  const consent = useSettingsStore((s) => s.sparkleImprovementConsent);
+  const pill = consentPillLabel(consent);
+  const barState = sparkleBarState(status, consent);
   return (
     <div
       data-hint="improve"
       onClick={onSelect}
-      title="Sparkle Improvement Agent — reviews your usage to make Sparkle better"
+      title="Improve Sparkle — reviews your usage to propose improvements to the open-source app"
       style={{
         flex: "0 0 auto",
         display: "flex",
@@ -2235,34 +2240,94 @@ function SparkleAgentRow({
       }}
     >
       <StatusDot status={status} />
-      <span aria-hidden style={{ fontSize: 14, lineHeight: 1 }}>
-        ✨
-      </span>
-      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 1 }}>
-        <span
-          style={{
-            color,
-            fontSize: 13,
-            fontWeight: active ? FONT_WEIGHT.semibold : FONT_WEIGHT.medium,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-          }}
-        >
-          {SPARKLE_AGENT_NAME}
-        </span>
-        <span
-          style={{
-            color: C.muted,
-            fontSize: 11,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-          }}
-        >
-          Improve Sparkle
-        </span>
+      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 3 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+          <span
+            style={{
+              color,
+              fontSize: 13,
+              fontWeight: active ? FONT_WEIGHT.semibold : FONT_WEIGHT.medium,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Improve Sparkle
+          </span>
+          <SparkleConsentPill label={pill} />
+        </div>
+        <SparkleRowProgress state={barState} />
       </div>
+    </div>
+  );
+}
+
+/** The Always / Manual / Off badge on the Improve Sparkle row — reflects the consent mode. */
+function SparkleConsentPill({ label }: { label: string }) {
+  // "Off" reads as muted/inactive; Always + Manual share the brand-teal outline (active modes).
+  const off = label === "Off";
+  return (
+    <span
+      style={{
+        flex: "0 0 auto",
+        fontSize: 10,
+        lineHeight: 1.4,
+        fontWeight: FONT_WEIGHT.semibold,
+        letterSpacing: 0.2,
+        padding: "1px 6px",
+        borderRadius: 999,
+        color: off ? C.muted : C.teal,
+        border: `1px solid ${off ? C.muted : C.teal}`,
+        opacity: off ? 0.7 : 1,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
+/**
+ * The Improve Sparkle row's progress bar. Like every other row's WorkflowLine it shows PROGRESS in
+ * the sparkle.ai cyan→blue logo gradient — NOT status color. Red/green/gray status (including
+ * "needs you": waiting/approval/errored) is carried by the row's StatusDot, not the bar. States
+ * (see sparkleBarState):
+ *   - building → the cyan→blue gradient sweeps left→right (agent is actively working a cycle)
+ *   - idle     → faint gray rail (not running / finished a cycle — no on-main ✓ terminal, since
+ *                this agent issues PRs and the backend handles merges for most users)
+ *   - off      → faint gray rail, dimmed (consent is Never)
+ */
+function SparkleRowProgress({ state }: { state: SparkleBarState }) {
+  const TRACK = "rgba(138,160,196,0.22)";
+  const barLabel = state === "off" ? "Off" : state === "building" ? "Working" : "Idle";
+  return (
+    <div
+      role="img"
+      aria-label={`Improve Sparkle: ${barLabel}`}
+      style={{
+        position: "relative",
+        height: 3,
+        borderRadius: 999,
+        background: TRACK,
+        overflow: "hidden",
+        opacity: state === "off" ? 0.5 : 1,
+      }}
+    >
+      {state === "building" && (
+        <div
+          className="sparkle-build"
+          style={{
+            position: "absolute",
+            top: 0,
+            bottom: 0,
+            left: 0,
+            width: "40%",
+            borderRadius: 999,
+            // The same cyan "S" → blue "i" logo gradient the WorkflowLine rows build in.
+            background: `linear-gradient(90deg, ${LINE_FROM}, ${LINE_TO})`,
+          }}
+        />
+      )}
     </div>
   );
 }
