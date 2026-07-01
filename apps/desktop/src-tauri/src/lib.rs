@@ -214,6 +214,7 @@ pub fn run() {
             accounts::accounts_import_default,
             accounts::accounts_mark_exhausted,
             accounts::accounts_usage,
+            accounts::accounts_identities,
             trial::trial_status,
             trial::trial_start,
             trial::trial_increment,

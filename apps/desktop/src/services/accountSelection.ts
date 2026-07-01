@@ -7,14 +7,25 @@
 // fire those two calls. So we cache the (accounts, usage) pair for a few seconds and de-dupe
 // concurrent loads — "cache reasonably" per the task. The cache is invalidated whenever the set
 // changes (add/remove/login) so badges and selection see fresh data promptly.
-import { listAccounts, getUsage, pickAccount, getPin, type Account, type Usage } from "./accountStore";
+import {
+  listAccounts,
+  getUsage,
+  getIdentities,
+  pickAccount,
+  getPin,
+  type Account,
+  type Usage,
+  type Identity,
+} from "./accountStore";
 
 export interface AccountState {
   accounts: Account[];
   usage: Usage[];
+  /** Real authenticated identity (email + org) per account id — the trustworthy badge label. */
+  identities: Identity[];
 }
 
-const EMPTY: AccountState = { accounts: [], usage: [] };
+const EMPTY: AccountState = { accounts: [], usage: [], identities: [] };
 
 /** How long a loaded (accounts, usage) snapshot is reused before re-fetching. Short: usage drifts
  *  as agents run, but a few seconds collapses a mount storm into one IPC pair. */
@@ -40,8 +51,12 @@ export async function loadAccountState(opts: { force?: boolean; now?: number } =
   const gen = generation;
   const p = (async () => {
     try {
-      const [accounts, usage] = await Promise.all([listAccounts(), getUsage()]);
-      const state: AccountState = { accounts, usage };
+      const [accounts, usage, identities] = await Promise.all([
+        listAccounts(),
+        getUsage(),
+        getIdentities(),
+      ]);
+      const state: AccountState = { accounts, usage, identities };
       if (gen === generation) cache = { at: now, state }; // skip if invalidated mid-load
       return state;
     } catch {

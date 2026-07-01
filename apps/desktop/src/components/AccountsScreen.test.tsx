@@ -5,7 +5,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AccountsScreen, type AccountsDeps } from "./AccountsScreen";
-import type { Account, Usage } from "../services/accountStore";
+import type { Account, Usage, Identity } from "../services/accountStore";
 
 afterEach(() => cleanup());
 
@@ -13,10 +13,11 @@ function acct(id: string, over: Partial<Account> = {}): Account {
   return { id, nickname: id, configDir: `/cfg/${id}`, isDefault: false, createdAt: 0, ...over };
 }
 
-function makeDeps(accounts: Account[], usage: Usage[] = []): AccountsDeps {
+function makeDeps(accounts: Account[], usage: Usage[] = [], identities: Identity[] = []): AccountsDeps {
   return {
     listAccounts: vi.fn(async () => accounts),
     getUsage: vi.fn(async () => usage),
+    getIdentities: vi.fn(async () => identities),
     addAccount: vi.fn(async (nickname: string) => acct("new", { nickname })),
     setNickname: vi.fn(async () => {}),
     removeAccount: vi.fn(async () => {}),
@@ -89,6 +90,31 @@ describe("AccountsScreen", () => {
     expect(deps.removeAccount).not.toHaveBeenCalled();
     fireEvent.click(screen.getByText("Confirm remove"));
     await waitFor(() => expect(deps.removeAccount).toHaveBeenCalledWith("a"));
+  });
+
+  it("shows the REAL authenticated email as the primary label, nickname as a secondary alias", async () => {
+    const deps = makeDeps(
+      [acct("a", { nickname: "DROdio Gmail", isDefault: true })],
+      [],
+      [{ id: "a", email: "drodio@storytell.ai", organization: "drodio@storytell.ai's Organization" }],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    // The trustworthy identity (email + org) is surfaced...
+    expect(await screen.findByText("drodio@storytell.ai")).toBeTruthy();
+    expect(screen.getByText("drodio@storytell.ai's Organization")).toBeTruthy();
+    // ...and the user-typed nickname is demoted to a secondary alias line, not the headline.
+    expect(screen.getByText("alias: DROdio Gmail")).toBeTruthy();
+  });
+
+  it("falls back to the nickname and flags 'Not signed in' for an account with no identity", async () => {
+    const deps = makeDeps(
+      [acct("a", { nickname: "DROdio Chief" })],
+      [],
+      [{ id: "a", email: null, organization: null }],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    expect(await screen.findByText("DROdio Chief")).toBeTruthy();
+    expect(screen.getByText("Not signed in")).toBeTruthy();
   });
 
   it("shows an exhausted-until indicator when an account is rate-limited", async () => {

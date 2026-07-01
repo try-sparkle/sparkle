@@ -3,11 +3,14 @@ import { C, ON_BRAND_FILL } from "../theme/colors";
 import {
   listAccounts,
   getUsage,
+  getIdentities,
   addAccount,
   setNickname,
   removeAccount,
+  accountLabel,
   type Account,
   type Usage,
+  type Identity,
 } from "../services/accountStore";
 
 // Accounts settings screen for multi Claude Max account support (design spec
@@ -23,7 +26,7 @@ import {
 // the integrator wires it to a PTY `claude login` (env CLAUDE_CONFIG_DIR=account.configDir). Until
 // that login completes the account exists but is unauthenticated — that's expected for Phase 1.
 
-const DEPS = { listAccounts, getUsage, addAccount, setNickname, removeAccount };
+const DEPS = { listAccounts, getUsage, getIdentities, addAccount, setNickname, removeAccount };
 export type AccountsDeps = typeof DEPS;
 
 export interface AccountsScreenProps {
@@ -144,6 +147,9 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
   const io: AccountsDeps = { ...DEPS, ...deps };
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [usage, setUsage] = useState<Usage[]>([]);
+  // Real authenticated identity (email + org) per account id — the trustworthy label read from each
+  // account's own .claude.json oauthAccount. The nickname is only a secondary alias.
+  const [identities, setIdentities] = useState<Identity[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
@@ -164,22 +170,25 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
   // The default (no `deps`) path resolves to the module-level DEPS, which are stable.
   const listAccountsFn = deps?.listAccounts ?? DEPS.listAccounts;
   const getUsageFn = deps?.getUsage ?? DEPS.getUsage;
+  const getIdentitiesFn = deps?.getIdentities ?? DEPS.getIdentities;
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const [a, u] = await Promise.all([listAccountsFn(), getUsageFn()]);
+      const [a, u, ids] = await Promise.all([listAccountsFn(), getUsageFn(), getIdentitiesFn()]);
       setAccounts(a);
       setUsage(u);
+      setIdentities(ids);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load accounts");
     }
-  }, [listAccountsFn, getUsageFn]);
+  }, [listAccountsFn, getUsageFn, getIdentitiesFn]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
   const usageFor = (id: string) => usage.find((u) => u.id === id);
+  const identityFor = (id: string) => identities.find((i) => i.id === id);
   const now = Date.now();
   // Each window's bar fills RELATIVE to the busiest account, so the emptiest account reads shortest
   // (= most headroom). Floor at 1 so an all-zero set divides cleanly to empty bars, not NaN.
@@ -302,8 +311,12 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
 
       {accounts.map((a) => {
         const u = usageFor(a.id);
+        const identity = identityFor(a.id);
         const exhausted = exhaustedLabel(u, now);
         const isEditing = editingId === a.id;
+        // Authoritative label = the REAL logged-in email; nickname is only a secondary alias.
+        const primary = accountLabel(a, identity);
+        const alias = identity?.email && a.nickname !== identity.email ? a.nickname : null;
         return (
           <div key={a.id} style={card}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -321,7 +334,23 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
                   style={{ ...inputStyle, flex: 1 }}
                 />
               ) : (
-                <span style={{ fontSize: 14, fontWeight: 600, flex: 1 }}>{a.nickname}</span>
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span
+                    style={{ fontSize: 14, fontWeight: 600, display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                    title={identity?.email ? undefined : "Not signed in — showing nickname until you log in"}
+                  >
+                    {primary}
+                  </span>
+                  {alias && (
+                    <span style={{ fontSize: 11, color: C.muted, display: "block" }}>alias: {alias}</span>
+                  )}
+                  {identity?.organization && (
+                    <span style={{ fontSize: 11, color: C.muted, display: "block" }}>{identity.organization}</span>
+                  )}
+                  {!identity?.email && (
+                    <span style={{ fontSize: 11, color: C.amber, display: "block" }}>Not signed in</span>
+                  )}
+                </span>
               )}
               {a.isDefault && <span style={tag}>default</span>}
               {!isEditing && (

@@ -6,6 +6,8 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...
 import {
   pickAccount,
   getUsage,
+  getIdentities,
+  accountLabel,
   addAccount,
   setNickname,
   removeAccount,
@@ -160,6 +162,36 @@ describe("getUsage snake_case → camelCase mapping", () => {
       { id: "a", tokens5h: 11, tokens7d: 22, exhaustedUntil: 1234 },
       { id: "b", tokens5h: 0, tokens7d: 0, exhaustedUntil: null },
     ]);
+  });
+});
+
+describe("getIdentities", () => {
+  beforeEach(() => invoke.mockReset());
+
+  it("invokes accounts_identities and returns identity rows verbatim", async () => {
+    invoke.mockResolvedValue([
+      { id: "a", email: "drodio@storytell.ai", organization: "drodio@storytell.ai's Organization" },
+      { id: "b", email: null, organization: null },
+    ]);
+    const out = await getIdentities();
+    expect(invoke).toHaveBeenCalledWith("accounts_identities");
+    expect(out).toEqual([
+      { id: "a", email: "drodio@storytell.ai", organization: "drodio@storytell.ai's Organization" },
+      { id: "b", email: null, organization: null },
+    ]);
+  });
+});
+
+describe("accountLabel — real email is authoritative, nickname is the fallback", () => {
+  it("prefers the real authenticated email over the nickname", () => {
+    expect(accountLabel(acct("a", { nickname: "DROdio Gmail" }), { id: "a", email: "drodio@storytell.ai", organization: null })).toBe(
+      "drodio@storytell.ai",
+    );
+  });
+
+  it("falls back to the nickname when the account has no identity (not signed in)", () => {
+    expect(accountLabel(acct("a", { nickname: "DROdio Chief" }), { id: "a", email: null, organization: null })).toBe("DROdio Chief");
+    expect(accountLabel(acct("a", { nickname: "DROdio Chief" }), undefined)).toBe("DROdio Chief");
   });
 });
 

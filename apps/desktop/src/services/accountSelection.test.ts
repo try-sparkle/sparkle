@@ -17,9 +17,13 @@ function mockBackend() {
   invoke.mockImplementation((cmd: string) => {
     if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
     if (cmd === "accounts_usage") return Promise.resolve([]); // no usage rows → all zero headroom
+    if (cmd === "accounts_identities") return Promise.resolve([]); // no identities → nickname fallback
     return Promise.reject(new Error(`unexpected command ${cmd}`));
   });
 }
+
+// listAccounts + getUsage + getIdentities fire together per (uncached) load.
+const CALLS_PER_LOAD = 3;
 
 describe("accountSelection cache", () => {
   beforeEach(() => {
@@ -34,15 +38,15 @@ describe("accountSelection cache", () => {
     await loadAccountState({ now: t0 });
     await loadAccountState({ now: t0 + 100 });
     await loadAccountState({ now: t0 + ACCOUNT_CACHE_TTL_MS - 1 });
-    // accounts_list + accounts_usage once total — the later reads hit the cache.
-    expect(invoke).toHaveBeenCalledTimes(2);
+    // One uncached load's worth of calls total — the later reads hit the cache.
+    expect(invoke).toHaveBeenCalledTimes(CALLS_PER_LOAD);
   });
 
   it("re-fetches after the TTL expires", async () => {
     const t0 = 2_000_000;
     await loadAccountState({ now: t0 });
     await loadAccountState({ now: t0 + ACCOUNT_CACHE_TTL_MS + 1 });
-    expect(invoke).toHaveBeenCalledTimes(4); // two pairs
+    expect(invoke).toHaveBeenCalledTimes(CALLS_PER_LOAD * 2); // two loads
   });
 
   it("invalidateAccountState forces the next load to re-fetch", async () => {
@@ -50,13 +54,13 @@ describe("accountSelection cache", () => {
     await loadAccountState({ now: t0 });
     invalidateAccountState();
     await loadAccountState({ now: t0 + 1 });
-    expect(invoke).toHaveBeenCalledTimes(4);
+    expect(invoke).toHaveBeenCalledTimes(CALLS_PER_LOAD * 2);
   });
 
-  it("de-dupes concurrent loads into a single IPC pair", async () => {
+  it("de-dupes concurrent loads into a single IPC batch", async () => {
     const t0 = 4_000_000;
     await Promise.all([loadAccountState({ now: t0 }), loadAccountState({ now: t0 }), loadAccountState({ now: t0 })]);
-    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledTimes(CALLS_PER_LOAD);
   });
 
   it("chooseAccountForAgent auto-picks lowest-usage, and honors a manual pin", async () => {
@@ -79,6 +83,7 @@ describe("accountSelection cache", () => {
     invoke.mockImplementation((cmd: string) => {
       if (cmd === "accounts_list") return new Promise((r) => (resolveList = r as typeof resolveList));
       if (cmd === "accounts_usage") return Promise.resolve([]);
+      if (cmd === "accounts_identities") return Promise.resolve([]);
       return Promise.reject(new Error(`unexpected ${cmd}`));
     });
 

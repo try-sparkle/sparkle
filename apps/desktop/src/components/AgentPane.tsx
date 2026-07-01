@@ -20,7 +20,7 @@ import {
   stopOrchestrationBridge,
 } from "../services/orchestrationLaunch";
 import { useSettingsStore } from "../stores/settingsStore";
-import { setPin, markExhausted, type Account } from "../services/accountStore";
+import { setPin, markExhausted, accountLabel, type Account, type Identity } from "../services/accountStore";
 import { chooseAccountForAgent, invalidateAccountState } from "../services/accountSelection";
 import { readWorkerResult } from "../pty";
 import { maybeAutoName } from "../services/agentNaming";
@@ -88,6 +88,9 @@ export function AgentPane({
   // THIS spawn runs under (its CLAUDE_CONFIG_DIR). `chosenAccountIdRef` mirrors the chosen id for the
   // rate-limit failover callback (which runs outside render). Empty accounts → no badge, default spawn.
   const [accounts, setAccounts] = useState<Account[]>([]);
+  // Real authenticated identity (email + org) per account id — the trustworthy badge label, read
+  // from each account's own .claude.json oauthAccount (the nickname is only a secondary alias).
+  const [identities, setIdentities] = useState<Identity[]>([]);
   const [chosenAccount, setChosenAccount] = useState<Account | null>(null);
   const chosenAccountIdRef = useRef<string | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
@@ -321,6 +324,7 @@ export function AgentPane({
       // Best-effort: chooseAccountForAgent never throws (it swallows IPC errors to empty state).
       const { chosen, state } = await chooseAccountForAgent(agent.id);
       setAccounts(state.accounts);
+      setIdentities(state.identities);
       setChosenAccount(chosen);
       chosenAccountIdRef.current = chosen?.id ?? null;
       const configDir = chosen?.configDir;
@@ -670,6 +674,7 @@ export function AgentPane({
           {accounts.length > 0 && chosenAccount && (
             <AccountBadge
               accounts={accounts}
+              identities={identities}
               chosen={chosenAccount}
               open={accountMenuOpen}
               onToggle={() => setAccountMenuOpen((v) => !v)}
@@ -691,22 +696,40 @@ export function AgentPane({
  */
 function AccountBadge({
   accounts,
+  identities,
   chosen,
   open,
   onToggle,
   onPick,
 }: {
   accounts: Account[];
+  identities: Identity[];
   chosen: Account;
   open: boolean;
   onToggle: () => void;
   onPick: (a: Account) => void;
 }) {
+  const identityFor = (id: string) => identities.find((i) => i.id === id);
+  const chosenIdentity = identityFor(chosen.id);
+  // The trustworthy label is the REAL logged-in email; the nickname is only a secondary alias.
+  const chosenReal = accountLabel(chosen, chosenIdentity);
+  const chosenOrg = chosenIdentity?.organization;
+  // Tooltip surfaces the full identity: email, org, and nickname alias when it differs from email.
+  const tooltip = [
+    chosenIdentity?.email
+      ? `Claude account: ${chosenIdentity.email}`
+      : `Claude account: ${chosen.nickname} (not signed in)`,
+    chosenOrg ? `Organization: ${chosenOrg}` : null,
+    chosenIdentity?.email && chosen.nickname !== chosenIdentity.email ? `Nickname: ${chosen.nickname}` : null,
+    "click to change",
+  ]
+    .filter(Boolean)
+    .join("\n");
   return (
     <div style={{ position: "absolute", top: 12, right: 12, zIndex: 20 }}>
       <button
         type="button"
-        title={`Claude account: ${chosen.nickname} — click to change`}
+        title={tooltip}
         onClick={onToggle}
         style={{
           display: "flex",
@@ -724,8 +747,8 @@ function AccountBadge({
         }}
       >
         <span style={{ width: 6, height: 6, borderRadius: 3, background: C.teal }} />
-        <span style={{ maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {chosen.nickname}
+        <span style={{ maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {chosenReal}
         </span>
         <span style={{ color: C.muted }}>▾</span>
       </button>
@@ -749,11 +772,16 @@ function AccountBadge({
           >
             {accounts.map((a) => {
               const active = a.id === chosen.id;
+              const identity = identityFor(a.id);
+              // Primary line = real logged-in email (or nickname when not signed in); the nickname
+              // becomes a secondary alias line whenever it differs from the email.
+              const primary = accountLabel(a, identity);
+              const alias = identity?.email && a.nickname !== identity.email ? a.nickname : null;
               return (
                 <div
                   key={a.id}
                   onClick={() => onPick(a)}
-                  title={a.configDir}
+                  title={identity?.organization ? `${a.configDir}\nOrganization: ${identity.organization}` : a.configDir}
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -772,14 +800,25 @@ function AccountBadge({
                       width: 6,
                       height: 6,
                       borderRadius: 3,
+                      flexShrink: 0,
                       background: active ? C.teal : "transparent",
                       border: active ? "none" : `1px solid ${C.muted}`,
                     }}
                   />
-                  <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {a.nickname}
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
+                    <span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {primary}
+                    </span>
+                    {alias && (
+                      <span style={{ display: "block", color: C.muted, fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {alias}
+                      </span>
+                    )}
+                    {!identity?.email && (
+                      <span style={{ display: "block", color: C.muted, fontSize: 10 }}>not signed in</span>
+                    )}
                   </span>
-                  {a.isDefault && <span style={{ color: C.muted, fontSize: 10 }}>default</span>}
+                  {a.isDefault && <span style={{ color: C.muted, fontSize: 10, flexShrink: 0 }}>default</span>}
                 </div>
               );
             })}

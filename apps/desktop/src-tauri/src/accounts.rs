@@ -74,6 +74,20 @@ pub struct AccountUsage {
     pub exhausted_until: Option<i64>,
 }
 
+/// The REAL authenticated Claude identity for one account, returned by
+/// [`accounts_identities`]. Read from that account's own `<config_dir>/.claude.json`
+/// (`oauthAccount.emailAddress` / `oauthAccount.organizationName`) — the trustworthy
+/// label the badge/AccountsScreen shows, as opposed to the user-typed `nickname`.
+/// `email`/`organization` are `None` for an account whose config dir has no
+/// `.claude.json` yet (created but never `claude login`ed → "not signed in").
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountIdentity {
+    pub id: String,
+    pub email: Option<String>,
+    pub organization: Option<String>,
+}
+
 /// Trailing usage windows, in seconds.
 const WINDOW_5H: i64 = 5 * 60 * 60;
 const WINDOW_7D: i64 = 7 * 24 * 60 * 60;
@@ -407,6 +421,50 @@ fn usage_for_account(acct: &Account, now: i64) -> AccountUsage {
     }
 }
 
+// ---- real OAuth identity (pure) -----------------------------------------------
+
+/// Resolve which config dir to read the OAuth identity from: an explicit non-empty
+/// path (a named account's `<app_data>/accounts/<id>/` or the imported default's
+/// `~/.claude`), else fall back to `<home>/.claude`. Mirrors how the spawn path treats
+/// an empty `CLAUDE_CONFIG_DIR` as "use the default". Returns `None` only when neither
+/// a usable explicit dir nor a home is available.
+fn resolve_identity_config_dir(config_dir: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(d) = config_dir {
+        if !d.as_os_str().is_empty() {
+            return Some(d.to_path_buf());
+        }
+    }
+    home.map(|h| h.join(".claude"))
+}
+
+/// Read the REAL authenticated identity Claude Code records in
+/// `<config_dir>/.claude.json` under `oauthAccount` (`emailAddress`,
+/// `organizationName`). DEFENSIVE and never errors: a missing file, unparseable JSON,
+/// a missing/empty `oauthAccount`, or a missing/empty `emailAddress` all yield `None`
+/// (an account dir created but never logged into — "not signed in"). The org is `None`
+/// when absent/empty even if the email is present. The email is the authoritative
+/// label; the nickname is only a secondary alias.
+fn read_oauth_identity_at(
+    config_dir: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<(String, Option<String>)> {
+    let dir = resolve_identity_config_dir(config_dir, home)?;
+    let bytes = std::fs::read(dir.join(".claude.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let oauth = v.get("oauthAccount")?;
+    let email = oauth
+        .get("emailAddress")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let organization = oauth
+        .get("organizationName")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some((email, organization))
+}
+
 // ---- Tauri commands (thin wrappers) -------------------------------------------
 
 /// All registered accounts (empty vec on a clean install).
@@ -503,6 +561,36 @@ pub fn accounts_usage(app: AppHandle) -> Result<Vec<AccountUsage>, String> {
     let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
     let now = now_secs();
     Ok(accounts.iter().map(|a| usage_for_account(a, now)).collect())
+}
+
+/// The REAL authenticated identity (email + org) for every account, read from each
+/// account's own `<config_dir>/.claude.json`. `email`/`organization` are `null` for an
+/// account with no identity yet (dir created but never `claude login`ed). This is the
+/// trustworthy account label the badge and Accounts screen surface, so the user can see
+/// which account a session actually runs under — not just the nickname they typed.
+#[tauri::command]
+pub fn accounts_identities(app: AppHandle) -> Result<Vec<AccountIdentity>, String> {
+    let app_data = crate::worktree::app_data_dir_pub(&app)?;
+    let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    Ok(accounts
+        .iter()
+        .map(|a| {
+            // The `<home>/.claude` fallback is only correct for the DEFAULT account (whose
+            // config_dir IS ~/.claude, sometimes stored empty). A NAMED account with an empty
+            // config_dir must NOT fall back to the home identity — that would mislabel the home
+            // user's email as this account's, the exact trust bug this change fixes. So pass home
+            // only for the default; a named account with no usable dir resolves to None ("not
+            // signed in") instead.
+            let home_for = if a.is_default { home.as_deref() } else { None };
+            let identity = read_oauth_identity_at(Some(Path::new(&a.config_dir)), home_for);
+            let (email, organization) = match identity {
+                Some((e, o)) => (Some(e), o),
+                None => (None, None),
+            };
+            AccountIdentity { id: a.id.clone(), email, organization }
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -775,6 +863,117 @@ mod tests {
         assert_eq!(parse_iso8601_to_epoch("not-a-date"), None);
         assert_eq!(parse_iso8601_to_epoch("2026-13-01T00:00:00Z"), None);
         assert_eq!(parse_iso8601_to_epoch("2026-06-25"), None);
+    }
+
+    /// Write a `.claude.json` into `dir` with the given raw JSON body.
+    fn write_claude_json(dir: &Path, body: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(".claude.json"), body).unwrap();
+    }
+
+    #[test]
+    fn read_oauth_identity_reads_email_and_org() {
+        let base = unique_dir("identity-ok");
+        write_claude_json(
+            &base,
+            r#"{"oauthAccount":{"emailAddress":"me@example.com","organizationName":"Acme Org"},"other":1}"#,
+        );
+        let id = read_oauth_identity_at(Some(&base), None);
+        assert_eq!(id, Some(("me@example.com".to_string(), Some("Acme Org".to_string()))));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_oauth_identity_email_present_org_absent_or_empty() {
+        let base = unique_dir("identity-no-org");
+        // organizationName missing entirely.
+        write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":"solo@example.com"}}"#);
+        assert_eq!(
+            read_oauth_identity_at(Some(&base), None),
+            Some(("solo@example.com".to_string(), None))
+        );
+        // organizationName present but empty → treated as None.
+        write_claude_json(
+            &base,
+            r#"{"oauthAccount":{"emailAddress":"solo@example.com","organizationName":""}}"#,
+        );
+        assert_eq!(
+            read_oauth_identity_at(Some(&base), None),
+            Some(("solo@example.com".to_string(), None))
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_oauth_identity_missing_file_is_none() {
+        // A never-logged-in account dir: exists but has no .claude.json.
+        let base = unique_dir("identity-missing-file");
+        assert_eq!(read_oauth_identity_at(Some(&base), None), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_oauth_identity_missing_oauth_account_is_none() {
+        // .claude.json present but with no oauthAccount (e.g. logged out / fresh config).
+        let base = unique_dir("identity-no-oauth");
+        write_claude_json(&base, r#"{"numStartups":3,"theme":"dark"}"#);
+        assert_eq!(read_oauth_identity_at(Some(&base), None), None);
+        // oauthAccount present but with no emailAddress → also None.
+        write_claude_json(&base, r#"{"oauthAccount":{"accountUuid":"abc"}}"#);
+        assert_eq!(read_oauth_identity_at(Some(&base), None), None);
+        // oauthAccount.emailAddress present but empty → None.
+        write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":""}}"#);
+        assert_eq!(read_oauth_identity_at(Some(&base), None), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_oauth_identity_unparseable_json_is_none() {
+        let base = unique_dir("identity-garbage");
+        write_claude_json(&base, "{not valid json at all");
+        assert_eq!(read_oauth_identity_at(Some(&base), None), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_identity_config_dir_falls_back_to_home_claude() {
+        // Empty / None config dir → <home>/.claude (the default account's real dir).
+        let home = Path::new("/home/me");
+        assert_eq!(
+            resolve_identity_config_dir(None, Some(home)),
+            Some(PathBuf::from("/home/me/.claude"))
+        );
+        assert_eq!(
+            resolve_identity_config_dir(Some(Path::new("")), Some(home)),
+            Some(PathBuf::from("/home/me/.claude"))
+        );
+        // An explicit non-empty dir wins over home.
+        assert_eq!(
+            resolve_identity_config_dir(Some(Path::new("/data/accounts/x")), Some(home)),
+            Some(PathBuf::from("/data/accounts/x"))
+        );
+        // No dir and no home → None.
+        assert_eq!(resolve_identity_config_dir(None, None), None);
+        // GUARD: an empty config dir WITHOUT a home fallback → None (the way `accounts_identities`
+        // calls it for a NAMED account: passing home = None so an empty/missing dir can't
+        // mislabel the home user's identity as this account's).
+        assert_eq!(resolve_identity_config_dir(Some(Path::new("")), None), None);
+        assert_eq!(read_oauth_identity_at(Some(Path::new("")), None), None);
+    }
+
+    #[test]
+    fn read_oauth_identity_defaults_to_home_claude_when_dir_absent() {
+        // With no explicit config dir, the reader looks in <home>/.claude/.claude.json.
+        let home = unique_dir("identity-home");
+        write_claude_json(
+            &home.join(".claude"),
+            r#"{"oauthAccount":{"emailAddress":"default@example.com","organizationName":"Home Org"}}"#,
+        );
+        assert_eq!(
+            read_oauth_identity_at(None, Some(&home)),
+            Some(("default@example.com".to_string(), Some("Home Org".to_string())))
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

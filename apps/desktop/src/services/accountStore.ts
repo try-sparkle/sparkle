@@ -31,6 +31,16 @@ export interface Usage {
   exhaustedUntil: number | null;
 }
 
+/** The REAL authenticated Claude identity for an account, read by the Rust side from that account's
+ *  own `<configDir>/.claude.json` (`oauthAccount`). This is the TRUSTWORTHY label — the email the
+ *  user actually logged into — as opposed to the user-typed {@link Account.nickname}. `email`/`org`
+ *  are null for an account with no identity yet (config dir created but never `claude login`ed). */
+export interface Identity {
+  id: string;
+  email: string | null;
+  organization: string | null;
+}
+
 /** Raw shape the Rust side returns (snake_case) — mapped to {@link Usage} at the boundary. */
 interface RawUsage {
   id: string;
@@ -82,6 +92,20 @@ export function importDefault(): Promise<Account> {
 export async function getUsage(): Promise<Usage[]> {
   const raw = await invoke<RawUsage[]>("accounts_usage");
   return raw.map(mapUsage);
+}
+
+/** The REAL authenticated identity (email + org) for every account, read from each account's own
+ *  `<configDir>/.claude.json`. `email`/`organization` are null for an account never logged into. */
+export function getIdentities(): Promise<Identity[]> {
+  return invoke<Identity[]>("accounts_identities");
+}
+
+/** The authoritative label to show for an account: its REAL logged-in email when known, otherwise
+ *  the user-typed nickname (an account never `claude login`ed has no identity yet). Use this — not
+ *  `account.nickname` — wherever the account is identified to the user, so the label reflects the
+ *  identity the session actually runs under. */
+export function accountLabel(account: Account, identity: Identity | undefined): string {
+  return identity?.email ?? account.nickname;
 }
 
 /** Flag an account as rate-limited until `untilEpoch` (epoch ms). Selection excludes it until then. */
