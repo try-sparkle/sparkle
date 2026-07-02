@@ -40,18 +40,40 @@ const heading = (size: number, top: number): CSSProperties => ({
   margin: `${top}px 0 6px`,
 });
 
+// Scheme allowlists for attacker-influenced markdown (assistant / tool output is untrusted).
+// react-markdown strips `javascript:` but NOT `file:`, `vscode:`, `smb:`, or other custom OS URI
+// handlers — so a `[x](vscode://…)` / `[x](file:///…)` link would otherwise hand `openUrl` an
+// arbitrary protocol and invoke a native handler. Only http(s) and mailto reach the opener; a
+// disallowed href renders as inert (non-navigating) text. Trim + case-insensitive so leading
+// whitespace / mixed case (` VSCODE:`) can't slip past.
+export const SAFE_LINK_SCHEME_RE = /^(https?|mailto):/i;
+// Images are fetched on render, so a remote `<img src>` is an outbound request / IP-leak beacon.
+// Constrain to `https:` (no plaintext http, no scheme-relative) and inline `data:` (no network).
+export const SAFE_IMG_SCHEME_RE = /^(https|data):/i;
+
+export function isSafeLinkHref(href: string | undefined): href is string {
+  return typeof href === "string" && SAFE_LINK_SCHEME_RE.test(href.trim());
+}
+export function isSafeImgSrc(src: string | undefined): src is string {
+  return typeof src === "string" && SAFE_IMG_SCHEME_RE.test(src.trim());
+}
+
 // Open links externally (Tauri shell) rather than navigating the webview; keep the href +
-// target on the anchor so it degrades gracefully and stays inspectable/testable.
+// target on the anchor so it degrades gracefully and stays inspectable/testable. Only an
+// allowlisted scheme opens — a disallowed one is inert (no href, click does nothing).
 function ExternalLink({ href, children }: { href?: string; children?: ReactNode }) {
+  const safe = isSafeLinkHref(href);
   return (
     <a
-      href={href}
+      // Drop the href entirely for a disallowed scheme so the webview can't navigate to it even
+      // via keyboard / middle-click; the text still renders, just inert.
+      href={safe ? href : undefined}
       target="_blank"
       rel="noopener noreferrer"
       onClick={(e) => {
-        if (!href) return;
+        // Always suppress the default navigation; only an allowlisted href reaches the opener.
         e.preventDefault();
-        void openUrl(href).catch(() => {});
+        if (safe) void openUrl(href).catch(() => {});
       }}
       style={{ color: C.accentInk, textDecoration: "underline" }}
     >
@@ -152,9 +174,13 @@ const components: Components = {
   td: ({ children }) => (
     <td style={{ border: `1px solid ${HAIRLINE}`, padding: "4px 8px" }}>{children}</td>
   ),
-  img: ({ src, alt }) => (
-    <img src={src} alt={alt} style={{ maxWidth: "100%", height: "auto", borderRadius: 6 }} />
-  ),
+  img: ({ src, alt }) => {
+    // Untrusted markdown: a remote image renders an outbound request (IP-leak beacon). Only allow
+    // https + inline data: URIs; anything else (http, scheme-relative, custom) degrades to alt text.
+    const safeSrc = isSafeImgSrc(typeof src === "string" ? src : undefined);
+    if (!safeSrc) return <span style={{ color: C.muted }}>{alt || ""}</span>;
+    return <img src={src as string} alt={alt} style={{ maxWidth: "100%", height: "auto", borderRadius: 6 }} />;
+  },
 };
 
 /** Render `text` as compact, theme-styled GitHub-flavored markdown for a chat bubble.

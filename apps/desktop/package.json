@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build:fresh": "cargo clean -p sparkle --manifest-path src-tauri/Cargo.toml && tauri build"
   },
   "dependencies": {
     "@sparkle/core": "workspace:*",

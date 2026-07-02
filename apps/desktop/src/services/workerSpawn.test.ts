@@ -42,7 +42,13 @@ describe("spawnWorker", () => {
 
     invokeMock.mockResolvedValueOnce({ path: "/wt/worker", branch: "sparkle/agent-w" });
 
-    const workerId = await spawnWorker({ projectId, parentAgentId: buildId, task: "Build login" });
+    const spawned = await spawnWorker({ projectId, parentAgentId: buildId, task: "Build login" });
+    const workerId = spawned.workerId;
+
+    // The return carries the AUTHORITATIVE identity captured from the worktree cut (not re-read from
+    // the store), so the orchestration reply can never degrade to empty branch/worktree (sparkle-yk3x).
+    expect(spawned.branch).toBe("sparkle/agent-w");
+    expect(spawned.worktree).toBe("/wt/worker");
 
     // Tauri call used the parent's branch as the base.
     expect(invokeMock).toHaveBeenCalledWith("create_worker_worktree", expect.objectContaining({
@@ -80,7 +86,7 @@ describe("spawnWorker", () => {
       return Promise.resolve(undefined);
     });
 
-    const workerId = await spawnWorker({ projectId, parentAgentId: buildId, task: "Build the login flow" });
+    const { workerId } = await spawnWorker({ projectId, parentAgentId: buildId, task: "Build the login flow" });
 
     // The naming backend was called with the worker's task as the basis.
     await vi.waitFor(() =>

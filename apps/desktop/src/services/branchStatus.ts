@@ -27,6 +27,14 @@ export interface WorkflowState {
   // downstream so a no-op branch (also trivially adds nothing) can't claim it landed. Optional in the
   // type so a Rust build that predates the field deserializes to falsy.
   landed?: boolean;
+  // The agent branch has been PUSHED to origin (its remote-tracking ref exists) — drives the "Pushed"
+  // stage LIVE even before any PR. Local/offline; reflects a push made from this repo. Optional so a
+  // Rust build predating the field deserializes to falsy (see Rust `branch_pushed`).
+  pushed?: boolean;
+  // The agent's work is SHIPPED — its tip is contained in a published release tag — drives the top
+  // "Shipped to Production" stage LIVE (previously unreachable). Optional for the same back-compat
+  // reason. Tip-relative, so a squash-landed branch reads false here (see Rust `tip_in_release`).
+  shipped?: boolean;
   prState: "open" | "merged" | "closed" | null; // GitHub PR state for the branch, if any
   prNumber: number | null;
   prUrl: string | null;

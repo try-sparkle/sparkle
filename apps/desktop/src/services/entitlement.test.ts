@@ -5,6 +5,7 @@ import {
   deriveAuthControl,
   deriveAuthView,
   parseAuthCode,
+  parseAuthState,
   type Me,
 } from "./entitlement";
 
@@ -135,5 +136,26 @@ describe("parseAuthCode", () => {
   it("returns null for malformed input", () => {
     expect(parseAuthCode("not a url")).toBeNull();
     expect(parseAuthCode("")).toBeNull();
+  });
+});
+
+describe("parseAuthState", () => {
+  it("extracts the echoed state from a sparkle://auth deep link", () => {
+    expect(parseAuthState("sparkle://auth?code=abc&state=st8-xyz")).toBe("st8-xyz");
+  });
+  it("url-decodes the state", () => {
+    expect(parseAuthState("sparkle://auth?code=abc&state=a%2Bb")).toBe("a+b");
+  });
+  it("returns '' (never null) when the state is absent, so exchangeCode always gets a string", () => {
+    expect(parseAuthState("sparkle://auth?code=abc")).toBe("");
+    expect(parseAuthState("sparkle://auth?code=abc&state=")).toBe("");
+  });
+  it("returns '' for the wrong scheme or a non-auth host (mirrors parseAuthCode gating)", () => {
+    expect(parseAuthState("https://example.com/auth?state=x")).toBe("");
+    expect(parseAuthState("sparkle://open?state=x")).toBe("");
+  });
+  it("returns '' for malformed input", () => {
+    expect(parseAuthState("not a url")).toBe("");
+    expect(parseAuthState("")).toBe("");
   });
 });

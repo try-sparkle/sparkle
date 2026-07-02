@@ -13,9 +13,16 @@ import { useAuthStore } from "../stores/authStore";
 import { useTrialStore, TRIAL_LIMIT } from "../stores/trialStore";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { TrialChrome } from "./TrialChrome";
-import { deriveAuthView, parseAuthCode } from "../services/entitlement";
+import { deriveAuthView, parseAuthCode, parseAuthState } from "../services/entitlement";
 import { safeUnlisten } from "../services/safeUnlisten";
-import { exchangeCode, openPaywall, openSignIn, PAYWALL_URL, SIGN_IN_URL } from "../services/sparkleApi";
+import {
+  exchangeCode,
+  lastSignInUrl,
+  openPaywall,
+  openSignIn,
+  PAYWALL_URL,
+  SIGN_IN_URL,
+} from "../services/sparkleApi";
 import { openPaywallCheckout, lastCheckoutUrl } from "../services/creditsMenuApi";
 import { PromoRedeem } from "./PromoRedeem";
 
@@ -96,9 +103,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
       const code = parseAuthCode(url);
       if (code) {
         try {
-          await exchangeCode(code);
+          // Pass the echoed `state` so Rust can bind this callback to the sign-in this instance
+          // started; a planted code (mismatched/absent state) is rejected before the exchange.
+          await exchangeCode(code, parseAuthState(url));
         } catch {
-          // expired/used code — refresh leaves us unauthenticated
+          // expired/used code, or state mismatch — refresh leaves us unauthenticated
         }
       }
       await refresh();
@@ -140,6 +149,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
     if (!ok) setFailedUrl(url);
   };
 
+  // Sign-in gets its own handler because the URL is dynamic (it carries the per-attempt state +
+  // code_challenge, sparkle-kqg0). On a launch failure we surface the ACTUAL URL just built
+  // (lastSignInUrl) — the bare SIGN_IN_URL would be an unbound link the server can't tie to a
+  // sign-in — falling back to SIGN_IN_URL only if nothing was built yet.
+  const handleSignIn = async () => {
+    setFailedUrl(null);
+    const ok = await openSignIn();
+    if (!ok) setFailedUrl(lastSignInUrl() ?? SIGN_IN_URL);
+  };
+
   // "Pay $99" one-click-to-Stripe. When signed in (a bearer token is present), create the
   // checkout session directly and land on checkout.stripe.com in one click — the same proven path
   // as in-app top-ups. Fall back to the web sign-in→paywall hand-off when signed out, or if the
@@ -168,7 +187,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // through web sign-in; token-less trial users still need the sign-in hand-off first.
   const handleTrialUnlock = () => {
     if (tokenPresent) void handlePay();
-    else void handOff(openSignIn, SIGN_IN_URL);
+    else void handleSignIn();
   };
 
   // Trial prompts still available to fall back to (device-local meter, independent of payment).
@@ -234,7 +253,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // welcome (token-less, trial not yet started)
   return (
     <WelcomeScreen
-      onSignIn={() => void handOff(openSignIn, SIGN_IN_URL)}
+      onSignIn={() => void handleSignIn()}
       onTryFree={() => void startTrial()}
       signInFailedUrl={failedUrl}
     />

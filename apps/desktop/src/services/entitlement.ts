@@ -94,3 +94,19 @@ export function parseAuthCode(url: string): string | null {
   const code = parsed.searchParams.get("code");
   return code && code.length > 0 ? code : null;
 }
+
+/**
+ * Parse the `state` echoed back in a `sparkle://auth?code=…&state=…` deep link. Returns "" (not
+ * null) when absent so the caller always passes a string to exchangeCode — Rust rejects an empty
+ * or non-matching state against the sign-in it started (login-CSRF binding, sparkle-kqg0).
+ */
+export function parseAuthState(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "";
+  }
+  if (parsed.protocol !== "sparkle:" || parsed.host !== "auth") return "";
+  return parsed.searchParams.get("state") ?? "";
+}

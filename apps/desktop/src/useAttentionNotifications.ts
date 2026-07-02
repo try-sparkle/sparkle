@@ -64,6 +64,17 @@ const isRelayRed = (s: AgentTabStatus | undefined): boolean =>
 const displayName = (a: AgentTab): string =>
   a.aiTitle || a.autoNameVariants?.title || a.name;
 
+/** Cap the raw terminal `detail` we relay to the phone. The trigger sits at the BOTTOM of the
+ *  screen/scrollback, so keep the tail (a runaway scrollback would otherwise bloat the payload).
+ *  Trailing blank lines a terminal snapshot pads with are stripped so the card doesn't render a
+ *  wall of empty space. */
+export const DETAIL_MAX = 4000;
+export const truncateDetail = (raw: string): string => {
+  const trimmed = raw.replace(/[ \t]*\n(?:[ \t]*\n)+$/g, "\n").trimEnd();
+  if (trimmed.length <= DETAIL_MAX) return trimmed;
+  return `…\n${trimmed.slice(trimmed.length - DETAIL_MAX)}`;
+};
+
 /** Bring this window to the foreground (notification click landed here). */
 async function bringToFront(): Promise<void> {
   try {
@@ -203,6 +214,13 @@ export function useAttentionNotifications(): void {
             // `errored` covers both a crash and a mid-stream API-error/self-prompt stall — the agent
             // is stuck until you look, so it relays as a (reply-less) "needs you" with its own copy.
             const errored = st === "errored";
+            // The EXACT terminal text that put this agent into the red state — the ask-screen
+            // snapshot captured when it crossed into waiting/approval, else the recent scrollback
+            // tail (errored/stalled agents have no ask snapshot). The phone renders this verbatim in
+            // monospace under the plain-English `question` summary.
+            const detail = truncateDetail(
+              useRuntimeStore.getState().attentionScreen[id] ?? getAgentScrollback(id) ?? "",
+            );
             emitAttention({
               attention_id: attentionId,
               agent_id: id,
@@ -216,6 +234,7 @@ export function useAttentionNotifications(): void {
                   : errored
                     ? `${agentName} hit an error / stalled in ${projectName} and needs you.`
                     : `${agentName} is waiting on your answer in ${projectName}.`),
+              ...(detail ? { detail } : {}),
               // Real heuristic-detected direct-answers (y/n, numbered menu) when present, else a
               // generic Approve/Deny for approvals. See suggestedRepliesFor.
               suggested_replies: suggestedRepliesFor(getAgentScrollback(id) ?? "", approval),

@@ -99,7 +99,7 @@ async function runSpawn(req: OrchestrationRequest): Promise<void> {
   // immediately and can't also pass the cap. Released in finally.
   incInFlight(req.projectId, req.buildAgentId);
   try {
-    const workerId = await spawnWorker({
+    const { workerId, branch, worktree } = await spawnWorker({
       projectId: req.projectId,
       parentAgentId: req.buildAgentId,
       task: req.payload.task ?? "",
@@ -114,12 +114,14 @@ async function runSpawn(req: OrchestrationRequest): Promise<void> {
     // existing so a never-materialized id can't be stranded in openAgentIds; the per-build-agent
     // concurrency cap is already enforced upstream (handleSpawn queues over-cap requests, and
     // runSpawn reserves its slot via incInFlight before reaching here), so opening cannot exceed it.
+    // (If a reconcile race evicted the record, ensureWorkersOpen's self-heal re-opens it.)
     if (worker) useRuntimeStore.getState().open(workerId);
-    await respond(req.reqId, {
-      workerId,
-      branch: worker?.branch ?? "",
-      worktree: worker?.worktreePath ?? "",
-    });
+    // Reply with the AUTHORITATIVE identity spawnWorker captured from the worktree cut — do NOT
+    // re-derive branch/worktree from the store lookup above. That record can be concurrently mutated
+    // (worktreePath reset to null on relocation, or rebuilt by a cross-window reconcile) between the
+    // await resolving and this read, which would silently yield empty branch/worktree and trip the
+    // MCP client's "malformed reply" guard (sparkle-yk3x). The spawnWorker return is always correct.
+    await respond(req.reqId, { workerId, branch, worktree });
   } catch (e) {
     await respond(req.reqId, { error: errMsg(e) });
   } finally {

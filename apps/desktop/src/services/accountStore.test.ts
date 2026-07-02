@@ -151,15 +151,15 @@ describe("pickAccount", () => {
 describe("getUsage snake_case → camelCase mapping", () => {
   beforeEach(() => invoke.mockReset());
 
-  it("maps tokens_5h/tokens_7d/exhausted_until and defaults null", async () => {
+  it("maps tokens_5h/tokens_7d, converts exhausted_until seconds→ms, and defaults null", async () => {
     invoke.mockResolvedValue([
-      { id: "a", tokens_5h: 11, tokens_7d: 22, exhausted_until: 1234 },
+      { id: "a", tokens_5h: 11, tokens_7d: 22, exhausted_until: 1234 }, // seconds from Rust
       { id: "b", tokens_5h: 0, tokens_7d: 0, exhausted_until: null },
     ]);
     const out = await getUsage();
     expect(invoke).toHaveBeenCalledWith("accounts_usage");
     expect(out).toEqual([
-      { id: "a", tokens5h: 11, tokens7d: 22, exhaustedUntil: 1234 },
+      { id: "a", tokens5h: 11, tokens7d: 22, exhaustedUntil: 1_234_000 }, // ms on this side
       { id: "b", tokens5h: 0, tokens7d: 0, exhaustedUntil: null },
     ]);
   });
@@ -214,8 +214,10 @@ describe("command wrappers pass camelCase args to invoke", () => {
     expect(invoke).toHaveBeenCalledWith("accounts_remove", { id: "a" });
   });
 
-  it("markExhausted", async () => {
-    await markExhausted("a", 9999);
+  it("markExhausted converts the epoch-ms arg to seconds for the Rust side", async () => {
+    // Caller passes a Date.now()-based ms instant; Rust stores + future-filters in seconds, so the
+    // wrapper must divide by 1000 (sparkle-ggvp — persisting ms made the future-filter a no-op).
+    await markExhausted("a", 9_999_000);
     expect(invoke).toHaveBeenCalledWith("accounts_mark_exhausted", { id: "a", untilEpoch: 9999 });
   });
 });

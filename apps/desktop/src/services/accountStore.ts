@@ -12,7 +12,10 @@ import { invoke } from "@tauri-apps/api/core";
 
 /** Sparkle metadata for one registered Claude config dir. `configDir` is the absolute path we set
  *  as CLAUDE_CONFIG_DIR when spawning under this account. `isDefault` marks the imported `~/.claude`
- *  (cannot be removed). `createdAt` is epoch ms. */
+ *  (cannot be removed). `createdAt` is epoch SECONDS — the unit the Rust side stores and returns
+ *  verbatim (persisted in accounts.json). It's display-only on this side, never compared to
+ *  `Date.now()`; the one field that IS time-compared here — {@link Usage.exhaustedUntil} — is
+ *  converted to ms at the boundary (see {@link mapUsage}). */
 export interface Account {
   id: string;
   nickname: string;
@@ -23,7 +26,9 @@ export interface Account {
 
 /** Per-account token tally (camelCase boundary type used by the whole app). `tokens5h` / `tokens7d`
  *  are the windowed token tallies read from that account's own transcripts. `exhaustedUntil` is the
- *  epoch-ms instant a real rate-limit is expected to reset (null = not exhausted). */
+ *  epoch-MS instant a real rate-limit is expected to reset (null = not exhausted). The Rust side
+ *  stores/reasons in epoch SECONDS; {@link mapUsage} multiplies by 1000 so everything on this side
+ *  (pickAccount vs `Date.now()`, `new Date(exhaustedUntil)` in AccountsScreen) stays in ms. */
 export interface Usage {
   id: string;
   tokens5h: number;
@@ -41,7 +46,8 @@ export interface Identity {
   organization: string | null;
 }
 
-/** Raw shape the Rust side returns (snake_case) — mapped to {@link Usage} at the boundary. */
+/** Raw shape the Rust side returns (snake_case) — mapped to {@link Usage} at the boundary.
+ *  `exhausted_until` is epoch SECONDS (Rust's unit); `mapUsage` converts it to ms. */
 interface RawUsage {
   id: string;
   tokens_5h: number;
@@ -49,12 +55,19 @@ interface RawUsage {
   exhausted_until: number | null;
 }
 
+/** Seconds ⇄ milliseconds at the Rust boundary. accounts.rs stores/filters `exhausted_until` in
+ *  epoch SECONDS (`now_secs()`); this side works in ms (`Date.now()`). Keeping the conversion in the
+ *  two boundary fns ({@link mapUsage} reading, {@link markExhausted} writing) is the whole fix for
+ *  the unit mismatch that made the Rust future-filter a permanent no-op (sparkle-ggvp). */
+const MS_PER_SEC = 1000;
+
 function mapUsage(raw: RawUsage): Usage {
   return {
     id: raw.id,
     tokens5h: raw.tokens_5h,
     tokens7d: raw.tokens_7d,
-    exhaustedUntil: raw.exhausted_until ?? null,
+    // Rust seconds → JS ms so callers can compare against Date.now() / feed new Date(...).
+    exhaustedUntil: raw.exhausted_until != null ? raw.exhausted_until * MS_PER_SEC : null,
   };
 }
 
@@ -108,9 +121,12 @@ export function accountLabel(account: Account, identity: Identity | undefined): 
   return identity?.email ?? account.nickname;
 }
 
-/** Flag an account as rate-limited until `untilEpoch` (epoch ms). Selection excludes it until then. */
+/** Flag an account as rate-limited until `untilEpoch` (epoch MS — callers pass a `Date.now()`-based
+ *  instant, e.g. from rateLimitWatch). Selection excludes it until then. Converts to epoch SECONDS
+ *  for the Rust side, which stores + future-filters in seconds (sparkle-ggvp): persisting ms there
+ *  made `exhausted_until > now_secs()` always true, so expired exhaustions never cleared. */
 export function markExhausted(id: string, untilEpoch: number): Promise<void> {
-  return invoke("accounts_mark_exhausted", { id, untilEpoch });
+  return invoke("accounts_mark_exhausted", { id, untilEpoch: Math.round(untilEpoch / MS_PER_SEC) });
 }
 
 // ── Selection logic (pure) ────────────────────────────────────────────────────────────────────

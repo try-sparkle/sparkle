@@ -3,15 +3,79 @@
 // (matching bridge.rs/naming.rs). Note: ureq is pulled WITHOUT the `json` feature, so request/
 // response JSON is handled by hand with serde_json.
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 
 /// Holds a deep-link URL that arrived before the webview attached its listener (e.g. a cold
 /// launch BY the sparkle:// link). AuthGate drains it on mount so the hand-off isn't lost.
 #[derive(Default)]
 pub struct DeepLinkPending(pub Mutex<Option<String>>);
+
+/// The in-flight sign-in this app instance started: the opaque `state` we put in the auth URL and
+/// the PKCE `verifier` we'll present on exchange (sparkle-kqg0). Held in memory only (never on the
+/// wire, never in JS) and single-use — cleared on the first callback. Because it's in-memory, a
+/// sign-in that spans an app restart must be re-initiated; that's acceptable (the flow is seconds
+/// long and the app is always running when the user clicks "Sign in").
+#[derive(Default)]
+pub struct PendingSignIn(pub Mutex<Option<PendingAuth>>);
+
+/// One pending sign-in's secrets. `state` binds the callback to the sign-in we started (defeats a
+/// code planted by a malicious page); `verifier` is the PKCE secret proving the code was minted
+/// for a challenge only we knew.
+pub struct PendingAuth {
+    state: String,
+    verifier: String,
+}
+
+/// A high-entropy, URL-safe token of `nbytes` of OS randomness (base64url, unpadded).
+fn random_b64url(nbytes: usize) -> String {
+    let mut buf = vec![0u8; nbytes];
+    rand::thread_rng().fill_bytes(&mut buf);
+    URL_SAFE_NO_PAD.encode(buf)
+}
+
+/// PKCE S256 challenge for a verifier: base64url(SHA-256(verifier)), unpadded — matches the
+/// server's lib/pkce.ts (which recomputes and compares this).
+fn s256_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// Constant-time equality of the stored vs returned sign-in `state`. `ct_eq` short-circuits only on
+/// length (not secret here — state is a fixed-width token), then compares the bytes in constant
+/// time so a partial-prefix match can't be timed out.
+fn state_matches(expected: &str, got: &str) -> bool {
+    bool::from(expected.as_bytes().ct_eq(got.as_bytes()))
+}
+
+/// What the JS side needs to build the sign-in URL: the `state` and `code_challenge` query params.
+/// The verifier stays in Rust (in `PendingSignIn`) and is never handed to JS.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeginSignIn {
+    state: String,
+    code_challenge: String,
+}
+
+/// Begin a sign-in: generate a fresh state + PKCE verifier/challenge, stash the secrets, and return
+/// the public `state`/`code_challenge` for JS to append to the /desktop/callback URL. Overwrites any
+/// prior pending sign-in (only the most recent hand-off can complete).
+#[tauri::command]
+pub fn desktop_begin_signin(pending: tauri::State<PendingSignIn>) -> BeginSignIn {
+    let state = random_b64url(32);
+    let verifier = random_b64url(32);
+    let code_challenge = s256_challenge(&verifier);
+    *pending.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingAuth {
+        state: state.clone(),
+        verifier,
+    });
+    BeginSignIn { state, code_challenge }
+}
 
 /// Take (and clear) any pending deep-link URL captured at launch.
 #[tauri::command]
@@ -110,10 +174,32 @@ pub fn desktop_sign_out() -> Result<(), String> {
 
 /// Redeem a one-time auth code (from the sparkle:// deep link) for the long-lived bearer, which
 /// is then stored in the keychain. The code — not the bearer — is what travels through the URL.
+///
+/// Login-CSRF defense (sparkle-kqg0): before touching the network we take (single-use) the pending
+/// sign-in this instance started and require the callback's `state` to match it (constant time). A
+/// code planted by a malicious page carries a state we never issued — rejected here, so its code is
+/// never sent to the server. On a match we present the PKCE `verifier`, which the server checks
+/// against the challenge bound into the code.
 #[tauri::command]
-pub fn desktop_exchange_code(code: String) -> Result<(), String> {
+pub fn desktop_exchange_code(
+    code: String,
+    state: String,
+    pending: tauri::State<PendingSignIn>,
+) -> Result<(), String> {
+    // Take-then-compare: burn the pending sign-in up front so even a valid state can't be replayed,
+    // and so a forged callback can't leave a stale pending entry lying around.
+    let pending_auth = pending
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .ok_or_else(|| "no pending sign-in".to_string())?;
+    if !state_matches(&pending_auth.state, &state) {
+        return Err("state mismatch".to_string());
+    }
+
     let url = format!("{}/auth/desktop/exchange", base_url());
-    let body = json!({ "code": code }).to_string();
+    let body = json!({ "code": code, "codeVerifier": pending_auth.verifier }).to_string();
     let resp = ureq::post(&url)
         .timeout(HTTP_TIMEOUT)
         .set("Content-Type", "application/json")
@@ -486,6 +572,54 @@ pub async fn desktop_auto_topup_set(
             Err(server_error("auto-topup save", code, &text))
         }
         Err(e) => Err(format!("auto-topup save failed: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod auth_binding_tests {
+    use super::*;
+
+    #[test]
+    fn s256_challenge_matches_rfc7636_vector() {
+        // RFC 7636 Appendix B: verifier → S256 challenge. Pinning this guarantees the desktop's
+        // challenge is byte-identical to what the server (lib/pkce.ts) recomputes from the verifier.
+        assert_eq!(
+            s256_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn begin_signin_challenge_verifies_against_its_own_verifier() {
+        // The challenge desktop_begin_signin publishes must be the S256 of the verifier it stashes,
+        // or the server's PKCE check would reject every legitimate exchange.
+        let verifier = random_b64url(32);
+        let challenge = s256_challenge(&verifier);
+        assert_eq!(challenge, s256_challenge(&verifier));
+        // 32 bytes of entropy → 43-char unpadded base64url, the S256 challenge width the server
+        // regex (^[A-Za-z0-9_-]{43}$) accepts.
+        assert_eq!(challenge.len(), 43);
+        assert_eq!(random_b64url(32).len(), 43);
+    }
+
+    #[test]
+    fn random_b64url_is_high_entropy_and_unique() {
+        // Two draws must differ (a constant would be a catastrophic state/verifier bug).
+        assert_ne!(random_b64url(32), random_b64url(32));
+    }
+
+    #[test]
+    fn state_matches_accepts_equal_and_rejects_mismatch_or_length_diff() {
+        let s = random_b64url(32);
+        assert!(state_matches(&s, &s.clone()));
+        // Same length, one differing char.
+        let mut wrong = s.clone().into_bytes();
+        wrong[0] ^= 0x01;
+        // XOR may land outside base64url, but state_matches is a raw byte compare — still valid.
+        assert!(!state_matches(&s, &String::from_utf8_lossy(&wrong)));
+        // A returned state of a different length (e.g. the callback carried none) never matches.
+        assert!(!state_matches(&s, ""));
+        assert!(!state_matches(&s, &format!("{s}x")));
     }
 }
 

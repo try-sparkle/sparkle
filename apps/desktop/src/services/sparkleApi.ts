@@ -34,10 +34,46 @@ export async function launch(url: string): Promise<boolean> {
   }
 }
 
-/** Open the system browser to the Clerk sign-in → desktop hand-off. Resolves `false` (never
- *  rejects) when the browser couldn't be launched, so the caller can offer the URL manually. */
-export function openSignIn(): Promise<boolean> {
-  return launch(SIGN_IN_URL);
+// The exact sign-in URL last built by openSignIn (base + state + code_challenge). The URL is
+// dynamic now (login-CSRF binding, sparkle-kqg0), so the copy/paste fallback must show THIS URL,
+// not the bare SIGN_IN_URL — pasting the base without the state/challenge would sign in unbound.
+let _lastSignInUrl: string | null = null;
+
+/** The full sign-in URL openSignIn last attempted (with state + code_challenge), or null before
+ *  the first attempt. Used by AuthGate for the manual copy/paste fallback when launch fails. */
+export function lastSignInUrl(): string | null {
+  return _lastSignInUrl;
+}
+
+/** Begin a sign-in in Rust (generates + stashes the state/PKCE secrets) and build the browser URL
+ *  carrying the public `state` + `code_challenge`. The verifier stays in Rust. */
+async function buildSignInUrl(): Promise<string> {
+  const { state, codeChallenge } = await invoke<{ state: string; codeChallenge: string }>(
+    "desktop_begin_signin",
+  );
+  const url = new URL(SIGN_IN_URL);
+  url.searchParams.set("state", state);
+  url.searchParams.set("code_challenge", codeChallenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  const built = url.toString();
+  _lastSignInUrl = built;
+  return built;
+}
+
+/** Open the system browser to the Clerk sign-in → desktop hand-off, binding this instance's
+ *  state/PKCE to the sign-in (sparkle-kqg0). Resolves `false` (never rejects) when the browser
+ *  couldn't be launched — the caller offers lastSignInUrl() manually. If beginning the sign-in in
+ *  Rust fails, we fall back to the bare (unbound) URL so sign-in isn't fully bricked. */
+export async function openSignIn(): Promise<boolean> {
+  let url: string;
+  try {
+    url = await buildSignInUrl();
+  } catch (e) {
+    console.error("Failed to begin sign-in (state/PKCE); falling back to the bare URL:", e);
+    _lastSignInUrl = SIGN_IN_URL;
+    url = SIGN_IN_URL;
+  }
+  return launch(url);
 }
 
 /** Open the system browser to the $99 paywall checkout. Resolves `false` (never rejects) when the
@@ -55,9 +91,11 @@ export async function hasToken(): Promise<boolean> {
   }
 }
 
-/** Redeem a one-time auth code (from the sparkle:// deep link) for the long-lived bearer. */
-export async function exchangeCode(code: string): Promise<void> {
-  await invoke("desktop_exchange_code", { code });
+/** Redeem a one-time auth code (from the sparkle:// deep link) for the long-lived bearer. `state`
+ *  is the value echoed back in the deep link; Rust rejects it unless it matches the sign-in this
+ *  instance started (login-CSRF binding, sparkle-kqg0), so a planted code never reaches the server. */
+export async function exchangeCode(code: string, state: string): Promise<void> {
+  await invoke("desktop_exchange_code", { code, state });
 }
 
 /** Redeem a promo/override code. Resolves on success (caller then refreshes entitlement);

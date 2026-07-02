@@ -8,12 +8,24 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { maybeAutoName } from "./agentNaming";
 import { aiFeatureNow } from "./aiGate";
 
+/** The authoritative identity of a freshly-spawned worker. Returned straight from the worktree
+ *  cut (createWorkerWorktree) — NOT re-derived from a later store read — so callers (the
+ *  orchestration reply) always get the correct, non-empty branch + worktree that match the worker
+ *  actually created, even if a concurrent reconcile/relocation mutates the store record afterward. */
+export interface SpawnedWorker {
+  workerId: string;
+  /** The worker's own branch (createWorkerWorktree guarantees this is non-empty). */
+  branch: string;
+  /** The worker's worktree path (createWorkerWorktree guarantees this is non-empty). */
+  worktree: string;
+}
+
 export async function spawnWorker(args: {
   projectId: string;
   parentAgentId: string;
   task: string;
   beadId?: string;
-}): Promise<string> {
+}): Promise<SpawnedWorker> {
   const store = useProjectStore.getState();
   const project = store.projects.find((p) => p.id === args.projectId);
   if (!project) throw new Error(`unknown project ${args.projectId}`);
@@ -64,7 +76,11 @@ export async function spawnWorker(args: {
     void maybeAutoName(args.projectId, workerId, args.task);
   }
 
-  return workerId;
+  // Return the AUTHORITATIVE identity captured from the worktree cut — never re-read from the store.
+  // The store record can be mutated (worktreePath reset to null on relocation, or the whole record
+  // rebuilt by a cross-window reconcile) between here and when the orchestration reply is assembled;
+  // a re-read there could yield empty branch/worktree and produce a "malformed reply" (sparkle-yk3x).
+  return { workerId, branch: info.branch, worktree: info.path };
 }
 
 /** Tear down a finished worker: kill its PTY, remove its worktree (branch is kept), drop its tab

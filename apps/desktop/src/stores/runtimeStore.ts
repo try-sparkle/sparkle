@@ -332,6 +332,11 @@ async function applyWorkflowState(
     ws,
     prev,
     parentReachedMain,
+    // Live Pushed/Shipped signals from the Rust workflow state (sparkle-v7d0). Without these the
+    // "Pushed" stage only lit via a PR probe and "Shipped" was unreachable; deriveLiveStage gates
+    // both on committedSeen so a no-op branch can't skip stages.
+    pushed: ws.pushed,
+    shipped: ws.shipped,
     // A bead-bound agent floors at Planned before any code work exists.
     hasBead: !!agent.beadId,
   });

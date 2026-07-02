@@ -56,11 +56,36 @@ pub struct Account {
     /// it's the user's real `~/.claude` (or `$CLAUDE_CONFIG_DIR`).
     pub config_dir: String,
     pub is_default: bool,
+    /// Epoch SECONDS the account was registered (Unix time). The frontend treats this
+    /// as seconds too (display-only; never compared to `Date.now()`).
     pub created_at: i64,
-    /// Epoch seconds until which this account is known-exhausted (hit a real rate
-    /// limit). Optional — absent on accounts that have never been throttled.
+    /// Epoch SECONDS until which this account is known-exhausted (hit a real rate
+    /// limit). Optional — absent on accounts that have never been throttled. The TS
+    /// writer (`markExhausted`) converts its `Date.now()`-based ms to seconds before
+    /// calling `accounts_mark_exhausted`, and reads it back multiplied to ms; keeping
+    /// this in seconds is what lets `usage_for_account`'s `e > now_secs()` future-filter
+    /// actually clear expired exhaustions (sparkle-ggvp). Legacy values persisted in ms
+    /// (pre-fix) are repaired on read by [`normalize_epoch_seconds`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exhausted_until: Option<i64>,
+}
+
+/// Any epoch at or above this is a stray MILLISECONDS value that must be scaled back to
+/// seconds. As seconds this is year ~5138; as ms it's year 1973 — so every realistic
+/// current/near-future instant is unambiguous: a seconds epoch is well below it (~1.7e9)
+/// and an ms epoch well above it (~1.7e12). Used by [`normalize_epoch_seconds`] to migrate
+/// records written before the seconds/ms unit was unified (sparkle-ggvp).
+const MS_EPOCH_THRESHOLD: i64 = 100_000_000_000;
+
+/// Coerce a possibly-milliseconds epoch to seconds. Idempotent: a real seconds value
+/// (< [`MS_EPOCH_THRESHOLD`]) is returned unchanged, a millisecond value is divided by
+/// 1000. This is the one-way migration for exhaustions persisted in ms before the unit fix.
+fn normalize_epoch_seconds(epoch: i64) -> i64 {
+    if epoch >= MS_EPOCH_THRESHOLD {
+        epoch / 1000
+    } else {
+        epoch
+    }
 }
 
 /// Per-account usage snapshot returned by [`accounts_usage`]: token tallies in the
@@ -130,7 +155,17 @@ fn generate_account_id() -> Result<String, String> {
 fn read_accounts_at(path: &Path) -> Result<Vec<Account>, String> {
     match std::fs::read(path) {
         Ok(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|e| format!("parse accounts.json: {e}"))
+            let mut accounts: Vec<Account> =
+                serde_json::from_slice(&bytes).map_err(|e| format!("parse accounts.json: {e}"))?;
+            // Migrate any epoch field persisted in milliseconds (pre-unit-fix) back to seconds so
+            // the future-filter and window math see a consistent unit (sparkle-ggvp). Idempotent —
+            // a no-op on records already written in seconds. Applied in-memory on every read; the
+            // next mutating write persists the repaired values.
+            for a in &mut accounts {
+                a.created_at = normalize_epoch_seconds(a.created_at);
+                a.exhausted_until = a.exhausted_until.map(normalize_epoch_seconds);
+            }
+            Ok(accounts)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!("read accounts.json: {e}")),
@@ -792,6 +827,54 @@ mod tests {
         assert_eq!(usage_for_account(&acct, 400).exhausted_until, Some(500));
         // Reset epoch in the past → cleared.
         assert_eq!(usage_for_account(&acct, 600).exhausted_until, None);
+    }
+
+    #[test]
+    fn normalize_epoch_seconds_scales_ms_and_leaves_seconds() {
+        let secs = 1_750_000_000; // ~2025, a realistic seconds epoch — must pass through unchanged
+        assert_eq!(normalize_epoch_seconds(secs), secs);
+        // A milliseconds epoch (~1.75e12) is scaled back to seconds…
+        assert_eq!(normalize_epoch_seconds(secs * 1000), secs);
+        // …and doing it again is a no-op (idempotent, so re-reads don't keep shrinking it).
+        assert_eq!(normalize_epoch_seconds(normalize_epoch_seconds(secs * 1000)), secs);
+        assert_eq!(normalize_epoch_seconds(0), 0);
+    }
+
+    #[test]
+    fn read_migrates_legacy_ms_exhaustion_so_it_can_expire() {
+        // Reproduces sparkle-ggvp: an exhaustion persisted in epoch MILLISECONDS (what the old TS
+        // writer stored) is always astronomically greater than `now_secs()`, so the Rust
+        // future-filter `e > now` could NEVER clear it. read_accounts_at now scales it back to
+        // seconds, after which it expires normally.
+        let base = unique_dir("ms-exhaustion-migrate");
+        let path = accounts_json_path(&base);
+
+        let reset_secs: i64 = 1_750_000_000; // ~2025
+        let created_secs: i64 = 1_749_000_000;
+        let mut acct = sample("legacy", false, "/nonexistent");
+        acct.created_at = created_secs * 1000; // legacy: stored in ms
+        acct.exhausted_until = Some(reset_secs * 1000); // legacy: stored in ms
+        write_accounts_at(&path, std::slice::from_ref(&acct)).unwrap();
+
+        // On read, both epoch fields are repaired to seconds.
+        let read = read_accounts_at(&path).unwrap();
+        assert_eq!(read[0].created_at, created_secs);
+        assert_eq!(read[0].exhausted_until, Some(reset_secs));
+
+        // Before the reset instant it's still surfaced; once `now` passes it, it clears — the exact
+        // behaviour the ms unit broke.
+        assert_eq!(
+            usage_for_account(&read[0], reset_secs - 60).exhausted_until,
+            Some(reset_secs),
+            "still exhausted just before the reset"
+        );
+        assert_eq!(
+            usage_for_account(&read[0], reset_secs + 60).exhausted_until,
+            None,
+            "expired exhaustion clears once now_secs passes the (migrated) reset"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

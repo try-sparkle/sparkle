@@ -47,6 +47,12 @@ serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 portable-pty = "0.8"
 base64 = "0.22"
+# PKCE + login-CSRF state for the desktop sign-in deep link (auth.rs, sparkle-kqg0): `rand` for the
+# high-entropy state/verifier, `sha2` for the S256 code_challenge, `subtle` for the constant-time
+# state compare. All already vendored transitively — declared here so auth.rs can use them directly.
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2"
 sherpa-onnx = "1.13.3"
 cpal = "0.15"
 ureq = "2"

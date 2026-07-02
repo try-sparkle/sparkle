@@ -27,8 +27,11 @@ const defaultSpawnImpl = async (args: { projectId: string; parentAgentId: string
     parentId: args.parentAgentId,
     task: args.task,
   });
-  useProjectStore.getState().setAgentWorktree(args.projectId, id, `/wt/${id}`, `sparkle/agent-${id}`);
-  return id;
+  const branch = `sparkle/agent-${id}`;
+  const worktree = `/wt/${id}`;
+  useProjectStore.getState().setAgentWorktree(args.projectId, id, worktree, branch);
+  // Mirror the real spawnWorker contract: return the AUTHORITATIVE identity from the worktree cut.
+  return { workerId: id, branch, worktree };
 };
 const spawnWorkerMock = vi.fn(defaultSpawnImpl);
 const spinDownWorkerMock = vi.fn(async (args: { projectId: string; workerId: string }) => {
@@ -82,6 +85,35 @@ describe("orchestrationListener", () => {
     const result = (args as { result: { workerId: string; branch: string; worktree: string } }).result;
     expect(result.workerId).toBeTruthy();
     expect(result.branch).toMatch(/^sparkle\/agent-/);
+    expect(result.worktree).toMatch(/^\/wt\//);
+  });
+
+  it("spawn_worker reply uses spawnWorker's authoritative identity, not a racy store re-read (sparkle-yk3x)", async () => {
+    // Reproduce the malformed-reply race: a concurrent reconcile/relocation removes the freshly
+    // spawned worker's store record (or nulls its worktreePath) in the microtask gap between
+    // spawnWorker resolving and the listener assembling its reply. The OLD code re-read branch/
+    // worktree from that record and degraded to "" — an empty reply the MCP client rejects as
+    // "malformed reply". The reply must instead carry the authoritative ids spawnWorker returned.
+    spawnWorkerMock.mockImplementationOnce(async (args: { projectId: string; parentAgentId: string; task: string }) => {
+      const id = useProjectStore.getState().addAgent(args.projectId, {
+        kind: "worker",
+        parentId: args.parentAgentId,
+        task: args.task,
+      });
+      const branch = `sparkle/agent-${id}`;
+      const worktree = `/wt/${id}`;
+      useProjectStore.getState().setAgentWorktree(args.projectId, id, worktree, branch);
+      // Simulate the concurrent reconcile wiping the record right after the worktree cut.
+      useProjectStore.getState().removeAgent(args.projectId, id);
+      return { workerId: id, branch, worktree };
+    });
+    fire({ reqId: "yk3x", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "race me" } });
+    await flush();
+    const [, args] = invokeMock.mock.calls.at(-1)!;
+    const result = (args as { result: { workerId: string; branch: string; worktree: string; error?: string } }).result;
+    expect(result.error).toBeUndefined();
+    expect(result.workerId).toBeTruthy();
+    expect(result.branch).toMatch(/^sparkle\/agent-/); // non-empty despite the wiped store record
     expect(result.worktree).toMatch(/^\/wt\//);
   });
 
@@ -230,7 +262,7 @@ describe("orchestrationListener", () => {
         task: args.task,
       });
       useProjectStore.getState().setAgentWorktree(args.projectId, id, `/wt/${id}`, `sparkle/agent-${id}`);
-      return id;
+      return { workerId: id, branch: `sparkle/agent-${id}`, worktree: `/wt/${id}` };
     };
     spawnWorkerMock.mockImplementationOnce(deferredSpawn).mockImplementationOnce(deferredSpawn);
     // Fire BOTH synchronously — no flush between, so neither worker is registered yet when the

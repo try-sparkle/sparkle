@@ -510,6 +510,20 @@ pub struct WorkflowState {
     /// those are). The frontend gates this on `committedSeen` so a no-op branch — which also trivially
     /// adds nothing — can't claim it landed.
     landed: bool,
+    /// The agent branch has been PUSHED to `origin` — its remote-tracking ref
+    /// (`refs/remotes/origin/sparkle/agent-<id>`) exists. git creates/updates that ref on push, so
+    /// this is a pure LOCAL lookup: offline-safe, no fetch, reflects a push made from THIS repo (the
+    /// common case — an agent pushing its own branch). Drives the "Pushed" stage LIVE even when no PR
+    /// exists yet (a PR previously the only path to Pushed). Distinct from `in_origin_main`, which is
+    /// about the tip landing on the DEFAULT branch, not the agent branch existing on the remote.
+    pushed: bool,
+    /// The agent's work is SHIPPED — its branch tip is contained in a published release tag (a
+    /// semver-ish tag like `v1.2.3`; `nightly`/`latest` don't count). `git tag --contains <tip>`,
+    /// filtered by `delivery::is_semver_tag`. Local + offline. Drives the top "Shipped to Production"
+    /// stage LIVE (previously unreachable — nothing ever set it). Gated by `committedSeen` downstream.
+    /// EDGE: a squash-landed branch's tip isn't an ancestor of the tagged release, so this reads false
+    /// for squashed work (the merge/`landed` signal still lights "Merged"); tip-relative on purpose.
+    shipped: bool,
     /// Best-effort GitHub PR state for this branch via `gh`, if one is found: "open" | "merged" |
     /// "closed". None when gh is absent/unauthed, there's no remote, or no PR matches the branch.
     pr_state: Option<String>,
@@ -570,6 +584,37 @@ fn branch_landed(root: &str, target: &str, branch: &str, tip: &str) -> bool {
     (!tip.is_empty() && (ref_contains(root, target, tip) || ref_contains(root, &origin_ref, tip)))
         || merge_adds_nothing(root, target, branch)
         || merge_adds_nothing(root, &origin_ref, branch)
+}
+
+/// True iff the agent branch has been pushed to `origin` — its remote-tracking ref exists locally.
+/// git creates/updates `refs/remotes/origin/<branch>` on a successful push, so a pure `rev-parse` of
+/// that ref answers "was this branch pushed" offline, with no fetch. Any missing ref / git error
+/// reads as not-pushed. This reflects a push done from THIS repo (the normal agent-pushes-its-own-
+/// branch flow); a push made elsewhere would only show after a fetch that includes the ref.
+fn branch_pushed(root: &str, branch: &str) -> bool {
+    if branch.trim().is_empty() {
+        return false;
+    }
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    git(root, &["rev-parse", "--verify", "--quiet", &remote_ref])
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
+/// True iff `tip` is contained in a published RELEASE tag — a semver-ish tag (`v1.2.3` / `1.2`), per
+/// `delivery::is_semver_tag`. `git tag --contains <tip>` lists every tag whose history includes the
+/// commit; we keep only release-looking ones so a `nightly`/`latest` tag can't read as shipped.
+/// Local + offline; an empty tip, no matching tag, or any git error reads as not-shipped. Because it
+/// is TIP-relative, a squash-landed branch (whose tip isn't an ancestor of the tagged release) reads
+/// false here on purpose — the `landed` signal still carries it to "Merged".
+fn tip_in_release(root: &str, tip: &str) -> bool {
+    if tip.trim().is_empty() {
+        return false;
+    }
+    match git(root, &["tag", "--contains", tip]) {
+        Ok(out) => out.lines().any(crate::delivery::is_semver_tag),
+        Err(_) => false,
+    }
 }
 
 /// Best-effort GitHub PR lookup for `branch` via the `gh` CLI. Returns (state, number, url) where
@@ -795,6 +840,13 @@ pub fn agent_workflow_state_at(
     // with a merge-tree no-op probe (shared with the close-agent safe delete so both agree).
     let landed = branch_landed(root, &default_branch, &branch, &tip);
 
+    // Pushed / shipped: two LOCAL, offline-safe signals that drive the "Pushed" and "Shipped" stages
+    // live (formerly only reachable via a PR probe / never, respectively). `branch_pushed` is a
+    // remote-tracking-ref lookup; `tip_in_release` is a release-tag containment check. Both frontend-
+    // gated by committedSeen, so a no-op branch can't skip stages.
+    let pushed = branch_pushed(root, &branch);
+    let shipped = tip_in_release(root, &tip);
+
     // Commits the agent AUTHORED that aren't yet landed (0 once merged into the integration ref).
     // Measured against the ref the branch was actually CUT FROM — `origin/<default>` when a
     // remote-tracking ref exists (see `effective_base`, which cuts new branches from origin),
@@ -833,6 +885,8 @@ pub fn agent_workflow_state_at(
         in_parent,
         ahead_of_base,
         landed,
+        pushed,
+        shipped,
         pr_state,
         pr_number,
         pr_url,
@@ -986,6 +1040,10 @@ fn workflow_state_shared(
     let in_origin_main = ref_contains(root, &origin_ref, tip);
     let in_parent = ref_contains(root, parent_branch, tip);
     let landed = branch_landed(root, default_branch, &branch, tip);
+    // Live Pushed/Shipped signals (sparkle-v7d0) — both pure local, offline-safe lookups (see
+    // agent_workflow_state_at). Kept in the batched path too so the 30s project poll lights these.
+    let pushed = branch_pushed(root, &branch);
+    let shipped = tip_in_release(root, tip);
     let base_for_ahead = if git(root, &["rev-parse", "--verify", "--quiet", &origin_ref]).is_ok() {
         origin_ref.clone()
     } else {
@@ -1011,6 +1069,8 @@ fn workflow_state_shared(
         in_parent,
         ahead_of_base,
         landed,
+        pushed,
+        shipped,
         pr_state,
         pr_number,
         pr_url,
@@ -2578,6 +2638,65 @@ mod tests {
         let s = agent_workflow_state_at(&root_str, "noop", "", false).unwrap();
         assert!(s.landed, "no changes ⇒ tip tree == main tree ⇒ trivially landed");
         assert_eq!(s.ahead_of_base, 0, "no authored work ⇒ committedSeen gate stays closed");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // `pushed` reflects whether the agent branch's remote-tracking ref exists — the LIVE signal that
+    // lights the "Pushed" stage without needing a PR. Before pushing there is no `origin/<branch>`
+    // ref; simulating a push (creating the remote-tracking ref, exactly what `git push` does locally)
+    // flips it true. Kept a pure local ref lookup so it's offline-safe.
+    #[test]
+    fn workflow_state_pushed_tracks_the_remote_tracking_ref() {
+        let root = unique_root("wf-pushed");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("wf-pushed-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "push", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info.path).join("w.txt"), "work\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+
+        let before = agent_workflow_state_at(&root_str, "push", "", false).unwrap();
+        assert!(!before.pushed, "no remote-tracking ref yet ⇒ not pushed");
+
+        // Simulate a push: git creates refs/remotes/origin/<branch> on a successful push.
+        let tip = git(&root_str, &["rev-parse", "sparkle/agent-push"]).unwrap();
+        git(&root_str, &["update-ref", "refs/remotes/origin/sparkle/agent-push", &tip]).unwrap();
+        let after = agent_workflow_state_at(&root_str, "push", "", false).unwrap();
+        assert!(after.pushed, "remote-tracking ref now exists ⇒ pushed (drives the Pushed stage live)");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // `shipped` is true only when the branch tip is contained in a RELEASE tag (semver-ish). A
+    // non-release tag (`nightly`) must NOT read as shipped; a `v*` tag must. This drives the top
+    // "Shipped to Production" stage live — previously unreachable.
+    #[test]
+    fn workflow_state_shipped_requires_a_release_tag_on_the_tip() {
+        let root = unique_root("wf-shipped");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("wf-shipped-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "ship", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info.path).join("w.txt"), "work\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+        let tip = git(&root_str, &["rev-parse", "sparkle/agent-ship"]).unwrap();
+
+        // A non-release tag on the tip must not count as shipped.
+        git(&root_str, &["tag", "nightly", &tip]).unwrap();
+        let s0 = agent_workflow_state_at(&root_str, "ship", "", false).unwrap();
+        assert!(!s0.shipped, "a non-release tag (nightly) is not a ship signal");
+
+        // A semver release tag containing the tip ⇒ shipped.
+        git(&root_str, &["tag", "v1.2.3", &tip]).unwrap();
+        let s1 = agent_workflow_state_at(&root_str, "ship", "", false).unwrap();
+        assert!(s1.shipped, "a v* release tag containing the tip ⇒ shipped (drives the Shipped stage live)");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
     }

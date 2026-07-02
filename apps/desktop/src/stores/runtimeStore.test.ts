@@ -229,6 +229,60 @@ describe("runtimeStore — workflowShipped sticky latch (review #13591)", () => 
   });
 });
 
+// sparkle-v7d0 #1: the Pushed/Shipped stages must update LIVE from the Rust workflow state. Before
+// the wire-up, applyWorkflowState never passed ws.pushed / ws.shipped to deriveLiveStage, so "Pushed"
+// only lit via a PR probe and "Shipped" was unreachable. These pin the store→engine plumbing.
+describe("runtimeStore — pushed/shipped wired live (sparkle-v7d0)", () => {
+  const wsState = (p: Record<string, unknown>) => ({
+    inLocalMain: false,
+    inOriginMain: false,
+    inParent: false,
+    aheadOfBase: 0,
+    prState: null,
+    prNumber: null,
+    prUrl: null,
+    ...p,
+  });
+  const bsStatus = (ahead: number) => ({
+    ahead,
+    behind: 0,
+    dirty: false,
+    filesChanged: 1,
+    insertions: 1,
+    deletions: 0,
+  });
+
+  it("advances to Pushed from ws.pushed even with no PR open", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    // Committed work, branch pushed to origin, but no PR yet (prState null).
+    store.getState().setBranchStatus(agentId, bsStatus(1));
+    agentWorkflowState.mockResolvedValue(wsState({ pushed: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(store.getState().workflowStage[agentId]).toBe("pushed");
+  });
+
+  it("advances to Shipped from ws.shipped once real work exists", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    store.getState().setBranchStatus(agentId, bsStatus(1));
+    agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true, pushed: true, shipped: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(store.getState().workflowStage[agentId]).toBe("shipped");
+  });
+
+  it("does NOT ship a no-op branch: shipped is gated on committed work", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    // No commits (ahead 0), no prior watermark, but Rust reports shipped (a tip trivially in a tag):
+    // committedSeen stays closed, so the stage must not jump to Shipped.
+    store.getState().setBranchStatus(agentId, bsStatus(0));
+    agentWorkflowState.mockResolvedValue(wsState({ shipped: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(store.getState().workflowStage[agentId]).toBe("building_unsaved");
+  });
+});
+
 // Seed a connected PAT + a project with one agent of the given kind; returns ids + handles.
 async function setup(kind: "build" | "think") {
   const { runtime, settings, projects } = await freshModules();

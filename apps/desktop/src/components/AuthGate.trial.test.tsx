@@ -8,6 +8,7 @@ vi.mock("../services/sparkleApi", () => ({
   exchangeCode: vi.fn(),
   openPaywall: vi.fn(),
   openSignIn: vi.fn(() => Promise.resolve(true)),
+  lastSignInUrl: vi.fn(() => "y"),
   PAYWALL_URL: "x",
   redeemPromo: vi.fn(),
   SIGN_IN_URL: "y",

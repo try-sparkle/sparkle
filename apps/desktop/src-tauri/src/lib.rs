@@ -82,6 +82,7 @@ pub fn run() {
         .manage(dictation::DictationState::default())
         .manage(bridge::BridgeManager::default())
         .manage(auth::DeepLinkPending::default())
+        .manage(auth::PendingSignIn::default())
         .manage(attention::BadgeCounts::default())
         .manage(accounts::AccountsLock::default())
         .manage(trial::TrialLock::default())
@@ -298,6 +299,7 @@ pub fn run() {
             auth::list_paired_devices,
             auth::revoke_paired_device,
             auth::desktop_sign_out,
+            auth::desktop_begin_signin,
             auth::desktop_exchange_code,
             auth::desktop_me,
             auth::desktop_consume,

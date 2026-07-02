@@ -52,6 +52,10 @@ export interface AttentionPayload {
   project_name: string;
   kind: "approval" | "question";
   question: string;
+  /** The exact Claude Code terminal text that triggered the attention (screen snapshot or recent
+   *  scrollback tail), truncated. Rendered verbatim in monospace on the phone. Optional so older
+   *  desktop builds that omit it still relay; no relay/backend schema change — just an extra field. */
+  detail?: string;
   risk_class?: "caution" | "dangerous";
   suggested_replies: SuggestedReply[];
   created_at: string;

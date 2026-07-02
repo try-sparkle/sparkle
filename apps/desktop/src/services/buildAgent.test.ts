@@ -142,6 +142,17 @@ describe("orchestrationPersona", () => {
     expect(p).toMatch(/report|consolidated/i);
   });
 
+  it("makes it drain roborev findings on each worker branch BEFORE spinning the worker down", () => {
+    // spin_down deletes the worktree (not a checkout), so the pre-checkout gate never fires and
+    // FAIL findings on worker commits would orphan. The persona must instruct an explicit drain.
+    expect(p).toMatch(/roborev list --open/);
+    expect(p).toMatch(/triage/i);
+    // The drain must be ordered BEFORE the spin-down, not after.
+    expect(p.indexOf("roborev list --open")).toBeLessThan(p.lastIndexOf("spin_down_worker"));
+    // References the cross-branch sweep backstop.
+    expect(p).toContain("roborev-list-all.py");
+  });
+
   it("reflects a different cap value", () => {
     expect(orchestrationPersona({ ownBranch: "b", maxConcurrentWorkers: 2 })).toContain("2");
   });

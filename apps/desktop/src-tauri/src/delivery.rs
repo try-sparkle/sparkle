@@ -94,7 +94,9 @@ fn git_ok(cwd: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// True iff `line` looks like a semver-ish release tag: optional leading `v`, then `N.N`(`.N`)?.
-fn is_semver_tag(line: &str) -> bool {
+/// `pub(crate)` so the workflow-state "shipped" check (worktree.rs `tip_in_release`) shares the ONE
+/// definition of "looks like a release tag" — the delivery monitor and the progress bar must agree.
+pub(crate) fn is_semver_tag(line: &str) -> bool {
     let s = line.trim();
     let s = s.strip_prefix('v').or_else(|| s.strip_prefix('V')).unwrap_or(s);
     let mut parts = s.split('.');
