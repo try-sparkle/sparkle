@@ -147,7 +147,7 @@ describe("PinnedPrompt — row actions", () => {
     fireEvent.click(rowB());
     fireEvent.click(screen.getByRole("button", { name: "Copy" }));
     expect(copyToClipboard).toHaveBeenCalledWith("second prompt\nwith a second line");
-    expect(screen.queryByRole("button", { name: "first prompt" })).toBeNull(); // closed
+    expect(screen.queryByRole("listbox", { name: "Prompt history" })).toBeNull(); // closed
   });
 
   it("Send to Composer hands the full raw prompt to the parent and closes", () => {
@@ -155,7 +155,7 @@ describe("PinnedPrompt — row actions", () => {
     fireEvent.click(rowB());
     fireEvent.click(screen.getByRole("button", { name: "Send to Composer" }));
     expect(onSendToComposer).toHaveBeenCalledWith("second prompt\nwith a second line");
-    expect(screen.queryByRole("button", { name: "first prompt" })).toBeNull(); // closed
+    expect(screen.queryByRole("listbox", { name: "Prompt history" })).toBeNull(); // closed
   });
 
   it("hides Send to Composer when no handler is provided (composer feature off)", () => {
@@ -174,6 +174,66 @@ describe("PinnedPrompt — row actions", () => {
   });
 });
 
+describe("PinnedPrompt — breadcrumb bar", () => {
+  it("shows the last ≤4 prompts as a breadcrumb, oldest→newest, dropping older ones", () => {
+    const long: PromptHistoryEntry[] = [
+      { id: "1", text: "p1", at: 1 },
+      { id: "2", text: "p2", at: 2 },
+      { id: "3", text: "p3", at: 3 },
+      { id: "4", text: "p4", at: 4 },
+      { id: "5", text: "p5", at: 5 },
+    ];
+    render(<PinnedPrompt prompt="p5" history={long} />);
+    // The oldest (p1) is dropped; the four most recent show (dropdown is closed, so these are the
+    // breadcrumb segments, not dropdown rows).
+    expect(screen.queryByText("p1")).toBeNull();
+    for (const t of ["p2", "p3", "p4", "p5"]) expect(screen.getByText(t)).toBeTruthy();
+  });
+
+  it("collapses newlines in a segment to one line", () => {
+    render(<PinnedPrompt prompt="second prompt" history={HISTORY} />);
+    // entry b's raw text has a newline; the breadcrumb segment renders it collapsed.
+    expect(screen.getByText("second prompt with a second line")).toBeTruthy();
+  });
+
+  it("renders one segment per prompt when there are fewer than four", () => {
+    const { container } = render(<PinnedPrompt prompt="second prompt" history={HISTORY} />);
+    expect(container.querySelectorAll('[data-testid^="ph-crumb-"]')).toHaveLength(2);
+    expect(screen.getByTestId("ph-crumb-a")).toBeTruthy();
+    expect(screen.getByTestId("ph-crumb-b")).toBeTruthy();
+  });
+
+  it("clicking a segment (dropdown closed) opens it with that prompt selected and expanded", () => {
+    render(<PinnedPrompt prompt="second prompt" history={HISTORY} />);
+    expect(screen.queryByRole("listbox", { name: "Prompt history" })).toBeNull();
+    // Click the OLDER segment ("first prompt" = entry a) — the dropdown opens on that row.
+    fireEvent.click(screen.getByTestId("ph-crumb-a"));
+    expect(screen.getByRole("listbox", { name: "Prompt history" })).toBeTruthy();
+    expect(rowA().getAttribute("aria-selected")).toBe("true");
+    expect(rowA().getAttribute("data-expanded")).toBe("true");
+    // Its actions are available immediately (selected row reveals them).
+    expect(screen.getByRole("button", { name: "Copy" })).toBeTruthy();
+  });
+
+  it("clicking a segment while the dropdown is already open (hover) selects+expands it", () => {
+    render(<PinnedPrompt prompt="second prompt" history={HISTORY} />);
+    // Open on hover first (clean slate — nothing selected), exercising onCrumbClick's `open` branch.
+    fireEvent.mouseEnter(screen.getByTestId("pinned-prompt-root"));
+    expect(rowA().getAttribute("aria-selected")).toBe("false");
+    fireEvent.click(screen.getByTestId("ph-crumb-a"));
+    expect(rowA().getAttribute("aria-selected")).toBe("true");
+    expect(rowA().getAttribute("data-expanded")).toBe("true");
+  });
+
+  it("the caret opens the full history with nothing pre-selected (clean slate)", () => {
+    render(<PinnedPrompt prompt="second prompt" history={HISTORY} />);
+    fireEvent.click(screen.getByRole("button", { name: "Show prompt history" }));
+    expect(screen.getByRole("listbox", { name: "Prompt history" })).toBeTruthy();
+    expect(rowA().getAttribute("aria-selected")).toBe("false");
+    expect(rowB().getAttribute("aria-selected")).toBe("false");
+  });
+});
+
 describe("PinnedPrompt — Jump action", () => {
   it("offers Jump only when an onJumpToPrompt handler is provided", () => {
     setup(); // no onJumpToPrompt
@@ -187,7 +247,7 @@ describe("PinnedPrompt — Jump action", () => {
     fireEvent.click(rowB());
     fireEvent.click(screen.getByRole("button", { name: "Jump" }));
     expect(onJumpToPrompt).toHaveBeenCalledWith("b"); // newest row = entry b
-    expect(screen.queryByRole("button", { name: "first prompt" })).toBeNull(); // closed
+    expect(screen.queryByRole("listbox", { name: "Prompt history" })).toBeNull(); // closed
   });
 
   it("Jump reports 'scrolled out' and keeps the menu open when the marker is gone", () => {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { copyToClipboard } from "../clipboard";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, DANGER } from "../theme/colors";
 import type { PromptHistoryEntry } from "../types";
@@ -9,13 +9,17 @@ import { formatAgo, oneLine } from "./promptHistory";
 export type JumpResult = "scrolled" | "missing";
 
 /**
- * Header showing the agent's most recent prompt (spec §7) — so you never have to scroll up
- * through terminal output to find what you last asked. Until the agent has its first prompt the
- * header renders nothing at all (no placeholder).
+ * Header showing the agent's recent prompts as a breadcrumb (spec §7) — so you never have to
+ * scroll up through terminal output to find what you last asked. It shows the last up to FOUR
+ * prompts, oldest→newest with the most recent on the right (`p1 › p2 › p3 › p4`); each segment
+ * shares the row width equally and truncates with "…" so four always fit on one line. Until the
+ * agent has its first prompt the header renders nothing at all (no placeholder).
  *
- * With history, the header pulls down a dropdown of every prompt sent to this agent (newest
- * first) on hover — moving the pointer over the bar opens it; leaving it closes it (clicking and
- * keyboard still work too). Each row reveals its actions on hover:
+ * Clicking a breadcrumb segment opens the history dropdown with that prompt already selected and
+ * expanded (full text + Copy/Jump/Send actions right there). With history, the header also pulls
+ * down that dropdown of every prompt sent to this agent (newest first) on hover — moving the
+ * pointer over the bar opens it; leaving it closes it (clicking and keyboard still work too).
+ * Each row reveals its actions on hover:
  *   - hovering a row shows [Copy], [Jump], and (when a composer is wired) [Send to Composer] on
  *     the right, without needing a click;
  *   - clicking a row selects it; clicking the selected row expands it to the full, selectable
@@ -44,20 +48,28 @@ export function PinnedPrompt({
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [expanded, setExpanded] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
-  const headerRef = useRef<HTMLDivElement>(null);
+  // The caret button; also the focus-return target on keyboard dismiss (see refocusTrigger).
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
+  // When a breadcrumb segment is clicked while the dropdown is closed, this remembers which entry
+  // the on-open effect should select+expand (that effect otherwise opens with nothing selected).
+  const pendingSelectId = useRef<string | null>(null);
   // The dropdown is worth showing whenever there's any history to act on.
   const interactive = history.length > 0;
   // The store keeps history oldest-first; the dropdown shows newest-first.
   const items = useMemo(() => history.slice().reverse(), [history]);
+  // The bar shows up to the last 4 prompts as a breadcrumb, oldest→newest (newest on the right).
+  // history's last entry is the current prompt (=== lastPrompt), so this ends with it. These four
+  // map to the top four rows of the newest-first dropdown, so a crumb click never has to scroll.
+  const recent = useMemo(() => history.slice(-4), [history]);
 
-  // Return focus to the trigger header (e.g. on keyboard dismiss / after an action) so a keyboard
-  // user keeps their place instead of dropping to document.body when the list unmounts.
-  const refocusHeader = () => requestAnimationFrame(() => headerRef.current?.focus());
+  // Return focus to the caret trigger button (e.g. on keyboard dismiss / after an action) so a
+  // keyboard user keeps their place instead of dropping to document.body when the list unmounts.
+  const refocusTrigger = () => requestAnimationFrame(() => triggerRef.current?.focus());
 
   const close = () => {
     setOpen(false);
-    refocusHeader();
+    refocusTrigger();
   };
 
   // Close on outside click, or on Esc anywhere while open. The Esc listener is document-level
@@ -72,7 +84,7 @@ export function PinnedPrompt({
       if (e.key === "Escape") {
         e.preventDefault();
         setOpen(false);
-        refocusHeader();
+        refocusTrigger();
       }
     };
     document.addEventListener("mousedown", onDown);
@@ -88,15 +100,21 @@ export function PinnedPrompt({
     if (!interactive && open) setOpen(false);
   }, [interactive, open]);
 
-  // On open, clear any prior selection and move keyboard focus into the list so arrow keys work
-  // immediately. Nothing is pre-selected — the user picks a row by click or arrow.
+  // On open, move keyboard focus into the list so arrow keys work immediately. A breadcrumb click
+  // may have asked for a specific row to open selected+expanded (pendingSelectId); honor it,
+  // otherwise open with a clean slate (nothing pre-selected — user picks by click or arrow).
   useEffect(() => {
     if (!open) return;
-    setSelectedIndex(-1);
-    setExpanded(false);
+    const wantId = pendingSelectId.current;
+    pendingSelectId.current = null;
+    const wantIdx = wantId ? items.findIndex((it) => it.id === wantId) : -1;
+    setSelectedIndex(wantIdx);
+    setExpanded(wantIdx >= 0);
     setScrolledOutId(null);
     const raf = requestAnimationFrame(() => listRef.current?.focus());
     return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- run only on open transition; `items`
+    // is read fresh at that moment, and we deliberately don't re-fire when history changes mid-open.
   }, [open]);
 
   // Click a row: a fresh row selects it (collapsed); clicking the already-selected row toggles its
@@ -163,6 +181,22 @@ export function PinnedPrompt({
     close();
   };
 
+  // Click a breadcrumb segment → open the history dropdown with that prompt selected + expanded, so
+  // its full text and row actions (Copy / Jump / Send) are immediately there. If the dropdown is
+  // already open (via hover), select it directly; otherwise stash the id for the on-open effect.
+  const onCrumbClick = (entry: PromptHistoryEntry) => {
+    const idx = items.findIndex((it) => it.id === entry.id);
+    if (idx < 0) return;
+    if (open) {
+      setSelectedIndex(idx);
+      setExpanded(true);
+      setScrolledOutId(null);
+    } else {
+      pendingSelectId.current = entry.id;
+      setOpen(true);
+    }
+  };
+
   // The selected row's id, exposed to AT via the listbox's aria-activedescendant so a screen
   // reader announces selection as arrow keys move it (focus stays on the <ul>; rows aren't tab stops).
   const activeId = selectedIndex >= 0 ? items[selectedIndex]?.id : undefined;
@@ -184,65 +218,122 @@ export function PinnedPrompt({
       onMouseLeave={interactive ? () => setOpen(false) : undefined}
       style={{ position: "relative", zIndex: 20, flex: "0 0 auto" }}
     >
+      {/* A plain container (not itself a button) so the interactive controls it holds — the crumb
+          buttons and the caret button — aren't nested inside another interactive control. Opening
+          on hover is handled by the root above; keyboard users reach the caret + crumb buttons. */}
       <div
-        ref={headerRef}
-        role={interactive ? "button" : undefined}
-        tabIndex={interactive ? 0 : undefined}
-        aria-haspopup={interactive ? "listbox" : undefined}
-        aria-expanded={interactive ? open : undefined}
-        aria-label={interactive ? "Show prompt history" : undefined}
-        onClick={interactive ? () => setOpen(true) : undefined}
-        onKeyDown={
-          interactive
-            ? (e) => {
-                if (e.key === "Enter" || e.key === " " || e.key === "ArrowDown") {
-                  e.preventDefault();
-                  setOpen(true);
-                }
-              }
-            : undefined
-        }
         style={{
           padding: "8px 14px",
-          background: C.deepForest,
+          // The last-prompt bar sits directly under the top bar and reads as part of the same
+          // chrome, so it uses the lighter barSurface (not the darker sidebar deepForest). The
+          // history dropdown it opens (below) stays deepForest, like the app's other menus.
+          background: C.barSurface,
           borderBottom: `1px solid ${C.forest}`,
           display: "flex",
           gap: 8,
           alignItems: "center",
           minHeight: 20,
-          cursor: interactive ? "pointer" : "default",
           userSelect: "none",
         }}
       >
-        <span style={{ color: C.accentInk, flex: "0 0 auto" }}>↩</span>
-        <span
-          style={{
-            color: prompt ? C.cream : C.muted,
-            fontWeight: prompt ? FONT_WEIGHT.medium : FONT_WEIGHT.regular,
-            fontSize: 13,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            flex: 1,
-            minWidth: 0,
-          }}
-        >
-          {prompt}
-        </span>
-        {interactive && (
-          // Caret rotates to point up while the menu is open.
+        {recent.length > 0 ? (
+          // Breadcrumb of the last ≤4 prompts, oldest→newest. Each segment shares the row width
+          // equally (flex 1 1 0) and truncates with "…", so four always fit on one line; thin ›
+          // separators sit between. Each segment is a real <button> so it's clickable AND keyboard-
+          // /screen-reader-reachable (Enter/Space activate it natively); it opens the dropdown on
+          // that prompt. recent is non-empty only when history is, so `interactive` is always true
+          // here — no per-segment guard needed.
+          <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center" }}>
+            {recent.map((entry, i) => (
+              <Fragment key={entry.id}>
+                {i > 0 && (
+                  <span
+                    aria-hidden="true"
+                    style={{ flex: "0 0 auto", color: C.muted, fontSize: 12, padding: "0 6px" }}
+                  >
+                    ›
+                  </span>
+                )}
+                <button
+                  type="button"
+                  data-testid={`ph-crumb-${entry.id}`}
+                  title={oneLine(entry.text)}
+                  onClick={() => onCrumbClick(entry)}
+                  style={{
+                    flex: "1 1 0",
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    textAlign: "left",
+                    background: "none",
+                    border: "none",
+                    padding: 0,
+                    margin: 0,
+                    color: C.cream,
+                    fontFamily: '"IBM Plex Sans", sans-serif',
+                    fontWeight: FONT_WEIGHT.regular,
+                    fontSize: 13,
+                    cursor: "pointer",
+                  }}
+                >
+                  {oneLine(entry.text)}
+                </button>
+              </Fragment>
+            ))}
+          </div>
+        ) : (
+          // No history yet (degenerate: a current prompt but no recorded history) — show it plain.
           <span
-            aria-hidden="true"
             style={{
-              color: C.muted,
+              color: C.cream,
+              fontWeight: FONT_WEIGHT.regular,
+              fontSize: 13,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              flex: 1,
+              minWidth: 0,
+            }}
+          >
+            {prompt}
+          </span>
+        )}
+        {interactive && (
+          // The caret is the "open the full history" affordance: a real button (Enter/Space open it
+          // natively; ArrowDown too), opening the dropdown with a clean slate (no crumb pre-selected).
+          // It's also the focus-return target on keyboard dismiss. Rotates up while the menu is open.
+          <button
+            ref={triggerRef}
+            type="button"
+            aria-haspopup="listbox"
+            aria-expanded={open}
+            aria-label="Show prompt history"
+            onClick={() => setOpen(true)}
+            onKeyDown={(e) => {
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setOpen(true);
+              }
+            }}
+            style={{
               flex: "0 0 auto",
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "none",
+              border: "none",
+              padding: 0,
+              margin: 0,
+              color: C.muted,
               fontSize: 10,
+              cursor: "pointer",
               transition: "transform 120ms ease",
               transform: open ? "rotate(180deg)" : "none",
             }}
           >
             ▾
-          </span>
+          </button>
         )}
       </div>
 

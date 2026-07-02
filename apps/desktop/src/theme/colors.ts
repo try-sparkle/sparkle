@@ -7,16 +7,25 @@
 // and Terminal reads them directly via xtermTheme() because xterm needs concrete hex.
 import { C as BRAND, AGENT_STATUS } from "@sparkle/ui";
 
-// deepForest is the app "chrome" surface (left sidebar + top bar) AND the shared secondary
-// surface for modals/dropdowns/pills. It sits directly behind the ACTIVE row/card, which is
-// painted in the content color `forest` (white in light, deep navy in dark). To make the active
-// row read clearly against inactive rows, deepForest is held ~10% away from forest: in light it
-// is ~10% darker than a near-white (#f1f4fa → #d9dce1, toward black); in dark it is ~10% lighter
-// (#0f2350 → #273962, toward white). Both preserve the original blue tint, so the shift only adds
-// chrome-vs-content contrast without changing the palette's character.
+// Two tinted chrome surfaces sit around the `forest` terminal content (white in light, deep navy
+// in dark), and they are deliberately DIFFERENT shades:
+//
+// • deepForest — the LEFT SIDEBAR (and its internals: the Think/Plan/Build chevron seam, the
+//   sticky New-Agent slot, the active card's flare border) plus shared secondary surfaces
+//   (modals, dropdowns, pills). Held ONE STEP away from `forest` so the active row — painted in
+//   `forest` — stands out against inactive rows: ~10% darker than near-white in light
+//   (#f1f4fa → #d9dce1, toward black), ~10% lighter than the base navy in dark (#0f2350 → #273962,
+//   toward white).
+//
+// • barSurface — the TOP BAR and the COMPOSER input box. These frame the live terminal directly,
+//   so they stay at the LIGHTER original chrome shade (#f1f4fa light / #0f2350 dark) and recede
+//   against the content instead of competing with the darker sidebar. (This is exactly the old
+//   deepForest value, split off so the sidebar can go darker without dragging the bars with it.)
+//
+// Both preserve the original blue tint — only the light/dark placement relative to `forest` changes.
 export const THEME_HEX = {
-  dark: { forest: "#0a1a3f", deepForest: "#273962", cream: "#eaf1ff", muted: "#8aa0c4", chatBubble: "#1d3a7a", chatBubbleActive: "#2c57b0", accentInk: "#34e0f0", agentIdle: "#8aa0c4", successInk: "#34c759" },
-  light: { forest: "#ffffff", deepForest: "#d9dce1", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#d6e0f5", chatBubbleActive: "#bccdf2", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d" },
+  dark: { forest: "#0a1a3f", deepForest: "#273962", barSurface: "#0f2350", cream: "#eaf1ff", muted: "#8aa0c4", chatBubble: "#1d3a7a", chatBubbleActive: "#2c57b0", accentInk: "#34e0f0", agentIdle: "#8aa0c4", successInk: "#34c759" },
+  light: { forest: "#ffffff", deepForest: "#d9dce1", barSurface: "#f1f4fa", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#d6e0f5", chatBubbleActive: "#bccdf2", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d" },
 } as const;
 
 // Themed token object for component inline styles. The four theme-dependent tokens become
@@ -27,6 +36,10 @@ export const C = {
   ...BRAND,
   forest: "var(--c-forest)",
   deepForest: "var(--c-deep-forest)",
+  // Lighter chrome for the top bar + composer box — the original deepForest shade. Kept distinct
+  // from (lighter than) deepForest so those bars recede against the terminal while the sidebar
+  // stays a step darker. See THEME_HEX above.
+  barSurface: "var(--c-bar-surface)",
   cream: "var(--c-cream)",
   muted: "var(--c-muted)",
   // Cyan (brand accent) is legible as TEXT only on dark backgrounds. As text it must flip to
