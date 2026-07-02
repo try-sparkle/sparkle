@@ -4,6 +4,7 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { projectWindowUrl } from "./projectWindows.url";
 import { clearWindowProject, findWindowForProject, setWindowProject } from "./windowRegistry";
+import { useProjectStore } from "../stores/projectStore";
 
 export type OpenMode = "replace" | "new";
 
@@ -12,6 +13,13 @@ export type OpenMode = "replace" | "new";
  *  capability gets ZERO permissions in Tauri v2, so invoke()/listen() silently fail (mic +
  *  PTY/agent break). The label is otherwise opaque (decoupled from the project id). */
 export const WINDOW_LABEL_PREFIX = "win-";
+
+/** Title for a window showing this project: the trimmed name, falling back to "Sparkle" when
+ *  absent or blank so the macOS Window menu never gets an unlabeled entry. Shared by the
+ *  initial-title path below and Workspace's setTitle effect so the fallback can't drift. */
+export function windowTitleFor(name?: string | null): string {
+  return name?.trim() || "Sparkle";
+}
 
 interface FocusableWindow {
   show(): Promise<void>;
@@ -96,9 +104,13 @@ export function defaultDeps(
       // entry so a later open doesn't focus a window that never came up.
       const label = `${WINDOW_LABEL_PREFIX}${crypto.randomUUID()}`;
       setWindowProject(label, projectId);
+      // Title the window after its project so the macOS Window menu is navigable with several
+      // windows open. Workspace keeps the title in sync after mount (rename/Replace); this just
+      // avoids a "Sparkle" flash before that effect runs.
+      const projectName = useProjectStore.getState().projects.find((p) => p.id === projectId)?.name;
       const win = new WebviewWindow(label, {
         url: projectWindowUrl(projectId, label, agentId),
-        title: "Sparkle",
+        title: windowTitleFor(projectName),
         width: 1200,
         height: 800,
         minWidth: 900,

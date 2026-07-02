@@ -1,6 +1,7 @@
 import { useEffect, type CSSProperties } from "react";
 import { C } from "../theme/colors";
 import { useAuthStore } from "../stores/authStore";
+import { useUiStore } from "../stores/uiStore";
 import { formatBalance } from "../services/creditPricing";
 
 // Shows the user's remaining AI-credit balance in the sidebar header — top-right of the left
@@ -30,9 +31,17 @@ export function BalanceBadge() {
   }, [refresh]);
 
   if (!me) return null;
+  // The pill is clickable: it deep-opens the settings dialog on the Credits pane (spec §1). The
+  // button wrapper is visually inert (no border/padding) so the pill itself looks unchanged.
   return (
-    <span style={badge} title="Remaining AI credits" aria-label="Remaining AI credits">
-      {formatBalance(me.balanceCents)}
-    </span>
+    <button
+      type="button"
+      aria-label="Open credits"
+      title="Remaining AI credits — click to manage"
+      onClick={() => useUiStore.getState().openSettings("credits")}
+      style={{ background: "transparent", border: "none", padding: 0, cursor: "pointer" }}
+    >
+      <span style={badge}>{formatBalance(me.balanceCents)}</span>
+    </button>
   );
 }

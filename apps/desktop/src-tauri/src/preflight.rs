@@ -121,6 +121,90 @@ pub fn resolve_node_path() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// git detection
+//
+// git is used as a bare `Command::new("git")` all over worktree.rs / sparkle_agent.rs, so a
+// brand-new Mac with no git makes every worktree op fail. We detect it up front so onboarding can
+// offer to install it.
+//
+// SUBTLETY (macOS): `/usr/bin/git` is a Command-Line-Tools *shim*. The file EXISTS even when the
+// CLT are NOT installed — and *running* it then pops Apple's "install developer tools" dialog. So
+// a plain `is_executable("/usr/bin/git")` check would report git as installed on a fresh Mac (and
+// probing its version would trigger the very installer we're trying to drive from the UI). We
+// therefore treat `/usr/bin/git` as the LAST candidate and only trust it when the CLT/Xcode are
+// actually present — checked via `xcode-select -p`, which never triggers the installer.
+// ---------------------------------------------------------------------------
+
+/// The macOS Command-Line-Tools `git` shim. Present on every Mac; only a usable git once the CLT or
+/// Xcode are installed (see the module note above). Kept last in [`known_git_paths_for`].
+const SYSTEM_GIT_SHIM: &str = "/usr/bin/git";
+
+/// Canonical absolute `git` locations, user-first: `~/.local/bin` (our own non-sudo installs and
+/// nvm-style setups), homebrew prefixes, then the macOS system shim last.
+pub fn known_git_paths_for(home: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = home {
+        paths.push(home.join(".local/bin/git"));
+    }
+    paths.push(PathBuf::from("/opt/homebrew/bin/git")); // homebrew (Apple silicon)
+    paths.push(PathBuf::from("/usr/local/bin/git")); // homebrew (Intel)
+    paths.push(PathBuf::from(SYSTEM_GIT_SHIM)); // macOS CLT shim — trusted only when CLT present
+    paths
+}
+
+/// True if the Xcode Command Line Tools (or full Xcode) are installed — i.e. `xcode-select -p`
+/// resolves to a developer dir. Authoritative "is `/usr/bin/git` real?" signal on macOS, checked
+/// WITHOUT running git so detection never triggers the CLT installer dialog.
+#[cfg(all(unix, target_os = "macos"))]
+fn command_line_tools_installed() -> bool {
+    Command::new("xcode-select")
+        .arg("-p")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// On non-macOS unix, `/usr/bin/git` (when present) is a genuine binary, so there's no shim caveat.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn command_line_tools_installed() -> bool {
+    true
+}
+
+/// Resolve an absolute `git` path. Prefer whatever the login shell resolves (covers a custom PATH),
+/// then the canonical install locations — but NEVER report the bare macOS system shim as git unless
+/// the Command Line Tools are actually installed (else running it triggers Apple's installer).
+#[cfg(unix)]
+pub fn resolve_git_path() -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // A standalone git (login-shell PATH, brew, ~/.local) that isn't the system shim works
+    // regardless of the CLT, so prefer it.
+    if let Some(p) = run_in_login_shell("command -v git") {
+        if p != SYSTEM_GIT_SHIM && Path::new(&p).is_absolute() && is_executable(Path::new(&p)) {
+            return Some(p);
+        }
+    }
+    let real_first: Vec<PathBuf> = known_git_paths_for(home)
+        .into_iter()
+        .filter(|p| p != Path::new(SYSTEM_GIT_SHIM))
+        .collect();
+    if let Some(p) = first_executable(&real_first) {
+        return Some(p);
+    }
+    // Fall back to the system shim only when it's backed by a real git (CLT/Xcode present).
+    let shim = PathBuf::from(SYSTEM_GIT_SHIM);
+    if is_executable(&shim) && command_line_tools_installed() {
+        return Some(SYSTEM_GIT_SHIM.to_string());
+    }
+    None
+}
+
+/// Windows: `where git` (GUI apps inherit PATH), then canonical install locations.
+#[cfg(not(unix))]
+pub fn resolve_git_path() -> Option<String> {
+    resolve_on_path("git").or_else(|| first_executable(&known_git_paths_for(home_dir())))
+}
+
+// ---------------------------------------------------------------------------
 // Session-lifetime path caches
 //
 // Both `claude` and `node` are resolved by shelling out to a LOGIN shell (`command -v …`), which is
@@ -142,6 +226,11 @@ fn claude_path_cache() -> &'static Mutex<Option<String>> {
 }
 
 fn node_path_cache() -> &'static Mutex<Option<String>> {
+    static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn git_path_cache() -> &'static Mutex<Option<String>> {
     static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
 }
@@ -194,14 +283,35 @@ pub fn resolve_node_path_cached() -> Option<String> {
     resolved
 }
 
-/// Clear the cached claude/node paths so the next resolve re-probes (e.g. the user moved/reinstalled
-/// a toolchain while the app was running). Note that a "not installed" result is never cached in the
-/// first place, so a fresh install is already picked up without calling this.
+/// Resolved absolute `git` path, cached for the app session (resolution per [`resolve_git_path`]).
+/// Only a positive hit is cached — see the cache note above.
+pub fn resolve_git_path_cached() -> Option<String> {
+    if let Ok(guard) = git_path_cache().lock() {
+        if let Some(path) = guard.as_ref() {
+            return Some(path.clone());
+        }
+    }
+    let resolved = resolve_git_path();
+    if let Some(path) = resolved.as_ref() {
+        if let Ok(mut guard) = git_path_cache().lock() {
+            *guard = Some(path.clone());
+        }
+    }
+    resolved
+}
+
+/// Clear the cached claude/node/git paths so the next resolve re-probes (e.g. the user
+/// moved/reinstalled a toolchain, or just finished an in-app install, while the app was running).
+/// Note that a "not installed" result is never cached in the first place, so a fresh install is
+/// already picked up without calling this.
 pub fn invalidate_preflight_caches() {
     if let Ok(mut g) = claude_path_cache().lock() {
         *g = None;
     }
     if let Ok(mut g) = node_path_cache().lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = git_path_cache().lock() {
         *g = None;
     }
 }
@@ -333,6 +443,62 @@ pub fn refresh_preflight() {
     invalidate_preflight_caches();
 }
 
+/// Generic install status for a runtime prerequisite (node/git). `installed` mirrors
+/// `path.is_some()`; both are returned so the UI can show the resolved location.
+#[derive(Serialize)]
+pub struct PrereqStatus {
+    pub installed: bool,
+    pub path: Option<String>,
+}
+
+impl PrereqStatus {
+    fn from_path(path: Option<String>) -> Self {
+        PrereqStatus { installed: path.is_some(), path }
+    }
+}
+
+/// Detect whether `node` is installed, resolving its absolute path off the main thread (cached for
+/// the session). Drives the first-run setup checklist.
+#[tauri::command]
+pub async fn node_preflight() -> PrereqStatus {
+    tauri::async_runtime::spawn_blocking(|| PrereqStatus::from_path(resolve_node_path_cached()))
+        .await
+        .unwrap_or(PrereqStatus { installed: false, path: None })
+}
+
+/// Detect whether `git` is installed, resolving its absolute path off the main thread (cached for
+/// the session). On macOS this never triggers the CLT installer (see [`resolve_git_path`]).
+#[tauri::command]
+pub async fn git_preflight() -> PrereqStatus {
+    tauri::async_runtime::spawn_blocking(|| PrereqStatus::from_path(resolve_git_path_cached()))
+        .await
+        .unwrap_or(PrereqStatus { installed: false, path: None })
+}
+
+/// Combined first-run probe for the three runtime prerequisites (claude / node / git) in ONE IPC
+/// round-trip, resolved off the main thread. Drives the setup checklist's initial detection pass.
+#[derive(Serialize)]
+pub struct PrereqsReport {
+    pub claude: PrereqStatus,
+    pub node: PrereqStatus,
+    pub git: PrereqStatus,
+}
+
+#[tauri::command]
+pub async fn prereqs_preflight() -> PrereqsReport {
+    tauri::async_runtime::spawn_blocking(|| PrereqsReport {
+        claude: PrereqStatus::from_path(cached_claude_path()),
+        node: PrereqStatus::from_path(resolve_node_path_cached()),
+        git: PrereqStatus::from_path(resolve_git_path_cached()),
+    })
+    .await
+    .unwrap_or(PrereqsReport {
+        claude: PrereqStatus { installed: false, path: None },
+        node: PrereqStatus { installed: false, path: None },
+        git: PrereqStatus { installed: false, path: None },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +552,40 @@ mod tests {
         let paths = super::known_node_paths_for(None);
         // No home → no ~/.local entry, but the system locations are still present.
         assert!(paths.iter().any(|p| p.ends_with("opt/homebrew/bin/node")));
+    }
+
+    #[test]
+    fn known_git_paths_prioritizes_user_then_brew_then_system_shim_last() {
+        let paths = super::known_git_paths_for(Some(PathBuf::from("/Users/x")));
+        let strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        // User-local first.
+        assert_eq!(strs[0], "/Users/x/.local/bin/git");
+        // The macOS system shim MUST be last — it's the least-trusted candidate (see module note).
+        assert_eq!(strs.last().unwrap(), super::SYSTEM_GIT_SHIM);
+        assert!(strs.contains(&"/opt/homebrew/bin/git".to_string()));
+        assert!(strs.contains(&"/usr/local/bin/git".to_string()));
+    }
+
+    #[test]
+    fn known_git_paths_handles_no_home() {
+        let paths = super::known_git_paths_for(None);
+        // No home → no ~/.local entry, but the system locations (incl. the shim) are still present.
+        assert!(paths.iter().any(|p| p.ends_with("opt/homebrew/bin/git")));
+        assert_eq!(paths.last().unwrap(), &PathBuf::from(super::SYSTEM_GIT_SHIM));
+        // Guard against the shim leaking in twice / a stray ~/.local entry with no home.
+        assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".local")));
+    }
+
+    #[test]
+    fn known_git_paths_first_executable_prefers_real_git_over_shim() {
+        // With the shim filtered out (as resolve_git_path does), a real brew/local git wins. Here we
+        // just assert the filter leaves the shim out and keeps the rest ordered.
+        let filtered: Vec<PathBuf> = super::known_git_paths_for(Some(PathBuf::from("/Users/x")))
+            .into_iter()
+            .filter(|p| p != Path::new(super::SYSTEM_GIT_SHIM))
+            .collect();
+        assert!(!filtered.iter().any(|p| p == Path::new(super::SYSTEM_GIT_SHIM)));
+        assert_eq!(filtered[0], PathBuf::from("/Users/x/.local/bin/git"));
     }
 
     // Exercises the Unix login-shell arg-passing path; the helper it calls is Unix-only.

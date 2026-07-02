@@ -51,6 +51,9 @@ export function assembleBuildSpawn(opts: {
   /** Newest Claude session id for this worktree. With `resume` true, spawns `--resume <id>` so the
    *  prior conversation is redrawn on reopen (bead sparkle-wwg7); undefined → `--continue`. */
   resumeSessionId?: string;
+  /** This build agent's chosen Claude model (services/models.ts id). Undefined/"default" →
+   *  no --model flag (inherit the user's Claude Code default). */
+  model?: string;
 }): { command: string; args: string[]; cwd: string } {
   const mcpConfig = buildOrchestratorMcpConfig({
     nodePath: opts.paths.nodePath,
@@ -64,6 +67,7 @@ export function assembleBuildSpawn(opts: {
     appendSystemPrompt: opts.persona,
     configDir: opts.configDir,
     resumeSessionId: opts.resumeSessionId,
+    model: opts.model,
   });
   return { command: SHELL, args: ["-l", "-c", exec], cwd: opts.cwd };
 }

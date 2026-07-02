@@ -4,6 +4,19 @@ import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import { migratePersistedUi } from "./composerPersist";
 
+// Settings-dialog category ids. Defined HERE (not SettingsDialog.tsx) so the store never depends
+// on a component file — SettingsDialog imports and re-exports it for its own consumers.
+export type CategoryId =
+  | "ai"
+  | "credits"
+  | "notifications"
+  | "appearance"
+  | "shortcuts"
+  | "workers"
+  | "accounts"
+  | "mobile"
+  | "advanced";
+
 export const COMPOSER_MIN = 64;
 // Smallest usable textarea height (≈ one line + its vertical padding). Used as the floor's
 // reserved input space when screenshot thumbnails push the composer's chrome taller, so an
@@ -90,6 +103,11 @@ interface UiState {
   // switch tabs. NOT persisted (see partialize) — resets to "build" each launch like the old local state.
   workMode: WorkMode;
   setWorkMode: (m: WorkMode) => void;
+  // One-shot "open this bead's detail when the board shows it" handoff (spec §8: clicking an
+  // orchestrator's epic pill jumps to the Plan board with that epic's DetailOverlay open). Set by
+  // the pill, consumed-then-cleared by BoardView once the bead is present. Transient — NOT persisted.
+  boardFocusBeadId: string | null;
+  setBoardFocusBeadId: (id: string | null) => void;
   // Whether ANY "+ New Build Agent" button is currently hovered. Shared so hovering the empty-state
   // start button on the Workspace also lights up the sidebar's button blue (and vice versa),
   // pointing the user at where that affordance normally lives. Transient — NOT persisted.
@@ -102,6 +120,12 @@ interface UiState {
   collapsedOrchestrators: Record<string, boolean>;
   isOrchestratorCollapsed: (id: string) => boolean;
   toggleOrchestratorCollapsed: (id: string) => void;
+  // Deep-open request for the ⋯ settings dialog: a component anywhere (e.g. BalanceBadge) asks
+  // for a category; TopBar (which owns the dialog) opens it there and clears the request on
+  // close. Transient — NOT persisted (see partialize), a relaunch must never restore a dialog.
+  settingsRequest: CategoryId | null;
+  openSettings: (cat: CategoryId) => void;
+  clearSettingsRequest: () => void;
 }
 
 export const useUiStore = create<UiState>()(
@@ -126,6 +150,8 @@ export const useUiStore = create<UiState>()(
       setAgentOrdering: (v) => set({ agentOrdering: v }),
       workMode: "build",
       setWorkMode: (m) => set({ workMode: m }),
+      boardFocusBeadId: null,
+      setBoardFocusBeadId: (id) => set({ boardFocusBeadId: id }),
       buildAgentHover: false,
       setBuildAgentHover: (v) => set({ buildAgentHover: v }),
       collapsedOrchestrators: {},
@@ -136,15 +162,25 @@ export const useUiStore = create<UiState>()(
           const cur = s.collapsedOrchestrators[id] ?? true;
           return { collapsedOrchestrators: { ...s.collapsedOrchestrators, [id]: !cur } };
         }),
+      settingsRequest: null,
+      openSettings: (cat) => set({ settingsRequest: cat }),
+      clearSettingsRequest: () => set({ settingsRequest: null }),
     }),
     {
       name: "sparkle-ui",
       storage: createJSONStorage(() => localStorage),
-      // Persist everything EXCEPT workMode and buildAgentHover, so the active sidebar tab resets to
-      // "build" on each launch (matching the prior local-useState default) and the transient hover
-      // flag never persists, while every other UI preference still sticks. Spreading `rest` keeps
-      // all existing persisted keys.
-      partialize: ({ workMode: _workMode, buildAgentHover: _buildAgentHover, ...rest }) => rest,
+      // Persist everything EXCEPT workMode, buildAgentHover, boardFocusBeadId, and
+      // settingsRequest, so the active sidebar tab resets to "build" on each launch (matching
+      // the prior local-useState default) and the transient hover flag / one-shot board-focus
+      // handoff / one-shot settings deep-open never persist, while every other UI preference
+      // still sticks. Spreading `rest` keeps all existing persisted keys.
+      partialize: ({
+        workMode: _workMode,
+        buildAgentHover: _buildAgentHover,
+        boardFocusBeadId: _boardFocusBeadId,
+        settingsRequest: _settingsRequest,
+        ...rest
+      }) => rest,
       // v1: the rest height shrank from 128 to the compact COMPOSER_SNAP. The pure
       // migratePersistedUi resets only users still parked on the OLD default, preserving a
       // height anyone deliberately dragged to. (composerMinimized hydrates from its default

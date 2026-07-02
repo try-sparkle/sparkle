@@ -3,7 +3,7 @@
 // pre-wrapped text mangled lists, code, and tables — so this component owns a compact,
 // theme-styled GFM render. Styling lives in inline `components={{...}}` overrides (no
 // global CSS) so the component is self-contained and the DOM stays lean.
-import type { CSSProperties, ReactNode } from "react";
+import { memo, type CSSProperties, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -11,6 +11,10 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, FONT } from "../theme/colors";
 
 const MONO = '"IBM Plex Mono", monospace';
+
+// Hoisted so ReactMarkdown receives a STABLE plugin-array reference across renders (a fresh
+// `[remarkGfm]` literal each render defeats react-markdown's own memoization of the parse).
+const REMARK_PLUGINS = [remarkGfm];
 
 // Subtle tint for inline code / blockquote / table chrome, derived from the accent so it
 // reads on both the dark and light themed surfaces without a second themed token.
@@ -153,13 +157,16 @@ const components: Components = {
   ),
 };
 
-/** Render `text` as compact, theme-styled GitHub-flavored markdown for a chat bubble. */
-export function Markdown({ text }: { text: string }) {
+/** Render `text` as compact, theme-styled GitHub-flavored markdown for a chat bubble.
+ *  Memoized: ReactMarkdown re-parses the whole string on every render, so in a streaming chat the
+ *  unchanged bubbles would re-parse their full text on every token. `text` is the only prop, so a
+ *  shallow-equal memo skips the re-parse whenever the text hasn't changed. */
+export const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
     <div style={prose}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={components}>
         {text}
       </ReactMarkdown>
     </div>
   );
-}
+});

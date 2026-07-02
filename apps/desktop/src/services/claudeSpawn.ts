@@ -2,6 +2,8 @@
 // AgentPane so the resume/fresh branching (bead ) is unit-testable
 // without rendering the component.
 
+import { DEFAULT_MODEL_ID } from "./models";
+
 /** macOS login shell we launch `claude` (and shell commands) through, as `zsh -l -c 'exec …'`: a
  *  login but NON-interactive shell, so it sources `.zprofile`/`.zlogin` for the user's real PATH/env
  *  but not `.zshrc`. Shared by every spawn path (AgentPane, orchestrationLaunch, the account-login
@@ -40,6 +42,9 @@ export interface ClaudeExecOpts {
    *  RED, its orchestrator blocks in wait_for_workers). We deliberately do NOT set this for Think or
    *  orchestrator/Build agents — those are interactive and a human is present to approve. */
   dangerouslySkipPermissions?: boolean;
+  /** The Claude model this agent runs (`--model <id>`, a services/models.ts id). Absent or the
+   *  "default" sentinel → no flag, so the agent inherits the user's own Claude Code default. */
+  model?: string;
   /** Per-spawn `CLAUDE_CONFIG_DIR` for multi Claude Max account support (design spec
    *  docs/superpowers/specs/2026-06-26-multi-max-account-design.md). When set, the exec exports it
    *  so the child `claude` authenticates from that account's isolated config dir — confined to the
@@ -77,6 +82,11 @@ export function buildClaudeExec(
   if (opts.dangerouslySkipPermissions) {
     cmd += " --dangerously-skip-permissions";
   }
+  // Per-agent model selection (bead sparkle-i6rw). The "default" sentinel means "no flag" so the
+  // agent inherits whatever the user's own Claude Code config says — same as before the feature.
+  if (opts.model && opts.model !== DEFAULT_MODEL_ID) {
+    cmd += ` --model ${shellQuote(opts.model)}`;
+  }
   if (opts.mcpConfig) {
     cmd += ` --mcp-config ${shellQuote(opts.mcpConfig)}`;
     // --mcp-config is variadic (like --add-dir); a following flag terminates it. We always pair it
@@ -108,6 +118,18 @@ export function buildClaudeExec(
     ? `export CLAUDE_CONFIG_DIR=${shellQuote(opts.configDir)}; `
     : "";
   return `${configExport}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
+}
+
+/** Build the `zsh -l -c` exec string that runs `claude login` — the interactive sign-in flow used
+ *  by the first-run setup checklist. Like {@link buildClaudeExec} it prepends `~/.local/bin` to
+ *  PATH so the `#!/usr/bin/env node` shebang in a freshly-installed `claude` resolves node. Kept
+ *  here (not inline in the component) so the launcher stays consistent with every other spawn path
+ *  and is unit-testable. `configDir` (optional) targets a specific account's config dir. */
+export function buildClaudeLoginExec(claudePath: string, opts: { configDir?: string } = {}): string {
+  const configExport = opts.configDir
+    ? `export CLAUDE_CONFIG_DIR=${shellQuote(opts.configDir)}; `
+    : "";
+  return `${configExport}export PATH="$HOME/.local/bin:$PATH"; exec ${shellQuote(claudePath)} login`;
 }
 
 /** Build the inline JSON for `claude --mcp-config` that launches the Sparkle orchestrator MCP

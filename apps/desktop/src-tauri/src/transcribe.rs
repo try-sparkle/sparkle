@@ -63,12 +63,14 @@ impl ParakeetTdt {
         let recognizer = OfflineRecognizer::create(&rc)
             .ok_or_else(|| "failed to create OfflineRecognizer (check model paths/format)".to_string())?;
 
-        let mut sv = SileroVadModelConfig::default();
-        sv.model = Some(m.vad.to_string_lossy().into_owned());
-        sv.threshold = 0.5;
-        sv.min_silence_duration = 0.25;
-        sv.min_speech_duration = 0.25;
-        sv.max_speech_duration = 8.0;
+        let sv = SileroVadModelConfig {
+            model: Some(m.vad.to_string_lossy().into_owned()),
+            threshold: 0.5,
+            min_silence_duration: 0.25,
+            min_speech_duration: 0.25,
+            max_speech_duration: 8.0,
+            ..Default::default()
+        };
         let vad_cfg = VadModelConfig {
             silero_vad: sv,
             sample_rate: 16_000,

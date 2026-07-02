@@ -24,6 +24,20 @@ export interface PtyWrite {
 const MAX = 4000;
 
 /**
+ * Terminate a submission with CR — the byte a physical Enter key sends. Raw-mode TUIs (Claude
+ * Code's Ink pickers/composer) only treat `\r` as Enter; LF is NOT Enter there, which is why
+ * phone-typed answers to a numbered picker used to vanish. Canonical-mode (line-buffered) prompts
+ * still submit fine: termios ICRNL translates the CR to NL on input. A trailing LF (older phone
+ * clients frame with `\n`) is converted rather than doubled.
+ */
+function terminateSubmit(value: string): string {
+  // Strip the ENTIRE existing terminator (LF, CR, or CRLF) before appending exactly one CR — a
+  // CRLF-framed value must not become "\r\r" (two Enters: answer the picker, then blindly
+  // confirm whatever renders next).
+  return `${value.replace(/\r?\n$|\r$/, "")}\r`;
+}
+
+/**
  * Authorize a phone DECISION. A decision may ONLY drive an agent we actually raised an attention
  * for (looked up by its per-attention id), so a relay/phone can't inject into an arbitrary PTY.
  * Single-use: a valid decision CONSUMES the attention from `liveAttentions`, so a replay returns
@@ -38,7 +52,9 @@ export function authorizeDecision(
   if (!agentId) return null; // not an attention we raised (or already consumed)
   if (typeof d.reply !== "string" || d.reply.length > MAX) return null;
   liveAttentions.delete(d.attention_id); // one decision per raised attention
-  const text = d.submit && !d.reply.endsWith("\n") ? `${d.reply}\n` : d.reply;
+  // The phone frames replies with a trailing LF; submit means "press Enter", so normalize to CR
+  // either way (see terminateSubmit) — a reply that already carries its newline still gets fixed.
+  const text = d.submit || d.reply.endsWith("\n") ? terminateSubmit(d.reply) : d.reply;
   return { agentId, text };
 }
 
@@ -53,8 +69,7 @@ export function authorizeAgentInput(
 ): PtyWrite | null {
   if (!i || typeof i.agent_id !== "string" || !watched.has(i.agent_id)) return null;
   if (typeof i.text !== "string" || i.text.length > MAX) return null;
-  const text = i.text.endsWith("\n") ? i.text : `${i.text}\n`;
-  return { agentId: i.agent_id, text };
+  return { agentId: i.agent_id, text: terminateSubmit(i.text) };
 }
 
 /**
@@ -75,8 +90,9 @@ export function resolveSuggestionClick(
   return { agentId: c.agent_id, value };
 }
 
-/** Frame a value for SUBMISSION into the PTY: ensure exactly one trailing newline so a prompt is
- *  actually entered (terminal keystroke values like "2\n" already have it). */
+/** Frame a value for SUBMISSION into the PTY: ensure exactly one trailing CR (Enter) so the
+ *  prompt is actually entered. Values authored with `\n` (e.g. heuristic buttons' "2\n") are
+ *  normalized, not doubled. */
 export function frameSubmit(value: string): string {
-  return value.endsWith("\n") ? value : `${value}\n`;
+  return terminateSubmit(value);
 }

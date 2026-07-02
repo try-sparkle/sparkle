@@ -14,9 +14,9 @@ const MENU_LINE = /^\s*[\[(]?(\d{1,2})[\]).]\s+\S/; // "1) x", "2. x", "[3] x", 
 // excluding it kills the main false-positive class that would otherwise inject "1\n" into a PTY).
 const CHOICE_KEYWORD = /(choice|choos|select|option|enter|pick|press|which)/i;
 
-function tail(scrollback: string): string[] {
+function tail(scrollback: string, n: number = TAIL_LINES): string[] {
   const lines = scrollback.replace(/\r/g, "").split("\n").filter((l) => l.trim().length > 0);
-  return lines.slice(-TAIL_LINES);
+  return lines.slice(-n);
 }
 
 function btn(label: string, value: string): SuggestionButton {
@@ -31,7 +31,69 @@ function asksChoice(lastLine: string): boolean {
   return /[?:>#»]\s*$/.test(lastLine) && !/[a-z]/i.test(lastLine);
 }
 
+// ── Claude Code's interactive option picker (AskUserQuestion / permission dialogs) ──
+// An Ink raw-mode dialog: numbered options (the highlighted one prefixed with a `❯` pointer),
+// closed by a footer like "Enter to select · ↑/↓ to navigate · Esc to cancel". Two things defeat
+// the generic menu heuristic below: the pointer stops option 1's line from matching, and the Ink
+// screen keeps rendering content (e.g. the task checklist) BELOW the dialog, so the footer is
+// never the last line. So this detector searches a wider window for the footer, then parses the
+// option block immediately above it.
+const PICKER_WINDOW = 50; // non-empty lines to search for the footer
+const PICKER_SPAN = 30; // non-empty lines above the footer the option block may span
+const PICKER_FOOTER = /enter to (select|confirm|submit)\b.*(navigate|cancel)/i;
+const PICKER_OPTION = /^\s*(?:[❯›>]\s*)?(\d{1,2})\.\s+(\S.*)/;
+const PICKER_LABEL_MAX = 40;
+const PICKER_MAX_BUTTONS = 6;
+
+function truncateLabel(s: string): string {
+  const t = s.trim();
+  return t.length <= PICKER_LABEL_MAX ? t : `${t.slice(0, PICKER_LABEL_MAX - 1)}…`;
+}
+
+/** Detect Claude Code's option picker; returns one button per option ("N · label" → "N\n"). */
+export function detectClaudeCodePicker(scrollback: string): SuggestionButton[] {
+  const lines = tail(scrollback, PICKER_WINDOW);
+  // The LAST footer wins — an earlier, answered picker higher in the window is stale.
+  let footerIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (PICKER_FOOTER.test(lines[i] ?? "")) {
+      footerIdx = i;
+      break;
+    }
+  }
+  if (footerIdx < 0) return [];
+
+  // Walk the block above the footer bottom-up, collecting options while the numbers count DOWN
+  // to 1. Most wrapped description lines don't match PICKER_OPTION and are skipped; one that
+  // DOES (a body line starting with a numbered-list fragment like "2. do that") is handled by
+  // the anchor rules: walking upward a real picker only ever counts down, so a HIGHER number
+  // than expected means the current anchor was junk below the true last option — restart the
+  // run from this line. A LOWER number than expected is junk inside the block — skip it.
+  let opts: { n: number; label: string }[] = [];
+  let expected = -1; // the next number we accept walking upward (-1 = any to start)
+  for (let i = footerIdx - 1; i >= Math.max(0, footerIdx - PICKER_SPAN); i--) {
+    const m = (lines[i] ?? "").match(PICKER_OPTION);
+    if (!m?.[1] || m[2] === undefined) continue;
+    const n = parseInt(m[1], 10);
+    if (expected !== -1 && n < expected) continue;
+    if (expected !== -1 && n > expected) {
+      opts = []; // bad anchor: this is the true bottom of the option run
+    }
+    opts.unshift({ n, label: m[2] });
+    if (n === 1) break;
+    expected = n - 1;
+  }
+  if (opts.length < 2 || opts[0]?.n !== 1) return [];
+  return opts
+    .slice(0, PICKER_MAX_BUTTONS)
+    .map((o) => btn(`${o.n} · ${truncateLabel(o.label)}`, `${o.n}\n`));
+}
+
 export function detectTerminalPrompts(scrollback: string): SuggestionButton[] {
+  // The Claude Code picker is the most specific (and most common) prompt — try it first.
+  const picker = detectClaudeCodePicker(scrollback);
+  if (picker.length > 0) return picker;
+
   const lines = tail(scrollback);
   if (lines.length === 0) return [];
 

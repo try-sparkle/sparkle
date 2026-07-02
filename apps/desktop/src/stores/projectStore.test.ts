@@ -424,3 +424,68 @@ describe("setAgentBeadId", () => {
     expect(agents.find((a) => a.id === a2)!.beadId).toBeUndefined();
   });
 });
+
+describe("setAgentModel (per-agent Claude model, sparkle-i6rw)", () => {
+  beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
+
+  it("a new agent has no model (inherit Claude Code's default)", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore.getState().addAgent(pid);
+    expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!.model)
+      .toBeUndefined();
+  });
+
+  it("addAgent carries an explicit model onto the new tab", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore.getState().addAgent(pid, { model: "claude-haiku-4-5" });
+    expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!.model)
+      .toBe("claude-haiku-4-5");
+  });
+
+  it("normalizes the 'default' sentinel to undefined at the store boundary (one canonical form)", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    // addAgent with the sentinel persists undefined, same as omitting it.
+    const aid = useProjectStore.getState().addAgent(pid, { model: "default" });
+    expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!.model)
+      .toBeUndefined();
+    // Picking a real model then re-picking Default also lands back on undefined.
+    useProjectStore.getState().setAgentModel(pid, aid, "claude-sonnet-5");
+    useProjectStore.getState().setAgentModel(pid, aid, "default");
+    expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!.model)
+      .toBeUndefined();
+  });
+
+  it("setAgentModel updates only the target agent and can clear back to undefined", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const a1 = useProjectStore.getState().addAgent(pid);
+    const a2 = useProjectStore.getState().addAgent(pid);
+    useProjectStore.getState().setAgentModel(pid, a1, "claude-opus-4-8");
+    let agents = useProjectStore.getState().projects[0]!.agents;
+    expect(agents.find((a) => a.id === a1)!.model).toBe("claude-opus-4-8");
+    expect(agents.find((a) => a.id === a2)!.model).toBeUndefined();
+    useProjectStore.getState().setAgentModel(pid, a1, undefined);
+    agents = useProjectStore.getState().projects[0]!.agents;
+    expect(agents.find((a) => a.id === a1)!.model).toBeUndefined();
+  });
+});
+
+describe("setAgentEpicId", () => {
+  beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
+  it("binds an epic id to an existing agent without disturbing others", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const a1 = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const a2 = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    useProjectStore.getState().setAgentEpicId(pid, a1, "epic-7");
+    const agents = useProjectStore.getState().projects[0]!.agents;
+    expect(agents.find((a) => a.id === a1)!.epicId).toBe("epic-7");
+    expect(agents.find((a) => a.id === a2)!.epicId).toBeUndefined();
+  });
+  it("re-binding overwrites the previous epic (a re-used orchestrator moves to the new epic)", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const a1 = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    useProjectStore.getState().setAgentEpicId(pid, a1, "epic-7");
+    useProjectStore.getState().setAgentEpicId(pid, a1, "epic-8");
+    const agents = useProjectStore.getState().projects[0]!.agents;
+    expect(agents.find((a) => a.id === a1)!.epicId).toBe("epic-8");
+  });
+});

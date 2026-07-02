@@ -1,11 +1,32 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import {
+  defaultDeps,
   openProjectInWindow,
   WINDOW_LABEL_PREFIX,
   type ProjectWindowDeps,
 } from "./projectWindows";
+import { resetWindowRegistry } from "./windowRegistry";
+import { useProjectStore } from "../stores/projectStore";
+import type { Project } from "../types";
+
+// Capture WebviewWindow constructions so defaultDeps.createWindow is assertable without a webview.
+const createdWindows = vi.hoisted(
+  () => [] as Array<{ label: string; options: { title?: string } }>,
+);
+vi.mock("@tauri-apps/api/webviewWindow", () => ({
+  WebviewWindow: class {
+    // Match the surface defaultDeps consumes (getByLabel backs deps.getByLabel).
+    static getByLabel = vi.fn(async () => null);
+    constructor(label: string, options: { title?: string }) {
+      createdWindows.push({ label, options });
+    }
+    once() {
+      return Promise.resolve(() => {});
+    }
+  },
+}));
 
 function makeDeps(over: Partial<ProjectWindowDeps> = {}): ProjectWindowDeps {
   return {
@@ -77,6 +98,41 @@ describe("openProjectInWindow", () => {
     const r = await openProjectInWindow("p4", "new", deps);
     expect(r).toBe("created");
     expect(clear).toHaveBeenCalledWith("project-ghost");
+  });
+});
+
+describe("defaultDeps.createWindow", () => {
+  // These tests mutate shared module state (project store, window registry, the capture array);
+  // reset it so later tests in this file can't inherit leaked state.
+  afterEach(() => {
+    useProjectStore.setState({ projects: [] });
+    resetWindowRegistry();
+    createdWindows.length = 0;
+  });
+
+  it("titles a new window with the project's name, falling back to 'Sparkle' when unknown", () => {
+    useProjectStore.setState({
+      projects: [{ id: "p1", name: "sparkle-desktop" } as Project],
+    });
+    const deps = defaultDeps(vi.fn(), vi.fn(), "main");
+
+    deps.createWindow("p1");
+    expect(createdWindows).toHaveLength(1);
+    expect(createdWindows[0]?.options.title).toBe("sparkle-desktop");
+    expect(createdWindows[0]?.label.startsWith(WINDOW_LABEL_PREFIX)).toBe(true);
+
+    // A project id the store doesn't know keeps the pre-hydration default.
+    deps.createWindow("no-such-project");
+    expect(createdWindows[1]?.options.title).toBe("Sparkle");
+  });
+
+  it("falls back to 'Sparkle' for a blank project name instead of titling blank", () => {
+    useProjectStore.setState({
+      projects: [{ id: "p-blank", name: "   " } as Project],
+    });
+    const deps = defaultDeps(vi.fn(), vi.fn(), "main");
+    deps.createWindow("p-blank");
+    expect(createdWindows[0]?.options.title).toBe("Sparkle");
   });
 });
 

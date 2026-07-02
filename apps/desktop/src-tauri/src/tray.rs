@@ -246,7 +246,8 @@ pub fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
-fn toggle_popover(app: &AppHandle) {
+/// pub(crate): also invoked by the global capture shortcut registered in lib.rs.
+pub(crate) fn toggle_popover(app: &AppHandle) {
     let Some(win) = app.get_webview_window(TRAY_LABEL) else {
         return;
     };

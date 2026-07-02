@@ -245,6 +245,16 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
           stale_build_block_commits: 25,
           require_fresh_branch: true,
         },
+        capture: { popover_shortcut: "ctrl+shift+r" },
+        done: { description: null, criteria: [] },
+        delivered: {
+          description: null,
+          detected_method: null,
+          confidence: null,
+          confidence_note: null,
+          learned: false,
+          criteria: [],
+        },
       },
       warnings: ["w1", "w2"],
     });

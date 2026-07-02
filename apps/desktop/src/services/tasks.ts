@@ -112,12 +112,62 @@ export interface GenerateArgs {
   prdRelPath: string;
   /** Chief asset id for the PRD (label target), when known. */
   prdAssetId?: string;
+  /** Extra line(s) appended to the epic body after the PRD back-link — e.g. the capture
+   *  flow's `Screenshot: <repo-relative path>` reference. */
+  epicBodyExtra?: string;
 }
 
 export interface GenerateResult {
   epicId: string;
   taskIds: string[];
   updatedPrdContent: string;
+}
+
+/** Reject plans with no tasks or a title-less task BEFORE any bead is created — structuredJson
+ *  returns untyped LLM output, and a task with a missing title would create an "undefined" bead. */
+function validatePlanTasks(plan: TaskPlan): void {
+  if (!Array.isArray(plan.tasks) || plan.tasks.length === 0) {
+    throw new Error("Task plan was empty or malformed (need an epic and at least one task).");
+  }
+  if (plan.tasks.some((t) => !t?.title || !t.title.trim())) {
+    throw new Error("Task plan has a task with no title — refusing to create malformed beads.");
+  }
+}
+
+/** Create the plan's child task beads under `epicId` (sequentially, so ids line up with plan
+ *  indices), then add the dependency edges: task i (blocked) depends on task j (blocker). Skips
+ *  self/out-of-range edges and dedupes repeated indices so an LLM emitting `dependsOn: [0, 0]`
+ *  doesn't double-add. Returns the new task ids in plan order. */
+async function createChildTasks(
+  deps: Pick<GenerateDeps, "createBeadFull" | "beadDepAdd">,
+  projectPath: string,
+  epicId: string,
+  plan: TaskPlan,
+): Promise<string[]> {
+  const taskIds: string[] = [];
+  for (const t of plan.tasks) {
+    const id = await deps.createBeadFull(
+      projectPath,
+      t.title,
+      t.description ?? "",
+      "task",
+      epicId,
+      "",
+      "",
+    );
+    taskIds.push(id);
+  }
+
+  for (let i = 0; i < plan.tasks.length; i++) {
+    const dependsOn = plan.tasks[i]!.dependsOn ?? [];
+    const seen = new Set<number>();
+    for (const j of dependsOn) {
+      if (!Number.isInteger(j) || j < 0 || j >= taskIds.length || j === i || seen.has(j)) continue;
+      seen.add(j);
+      await deps.beadDepAdd(projectPath, taskIds[i]!, taskIds[j]!);
+    }
+  }
+  return taskIds;
 }
 
 /**
@@ -129,17 +179,16 @@ export async function generateTasks(
   args: GenerateArgs,
 ): Promise<GenerateResult> {
   const plan = await deps.structuredJson<TaskPlan>(TASK_PLAN_SYSTEM, args.prdContent);
-  if (!plan?.epic?.title || !Array.isArray(plan.tasks) || plan.tasks.length === 0) {
+  if (!plan?.epic?.title) {
     throw new Error("Task plan was empty or malformed (need an epic and at least one task).");
   }
-  // structuredJson returns untyped LLM output — a task with a missing title would create an
-  // "undefined" bead. Require a non-empty title per task; default the free-text bodies to "".
-  if (plan.tasks.some((t) => !t?.title || !t.title.trim())) {
-    throw new Error("Task plan has a task with no title — refusing to create malformed beads.");
-  }
+  validatePlanTasks(plan);
 
-  // 2. Epic — carries the PRD path so any bead can jump back to its spec.
-  const epicBody = `${plan.epic.description ?? ""}\n\nPRD file: ${args.prdRelPath}`;
+  // 2. Epic — carries the PRD path so any bead can jump back to its spec (and the capture
+  //    screenshot reference, when the caller passes one).
+  const epicBody =
+    `${plan.epic.description ?? ""}\n\nPRD file: ${args.prdRelPath}` +
+    (args.epicBodyExtra ? `\n${args.epicBodyExtra}` : "");
   const epicId = await deps.createBeadFull(
     args.projectPath,
     plan.epic.title,
@@ -150,32 +199,8 @@ export async function generateTasks(
     "think-build-loop",
   );
 
-  // 3. Children — created sequentially so their ids line up with the plan indices.
-  const taskIds: string[] = [];
-  for (const t of plan.tasks) {
-    const id = await deps.createBeadFull(
-      args.projectPath,
-      t.title,
-      t.description ?? "",
-      "task",
-      epicId,
-      "",
-      "",
-    );
-    taskIds.push(id);
-  }
-
-  // 4. Dependencies — task i (blocked) depends on task j (blocker). Skip self/out-of-range edges
-  //    and dedupe repeated indices so the LLM emitting `dependsOn: [0, 0]` doesn't double-add.
-  for (let i = 0; i < plan.tasks.length; i++) {
-    const dependsOn = plan.tasks[i]!.dependsOn ?? [];
-    const seen = new Set<number>();
-    for (const j of dependsOn) {
-      if (!Number.isInteger(j) || j < 0 || j >= taskIds.length || j === i || seen.has(j)) continue;
-      seen.add(j);
-      await deps.beadDepAdd(args.projectPath, taskIds[i]!, taskIds[j]!);
-    }
-  }
+  // 3-4. Children + dependency edges under the fresh epic.
+  const taskIds = await createChildTasks(deps, args.projectPath, epicId, plan);
 
   // 5. Write the epic + task ids back into the PRD frontmatter.
   const updatedPrdContent = updateFrontmatter(args.prdContent, { epic: epicId, tasks: taskIds });
@@ -202,7 +227,97 @@ export async function generateTasks(
   return { epicId, taskIds, updatedPrdContent };
 }
 
+// ── decomposeEpic — child tasks for an EXISTING epic (spec §7 auto-decompose) ──────────────────
+
+/** Pull the `PRD file: <relPath>` back-link out of an epic body (written by generateTasks /
+ *  capturePlan). Returns the repo-relative path plus the bare filename (what the read_prd /
+ *  write_prd commands take), or null when the epic carries no PRD reference. Pure. */
+export function parsePrdRef(body: string): { relPath: string; filename: string } | null {
+  // Capture to end of line, not \S+ — PRD paths may contain spaces (write_prd allows them).
+  const relPath = /PRD file:[ \t]*(.+)$/m.exec(body)?.[1]?.trim();
+  if (!relPath) return null;
+  const filename = relPath.split("/").pop();
+  if (!filename) return null;
+  return { relPath, filename };
+}
+
+export interface DecomposeDeps {
+  structuredJson: GenerateDeps["structuredJson"];
+  createBeadFull: GenerateDeps["createBeadFull"];
+  beadDepAdd: GenerateDeps["beadDepAdd"];
+  /** Wraps the Rust `read_prd` command; takes the BARE filename, returns the file content. */
+  readPrd: (projectPath: string, filename: string) => Promise<string>;
+  writePrd: GenerateDeps["writePrd"];
+}
+
+export interface DecomposeArgs {
+  projectPath: string;
+  /** The existing epic bead to decompose (id/title/body — the Bead shape, structurally). */
+  epic: { id: string; title: string; description: string };
+}
+
+export interface DecomposeResult {
+  taskIds: string[];
+}
+
+/**
+ * Decompose an EXISTING epic into child task beads + dependency edges — the auto-decompose
+ * counterpart of generateTasks (which creates the epic itself). Plans from the epic's PRD content
+ * when the body carries a `PRD file:` back-link (falling back to title+body if the read fails or
+ * no PRD exists), creates the children under the existing epic id, and writes the epic/task ids
+ * back into the PRD frontmatter when a PRD was read. Errors propagate — the caller (the decompose
+ * sweep) owns the guard-label bookkeeping.
+ */
+export async function decomposeEpic(
+  deps: DecomposeDeps,
+  args: DecomposeArgs,
+): Promise<DecomposeResult> {
+  const { projectPath, epic } = args;
+
+  // Prefer the full PRD as planning input; a failed or EMPTY read degrades to title+body, never
+  // throws — an epic whose PRD was moved/deleted/blanked still decomposes from the bead itself.
+  // `prdContent !== null` is the single "a PRD was read" signal for both the plan input and the
+  // write-back below.
+  const ref = parsePrdRef(epic.description);
+  let prdContent: string | null = null;
+  if (ref) {
+    try {
+      const raw = await deps.readPrd(projectPath, ref.filename);
+      prdContent = raw.trim() ? raw : null;
+    } catch {
+      prdContent = null;
+    }
+  }
+  const planInput = prdContent ?? `# ${epic.title}\n\n${epic.description}`;
+
+  const plan = await deps.structuredJson<TaskPlan>(TASK_PLAN_SYSTEM, planInput);
+  if (!plan || typeof plan !== "object") {
+    throw new Error("Task plan was empty or malformed (need an epic and at least one task).");
+  }
+  validatePlanTasks(plan);
+
+  const taskIds = await createChildTasks(deps, projectPath, epic.id, plan);
+
+  // Write-back only when we actually read a PRD: patching a file we never saw would clobber it.
+  // Re-read right before patching — the AI call above takes seconds, and rewriting from the
+  // planning-time snapshot would silently revert any edit made in that window. If the re-read
+  // fails the planning copy still stands in (better a slightly-stale write than a lost linkage).
+  if (prdContent !== null && ref) {
+    const fresh = await deps.readPrd(projectPath, ref.filename).catch(() => prdContent!);
+    const updated = updateFrontmatter(fresh, { epic: epic.id, tasks: taskIds });
+    await deps.writePrd(projectPath, ref.filename, updated);
+  }
+
+  return { taskIds };
+}
+
 // --- thin invoke wrappers so the UI can pass real backends as deps ----------------------------
+
+/** Read a doc from the project's `PRD/` directory. `filename` must be bare (no slashes); wraps the
+ *  Rust `read_prd` command. */
+export async function readPrd(projectPath: string, filename: string): Promise<string> {
+  return invoke<string>("read_prd", { projectPath, filename });
+}
 
 /** Create a bead with full options; returns the new id. Wraps the Rust `create_bead_full`. */
 export async function createBeadFull(

@@ -182,6 +182,9 @@ fn guard_resize_size(id: &str, cols: u16, rows: u16) -> (u16, u16) {
 
 /// Spawn `command` in a PTY. Output streams to the frontend via the `pty:output`
 /// event; `pty:exit` fires when the process ends.
+// too_many_arguments: each arg is a distinct field of the frontend's invoke payload; bundling
+// them into a struct would only move the count into a struct literal at the one call site.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn pty_spawn(
     app: AppHandle,

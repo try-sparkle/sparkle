@@ -5,6 +5,7 @@ import { writePty } from "../pty";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { appendNote, createTask } from "../services/projectFs";
 import { useHandoffStore } from "../stores/handoffStore";
+import type { CaptureAttachment } from "../capture/types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -25,8 +26,14 @@ export function truncateTitle(text: string, max = 80): string {
   return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : firstLine;
 }
 
-/** Open (or reuse) the project's singleton think agent and queue an initial prompt. */
-export function openThink(projectId: string, text: string, autoSend: boolean): void {
+/** Open (or reuse) the project's singleton think agent and queue an initial prompt.
+ *  `attachments` (capture screenshots) ride along on the handoff when provided. */
+export function openThink(
+  projectId: string,
+  text: string,
+  autoSend: boolean,
+  attachments?: CaptureAttachment[],
+): void {
   const ps = useProjectStore.getState();
   const project = ps.projects.find((p) => p.id === projectId);
   if (!project) return;
@@ -35,7 +42,11 @@ export function openThink(projectId: string, text: string, autoSend: boolean): v
   useUiStore.getState().setActiveSpecial(null);
   ps.selectAgent(projectId, id);
   useRuntimeStore.getState().open(id);
-  useHandoffStore.getState().setPending({ projectId, text, autoSend });
+  useHandoffStore
+    .getState()
+    .setPending(
+      attachments?.length ? { projectId, text, autoSend, attachments } : { projectId, text, autoSend },
+    );
 }
 
 export function thinkWith(projectId: string, text: string): void {

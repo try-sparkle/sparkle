@@ -24,7 +24,7 @@ export const PAYWALL_URL = `${WEB_BASE_URL}/paywall`;
 // OS denial. Left unhandled (callers used `() => void openSignIn()`) that surfaced as an "Unhandled
 // rejection: Not allowed to open url" burst AND a dead button with no feedback. Swallow + log here
 // and report success so the caller can show a manual-link fallback instead.
-async function launch(url: string): Promise<boolean> {
+export async function launch(url: string): Promise<boolean> {
   try {
     await openUrl(url);
     return true;
@@ -74,6 +74,39 @@ export async function fetchMe(): Promise<Me | null> {
   } catch {
     return null;
   }
+}
+
+/** Mint a 6-char pairing code for signing a phone in (15-min TTL, single-use). Rejects with the
+ *  Rust error string on failure (not signed in, relay unreachable). */
+export async function mintPairCode(): Promise<string> {
+  return await invoke<string>("desktop_pair_code");
+}
+
+/** One paired device as reported by the relay device registry (GET /devices). */
+export interface PairedDevice {
+  id: string;
+  name: string;
+  platform: string;
+  createdAt: string;
+  lastSeenAt: string | null;
+  /** True when this row is the caller — i.e. this Mac's own token. */
+  current: boolean;
+}
+
+/** List devices paired to this account. Rejects with the stable string "devices_unsupported"
+ *  when the deployed relay predates the device registry (the UI shows a graceful pending state). */
+export async function listPairedDevices(): Promise<PairedDevice[]> {
+  const resp = await invoke<{ devices?: PairedDevice[] }>("list_paired_devices");
+  if (!Array.isArray(resp?.devices)) {
+    throw new Error("unexpected device list response from relay");
+  }
+  return resp.devices;
+}
+
+/** Unpair one device by id (server enforces it belongs to this user). Idempotent: the Rust
+ *  side treats a 404 (already revoked, or pre-registry relay) as success. */
+export async function revokePairedDevice(id: string): Promise<void> {
+  await invoke("revoke_paired_device", { id });
 }
 
 /** Clear the stored token (sign out locally). */

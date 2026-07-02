@@ -7,6 +7,7 @@
 //! Two layered files, both optional:
 //!   - global:  `<app_data>/config.toml`         — machine/user prefs (all sections)
 //!   - project: `<repo>/.sparkle/config.toml`     — per-repo `[workflow]` overrides only
+//!
 //! Precedence: **defaults → global → per-project**. Per-project `[workers]`/`[ai]` are
 //! ignored (with a warning) because they are machine-wide, not repo-scoped.
 //!
@@ -81,6 +82,47 @@ pub struct FreshnessConfig {
     pub require_fresh_branch: bool,
 }
 
+/// Menu-bar capture flow. Machine-wide (like [workers]/[ai]): the OS registers ONE global
+/// hotkey per machine, so a per-project value is meaningless and ignored with a warning.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CaptureConfig {
+    /// Global accelerator toggling the menu-bar popover (tauri-plugin-global-shortcut
+    /// syntax, e.g. "ctrl+shift+r", "alt+f9"). Unparseable/taken → warn + no shortcut.
+    pub popover_shortcut: String,
+}
+
+/// One criterion in a stage definition. `kind` is "auto" (Sparkle observes it via `signal`)
+/// or "manual" (a human ticks it). `signal` is a known AutoSignal id, required iff kind="auto".
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StageCriterion {
+    pub text: String,
+    pub kind: String,
+    pub signal: Option<String>,
+}
+
+/// Per-project definition of what "Done" means. Undefined = None description + empty criteria.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DoneConfig {
+    pub description: Option<String>,
+    pub criteria: Vec<StageCriterion>,
+}
+
+/// Per-project definition of what "Delivered" means, plus the DETECTED production-ship signal
+/// (method/confidence) and the learn-then-automate flag. Undefined = all None/false/empty.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DeliveredConfig {
+    pub description: Option<String>,
+    pub detected_method: Option<String>,
+    pub confidence: Option<String>,
+    pub confidence_note: Option<String>,
+    pub learned: bool,
+    pub criteria: Vec<StageCriterion>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SparkleConfig {
@@ -88,6 +130,11 @@ pub struct SparkleConfig {
     pub workers: WorkersConfig,
     pub ai: AiConfig,
     pub freshness: FreshnessConfig,
+    pub capture: CaptureConfig,
+    /// Per-project "Done" stage definition (see the Definable Done & Delivered feature).
+    pub done: DoneConfig,
+    /// Per-project "Delivered" stage definition + detected production-ship signal.
+    pub delivered: DeliveredConfig,
 }
 
 impl Default for SparkleConfig {
@@ -122,6 +169,18 @@ impl Default for SparkleConfig {
                 staleness_warn_commits: 25,
                 stale_build_block_commits: 25,
                 require_fresh_branch: true,
+            },
+            capture: CaptureConfig { popover_shortcut: "ctrl+shift+r".into() },
+            // Undefined by default: every project starts with no Done/Delivered definition until
+            // the user defines one (see the Definable Done & Delivered feature).
+            done: DoneConfig { description: None, criteria: Vec::new() },
+            delivered: DeliveredConfig {
+                description: None,
+                detected_method: None,
+                confidence: None,
+                confidence_note: None,
+                learned: false,
+                criteria: Vec::new(),
             },
         }
     }
@@ -177,11 +236,42 @@ struct PartialFreshness {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialCapture {
+    popover_shortcut: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialStageCriterion {
+    text: Option<String>,
+    kind: Option<String>,
+    signal: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialDone {
+    description: Option<String>,
+    criteria: Option<Vec<PartialStageCriterion>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialDelivered {
+    description: Option<String>,
+    detected_method: Option<String>,
+    confidence: Option<String>,
+    confidence_note: Option<String>,
+    learned: Option<bool>,
+    criteria: Option<Vec<PartialStageCriterion>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialConfig {
     workflow: Option<PartialWorkflow>,
     workers: Option<PartialWorkers>,
     ai: Option<PartialAi>,
     freshness: Option<PartialFreshness>,
+    capture: Option<PartialCapture>,
+    done: Option<PartialDone>,
+    delivered: Option<PartialDelivered>,
 }
 
 /// Parse one layer's TOML text into a partial config. Err carries a human-readable reason —
@@ -242,6 +332,12 @@ fn apply_freshness(into: &mut FreshnessConfig, p: Option<PartialFreshness>) {
     }
 }
 
+fn apply_capture(into: &mut CaptureConfig, p: Option<PartialCapture>) {
+    if let Some(PartialCapture { popover_shortcut: Some(v) }) = p {
+        into.popover_shortcut = v;
+    }
+}
+
 fn apply_ai(into: &mut AiConfig, p: Option<PartialAi>) {
     let Some(p) = p else { return };
     if let Some(v) = p.auto_rename {
@@ -258,6 +354,51 @@ fn apply_ai(into: &mut AiConfig, p: Option<PartialAi>) {
     }
     if let Some(v) = p.suggested_actions {
         into.suggested_actions = v;
+    }
+}
+
+/// Materialize partial criteria into effective ones. A missing `text`/`kind` degrades to an empty
+/// string rather than erroring (preserves the "unknown/missing never errors" contract); downstream
+/// units validate/normalize kind + signal.
+fn apply_criteria(p: Vec<PartialStageCriterion>) -> Vec<StageCriterion> {
+    p.into_iter()
+        .map(|c| StageCriterion {
+            text: c.text.unwrap_or_default(),
+            kind: c.kind.unwrap_or_default(),
+            signal: c.signal,
+        })
+        .collect()
+}
+
+fn apply_done(into: &mut DoneConfig, p: Option<PartialDone>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.description {
+        into.description = Some(v);
+    }
+    if let Some(c) = p.criteria {
+        into.criteria = apply_criteria(c);
+    }
+}
+
+fn apply_delivered(into: &mut DeliveredConfig, p: Option<PartialDelivered>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.description {
+        into.description = Some(v);
+    }
+    if let Some(v) = p.detected_method {
+        into.detected_method = Some(v);
+    }
+    if let Some(v) = p.confidence {
+        into.confidence = Some(v);
+    }
+    if let Some(v) = p.confidence_note {
+        into.confidence_note = Some(v);
+    }
+    if let Some(v) = p.learned {
+        into.learned = v;
+    }
+    if let Some(c) = p.criteria {
+        into.criteria = apply_criteria(c);
     }
 }
 
@@ -300,6 +441,9 @@ fn build_effective(
                 apply_workers(&mut cfg.workers, p.workers);
                 apply_ai(&mut cfg.ai, p.ai);
                 apply_freshness(&mut cfg.freshness, p.freshness);
+                apply_capture(&mut cfg.capture, p.capture);
+                apply_done(&mut cfg.done, p.done);
+                apply_delivered(&mut cfg.delivered, p.delivered);
             }
             Err(e) => {
                 warnings.push(format!("global config.toml has a syntax error and was ignored: {e}"));
@@ -325,9 +469,21 @@ fn build_effective(
                             .to_string(),
                     );
                 }
-                // Per-project layer: [workflow] and [freshness] are repo-scoped and may override.
+                if p.capture.is_some() {
+                    warnings.push(
+                        "[capture] in a per-project .sparkle/config.toml is ignored — the \
+                         global shortcut is a machine-wide setting; set it in the global \
+                         config.toml"
+                            .to_string(),
+                    );
+                }
+                // Per-project layer: [workflow], [freshness], and the [done]/[delivered] stage
+                // definitions are repo-scoped and may override (the stage definitions are
+                // per-project BY DESIGN — they describe how *this* repo ships).
                 apply_workflow(&mut cfg.workflow, p.workflow);
                 apply_freshness(&mut cfg.freshness, p.freshness);
+                apply_done(&mut cfg.done, p.done);
+                apply_delivered(&mut cfg.delivered, p.delivered);
             }
             Err(e) => {
                 warnings.push(format!(
@@ -477,6 +633,14 @@ brainstorm      = true   # show the Think agent (chat with Chief)
 composer        = true   # use the AI-enhanced composer; off = a plain terminal input
 # suggested_actions = true   # show one-click suggested action buttons in the composer
 
+# --- Menu-bar capture (per-machine; ignored in a project file) --------------------------
+[capture]
+# Global keyboard shortcut that toggles the Sparkle menu-bar popover from anywhere.
+# Format: modifiers+key, e.g. "ctrl+shift+r", "alt+f9", "cmd+shift+7". If the value can't
+# be parsed or the combo is taken by another app, Sparkle logs a warning and runs without
+# a shortcut (the menu-bar icon still works).
+popover_shortcut = "ctrl+shift+r"
+
 # --- Branch/build freshness guardrails (repo-scoped; overridable in a project file) ----
 # These stop work from being done on — or a DMG from being shipped from — a branch that has
 # fallen far behind origin/main (the stale-build trap).
@@ -491,6 +655,36 @@ stale_build_block_commits = 25
 # Advisory reminder that new work should start from a fresh-from-origin/main branch
 # (e.g. scripts/new-feature.sh), not an inherited stale one.
 require_fresh_branch      = true
+
+# --- What "Done" and "Delivered" mean for THIS project (repo-scoped) --------------------
+# These two sections let each project define its own Plan/Tasks board semantics. They are
+# normally written by Sparkle's in-app "Define Done/Delivered" flow (a short chat), not by
+# hand — but you can edit them here. Leaving them out (as below) means "undefined": the board
+# behaves with its built-in defaults and offers a Define button. Example shapes:
+#
+# [done]
+# description = "Merged into the remote main branch."
+# [[done.criteria]]
+# text   = "Merged into origin/main"
+# kind   = "auto"              # "auto" = Sparkle observes it | "manual" = a human ticks it
+# signal = "merged_to_main"    # required iff kind="auto"; one of the known auto-signal ids
+# [[done.criteria]]
+# text = "Reviewed by a teammate"
+# kind = "manual"
+#
+# [delivered]
+# description = "Shipped to production."
+# detected_method = "release_tag"   # how this repo ships; DETECTED per project
+# confidence      = "high"          # high | medium | low | none
+# confidence_note = "Ships via GitHub Releases (v* tags)."
+# learned         = false           # true once a human confirms >=1 real delivery for this signal
+# [[delivered.criteria]]
+# text   = "Commit is in a cut release"
+# kind   = "auto"
+# signal = "in_release"
+# [[delivered.criteria]]
+# text = "Deployed to prod verified"
+# kind = "manual"
 "#;
 
 /// Convert a JSON scalar from the frontend into a `toml_edit` value. Only bool / integer /
@@ -603,6 +797,114 @@ pub fn reset(app_data: &Path) -> Result<(), String> {
     write_atomic(&global_path(app_data), DEFAULT_TEMPLATE)
 }
 
+// ---- per-project stage-definition writer (Definable Done & Delivered) --------------------------
+// Unlike the scalar dotted setter, a stage definition is an ENTIRE `[done]`/`[delivered]` table
+// with a `[[<key>.criteria]]` array-of-tables — not expressible as a dotted scalar. This writes the
+// whole section into the PER-PROJECT `.sparkle/config.toml` (the stage definitions are repo-scoped),
+// insert-or-replacing it while preserving the rest of the file (comments + other sections).
+
+/// Build the `[[<key>.criteria]]` array-of-tables from parsed partial criteria. A `manual`
+/// criterion carries no `signal`, so it's emitted only when present.
+fn criteria_array_of_tables(criteria: &Option<Vec<PartialStageCriterion>>) -> toml_edit::ArrayOfTables {
+    let mut aot = toml_edit::ArrayOfTables::new();
+    if let Some(list) = criteria {
+        for c in list {
+            let mut t = toml_edit::Table::new();
+            t["text"] = toml_edit::value(c.text.clone().unwrap_or_default());
+            t["kind"] = toml_edit::value(c.kind.clone().unwrap_or_default());
+            if let Some(sig) = &c.signal {
+                t["signal"] = toml_edit::value(sig.clone());
+            }
+            aot.push(t);
+        }
+    }
+    aot
+}
+
+/// Build the `[done]` table (description + criteria) from a parsed partial.
+fn done_table(p: &PartialDone) -> toml_edit::Table {
+    let mut t = toml_edit::Table::new();
+    if let Some(d) = &p.description {
+        t["description"] = toml_edit::value(d.clone());
+    }
+    t["criteria"] = toml_edit::Item::ArrayOfTables(criteria_array_of_tables(&p.criteria));
+    t
+}
+
+/// Build the `[delivered]` table (description + detected signal metadata + criteria) from a parsed
+/// partial.
+fn delivered_table(p: &PartialDelivered) -> toml_edit::Table {
+    let mut t = toml_edit::Table::new();
+    if let Some(d) = &p.description {
+        t["description"] = toml_edit::value(d.clone());
+    }
+    if let Some(m) = &p.detected_method {
+        t["detected_method"] = toml_edit::value(m.clone());
+    }
+    if let Some(c) = &p.confidence {
+        t["confidence"] = toml_edit::value(c.clone());
+    }
+    if let Some(n) = &p.confidence_note {
+        t["confidence_note"] = toml_edit::value(n.clone());
+    }
+    if let Some(l) = p.learned {
+        t["learned"] = toml_edit::value(l);
+    }
+    t["criteria"] = toml_edit::Item::ArrayOfTables(criteria_array_of_tables(&p.criteria));
+    t
+}
+
+/// Insert-or-replace the `[done]`/`[delivered]` stage definition in `<project_root>/.sparkle/
+/// config.toml`, preserving the rest of the file (comments + unrelated sections). `definition` is
+/// the snake_case config shape (see `PartialDone`/`PartialDelivered`); it is validated against the
+/// typed layer both up front (rejecting wrong types) and after rendering (so a malformed result can
+/// never be persisted). Written atomically. Pure over the filesystem so it's unit-testable.
+fn write_stage_definition(
+    project_root: &str,
+    key: &str,
+    definition: &serde_json::Value,
+) -> Result<(), String> {
+    // Validate the incoming JSON against the typed partial schema and build the section table.
+    let table = match key {
+        "done" => {
+            let p: PartialDone = serde_json::from_value(definition.clone())
+                .map_err(|e| format!("invalid [done] definition: {e}"))?;
+            done_table(&p)
+        }
+        "delivered" => {
+            let p: PartialDelivered = serde_json::from_value(definition.clone())
+                .map_err(|e| format!("invalid [delivered] definition: {e}"))?;
+            delivered_table(&p)
+        }
+        other => {
+            return Err(format!(
+                "unknown stage key '{other}' (expected \"done\" or \"delivered\")"
+            ))
+        }
+    };
+
+    let path = project_path(project_root);
+    // Preserve the existing project file (comments + other sections). If it exists but is
+    // unparseable, refuse rather than clobber a hand-edited file; if absent, start from empty.
+    let mut doc = match read_if_exists(&path) {
+        Some(text) => text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+            format!("existing .sparkle/config.toml is not valid TOML; fix it before defining a stage: {e}")
+        })?,
+        None => toml_edit::DocumentMut::new(),
+    };
+    // Insert-or-replace: assigning the key REPLACES the whole prior `[done]`/`[delivered]` table
+    // (and its `[[<key>.criteria]]`) in place, rather than appending a second one.
+    doc[key] = toml_edit::Item::Table(table);
+
+    let text = doc.to_string();
+    // Round-trip validation: the rendered file must parse cleanly through the typed layer before we
+    // persist it (matches the write_text / set_value contract — never write an invalid config).
+    parse_layer(&text).map_err(|e| {
+        format!("rejected: that stage definition would make config.toml invalid: {e}")
+    })?;
+    write_atomic(&path, &text)
+}
+
 // ============================ Tauri command layer + watcher =======================
 
 use tauri::{AppHandle, Emitter};
@@ -698,6 +1000,23 @@ pub fn reset_config(app: AppHandle) -> Result<(), String> {
 pub fn read_config_text(app: AppHandle) -> Result<String, String> {
     let ad = app_data(&app)?;
     Ok(read_if_exists(&global_path(&ad)).unwrap_or_else(|| DEFAULT_TEMPLATE.to_string()))
+}
+
+/// Insert-or-replace a per-project `[done]`/`[delivered]` stage definition in the project's
+/// `.sparkle/config.toml`, preserving comments + other sections. `key` must be "done" or
+/// "delivered"; `definition` is the snake_case config shape (description, criteria[{text,kind,
+/// signal}], and for delivered: detected_method, confidence, confidence_note, learned). Emits a
+/// `config-changed` carrying the fresh per-project effective config so the board/modal re-render.
+#[tauri::command]
+pub fn set_stage_definition(
+    app: AppHandle,
+    project_root: String,
+    key: String,
+    definition: serde_json::Value,
+) -> Result<(), String> {
+    write_stage_definition(&project_root, &key, &definition)?;
+    let _ = app.emit("config-changed", for_project(&project_root));
+    Ok(())
 }
 
 /// Load the global config at startup and watch it for live reload. Call once from `setup`.
@@ -863,6 +1182,31 @@ mod tests {
     }
 
     #[test]
+    fn capture_defaults_and_overrides() {
+        // Absent [capture] section → the built-in default shortcut.
+        let (cfg, _, _) = effective(None, None);
+        assert_eq!(cfg.capture.popover_shortcut, "ctrl+shift+r");
+
+        // Global layer overrides it.
+        let g = "[capture]\npopover_shortcut = \"alt+f9\"\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.capture.popover_shortcut, "alt+f9");
+    }
+
+    #[test]
+    fn project_capture_is_ignored_with_warning() {
+        // A global keyboard shortcut is machine-wide, not repo-scoped — a per-project
+        // [capture] section is ignored (like [workers]/[ai]) so two repos can't fight
+        // over which accelerator the one OS-level hotkey uses.
+        let p = "[capture]\npopover_shortcut = \"alt+f9\"\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert_eq!(cfg.capture.popover_shortcut, "ctrl+shift+r");
+        assert!(warns.iter().any(|w| w.contains("[capture]")));
+    }
+
+    #[test]
     fn validate_warns_when_block_is_below_warn() {
         // block (5) < warn (25 default) is incoherent — surface a non-fatal warning.
         let g = "[freshness]\nstale_build_block_commits = 5\n";
@@ -877,6 +1221,87 @@ mod tests {
         assert!(!hard);
         assert!(warns.is_empty());
         assert_eq!(cfg, SparkleConfig::default());
+    }
+
+    #[test]
+    fn done_and_delivered_default_to_undefined() {
+        let (cfg, _, _) = effective(None, None);
+        assert_eq!(cfg.done.description, None);
+        assert!(cfg.done.criteria.is_empty());
+        assert_eq!(cfg.delivered.description, None);
+        assert_eq!(cfg.delivered.detected_method, None);
+        assert_eq!(cfg.delivered.confidence, None);
+        assert_eq!(cfg.delivered.confidence_note, None);
+        assert!(!cfg.delivered.learned);
+        assert!(cfg.delivered.criteria.is_empty());
+    }
+
+    #[test]
+    fn done_and_delivered_honored_per_project_and_global() {
+        // A definition with a description + one auto criterion and one manual criterion per stage.
+        let toml = r#"
+            [done]
+            description = "Merged into origin/main."
+            [[done.criteria]]
+            text   = "Merged into origin/main"
+            kind   = "auto"
+            signal = "merged_to_main"
+            [[done.criteria]]
+            text = "Reviewed by a teammate"
+            kind = "manual"
+
+            [delivered]
+            description = "Shipped to production."
+            detected_method = "release_tag"
+            confidence      = "high"
+            confidence_note = "Ships via GitHub Releases (v* tags)."
+            learned         = true
+            [[delivered.criteria]]
+            text   = "Commit is in a cut release"
+            kind   = "auto"
+            signal = "in_release"
+            [[delivered.criteria]]
+            text = "Deployed to prod verified"
+            kind = "manual"
+        "#;
+
+        // (1) Per-project honoring — [done]/[delivered] are repo-scoped BY DESIGN (unlike
+        // [workers]/[ai]/[capture], which are ignored in a project file with a warning).
+        let (cfg, warns, hard) = effective(None, Some(toml));
+        assert!(!hard);
+        assert!(
+            !warns.iter().any(|w| w.contains("[done]") || w.contains("[delivered]")),
+            "stage definitions must NOT be reported as ignored in a project file"
+        );
+
+        assert_eq!(cfg.done.description.as_deref(), Some("Merged into origin/main."));
+        assert_eq!(cfg.done.criteria.len(), 2);
+        assert_eq!(cfg.done.criteria[0].text, "Merged into origin/main");
+        assert_eq!(cfg.done.criteria[0].kind, "auto");
+        assert_eq!(cfg.done.criteria[0].signal.as_deref(), Some("merged_to_main"));
+        assert_eq!(cfg.done.criteria[1].kind, "manual");
+        assert_eq!(cfg.done.criteria[1].signal, None); // manual → no signal
+
+        assert_eq!(cfg.delivered.description.as_deref(), Some("Shipped to production."));
+        assert_eq!(cfg.delivered.detected_method.as_deref(), Some("release_tag"));
+        assert_eq!(cfg.delivered.confidence.as_deref(), Some("high"));
+        assert_eq!(
+            cfg.delivered.confidence_note.as_deref(),
+            Some("Ships via GitHub Releases (v* tags).")
+        );
+        assert!(cfg.delivered.learned);
+        assert_eq!(cfg.delivered.criteria.len(), 2);
+        assert_eq!(cfg.delivered.criteria[0].signal.as_deref(), Some("in_release"));
+        assert_eq!(cfg.delivered.criteria[1].kind, "manual");
+        assert_eq!(cfg.delivered.criteria[1].signal, None);
+
+        // (2) The SAME sections in the GLOBAL file are also honored (global holds defaults).
+        let (gcfg, gwarns, ghard) = effective(Some(toml), None);
+        assert!(!ghard);
+        assert!(gwarns.is_empty());
+        assert_eq!(gcfg.done.criteria.len(), 2);
+        assert_eq!(gcfg.delivered.confidence.as_deref(), Some("high"));
+        assert!(gcfg.delivered.learned);
     }
 
     #[test]
@@ -1019,6 +1444,101 @@ mod tests {
         let (cfg, _, hard) = effective(Some(&doc.to_string()), None);
         assert!(!hard, "fallback document must be valid TOML");
         assert_eq!(cfg, SparkleConfig::default());
+    }
+
+    #[test]
+    fn set_stage_definition_round_trips_and_replaces_preserving_other_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let path = project_path(&root);
+        // Pre-existing per-project file with an UNRELATED [workflow] section + a comment, which the
+        // stage-definition write must leave byte-intact.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# keep this comment\n[workflow]\nrequire_pr = false\n").unwrap();
+
+        // A [delivered] def: description + one AUTO + one MANUAL criterion + confidence metadata.
+        let def = serde_json::json!({
+            "description": "Shipped to production.",
+            "detected_method": "release_tag",
+            "confidence": "high",
+            "confidence_note": "Ships via GitHub Releases (v* tags).",
+            "learned": false,
+            "criteria": [
+                { "text": "Commit is in a cut release", "kind": "auto", "signal": "in_release" },
+                { "text": "Deployed to prod verified", "kind": "manual", "signal": null }
+            ]
+        });
+        write_stage_definition(&root, "delivered", &def).unwrap();
+
+        // (1) Round-trips through build_effective (per-project honoring, project_root = temp).
+        let ptext = std::fs::read_to_string(&path).unwrap();
+        let (cfg, _, hard) = build_effective(SparkleConfig::default(), None, Some(&ptext));
+        assert!(!hard);
+        assert_eq!(cfg.delivered.description.as_deref(), Some("Shipped to production."));
+        assert_eq!(cfg.delivered.detected_method.as_deref(), Some("release_tag"));
+        assert_eq!(cfg.delivered.confidence.as_deref(), Some("high"));
+        assert_eq!(
+            cfg.delivered.confidence_note.as_deref(),
+            Some("Ships via GitHub Releases (v* tags).")
+        );
+        assert!(!cfg.delivered.learned);
+        assert_eq!(cfg.delivered.criteria.len(), 2);
+        assert_eq!(cfg.delivered.criteria[0].kind, "auto");
+        assert_eq!(cfg.delivered.criteria[0].signal.as_deref(), Some("in_release"));
+        assert_eq!(cfg.delivered.criteria[1].kind, "manual");
+        assert_eq!(cfg.delivered.criteria[1].signal, None);
+        // The unrelated [workflow] override still applies + the comment survived.
+        assert!(!cfg.workflow.require_pr);
+        assert!(ptext.contains("# keep this comment"));
+
+        // (2) Writing AGAIN REPLACES (not appends) the [delivered] section.
+        let def2 = serde_json::json!({
+            "description": "Only one criterion now.",
+            "detected_method": "ci_deploy",
+            "confidence": "medium",
+            "confidence_note": null,
+            "learned": true,
+            "criteria": [ { "text": "Deployed by CI", "kind": "auto", "signal": "in_release" } ]
+        });
+        write_stage_definition(&root, "delivered", &def2).unwrap();
+        let ptext2 = std::fs::read_to_string(&path).unwrap();
+        // Exactly ONE [delivered] header — replaced in place, not appended.
+        assert_eq!(ptext2.matches("[delivered]").count(), 1, "section replaced, not appended");
+        let (cfg2, _, _) = build_effective(SparkleConfig::default(), None, Some(&ptext2));
+        assert_eq!(cfg2.delivered.description.as_deref(), Some("Only one criterion now."));
+        assert_eq!(cfg2.delivered.detected_method.as_deref(), Some("ci_deploy"));
+        assert!(cfg2.delivered.learned);
+        assert_eq!(cfg2.delivered.criteria.len(), 1);
+        // The old confidence_note key is gone (wholesale replace), not carried over.
+        assert_eq!(cfg2.delivered.confidence_note, None);
+        // [workflow] + comment STILL intact after the second write.
+        assert!(ptext2.contains("# keep this comment"));
+        assert!(!cfg2.workflow.require_pr);
+
+        // (3) An unknown stage key is rejected (only done/delivered allowed).
+        assert!(write_stage_definition(&root, "backlog", &def2).is_err());
+    }
+
+    #[test]
+    fn set_stage_definition_creates_missing_sparkle_dir_and_file() {
+        // No pre-existing .sparkle dir: the writer must create it and the file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let def = serde_json::json!({
+            "description": "Merged into origin/main.",
+            "criteria": [
+                { "text": "Merged into origin/main", "kind": "auto", "signal": "merged_to_main" },
+                { "text": "Reviewed by a teammate", "kind": "manual", "signal": null }
+            ]
+        });
+        write_stage_definition(&root, "done", &def).unwrap();
+        let ptext = std::fs::read_to_string(project_path(&root)).unwrap();
+        let (cfg, _, hard) = build_effective(SparkleConfig::default(), None, Some(&ptext));
+        assert!(!hard);
+        assert_eq!(cfg.done.description.as_deref(), Some("Merged into origin/main."));
+        assert_eq!(cfg.done.criteria.len(), 2);
+        assert_eq!(cfg.done.criteria[0].signal.as_deref(), Some("merged_to_main"));
+        assert_eq!(cfg.done.criteria[1].kind, "manual");
     }
 
     #[test]

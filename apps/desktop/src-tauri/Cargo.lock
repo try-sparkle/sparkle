@@ -4464,7 +4464,7 @@ dependencies = [
 
 [[package]]
 name = "sparkle"
-version = "0.11.0"
+version = "0.15.1"
 dependencies = [
  "base64 0.22.1",
  "bzip2",
@@ -4472,9 +4472,11 @@ dependencies = [
  "cpal",
  "hound",
  "keyring",
+ "libc",
  "mac-notification-sys",
  "notify",
  "portable-pty",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

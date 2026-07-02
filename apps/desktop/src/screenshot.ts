@@ -25,3 +25,12 @@ export async function captureScreenRegion(): Promise<Screenshot | null> {
   if (!res) return null;
   return { path: res.path, dataUrl: res.data_url };
 }
+
+/**
+ * Hand a captured shot to the dedicated `capture` window (src-tauri/src/capture_window.rs):
+ * positions it on the cursor's monitor, shows it, and emits `capture://shot` to its webview.
+ * CaptureShot is serde camelCase, so the invoke payload is `{ shot: { path, dataUrl } }`.
+ */
+export async function showCaptureWindow(shot: Screenshot): Promise<void> {
+  await invoke("show_capture_window", { shot: { path: shot.path, dataUrl: shot.dataUrl } });
+}

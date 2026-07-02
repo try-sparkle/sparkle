@@ -90,8 +90,6 @@ export function AiFeaturesMenu() {
   const aiBrainstorm = useSettingsStore((s) => s.aiBrainstorm);
   const aiComposer = useSettingsStore((s) => s.aiComposer);
   const aiSuggestedActions = useSettingsStore((s) => s.aiSuggestedActions);
-  const autoApplyUpdates = useSettingsStore((s) => s.autoApplyUpdates);
-  const setAutoApplyUpdates = useSettingsStore((s) => s.setAutoApplyUpdates);
 
   const flags = { aiAutoRename, cloudDictation, aiBrainstorm, aiComposer, aiSuggestedActions };
   const mode = aiFeatureMode(flags);
@@ -119,13 +117,6 @@ export function AiFeaturesMenu() {
             onToggle={() => setAiFeature(key, !valueByKey[key])}
           />
         ))}
-        {/* Not an AI feature, but lives with the other app toggles: silent auto-apply of desktop
-            updates (default on). Off → the updater shows a "Restart to apply" prompt instead. */}
-        <SettingCheckbox
-          label="Automatically apply updates"
-          checked={autoApplyUpdates}
-          onToggle={() => setAutoApplyUpdates(!autoApplyUpdates)}
-        />
       </div>
     </div>
   );

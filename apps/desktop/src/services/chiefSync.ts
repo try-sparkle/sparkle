@@ -6,7 +6,14 @@
 // `syncProjectMarkdown` is pure glue over invoke + the chief client (unit-tested). The
 // store-reading wrapper that fires it from the branch-status poll lives in runtimeStore.
 import { invoke } from "@tauri-apps/api/core";
-import { ensureChiefProject, uploadAsset, deleteAsset } from "./chief";
+import {
+  ensureChiefProject,
+  uploadAsset,
+  deleteAsset,
+  listAllAssets,
+  assetLooksStuck,
+  STUCK_RESERVATION_MIN_AGE_MS,
+} from "./chief";
 import type { ChiefDocState } from "../stores/settingsStore";
 
 /** Directory pathspecs synced to Chief. Scoped (not "all markdown") to avoid uploading
@@ -77,6 +84,26 @@ export async function syncProjectMarkdown(params: ProjectSyncParams): Promise<Pr
   }
 
   const pid = await ensureChiefProject(pat, projectName, chiefProjectId);
+
+  // Library health check: a ledger hash match normally skips a path, but that trusts that the
+  // recorded asset actually holds bytes. A failed run can leave a 1-byte reservation whose md5
+  // the server then "dedups" against forever (see assetLooksStuck) — the ledger says synced while
+  // Chief has nothing. So verify against the live library and re-upload paths whose asset is
+  // stuck. Listing is best-effort: when it fails, fall back to hash-only skipping.
+  let stuckIds: Set<string> | null = null;
+  let sweepableIds: string[] = [];
+  try {
+    const assets = await listAllAssets(pat, pid);
+    const stuck = assets.filter(assetLooksStuck);
+    stuckIds = new Set(stuck.map((a) => a.asset_id));
+    const cutoff = Date.now() - STUCK_RESERVATION_MIN_AGE_MS;
+    sweepableIds = stuck
+      .filter((a) => a.created_at && Date.parse(a.created_at) < cutoff)
+      .map((a) => a.asset_id);
+  } catch {
+    stuckIds = null;
+  }
+
   const next: Record<string, ChiefDocState> = {};
   const uploaded: string[] = [];
   const deletedAssetIds: string[] = [];
@@ -86,25 +113,52 @@ export async function syncProjectMarkdown(params: ProjectSyncParams): Promise<Pr
     currentPaths.add(f.path);
     const hash = hashContent(f.content);
     const prev = docState[f.path];
-    if (prev && prev.hash === hash) {
-      next[f.path] = prev; // unchanged — keep the existing asset
+    const prevStuck = prev?.assetId ? stuckIds?.has(prev.assetId) === true : false;
+    if (prev && prev.hash === hash && !prevStuck) {
+      next[f.path] = prev; // unchanged and verifiably (or presumably) live — keep the asset
       continue;
     }
     // Upload first so retrieval always has a live copy, THEN delete the superseded asset.
     const { assetId } = await uploadAsset(pat, pid, f.path, f.content);
     if (prev && prev.assetId && prev.assetId !== assetId) {
-      await deleteAsset(pat, pid, prev.assetId);
-      deletedAssetIds.push(prev.assetId);
+      try {
+        await deleteAsset(pat, pid, prev.assetId);
+        deletedAssetIds.push(prev.assetId);
+      } catch {
+        // Best-effort: upload recovery may already have deleted it (a stuck md5 match), or
+        // another agent got there first. Leftovers are caught by the sweep below on a later run.
+      }
     }
     next[f.path] = { hash, assetId };
     uploaded.push(f.path);
   }
 
   // Docs that vanished from the tree: drop their assets so Chief reflects current state.
+  // Best-effort — the asset may already be gone (another agent's sweep, or a prior run that
+  // crashed between the DELETE landing and docState persisting). Throwing would wedge the
+  // sync forever on the same 404: the entry is dropped from `next` either way, so a live
+  // leftover is caught by a later sweep once it looks stuck, or lingers harmlessly if real.
   for (const [path, st] of Object.entries(docState)) {
     if (!currentPaths.has(path) && st.assetId) {
-      await deleteAsset(pat, pid, st.assetId);
-      deletedAssetIds.push(st.assetId);
+      try {
+        await deleteAsset(pat, pid, st.assetId);
+        deletedAssetIds.push(st.assetId);
+      } catch {
+        // already deleted or contested — never re-throw on a doc we're dropping anyway
+      }
+    }
+  }
+
+  // Sweep junk reservations left by earlier failed runs (each failed upload strands one per
+  // content version). Skip anything the fresh ledger references and anything already deleted.
+  const referenced = new Set(Object.values(next).map((st) => st.assetId));
+  for (const assetId of sweepableIds) {
+    if (referenced.has(assetId) || deletedAssetIds.includes(assetId)) continue;
+    try {
+      await deleteAsset(pat, pid, assetId);
+      deletedAssetIds.push(assetId);
+    } catch {
+      // Best-effort: an already-deleted or contested asset shouldn't fail the sync.
     }
   }
 

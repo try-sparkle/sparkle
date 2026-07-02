@@ -4,6 +4,8 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import type { AgentKind, AgentName, AgentTab, Project } from "../types";
+import { isDefaultModel } from "../services/models";
+import { usageTelemetry } from "../services/usageTelemetry";
 
 // Cap on how many prompts we keep per agent so the persisted localStorage record stays bounded.
 // The oldest entries fall off; the most recent PROMPT_HISTORY_LIMIT are kept.
@@ -19,6 +21,9 @@ export interface AddAgentOpts {
   parentBranch?: string;
   shellCommand?: string;
   beadId?: string;
+  /** Claude model id for this agent (services/models.ts); undefined/"default" → inherit the
+   *  user's Claude Code default. */
+  model?: string;
 }
 
 // Default display name for a freshly created agent, numbered within its kind so you get
@@ -53,6 +58,13 @@ interface ProjectState {
   addAgent: (projectId: string, opts?: AddAgentOpts) => string;
   /** Attach a bead id to an existing agent (e.g. after async bead creation on build-agent spawn). */
   setAgentBeadId: (projectId: string, agentId: string, beadId: string) => void;
+  /** Set the agent's Claude model (a models.ts id, or "default"/undefined to inherit the user's
+   *  Claude Code default). Persisted only — delivering the change to a live PTY is the caller's
+   *  job (services/agentModel.ts). */
+  setAgentModel: (projectId: string, agentId: string, model: string | undefined) => void;
+  /** Bind the epic an orchestrator is building (set at sendToBuild handoff — drives the sidebar
+   *  epic pill immediately, before any of its workers bind to a bead). */
+  setAgentEpicId: (projectId: string, agentId: string, epicId: string) => void;
   removeAgent: (projectId: string, agentId: string) => void;
   /** Manual rename: sets the name AND pins it (freezes auto-naming, shows the pin icon). When
    *  the caller passes `pinnedIndex` (the agent's current displayed slot), also anchor the row
@@ -320,11 +332,18 @@ export const useProjectStore = create<ProjectState>()(
               autoNameBasis: null,
               autoNameVariants: null,
               shellCommand: opts?.shellCommand ?? null,
+              // Normalize "inherit the default" to undefined at the store boundary, so persisted
+              // records have ONE canonical form and consumers can compare raw values safely (the
+              // "default" sentinel stays a UI-only dropdown value).
+              model: isDefaultModel(opts?.model) ? undefined : opts?.model,
               pinnedIndex: null,
             };
             return { ...p, agents: [...p.agents, agent], selectedAgentId: id };
           }),
         }));
+        // Anonymous funnel telemetry — every agent/worker tab creation flows through here.
+        // Fire-and-forget; the service swallows all errors and never blocks this setter.
+        void usageTelemetry.trackAgentSpawned(kind);
         return id;
       },
 
@@ -333,6 +352,25 @@ export const useProjectStore = create<ProjectState>()(
           projects: mapProject(s.projects, projectId, (p) => ({
             ...p,
             agents: p.agents.map((a) => (a.id === agentId ? { ...a, beadId } : a)),
+          })),
+        })),
+
+      setAgentModel: (projectId, agentId, model) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            // Same normalization as addAgent: undefined is the single persisted "default" form.
+            mapAgent(p, agentId, (a) => ({
+              ...a,
+              model: isDefaultModel(model) ? undefined : model,
+            })),
+          ),
+        })),
+
+      setAgentEpicId: (projectId, agentId, epicId) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) => ({
+            ...p,
+            agents: p.agents.map((a) => (a.id === agentId ? { ...a, epicId } : a)),
           })),
         })),
 

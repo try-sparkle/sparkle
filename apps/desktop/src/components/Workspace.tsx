@@ -6,6 +6,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
+import { useNewBuildAgentDrop } from "../hooks/useNewBuildAgentDrop";
 import { AgentSidebar, NewBuildAgentButton } from "./AgentSidebar";
 import { TopBar } from "./TopBar";
 import { OfflineBanner } from "./OfflineBanner";
@@ -19,9 +20,11 @@ import {
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { startOrchestrationListener } from "../services/orchestrationListener";
 import { killProjectAgents, planWindowClose } from "../services/windowClose";
+import { windowTitleFor } from "../services/projectWindows";
 import { clearWindowProject } from "../services/windowRegistry";
 import { clearWindowRoster } from "../services/attention";
 import { safeUnlisten } from "../services/safeUnlisten";
+import { useImprovementScheduler } from "../useImprovementScheduler";
 
 // Code-split the heavy, not-always-visible surfaces so a cold start doesn't ship them in the
 // initial chunk (bead sparkle-alrm.5, #9). AgentPane pulls the terminal (xterm + webgl), the
@@ -66,6 +69,10 @@ export function Workspace() {
   const zoomIn = useUiStore((s) => s.zoomIn);
   const zoomOut = useUiStore((s) => s.zoomOut);
   const resetZoom = useUiStore((s) => s.resetZoom);
+
+  // The hourly self-improvement pass clock (consent banner's "once per hour" promise). Main
+  // window only — one scheduler per app, never one per window.
+  useImprovementScheduler(isMainWindow);
 
   // On boot, drop any persisted open-agent ids whose agent no longer exists (e.g. deleted
   // between launches) so a resumed session can't reference a vanished agent (bead ).
@@ -146,10 +153,27 @@ export function Workspace() {
   }, [zoomIn, zoomOut, resetZoom]);
 
   const project = projects.find((p) => p.id === currentProjectId) ?? null;
+  const projectName = project?.name ?? null;
+
+  // Title the window after its project so the macOS Window menu lists windows by project
+  // instead of N identical "Sparkle" entries. Keyed on the NAME (not just the id) so a
+  // rename/relocate re-titles in place; Replace re-titles because currentProjectId is reactive.
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    // A rejection (e.g. window tearing down mid-call) must not surface as an unhandled rejection.
+    getCurrentWindow()
+      .setTitle(windowTitleFor(projectName))
+      .catch(() => {});
+  }, [projectName]);
+
   const activeAgentId = project?.selectedAgentId ?? null;
   // Lets the empty-state start button create a build agent exactly like the sidebar's "+ New Build
   // Agent" row does (same hook → same behavior).
   const spawnBuild = useSpawnBuildAgent(project);
+  // Files dropped on either "+ New Build Agent" button spawn a new build agent with the files
+  // attached to ITS composer. Mounted here (not in a composer) so it also works when no agent
+  // exists yet — the empty-state button has no active composer to piggyback on.
+  useNewBuildAgentDrop(project);
 
   // Only mount THIS window's project's agents. Each window owns one project; mounting every
   // project's agents in every window would attach two xterms to the same PTY.

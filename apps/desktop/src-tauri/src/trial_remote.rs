@@ -68,6 +68,10 @@ fn ensure_device_token() -> Result<String, String> {
 }
 
 /// POST `{ deviceToken }` to a `/trial/*` endpoint.
+// result_large_err: ureq::Error embeds the Response for Status errors (~272 bytes). Boxing it
+// would ripple through classify()'s by-value match for no gain — this runs a handful of times
+// per trial session, never on a hot path.
+#[allow(clippy::result_large_err)]
 fn send_trial(path: &str, token: &str) -> Result<ureq::Response, ureq::Error> {
     let url = format!("{}{}", base_url(), path);
     let body = json!({ "deviceToken": token }).to_string();

@@ -1,16 +1,59 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Project } from "../types";
-import { DELIVERED_LABEL, type Bead } from "../services/beads";
+import {
+  childrenOf,
+  claimBead,
+  labelBead,
+  DELIVERED_LABEL,
+  type Bead,
+  type BoardColumn,
+} from "../services/beads";
+import { DECOMPOSE_FAILED_LABEL, DECOMPOSING_LABEL } from "../services/epicDecompose";
+import { parsePrdRef } from "../services/tasks";
 import { useBeadsStore } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useUiStore } from "../stores/uiStore";
 import { useShallow } from "zustand/react/shallow";
 import { sendToBuild } from "../services/sendToBuild";
-import { workersForBead, epicStatus, beadStage, type EpicStatus } from "../services/planView";
+import {
+  workersForBead,
+  epicStatus,
+  beadStage,
+  epicChildViews,
+  orchestratorNameForEpic,
+  type EpicStatus,
+  type EpicChildView,
+} from "../services/planView";
 import { WorkflowLine } from "./WorkflowLine";
 import { stageMeta, stageLineColor, type WorkflowStageId } from "../engine/workflowStage";
 import type { AgentTab } from "../types";
+import { getConfig, onConfigChanged } from "../services/config";
+import { readStageDef, isDefined, type StageKey, type StageDefinition } from "../services/stageDefs";
+import {
+  startDeliveryMonitor,
+  stopDeliveryMonitor,
+  type DeliveryMonitorUpdate,
+  type WatchedBead,
+} from "../services/deliveryMonitor";
+import { DefineStageModal } from "./DefineStageModal";
+import { StageColumnHeader, DefineStageCta, definableStageKey, type DeliveryChip } from "./StageColumnHeader";
+import { CardCriteria } from "./CardCriteria";
+
+/** The next board stage a card in `columnKey` is progressing toward (whose criteria we evaluate):
+ *  Backlog / In Progress → Done; Done → Delivered; Delivered is terminal (none). */
+function nextStageOf(columnKey: BoardColumn): StageKey | null {
+  if (columnKey === "backlog" || columnKey === "inProgress") return "done";
+  if (columnKey === "done") return "delivered";
+  return null;
+}
+
+/** Per-project Done/Delivered definitions, read once from config and refreshed on config-changed. */
+interface StageDefs {
+  done?: StageDefinition;
+  delivered?: StageDefinition;
+}
 
 // The four board columns, in display order, paired with the Board snapshot key each reads.
 const COLUMNS: { key: "backlog" | "inProgress" | "done" | "delivered"; label: string }[] = [
@@ -47,6 +90,92 @@ export function BoardView({ project }: { project: Project }) {
 
   const board = snapshot?.board;
   const allBeads = snapshot?.beads ?? [];
+
+  // ── Definable Done & Delivered (Unit 5) ──────────────────────────────────────────────────────
+  // Which stage's Define/Edit modal is open (null = none).
+  const [defineStage, setDefineStage] = useState<StageKey | null>(null);
+  // Per-project Done/Delivered definitions: read once per project, refreshed on config-changed.
+  const [defs, setDefs] = useState<StageDefs>({});
+  // Latest delivery-monitor tick (drives the Delivered header chip + per-card `in_release`).
+  const [delivery, setDelivery] = useState<DeliveryMonitorUpdate | null>(null);
+
+  // Load the definitions once per project, then live-refresh on any config write/edit. The modal's
+  // save fires `config-changed`, so the board picks up a fresh definition without a manual poll.
+  useEffect(() => {
+    let cancelled = false;
+    const apply = (cfg: Parameters<typeof readStageDef>[0]) => {
+      if (cancelled) return;
+      setDefs({ done: readStageDef(cfg, "done"), delivered: readStageDef(cfg, "delivered") });
+    };
+    getConfig(project.rootPath)
+      .then((eff) => apply(eff.config))
+      .catch(() => {
+        /* undefined-as-a-whole is the honest fallback; the board renders as today. */
+      });
+    let unlisten: (() => void) | undefined;
+    onConfigChanged((eff) => apply(eff.config))
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [project.rootPath]);
+
+  const deliveredDefined = isDefined(defs.delivered);
+
+  // The delivery monitor watches in-flight/closed beads for a shipped-release signal and pushes live
+  // updates. It runs only once Delivered is defined (no point otherwise). We feed it a fresh watch
+  // set each tick via a ref so add/remove beads don't restart it. Merge SHAs aren't tracked per-bead
+  // on the board today, so we pass `mergeSha: null` — the monitor then honestly reports not-in-release
+  // / "can't detect", never claiming a delivery it can't verify.
+  const boardRef = useRef(board);
+  boardRef.current = board;
+  useEffect(() => {
+    if (!deliveredDefined) {
+      stopDeliveryMonitor();
+      setDelivery(null);
+      return;
+    }
+    const getBeads = (): WatchedBead[] => {
+      const b = boardRef.current;
+      if (!b) return [];
+      // Candidates for a delivery signal: everything that's reached Done or beyond (plus in-flight).
+      return [...b.inProgress, ...b.done, ...b.delivered].map((x) => ({ beadId: x.id, mergeSha: null }));
+    };
+    startDeliveryMonitor(project.rootPath, (u) => setDelivery(u), getBeads);
+    return () => stopDeliveryMonitor();
+  }, [project.rootPath, deliveredDefined]);
+
+  // Per-bead `in_release` verdict from the latest tick, for the Delivered criteria evaluation.
+  const inReleaseByBead = useMemo(() => {
+    const m = new Map<string, boolean>();
+    for (const s of delivery?.signals ?? []) m.set(s.beadId, s.inRelease);
+    return m;
+  }, [delivery]);
+
+  const deliveryChip: DeliveryChip | undefined = delivery
+    ? // We render our own FiCheck/FiAlertTriangle icon, so strip ANY leading glyph/symbol/space the
+      // monitor prepends (⚠/✓ today, but robust to any future marker) to avoid a doubled indicator.
+      { detectable: delivery.detectable, label: delivery.status.replace(/^[^\p{L}\p{N}]+/u, "") }
+    : undefined;
+
+  // One-shot board-focus handoff (spec §8): the sidebar epic pill sets boardFocusBeadId before
+  // switching here; once the bead is present in a snapshot, open its DetailOverlay and clear the
+  // handoff. Deliberately left SET while the bead is still missing (e.g. first poll in flight) —
+  // the effect re-runs when the snapshot lands, so the jump survives the loading state.
+  const boardFocusBeadId = useUiStore((s) => s.boardFocusBeadId);
+  useEffect(() => {
+    if (!boardFocusBeadId || !snapshot) return;
+    const hit = snapshot.beads.find((b) => b.id === boardFocusBeadId);
+    if (hit) {
+      setSelected(hit);
+      useUiStore.getState().setBoardFocusBeadId(null);
+    }
+  }, [boardFocusBeadId, snapshot]);
   // Workers live in the agent store; the Plan view reads them to show who's building each bead.
   const agents = useProjectStore((s) => s.projects.find((p) => p.id === project.id)?.agents ?? NO_AGENTS);
 
@@ -99,9 +228,16 @@ export function BoardView({ project }: { project: Project }) {
           {COLUMNS.map(({ key, label }) => (
             <Column
               key={key}
+              columnKey={key}
               label={label}
               beads={board[key]}
+              allBeads={allBeads}
               agents={agents}
+              project={project}
+              defs={defs}
+              deliveryChip={deliveryChip}
+              inReleaseByBead={inReleaseByBead}
+              onDefine={setDefineStage}
               onOpen={(b) => setSelected(b)}
             />
           ))}
@@ -117,21 +253,54 @@ export function BoardView({ project }: { project: Project }) {
           onClose={() => setSelected(null)}
         />
       )}
+
+      {/* Definable Done & Delivered — the Define/Edit modal, opened from a column header or CTA. */}
+      {defineStage && (
+        <DefineStageModal
+          stageKey={defineStage}
+          projectName={project.name}
+          projectRoot={project.rootPath}
+          onClose={() => setDefineStage(null)}
+        />
+      )}
     </div>
   );
 }
 
 function Column({
+  columnKey,
   label,
   beads,
+  allBeads,
   agents,
+  project,
+  defs,
+  deliveryChip,
+  inReleaseByBead,
+  onDefine,
   onOpen,
 }: {
+  columnKey: BoardColumn;
   label: string;
   beads: Bead[];
+  allBeads: Bead[];
   agents: AgentTab[];
+  project: Project;
+  defs: StageDefs;
+  deliveryChip?: DeliveryChip;
+  inReleaseByBead: Map<string, boolean>;
+  onDefine: (key: StageKey) => void;
   onOpen: (b: Bead) => void;
 }) {
+  // This column's own stage (for the header chip + undefined CTA), and the next stage a card here
+  // is progressing toward (whose criteria the cards evaluate).
+  const ownStageKey = definableStageKey(columnKey);
+  const ownDef = ownStageKey ? defs[ownStageKey] : undefined;
+  const ownDefined = isDefined(ownDef);
+  const nextStageKey = nextStageOf(columnKey);
+  const nextDef = nextStageKey ? defs[nextStageKey] : undefined;
+  const nextDefined = isDefined(nextDef);
+
   return (
     <div
       style={{
@@ -144,22 +313,14 @@ function Column({
         minHeight: 0,
       }}
     >
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          padding: "10px 12px",
-          fontSize: 12,
-          textTransform: "uppercase",
-          letterSpacing: 1,
-          fontWeight: FONT_WEIGHT.semibold,
-          color: C.muted,
-        }}
-      >
-        <span>{label}</span>
-        <span style={{ color: C.muted, opacity: 0.7 }}>{beads.length}</span>
-      </div>
+      <StageColumnHeader
+        columnKey={columnKey}
+        label={label}
+        count={beads.length}
+        defined={ownDefined}
+        deliveryChip={deliveryChip}
+        onDefine={onDefine}
+      />
       <div
         style={{
           flex: 1,
@@ -171,19 +332,60 @@ function Column({
           minHeight: 0,
         }}
       >
+        {/* Undefined Done/Delivered → the centered blue Define CTA (shown even above legacy cards). */}
+        {ownStageKey && !ownDefined && (
+          <DefineStageCta stageKey={ownStageKey} label={label} onDefine={onDefine} />
+        )}
         {beads.length === 0 ? (
-          <div style={{ color: C.muted, opacity: 0.5, fontSize: 12, padding: "8px 2px" }}>
-            Nothing here yet
-          </div>
+          // Suppress the "nothing here yet" hint when the Define CTA already fills an empty column.
+          ownStageKey && !ownDefined ? null : (
+            <div style={{ color: C.muted, opacity: 0.5, fontSize: 12, padding: "8px 2px" }}>
+              Nothing here yet
+            </div>
+          )
         ) : (
-          beads.map((b) => <Card key={b.id} bead={b} agents={agents} onOpen={onOpen} />)
+          beads.map((b) => (
+            <Card
+              key={b.id}
+              bead={b}
+              columnKey={columnKey}
+              allBeads={allBeads}
+              agents={agents}
+              project={project}
+              nextStageKey={nextDefined ? nextStageKey : null}
+              nextDef={nextDefined ? nextDef : undefined}
+              inRelease={inReleaseByBead.get(b.id)}
+              onOpen={onOpen}
+            />
+          ))
         )}
       </div>
     </div>
   );
 }
 
-function Card({ bead, agents, onOpen }: { bead: Bead; agents: AgentTab[]; onOpen: (b: Bead) => void }) {
+function Card({
+  bead,
+  columnKey,
+  allBeads,
+  agents,
+  project,
+  nextStageKey,
+  nextDef,
+  inRelease,
+  onOpen,
+}: {
+  bead: Bead;
+  columnKey: BoardColumn;
+  allBeads: Bead[];
+  agents: AgentTab[];
+  project: Project;
+  /** The defined next stage this card evaluates toward (null when that stage is undefined). */
+  nextStageKey: StageKey | null;
+  nextDef?: StageDefinition;
+  inRelease?: boolean;
+  onOpen: (b: Bead) => void;
+}) {
   const preview =
     bead.description.length > DESC_PREVIEW
       ? `${bead.description.slice(0, DESC_PREVIEW)}…`
@@ -203,47 +405,274 @@ function Card({ bead, agents, onOpen }: { bead: Bead; agents: AgentTab[]; onOpen
   );
   const stage = beadStage(bead.status, bead.labels.includes(DELIVERED_LABEL), workerStages);
   return (
-    <button
-      onClick={() => onOpen(bead)}
+    // The card's visual shell is a div so the interactive Start button can live BESIDE the
+    // clickable body (a <button> must not contain a nested <button>). The body button opens detail;
+    // StartControls is a sibling, so a Start click never bubbles to the body.
+    <div
       style={{
-        textAlign: "left",
         background: C.forest,
         border: `1px solid ${C.deepForest}`,
         borderRadius: 8,
         padding: "10px 12px",
-        cursor: "pointer",
         display: "flex",
         flexDirection: "column",
         gap: 6,
         fontFamily: '"IBM Plex Sans", sans-serif',
       }}
     >
-      <div style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold, fontSize: 13, lineHeight: 1.3 }}>
-        {bead.title}
-      </div>
-      {preview && (
-        <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.4 }}>{preview}</div>
-      )}
-      <div
+      <button
+        onClick={() => onOpen(bead)}
         style={{
-          color: C.muted,
-          opacity: 0.7,
-          fontSize: 11,
-          fontFamily: '"IBM Plex Mono", monospace',
+          textAlign: "left",
+          background: "transparent",
+          border: "none",
+          padding: 0,
+          cursor: "pointer",
+          display: "flex",
+          flexDirection: "column",
+          gap: 6,
+          width: "100%",
+          fontFamily: '"IBM Plex Sans", sans-serif',
         }}
       >
-        {bead.id}
-      </div>
-      {workers.length > 0 && (
-        <div style={{ color: C.teal, fontSize: 11, lineHeight: 1.4 }}>
-          ⚙ {workers.length === 1 ? "1 worker" : `${workers.length} workers`}: {workers.join(", ")}
+        <div style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold, fontSize: 13, lineHeight: 1.3 }}>
+          {bead.title}
         </div>
+        {preview && (
+          <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.4 }}>{preview}</div>
+        )}
+        <div
+          style={{
+            color: C.muted,
+            opacity: 0.7,
+            fontSize: 11,
+            fontFamily: '"IBM Plex Mono", monospace',
+          }}
+        >
+          {bead.id}
+        </div>
+        {workers.length > 0 && (
+          <div style={{ color: C.teal, fontSize: 11, lineHeight: 1.4 }}>
+            ⚙ {workers.length === 1 ? "1 worker" : `${workers.length} workers`}: {workers.join(", ")}
+          </div>
+        )}
+        {/* Unified Think→Plan→Build progress: the blue logo-gradient line + its stage label. */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <WorkflowLine stage={stage} height={3} />
+          </div>
+          <span
+            style={{
+              flex: "0 0 auto",
+              fontSize: 10,
+              fontWeight: 600,
+              color: stageLineColor(stage),
+              whiteSpace: "nowrap",
+            }}
+          >
+            {stageMeta(stage).short}
+          </span>
+        </div>
+      </button>
+      {/* Backlog epic → Start controls (spec §7): claim + hand off to Build, with the
+          decompose-state affordances (disabled while decomposing/childless, retry on failure). */}
+      {columnKey === "backlog" && bead.type === "epic" && (
+        <StartControls bead={bead} allBeads={allBeads} project={project} />
       )}
-      {/* Unified Think→Plan→Build progress: the blue logo-gradient line + its stage label. */}
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <WorkflowLine stage={stage} height={3} />
-        </div>
+      {/* Definable Done & Delivered (Unit 5): when the card's NEXT stage is defined, show its compact
+          criteria progress + the confirm-first "Mark as …" control (only when every criterion is met).
+          A sibling of the body button so its clicks never open the detail overlay. */}
+      {nextStageKey && nextDef && (
+        <CardCriteria
+          bead={bead}
+          stageKey={nextStageKey}
+          def={nextDef}
+          stage={stage}
+          inRelease={inRelease}
+          projectRoot={project.rootPath}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Backlog-epic Start controls (spec §7). Start claims the epic (→ in_progress) and hands it to the
+ * Build orchestrator via sendToBuild — PRD path parsed from the epic body, or null for a PRD-less
+ * epic (sendToBuild seeds off the epic bead itself). Disabled with a "decomposing…" tooltip while
+ * the epic is still being decomposed (zero children) or carries the `decomposing` label; both the
+ * `decomposing…` and `decompose failed` badges are click-to-clear (stuck-label recovery / retry —
+ * clearing the label lets the next sweep re-decompose). All clicks stopPropagation so they never
+ * open the card's detail overlay.
+ */
+function StartControls({
+  bead,
+  allBeads,
+  project,
+}: {
+  bead: Bead;
+  allBeads: Bead[];
+  project: Project;
+}) {
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const isDecomposing = bead.labels.includes(DECOMPOSING_LABEL);
+  const isFailed = bead.labels.includes(DECOMPOSE_FAILED_LABEL);
+  const noChildren = childrenOf(allBeads, bead.id).length === 0;
+  const startDisabled = isDecomposing || noChildren || busy;
+
+  async function handleStart(e: MouseEvent) {
+    e.stopPropagation(); // never let Start also open the detail overlay
+    if (startDisabled) return;
+    setErr("");
+    setBusy(true);
+    try {
+      await claimBead(project.rootPath, bead.id); // → in_progress
+      const prd = parsePrdRef(bead.description);
+      sendToBuild({ projectId: project.id, epicId: bead.id, prdPath: prd?.relPath ?? null });
+    } catch (e2) {
+      setErr(e2 instanceof Error ? e2.message : String(e2));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearLabel(e: MouseEvent, label: string) {
+    e.stopPropagation();
+    setErr("");
+    try {
+      await labelBead(project.rootPath, "remove", bead.id, label);
+    } catch (e2) {
+      setErr(e2 instanceof Error ? e2.message : String(e2));
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 2 }}>
+      <button
+        onClick={handleStart}
+        disabled={startDisabled}
+        title={
+          startDisabled
+            ? "decomposing…"
+            : "Start this epic — claim it and hand it to the Build orchestrator"
+        }
+        style={{
+          background: startDisabled ? C.deepForest : C.teal,
+          color: startDisabled ? C.muted : C.cream,
+          border: "none",
+          borderRadius: 4,
+          padding: "3px 12px",
+          fontSize: 12,
+          fontWeight: FONT_WEIGHT.semibold,
+          cursor: startDisabled ? "default" : "pointer",
+          fontFamily: '"IBM Plex Sans", sans-serif',
+        }}
+      >
+        Start
+      </button>
+      {isDecomposing && (
+        <button
+          onClick={(e) => clearLabel(e, DECOMPOSING_LABEL)}
+          title="Stuck? Click to clear the decomposing label so the next sweep retries"
+          style={{
+            background: "transparent",
+            border: `1px solid ${C.muted}`,
+            borderRadius: 4,
+            color: C.muted,
+            cursor: "pointer",
+            padding: "2px 8px",
+            fontSize: 11,
+            fontFamily: '"IBM Plex Sans", sans-serif',
+          }}
+        >
+          decomposing…
+        </button>
+      )}
+      {isFailed && (
+        <button
+          onClick={(e) => clearLabel(e, DECOMPOSE_FAILED_LABEL)}
+          title="Decompose failed — click to retry (clears the label; the next sweep re-decomposes)"
+          style={{
+            background: "transparent",
+            border: `1px solid ${C.sienna}`,
+            borderRadius: 4,
+            color: C.sienna,
+            cursor: "pointer",
+            padding: "2px 8px",
+            fontSize: 11,
+            fontFamily: '"IBM Plex Sans", sans-serif',
+          }}
+        >
+          decompose failed
+        </button>
+      )}
+      {err && <span style={{ color: C.sienna, fontSize: 11 }}>{err}</span>}
+    </div>
+  );
+}
+
+/**
+ * The epic's live build status (spec §7): the bound orchestrator's name + one row per child task
+ * showing its live WorkflowLine stage and the workers on it — "see the whole epic's build from
+ * Plan". Renders nothing until the epic has children (a still-decomposing epic shows the
+ * decomposing badge on its board card instead).
+ */
+function EpicLiveStatus({
+  epicId,
+  allBeads,
+  agents,
+}: {
+  epicId: string;
+  allBeads: Bead[];
+  agents: AgentTab[];
+}) {
+  const rows = epicChildViews(allBeads, agents, epicId);
+  if (rows.length === 0) return null;
+  const orchestrator = orchestratorNameForEpic(allBeads, agents, epicId);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", gap: 8, fontSize: 13 }}>
+        <span style={{ color: C.muted, minWidth: 90 }}>Orchestrator</span>
+        <span style={{ color: orchestrator ? C.teal : C.muted }}>
+          {orchestrator ?? "not started"}
+        </span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {rows.map((row) => (
+          <EpicChildRow key={row.bead.id} row={row} agents={agents} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** One child-task row of the epic's live status view: title + live stage (from the child's
+ *  worker(s), same subscription pattern as the board Card) + the workers on it. */
+function EpicChildRow({ row, agents }: { row: EpicChildView; agents: AgentTab[] }) {
+  const { bead, workers } = row;
+  const workerIds = agents
+    .filter((a) => a.kind === "worker" && a.beadId === bead.id)
+    .map((a) => a.id);
+  const workerStages = useRuntimeStore(
+    useShallow(
+      (s) => workerIds.map((id) => s.workflowStage[id]).filter(Boolean) as WorkflowStageId[],
+    ),
+  );
+  const stage = beadStage(bead.status, bead.labels.includes(DELIVERED_LABEL), workerStages);
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        padding: "6px 8px",
+        background: C.forest,
+        borderRadius: 6,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ flex: 1, minWidth: 0, color: C.cream, fontSize: 13 }}>{bead.title}</span>
         <span
           style={{
             flex: "0 0 auto",
@@ -256,7 +685,11 @@ function Card({ bead, agents, onOpen }: { bead: Bead; agents: AgentTab[]; onOpen
           {stageMeta(stage).short}
         </span>
       </div>
-    </button>
+      <WorkflowLine stage={stage} height={3} />
+      {workers.length > 0 && (
+        <div style={{ color: C.teal, fontSize: 11, lineHeight: 1.4 }}>{workers.join(", ")}</div>
+      )}
+    </div>
   );
 }
 
@@ -379,7 +812,7 @@ function DetailOverlay({
                 letterSpacing: 0.5,
                 color: status === "done" ? C.teal : status === "in_progress" ? C.cream : C.muted,
                 border: `1px solid ${C.forest}`,
-                borderRadius: 999,
+                borderRadius: 4,
                 padding: "2px 10px",
               }}
             >
@@ -405,6 +838,9 @@ function DetailOverlay({
             {buildErr && <span style={{ color: C.sienna, fontSize: 12 }}>{buildErr}</span>}
           </div>
         )}
+
+        {/* Live epic status (spec §7): orchestrator + per-child WorkflowLine stages + workers. */}
+        {isEpic && <EpicLiveStatus epicId={bead.id} allBeads={allBeads} agents={agents} />}
 
         {bead.description && (
           <div

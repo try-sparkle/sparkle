@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect } from "react";
+import { lazy, Suspense, useEffect, useRef } from "react";
 import { AuthGate } from "./components/AuthGate";
 import { useAmbientVoice } from "./useDictation";
 import { useApplyTheme } from "./theme/theme";
@@ -10,7 +10,15 @@ import { startRelayHost, stopRelayHost } from "./services/relayClient";
 import { useSettingsStore } from "./stores/settingsStore";
 import { getConfig, onConfigChanged } from "./services/config";
 import { safeUnlisten } from "./services/safeUnlisten";
-import { CurrentProjectProvider } from "./windowContext";
+import {
+  CurrentProjectProvider,
+  useCurrentProjectId,
+  useCurrentWindowLabel,
+  useIsMainWindow,
+  useReplaceCurrentProject,
+} from "./windowContext";
+import { LastFocusedProjectTracker } from "./capture/LastFocusedProjectTracker";
+import { initCaptureSendListener, type CaptureSendCtx } from "./services/captureSends";
 import { useAttentionNotifications } from "./useAttentionNotifications";
 import { useRosterPublisher } from "./useRosterPublisher";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -56,6 +64,29 @@ function AttentionController() {
 // regardless of auth/loading state, matching its prior always-on behavior. Paints no UI.
 function RosterPublisher() {
   useRosterPublisher();
+  return null;
+}
+
+// NOTE: LastFocusedProjectTracker lives in capture/LastFocusedProjectTracker.tsx (extracted
+// with its own tests by the T3 worker); it must render inside CurrentProjectProvider.
+
+// Mounts the capture://send listener once per window (spec §4/§5/§6). The capture modal
+// broadcasts one payload to every window; this window's routing (ownership + main's stale-owner
+// self-heal) decides whether to act, then dispatches Think/Build/Plan. MUST render inside
+// CurrentProjectProvider — it needs this window's label/isMain/current project + `replace` (to
+// adopt an orphan project). A ref feeds the listener FRESH context each event without re-mounting
+// (the label/isMain are fixed; projectId changes as the user switches projects). Paints no UI.
+function CaptureSendController() {
+  const isMain = useIsMainWindow();
+  const label = useCurrentWindowLabel();
+  const projectId = useCurrentProjectId();
+  const replace = useReplaceCurrentProject();
+  const ctxRef = useRef<CaptureSendCtx>({ isMain, label, projectId, replace });
+  ctxRef.current = { isMain, label, projectId, replace };
+  useEffect(() => {
+    const unlistenPromise = initCaptureSendListener(() => ctxRef.current);
+    return () => void safeUnlisten(unlistenPromise);
+  }, []);
   return null;
 }
 
@@ -181,6 +212,8 @@ export function App() {
   return (
     <CurrentProjectProvider>
       <RosterPublisher />
+      <LastFocusedProjectTracker />
+      <CaptureSendController />
       <AuthGate>
         <AttentionController />
         <UpdateBanner />

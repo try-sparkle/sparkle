@@ -15,25 +15,31 @@ mod bridge;
 #[cfg(not(unix))]
 #[path = "bridge_windows.rs"]
 mod bridge;
+mod capture_window;
 mod chief;
 mod claude;
 mod claude_chat;
 mod cloud;
 mod config;
 mod connectivity;
+mod delivery;
 mod dictation;
 mod history;
 mod hooks;
 mod judge;
 mod logging;
 mod model;
+mod model_catalog;
 mod naming;
 mod preflight;
 mod pty;
 mod transcribe;
 mod screenshot;
+mod setup;
 mod socket;
 mod sparkle_agent;
+mod sparkle_improve;
+mod support;
 mod transcript;
 mod tray;
 mod trial;
@@ -72,6 +78,7 @@ pub fn run() {
         .plugin(tauri_plugin_positioner::init())
         .manage(PtyManager::default())
         .manage(claude_chat::ClaudeChatManager::default())
+        .manage(sparkle_improve::SparkleImproveManager::default())
         .manage(dictation::DictationState::default())
         .manage(bridge::BridgeManager::default())
         .manage(auth::DeepLinkPending::default())
@@ -88,12 +95,12 @@ pub fn run() {
             if let tauri::WindowEvent::Focused(focused) = event {
                 let app = window.app_handle();
                 app.state::<dictation::DictationState>()
-                    .note_focus_event(&app, *focused);
+                    .note_focus_event(app, *focused);
             }
         })
         .setup(|app| {
             // Stand up unified logging before anything else so startup itself is captured.
-            match logging::init(&app.handle()) {
+            match logging::init(app.handle()) {
                 Ok(dir) => tracing::info!(
                     version = %app.package_info().version,
                     log_dir = %dir.display(),
@@ -137,11 +144,45 @@ pub fn run() {
             // Editable TOML config: load the global config.toml and watch it for live reload.
             // Best-effort — a failure here must not stop the app; the engine falls back to
             // built-in defaults (config::current_effective() returns defaults when never loaded).
-            if let Err(e) = config::init_and_watch(&app.handle()) {
+            if let Err(e) = config::init_and_watch(app.handle()) {
                 tracing::error!("config init/watch failed: {e}");
             }
-            if let Err(e) = tray::init_tray(&app.handle()) {
+            if let Err(e) = tray::init_tray(app.handle()) {
                 tracing::error!("tray init failed: {e}");
+            }
+            // Hidden transparent capture window (menu-bar capture flow). Best-effort:
+            // a failure only loses the capture feature, never blocks boot.
+            if let Err(e) = capture_window::init_capture_window(app.handle()) {
+                tracing::error!("capture window init failed: {e}");
+            }
+            // Global shortcut (default Ctrl+Shift+R, [capture].popover_shortcut in
+            // config.toml) toggling the menu-bar popover from anywhere. Fail-soft by
+            // contract: an unparseable or already-taken accelerator logs a warning and
+            // the app runs without a shortcut — never a panic (spec §1/§9).
+            {
+                use std::str::FromStr;
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+                let accel = config::current_effective().config.capture.popover_shortcut;
+                match Shortcut::from_str(accel.trim()) {
+                    Ok(shortcut) => {
+                        let registered =
+                            app.handle().global_shortcut().on_shortcut(shortcut, |app, _, event| {
+                                if event.state == ShortcutState::Pressed {
+                                    tray::toggle_popover(app);
+                                }
+                            });
+                        if let Err(e) = registered {
+                            tracing::warn!(
+                                "could not register [capture].popover_shortcut '{accel}' \
+                                 (already taken by another app?): {e}"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "[capture].popover_shortcut '{accel}' is not a valid accelerator, \
+                         running without a global shortcut: {e}"
+                    ),
+                }
             }
             // Show-on-ready backstop (bead sparkle-alrm.5, #10). The main window is created hidden
             // ("visible": false) so no blank frame flashes before React paints; the frontend calls
@@ -174,11 +215,20 @@ pub fn run() {
             preflight::claude_version,
             preflight::claude_session_info,
             preflight::refresh_preflight,
+            preflight::node_preflight,
+            preflight::git_preflight,
+            preflight::prereqs_preflight,
+            setup::install_node,
+            setup::install_claude_code,
+            setup::install_git,
             claude_chat::claude_chat_send,
             claude_chat::claude_chat_cancel,
+            sparkle_improve::sparkle_improve_run,
+            sparkle_improve::sparkle_improve_cancel,
             claude::claude_has_session,
             claude::claude_latest_session_id,
             claude::agent_session_title,
+            model_catalog::list_claude_models,
             screenshot::capture_screen_region,
             attachments::load_attachment,
             attachments::copy_image_to_clipboard,
@@ -226,6 +276,8 @@ pub fn run() {
             notes::append_note,
             notes::create_bead,
             notes::write_prd,
+            notes::read_prd,
+            notes::copy_capture_asset,
             notes::list_beads,
             notes::bead_show,
             notes::create_bead_full,
@@ -243,13 +295,23 @@ pub fn run() {
             auth::desktop_has_token,
             auth::desktop_bearer_token,
             auth::desktop_pair_code,
+            auth::list_paired_devices,
+            auth::revoke_paired_device,
             auth::desktop_sign_out,
             auth::desktop_exchange_code,
             auth::desktop_me,
             auth::desktop_consume,
             auth::desktop_refund,
             auth::desktop_redeem_promo,
+            auth::desktop_topup_checkout,
+            auth::desktop_credit_history,
+            auth::desktop_auto_topup_get,
+            auth::desktop_auto_topup_set,
             auth::desktop_take_pending_deeplink,
+            support::read_recent_logs,
+            support::support_metadata,
+            support::support_chat_send,
+            support::desktop_create_ticket,
             attention::set_window_attention,
             attention::notify_attention,
             attention_summary::summarize_attention,
@@ -261,6 +323,7 @@ pub fn run() {
             accounts::accounts_mark_exhausted,
             accounts::accounts_usage,
             accounts::accounts_identities,
+            accounts::claude_signed_in,
             trial::trial_status,
             trial::trial_start,
             trial::trial_increment,
@@ -273,11 +336,16 @@ pub fn run() {
             config::write_config_text,
             config::reset_config,
             config::read_config_text,
+            config::set_stage_definition,
+            delivery::collect_delivery_evidence,
+            delivery::tag_contains_commit,
             tray::publish_window_roster,
             tray::clear_window_roster,
             tray::get_tray_roster,
             tray::set_tray_image,
-            tray::quit_app
+            tray::quit_app,
+            capture_window::show_capture_window,
+            capture_window::hide_capture_window
         ])
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")

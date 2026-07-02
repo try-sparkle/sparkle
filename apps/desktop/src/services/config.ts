@@ -33,11 +33,42 @@ export interface FreshnessConfig {
   stale_build_block_commits: number;
   require_fresh_branch: boolean;
 }
+/** Menu-bar capture flow (machine-wide; ignored in a per-project file). */
+export interface CaptureConfig {
+  popover_shortcut: string;
+}
+/** One criterion in a stage definition. `kind` is "auto" (observed via `signal`) or "manual"
+ *  (a human ticks it); `signal` is a known auto-signal id, present iff kind === "auto".
+ *  Field casing mirrors the Rust serde output exactly (snake_case, Option → value | null). */
+export interface StageCriterion {
+  text: string;
+  kind: string;
+  signal: string | null;
+}
+/** Per-project "Done" stage definition. Undefined = null description + empty criteria. */
+export interface DoneConfig {
+  description: string | null;
+  criteria: StageCriterion[];
+}
+/** Per-project "Delivered" stage definition + the detected production-ship signal. */
+export interface DeliveredConfig {
+  description: string | null;
+  detected_method: string | null;
+  confidence: string | null;
+  confidence_note: string | null;
+  learned: boolean;
+  criteria: StageCriterion[];
+}
 export interface SparkleConfig {
   workflow: WorkflowConfig;
   workers: WorkersConfig;
   ai: AiConfig;
   freshness: FreshnessConfig;
+  capture: CaptureConfig;
+  /** Per-project "Done" stage definition (Definable Done & Delivered feature). */
+  done: DoneConfig;
+  /** Per-project "Delivered" stage definition + detected production-ship signal. */
+  delivered: DeliveredConfig;
 }
 /** The merged effective config plus any non-fatal load warnings (malformed layer, ignored keys). */
 export interface EffectiveConfig {

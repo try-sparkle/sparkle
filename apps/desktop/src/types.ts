@@ -48,6 +48,7 @@ export interface AgentTab {
   task?: string; // for workers: the one-shot task the build agent assigned; drives the worker persona
   parentBranch?: string; // for workers: the parent build agent's branch at spawn time (stable, not re-resolved)
   beadId?: string; // for workers: the bead this worker implements, when spawned from a Plan epic (Think→Plan→Build linkage)
+  epicId?: string; // for build agents: the epic handed to this orchestrator, set at sendToBuild time (drives the sidebar epic pill before any worker binds to a bead)
   // Auto-naming (spec: agents summarize their own work). `namePinned` is set when the user
   // renames by hand — it freezes the name (pin icon) and stops auto-renaming. `autoNameBasis`
   // is the prompt the current auto-name was derived from, used to decide when the work has
@@ -67,6 +68,11 @@ export interface AgentTab {
   // For "shell" agents (Run-as-cmd from the terminal selection popup): the command this tab
   // runs on spawn. Null for all other kinds.
   shellCommand: string | null;
+  // The Claude model this agent runs (services/models.ts). A model id passed as `--model` at
+  // spawn (and `/model` into a live PTY on change); undefined or the "default" sentinel means
+  // inherit the user's own Claude Code default (no flag). Optional so legacy records need no
+  // migration step.
+  model?: string;
   // Manual reorder anchor (spec: manual-agent-reorder-pin). When non-null, this top-level
   // agent is pinned to this row index and does NOT attention-sort; unpinned agents flow
   // around it. Set together with `namePinned` on drag/rename; cleared together on unpin.

@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, type CSSProperties, type ComponentType } from "react";
-import { FiZap, FiBell, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand } from "react-icons/fi";
+import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone } from "react-icons/fi";
 import { C, ROW_ACTIVE_BUBBLE } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
-import { useUiStore } from "../stores/uiStore";
+import { openSignIn, signOut } from "../services/sparkleApi";
+import { useAuthStore } from "../stores/authStore";
+import { useUiStore, type CategoryId } from "../stores/uiStore";
 import { AiFeaturesMenu } from "./AiFeaturesMenu";
 import { NotificationsMenu } from "./NotificationsMenu";
 import { ThemeToggle } from "./ThemeToggle";
@@ -10,7 +12,9 @@ import { AgentOrderToggle } from "./AgentOrderToggle";
 import { BranchCleanupToggle } from "./BranchCleanupToggle";
 import { WorkerLimitControl } from "./WorkerLimitControl";
 import { AdvancedConfigMenu } from "./AdvancedConfigMenu";
+import { MobileDevicesPane } from "./MobileDevicesPane";
 import { KeyboardShortcutsMenu } from "./KeyboardShortcutsMenu";
+import { CreditsPanel } from "./CreditsPanel";
 
 // The ⋯ settings dialog. A focused, centered dialog with a left rail of categories driving a
 // single right pane (the "macOS System Settings" pattern), replacing the old 80vw×80vh stack
@@ -18,7 +22,9 @@ import { KeyboardShortcutsMenu } from "./KeyboardShortcutsMenu";
 // same component reading/writing the same stores; this file only re-parents them into panes and
 // owns the shell (backdrop, box, rail, close). Escape-to-close is still wired by the caller.
 
-type CategoryId = "ai" | "notifications" | "appearance" | "shortcuts" | "workers" | "accounts" | "advanced";
+// Re-exported for this dialog's consumers; the union itself lives in uiStore (store layer must
+// not import from components).
+export type { CategoryId };
 
 interface Category {
   id: CategoryId;
@@ -30,11 +36,13 @@ interface Category {
 
 const CATEGORIES: Category[] = [
   { id: "ai", label: "AI features", Icon: FiZap, blurb: "Each feature degrades to a non-AI baseline when off." },
+  { id: "credits", label: "Credits", Icon: FiCreditCard, blurb: "Your AI credit balance, top-ups, and usage." },
   { id: "notifications", label: "Notifications", Icon: FiBell, blurb: "Which agent transitions raise a desktop banner." },
   { id: "appearance", label: "Appearance", Icon: FiEye, blurb: "Theme, text size, and how agents are ordered." },
   { id: "shortcuts", label: "Shortcuts", Icon: FiCommand, blurb: "Rebind keyboard shortcuts. Tap a modifier or press a combo." },
   { id: "workers", label: "Workers", Icon: FiCpu, blurb: "How many agents an orchestrator runs in parallel." },
-  { id: "accounts", label: "Accounts", Icon: FiUsers, blurb: "Your Claude accounts." },
+  { id: "accounts", label: "Accounts", Icon: FiUsers, blurb: "Your Sparkle and Claude accounts." },
+  { id: "mobile", label: "Mobile", Icon: FiSmartphone, blurb: "Pair your phone with this Mac and manage paired devices." },
   { id: "advanced", label: "Advanced", Icon: FiSliders, blurb: "Edit the configuration file directly." },
 ];
 
@@ -43,10 +51,17 @@ export interface SettingsDialogProps {
   onClose: () => void;
   /** Open the existing Claude-accounts modal (the caller owns that modal + its login seam). */
   onManageAccounts: () => void;
+  /** Which pane to open on (deep-open, e.g. BalanceBadge → Credits). Defaults to "ai". */
+  initialCategory?: CategoryId;
 }
 
-export function SettingsDialog({ onClose, onManageAccounts }: SettingsDialogProps) {
-  const [active, setActive] = useState<CategoryId>("ai");
+export function SettingsDialog({ onClose, onManageAccounts, initialCategory }: SettingsDialogProps) {
+  const [active, setActive] = useState<CategoryId>(initialCategory ?? "ai");
+  // A deep-open request can also arrive while the dialog is ALREADY open (e.g. a future
+  // low-balance toast while the user is in Settings) — follow the prop, don't just seed from it.
+  useEffect(() => {
+    if (initialCategory) setActive(initialCategory);
+  }, [initialCategory]);
   // `active` is always one of CATEGORIES' ids, so find() can't miss.
   const current = CATEGORIES.find((c) => c.id === active) as Category;
 
@@ -115,6 +130,8 @@ function PaneBody({
   switch (id) {
     case "ai":
       return <AiFeaturesMenu />;
+    case "credits":
+      return <CreditsPanel />;
     case "notifications":
       return <NotificationsMenu />;
     case "appearance":
@@ -124,14 +141,92 @@ function PaneBody({
     case "workers":
       return <WorkerLimitControl />;
     case "accounts":
-      return (
-        <button type="button" style={fullButton} onClick={onManageAccounts}>
-          Manage accounts…
-        </button>
-      );
+      return <AccountsPane onManageAccounts={onManageAccounts} />;
+    case "mobile":
+      return <MobileDevicesPane />;
     case "advanced":
       return <AdvancedConfigMenu />;
   }
+}
+
+/** Sparkle account (sign in / sign out) on top, then the existing Claude/cloud accounts entry.
+ *  Reads the auth store that AuthGate keeps fresh; sign-out clears the keychain token then
+ *  resets the store, so AuthGate drops back to the welcome/trial view — that's expected. */
+function AccountsPane({ onManageAccounts }: { onManageAccounts: () => void }) {
+  const me = useAuthStore((s) => s.me);
+  const tokenPresent = useAuthStore((s) => s.tokenPresent);
+  const loading = useAuthStore((s) => s.loading);
+  const [signingOut, setSigningOut] = useState(false);
+
+  // Who to show: email is the identity users recognize; name and the raw Clerk id are
+  // fallbacks. `me` can be null with a token present (e.g. offline) — still signed in,
+  // just without a resolvable identity.
+  const identity = me?.email ?? me?.name ?? me?.clerkUserId ?? null;
+
+  const handleSignOut = async () => {
+    setSigningOut(true);
+    try {
+      await signOut(); // clears the keychain token (best-effort, never rejects)
+      useAuthStore.getState().reset();
+    } catch (e) {
+      // signOut's contract is never-reject; if that drifts, don't let the rejection escape the
+      // void'd click handler unlogged — the button re-enabling below makes retry the recovery.
+      console.error("Sign out failed:", e);
+    } finally {
+      // Always clear the flag: a rejection or a later sign-in from this same mounted pane must
+      // not leave a wedged, disabled "Signing out…" button.
+      setSigningOut(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div>
+        <div style={subLabel}>Sparkle account</div>
+        {loading ? (
+          <div style={accountLine}>Checking sign-in status…</div>
+        ) : tokenPresent ? (
+          <div style={accountStack}>
+            <div style={accountLine}>
+              {identity ? (
+                <>
+                  Signed in as <span style={{ color: C.cream }}>{identity}</span>
+                </>
+              ) : (
+                "Signed in"
+              )}
+            </div>
+            <button
+              type="button"
+              style={fullButton}
+              disabled={signingOut}
+              onClick={() => void handleSignOut()}
+            >
+              {signingOut ? "Signing out…" : "Sign out"}
+            </button>
+          </div>
+        ) : (
+          <div style={accountStack}>
+            <div style={accountLine}>
+              Not signed in — Sparkle is running in limited free-trial mode.
+            </div>
+            <button type="button" style={fullButton} onClick={() => void openSignIn()}>
+              Sign in
+            </button>
+          </div>
+        )}
+      </div>
+      <div>
+        <div style={subLabel}>Cloud accounts</div>
+        <div style={{ ...accountLine, marginBottom: 10 }}>
+          The Claude accounts your agents run under.
+        </div>
+        <button type="button" style={fullButton} onClick={onManageAccounts}>
+          Manage accounts…
+        </button>
+      </div>
+    </div>
+  );
 }
 
 /** Theme + Text size + Agent order, each under its own sub-label. */
@@ -299,6 +394,19 @@ const stepBtn: CSSProperties = {
   fontSize: 14,
   fontFamily: '"IBM Plex Sans", sans-serif',
   textAlign: "center",
+};
+
+const accountStack: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "flex-start",
+  gap: 10,
+};
+
+const accountLine: CSSProperties = {
+  fontSize: 13,
+  color: C.muted,
+  lineHeight: 1.5,
 };
 
 const fullButton: CSSProperties = {

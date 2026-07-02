@@ -7,9 +7,16 @@
 // and Terminal reads them directly via xtermTheme() because xterm needs concrete hex.
 import { C as BRAND, AGENT_STATUS } from "@sparkle/ui";
 
+// deepForest is the app "chrome" surface (left sidebar + top bar) AND the shared secondary
+// surface for modals/dropdowns/pills. It sits directly behind the ACTIVE row/card, which is
+// painted in the content color `forest` (white in light, deep navy in dark). To make the active
+// row read clearly against inactive rows, deepForest is held ~10% away from forest: in light it
+// is ~10% darker than a near-white (#f1f4fa → #d9dce1, toward black); in dark it is ~10% lighter
+// (#0f2350 → #273962, toward white). Both preserve the original blue tint, so the shift only adds
+// chrome-vs-content contrast without changing the palette's character.
 export const THEME_HEX = {
-  dark: { forest: "#0a1a3f", deepForest: "#0f2350", cream: "#eaf1ff", muted: "#8aa0c4", chatBubble: "#1d3a7a", chatBubbleActive: "#2c57b0", accentInk: "#34e0f0", agentIdle: "#8aa0c4", successInk: "#34c759" },
-  light: { forest: "#ffffff", deepForest: "#f1f4fa", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#d6e0f5", chatBubbleActive: "#bccdf2", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d" },
+  dark: { forest: "#0a1a3f", deepForest: "#273962", cream: "#eaf1ff", muted: "#8aa0c4", chatBubble: "#1d3a7a", chatBubbleActive: "#2c57b0", accentInk: "#34e0f0", agentIdle: "#8aa0c4", successInk: "#34c759" },
+  light: { forest: "#ffffff", deepForest: "#d9dce1", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#d6e0f5", chatBubbleActive: "#bccdf2", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d" },
 } as const;
 
 // Themed token object for component inline styles. The four theme-dependent tokens become

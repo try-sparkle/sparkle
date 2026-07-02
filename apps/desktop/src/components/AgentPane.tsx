@@ -415,6 +415,7 @@ export function AgentPane({
           initialPrompt: workerMission(agent.task ?? "", agent.id),
           configDir,
           resumeSessionId,
+          model: agent.model,
           // Workers run unattended in an isolated worktree: auto-approve every tool call so an
           // approval prompt can't silently deadlock the worker (and its waiting orchestrator).
           dangerouslySkipPermissions: true,
@@ -462,6 +463,7 @@ export function AgentPane({
               paths,
               configDir,
               resumeSessionId,
+              model: agent.model,
             }),
             resuming: resume,
           });
@@ -476,7 +478,7 @@ export function AgentPane({
           throw e;
         }
       } else {
-        exec = buildClaudeExec(claude.path, resume, { configDir, resumeSessionId });
+        exec = buildClaudeExec(claude.path, resume, { configDir, resumeSessionId, model: agent.model });
       }
       setSpawn({
         command: SHELL,
@@ -594,9 +596,6 @@ export function AgentPane({
         onJumpToPrompt={(id) => terminalApiRef.current?.scrollToPrompt(id) ?? "missing"}
       />
 
-      {phase === "preparing" && (
-        <Centered>Preparing your agent's safe workspace…</Centered>
-      )}
       {phase === "error" && (
         <Centered>
           <div style={{ color: C.sienna, marginBottom: 10 }}>Couldn't start this agent</div>
@@ -607,10 +606,14 @@ export function AgentPane({
         </Centered>
       )}
       {phase === "no-claude" && <Onboarding onRetry={() => void prepare()} />}
-      {phase === "ready" && spawn && (
+      {(phase === "preparing" || (phase === "ready" && spawn)) && (
         // Relative stage: the terminal fills it; the composer floats over the bottom as an
-        // overlay (so dragging the composer never resizes/reflows the terminal beneath it).
+        // overlay (so dragging the composer never resizes/reflows the terminal beneath it). The
+        // composer mounts during "preparing" too — as the SAME element across the preparing→ready
+        // transition — so a draft typed while the agent's workspace spins up is preserved (the
+        // element is never remounted) and an eager send is queued + auto-delivered when ready.
         <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
+          {phase === "ready" && spawn ? (
           <div
             style={{
               position: "absolute",
@@ -663,6 +666,12 @@ export function AgentPane({
               apiRef={terminalApiRef}
             />
           </div>
+          ) : (
+            <Centered>
+              Starting your agent's safe workspace — go ahead and start typing or talking now, and
+              I'll send it the moment it's ready.
+            </Centered>
+          )}
           {/* AI-enhanced composer (feature-gated). Off → no overlay: the user types straight into
               the terminal beneath (and photo-drop + Send go away with it).
               NOTE: auto-rename (maybeAutoName below) is intentionally coupled to the composer — the
@@ -673,7 +682,10 @@ export function AgentPane({
             <Composer
               agentId={agent.id}
               active={visible}
-              disabled={!ptyReady}
+              // Usable immediately: during "preparing" (no spawn yet) or before the PTY reports
+              // ready, the composer accepts typing/voice and QUEUES a send, auto-delivering it the
+              // moment the PTY is live — so the user never waits on the workspace spin-up to compose.
+              preparing={phase !== "ready" || !ptyReady}
               inputRef={composerInputRef}
               apiRef={composerApiRef}
               onArrowOverflow={(dir) => terminalApiRef.current?.arrowFromComposer(dir)}

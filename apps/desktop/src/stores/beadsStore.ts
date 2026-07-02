@@ -4,6 +4,7 @@
 // and a re-render never touches the interval.
 import { create } from "zustand";
 import { listBeads, bucketBeads, type Bead, type Board } from "../services/beads";
+import { runDecomposeWatcherForPoll } from "../services/epicDecompose";
 
 /** Default poll interval. bd is local + cheap, but 5s keeps the board feeling live without
  *  hammering the CLI. */
@@ -67,6 +68,10 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
         loading: { ...s.loading, [projectId]: false },
         error: { ...s.error, [projectId]: undefined },
       }));
+      // Post-poll auto-decompose watcher (spec §7). Every guard (main-window election, AI gate,
+      // baseline, re-entrancy) lives in the service so the store stays dumb. Fire-and-forget —
+      // it never throws, and the next poll picks up whatever labels/children it wrote.
+      void runDecomposeWatcherForPoll(projectId, projectPath, board);
     } catch (e) {
       // Best-effort: a bd/parse failure must not break the UI. Keep the last snapshot,
       // surface the message, and clear the loading flag.

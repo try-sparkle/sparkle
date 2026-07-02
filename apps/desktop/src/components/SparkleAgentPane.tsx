@@ -3,14 +3,17 @@ import { C, FONT_WEIGHT } from "../theme/colors";
 import { createAgentWorktree, installWorktreeGuard, assertWorkspaceIntegrity } from "../services/worktree";
 import { checkClaude, claudeHasSession } from "../preflight";
 import { buildClaudeExec } from "../services/claudeSpawn";
+import { cancelImprovementPass } from "../services/improvementPass";
 import {
   ensureSparkleRepo,
   sparklePersona,
   sparkleMissionPrompt,
+  sparkleChatOnlyMissionPrompt,
   SPARKLE_AGENT_ID,
   SPARKLE_PROJECT_ID,
 } from "../services/sparkleAgent";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
 import { PinnedPrompt } from "./PinnedPrompt";
 import { SparkleConsentBanner } from "./SparkleConsentBanner";
@@ -56,6 +59,10 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
     setErrorMsg("");
     setPtyReady(false);
     try {
+      // If an hourly headless pass is mid-flight (improvementPass.ts), kill it first: two
+      // `claude` processes must never share this worktree. Nothing is lost — the interactive
+      // session below resumes the worktree's most recent conversation, including the pass's.
+      await cancelImprovementPass().catch(() => {});
       // App-owned workspace: clone the OSS repo (once) + locate the log dir. Never the user's project.
       const ws = await ensureSparkleRepo();
       // Cut this agent's isolated worktree off the clone's actual default branch (reuses the normal
@@ -78,15 +85,22 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
         return;
       }
       const resume = await claudeHasSession(wt.path).catch(() => false);
+      // Consent gates what the agent may do (bead sparkle-4xwk.1). Read at prepare() time — the
+      // spawned command is built here, so a consent change while a session is already running is
+      // picked up on the next prepare/resume, not mid-session.
+      const consent = useSettingsStore.getState().sparkleImprovementConsent;
       setSpawn({
         command: SHELL,
         args: [
           "-l",
           "-c",
           buildClaudeExec(claude.path, resume, {
-            appendSystemPrompt: sparklePersona(ws.logDir, wt.path),
-            addDirs: [ws.logDir],
-            initialPrompt: sparkleMissionPrompt(),
+            appendSystemPrompt: sparklePersona(ws.logDir, wt.path, consent),
+            // "Never" = chat-only: don't even grant the agent read access to the log dir, and open
+            // with an introduction instead of a log-review mission.
+            ...(consent === "never" ? {} : { addDirs: [ws.logDir] }),
+            initialPrompt:
+              consent === "never" ? sparkleChatOnlyMissionPrompt() : sparkleMissionPrompt(),
           }),
         ],
         cwd: wt.path,

@@ -64,9 +64,48 @@ const actionBtn = {
   textAlign: "center" as const,
 };
 
-/** Logo + balance pill, plus the Recent / Open / New action row. `onAction` fires after any
- *  action so the caller can hide the popover. */
-export function TrayHeader({ onAction }: { onAction: () => void }) {
+// Primary (teal-filled) emphasis, shared by New and Capture so they can't drift apart.
+const primaryBtn = { ...actionBtn, borderColor: C.teal, background: C.teal };
+
+// Approved capture icon (spec §3 mockup): stroke-style camera + lens, with four waveform bars
+// to the right — inline SVG, react-icons look, no emoji. aria-hidden so the button's accessible
+// name stays "Capture".
+function CaptureIcon() {
+  return (
+    <svg
+      width={20}
+      height={16}
+      viewBox="0 0 30 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M2 8a2 2 0 0 1 2-2h1.3l1.2-2h4.6l1.2 2H15a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z" />
+      <circle cx="9.5" cy="12.5" r="3" />
+      <path d="M20.5 10v5M23 6.5v12M25.5 8.5v8M28 10.5v4" />
+    </svg>
+  );
+}
+
+/** Logo + balance pill, plus the Recent / Open / New / Capture action row. `onAction` fires after
+ *  any open action so the caller can hide the popover; `onCapture` runs the capture flow (which
+ *  hides the popover itself before the crosshairs, so it never fires `onAction`). `captureBusy`
+ *  disables the Capture button while a capture is in flight (re-entrancy guard). */
+export function TrayHeader({
+  onAction,
+  onCapture,
+  captureBusy = false,
+  captureError = null,
+}: {
+  onAction: () => void;
+  onCapture: () => void;
+  captureBusy?: boolean;
+  /** One-line failure notice under the Capture button (spec §9 TCC toast) — null when clean. */
+  captureError?: string | null;
+}) {
   const projects = useProjectStore((s) => s.projects);
   const [recentOpen, setRecentOpen] = useState(false);
   // Most-recently-opened first, mirroring TopBar's Recent ordering.
@@ -95,12 +134,32 @@ export function TrayHeader({ onAction }: { onAction: () => void }) {
           Open
         </button>
         <button
-          style={{ ...actionBtn, flex: 1, borderColor: C.teal, background: C.teal }}
+          style={{ ...primaryBtn, flex: 1 }}
           onClick={() => void pickAndOpen("New project — choose or create its folder", close)}
         >
           New
         </button>
       </div>
+      <button
+        disabled={captureBusy}
+        style={{
+          ...primaryBtn,
+          borderRadius: 4,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 6,
+          opacity: captureBusy ? 0.55 : 1,
+          cursor: captureBusy ? "default" : "pointer",
+        }}
+        onClick={() => onCapture()}
+      >
+        <CaptureIcon />
+        Capture
+      </button>
+      {captureError && (
+        <div role="alert" style={{ color: C.sienna, fontSize: 12, padding: "0 2px" }}>{captureError}</div>
+      )}
       {recentOpen && (
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
           {recent.length === 0 ? (

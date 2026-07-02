@@ -5,11 +5,17 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 // embeds the epic id the orchestrator will act on.
 const addAgentMock = vi.fn();
 const appendPromptMock = vi.fn();
+const setAgentEpicIdMock = vi.fn();
 let projects: Array<{ id: string; agents: Array<{ id: string; kind: string }> }> = [];
 
 vi.mock("../stores/projectStore", () => ({
   useProjectStore: {
-    getState: () => ({ projects, addAgent: addAgentMock, appendPrompt: appendPromptMock }),
+    getState: () => ({
+      projects,
+      addAgent: addAgentMock,
+      appendPrompt: appendPromptMock,
+      setAgentEpicId: setAgentEpicIdMock,
+    }),
   },
 }));
 
@@ -24,6 +30,7 @@ describe("sendToBuild", () => {
   beforeEach(() => {
     addAgentMock.mockReset();
     appendPromptMock.mockReset();
+    setAgentEpicIdMock.mockReset();
     openMock.mockReset();
     appendPromptMock.mockReturnValue("prompt-id");
     projects = [];
@@ -40,6 +47,8 @@ describe("sendToBuild", () => {
     expect(addAgentMock).toHaveBeenCalledWith("proj1", { kind: "build" });
     // Opened the new agent (mounts pane / drives PTY launch).
     expect(openMock).toHaveBeenCalledWith("build-new");
+    // Bound the epic to the new orchestrator (drives the sidebar epic pill — spec §8).
+    expect(setAgentEpicIdMock).toHaveBeenCalledWith("proj1", "build-new", "epic-42");
     // Seeded the orchestrator's first message.
     expect(appendPromptMock).toHaveBeenCalledTimes(1);
     const [projectId, agentId, seed] = appendPromptMock.mock.calls[0]!;
@@ -66,6 +75,8 @@ describe("sendToBuild", () => {
     expect(addAgentMock).not.toHaveBeenCalled(); // reused, not created
     expect(openMock).toHaveBeenCalledWith("build1");
     expect(appendPromptMock).toHaveBeenCalledWith("proj1", "build1", expect.stringContaining("epic-7"));
+    // The reused orchestrator is re-bound to the epic it was just handed.
+    expect(setAgentEpicIdMock).toHaveBeenCalledWith("proj1", "build1", "epic-7");
   });
 
   it("throws for an unknown project", () => {
@@ -73,6 +84,19 @@ describe("sendToBuild", () => {
     expect(() => sendToBuild({ projectId: "ghost", epicId: "e", prdPath: "p" })).toThrow(/unknown project/);
     expect(addAgentMock).not.toHaveBeenCalled();
     expect(openMock).not.toHaveBeenCalled();
+    expect(setAgentEpicIdMock).not.toHaveBeenCalled();
+  });
+
+  it("omits the PRD instruction for a PRD-less epic (prdPath null) instead of blocking", () => {
+    projects = [{ id: "proj1", agents: [{ id: "build1", kind: "build" }] }];
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-1", prdPath: null });
+
+    const seed = appendPromptMock.mock.calls[0]![2] as string;
+    expect(seed).not.toMatch(/read the PRD/i);
+    expect(seed).toContain("epic-1");
+    expect(seed).toContain("BEADS PROTOCOL"); // protocol still embedded
+    expect(seed).toMatch(/bd show/i); // the epic bead itself is the spec now
   });
 
   it("seeds a prompt that instructs reading the PRD and following the beads protocol", () => {

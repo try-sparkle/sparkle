@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C } from "../theme/colors";
 import { getAppVersion, getLogDir, revealLogs, log } from "../logger";
+import { SupportModal } from "./SupportModal";
 
 const CHANGELOG_URL = "https://sparkle.ai/changelog";
 
@@ -16,6 +17,7 @@ export function StatusBar() {
   const [version, setVersion] = useState<string>("");
   const [logDir, setLogDir] = useState<string>("");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [supportOpen, setSupportOpen] = useState(false);
   const versionRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -53,6 +55,11 @@ export function StatusBar() {
   const onChangelog = () => {
     log.info("statusbar", "changelog clicked");
     void openUrl(CHANGELOG_URL).catch((e) => log.error("statusbar", "open changelog failed", e));
+  };
+
+  const onSupport = () => {
+    log.info("statusbar", "support clicked");
+    setSupportOpen(true);
   };
 
   return (
@@ -149,6 +156,26 @@ export function StatusBar() {
       >
         Changelog
       </button>
+      <span aria-hidden>·</span>
+      <button
+        data-hint="support"
+        onClick={onSupport}
+        title="Get help or open a support ticket"
+        style={{
+          background: "transparent",
+          border: "none",
+          padding: 0,
+          margin: 0,
+          color: C.accentInk,
+          fontSize: 11,
+          fontFamily: '"IBM Plex Sans", sans-serif',
+          cursor: "pointer",
+          textDecoration: "underline",
+        }}
+      >
+        Support
+      </button>
+      {supportOpen && <SupportModal onClose={() => setSupportOpen(false)} />}
     </div>
   );
 }

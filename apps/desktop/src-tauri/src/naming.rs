@@ -1,18 +1,19 @@
 // Auto-naming: turn an agent's first (or meaningfully-changed) prompt into a short TITLE plus a
 // one-sentence DESCRIPTION of the work, by asking the cheapest Claude model (Haiku 4.5) in one
 // call. The sidebar shows the title (truncated to fit the column) and reveals the title + the
-// description on hover. The call lives in Rust — not the webview — so the BYOK Anthropic key never
-// ships in the JS bundle and we can read it from the user's `.env.local` on disk.
+// description on hover. The call lives in Rust — not the webview — so the user's Sparkle bearer
+// token never ships in the JS bundle.
 //
-// Key resolution (first hit wins): ANTHROPIC_API_KEY env, ANTHROPIC_API env, then `.env.local`
-// at EXACT paths only — the current dir (DEBUG builds only) and `$HOME/Projects/sparkle/.env.local`.
-// We deliberately do NOT walk parent directories (that was a key-injection vector); see
-// `resolve_anthropic_key`. Either `ANTHROPIC_API_KEY=` or `ANTHROPIC_API=` is accepted inside the
-// file (the user named theirs `ANTHROPIC_API`).
+// Billing (task #10): the Anthropic call goes through the orchestration `POST /ai/anthropic` proxy
+// on the user's keychain bearer (see `ai::call_anthropic_proxy`). The SERVER holds the vendor key
+// and meters credits — there is no BYOK Anthropic key on the desktop anymore, so no developer
+// secret ships in the binary. Cloud dictation moved the SAME way (task #13): the Deepgram key +
+// meter now live behind the orchestration `/ai/deepgram` relay, so the local Deepgram key resolver
+// was removed too. (The `resolve_env_secret` helper below survives ONLY for the Chief PAT.)
 //
-// Everything degrades gracefully: no key, or any network/parse failure, returns Err — the
-// frontend treats that as "leave the current name alone", so the feature is a no-op until
-// a key exists rather than a hard error.
+// Everything degrades gracefully: signed out, out of credits, or any network/parse failure returns
+// Err — the frontend treats that as "leave the current name alone", so the feature is a no-op until
+// the user is signed in with credit rather than a hard error.
 
 use std::path::{Path, PathBuf};
 
@@ -79,13 +80,14 @@ fn parse_env_value(body: &str, keys: &[&str]) -> Option<String> {
 }
 
 /// Read ONE dotenv file at the exact `path` and pull the first matching key. Deliberately not
-/// a directory walk — see `resolve_anthropic_key` for why ancestor traversal is unsafe.
+/// a directory walk — see `resolve_env_secret` for why ancestor traversal is unsafe.
 fn read_dotenv_key(path: &Path, keys: &[&str]) -> Option<String> {
     let body = std::fs::read_to_string(path).ok()?;
     parse_env_value(&body, keys)
 }
 
-/// Best-effort secret lookup shared by the BYOK integrations (Anthropic key, Chief PAT).
+/// Best-effort secret lookup for the remaining local integration (the Chief PAT). The Anthropic and
+/// Deepgram key resolvers were removed — both now run server-side through the `/ai/*` proxies.
 /// Resolution order (first non-empty wins):
 ///   1. each name in `keys` as a process env var (all builds).
 ///   2. DEBUG builds only: `.env.local` in the process's current dir (the repo root in `tauri dev`).
@@ -127,20 +129,6 @@ pub(crate) fn resolve_env_secret(keys: &[&str]) -> Option<String> {
         }
     }
     None
-}
-
-/// Best-effort BYOK key lookup. See module docs for the resolution order. `pub(crate)` so the
-/// generic chat command in `ai.rs` reuses the exact same resolver (env → `.env.local`).
-pub(crate) fn resolve_anthropic_key() -> Option<String> {
-    resolve_env_secret(&["ANTHROPIC_API_KEY", "ANTHROPIC_API"])
-}
-
-/// Best-effort Deepgram key lookup for the cloud dictation path. The user named theirs
-/// `DEEPGRAM_API` in `.env.local` (mirroring the `ANTHROPIC_API` convention); also accept the
-/// conventional `DEEPGRAM_API_KEY`. Same resolution order and security posture as the Anthropic
-/// key (runtime read, exact paths only) — see `resolve_env_secret`.
-pub(crate) fn resolve_deepgram_key() -> Option<String> {
-    resolve_env_secret(&["DEEPGRAM_API_KEY", "DEEPGRAM_API"])
 }
 
 /// Trim the model's reply down to a clean title of at most `max_words` words. Defensive
@@ -267,65 +255,34 @@ pub async fn generate_agent_name(prompt: String) -> Result<AgentName, String> {
     if prompt.is_empty() {
         return Err("empty prompt".into());
     }
-    let key = resolve_anthropic_key()
-        .ok_or_else(|| "no Anthropic API key (set ANTHROPIC_API_KEY or add it to .env.local)".to_string())?;
+    // The Anthropic call runs server-side on the user's Sparkle bearer (from the keychain).
+    let base = crate::auth::base_url(); // just an env read — cheap, non-blocking.
 
-    // ureq is blocking; keep it off the async runtime's worker.
-    tauri::async_runtime::spawn_blocking(move || call_anthropic(&key, &prompt))
-        .await
-        .map_err(|e| format!("join error: {e}"))?
+    // ureq is blocking AND the keychain read is a syscall that can block on a locked keychain — keep
+    // BOTH off the async runtime's worker by resolving the token inside the blocking closure. No
+    // token → signed out; degrade (leave the name as-is) rather than call the proxy.
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = crate::auth::bearer_token().ok_or_else(|| "not signed in".to_string())?;
+        call_anthropic(&base, &token, &prompt)
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
 }
 
-fn call_anthropic(key: &str, prompt: &str) -> Result<AgentName, String> {
-    // Serialize/parse via serde_json directly so we don't depend on ureq's optional `json`
-    // feature (the crate is pulled in without it).
-    let body = serde_json::json!({
-        // A short title + one sentence (plus JSON braces/keys/quotes, and a ```json fence the
-        // model often adds) fits comfortably in 256 tokens; the prior three-variant schema needed
-        // 512, but this reply is much smaller.
-        "model": NAMING_MODEL,
-        "max_tokens": 256,
-        "system": SYSTEM_PROMPT,
-        "messages": [{ "role": "user", "content": prompt }],
-    });
-    let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {e}"))?;
-
-    let resp = ureq::post("https://api.anthropic.com/v1/messages")
-        .set("x-api-key", key)
-        .set("anthropic-version", "2023-06-01")
-        .set("content-type", "application/json")
-        .send_string(&body_str);
-
-    let raw = match resp {
-        Ok(r) => r.into_string().map_err(|e| format!("read body: {e}"))?,
-        Err(ureq::Error::Status(code, r)) => {
-            // Don't surface the upstream response body to the UI: it can echo request context,
-            // and the API key lives in this function. Log it for debugging, return a generic msg.
-            let detail = r.into_string().unwrap_or_default();
-            tracing::debug!(code, detail = %detail, "anthropic naming call returned an error status");
-            return Err(format!("naming failed (Anthropic HTTP {code})"));
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "anthropic naming request failed");
-            return Err("naming request failed".into());
-        }
-    };
-    let json: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("bad JSON: {e}"))?;
-
-    // Messages API: { "content": [ { "type": "text", "text": "..." }, ... ] }
-    let mut text = String::new();
-    if let Some(blocks) = json.get("content").and_then(serde_json::Value::as_array) {
-        for block in blocks {
-            if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
-                if let Some(t) = block.get("text").and_then(serde_json::Value::as_str) {
-                    text = t.to_string();
-                    break;
-                }
-            }
-        }
-    }
-
+fn call_anthropic(base: &str, token: &str, prompt: &str) -> Result<AgentName, String> {
+    // A short title + one sentence (plus JSON braces/keys/quotes, and a ```json fence the model
+    // often adds) fits comfortably in 256 tokens. The proxy holds the vendor key + meters credits.
+    let json = crate::ai::call_anthropic_proxy(
+        base,
+        token,
+        NAMING_MODEL,
+        SYSTEM_PROMPT,
+        prompt,
+        256,
+        crate::ai::CLASSIFY_READ_TIMEOUT,
+    )?;
+    let text = crate::ai::extract_text(&json)
+        .ok_or_else(|| "naming returned no text".to_string())?;
     interpret_reply(&text)
 }
 
@@ -342,21 +299,6 @@ mod tests {
         assert_eq!(
             parse_env_value(body, &["ANTHROPIC_API_KEY", "ANTHROPIC_API"]),
             Some("dummy-key-value".to_string())
-        );
-    }
-
-    #[test]
-    fn parses_the_deepgram_key_under_either_name() {
-        // The cloud dictation path resolves the same way; the user's file uses DEEPGRAM_API.
-        let body = "DEEPGRAM_API=\"dg-dummy\"\n";
-        assert_eq!(
-            parse_env_value(body, &["DEEPGRAM_API_KEY", "DEEPGRAM_API"]),
-            Some("dg-dummy".to_string())
-        );
-        let body2 = "DEEPGRAM_API_KEY=dg-conventional\n";
-        assert_eq!(
-            parse_env_value(body2, &["DEEPGRAM_API_KEY", "DEEPGRAM_API"]),
-            Some("dg-conventional".to_string())
         );
     }
 

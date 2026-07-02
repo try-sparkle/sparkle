@@ -4,27 +4,18 @@
 // tells you the actual question instead of a generic "Needs your answer".
 //
 // Like judge.rs / naming.rs this asks the cheapest Claude model (Haiku 4.5) and lives in Rust — not
-// the webview — so the BYOK Anthropic key never ships in the JS bundle. It reuses
-// `naming::resolve_anthropic_key` for identical key resolution and `ai::extract_text` for the
-// Messages-API reply shape. Degrades gracefully: no key / network / parse / empty returns Err, and
-// the caller (useAttentionNotifications) falls back to the existing generic body — so the feature is
-// a no-op until a key exists rather than a hard error or a blank banner.
+// the webview — so the user's Sparkle bearer never ships in the JS bundle. The call goes through the
+// server-side `/ai/anthropic` proxy (`ai::call_anthropic_proxy`); the server holds the vendor key
+// and meters credits. Degrades gracefully: signed out / out of credits / network / parse / empty
+// returns Err, and the caller (useAttentionNotifications) falls back to the existing generic body —
+// so the feature is a no-op until the user is signed in with credit rather than a blank banner.
 
-use std::time::Duration;
-
-use crate::ai::extract_text;
-use crate::naming::resolve_anthropic_key;
+use crate::ai::{call_anthropic_proxy, extract_text, CLASSIFY_READ_TIMEOUT};
 
 /// Cheapest current Claude model — a one-line summary needs nothing more. (claude-api skill:
-/// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.)
+/// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.) It is also the
+/// only model the server-side proxy meters, so every proxied call must use it.
 const SUMMARY_MODEL: &str = "claude-haiku-4-5";
-
-/// Bound the Anthropic call so a stalled api.anthropic.com can't pin a spawn_blocking thread
-/// forever and exhaust the blocking pool. ureq has no default timeout; a hung endpoint then hits
-/// the Err path (which the caller degrades to the generic body). A one-line reply returns fast, so
-/// the read budget is modest. Mirrors judge.rs's AgentBuilder shape.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A single short line out (≤ ~12 words), so a tiny budget is plenty.
 const SUMMARY_MAX_TOKENS: u32 = 40;
@@ -82,52 +73,30 @@ pub async fn summarize_attention(screen: String) -> Result<String, String> {
     if screen.is_empty() {
         return Err("empty screen".into());
     }
-    let key = resolve_anthropic_key().ok_or_else(|| {
-        "no Anthropic API key (set ANTHROPIC_API_KEY or add it to .env.local)".to_string()
-    })?;
+    // Server-side proxy on the user's bearer (see module docs).
+    let base = crate::auth::base_url(); // just an env read — cheap, non-blocking.
 
-    // ureq is blocking; keep it off the async runtime's worker.
-    tauri::async_runtime::spawn_blocking(move || call_summarize(&key, &screen))
-        .await
-        .map_err(|e| format!("join error: {e}"))?
+    // ureq is blocking AND the keychain read is a syscall that can block on a locked keychain — keep
+    // BOTH off the async runtime's worker by resolving the token inside the blocking closure. No
+    // token → signed out; degrade (generic banner) rather than call the proxy.
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = crate::auth::bearer_token().ok_or_else(|| "not signed in".to_string())?;
+        call_summarize(&base, &token, &screen)
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
 }
 
-fn call_summarize(key: &str, screen: &str) -> Result<String, String> {
-    let body = serde_json::json!({
-        "model": SUMMARY_MODEL,
-        "max_tokens": SUMMARY_MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
-        "messages": [{ "role": "user", "content": screen }],
-    });
-    let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {e}"))?;
-
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(READ_TIMEOUT)
-        .build();
-    let resp = agent
-        .post("https://api.anthropic.com/v1/messages")
-        .set("x-api-key", key)
-        .set("anthropic-version", "2023-06-01")
-        .set("content-type", "application/json")
-        .send_string(&body_str);
-
-    let raw = match resp {
-        Ok(r) => r.into_string().map_err(|e| format!("read body: {e}"))?,
-        Err(ureq::Error::Status(code, r)) => {
-            // Don't surface the upstream body to the UI: it can echo request context, and the API
-            // key lives in this function. Log for debugging, return a generic message.
-            let detail = r.into_string().unwrap_or_default();
-            tracing::debug!(code, detail = %detail, "anthropic summarize call returned an error status");
-            return Err(format!("summarize failed (Anthropic HTTP {code})"));
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "anthropic summarize request failed");
-            return Err("summarize request failed".into());
-        }
-    };
-    let json: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("bad JSON: {e}"))?;
+fn call_summarize(base: &str, token: &str, screen: &str) -> Result<String, String> {
+    let json = call_anthropic_proxy(
+        base,
+        token,
+        SUMMARY_MODEL,
+        SYSTEM_PROMPT,
+        screen,
+        SUMMARY_MAX_TOKENS,
+        CLASSIFY_READ_TIMEOUT,
+    )?;
     let text = extract_text(&json).ok_or_else(|| "summarize returned no text".to_string())?;
     let cleaned = clean_summary(&text);
     if cleaned.is_empty() {

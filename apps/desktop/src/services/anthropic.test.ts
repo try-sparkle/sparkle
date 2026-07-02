@@ -5,6 +5,7 @@ const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
 
 import { chatOnce, structuredJson, extractJson } from "./anthropic";
+import { OutOfCreditsError } from "./credits";
 
 afterEach(() => {
   invokeMock.mockReset();
@@ -40,6 +41,21 @@ describe("chatOnce", () => {
   it("propagates a thrown Error unchanged", async () => {
     invokeMock.mockRejectedValue(new Error("network down"));
     await expect(chatOnce("sys", "usr")).rejects.toThrow("network down");
+  });
+
+  it("maps the server's typed insufficient_credits error to OutOfCreditsError with the balance", async () => {
+    // The Rust proxy returns `insufficient_credits:<balanceCents>` when the /ai/anthropic gate 402s.
+    invokeMock.mockRejectedValue("insufficient_credits:1234");
+    const err = await chatOnce("sys", "usr").catch((e) => e);
+    expect(err).toBeInstanceOf(OutOfCreditsError);
+    expect((err as OutOfCreditsError).balanceCents).toBe(1234);
+  });
+
+  it("defaults the balance to 0 when the credits error carries no amount", async () => {
+    invokeMock.mockRejectedValue("insufficient_credits");
+    const err = await chatOnce("sys", "usr").catch((e) => e);
+    expect(err).toBeInstanceOf(OutOfCreditsError);
+    expect((err as OutOfCreditsError).balanceCents).toBe(0);
   });
 });
 

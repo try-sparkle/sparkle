@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { C } from "@sparkle/ui";
 import { TrayDashboard } from "./TrayDashboard";
@@ -7,6 +7,7 @@ import { bucketCounts, drawTrayIcon } from "./trayIcon";
 import type { TrayRoster } from "./trayRoster";
 import { getTrayRoster, onTrayRosterChanged, setTrayImage, emitFocusAgent } from "../services/attention";
 import { safeUnlisten } from "../services/safeUnlisten";
+import { captureScreenRegion, showCaptureWindow } from "../screenshot";
 
 const EMPTY: TrayRoster = { projects: [], counts: { red: 0, grey: 0, green: 0 } };
 
@@ -30,6 +31,12 @@ function paintTrayIcon(roster: TrayRoster): void {
 export function TrayApp() {
   const [roster, setRoster] = useState<TrayRoster>(EMPTY);
   const [now, setNow] = useState(() => Date.now());
+  const [captureBusy, setCaptureBusy] = useState(false);
+  const [captureError, setCaptureError] = useState<string | null>(null);
+  // Synchronous re-entrancy guard: `captureBusy` state is read from the render closure, so two
+  // clicks landing before a re-render could both pass a state-only check. The ref flips
+  // immediately; the state only drives the disabled visual.
+  const captureBusyRef = useRef(false);
 
   // Live roster: seed once, then follow the aggregator's pushes. Repaint the menu-bar icon on each.
   useEffect(() => {
@@ -55,12 +62,38 @@ export function TrayApp() {
 
   const hide = () => void getCurrentWindow().hide();
 
-  // Pinned header (logo + balance + Recent/Open/New) and footer (Quit), with the agent dashboard
-  // scrolling between them. background on the root so the (deepForest) chrome and (forest) list
-  // share one surface with no gaps.
+  // Capture flow (spec §3): hide the popover FIRST so it isn't in the shot, then the native
+  // crosshair picker; null = user Esc'd at the crosshairs — silently done. Otherwise hand the
+  // shot to the dedicated capture window. The button stays disabled until the whole sequence
+  // settles (including invoke failure).
+  const capture = async () => {
+    if (captureBusyRef.current) return;
+    captureBusyRef.current = true;
+    setCaptureBusy(true);
+    setCaptureError(null);
+    try {
+      await getCurrentWindow().hide();
+      const shot = await captureScreenRegion();
+      if (shot) await showCaptureWindow(shot);
+    } catch (e) {
+      console.error("tray: capture flow failed", e);
+      // Spec §9: a failed capture must not be indistinguishable from an Esc — the popover is
+      // already hidden, so re-show it with a one-line notice. The copy hedges: any of the
+      // three awaits can throw, but TCC Screen Recording denial is the expected first-run one.
+      setCaptureError("Capture failed — if this is your first capture, check Screen Recording in System Settings.");
+      void getCurrentWindow().show().catch((err) => console.error("tray: failed to re-show popover", err));
+    } finally {
+      captureBusyRef.current = false;
+      setCaptureBusy(false);
+    }
+  };
+
+  // Pinned header (logo + balance + Recent/Open/New/Capture) and footer (Quit), with the agent
+  // dashboard scrolling between them. background on the root so the (deepForest) chrome and
+  // (forest) list share one surface with no gaps.
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: C.forest }}>
-      <TrayHeader onAction={hide} />
+      <TrayHeader onAction={hide} onCapture={() => void capture()} captureBusy={captureBusy} captureError={captureError} />
       <div style={{ flex: 1, overflowY: "auto" }}>
         <TrayDashboard
           roster={roster}

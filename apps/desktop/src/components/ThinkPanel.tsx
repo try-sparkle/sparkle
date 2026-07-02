@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { TbBulb } from "react-icons/tb";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Project } from "../types";
@@ -26,6 +26,8 @@ import { useProjectStore } from "../stores/projectStore";
 import { useUiStore } from "../stores/uiStore";
 import { registerThink } from "../services/thinkBridge";
 import { AiDisabledError, OutOfCreditsError } from "../services/credits";
+import { aiFeatureLockedNow, useAiFeatureLocked } from "../services/aiGate";
+import { AiLockedNotice } from "./AiLockedNotice";
 import { useHistoryStore } from "../stores/historyStore";
 import type { HistoryEntry, HistoryKind } from "../services/history";
 import { sendClaudeChat, cancelClaudeChat, resolveClaudePath } from "../services/claudeChat";
@@ -34,6 +36,9 @@ import { answerAsVoice } from "../services/voiceAnswer";
 import { Markdown } from "./Markdown";
 import { MentionPicker, type MentionPick } from "./MentionPicker";
 import { searchVoices, findVoice } from "../services/expertRoster";
+import { screenshotAttachment } from "./composer/attachmentsApi";
+import { composeThinkTurn } from "./thinkCompose";
+import type { Attachment } from "./composer/attachments";
 
 // Who authored a chat message. "user" = you. "claude" = the headless Claude Code engine (the
 // primary, fast responder). "chief" = Chief popping in with a library-grounded observation, or the
@@ -235,9 +240,25 @@ export function ThinkPanel({
 
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
+  // Capture screenshots handed off with the draft (pending.attachments). Shown as pills above
+  // the composer; on send each becomes a `[Screenshot: <path>]` line in the turn text — neither
+  // the headless Claude Code chat nor Chief takes image content blocks yet, and Claude Code can
+  // read the file from disk via its path.
+  const [attachedShots, setAttachedShots] = useState<Attachment[]>([]);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  // Trial "see it but buy to use it": Think is VISIBLE during the trial (aiGate visible split), but
+  // submitting while LOCKED (flag on, no credits) shows this inline buy-to-use notice instead of
+  // firing any backend — the typed text is preserved so the user can send for real after buying.
+  const [showLockedNotice, setShowLockedNotice] = useState(false);
+  // Reactive lock state so the notice self-clears the moment the app is bought (becomes entitled),
+  // mirroring the other visible-but-locked surfaces — otherwise it would linger for an already-
+  // entitled user until the next dispatch() ran.
+  const thinkLocked = useAiFeatureLocked("brainstorm");
+  useEffect(() => {
+    if (!thinkLocked) setShowLockedNotice(false);
+  }, [thinkLocked]);
   const [planning, setPlanning] = useState(false);
   const [claudePath, setClaudePath] = useState<string | null>(null);
   const [claudeReady, setClaudeReady] = useState<"checking" | "ok" | "missing">("checking");
@@ -558,6 +579,15 @@ export function ThinkPanel({
   const dispatch = async (raw: string, { capture = true } = {}) => {
     const prompt = raw.trim();
     if (!prompt || sending) return;
+    // Visible-but-locked (trial / no credits): Think is shown but can't run. Surface the buy-to-use
+    // notice and fire NO backend (Claude/Chief/voice). This also guards the non-composer callers
+    // (capture/handoff auto-send, the connectivity nudge); send() already blocks before clearing the
+    // composer, so the user's typed text is never lost.
+    if (aiFeatureLockedNow("brainstorm")) {
+      setShowLockedNotice(true);
+      return;
+    }
+    setShowLockedNotice(false);
     setError("");
     const { question, responders } = routeMessage(prompt);
 
@@ -610,10 +640,20 @@ export function ThinkPanel({
   };
 
   // --- composer send + key handling -------------------------------------------------------
+  // Attached capture screenshots go into the dispatched turn as `[Screenshot: <path>]` lines
+  // (see attachedShots above) — an image alone is sendable, matching the capture modal's rule.
   const send = () => {
-    const prompt = input.trim();
-    if (!prompt || sending) return;
+    const typed = input.trim();
+    if ((!typed && attachedShots.length === 0) || sending) return;
+    // Locked (trial / no credits): show the buy-to-use notice WITHOUT clearing the composer or
+    // firing a backend, so the typed text + attachments survive for a real send after buying.
+    if (aiFeatureLockedNow("brainstorm")) {
+      setShowLockedNotice(true);
+      return;
+    }
+    const prompt = composeThinkTurn(typed, attachedShots.map((a) => a.path));
     setInput("");
+    setAttachedShots([]);
     closePicker();
     void dispatch(prompt);
   };
@@ -795,14 +835,24 @@ export function ThinkPanel({
     });
   }, [agentId]);
 
-  // A terminal-selection action queued a prompt for this project's think agent.
+  // A terminal-selection action (or the capture modal) queued a prompt for this project's think
+  // agent. Capture handoffs also carry screenshots — surfaced as pills above the composer.
   useEffect(() => {
     if (!handoff || handoff.projectId !== project.id) return;
-    const { text, autoSend } = handoff;
+    const { text, autoSend, attachments } = handoff;
     clearHandoff();
     if (autoSend) {
-      void dispatch(text);
+      // Compose the screenshot refs straight into the auto-sent turn (roborev 25166/25167) — do
+      // NOT stage them as pills, or they'd silently ride the user's next, unrelated send. This
+      // also makes an image-only autoSend (text: "") dispatch, matching send()'s rule.
+      void dispatch(composeThinkTurn(text, attachments?.map((a) => a.path) ?? []));
     } else {
+      if (attachments?.length) {
+        setAttachedShots((prev) => [
+          ...prev,
+          ...attachments.map((a) => screenshotAttachment(a.path, a.dataUrl)),
+        ]);
+      }
       setInput(text);
       inputRef.current?.focus();
     }
@@ -882,6 +932,11 @@ export function ThinkPanel({
       {notice && !error && (
         <div style={{ padding: "8px 16px", color: C.muted, fontSize: 12 }}>{notice}</div>
       )}
+      {showLockedNotice && thinkLocked && (
+        <div style={{ padding: "0 16px 8px" }}>
+          <AiLockedNotice label="Buy Sparkle to think with AI." />
+        </div>
+      )}
 
       {/* The single Plan handoff action */}
       <div
@@ -927,6 +982,17 @@ export function ThinkPanel({
 
       {/* Composer (with the @-mention picker floating above it) */}
       <div style={{ position: "relative", padding: 12, borderTop: `1px solid ${C.deepForest}` }}>
+        {attachedShots.length > 0 && (
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+            {attachedShots.map((a) => (
+              <CaptureShotPill
+                key={a.id}
+                att={a}
+                onRemove={() => setAttachedShots((prev) => prev.filter((x) => x.id !== a.id))}
+              />
+            ))}
+          </div>
+        )}
         {pickerOpen && (
           <div style={{ position: "absolute", bottom: "100%", left: 12, marginBottom: 6, zIndex: 20 }}>
             <MentionPicker
@@ -1020,23 +1086,97 @@ export function ThinkPanel({
           </div>
           <button
             onClick={() => (sending ? stopTurn() : send())}
-            disabled={!sending && !input.trim()}
+            disabled={!sending && !input.trim() && attachedShots.length === 0}
             title={sending ? "Stop the current turn" : "Send"}
             style={{
               alignSelf: "stretch",
-              background: sending ? C.sienna : input.trim() ? C.teal : C.forest,
+              background: sending
+                ? C.sienna
+                : input.trim() || attachedShots.length > 0
+                ? C.teal
+                : C.forest,
               color: C.cream,
               border: "none",
               borderRadius: 8,
               padding: "0 18px",
               fontWeight: FONT_WEIGHT.semibold,
-              cursor: !sending && !input.trim() ? "default" : "pointer",
+              cursor:
+                !sending && !input.trim() && attachedShots.length === 0 ? "default" : "pointer",
             }}
           >
             {sending ? "Stop" : "Send"}
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// A capture screenshot riding with the draft — AttachmentTile's visual language (46px image
+// tile, thin border, floating × remove) at the app-wide 4px radius. Read-only beyond remove:
+// no lightbox/multi-select here, the Think composer just needs the "this image is attached" cue.
+function CaptureShotPill({ att, onRemove }: { att: Attachment; onRemove: () => void }) {
+  return (
+    <div style={{ position: "relative", lineHeight: 0 }}>
+      <div
+        title={att.path}
+        style={{
+          height: 46,
+          maxWidth: 120,
+          display: "flex",
+          alignItems: "center",
+          borderRadius: 4,
+          border: `1px solid ${C.forest}`,
+          overflow: "hidden",
+          boxSizing: "border-box",
+          background: C.deepForest,
+        }}
+      >
+        {att.dataUrl ? (
+          <img
+            src={att.dataUrl}
+            alt={att.name}
+            style={{ height: "100%", maxWidth: 118, objectFit: "cover", display: "block" }}
+          />
+        ) : (
+          <span
+            style={{
+              padding: "0 8px",
+              color: C.cream,
+              fontSize: 11,
+              fontWeight: FONT_WEIGHT.semibold,
+              fontFamily: '"IBM Plex Sans", sans-serif',
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              lineHeight: 1.2,
+            }}
+          >
+            {att.name}
+          </span>
+        )}
+      </div>
+      <button
+        onClick={onRemove}
+        title="Remove"
+        style={{
+          position: "absolute",
+          top: -6,
+          right: -6,
+          width: 18,
+          height: 18,
+          borderRadius: 4,
+          background: C.sienna,
+          color: C.cream,
+          border: "none",
+          cursor: "pointer",
+          fontSize: 12,
+          lineHeight: "18px",
+          padding: 0,
+        }}
+      >
+        ×
+      </button>
     </div>
   );
 }
@@ -1056,7 +1196,11 @@ function authorLabel(m: ChatMsg): string {
   return "Sparkle";
 }
 
-function Bubble({ msg }: { msg: ChatMsg }) {
+// Memoized: the message list re-renders on every streaming token (patchMsg replaces the messages
+// array), but patchMsg preserves object identity for every message EXCEPT the one being patched, so
+// a shallow-equal memo re-renders only the streaming bubble — the rest (and their markdown parse)
+// are skipped. Without this, an N-message conversation re-parsed all N bubbles' markdown per token.
+const Bubble = memo(function Bubble({ msg }: { msg: ChatMsg }) {
   const mine = msg.author === "user";
   // Author-tinted left border so Claude / Chief / a voice are visually distinct at a glance.
   const accent =
@@ -1093,4 +1237,4 @@ function Bubble({ msg }: { msg: ChatMsg }) {
       </div>
     </div>
   );
-}
+});

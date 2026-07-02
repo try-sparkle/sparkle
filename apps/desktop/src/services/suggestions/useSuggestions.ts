@@ -5,6 +5,7 @@ import { useAiFeature } from "../aiGate";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { pushSuggestions } from "../relayClient";
 import { closeBuildAgentButton } from "./controlButtons";
+import { log } from "../../logger";
 import type { AgentTabStatus } from "../../types";
 import type { SuggestionButton } from "./types";
 
@@ -36,15 +37,21 @@ export function shouldRecompute(a: {
   return a.lastHash !== a.nextHash;
 }
 
-// Cap consecutive failed computes for the SAME state so a persistently-rejecting compute can't
-// self-perpetuate into an unbounded retry loop (the reject path bumps retryTick to recover from a
-// transient failure; without a cap that would spin). Resets on success or a genuine state change.
-export const MAX_COMPUTE_RETRIES = 3;
+// Cap TOTAL attempts (the initial compute plus its retries) for the SAME failing state so a
+// persistently-rejecting compute can't self-perpetuate into an unbounded retry loop (the reject
+// path bumps retryTick to recover from a transient failure; without a cap that would spin).
+// Resets on success or a genuine state change.
+export const MAX_COMPUTE_ATTEMPTS = 3;
 
-/** Whether a failing state still has retry budget left (exported as a pure unit for testing). */
+/** Whether a failing state still has attempt budget left (exported as a pure unit for testing).
+ *  `failures` counts attempts already failed, so budget remains while it's below the cap. */
 export function withinRetryBudget(failures: number): boolean {
-  return failures < MAX_COMPUTE_RETRIES;
+  return failures < MAX_COMPUTE_ATTEMPTS;
 }
+
+// How often the settle-watcher re-hashes the scrollback while the agent is blocked on the user.
+// Two consecutive identical hashes = the terminal has finished painting (settled).
+export const SETTLE_TICK_MS = 1200;
 
 /**
  * Owns the per-agent suggestion set. Recomputes once when the agent enters a your-turn status with
@@ -115,10 +122,20 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
     const nextHash = hashScrollback(scrollback);
     if (!shouldRecompute({ lastHash: lastHash.current, nextHash, composerEmpty })) return;
     // A genuinely different state gets a fresh retry budget; retries of the SAME failing state draw
-    // down the budget set in .catch below.
+    // down the budget set in .catch below — and once that budget is exhausted, ANY re-trigger for
+    // the same hash (composer typed-then-cleared, learnedOn toggled) must bail here too, or each
+    // such cycle would buy a fresh paid call the budget already refused (lastHash was never
+    // committed for a failing hash, so shouldRecompute alone can't stop it).
     if (nextHash !== lastFailHash.current) failures.current = 0;
+    else if (!withinRetryBudget(failures.current)) return;
     computing.current = true;
     let alive = true;
+    // Whether the finally block should bump retryTick. The bump must happen AFTER the in-flight
+    // guard clears: if the re-render it triggers is processed between .catch and .finally (React
+    // is free to flush it on any microtask boundary), the effect re-runs while computing.current
+    // is still true, early-returns, and the retry is silently dropped.
+    let retryAfter = false;
+    log.debug("suggestions", "compute", { agentId, chars: scrollback.length, learnedOn });
     void computeSuggestions({ agentId, scrollback, aiEnabled: learnedOn, entitled: true })
       .then((set) => {
         // Commit the hash ONLY when we actually apply the result. If the composer went non-empty
@@ -126,7 +143,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // retryTick so the state we're actually in now recomputes — otherwise the suggestions for
         // that blocked state would be lost until the scrollback or status changed.
         if (!alive) {
-          setRetryTick((t) => t + 1);
+          retryAfter = true;
           return;
         }
         failures.current = 0;
@@ -134,6 +151,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         lastHash.current = nextHash;
         setDismissed(new Set());
         setButtons(set.buttons);
+        log.debug("suggestions", "computed", { agentId, buttons: set.buttons.length });
         // Mirror the buttons to a watching phone (no-op if the relay isn't connected). Skip an
         // empty push when nothing non-empty was ever pushed — there's nothing to clear, and we
         // don't want a chatty empty `suggestions` event on every your-turn transition that yields
@@ -146,23 +164,70 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         }
         pushedNonEmpty.current = set.buttons.length > 0;
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         // The compute rejected — leave lastHash unadvanced and re-trigger so this state can retry,
-        // but only up to MAX_COMPUTE_RETRIES for the SAME failing state, so a persistent rejection
+        // but only up to MAX_COMPUTE_ATTEMPTS for the SAME failing state, so a persistent rejection
         // can't spin into an unbounded loop of paid computes. A genuine state change resets this.
         failures.current += 1;
         lastFailHash.current = nextHash;
-        if (alive && withinRetryBudget(failures.current)) setRetryTick((t) => t + 1);
+        log.warn("suggestions", "compute failed", {
+          agentId,
+          failures: failures.current,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        if (!alive) return;
+        if (withinRetryBudget(failures.current)) {
+          retryAfter = true;
+        } else {
+          // Budget exhausted: this settled state is known-uncomputable. Keeping the PREVIOUS
+          // state's buttons through the transient retries was fine, but past the last retry
+          // they're stale on a terminal that shows something else — drop them locally and retire
+          // the phone's copy so a phone can't click an action for a state that no longer exists.
+          setButtons([]);
+          retire();
+        }
       })
       .finally(() => {
         // ALWAYS clear the guard, so a rejected compute can never permanently lock out future
         // computes for this agent (the guard at the top of the effect keys off this flag).
         computing.current = false;
+        // Bump only now that the guard is clear — see retryAfter above.
+        if (retryAfter) setRetryTick((t) => t + 1);
       });
     return () => {
       alive = false;
     };
-  }, [agentId, isYourTurn, composerEmpty, learnedOn, retryTick, shipped]);
+  }, [agentId, isYourTurn, composerEmpty, learnedOn, retryTick, shipped, retire]);
+
+  // Settle-watcher. The your-turn status flip (Claude's Stop hook) RACES the final terminal paint
+  // into xterm, so the compute above frequently hashes a mid-paint — or, right after a pane mount,
+  // empty — scrollback, commits that hash, and (having no scrollback subscription) would never look
+  // again: the buttons for the settled state simply never appear. While the agent stays blocked on
+  // the user with an empty composer, re-hash the tail on a slow tick; when it has SETTLED (two
+  // consecutive identical hashes) on a state we haven't computed, bump retryTick so the compute
+  // effect re-runs. The settle requirement keeps mid-stream frames from triggering paid computes,
+  // the lastHash gate keeps each distinct settled state to exactly one compute, and the failure
+  // budget is honored so the watcher can't resurrect an unbounded retry loop the .catch above
+  // deliberately capped.
+  useEffect(() => {
+    if (shipped || !isYourTurn || !composerEmpty) return;
+    let prevTickHash: string | null = null;
+    const id = window.setInterval(() => {
+      if (computing.current) return;
+      // A null provider means the terminal is UNMOUNTED, not that the terminal is empty — don't
+      // spend a compute on no content (or clobber good buttons with the empty result). Ticks
+      // resume once the provider registers, which still covers the mount race.
+      const scrollback = getAgentScrollback(agentId);
+      if (scrollback == null) return;
+      const h = hashScrollback(scrollback);
+      const settled = h === prevTickHash;
+      prevTickHash = h;
+      if (!settled || h === lastHash.current) return;
+      if (h === lastFailHash.current && !withinRetryBudget(failures.current)) return;
+      setRetryTick((t) => t + 1);
+    }, SETTLE_TICK_MS);
+    return () => window.clearInterval(id);
+  }, [agentId, isYourTurn, composerEmpty, shipped]);
 
   // When the agent goes back to working (no longer the user's turn) and hasn't shipped, drop the
   // stale buttons — the terminal state has moved on, so retire the phone's copy too. (When shipped,
@@ -183,9 +248,13 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   const dismiss = useCallback((id: string) => setDismissed((d) => new Set(d).add(id)), []);
   const clear = useCallback(() => {
     setButtons([]);
-    lastHash.current = null;
+    // Commit the CURRENT scrollback hash rather than nulling: the agent often stays your-turn
+    // (settled) for a beat after a suggestion click, and a null lastHash would let the settle-
+    // watcher immediately recompute — resurrecting the very buttons the user just acted on (and
+    // re-pushing them to the phone). The watcher recomputes only once the terminal actually moves.
+    lastHash.current = hashScrollback(getAgentScrollback(agentId) ?? "");
     retire();
-  }, [retire]);
+  }, [agentId, retire]);
 
   return { buttons: buttons.filter((b) => !dismissed.has(b.id)), dismiss, clear };
 }

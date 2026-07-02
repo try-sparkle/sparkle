@@ -50,4 +50,15 @@ describe("assembleBuildSpawn", () => {
     const exec = assembleBuildSpawn(base).args[2];
     expect(exec).not.toContain("CLAUDE_CONFIG_DIR");
   });
+
+  // Per-agent model selection (sparkle-i6rw): the pass-through into buildClaudeExec.
+  it("carries the agent's model into the exec as --model <id>", () => {
+    const exec = assembleBuildSpawn({ ...base, model: "claude-opus-4-8" }).args[2];
+    expect(exec).toContain("--model 'claude-opus-4-8'");
+  });
+
+  it("omits --model for the 'default' sentinel and when no model is set", () => {
+    expect(assembleBuildSpawn(base).args[2]).not.toContain("--model");
+    expect(assembleBuildSpawn({ ...base, model: "default" }).args[2]).not.toContain("--model");
+  });
 });

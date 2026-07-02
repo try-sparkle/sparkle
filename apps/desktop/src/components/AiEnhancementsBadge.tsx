@@ -15,7 +15,7 @@ const wrap: CSSProperties = {
   alignItems: "center",
   gap: 8,
   padding: "8px 16px",
-  borderRadius: 999,
+  borderRadius: 4,
   border: "1.5px solid transparent",
   background: `linear-gradient(${C.forest}, ${C.forest}) padding-box, ${AI_ENHANCEMENTS_GRADIENT} border-box`,
   fontFamily: '"IBM Plex Sans", sans-serif',

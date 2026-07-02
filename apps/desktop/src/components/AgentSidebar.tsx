@@ -22,7 +22,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useSettingsStore } from "../stores/settingsStore";
-import { useAiFeature } from "../services/aiGate";
+import { useAiFeatureVisible } from "../services/aiGate";
 import { removeAgentWorkspace } from "../services/worktree";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
@@ -32,7 +32,7 @@ import { refreshAgentTitle } from "../services/sessionTitle";
 import { SPARKLE_AGENT_ID } from "../services/sparkleAgent";
 import { consentPillLabel, sparkleBarState, type SparkleBarState } from "./sparkleRowStatus";
 import { useBeadsStore } from "../stores/beadsStore";
-import { beadLabel, epicForBuild } from "../services/planView";
+import { beadLabel, epicForBuild, epicPillFor } from "../services/planView";
 import { type Bead } from "../services/beads";
 import { orderedTopLevelAgents, firstVisibleAgentId } from "../engine/agentOrdering";
 import { withUnstartedWorkerAttention, withRedWorkerAttention } from "../engine/workerAttention";
@@ -44,6 +44,8 @@ import { StatusDot } from "./StatusDot";
 import { StatusBar } from "./StatusBar";
 import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
+import { ModelPill } from "./ModelPill";
+import { applyModelToRunningAgent } from "../services/agentModel";
 import { WorkflowLine } from "./WorkflowLine";
 import { HistorySearch } from "./HistorySearch";
 import { OtherWindowAgentRow } from "./OtherWindowAgentRow";
@@ -55,6 +57,7 @@ import { openProjectInWindow, defaultDeps } from "../services/projectWindows";
 import { resolveStage, rollupStages, stageFraction, stageIndex, LINE_FROM, LINE_TO } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
+import { NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
 import { CloseWorkerPrompt } from "./CloseWorkerPrompt";
 import { CloseAgentPrompt } from "./CloseAgentPrompt";
 import { BalanceBadge } from "./BalanceBadge";
@@ -140,7 +143,8 @@ function createBtnStyle(
 }
 
 // A dashed-outline "+ New <kind> Agent" row — the per-mode affordance for creating an agent,
-// shown at the top of the sidebar list (under Search history) for the active Build/Think mode.
+// shown in the sidebar list for the active Build/Think mode: below the last row when the list
+// fits, or pinned (sticky) at the top when the list is tall enough to scroll.
 // Border is split into longhand props (width/style/color) so NewAgentRow's hover state can flip
 // just the style (dashed → solid) and color without fighting a `border` shorthand.
 const DASHED_ROW_STYLE: React.CSSProperties = {
@@ -160,6 +164,16 @@ const DASHED_ROW_STYLE: React.CSSProperties = {
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",
+};
+
+// Wrapper shared by BOTH placements of the "+ New … Agent" button (sticky top / below the last
+// row). A flex column so the button's margins can't collapse out of it — which keeps the button's
+// flow-height contribution IDENTICAL in the two slots (block margins would collapse differently at
+// the bottom of the list), so the overflow measurement is placement-independent and the placement
+// can't oscillate or develop a hysteresis band at the boundary.
+const NEW_AGENT_SLOT_STYLE: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
 };
 
 // Coordinates the gentle auto-scroll of the agent list when a near-the-bottom row's hover card
@@ -201,6 +215,7 @@ function NewAgentRow({
   onClick,
   sharedHover,
   onHoverChange,
+  dndTarget,
 }: {
   icon: React.ReactNode;
   label: string;
@@ -208,11 +223,15 @@ function NewAgentRow({
   onClick: () => void;
   sharedHover?: boolean;
   onHoverChange?: (v: boolean) => void;
+  // Marks the button as a webview drag-drop target (see services/dndTargets.ts) so the
+  // window-global drag handlers can hit-test the cursor against it with elementFromPoint.
+  dndTarget?: string;
 }) {
   const [hover, setHover] = useState(false);
   const lit = hover || !!sharedHover;
   return (
     <button
+      data-dnd-target={dndTarget}
       onClick={onClick}
       onMouseEnter={() => {
         setHover(true);
@@ -238,6 +257,9 @@ function NewAgentRow({
 // The Build variant of NewAgentRow, wired to the shared `buildAgentHover` flag so every instance
 // (the sidebar's row AND the Workspace empty-state start button) highlights in sync. Exported so
 // the Workspace can drop the exact same button in place of its old "Add an agent" hint text.
+// Also a drag-drop target: dropping files on it spawns a new build agent with the files attached
+// to ITS composer (useNewBuildAgentDrop), which lights buildAgentHover during the drag — so the
+// drag-over visual IS the normal hover visual, on both copies.
 export function NewBuildAgentButton({ onClick }: { onClick: () => void }) {
   const buildAgentHover = useUiStore((s) => s.buildAgentHover);
   const setBuildAgentHover = useUiStore((s) => s.setBuildAgentHover);
@@ -253,6 +275,7 @@ export function NewBuildAgentButton({ onClick }: { onClick: () => void }) {
       onClick={onClick}
       sharedHover={buildAgentHover}
       onHoverChange={setBuildAgentHover}
+      dndTarget={NEW_BUILD_AGENT_DND_TARGET}
     />
   );
 }
@@ -391,7 +414,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     return () => clearInterval(id);
   }, [projectId]);
   // AI Brainstorming feature gate (Use AI Features menu). Off → hide the ✦ Brainstorm button.
-  const aiBrainstorm = useAiFeature("brainstorm");
+  // VISIBLE (settings flag only, ignores credits): the Think chevron + Think-mode navigation must
+  // show during the trial / when out of credits so the user can SEE the feature. The buy-to-use
+  // upsell fires later, in ThinkPanel's submit (aiFeatureLockedNow("brainstorm")) — this variable
+  // only governs UI presence and work-mode reconciliation, never an AI action, so `visible` is
+  // correct for every site it gates.
+  const aiBrainstorm = useAiFeatureVisible("brainstorm");
   const [editing, setEditing] = useState<string | null>(null);
   // Which agent the Ship/Save/Discard close prompt is asking about (null = no prompt).
   const [closePromptId, setClosePromptId] = useState<string | null>(null);
@@ -676,6 +704,31 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const seenStageRef = useRef<Record<string, WorkflowStageId>>({});
   const pendingRef = useRef<string[]>([]);
 
+  // Whether the agent list overflows its viewport. Drives where the "+ New … Agent" button lives:
+  // a short list gets it BELOW the last row; once the list is tall enough to scroll, it pins to the
+  // top (sticky) so it's always reachable without scrolling. The button occupies the same flow
+  // height in either placement, so the comparison is placement-independent — no oscillation.
+  const [listOverflows, setListOverflows] = useState(false);
+  // Deliberately dep-less: content height changes whenever the row set re-renders, and the check is
+  // one DOM read + a bail-out setState. Container-size changes that DON'T re-render React (window /
+  // column resize) are caught by the ResizeObserver below.
+  useLayoutEffect(() => {
+    const sc = listScrollRef.current;
+    if (!sc) return;
+    const next = sc.scrollHeight > sc.clientHeight;
+    setListOverflows((prev) => (prev === next ? prev : next));
+  });
+  useEffect(() => {
+    const sc = listScrollRef.current;
+    if (!sc || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      const next = sc.scrollHeight > sc.clientHeight;
+      setListOverflows((prev) => (prev === next ? prev : next));
+    });
+    ro.observe(sc);
+    return () => ro.disconnect();
+  }, []);
+
   // Gentle auto-scroll of the agent list so a bottom row's hover card is never clipped. The list's
   // scroll container is `listScrollRef` (attached to the overflow:auto div below). `baselineRef`
   // remembers where the user had the list before we auto-scrolled, so we can ease back on un-hover.
@@ -711,6 +764,37 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     },
     [],
   );
+  // Two-finger scroll must keep working while a hover card is open. The card is a fixed-position
+  // portal on document.body, so wheel events over it never reach this list's overflow:auto
+  // container — and since a card covers whatever row the cursor is on (and there's nearly always a
+  // card), the list was effectively unscrollable. When the POINTER sits inside the list's box but
+  // the wheel event is riding an overlay — the hover card, or document.body, where Chromium
+  // retargets the remainder of a scroll gesture after the card under it unmounts — forward the
+  // delta straight to the container. The resulting scroll event then closes the card via the rows'
+  // own user-scroll handling, and hover re-evaluates on whatever row lands under the cursor.
+  // Window-level so it survives the card's mid-gesture unmount, and a NATIVE passive:false
+  // listener because forwarding must preventDefault (React registers onWheel passively) so a
+  // scrollable card detail can't also consume the same delta.
+  useEffect(() => {
+    const onWheel = (e: WheelEvent) => {
+      const sc = listScrollRef.current;
+      if (!sc) return;
+      const r = sc.getBoundingClientRect();
+      if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) return;
+      const t = e.target;
+      if (t instanceof Node && sc.contains(t)) return; // over the list itself — native scroll owns it
+      const overCard = t instanceof Element && t.closest('[data-testid="agent-hover-card"]') != null;
+      const orphaned = t === document.body || t === document.documentElement;
+      if (!overCard && !orphaned) return; // some OTHER overlay (menu, modal) owns this wheel
+      e.preventDefault();
+      // A direct scrollTop write cancels any in-flight smooth reveal; drop the "auto" flag with it
+      // so the rows treat the resulting scroll as the user's (close the card, keep their position).
+      autoTargetRef.current = null;
+      sc.scrollTop += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+    };
+    window.addEventListener("wheel", onWheel, { passive: false, capture: true });
+    return () => window.removeEventListener("wheel", onWheel, { capture: true });
+  }, []);
   const sidebarScroll = useMemo<SidebarScrollApi>(() => {
     // Start a programmatic smooth scroll to `target`, marking it "ours" until the container reaches
     // it. A fallback timer drops the flag even if the animation is interrupted or never lands within
@@ -853,6 +937,20 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     [project, status, mode, agentOrdering],
   );
 
+  // The active mode's "+ New … Agent" button (null in Plan / no project / Think gated off).
+  // Rendered in ONE of two slots in the scroll container below, chosen by listOverflows.
+  const newAgentButton =
+    project && mode === "build" ? (
+      <NewBuildAgentButton onClick={spawnBuildAgent} />
+    ) : project && mode === "think" && aiBrainstorm ? (
+      <NewAgentRow
+        icon={<TbBulb size={16} style={{ flexShrink: 0 }} />}
+        label="+ New Think Agent"
+        hoverColor={FADE_0}
+        onClick={onAddThink}
+      />
+    ) : null;
+
   return (
     <SidebarScrollContext.Provider value={sidebarScroll}>
     <div
@@ -962,19 +1060,31 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         style={{ flex: 1, overflowY: "auto", padding: "0 8px" }}
       >
         {/* Per-mode "+ New … Agent" affordance — the only way to create agents now that the chevrons
-            are a selector. Sits above the (mode-filtered) list. Plan has none (no agents in Plan). */}
-        {project && mode === "build" && <NewBuildAgentButton onClick={spawnBuildAgent} />}
-        {project && mode === "think" && aiBrainstorm && (
-          <NewAgentRow
-            icon={<TbBulb size={16} style={{ flexShrink: 0 }} />}
-            label="+ New Think Agent"
-            hoverColor={FADE_0}
-            onClick={onAddThink}
-          />
+            are a selector. Plan has none (no agents in Plan). Placement is dynamic (listOverflows):
+            a list short enough to fit gets the button BELOW its last row; a list tall enough to
+            scroll pins it here at the top (sticky) so it's always visible. The sticky wrapper is a
+            flex column (margins can't collapse through it) with the sidebar background so rows
+            scrolling underneath never show through the button's transparent fill/margins. */}
+        {newAgentButton && listOverflows && (
+          <div
+            style={{
+              ...NEW_AGENT_SLOT_STYLE,
+              position: "sticky",
+              top: 0,
+              // Above the rows' drag drop-target overlays (zIndex 2), so a drop released over the
+              // pinned button can't land on a hidden row's target underneath it.
+              zIndex: 3,
+              background: C.deepForest,
+            }}
+          >
+            {newAgentButton}
+          </div>
         )}
         {/* Cross-window attention block: red agents from OTHER open windows, each tagged with a
-            project pill. Sits BELOW the "+ New … Agent" button and ABOVE this window's own agents;
-            hidden when there are none. Click raises the owning window and selects the agent. */}
+            project pill. Sits ABOVE this window's own agents (and below the "+ New … Agent" button
+            when the overflowing list pins it to the top — with a short list the button renders
+            below the last row instead); hidden when there are none. Click raises the owning window
+            and selects the agent. */}
         {otherWindowRedAgents.length > 0 && (
           <div style={{ paddingTop: 2, paddingBottom: 6, marginBottom: 4, borderBottom: `1px solid ${CHAT_USER_BUBBLE}` }}>
             {otherWindowRedAgents.map((a) => (
@@ -1121,6 +1231,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             );
           });
         })()}
+        {/* Default placement: below the last row, when the list fits without scrolling. (When it
+            doesn't fit, the sticky top slot above renders the button instead.) Same wrapper as the
+            sticky slot minus the pinning, so the button adds the same height either way. */}
+        {newAgentButton && !listOverflows && (
+          <div style={NEW_AGENT_SLOT_STYLE}>{newAgentButton}</div>
+        )}
         {/* Per-mode empty hint: the dashed "+ New …" row above is the call to action. */}
         {project &&
           mode === "build" &&
@@ -1442,12 +1558,18 @@ const AgentRow = memo(function AgentRow({
 }: AgentRowProps) {
   const renameAgent = useProjectStore((s) => s.renameAgent);
   const unpinAgent = useProjectStore((s) => s.unpinAgent);
+  const setAgentModel = useProjectStore((s) => s.setAgentModel);
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
   // Beads for this project (stable fallback to avoid a re-render loop). Drives the Build-tab
   // linkage hovers: a worker shows the bead it's on; an orchestrator shows its epic.
   const beads = useBeadsStore((s) => s.byProject[project.id]?.beads ?? NO_BEADS);
   const beadHover = a.kind === "worker" ? beadLabel(beads, a.beadId) : null;
   const epicHover = a.kind === "build" ? epicForBuild(beads, project.agents, a.id) : null;
+  // Always-visible epic pill on orchestrator rows (spec §8): prefers the agent's own epicId (set at
+  // sendToBuild handoff, so it shows before any worker binds a bead), else the worker-derived epic.
+  // Click jumps to the Plan board and opens that epic's DetailOverlay via the boardFocusBeadId handoff.
+  const board = useBeadsStore((s) => s.byProject[project.id]?.board ?? null);
+  const epicPillData = a.kind === "build" ? epicPillFor(a, board, project.agents) : null;
 
   const rowRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<number | null>(null);
@@ -1601,6 +1723,17 @@ const AgentRow = memo(function AgentRow({
   // count is identical in both and never jumps when the cursor moves on/off the row (see useRowClock).
   const clockNow = useRowClock(lastTouchAt);
 
+  // Per-agent Claude model (bead sparkle-i6rw). Only claude-terminal kinds get the pill — think
+  // (Chief chat) and shell (plain command) tabs never spawn `claude`, so a model is meaningless
+  // there. Picking a model ALWAYS persists it (next spawn adds --model); when the agent's PTY is
+  // already live it's ALSO delivered in-session by typing `/model <id>` into the REPL — so a model
+  // chosen right after spawn (idle or working) takes effect without a respawn.
+  const showModelPill = a.kind === "build" || a.kind === "worker";
+  const handleModelChange = (modelId: string) => {
+    setAgentModel(project.id, a.id, modelId); // store normalizes "default" → undefined
+    void applyModelToRunningAgent(a.id, modelId);
+  };
+
   // The pin chip (manual pin: name frozen + row anchored). Click to release. Shared by both states.
   const pinChip = a.namePinned ? (
     <span
@@ -1612,6 +1745,40 @@ const AgentRow = memo(function AgentRow({
       style={{ display: "inline-flex", flex: "0 0 auto", cursor: "pointer", lineHeight: 1, color: C.muted }}
     >
       <TbPinFilled size={11} />
+    </span>
+  ) : null;
+
+  // The source-epic pill (spec §8): a small 4px-radius chip on orchestrator rows showing the epic
+  // title (ellipsized ~18ch). Clicking it (stopPropagation so it doesn't select the agent) jumps to
+  // the Plan board and opens that epic's DetailOverlay via the one-shot boardFocusBeadId handoff.
+  const epicPill = epicPillData ? (
+    <span
+      onClick={(e) => {
+        e.stopPropagation();
+        const ui = useUiStore.getState();
+        ui.setWorkMode("plan");
+        ui.setActiveSpecial("board");
+        ui.setBoardFocusBeadId(epicPillData.id);
+      }}
+      title={`Epic ${epicPillData.id} · ${epicPillData.title} — open in Plan`}
+      style={{
+        flex: "0 1 auto",
+        minWidth: 0,
+        maxWidth: "18ch",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        cursor: "pointer",
+        fontSize: 10,
+        lineHeight: 1.4,
+        padding: "1px 5px",
+        borderRadius: 4,
+        background: C.deepForest,
+        color: C.teal,
+        border: `1px solid ${C.teal}55`,
+      }}
+    >
+      {epicPillData.title}
     </span>
   ) : null;
 
@@ -1741,8 +1908,15 @@ const AgentRow = memo(function AgentRow({
                     </span>
                   )}
                 </div>
+                {epicPill}
                 {pinChip}
               </div>
+              {/* The model pill anchors the card's top-right corner, above the progress bar's
+                  status text — clickable any time (idle or running) to change this agent's
+                  Claude model. Its own clicks stop propagation so it never selects the card. */}
+              {showModelPill && (
+                <ModelPill value={a.model} onChange={handleModelChange} compact />
+              )}
             </div>
           ) : (
             // Collapsed: the live "elapsed since last prompt" timer (once there's a prompt to time
@@ -1766,6 +1940,7 @@ const AgentRow = memo(function AgentRow({
                     setEditing(a.id);
                   }}
                 />
+                {epicPill}
                 {pinChip}
               </div>
             </div>
@@ -2412,7 +2587,7 @@ function SparkleConsentPill({ label }: { label: string }) {
         fontWeight: FONT_WEIGHT.semibold,
         letterSpacing: 0.2,
         padding: "1px 6px",
-        borderRadius: 999,
+        borderRadius: 4,
         color: off ? C.muted : C.teal,
         border: `1px solid ${off ? C.muted : C.teal}`,
         opacity: off ? 0.7 : 1,

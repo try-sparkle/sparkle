@@ -15,7 +15,6 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::audio::{rms_level, Capture};
 use crate::cloud::DeepgramSession;
 use crate::model;
-use crate::naming::resolve_deepgram_key;
 use crate::transcribe::{ParakeetTdt, Transcriber};
 
 /// Monotonic id stamped on every emitted partial so the log can prove whether a
@@ -64,14 +63,34 @@ pub(crate) fn emit_interim(app: &AppHandle, seg: String) {
     let _ = app.emit("dictation://interim", seg);
 }
 
-/// Signal that the cloud (Deepgram) worker has exited — whether a clean close or a mid-stream
-/// failure. The frontend handles this by clearing the interim preview and calling stop_cloud_stream,
-/// which flips `cloud_active` back to false so the capture callback resumes routing frames to the
-/// on-device model. Without this, a mid-stream socket death would strand dictation: frames keep
-/// going to the dead session, the on-device wake/stop-word path never resumes, and the last interim
-/// stays painted as a stale ghost.
-pub(crate) fn emit_cloud_ended(app: &AppHandle) {
-    let _ = app.emit("dictation://cloud-ended", ());
+/// Signal that the cloud (relay) worker has exited — whether a clean close, a mid-stream failure, or
+/// the relay signalling out-of-credits. The frontend handles this by clearing the interim preview and
+/// calling stop_cloud_stream, which flips `cloud_active` back to false so the capture callback resumes
+/// routing frames to the on-device model. Without this, a mid-stream socket death would strand
+/// dictation: frames keep going to the dead session, the on-device wake/stop-word path never resumes,
+/// and the last interim stays painted as a stale ghost. `exhausted` is true when the relay tore the
+/// stream down for out-of-credits, so the frontend can refresh the (now-depleted) balance pill.
+pub(crate) fn emit_cloud_ended(app: &AppHandle, exhausted: bool) {
+    let _ = app.emit("dictation://cloud-ended", exhausted);
+}
+
+/// The server-authoritative post-debit balance the relay reports after each metered minute.
+/// `balance_cents` is None when the relay omits it (the frontend then optimistically decrements by
+/// `debited_cents`); mirrors deepgramRelay.ts's `balance` control frame.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudBalance {
+    balance_cents: Option<i64>,
+    debited_cents: i64,
+}
+
+/// Forward a relay `balance` control frame to the frontend so the credits pill ticks down in real
+/// time from the SERVER's authoritative post-debit balance (client-side metering is gone).
+pub(crate) fn emit_cloud_balance(app: &AppHandle, balance_cents: Option<i64>, debited_cents: i64) {
+    let _ = app.emit(
+        "dictation://cloud-balance",
+        CloudBalance { balance_cents, debited_cents },
+    );
 }
 
 /// Which transcription engine to use. The on-device model is always the fallback; the cloud path
@@ -91,6 +110,7 @@ pub(crate) enum Engine {
 ///     start bumped it since we claimed our attempt).
 ///   - `capture_present`: the mic capture is still live (not torn down by a stop).
 ///   - `already_active`: a cloud stream is already installed (a racing start won).
+///
 /// Install only when the intent that opened this stream is still exactly current.
 ///
 /// CALLER CONTRACT: all four inputs MUST be sampled while holding `DictationState`'s lock (the same
@@ -106,13 +126,14 @@ pub(crate) fn should_install_cloud(
     same_generation && still_current && capture_present && !already_active
 }
 
-/// Decide the engine for an active-dictation stream. This is the single seam the AI-credits
-/// system (built separately) plugs into: today `credits_ok` is a stub passed as true, but the
-/// decision table is here and unit-tested so wiring real credit checks in later is a one-line
-/// change at the call site. Offline is handled implicitly — if Cloud is chosen but the Deepgram
-/// handshake fails, the caller falls back to Local — so we don't probe connectivity here.
-pub(crate) fn choose_engine(setting_enabled: bool, key_present: bool, credits_ok: bool) -> Engine {
-    if setting_enabled && key_present && credits_ok {
+/// Decide the engine for an active-dictation stream. Cloud requires the setting on AND a signed-in
+/// user (a Sparkle bearer to authenticate to the relay). `credits_ok` is now enforced
+/// SERVER-side — the relay refuses the WS upgrade when the user isn't entitled or can't afford the
+/// first minute — so the caller passes it true and lets a failed handshake fall back to Local.
+/// Offline is handled the same implicit way: if Cloud is chosen but the relay handshake fails, the
+/// caller falls back to Local, so we don't probe connectivity or credits here.
+pub(crate) fn choose_engine(setting_enabled: bool, signed_in: bool, credits_ok: bool) -> Engine {
+    if setting_enabled && signed_in && credits_ok {
         Engine::Cloud
     } else {
         Engine::Local
@@ -133,6 +154,7 @@ pub(crate) fn frame_speaking(cloud_active: bool, vad_detected: bool) -> bool {
 /// Whether the cpal mic capture should currently be live. Two conditions, both required:
 ///   - `armed`: the frontend wants the mic on (the user hasn't muted it).
 ///   - `focused`: at least one Sparkle window is the focused/active OS window.
+///
 /// When the user tabs to another app every Sparkle window blurs, `focused` goes false, and we
 /// release the OS mic — so Sparkle never captures audio while you're looking at something else.
 /// Pure so the arm×focus matrix is unit-testable without an audio device or real windows.
@@ -148,6 +170,7 @@ pub(crate) fn capture_should_be_live(armed: bool, focused: bool) -> bool {
 ///   - `my_gen == latest_gen`: no newer focus event superseded this one (a becomeKey would have
 ///     bumped the generation), AND
 ///   - `!any_focused_now`: a re-poll still finds no Sparkle window focused (a real tab-away).
+///
 /// Pure so the coalescing decision is unit-testable without threads, timers, or real windows.
 pub(crate) fn should_emit_blur(my_gen: u64, latest_gen: u64, any_focused_now: bool) -> bool {
     my_gen == latest_gen && !any_focused_now
@@ -191,6 +214,11 @@ pub struct DictationSession {
 /// focus switches (see `note_focus_event`): every focus event bumps it so a deferred blur from an
 /// older event can detect it's been superseded and bow out.
 pub struct DictationState(pub Arc<Mutex<DictationSession>>, pub Arc<AtomicU64>);
+// arc_with_non_send_sync: DictationSession holds a !Send cpal Stream, so this Arc<Mutex<…>> is
+// not Send/Sync by itself — it crosses threads only via DictationState's `unsafe impl Send/Sync`
+// (see the SAFETY note beside them). Shared ownership across the tauri State and worker threads
+// is still required, so the lint's Rc/redesign suggestions don't apply.
+#[allow(clippy::arc_with_non_send_sync)]
 impl Default for DictationState { fn default() -> Self { Self(Arc::new(Mutex::new(DictationSession::default())), Arc::new(AtomicU64::new(0))) } }
 
 impl DictationState {
@@ -366,9 +394,8 @@ fn build_capture(
             let _ = app_cb.emit("dictation://speaking", speaking);
         }
     })
-    .map_err(|e| {
+    .inspect_err(|e| {
         let _ = app.emit("dictation://error", e.clone());
-        e
     })
 }
 
@@ -423,15 +450,15 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
     Ok(())
 }
 
-/// Open the Deepgram cloud stream for the active-dictation window. The frontend calls this only when
+/// Open the cloud (relay) stream for the active-dictation window. The frontend calls this only when
 /// the wake-word machine transitions to ACTIVE *and* it has already gated on the live "voice
-/// dictation" + composer settings — so this command's job is just "open if a key is present". (The
+/// dictation" + composer settings — so this command's job is just "open if signed in". (The
 /// voice-setting gate lives entirely in the frontend, the single source of truth; no `cloud` arg.)
 ///
-/// Returns TRUE only when a live cloud socket was actually installed. Returns FALSE on every
-/// stay-on-device path (no key, handshake failure, or a stop/restart race discard) so the frontend
-/// knows NOT to start per-minute billing — otherwise a user with no DEEPGRAM_API would be charged
-/// for cloud dictation they never received.
+/// Returns TRUE only when a live relay socket was actually installed. Returns FALSE on every
+/// stay-on-device path (signed out, handshake failure — which includes the relay refusing an
+/// unentitled / can't-afford-a-minute user — or a stop/restart race discard) so the frontend knows to
+/// stay on the on-device model. Metering is server-side now, so a FALSE simply means "no cloud".
 #[tauri::command]
 pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool {
     // Capture, under one lock, the state we need to (a) decide whether to open a stream and
@@ -464,18 +491,23 @@ pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool 
             sess.cloud_epoch.clone(),
         )
     };
-    let key = resolve_deepgram_key();
-    // setting_enabled is true here: the frontend already gated on the live voice setting before
-    // calling. credits_ok is the seam the AI-credits system plugs into later; true for now.
-    if choose_engine(true, key.is_some(), true) != Engine::Cloud {
-        return false; // no key → stay on the on-device model; don't consume an epoch on this path
+    // Cloud dictation now runs through the orchestration relay on the user's Sparkle bearer (the
+    // relay holds Sparkle's Deepgram key and meters server-side). setting_enabled is true here (the
+    // frontend already gated on the live voice setting); a signed-out user has no bearer → stay
+    // on-device. credits_ok is enforced by the relay (it refuses the upgrade when not entitled / can't
+    // afford the first minute — a handshake failure we treat as fall-back-to-on-device), so we pass it
+    // true here. This is a sync Tauri command (its own thread), so the keychain read is fine inline.
+    let token = crate::auth::bearer_token();
+    if choose_engine(true, token.is_some(), true) != Engine::Cloud {
+        return false; // signed out → stay on the on-device model; don't consume an epoch on this path
     }
-    let key = key.expect("choose_engine returned Cloud only when key is present");
+    let token = token.expect("choose_engine returned Cloud only when a bearer is present");
+    let base_url = crate::auth::base_url();
     // Claim this attempt only now that we're committing to open. The epoch is an atomic token, so
     // bumping it outside the lock is sound — the post-handshake re-validation re-reads it under the
     // lock, and any racing stop/start that bumps it meanwhile correctly invalidates this attempt.
     let my_epoch = cloud_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-    match DeepgramSession::start(app, key) {
+    match DeepgramSession::start(app, base_url, token) {
         Ok(session) => {
             // The handshake above is blocking (~hundreds of ms). Re-validate under the lock before
             // installing, so a stop/restart that raced the handshake can't leave an orphaned stream:
@@ -663,12 +695,12 @@ mod tests {
     }
 
     #[test]
-    fn choose_engine_requires_setting_key_and_credits() {
+    fn choose_engine_requires_setting_signed_in_and_credits() {
         // Cloud only when ALL three hold.
         assert_eq!(choose_engine(true, true, true), Engine::Cloud);
         // Any one missing → fall back to the on-device model.
         assert_eq!(choose_engine(false, true, true), Engine::Local, "setting off");
-        assert_eq!(choose_engine(true, false, true), Engine::Local, "no key");
+        assert_eq!(choose_engine(true, false, true), Engine::Local, "signed out (no bearer)");
         assert_eq!(choose_engine(true, true, false), Engine::Local, "no credits");
         assert_eq!(choose_engine(false, false, false), Engine::Local);
     }

@@ -15,6 +15,7 @@ import { OpenTargetDialog } from "./OpenTargetDialog";
 import { ModalShell } from "./ModalShell";
 import { AccountsScreen } from "./AccountsScreen";
 import { AccountLoginModal } from "./AccountLoginModal";
+import { AuthStatusButton } from "./AuthStatusButton";
 import { invalidateAccountState } from "../services/accountSelection";
 import type { Account } from "../services/accountStore";
 import {
@@ -129,15 +130,29 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const agentOrdering = useUiStore((s) => s.agentOrdering);
   const [recentOpen, setRecentOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  // Deep-open: other components (e.g. BalanceBadge → Credits) request a settings category via
+  // uiStore.openSettings; this TopBar owns the dialog, so it opens it there. Every close path
+  // clears the request so a later request for the SAME category still re-triggers.
+  const settingsRequest = useUiStore((s) => s.settingsRequest);
+  const clearSettingsRequest = useUiStore((s) => s.clearSettingsRequest);
+  useEffect(() => {
+    if (settingsRequest) setMenuOpen(true);
+  }, [settingsRequest]);
+  const closeMenu = () => {
+    setMenuOpen(false);
+    clearSettingsRequest();
+  };
   // The settings modal is a true centered dialog now, so Escape should dismiss it (backdrop click
   // alone isn't enough for keyboard users). Only listen while it's open.
   useEffect(() => {
     if (!menuOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setMenuOpen(false);
+      if (e.key === "Escape") closeMenu();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+    // closeMenu is stable in behavior (setState + store action); re-binding on menuOpen alone is enough.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [menuOpen]);
   // Multi Claude Max account support: the "Claude accounts" settings modal, and (when the user adds
   // an account) the interactive `claude login` modal handed off from AccountsScreen's onLogin seam.
@@ -390,20 +405,25 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
           aria-label="More options"
           title="More options"
           style={{ ...btn, position: "relative", zIndex: 42, padding: "4px 10px", fontSize: 18, lineHeight: 1 }}
-          onClick={() => setMenuOpen((v) => !v)}
+          onClick={() => (menuOpen ? closeMenu() : setMenuOpen(true))}
         >
           ⋯
         </button>
         {menuOpen && (
           <SettingsDialog
-            onClose={() => setMenuOpen(false)}
+            initialCategory={settingsRequest ?? undefined}
+            onClose={closeMenu}
             onManageAccounts={() => {
-              setMenuOpen(false);
+              closeMenu();
               setAccountsOpen(true);
             }}
           />
         )}
       </div>
+
+      {/* Profile / auth-status control — sits just RIGHT of the ⋯ menu. Signed in → avatar;
+          returning user → "Log in"; brand-new → "Sign up". All open the ⋯ menu's Accounts pane. */}
+      <AuthStatusButton />
 
       {pending && (
         <OpenTargetDialog

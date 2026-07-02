@@ -4,27 +4,18 @@
 // "blocked on you" verdict into a RED status; everything else stays gray.
 //
 // Like naming.rs this asks the cheapest Claude model (Haiku 4.5) and lives in Rust — not the
-// webview — so the BYOK Anthropic key never ships in the JS bundle. It reuses
-// `naming::resolve_anthropic_key` for identical key resolution and `ai::extract_text` for the
-// Messages-API reply shape. Degrades gracefully: no key / network / parse failure returns Err, and
-// the caller treats any failure as "not a followup" (gray), so the feature is a no-op until a key
-// exists rather than a hard error or a false red.
+// webview — so the user's Sparkle bearer never ships in the JS bundle. The call goes through the
+// server-side `/ai/anthropic` proxy (`ai::call_anthropic_proxy`); the server holds the vendor key
+// and meters credits. Degrades gracefully: signed out / out of credits / network / parse failure
+// returns Err, and the caller treats any failure as "not a followup" (gray), so the feature is a
+// no-op until the user is signed in with credit rather than a hard error or a false red.
 
-use std::time::Duration;
-
-use crate::ai::extract_text;
-use crate::naming::resolve_anthropic_key;
+use crate::ai::{call_anthropic_proxy, extract_text, CLASSIFY_READ_TIMEOUT};
 
 /// Cheapest current Claude model — a one-word classification needs nothing more. (claude-api skill:
-/// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.)
+/// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.) It is also the
+/// only model the server-side proxy meters, so every proxied call must use it.
 const JUDGE_MODEL: &str = "claude-haiku-4-5";
-
-/// Bound the Anthropic call so a stalled api.anthropic.com can't pin a spawn_blocking thread
-/// forever and exhaust the blocking pool. ureq has no default timeout; a hung endpoint then hits
-/// the existing Err path (which the caller degrades to gray). A one-word verdict returns fast, so
-/// the read budget is modest. Mirrors connectivity.rs's AgentBuilder shape.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One word out, so a tiny budget is plenty (a couple tokens of headroom over "FOLLOWUP").
 const JUDGE_MAX_TOKENS: u32 = 8;
@@ -87,53 +78,31 @@ pub async fn judge_turn_followup(task: String, response: String) -> Result<Strin
     if response.is_empty() {
         return Err("empty response".into());
     }
-    let key = resolve_anthropic_key().ok_or_else(|| {
-        "no Anthropic API key (set ANTHROPIC_API_KEY or add it to .env.local)".to_string()
-    })?;
+    // Server-side proxy on the user's bearer (see module docs).
+    let base = crate::auth::base_url(); // just an env read — cheap, non-blocking.
 
-    // ureq is blocking; keep it off the async runtime's worker.
-    tauri::async_runtime::spawn_blocking(move || call_judge(&key, &task, &response))
-        .await
-        .map_err(|e| format!("join error: {e}"))?
+    // ureq is blocking AND the keychain read is a syscall that can block on a locked keychain — keep
+    // BOTH off the async runtime's worker by resolving the token inside the blocking closure. No
+    // token → signed out; degrade (gray verdict) rather than call the proxy.
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = crate::auth::bearer_token().ok_or_else(|| "not signed in".to_string())?;
+        call_judge(&base, &token, &task, &response)
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
 }
 
-fn call_judge(key: &str, task: &str, response: &str) -> Result<String, String> {
+fn call_judge(base: &str, token: &str, task: &str, response: &str) -> Result<String, String> {
     let user = build_user_message(task, response);
-    let body = serde_json::json!({
-        "model": JUDGE_MODEL,
-        "max_tokens": JUDGE_MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
-        "messages": [{ "role": "user", "content": user }],
-    });
-    let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {e}"))?;
-
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(READ_TIMEOUT)
-        .build();
-    let resp = agent
-        .post("https://api.anthropic.com/v1/messages")
-        .set("x-api-key", key)
-        .set("anthropic-version", "2023-06-01")
-        .set("content-type", "application/json")
-        .send_string(&body_str);
-
-    let raw = match resp {
-        Ok(r) => r.into_string().map_err(|e| format!("read body: {e}"))?,
-        Err(ureq::Error::Status(code, r)) => {
-            // Don't surface the upstream body to the UI: it can echo request context, and the API
-            // key lives in this function. Log for debugging, return a generic message.
-            let detail = r.into_string().unwrap_or_default();
-            tracing::debug!(code, detail = %detail, "anthropic judge call returned an error status");
-            return Err(format!("judge failed (Anthropic HTTP {code})"));
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "anthropic judge request failed");
-            return Err("judge request failed".into());
-        }
-    };
-    let json: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("bad JSON: {e}"))?;
+    let json = call_anthropic_proxy(
+        base,
+        token,
+        JUDGE_MODEL,
+        SYSTEM_PROMPT,
+        &user,
+        JUDGE_MAX_TOKENS,
+        CLASSIFY_READ_TIMEOUT,
+    )?;
     extract_text(&json).ok_or_else(|| "judge returned no text".to_string())
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "sparkle"
-version = "0.11.0"
+version = "0.15.1"
 edition = "2021"
 description = "Sparkle desktop (macOS)"
 
@@ -14,7 +14,9 @@ tauri-build = { version = "2", features = [] }
 cc = "1"
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# macos-private-api: required for the transparent capture-window takeover (capture_window.rs);
+# paired with "macOSPrivateApi": true in tauri.conf.json. Other windows stay opaque.
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"
@@ -48,6 +50,9 @@ base64 = "0.22"
 sherpa-onnx = "1.13.3"
 cpal = "0.15"
 ureq = "2"
+# Best-effort secret redaction of the log tail we attach to support tickets (support.rs). Already
+# in the tree transitively; declared here so support.rs can use it directly.
+regex = "1"
 # Blocking WebSocket client for the Deepgram Nova-3 streaming STT path. rustls (not native-tls)
 # to reuse the rustls/webpki-roots already in the tree (via reqwest/tauri) — no new system-TLS dep.
 tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "handshake"] }
@@ -79,6 +84,12 @@ mac-notification-sys = "=0.6.15"
 # extra crate in attention.rs (see the #[cfg(not(target_os = "macos"))] path).
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+
+# Unix: raw kill(2) for signalling a whole process GROUP (negative pid) — used by
+# sparkle_improve.rs to take out a headless pass AND everything it spawned (git/gh/tests);
+# std's Child::kill only reaches the direct child.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 hound = "3.5"

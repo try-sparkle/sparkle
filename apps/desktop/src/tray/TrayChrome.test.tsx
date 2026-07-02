@@ -39,7 +39,7 @@ afterEach(() => cleanup());
 describe("TrayHeader", () => {
   it("renders the Sparkle logo and the Recent/Open/New actions", async () => {
     const { TrayHeader } = await import("./TrayChrome");
-    render(<TrayHeader onAction={() => {}} />);
+    render(<TrayHeader onAction={() => {}} onCapture={() => {}} />);
     expect(screen.getByAltText("Sparkle")).toBeTruthy();
     expect(screen.getByText("Open")).toBeTruthy();
     expect(screen.getByText("New")).toBeTruthy();
@@ -49,7 +49,7 @@ describe("TrayHeader", () => {
   it("opens a new project window via the picker, then signals onAction", async () => {
     const onAction = vi.fn();
     const { TrayHeader } = await import("./TrayChrome");
-    render(<TrayHeader onAction={onAction} />);
+    render(<TrayHeader onAction={onAction} onCapture={() => {}} />);
     fireEvent.click(screen.getByText("New"));
     await waitFor(() => expect(openProjectInWindow).toHaveBeenCalledWith("p1", "new", expect.anything()));
     expect(pickProjectFolder).toHaveBeenCalled();
@@ -59,11 +59,53 @@ describe("TrayHeader", () => {
   it("expands Recent and opens the chosen project in a window", async () => {
     const onAction = vi.fn();
     const { TrayHeader } = await import("./TrayChrome");
-    render(<TrayHeader onAction={onAction} />);
+    render(<TrayHeader onAction={onAction} onCapture={() => {}} />);
     fireEvent.click(screen.getByText("Recent ▾"));
     fireEvent.click(screen.getByText("Alpha"));
     await waitFor(() => expect(openProjectInWindow).toHaveBeenCalledWith("p1", "new", expect.anything()));
     expect(onAction).toHaveBeenCalled();
+  });
+});
+
+describe("TrayHeader Capture button", () => {
+  it("renders a Capture button with a 4px radius and the camera+waveform stroke icon", async () => {
+    const { TrayHeader } = await import("./TrayChrome");
+    const { container } = render(<TrayHeader onAction={() => {}} onCapture={() => {}} />);
+    const btn = screen.getByRole("button", { name: "Capture" }) as HTMLButtonElement;
+    expect(btn.style.borderRadius).toBe("4px");
+    // Approved icon: inline stroke SVG (no emoji) — camera body + lens circle + waveform bars.
+    const svg = container.querySelector('svg[viewBox="0 0 30 24"]');
+    expect(svg).toBeTruthy();
+    expect(svg!.getAttribute("fill")).toBe("none");
+    expect(svg!.querySelector("circle")).toBeTruthy();
+    expect(svg!.querySelectorAll("path").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("fires onCapture on click without also firing onAction (the flow hides the popover itself)", async () => {
+    const onAction = vi.fn();
+    const onCapture = vi.fn();
+    const { TrayHeader } = await import("./TrayChrome");
+    render(<TrayHeader onAction={onAction} onCapture={onCapture} />);
+    fireEvent.click(screen.getByRole("button", { name: "Capture" }));
+    expect(onCapture).toHaveBeenCalledTimes(1);
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("is disabled while a capture is in flight (re-entrancy guard)", async () => {
+    const onCapture = vi.fn();
+    const { TrayHeader } = await import("./TrayChrome");
+    render(<TrayHeader onAction={() => {}} onCapture={onCapture} captureBusy />);
+    const btn = screen.getByRole("button", { name: "Capture" }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    fireEvent.click(btn);
+    expect(onCapture).not.toHaveBeenCalled();
+  });
+
+  it("renders the one-line capture error as an alert when captureError is set", async () => {
+    const { TrayHeader } = await import("./TrayChrome");
+    render(<TrayHeader onAction={() => {}} onCapture={() => {}} captureError="Capture failed — check Screen Recording in System Settings." />);
+    // role="alert" so assistive tech announces the failure — query by role to pin it.
+    expect(screen.getByRole("alert").textContent).toMatch(/Screen Recording/);
   });
 });
 

@@ -26,7 +26,9 @@ beforeEach(() => computeSuggestions.mockReset());
 describe("useSuggestions concurrency guard", () => {
   it("does not start a second compute while one is in flight (same state)", async () => {
     let resolve1: (v: unknown) => void = () => {};
-    computeSuggestions.mockReturnValueOnce(new Promise((r) => (resolve1 = r)));
+    computeSuggestions
+      .mockReturnValueOnce(new Promise((r) => (resolve1 = r)))
+      .mockResolvedValueOnce({ agentId: "a1", buttons: [] });
 
     const { rerender } = renderHook(({ empty }) => useSuggestions("a1", empty), {
       initialProps: { empty: true },
@@ -41,9 +43,13 @@ describe("useSuggestions concurrency guard", () => {
     await act(async () => {});
     expect(computeSuggestions).toHaveBeenCalledTimes(1);
 
+    // The first compute was superseded (composer toggled mid-flight), so once it resolves its
+    // result is discarded and the state we're back in recomputes — exactly one follow-up.
     await act(async () => {
       resolve1({ agentId: "a1", buttons: [] });
     });
+    await act(async () => {});
+    expect(computeSuggestions).toHaveBeenCalledTimes(2);
   });
 
   it("does not lock up permanently if a compute rejects (retries)", async () => {

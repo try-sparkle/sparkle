@@ -196,6 +196,11 @@ interface SettingsState {
   /** Consent for the Sparkle self-improvement agent to use the user's anonymous logs. See
    *  SparkleImprovementConsent. Persisted; defaults to "case_by_case". */
   sparkleImprovementConsent: SparkleImprovementConsent;
+  /** Epoch ms of the last hourly improvement-pass ATTEMPT (recorded at pass start, success or
+   *  not, so a failing setup retries next hour instead of hot-looping). null = never — the
+   *  scheduler seeds it on its first tick, so the first pass lands ~1h after consent is active
+   *  rather than the moment the app opens. Persisted (a restart must not reset the hour). */
+  improvementLastRunAt: number | null;
 
   // --- Editable config-file mirror (reflections of config.toml; the file is the source of truth) ---
   // Hydrated from the TOML config via `hydrateFromConfig` at startup and on every config-changed
@@ -236,6 +241,8 @@ interface SettingsState {
   setAllAiFeatures: (on: boolean) => void;
   /** Set the Sparkle self-improvement consent mode (the banner's Always/Case by case/Never control). */
   setSparkleImprovementConsent: (mode: SparkleImprovementConsent) => void;
+  /** Record when an hourly improvement pass was last attempted (see improvementLastRunAt). */
+  setImprovementLastRunAt: (at: number) => void;
   /** Reflect the effective config (from config.toml) into the mirrored store fields. Called at
    *  startup and whenever the file changes. The file is the source of truth — this is the read side. */
   hydrateFromConfig: (eff: EffectiveConfig) => void;
@@ -257,6 +264,7 @@ export const useSettingsStore = create<SettingsState>()(
       autoApplyUpdates: true,
       notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
       sparkleImprovementConsent: DEFAULT_SPARKLE_CONSENT,
+      improvementLastRunAt: null,
 
       // Config-file mirror defaults (match SparkleConfig::default() in config.rs; overwritten by hydrate).
       requirePr: true,
@@ -286,6 +294,7 @@ export const useSettingsStore = create<SettingsState>()(
           aiSuggestedActions: on,
         }),
       setSparkleImprovementConsent: (mode) => set({ sparkleImprovementConsent: mode }),
+      setImprovementLastRunAt: (at) => set({ improvementLastRunAt: at }),
 
       setChiefProject: (sparkleProjectId, chiefProjectId) =>
         set((s) => ({
@@ -374,6 +383,7 @@ export const useSettingsStore = create<SettingsState>()(
         autoApplyUpdates: s.autoApplyUpdates,
         notifyStatuses: s.notifyStatuses,
         sparkleImprovementConsent: s.sparkleImprovementConsent,
+        improvementLastRunAt: s.improvementLastRunAt,
       }),
     },
   ),

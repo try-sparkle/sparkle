@@ -3,8 +3,12 @@ import { SEED_CATALOG } from "./catalog";
 import { deriveContextTags } from "./contextTags";
 import { useSuggestionStore } from "../../stores/suggestionStore";
 import { chatOnce, extractJson } from "../anthropic";
+import { log } from "../../logger";
 import type { SuggestionButton, SuggestionSet } from "./types";
 
+// Surface up to THREE candidate actions, ordered most-likely-first. The composer shows only
+// index [0] at rest; the caret popover discloses #2 and #3. Capping here (not in the UI) means
+// both desktop and the phone relay receive the same short, ranked set.
 const MAX_BUTTONS = 3;
 const SCROLLBACK_LINES = 300;
 
@@ -21,9 +25,10 @@ export interface ComputeOpts {
 export { deriveContextTags };
 
 const SYSTEM = [
-  "You suggest 1-3 next actions a developer would take, given recent terminal output.",
+  "You suggest the next actions a developer would most likely take, given recent terminal output.",
   "Only suggest actions the user plausibly does habitually in this exact situation.",
-  "Reply with ONLY a JSON array of objects: {label, value}.",
+  "Reply with ONLY a JSON array of up to THREE objects: {label, value}, ordered MOST-LIKELY FIRST",
+  "(index 0 = the single most-likely action). Fewer than three is fine; do not pad with weak guesses.",
   "label: <=40 chars button text. value: a natural-language instruction to send to the",
   "coding agent (e.g. 'Rebase main, open a PR, and merge'). NEVER raw shell commands or keystrokes.",
   "If nothing is clearly worth suggesting, reply []. Never suggest destructive actions.",
@@ -89,8 +94,21 @@ export async function computeSuggestions(opts: ComputeOpts): Promise<SuggestionS
   try {
     const reply = await call(SYSTEM, user);
     buttons = sanitize(JSON.parse(extractJson(reply)));
-  } catch {
-    buttons = []; // fail closed on any error / parse failure
+  } catch (err) {
+    // A failed call or unusable (truncated/malformed) reply is RETRYABLE, not "nothing to
+    // suggest" — rethrow so the hook's bounded failure budget owns it. Resolving [] here would
+    // let the hook commit lastHash for this settled state, permanently suppressing its buttons
+    // after one transient API error. Fail-closed-empty stays reserved for a genuine model "[]"
+    // (and for the aiEnabled/entitled gates above). Known asymmetry, accepted: a reply that
+    // parses to valid JSON of the wrong SHAPE sanitizes to [] and resolves (treated as "model
+    // offered nothing usable"), while non-JSON rethrows — both outcomes are bounded and logged,
+    // and distinguishing them would add a branch for a rare flavor of model misbehavior.
+    log.warn("suggestions", "learned compute failed", {
+      agentId,
+      tags,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err instanceof Error ? err : new Error(String(err));
   }
   return { agentId, buttons };
 }

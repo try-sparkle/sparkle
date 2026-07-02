@@ -593,6 +593,19 @@ pub fn accounts_identities(app: AppHandle) -> Result<Vec<AccountIdentity>, Strin
         .collect())
 }
 
+/// Whether Claude Code has a completed sign-in for the given config dir — i.e. `claude login` wrote
+/// an `oauthAccount.emailAddress` into `<config_dir>/.claude.json`. Drives the first-run setup
+/// checklist's "Sign in to Claude Code" step: unlike a mere binary-presence check, this confirms the
+/// user actually authenticated. `config_dir` omitted/empty → the default `~/.claude` (the first-run
+/// case, before any named account exists). Never errors — an unreadable/missing file is "not signed
+/// in". Note: this detects the OAuth (`claude login`) flow, which is exactly what the step runs.
+#[tauri::command]
+pub fn claude_signed_in(config_dir: Option<String>) -> bool {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let dir = config_dir.filter(|s| !s.is_empty()).map(PathBuf::from);
+    read_oauth_identity_at(dir.as_deref(), home.as_deref()).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,6 +882,28 @@ mod tests {
     fn write_claude_json(dir: &Path, body: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join(".claude.json"), body).unwrap();
+    }
+
+    #[test]
+    fn claude_signed_in_true_for_explicit_dir_with_oauth_email() {
+        // The first-run setup gate's real sign-in check: an oauthAccount.emailAddress means
+        // `claude login` completed. An explicit non-empty dir bypasses the HOME fallback.
+        let base = unique_dir("signed-in-yes");
+        write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":"me@example.com"}}"#);
+        assert!(claude_signed_in(Some(base.to_string_lossy().into_owned())));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn claude_signed_in_false_when_no_file_or_no_email() {
+        let base = unique_dir("signed-in-no");
+        // Dir exists but never logged in (no .claude.json) → not signed in.
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(!claude_signed_in(Some(base.to_string_lossy().into_owned())));
+        // oauthAccount present but empty email → not signed in.
+        write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":""}}"#);
+        assert!(!claude_signed_in(Some(base.to_string_lossy().into_owned())));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

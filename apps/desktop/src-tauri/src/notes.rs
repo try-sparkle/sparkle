@@ -116,20 +116,29 @@ fn select_bd_action(success: bool, stdout: &str, stderr: &str) -> Result<String,
     Err("bd produced no output".into())
 }
 
-/// Write a markdown doc into the project's `PRD/` directory. `filename` MUST be a bare filename:
-/// reject anything containing a path separator, a `..` traversal, or an absolute path, so a caller
-/// can never escape `PRD/` and clobber arbitrary files. Creates `PRD/` if needed and returns the
-/// repo-relative path (`PRD/<filename>`) on success.
-#[tauri::command]
-pub fn write_prd(project_path: String, filename: String, content: String) -> Result<String, String> {
+/// Shared bare-filename gate for the PRD read/write commands: reject anything containing a path
+/// separator, a `..` traversal, an absolute path, or a `:` (a Windows drive-relative name like
+/// `C:secret.txt` is neither separated nor absolute, yet `Path::join` would replace the whole
+/// base path there), so a caller can never escape `PRD/`.
+fn validate_bare_filename(filename: &str) -> Result<(), String> {
     if filename.is_empty()
         || filename.contains('/')
         || filename.contains('\\')
+        || filename.contains(':')
         || filename.contains("..")
-        || Path::new(&filename).is_absolute()
+        || Path::new(filename).is_absolute()
     {
         return Err(format!("invalid filename (must be a bare filename): {filename}"));
     }
+    Ok(())
+}
+
+/// Write a markdown doc into the project's `PRD/` directory. `filename` MUST be a bare filename
+/// (see `validate_bare_filename`). Creates `PRD/` if needed and returns the repo-relative path
+/// (`PRD/<filename>`) on success.
+#[tauri::command]
+pub fn write_prd(project_path: String, filename: String, content: String) -> Result<String, String> {
+    validate_bare_filename(&filename)?;
     let prd_dir = Path::new(&project_path).join("PRD");
     std::fs::create_dir_all(&prd_dir).map_err(|e| format!("create {}: {e}", prd_dir.display()))?;
     let path = prd_dir.join(&filename);
@@ -137,15 +146,79 @@ pub fn write_prd(project_path: String, filename: String, content: String) -> Res
     Ok(format!("PRD/{filename}"))
 }
 
-/// List all beads in `project_path` via `bd list --json`. Returns bd's raw JSON stdout (a JSON
-/// array) for the frontend to parse. Runs through a login shell so the GUI app inherits the
-/// user's PATH (where `bd` lives); the project path is a positional arg, never interpolated.
+/// Read a markdown doc back out of the project's `PRD/` directory — the read counterpart of
+/// `write_prd`, behind the same `validate_bare_filename` gate. Returns the file content; a
+/// missing file is an Err (caller decides how to degrade).
+#[tauri::command]
+pub fn read_prd(project_path: String, filename: String) -> Result<String, String> {
+    validate_bare_filename(&filename)?;
+    let path = Path::new(&project_path).join("PRD").join(&filename);
+    std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))
+}
+
+/// The `.gitignore` rule keeping capture screenshots out of git history. Screen captures
+/// routinely contain sensitive content (tokens, emails, other apps) and must never be
+/// committed — they stay local, referenced by repo-relative path.
+const CAPTURE_ASSETS_IGNORE: &str = "PRD/assets/";
+
+/// Pure: return `.gitignore` content with the `PRD/assets/` rule appended, or `None` when the
+/// rule (with or without the trailing slash) is already present and no write is needed.
+fn ensure_ignore_rule(existing: &str) -> Option<String> {
+    let already = existing
+        .lines()
+        .map(|l| l.trim())
+        .any(|l| l == CAPTURE_ASSETS_IGNORE || l == "PRD/assets");
+    if already {
+        return None;
+    }
+    let mut contents = existing.to_string();
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(CAPTURE_ASSETS_IGNORE);
+    contents.push('\n');
+    Some(contents)
+}
+
+/// Copy a capture screenshot into `<project_path>/PRD/assets/<filename>` (dir created if
+/// needed) and ensure `PRD/assets/` is gitignored. `filename` MUST be a bare filename (same
+/// `validate_bare_filename` traversal gate as `write_prd`). `src` is an absolute path to the
+/// screencapture temp file (copied FROM, not resolved within the repo). Returns the
+/// repo-relative path (`PRD/assets/<filename>`).
+#[tauri::command]
+pub fn copy_capture_asset(
+    project_path: String,
+    src: String,
+    filename: String,
+) -> Result<String, String> {
+    validate_bare_filename(&filename)?;
+    let assets_dir = Path::new(&project_path).join("PRD").join("assets");
+    std::fs::create_dir_all(&assets_dir)
+        .map_err(|e| format!("create {}: {e}", assets_dir.display()))?;
+    let dest = assets_dir.join(&filename);
+    std::fs::copy(&src, &dest).map_err(|e| format!("copy {src} -> {}: {e}", dest.display()))?;
+
+    let gitignore = Path::new(&project_path).join(".gitignore");
+    let existing = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    if let Some(updated) = ensure_ignore_rule(&existing) {
+        std::fs::write(&gitignore, updated)
+            .map_err(|e| format!("write {}: {e}", gitignore.display()))?;
+    }
+    Ok(format!("PRD/assets/{filename}"))
+}
+
+/// List all beads in `project_path` via `bd list --all --limit 0 --json`. Returns bd's raw JSON
+/// stdout (a JSON array) for the frontend to parse. `--all` is REQUIRED: a bare `bd list` applies
+/// a default filter that excludes closed issues (so the board's "done"/"delivered" columns come
+/// back empty) and caps output at 50 rows; `--all --limit 0` overrides both so the board sees every
+/// issue in every status. Runs through a login shell so the GUI app inherits the user's PATH (where
+/// `bd` lives); the project path is a positional arg, never interpolated.
 #[tauri::command]
 pub fn list_beads(project_path: String) -> Result<String, String> {
     let output = Command::new("/bin/zsh")
         .arg("-l")
         .arg("-c")
-        .arg(r#"cd "$1" && bd list --json"#)
+        .arg(r#"cd "$1" && bd list --all --limit 0 --json"#)
         .arg("sparkle")     // $0
         .arg(&project_path) // $1
         .output()
@@ -511,6 +584,40 @@ mod tests {
     }
 
     #[test]
+    fn read_prd_rejects_unsafe_filenames() {
+        let dir = std::env::temp_dir().join(format!("sparkle_prd_read_reject_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("PRD")).unwrap();
+        std::fs::write(dir.join("secret.txt"), "top secret").unwrap();
+        let p = dir.to_string_lossy().to_string();
+
+        // `C:secret.txt` is drive-relative on Windows: no separator, not absolute, yet
+        // Path::join would replace the whole base path there. Reject it everywhere.
+        for bad in ["../secret.txt", "sub/dir.md", "a\\b.md", "..", "/etc/passwd", "", "C:secret.txt"] {
+            let r = read_prd(p.clone(), bad.to_string());
+            let w = write_prd(p.clone(), bad.to_string(), "x".into());
+            assert!(r.is_err(), "expected read rejection for {bad:?}, got {r:?}");
+            assert!(w.is_err(), "expected write rejection for {bad:?}, got {w:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_prd_round_trips_a_written_prd() {
+        let dir = std::env::temp_dir().join(format!("sparkle_prd_read_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.to_string_lossy().to_string();
+
+        write_prd(p.clone(), "branch.md".into(), "# hello\n".into()).unwrap();
+        assert_eq!(read_prd(p.clone(), "branch.md".into()).unwrap(), "# hello\n");
+        // A missing file is an Err, not a panic.
+        assert!(read_prd(p.clone(), "nope.md".into()).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn build_create_bead_command_minimal_uses_defaults() {
         // Empty type defaults to "task"; no optional flags appended; only 4 positional args.
         let (script, args) =
@@ -565,5 +672,51 @@ mod tests {
     fn bead_label_rejects_invalid_action() {
         let r = bead_label("/proj".into(), "delete".into(), "sparkle-x".into(), "ui".into());
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn ensure_ignore_rule_appends_when_missing() {
+        assert_eq!(ensure_ignore_rule(""), Some("PRD/assets/\n".into()));
+        assert_eq!(
+            ensure_ignore_rule("node_modules/\n.sparkle/\n"),
+            Some("node_modules/\n.sparkle/\nPRD/assets/\n".into())
+        );
+        // Existing content missing its trailing newline gets one before the rule.
+        assert_eq!(
+            ensure_ignore_rule("node_modules/"),
+            Some("node_modules/\nPRD/assets/\n".into())
+        );
+    }
+
+    #[test]
+    fn ensure_ignore_rule_is_idempotent() {
+        assert_eq!(ensure_ignore_rule("PRD/assets/\n"), None);
+        assert_eq!(ensure_ignore_rule("  PRD/assets/  \n"), None); // trimmed match
+        assert_eq!(ensure_ignore_rule("PRD/assets\n"), None); // slashless variant counts
+    }
+
+    #[test]
+    fn copy_capture_asset_rejects_traversal_and_copies_plus_ignores() {
+        let dir = std::env::temp_dir().join(format!("sparkle_capasset_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let proj = dir.to_string_lossy().to_string();
+        let src = dir.join("shot.png");
+        std::fs::write(&src, b"png-bytes").unwrap();
+        let src_s = src.to_string_lossy().to_string();
+
+        assert!(copy_capture_asset(proj.clone(), src_s.clone(), "../evil.png".into()).is_err());
+        assert!(copy_capture_asset(proj.clone(), src_s.clone(), "a/b.png".into()).is_err());
+
+        let rel = copy_capture_asset(proj.clone(), src_s, "t-capture.png".into()).unwrap();
+        assert_eq!(rel, "PRD/assets/t-capture.png");
+        assert_eq!(
+            std::fs::read(dir.join("PRD/assets/t-capture.png")).unwrap(),
+            b"png-bytes"
+        );
+        let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(ignore.lines().any(|l| l.trim() == "PRD/assets/"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

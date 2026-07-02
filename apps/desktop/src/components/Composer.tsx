@@ -13,7 +13,8 @@ import {
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { submitPrompt, writePty } from "../pty";
-import { SuggestionRow } from "./composer/SuggestionRow";
+import { SuggestionRow, SUGGESTION_PILL_ZONE } from "./composer/SuggestionRow";
+import { suggestionRowVisible } from "./composer/suggestionVisibility";
 import { useSuggestions } from "../services/suggestions/useSuggestions";
 import { deriveContextTags } from "../services/suggestions/contextTags";
 import { getAgentScrollback } from "../services/terminalScrollback";
@@ -23,6 +24,10 @@ import { parseControlAction, CLOSE_AGENT_ACTION } from "../services/suggestions/
 import type { SuggestionButton } from "../services/suggestions/types";
 import { trialSendAllowed, recordTrialSend } from "../services/trialMeter";
 import { safeUnlisten } from "../services/safeUnlisten";
+import { isOverDndTarget, NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
+import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
+import { useHandoffStore } from "../stores/handoffStore";
+import { useProjectStore } from "../stores/projectStore";
 import { captureScreenRegion } from "../screenshot";
 import { AttachmentRow } from "./composer/AttachmentRow";
 import {
@@ -134,6 +139,7 @@ export function Composer({
   agentId,
   active = true,
   disabled = false,
+  preparing = false,
   inputRef,
   apiRef,
   onSubmitPrompt,
@@ -144,6 +150,11 @@ export function Composer({
   // Only the visible pane's composer reacts to native file drops (panes stay mounted).
   active?: boolean;
   disabled?: boolean;
+  // The agent is still starting (worktree/PTY spinning up), so its PTY can't receive input YET —
+  // but the composer is fully usable so the user can type/talk immediately instead of waiting. A
+  // send while `preparing` is QUEUED and auto-delivered the moment the PTY is ready (see the flush
+  // effect), rather than dropped. Distinct from `disabled` (a hard block that also stops typing).
+  preparing?: boolean;
   inputRef?: RefObject<HTMLTextAreaElement | null>;
   // Imperative bridge so the parent can push text into the box (e.g. "Send to Composer").
   apiRef?: RefObject<ComposerApi | null>;
@@ -162,6 +173,15 @@ export function Composer({
   onEnterOverflow?: () => void;
 }) {
   const [value, setValue] = useState("");
+  // A prompt the user sent BEFORE the agent's PTY was ready (composed during `preparing`). Held
+  // here and flushed by the effect below the moment `preparing` clears, so an eager first prompt is
+  // never dropped. Null when nothing is queued. Multiple pre-ready sends merge (newest appended).
+  const pendingSendRef = useRef<{
+    typed: string;
+    atts: Attachment[];
+    blocks: TextBlock[];
+    text: string;
+  } | null>(null);
   // True while a native file (e.g. a log) is dragged over the window — drives the drop hint.
   const [dropActive, setDropActive] = useState(false);
   // While focused, the placeholder switches from the "Hey Sparkle" voice prompt to a typing hint.
@@ -522,42 +542,53 @@ export function Composer({
     if (!disabled && !minimized) inputRef?.current?.focus();
   }, [disabled, inputRef, minimized]);
 
+  // Load dropped/handed-off file paths into attachment tiles (images get a preview, others a
+  // file chip), surface the box, and append them in order — loads resolve at different speeds,
+  // so collect them before appending rather than racing. A failed load is logged and skipped.
+  const attachPaths = useCallback(
+    (paths: string[]) => {
+      setMinimized(false); // surface the box so the new tiles are visible
+      inputRef?.current?.focus();
+      void Promise.all(
+        paths.map((path) =>
+          loadAttachment(path).catch((e) => {
+            log.error("composer", "load dropped file failed", { path, e });
+            return null;
+          }),
+        ),
+      ).then((loaded) => {
+        const ok = loaded.filter((a): a is Attachment => a !== null);
+        if (ok.length) setAttachments((prev) => [...prev, ...ok]);
+      });
+    },
+    [inputRef, setMinimized],
+  );
+
   // Native file drag-and-drop: drag a file (image or otherwise) onto the active composer
-  // and it becomes a tile above the textarea — image files preview as a thumbnail, others
-  // show as a file chip. The tile carries the file's absolute path, prefixed to the message
-  // on send so the agent reads it straight from disk (same trick as screenshot attachments).
-  // Tauri's webview drag-drop event carries real filesystem paths; a plain HTML5 drop in a
-  // sandboxed webview does not. Only the visible pane listens (others stay mounted).
+  // and it becomes a tile above the textarea. The tile carries the file's absolute path,
+  // prefixed to the message on send so the agent reads it straight from disk (same trick as
+  // screenshot attachments). Tauri's webview drag-drop event carries real filesystem paths; a
+  // plain HTML5 drop in a sandboxed webview does not. Only the visible pane listens (others
+  // stay mounted). One carve-out: the "+ New Build Agent" button is its OWN drop target
+  // (useNewBuildAgentDrop spawns a new agent and attaches the files there), so we hit-test
+  // every position ourselves and stand down over the button — no dropped-on-the-button file
+  // may land in THIS composer, and no listener-ordering assumption is needed.
   useEffect(() => {
     if (!active) return;
     const unlistenPromise = getCurrentWebview()
       .onDragDropEvent((event) => {
         const p = event.payload;
         if (p.type === "enter" || p.type === "over") {
-          setDropActive(true);
+          setDropActive(!isOverDndTarget(p.position, NEW_BUILD_AGENT_DND_TARGET));
         } else if (p.type === "leave") {
           setDropActive(false);
         } else if (p.type === "drop") {
           setDropActive(false);
+          if (isOverDndTarget(p.position, NEW_BUILD_AGENT_DND_TARGET)) return;
           const paths = p.paths ?? [];
           if (paths.length === 0) return;
           log.info("composer", `dropped ${paths.length} file(s) into chat`, paths);
-          setMinimized(false); // surface the box so the new tiles are visible
-          inputRef?.current?.focus();
-          // Load each dropped file into an attachment tile (images get a preview), then
-          // append them in drop order — loads resolve at different speeds, so collect them
-          // before appending rather than racing. A failed load is logged and skipped.
-          void Promise.all(
-            paths.map((path) =>
-              loadAttachment(path).catch((e) => {
-                log.error("composer", "load dropped file failed", { path, e });
-                return null;
-              }),
-            ),
-          ).then((loaded) => {
-            const ok = loaded.filter((a): a is Attachment => a !== null);
-            if (ok.length) setAttachments((prev) => [...prev, ...ok]);
-          });
+          attachPaths(paths);
         }
       })
       .catch((e) => {
@@ -571,7 +602,55 @@ export function Composer({
       // torn down (and the Tauri teardown race is swallowed).
       void safeUnlisten(unlistenPromise);
     };
-  }, [active, inputRef, setMinimized]);
+  }, [active, attachPaths]);
+
+  // Files dropped on the "+ New Build Agent" button were queued for this agent BEFORE this
+  // composer existed (the drop spawned the agent — see useNewBuildAgentDrop). Drain our entry
+  // once we're the active pane and attach the paths exactly like a direct drop. Draining is
+  // idempotent (the entry empties), so re-running on activation is harmless.
+  useEffect(() => {
+    if (!active) return;
+    const paths = usePendingAttachmentsStore.getState().drain(agentId);
+    if (paths.length === 0) return;
+    log.info("composer", `attaching ${paths.length} handed-off file(s)`, paths);
+    attachPaths(paths);
+  }, [active, agentId, attachPaths]);
+
+  // A capture-modal "Build ❯" queued a draft (text + screenshots) for this project's build
+  // agent (handoffStore.buildDraft — same handoff shape as pendingAttachmentsStore, but keyed
+  // by project since the router may create the agent in the same tick). Consume it when this
+  // composer is the active pane of a build agent in that project: attachment tiles + draft
+  // text, then clear. NEVER auto-sent — the user reviews and hits Enter.
+  const buildDraft = useHandoffStore((s) => s.buildDraft);
+  useEffect(() => {
+    if (!active || disabled || !buildDraft) return;
+    // Re-read the draft from the store inside the effect (roborev 25174): the first consumer's
+    // clearBuildDraft() below makes any replay of this effect (HMR / StrictMode double-mount)
+    // a no-op, so the text/attachments can never be double-applied. The subscribed `buildDraft`
+    // above serves only as the trigger.
+    const draft = useHandoffStore.getState().buildDraft;
+    if (!draft) return;
+    const project = useProjectStore
+      .getState()
+      .projects.find((p) => p.agents.some((a) => a.id === agentId));
+    if (!project || project.id !== draft.projectId) return;
+    if (project.agents.find((a) => a.id === agentId)?.kind !== "build") return;
+    useHandoffStore.getState().clearBuildDraft();
+    if (draft.attachments.length > 0) {
+      setAttachments((prev) => [
+        ...prev,
+        ...draft.attachments.map((a) => screenshotAttachment(a.path, a.dataUrl)),
+      ]);
+    }
+    if (draft.text.trim()) {
+      // Same replace-if-empty/append-on-new-line rule as insertPrompt, so an in-progress
+      // draft is never clobbered.
+      setValue((v) => (v.trim() ? `${v}${v.endsWith("\n") ? "" : "\n"}${draft.text}` : draft.text));
+      setGhostDismissed(true);
+    }
+    setMinimized(false);
+    requestAnimationFrame(() => inputRef?.current?.focus());
+  }, [active, disabled, agentId, buildDraft, inputRef, setMinimized]);
 
   // Open the native macOS crosshair picker and stash the result as a thumbnail.
   // Esc (cancel) resolves null — a quiet no-op. While the picker is up the call
@@ -641,7 +720,7 @@ export function Composer({
   };
 
   const send = async () => {
-    if (disabled) return; // PTY not spawned yet — don't drop the prompt
+    if (disabled) return; // hard-blocked (not merely starting) — nothing to do
     const typed = value;
     const text = value.trim();
     const atts = attachments;
@@ -659,6 +738,27 @@ export function Composer({
     // leave it sitting tall (clears any manual sizing too). Send is unreachable while minimized,
     // so this never fights the keep-minimized exception.
     resetComposerSize();
+    // The agent is still starting: its PTY can't receive input yet. Queue this prompt (merging with
+    // any already queued so nothing is lost) and let the flush effect deliver it the instant the PTY
+    // is ready — so the user could compose immediately instead of waiting on the workspace spin-up.
+    if (preparing) {
+      const prev = pendingSendRef.current;
+      pendingSendRef.current = prev
+        ? {
+            typed: `${prev.typed}\n${typed}`,
+            atts: [...prev.atts, ...atts],
+            blocks: [...prev.blocks, ...blocks],
+            text: `${prev.text}\n${text}`.trim(),
+          }
+        : { typed, atts, blocks, text };
+      log.info("composer", "queue prompt (agent starting)", {
+        agentId,
+        chars: text.length,
+        attachments: atts.length,
+        textBlocks: blocks.length,
+      });
+      return;
+    }
     log.info("composer", "send prompt", {
       agentId,
       chars: text.length,
@@ -678,6 +778,27 @@ export function Composer({
       });
     }
   };
+
+  // Flush a prompt that was queued while the agent was starting, the moment its PTY is ready
+  // (`preparing` clears). Delivered exactly once — the ref is cleared before delivery, and the
+  // effect only re-fires when `preparing` transitions. If the agent instead fails to start, the
+  // composer unmounts and the queued prompt is intentionally discarded (don't feed a broken agent).
+  useEffect(() => {
+    if (preparing) return;
+    const queued = pendingSendRef.current;
+    if (!queued) return;
+    pendingSendRef.current = null;
+    log.info("composer", "flush queued prompt (agent ready)", {
+      agentId,
+      chars: queued.text.length,
+      attachments: queued.atts.length,
+      textBlocks: queued.blocks.length,
+    });
+    void deliverPrompt(queued.typed, queued.atts, queued.blocks);
+    // deliverPrompt is a fresh closure each render but reads only its args + stable refs; re-running
+    // this on its identity would risk a double-flush, so key it solely on the preparing transition.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preparing]);
 
   // Send a suggestion button's action immediately (one click). Terminal-kind buttons inject raw
   // keystrokes straight into the PTY (y/n, numbered choices); prompt-kind buttons go through the
@@ -1092,6 +1213,18 @@ export function Composer({
                 opacity: disabled ? 0.6 : 1,
               }}
             />
+            {/* The single recommended action is an absolute overlay pinned to the textarea's
+                trailing-right edge (vertically centered), NOT a width-eating sibling — so the
+                composer keeps its full width. It only shows on an empty composer, so it never
+                overlaps typed text; the empty input's caret/placeholder sit at the left. It stays
+                visible while the mic is hot but nothing's been said (composerEmptyNow && listening),
+                hiding only on interim speech or typed content. */}
+            <SuggestionRow
+              buttons={suggestionButtons}
+              visible={suggestionRowVisible(composerEmptyNow, interimActive)}
+              onClick={(b) => void onSuggestionClick(b)}
+              onDismiss={dismissSuggestion}
+            />
           </div>
           {showRichPlaceholder && (
             // Styled stand-in for the native placeholder so "Hey Sparkle" can be bold + blue.
@@ -1103,7 +1236,13 @@ export function Composer({
                 position: "absolute",
                 top: 9,
                 left: 11,
-                right: 11,
+                // Right-padding safety: when the single recommended pill overlays the trailing
+                // right edge, reserve its full footprint (SUGGESTION_PILL_ZONE, derived from the
+                // pill's own max width so the two can't drift) so a long placeholder hint wraps
+                // early instead of sliding underneath the (translucent) pill. showRichPlaceholder
+                // implies an empty composer, so the pill is present here exactly when there's a
+                // suggestion button.
+                right: suggestionButtons.length > 0 ? SUGGESTION_PILL_ZONE : 11,
                 pointerEvents: "none",
                 color: C.muted,
                 fontFamily: '"IBM Plex Sans", sans-serif',
@@ -1141,12 +1280,6 @@ export function Composer({
             </div>
           )}
         </div>
-        <SuggestionRow
-          buttons={suggestionButtons}
-          visible={composerEmptyNow && !interimActive && !liveActive}
-          onClick={(b) => void onSuggestionClick(b)}
-          onDismiss={dismissSuggestion}
-        />
         <button
           data-hint="screenshot"
           onClick={() => void capture()}

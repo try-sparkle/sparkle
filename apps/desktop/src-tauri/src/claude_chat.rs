@@ -107,8 +107,9 @@ struct ChatError {
 
 /// Single-quote a value for safe use inside a `zsh -c '…'` string (mirrors `shellQuote`
 /// in `claudeSpawn.ts`). A `'` becomes `'\''` so an attacker-controlled prompt/path/sid
-/// can't break out of the quoting.
-fn shell_quote(s: &str) -> String {
+/// can't break out of the quoting. `pub(crate)`: also used by `sparkle_improve.rs`, which
+/// builds its own headless `claude -p` exec the same way.
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -145,7 +146,10 @@ fn build_claude_exec(claude_path: &str, prompt: &str, resume_session_id: Option<
 ///  - `system`/`init` → capture `session_id`.
 ///  - `stream_event` content_block_delta/text_delta → incremental assistant text → `emit_delta`.
 ///  - `result` → capture the final `session_id` and the clean final `result` text.
-fn handle_event(
+///
+/// `pub(crate)`: `sparkle_improve.rs` drives the same `claude -p --output-format stream-json`
+/// NDJSON stream, so it reuses this parser rather than forking the event shapes.
+pub(crate) fn handle_event(
     ev: &Value,
     session_id: &mut String,
     final_text: &mut String,

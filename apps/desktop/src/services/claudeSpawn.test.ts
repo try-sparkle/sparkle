@@ -1,7 +1,32 @@
 import { describe, it, expect } from "vitest";
-import { buildClaudeExec, shellQuote, buildOrchestratorMcpConfig } from "./claudeSpawn";
+import {
+  buildClaudeExec,
+  buildClaudeLoginExec,
+  shellQuote,
+  buildOrchestratorMcpConfig,
+} from "./claudeSpawn";
 
 const PATH_PREFIX = `export PATH="$HOME/.local/bin:$PATH"; `;
+
+describe("buildClaudeLoginExec (first-run setup)", () => {
+  it("runs `claude login` with the ~/.local/bin PATH prefix", () => {
+    expect(buildClaudeLoginExec("/usr/local/bin/claude")).toBe(
+      `${PATH_PREFIX}exec '/usr/local/bin/claude' login`,
+    );
+  });
+
+  it("single-quotes a claude path containing a space", () => {
+    expect(buildClaudeLoginExec("/path with space/claude")).toBe(
+      `${PATH_PREFIX}exec '/path with space/claude' login`,
+    );
+  });
+
+  it("exports CLAUDE_CONFIG_DIR before login when a config dir is given", () => {
+    expect(buildClaudeLoginExec("/bin/claude", { configDir: "/acc/dir" })).toBe(
+      `export CLAUDE_CONFIG_DIR='/acc/dir'; ${PATH_PREFIX}exec '/bin/claude' login`,
+    );
+  });
+});
 
 describe("buildClaudeExec ()", () => {
   it("appends --continue when a prior session exists", () => {
@@ -165,6 +190,38 @@ describe("buildClaudeExec ()", () => {
   it("shell-quotes a session id (defense in depth, though ids are uuids)", () => {
     const cmd = buildClaudeExec("/bin/claude", true, { resumeSessionId: "a'b" });
     expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --resume 'a'\\''b'`);
+  });
+
+  // Per-agent model selection (bead sparkle-i6rw).
+  it("emits --model <id>, shell-quoted, when a model is set", () => {
+    const cmd = buildClaudeExec("/bin/claude", false, { model: "claude-opus-4-8" });
+    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --model 'claude-opus-4-8'`);
+  });
+
+  it("omits --model when the model is undefined or the 'default' sentinel", () => {
+    expect(buildClaudeExec("/bin/claude", false)).not.toContain("--model");
+    expect(buildClaudeExec("/bin/claude", false, { model: undefined })).not.toContain("--model");
+    expect(buildClaudeExec("/bin/claude", false, { model: "default" })).not.toContain("--model");
+    // Empty string behaves like unset — never emit `--model ''`.
+    expect(buildClaudeExec("/bin/claude", false, { model: "" })).not.toContain("--model");
+  });
+
+  it("keeps --model on a resumed session and orders it before the persona/prompt opts", () => {
+    const cmd = buildClaudeExec("/bin/claude", true, {
+      model: "claude-haiku-4-5",
+      appendSystemPrompt: "persona",
+    });
+    expect(cmd).toBe(
+      `${PATH_PREFIX}exec '/bin/claude' --continue --model 'claude-haiku-4-5' --append-system-prompt 'persona'`,
+    );
+  });
+
+  it("combines --model with a fresh initial prompt (worker spawn shape)", () => {
+    const cmd = buildClaudeExec("/bin/claude", false, {
+      model: "claude-sonnet-5",
+      initialPrompt: "go",
+    });
+    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --model 'claude-sonnet-5' -- 'go'`);
   });
 });
 

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { C, ON_BRAND_FILL } from "../theme/colors";
+import { SettingCheckbox } from "./SettingCheckbox";
 import { useSettingsStore } from "../stores/settingsStore";
 import {
   configFilePaths,
@@ -30,6 +31,8 @@ const help: CSSProperties = { color: C.muted, fontSize: 12, lineHeight: 1.45, ma
 
 export function AdvancedConfigMenu() {
   const warnings = useSettingsStore((s) => s.configWarnings);
+  const autoApplyUpdates = useSettingsStore((s) => s.autoApplyUpdates);
+  const setAutoApplyUpdates = useSettingsStore((s) => s.setAutoApplyUpdates);
 
   const [text, setText] = useState("");
   const [loaded, setLoaded] = useState(false);
@@ -94,6 +97,18 @@ export function AdvancedConfigMenu() {
 
   return (
     <div>
+      {/* Silent auto-apply of desktop updates (default on). Off → the updater shows a
+          "Restart to apply" prompt instead; see services/updaterService. Unlike the AI feature
+          flags, this persists in the app settings store (localStorage), NOT in the config.toml
+          edited below. */}
+      <div style={{ marginBottom: 10 }}>
+        <SettingCheckbox
+          label="Automatically apply updates"
+          checked={autoApplyUpdates}
+          onToggle={() => setAutoApplyUpdates(!autoApplyUpdates)}
+        />
+      </div>
+
       <p style={help}>
         Edit the configuration file directly (advanced). This is the source of truth for workflow
         rules, worker concurrency, and AI features. Comments you add are preserved. Saving validates

@@ -4,9 +4,9 @@
 //! hands the user the native crosshair to drag out a region (or Esc to cancel).
 //! We write the PNG to a temp file and return BOTH:
 //!   - `path`     — so the caller can reference the image in a CLI prompt (the
-//!                  Claude Code CLI reads image paths natively), and
+//!     Claude Code CLI reads image paths natively), and
 //!   - `data_url` — a `data:image/png;base64,…` so the UI can render a thumbnail
-//!                  without a second IPC round-trip.
+//!     without a second IPC round-trip.
 //!
 //! First use triggers the macOS Screen Recording permission prompt; once granted,
 //! Sparkle keeps the grant in System Settings → Privacy & Security.

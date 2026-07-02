@@ -17,9 +17,12 @@ describe("deriveContextTags", () => {
 });
 
 describe("computeSuggestions", () => {
-  it("returns heuristic buttons and skips Haiku when a prompt is present", async () => {
+  it("returns heuristic buttons (top-ranked first) and skips Haiku when a prompt is present", async () => {
+    // A y/n prompt heuristically yields Approve/Deny; MAX_BUTTONS=3 keeps both, Approve first.
     const callHaiku = vi.fn();
     const set = await computeSuggestions({ ...base, scrollback: "Continue? (y/n) ", callHaiku });
+    expect(set.buttons.length).toBeLessThanOrEqual(3);
+    expect(set.buttons[0]?.label).toBe("Approve");
     expect(set.buttons.map((b) => b.label)).toEqual(["Approve", "Deny"]);
     expect(callHaiku).not.toHaveBeenCalled();
   });
@@ -44,17 +47,28 @@ describe("computeSuggestions", () => {
     expect(callHaiku).not.toHaveBeenCalled();
   });
 
-  it("ignores malformed Haiku output (fails closed to empty)", async () => {
+  it("rejects on malformed Haiku output so the caller's retry budget applies", async () => {
     const callHaiku = vi.fn().mockResolvedValue("not json at all");
-    const set = await computeSuggestions({ ...base, scrollback: "Done. Committed abc.", callHaiku });
-    expect(set.buttons).toEqual([]);
+    await expect(
+      computeSuggestions({ ...base, scrollback: "Done. Committed abc.", callHaiku }),
+    ).rejects.toThrow();
   });
 
-  it("caps learned buttons at 3", async () => {
+  it("rejects (does not resolve empty) when the Haiku call itself fails", async () => {
+    const callHaiku = vi.fn().mockRejectedValue(new Error("api down"));
+    await expect(
+      computeSuggestions({ ...base, scrollback: "Done. Committed abc.", callHaiku }),
+    ).rejects.toThrow("api down");
+  });
+
+  it("caps learned buttons at AT MOST 3, keeping the most-likely-first order", async () => {
     const many = Array.from({ length: 6 }, (_, i) => ({ label: `act${i}`, value: `v${i}`, kind: "prompt" }));
     const callHaiku = vi.fn().mockResolvedValue(JSON.stringify(many));
     const set = await computeSuggestions({ ...base, scrollback: "Done. Committed abc.", callHaiku });
+    expect(set.buttons.length).toBeLessThanOrEqual(3);
     expect(set.buttons).toHaveLength(3);
+    // Ranking is unchanged: index [0] is the top-ranked (most-likely-first) entry.
+    expect(set.buttons.map((b) => b.label)).toEqual(["act0", "act1", "act2"]);
   });
 
   it("parses a markdown-fenced JSON reply", async () => {

@@ -64,6 +64,7 @@ vi.mock("../services/thinkBridge", () => ({ registerThink: () => () => {} }));
 
 import { ThinkPanel, routeMessage, activeMentionToken, splitMentions } from "./ThinkPanel";
 import { useSettingsStore } from "../stores/settingsStore";
+import { useAuthStore } from "../stores/authStore";
 import { useHandoffStore } from "../stores/handoffStore";
 import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -88,6 +89,14 @@ beforeEach(() => {
     aiBrainstorm: true,
     aiComposer: true,
   } as never);
+  // Think now requires the app to be bought (entitled) to actually SEND — the trial "visible-but-
+  // locked" gate. Default the suite to an entitled user so the routing/wiring behavior is what's
+  // under test; the dedicated lock test below flips `me` back to the anonymous-trial (null) state.
+  useAuthStore.setState({
+    me: { clerkUserId: "u", entitled: true, balanceCents: 20000, tokenVersion: 1 },
+    tokenPresent: true,
+    loading: false,
+  });
   useHandoffStore.setState({ pending: null });
   useHistoryStore.setState({ record: recordSpy as never });
   useUiStore.setState({ workMode: "think" });
@@ -365,5 +374,22 @@ describe("ThinkPanel — routing + wiring", () => {
       expect(screen.getByText(/blocked but visible/)).toBeTruthy();
     });
     expect(screen.getByText(/AI features are off/)).toBeTruthy();
+  });
+
+  it("visible-but-locked (trial): submitting shows the buy-to-use notice, fires no backend, keeps the text", async () => {
+    // Anonymous trial: no token, no `me` → the app isn't bought, so Think is locked.
+    useAuthStore.setState({ me: null, tokenPresent: false, loading: false });
+    render(<ThinkPanel project={project} agentId="a1" visible />);
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "help me think" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    // The buy-to-use notice appears and NO AI backend fires.
+    await screen.findByText(/Buy Sparkle to think/);
+    expect(screen.getByRole("button", { name: /Unlock Sparkle/ })).toBeTruthy();
+    expect(sendClaudeChat).not.toHaveBeenCalled();
+    expect(startChat).not.toHaveBeenCalled();
+    expect(answerAsVoice).not.toHaveBeenCalled();
+    // The typed text is preserved so the user can send it for real after buying.
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("help me think");
   });
 });

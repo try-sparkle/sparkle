@@ -5,14 +5,7 @@ import { useDictationStore } from "./stores/dictationStore";
 import { useAiFeature, aiFeatureNow } from "./services/aiGate";
 import { useAuthStore } from "./stores/authStore";
 import { advance, type Advance } from "./voice/wakeMachine";
-import { creditDeps } from "./services/sparkleApi";
-import {
-  createCloudDictationMeter,
-  setActiveCloudMeter,
-  stopActiveCloudMeter,
-  openMeteredCloudWindow,
-  nextBalanceCents,
-} from "./services/cloudDictationMeter";
+import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDictation";
 
 /**
  * The cloud-stream command (if any) a wake-machine transition implies. Pure so the
@@ -101,18 +94,39 @@ export async function createDictationController(
       useDictationStore.getState().setInterim(e.payload);
     }),
 
-    // The cloud (Deepgram) worker exited — clean close OR a mid-stream failure. Clear the stale
-    // interim ghost and call stop_cloud_stream, which flips cloud_active off so the capture callback
-    // resumes routing frames to the on-device model (seamless fallback; on a mid-stream death the
-    // on-device wake/stop-word path resumes instead of dictation getting stranded). Idempotent on
-    // the normal stop path (cloud already torn down).
-    listen("dictation://cloud-ended", () => {
-      // The cloud stream is gone — stop per-minute billing immediately (don't keep debiting a dead
-      // stream), clear the stale preview, and tell the backend to resume on-device routing.
-      stopActiveCloudMeter();
+    // The cloud (relay) worker exited — clean close, a mid-stream failure, OR the relay signalling
+    // out-of-credits (payload `exhausted`). Clear the stale interim ghost and call stop_cloud_stream,
+    // which flips cloud_active off so the capture callback resumes routing frames to the on-device
+    // model (seamless fallback; on a mid-stream death the on-device wake/stop-word path resumes
+    // instead of dictation getting stranded). Idempotent on the normal stop path (cloud already torn
+    // down). Metering is server-side now, so there's no client meter to stop here.
+    listen<boolean>("dictation://cloud-ended", (e) => {
       useDictationStore.getState().setInterim("");
       invoke("stop_cloud_stream").catch(() => {});
+      // Out-of-credits teardown → refresh the balance so the credits pill reflects the now-depleted
+      // balance (the last relay `balance` frame was pre-decline). A clean close (payload false) skips
+      // the round-trip.
+      if (e.payload) void useAuthStore.getState().refresh();
     }),
+
+    // The relay's per-minute `balance` control frame (server-authoritative). Cloud metering lives on
+    // the server now, so this is how the credits pill ticks down in real time: prefer the server's
+    // post-debit balance, optimistically decrement by the debited amount when it's absent. Broadcast
+    // to every window (they all show the same balance), so no per-window focus gate is needed.
+    listen<{ balanceCents: number | null; debitedCents: number }>(
+      "dictation://cloud-balance",
+      (e) => {
+        const { me } = useAuthStore.getState();
+        if (!me) return;
+        const { balanceCents, debitedCents } = e.payload;
+        useAuthStore.setState({
+          me: {
+            ...me,
+            balanceCents: nextBalanceCents(me.balanceCents, balanceCents, debitedCents),
+          },
+        });
+      },
+    ),
 
     listen<number>("dictation://level", (e) => {
       // Capture started — clear any lingering model-download progress. This fires ~25×/sec, so
@@ -148,7 +162,6 @@ export async function createDictationController(
     listen<boolean>("dictation://focus", (e) => {
       const store = useDictationStore.getState();
       if (!e.payload) {
-        stopActiveCloudMeter();
         invoke("stop_cloud_stream").catch(() => {});
         store.setInterim("");
         store.setLevel(0);
@@ -176,7 +189,7 @@ export async function createDictationController(
   const toggle = async () => {
     const state = useDictationStore.getState();
     if (state.status === "listening") {
-      stopActiveCloudMeter(); // stopping dictation halts per-minute cloud billing
+      // stop_dictation tears down any live relay stream in Rust, which stops server-side metering.
       await invoke("stop_dictation");
       state.setModelProgress(null);
       state.setStatus("idle");
@@ -218,75 +231,35 @@ export function useAmbientVoice(): void {
   const aiComposer = useAiFeature("composer");
 
   // If the user turns voice dictation OR the composer off WHILE a cloud stream is open, close it
-  // immediately rather than waiting for the stop word — otherwise a billable Deepgram socket lingers
-  // (and, with the composer off, streams into a sink that no longer renders). Stop the per-minute
-  // meter too so billing halts. Idempotent; re-enabling reopens on the next wake.
+  // immediately rather than waiting for the stop word — otherwise a billable relay socket lingers
+  // (and, with the composer off, streams into a sink that no longer renders). Closing the socket
+  // stops the server-side meter. Idempotent; re-enabling reopens on the next wake.
   useEffect(() => {
     // Only when the mic is hot can a cloud stream be open, so gate on `enabled` to avoid a backend
     // round-trip on mount / benign re-renders when nothing is streaming.
     if (enabled && (!cloudDictation || !aiComposer)) {
-      stopActiveCloudMeter();
       invoke("stop_cloud_stream").catch(() => {});
       useDictationStore.getState().setInterim("");
     }
   }, [enabled, cloudDictation, aiComposer]);
 
-  // Monotonic id per metered cloud window, for debit idempotency keys.
-  const cloudSessionSeq = useRef(0);
-
-  // Open the billing-safe metered cloud (Deepgram) window. Shared by BOTH the wake→active
-  // transition AND focus-regain resume, so a "Hey Sparkle" session stays active across tabbing
-  // away and back without re-saying the wake word. Gated on the live cloud-dictation prefs — a
-  // no-op when off, so a key-less / composer-off user is never billed. CRITICAL ordering: open
-  // FIRST, meter only on a confirmed open (handled inside openMeteredCloudWindow).
-  const openMeteredCloud = useRef((now: number) => {
+  // Open the cloud (relay) dictation window. Shared by BOTH the wake→active transition AND
+  // focus-regain resume, so a "Hey Sparkle" session stays active across tabbing away and back
+  // without re-saying the wake word. Gated on the live cloud-dictation prefs — a no-op when off, so
+  // a signed-out / composer-off user never opens a stream. Metering + entitlement/affordability are
+  // enforced SERVER-side by the relay: start_cloud_stream returns false when it refuses (stay
+  // on-device), and mid-stream out-of-credits arrives via the cloud-ended event. Balance updates
+  // arrive via the cloud-balance event (both wired in createDictationController above).
+  const openCloud = useRef(() => {
     if (!(aiFeatureNow("composer") && aiFeatureNow("voiceDictation"))) return;
-    const sessionId = `cd-${now}-${cloudSessionSeq.current++}`;
-    void openMeteredCloudWindow({
+    void openCloudDictationWindow({
       startCloudStream: () => invoke<boolean>("start_cloud_stream"),
       stopCloudStream: () => void invoke("stop_cloud_stream").catch(() => {}),
       isStillActive: () =>
         useDictationStore.getState().phase === "active" &&
         aiFeatureNow("composer") &&
         aiFeatureNow("voiceDictation"),
-      createMeter: () => {
-        const meter = createCloudDictationMeter({
-          consume: creditDeps.consume,
-          isAiEnabled: creditDeps.isAiEnabled,
-          setInterval: (fn, ms) => window.setInterval(fn, ms),
-          clearInterval: (h) => window.clearInterval(h),
-          onExhausted: () => {
-            // Out of credits mid-stream → clear the singleton, close the socket, clear preview.
-            stopActiveCloudMeter();
-            void invoke("stop_cloud_stream").catch(() => {});
-            useDictationStore.getState().setInterim("");
-            // Surface why dictation just dropped to on-device: refresh the balance so the
-            // credits pill reflects the now-depleted balance (the user's explicit ask).
-            void useAuthStore.getState().refresh();
-          },
-          onDebited: (balanceAfterCents, debitedCents) => {
-            // Each successful per-minute debit ticks the displayed balance down in real time.
-            // Prefer the server's post-debit balance; optimistically decrement when it's absent.
-            const { me } = useAuthStore.getState();
-            if (!me) return;
-            useAuthStore.setState({
-              me: {
-                ...me,
-                balanceCents: nextBalanceCents(me.balanceCents, balanceAfterCents, debitedCents),
-              },
-            });
-          },
-          sessionId,
-        });
-        setActiveCloudMeter(meter);
-        return meter;
-      },
       clearInterim: () => useDictationStore.getState().setInterim(""),
-      clearActiveMeter: () => stopActiveCloudMeter(),
-      // Opened but the first debit failed (out of credits / server error) → refresh the
-      // balance so the credits pill shows the real (e.g. zero) balance instead of silently
-      // falling back to on-device with no signal.
-      onUnavailable: () => void useAuthStore.getState().refresh(),
     });
   });
 
@@ -307,9 +280,9 @@ export function useAmbientVoice(): void {
       // stop billing + close it and resume on-device wake-word listening.
       const cmd = cloudStreamCommandFor(r);
       if (cmd === "start_cloud_stream") {
-        openMeteredCloud.current(now);
+        openCloud.current();
       } else if (cmd === "stop_cloud_stream") {
-        stopActiveCloudMeter();
+        // Closing the relay socket stops server-side metering; the trailing final still commits.
         invoke("stop_cloud_stream").catch(() => {});
       }
       if (r.phase === "passive") store.setInterim("");
@@ -326,7 +299,7 @@ export function useAmbientVoice(): void {
     let cancelled = false;
     const p = createDictationController({
       onSegment: onSegment.current,
-      onResumeActive: () => openMeteredCloud.current(Date.now()),
+      onResumeActive: () => openCloud.current(),
     });
     controllerPromiseRef.current = p;
     p.then((ctrl) => {
@@ -367,7 +340,8 @@ export function useAmbientVoice(): void {
           store.setEnabled(false);
         });
     } else {
-      stopActiveCloudMeter(); // muting the mic must halt per-minute cloud billing
+      // Muting the mic tears down dictation in Rust, which closes any relay stream (stopping
+      // server-side metering).
       invoke("stop_dictation").catch(() => {});
       store.setStatus("idle");
       store.setLevel(0);

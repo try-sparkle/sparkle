@@ -31,8 +31,17 @@ const DEFAULT_ORCHESTRATION_URL: &str = "http://localhost:3001";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Orchestration base URL. Override with ORCHESTRATION_URL for local dev (http://localhost:3001).
-fn base_url() -> String {
+/// `pub(crate)` so the server-side AI proxy callers (ai.rs — Anthropic naming/chat/judge/attention)
+/// hit the SAME orchestration host as the auth/credit commands.
+pub(crate) fn base_url() -> String {
     std::env::var("ORCHESTRATION_URL").unwrap_or_else(|_| DEFAULT_ORCHESTRATION_URL.to_string())
+}
+
+/// The stored desktop bearer token, or None when signed out. `pub(crate)` so the AI proxy callers
+/// (ai.rs) can authenticate their server-side `/ai/*` calls as this user — the token is read from
+/// the keychain here and never crosses into JS (mirrors how the auth/credit commands work).
+pub(crate) fn bearer_token() -> Option<String> {
+    read_token()
 }
 
 fn entry() -> Result<keyring::Entry, String> {
@@ -48,6 +57,13 @@ fn read_token() -> Option<String> {
     }
 }
 
+/// The stored desktop bearer token (or None if signed out), for other Rust modules that need to
+/// authenticate a call to a Sparkle backend on the user's behalf (e.g. support.rs attaching it to
+/// a ticket). The token stays in Rust — this never crosses into JS.
+pub fn token() -> Option<String> {
+    read_token()
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Me {
@@ -55,6 +71,17 @@ pub struct Me {
     entitled: bool,
     balance_cents: i64,
     token_version: i64,
+    // Display profile (Settings "Signed in as …"). #[serde(default)] so a response from an
+    // older deployed server that predates these fields still deserializes.
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    /// Auto-top-up settings (credits-menu spec §3), passed through verbatim — without this field
+    /// serde would silently DROP the server's `autoTopup` key and JS would always read undefined.
+    /// Optional (and omitted when absent) to tolerate older orchestration servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_topup: Option<Value>,
 }
 
 /// True if a (non-empty) desktop bearer token is stored.
@@ -120,6 +147,83 @@ pub fn desktop_pair_code() -> Result<String, String> {
         .and_then(|c| c.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| "pair response missing code".to_string())
+}
+
+/// Stable error sentinel: the deployed relay predates the device registry (GET /devices
+/// 404s). The Settings pane compares against this exact string to show "relay update pending".
+pub const DEVICES_UNSUPPORTED: &str = "devices_unsupported";
+
+/// List the devices paired to this account (GET /devices, authed). Returns the relay JSON
+/// verbatim (`{ devices: [{ id, name, platform, createdAt, lastSeenAt, current }] }`); the UI
+/// owns the shape.
+#[tauri::command]
+pub fn list_paired_devices() -> Result<Value, String> {
+    let token = read_token().ok_or_else(|| "not signed in".to_string())?;
+    let url = format!("{}/devices", base_url());
+    match ureq::get(&url)
+        .timeout(HTTP_TIMEOUT)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(resp) => {
+            let text = resp.into_string().map_err(|e| e.to_string())?;
+            serde_json::from_str(&text).map_err(|e| e.to_string())
+        }
+        Err(ureq::Error::Status(404, _)) => Err(DEVICES_UNSUPPORTED.to_string()),
+        Err(e) => Err(format!("device list failed: {e}")),
+    }
+}
+
+/// Unpair one device by id (DELETE /devices/:id, authed; server enforces the device belongs to
+/// the caller). Revoke is idempotent, so a 404 (already revoked elsewhere, stale list, or a
+/// pre-registry relay whose route is missing entirely) counts as success — the device is gone
+/// either way, and list_paired_devices alone owns the DEVICES_UNSUPPORTED signal.
+/// Device ids are relay-issued UUIDs; reject anything that could rewrite the request
+/// path/query when interpolated into the URL — including "me", the one in-charset value the
+/// relay routes differently (DELETE /devices/me = self-revoke, owned by the phone flow).
+fn is_valid_device_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id != "me"
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+#[tauri::command]
+pub fn revoke_paired_device(id: String) -> Result<(), String> {
+    if !is_valid_device_id(&id) {
+        return Err("invalid device id".to_string());
+    }
+    let token = read_token().ok_or_else(|| "not signed in".to_string())?;
+    let url = format!("{}/devices/{}", base_url(), id);
+    match ureq::delete(&url)
+        .timeout(HTTP_TIMEOUT)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
+        Err(e) => Err(format!("unpair failed: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod device_id_tests {
+    use super::is_valid_device_id;
+
+    #[test]
+    fn accepts_relay_uuids() {
+        assert!(is_valid_device_id("3920d3fa-b53c-4eb0-83ed-057297baee6c"));
+        assert!(is_valid_device_id("abc_DEF-123"));
+    }
+
+    #[test]
+    fn rejects_path_rewriting_and_route_changing_ids() {
+        for bad in ["", "me", "../pair/code", "a/b", "a?x=1", "a#f", "a b", "a%2Fb"] {
+            assert!(!is_valid_device_id(bad), "should reject {bad:?}");
+        }
+        assert!(!is_valid_device_id(&"a".repeat(65)));
+    }
 }
 
 /// Entitlement + balance for the signed-in user.
@@ -225,5 +329,264 @@ pub fn desktop_redeem_promo(code: String) -> Result<(), String> {
         Ok(_) => Ok(()),
         Err(ureq::Error::Status(400, _)) => Err("invalid_code".to_string()),
         Err(e) => Err(format!("promo redeem failed: {e}")),
+    }
+}
+
+// ---- Credits menu (design spec: docs/superpowers/specs/2026-07-01-credits-menu-design.md) ----
+// Pure request-shape helpers below are unit-tested; the commands are thin ureq shells that follow
+// desktop_me/desktop_redeem_promo's bearer + error-mapping style.
+
+/// JSON body for POST /billing/checkout — pack omitted entirely when None (the server's zod
+/// schema treats `pack` as optional, and card_setup/paywall kinds send no pack at all).
+fn checkout_body(kind: &str, pack: Option<&str>) -> String {
+    let mut v = json!({ "kind": kind });
+    if let Some(p) = pack {
+        v["pack"] = json!(p);
+    }
+    v.to_string()
+}
+
+/// Path + query for GET /credits/history. The cursor is opaque (base64url today), so escape
+/// anything outside the URL-unreserved set rather than trusting the server's encoding choice.
+fn history_path(cursor: Option<&str>, limit: Option<u32>) -> String {
+    let mut path = format!("/credits/history?limit={}", limit.unwrap_or(20));
+    if let Some(c) = cursor {
+        path.push_str("&cursor=");
+        for b in c.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    path.push(b as char)
+                }
+                _ => path.push_str(&format!("%{b:02X}")),
+            }
+        }
+    }
+    path
+}
+
+/// JSON body for PUT /billing/auto-topup (contract field names, camelCase).
+fn auto_topup_body(enabled: bool, threshold_cents: i64, pack_id: &str) -> String {
+    json!({ "enabled": enabled, "thresholdCents": threshold_cents, "packId": pack_id }).to_string()
+}
+
+/// Map a non-2xx body to the server's stable `error` code when parseable (so JS can string-match
+/// e.g. "bad_pack", mirroring desktop_redeem_promo's "invalid_code"), else a loud status+snippet.
+fn server_error(prefix: &str, code: u16, body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+            if !e.is_empty() {
+                return e.to_string();
+            }
+        }
+    }
+    let snippet: String = body.chars().take(200).collect();
+    format!("{prefix} failed: HTTP {code}: {snippet}")
+}
+
+/// Parse a JSON response body, mapping transport/parse errors to strings.
+fn json_response(resp: ureq::Response) -> Result<Value, String> {
+    let text = resp.into_string().map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// Start a Stripe Checkout for a credits top-up (`kind:"topup"` + pack) or a card-save session
+/// (`kind:"card_setup"`). Returns the hosted checkout URL for the JS side to open in the browser.
+/// `async` (as are the three commands below) so Tauri runs the blocking ureq call off the main
+/// thread — these fire from the interactive Credits pane, where a 15s freeze would be felt.
+#[tauri::command]
+pub async fn desktop_topup_checkout(kind: String, pack: Option<String>) -> Result<String, String> {
+    let token = read_token().ok_or_else(|| "not signed in".to_string())?;
+    let url = format!("{}/billing/checkout", base_url());
+    let body = checkout_body(&kind, pack.as_deref());
+    let req = ureq::post(&url)
+        .timeout(HTTP_TIMEOUT)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json");
+    match req.send_string(&body) {
+        Ok(resp) => {
+            let v = json_response(resp)?;
+            v.get("url")
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| "checkout response missing url".to_string())
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(server_error("checkout", code, &text))
+        }
+        Err(e) => Err(format!("checkout failed: {e}")),
+    }
+}
+
+/// Cursor-paginated credit ledger page. Returns the contract JSON verbatim:
+/// `{ entries: [{id, createdAt, reason, deltaCents}], nextCursor? }`.
+#[tauri::command]
+pub async fn desktop_credit_history(
+    cursor: Option<String>,
+    limit: Option<u32>,
+) -> Result<Value, String> {
+    let token = read_token().ok_or_else(|| "not signed in".to_string())?;
+    let url = format!("{}{}", base_url(), history_path(cursor.as_deref(), limit));
+    match ureq::get(&url)
+        .timeout(HTTP_TIMEOUT)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(resp) => json_response(resp),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(server_error("history", code, &text))
+        }
+        Err(e) => Err(format!("history failed: {e}")),
+    }
+}
+
+/// Current auto-top-up settings (contract `AutoTopup` shape, verbatim JSON).
+#[tauri::command]
+pub async fn desktop_auto_topup_get() -> Result<Value, String> {
+    let token = read_token().ok_or_else(|| "not signed in".to_string())?;
+    let url = format!("{}/billing/auto-topup", base_url());
+    match ureq::get(&url)
+        .timeout(HTTP_TIMEOUT)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(resp) => json_response(resp),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(server_error("auto-topup", code, &text))
+        }
+        Err(e) => Err(format!("auto-topup failed: {e}")),
+    }
+}
+
+/// Save auto-top-up settings; returns the server-authoritative `AutoTopup` JSON.
+#[tauri::command]
+pub async fn desktop_auto_topup_set(
+    enabled: bool,
+    threshold_cents: i64,
+    pack_id: String,
+) -> Result<Value, String> {
+    // The server is the authority, but a non-positive threshold is never meaningful — reject it
+    // before it leaves the device (first line of defense against a runaway auto-top-up config).
+    if threshold_cents <= 0 {
+        return Err("bad_threshold".to_string());
+    }
+    let token = read_token().ok_or_else(|| "not signed in".to_string())?;
+    let url = format!("{}/billing/auto-topup", base_url());
+    let body = auto_topup_body(enabled, threshold_cents, &pack_id);
+    let req = ureq::put(&url)
+        .timeout(HTTP_TIMEOUT)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json");
+    match req.send_string(&body) {
+        Ok(resp) => json_response(resp),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(server_error("auto-topup save", code, &text))
+        }
+        Err(e) => Err(format!("auto-topup save failed: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkout_body_includes_pack_when_present() {
+        let v: Value = serde_json::from_str(&checkout_body("topup", Some("pack_25"))).unwrap();
+        assert_eq!(v["kind"], "topup");
+        assert_eq!(v["pack"], "pack_25");
+    }
+
+    #[test]
+    fn checkout_body_omits_pack_when_absent() {
+        let v: Value = serde_json::from_str(&checkout_body("card_setup", None)).unwrap();
+        assert_eq!(v["kind"], "card_setup");
+        assert!(v.get("pack").is_none());
+    }
+
+    #[test]
+    fn history_path_defaults_limit_to_20() {
+        assert_eq!(history_path(None, None), "/credits/history?limit=20");
+    }
+
+    #[test]
+    fn history_path_carries_limit_and_cursor() {
+        assert_eq!(
+            history_path(Some("abc-_123"), Some(50)),
+            "/credits/history?limit=50&cursor=abc-_123"
+        );
+    }
+
+    #[test]
+    fn history_path_percent_encodes_cursor_outside_unreserved() {
+        // Cursors are opaque base64url (already URL-safe); anything else must be escaped, not
+        // pasted raw into the query string.
+        assert_eq!(
+            history_path(Some("a+b/c="), None),
+            "/credits/history?limit=20&cursor=a%2Bb%2Fc%3D"
+        );
+        // Multibyte UTF-8: byte-wise encoding must emit one %XX per BYTE (a char-based encoder
+        // would differ exactly here).
+        assert_eq!(history_path(Some("é"), None), "/credits/history?limit=20&cursor=%C3%A9");
+    }
+
+    #[test]
+    fn auto_topup_set_rejects_non_positive_threshold_before_any_io() {
+        // The guard runs before the keychain/network, so this is deterministic in CI.
+        let err = tauri::async_runtime::block_on(desktop_auto_topup_set(true, 0, "pack_25".into()))
+            .unwrap_err();
+        assert_eq!(err, "bad_threshold");
+        let err =
+            tauri::async_runtime::block_on(desktop_auto_topup_set(true, -500, "pack_25".into()))
+                .unwrap_err();
+        assert_eq!(err, "bad_threshold");
+    }
+
+    #[test]
+    fn me_passes_auto_topup_through_and_tolerates_its_absence() {
+        // Without the auto_topup field serde silently DROPS the server's key — JS would always
+        // read undefined even against a current server. Pin the round-trip both ways.
+        let with: Me = serde_json::from_str(
+            r#"{"clerkUserId":"u1","entitled":true,"balanceCents":100,"tokenVersion":1,
+                "autoTopup":{"enabled":true,"thresholdCents":500,"packId":"pack_25",
+                             "hasSavedCard":true,"lastFailure":null}}"#,
+        )
+        .unwrap();
+        let out = serde_json::to_value(&with).unwrap();
+        assert_eq!(out["autoTopup"]["packId"], "pack_25");
+        let without: Me = serde_json::from_str(
+            r#"{"clerkUserId":"u1","entitled":true,"balanceCents":100,"tokenVersion":1}"#,
+        )
+        .unwrap();
+        let out = serde_json::to_value(&without).unwrap();
+        assert!(out.get("autoTopup").is_none());
+    }
+
+    #[test]
+    fn auto_topup_body_uses_contract_field_names() {
+        let v: Value = serde_json::from_str(&auto_topup_body(true, 500, "pack_25")).unwrap();
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["thresholdCents"], 500);
+        assert_eq!(v["packId"], "pack_25");
+    }
+
+    #[test]
+    fn server_error_prefers_stable_error_code() {
+        assert_eq!(server_error("checkout", 409, r#"{"error":"bad_pack"}"#), "bad_pack");
+    }
+
+    #[test]
+    fn server_error_falls_back_to_status_and_snippet() {
+        assert_eq!(
+            server_error("checkout", 500, "oops"),
+            "checkout failed: HTTP 500: oops"
+        );
+        assert_eq!(
+            server_error("history", 400, r#"{"message":"no error field"}"#),
+            r#"history failed: HTTP 400: {"message":"no error field"}"#
+        );
     }
 }

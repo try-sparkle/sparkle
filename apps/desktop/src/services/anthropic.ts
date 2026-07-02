@@ -1,18 +1,30 @@
 // apps/desktop/src/services/anthropic.ts
-// Frontend bindings for the Claude-direct chat sink (Rust: src-tauri command `anthropic_chat`,
-// model claude-sonnet-4-6). Tauri maps the Rust `max_tokens` arg to JS `maxTokens` (camelCase).
+// Frontend bindings for the Claude chat sink. The Rust command `anthropic_chat` no longer calls
+// Anthropic directly with a BYOK key — it proxies through the orchestration `POST /ai/anthropic`
+// route on the user's Sparkle bearer, where the server holds the vendor key and meters credits
+// (Haiku 4.5 at 10× actual usage). Tauri maps the Rust `max_tokens` arg to JS `maxTokens`.
 import { invoke } from "@tauri-apps/api/core";
+import { OutOfCreditsError } from "./credits";
 
 /**
  * Send a single system+user turn to Claude and return the assistant's trimmed text.
  * Errors from the Rust side propagate as Error (a thrown string is wrapped with a friendly prefix).
+ * The proxy's typed out-of-credits error (`insufficient_credits:<balanceCents>`) is re-thrown as an
+ * {@link OutOfCreditsError} so callers surface the existing upsell/credits UI instead of a raw string.
  */
 export async function chatOnce(system: string, user: string, maxTokens = 1024): Promise<string> {
   try {
     const raw = await invoke<string>("anthropic_chat", { system, user, maxTokens });
     return raw.trim();
   } catch (err) {
-    if (typeof err === "string") throw new Error(`Claude request failed: ${err}`);
+    if (typeof err === "string") {
+      // Typed server gate: `insufficient_credits:<balanceCents>` → the credits UX path.
+      if (err.startsWith("insufficient_credits")) {
+        const balanceCents = Number.parseInt(err.split(":")[1] ?? "", 10);
+        throw new OutOfCreditsError(Number.isFinite(balanceCents) ? balanceCents : 0);
+      }
+      throw new Error(`Claude request failed: ${err}`);
+    }
     throw err;
   }
 }

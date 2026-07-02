@@ -2,8 +2,11 @@ import { describe, it, expect, vi } from "vitest";
 import {
   updateFrontmatter,
   generateTasks,
+  decomposeEpic,
+  parsePrdRef,
   TASK_PLAN_SYSTEM,
   type GenerateDeps,
+  type DecomposeDeps,
   type TaskPlan,
 } from "./tasks";
 
@@ -116,6 +119,25 @@ describe("generateTasks", () => {
     expect(content).toContain('tasks: ["sparkle-ep.1", "sparkle-ep.2", "sparkle-ep.3"]');
   });
 
+  it("appends epicBodyExtra to the epic body (capture screenshot back-link)", async () => {
+    const { deps, createBeadFull } = makeDeps();
+    await generateTasks(deps, {
+      ...args,
+      epicBodyExtra: "Screenshot: PRD/assets/2026-07-01-capture.png",
+    });
+    const epicBody = createBeadFull.mock.calls[0]![2] as string;
+    expect(epicBody).toContain("PRD file: PRD/2026-06-27-foo.md");
+    expect(epicBody.endsWith("Screenshot: PRD/assets/2026-07-01-capture.png")).toBe(true);
+  });
+
+  it("omits the extra line entirely when epicBodyExtra is absent", async () => {
+    const { deps, createBeadFull } = makeDeps();
+    await generateTasks(deps, args);
+    const epicBody = createBeadFull.mock.calls[0]![2] as string;
+    expect(epicBody).not.toContain("Screenshot:");
+    expect(epicBody.endsWith("PRD file: PRD/2026-06-27-foo.md")).toBe(true);
+  });
+
   it("stores decisions as memories and labels the PRD asset (best-effort)", async () => {
     const { deps, createMemory, attachLabel } = makeDeps();
     await generateTasks(deps, args);
@@ -197,5 +219,176 @@ describe("generateTasks", () => {
 
   it("exports a usable system prompt", () => {
     expect(TASK_PLAN_SYSTEM).toContain("dependsOn");
+  });
+});
+
+describe("parsePrdRef", () => {
+  it("extracts the relative path and bare filename from a 'PRD file:' line", () => {
+    const body = "Do the thing.\n\nPRD file: PRD/2026-07-01-foo.md";
+    expect(parsePrdRef(body)).toEqual({
+      relPath: "PRD/2026-07-01-foo.md",
+      filename: "2026-07-01-foo.md",
+    });
+  });
+
+  it("returns null when the body has no PRD reference", () => {
+    expect(parsePrdRef("just an epic body")).toBeNull();
+    expect(parsePrdRef("")).toBeNull();
+  });
+
+  it("captures a path containing spaces to the end of the line", () => {
+    const body = "Body.\n\nPRD file: PRD/my plan.md\nScreenshot: x.png";
+    expect(parsePrdRef(body)).toEqual({ relPath: "PRD/my plan.md", filename: "my plan.md" });
+  });
+});
+
+// ── decomposeEpic ──────────────────────────────────────────────────────────────────────────────
+
+function makeDecomposeDeps(over: Partial<DecomposeDeps> = {}) {
+  const plan: TaskPlan = {
+    epic: { title: "ignored", description: "ignored" },
+    tasks: [
+      { title: "T0", description: "first", dependsOn: [] },
+      { title: "T1", description: "second", dependsOn: [0] },
+    ],
+  };
+  const structuredJson = vi.fn().mockResolvedValue(plan);
+  let n = 0;
+  const createBeadFull = vi.fn().mockImplementation(async () => `sparkle-ep.${++n}`);
+  const beadDepAdd = vi.fn().mockResolvedValue(undefined);
+  const prdMarkdown = ["---", "epic: null", "tasks: []", "---", "", "# Foo PRD"].join("\n");
+  const readPrd = vi.fn().mockResolvedValue(prdMarkdown);
+  const writePrd = vi.fn().mockResolvedValue("PRD/2026-07-01-foo.md");
+  const deps: DecomposeDeps = {
+    structuredJson: structuredJson as unknown as DecomposeDeps["structuredJson"],
+    createBeadFull,
+    beadDepAdd,
+    readPrd,
+    writePrd,
+    ...over,
+  };
+  return { deps, prdMarkdown, structuredJson, createBeadFull, beadDepAdd, readPrd, writePrd };
+}
+
+const epicWithPrd = {
+  id: "sparkle-ep",
+  title: "Foo epic",
+  description: "Do foo.\n\nPRD file: PRD/2026-07-01-foo.md",
+};
+
+describe("decomposeEpic", () => {
+  it("plans from the PRD content and creates children + edges under the EXISTING epic", async () => {
+    const { deps, prdMarkdown, structuredJson, createBeadFull, beadDepAdd, readPrd } =
+      makeDecomposeDeps();
+    const res = await decomposeEpic(deps, { projectPath: "/repo", epic: epicWithPrd });
+
+    expect(readPrd).toHaveBeenCalledWith("/repo", "2026-07-01-foo.md");
+    // The plan is prompted from the PRD markdown, not the epic body.
+    expect(structuredJson).toHaveBeenCalledWith(TASK_PLAN_SYSTEM, prdMarkdown);
+    // NO epic bead is created — children only, parented to the existing epic id.
+    expect(createBeadFull).toHaveBeenCalledTimes(2);
+    expect(createBeadFull).toHaveBeenNthCalledWith(1, "/repo", "T0", "first", "task", "sparkle-ep", "", "");
+    expect(createBeadFull).toHaveBeenNthCalledWith(2, "/repo", "T1", "second", "task", "sparkle-ep", "", "");
+    expect(res.taskIds).toEqual(["sparkle-ep.1", "sparkle-ep.2"]);
+    // T1 depends on T0 (blocked, blocker).
+    expect(beadDepAdd).toHaveBeenCalledTimes(1);
+    expect(beadDepAdd).toHaveBeenCalledWith("/repo", "sparkle-ep.2", "sparkle-ep.1");
+  });
+
+  it("writes the epic + task ids back into the PRD frontmatter when a PRD exists", async () => {
+    const { deps, writePrd } = makeDecomposeDeps();
+    await decomposeEpic(deps, { projectPath: "/repo", epic: epicWithPrd });
+    expect(writePrd).toHaveBeenCalledTimes(1);
+    const [path, filename, content] = writePrd.mock.calls[0]!;
+    expect(path).toBe("/repo");
+    expect(filename).toBe("2026-07-01-foo.md");
+    expect(content).toContain('epic: "sparkle-ep"');
+    expect(content).toContain('tasks: ["sparkle-ep.1", "sparkle-ep.2"]');
+  });
+
+  it("falls back to title+body when the epic has no PRD reference (and skips the write-back)", async () => {
+    const { deps, structuredJson, readPrd, writePrd } = makeDecomposeDeps();
+    const epic = { id: "sparkle-ep", title: "Bare epic", description: "no prd here" };
+    await decomposeEpic(deps, { projectPath: "/repo", epic });
+    expect(readPrd).not.toHaveBeenCalled();
+    expect(writePrd).not.toHaveBeenCalled();
+    const [, user] = structuredJson.mock.calls[0]!;
+    expect(user).toContain("Bare epic");
+    expect(user).toContain("no prd here");
+  });
+
+  it("falls back to title+body when the PRD read fails (and skips the write-back)", async () => {
+    const { deps, structuredJson, writePrd } = makeDecomposeDeps({
+      readPrd: vi.fn().mockRejectedValue(new Error("gone")),
+    });
+    await decomposeEpic(deps, { projectPath: "/repo", epic: epicWithPrd });
+    expect(writePrd).not.toHaveBeenCalled();
+    const [, user] = structuredJson.mock.calls[0]!;
+    expect(user).toContain("Foo epic");
+  });
+
+  it("treats an empty/whitespace-only PRD as missing (title+body fallback, no write-back)", async () => {
+    const { deps, structuredJson, writePrd } = makeDecomposeDeps({
+      readPrd: vi.fn().mockResolvedValue("  \n"),
+    });
+    await decomposeEpic(deps, { projectPath: "/repo", epic: epicWithPrd });
+    expect(writePrd).not.toHaveBeenCalled();
+    const [, user] = structuredJson.mock.calls[0]!;
+    expect(user).toContain("Foo epic");
+  });
+
+  it("re-reads the PRD before the write-back so concurrent edits aren't clobbered", async () => {
+    const planningCopy = ["---", "epic: null", "tasks: []", "---", "", "# v1"].join("\n");
+    const editedCopy = ["---", "epic: null", "tasks: []", "---", "", "# v2 (edited mid-plan)"].join("\n");
+    const readPrd = vi.fn().mockResolvedValueOnce(planningCopy).mockResolvedValueOnce(editedCopy);
+    const { deps, structuredJson, writePrd } = makeDecomposeDeps({ readPrd });
+    await decomposeEpic(deps, { projectPath: "/repo", epic: epicWithPrd });
+    // Planned from the first read…
+    expect(structuredJson).toHaveBeenCalledWith(TASK_PLAN_SYSTEM, planningCopy);
+    // …but the write-back patches the FRESH copy.
+    const [, , content] = writePrd.mock.calls[0]!;
+    expect(content).toContain("# v2 (edited mid-plan)");
+    expect(content).toContain('epic: "sparkle-ep"');
+  });
+
+  it("propagates a child-creation failure without any PRD write-back", async () => {
+    const { deps, writePrd } = makeDecomposeDeps({
+      createBeadFull: vi.fn().mockRejectedValue(new Error("bd down")),
+    });
+    await expect(
+      decomposeEpic(deps, { projectPath: "/repo", epic: epicWithPrd }),
+    ).rejects.toThrow("bd down");
+    expect(writePrd).not.toHaveBeenCalled();
+  });
+
+  it("propagates a write-back failure after the children were created", async () => {
+    const { deps, createBeadFull } = makeDecomposeDeps({
+      writePrd: vi.fn().mockRejectedValue(new Error("disk full")),
+    });
+    await expect(
+      decomposeEpic(deps, { projectPath: "/repo", epic: epicWithPrd }),
+    ).rejects.toThrow("disk full");
+    expect(createBeadFull).toHaveBeenCalledTimes(2); // children exist; caller owns the label
+  });
+
+  it("throws (no beads created) on an empty or title-less plan", async () => {
+    const empty = makeDecomposeDeps({
+      structuredJson: vi.fn().mockResolvedValue({ epic: { title: "x" }, tasks: [] }) as never,
+    });
+    await expect(
+      decomposeEpic(empty.deps, { projectPath: "/repo", epic: epicWithPrd }),
+    ).rejects.toThrow(/empty or malformed/);
+    expect(empty.createBeadFull).not.toHaveBeenCalled();
+
+    const untitled = makeDecomposeDeps({
+      structuredJson: vi.fn().mockResolvedValue({
+        epic: { title: "x" },
+        tasks: [{ title: " ", description: "b" }],
+      }) as never,
+    });
+    await expect(
+      decomposeEpic(untitled.deps, { projectPath: "/repo", epic: epicWithPrd }),
+    ).rejects.toThrow(/no title/);
+    expect(untitled.createBeadFull).not.toHaveBeenCalled();
   });
 });

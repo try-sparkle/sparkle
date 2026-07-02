@@ -37,7 +37,16 @@ vi.mock("@tauri-apps/api/core", () => ({
 // Modules under test (imported after mocks are registered)
 // ---------------------------------------------------------------------------
 import { useDictationStore } from "./stores/dictationStore";
+import { useAuthStore } from "./stores/authStore";
 import { createDictationController, cloudStreamCommandFor } from "./useDictation";
+
+/** A minimal signed-in `me` for the credits-pill tests. */
+const meWith = (balanceCents: number) => ({
+  clerkUserId: "u1",
+  entitled: true,
+  balanceCents,
+  tokenVersion: 1,
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -195,6 +204,41 @@ describe("createDictationController (hook logic without renderHook)", () => {
     // Stale preview cleared, and the backend is told to resume on-device routing.
     expect(useDictationStore.getState().interim).toBe("");
     expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
+  });
+
+  it("dictation://cloud-ended with exhausted=true refreshes the balance (relay ran out of credits)", () => {
+    const refresh = vi.spyOn(useAuthStore.getState(), "refresh").mockResolvedValue();
+    emit("dictation://cloud-ended", true);
+    // Out-of-credits teardown → refresh so the credits pill reflects the now-depleted balance.
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
+    refresh.mockRestore();
+  });
+
+  it("dictation://cloud-ended with exhausted=false (clean close) does NOT refresh the balance", () => {
+    const refresh = vi.spyOn(useAuthStore.getState(), "refresh").mockResolvedValue();
+    emit("dictation://cloud-ended", false);
+    expect(refresh).not.toHaveBeenCalled();
+    refresh.mockRestore();
+  });
+
+  it("dictation://cloud-balance ticks the credits pill down from the relay's server balance", () => {
+    useAuthStore.setState({ me: meWith(20000) });
+    emit("dictation://cloud-balance", { balanceCents: 19994, debitedCents: 6 });
+    // Server-authoritative post-debit balance wins.
+    expect(useAuthStore.getState().me?.balanceCents).toBe(19994);
+  });
+
+  it("dictation://cloud-balance optimistically decrements when the relay omits the balance", () => {
+    useAuthStore.setState({ me: meWith(19994) });
+    emit("dictation://cloud-balance", { balanceCents: null, debitedCents: 5 });
+    expect(useAuthStore.getState().me?.balanceCents).toBe(19989);
+  });
+
+  it("dictation://cloud-balance is a no-op when signed out (no me to update)", () => {
+    useAuthStore.setState({ me: null });
+    emit("dictation://cloud-balance", { balanceCents: 100, debitedCents: 6 });
+    expect(useAuthStore.getState().me).toBeNull();
   });
 
   it("dictation://level updates store level", () => {

@@ -236,6 +236,11 @@ export interface UploadAssetResult {
  * Upload `content` into `projectId`'s library as an asset named `filename`. Runs the 3-step
  * flow (create → PUT signed url → complete), or short-circuits on a server-side content-dedup
  * hit. The signed PUT targets an absolute storage URL, so it bypasses the `/chief-api` proxy.
+ *
+ * A dedup hit is only trusted after verifying the matched asset actually holds bytes: Chief's
+ * md5 registry also matches reservations whose upload never happened (stuck at AWAITING_UPLOAD
+ * with a 1-byte placeholder — see `assetLooksStuck`), and trusting one of those drops this
+ * content forever. A stuck match is deleted to free its md5, then the create is retried.
  */
 export async function uploadAsset(
   pat: string,
@@ -244,51 +249,111 @@ export async function uploadAsset(
   content: string,
   mimeType = "text/markdown",
 ): Promise<UploadAssetResult> {
-  const createRes = await httpFetch(`${BASE}/v1/assets`, {
-    method: "POST",
-    headers: headers(pat, projectId),
-    // `md5` lets Chief return the existing asset for content it already holds, instead of minting a
-    // fresh upload URL — a server-side gate against re-ingesting identical markdown (bead sparkle).
-    body: JSON.stringify({ filename, mime_type: mimeType, md5: md5Hex(content) }),
-  });
-  const created = (await parseOrThrow(createRes)) as CreateAssetResponse;
-  // A genuine content-dedup hit: Chief already has these bytes — nothing more to do.
-  if (created.already_exists) {
-    return { assetId: created.asset_id, alreadyExists: true };
-  }
-  // A fresh reservation MUST carry an upload URL. Its absence is a malformed response, not a
-  // dedup hit — surface it (rather than silently "succeeding") so the bytes aren't dropped and
-  // the caller leaves its sync marker un-advanced for retry.
-  if (!created.upload_url) {
-    throw new ChiefError(`Chief returned no upload url for "${filename}"`);
-  }
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const createRes = await httpFetch(`${BASE}/v1/assets`, {
+      method: "POST",
+      headers: headers(pat, projectId),
+      // `md5` lets Chief return the existing asset for content it already holds, instead of minting a
+      // fresh upload URL — a server-side gate against re-ingesting identical markdown (bead sparkle).
+      body: JSON.stringify({ filename, mime_type: mimeType, md5: md5Hex(content) }),
+    });
+    const created = (await parseOrThrow(createRes)) as CreateAssetResponse;
+    if (created.already_exists) {
+      // Content of ≤1 byte legitimately matches a 1-byte asset — verification can't tell it
+      // from a stuck reservation and would delete/re-create it on every sync. Trust the dedup.
+      if (new TextEncoder().encode(content).length <= 1) {
+        return { assetId: created.asset_id, alreadyExists: true };
+      }
+      let existing: ChiefAsset | null = null;
+      try {
+        existing = await getAsset(pat, projectId, created.asset_id);
+      } catch {
+        // Can't verify — trust the dedup (the historical behavior) rather than fail the sync.
+      }
+      // Only a stuck reservation old enough that no other agent can still be mid-upload gets
+      // reclaimed; a fresh one (or one with no created_at to judge by) is trusted — if it IS
+      // stuck, the hourly re-sync reclaims it once it ages past the threshold.
+      const reclaimable =
+        existing &&
+        assetLooksStuck(existing) &&
+        existing.created_at &&
+        Date.parse(existing.created_at) < Date.now() - STUCK_RESERVATION_MIN_AGE_MS;
+      if (!reclaimable) {
+        // A genuine content-dedup hit: Chief already has these bytes — nothing more to do.
+        return { assetId: created.asset_id, alreadyExists: true };
+      }
+      // The match is an empty reservation. Delete it so the md5 registry lets go of it, then
+      // re-create to mint a real upload URL. Best-effort: a concurrent sweep may have deleted
+      // it already — the retried create sorts it out either way.
+      try {
+        await deleteAsset(pat, projectId, created.asset_id);
+      } catch {
+        // fall through to the retry
+      }
+      continue;
+    }
+    // A fresh reservation MUST carry an upload URL. Its absence is a malformed response, not a
+    // dedup hit — surface it (rather than silently "succeeding") so the bytes aren't dropped and
+    // the caller leaves its sync marker un-advanced for retry.
+    if (!created.upload_url) {
+      throw new ChiefError(`Chief returned no upload url for "${filename}"`);
+    }
 
-  // The signed PUT goes to an absolute storage URL (not api.storytell.ai), so it stays on web
-  // `fetch`: it's outside the Tauri HTTP scope, and signed storage endpoints generally allow the
-  // PUT cross-origin. If commit-doc sync ever shows "Load failed" in the packaged app, this is the
-  // line to route through the plugin (and add the storage host to capabilities) — bead .
-  const put = await fetch(created.upload_url, {
-    method: created.upload_method ?? "PUT",
-    headers: created.upload_headers ?? { "Content-Type": mimeType },
-    body: content,
-  });
-  if (!put.ok) {
-    throw new ChiefError(`asset upload failed (${put.status})`, put.status);
-  }
+    // The signed PUT goes to an absolute storage URL (Google Cloud Storage, not api.storytell.ai).
+    // It must ride `httpFetch`: in the packaged app the webview CSP's connect-src doesn't include
+    // the storage host, so a web `fetch` dies with a bare "TypeError: Load failed" — the failure
+    // that stranded every PRD at AWAITING_UPLOAD (bead ). The Rust transport bypasses
+    // CSP + CORS; the storage host is allow-listed in src-tauri/capabilities/default.json.
+    const put = await httpFetch(created.upload_url, {
+      method: created.upload_method ?? "PUT",
+      headers: created.upload_headers ?? { "Content-Type": mimeType },
+      body: content,
+    });
+    if (!put.ok) {
+      throw new ChiefError(`asset upload failed (${put.status})`, put.status);
+    }
 
-  const completeRes = await httpFetch(`${BASE}/v1/assets/${created.asset_id}/complete`, {
-    method: "POST",
-    headers: headers(pat, projectId),
-    body: "{}",
-  });
-  await parseOrThrow(completeRes);
-  return { assetId: created.asset_id, alreadyExists: false };
+    const completeRes = await httpFetch(`${BASE}/v1/assets/${created.asset_id}/complete`, {
+      method: "POST",
+      headers: headers(pat, projectId),
+      body: "{}",
+    });
+    await parseOrThrow(completeRes);
+    return { assetId: created.asset_id, alreadyExists: false };
+  }
+  throw new ChiefError(
+    `asset "${filename}" kept deduping to a stuck (never-uploaded) reservation after ${maxAttempts} attempts`,
+  );
 }
 
 export interface ChiefAsset {
   asset_id: string;
   filename: string;
   status?: string;
+  size_in_bytes?: number;
+  created_at?: string;
+}
+
+/**
+ * True when an asset is a reservation whose bytes never arrived: the create step ran but the
+ * signed-URL PUT didn't, leaving it at AWAITING_UPLOAD forever (this API reports that as
+ * status "ingesting" with a 1-byte placeholder size, indistinguishable from real ingestion by
+ * status alone). Only a positively observed placeholder counts — a missing size means
+ * "unknown", never "stuck", so we never delete an asset we can't see clearly.
+ */
+export function assetLooksStuck(a: ChiefAsset): boolean {
+  return typeof a.size_in_bytes === "number" && a.size_in_bytes <= 1 && a.status !== "ready";
+}
+
+/** A stuck reservation younger than this may be another agent's upload still in flight — leave
+ *  it alone (deleting it would fail their `complete`). Older ones are junk from failed runs. */
+export const STUCK_RESERVATION_MIN_AGE_MS = 60 * 60 * 1000;
+
+/** One asset's metadata (status + size). Used to tell a real dedup hit from a stuck reservation. */
+export async function getAsset(pat: string, projectId: string, assetId: string): Promise<ChiefAsset> {
+  const res = await httpFetch(`${BASE}/v1/assets/${assetId}`, { headers: headers(pat, projectId) });
+  return (await parseOrThrow(res)) as ChiefAsset;
 }
 
 /** One page of the project's library. `data` is the documented array; `assets` accepted as a
@@ -504,7 +569,7 @@ export async function ensureChiefProject(
   // Match and create against the SAME (truncated) name Chief will actually store, so a project
   // name >128 chars doesn't make the reuse lookup miss its own previously-created project.
   const stored = name.slice(0, 128);
-  const key = `${pat} ${stored}`;
+  const key = `${pat}\u0000${stored}`;
   const pending = inflightEnsure.get(key);
   if (pending) return pending;
 

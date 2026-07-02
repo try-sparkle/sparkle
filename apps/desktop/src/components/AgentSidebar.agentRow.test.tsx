@@ -401,3 +401,54 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
     expect(scrollTo).toHaveBeenCalledTimes(1); // still just the reveal — no restore
   });
 });
+
+// The hover card is a fixed-position portal on document.body, so wheel events over it never reach
+// the list's overflow:auto container — and because a card covers whatever row the cursor is on,
+// this made the list unscrollable basically ALWAYS. The sidebar owns a window-level wheel listener
+// that forwards the delta to the list whenever the POINTER is over the list's box but the event is
+// riding an overlay (the card — or document.body, where Chromium retargets the remainder of a
+// scroll gesture after the card under it unmounts). These tests pin that forwarding contract.
+describe("AgentSidebar — two-finger scroll works while a hover card is open", () => {
+  // The listener reads only the LIST's rect (pointer-in-box gate); stub it on the instance.
+  const LIST_RECT = { left: 0, top: 0, right: 200, bottom: 600, width: 200, height: 600, x: 0, y: 0, toJSON: () => {} } as DOMRect;
+  const setup = () => {
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    const list = screen.getByTestId("agent-list-scroll");
+    list.getBoundingClientRect = () => LIST_RECT;
+    fireEvent.mouseOver(screen.getByText(TITLE)); // open the hover card
+    return { list, card: screen.getByTestId("agent-hover-card") };
+  };
+
+  it("forwards a wheel over the hover card to the list and consumes the event", () => {
+    const { list, card } = setup();
+    const notPrevented = fireEvent.wheel(card, { deltaY: 48, clientX: 100, clientY: 100, cancelable: true });
+    expect(list.scrollTop).toBe(48);
+    expect(notPrevented).toBe(false); // preventDefault — nothing else may double-consume the delta
+  });
+
+  it("normalizes line-mode wheels (real mouse wheel) to pixels", () => {
+    const { list, card } = setup();
+    fireEvent.wheel(card, { deltaY: 3, deltaMode: 1, clientX: 100, clientY: 100, cancelable: true });
+    expect(list.scrollTop).toBe(48); // 3 lines × 16px
+  });
+
+  it("keeps forwarding when the gesture retargets to document.body (card unmounted mid-scroll)", () => {
+    const { list } = setup();
+    fireEvent.wheel(document.body, { deltaY: 30, clientX: 100, clientY: 100, cancelable: true });
+    expect(list.scrollTop).toBe(30);
+  });
+
+  it("leaves the wheel alone when the pointer is past the list's edge (terminal side of the card)", () => {
+    const { list, card } = setup();
+    const notPrevented = fireEvent.wheel(card, { deltaY: 48, clientX: 500, clientY: 100, cancelable: true });
+    expect(list.scrollTop).toBe(0);
+    expect(notPrevented).toBe(true);
+  });
+
+  it("leaves the wheel alone over the list's own content (native scroll owns it)", () => {
+    const { list } = setup();
+    const notPrevented = fireEvent.wheel(list, { deltaY: 48, clientX: 100, clientY: 100, cancelable: true });
+    expect(list.scrollTop).toBe(0); // no forwarding — jsdom has no native scroll, so 0 proves we didn't touch it
+    expect(notPrevented).toBe(true);
+  });
+});

@@ -422,13 +422,6 @@ pub fn agent_branch_status_at(
     let wt = worktree_path(app_data, project_id, agent_id)?;
     let wt_str = wt.to_string_lossy().to_string();
 
-    // `--left-right --count A...B` emits "<left>\t<right>": left = base-only = behind,
-    // right = branch-only = ahead.
-    let counts = git(root, &["rev-list", "--left-right", "--count", &format!("{base}...{branch}")])?;
-    let mut it = counts.split_whitespace();
-    let behind: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let ahead: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-
     // Dirtiness needs the actual worktree. When it's GONE (a landed/cleaned-up agent whose tab
     // stays open and keeps getting polled), a removed tree has no uncommitted changes — report
     // dirty=false instead of erroring, so the 30s poll doesn't re-fail every tick forever and
@@ -439,6 +432,29 @@ pub fn agent_branch_status_at(
     } else {
         false
     };
+
+    // A brand-new or non-git agent (chat/think/shell, or one polled before its first commit) has no
+    // `sparkle/agent-<id>` ref yet. `rev-list <base>...<missing>` then hard-fails with
+    // "fatal: ambiguous argument ... unknown revision" — an error the removed-worktree latch
+    // (isWorktreeGoneError in runtimeStore.ts) does NOT match, so the 30s poll would re-fail every
+    // tick for the app's lifetime, spam the log, and never resolve. There's no divergence to count
+    // against a ref that doesn't exist: return a zeroed status (mirrors the born-fresh model), still
+    // reflecting the worktree's dirty state.
+    if git(
+        root,
+        &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+    )
+    .is_err()
+    {
+        return Ok(BranchStatus { ahead: 0, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0 });
+    }
+
+    // `--left-right --count A...B` emits "<left>\t<right>": left = base-only = behind,
+    // right = branch-only = ahead.
+    let counts = git(root, &["rev-list", "--left-right", "--count", &format!("{base}...{branch}")])?;
+    let mut it = counts.split_whitespace();
+    let behind: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ahead: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
     // numstat: sum insertions/deletions, count file lines.
     let numstat = git(root, &["diff", "--numstat", &format!("{base}...{branch}")]).unwrap_or_default();
@@ -2377,6 +2393,38 @@ mod tests {
         assert_eq!(st.behind, 0);
         assert!(!st.dirty, "a removed worktree reports clean, not an error");
         assert_eq!(st.files_changed, 1, "numstat runs against root refs, unaffected");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn agent_branch_status_zeroes_when_branch_ref_is_absent() {
+        // Repro of the indefinite-poll log spam: an agent with no `sparkle/agent-<id>` ref yet
+        // (chat/think/shell, or polled before its first commit). The old code ran
+        // `rev-list <base>...sparkle/agent-<id>` against a non-existent ref, which fails with
+        // "ambiguous argument ... unknown revision" — not matched by the removed-worktree latch, so
+        // the 30s poll re-failed forever. We must return Ok with a zeroed, clean status instead.
+        let root = unique_root("status-noref");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("status-noref-appdata");
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        // No create_worktree_at for "s1" → refs/heads/sparkle/agent-s1 never exists.
+        assert!(
+            git(&root_str, &["rev-parse", "--verify", "--quiet", "refs/heads/sparkle/agent-s1"]).is_err(),
+            "precondition: agent branch ref absent",
+        );
+
+        let st = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        assert_eq!(st.ahead, 0, "no ref ⇒ nothing ahead");
+        assert_eq!(st.behind, 0, "no ref ⇒ nothing behind");
+        assert!(!st.dirty, "no worktree ⇒ clean");
+        assert_eq!(st.files_changed, 0);
+        assert_eq!(st.insertions, 0);
+        assert_eq!(st.deletions, 0);
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);

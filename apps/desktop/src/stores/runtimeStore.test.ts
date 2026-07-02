@@ -532,6 +532,33 @@ describe("runtimeStore — programmatic bead writes on stage transitions (review
     expect(claimBead).not.toHaveBeenCalled(); // forward-only guard: no reopen
   });
 
+  it("latches a bead CLOSED in a prior session instead of re-claiming it every poll", async () => {
+    // Repro of the every-tick "issue not claimable: status closed" log spam: a bead closed in a
+    // PRIOR session has its in-memory lifecycle watermark reset on relaunch, so a building-stage
+    // agent re-attempts the claim each poll. bd rejects claiming a closed issue; without the latch
+    // the 30s poll re-fails forever. The claim must be attempted once, recognized as already-closed,
+    // and latched so subsequent polls don't re-attempt it.
+    const { runtime, projects, projectId, agentId } = await setup("build");
+    projects.useProjectStore.getState().setAgentBeadId(projectId, agentId, "bd-7");
+    const store = runtime.useRuntimeStore;
+    claimBead
+      .mockReset()
+      .mockRejectedValue(new Error("Error claiming bd-7: issue not claimable: status closed"));
+    store.getState().setBranchStatus(agentId, bsStatus(1)); // building_saved ⇒ target in_progress
+    agentWorkflowState.mockResolvedValue(wsState({}));
+
+    // First poll: attempts the claim, recognizes the already-closed status, latches WITHOUT throwing.
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    await new Promise((r) => setTimeout(r, 0)); // flush the fire-and-forget syncBeadLifecycle
+    expect(claimBead).toHaveBeenCalledTimes(1);
+
+    // Second poll: the watermark is now latched at `closed`, so the claim is NOT re-attempted — the
+    // fix (before it, the same claim re-fired and re-failed every tick for the app's lifetime).
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(claimBead).toHaveBeenCalledTimes(1);
+  });
+
   it("fires no bead write for an agent with no bead", async () => {
     const { runtime, projectId, agentId } = await setup("build");
     const store = runtime.useRuntimeStore;

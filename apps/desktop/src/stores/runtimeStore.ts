@@ -87,6 +87,17 @@ export function isWorktreeGoneError(e: unknown): boolean {
   return /cannot change to/i.test(msg) || /not a git repository/i.test(msg);
 }
 
+/** Does this `bd update --claim` error mean the bead is already CLOSED (so a claim is a no-op)? bd
+ *  rejects claiming a non-open issue with "issue not claimable: status closed". This is NOT a
+ *  retryable failure: a bead closed in a PRIOR session has its in-memory lifecycle watermark reset on
+ *  relaunch, so syncBeadLifecycle would re-attempt the claim (and re-fail) every poll for the app's
+ *  lifetime. Match BOTH the "not claimable" verb and the "closed" status so a claim rejected for any
+ *  other reason (e.g. a blocked issue, level < closed) still surfaces rather than being mis-latched. */
+export function isBeadAlreadyClosedError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /not claimable/i.test(msg) && /closed/i.test(msg);
+}
+
 /** Test-only: clear the removed-worktree skip-set between cases. */
 export function __resetDeadWorktrees(): void {
   deadWorktrees.clear();
@@ -273,8 +284,20 @@ export async function syncBeadLifecycle(
       if (!beadId) return;
       // Map the engine's monotonic actions to bd's canonical verbs (claim=in_progress+assignee,
       // close, label-then-close=delivered).
-      if (action === "in_progress") await claimBead(projectPath, beadId);
-      else if (action === "closed") await closeBead(projectPath, beadId);
+      if (action === "in_progress") {
+        try {
+          await claimBead(projectPath, beadId);
+        } catch (e) {
+          // A bead CLOSED in a prior session can't be claimed ("not claimable: status closed"). Its
+          // in-memory watermark reset on relaunch, so without this we'd re-attempt the claim — and
+          // re-fail — every poll forever. The bead is already PAST in_progress: latch the watermark
+          // at `closed` (never reopen it — the forward-only invariant) and stop. Re-throw anything
+          // else so a genuine claim failure still retries next poll.
+          if (!isBeadAlreadyClosedError(e)) throw e;
+          beadLevelFor.set(agent.id, Math.max(beadLevelFor.get(agent.id) ?? 0, BEAD_LEVEL.closed));
+          continue;
+        }
+      } else if (action === "closed") await closeBead(projectPath, beadId);
       else if (action === "delivered") await markBeadDelivered(projectPath, beadId);
       // Advance the watermark only after the write resolved, so a throw retries it next poll.
       beadLevelFor.set(agent.id, Math.max(beadLevelFor.get(agent.id) ?? 0, levelAfter(action)));

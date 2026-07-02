@@ -13,6 +13,11 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ onCloseRequested: () => Promise.resolve(() => {}) }),
   getAllWindows: () => Promise.resolve([{}]),
 }));
+// Workspace also mounts the "+ New Build Agent" drop-target listener (useNewBuildAgentDrop),
+// which registers on the current webview.
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({ onDragDropEvent: () => Promise.resolve(() => {}) }),
+}));
 
 // --- window context hooks: return stable stub values so Workspace renders without a provider ---
 vi.mock("../windowContext", () => ({

@@ -1,20 +1,33 @@
-//! Deepgram Nova-3 streaming STT — the gold-standard cloud dictation path.
+//! Deepgram Nova-3 cloud dictation — streamed through the SERVER-SIDE orchestration relay.
 //!
 //! Audio is captured natively (see `audio.rs`) as 16 kHz mono f32. When the user is actively
-//! dictating (the wake-word phase machine is ACTIVE — see the frontend), we open a Deepgram
-//! WebSocket and stream PCM16 frames to it, emitting Deepgram's interim results live and its
-//! finalized results as committed text. The always-listening wake-word detection itself stays
-//! fully on-device (Parakeet/Silero), so the cloud only ever sees speech the user intended to
-//! dictate — the "local gate, then stream" design.
+//! dictating (the wake-word phase machine is ACTIVE — see the frontend) we open a WebSocket to the
+//! orchestration relay's `/ai/deepgram` endpoint (see apps/orchestration/src/socket/deepgramRelay.ts)
+//! and stream PCM16 frames up. The relay authenticates the user's Sparkle bearer, opens Deepgram
+//! Nova-3 on SPARKLE's key (not a local one), meters per-minute server-authoritatively, and streams
+//! transcripts + post-debit balance back down. This replaces the old direct-to-Deepgram path that
+//! used a local `DEEPGRAM_API_KEY` and a bypassable client-side meter.
+//!
+//! Wire protocol (relay → client, JSON text frames):
+//!   - Deepgram `Results` frames are forwarded VERBATIM, so `parse_deepgram_message` parses them
+//!     exactly as it did on the direct connection (interim + final transcripts).
+//!   - The relay's own control frames carry a lowercase `type`: `ready` (metering is live — start
+//!     streaming), `balance` (post-debit balance, ticks the credits pill), `exhausted` (out of
+//!     credits — tear down and fall back on-device), `error` (upstream failure — same teardown).
+//!
+//! Client → relay: binary PCM16 audio frames, plus Deepgram's own `{"type":"CloseStream"}` /
+//! `{"type":"Finalize"}` control text (forwarded verbatim by the relay).
 //!
 //! Threading: cpal's audio callback must never block, so it only pushes frames onto an mpsc
 //! channel. A dedicated worker thread owns the WebSocket and does a single-threaded select loop
 //! — drain pending audio and send it, then read one message under a short socket read-timeout —
 //! which gives full-duplex behavior over one blocking socket without splitting it.
 //!
-//! Everything degrades gracefully: if the handshake fails (offline, bad key, etc.) `start`
-//! returns Err and the caller falls back to the on-device transcriber; a mid-stream error ends
-//! the worker and the session is torn down.
+//! Everything degrades gracefully: if the handshake fails (offline, signed out, not entitled, or the
+//! relay refuses because the user can't afford the first minute — a non-101 status) `start` returns
+//! Err and the caller falls back to the on-device transcriber; a mid-stream error (or an `exhausted`
+//! control frame) ends the worker and the session is torn down back to on-device.
+use std::collections::VecDeque;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -26,12 +39,15 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
-use crate::dictation::{emit_cloud_ended, emit_interim, emit_partial};
+use crate::dictation::{emit_cloud_balance, emit_cloud_ended, emit_interim, emit_partial};
 
 /// The capture pipeline always hands us 16 kHz mono (downmix_resample target), so that's the
-/// rate we declare to Deepgram. Kept as a constant rather than threaded through so the wire
-/// format can't drift from what `audio.rs` actually produces.
+/// rate we declare (via the `?sample_rate=` query the relay reads). Kept as a constant rather than
+/// threaded through so the wire format can't drift from what `audio.rs` actually produces.
 pub const SAMPLE_RATE: u32 = 16_000;
+
+/// The relay WebSocket path (mirrors `DEEPGRAM_WS_PATH` in deepgramRelay.ts).
+const RELAY_WS_PATH: &str = "/ai/deepgram";
 
 /// How long the worker blocks on a single socket read before looping back to send more audio.
 /// Short enough that outbound audio latency stays well under Deepgram's own ~100–300 ms result
@@ -45,11 +61,12 @@ const READ_TIMEOUT: Duration = Duration::from_millis(40);
 /// is retried (see the send loop), so a few seconds is the right magnitude.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// After we tell Deepgram the stream is closing, keep reading this many extra timeouts (~2 s) to
+/// After we tell the relay the stream is closing, keep reading this many extra timeouts (~2 s) to
 /// collect the trailing final result(s) before giving up — so the last spoken words aren't lost.
 const DRAIN_TICKS_AFTER_CLOSE: u32 = 50;
 
 /// Deepgram control message: "no more audio is coming; finalize and send remaining results."
+/// The relay forwards this text frame verbatim to Deepgram.
 const CLOSE_STREAM_MSG: &str = "{\"type\":\"CloseStream\"}";
 
 /// Deepgram control message: flush + finalize the audio sent so far and emit the trailing final,
@@ -57,15 +74,22 @@ const CLOSE_STREAM_MSG: &str = "{\"type\":\"CloseStream\"}";
 /// utterance still commits while the connection stays reusable for the next one.
 const FINALIZE_MSG: &str = "{\"type\":\"Finalize\"}";
 
-/// How long an idle (paused) Deepgram socket is kept open for instant reuse by the next utterance,
-/// instead of being torn down. The per-utterance TLS+WS handshake (~hundreds of ms — see `connect`)
-/// is the dominant cold-start latency the user feels; reusing a warm socket eliminates it for
-/// back-to-back dictation. Deliberately kept UNDER Deepgram's ~10 s server-side idle-close window so
-/// we never need to send KeepAlive frames: if the user resumes within it we reuse the socket, and if
-/// they don't the worker closes it cleanly (well before Deepgram would). Billing is unaffected — the
-/// per-minute meter is tied to the ACTIVE phase on the frontend, not to socket lifetime, so a warm
-/// idle socket is never billed.
+/// How long an idle (paused) relay socket is kept open for instant reuse by the next utterance,
+/// instead of being torn down. The per-utterance TLS+WS handshake (plus the relay opening its own
+/// Deepgram upstream) is the dominant cold-start latency the user feels; reusing a warm socket
+/// eliminates it for back-to-back dictation. Deliberately kept UNDER Deepgram's ~10 s server-side
+/// idle-close window so the relay never has to send KeepAlive frames. NOTE: unlike the old
+/// client-metered path, the relay meters by socket LIFETIME, so a warm socket held across a pause is
+/// billed for that elapsed time (bounded to well under one minute per idle window) — an accepted
+/// tradeoff for instant reuse and an honest reflection of a held-open server resource.
 const WARM_STANDBY: Duration = Duration::from_secs(8);
+
+/// Cap on how many audio frames we buffer locally while waiting for the relay's `ready` signal (see
+/// the send loop). The relay DROPS any client audio it receives before its first-minute debit clears
+/// (`meteringLive`), so buffering here avoids clipping the first words of an utterance during the
+/// relay→Deepgram open. Bounded so a relay that never sends `ready` can't grow this unboundedly;
+/// oldest frames are dropped past the cap (a few seconds of 16 kHz PCM16).
+const MAX_PREREADY_FRAMES: usize = 400;
 
 /// What the worker thread receives from the audio callback.
 enum AudioMsg {
@@ -73,7 +97,7 @@ enum AudioMsg {
     /// cpal callback thread — it's a cheap, lock-free, non-blocking per-sample loop + one alloc, so
     /// it's safe on the audio hot path; the worker just forwards the bytes.
     Frame(Vec<u8>),
-    /// The user stopped dictating — flush Deepgram and wind the worker down.
+    /// The user stopped dictating — flush the relay and wind the worker down.
     Close,
     /// The user stopped this utterance but may dictate again shortly: Finalize the current segment
     /// and drop into warm standby (keep the socket, stop expecting audio). After `WARM_STANDBY` with
@@ -84,7 +108,7 @@ enum AudioMsg {
     Resume,
 }
 
-/// A live Deepgram streaming session. Holds the channel the audio callback feeds and the worker
+/// A live relay streaming session. Holds the channel the audio callback feeds and the worker
 /// thread handle. Drop signals close and detaches; call `finish()` to also join (used on stop).
 pub struct DeepgramSession {
     audio_tx: Sender<AudioMsg>,
@@ -102,25 +126,28 @@ pub struct DeepgramSession {
 }
 
 impl DeepgramSession {
-    /// Open the WebSocket (synchronous handshake) and spawn the worker. Returns Err if the
-    /// handshake fails, so the caller can fall back to the on-device path before any audio is
-    /// captured — no partial/dead session is ever returned.
-    pub fn start(app: AppHandle, key: String) -> Result<DeepgramSession, String> {
-        let socket = connect(&key, SAMPLE_RATE)?;
+    /// Open the relay WebSocket (synchronous handshake) and spawn the worker. `base_url` is the
+    /// orchestration host (from `auth::base_url()`); `token` is the user's Sparkle bearer (from the
+    /// keychain). Returns Err if the handshake fails — offline, signed out, not entitled, or the
+    /// relay refused because the user can't afford the first minute (a non-101 status) — so the
+    /// caller can fall back to the on-device path before any audio is captured; no partial/dead
+    /// session is ever returned.
+    pub fn start(app: AppHandle, base_url: String, token: String) -> Result<DeepgramSession, String> {
+        let socket = connect(&base_url, &token, SAMPLE_RATE)?;
         let (tx, rx) = std::sync::mpsc::channel::<AudioMsg>();
         let suppress_ended = Arc::new(AtomicBool::new(false));
         let suppress_cb = suppress_ended.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_cb = alive.clone();
         let worker = std::thread::Builder::new()
-            .name("deepgram-stream".into())
+            .name("deepgram-relay".into())
             .spawn(move || run_session(app, socket, rx, suppress_cb, alive_cb))
-            .map_err(|e| format!("spawn deepgram worker: {e}"))?;
-        tracing::info!(target: "dictation", "deepgram stream opened");
+            .map_err(|e| format!("spawn relay worker: {e}"))?;
+        tracing::info!(target: "dictation", "cloud relay stream opened");
         Ok(DeepgramSession { audio_tx: tx, worker: Some(worker), suppress_ended, alive })
     }
 
-    /// Push one 16 kHz mono frame to Deepgram. Converts to PCM16 here (cheap) so the caller's
+    /// Push one 16 kHz mono frame to the relay. Converts to PCM16 here (cheap) so the caller's
     /// audio callback stays minimal. Silently no-ops if the worker has already exited.
     pub fn send_audio(&self, frame: &[f32]) {
         let _ = self.audio_tx.send(AudioMsg::Frame(f32_to_pcm16le(frame)));
@@ -144,7 +171,7 @@ impl DeepgramSession {
         self.alive.load(Ordering::Relaxed)
     }
 
-    /// End the stream: tell Deepgram to finalize, then join the worker. The shutdown path itself is
+    /// End the stream: tell the relay to finalize, then join the worker. The shutdown path itself is
     /// bounded to ~2 s: on entering `closing` the worker shrinks the write timeout to the read
     /// interval, so the CloseStream flush + trailing-final read-drain are both capped by the read-tick
     /// budget regardless of link state. The one unbounded tail is frames already queued in the
@@ -154,9 +181,10 @@ impl DeepgramSession {
     /// operating point we target); normal and brief-jitter teardown is ~2 s, never a hang.
     pub fn finish(mut self) {
         // Suppress the worker's cloud-ended emit: finish() is only called from the frontend-initiated
-        // stop paths (stop_cloud_stream / stop_dictation), which have already torn down the meter and
-        // UI. Emitting would just trigger a redundant stop_cloud_stream round-trip. cloud-ended is
-        // reserved for UNSOLICITED worker death (socket error), where the frontend must be told.
+        // stop paths (stop_cloud_stream / stop_dictation), which have already torn down the UI.
+        // Emitting would just trigger a redundant stop_cloud_stream round-trip. cloud-ended is
+        // reserved for UNSOLICITED worker death (socket error / exhaustion), where the frontend must
+        // be told.
         self.suppress_ended.store(true, Ordering::Relaxed);
         let _ = self.audio_tx.send(AudioMsg::Close);
         if let Some(w) = self.worker.take() {
@@ -173,25 +201,39 @@ impl Drop for DeepgramSession {
     }
 }
 
-/// Silence (ms) Deepgram waits before finalizing a segment — i.e. how long the live italic interim
-/// lingers before it commits to non-italic text. Lower = snappier perceived dictation (the words
-/// "lock in" sooner); too low fragments a sentence on natural mid-thought pauses (premature periods
-/// / split utterances). 200 ms trims the felt latency from the prior 300 ms while staying above the
-/// ~breath-pause range, so real sentence boundaries still drive the cut, not every micro-pause.
-const DEEPGRAM_ENDPOINTING_MS: u32 = 200;
-
-/// Build the Deepgram streaming URL. `nova-3` + `language=multi` selects Nova-3 **Multilingual**
-/// (code-switching across languages) — the variant our credit pricing is based on
-/// (creditPricing.ts, $0.0058/min). `smart_format` + `punctuate` give sentence-aware punctuation
-/// (the fix for spurious per-pause periods); `interim_results` drives the live word-by-word preview;
-/// `endpointing` finalizes a segment after `DEEPGRAM_ENDPOINTING_MS` of silence (real-sentence
-/// boundaries, not every micro-pause).
-pub(crate) fn deepgram_ws_url(sample_rate: u32) -> String {
-    format!(
-        "wss://api.deepgram.com/v1/listen?model=nova-3&language=multi&encoding=linear16\
-         &sample_rate={sample_rate}&channels=1&interim_results=true\
-         &smart_format=true&punctuate=true&endpointing={DEEPGRAM_ENDPOINTING_MS}"
-    )
+/// Build the relay WebSocket URL, TCP connect target, and TLS flag from the orchestration base URL.
+/// Pure so the http→ws / https→wss mapping and the default-port logic are unit-testable. Returns
+/// `(ws_url, host:port, tls)`. Accepts `http(s)://` (the base_url form) and `ws(s)://` defensively.
+fn relay_target(base_url: &str, sample_rate: u32) -> Result<(String, String, bool), String> {
+    let trimmed = base_url.trim();
+    let (tls, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = trimmed.strip_prefix("wss://") {
+        (true, r)
+    } else if let Some(r) = trimmed.strip_prefix("http://") {
+        (false, r)
+    } else if let Some(r) = trimmed.strip_prefix("ws://") {
+        (false, r)
+    } else {
+        return Err(format!("unsupported orchestration URL scheme: {base_url}"));
+    };
+    // Authority is everything up to the first '/', '?', or '#', dropping any path/query/fragment the
+    // base URL might carry (auth::base_url() returns a bare scheme+host today; this is defensive so a
+    // stray query can't fold into the host:port or a subpath silently vanish).
+    let authority = rest.split(&['/', '?', '#'][..]).next().unwrap_or("").trim();
+    if authority.is_empty() {
+        return Err(format!("orchestration URL has no host: {base_url}"));
+    }
+    // The TCP target needs an explicit port; the WS URL keeps the authority verbatim so tungstenite
+    // fills the Host header (and TLS SNI) from the real domain.
+    let host_port = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{}:{}", authority, if tls { 443 } else { 80 })
+    };
+    let scheme = if tls { "wss" } else { "ws" };
+    let ws_url = format!("{scheme}://{authority}{RELAY_WS_PATH}?sample_rate={sample_rate}");
+    Ok((ws_url, host_port, tls))
 }
 
 /// Convert 16 kHz mono f32 samples to PCM16 little-endian bytes (Deepgram `encoding=linear16`).
@@ -205,7 +247,7 @@ pub(crate) fn f32_to_pcm16le(frame: &[f32]) -> Vec<u8> {
     out
 }
 
-/// One transcript update parsed from a Deepgram `Results` message.
+/// One transcript update parsed from a Deepgram `Results` message (forwarded verbatim by the relay).
 #[derive(Debug, PartialEq)]
 pub(crate) struct DeepgramResult {
     pub transcript: String,
@@ -234,41 +276,108 @@ pub(crate) fn parse_deepgram_message(json: &str) -> Option<DeepgramResult> {
     Some(DeepgramResult { transcript, is_final })
 }
 
-/// Deepgram's API host:port. The WS URL always targets this, so we connect the TCP socket here
-/// (with a timeout) rather than letting tungstenite::connect() do an unbounded blocking connect.
-const DEEPGRAM_ADDR: &str = "api.deepgram.com:443";
+/// A relay control frame — the relay's own billing/lifecycle signals, distinct from the Deepgram
+/// transcript frames it forwards verbatim. Tagged by a lowercase `type` (see deepgramRelay.ts's
+/// `ClientControl`).
+#[derive(Debug, PartialEq)]
+pub(crate) enum RelayControl {
+    /// Metering is live and the relay's Deepgram upstream is open — the client may stream audio.
+    Ready,
+    /// A per-minute debit landed: `balance_cents` is the server's post-debit balance (None when the
+    /// server omits it → the client optimistically decrements by `debited_cents`).
+    Balance { balance_cents: Option<i64>, debited_cents: i64 },
+    /// Out of credits (or a first-minute decline) — the client tears down and falls back on-device.
+    Exhausted,
+    /// The relay's upstream failed — same teardown as `Exhausted` but without the balance refresh.
+    Error,
+}
+
+/// Parse a relay control frame. Returns None for anything that isn't one of the relay's own control
+/// types (e.g. a Deepgram `Results`/`Metadata` frame), so the caller can fall through to
+/// `parse_deepgram_message`.
+pub(crate) fn parse_relay_control(json: &str) -> Option<RelayControl> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    match v.get("type").and_then(|t| t.as_str())? {
+        "ready" => Some(RelayControl::Ready),
+        "balance" => Some(RelayControl::Balance {
+            // Absent OR JSON null → None (the client then optimistically decrements).
+            balance_cents: v.get("balanceCents").and_then(serde_json::Value::as_i64),
+            debited_cents: v
+                .get("debitedCents")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+        }),
+        "exhausted" => Some(RelayControl::Exhausted),
+        "error" => Some(RelayControl::Error),
+        _ => None,
+    }
+}
+
+/// What one incoming relay text frame means to the worker. Pure classification (control vs
+/// transcript vs ignorable) so the dispatch is unit-testable without a socket.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RelayFrame {
+    /// A committed (final) transcript segment — emit as a partial.
+    Partial(String),
+    /// A live interim transcript — emit as the volatile preview.
+    Interim(String),
+    /// A relay control frame.
+    Control(RelayControl),
+    /// Nothing actionable (Deepgram Metadata/UtteranceEnd, an empty transcript, or unparseable text).
+    Ignore,
+}
+
+/// Classify a relay text frame: a relay control frame wins; otherwise a Deepgram `Results` frame
+/// becomes an interim/final transcript; anything else is ignored.
+pub(crate) fn classify_relay_frame(json: &str) -> RelayFrame {
+    if let Some(ctrl) = parse_relay_control(json) {
+        return RelayFrame::Control(ctrl);
+    }
+    match parse_deepgram_message(json) {
+        Some(r) if r.is_final => RelayFrame::Partial(r.transcript),
+        Some(r) => RelayFrame::Interim(r.transcript),
+        None => RelayFrame::Ignore,
+    }
+}
+
 /// Bound the whole handshake (TCP connect + TLS + WS upgrade). Without this an offline/black-holed
 /// network stalls the start_cloud_stream command thread for the OS SYN timeout (tens of seconds),
 /// undercutting the fast fall-back-to-on-device design.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Open the WebSocket to Deepgram with the API key as a `Token` Authorization header. Blocking but
-/// bounded by CONNECT_TIMEOUT — callers run it on the Tauri command thread and treat Err as "fall
-/// back to on-device". run_session resets the socket timeouts to its own values after this returns.
-fn connect(key: &str, sample_rate: u32) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
-    let url = deepgram_ws_url(sample_rate);
+/// Open the WebSocket to the orchestration relay with the Sparkle bearer as the `Authorization`
+/// header. Blocking but bounded by CONNECT_TIMEOUT — callers run it on the Tauri command thread and
+/// treat Err as "fall back to on-device". A non-101 handshake response (the relay's 401/402/403/503
+/// gates) surfaces as Err too. run_session resets the socket timeouts to its own values after this
+/// returns.
+fn connect(
+    base_url: &str,
+    token: &str,
+    sample_rate: u32,
+) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
+    let (ws_url, host_port, tls) = relay_target(base_url, sample_rate)?;
     // into_client_request() fills in the required handshake headers (Host, Upgrade, Sec-*); we
     // only add Authorization on top.
-    let mut req = url
+    let mut req = ws_url
         .as_str()
         .into_client_request()
-        .map_err(|e| format!("bad deepgram request: {e}"))?;
+        .map_err(|e| format!("bad relay request: {e}"))?;
     req.headers_mut().insert(
         "Authorization",
-        format!("Token {key}")
+        format!("Bearer {token}")
             .parse()
-            .map_err(|_| "invalid Deepgram auth header".to_string())?,
+            .map_err(|_| "invalid Sparkle auth header".to_string())?,
     );
     // Resolve + TCP-connect with a timeout (fail fast when offline), bound the TLS+WS upgrade reads/
-    // writes too, then run the handshake over the prepared stream via tungstenite::client_tls. Try
-    // every resolved address (not just the first) so an unreachable record — e.g. an IPv6 addr on an
-    // IPv4-only path — doesn't force a fallback when a later address would connect.
-    let addrs: Vec<_> = DEEPGRAM_ADDR
+    // writes too, then run the handshake over the prepared stream. Try every resolved address (not
+    // just the first) so an unreachable record — e.g. an IPv6 addr on an IPv4-only path — doesn't
+    // force a fallback when a later address would connect.
+    let addrs: Vec<_> = host_port
         .to_socket_addrs()
-        .map_err(|e| format!("deepgram dns: {e}"))?
+        .map_err(|e| format!("relay dns: {e}"))?
         .collect();
     if addrs.is_empty() {
-        return Err("deepgram dns: no address".to_string());
+        return Err("relay dns: no address".to_string());
     }
     let mut tcp = None;
     let mut last_err = String::new();
@@ -281,12 +390,20 @@ fn connect(key: &str, sample_rate: u32) -> Result<WebSocket<MaybeTlsStream<TcpSt
             Err(e) => last_err = e.to_string(),
         }
     }
-    let tcp = tcp.ok_or_else(|| format!("deepgram connect failed: {last_err}"))?;
+    let tcp = tcp.ok_or_else(|| format!("relay connect failed: {last_err}"))?;
     let _ = tcp.set_read_timeout(Some(CONNECT_TIMEOUT));
     let _ = tcp.set_write_timeout(Some(CONNECT_TIMEOUT));
-    let (socket, _resp) = tungstenite::client_tls(req, tcp)
-        .map_err(|e| format!("deepgram handshake failed: {e}"))?;
-    Ok(socket)
+    if tls {
+        let (socket, _resp) = tungstenite::client_tls(req, tcp)
+            .map_err(|e| format!("relay handshake failed: {e}"))?;
+        Ok(socket)
+    } else {
+        // Plaintext (local dev, e.g. ws://localhost:3001): wrap the TcpStream as MaybeTlsStream::Plain
+        // so the returned socket has the same type as the TLS path (set_socket_timeouts handles both).
+        let (socket, _resp) = tungstenite::client(req, MaybeTlsStream::Plain(tcp))
+            .map_err(|e| format!("relay handshake failed: {e}"))?;
+        Ok(socket)
+    }
 }
 
 /// Set the read AND write timeouts on the underlying TCP socket (works for both plaintext and
@@ -311,14 +428,14 @@ fn set_socket_timeouts(
             let _ = s.sock.set_read_timeout(Some(read));
             let _ = s.sock.set_write_timeout(Some(write));
         }
-        // MaybeTlsStream is #[non_exhaustive]; with the rustls-tls-webpki-roots feature a wss://
-        // connection is always Rustls, so this is unreachable today. Fail LOUD if a future TLS
-        // backend change lands a variant here — silently no-op'ing would leave read()/write()
-        // unbounded and quietly defeat finish()'s bounded-join guarantee.
+        // MaybeTlsStream is #[non_exhaustive]. Both the wss:// (Rustls) and local ws:// (Plain, set
+        // explicitly in `connect`) paths are handled above. Fail LOUD if a future TLS backend change
+        // lands another variant here — silently no-op'ing would leave read()/write() unbounded and
+        // quietly defeat finish()'s bounded-join guarantee.
         _ => {
             tracing::warn!(
                 target: "dictation",
-                "deepgram socket: unhandled stream variant; read/write timeouts NOT set — finish() may not be bounded"
+                "relay socket: unhandled stream variant; read/write timeouts NOT set — finish() may not be bounded"
             );
             debug_assert!(false, "set_socket_timeouts: unhandled MaybeTlsStream variant");
         }
@@ -333,20 +450,21 @@ fn is_timeout(e: &std::io::Error) -> bool {
     )
 }
 
-/// The worker loop: interleave sending queued audio with reading Deepgram results, emitting
-/// interim/final transcript events, until the stream is closed or the socket errors.
-///
-/// Test coverage: the pure helpers (`deepgram_ws_url`, `f32_to_pcm16le`, `parse_deepgram_message`)
-/// are unit-tested and the whole wire path is covered by the opt-in `live_deepgram_roundtrip` test
-/// (SPARKLE_DG_LIVE=1). This loop's timeout/`closing`-drain state machine is NOT exercised
-/// hermetically — doing so would require abstracting the socket behind a transport trait, which we
-/// judged not worth the indirection for this single call site (the live test is the real check).
 /// Whether a warm-standby socket has idled past its reuse window and should be closed. Pure so the
 /// boundary is unit-testable without a real clock.
 fn warm_expired(elapsed: Duration, window: Duration) -> bool {
     elapsed >= window
 }
 
+/// The worker loop: interleave sending queued audio with reading relay messages, emitting
+/// interim/final transcript events + balance updates, until the stream is closed or the socket
+/// errors / the relay signals exhaustion.
+///
+/// Test coverage: the pure helpers (`relay_target`, `f32_to_pcm16le`, `parse_deepgram_message`,
+/// `parse_relay_control`, `classify_relay_frame`, `warm_expired`) are unit-tested. This loop's
+/// timeout/`closing`-drain/pre-ready-buffer state machine is NOT exercised hermetically — doing so
+/// would require abstracting the socket behind a transport trait, which we judged not worth the
+/// indirection for this single call site.
 fn run_session(
     app: AppHandle,
     mut socket: WebSocket<MaybeTlsStream<TcpStream>>,
@@ -361,6 +479,14 @@ fn run_session(
     // keeps the socket open until the user resumes (instant reuse) or `WARM_STANDBY` elapses.
     let mut paused = false;
     let mut warm_since: Option<Instant> = None;
+    // The relay drops any client audio it receives before it sends `ready` (the first-minute debit
+    // clearing + its Deepgram upstream opening). Buffer frames until then so we don't clip the first
+    // words. `ready` persists across pause/resume — the relay's metering is per-connection.
+    let mut ready = false;
+    let mut prebuffer: VecDeque<Vec<u8>> = VecDeque::new();
+    // Set when the relay tells us the user ran out of credits, so the cloud-ended emit on exit can
+    // tell the frontend to refresh the (now-depleted) balance rather than treat it as a clean close.
+    let mut exhausted = false;
 
     'session: loop {
         // 0) Warm-standby expiry: paused with no resume for the whole window → close cleanly (well
@@ -384,6 +510,14 @@ fn run_session(
                 // audio). In practice none arrive while paused — the capture callback routes frames
                 // on-device when cloud_active is false — but guard defensively.
                 Ok(AudioMsg::Frame(_)) if closing || paused => {}
+                // Not yet `ready`: buffer (bounded) rather than send, so the relay doesn't drop these
+                // pre-metering frames and clip the utterance's opening words.
+                Ok(AudioMsg::Frame(bytes)) if !ready => {
+                    if prebuffer.len() >= MAX_PREREADY_FRAMES {
+                        prebuffer.pop_front(); // drop oldest; bound memory if `ready` never comes
+                    }
+                    prebuffer.push_back(bytes);
+                }
                 Ok(AudioMsg::Frame(bytes)) => {
                     match socket.write(Message::binary(bytes)) {
                         Ok(()) => {}
@@ -440,17 +574,48 @@ fn run_session(
         // wedged one.
         let _ = socket.flush();
 
-        // 2) Read one message (bounded by the read timeout), emitting any transcript it carries.
+        // 2) Read one message (bounded by the read timeout), acting on the transcript/control it
+        // carries.
         match socket.read() {
-            Ok(Message::Text(txt)) => {
-                if let Some(r) = parse_deepgram_message(txt.as_str()) {
-                    if r.is_final {
-                        emit_partial(&app, "deepgram", r.transcript);
-                    } else {
-                        emit_interim(&app, r.transcript);
+            Ok(Message::Text(txt)) => match classify_relay_frame(txt.as_str()) {
+                RelayFrame::Partial(t) => emit_partial(&app, "deepgram", t),
+                RelayFrame::Interim(t) => emit_interim(&app, t),
+                RelayFrame::Control(RelayControl::Ready) => {
+                    // Metering is live — flush the frames we buffered during the relay→Deepgram open
+                    // (oldest first), then stream directly from here on. A write timeout does NOT lose
+                    // the frame — tungstenite retains it in its outgoing buffer — so we keep queueing
+                    // the rest (bounded by MAX_PREREADY_FRAMES) and let them flush in FIFO order when
+                    // the link drains, rather than `break`ing and discarding the tail (which would
+                    // re-introduce the opening-word clipping this buffer exists to prevent). Only a
+                    // hard socket error tears the session down.
+                    if !ready {
+                        ready = true;
+                        while let Some(bytes) = prebuffer.pop_front() {
+                            match socket.write(Message::binary(bytes)) {
+                                Ok(()) => {}
+                                Err(tungstenite::Error::Io(ref e)) if is_timeout(e) => {}
+                                Err(_) => break 'session,
+                            }
+                        }
+                        let _ = socket.flush();
                     }
                 }
-            }
+                RelayFrame::Control(RelayControl::Balance { balance_cents, debited_cents }) => {
+                    // Server-authoritative post-debit balance → tick the credits pill.
+                    emit_cloud_balance(&app, balance_cents, debited_cents);
+                }
+                RelayFrame::Control(RelayControl::Exhausted) => {
+                    // Out of credits — tear down and fall back on-device (flag the refresh).
+                    tracing::info!(target: "dictation", "relay signalled out-of-credits; falling back on-device");
+                    exhausted = true;
+                    break;
+                }
+                RelayFrame::Control(RelayControl::Error) => {
+                    tracing::debug!(target: "dictation", "relay signalled upstream error");
+                    break;
+                }
+                RelayFrame::Ignore => {}
+            },
             Ok(Message::Close(_)) => break,
             Ok(_) => {} // Ping/Pong/Binary — ignore (pongs are auto-queued and flushed above)
             Err(tungstenite::Error::Io(ref e)) if is_timeout(e) => {
@@ -464,19 +629,20 @@ fn run_session(
                 }
             }
             Err(e) => {
-                tracing::debug!(target: "dictation", error = %e, "deepgram stream ended");
+                tracing::debug!(target: "dictation", error = %e, "relay stream ended");
                 break;
             }
         }
     }
     // Mark dead BEFORE the cloud-ended emit so any concurrent reuse check (is_alive) sees the truth.
     alive.store(false, Ordering::Relaxed);
-    tracing::info!(target: "dictation", "deepgram stream closed");
-    // Tell the frontend the cloud stream is gone (clean close OR mid-stream failure) so it clears
-    // the interim preview and calls stop_cloud_stream — resuming on-device routing/fallback. Skipped
-    // for a discarded orphan (see discard()), whose event would otherwise stop the current session.
+    tracing::info!(target: "dictation", "cloud relay stream closed");
+    // Tell the frontend the cloud stream is gone (clean close OR mid-stream failure / exhaustion) so
+    // it clears the interim preview and calls stop_cloud_stream — resuming on-device routing/fallback.
+    // `exhausted` asks the frontend to refresh the (now-depleted) balance. Skipped for a discarded
+    // orphan (see discard()), whose event would otherwise stop the current session.
     if !suppress_ended.load(Ordering::Relaxed) {
-        emit_cloud_ended(&app);
+        emit_cloud_ended(&app, exhausted);
     }
 }
 
@@ -502,24 +668,64 @@ mod tests {
     }
 
     #[test]
-    fn url_carries_the_streaming_params() {
-        let url = deepgram_ws_url(16_000);
-        assert!(url.starts_with("wss://api.deepgram.com/v1/listen?"));
-        for needle in [
-            "model=nova-3",
-            "language=multi",
-            "encoding=linear16",
-            "sample_rate=16000",
-            "channels=1",
-            "interim_results=true",
-            "smart_format=true",
-            "punctuate=true",
-            "endpointing=200",
-        ] {
-            assert!(url.contains(needle), "url missing {needle}: {url}");
-        }
-        // No stray whitespace from the multi-line string literal leaked into the URL.
-        assert!(!url.contains(' '), "url must not contain spaces: {url}");
+    fn relay_target_maps_https_to_wss_on_443() {
+        let (ws_url, host_port, tls) =
+            relay_target("http://localhost:3001", 16_000).expect("valid https URL");
+        assert_eq!(
+            ws_url,
+            "ws://localhost:3001/ai/deepgram?sample_rate=16000"
+        );
+        assert_eq!(host_port, "localhost:3001:443");
+        assert!(tls);
+    }
+
+    #[test]
+    fn relay_target_maps_http_localhost_to_ws_keeping_the_explicit_port() {
+        let (ws_url, host_port, tls) =
+            relay_target("http://localhost:3001", 16_000).expect("valid http URL");
+        assert_eq!(ws_url, "ws://localhost:3001/ai/deepgram?sample_rate=16000");
+        assert_eq!(host_port, "localhost:3001");
+        assert!(!tls);
+    }
+
+    #[test]
+    fn relay_target_defaults_port_80_for_plain_http_without_a_port() {
+        let (_ws_url, host_port, tls) = relay_target("http://example.test", 16_000).expect("valid");
+        assert_eq!(host_port, "example.test:80");
+        assert!(!tls);
+    }
+
+    #[test]
+    fn relay_target_drops_a_trailing_path_and_slash() {
+        // A base URL that carries a path/trailing slash must not leak into the authority or a doubled
+        // WS path.
+        let (ws_url, host_port, _tls) =
+            relay_target("https://host.test/", 16_000).expect("valid");
+        assert_eq!(ws_url, "wss://host.test/ai/deepgram?sample_rate=16000");
+        assert_eq!(host_port, "host.test:443");
+    }
+
+    #[test]
+    fn relay_target_isolates_the_authority_from_a_query_or_fragment() {
+        // A stray query/fragment must NOT fold into the host:port (which would break DNS/SNI).
+        let (ws_url, host_port, _tls) =
+            relay_target("https://host.test?x=y", 16_000).expect("valid");
+        assert_eq!(host_port, "host.test:443", "query must not leak into the authority");
+        assert_eq!(ws_url, "wss://host.test/ai/deepgram?sample_rate=16000");
+        let (_ws_url2, host_port2, _) = relay_target("http://h.test:9/p#frag", 16_000).expect("valid");
+        assert_eq!(host_port2, "h.test:9");
+    }
+
+    #[test]
+    fn relay_target_rejects_an_unsupported_scheme() {
+        assert!(relay_target("ftp://nope.test", 16_000).is_err());
+        assert!(relay_target("localhost:3001", 16_000).is_err(), "bare host has no scheme");
+    }
+
+    #[test]
+    fn relay_target_carries_the_requested_sample_rate() {
+        let (ws_url, _, _) = relay_target("https://host.test", 48_000).expect("valid");
+        assert!(ws_url.ends_with("/ai/deepgram?sample_rate=48000"), "url: {ws_url}");
     }
 
     #[test]
@@ -559,53 +765,6 @@ mod tests {
         assert!(!r.is_final);
     }
 
-    /// Live end-to-end check against the real Deepgram API. Opt-in (set SPARKLE_DG_LIVE=1) so
-    /// `cargo test` stays hermetic and CI — which has no key — never hits the network. Verifies
-    /// the parts a mock can't: the URL/auth handshake, that `linear16` PCM frames are accepted,
-    /// and that the CloseStream handshake yields a clean close with at least one well-formed
-    /// server message (Metadata/Results). Run: `SPARKLE_DG_LIVE=1 cargo test live_deepgram -- --nocapture`.
-    #[test]
-    fn live_deepgram_roundtrip() {
-        if std::env::var("SPARKLE_DG_LIVE").is_err() {
-            return; // opt-in only
-        }
-        let key = crate::naming::resolve_deepgram_key()
-            .expect("DEEPGRAM_API must resolve for the live test");
-        let mut socket = connect(&key, SAMPLE_RATE).expect("deepgram handshake should succeed");
-        set_socket_timeouts(&mut socket, Duration::from_millis(200), WRITE_TIMEOUT);
-
-        // Stream ~1s of a 220 Hz tone as PCM16 in 20 ms (320-sample) chunks.
-        for chunk in 0..50 {
-            let frame: Vec<f32> = (0..320)
-                .map(|i| {
-                    let n = chunk * 320 + i;
-                    (2.0 * std::f32::consts::PI * 220.0 * n as f32 / SAMPLE_RATE as f32).sin() * 0.3
-                })
-                .collect();
-            socket.send(Message::binary(f32_to_pcm16le(&frame))).expect("send audio frame");
-        }
-        socket.send(Message::text(CLOSE_STREAM_MSG)).expect("send CloseStream");
-
-        // Read until the server closes (or we hit a generous tick budget), proving it parsed our
-        // stream: every text frame must be valid JSON carrying a recognizable `type`.
-        let mut saw_server_message = false;
-        for _ in 0..50 {
-            match socket.read() {
-                Ok(Message::Text(t)) => {
-                    let v: serde_json::Value =
-                        serde_json::from_str(t.as_str()).expect("server frame must be JSON");
-                    assert!(v.get("type").and_then(|x| x.as_str()).is_some(), "frame has a type");
-                    saw_server_message = true;
-                }
-                Ok(Message::Close(_)) => break,
-                Ok(_) => {}
-                Err(tungstenite::Error::Io(ref e)) if is_timeout(e) => {}
-                Err(e) => panic!("unexpected stream error: {e}"),
-            }
-        }
-        assert!(saw_server_message, "expected at least one Metadata/Results frame from Deepgram");
-    }
-
     #[test]
     fn ignores_non_results_and_empty_transcripts() {
         // Non-Results control messages carry no transcript to surface.
@@ -622,5 +781,70 @@ mod tests {
         // Garbage is ignored rather than panicking the worker.
         assert_eq!(parse_deepgram_message("not json"), None);
         assert_eq!(parse_deepgram_message("{}"), None);
+    }
+
+    #[test]
+    fn parses_the_relay_ready_control() {
+        assert_eq!(parse_relay_control(r#"{"type":"ready","sampleRate":16000}"#), Some(RelayControl::Ready));
+    }
+
+    #[test]
+    fn parses_the_relay_balance_control_with_a_server_balance() {
+        assert_eq!(
+            parse_relay_control(r#"{"type":"balance","balanceCents":19994,"debitedCents":6,"minute":0}"#),
+            Some(RelayControl::Balance { balance_cents: Some(19994), debited_cents: 6 })
+        );
+    }
+
+    #[test]
+    fn parses_the_relay_balance_control_with_a_null_balance() {
+        // A null (or absent) server balance → None, so the client optimistically decrements.
+        assert_eq!(
+            parse_relay_control(r#"{"type":"balance","balanceCents":null,"debitedCents":5}"#),
+            Some(RelayControl::Balance { balance_cents: None, debited_cents: 5 })
+        );
+        assert_eq!(
+            parse_relay_control(r#"{"type":"balance","debitedCents":5}"#),
+            Some(RelayControl::Balance { balance_cents: None, debited_cents: 5 })
+        );
+    }
+
+    #[test]
+    fn parses_the_relay_exhausted_and_error_controls() {
+        assert_eq!(parse_relay_control(r#"{"type":"exhausted","reason":"declined"}"#), Some(RelayControl::Exhausted));
+        assert_eq!(parse_relay_control(r#"{"type":"error","error":"upstream_error"}"#), Some(RelayControl::Error));
+    }
+
+    #[test]
+    fn relay_control_ignores_deepgram_and_unknown_frames() {
+        // A Deepgram Results/Metadata frame is NOT a relay control frame — it must fall through so
+        // classify_relay_frame routes it to the transcript path.
+        assert_eq!(parse_relay_control(r#"{"type":"Results","channel":{}}"#), None);
+        assert_eq!(parse_relay_control(r#"{"type":"Metadata"}"#), None);
+        assert_eq!(parse_relay_control(r#"{"type":"nonsense"}"#), None);
+        assert_eq!(parse_relay_control("not json"), None);
+    }
+
+    #[test]
+    fn classify_routes_control_transcript_and_ignore() {
+        // Control frames win.
+        assert_eq!(classify_relay_frame(r#"{"type":"ready"}"#), RelayFrame::Control(RelayControl::Ready));
+        assert_eq!(
+            classify_relay_frame(r#"{"type":"balance","balanceCents":10,"debitedCents":6}"#),
+            RelayFrame::Control(RelayControl::Balance { balance_cents: Some(10), debited_cents: 6 })
+        );
+        assert_eq!(classify_relay_frame(r#"{"type":"exhausted"}"#), RelayFrame::Control(RelayControl::Exhausted));
+        // Deepgram transcripts map to Partial (final) / Interim (not final).
+        assert_eq!(
+            classify_relay_frame(r#"{"type":"Results","is_final":true,"channel":{"alternatives":[{"transcript":"done"}]}}"#),
+            RelayFrame::Partial("done".into())
+        );
+        assert_eq!(
+            classify_relay_frame(r#"{"type":"Results","is_final":false,"channel":{"alternatives":[{"transcript":"typing"}]}}"#),
+            RelayFrame::Interim("typing".into())
+        );
+        // Metadata / empty / garbage → Ignore.
+        assert_eq!(classify_relay_frame(r#"{"type":"Metadata"}"#), RelayFrame::Ignore);
+        assert_eq!(classify_relay_frame("not json"), RelayFrame::Ignore);
     }
 }

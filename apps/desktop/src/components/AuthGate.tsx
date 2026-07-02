@@ -10,19 +10,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { C, ON_BRAND_FILL, DANGER } from "../theme/colors";
 import { useAuthStore } from "../stores/authStore";
-import { useTrialStore } from "../stores/trialStore";
+import { useTrialStore, TRIAL_LIMIT } from "../stores/trialStore";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { TrialChrome } from "./TrialChrome";
 import { deriveAuthView, parseAuthCode } from "../services/entitlement";
 import { safeUnlisten } from "../services/safeUnlisten";
-import {
-  exchangeCode,
-  openPaywall,
-  openSignIn,
-  PAYWALL_URL,
-  redeemPromo,
-  SIGN_IN_URL,
-} from "../services/sparkleApi";
+import { exchangeCode, openPaywall, openSignIn, PAYWALL_URL, SIGN_IN_URL } from "../services/sparkleApi";
+import { openPaywallCheckout, lastCheckoutUrl } from "../services/creditsMenuApi";
+import { PromoRedeem } from "./PromoRedeem";
+
+// Extracted to its own file for reuse in the Credits settings pane; re-exported so existing
+// imports (incl. AuthGate.promo.test.tsx) keep resolving from here.
+export { PromoRedeem } from "./PromoRedeem";
 
 const screen: CSSProperties = {
   position: "fixed",
@@ -60,17 +59,6 @@ const linkBtn: CSSProperties = {
   textDecoration: "underline",
 };
 
-const promoInput: CSSProperties = {
-  background: C.cream,
-  color: C.forest,
-  border: `1px solid ${C.muted}`,
-  borderRadius: 6,
-  padding: "8px 10px",
-  fontSize: 14,
-  fontFamily: '"IBM Plex Sans", sans-serif',
-  width: 160,
-};
-
 function Screen({ children }: { children: ReactNode }) {
   return <div style={screen}>{children}</div>;
 }
@@ -86,70 +74,11 @@ function LaunchFallback({ url }: { url: string }) {
   );
 }
 
-/** Small "Have a code?" redeemer on the paywall. Forwards the typed code to the server (the code
- *  value never lives in this client); on success it refreshes entitlement so the gate re-derives
- *  to "entitled". Used until real Stripe promo codes land. */
-export function PromoRedeem({ refresh }: { refresh: () => Promise<void> }) {
-  const [code, setCode] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const submit = async () => {
-    const trimmed = code.trim();
-    if (!trimmed || submitting) return;
-    setSubmitting(true);
-    setError(null);
-    let redeemed = false;
-    try {
-      await redeemPromo(trimmed);
-      redeemed = true;
-      await refresh(); // entitled now → the gate re-derives and unmounts this component
-    } catch (e) {
-      // Keep the redeem failure distinct from a post-redeem refresh failure: once the code is
-      // accepted, the grant is real, so never tell the user it "didn't work" — point them at
-      // the refresh affordance instead.
-      setError(
-        redeemed
-          ? 'Redeemed — tap "I already paid — refresh".'
-          : String(e).includes("invalid_code")
-            ? "That code didn't work."
-            : "Couldn't redeem — try again.",
-      );
-    } finally {
-      // Always re-enable: if refresh resolves without entitlement flipping (stale /me), the
-      // control must recover rather than stay stuck on "…".
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, marginTop: 4 }}>
-      <div style={{ display: "flex", gap: 8 }}>
-        <input
-          style={promoInput}
-          value={code}
-          onChange={(e) => setCode(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && void submit()}
-          placeholder="Have a code?"
-          aria-label="Promo code"
-          disabled={submitting}
-          autoCapitalize="characters"
-          autoCorrect="off"
-          spellCheck={false}
-        />
-        <button style={primaryBtn} onClick={() => void submit()} disabled={submitting}>
-          {submitting ? "…" : "Redeem"}
-        </button>
-      </div>
-      {error && <p style={{ color: DANGER, fontSize: 12, margin: 0 }}>{error}</p>}
-    </div>
-  );
-}
-
 export function AuthGate({ children }: { children: ReactNode }) {
   const { me, tokenPresent, loading, refresh } = useAuthStore();
   const trialStarted = useTrialStore((s) => s.started);
   const trialLoading = useTrialStore((s) => s.loading);
+  const promptsUsed = useTrialStore((s) => s.promptsUsed);
   const refreshTrial = useTrialStore((s) => s.refresh);
   const startTrial = useTrialStore((s) => s.start);
   // De-dupe URLs across the two delivery paths (the live "deep-link" event and the
@@ -211,7 +140,48 @@ export function AuthGate({ children }: { children: ReactNode }) {
     if (!ok) setFailedUrl(url);
   };
 
-  const view = deriveAuthView({ loading, hasToken: tokenPresent, me, trialStarted, trialLoading });
+  // "Pay $99" one-click-to-Stripe. When signed in (a bearer token is present), create the
+  // checkout session directly and land on checkout.stripe.com in one click — the same proven path
+  // as in-app top-ups. Fall back to the web sign-in→paywall hand-off when signed out, or if the
+  // direct checkout throws (server refused, e.g. no bearer) so the pre-auth path never regresses.
+  const handlePay = async () => {
+    setFailedUrl(null);
+    if (tokenPresent) {
+      try {
+        if (await openPaywallCheckout()) return;
+        // The session WAS created but the system browser wouldn't open — offer the real hosted
+        // Stripe URL to copy/paste rather than bouncing back to the generic web paywall page.
+        const url = lastCheckoutUrl();
+        if (url) {
+          setFailedUrl(url);
+          return;
+        }
+      } catch (e) {
+        console.warn("Direct paywall checkout failed; falling back to the web paywall flow:", e);
+      }
+    }
+    await handOff(openPaywall, PAYWALL_URL);
+  };
+
+  // Unlock action for the trial view. A signed-in (but unpaid) user who dismissed the paywall to
+  // stay on the trial should convert via the same one-click Stripe path, NOT be bounced back
+  // through web sign-in; token-less trial users still need the sign-in hand-off first.
+  const handleTrialUnlock = () => {
+    if (tokenPresent) void handlePay();
+    else void handOff(openSignIn, SIGN_IN_URL);
+  };
+
+  // Trial prompts still available to fall back to (device-local meter, independent of payment).
+  const trialRemaining = Math.max(0, TRIAL_LIMIT - promptsUsed);
+  // Escape hatch: a signed-in-but-unpaid user who started the trial and still has prompts can
+  // dismiss the unlock screen and return to the trial workspace. deriveAuthView reports "unpaid"
+  // purely from (token && !entitled), so we override it locally to the "trial" render path. The
+  // override is LATCHED on dismissedPaywall (not the live count) so exhausting the last prompt
+  // hands off to TrialChrome's own exhausted upsell instead of snapping back to this screen.
+  const [dismissedPaywall, setDismissedPaywall] = useState(false);
+
+  let view = deriveAuthView({ loading, hasToken: tokenPresent, me, trialStarted, trialLoading });
+  if (view === "unpaid" && dismissedPaywall && trialStarted) view = "trial";
 
   if (view === "entitled") return <>{children}</>;
 
@@ -221,7 +191,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     return (
       <>
         {children}
-        <TrialChrome onUnlock={() => void handOff(openSignIn, SIGN_IN_URL)} signInFailedUrl={failedUrl} />
+        <TrialChrome onUnlock={handleTrialUnlock} signInFailedUrl={failedUrl} />
       </>
     );
   }
@@ -243,7 +213,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
           <strong style={{ color: C.cream }}>$200 of AI credits</strong> to power building and
           thinking.
         </p>
-        <button style={primaryBtn} onClick={() => void handOff(openPaywall, PAYWALL_URL)}>
+        <button style={primaryBtn} onClick={() => void handlePay()}>
           Pay $99 &amp; get $200 in credits
         </button>
         {failedUrl && <LaunchFallback url={failedUrl} />}
@@ -251,6 +221,12 @@ export function AuthGate({ children }: { children: ReactNode }) {
           I already paid — refresh
         </button>
         <PromoRedeem refresh={refresh} />
+        {trialStarted && trialRemaining > 0 && (
+          <button style={linkBtn} onClick={() => setDismissedPaywall(true)}>
+            Nevermind, I want to stay on the free trial and use the {trialRemaining} prompt
+            {trialRemaining === 1 ? "" : "s"} I have left.
+          </button>
+        )}
       </Screen>
     );
   }

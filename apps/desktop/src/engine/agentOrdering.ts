@@ -9,9 +9,14 @@ import type { AgentKind, AgentTabStatus } from "../types";
 // (the sort below is stable). Tune the taxonomy → tier mapping here, nothing else
 // hardcodes it. A status absent from this map sorts to the bottom (see STATUS_RANK_FALLBACK).
 export const STATUS_RANK: Record<AgentTabStatus, number> = {
-  // Tier 0 — red: genuinely waiting on your answer/approval. Most support needed.
+  // Tier 0 — red: needs YOU before it can make progress. Most support needed. `errored` belongs
+  // here (not the dormant tier): a crashed / mid-stream-stalled agent is stuck until you step in,
+  // and it's already treated as RED everywhere else — the attention set (engine/attention.ts), the
+  // dock badge + notifications (isRedStatus), and the cross-window red tier. Ranking it at the
+  // bottom made a red agent SINK instead of floating up, contradicting all of those (sparkle-pqxh).
   waiting: 0,
   approval: 0,
+  errored: 0,
   // Tier 1 — finished its turn; it's your move (review / next prompt).
   idle: 1,
   done: 1,
@@ -19,7 +24,6 @@ export const STATUS_RANK: Record<AgentTabStatus, number> = {
   working: 2,
   // Tier 3 — dormant: not asking, not running.
   blocked: 3,
-  errored: 3,
   stopped: 3,
 };
 

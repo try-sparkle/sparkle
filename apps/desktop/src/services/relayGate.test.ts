@@ -27,23 +27,32 @@ describe("resolveSuggestionClick (the single click gate, raw value)", () => {
   });
 });
 
+// Submissions terminate with CR (`\r`) — what a physical Enter sends. Raw-mode TUIs (Claude
+// Code's Ink pickers) don't treat LF as Enter, so LF-framed answers to a numbered picker vanish;
+// canonical-mode prompts still accept CR via ICRNL.
 describe("frameSubmit (PTY submission framing)", () => {
-  it("adds a trailing newline to a prompt that lacks one", () => {
+  it("adds a trailing CR to a prompt that lacks one", () => {
     expect(frameSubmit("Rebase main, open a PR, and merge.")).toBe(
-      "Rebase main, open a PR, and merge.\n",
+      "Rebase main, open a PR, and merge.\r",
     );
   });
-  it("leaves a keystroke value that already ends in a newline unchanged", () => {
-    expect(frameSubmit("2\n")).toBe("2\n");
+  it("converts a legacy LF-framed keystroke value to CR (not doubled)", () => {
+    expect(frameSubmit("2\n")).toBe("2\r");
+  });
+  it("leaves a value already ending in CR unchanged", () => {
+    expect(frameSubmit("2\r")).toBe("2\r");
+  });
+  it("collapses a CRLF terminator to a single CR (never a double Enter)", () => {
+    expect(frameSubmit("2\r\n")).toBe("2\r");
   });
 });
 
 describe("authorizeDecision (the host PTY-write gate)", () => {
-  it("injects only for an attention WE raised, framed with a newline", () => {
+  it("injects only for an attention WE raised, framed with a CR (Enter)", () => {
     const live = new Map([["att1", "agentA"]]);
     expect(authorizeDecision(live, { attention_id: "att1", reply: "y", submit: true })).toEqual({
       agentId: "agentA",
-      text: "y\n",
+      text: "y\r",
     });
   });
 
@@ -67,19 +76,26 @@ describe("authorizeDecision (the host PTY-write gate)", () => {
     expect(authorizeDecision(live, { attention_id: "att1", reply: undefined })).toBeNull();
   });
 
-  it("does not double-add a newline when the reply already ends with one", () => {
+  it("converts a phone reply's LF framing to CR without doubling", () => {
     const live = new Map([["att1", "agentA"]]);
-    expect(authorizeDecision(live, { attention_id: "att1", reply: "2\n", submit: true })?.text).toBe("2\n");
+    expect(authorizeDecision(live, { attention_id: "att1", reply: "2\n", submit: true })?.text).toBe("2\r");
+  });
+
+  it("normalizes an LF-terminated reply even without submit (it already carries its Enter)", () => {
+    const live = new Map([["att1", "agentA"]]);
+    expect(authorizeDecision(live, { attention_id: "att1", reply: "1\n" })?.text).toBe("1\r");
   });
 });
 
 describe("authorizeAgentInput (free-type gate)", () => {
-  it("injects only for a WATCHED agent, submitting with a newline", () => {
+  it("injects only for a WATCHED agent, submitting with a CR (Enter)", () => {
     const watched = new Set(["agentA"]);
     expect(authorizeAgentInput(watched, { agent_id: "agentA", text: "ls" })).toEqual({
       agentId: "agentA",
-      text: "ls\n",
+      text: "ls\r",
     });
+    // Legacy phone framing (trailing LF) is converted, not doubled.
+    expect(authorizeAgentInput(watched, { agent_id: "agentA", text: "1\n" })?.text).toBe("1\r");
   });
 
   it("drops input for an unwatched agent (never an arbitrary PTY)", () => {

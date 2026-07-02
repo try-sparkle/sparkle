@@ -99,7 +99,10 @@ export function Terminal({
   projectRootPath: string;
   command: string;
   args: string[];
-  cwd: string;
+  // The child's working directory. Optional: a PTY doesn't require one, and some spawns (e.g. the
+  // first-run `claude login`, which runs before any worktree exists) deliberately pass none so
+  // pty_spawn opens without a cwd. When set, it must resolve inside the managed worktrees tree.
+  cwd?: string;
   active: boolean;
   // Whether this spawn resumes a prior Claude session (`claude --resume`) vs starts fresh. Drives
   // the loading affordance shown until the first PTY byte: a `--resume` redraw of a large transcript

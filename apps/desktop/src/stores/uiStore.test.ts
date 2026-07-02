@@ -102,6 +102,35 @@ describe("uiStore workMode", () => {
   });
 });
 
+describe("uiStore boardFocusBeadId (spec §8 pill → board handoff)", () => {
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({ boardFocusBeadId: null, themePref: "auto" });
+  });
+
+  it("defaults to null", () => {
+    expect(useUiStore.getState().boardFocusBeadId).toBeNull();
+  });
+
+  it("setBoardFocusBeadId round-trips a bead id and clears back to null", () => {
+    useUiStore.getState().setBoardFocusBeadId("epic-42");
+    expect(useUiStore.getState().boardFocusBeadId).toBe("epic-42");
+    useUiStore.getState().setBoardFocusBeadId(null);
+    expect(useUiStore.getState().boardFocusBeadId).toBeNull();
+  });
+
+  // Transient one-shot handoff: it must NEVER persist, or a stale id would re-open an epic's
+  // DetailOverlay on the next launch. partialize drops it (like workMode/buildAgentHover).
+  it("never writes boardFocusBeadId to the persisted blob", () => {
+    useUiStore.getState().setBoardFocusBeadId("epic-42");
+    useUiStore.getState().setThemePref("dark");
+    const blob = JSON.parse(localStorage.getItem("sparkle-ui") ?? "{}");
+    expect(blob.state).not.toHaveProperty("boardFocusBeadId");
+    // Sanity: a genuinely-persisted field from the same write did land in the blob.
+    expect(blob.state.themePref).toBe("dark");
+  });
+});
+
 describe("uiStore orchestrator collapse", () => {
   afterEach(() => {
     localStorage.clear();

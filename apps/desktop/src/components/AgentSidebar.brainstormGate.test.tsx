@@ -56,15 +56,14 @@ describe("AgentSidebar — AI Think (Chief) gate", () => {
     expect(screen.getByRole("button", { name: "⚒ Build" })).toBeTruthy();
   });
 
-  it("hides the Think button when out of credits even if the flag is on", () => {
+  it("still SHOWS the Think button during the trial / out of credits (visible-but-locked)", () => {
+    // The Think chevron is now gated on the settings flag ONLY (useAiFeatureVisible), so a trial /
+    // no-credits user can SEE the feature. The buy-to-use lock is enforced at submit (ThinkPanel),
+    // not by hiding the chevron. Anonymous trial: no token, no `me`.
     useSettingsStore.getState().setAllAiFeatures(true);
-    useAuthStore.setState({
-      me: { ...entitledMe, balanceCents: 0 },
-      tokenPresent: true,
-      loading: false,
-    });
+    useAuthStore.setState({ me: null, tokenPresent: false, loading: false });
     render(<AgentSidebar project={project} />);
-    expect(screen.queryByRole("button", { name: "Think" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Think" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "⚒ Build" })).toBeTruthy();
   });
 });

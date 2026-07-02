@@ -14,8 +14,7 @@ afterEach(() => cleanup());
 
 const mode = () => aiFeatureMode(useSettingsStore.getState());
 
-// The four AI-feature checkboxes, addressed by label — distinct from the independent
-// "Automatically apply updates" toggle that also renders in this menu (see updaterService).
+// The four AI-feature checkboxes, addressed by label.
 const AI_LABELS = [
   "Auto-rename workers based on the work they're doing",
   "Use AI-enhanced voice dictation for much better accuracy",
@@ -45,17 +44,9 @@ describe("AiFeaturesMenu", () => {
     expect(aiBoxes().every((b) => b.getAttribute("aria-checked") === "true")).toBe(true);
   });
 
-  it("the 'Automatically apply updates' toggle is independent of the AI master", () => {
-    useSettingsStore.getState().setAutoApplyUpdates(true);
+  it("no longer renders the 'Automatically apply updates' toggle (it moved to Advanced)", () => {
     render(<AiFeaturesMenu />);
-    const box = screen.getByRole("checkbox", { name: "Automatically apply updates" });
-    expect(box.getAttribute("aria-checked")).toBe("true");
-    // Off bulk-sets the AI features but must NOT touch auto-apply.
-    fireEvent.click(screen.getByText("Off"));
-    expect(useSettingsStore.getState().autoApplyUpdates).toBe(true);
-    // Toggling it flips only autoApplyUpdates.
-    fireEvent.click(box);
-    expect(useSettingsStore.getState().autoApplyUpdates).toBe(false);
+    expect(screen.queryByRole("checkbox", { name: "Automatically apply updates" })).toBeNull();
   });
 
   it("unchecking one feature drops the master to 'Some'", () => {
