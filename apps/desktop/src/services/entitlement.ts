@@ -28,9 +28,19 @@ export function deriveAuthView(input: {
   me: Me | null;
   trialStarted: boolean;
   trialLoading: boolean;
+  /** A signed-in-but-unpaid user dismissed the paywall to stay on the trial (authStore). When set
+   *  (and a trial is active) they render the trial workspace instead of the unpaid wall — so both
+   *  AuthGate and TopBar agree and the in-bar counter shows. */
+  paywallDismissed?: boolean;
 }): AuthView {
   if (input.loading || input.trialLoading) return "loading";
-  if (input.hasToken && input.me) return input.me.entitled ? "entitled" : "unpaid";
+  if (input.hasToken && input.me) {
+    if (input.me.entitled) return "entitled";
+    // Dismissed the $99 wall while a trial is active → back to the trial workspace (matches
+    // AuthGate's "stay on the free trial" escape hatch).
+    if (input.paywallDismissed && input.trialStarted) return "trial";
+    return "unpaid";
+  }
   // Token-less: either the first-run welcome or the active anonymous trial.
   return input.trialStarted ? "trial" : "welcome";
 }

@@ -42,6 +42,43 @@ describe("deriveAuthView", () => {
       deriveAuthView({ ...base, loading: false, hasToken: true, me: me({ entitled: false }), trialStarted: true }),
     ).toBe("unpaid");
   });
+  it("a signed-in-unpaid user who dismissed the paywall (with an active trial) -> trial", () => {
+    // The edge case: without this, TopBar reads them as "unpaid" and hides the in-bar counter.
+    expect(
+      deriveAuthView({
+        ...base,
+        loading: false,
+        hasToken: true,
+        me: me({ entitled: false }),
+        trialStarted: true,
+        paywallDismissed: true,
+      }),
+    ).toBe("trial");
+  });
+  it("paywallDismissed does NOT apply without an active trial (stays unpaid)", () => {
+    expect(
+      deriveAuthView({
+        ...base,
+        loading: false,
+        hasToken: true,
+        me: me({ entitled: false }),
+        trialStarted: false,
+        paywallDismissed: true,
+      }),
+    ).toBe("unpaid");
+  });
+  it("paywallDismissed never overrides a PAID user (stays entitled)", () => {
+    expect(
+      deriveAuthView({
+        ...base,
+        loading: false,
+        hasToken: true,
+        me: me({ entitled: true }),
+        trialStarted: true,
+        paywallDismissed: true,
+      }),
+    ).toBe("entitled");
+  });
   it("is entitled when paid", () => {
     expect(deriveAuthView({ ...base, loading: false, hasToken: true, me: me({ entitled: true }) })).toBe(
       "entitled",

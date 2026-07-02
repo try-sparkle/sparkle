@@ -82,7 +82,8 @@ function LaunchFallback({ url }: { url: string }) {
 }
 
 export function AuthGate({ children }: { children: ReactNode }) {
-  const { me, tokenPresent, loading, refresh } = useAuthStore();
+  const { me, tokenPresent, loading, refresh, paywallDismissed, setPaywallDismissed } =
+    useAuthStore();
   const trialStarted = useTrialStore((s) => s.started);
   const trialLoading = useTrialStore((s) => s.loading);
   const promptsUsed = useTrialStore((s) => s.promptsUsed);
@@ -192,18 +193,21 @@ export function AuthGate({ children }: { children: ReactNode }) {
     else void handleSignIn();
   };
 
-
   // Trial prompts still available to fall back to (device-local meter, independent of payment).
   const trialRemaining = Math.max(0, TRIAL_LIMIT - promptsUsed);
   // Escape hatch: a signed-in-but-unpaid user who started the trial and still has prompts can
-  // dismiss the unlock screen and return to the trial workspace. deriveAuthView reports "unpaid"
-  // purely from (token && !entitled), so we override it locally to the "trial" render path. The
-  // override is LATCHED on dismissedPaywall (not the live count) so exhausting the last prompt
-  // hands off to TrialChrome's own exhausted upsell instead of snapping back to this screen.
-  const [dismissedPaywall, setDismissedPaywall] = useState(false);
-
-  let view = deriveAuthView({ loading, hasToken: tokenPresent, me, trialStarted, trialLoading });
-  if (view === "unpaid" && dismissedPaywall && trialStarted) view = "trial";
+  // dismiss the unlock screen and return to the trial workspace. The dismissed flag is LATCHED
+  // (not the live count) so exhausting the last prompt hands off to TrialChrome's own exhausted
+  // upsell instead of snapping back to this screen. It lives in authStore (not local state) so the
+  // TopBar's independent deriveAuthView agrees and keeps showing the in-bar trial counter.
+  const view = deriveAuthView({
+    loading,
+    hasToken: tokenPresent,
+    me,
+    trialStarted,
+    trialLoading,
+    paywallDismissed,
+  });
 
   if (view === "entitled") return <>{children}</>;
 
@@ -246,7 +250,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
         </button>
         <PromoRedeem refresh={refresh} />
         {trialStarted && trialRemaining > 0 && (
-          <button style={linkBtn} onClick={() => setDismissedPaywall(true)}>
+          <button style={linkBtn} onClick={() => setPaywallDismissed(true)}>
             Nevermind, I want to stay on the free trial and use the {trialRemaining} prompt
             {trialRemaining === 1 ? "" : "s"} I have left.
           </button>

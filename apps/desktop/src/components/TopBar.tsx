@@ -125,11 +125,18 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const authLoading = useAuthStore((s) => s.loading);
   const tokenPresent = useAuthStore((s) => s.tokenPresent);
   const me = useAuthStore((s) => s.me);
+  const paywallDismissed = useAuthStore((s) => s.paywallDismissed);
   const trialStarted = useTrialStore((s) => s.started);
   const trialLoading = useTrialStore((s) => s.loading);
   const inTrial =
-    deriveAuthView({ loading: authLoading, hasToken: tokenPresent, me, trialStarted, trialLoading }) ===
-    "trial";
+    deriveAuthView({
+      loading: authLoading,
+      hasToken: tokenPresent,
+      me,
+      trialStarted,
+      trialLoading,
+      paywallDismissed,
+    }) === "trial";
   const [trialFailedUrl, setTrialFailedUrl] = useState<string | null>(null);
   const onTrialUnlock = () => void performTrialUnlock(tokenPresent, setTrialFailedUrl);
 

@@ -75,13 +75,33 @@ function tokenlessTrial(promptsUsed: number) {
   useTrialStore.setState({ started: true, promptsUsed, loading: false });
 }
 
+// Signed-in-but-unpaid who dismissed the $99 wall to stay on the trial. Without the shared
+// paywallDismissed flag, TopBar's own deriveAuthView would read this as "unpaid" and hide the
+// counter — the edge case this test guards.
+function signedInUnpaidDismissed(promptsUsed: number) {
+  useAuthStore.setState({
+    me: { clerkUserId: "u1", entitled: false, balanceCents: 0, tokenVersion: 1 },
+    tokenPresent: true,
+    loading: false,
+    refresh: vi.fn(),
+    paywallDismissed: true,
+  });
+  useTrialStore.setState({ started: true, promptsUsed, loading: false });
+}
+
 beforeEach(() => {
   mockOpenSignIn.mockReset().mockResolvedValue(true);
   mockCheckout.mockReset().mockResolvedValue(true);
 });
 afterEach(() => {
   cleanup();
-  useAuthStore.setState({ me: null, tokenPresent: false, loading: true, refresh: vi.fn() });
+  useAuthStore.setState({
+    me: null,
+    tokenPresent: false,
+    loading: true,
+    refresh: vi.fn(),
+    paywallDismissed: false,
+  });
   useTrialStore.setState({ started: false, promptsUsed: 0, loading: true });
 });
 
@@ -93,6 +113,22 @@ describe("TopBar — in-bar trial indicator", () => {
     const recent = screen.getByRole("button", { name: /Recent/ });
     // In-row placement: the indicator sits to the LEFT of the action cluster (earlier in the DOM).
     expect(counter.compareDocumentPosition(recent) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("shows the counter for a signed-in-unpaid user who dismissed the paywall (the edge case)", () => {
+    signedInUnpaidDismissed(3);
+    render(<TopBar onOpenSettings={vi.fn()} />);
+    // Before the shared paywallDismissed flag, TopBar read this user as "unpaid" and hid this.
+    expect(screen.getByText(/97 prompts left/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Unlock/ })).toBeTruthy();
+  });
+
+  it("that dismissed-unpaid user's Unlock converts via one-click checkout, not sign-in", async () => {
+    signedInUnpaidDismissed(3);
+    render(<TopBar onOpenSettings={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /Unlock/ }));
+    await waitFor(() => expect(mockCheckout).toHaveBeenCalledTimes(1));
+    expect(mockOpenSignIn).not.toHaveBeenCalled(); // signed in → Stripe checkout, never sign-in
   });
 
   it("hides the indicator when not in trial mode", () => {

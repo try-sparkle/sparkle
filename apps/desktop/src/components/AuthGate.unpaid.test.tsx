@@ -62,8 +62,16 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
-  // Zustand stores are module singletons — reset so state can't leak across tests/files.
-  useAuthStore.setState({ me: null, tokenPresent: false, loading: true, refresh: vi.fn() });
+  // Zustand stores are module singletons — reset so state can't leak across tests/files. Crucially
+  // reset paywallDismissed: a test that clicks "stay on the free trial" latches it true, which would
+  // otherwise make a later signedInUnpaid render the trial view instead of the unpaid wall.
+  useAuthStore.setState({
+    me: null,
+    tokenPresent: false,
+    loading: true,
+    refresh: vi.fn(),
+    paywallDismissed: false,
+  });
   useTrialStore.setState({ started: false, promptsUsed: 0, loading: true });
 });
 

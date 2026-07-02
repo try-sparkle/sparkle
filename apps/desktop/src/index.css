@@ -44,7 +44,7 @@
    (not JS) so flipping <html data-theme> re-themes with no FOUC and no re-render. */
 :root {
   --c-forest: #0a1a3f;
-  --c-deep-forest: #0f2350;
+  --c-deep-forest: #273962;
   --c-cream: #eaf1ff;
   --c-muted: #8aa0c4;
   --c-chat-bubble: #1d3a7a;
@@ -55,7 +55,7 @@
 }
 :root[data-theme="light"] {
   --c-forest: #ffffff;
-  --c-deep-forest: #f1f4fa;
+  --c-deep-forest: #d9dce1;
   --c-cream: #0a1a3f;
   --c-muted: #5b6b8c;
   --c-chat-bubble: #d6e0f5;
