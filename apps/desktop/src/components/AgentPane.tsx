@@ -39,6 +39,8 @@ import { useScrollIntentStore, applyScrollIntent } from "../stores/scrollIntentS
 import { PinnedPrompt } from "./PinnedPrompt";
 import { Terminal, type TerminalApi } from "./Terminal";
 import { Composer, type ComposerApi } from "./Composer";
+import { DragVisionHintPill } from "./DragVisionHintPill";
+import { useDragVisionHint } from "../hooks/useDragVisionHint";
 import { Onboarding } from "./Onboarding";
 import { ThinkPanel } from "./ThinkPanel";
 import { paneVisibilityStyle } from "./paneVisibility";
@@ -129,6 +131,14 @@ export function AgentPane({
   const aiAutoRename = useAiFeature("autoRename");
   // Imperative bridge to the terminal (e.g. arrow hand-off from the composer).
   const terminalApiRef = useRef<TerminalApi | null>(null);
+  // The terminal pane box, so the drag-vision hint pill can anchor just above it.
+  const terminalStageRef = useRef<HTMLDivElement>(null);
+  // Drag-vision hint (spec 2026-07-02): when the composer is OFF (no overlay to catch drops), an
+  // image dragged onto the terminal shows a "enable AI Features for vision" pill. Only the visible,
+  // non-think pane listens — the webview drag event is window-global, so gating on `visible`
+  // keeps every background pane from popping its own pill for the same drag. With the composer ON,
+  // Composer.tsx owns the drop (attaches the image), so this listener stands down (!aiComposer).
+  const dragHint = useDragVisionHint(visible && !aiComposer && agent.kind !== "think");
 
   // Status routing: Claude Code's hook events are authoritative, but the screen scraper drives
   // until the first hook arrives (and for non-Claude programs that never emit one). The router
@@ -613,7 +623,7 @@ export function AgentPane({
         // composer mounts during "preparing" too — as the SAME element across the preparing→ready
         // transition — so a draft typed while the agent's workspace spins up is preserved (the
         // element is never remounted) and an eager send is queued + auto-delivered when ready.
-        <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
+        <div ref={terminalStageRef} style={{ position: "relative", flex: 1, minHeight: 0 }}>
           {phase === "ready" && spawn ? (
           <div
             style={{
@@ -725,6 +735,11 @@ export function AgentPane({
               onToggle={() => setAccountMenuOpen((v) => !v)}
               onPick={pickAccount}
             />
+          )}
+          {/* Drag-vision hint: only appears when the composer is off and an image was dragged onto
+              the terminal (see useDragVisionHint / dragHint). Portaled, anchored above this pane. */}
+          {dragHint.show && (
+            <DragVisionHintPill anchorRef={terminalStageRef} onDismiss={dragHint.dismiss} />
           )}
         </div>
       )}
