@@ -15,15 +15,13 @@ import { WelcomeScreen } from "./WelcomeScreen";
 import { TrialChrome } from "./TrialChrome";
 import { deriveAuthView, parseAuthCode, parseAuthState } from "../services/entitlement";
 import { safeUnlisten } from "../services/safeUnlisten";
+import { exchangeCode } from "../services/sparkleApi";
 import {
-  exchangeCode,
-  lastSignInUrl,
-  openPaywall,
-  openSignIn,
-  PAYWALL_URL,
-  SIGN_IN_URL,
-} from "../services/sparkleApi";
-import { openPaywallCheckout, lastCheckoutUrl } from "../services/creditsMenuApi";
+  checkoutOrWebPaywall,
+  webPaywallHandoff,
+  signInHandoff,
+  performTrialUnlock,
+} from "../services/trialUnlock";
 import { PromoRedeem } from "./PromoRedeem";
 
 // Extracted to its own file for reuse in the Credits settings pane; re-exported so existing
@@ -140,58 +138,22 @@ export function AuthGate({ children }: { children: ReactNode }) {
     };
   }, [refresh, refreshTrial]);
 
-  // When the system-browser hand-off can't launch (no default browser, opener-scope denial, …),
-  // openSignIn/openPaywall resolve false instead of throwing. Remember which URL failed so we can
-  // show it as a copy/paste fallback rather than leaving the user on a dead button.
+  // When the system-browser hand-off can't launch (no default browser, opener-scope denial, …), the
+  // shared primitives resolve false and report the copy/paste URL through this setter (rendered as a
+  // LaunchFallback below) rather than leaving the user on a dead button.
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
-  const handOff = async (open: () => Promise<boolean>, url: string) => {
-    setFailedUrl(null);
-    const ok = await open();
-    if (!ok) setFailedUrl(url);
-  };
 
-  // Sign-in gets its own handler because the URL is dynamic (it carries the per-attempt state +
-  // code_challenge, sparkle-kqg0). On a launch failure we surface the ACTUAL URL just built
-  // (lastSignInUrl) — the bare SIGN_IN_URL would be an unbound link the server can't tie to a
-  // sign-in — falling back to SIGN_IN_URL only if nothing was built yet.
-  const handleSignIn = async () => {
-    setFailedUrl(null);
-    const ok = await openSignIn();
-    if (!ok) setFailedUrl(lastSignInUrl() ?? SIGN_IN_URL);
-  };
-
-  // "Pay $99" one-click-to-Stripe. When signed in (a bearer token is present), create the
-  // checkout session directly and land on checkout.stripe.com in one click — the same proven path
-  // as in-app top-ups. Fall back to the web sign-in→paywall hand-off when signed out, or if the
-  // direct checkout throws (server refused, e.g. no bearer) so the pre-auth path never regresses.
-  const handlePay = async () => {
-    setFailedUrl(null);
-    if (tokenPresent) {
-      try {
-        if (await openPaywallCheckout()) return;
-        // The session WAS created but the system browser wouldn't open — offer the real hosted
-        // Stripe URL to copy/paste rather than bouncing back to the generic web paywall page.
-        const url = lastCheckoutUrl();
-        if (url) {
-          setFailedUrl(url);
-          return;
-        }
-      } catch (e) {
-        console.warn("Direct paywall checkout failed; falling back to the web paywall flow:", e);
-      }
-    }
-    await handOff(openPaywall, PAYWALL_URL);
-  };
-
-  // Unlock action for the trial view (also used by the exhausted full-screen upsell). A signed-in
-  // (but unpaid) user converts via the one-click Stripe path, NOT bounced back through web sign-in;
-  // token-less trial users still need the sign-in hand-off first. AuthGate delegates to its local
-  // handlePay/handleSignIn (kept current with the paywall flow); the in-bar TopBar TrialIndicator
-  // routes through the shared performTrialUnlock, which mirrors the same checkout-else-sign-in rule.
-  const handleTrialUnlock = () => {
-    if (tokenPresent) void handlePay();
-    else void handleSignIn();
-  };
+  // All three "convert" entry points delegate to the shared primitives in trialUnlock.ts — the SAME
+  // ones the in-bar TopBar TrialIndicator uses — so the checkout / sign-in behavior (incl. the
+  // fallback URLs) lives in ONE place and the two surfaces can't drift.
+  //   • Welcome sign-in.
+  const handleSignIn = () => void signInHandoff(setFailedUrl);
+  //   • "Pay $99": signed-in → one-click Stripe (falling back to the web paywall); signed-out → the
+  //     web paywall directly, since there's no bearer to create a checkout session.
+  const handlePay = () =>
+    void (tokenPresent ? checkoutOrWebPaywall(setFailedUrl) : webPaywallHandoff(setFailedUrl));
+  //   • Trial "Unlock" (exhausted upsell + in-bar): signed-in → checkout, signed-out → sign-in.
+  const handleTrialUnlock = () => void performTrialUnlock(tokenPresent, setFailedUrl);
 
   // Trial prompts still available to fall back to (device-local meter, independent of payment).
   const trialRemaining = Math.max(0, TRIAL_LIMIT - promptsUsed);

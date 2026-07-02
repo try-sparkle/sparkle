@@ -263,7 +263,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
         alignItems: "center",
         gap: 10,
         padding: "10px 14px",
-        background: C.deepForest,
+        background: C.barSurface,
         borderBottom: `1px solid ${C.forest}`,
         minHeight: 30,
         position: "relative",

@@ -1035,7 +1035,7 @@ export function Composer({
         // Minimized → no chrome: the strip is transparent so only the little gradient pull tab
         // floats over the exposed terminal. Open → the solid message-box surface with its top rule.
         background: minimized ? "transparent" : C.forest,
-        borderTop: minimized ? "none" : `1px solid ${C.deepForest}`,
+        borderTop: minimized ? "none" : `1px solid ${C.barSurface}`,
       }}
     >
       {/* Persistent grab handle: open → thin pill (drag up taller, down to minimize); minimized
@@ -1120,7 +1120,7 @@ export function Composer({
                 overflow: "hidden",
                 pointerEvents: "none",
                 boxSizing: "border-box",
-                background: C.deepForest,
+                background: C.barSurface,
                 // Transparent border of the same width keeps the content box aligned with the
                 // textarea's (whose visible border is painted on top).
                 border: dropActive ? "1.5px solid transparent" : "1px solid transparent",

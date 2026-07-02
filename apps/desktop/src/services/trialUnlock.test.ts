@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../services/sparkleApi", () => ({
   openPaywall: vi.fn(() => Promise.resolve(true)),
   openSignIn: vi.fn(() => Promise.resolve(true)),
+  lastSignInUrl: vi.fn(() => null),
   PAYWALL_URL: "paywall-url",
   SIGN_IN_URL: "sign-in-url",
 }));
@@ -17,19 +18,21 @@ vi.mock("../services/creditsMenuApi", () => ({
 }));
 
 import { performTrialUnlock } from "./trialUnlock";
-import { openPaywall, openSignIn } from "../services/sparkleApi";
+import { openPaywall, openSignIn, lastSignInUrl } from "../services/sparkleApi";
 import { openPaywallCheckout, lastCheckoutUrl } from "../services/creditsMenuApi";
 
 const mockCheckout = vi.mocked(openPaywallCheckout);
 const mockOpenPaywall = vi.mocked(openPaywall);
 const mockOpenSignIn = vi.mocked(openSignIn);
 const mockLastCheckoutUrl = vi.mocked(lastCheckoutUrl);
+const mockLastSignInUrl = vi.mocked(lastSignInUrl);
 
 beforeEach(() => {
   mockCheckout.mockReset();
   mockOpenPaywall.mockReset().mockResolvedValue(true);
   mockOpenSignIn.mockReset().mockResolvedValue(true);
   mockLastCheckoutUrl.mockReset().mockReturnValue(null);
+  mockLastSignInUrl.mockReset().mockReturnValue(null);
 });
 afterEach(() => vi.clearAllMocks());
 
@@ -68,8 +71,21 @@ describe("performTrialUnlock", () => {
     expect(mockCheckout).not.toHaveBeenCalled();
   });
 
-  it("signed out: reports the sign-in URL as a copy/paste fallback when the browser can't open", async () => {
+  it("signed out: reports the ACTUAL bound sign-in URL (lastSignInUrl) as the fallback, not the bare one", async () => {
+    // The bug this unification fixes: the bare SIGN_IN_URL is an unbound link the server can't tie
+    // to a sign-in. When one was built, surface THAT (matching AuthGate's handleSignIn).
     mockOpenSignIn.mockResolvedValue(false);
+    mockLastSignInUrl.mockReturnValue("https://sparkle.ai/desktop/callback?state=abc&code_challenge=xyz");
+    const onFailedUrl = vi.fn();
+    await performTrialUnlock(false, onFailedUrl);
+    expect(onFailedUrl).toHaveBeenLastCalledWith(
+      "https://sparkle.ai/desktop/callback?state=abc&code_challenge=xyz",
+    );
+  });
+
+  it("signed out: falls back to the bare SIGN_IN_URL only when nothing was built yet", async () => {
+    mockOpenSignIn.mockResolvedValue(false);
+    mockLastSignInUrl.mockReturnValue(null);
     const onFailedUrl = vi.fn();
     await performTrialUnlock(false, onFailedUrl);
     expect(onFailedUrl).toHaveBeenLastCalledWith("sign-in-url");
