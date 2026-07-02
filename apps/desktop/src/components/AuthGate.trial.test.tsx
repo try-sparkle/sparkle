@@ -1,4 +1,9 @@
 // @vitest-environment jsdom
+//
+// AuthGate's trial branch. NOTE: after Improvement A the small "N prompts left" counter + Unlock
+// live INSIDE the TopBar (TrialIndicator), NOT as an overlay AuthGate renders — so those are
+// covered by TrialIndicator.test.tsx / TopBar.trial.test.tsx, not here. AuthGate still owns the
+// token-less welcome screen and the full-screen EXHAUSTED upsell, which is what this file asserts.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
@@ -12,6 +17,10 @@ vi.mock("../services/sparkleApi", () => ({
   PAYWALL_URL: "x",
   redeemPromo: vi.fn(),
   SIGN_IN_URL: "y",
+}));
+vi.mock("../services/creditsMenuApi", () => ({
+  openPaywallCheckout: vi.fn(),
+  lastCheckoutUrl: vi.fn(() => null),
 }));
 
 import { AuthGate } from "./AuthGate";
@@ -42,48 +51,17 @@ describe("AuthGate — trial flow", () => {
     expect(screen.getByRole("button", { name: /Try it now/ })).toBeTruthy();
     expect(screen.queryByText("WORKSPACE")).toBeNull();
   });
-  it("renders the workspace + trial counter once the trial has started", () => {
+  it("renders the workspace (in free mode) once the trial has started", () => {
     useTrialStore.setState({ started: true, promptsUsed: 3 });
     render(
       <AuthGate>
         <div>WORKSPACE</div>
       </AuthGate>,
     );
+    // The Workspace mounts in free mode. The counter itself now lives in the TopBar (TrialIndicator),
+    // which isn't part of this fake child — so AuthGate must NOT render its own covering pill here.
     expect(screen.getByText("WORKSPACE")).toBeTruthy();
-    expect(screen.getByText(/97 prompts left/)).toBeTruthy();
-  });
-  it("pluralizes the counter for a single remaining prompt", () => {
-    useTrialStore.setState({ started: true, promptsUsed: 99 });
-    render(
-      <AuthGate>
-        <div>WORKSPACE</div>
-      </AuthGate>,
-    );
-    expect(screen.getByText(/1 prompt left/)).toBeTruthy();
-    expect(screen.queryByText(/1 prompts left/)).toBeNull();
-  });
-  it("surfaces the manual-link fallback by the pill when the Unlock hand-off can't open the browser", async () => {
-    (openSignIn as unknown as { mockResolvedValueOnce: (v: boolean) => void }).mockResolvedValueOnce(false);
-    useTrialStore.setState({ started: true, promptsUsed: 3 });
-    render(
-      <AuthGate>
-        <div>WORKSPACE</div>
-      </AuthGate>,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /Unlock/ }));
-    // handOff awaits openSignIn (false) → failedUrl set → the pill renders the manual link.
-    expect(await screen.findByText(/Couldn.t open your browser/)).toBeTruthy();
-    expect(screen.getByText("y")).toBeTruthy(); // SIGN_IN_URL mock value
-  });
-  it("Unlock starts the sign-in hand-off", () => {
-    useTrialStore.setState({ started: true, promptsUsed: 3 });
-    render(
-      <AuthGate>
-        <div>WORKSPACE</div>
-      </AuthGate>,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /Unlock/ }));
-    expect(openSignIn).toHaveBeenCalled();
+    expect(screen.queryByText(/prompts left/)).toBeNull();
   });
   it("at the limit: keeps the Workspace mounted, shows the upsell, drops 'Try it now'", () => {
     useTrialStore.setState({ started: true, promptsUsed: 100 });
@@ -97,6 +75,7 @@ describe("AuthGate — trial flow", () => {
     expect(screen.getByText("WORKSPACE")).toBeTruthy();
     // The only action is to convert — no dead "Try it now" beside the exhausted banner.
     expect(screen.queryByRole("button", { name: /Try it now/ })).toBeNull();
+    // Token-less → the upsell's convert button routes to the sign-in hand-off (same as main).
     fireEvent.click(screen.getByRole("button", { name: /Log in \/ Sign up/ }));
     expect(openSignIn).toHaveBeenCalled();
   });

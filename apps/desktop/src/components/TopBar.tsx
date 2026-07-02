@@ -24,6 +24,11 @@ import {
   useCurrentWindowLabel,
 } from "../windowContext";
 import { StatusDot } from "./StatusDot";
+import { useAuthStore } from "../stores/authStore";
+import { useTrialStore } from "../stores/trialStore";
+import { deriveAuthView } from "../services/entitlement";
+import { performTrialUnlock } from "../services/trialUnlock";
+import { TrialIndicator } from "./TrialChrome";
 
 /** Most common status across a project's agents — drives the project's color (spec). */
 function majorityStatus(
@@ -112,6 +117,22 @@ const btn: CSSProperties = {
  * actions on the same row.
  */
 export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => void }) {
+  // Trial counter + Unlock, shown in-row (left of the action cluster) only while in trial mode.
+  // We derive the view here rather than threading a prop down from AuthGate through Workspace, and
+  // route Unlock through the SAME shared paywall handler AuthGate's upsell uses (performTrialUnlock),
+  // so a signed-in user converts via one-click Stripe — never bare sign-in. Only the placement of
+  // the counter moved out of the covering pill; the unlock behavior is unchanged.
+  const authLoading = useAuthStore((s) => s.loading);
+  const tokenPresent = useAuthStore((s) => s.tokenPresent);
+  const me = useAuthStore((s) => s.me);
+  const trialStarted = useTrialStore((s) => s.started);
+  const trialLoading = useTrialStore((s) => s.loading);
+  const inTrial =
+    deriveAuthView({ loading: authLoading, hasToken: tokenPresent, me, trialStarted, trialLoading }) ===
+    "trial";
+  const [trialFailedUrl, setTrialFailedUrl] = useState<string | null>(null);
+  const onTrialUnlock = () => void performTrialUnlock(tokenPresent, setTrialFailedUrl);
+
   const projects = useProjectStore((s) => s.projects);
   const addProject = useProjectStore((s) => s.addProject);
   const touchProjectOpened = useProjectStore((s) => s.touchProjectOpened);
@@ -276,6 +297,10 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
 
       {/* Push the actions to the right. */}
       <div style={{ flex: 1 }} />
+
+      {/* Trial counter + Unlock — in-row, to the LEFT of the Recent/Open/New/⋯ + auth-status
+          cluster, so it can never cover them. Only in trial mode; hides once the trial is spent. */}
+      {inTrial && <TrialIndicator onUnlock={onTrialUnlock} signInFailedUrl={trialFailedUrl} />}
 
       <div style={{ position: "relative" }}>
         <button

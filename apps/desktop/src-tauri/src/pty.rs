@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -180,15 +180,19 @@ fn guard_resize_size(id: &str, cols: u16, rows: u16) -> (u16, u16) {
     (c, r)
 }
 
+/// The `Send` pieces `pty_spawn`'s blocking setup hands back to the async side: the session to
+/// insert into the manager, plus the child's output reader and the child itself (each reaped on
+/// its own thread).
+type SpawnedPty = (PtySession, Box<dyn Read + Send>, Box<dyn Child + Send + Sync>);
+
 /// Spawn `command` in a PTY. Output streams to the frontend via the `pty:output`
 /// event; `pty:exit` fires when the process ends.
 // too_many_arguments: each arg is a distinct field of the frontend's invoke payload; bundling
 // them into a struct would only move the count into a struct literal at the one call site.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
-pub fn pty_spawn(
+pub async fn pty_spawn(
     app: AppHandle,
-    manager: State<PtyManager>,
     id: String,
     command: String,
     args: Vec<String>,
@@ -196,7 +200,6 @@ pub fn pty_spawn(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let validated_cwd = validate_spawn(&app, &command, cwd.as_deref())?;
     // Log the command and arg COUNT at info. The full args carry the built `zsh -c '…'` script,
     // which embeds the user's prompt/persona (and could in principle carry a secret passed as a
     // flag), so they're NEVER written to the shared daily log by default — even though our default
@@ -209,54 +212,74 @@ pub fn pty_spawn(
     // Backstop against the thin-column bug (see guard_spawn_size): never open a PTY at an
     // implausibly small size, whatever the frontend sent.
     let (cols, rows) = guard_spawn_size(&id, cols, rows);
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-        .map_err(|e| e.to_string())?;
 
-    let mut cmd = CommandBuilder::new(&command);
-    cmd.args(&args);
-    // A GUI-launched .app inherits no shell environment, so without these the child
-    // (claude's TUI) sees a "dumb" terminal and disables ALL ANSI color — every line
-    // renders in the default foreground (near-white). Declare a real color terminal so
-    // TUIs emit their normal palette. (env() overrides on top of the inherited env.)
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    // Spawn into the *validated, canonicalized* cwd (not the original string), so a symlink swap
-    // between check and use can't redirect the working dir outside the worktrees tree.
-    if let Some(dir) = validated_cwd {
-        cmd.cwd(dir);
-    }
+    // Run the blocking work — cwd canonicalize (validate_spawn), openpty, and spawn_command — OFF
+    // the main thread (mirrors `create_agent_worktree`). `pty_spawn` fires on nearly every
+    // agent/terminal open, so doing this synchronously on the UI thread spins the beachball. We
+    // return the session pieces (+ reader/child) and finish the cheap wiring (map insert, thread
+    // spawns) back on the async side.
+    let spawn_app = app.clone();
+    let (session, reader, child) = tauri::async_runtime::spawn_blocking(
+        move || -> Result<SpawnedPty, String> {
+            let validated_cwd = validate_spawn(&spawn_app, &command, cwd.as_deref())?;
+            let pty_system = native_pty_system();
+            let pair = pty_system
+                .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+                .map_err(|e| e.to_string())?;
 
-    let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
-    let killer = child.clone_killer();
-    // Drop the slave so the master sees EOF when the child exits.
-    drop(pair.slave);
+            let mut cmd = CommandBuilder::new(&command);
+            cmd.args(&args);
+            // A GUI-launched .app inherits no shell environment, so without these the child
+            // (claude's TUI) sees a "dumb" terminal and disables ALL ANSI color — every line
+            // renders in the default foreground (near-white). Declare a real color terminal so
+            // TUIs emit their normal palette. (env() overrides on top of the inherited env.)
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+            // Spawn into the *validated, canonicalized* cwd (not the original string), so a symlink
+            // swap between check and use can't redirect the working dir outside the worktrees tree.
+            if let Some(dir) = validated_cwd {
+                cmd.cwd(dir);
+            }
 
-    // The child is already running. If wiring up its reader/writer fails here, nothing downstream
-    // will reap it (no session is inserted, no reaper thread is spawned), so it would orphan/zombie.
-    // Kill + wait it on these error paths before bubbling the error up.
-    let mut reader = match pair.master.try_clone_reader() {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e.to_string());
-        }
-    };
-    let writer = match pair.master.take_writer() {
-        Ok(w) => w,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e.to_string());
-        }
-    };
+            let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+            let killer = child.clone_killer();
+            // Drop the slave so the master sees EOF when the child exits.
+            drop(pair.slave);
 
-    manager.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(
-        id.clone(),
-        PtySession { writer, master: pair.master, killer },
-    );
+            // The child is already running. If wiring up its reader/writer fails here, nothing
+            // downstream will reap it (no session is inserted, no reaper thread is spawned), so it
+            // would orphan/zombie. Kill + wait it on these error paths before bubbling the error up.
+            let reader = match pair.master.try_clone_reader() {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e.to_string());
+                }
+            };
+            let writer = match pair.master.take_writer() {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e.to_string());
+                }
+            };
+
+            Ok((PtySession { writer, master: pair.master, killer }, reader, child))
+        },
+    )
+    .await
+    .map_err(|e| format!("pty_spawn task failed: {e}"))??;
+
+    let mut reader = reader;
+    let mut child = child;
+
+    app.state::<PtyManager>()
+        .sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), session);
 
     // Reap the child so it doesn't zombie.
     std::thread::spawn(move || {

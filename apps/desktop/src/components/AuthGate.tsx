@@ -182,13 +182,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
     await handOff(openPaywall, PAYWALL_URL);
   };
 
-  // Unlock action for the trial view. A signed-in (but unpaid) user who dismissed the paywall to
-  // stay on the trial should convert via the same one-click Stripe path, NOT be bounced back
-  // through web sign-in; token-less trial users still need the sign-in hand-off first.
+  // Unlock action for the trial view (also used by the exhausted full-screen upsell). A signed-in
+  // (but unpaid) user converts via the one-click Stripe path, NOT bounced back through web sign-in;
+  // token-less trial users still need the sign-in hand-off first. AuthGate delegates to its local
+  // handlePay/handleSignIn (kept current with the paywall flow); the in-bar TopBar TrialIndicator
+  // routes through the shared performTrialUnlock, which mirrors the same checkout-else-sign-in rule.
   const handleTrialUnlock = () => {
     if (tokenPresent) void handlePay();
     else void handleSignIn();
   };
+
 
   // Trial prompts still available to fall back to (device-local meter, independent of payment).
   const trialRemaining = Math.max(0, TRIAL_LIMIT - promptsUsed);
@@ -205,8 +208,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (view === "entitled") return <>{children}</>;
 
   if (view === "trial") {
-    // The Workspace runs in free mode; TrialChrome overlays the counter + Unlock, and the
-    // full-screen upsell once the 100 prompts are spent (Workspace stays mounted underneath).
+    // The Workspace runs in free mode. The small "N prompts left" counter + Unlock now live INSIDE
+    // the TopBar (TrialIndicator), so they can't cover the action buttons. TrialChrome here is only
+    // the full-screen upsell shown once the 100 prompts are spent (a no-op until then; the Workspace
+    // stays mounted underneath so running workers survive until the user converts).
     return (
       <>
         {children}

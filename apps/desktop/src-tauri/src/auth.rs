@@ -312,9 +312,11 @@ mod device_id_tests {
     }
 }
 
-/// Entitlement + balance for the signed-in user.
+/// Entitlement + balance for the signed-in user. `async` (like `desktop_topup_checkout`) so Tauri
+/// runs the blocking `ureq` call off the main thread — this fires on app load, where a stalled
+/// network (up to `HTTP_TIMEOUT` = 15s) would otherwise freeze the UI.
 #[tauri::command]
-pub fn desktop_me() -> Result<Me, String> {
+pub async fn desktop_me() -> Result<Me, String> {
     let token = read_token().ok_or_else(|| "not signed in".to_string())?;
     let url = format!("{}/me", base_url());
     let resp = ureq::get(&url)
@@ -328,8 +330,11 @@ pub fn desktop_me() -> Result<Me, String> {
 
 /// Server-authoritative debit. Returns the orchestration JSON verbatim:
 /// `{ ok: true, balanceAfterCents, ledgerId }` on success, or `{ ok: false, balanceCents }` on 402.
+/// `async` (like `desktop_topup_checkout`) so Tauri runs the blocking `ureq` call off the main
+/// thread — this fires on every credit spend, where a stalled network (up to `HTTP_TIMEOUT` = 15s)
+/// would otherwise freeze the UI.
 #[tauri::command]
-pub fn desktop_consume(
+pub async fn desktop_consume(
     cents: i64,
     reason: String,
     meta: Value,

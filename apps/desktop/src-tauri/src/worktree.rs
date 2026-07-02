@@ -470,8 +470,10 @@ pub fn agent_branch_status_at(
 }
 
 /// Live ahead/behind + dirty + size of an agent branch vs its (no-fetch) effective base.
+/// `async` + `spawn_blocking` (mirroring `create_agent_worktree`) so the several synchronous `git`
+/// subprocesses this runs per sidebar/status poll never stall the UI thread.
 #[tauri::command]
-pub fn agent_branch_status(
+pub async fn agent_branch_status(
     app: AppHandle,
     root: String,
     project_id: String,
@@ -479,7 +481,11 @@ pub fn agent_branch_status(
     base_branch: String,
 ) -> Result<BranchStatus, String> {
     let app_data = app_data_dir(&app)?;
-    agent_branch_status_at(&root, &project_id, &agent_id, &base_branch, &app_data)
+    tauri::async_runtime::spawn_blocking(move || {
+        agent_branch_status_at(&root, &project_id, &agent_id, &base_branch, &app_data)
+    })
+    .await
+    .map_err(|e| format!("agent_branch_status task failed: {e}"))?
 }
 
 /// Where an agent's work sits in the land-to-green workflow, beyond what ahead/behind can show.
@@ -896,14 +902,20 @@ pub fn agent_workflow_state_at(
 /// Live workflow stage signals for an agent: local-ref reachability + a best-effort GitHub PR
 /// probe. See `WorkflowState`. The PR probe is gated by `probe_pr_state` (skip it on fast polls or
 /// remoteless projects).
+/// `async` + `spawn_blocking` (mirroring `create_agent_worktree`) so the several `git` subprocesses
+/// plus the (network) `gh` PR probe this runs per poll never stall the UI thread.
 #[tauri::command]
-pub fn agent_workflow_state(
+pub async fn agent_workflow_state(
     root: String,
     agent_id: String,
     parent_branch: String,
     probe_pr_state: bool,
 ) -> Result<WorkflowState, String> {
-    agent_workflow_state_at(&root, &agent_id, &parent_branch, probe_pr_state)
+    tauri::async_runtime::spawn_blocking(move || {
+        agent_workflow_state_at(&root, &agent_id, &parent_branch, probe_pr_state)
+    })
+    .await
+    .map_err(|e| format!("agent_workflow_state task failed: {e}"))?
 }
 
 // ── Batched per-project status (sparkle-zlic) ────────────────────────────────────────────────────

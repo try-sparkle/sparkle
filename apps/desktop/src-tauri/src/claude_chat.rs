@@ -213,10 +213,15 @@ pub(crate) fn handle_event(
 ///
 /// `claude_path` is resolved on the FRONTEND via preflight (`checkClaude`) and passed in, so
 /// path resolution stays in one place (preflight.rs). `cwd` is the project root.
+/// `async` + `spawn_blocking` (mirroring `create_agent_worktree` in worktree.rs) so the blocking
+/// work — cwd canonicalize, the `zsh -l -c 'exec claude …'` spawn, and (critically) the kill+wait
+/// of any superseded in-flight child on a same-id re-send — runs OFF the Tauri main thread. Waiting
+/// for the old `claude` to die used to freeze the UI on every rapid resend. The manager is reached
+/// via `app.state()` inside the closure (the same pattern the reader thread's reap already uses)
+/// rather than a `State` param, so no non-`Send` borrow crosses the `.await`.
 #[tauri::command]
-pub fn claude_chat_send(
+pub async fn claude_chat_send(
     app: AppHandle,
-    manager: State<ClaudeChatManager>,
     id: String,
     prompt: String,
     cwd: String,
@@ -225,57 +230,75 @@ pub fn claude_chat_send(
 ) -> Result<(), String> {
     // Defense-in-depth (NOT the primary boundary — that's the WebView CSP, see module docs):
     // require an absolute claude path (no $PATH-relative resolution) and a real cwd directory.
+    // (Cheap, no I/O — keep it on the async side so a bad payload fails fast.)
     if claude_path.is_empty() || !std::path::Path::new(&claude_path).is_absolute() {
         return Err("claude_chat_send: claude_path must be a non-empty absolute path".into());
     }
     if cwd.is_empty() {
         return Err("claude_chat_send: cwd must be provided".into());
     }
-    // Canonicalize so we spawn into the resolved real path (closing a check-vs-use window) and
-    // so a bogus cwd fails fast here rather than as an opaque spawn error.
-    let real_cwd =
-        std::fs::canonicalize(&cwd).map_err(|e| format!("claude_chat_send: invalid cwd: {e}"))?;
 
-    let script = build_claude_exec(&claude_path, &prompt, resume_session_id.as_deref());
-    // Log id/path/cwd but never the built script: it embeds the user's prompt (and could carry
-    // a secret), matching pty.rs's "args may contain prompt text" caution.
-    tracing::info!(
-        %id, %claude_path, cwd = %real_cwd.display(),
-        resume = resume_session_id.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
-        "claude_chat_send"
-    );
+    // Spawn the child (and reap any superseded one) off the main thread; hand stdout/stderr + the
+    // turn token back so the reader/stderr threads can be wired up on the async side below.
+    let blk_app = app.clone();
+    let blk_id = id.clone();
+    let (stdout, stderr, token) = tauri::async_runtime::spawn_blocking(
+        move || -> Result<(std::process::ChildStdout, std::process::ChildStderr, u64), String> {
+            // Canonicalize so we spawn into the resolved real path (closing a check-vs-use window)
+            // and so a bogus cwd fails fast here rather than as an opaque spawn error.
+            let real_cwd = std::fs::canonicalize(&cwd)
+                .map_err(|e| format!("claude_chat_send: invalid cwd: {e}"))?;
 
-    let mut cmd = Command::new(SHELL);
-    cmd.args(["-l", "-c", &script]);
-    cmd.current_dir(&real_cwd);
-    // No stdin: `-p` is one-shot, and a null stdin guarantees nothing can block on input.
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+            let script = build_claude_exec(&claude_path, &prompt, resume_session_id.as_deref());
+            // Log id/path/cwd but never the built script: it embeds the user's prompt (and could
+            // carry a secret), matching pty.rs's "args may contain prompt text" caution.
+            tracing::info!(
+                id = %blk_id, %claude_path, cwd = %real_cwd.display(),
+                resume = resume_session_id.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+                "claude_chat_send"
+            );
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("claude_chat_send: spawn failed: {e}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "claude_chat_send: child has no stdout".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "claude_chat_send: child has no stderr".to_string())?;
+            let mut cmd = Command::new(SHELL);
+            cmd.args(["-l", "-c", &script]);
+            cmd.current_dir(&real_cwd);
+            // No stdin: `-p` is one-shot, and a null stdin guarantees nothing can block on input.
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
 
-    // Register this turn under a fresh token. If an entry already exists for this id, a prior
-    // turn is still in flight (same-id reuse / rapid re-send): this send SUPERSEDES it — we
-    // take the old child out (atomically, under the lock) and kill+reap it below. Its reader
-    // will EOF, find a different token in the map, and stay silent (see the reader's reap).
-    let token = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
-    let superseded = lock_sessions(&manager.sessions).insert(id.clone(), ChatSession { child, token });
-    if let Some(mut old) = superseded {
-        tracing::info!(%id, "claude_chat_send superseded an in-flight turn; killing the old child");
-        let _ = old.child.kill();
-        let _ = old.child.wait();
-    }
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| format!("claude_chat_send: spawn failed: {e}"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "claude_chat_send: child has no stdout".to_string())?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| "claude_chat_send: child has no stderr".to_string())?;
+
+            // Register this turn under a fresh token. If an entry already exists for this id, a
+            // prior turn is still in flight (same-id reuse / rapid re-send): this send SUPERSEDES
+            // it — we take the old child out (atomically, under the lock) and kill+reap it below.
+            // Its reader will EOF, find a different token in the map, and stay silent (see the
+            // reader's reap).
+            let token = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
+            let superseded = {
+                let manager = blk_app.state::<ClaudeChatManager>();
+                let mut sessions = lock_sessions(&manager.sessions);
+                sessions.insert(blk_id.clone(), ChatSession { child, token })
+            };
+            if let Some(mut old) = superseded {
+                tracing::info!(id = %blk_id, "claude_chat_send superseded an in-flight turn; killing the old child");
+                let _ = old.child.kill();
+                let _ = old.child.wait();
+            }
+            Ok((stdout, stderr, token))
+        },
+    )
+    .await
+    .map_err(|e| format!("claude_chat_send task failed: {e}"))??;
 
     // Drain stderr on its own thread so a full stderr pipe can't deadlock the child, and join
     // it before reading so an error message is complete. Only used on the failure path.

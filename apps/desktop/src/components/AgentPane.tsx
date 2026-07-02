@@ -10,6 +10,7 @@ import {
 } from "../services/worktree";
 import { resolveDefaultBranch } from "../services/branchStatus";
 import { useAiFeature } from "../services/aiGate";
+import { recordTrialSend } from "../services/trialMeter";
 import { checkClaude, claudeSessionInfo } from "../preflight";
 import { buildClaudeExec, SHELL } from "../services/claudeSpawn";
 import { shouldResetReusedSlotIdentity } from "../services/slotIdentity";
@@ -662,6 +663,12 @@ export function AgentPane({
                 }
               }}
               onRequestFocus={() => composerInputRef.current?.focus()}
+              // Meter free-trial prompts for trial users, who type straight into this raw terminal
+              // (the credit-gated Composer never mounts for them). Terminal's onSubmitLine fires once
+              // per non-empty submitted line (terminalSubmit.ts), so one prompt = one decrement. Only
+              // wired on the NO-composer path (matching the composer's own metering on the AI path);
+              // recordTrialSend also self-gates, no-opping for entitled users.
+              onSubmitLine={aiComposer ? undefined : () => void recordTrialSend()}
               focusRef={termFocusRef}
               apiRef={terminalApiRef}
             />

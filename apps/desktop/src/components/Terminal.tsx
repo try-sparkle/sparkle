@@ -20,6 +20,7 @@ import { isCopySelectionKey } from "./copySelectionKey";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
 import { resolveTerminalOverlay } from "./terminalOverlay";
+import { makeLineScanState, scanSubmittedLines } from "./terminalSubmit";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { isMeasuredSize, spawnSize, convergeStep, CONVERGE_MAX_FRAMES } from "./terminalSize";
 import { SelectionPopup } from "./SelectionPopup";
@@ -90,6 +91,7 @@ export function Terminal({
   onExit,
   onRateLimit,
   onRequestFocus,
+  onSubmitLine,
   focusRef,
   apiRef,
   resuming = false,
@@ -118,6 +120,10 @@ export function Terminal({
   onRateLimit?: (untilEpoch: number) => void;
   // Called when the active tab is shown, to put initial focus in the composer.
   onRequestFocus?: () => void;
+  // Called when the user submits a line to the agent by pressing Enter directly in the terminal
+  // (a carriage return in USER input) — one call per submitted line. The parent uses this to meter
+  // free-trial prompts for trial users who type into the raw terminal (no composer). Best-effort.
+  onSubmitLine?: () => void;
   // The parent sets this to an imperative focus() so it can move focus into the terminal
   // (e.g. on ⌘J / when the composer minimizes) without the user clicking it.
   focusRef?: RefObject<(() => void) | null>;
@@ -145,6 +151,9 @@ export function Terminal({
   // Latest onRateLimit, read by the (agentId-keyed) output effect without re-subscribing.
   const onRateLimitRef = useRef(onRateLimit);
   onRateLimitRef.current = onRateLimit;
+  // Latest onSubmitLine, read by the (agentId-keyed) onData handler without re-subscribing.
+  const onSubmitLineRef = useRef(onSubmitLine);
+  onSubmitLineRef.current = onSubmitLine;
   const zoom = useUiStore((s) => s.zoom);
   const resolvedTheme = useResolvedTheme();
   // Brief "Copied to clipboard" flash shown after a mouse selection is copied.
@@ -203,6 +212,62 @@ export function Terminal({
     }
   }, []);
 
+  // Attach the xterm WebGL renderer to the live terminal. Called ONLY when this pane is
+  // visible/active (see the visibility effect below). WKWebView caps the number of concurrent
+  // WebGL contexts (~8–16), and the app keeps one xterm per open agent — including hidden panes,
+  // which stay laid out (visibility:hidden, not display:none) and so used to keep a live context
+  // each. Past the cap the engine force-loses and restores contexts in a thrash loop that blocks
+  // the main thread (the "spinning beachball" that got worse the more agents were open). Holding a
+  // context only for the visible pane keeps us far under the cap. The xterm core, its scrollback,
+  // and the PTY are untouched — only the renderer addon is added. Idempotent; safe once disposed.
+  const attachWebgl = useCallback(() => {
+    if (disposedRef.current) return;
+    const term = termRef.current;
+    if (!term || webglRef.current) return; // no terminal yet, or already attached
+    // WebGL renderer enables customGlyphs (the default DOM renderer does not), giving crisp,
+    // exactly-aligned box-drawing. Fall back silently to the DOM renderer if WebGL is unavailable.
+    try {
+      const webgl = new WebglAddon();
+      // On a lost GPU context the default renderer must take over and the screen must be repainted,
+      // else it stays blank/stale until the next PTY write. recoverFromWebglContextLoss disposes the
+      // addon, nulls the ref (so the re-theme effect doesn't touch a disposed addon), and refreshes.
+      webgl.onContextLoss(() => {
+        recoverFromWebglContextLoss(webgl, termRef.current, () => {
+          webglRef.current = null;
+        });
+      });
+      term.loadAddon(webgl);
+      webglRef.current = webgl;
+      // NOTE: we deliberately do NOT force a repaint here. attachWebgl is only ever called when this
+      // pane is (becoming) active, and the become-active reveal effect below OWNS the repaint — it
+      // waits for the box to lay out, then forceFullRepaints (clearing the fresh atlas so cells
+      // buffered on the DOM renderer while hidden rasterize into the new WebGL model). Keeping a
+      // single repaint path preserves the tested reveal-repaint contract (Terminal.revealRepaint).
+    } catch {
+      /* no WebGL — keep the default DOM renderer (TUI borders may be less crisp) */
+    }
+  }, []);
+
+  // Detach + dispose the WebGL renderer, releasing its GPU context. xterm falls back to its DOM
+  // renderer when no WebGL addon is loaded (the same fallback recoverFromWebglContextLoss relies
+  // on), so the terminal keeps rendering; the content buffer, scrollback, and PTY all live on the
+  // xterm core and are untouched. Called when this pane becomes hidden. Idempotent.
+  const detachWebgl = useCallback(() => {
+    const webgl = webglRef.current;
+    if (!webgl) return;
+    // Null the ref BEFORE dispose so any repaint/re-theme effect that reads webglRef can't touch a
+    // half-disposed addon if it races in during teardown.
+    webglRef.current = null;
+    try {
+      webgl.dispose();
+    } catch {
+      /* already torn down — nothing to release */
+    }
+    // Repaint via the now-active DOM renderer so the screen doesn't go stale after the swap
+    // (mirrors recoverFromWebglContextLoss). No-op once disposed.
+    safeRefresh();
+  }, [safeRefresh]);
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -246,24 +311,11 @@ export function Terminal({
       }),
     );
     term.open(container);
-    // WebGL renderer enables customGlyphs (the default DOM renderer does not), giving
-    // crisp, exactly-aligned box-drawing. Fall back silently if WebGL is unavailable.
-    try {
-      const webgl = new WebglAddon();
-      // On a lost GPU context the default renderer must take over and the screen must be
-      // repainted, else it stays blank/stale until the next PTY write. recoverFromWebglContextLoss
-      // disposes the addon, nulls the ref (so the re-theme effect doesn't touch a disposed addon),
-      // and forces a full refresh.
-      webgl.onContextLoss(() => {
-        recoverFromWebglContextLoss(webgl, termRef.current, () => {
-          webglRef.current = null;
-        });
-      });
-      term.loadAddon(webgl);
-      webglRef.current = webgl;
-    } catch {
-      /* no WebGL — keep the default renderer (TUI borders may be less crisp) */
-    }
+    // NOTE: the WebGL renderer is NOT loaded here anymore. It is attached lazily — only while this
+    // pane is the visible/active one — by attachWebgl (via the mount-time call below and the
+    // visibility effect further down), and disposed when the pane is hidden. This caps the app at
+    // one live WebGL context (WKWebView's context cap is ~8–16; keeping one per open agent thrashed
+    // the GPU and froze the main thread). Until WebGL attaches, xterm uses its DOM renderer.
     try {
       fit.fit();
     } catch {
@@ -271,6 +323,11 @@ export function Terminal({
     }
     termRef.current = term;
     fitRef.current = fit;
+    // Attach the WebGL renderer straight away if this pane mounts active/visible. (Placed after
+    // termRef is set so attachWebgl can find the terminal.) A pane that mounts hidden stays on the
+    // DOM renderer and gets WebGL on its first reveal via the visibility effect. `active` is read at
+    // mount/retry only; every later hide/show transition is handled by the visibility effect.
+    if (active) attachWebgl();
     // The terminal opens — and starts writing PTY output — BEFORE the async webfont (Source Code
     // Pro, loaded from Google Fonts with display=swap) necessarily finishes downloading; on a cold
     // launch a lot of output can stream in that window. The WebGL renderer rasterizes those glyphs
@@ -313,8 +370,17 @@ export function Terminal({
     // Forward keystrokes typed directly in the terminal to the PTY. onData fires for USER input
     // only (never programmatic agent output), so it's our signal that the user just interacted —
     // record it (throttled) to reset the sidebar's "running without my interaction" timer.
+    //
+    // Tracks the user's input line so onSubmitLine (the raw-terminal analogue of the composer's
+    // per-send boundary) fires only when the user submits NON-EMPTY content — a bare Enter, a
+    // permission/y-n confirmation pressed without typing, or menu navigation (arrow keys + Enter)
+    // must not burn a free trial prompt. See terminalSubmit.ts. onData never sees programmatic
+    // agent output, so this can't be triggered by the agent itself.
+    const lineScan = makeLineScanState();
     term.onData((d) => {
       useInteractionStore.getState().touch(agentId);
+      const submits = scanSubmittedLines(lineScan, d);
+      for (let i = 0; i < submits; i += 1) onSubmitLineRef.current?.();
       void writePty(agentId, d).catch(ignorePtyGone);
     });
 
@@ -652,6 +718,20 @@ export function Terminal({
     // down and re-spawn the terminal from scratch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, attempt]);
+
+  // Visibility-driven WebGL renderer lifecycle — the core fix for WebGL-context-exhaustion latency.
+  // Hold a live WebGL context ONLY for the visible pane: attach when this pane becomes active,
+  // dispose (releasing the GPU context) when it becomes hidden. With one xterm per open agent and
+  // WKWebView capping concurrent contexts (~8–16), keeping a live context per hidden pane exhausted
+  // the cap and the engine thrashed force-lose/restore on the main thread — the beachball that got
+  // worse the more agents were open. The initial attach for a pane that MOUNTS active is done in
+  // the mount effect above (which owns termRef's creation); this effect drives every later hide/show
+  // and re-attaches after a "Start again" remount. The xterm core, scrollback, and PTY are never
+  // touched — only the renderer addon is attached/detached, so content and the connection survive.
+  useEffect(() => {
+    if (active) attachWebgl();
+    else detachWebgl();
+  }, [active, attachWebgl, detachWebgl]);
 
   // Re-fit when this tab becomes the active one (was display:none). Focus goes to the
   // composer, not the terminal — all input lives in the composer overlay.
