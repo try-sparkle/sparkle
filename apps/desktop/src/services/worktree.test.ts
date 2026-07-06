@@ -5,6 +5,7 @@ import {
   createAgentWorktree,
   assertWorkspaceIntegrity,
   prepareAgentWorkspace,
+  prepareWorkerWorkspace,
   removeAgentWorkspace,
 } from "./worktree";
 
@@ -57,5 +58,35 @@ describe("worktree service", () => {
     expect(invoke).toHaveBeenCalledWith("remove_agent_worktree", {
       root, projectId: "p", agentId: "b",
     });
+  });
+
+  it("serializes concurrent worker worktree cuts on the same root (no index.lock race)", async () => {
+    // Regression for the concurrent spawn_worker corruption: two worker cuts on the same repo must
+    // NOT run `git worktree add` in parallel (they'd collide on .git/index.lock). Gate the first cut
+    // and assert the second doesn't start until the first resolves.
+    let releaseFirst!: (v: { path: string; branch: string }) => void;
+    const firstGate = new Promise<{ path: string; branch: string }>((r) => { releaseFirst = r; });
+    let cuts = 0;
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "create_worker_worktree") {
+        cuts += 1;
+        return cuts === 1 ? firstGate : Promise.resolve({ path: "/wt2", branch: "b2" });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const root = "/root-worker-serialize";
+    const a = prepareWorkerWorkspace({ root, projectId: "p", workerId: "w1", parentBranch: "main" });
+    const b = prepareWorkerWorkspace({ root, projectId: "p", workerId: "w2", parentBranch: "main" });
+
+    // First cut is gated in flight; the second must wait on the shared per-root lock.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(cuts).toBe(1);
+
+    releaseFirst({ path: "/wt1", branch: "b1" });
+    await a;
+    await b;
+    expect(cuts).toBe(2);
   });
 });

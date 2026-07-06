@@ -2,8 +2,8 @@
 // from the parent's local branch, and persist the worktree. The PTY launch happens when the
 // worker tab opens (AgentPane), driven by the worker persona + the stored task.
 import { useProjectStore } from "../stores/projectStore";
-import { createWorkerWorktree, type WorktreeInfo, killPty } from "../pty";
-import { removeAgentWorktree } from "./worktree";
+import { type WorktreeInfo, killPty } from "../pty";
+import { prepareWorkerWorkspace, removeAgentWorkspace } from "./worktree";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { maybeAutoName } from "./agentNaming";
 import { aiFeatureNow } from "./aiGate";
@@ -47,7 +47,7 @@ export async function spawnWorker(args: {
 
   let info: WorktreeInfo;
   try {
-    info = await createWorkerWorktree({
+    info = await prepareWorkerWorkspace({
       root: project.rootPath,
       projectId: args.projectId,
       workerId,
@@ -95,8 +95,8 @@ export async function spinDownWorker(args: { projectId: string; workerId: string
   // Errors are swallowed so a partially-gone worker still finishes teardown; warn so a failed
   // PTY kill / worktree removal (e.g. a transient git error leaving an orphan on disk) is visible.
   await killPty(args.workerId).catch((e) => console.warn("spinDownWorker: killPty failed", e));
-  await removeAgentWorktree(project.rootPath, args.projectId, args.workerId).catch((e) =>
-    console.warn("spinDownWorker: removeAgentWorktree failed", e),
+  await removeAgentWorkspace(project.rootPath, args.projectId, args.workerId).catch((e) =>
+    console.warn("spinDownWorker: removeAgentWorkspace failed", e),
   );
   useRuntimeStore.getState().close(args.workerId);
   useProjectStore.getState().removeAgent(args.projectId, args.workerId);

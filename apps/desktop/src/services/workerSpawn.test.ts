@@ -14,10 +14,10 @@ vi.mock("../pty", async (orig) => ({
   ...(await orig<typeof import("../pty")>()),
   killPty: (...a: unknown[]) => killPtyMock(...a),
 }));
-const removeWtMock = vi.fn();
+const removeWsMock = vi.fn();
 vi.mock("./worktree", async (orig) => ({
   ...(await orig<typeof import("./worktree")>()),
-  removeAgentWorktree: (...a: unknown[]) => removeWtMock(...a),
+  removeAgentWorkspace: (...a: unknown[]) => removeWsMock(...a),
 }));
 
 import { useProjectStore } from "../stores/projectStore";
@@ -152,8 +152,8 @@ describe("spinDownWorker", () => {
     useRuntimeStore.setState({ status: {}, openAgentIds: [], branchStatus: {} });
     killPtyMock.mockReset();
     killPtyMock.mockResolvedValue(undefined);
-    removeWtMock.mockReset();
-    removeWtMock.mockResolvedValue(undefined);
+    removeWsMock.mockReset();
+    removeWsMock.mockResolvedValue(undefined);
   });
 
   it("kills pty, removes worktree, closes runtime entry, removes tab, keeps branch", async () => {
@@ -169,7 +169,7 @@ describe("spinDownWorker", () => {
     await spinDownWorker({ projectId, workerId });
 
     expect(killPtyMock).toHaveBeenCalledWith(workerId);
-    expect(removeWtMock).toHaveBeenCalledWith("/tmp/demo", projectId, workerId);
+    expect(removeWsMock).toHaveBeenCalledWith("/tmp/demo", projectId, workerId);
     expect(runtimeCloseMock).toHaveBeenCalledWith(workerId); // runtime entry closed
     const agents = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
     expect(agents.some((a) => a.id === workerId)).toBe(false); // tab gone
@@ -183,7 +183,7 @@ describe("spinDownWorker", () => {
     await expect(spinDownWorker({ projectId: "ghost", workerId: "ghost" })).resolves.toBeUndefined();
 
     expect(killPtyMock).not.toHaveBeenCalled();
-    expect(removeWtMock).not.toHaveBeenCalled();
+    expect(removeWsMock).not.toHaveBeenCalled();
   });
 
   it("is a no-op when passed a build agent id (worker-only contract)", async () => {
@@ -198,13 +198,13 @@ describe("spinDownWorker", () => {
     await spinDownWorker({ projectId, workerId: buildId });
 
     expect(killPtyMock).not.toHaveBeenCalled();
-    expect(removeWtMock).not.toHaveBeenCalled();
+    expect(removeWsMock).not.toHaveBeenCalled();
     const agents = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
     expect(agents.some((a) => a.id === buildId)).toBe(true); // build still present
     expect(agents.some((a) => a.id === workerId)).toBe(true); // its worker not cascade-removed
   });
 
-  it("still removes the tab when killPty / removeAgentWorktree reject", async () => {
+  it("still removes the tab when killPty / removeAgentWorkspace reject", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
     const buildId = store.addAgent(projectId, { kind: "build" });
@@ -213,7 +213,7 @@ describe("spinDownWorker", () => {
     store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
 
     killPtyMock.mockRejectedValue(new Error("pty gone"));
-    removeWtMock.mockRejectedValue(new Error("git failed"));
+    removeWsMock.mockRejectedValue(new Error("git failed"));
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     await expect(spinDownWorker({ projectId, workerId })).resolves.toBeUndefined();

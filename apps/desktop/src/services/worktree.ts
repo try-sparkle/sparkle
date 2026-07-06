@@ -4,6 +4,7 @@
 // Rust params automatically.
 import { invoke } from "@tauri-apps/api/core";
 import { loadAccountState } from "./accountSelection";
+import { createWorkerWorktree } from "../pty";
 
 export interface WorktreeInfo {
   path: string;
@@ -121,6 +122,24 @@ export function prepareAgentWorkspace(
     await ensureProjectRepo(root);
     return createAgentWorktree(root, projectId, agentId, baseBranch);
   });
+}
+
+/**
+ * Cut a worker's isolated worktree from its parent branch — serialized on the SAME per-root lock
+ * as prepareAgentWorkspace/removeAgentWorkspace. Worker spawn previously called createWorkerWorktree
+ * RAW (bypassing this lock), so two concurrent spawn_worker calls ran parallel `git worktree add`
+ * on the same repo and collided on `.git/index.lock`, leaving dead, un-initialized worktrees
+ * (sparkle-<id>). Routing it through withRepoLock queues worker cuts behind any other git op on the
+ * root — the fix for the concurrent-spawn corruption that yk3x's authoritative-reply change didn't
+ * cover.
+ */
+export function prepareWorkerWorkspace(args: {
+  root: string;
+  projectId: string;
+  workerId: string;
+  parentBranch: string;
+}): Promise<WorktreeInfo> {
+  return withRepoLock(args.root, () => createWorkerWorktree(args));
 }
 
 /**
