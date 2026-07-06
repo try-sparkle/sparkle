@@ -37,7 +37,7 @@ import { type Bead } from "../services/beads";
 import { orderedTopLevelAgents, firstVisibleAgentId } from "../engine/agentOrdering";
 import { withUnstartedWorkerAttention, withRedWorkerAttention } from "../engine/workerAttention";
 import { needsAttention } from "../engine/attention";
-import { RedWorkerRow } from "./RedWorkerRow";
+import { SubAgentRow } from "./SubAgentRow";
 import { reconcileWorkMode } from "../engine/workMode";
 import { selectAndOpen } from "../useAttentionNotifications";
 import { StatusDot } from "./StatusDot";
@@ -305,7 +305,17 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
   const workflowShipped = useRuntimeStore((s) => s.workflowShipped);
+  // Manually-pinned workers (surfaced as their own SubAgentRow until un-pinned) + the pin actions.
+  const pinnedWorkerIds = useRuntimeStore((s) => s.pinnedWorkerIds);
+  const pinWorker = useRuntimeStore((s) => s.pinWorker);
+  const unpinWorker = useRuntimeStore((s) => s.unpinWorker);
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
+  // Per-orchestrator hover controllers: the head AgentRow registers its show/hide here (keyed by
+  // the orchestrator id) so its surfaced SubAgentRows can drive the SAME hover card — hovering a
+  // sub-row opens/keeps the orchestrator's card, and moving head↔card↔sub-row never crosses a
+  // dismiss boundary (kills the flicker). show/hide read only refs + stable dispatchers, so a
+  // once-registered controller stays correct even across parent re-renders (see AgentRow).
+  const hoverCtlsRef = useRef<Map<string, { show: () => void; hide: () => void }>>(new Map());
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
 
@@ -783,6 +793,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) return;
       const t = e.target;
       if (t instanceof Node && sc.contains(t)) return; // over the list itself — native scroll owns it
+      // Over the card's scrollable detail (a tall many-worker card) → let the CARD scroll its own
+      // content natively instead of forwarding the delta to the column. Gated on it actually being
+      // scrollable, so a short card still forwards to the list (keeps the list reachable under it).
+      const detail = t instanceof Element ? t.closest("[data-hovercard-detail]") : null;
+      if (detail instanceof HTMLElement && detail.scrollHeight > detail.clientHeight) return;
       const overCard = t instanceof Element && t.closest('[data-testid="agent-hover-card"]') != null;
       const orphaned = t === document.body || t === document.documentElement;
       if (!overCard && !orphaned) return; // some OTHER overlay (menu, modal) owns this wheel
@@ -1116,24 +1131,36 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             // we simply don't render a tracker for it — see renderRow.)
             const workerStages = workers.map((w) => stageOf(w.id));
             const rollup = rollupStages(workerStages);
-            // A worker that has gone RED (waiting / approval / errored) is pulled OUT of the inline
-            // roll-up and promoted to its own selectable row below the head (see the return below),
-            // so the human can reach it and unblock it. It collapses back into the roll-up once it's
-            // no longer red. Everything else (the rollup chevron, workerCount) still counts all
-            // workers — only the inline detail lines below exclude the promoted ones (no duplicate).
+            // A worker SURFACES as its own indented SubAgentRow below the head for one of two
+            // reasons; everything else stays a compact anonymous bar in the roll-up:
+            //   • ATTENTION (auto): its OWN LIVE status went red (waiting / approval / errored). It
+            //     collapses back into the roll-up once it's no longer red.
+            //   • PINNED (manual): the human clicked its name in the hover card. It persists until
+            //     un-pinned regardless of status.
+            // The rollup chevron + workerCount still count ALL workers — only the inline detail
+            // lines below exclude the surfaced ones (no duplicate).
             //
-            // Keyed on the worker's OWN LIVE status (liveStatus), NOT the composed `status`: the
-            // composite paints a synthetic "approval" onto an UNSTARTED/stranded worker (one whose
+            // Attention keys on the worker's OWN LIVE status (liveStatus), NOT the composed `status`:
+            // the composite paints a synthetic "approval" onto an UNSTARTED/stranded worker (one whose
             // pane never mounted), but that worker needs "Start", not "open + answer" — and the
             // self-healing auto-open (workersNeedingOpen) already re-launches it. So a strand stays
-            // in the roll-up; only a worker with a genuine red PTY status pops out here.
-            const redWorkers = workers.filter((w) => needsAttention(liveStatus[w.id]));
-            const redWorkerIds = new Set(redWorkers.map((w) => w.id));
-            // Each non-red worker's collapsed bare line + expanded detail live INSIDE the
+            // in the roll-up; only a worker with a genuine red PTY status pops out here. (A pin,
+            // being an explicit human choice, surfaces the worker regardless.)
+            const attentionWorkers = workers.filter((w) => needsAttention(liveStatus[w.id]));
+            const attentionIds = new Set(attentionWorkers.map((w) => w.id));
+            const pinnedWorkers = workers.filter(
+              (w) => pinnedWorkerIds.includes(w.id) && !attentionIds.has(w.id),
+            );
+            // Attention-first, then pinned; natural worker order within each. A worker that is BOTH
+            // red and pinned appears once (in the attention band) — it still shows its ✕ because the
+            // row's `pinned` prop is computed per-row from pinnedWorkerIds, not from the band.
+            const surfacedWorkers = [...attentionWorkers, ...pinnedWorkers];
+            const surfacedIds = new Set(surfacedWorkers.map((w) => w.id));
+            // Each non-surfaced worker's collapsed bare line + expanded detail live INSIDE the
             // orchestrator's own AgentRow. Pre-compute the minimal per-worker view-model here, where
             // stageOf/status/branchStatus/shippedOf are in scope.
             const workerDetails = workers
-              .filter((w) => !redWorkerIds.has(w.id))
+              .filter((w) => !surfacedIds.has(w.id))
               .map((w) => {
               const wst = status[w.id] ?? "stopped";
               const wcolor =
@@ -1153,6 +1180,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                 worktreePath: w.worktreePath,
                 baseBranch: w.baseBranch,
                 onLand: () => onLand(w),
+                onOpen: () => onSelect(w.id),
+                onPin: () => pinWorker(w.id),
               };
             });
             const renderRow = (
@@ -1188,6 +1217,16 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               shipped={rowShipped}
               workerCount={a.id === top.id ? workers.length : 0}
               workers={a.id === top.id ? workerDetails : []}
+              registerHover={
+                a.id === top.id
+                  ? (c) => {
+                      hoverCtlsRef.current.set(top.id, c);
+                      // Cleanup drops the entry when the head row unmounts (orchestrator closed),
+                      // so the registry can't grow unbounded across a session.
+                      return () => hoverCtlsRef.current.delete(top.id);
+                    }
+                  : undefined
+              }
               orderedIndex={rowIndex}
               dragActive={dragId != null}
               onDragStartAgent={onAgentDragStart}
@@ -1210,21 +1249,29 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                 : rollup
                   ? rollup.stage
                   : stageOf(top.id);
-            // The orchestrator's head row owns its NON-red workers: each renders as a bare indented
-            // progress line below the head (collapsed), and as a stacked detail block on the head's
-            // hover overlay (expanded) — see AgentRow's `workers` prop. A red worker is instead
-            // promoted to its own selectable RedWorkerRow beneath the head, so it can be opened and
-            // unblocked; it rejoins the roll-up once it's no longer red.
+            // The orchestrator's head row owns its NON-surfaced workers: each renders as a bare
+            // indented progress line below the head (collapsed), and as a stacked detail block on the
+            // head's hover overlay (expanded) — see AgentRow's `workers` prop. A surfaced worker
+            // (red or pinned) is instead its own selectable SubAgentRow beneath the head, so it can
+            // be opened; a red one rejoins the roll-up once it's no longer red, a pinned one stays
+            // until un-pinned. Surfaced rows share the head's hover card (hoverCtlsRef) so hovering
+            // one opens/keeps the orchestrator's card without flicker.
             return (
               <div key={top.id}>
                 {renderRow(top, headStage, orderedIndex)}
-                {redWorkers.map((w) => (
-                  <RedWorkerRow
+                {surfacedWorkers.map((w) => (
+                  <SubAgentRow
                     key={w.id}
                     name={w.autoNameVariants?.title?.trim() || w.name}
                     status={status[w.id] ?? "stopped"}
+                    stage={stageOf(w.id)}
+                    shipped={shippedOf(w.id)}
                     active={!activeSpecial && project.selectedAgentId === w.id}
+                    pinned={pinnedWorkerIds.includes(w.id)}
                     onSelect={() => onSelect(w.id)}
+                    onUnpin={() => unpinWorker(w.id)}
+                    onHoverEnter={() => hoverCtlsRef.current.get(top.id)?.show()}
+                    onHoverLeave={() => hoverCtlsRef.current.get(top.id)?.hide()}
                   />
                 ))}
               </div>
@@ -1429,7 +1476,58 @@ type WorkerDetail = {
   worktreePath: string | null;
   baseBranch: string | null;
   onLand: () => void;
+  /** Select + open this worker (its hover-card name is clickable). */
+  onOpen: () => void;
+  /** Pin this worker so it surfaces as its own row (clicking its hover-card name pins + opens). */
+  onPin: () => void;
 };
+
+// A worker's name inside the orchestrator's hover card. Clicking it PINS the worker (so it surfaces
+// as its own SubAgentRow in the column) AND opens it in the main pane — the "open + pin" affordance.
+// stopPropagation keeps the click off the card's own onClick (which selects the orchestrator).
+function WorkerNameButton({ w }: { w: WorkerDetail }) {
+  const [hover, setHover] = useState(false);
+  const pinAndOpen = () => {
+    w.onPin();
+    w.onOpen();
+  };
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      aria-label={`Open and pin ${w.autoTitle || w.name}`}
+      title="Open + pin this sub-agent"
+      onClick={(e) => {
+        e.stopPropagation();
+        pinAndOpen();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          pinAndOpen();
+        }
+      }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        minWidth: 0,
+        lineHeight: 1.3,
+        cursor: "pointer",
+        textDecoration: hover ? "underline" : "none",
+      }}
+    >
+      <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.semibold }}>
+        {w.autoTitle || w.name}
+      </span>
+      {w.description && (
+        <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.regular }}>
+          {`:  ${w.description}`}
+        </span>
+      )}
+    </div>
+  );
+}
 
 /**
  * One agent row. Collapsed (default) it shows: the kind glyph, the status dot, the width-fitted
@@ -1461,6 +1559,10 @@ type AgentRowProps = {
   // The orchestrator's workers, rendered inline on this row (collapsed lines + expanded detail).
   // `[]` for every non-orchestrator row.
   workers: WorkerDetail[];
+  // Head orchestrator rows only: register this row's hover show/hide so its surfaced SubAgentRows
+  // can drive the SAME hover card (see AgentSidebar.hoverCtlsRef). Undefined for non-head rows.
+  // Returns an unregister fn (used as the effect cleanup) so the entry is dropped on unmount.
+  registerHover?: (controls: { show: () => void; hide: () => void }) => (() => void) | void;
   // The agent's current row in the ordered top-level stack (undefined for nested workers).
   // Passed to renameAgent so a manual rename anchors the row there (the unified pin). Also the
   // drop index for drag-reorder. The drag props are only acted on for top-level rows.
@@ -1545,6 +1647,7 @@ const AgentRow = memo(function AgentRow({
   shipped,
   workerCount,
   workers,
+  registerHover,
   orderedIndex,
   dragActive,
   onDragStartAgent,
@@ -1614,13 +1717,25 @@ const AgentRow = memo(function AgentRow({
     },
     [],
   );
+  // Publish this row's show/hide to the parent's per-orchestrator registry so its surfaced
+  // SubAgentRows can drive the SAME card. Runs every render (deps intentionally omitted): show/hide
+  // are fresh closures each render but only touch refs + stable dispatchers, so even the first
+  // registration stays correct — re-publishing just keeps the map entry present. Head rows only
+  // (registerHover is undefined otherwise). The returned unregister is the effect cleanup, so the
+  // entry is dropped when this head row unmounts (no unbounded map growth).
+  useEffect(() => registerHover?.({ show, hide }));
   // The overlay is pinned to the row's rect captured at hover time. On a USER scroll it would detach
   // from its row, so we close it (the original behavior). But during OUR OWN auto-scroll-to-fit
   // (sidebarScroll.isAutoScrolling) we instead re-pin to the row's live position each event, so the
   // card glides smoothly upward glued to its row instead of vanishing. A resize still just closes.
   useEffect(() => {
     if (!hover) return;
-    const onScroll = () => {
+    const onScroll = (e: Event) => {
+      // The card's OWN detail scroll (overflow-y:auto) bubbles here in the capture phase — that is
+      // the user reading a tall worker list INSIDE the card, NOT scrolling the list away, so it must
+      // never close the card. Ignore any scroll originating within the detail region.
+      const t = e.target;
+      if (t instanceof Node && detailRef.current?.contains(t)) return;
       if (sidebarScroll?.isAutoScrolling()) {
         const el = rowRef.current;
         if (el) {
@@ -2009,16 +2124,7 @@ const AgentRow = memo(function AgentRow({
         <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8, marginLeft: 16 }}>
           {workers.map((w) => (
             <div key={w.id} style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
-              <div style={{ minWidth: 0, lineHeight: 1.3 }}>
-                <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.semibold }}>
-                  {w.autoTitle || w.name}
-                </span>
-                {w.description && (
-                  <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.regular }}>
-                    {`:  ${w.description}`}
-                  </span>
-                )}
-              </div>
+              <WorkerNameButton w={w} />
               {/* The worker's progress bar moves DOWN to here on hover (collapsed it's the bare
                   indented line under the orchestrator in the column). Expanded, so it carries the same
                   stage status label the orchestrator's bar gets. */}
@@ -2260,6 +2366,9 @@ const AgentRow = memo(function AgentRow({
                 carries dragProps (see the strip) so the whole card is a drag handle. */}
             <div
               ref={detailRef}
+              // Marks the card's scrollable region so the sidebar wheel-forwarder yields to it (2b)
+              // — wheeling a tall many-worker card scrolls the card, not the column.
+              data-hovercard-detail=""
               {...dragProps}
               onClick={onSelect}
               onMouseEnter={show}
