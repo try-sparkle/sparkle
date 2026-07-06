@@ -103,14 +103,15 @@ export async function spawnWorker(args: {
 
   useProjectStore.getState().setAgentWorktree(args.projectId, workerId, info.path, info.branch);
 
-  // Auto-name the worker from its assigned task, the same way a build/orchestrator agent is named
-  // from its first typed prompt. A worker's task never flows through the Composer's onSubmitPrompt
-  // handler (it's injected as the PTY's initialPrompt at launch), so without this it would keep its
-  // default "Worker N" name until Claude Code eventually writes a session title. Fire-and-forget,
-  // gated on the same autoRename AI feature; no-ops if pinned, thin, or no API key. Claude Code's
-  // later ai-title still supersedes (maybeAutoName bails once aiTitle is set).
+  // Auto-name the worker from its assigned task. A worker's task never flows through the Composer's
+  // onSubmitPrompt handler (it's injected as the PTY's initialPrompt at launch) and its promptHistory
+  // is empty at spawn — so this is the worker's ONE naming moment from the task signal. Pass
+  // bypassFirstTurnDefer so the self-reporting-agent first-turn deferral doesn't swallow it (a worker
+  // has no earlier self-report opportunity). Fire-and-forget, gated on the autoRename AI feature;
+  // no-ops if pinned, thin, or no API key. Claude Code's later ai-title / rename_agent still
+  // supersedes (maybeAutoName bails once aiTitle is set or the tab is pinned).
   if (aiFeatureNow("autoRename") && args.task.trim()) {
-    void maybeAutoName(args.projectId, workerId, args.task);
+    void maybeAutoName(args.projectId, workerId, args.task, { bypassFirstTurnDefer: true });
   }
 
   // Return the AUTHORITATIVE identity captured from the worktree cut — never re-read from the store.

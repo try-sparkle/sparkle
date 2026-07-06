@@ -1,5 +1,11 @@
-import { describe, it, expect } from "vitest";
-import { shouldRename } from "./agentNaming";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const invoke = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
+
+import { shouldRename, isSelfNamingAgent, shouldHaikuName, maybeAutoName } from "./agentNaming";
+import { useProjectStore } from "../stores/projectStore";
+import type { AgentTab, Project } from "../types";
 
 describe("shouldRename heuristic", () => {
   it("names the first substantive prompt", () => {
@@ -82,5 +88,146 @@ describe("shouldRename — tactical command filter", () => {
         prompt: "push to production",
       }),
     ).toBe(false);
+  });
+});
+
+describe("isSelfNamingAgent (build/worker self-report; think/shell do not)", () => {
+  it("treats the Claude-Code kinds (build, worker) as self-reporting", () => {
+    expect(isSelfNamingAgent({ kind: "build" })).toBe(true);
+    expect(isSelfNamingAgent({ kind: "worker" })).toBe(true);
+  });
+
+  it("does NOT treat think (Chief chat) or shell (raw command) as self-reporting", () => {
+    expect(isSelfNamingAgent({ kind: "think" })).toBe(false);
+    expect(isSelfNamingAgent({ kind: "shell" })).toBe(false);
+  });
+});
+
+describe("shouldHaikuName precedence (Phase 2a demotion, sparkle-q1rq)", () => {
+  const base = {
+    namePinned: false,
+    aiTitle: null as string | null,
+    autoNameBasis: null as string | null,
+    promptCount: 1,
+    prompt: "fix the login redirect bug",
+  };
+
+  it("self-reporting agent WITH an aiTitle → no Haiku call", () => {
+    expect(shouldHaikuName({ ...base, kind: "worker", aiTitle: "Login Redirect Fix", promptCount: 3 })).toBe(false);
+    expect(shouldHaikuName({ ...base, kind: "build", aiTitle: "Login Redirect Fix", promptCount: 3 })).toBe(false);
+  });
+
+  it("self-reporting agent that self-named (namePinned) → no Haiku call", () => {
+    expect(shouldHaikuName({ ...base, kind: "worker", namePinned: true, promptCount: 3 })).toBe(false);
+  });
+
+  it("self-reporting agent's FIRST prompt (no aiTitle, not named) → deferred, no Haiku call", () => {
+    expect(shouldHaikuName({ ...base, kind: "worker", promptCount: 1 })).toBe(false);
+    expect(shouldHaikuName({ ...base, kind: "build", promptCount: 1 })).toBe(false);
+  });
+
+  it("self-reporting agent falls back to Haiku on a LATER prompt (>=2) when still unnamed & untitled", () => {
+    expect(shouldHaikuName({ ...base, kind: "worker", promptCount: 2 })).toBe(true);
+    expect(shouldHaikuName({ ...base, kind: "build", promptCount: 2 })).toBe(true);
+  });
+
+  it("bypassFirstTurnDefer lets a worker's spawn-time naming fire at promptCount 0 (its one naming moment)", () => {
+    // Regression guard (roborev Medium): a worker is named once at spawn with an empty promptHistory;
+    // without the bypass the first-turn deferral would swallow it and it would stay "Worker N".
+    expect(shouldHaikuName({ ...base, kind: "worker", promptCount: 0 })).toBe(false);
+    expect(shouldHaikuName({ ...base, kind: "worker", promptCount: 0, bypassFirstTurnDefer: true })).toBe(true);
+    // Bypass still yields to a real name/title: aiTitle and pinned continue to win.
+    expect(
+      shouldHaikuName({ ...base, kind: "worker", promptCount: 0, bypassFirstTurnDefer: true, aiTitle: "Login Fix" }),
+    ).toBe(false);
+    expect(
+      shouldHaikuName({ ...base, kind: "worker", promptCount: 0, bypassFirstTurnDefer: true, namePinned: true }),
+    ).toBe(false);
+  });
+
+  it("non-self-reporting agent (shell) → Haiku on the first prompt, exactly as before", () => {
+    expect(shouldHaikuName({ ...base, kind: "shell", promptCount: 1 })).toBe(true);
+  });
+
+  it("still honors the thin/tactical prompt skips even for a fallback-eligible self-reporting agent", () => {
+    expect(shouldHaikuName({ ...base, kind: "worker", promptCount: 2, prompt: "push to production" })).toBe(false);
+    expect(shouldHaikuName({ ...base, kind: "shell", prompt: "ok continue" })).toBe(false);
+  });
+});
+
+// ── maybeAutoName end-to-end: does the paid `generate_agent_name` invoke fire or not? ──
+function agentTab(over: Partial<AgentTab>): AgentTab {
+  return {
+    id: "a1",
+    name: "Worker 1",
+    kind: "worker",
+    parentId: null,
+    runtime: "local",
+    worktreePath: null,
+    branch: null,
+    baseBranch: null,
+    lastPrompt: "",
+    promptHistory: [],
+    namePinned: false,
+    autoNameBasis: null,
+    autoNameVariants: null,
+    shellCommand: null,
+    pinnedIndex: null,
+    ...over,
+  };
+}
+
+function seed(agent: AgentTab): void {
+  const project: Project = {
+    id: "p1",
+    name: "Proj",
+    rootPath: "/tmp/p",
+    defaultBranch: "main",
+    createdAt: "2026-01-01",
+    agents: [agent],
+    selectedAgentId: agent.id,
+  };
+  useProjectStore.setState({ projects: [project] });
+}
+
+// promptHistory entries: naming reads only `.length`, so ids/text are placeholders.
+function history(n: number): AgentTab["promptHistory"] {
+  return Array.from({ length: n }, (_, i) => ({ id: `h${i}`, text: `p${i}`, at: 0 }));
+}
+
+describe("maybeAutoName — paid call gating for self-reporting agents", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    invoke.mockResolvedValue({ title: "Some Name", description: "" });
+  });
+
+  it("self-reporting worker WITH aiTitle → does NOT call generate_agent_name", async () => {
+    seed(agentTab({ kind: "worker", aiTitle: "Login Redirect Fix", promptHistory: history(3) }));
+    await maybeAutoName("p1", "a1", "fix the login redirect bug");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("self-reporting worker that self-named (namePinned) → does NOT call generate_agent_name", async () => {
+    seed(agentTab({ kind: "worker", namePinned: true, promptHistory: history(3) }));
+    await maybeAutoName("p1", "a1", "fix the login redirect bug");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("self-reporting worker on its FIRST prompt (neither self-named nor titled) → deferred, no call", async () => {
+    seed(agentTab({ kind: "worker", promptHistory: history(1) }));
+    await maybeAutoName("p1", "a1", "fix the login redirect bug");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("self-reporting worker on a LATER prompt with neither signal → falls back to Haiku", async () => {
+    seed(agentTab({ kind: "worker", promptHistory: history(2) }));
+    await maybeAutoName("p1", "a1", "fix the login redirect bug");
+    expect(invoke).toHaveBeenCalledWith("generate_agent_name", { prompt: "fix the login redirect bug" });
+  });
+
+  it("non-self-reporting shell agent → Haiku on the first prompt, as before", async () => {
+    seed(agentTab({ kind: "shell", promptHistory: history(1) }));
+    await maybeAutoName("p1", "a1", "fix the login redirect bug");
+    expect(invoke).toHaveBeenCalledWith("generate_agent_name", { prompt: "fix the login redirect bug" });
   });
 });
