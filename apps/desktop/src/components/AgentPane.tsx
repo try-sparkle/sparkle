@@ -21,6 +21,7 @@ import {
   assembleBuildSpawn,
   stopOrchestrationBridge,
 } from "../services/orchestrationLaunch";
+import { purgeBuildAgent } from "../services/orchestrationListener";
 import { useSettingsStore } from "../stores/settingsStore";
 import { setPin, markExhausted, accountLabel, type Account, type Identity } from "../services/accountStore";
 import { chooseAccountForAgent, invalidateAccountState } from "../services/accountSelection";
@@ -117,6 +118,10 @@ export function AgentPane({
   // Replacing a plain boolean avoids the bug where the second prepare() reset the boolean before
   // the first cleanup's signal could be read.
   const prepareRunRef = useRef(0);
+  // Per-launch owner token for THIS agent's orchestration bridge (). Minted fresh each
+  // prepare() run and passed to start/stop so a stale run's teardown (a sub-second close-reopen, or
+  // a superseded prepare()) can only stop the bridge instance IT owns — never a newer run's bridge.
+  const bridgeLaunchTokenRef = useRef<string>("");
   // The composer's textarea — initial focus lands here when a tab opens.
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   // Imperative bridge to push text into the composer (pinned-prompt "Send to Composer").
@@ -266,6 +271,10 @@ export function AgentPane({
     // post-bridge guard (myRun !== prepareRunRef.current). Placing it after the early non-async
     // returns (think/shell) means it only runs when we're about to do async work.
     const myRun = ++prepareRunRef.current;
+    // Mint this run's bridge owner token (). Stored in a ref so the effect-cleanup stop
+    // (which runs outside prepare) presents the same token this run started the bridge with.
+    const launchToken = crypto.randomUUID();
+    bridgeLaunchTokenRef.current = launchToken;
     // Warm the spawn caches for this project (claude/node paths, account state, background origin
     // fetch) once per root — fire-and-forget, so later agents on this project skip the cold resolves.
     prewarmProjectCaches(project.rootPath);
@@ -439,10 +448,10 @@ export function AgentPane({
         // `myRun` was minted at the top of prepare() (before all awaits) so any cleanup increment
         // during worktree-prep, Claude-check, or bridge-start is captured — the guard below fires
         // for unmounts that happen anywhere in the early async path, not just at the bridge await.
-        const bridge = await startOrchestrationBridge(project.id, agent.id);
+        const bridge = await startOrchestrationBridge(project.id, agent.id, launchToken);
         // Guard: check our token — a mismatch means this run was superseded while we awaited.
         if (myRun !== prepareRunRef.current) {
-          void stopOrchestrationBridge(agent.id).catch((e) =>
+          void stopOrchestrationBridge(agent.id, launchToken).catch((e) =>
             console.warn("stopOrchestrationBridge (stale-run cleanup) failed", e),
           );
           return;
@@ -455,7 +464,7 @@ export function AgentPane({
           // Guard: check again after orchestratorMcpPaths — a cleanup increment during that
           // await means this run was superseded; stop the bridge we started and bail out.
           if (myRun !== prepareRunRef.current) {
-            void stopOrchestrationBridge(agent.id).catch((e) =>
+            void stopOrchestrationBridge(agent.id, launchToken).catch((e) =>
               console.warn("stopOrchestrationBridge (stale-run cleanup) failed", e),
             );
             return;
@@ -483,7 +492,7 @@ export function AgentPane({
         } catch (e) {
           // Bridge started but subsequent step failed — stop it before rethrowing so the outer
           // catch can set the error phase without leaving a zombie bridge behind.
-          void stopOrchestrationBridge(agent.id).catch((stopErr) =>
+          void stopOrchestrationBridge(agent.id, launchToken).catch((stopErr) =>
             console.warn("stopOrchestrationBridge (error path cleanup) failed", stopErr),
           );
           throw e;
@@ -514,9 +523,13 @@ export function AgentPane({
       prepareRunRef.current++;
       stopHookWatch();
       // A build agent owns an orchestration bridge for its lifetime — stop it on close so its
-      // socket + accept thread don't linger. Best-effort: a missing bridge stop is a harmless no-op.
+      // socket + accept thread don't linger. Present THIS run's owner token so a fast close-reopen
+      // can't tear down a newer run's bridge (). Purge this build agent's queued spawns
+      // + in-flight reservations so a closed orchestrator's deferred requests don't linger and
+      // over-count a later reincarnation's cap.
       if (agent.kind === "build") {
-        void stopOrchestrationBridge(agent.id).catch((e) =>
+        purgeBuildAgent(agent.id);
+        void stopOrchestrationBridge(agent.id, bridgeLaunchTokenRef.current).catch((e) =>
           console.warn("stopOrchestrationBridge failed", e),
         );
       }

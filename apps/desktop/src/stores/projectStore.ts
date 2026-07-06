@@ -2,7 +2,7 @@
 // last prompts. Persisted to localStorage (durable in the Tauri webview) so quit/relaunch
 // restores everything. Live process/status state is NOT here (see runtimeStore).
 import { create } from "zustand";
-import { persist, createJSONStorage } from "zustand/middleware";
+import { persist, createJSONStorage, type StateStorage } from "zustand/middleware";
 import type { AgentKind, AgentName, AgentTab, Project } from "../types";
 import { isDefaultModel } from "../services/models";
 import { usageTelemetry } from "../services/usageTelemetry";
@@ -252,6 +252,118 @@ function mapAgent(p: Project, agentId: string, fn: (a: AgentTab) => AgentTab): P
 /** localStorage key the project store persists under. Shared so cross-window sync
  *  (crossWindowSync.ts) listens on the same key instead of duplicating the literal. */
 export const PROJECTS_PERSIST_KEY = "sparkle-projects";
+
+/** Trailing-debounce window for the projects blob write (sparkle-pngb). Long enough to coalesce a
+ *  burst of prompt appends / rapid tab switches into ONE write, short enough that a normal pause
+ *  flushes promptly. Structural (cross-window) changes bypass this via flushProjectsPersist(). */
+export const PROJECTS_PERSIST_DEBOUNCE_MS = 400;
+
+/** Wrap `localStorage` so writes are TRAILING-DEBOUNCED (sparkle-pngb). projectStore persists the
+ *  ENTIRE projects array — each agent up to PROMPT_HISTORY_LIMIT prompts — on EVERY mutation
+ *  (appendPrompt on each keystroke-submitted prompt, selectAgent on every tab switch, …), and the
+ *  JSON.stringify + setItem ran synchronously on the main thread each time. Coalescing bursts into
+ *  one write keeps the UI responsive. Durability: the pending write is flushed on the trailing timer
+ *  AND eagerly on pagehide/beforeunload/visibility-hidden, so a quit/relaunch never loses the last
+ *  write. `getItem` deliberately reads REAL localStorage (never this window's pending value) so a
+ *  cross-window rehydrate reflects the shared on-disk truth and can't clobber another window's change
+ *  with a not-yet-observed local edit. Exported for direct unit testing. */
+export function debouncedLocalStorage(delayMs: number): { storage: StateStorage; flush: () => void } {
+  const pending = new Map<string, string>();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const flush = (): void => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (pending.size === 0) return;
+    for (const [k, v] of pending) {
+      try {
+        localStorage.setItem(k, v);
+      } catch {
+        /* quota exceeded / storage disabled — drop this write rather than throw out of persist */
+      }
+    }
+    pending.clear();
+  };
+  if (typeof window !== "undefined") {
+    // Never let a debounced write be lost to a quit or navigation.
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") flush();
+      });
+    }
+  }
+  const storage: StateStorage = {
+    getItem: (name) => {
+      try {
+        return localStorage.getItem(name);
+      } catch {
+        return null;
+      }
+    },
+    setItem: (name, value) => {
+      pending.set(name, value);
+      if (!timer) timer = setTimeout(flush, delayMs);
+    },
+    removeItem: (name) => {
+      pending.delete(name);
+      try {
+        localStorage.removeItem(name);
+      } catch {
+        /* ignore */
+      }
+    },
+  };
+  return { storage, flush };
+}
+
+const { storage: debouncedProjectsStorage, flush: flushProjectsPersistImpl } =
+  debouncedLocalStorage(PROJECTS_PERSIST_DEBOUNCE_MS);
+
+/** Synchronously flush any pending debounced projects write to localStorage. Called by the
+ *  cross-window sync layer BEFORE it broadcasts a structural change (sparkle-pngb), so a receiving
+ *  window rehydrates the fresh blob rather than a stale one still sitting in the debounce buffer. */
+export function flushProjectsPersist(): void {
+  flushProjectsPersistImpl();
+}
+
+/** Rehydration merge that NEVER drops a live worker (sparkle-3tqv). Every rehydrate — startup and,
+ *  crucially, cross-window (crossWindowSync.ts rehydrates from the shared localStorage blob on
+ *  every remote change) — replaces the in-memory `projects` with the persisted snapshot. If another
+ *  window persisted a blob that predates a just-spawned worker (last-writer-wins), the default
+ *  whole-array replace would EVICT that worker from this window even though its worktree + manifest
+ *  are live on disk — the original corruption root cause Tier-1's `reconcileWorkersFromDisk` had to
+ *  self-heal after the fact. This makes the merge itself protective: for each project, any in-memory
+ *  worker with a cut worktree (`worktreePath` set) that is MISSING from the incoming snapshot is
+ *  re-attached, provided its parent build agent still exists in that snapshot (so we never resurrect
+ *  a worker whose orchestrator was deliberately closed). Everything else takes the persisted value,
+ *  preserving the store's action functions (which the persisted JSON never carries). Pure + exported
+ *  for direct unit testing. */
+export function mergePreservingLiveWorkers(
+  persistedState: unknown,
+  currentState: ProjectState,
+): ProjectState {
+  const persisted = (persistedState ?? undefined) as Partial<ProjectState> | undefined;
+  const merged = { ...currentState, ...(persisted ?? {}) } as ProjectState;
+  const currentProjects = currentState.projects ?? [];
+  const incoming = persisted?.projects ?? currentProjects;
+  merged.projects = incoming.map((pp) => {
+    const cur = currentProjects.find((c) => c.id === pp.id);
+    if (!cur) return pp;
+    const present = new Set(pp.agents.map((a) => a.id));
+    const survivors = cur.agents.filter(
+      (a) =>
+        a.kind === "worker" &&
+        !!a.worktreePath &&
+        !present.has(a.id) &&
+        pp.agents.some((x) => x.id === a.parentId),
+    );
+    return survivors.length > 0 ? { ...pp, agents: [...pp.agents, ...survivors] } : pp;
+  });
+  return merged;
+}
 
 export const useProjectStore = create<ProjectState>()(
   persist(
@@ -583,7 +695,9 @@ export const useProjectStore = create<ProjectState>()(
     }),
     {
       name: PROJECTS_PERSIST_KEY,
-      storage: createJSONStorage(() => localStorage),
+      // Debounced localStorage (sparkle-pngb) so a burst of prompt appends / tab switches coalesces
+      // into ONE main-thread JSON.stringify + setItem instead of one per mutation.
+      storage: createJSONStorage(() => debouncedProjectsStorage),
       // Bumped when the persisted shape gains fields. v1 backfills the main-first-defaults
       // fields so legacy records rehydrate with `null` (matching fresh records) rather than
       // `undefined` — an undefined baseBranch would otherwise send "" to the git commands.
@@ -596,6 +710,9 @@ export const useProjectStore = create<ProjectState>()(
       // (manual reorder anchor) without touching namePinned.
       version: 8,
       migrate: (persisted, version) => migratePersisted(persisted, version) as ProjectState,
+      // sparkle-3tqv: a protective merge so no rehydrate (startup or cross-window) can evict a
+      // worker whose worktree is live on disk.
+      merge: (persisted, current) => mergePreservingLiveWorkers(persisted, current),
     },
   ),
 );

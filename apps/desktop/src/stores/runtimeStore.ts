@@ -359,6 +359,55 @@ async function applyWorkflowState(
   }
 }
 
+/** localStorage key the runtime store persists under. Exported so the multi-window open-set merge
+ *  () and any test read the SAME key instead of duplicating the literal. */
+export const RUNTIME_PERSIST_KEY = "sparkle-runtime";
+
+/** Read the `openAgentIds` currently persisted under {@link RUNTIME_PERSIST_KEY}. Multi-window
+ *  correctness (): EVERY window persists its own open set to this ONE shared key, so a
+ *  naive whole-array write is last-writer-wins and silently drops another live window's agents from
+ *  the set a relaunch restores from (window A opening a3 persists [..,a3] and clobbers b1 that window
+ *  B just wrote). `open`/`close` merge against THIS value so the persisted set stays the UNION across
+ *  all live windows, minus only the id a window explicitly closes. Best-effort: a malformed/absent
+ *  blob reads as empty so a parse hiccup can never break open/close. */
+export function readPersistedOpenAgentIds(): string[] {
+  try {
+    if (typeof localStorage === "undefined") return [];
+    const raw = localStorage.getItem(RUNTIME_PERSIST_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as { state?: { openAgentIds?: unknown } };
+    const ids = parsed?.state?.openAgentIds;
+    return Array.isArray(ids) ? ids.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Union this window's in-memory open set with the shared persisted set (other windows' opens),
+ *  preserving in-memory order and appending persisted-only ids after; `add` is appended if new. Pure
+ *  + exported for testing. This is the read-modify-MERGE that fixes the cross-window clobber
+ *  () — we never overwrite the shared array with just our own ids. */
+export function mergeOpenAgentIds(inMemory: string[], persisted: string[], add?: string): string[] {
+  const seen = new Set(inMemory);
+  const out = [...inMemory];
+  for (const id of persisted) {
+    if (!seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  if (add && !seen.has(add)) out.push(add);
+  return out;
+}
+
+/** Element-wise array equality — lets `open` keep the `openAgentIds` reference stable on a no-op
+ *  merge so subscribers don't re-render for nothing. */
+function sameStringOrder(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 interface RuntimeState {
   status: Record<string, AgentTabStatus>; // agentId -> status (live-only, never persisted)
   // agentId -> the terminal screen text captured the moment the agent entered an "ask" status
@@ -469,11 +518,12 @@ export const useRuntimeStore = create<RuntimeState>()(
         ),
 
       open: (agentId) =>
-        set((s) =>
-          s.openAgentIds.includes(agentId)
-            ? s
-            : { openAgentIds: [...s.openAgentIds, agentId] },
-        ),
+        set((s) => {
+          // Merge against the shared persisted set so a concurrent window's open ids aren't clobbered
+          // by this whole-array write (): union {this window's set, persisted set, agentId}.
+          const merged = mergeOpenAgentIds(s.openAgentIds, readPersistedOpenAgentIds(), agentId);
+          return sameStringOrder(merged, s.openAgentIds) ? s : { openAgentIds: merged };
+        }),
 
       close: (agentId) =>
         set((s) => {
@@ -484,8 +534,12 @@ export const useRuntimeStore = create<RuntimeState>()(
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
+          // Read-modify-MERGE the shared persisted set, then drop ONLY this id (): the
+          // union retains other live windows' open ids in the persisted write, so closing a3 here
+          // can't clobber window B's b1 — while still removing a3 itself.
+          const mergedOpen = mergeOpenAgentIds(s.openAgentIds, readPersistedOpenAgentIds());
           return {
-            openAgentIds: s.openAgentIds.filter((id) => id !== agentId),
+            openAgentIds: mergedOpen.filter((id) => id !== agentId),
             status,
             attentionScreen,
             branchStatus,
@@ -513,7 +567,10 @@ export const useRuntimeStore = create<RuntimeState>()(
         }),
 
       setStatus: (agentId, status) =>
-        set((s) => ({ status: { ...s.status, [agentId]: status } })),
+        // Skip the write when the value is unchanged (sparkle-f2uz): setStatus makes a NEW `status`
+        // map ref, which every whole-map subscriber (sidebar/TopBar) re-renders on. A redundant tick
+        // of the SAME status (e.g. repeated "working"/"listening"/"blocked") must not churn a render.
+        set((s) => (s.status[agentId] === status ? s : { status: { ...s.status, [agentId]: status } })),
 
       setAttentionScreen: (agentId, text) =>
         set((s) => ({ attentionScreen: { ...s.attentionScreen, [agentId]: text } })),
@@ -656,7 +713,7 @@ export const useRuntimeStore = create<RuntimeState>()(
         }),
     }),
     {
-      name: "sparkle-runtime",
+      name: RUNTIME_PERSIST_KEY,
       storage: createJSONStorage(() => localStorage),
       // The open set, the workflow-stage watermark, and the sticky shipped ✓ survive a relaunch.
       // Persisting the watermark is what lets a merged/shipped agent read back as Merged instead of

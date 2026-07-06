@@ -54,5 +54,25 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=Foundation");
     }
 
+    // bnvs (sparkle-bnvs): embed the git SHA of the source this binary was built from so the
+    // running app can report which build is live (the orchestration bridge exposes it via the
+    // `bridge_info` op and augments list_workers with `runningSha`). The running app embeds the
+    // MCP/bridge and does NOT hot-reload, so a fix on main isn't live until an app restart — this
+    // SHA is the signal that lets a developer/orchestrator notice the running build is stale.
+    // Best-effort: an unavailable git (e.g. a tarball build) yields "unknown" rather than failing.
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=SPARKLE_GIT_SHA={sha}");
+    // Rebuild when HEAD moves so the embedded SHA stays honest across commits/checkouts.
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/refs/heads");
+
     tauri_build::build()
 }

@@ -17,17 +17,23 @@ export interface McpPaths {
   serverPath: string;
 }
 
-/** Start (idempotently) the orchestration bridge for this build agent; returns its socket + token. */
+/** Start (idempotently) the orchestration bridge for this build agent; returns its socket + token.
+ *  `launchToken` is a per-prepare()-run nonce that stamps this launch as the bridge's owner: a
+ *  re-prepare transfers ownership to the newest launch, and stopOrchestrationBridge only tears the
+ *  bridge down when it presents the current owner's token — so a stale run's cleanup (a sub-second
+ *  close-reopen, or a superseded prepare()) can't destroy a newer run's live bridge (). */
 export function startOrchestrationBridge(
   projectId: string,
   buildAgentId: string,
+  launchToken: string,
 ): Promise<BridgeInfo> {
-  return invoke<BridgeInfo>("start_orchestration_bridge", { projectId, buildAgentId });
+  return invoke<BridgeInfo>("start_orchestration_bridge", { projectId, buildAgentId, launchToken });
 }
 
-/** Stop the orchestration bridge for this build agent (on close). */
-export function stopOrchestrationBridge(buildAgentId: string): Promise<void> {
-  return invoke<void>("stop_orchestration_bridge", { buildAgentId });
+/** Stop the orchestration bridge for this build agent (on close). Only tears down when `launchToken`
+ *  matches the bridge's current owner — a stale run presenting an old token is a no-op (). */
+export function stopOrchestrationBridge(buildAgentId: string, launchToken: string): Promise<void> {
+  return invoke<void>("stop_orchestration_bridge", { buildAgentId, launchToken });
 }
 
 /** Resolve the node binary + the bundled orchestrator server.js absolute paths. */

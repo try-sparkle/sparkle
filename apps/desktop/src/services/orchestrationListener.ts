@@ -61,6 +61,26 @@ function decInFlight(projectId: string, buildAgentId: string): void {
   else inFlight.set(k, n);
 }
 
+/** Purge all orchestration state for a build agent whose bridge is being stopped ():
+ *  reply-and-drop every one of its still-queued spawn requests (so a closed orchestrator's deferred
+ *  spawns don't linger and can't fire against a torn-down bridge), and clear its in-flight slot
+ *  reservations across every project (keyed `${projectId}:${buildAgentId}`) so a later reincarnation
+ *  of the same build agent id starts from a clean cap. Idempotent and cheap; safe to call on every
+ *  build-agent close. The Rust `stop_bridge` separately releases the blocked accept threads, so
+ *  this only needs to handle the frontend-side queue + reservation bookkeeping. */
+export function purgeBuildAgent(buildAgentId: string): void {
+  for (let i = spawnQueue.length - 1; i >= 0; i--) {
+    if (spawnQueue[i]!.buildAgentId === buildAgentId) {
+      const [dropped] = spawnQueue.splice(i, 1);
+      void respond(dropped!.reqId, { error: "orchestration bridge stopped" });
+    }
+  }
+  const suffix = `:${buildAgentId}`;
+  for (const key of [...inFlight.keys()]) {
+    if (key.endsWith(suffix)) inFlight.delete(key);
+  }
+}
+
 /** Reply to a round-trip op. The bridge wraps `result` into the socket response; a frontend-side
  *  failure is conveyed as `{ error }` (the MCP server treats that as a tool error). */
 function respond(reqId: string, result: unknown): Promise<void> {

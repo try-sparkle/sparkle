@@ -17,26 +17,54 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::worktree::read_worker_result_at;
 
-/// Rendezvous map: reqId → reply sender. Used to bridge async frontend responses back to the
+/// A registered rendezvous: the reply sender plus the build agent that owns the in-flight op.
+/// The `build_agent_id` lets `stop_bridge` release EVERY pending op belonging to a build agent
+/// whose bridge is being torn down (), instead of leaving those blocked accept threads
+/// to wait out the full 600s round-trip timeout.
+pub(crate) struct PendingEntry {
+    tx: mpsc::Sender<Value>,
+    build_agent_id: String,
+}
+
+/// Rendezvous map: reqId → pending entry. Used to bridge async frontend responses back to the
 /// blocking accept-thread op that emitted the request. `register_pending` inserts a fresh channel
 /// sender and returns the receiver; `resolve_pending` delivers the value and removes the entry.
-pub type PendingMap = Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>;
+pub type PendingMap = Arc<Mutex<HashMap<String, PendingEntry>>>;
 
-/// Register a rendezvous for `req_id`; returns the receiver the awaiting op blocks on.
-/// Called by 2b-C async ops (unused in production until that sub-plan lands).
-#[allow(dead_code)]
-pub fn register_pending(pending: &PendingMap, req_id: &str) -> mpsc::Receiver<Value> {
+/// Register a rendezvous for `req_id` owned by `build_agent_id`; returns the receiver the awaiting
+/// op blocks on. The owner id lets a bridge teardown resolve every one of its still-blocked ops.
+pub fn register_pending(pending: &PendingMap, req_id: &str, build_agent_id: &str) -> mpsc::Receiver<Value> {
     let (tx, rx) = mpsc::channel();
     // Poison-tolerant: a panic in a prior holder must not permanently wedge the bridge.
-    pending.lock().unwrap_or_else(|e| e.into_inner()).insert(req_id.to_string(), tx);
+    pending.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        req_id.to_string(),
+        PendingEntry { tx, build_agent_id: build_agent_id.to_string() },
+    );
     rx
 }
 
 /// Deliver `value` to the op awaiting `req_id` (if any), removing the entry. No-op if absent or
 /// the receiver was already dropped (e.g. the op timed out).
 pub fn resolve_pending(pending: &PendingMap, req_id: &str, value: Value) {
-    if let Some(tx) = pending.lock().unwrap_or_else(|e| e.into_inner()).remove(req_id) {
-        let _ = tx.send(value);
+    if let Some(entry) = pending.lock().unwrap_or_else(|e| e.into_inner()).remove(req_id) {
+        let _ = entry.tx.send(value);
+    }
+}
+
+/// Release EVERY pending op owned by `build_agent_id` (): send each blocked accept
+/// thread a `null` so it returns immediately with a "round-trip timeout"-shaped None instead of
+/// waiting out the full 600s timeout after its bridge was stopped. Called from `stop_bridge`.
+fn resolve_pending_for_agent(pending: &PendingMap, build_agent_id: &str) {
+    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
+    let stale: Vec<String> = map
+        .iter()
+        .filter(|(_, e)| e.build_agent_id == build_agent_id)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in stale {
+        if let Some(entry) = map.remove(&k) {
+            let _ = entry.tx.send(Value::Null);
+        }
     }
 }
 
@@ -45,6 +73,11 @@ struct BridgeHandle {
     token: String,
     shutdown: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+    /// The per-launch token of the AgentPane run that currently owns this bridge ().
+    /// Each `prepare()` run mints a fresh launch token; `stop_bridge` only tears the bridge down
+    /// when the caller presents THIS owner's token, so a stale run's teardown (a sub-second
+    /// close-reopen, or a superseded prepare()) can't destroy a NEWER run's live bridge.
+    owner: String,
 }
 
 #[derive(Default)]
@@ -70,6 +103,7 @@ pub fn start_bridge_at(
     app_data: &Path,
     project_id: &str,
     build_agent_id: &str,
+    launch_token: &str,
 ) -> Result<(PathBuf, String), String> {
     // Hold the lock across check → bind → insert so two concurrent starts for the same
     // build_agent_id can't both bind (the loser would orphan a thread whose shutdown flag
@@ -79,8 +113,12 @@ pub fn start_bridge_at(
     let mut map = manager.bridges.lock().unwrap_or_else(|e| e.into_inner());
     // FIX 2: idempotency check — only return the existing handle if its accept loop is still alive.
     // If the loop died (fatal error branch), treat as stale: tear down and fall through to rebind.
-    if let Some(h) = map.get(build_agent_id) {
+    if let Some(h) = map.get_mut(build_agent_id) {
         if h.alive.load(Ordering::SeqCst) {
+            // : a re-prepare() of the same build agent reuses the live bridge, but it is
+            // now owned by the NEWEST launch. Transfer ownership so a still-pending teardown from the
+            // PRIOR launch (which presents the old token) becomes a no-op and can't kill this bridge.
+            h.owner = launch_token.to_string();
             return Ok((h.socket_path.clone(), h.token.clone()));
         }
         let _ = std::fs::remove_file(&h.socket_path); // stale/dead listener — tear down + rebind below
@@ -155,7 +193,13 @@ pub fn start_bridge_at(
 
     map.insert(
         build_agent_id.to_string(),
-        BridgeHandle { socket_path: sock.clone(), token: token.clone(), shutdown, alive },
+        BridgeHandle {
+            socket_path: sock.clone(),
+            token: token.clone(),
+            shutdown,
+            alive,
+            owner: launch_token.to_string(),
+        },
     );
     Ok((sock, token))
 }
@@ -194,11 +238,53 @@ fn serve_conn(
     }
 }
 
-/// Signal shutdown, remove the socket file and the map entry.
-pub fn stop_bridge(manager: &BridgeManager, build_agent_id: &str) {
-    if let Some(h) = manager.bridges.lock().unwrap_or_else(|e| e.into_inner()).remove(build_agent_id) {
+/// Signal shutdown, remove the socket file and the map entry, and release every op still blocked
+/// on this bridge (). `launch_token` is the per-launch owner token the caller started
+/// the bridge with: teardown happens ONLY when it matches the current owner (or is `None`, an
+/// unconditional stop). A stale run presenting an old token is a no-op — it can't tear down a
+/// NEWER launch's live bridge (the sub-second close-reopen / superseded-prepare race).
+pub fn stop_bridge(manager: &BridgeManager, build_agent_id: &str, launch_token: Option<&str>) {
+    let mut map = manager.bridges.lock().unwrap_or_else(|e| e.into_inner());
+    // Only tear down when this caller owns the current bridge (or forces it with None).
+    let owns = match (map.get(build_agent_id), launch_token) {
+        (Some(h), Some(tok)) => h.owner == tok,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if !owns {
+        return;
+    }
+    if let Some(h) = map.remove(build_agent_id) {
         h.shutdown.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_file(&h.socket_path);
+    }
+    // Drop the map lock BEFORE resolving pending ops so a woken accept thread can't contend on it.
+    drop(map);
+    // Release any blocked round-trip ops owned by this build agent so their accept threads return
+    // immediately instead of waiting out the 600s timeout.
+    resolve_pending_for_agent(&manager.pending, build_agent_id);
+}
+
+/// The git SHA this binary was built from (sparkle-bnvs), embedded at compile time by build.rs.
+/// "unknown" when git was unavailable at build (e.g. a tarball build). The running app embeds the
+/// MCP/bridge and does NOT hot-reload, so this is the signal that reveals a stale running build.
+pub fn running_build_sha() -> &'static str {
+    option_env!("SPARKLE_GIT_SHA").unwrap_or("unknown")
+}
+
+/// Append a line to the durable orchestration log under app-data (sparkle-bnvs). Best-effort:
+/// a logging failure never affects bridge start/stop. Gives spawn/reconcile/bridge lifecycle a
+/// durable, greppable trail (`<app_data>/orchestration.log`) that survives the app restart the
+/// stale-build trap requires — so "which build was running when this went wrong" is answerable.
+pub fn append_orch_log(app_data: &Path, line: &str) {
+    use std::io::Write as _;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = app_data.join("orchestration.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{ts} sha={} {line}", running_build_sha());
     }
 }
 
@@ -228,16 +314,30 @@ pub fn start_orchestration_bridge(
     manager: State<BridgeManager>,
     project_id: String,
     build_agent_id: String,
+    launch_token: String,
 ) -> Result<BridgeInfo, String> {
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
-    let (sock, token) = start_bridge_at(Some(app.clone()), &manager, &app_data, &project_id, &build_agent_id)?;
+    let (sock, token) =
+        start_bridge_at(Some(app.clone()), &manager, &app_data, &project_id, &build_agent_id, &launch_token)?;
+    // sparkle-bnvs: durable record of which build served this bridge start (embeds the SHA).
+    append_orch_log(&app_data, &format!("bridge_start build={build_agent_id} project={project_id}"));
     Ok(BridgeInfo { socket_path: sock.to_string_lossy().to_string(), token })
 }
 
-/// Stop the orchestration bridge for a build agent (Tauri command).
+/// Stop the orchestration bridge for a build agent (Tauri command). `launch_token` is the
+/// per-launch owner token: teardown only happens when it matches the current owner, so a stale
+/// run's cleanup can't kill a newer run's bridge ().
 #[tauri::command]
-pub fn stop_orchestration_bridge(manager: State<BridgeManager>, build_agent_id: String) -> Result<(), String> {
-    stop_bridge(&manager, &build_agent_id);
+pub fn stop_orchestration_bridge(
+    app: AppHandle,
+    manager: State<BridgeManager>,
+    build_agent_id: String,
+    launch_token: String,
+) -> Result<(), String> {
+    stop_bridge(&manager, &build_agent_id, Some(&launch_token));
+    if let Ok(app_data) = crate::worktree::app_data_dir_pub(&app) {
+        append_orch_log(&app_data, &format!("bridge_stop build={build_agent_id}"));
+    }
     Ok(())
 }
 
@@ -315,6 +415,15 @@ fn handle_request_line(line: &str, expected_token: &str) -> String {
                 Err(e) => json!({ "id": id, "ok": false, "error": e }).to_string(),
             }
         }
+        Some("bridge_info") => {
+            // sparkle-bnvs: report the running build so the orchestrator (or a developer) can tell
+            // whether the live app embeds a stale bridge — the app does NOT hot-reload, so a fix on
+            // main isn't live until a restart. `sha` is baked in at compile time (build.rs).
+            json!({ "id": id, "ok": true, "result": {
+                "sha": running_build_sha(),
+                "pid": std::process::id(),
+            } }).to_string()
+        }
         _ => json!({ "id": id, "ok": false, "error": "unknown op" }).to_string(),
     }
 }
@@ -386,7 +495,7 @@ fn handle_frontend_op(
         Ok(t) => t,
         Err(e) => return json!({ "id": id, "ok": false, "error": format!("reqId gen: {e}") }).to_string(),
     };
-    let rx = register_pending(pending, &req_id);
+    let rx = register_pending(pending, &req_id, build_agent_id);
     let event = json!({
         "reqId": req_id,
         "op": op,
@@ -399,7 +508,16 @@ fn handle_frontend_op(
         return json!({ "id": id, "ok": false, "error": format!("emit failed: {e}") }).to_string();
     }
     match wait_pending(rx, pending, &req_id, ROUNDTRIP_TIMEOUT) {
-        Some(val) => json!({ "id": id, "ok": true, "result": val }).to_string(),
+        Some(mut val) => {
+            // sparkle-bnvs: stamp every list_workers reply with the running build SHA so the
+            // orchestrator sees on each poll which build is live and can flag a stale one.
+            if op == "list_workers" {
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("runningSha".to_string(), json!(running_build_sha()));
+                }
+            }
+            json!({ "id": id, "ok": true, "result": val }).to_string()
+        }
         None => json!({ "id": id, "ok": false, "error": "frontend round-trip timeout" }).to_string(),
     }
 }
@@ -534,7 +652,7 @@ mod tests {
     fn listener_serves_authed_read_result_and_rejects_bad_token() {
         let app_data = short_unique_dir("lad");
         let mgr = BridgeManager::default();
-        let (sock, token) = start_bridge_at(None, &mgr, &app_data, "p", "build1").unwrap();
+        let (sock, token) = start_bridge_at(None, &mgr, &app_data, "p", "build1", "L1").unwrap();
         // 0600 perms on the socket file.
         #[cfg(unix)]
         {
@@ -573,7 +691,7 @@ mod tests {
         assert_eq!(v2["ok"], false);
         assert_eq!(v2["error"], "unauthorized");
 
-        stop_bridge(&mgr, "build1");
+        stop_bridge(&mgr, "build1", None);
         assert!(!sock.exists(), "socket file removed on stop");
         let _ = std::fs::remove_dir_all(&app_data);
         let _ = std::fs::remove_dir_all(&wt);
@@ -584,11 +702,11 @@ mod tests {
     fn start_bridge_at_is_idempotent() {
         let app_data = short_unique_dir("idem");
         let mgr = BridgeManager::default();
-        let (sock1, token1) = start_bridge_at(None, &mgr, &app_data, "p", "idem-agent").unwrap();
-        let (sock2, token2) = start_bridge_at(None, &mgr, &app_data, "p", "idem-agent").unwrap();
+        let (sock1, token1) = start_bridge_at(None, &mgr, &app_data, "p", "idem-agent", "L1").unwrap();
+        let (sock2, token2) = start_bridge_at(None, &mgr, &app_data, "p", "idem-agent", "L1").unwrap();
         assert_eq!(sock1, sock2, "idempotent: same socket path");
         assert_eq!(token1, token2, "idempotent: same token");
-        stop_bridge(&mgr, "idem-agent");
+        stop_bridge(&mgr, "idem-agent", None);
         let _ = std::fs::remove_dir_all(&app_data);
     }
 
@@ -597,10 +715,10 @@ mod tests {
     fn connect_fails_after_stop_bridge() {
         let app_data = short_unique_dir("stop");
         let mgr = BridgeManager::default();
-        let (sock, _token) = start_bridge_at(None, &mgr, &app_data, "p", "stop-agent").unwrap();
+        let (sock, _token) = start_bridge_at(None, &mgr, &app_data, "p", "stop-agent", "L1").unwrap();
         // Confirm we can connect before stop.
         assert!(UnixStream::connect(&sock).is_ok(), "should connect before stop");
-        stop_bridge(&mgr, "stop-agent");
+        stop_bridge(&mgr, "stop-agent", None);
         // After stop the socket file is gone; connect must fail.
         assert!(UnixStream::connect(&sock).is_err(), "must not connect after stop");
         let _ = std::fs::remove_dir_all(&app_data);
@@ -612,7 +730,7 @@ mod tests {
     fn stale_dead_handle_is_rebound() {
         let app_data = short_unique_dir("stale");
         let mgr = BridgeManager::default();
-        let (_sock1, token1) = start_bridge_at(None, &mgr, &app_data, "p", "stale-agent").unwrap();
+        let (_sock1, token1) = start_bridge_at(None, &mgr, &app_data, "p", "stale-agent", "L1").unwrap();
 
         // Reach into the manager and flip alive to false — simulating a fatal accept-loop exit.
         {
@@ -622,11 +740,100 @@ mod tests {
         }
 
         // A second call for the same id must detect the dead handle, tear it down, and rebind.
-        let (_sock2, token2) = start_bridge_at(None, &mgr, &app_data, "p", "stale-agent").unwrap();
+        let (_sock2, token2) = start_bridge_at(None, &mgr, &app_data, "p", "stale-agent", "L2").unwrap();
         assert_ne!(token1, token2, "fresh bind must produce a new token, not the stale one");
 
-        stop_bridge(&mgr, "stale-agent");
+        stop_bridge(&mgr, "stale-agent", None);
         let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    //  — stale teardown must NOT kill a live bridge. A stop presenting a token that is
+    // not the current owner is a no-op; the correct owner's stop tears it down.
+    #[test]
+    fn stop_bridge_ignores_stale_launch_token() {
+        let app_data = short_unique_dir("s16a");
+        let mgr = BridgeManager::default();
+        let (sock, _tok) = start_bridge_at(None, &mgr, &app_data, "p", "s16-agent", "L1").unwrap();
+        assert!(UnixStream::connect(&sock).is_ok(), "connect before any stop");
+        // A stale run (old token) tries to stop it — must be a no-op.
+        stop_bridge(&mgr, "s16-agent", Some("STALE"));
+        assert!(UnixStream::connect(&sock).is_ok(), "stale-token stop must NOT tear down the bridge");
+        // The real owner stops it — now it's gone.
+        stop_bridge(&mgr, "s16-agent", Some("L1"));
+        assert!(UnixStream::connect(&sock).is_err(), "owner stop tears the bridge down");
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    //  — a re-prepare() of the same build agent transfers ownership to the newest launch,
+    // so the PRIOR launch's still-pending teardown becomes a no-op and can't kill the live bridge.
+    #[test]
+    fn reprepare_transfers_ownership_stale_stop_is_noop() {
+        let app_data = short_unique_dir("s16b");
+        let mgr = BridgeManager::default();
+        let (sock1, tok1) = start_bridge_at(None, &mgr, &app_data, "p", "s16b-agent", "L1").unwrap();
+        // Idempotent re-start under a NEWER launch token: same socket/token, ownership moves to L2.
+        let (sock2, tok2) = start_bridge_at(None, &mgr, &app_data, "p", "s16b-agent", "L2").unwrap();
+        assert_eq!(sock1, sock2, "reused live bridge keeps its socket");
+        assert_eq!(tok1, tok2, "reused live bridge keeps its token");
+        // The OLD launch's teardown fires (old token) — must NOT tear down the bridge L2 now owns.
+        stop_bridge(&mgr, "s16b-agent", Some("L1"));
+        assert!(UnixStream::connect(&sock1).is_ok(), "prior launch's stop must be a no-op after ownership transfer");
+        // The current owner's stop works.
+        stop_bridge(&mgr, "s16b-agent", Some("L2"));
+        assert!(UnixStream::connect(&sock1).is_err(), "current owner stop tears it down");
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    //  — stop_bridge releases every op still blocked on the torn-down bridge so its
+    // accept thread returns immediately instead of hanging for the full 600s round-trip timeout.
+    #[test]
+    fn stop_bridge_releases_pending_ops() {
+        let app_data = short_unique_dir("s16c");
+        let mgr = BridgeManager::default();
+        // A live bridge for agentA (its accept thread is what would otherwise block on the pendings).
+        let _ = start_bridge_at(None, &mgr, &app_data, "p", "agentA", "L1").unwrap();
+        // Two pending ops for agentA, one for a bystander agentB that must survive the stop.
+        let rx_a1 = register_pending(&mgr.pending, "a1", "agentA");
+        let rx_a2 = register_pending(&mgr.pending, "a2", "agentA");
+        let rx_b = register_pending(&mgr.pending, "b1", "agentB");
+        // The owner stops agentA's bridge — every one of agentA's blocked ops is released with null.
+        stop_bridge(&mgr, "agentA", Some("L1"));
+        assert_eq!(rx_a1.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), Value::Null);
+        assert_eq!(rx_a2.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), Value::Null);
+        // The bystander's op is untouched — its entry remains and it receives no value.
+        assert!(rx_b.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        assert!(mgr.pending.lock().unwrap().contains_key("b1"), "bystander pending must survive");
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // sparkle-bnvs — bridge_info reports the running build SHA (token-gated) so the orchestrator
+    // can detect a stale running build (the app embeds the bridge and does not hot-reload).
+    #[test]
+    fn bridge_info_reports_running_sha() {
+        let v: serde_json::Value = serde_json::from_str(
+            &handle_request_line(r#"{"id":"1","token":"T","op":"bridge_info"}"#, "T"),
+        )
+        .unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v["result"]["sha"].is_string(), "sha must be present");
+        assert!(v["result"]["pid"].is_number(), "pid must be present");
+        // Unauthorized without the token.
+        let bad: serde_json::Value = serde_json::from_str(
+            &handle_request_line(r#"{"id":"1","token":"X","op":"bridge_info"}"#, "T"),
+        )
+        .unwrap();
+        assert_eq!(bad["error"], "unauthorized");
+    }
+
+    // sparkle-bnvs — the durable orchestration log appends a line under app-data and stamps the SHA.
+    #[test]
+    fn append_orch_log_writes_line() {
+        let dir = short_unique_dir("olog");
+        append_orch_log(&dir, "bridge_start build=x project=y");
+        let contents = std::fs::read_to_string(dir.join("orchestration.log")).unwrap();
+        assert!(contents.contains("bridge_start build=x project=y"));
+        assert!(contents.contains("sha="), "log line must carry the running SHA");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -635,7 +842,7 @@ mod tests {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Register, resolve from another thread, receive the value.
-        let rx = register_pending(&pending, "req1");
+        let rx = register_pending(&pending, "req1", "b");
         let p2 = pending.clone();
         std::thread::spawn(move || {
             resolve_pending(&p2, "req1", serde_json::json!({ "workerId": "w1" }));
@@ -644,7 +851,7 @@ mod tests {
         assert_eq!(got["workerId"], "w1");
 
         // Unresolved request times out.
-        let rx2 = register_pending(&pending, "req2");
+        let rx2 = register_pending(&pending, "req2", "b");
         assert!(rx2.recv_timeout(Duration::from_millis(50)).is_err());
 
         // Resolving an unknown id is a no-op (does not panic).
@@ -663,7 +870,7 @@ mod tests {
             panic!("simulated panic while holding the pending lock");
         }));
         // Lock is now poisoned; the poison-tolerant register/resolve must still function.
-        let rx = register_pending(&pending, "after-poison");
+        let rx = register_pending(&pending, "after-poison", "b");
         resolve_pending(&pending, "after-poison", serde_json::json!({ "ok": true }));
         let got = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert_eq!(got["ok"], true);
@@ -675,14 +882,14 @@ mod tests {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Resolved before the timeout → Some(value).
-        let rx = register_pending(&pending, "rp1");
+        let rx = register_pending(&pending, "rp1", "b");
         let p2 = pending.clone();
         std::thread::spawn(move || resolve_pending(&p2, "rp1", serde_json::json!({ "ok": 1 })));
         let got = wait_pending(rx, &pending, "rp1", Duration::from_secs(2));
         assert_eq!(got, Some(serde_json::json!({ "ok": 1 })));
 
         // Never resolved → None, and the stale pending entry is removed.
-        let rx2 = register_pending(&pending, "rp2");
+        let rx2 = register_pending(&pending, "rp2", "b");
         let none = wait_pending(rx2, &pending, "rp2", Duration::from_millis(20));
         assert_eq!(none, None);
         assert!(!pending.lock().unwrap().contains_key("rp2"), "stale entry must be removed on timeout");

@@ -654,3 +654,83 @@ describe("runtimeStore — pinned workers (sub-agent surfacing)", () => {
     expect(persisted.state.pinnedWorkerIds).toBeUndefined();
   });
 });
+
+describe("runtimeStore — multi-window open-set merge ()", () => {
+  it("open() UNIONs against the shared persisted set instead of clobbering another window's ids", async () => {
+    const useRuntimeStore = await freshStore();
+    const { open } = useRuntimeStore.getState();
+    // Window A opens its own two agents.
+    open("a1");
+    open("a2");
+    // Window B (another window, SAME localStorage key) has since persisted its own open agent on top.
+    localStorage.setItem(
+      STORE_KEY,
+      JSON.stringify({ state: { openAgentIds: ["a1", "a2", "b1"] }, version: 0 }),
+    );
+    // Window A opens a3. The naive whole-array write would persist [a1,a2,a3] and DROP b1.
+    open("a3");
+    const persisted = JSON.parse(localStorage.getItem(STORE_KEY) as string);
+    expect(persisted.state.openAgentIds).toContain("b1"); // window B's agent survives
+    expect(persisted.state.openAgentIds).toContain("a3"); // window A's new agent is added
+    expect(persisted.state.openAgentIds).toEqual(
+      expect.arrayContaining(["a1", "a2", "a3", "b1"]),
+    );
+  });
+
+  it("close() removes ONLY the closed id and preserves another window's persisted ids", async () => {
+    const useRuntimeStore = await freshStore();
+    const { open, close } = useRuntimeStore.getState();
+    open("a1");
+    open("a2");
+    // Another window persisted b1 into the shared set.
+    localStorage.setItem(
+      STORE_KEY,
+      JSON.stringify({ state: { openAgentIds: ["a1", "a2", "b1"] }, version: 0 }),
+    );
+    close("a2");
+    const persisted = JSON.parse(localStorage.getItem(STORE_KEY) as string);
+    expect(persisted.state.openAgentIds).toContain("b1"); // not clobbered
+    expect(persisted.state.openAgentIds).not.toContain("a2"); // the closed id is gone
+    expect(persisted.state.openAgentIds).toContain("a1");
+  });
+
+  it("mergeOpenAgentIds unions preserving in-memory order then persisted extras, adding new id last", async () => {
+    const { mergeOpenAgentIds } = await import("./runtimeStore");
+    expect(mergeOpenAgentIds(["a1", "a2"], ["a1", "a2", "b1"], "a3")).toEqual([
+      "a1",
+      "a2",
+      "b1",
+      "a3",
+    ]);
+    // No-op add (already present) doesn't duplicate.
+    expect(mergeOpenAgentIds(["a1"], ["a1", "b1"], "a1")).toEqual(["a1", "b1"]);
+    // Undefined add just unions.
+    expect(mergeOpenAgentIds(["a1"], ["b1"])).toEqual(["a1", "b1"]);
+  });
+
+  it("readPersistedOpenAgentIds tolerates a missing / malformed blob", async () => {
+    const { readPersistedOpenAgentIds } = await import("./runtimeStore");
+    expect(readPersistedOpenAgentIds()).toEqual([]); // nothing persisted yet
+    localStorage.setItem(STORE_KEY, "not json{");
+    expect(readPersistedOpenAgentIds()).toEqual([]);
+    localStorage.setItem(STORE_KEY, JSON.stringify({ state: { openAgentIds: "nope" } }));
+    expect(readPersistedOpenAgentIds()).toEqual([]);
+  });
+});
+
+describe("runtimeStore — setStatus ref stability (sparkle-f2uz)", () => {
+  it("keeps the status map reference stable on a redundant same-value tick, and swaps it on a real change", async () => {
+    const useRuntimeStore = await freshStore();
+    const { setStatus } = useRuntimeStore.getState();
+    setStatus("a", "working");
+    const ref1 = useRuntimeStore.getState().status;
+    // A redundant tick of the SAME status must NOT allocate a new map — whole-map subscribers
+    // (sidebar / TopBar) would otherwise re-render for nothing.
+    setStatus("a", "working");
+    expect(useRuntimeStore.getState().status).toBe(ref1);
+    // A genuine change swaps the reference (and re-renders, as intended).
+    setStatus("a", "idle");
+    expect(useRuntimeStore.getState().status).not.toBe(ref1);
+    expect(useRuntimeStore.getState().status["a"]).toBe("idle");
+  });
+});

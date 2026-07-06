@@ -43,14 +43,17 @@ pub fn start_orchestration_bridge(
     _manager: State<BridgeManager>,
     _project_id: String,
     _build_agent_id: String,
+    _launch_token: String,
 ) -> Result<BridgeInfo, String> {
     Err(UNSUPPORTED.to_string())
 }
 
 #[tauri::command]
 pub fn stop_orchestration_bridge(
+    _app: AppHandle,
     _manager: State<BridgeManager>,
     _build_agent_id: String,
+    _launch_token: String,
 ) -> Result<(), String> {
     // Idempotent on Unix; a no-op here since nothing was ever started.
     Ok(())

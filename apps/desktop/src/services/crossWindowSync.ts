@@ -3,7 +3,7 @@
 // The browser `storage` event is kept as a best-effort bonus only — it is not reliably delivered
 // across separate Tauri WebViews (WKWebView on macOS especially).
 import { emit, listen } from "@tauri-apps/api/event";
-import { useProjectStore, PROJECTS_PERSIST_KEY } from "../stores/projectStore";
+import { useProjectStore, PROJECTS_PERSIST_KEY, flushProjectsPersist } from "../stores/projectStore";
 import { useDictationStore, DICTATION_PERSIST_KEY } from "../stores/dictationStore";
 
 const inTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -25,6 +25,10 @@ interface SyncSpec {
     };
   };
   signature: () => string;
+  /** Optional: synchronously flush the store's (debounced) localStorage write BEFORE broadcasting,
+   *  so a receiving window rehydrates the fresh blob and not a stale one still in the debounce
+   *  buffer (sparkle-pngb + ). */
+  flush?: () => void;
 }
 
 /** Wire one persisted store for cross-window consistency, pushing teardown fns into `unsubs`. */
@@ -78,6 +82,9 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>): void {
     const now = spec.signature();
     if (now === last) return;
     last = now;
+    // Structural change is about to fan out to other windows — make sure the debounced projects
+    // write has hit real localStorage first, so the receivers rehydrate the fresh blob.
+    spec.flush?.();
     if (inTauri()) void emit(spec.event);
   });
   unsubs.push(unsubStore);
@@ -116,6 +123,7 @@ export function subscribeToCrossWindowSync(): () => void {
       persistKey: PROJECTS_PERSIST_KEY,
       store: useProjectStore,
       signature: projectSignature,
+      flush: flushProjectsPersist,
     },
     unsubs,
   );
