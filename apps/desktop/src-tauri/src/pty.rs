@@ -766,6 +766,77 @@ mod tests {
         ps.wait_while_paused(); // still returns at once after a resume
     }
 
+    // ── .4: live PTY boundary (output bytes → exit) ────────────────────────────────
+    /// One real integration test at the PTY boundary. It spawns an actual pseudo-terminal running a
+    /// deterministic, always-available command (`/bin/echo`) via the SAME `portable_pty` primitives
+    /// `pty_spawn` uses (openpty → spawn_command → drop slave → clone master reader → reap child),
+    /// then drives the exact read loop the reader thread runs:
+    ///   - `pty:output` boundary: the bytes read off the master carry the child\'s stdout marker.
+    ///   - `pty:exit`   boundary: the master reader reaches EOF (`Ok(0)`) once the child exits, and
+    ///     the child is reapable — the two conditions that make `pty_spawn` emit `pty:exit`.
+    /// Robust/non-flaky: the marker is fixed, the command exits on its own, and the master read runs
+    /// on a worker thread so the assertion is bounded by a `recv_timeout` (never an open-ended hang).
+    /// Gated to skip only if the environment can\'t open a PTY at all (e.g. a locked-down sandbox);
+    /// on macOS/Linux CI a PTY is available, so it runs for real.
+    #[test]
+    fn pty_boundary_delivers_output_bytes_then_exits() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::Read;
+        use std::sync::mpsc;
+
+        const MARKER: &str = "pty-boundary-probe-ova4";
+
+        let sys = native_pty_system();
+        let Ok(pair) =
+            sys.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        else {
+            eprintln!("no PTY available — skipping pty_boundary_delivers_output_bytes_then_exits");
+            return;
+        };
+
+        // Deterministic, universally-present command that prints a fixed marker and exits 0.
+        let mut cmd = CommandBuilder::new("/bin/echo");
+        cmd.arg(MARKER);
+        let Ok(mut child) = pair.slave.spawn_command(cmd) else {
+            eprintln!("spawn failed — skipping pty_boundary_delivers_output_bytes_then_exits");
+            return;
+        };
+        // Drop the slave so the master sees EOF once the child exits — exactly as `pty_spawn` does.
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().expect("clone master reader");
+
+        // Read the master to EOF on a worker thread (mirrors the reader thread\'s `Ok(0) => break`),
+        // so the test can bound the wait and never hang if EOF somehow never arrives.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,                              // EOF → child exited (pty:exit)
+                    Ok(n) => out.extend_from_slice(&buf[..n]),   // bytes → pty:output
+                    Err(_) => break, // some backends surface EOF as an error; treat it as end-of-stream
+                }
+            }
+            let _ = tx.send(out);
+        });
+
+        // pty:output boundary — the emitted stream must carry the child\'s stdout bytes.
+        let out = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("master reader must reach EOF within 10s (pty:exit boundary)");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains(MARKER),
+            "pty:output must carry the child\'s bytes; got {text:?}"
+        );
+
+        // pty:exit boundary — the process ended and is reapable (what the reaper thread relies on).
+        let status = child.wait().expect("child must be reapable at exit");
+        assert!(status.success(), "/bin/echo must exit 0; got {status:?}");
+    }
+
     /// `pty_kill` on a paused session sets `pause.set(false)` BEFORE `killer.kill()` so a reader
     /// parked on the pause gate wakes, then reads the child's EOF and runs teardown. This pins that
     /// kill-while-paused ordering contract ().

@@ -1,8 +1,9 @@
 import { defineConfig } from "vitest/config";
 
-// Coverage for the shared risk classifier. No thresholds yet — measurement first;
-// a non-decreasing ratchet in CI is tracked as a follow-up bead so a mis-set floor
-// can't redden the gate before it's tuned against the CI runner.
+// Coverage for the shared risk classifier with a blocking ratchet (bead .1):
+// CI fails if statement/line coverage regresses below the floor below. The floor is set
+// a few points UNDER the measured coverage so it doesn't flake on the CI runner; raise it
+// as coverage climbs, but never above the current measured value.
 export default defineConfig({
   test: {
     coverage: {
@@ -12,6 +13,11 @@ export default defineConfig({
       include: ["*.ts"],
       exclude: ["*.test.ts", "*.config.ts"],
       reporter: ["text-summary", "json-summary"],
+      // Blocking floor — a few points below the measured statement/line coverage.
+      thresholds: {
+        statements: 72,
+        lines: 72,
+      },
     },
   },
 });

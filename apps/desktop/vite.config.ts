@@ -126,13 +126,20 @@ export default defineConfig(({ mode, command }) => {
   // `// @vitest-environment jsdom` docblock (see Composer.dictation.test.tsx).
   test: {
     setupFiles: ["./src/test-setup.ts"],
-    // Coverage measurement only (no thresholds yet — see the CI-ratchet bead). The
-    // numbers are informational until a floor is tuned against the CI runner.
+    // Coverage with a blocking ratchet (bead .1): CI fails if statement/line
+    // coverage regresses below the floor below. The floor is set a few points UNDER the
+    // measured coverage so it doesn't flake on the CI runner; raise it as coverage climbs,
+    // but never above the current measured value.
     coverage: {
       provider: "v8",
       include: ["src/**/*.{ts,tsx}"],
       exclude: ["src/**/*.test.{ts,tsx}", "src/test-setup.ts", "src/**/*.d.ts"],
       reporter: ["text-summary", "json-summary"],
+      // Blocking floor — a few points below the measured statement/line coverage.
+      thresholds: {
+        statements: 30,
+        lines: 30,
+      },
     },
   },
   };
