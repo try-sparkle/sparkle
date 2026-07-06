@@ -99,6 +99,23 @@ interface ProjectState {
   /** Select an agent, or pass `null` to clear selection (routes the main pane to the blank state). */
   selectAgent: (projectId: string, agentId: string | null) => void;
   setAgentWorktree: (projectId: string, agentId: string, path: string, branch: string) => void;
+  /** Re-adopt a worker whose worktree + on-disk manifest survive on disk but whose in-memory
+   *  record was evicted by a reconcile/relocation/cross-window race (sparkle-3xus). Inserts a
+   *  worker AgentTab under `worker.parentId` if none with `worker.id` exists; a no-op when the
+   *  record is already present. Deliberately does NOT touch `selectedAgentId` — reconcile is a
+   *  background self-heal, not a user navigation, so it must not yank the user's active tab. */
+  adoptWorker: (
+    projectId: string,
+    worker: {
+      id: string;
+      parentId: string;
+      branch: string | null;
+      worktreePath: string | null;
+      task?: string;
+      beadId?: string;
+      parentBranch?: string;
+    },
+  ) => void;
   /** Record a submitted prompt: updates `lastPrompt` (pinned header) AND appends to
    *  `promptHistory` (capped). Returns the new entry's id so the caller can register the matching
    *  terminal scroll marker under the same key. */
@@ -512,6 +529,38 @@ export const useProjectStore = create<ProjectState>()(
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) => ({ ...a, worktreePath: path, branch })),
           ),
+        })),
+
+      adoptWorker: (projectId, worker) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) => {
+            // Idempotent: an existing record wins — never clobber live in-memory state (e.g. a
+            // name the user already saw) with the disk snapshot.
+            if (p.agents.some((a) => a.id === worker.id)) return p;
+            const agent: AgentTab = {
+              id: worker.id,
+              name: defaultAgentName(p, "worker"),
+              kind: "worker",
+              parentId: worker.parentId,
+              runtime: "local",
+              worktreePath: worker.worktreePath,
+              branch: worker.branch,
+              baseBranch: p.defaultBranch,
+              lastPrompt: "",
+              promptHistory: [],
+              task: worker.task,
+              parentBranch: worker.parentBranch,
+              beadId: worker.beadId,
+              namePinned: false,
+              autoNameBasis: null,
+              autoNameVariants: null,
+              shellCommand: null,
+              model: undefined,
+              pinnedIndex: null,
+            };
+            // Append WITHOUT changing selectedAgentId — the self-heal must be invisible to the user.
+            return { ...p, agents: [...p.agents, agent] };
+          }),
         })),
 
       appendPrompt: (projectId, agentId, text) => {

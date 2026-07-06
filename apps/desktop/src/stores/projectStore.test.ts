@@ -489,3 +489,56 @@ describe("setAgentEpicId", () => {
     expect(agents.find((a) => a.id === a1)!.epicId).toBe("epic-8");
   });
 });
+
+describe("adoptWorker (sparkle-3xus disk reconcile)", () => {
+  beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
+
+  it("inserts an evicted worker under its parent without stealing the selected tab", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const buildId = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    // The user is looking at the build agent; adoption must not yank selection to the new worker.
+    useProjectStore.getState().selectAgent(pid, buildId);
+
+    useProjectStore.getState().adoptWorker(pid, {
+      id: "w-adopt",
+      parentId: buildId,
+      branch: "sparkle/agent-w",
+      worktreePath: "/wt/w",
+      task: "do the thing",
+      beadId: "bead-1",
+    });
+
+    const proj = useProjectStore.getState().projects[0]!;
+    const w = proj.agents.find((a) => a.id === "w-adopt")!;
+    expect(w.kind).toBe("worker");
+    expect(w.parentId).toBe(buildId);
+    expect(w.branch).toBe("sparkle/agent-w");
+    expect(w.worktreePath).toBe("/wt/w");
+    expect(w.task).toBe("do the thing");
+    expect(w.beadId).toBe("bead-1");
+    expect(w.namePinned).toBe(false); // stays auto-nameable
+    expect(proj.selectedAgentId).toBe(buildId); // selection untouched (background self-heal)
+  });
+
+  it("is idempotent — never clobbers an existing in-memory record", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const buildId = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const wid = useProjectStore.getState().addAgent(pid, { kind: "worker", parentId: buildId, task: "live task" });
+    useProjectStore.getState().renameAgent(pid, wid, "My Worker");
+
+    // Re-adopting the SAME id must be a no-op (keep the live name/task, not the disk snapshot).
+    useProjectStore.getState().adoptWorker(pid, {
+      id: wid,
+      parentId: buildId,
+      branch: "sparkle/agent-x",
+      worktreePath: "/wt/x",
+      task: "stale task",
+    });
+
+    const proj = useProjectStore.getState().projects[0]!;
+    expect(proj.agents.filter((a) => a.id === wid).length).toBe(1); // no duplicate
+    const w = proj.agents.find((a) => a.id === wid)!;
+    expect(w.name).toBe("My Worker"); // live name preserved
+    expect(w.task).toBe("live task"); // live task preserved
+  });
+});

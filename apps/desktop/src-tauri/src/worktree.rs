@@ -1910,6 +1910,116 @@ pub async fn read_worker_result(worktree: String) -> Result<Option<String>, Stri
         .map_err(|e| format!("read_worker_result task failed: {e}"))?
 }
 
+// ── Durable per-worktree worker manifest (sparkle-hwfv / a670 / 3xus) ──────────────────────────
+//
+// A worker's identity + ownership used to live ONLY in the frontend projectStore, which is
+// persisted-per-mutation, cross-window synced (last-writer-wins), and rebuilt by reconcile /
+// relocation passes that can EVICT a just-added worker AFTER its worktree is cut. When that
+// happens the worker is lost from list_workers, spin_down reports "not owned", and the worker
+// stalls with no task — needing an app restart. The fix writes an authoritative copy of the
+// worker's identity to disk INSIDE its worktree (`.sparkle/worker.json`, sibling of the
+// `result.json` read above), so an evicted in-memory record can be re-derived from disk without
+// a restart. Mirrors `read_worker_result_at` — same `.sparkle/` dir (gitignored by
+// `ensure_project_repo`), same not-found-is-Ok semantics.
+
+/// Path to a worker's durable manifest inside its worktree.
+pub fn worker_manifest_path(worktree: &Path) -> PathBuf {
+    worktree.join(".sparkle").join("worker.json")
+}
+
+/// Write a worker's manifest (`.sparkle/worker.json`) into its worktree, creating `.sparkle/` if
+/// needed. Pretty-printed for human inspection. `manifest` is the full identity object the
+/// frontend assembled at spawn (`{workerId,buildAgentId,projectId,branch,worktree,task,beadId,
+/// createdAt}`). Written BEFORE spawn replies, so the reply can never precede the durable record.
+pub fn write_worker_manifest_at(worktree: &Path, manifest: &Value) -> Result<(), String> {
+    let sparkle = worktree.join(".sparkle");
+    std::fs::create_dir_all(&sparkle).map_err(|e| format!("mkdir .sparkle: {e}"))?;
+    let body = serde_json::to_string_pretty(manifest)
+        .map_err(|e| format!("serialize worker manifest: {e}"))?;
+    std::fs::write(worker_manifest_path(worktree), body)
+        .map_err(|e| format!("write worker manifest: {e}"))
+}
+
+/// Read a worker's manifest from its worktree. `Ok(None)` if absent (a legacy worker cut before
+/// manifests existed, or a worktree that was never a worker). Malformed JSON is surfaced as Err.
+pub fn read_worker_manifest_at(worktree: &Path) -> Result<Option<Value>, String> {
+    match std::fs::read_to_string(worker_manifest_path(worktree)) {
+        Ok(s) => {
+            let v: Value =
+                serde_json::from_str(&s).map_err(|e| format!("parse worker manifest: {e}"))?;
+            Ok(Some(v))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("failed to read worker manifest: {e}")),
+    }
+}
+
+/// Scan every worktree under `<app_data>/worktrees/<project_id>/` and return the parsed manifest
+/// of each one that has a readable `.sparkle/worker.json`. Each returned manifest has its
+/// `worktree` field set to the ACTUAL directory found on disk (authoritative, even if the value
+/// written at spawn is stale), so the reconcile pass can re-adopt the worker at its real path.
+/// Worktrees without a manifest (legacy workers, agent worktrees) or with unparseable JSON are
+/// skipped — the scan is a best-effort self-heal, never fatal. A missing worktrees dir -> empty.
+pub fn scan_worker_manifests_at(app_data: &Path, project_id: &str) -> Result<Vec<Value>, String> {
+    validate_id("project_id", project_id)?;
+    let dir = app_data.join("worktrees").join(project_id);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read worktrees dir: {e}")),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let wt = entry.path();
+        if !wt.is_dir() {
+            continue;
+        }
+        // Skip unreadable/malformed manifests rather than failing the whole scan.
+        let mut v = match read_worker_manifest_at(&wt) {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+        let Some(obj) = v.as_object_mut() else { continue };
+        // Overwrite `worktree` with the real on-disk path — the source of truth for adoption.
+        obj.insert(
+            "worktree".to_string(),
+            Value::String(wt.to_string_lossy().to_string()),
+        );
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// Write a worker's durable manifest into its worktree (Tauri command). Called by spawnWorker
+/// after the worktree is cut and BEFORE the orchestration reply is assembled (sparkle-hwfv).
+#[tauri::command]
+pub async fn write_worker_manifest(worktree: String, manifest: Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        write_worker_manifest_at(Path::new(&worktree), &manifest)
+    })
+    .await
+    .map_err(|e| format!("write_worker_manifest task failed: {e}"))?
+}
+
+/// Read a single worker's manifest (Tauri command). `Ok(None)` if absent.
+#[tauri::command]
+pub async fn read_worker_manifest(worktree: String) -> Result<Option<Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || read_worker_manifest_at(Path::new(&worktree)))
+        .await
+        .map_err(|e| format!("read_worker_manifest task failed: {e}"))?
+}
+
+/// Scan a project's worktrees for worker manifests (Tauri command). Powers the on-disk reconcile
+/// pass (sparkle-3xus): the frontend re-adopts any worker whose worktree+manifest survive on disk
+/// but whose in-memory store record was evicted.
+#[tauri::command]
+pub async fn scan_worker_manifests(app: AppHandle, project_id: String) -> Result<Vec<Value>, String> {
+    let app_data = app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || scan_worker_manifests_at(&app_data, &project_id))
+        .await
+        .map_err(|e| format!("scan_worker_manifests task failed: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     //! Engine harness (spec §10): proves the "multiple tabs, never overwriting each
@@ -3234,5 +3344,59 @@ mod tests {
         std::fs::write(sparkle.join("result.json"), r#"{"ok":true}"#).unwrap();
         assert_eq!(read_worker_result_at(&dir).unwrap().as_deref(), Some(r#"{"ok":true}"#));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_manifest_write_then_read_roundtrips() {
+        // sparkle-hwfv: writing a manifest into a worktree makes it readable back verbatim,
+        // creating `.sparkle/` as needed.
+        let dir = unique_root("worker-manifest-rt");
+        assert!(read_worker_manifest_at(&dir).unwrap().is_none()); // absent → None
+        let manifest = json!({
+            "workerId": "w1", "buildAgentId": "b1", "projectId": "p1",
+            "branch": "sparkle/agent-w1", "worktree": dir.to_string_lossy(),
+            "task": "do it", "beadId": "bead-9", "createdAt": "2026-07-06T00:00:00Z",
+        });
+        write_worker_manifest_at(&dir, &manifest).unwrap();
+        let got = read_worker_manifest_at(&dir).unwrap().expect("manifest present after write");
+        assert_eq!(got["workerId"], "w1");
+        assert_eq!(got["buildAgentId"], "b1");
+        assert_eq!(got["task"], "do it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_worker_manifests_collects_and_injects_worktree_path() {
+        // sparkle-3xus: the scan returns each worktree's manifest, overwriting `worktree` with the
+        // ACTUAL on-disk directory (authoritative) and skipping dirs without a manifest.
+        let app_data = unique_root("scan-app-data");
+        let project_id = "proj-scan";
+        let wt_root = app_data.join("worktrees").join(project_id);
+        std::fs::create_dir_all(&wt_root).unwrap();
+
+        // Worker A: has a manifest (with a deliberately STALE worktree value to prove it's fixed).
+        let wa = wt_root.join("worker-a");
+        std::fs::create_dir_all(&wa).unwrap();
+        write_worker_manifest_at(
+            &wa,
+            &json!({ "workerId": "worker-a", "buildAgentId": "b1", "projectId": project_id,
+                     "branch": "sparkle/agent-a", "worktree": "/stale/path", "task": "t",
+                     "createdAt": "x" }),
+        )
+        .unwrap();
+
+        // Worker B: a bare worktree dir with NO manifest (legacy worker) → skipped.
+        std::fs::create_dir_all(wt_root.join("worker-b")).unwrap();
+
+        let found = scan_worker_manifests_at(&app_data, project_id).unwrap();
+        assert_eq!(found.len(), 1, "only the dir with a manifest is returned");
+        let m = &found[0];
+        assert_eq!(m["workerId"], "worker-a");
+        // `worktree` is the REAL directory found, not the stale value written into the file.
+        assert_eq!(m["worktree"], wa.to_string_lossy().to_string());
+
+        // A project with no worktrees dir yet → empty (not an error).
+        assert!(scan_worker_manifests_at(&app_data, "no-such-project").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&app_data);
     }
 }

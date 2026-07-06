@@ -11,6 +11,40 @@ export interface WorktreeInfo {
   branch: string;
 }
 
+/** The durable per-worktree worker manifest (`.sparkle/worker.json`), the disk-authoritative copy
+ *  of a worker's identity + ownership (sparkle-hwfv). Written at spawn BEFORE the orchestration
+ *  reply, so an evicted in-memory projectStore record can be re-derived from disk without an app
+ *  restart. `worktree` is filled in from the actual on-disk path by scanWorkerManifests. */
+export interface WorkerManifest {
+  workerId: string;
+  buildAgentId: string;
+  projectId: string;
+  branch: string;
+  worktree: string;
+  task: string;
+  beadId?: string;
+  createdAt: string;
+}
+
+/** Write a worker's durable manifest into its worktree. Awaited at spawn before replying so the
+ *  disk record can never lag the reply (sparkle-hwfv / a670). */
+export function writeWorkerManifest(worktree: string, manifest: WorkerManifest): Promise<void> {
+  return invoke("write_worker_manifest", { worktree, manifest });
+}
+
+/** Read a single worker's manifest from its worktree; null if none has been written yet. */
+export function readWorkerManifest(worktree: string): Promise<WorkerManifest | null> {
+  return invoke<WorkerManifest | null>("read_worker_manifest", { worktree });
+}
+
+/** Scan a project's worktrees for worker manifests — the on-disk half of ownership reconcile
+ *  (sparkle-3xus). Each returned manifest's `worktree` is the real directory found on disk.
+ *  Best-effort: malformed/legacy entries are dropped by the backend, so this never throws on a
+ *  stray file. */
+export function scanWorkerManifests(projectId: string): Promise<WorkerManifest[]> {
+  return invoke<WorkerManifest[]>("scan_worker_manifests", { projectId });
+}
+
 /** Backend prewarm for a project root: warm the claude + node path caches and kick a throttled
  *  background origin fetch, so the first real agent spawn is already hot. Fire-and-forget. */
 export function prewarmSpawn(root: string): Promise<void> {

@@ -3,7 +3,7 @@
 // worker tab opens (AgentPane), driven by the worker persona + the stored task.
 import { useProjectStore } from "../stores/projectStore";
 import { type WorktreeInfo, killPty } from "../pty";
-import { prepareWorkerWorkspace, removeAgentWorkspace } from "./worktree";
+import { prepareWorkerWorkspace, removeAgentWorkspace, writeWorkerManifest } from "./worktree";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { maybeAutoName } from "./agentNaming";
 import { aiFeatureNow } from "./aiGate";
@@ -45,6 +45,21 @@ export async function spawnWorker(args: {
     beadId: args.beadId,
   });
 
+  // Fail-closed rollback (sparkle-a670): drop the orphan tab, restore the user's previously-active
+  // tab (removeAgent recomputes selection to agents[0], which may not be where the user was), and —
+  // when the worktree was already cut — remove it from disk so no half-registered worktree leaks.
+  const rollback = async (removeWorktree: boolean): Promise<void> => {
+    if (removeWorktree) {
+      await removeAgentWorkspace(project.rootPath, args.projectId, workerId).catch((e) =>
+        console.warn("spawnWorker rollback: removeAgentWorkspace failed", e),
+      );
+    }
+    useProjectStore.getState().removeAgent(args.projectId, workerId);
+    if (prevSelectedId) {
+      useProjectStore.getState().selectAgent(args.projectId, prevSelectedId);
+    }
+  };
+
   let info: WorktreeInfo;
   try {
     info = await prepareWorkerWorkspace({
@@ -54,16 +69,38 @@ export async function spawnWorker(args: {
       parentBranch: parent.branch,
     });
   } catch (e) {
-    // Roll back the orphaned tab: a failed worktree cut must not leave a dead, un-launchable
-    // worker (worktreePath/branch null) stranded in the sidebar.
-    useProjectStore.getState().removeAgent(args.projectId, workerId);
-    // Restore the previously-active tab — removeAgent recomputes selection to agents[0] which
-    // may not be the agent the user was working in.
-    if (prevSelectedId) {
-      useProjectStore.getState().selectAgent(args.projectId, prevSelectedId);
-    }
+    // A failed worktree cut left nothing durable on disk — just drop the orphan tab so a dead,
+    // un-launchable worker (worktreePath/branch null) isn't stranded in the sidebar.
+    await rollback(false);
     throw e;
   }
+
+  // sparkle-hwfv/a670 — Durability BEFORE registration: write the worker's identity to disk
+  // (`.sparkle/worker.json`) INSIDE its just-cut worktree, awaited before we finalize the store
+  // record or reply. This is the disk-authoritative copy of {workerId, buildAgentId, projectId,
+  // branch, task, beadId} that survives a store eviction, so an evicted in-memory record can be
+  // re-derived from disk (reconcile, sparkle-3xus) with no app restart — and the task-on-disk lets
+  // the worker read its mission even if its store record is gone (kills the taskless-stall half).
+  // Ordered manifest → setAgentWorktree so the moment the worker is observable as "materialized"
+  // (worktreePath set) it is already durable on disk.
+  try {
+    await writeWorkerManifest(info.path, {
+      workerId,
+      buildAgentId: args.parentAgentId,
+      projectId: args.projectId,
+      branch: info.branch,
+      worktree: info.path,
+      task: args.task,
+      beadId: args.beadId,
+      createdAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    // Fail closed: a worker we can't make durable must NOT be returned as a live worktree. Remove
+    // the just-cut worktree and the orphan tab so the spawn atomically rolls back (a670).
+    await rollback(true);
+    throw e;
+  }
+
   useProjectStore.getState().setAgentWorktree(args.projectId, workerId, info.path, info.branch);
 
   // Auto-name the worker from its assigned task, the same way a build/orchestrator agent is named

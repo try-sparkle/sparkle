@@ -28,6 +28,10 @@ describe("spawnWorker", () => {
   beforeEach(() => {
     useProjectStore.setState({ projects: [], selectedProjectId: null });
     invokeMock.mockReset();
+    // rollback() awaits removeAgentWorkspace(...).catch(...), so the mock must return a thenable;
+    // reset per-test so the "not called" assertion isn't polluted by a prior rollback test.
+    removeWsMock.mockReset();
+    removeWsMock.mockResolvedValue(undefined);
     // Default: AI enhancements locked (anonymous) so the auto-name path stays dormant and these
     // tests assert spawn mechanics without a second (generate_agent_name) invoke.
     useAuthStore.setState({ me: null });
@@ -40,7 +44,11 @@ describe("spawnWorker", () => {
     // Give the parent a known branch (as the worktree step would have).
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
 
-    invokeMock.mockResolvedValueOnce({ path: "/wt/worker", branch: "sparkle/agent-w" });
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "create_worker_worktree")
+        return Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" });
+      return Promise.resolve(undefined); // write_worker_manifest, etc.
+    });
 
     const spawned = await spawnWorker({ projectId, parentAgentId: buildId, task: "Build login" });
     const workerId = spawned.workerId;
@@ -54,6 +62,20 @@ describe("spawnWorker", () => {
     expect(invokeMock).toHaveBeenCalledWith("create_worker_worktree", expect.objectContaining({
       root: "/tmp/demo", projectId, workerId, parentBranch: "sparkle/agent-build1",
     }));
+
+    // sparkle-hwfv: a durable manifest was written INTO the worktree before returning, carrying the
+    // worker's disk-authoritative identity (task-on-disk kills the taskless-stall on eviction).
+    expect(invokeMock).toHaveBeenCalledWith("write_worker_manifest", {
+      worktree: "/wt/worker",
+      manifest: expect.objectContaining({
+        workerId,
+        buildAgentId: buildId,
+        projectId,
+        branch: "sparkle/agent-w",
+        worktree: "/wt/worker",
+        task: "Build login",
+      }),
+    });
 
     const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
     const worker = proj.agents.find((a) => a.id === workerId)!;
@@ -109,12 +131,17 @@ describe("spawnWorker", () => {
     const buildId = store.addAgent(projectId, { kind: "build" });
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
 
-    invokeMock.mockResolvedValueOnce({ path: "/wt/worker", branch: "sparkle/agent-w" });
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "create_worker_worktree")
+        return Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" });
+      return Promise.resolve(undefined);
+    });
 
     await spawnWorker({ projectId, parentAgentId: buildId, task: "Build the login flow" });
 
-    // Only the worktree call — no billed naming call when the feature is gated off.
-    expect(invokeMock).toHaveBeenCalledTimes(1);
+    // The worktree cut + the durable manifest write — but NO billed naming call when gated off.
+    expect(invokeMock).toHaveBeenCalledWith("create_worker_worktree", expect.anything());
+    expect(invokeMock).toHaveBeenCalledWith("write_worker_manifest", expect.anything());
     expect(invokeMock).not.toHaveBeenCalledWith("generate_agent_name", expect.anything());
   });
 
@@ -142,6 +169,52 @@ describe("spawnWorker", () => {
     expect(proj.agents.some((a) => a.kind === "worker")).toBe(false);
     // Selection is restored to the build agent the user was on before the spawn attempt.
     expect(proj.selectedAgentId).toBe(buildId);
+  });
+
+  it("rolls back the just-cut worktree AND the tab if the manifest write fails (fail-closed, a670)", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" });
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    const before = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents.length;
+
+    // Worktree cut succeeds, but persisting the durable manifest fails → the whole spawn must roll
+    // back so we NEVER return a worktree for a worker that isn't fully registered.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "create_worker_worktree")
+        return Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" });
+      if (cmd === "write_worker_manifest") return Promise.reject(new Error("disk full"));
+      return Promise.resolve(undefined);
+    });
+
+    await expect(spawnWorker({ projectId, parentAgentId: buildId, task: "x" })).rejects.toThrow(
+      /disk full/,
+    );
+
+    // The just-cut worktree was removed from disk (rollback), and the orphan tab is gone.
+    expect(removeWsMock).toHaveBeenCalledWith("/tmp/demo", projectId, expect.any(String));
+    const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
+    expect(proj.agents.length).toBe(before);
+    expect(proj.agents.some((a) => a.kind === "worker")).toBe(false);
+    expect(proj.selectedAgentId).toBe(buildId);
+  });
+
+  it("does NOT try to remove a worktree when the cut itself failed (nothing to roll back)", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" });
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "create_worker_worktree") return Promise.reject(new Error("git failed"));
+      return Promise.resolve(undefined);
+    });
+
+    await expect(spawnWorker({ projectId, parentAgentId: buildId, task: "x" })).rejects.toThrow(
+      /git failed/,
+    );
+    // No worktree exists yet, so removeAgentWorkspace must NOT be called on this path.
+    expect(removeWsMock).not.toHaveBeenCalled();
   });
 });
 

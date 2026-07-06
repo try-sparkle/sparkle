@@ -11,6 +11,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { safeUnlisten } from "./safeUnlisten";
 import { spawnWorker, spinDownWorker } from "./workerSpawn";
+import { scanWorkerManifests, type WorkerManifest } from "./worktree";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -143,8 +144,58 @@ function handleSpawn(req: OrchestrationRequest): void {
   void runSpawn(req);
 }
 
+/** Re-adopt workers whose worktree + on-disk manifest survive but whose in-memory projectStore
+ *  record was evicted by a reconcile/relocation/cross-window race (sparkle-3xus). Scans each
+ *  project's worktrees for `.sparkle/worker.json` manifests; for any manifest whose parent build
+ *  agent still exists but whose worker record was lost, it re-inserts the worker under the
+ *  manifest's buildAgentId — the self-heal that makes an evicted record recover WITHOUT an app
+ *  restart. Best-effort and idempotent: an already-present worker is skipped; a manifest whose
+ *  build agent is gone is skipped (don't resurrect a worker for a closed orchestrator); a failed
+ *  scan of one project never blocks the others. Returns the number of workers adopted. Exported as
+ *  the callable repair path and run on listener start. */
+export async function reconcileWorkersFromDisk(projectId?: string): Promise<number> {
+  const initial = useProjectStore.getState().projects;
+  const targets = projectId ? initial.filter((p) => p.id === projectId) : initial;
+  let adopted = 0;
+  for (const target of targets) {
+    let manifests: WorkerManifest[];
+    try {
+      manifests = await scanWorkerManifests(target.id);
+    } catch (e) {
+      // A backend scan failure (e.g. app-data unavailable) must not break list/spin_down — the
+      // in-memory store still answers; disk reconcile just doesn't augment it this pass.
+      console.warn("[orchestration] scanWorkerManifests failed", target.id, e);
+      continue;
+    }
+    for (const m of manifests) {
+      if (!m || !m.workerId || !m.buildAgentId || !m.worktree) continue;
+      // Re-read fresh each iteration — an earlier adopt in this loop already mutated the store.
+      const project = useProjectStore.getState().projects.find((p) => p.id === target.id);
+      if (!project) continue;
+      if (project.agents.some((a) => a.id === m.workerId)) continue; // record already present
+      // Only adopt under a build agent that still exists: never resurrect a worker whose
+      // orchestrator was deliberately closed (that worktree is orphaned — a separate concern).
+      if (!project.agents.some((a) => a.id === m.buildAgentId)) continue;
+      useProjectStore.getState().adoptWorker(target.id, {
+        id: m.workerId,
+        parentId: m.buildAgentId,
+        branch: m.branch || null,
+        worktreePath: m.worktree,
+        task: m.task,
+        beadId: m.beadId,
+      });
+      adopted++;
+    }
+  }
+  return adopted;
+}
+
 async function handleList(req: OrchestrationRequest): Promise<void> {
   try {
+    // Self-heal first: re-adopt any of this build agent's workers whose store record was evicted
+    // but whose worktree+manifest survive on disk, so the list reflects disk truth, not just the
+    // (possibly-corrupted) in-memory store (sparkle-3xus).
+    await reconcileWorkersFromDisk(req.projectId);
     const project = useProjectStore.getState().projects.find((p) => p.id === req.projectId);
     const workers = (project?.agents ?? [])
       .filter((a) => a.kind === "worker" && a.parentId === req.buildAgentId)
@@ -164,6 +215,11 @@ async function handleList(req: OrchestrationRequest): Promise<void> {
 
 async function handleSpinDown(req: OrchestrationRequest): Promise<void> {
   const workerId = req.payload.workerId ?? "";
+  // Consult disk before deciding ownership: an evicted in-memory record would otherwise be
+  // (wrongly) reported "not owned by this build agent" even though its manifest — under THIS
+  // buildAgentId — still exists on disk. Reconcile re-adopts it so the check below passes and the
+  // worktree is actually torn down (sparkle-3xus).
+  await reconcileWorkersFromDisk(req.projectId);
   const project = useProjectStore.getState().projects.find((p) => p.id === req.projectId);
   const worker = project?.agents.find((a) => a.id === workerId);
   // Bound to the build agent's OWN workers — reject any cross-agent target.
@@ -298,6 +354,12 @@ async function doStart(): Promise<() => void> {
     scheduleEnsureWorkersOpen();
   });
   scheduleEnsureWorkersOpen(); // heal anything already stranded when the listener (re)starts
+  // Re-adopt from disk any workers whose in-memory record was lost before this listener started
+  // (e.g. a crash/restart mid-spawn): the manifest-backed self-heal, fire-and-forget so a slow or
+  // failing scan can't delay listener startup (sparkle-3xus).
+  void reconcileWorkersFromDisk().catch((e) =>
+    console.warn("[orchestration] startup reconcile failed", e),
+  );
   return teardown;
 }
 

@@ -42,6 +42,15 @@ vi.mock("./workerSpawn", () => ({
   spinDownWorker: (a: unknown) => spinDownWorkerMock(a as never),
 }));
 
+// --- mock the on-disk manifest scan (sparkle-3xus). Default: no manifests (store-only), so the
+//     existing store-driven tests are unaffected. Individual tests override it to simulate an
+//     evicted record that survives on disk. adoptWorker (the store method reconcile calls) is real. ---
+const scanWorkerManifestsMock = vi.fn(async (_projectId: string) => [] as unknown[]);
+vi.mock("./worktree", async (orig) => ({
+  ...(await orig<typeof import("./worktree")>()),
+  scanWorkerManifests: (...a: unknown[]) => scanWorkerManifestsMock(...(a as [string])),
+}));
+
 import { startOrchestrationListener, type OrchestrationRequest } from "./orchestrationListener";
 
 const fire = (req: OrchestrationRequest) => firedHandler!({ payload: req });
@@ -65,6 +74,8 @@ describe("orchestrationListener", () => {
     useProjectStore.setState({ projects: [], selectedProjectId: null });
     useRuntimeStore.setState({ openAgentIds: [] });
     useSettingsStore.setState({ maxConcurrentWorkers: 4 });
+    scanWorkerManifestsMock.mockReset();
+    scanWorkerManifestsMock.mockResolvedValue([]); // default: nothing on disk to reconcile
     const store = useProjectStore.getState();
     projectId = store.addProject("Demo", "/tmp/demo");
     buildId = store.addAgent(projectId, { kind: "build" });
@@ -355,5 +366,79 @@ describe("orchestrationListener", () => {
     expect(() => cleanup?.()).not.toThrow();
     expect(unlistenMock).toHaveBeenCalled();
     cleanup = undefined;
+  });
+
+  it("list_workers re-adopts a worker from its on-disk manifest when the store record was evicted (sparkle-3xus)", async () => {
+    // The store has NO record for this worker (a reconcile/relocation race evicted it), but its
+    // durable manifest survives on disk under THIS build agent. list_workers must consult disk,
+    // re-adopt it, and report it — self-heal with no app restart.
+    const ghostId = "worker-ghost-3xus";
+    scanWorkerManifestsMock.mockResolvedValueOnce([
+      {
+        workerId: ghostId,
+        buildAgentId: buildId,
+        projectId,
+        branch: "sparkle/agent-ghost",
+        worktree: "/wt/ghost",
+        task: "resurrect me",
+        createdAt: "2026-07-06T00:00:00.000Z",
+      },
+    ]);
+    fire({ reqId: "l3x", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+    await flush();
+    const [, args] = invokeMock.mock.calls.at(-1)!;
+    const workers = (args as { result: { workers: Array<{ workerId: string; worktree: string }> } })
+      .result.workers;
+    expect(workers.map((w) => w.workerId)).toContain(ghostId);
+    // And the record is back in the store (re-derived from disk).
+    const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
+    const adopted = proj.agents.find((a) => a.id === ghostId);
+    expect(adopted).toBeTruthy();
+    expect(adopted!.task).toBe("resurrect me"); // task-on-disk restored (kills the taskless stall)
+    expect(adopted!.worktreePath).toBe("/wt/ghost");
+  });
+
+  it("spin_down of an evicted worker is NOT rejected 'not owned' — its manifest re-derives ownership (sparkle-3xus)", async () => {
+    // The worker's store record is gone but its manifest (under buildId) is on disk. spin_down must
+    // reconcile from disk, find it owned by this build agent, and tear it down — not falsely reject.
+    const ghostId = "worker-spin-3xus";
+    scanWorkerManifestsMock.mockResolvedValueOnce([
+      {
+        workerId: ghostId,
+        buildAgentId: buildId,
+        projectId,
+        branch: "sparkle/agent-spin",
+        worktree: "/wt/spin",
+        task: "t",
+        createdAt: "2026-07-06T00:00:00.000Z",
+      },
+    ]);
+    fire({ reqId: "d3x", op: "spin_down", buildAgentId: buildId, projectId, payload: { workerId: ghostId } });
+    await flush();
+    expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId: ghostId });
+    const [, args] = invokeMock.mock.calls.at(-1)!;
+    const result = (args as { result: { spunDown?: boolean; error?: string } }).result;
+    expect(result.error).toBeUndefined();
+    expect(result.spunDown).toBe(true);
+  });
+
+  it("reconcile does NOT resurrect a worker whose parent build agent is gone", async () => {
+    // A manifest for a build agent that no longer exists in the store must be ignored — we don't
+    // re-open workers for a deliberately-closed orchestrator.
+    scanWorkerManifestsMock.mockResolvedValueOnce([
+      {
+        workerId: "orphan-w",
+        buildAgentId: "build-that-was-closed",
+        projectId,
+        branch: "sparkle/agent-orphan",
+        worktree: "/wt/orphan",
+        task: "t",
+        createdAt: "2026-07-06T00:00:00.000Z",
+      },
+    ]);
+    fire({ reqId: "l-orphan", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+    await flush();
+    const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
+    expect(proj.agents.some((a) => a.id === "orphan-w")).toBe(false);
   });
 });
