@@ -20,6 +20,7 @@ import {
   readRecentLogs,
   supportChatSend,
   supportMetadata,
+  TICKET_CREATED_EVENT,
   type CreatedTicket,
   type DocLink,
   type SupportMeta,
@@ -164,6 +165,9 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
       const ticket = await desktopCreateTicket(payload);
       log.info("support", "ticket created", { id: ticket.id });
       setCreated(ticket);
+      // Nudge the sidebar status banner to refetch immediately (instead of waiting for its 60s
+      // poll) so the freshly created ticket shows up right away.
+      window.dispatchEvent(new Event(TICKET_CREATED_EVENT));
     } catch (e) {
       log.error("support", "create ticket failed", e);
       setTicketError("Something went wrong opening your ticket. Please try again in a moment — your message is safe.");

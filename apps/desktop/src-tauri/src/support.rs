@@ -385,6 +385,82 @@ pub fn desktop_create_ticket(payload: CreateTicketPayload) -> Result<CreatedTick
     })
 }
 
+// ── Ticket listing (status banner) ────────────────────────────────────────────────────────────
+
+/// One ticket as surfaced to the desktop status banner. Mirrors a row of the web
+/// `GET /api/support/tickets` response, but only the fields the banner needs. `status` stays a
+/// raw String (the JS side narrows it to the three-status union); `last_message_at` is the ISO
+/// timestamp the web route serializes from the `lastMessageAt` column.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketStatus {
+    pub id: String,
+    pub token: String,
+    pub subject: String,
+    pub status: String,
+    pub last_message_at: Option<String>,
+}
+
+/// Extract the banner ticket rows from a parsed `GET /api/support/tickets` body. A row missing a
+/// required string field (`id`/`token`/`subject`/`status`) is SKIPPED with a warning rather than
+/// silently dropped, so a systematic serialization mismatch surfaces in the logs instead of
+/// masquerading as "no tickets". Pure over `serde_json::Value` so it unit-tests without any HTTP.
+fn parse_tickets(v: &Value) -> Vec<TicketStatus> {
+    let Some(arr) = v.get("tickets").and_then(|t| t.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for t in arr {
+        let row = (|| {
+            Some(TicketStatus {
+                id: t.get("id").and_then(|x| x.as_str())?.to_string(),
+                token: t.get("token").and_then(|x| x.as_str())?.to_string(),
+                subject: t.get("subject").and_then(|x| x.as_str())?.to_string(),
+                status: t.get("status").and_then(|x| x.as_str())?.to_string(),
+                last_message_at: t
+                    .get("lastMessageAt")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string()),
+            })
+        })();
+        match row {
+            Some(r) => out.push(r),
+            None => tracing::warn!(target: "support", "skipping ticket row missing a required field"),
+        }
+    }
+    out
+}
+
+/// List the signed-in user's own support tickets (`GET {web_base_url}/api/support/tickets`).
+/// Attaches the desktop bearer as `Authorization` — the web route resolves it via Clerk and
+/// returns the caller's own tickets. When no bearer is stored (signed-out) there are no tickets
+/// to show, so we short-circuit to an empty Vec and skip the network call. Mirrors
+/// `desktop_create_ticket`: ureq + serde_json (no `json` feature).
+#[tauri::command]
+pub fn desktop_list_tickets() -> Result<Vec<TicketStatus>, String> {
+    let Some(token) = crate::auth::token() else {
+        return Ok(Vec::new());
+    };
+    let url = format!("{}/api/support/tickets", web_base_url());
+    let resp = ureq::get(&url)
+        .timeout(HTTP_TIMEOUT)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .map_err(|e| format!("list tickets failed: {e}"))?;
+    let text = resp.into_string().map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+
+    // The GET route returns EVERY ticket (not just the caller's own) when the signed-in user is the
+    // super admin (`isAdmin: true`). This banner is the personal "your open tickets" view, so for an
+    // admin it would surface the whole support queue with inverted attention semantics (an admin's
+    // actionable tickets are `awaiting_support`, not `awaiting_user`). Suppress it for admins — they
+    // use the /admin support console instead (design spec §2).
+    if v.get("isAdmin").and_then(|a| a.as_bool()).unwrap_or(false) {
+        return Ok(Vec::new());
+    }
+    Ok(parse_tickets(&v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +601,54 @@ mod tests {
     fn keeps_ordinary_text() {
         let s = "started 3 agents; worktree ready; opened composer";
         assert_eq!(redact_secrets(s), s);
+    }
+
+    // ── parse_tickets (banner listing) ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_tickets_maps_full_rows() {
+        let v = json!({
+            "ok": true,
+            "isAdmin": false,
+            "tickets": [
+                { "id": "t1", "token": "tok1", "subject": "Won't start", "status": "awaiting_support", "lastMessageAt": "2026-07-06T00:00:00.000Z" },
+                { "id": "t2", "token": "tok2", "subject": "Reply please", "status": "awaiting_user" }
+            ]
+        });
+        let out = parse_tickets(&v);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "t1");
+        assert_eq!(out[0].token, "tok1");
+        assert_eq!(out[0].status, "awaiting_support");
+        assert_eq!(out[0].last_message_at.as_deref(), Some("2026-07-06T00:00:00.000Z"));
+        // lastMessageAt is optional — absent → None, not an error.
+        assert_eq!(out[1].status, "awaiting_user");
+        assert_eq!(out[1].last_message_at, None);
+    }
+
+    #[test]
+    fn parse_tickets_handles_empty_array() {
+        assert!(parse_tickets(&json!({ "ok": true, "tickets": [] })).is_empty());
+    }
+
+    #[test]
+    fn parse_tickets_handles_absent_tickets_key() {
+        // A 401/unexpected body with no `tickets` array yields an empty list, not a panic.
+        assert!(parse_tickets(&json!({ "error": "unauthorized" })).is_empty());
+    }
+
+    #[test]
+    fn parse_tickets_skips_rows_missing_required_fields() {
+        let v = json!({
+            "tickets": [
+                { "id": "good", "token": "tok", "subject": "ok", "status": "awaiting_support" },
+                { "id": "no-token", "subject": "missing token", "status": "awaiting_support" },
+                { "token": "tok3", "subject": "missing id", "status": "resolved" }
+            ]
+        });
+        let out = parse_tickets(&v);
+        // Only the complete row survives; the two malformed rows are dropped (and warn-logged).
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "good");
     }
 }

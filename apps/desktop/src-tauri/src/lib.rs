@@ -323,6 +323,7 @@ pub fn run() {
             support::support_metadata,
             support::support_chat_send,
             support::desktop_create_ticket,
+            support::desktop_list_tickets,
             attention::set_window_attention,
             attention::notify_attention,
             attention_summary::summarize_attention,

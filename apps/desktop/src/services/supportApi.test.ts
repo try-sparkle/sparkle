@@ -4,7 +4,14 @@ import { describe, it, expect, vi } from "vitest";
 // imported without a Tauri runtime (the command wrappers aren't exercised here).
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-import { deriveSubject, buildTicketPayload, type ChatMsg, type SupportMeta } from "./supportApi";
+import {
+  deriveSubject,
+  buildTicketPayload,
+  bannerFromTickets,
+  type ChatMsg,
+  type SupportMeta,
+  type TicketStatus,
+} from "./supportApi";
 
 const META: SupportMeta = { appVersion: "0.10.0", os: "macos", arch: "aarch64" };
 
@@ -65,5 +72,56 @@ describe("buildTicketPayload", () => {
     expect(p.subject).toBe("Sparkle desktop support request");
     expect(p.message).toBe("(Opened a support ticket from the Sparkle desktop app.)");
     expect(p.assistantTranscript).toEqual([]);
+  });
+});
+
+describe("bannerFromTickets", () => {
+  const ticket = (status: TicketStatus["status"], id: string = status): TicketStatus => ({
+    id,
+    token: `tok-${id}`,
+    subject: `subject ${id}`,
+    status,
+  });
+
+  it("returns null when there are no tickets", () => {
+    expect(bannerFromTickets([])).toBeNull();
+  });
+
+  it("returns null when every ticket is resolved (no open tickets)", () => {
+    expect(bannerFromTickets([ticket("resolved", "a"), ticket("resolved", "b")])).toBeNull();
+  });
+
+  it("shows Submitted with no alert for a single awaiting_support ticket", () => {
+    const banner = bannerFromTickets([ticket("awaiting_support")]);
+    expect(banner).not.toBeNull();
+    expect(banner!.label).toBe("Submitted");
+    expect(banner!.alert).toBe(false);
+    expect(banner!.openTickets).toHaveLength(1);
+  });
+
+  it("shows Responded with an alert for a single awaiting_user ticket", () => {
+    const banner = bannerFromTickets([ticket("awaiting_user")]);
+    expect(banner!.label).toBe("Responded");
+    expect(banner!.alert).toBe(true);
+    expect(banner!.openTickets).toHaveLength(1);
+  });
+
+  it("treats an unknown/future terminal status as NOT open (allow-list, not deny-list)", () => {
+    // A backend that later adds e.g. "closed" must not keep the banner pinned open. The status
+    // union is cast here to simulate a value outside the three the client currently knows.
+    const closed = { ...ticket("resolved", "z"), status: "closed" as TicketStatus["status"] };
+    expect(bannerFromTickets([closed])).toBeNull();
+  });
+
+  it("escalates to Responded/alert when any open ticket is awaiting_user (mixed)", () => {
+    const banner = bannerFromTickets([
+      ticket("awaiting_support", "a"),
+      ticket("awaiting_user", "b"),
+      ticket("resolved", "c"),
+    ]);
+    expect(banner!.label).toBe("Responded");
+    expect(banner!.alert).toBe(true);
+    // Only the two OPEN tickets are carried; the resolved one drops off.
+    expect(banner!.openTickets.map((t) => t.id)).toEqual(["a", "b"]);
   });
 });

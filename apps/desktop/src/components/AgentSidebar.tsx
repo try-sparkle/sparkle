@@ -15,7 +15,9 @@ import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled, TbBulb } from "react-icons/tb";
 import { FaTasks } from "react-icons/fa";
-import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK, statusInk } from "../theme/colors";
+import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK, DANGER, statusInk } from "../theme/colors";
+import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
+import { WEB_BASE_URL } from "../services/sparkleApi";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -1316,6 +1318,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         status={status[SPARKLE_AGENT_ID] ?? "stopped"}
         onSelect={onSelectSparkle}
       />
+
+      {/* Support-ticket status banner: shows the user's OPEN tickets (Submitted / Responded).
+          Renders nothing when there are none. Sits between Improve Sparkle and the footer. */}
+      <SupportTicketRow />
 
       {/* Bottom-left: version + "Show logs". Pinned under the agent list. */}
       <StatusBar />
@@ -2701,6 +2707,205 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
         </div>
         <SparkleRowProgress state={barState} />
       </div>
+    </div>
+  );
+});
+
+/** Red Feather `alert-circle`, inline (no emoji — house rule). Sized to the caller. */
+function AlertCircleIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke={DANGER}
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <circle cx="12" cy="12" r="10" />
+      <line x1="12" y1="8" x2="12" y2="12" />
+      <line x1="12" y1="16" x2="12.01" y2="16" />
+    </svg>
+  );
+}
+
+/** Open a ticket's web thread in the system browser — same `/support/t/[token]` link + opener
+ *  hand-off SupportModal uses for "View your ticket". */
+function openTicketThread(token: string) {
+  openUrl(`${WEB_BASE_URL}/support/t/${token}`).catch((err) =>
+    console.error("Failed to open support ticket:", err),
+  );
+}
+
+/** Pinned status banner for the signed-in user's OPEN support tickets, shown between the "Improve
+ *  Sparkle" row and the footer StatusBar. Renders nothing when there are no open tickets. Polls
+ *  every 60s, refetches on window focus, and refreshes when a ticket is created (via
+ *  TICKET_CREATED_EVENT). One open ticket → click opens its thread; many → click toggles an
+ *  expanded per-ticket list directly beneath the banner. `memo`'d (no props) so unrelated sidebar
+ *  re-renders don't churn it. */
+const SupportTicketRow = memo(function SupportTicketRow() {
+  const [tickets, setTickets] = useState<TicketStatus[]>([]);
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    const refetch = () => {
+      listMyTickets()
+        .then((t) => {
+          if (alive) setTickets(t);
+        })
+        .catch(() => {
+          // Signed-out / offline / transient — leave the last-known list; the banner just hides
+          // when there are no open tickets. Not worth surfacing an error in the sidebar chrome.
+        });
+    };
+    refetch();
+    const timer = window.setInterval(refetch, 60_000);
+    window.addEventListener("focus", refetch);
+    window.addEventListener(TICKET_CREATED_EVENT, refetch);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refetch);
+      window.removeEventListener(TICKET_CREATED_EVENT, refetch);
+    };
+  }, []);
+
+  const banner = bannerFromTickets(tickets);
+  if (!banner) return null;
+  const { label, alert, openTickets } = banner;
+  const multiple = openTickets.length > 1;
+
+  const onBannerClick = () => {
+    if (multiple) {
+      setExpanded((e) => !e);
+    } else {
+      openTicketThread(openTickets[0]!.token);
+    }
+  };
+
+  return (
+    <div style={{ flex: "0 0 auto", margin: "0 8px 6px" }}>
+      {/* The blue status banner. Mirrors SparkleAgentRow's inline-styled pill idiom. */}
+      <div
+        onClick={onBannerClick}
+        title={
+          multiple
+            ? `${openTickets.length} open support tickets — click to ${expanded ? "hide" : "show"}`
+            : "View your support ticket"
+        }
+        style={{
+          position: "relative",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "8px 10px",
+          borderRadius: expanded ? "8px 8px 0 0" : 8,
+          cursor: "pointer",
+          background: C.teal,
+          color: ON_BRAND_FILL,
+          fontSize: 13,
+          fontWeight: FONT_WEIGHT.semibold,
+        }}
+      >
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          Ticket: {label}
+        </span>
+        {multiple && (
+          <span style={{ flex: "0 0 auto", fontSize: 11, opacity: 0.85 }}>{openTickets.length}</span>
+        )}
+        {alert && (
+          // Top-right corner alert marker (support replied, waiting on the user). A white halo keeps
+          // the red glyph legible against the blue fill.
+          <span
+            style={{
+              position: "absolute",
+              top: -6,
+              right: -6,
+              display: "inline-flex",
+              borderRadius: "50%",
+              background: ON_BRAND_FILL,
+              padding: 1,
+            }}
+          >
+            <AlertCircleIcon size={15} />
+          </span>
+        )}
+      </div>
+
+      {/* Expanded per-ticket list, directly beneath the banner (only when >1 open ticket). */}
+      {multiple && expanded && (
+        <div
+          style={{
+            border: `1px solid ${C.teal}`,
+            borderTop: "none",
+            borderRadius: "0 0 8px 8px",
+            overflow: "hidden",
+          }}
+        >
+          {openTickets.map((t, i) => {
+            const rowAlert = t.status === "awaiting_user";
+            return (
+              <div
+                key={t.id}
+                onClick={() => openTicketThread(t.token)}
+                title={t.subject}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "7px 10px",
+                  cursor: "pointer",
+                  background: C.deepForest,
+                  borderTop: i === 0 ? "none" : `1px solid ${C.forest}`,
+                }}
+              >
+                <span
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    fontSize: 12.5,
+                    color: C.cream,
+                  }}
+                >
+                  {t.subject}
+                </span>
+                {rowAlert ? (
+                  <span style={{ flex: "0 0 auto", display: "inline-flex" }}>
+                    <AlertCircleIcon size={13} />
+                  </span>
+                ) : (
+                  <span
+                    style={{
+                      flex: "0 0 auto",
+                      fontSize: 10.5,
+                      fontWeight: FONT_WEIGHT.semibold,
+                      color: C.muted,
+                      letterSpacing: 0.2,
+                    }}
+                  >
+                    Submitted
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 });

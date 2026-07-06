@@ -11,7 +11,9 @@ import { withCredits, type ConsumeResult, type CreditAction, type CreditDeps } f
 import { useSettingsStore, aiFeatureMode } from "../stores/settingsStore";
 
 // The marketing/auth web app. Override with VITE_WEB_BASE_URL for local dev (http://localhost:3000).
-const WEB_BASE_URL =
+// Exported so other UI (e.g. the support-ticket status banner) can build `${WEB_BASE_URL}/…` links
+// against the same base as the sign-in / paywall hand-offs.
+export const WEB_BASE_URL =
   (import.meta.env.VITE_WEB_BASE_URL as string | undefined) ?? "https://sparkle.ai";
 
 /** The two URLs the app hands off to the system browser. Exported so the UI can offer them as a

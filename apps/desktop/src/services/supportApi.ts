@@ -57,6 +57,20 @@ export interface CreatedTicket {
   url: string;
 }
 
+/** One of the signed-in user's tickets, as surfaced to the sidebar status banner. `status` is the
+ *  reused DB status; an OPEN ticket is one whose status !== "resolved". */
+export interface TicketStatus {
+  id: string;
+  token: string;
+  subject: string;
+  status: "awaiting_support" | "awaiting_user" | "resolved";
+  lastMessageAt?: string;
+}
+
+/** Dispatched on `window` after a ticket is created so the sidebar status banner refetches
+ *  immediately instead of waiting for its 60s poll. */
+export const TICKET_CREATED_EVENT = "sparkle:ticket-created";
+
 // ── Command wrappers ────────────────────────────────────────────────────────────────────────────
 
 /** Tail the unified log (current + most recent rotated), redacted of secrets, capped at ~200 KB. */
@@ -77,6 +91,31 @@ export function supportChatSend(messages: ChatMsg[]): Promise<ChatResp> {
 /** Create a support ticket (attaches the keychain bearer in Rust if the user is signed in). */
 export function desktopCreateTicket(payload: CreateTicketPayload): Promise<CreatedTicket> {
   return invoke<CreatedTicket>("desktop_create_ticket", { payload });
+}
+
+/** List the signed-in user's own support tickets. Returns [] when signed out (Rust short-circuits
+ *  without a network call). */
+export function listMyTickets(): Promise<TicketStatus[]> {
+  return invoke<TicketStatus[]>("desktop_list_tickets");
+}
+
+/** Reduce the user's tickets to the single sidebar banner state, or null when there is nothing to
+ *  show. An OPEN ticket is an ACTIVE one (`awaiting_support` or `awaiting_user`); `openTickets` are
+ *  those, in input order. Defined as an allow-list of the two active states (rather than "not
+ *  resolved") so any future terminal status the backend adds — `closed`, `archived`, … — correctly
+ *  defaults to hidden instead of pinning the banner open. The banner reflects the
+ *  most-attention-needing open ticket: if ANY open ticket is `awaiting_user` (support replied,
+ *  waiting on the user) the banner is "Responded" + alert; else it's "Submitted" (waiting on
+ *  support) with no alert. Pure — unit-tested, no IO. */
+export function bannerFromTickets(
+  tickets: TicketStatus[],
+): { label: "Submitted" | "Responded"; alert: boolean; openTickets: TicketStatus[] } | null {
+  const openTickets = tickets.filter(
+    (t) => t.status === "awaiting_support" || t.status === "awaiting_user",
+  );
+  if (openTickets.length === 0) return null;
+  const alert = openTickets.some((t) => t.status === "awaiting_user");
+  return { label: alert ? "Responded" : "Submitted", alert, openTickets };
 }
 
 // ── Pure payload assembly (unit-tested) ───────────────────────────────────────────────────────
