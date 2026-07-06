@@ -1417,7 +1417,18 @@ pub async fn refresh_agent_branch(
 #[derive(Serialize)]
 #[serde(untagged)]
 pub enum LandOutcome {
-    Ok { ok: bool, target: String },
+    // `merge_sha` is the merge commit this land created on the target — captured so the caller can
+    // record it on the bead and the delivery monitor can later test that exact commit for release
+    // containment (Task B). Empty only if `rev-parse` failed. NOTE: `LandOutcome` is `untagged` with
+    // no container `rename_all`, so this multi-word field MUST carry an explicit `rename` — the TS
+    // `LandResult` reads `mergeSha`, and without this it would deserialize as undefined (silent
+    // no-op). The pre-existing fields are single words, which is why none needed a rename.
+    Ok {
+        ok: bool,
+        target: String,
+        #[serde(rename = "mergeSha")]
+        merge_sha: String,
+    },
     Err { ok: bool, reason: String, files: Vec<String> },
 }
 
@@ -1487,7 +1498,13 @@ pub fn land_agent_branch_at(
     merge.arg("-C").arg(&wt).args(["merge", "--no-ff", &branch, "-m", &msg]);
     apply_noninteractive(&mut merge);
     match merge.output() {
-        Ok(o) if o.status.success() => Ok(LandOutcome::Ok { ok: true, target: target.to_string() }),
+        Ok(o) if o.status.success() => {
+            // The merge (--no-ff) left a merge commit at the target worktree's HEAD — record it so
+            // the bead can carry its exact landed SHA for release-containment checks. Best-effort:
+            // an empty string just means the monitor treats this bead as not-yet-testable (honest).
+            let merge_sha = git(&wt, &["rev-parse", "HEAD"]).unwrap_or_default().trim().to_string();
+            Ok(LandOutcome::Ok { ok: true, target: target.to_string(), merge_sha })
+        }
         _ => {
             // Conflicted paths distinguish a real merge conflict from a non-conflict failure (git
             // errored, or the process failed to spawn): only the former populates --diff-filter=U.
@@ -2858,9 +2875,14 @@ mod tests {
 
         // Clean target → the merge lands and main now contains the agent tip.
         match land_agent_branch_at(&root_str, "L1", "main").unwrap() {
-            LandOutcome::Ok { target, ok } => {
+            LandOutcome::Ok { target, ok, merge_sha } => {
                 assert!(ok);
                 assert_eq!(target, "main");
+                // The land captured the merge commit it created — a full 40-char SHA equal to
+                // main's new HEAD (Task B: the bead records this for release-containment checks).
+                let head = git(&root_str, &["rev-parse", "main"]).unwrap().trim().to_string();
+                assert_eq!(merge_sha, head, "captured merge_sha should be main's new HEAD");
+                assert_eq!(merge_sha.len(), 40, "expected a full commit SHA");
             }
             LandOutcome::Err { reason, .. } => panic!("expected land to succeed, got {reason}"),
         }
@@ -2875,6 +2897,18 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn land_outcome_serializes_merge_sha_as_camelcase_for_the_ts_client() {
+        // Guards the serde field-name boundary the in-process land test can't see: `LandOutcome` is
+        // untagged with no container rename_all, so the multi-word field must serialize as `mergeSha`
+        // (what TS `LandResult` reads). Without the explicit rename this is `merge_sha` and the whole
+        // capture feature no-ops silently in production.
+        let ok = LandOutcome::Ok { ok: true, target: "main".into(), merge_sha: "deadbeef".into() };
+        let v = serde_json::to_value(&ok).unwrap();
+        assert_eq!(v.get("mergeSha").and_then(|s| s.as_str()), Some("deadbeef"));
+        assert!(v.get("merge_sha").is_none(), "must not leak the snake_case field name");
     }
 
     #[test]

@@ -147,6 +147,34 @@ export async function deleteBead(projectPath: string, id: string): Promise<void>
   await invoke<string>("delete_bead", { projectPath, id });
 }
 
+/** Label prefix carrying the commit a bead's branch landed as (Task B). Stored as a label because
+ *  bd has no first-class field for it, and labels round-trip through `list_beads` so the board can
+ *  read the SHA back without an extra query. The value after the prefix is the full merge SHA. */
+export const MERGED_SHA_PREFIX = "merged-sha:";
+
+/** Record the commit a bead's branch landed as, so the delivery monitor can later test THAT exact
+ *  commit for release containment. No-op when `sha` is blank (an older Rust build, or a land that
+ *  couldn't resolve HEAD — honest: the bead simply stays not-yet-testable). Best-effort at the
+ *  call site (like the other lifecycle writes); idempotent-enough (bd de-dupes identical labels). */
+export async function recordBeadMergeSha(
+  projectPath: string,
+  id: string,
+  sha: string | undefined | null,
+): Promise<void> {
+  const clean = sha?.trim();
+  if (!clean) return;
+  await labelBead(projectPath, "add", id, `${MERGED_SHA_PREFIX}${clean}`);
+}
+
+/** The merge commit recorded on a bead (see {@link recordBeadMergeSha}), or null when none is set —
+ *  e.g. a bead shipped via PR (merged later on GitHub, uncapturable at ship time) or one landed by a
+ *  Rust build predating the capture. Pure; reads the first `merged-sha:` label. */
+export function mergeShaOf(bead: Bead): string | null {
+  const label = bead.labels.find((l) => l.startsWith(MERGED_SHA_PREFIX));
+  const sha = label?.slice(MERGED_SHA_PREFIX.length).trim();
+  return sha && sha.length > 0 ? sha : null;
+}
+
 export type BoardColumn = "backlog" | "inProgress" | "done" | "delivered";
 
 /** A closed bead carrying this label lands in "delivered" instead of "done". */

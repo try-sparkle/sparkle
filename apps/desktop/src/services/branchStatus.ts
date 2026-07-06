@@ -63,7 +63,14 @@ export function agentWorkflowState(
  *  `reason` is one of: no-target | no-branch | nothing-to-land | target-not-checked-out | dirty |
  *  conflict; `files` lists conflicted paths for the conflict case. */
 export type LandResult =
-  | { ok: true; target: string }
+  | {
+      ok: true;
+      target: string;
+      // The merge commit this land created on `target`. Recorded on the bead so the delivery
+      // monitor can test that exact commit for release containment (Task B). Optional so a Rust
+      // build predating the field deserializes to undefined (treated as "no SHA yet" — honest).
+      mergeSha?: string;
+    }
   | {
       ok: false;
       reason:

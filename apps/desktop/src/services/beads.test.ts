@@ -11,6 +11,9 @@ import {
   bucketBeads,
   childrenOf,
   parseCreatedBeadId,
+  mergeShaOf,
+  recordBeadMergeSha,
+  MERGED_SHA_PREFIX,
   DELIVERED_LABEL,
   type Bead,
 } from "./beads";
@@ -160,5 +163,36 @@ describe("childrenOf", () => {
     ];
     const kids = childrenOf(beads, "epic-1");
     expect(kids.map((b) => b.id)).toEqual(["epic-1.1", "epic-1.2", "other"]);
+  });
+});
+
+describe("mergeShaOf", () => {
+  it("reads the SHA out of the merged-sha: label", () => {
+    const sha = "deadbeef1234deadbeef1234deadbeef12341234";
+    expect(mergeShaOf(bead({ id: "b", status: "closed", labels: [`${MERGED_SHA_PREFIX}${sha}`] }))).toBe(sha);
+  });
+  it("returns null when there's no merged-sha label (e.g. shipped via PR)", () => {
+    expect(mergeShaOf(bead({ id: "b", status: "closed", labels: [DELIVERED_LABEL] }))).toBeNull();
+  });
+  it("returns null for a blank/empty merged-sha label rather than an empty string", () => {
+    expect(mergeShaOf(bead({ id: "b", labels: [`${MERGED_SHA_PREFIX}   `] }))).toBeNull();
+  });
+});
+
+describe("recordBeadMergeSha", () => {
+  it("adds the merged-sha:<sha> label via bead_label", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await recordBeadMergeSha("/proj", "bd-1", "abc123");
+    expect(invokeMock).toHaveBeenCalledWith("bead_label", {
+      projectPath: "/proj",
+      action: "add",
+      id: "bd-1",
+      label: `${MERGED_SHA_PREFIX}abc123`,
+    });
+  });
+  it("no-ops on a blank/undefined SHA (an older Rust build, or a land that couldn't resolve HEAD)", async () => {
+    await recordBeadMergeSha("/proj", "bd-1", undefined);
+    await recordBeadMergeSha("/proj", "bd-1", "  ");
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });

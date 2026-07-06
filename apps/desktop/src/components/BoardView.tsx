@@ -5,6 +5,7 @@ import {
   childrenOf,
   claimBead,
   labelBead,
+  mergeShaOf,
   DELIVERED_LABEL,
   type Bead,
   type BoardColumn,
@@ -130,9 +131,10 @@ export function BoardView({ project }: { project: Project }) {
 
   // The delivery monitor watches in-flight/closed beads for a shipped-release signal and pushes live
   // updates. It runs only once Delivered is defined (no point otherwise). We feed it a fresh watch
-  // set each tick via a ref so add/remove beads don't restart it. Merge SHAs aren't tracked per-bead
-  // on the board today, so we pass `mergeSha: null` — the monitor then honestly reports not-in-release
-  // / "can't detect", never claiming a delivery it can't verify.
+  // set each tick via a ref so add/remove beads don't restart it. Each bead carries the commit SHA
+  // its branch landed as (captured at land time onto a `merged-sha:` label, Task B); when present the
+  // monitor tests THAT exact commit for release containment, and when absent (shipped via PR, or an
+  // older build) it honestly reports not-in-release rather than claiming a delivery it can't verify.
   const boardRef = useRef(board);
   boardRef.current = board;
   useEffect(() => {
@@ -145,7 +147,10 @@ export function BoardView({ project }: { project: Project }) {
       const b = boardRef.current;
       if (!b) return [];
       // Candidates for a delivery signal: everything that's reached Done or beyond (plus in-flight).
-      return [...b.inProgress, ...b.done, ...b.delivered].map((x) => ({ beadId: x.id, mergeSha: null }));
+      return [...b.inProgress, ...b.done, ...b.delivered].map((x) => ({
+        beadId: x.id,
+        mergeSha: mergeShaOf(x),
+      }));
     };
     startDeliveryMonitor(project.rootPath, (u) => setDelivery(u), getBeads);
     return () => stopDeliveryMonitor();

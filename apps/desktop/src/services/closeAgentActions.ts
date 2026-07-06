@@ -9,7 +9,7 @@ import {
   deleteAgentBranch,
   deleteAgentBranchIfMerged,
 } from "./branchStatus";
-import { closeBead, markBeadDelivered, deleteBead } from "./beads";
+import { closeBead, markBeadDelivered, recordBeadMergeSha, deleteBead } from "./beads";
 import { removeAgentWorkspace } from "./worktree";
 
 export interface ShipParams {
@@ -34,7 +34,13 @@ export async function shipAgent(p: ShipParams): Promise<void> {
       console.warn("ship-on-close: local land failed (branch kept):", r.reason);
       return; // do NOT close/deliver the bead — the work didn't land
     }
-    if (p.beadId) await markBeadDelivered(p.root, p.beadId).catch(() => {}); // landed on main
+    if (p.beadId) {
+      // Record the exact commit the branch landed as BEFORE marking delivered, so the delivery
+      // monitor can test that SHA for release containment (Task B). The PR path can't do this — its
+      // merge happens later on GitHub — so only a local land carries a SHA (honest).
+      await recordBeadMergeSha(p.root, p.beadId, r.mergeSha).catch(() => {});
+      await markBeadDelivered(p.root, p.beadId).catch(() => {}); // landed on main
+    }
     return;
   }
   // Pushed to the remote → open a PR for review. Only mark the bead closed (submitted for review) if

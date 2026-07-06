@@ -10,6 +10,7 @@ vi.mock("./branchStatus", () => ({
 vi.mock("./beads", () => ({
   closeBead: vi.fn(),
   markBeadDelivered: vi.fn(),
+  recordBeadMergeSha: vi.fn(),
   deleteBead: vi.fn(),
 }));
 vi.mock("./worktree", () => ({ removeAgentWorkspace: vi.fn() }));
@@ -28,6 +29,7 @@ beforeEach(() => {
   vi.mocked(branch.deleteAgentBranch).mockResolvedValue(undefined);
   vi.mocked(beads.closeBead).mockResolvedValue(undefined);
   vi.mocked(beads.markBeadDelivered).mockResolvedValue(undefined);
+  vi.mocked(beads.recordBeadMergeSha).mockResolvedValue(undefined);
   vi.mocked(beads.deleteBead).mockResolvedValue(undefined);
   vi.mocked(worktree.removeAgentWorkspace).mockResolvedValue(undefined);
 });
@@ -50,13 +52,35 @@ describe("shipAgent", () => {
     expect(beads.closeBead).not.toHaveBeenCalled();
   });
 
-  it("no remote → lands locally and marks the bead delivered on success", async () => {
+  it("no remote → lands locally, records the merge SHA, then marks the bead delivered", async () => {
+    vi.mocked(branch.pushAgentBranch).mockResolvedValue("no-remote");
+    vi.mocked(branch.landAgentBranch).mockResolvedValue({ ok: true, target: "main", mergeSha: "abc123" });
+    await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
+    expect(branch.landAgentBranch).toHaveBeenCalled();
+    // The landed SHA is recorded (Task B) BEFORE delivered, so the monitor can test it for release
+    // containment. Ordering matters: capture the commit before the bead moves.
+    expect(beads.recordBeadMergeSha).toHaveBeenCalledWith("/r", "bd-1", "abc123");
+    const recordOrder = vi.mocked(beads.recordBeadMergeSha).mock.invocationCallOrder[0]!;
+    const deliverOrder = vi.mocked(beads.markBeadDelivered).mock.invocationCallOrder[0]!;
+    expect(recordOrder).toBeLessThan(deliverOrder);
+    expect(beads.markBeadDelivered).toHaveBeenCalledWith("/r", "bd-1");
+    expect(branch.openAgentPr).not.toHaveBeenCalled();
+  });
+
+  it("no remote, land returns no SHA (older Rust) → still delivers; recordBeadMergeSha no-ops on undefined", async () => {
     vi.mocked(branch.pushAgentBranch).mockResolvedValue("no-remote");
     vi.mocked(branch.landAgentBranch).mockResolvedValue({ ok: true, target: "main" });
     await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
-    expect(branch.landAgentBranch).toHaveBeenCalled();
+    // We still call through (the helper itself no-ops on a blank SHA — honesty lives in one place).
+    expect(beads.recordBeadMergeSha).toHaveBeenCalledWith("/r", "bd-1", undefined);
     expect(beads.markBeadDelivered).toHaveBeenCalledWith("/r", "bd-1");
-    expect(branch.openAgentPr).not.toHaveBeenCalled();
+  });
+
+  it("pushed (PR path) → never records a merge SHA (the GitHub merge is uncapturable here)", async () => {
+    vi.mocked(branch.pushAgentBranch).mockResolvedValue("pushed");
+    vi.mocked(branch.openAgentPr).mockResolvedValue("https://pr/1");
+    await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
+    expect(beads.recordBeadMergeSha).not.toHaveBeenCalled();
   });
 
   it("no remote + land FAILS → does not touch the bead (work didn't land)", async () => {
