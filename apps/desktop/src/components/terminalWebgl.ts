@@ -49,16 +49,23 @@ export function forceFullRepaint(
 
 // Decide how the debounced output-settle (and the ResizeObserver) should repaint, given whether
 // output is cache-poisoned (written while the pane couldn't paint — see Terminal's poisonedRef)
-// and whether the pane can paint right now. The expensive full repaint (forceFullRepaint, which
-// clears the WebGL model so poisoned cells redraw) runs ONCE per poisoning episode: only when
-// poisoned AND paintable, and it clears the flag. Otherwise the cheap refresh() runs and the flag
-// is preserved (so a later paintable settle/resize still drains it). Pure + tested so the
-// "repaint once per episode" guarantee can't be silently refactored away.
+// and whether the pane can paint right now. Three outcomes:
+//   • SKIP  — the pane isn't paintable (backgrounded / hidden: visibility:hidden or 0-sized). It
+//     isn't on screen, so a refresh would be pure wasted DOM/style work — and with 10-20 concurrent
+//     background agents all streaming output that adds up (bead sparkle-6x3g). We skip painting and
+//     PRESERVE the poisoned flag; the become-active reveal (which force-repaints) draws the buffered
+//     output when the pane is next shown.
+//   • FULL  — poisoned AND paintable: drain the poisoning with one forceFullRepaint (clears the WebGL
+//     model so poisoned cells redraw) and clear the flag. Runs ONCE per poisoning episode.
+//   • REFRESH — the normal visible-streaming path: a cheap refresh() marks the new rows dirty.
+// Pure + tested so the "skip while hidden / repaint once per episode" guarantees can't be silently
+// refactored away.
 export function settleRepaintPlan(
   poisoned: boolean,
   paintable: boolean,
-): { action: "full" | "refresh"; poisoned: boolean } {
-  if (poisoned && paintable) return { action: "full", poisoned: false };
+): { action: "full" | "refresh" | "skip"; poisoned: boolean } {
+  if (!paintable) return { action: "skip", poisoned };
+  if (poisoned) return { action: "full", poisoned: false };
   return { action: "refresh", poisoned };
 }
 

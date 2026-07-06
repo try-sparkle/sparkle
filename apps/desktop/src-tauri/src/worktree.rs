@@ -175,8 +175,10 @@ fn effective_base(root: &str, branch: &str, fetch: bool) -> String {
 
 /// Auto-detect the project's logical integration branch name (e.g. `main`).
 #[tauri::command]
-pub fn project_default_branch(root: String) -> Result<String, String> {
-    Ok(resolve_default_branch(&root))
+pub async fn project_default_branch(root: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(resolve_default_branch(&root)))
+        .await
+        .map_err(|e| format!("project_default_branch task failed: {e}"))?
 }
 
 /// Roots whose repo has already been ensured this session. `ensure_project_repo` is idempotent but
@@ -189,8 +191,9 @@ fn ready_repos() -> &'static Mutex<HashSet<String>> {
 
 /// Ensure `<path>` is a git repo with a committable identity, at least one commit,
 /// and `.sparkle/` ignored. Idempotent. Cached per root for the session (see [`ready_repos`]).
-#[tauri::command]
-pub fn ensure_project_repo(path: String) -> Result<(), String> {
+/// Sync core of [`ensure_project_repo`] (the git-subprocess work). Kept as a plain fn so the
+/// async command can offload it via `spawn_blocking` and the test suite can drive it directly.
+fn ensure_project_repo_inner(path: String) -> Result<(), String> {
     // Fast path: already ensured this session. The underlying work is idempotent, so this only
     // skips redundant git subprocesses — the first successful call is what seeds the set.
     if ready_repos().lock().map(|s| s.contains(&path)).unwrap_or(false) {
@@ -222,6 +225,16 @@ pub fn ensure_project_repo(path: String) -> Result<(), String> {
         set.insert(path);
     }
     Ok(())
+}
+
+/// Ensure `<path>` is a git repo with a committable identity, at least one commit, and `.sparkle/`
+/// ignored. Idempotent. `async` + `spawn_blocking` so the 3-4 git subprocesses the first agent per
+/// project pays never stall the UI thread.
+#[tauri::command]
+pub async fn ensure_project_repo(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || ensure_project_repo_inner(path))
+        .await
+        .map_err(|e| format!("ensure_project_repo task failed: {e}"))?
 }
 
 /// Append `.sparkle/` to `<root>/.gitignore` if not already ignored. Idempotent.
@@ -360,7 +373,7 @@ pub fn create_worktree_from_local(
 
 /// Create (or return) a worker's worktree, cut from `parent_branch` (a local branch).
 #[tauri::command]
-pub fn create_worker_worktree(
+pub async fn create_worker_worktree(
     app: AppHandle,
     root: String,
     project_id: String,
@@ -369,8 +382,12 @@ pub fn create_worker_worktree(
 ) -> Result<WorktreeInfo, String> {
     tracing::info!(%root, %project_id, %worker_id, %parent_branch, "create_worker_worktree");
     let app_data = app_data_dir(&app)?;
-    create_worktree_from_local(&root, &project_id, &worker_id, &parent_branch, &app_data)
-        .inspect_err(|e| tracing::error!(%worker_id, error = %e, "create_worker_worktree failed"))
+    tauri::async_runtime::spawn_blocking(move || {
+        create_worktree_from_local(&root, &project_id, &worker_id, &parent_branch, &app_data)
+            .inspect_err(|e| tracing::error!(%worker_id, error = %e, "create_worker_worktree failed"))
+    })
+    .await
+    .map_err(|e| format!("create_worker_worktree task failed: {e}"))?
 }
 
 /// Create (or return, if it already exists) the isolated worktree for `agent_id`.
@@ -1310,7 +1327,7 @@ pub fn markdown_changed_since_at(
 
 /// Markdown an agent committed since `since_sha`, scoped to `dirs`, for upload into Chief.
 #[tauri::command]
-pub fn markdown_changed_since(
+pub async fn markdown_changed_since(
     app: AppHandle,
     project_id: String,
     agent_id: String,
@@ -1318,7 +1335,11 @@ pub fn markdown_changed_since(
     dirs: Vec<String>,
 ) -> Result<MarkdownSync, String> {
     let app_data = app_data_dir(&app)?;
-    markdown_changed_since_at(&project_id, &agent_id, &since_sha, &dirs, &app_data)
+    tauri::async_runtime::spawn_blocking(move || {
+        markdown_changed_since_at(&project_id, &agent_id, &since_sha, &dirs, &app_data)
+    })
+    .await
+    .map_err(|e| format!("markdown_changed_since task failed: {e}"))?
 }
 
 #[derive(Serialize)]
@@ -1378,7 +1399,7 @@ pub fn refresh_agent_branch_at(
 /// Rebase an agent branch onto its fresh effective base. Refuses a dirty/mid-operation tree;
 /// aborts cleanly on conflict. `busy` (a live PTY) is gated on the frontend.
 #[tauri::command]
-pub fn refresh_agent_branch(
+pub async fn refresh_agent_branch(
     app: AppHandle,
     root: String,
     project_id: String,
@@ -1386,7 +1407,11 @@ pub fn refresh_agent_branch(
     base_branch: String,
 ) -> Result<RefreshOutcome, String> {
     let app_data = app_data_dir(&app)?;
-    refresh_agent_branch_at(&root, &project_id, &agent_id, &base_branch, &app_data)
+    tauri::async_runtime::spawn_blocking(move || {
+        refresh_agent_branch_at(&root, &project_id, &agent_id, &base_branch, &app_data)
+    })
+    .await
+    .map_err(|e| format!("refresh_agent_branch task failed: {e}"))?
 }
 
 #[derive(Serialize)]
@@ -1486,12 +1511,16 @@ pub fn land_agent_branch_at(
 /// default for a build agent) locally. Refuses a dirty target; aborts cleanly on conflict. A live
 /// PTY on the target worktree is gated on the frontend.
 #[tauri::command]
-pub fn land_agent_branch(
+pub async fn land_agent_branch(
     root: String,
     agent_id: String,
     target_branch: String,
 ) -> Result<LandOutcome, String> {
-    land_agent_branch_at(&root, &agent_id, &target_branch)
+    tauri::async_runtime::spawn_blocking(move || {
+        land_agent_branch_at(&root, &agent_id, &target_branch)
+    })
+    .await
+    .map_err(|e| format!("land_agent_branch task failed: {e}"))?
 }
 
 /// Core (testable): push an agent's branch to `origin`. Returns "pushed" on success, or "no-remote"
@@ -1510,8 +1539,10 @@ pub fn push_agent_branch_at(root: &str, agent_id: &str) -> Result<String, String
 
 /// Push an agent's branch to `origin` for the close-agent Ship/Save paths. "pushed" | "no-remote".
 #[tauri::command]
-pub fn push_agent_branch(root: String, agent_id: String) -> Result<String, String> {
-    push_agent_branch_at(&root, &agent_id)
+pub async fn push_agent_branch(root: String, agent_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || push_agent_branch_at(&root, &agent_id))
+        .await
+        .map_err(|e| format!("push_agent_branch task failed: {e}"))?
 }
 
 /// Core (testable): delete an agent's local branch — the Discard path. Force (`-D`) because the
@@ -1528,8 +1559,10 @@ pub fn delete_agent_branch_at(root: &str, agent_id: &str) -> Result<(), String> 
 
 /// Delete an agent's local branch (Discard). See `delete_agent_branch_at`.
 #[tauri::command]
-pub fn delete_agent_branch(root: String, agent_id: String) -> Result<(), String> {
-    delete_agent_branch_at(&root, &agent_id)
+pub async fn delete_agent_branch(root: String, agent_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || delete_agent_branch_at(&root, &agent_id))
+        .await
+        .map_err(|e| format!("delete_agent_branch task failed: {e}"))?
 }
 
 /// Core (testable): delete an agent's local branch on close, ONLY when it's effectively landed on
@@ -1570,8 +1603,10 @@ pub fn delete_agent_branch_if_merged_at(root: &str, agent_id: &str) -> Result<()
 /// SAFELY delete an agent's merged branch (close a shipped agent). See
 /// `delete_agent_branch_if_merged_at`.
 #[tauri::command]
-pub fn delete_agent_branch_if_merged(root: String, agent_id: String) -> Result<(), String> {
-    delete_agent_branch_if_merged_at(&root, &agent_id)
+pub async fn delete_agent_branch_if_merged(root: String, agent_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || delete_agent_branch_if_merged_at(&root, &agent_id))
+        .await
+        .map_err(|e| format!("delete_agent_branch_if_merged task failed: {e}"))?
 }
 
 /// Build the `gh pr create` argv for an agent branch. Pure + tested so the guard/defaulting logic is
@@ -1604,29 +1639,33 @@ fn pr_create_args(branch: &str, target: &str, title: &str) -> Result<Vec<String>
 /// as clear errors instead of opaque `gh` stderr; other failures (no gh / PR already exists / no
 /// remote) surface as Err for the caller to handle.
 #[tauri::command]
-pub fn open_agent_pr(
+pub async fn open_agent_pr(
     root: String,
     agent_id: String,
     target_branch: String,
     title: String,
 ) -> Result<String, String> {
-    let branch = format!("sparkle/agent-{agent_id}");
-    if git(&root, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_err() {
-        return Err("no-branch".to_string());
-    }
-    let args = pr_create_args(&branch, &target_branch, &title)?;
-    let mut cmd = Command::new("gh");
-    cmd.args(&args)
-        .current_dir(&root)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_NO_UPDATE_NOTIFIER", "1");
-    apply_noninteractive(&mut cmd);
-    let out = cmd.output().map_err(|e| format!("failed to run gh: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let branch = format!("sparkle/agent-{agent_id}");
+        if git(&root, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_err() {
+            return Err("no-branch".to_string());
+        }
+        let args = pr_create_args(&branch, &target_branch, &title)?;
+        let mut cmd = Command::new("gh");
+        cmd.args(&args)
+            .current_dir(&root)
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1");
+        apply_noninteractive(&mut cmd);
+        let out = cmd.output().map_err(|e| format!("failed to run gh: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("open_agent_pr task failed: {e}"))?
 }
 
 /// Core (AppHandle-free, testable): remove an agent's external worktree (force, to discard
@@ -1685,8 +1724,9 @@ pub async fn remove_agent_worktree(
 /// Move/rename a project folder on disk (rename = move within the same parent), then
 /// repair the git worktree links so the per-agent worktrees keep working at the new
 /// location. Caller must stop the project's agents first (their PTYs hold the old cwd).
-#[tauri::command]
-pub fn move_project(old_path: String, new_path: String) -> Result<(), String> {
+/// Sync core of [`move_project`]; a plain fn so the async command can offload it via
+/// `spawn_blocking` and the test suite can drive it directly.
+fn move_project_inner(old_path: String, new_path: String) -> Result<(), String> {
     let old = Path::new(&old_path);
     let new = Path::new(&new_path);
     if old_path == new_path {
@@ -1723,10 +1763,20 @@ pub fn move_project(old_path: String, new_path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Move/rename a project folder on disk, then repair its worktree links. `async` + `spawn_blocking`
+/// so the `std::fs::rename` (cross-dir) and `git worktree repair` subprocesses can't stall the UI.
+#[tauri::command]
+pub async fn move_project(old_path: String, new_path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || move_project_inner(old_path, new_path))
+        .await
+        .map_err(|e| format!("move_project task failed: {e}"))?
+}
+
 /// Tripwire: confirm a worktree path's git toplevel IS that worktree — i.e. it can't resolve
 /// up into a parent checkout. Called before spawning an agent's PTY.
-#[tauri::command]
-pub fn assert_workspace_integrity(worktree: String) -> Result<(), String> {
+/// Sync core of [`assert_workspace_integrity`]; a plain fn so the async command can offload it via
+/// `spawn_blocking` and the test suite can drive it directly.
+fn assert_workspace_integrity_inner(worktree: String) -> Result<(), String> {
     let canon_wt = std::fs::canonicalize(&worktree)
         .map_err(|e| format!("worktree path does not exist: {e}"))?;
     let toplevel = git(&worktree, &["rev-parse", "--show-toplevel"])
@@ -1741,6 +1791,16 @@ pub fn assert_workspace_integrity(worktree: String) -> Result<(), String> {
             canon_top.display(), canon_wt.display()
         ))
     }
+}
+
+/// Confirm a worktree path's git toplevel IS that worktree (isolation tripwire, run before spawning
+/// an agent's PTY). `async` + `spawn_blocking` so the `canonicalize` + `git rev-parse` never stall
+/// the UI thread.
+#[tauri::command]
+pub async fn assert_workspace_integrity(worktree: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || assert_workspace_integrity_inner(worktree))
+        .await
+        .map_err(|e| format!("assert_workspace_integrity task failed: {e}"))?
 }
 
 /// Merge the PreToolUse guard hook into existing settings JSON (or a fresh object), preserving
@@ -1785,23 +1845,30 @@ pub fn merge_guard_settings(existing: Option<&str>, guard_cmd: &str) -> String {
 
 /// Write/merge the guard into `<worktree>/.claude/settings.local.json` (the gitignored variant).
 #[tauri::command]
-pub fn install_worktree_guard(app: AppHandle, worktree: String) -> Result<(), String> {
-    // Stage the guard to a stable app-data path (not the app bundle) so the command baked into
-    // settings.local.json survives the bundle being renamed/replaced/removed. See
-    // hooks::stage_resource_script; hooks::heal_agent_hooks re-points stale copies at launch.
-    let guard = crate::hooks::stage_resource_script(&app, "worktree-guard.mjs")?;
-    let guard_cmd = format!(
-        "node {} {}",
-        shell_quote(&guard.to_string_lossy()),
-        shell_quote(&worktree)
-    );
+pub async fn install_worktree_guard(app: AppHandle, worktree: String) -> Result<(), String> {
+    // `async` + `spawn_blocking`: the resource staging (fs copy into app-data) and the
+    // settings.local.json read/merge/write are IO that must not stall the UI thread. AppHandle is
+    // Send + Clone, so it moves cleanly onto the blocking task.
+    tauri::async_runtime::spawn_blocking(move || {
+        // Stage the guard to a stable app-data path (not the app bundle) so the command baked into
+        // settings.local.json survives the bundle being renamed/replaced/removed. See
+        // hooks::stage_resource_script; hooks::heal_agent_hooks re-points stale copies at launch.
+        let guard = crate::hooks::stage_resource_script(&app, "worktree-guard.mjs")?;
+        let guard_cmd = format!(
+            "node {} {}",
+            shell_quote(&guard.to_string_lossy()),
+            shell_quote(&worktree)
+        );
 
-    let dir = Path::new(&worktree).join(".claude");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir .claude: {e}"))?;
-    let file = dir.join("settings.local.json");
-    let existing = std::fs::read_to_string(&file).ok();
-    let merged = merge_guard_settings(existing.as_deref(), &guard_cmd);
-    std::fs::write(&file, merged).map_err(|e| format!("write settings.local.json: {e}"))
+        let dir = Path::new(&worktree).join(".claude");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir .claude: {e}"))?;
+        let file = dir.join("settings.local.json");
+        let existing = std::fs::read_to_string(&file).ok();
+        let merged = merge_guard_settings(existing.as_deref(), &guard_cmd);
+        std::fs::write(&file, merged).map_err(|e| format!("write settings.local.json: {e}"))
+    })
+    .await
+    .map_err(|e| format!("install_worktree_guard task failed: {e}"))?
 }
 
 /// Minimal POSIX single-quote escaping for embedding a path in a hook command string.
@@ -1820,8 +1887,10 @@ pub fn read_worker_result_at(worktree: &Path) -> Result<Option<String>, String> 
 }
 
 #[tauri::command]
-pub fn read_worker_result(worktree: String) -> Result<Option<String>, String> {
-    read_worker_result_at(Path::new(&worktree))
+pub async fn read_worker_result(worktree: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || read_worker_result_at(Path::new(&worktree)))
+        .await
+        .map_err(|e| format!("read_worker_result task failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -2085,7 +2154,7 @@ mod tests {
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("iso-appdata");
 
-        ensure_project_repo(root_str.clone()).expect("ensure repo");
+        ensure_project_repo_inner(root_str.clone()).expect("ensure repo");
 
         // .sparkle/ must be ignored so agent worktrees never pollute the user's repo.
         let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
@@ -2207,7 +2276,7 @@ mod tests {
         let root = unique_root("ext-iso");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("ext-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
 
         let info = create_worktree_at(&root_str, "proj1", "a1", "HEAD", &app_data).unwrap();
 
@@ -2236,7 +2305,7 @@ mod tests {
         let root = unique_root("rm-ext");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("rm-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         let info = create_worktree_at(&root_str, "p", "a", "HEAD", &app_data).unwrap();
         assert!(Path::new(&info.path).exists());
 
@@ -2253,13 +2322,13 @@ mod tests {
         let root = unique_root("mv-from");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("mv-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         let info = create_worktree_at(&root_str, "p", "a", "HEAD", &app_data).unwrap();
 
         let dest = root.parent().unwrap().join(format!("mv-to-{}", std::process::id()));
         let dest_str = dest.to_string_lossy().to_string();
         let _ = std::fs::remove_dir_all(&dest);
-        move_project(root_str.clone(), dest_str.clone()).unwrap();
+        move_project_inner(root_str.clone(), dest_str.clone()).unwrap();
 
         // The worktree (in app_data) still works and now points at the repo's NEW location.
         let common = git(&info.path, &["rev-parse", "--git-common-dir"]).unwrap();
@@ -2275,16 +2344,16 @@ mod tests {
         let root = unique_root("intg");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("intg-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         let info = create_worktree_at(&root_str, "p", "a", "HEAD", &app_data).unwrap();
 
         // A correct external worktree passes.
-        assert!(assert_workspace_integrity(info.path.clone()).is_ok());
+        assert!(assert_workspace_integrity_inner(info.path.clone()).is_ok());
 
         // A nested dir inside the project checkout fails (its toplevel is the parent repo).
         let nested = root.join("subdir");
         std::fs::create_dir_all(&nested).unwrap();
-        assert!(assert_workspace_integrity(nested.to_string_lossy().to_string()).is_err());
+        assert!(assert_workspace_integrity_inner(nested.to_string_lossy().to_string()).is_err());
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
@@ -2309,7 +2378,7 @@ mod tests {
         let root = unique_root("migrate");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("migrate-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
 
         // Simulate a legacy nested worktree for agent "a".
         let legacy = root.join(".sparkle").join("worktrees").join("a");
@@ -2331,7 +2400,7 @@ mod tests {
         let root = unique_root("refresh-ok");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("refresh-ok-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         create_worktree_at(&root_str, "p", "r1", "main", &app_data).unwrap();
@@ -2353,7 +2422,7 @@ mod tests {
         let root = unique_root("refresh-dirty");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("refresh-dirty-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         let info = create_worktree_at(&root_str, "p", "r2", "main", &app_data).unwrap();
@@ -2374,7 +2443,7 @@ mod tests {
         let root = unique_root("refresh-conflict");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("refresh-conflict-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         // Seed a shared file on main.
         std::fs::write(root.join("f.txt"), "base\n").unwrap();
         git(&root_str, &["add", "-A"]).unwrap();
@@ -2406,7 +2475,7 @@ mod tests {
         let root = unique_root("status");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("status-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         let info = create_worktree_at(&root_str, "p", "s1", "main", &app_data).unwrap();
@@ -2448,7 +2517,7 @@ mod tests {
         let root = unique_root("status-gone");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("status-gone-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         let info = create_worktree_at(&root_str, "p", "s1", "main", &app_data).unwrap();
@@ -2480,7 +2549,7 @@ mod tests {
         let root = unique_root("status-noref");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("status-noref-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
 
@@ -2507,7 +2576,7 @@ mod tests {
         let root = unique_root("wf-state");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("wf-state-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         let info = create_worktree_at(&root_str, "p", "w1", "main", &app_data).unwrap();
@@ -2558,7 +2627,7 @@ mod tests {
         let root = unique_root("del-branch");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("del-branch-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         let info = create_worktree_at(&root_str, "p", "d1", "main", &app_data).unwrap();
@@ -2585,7 +2654,7 @@ mod tests {
         let root = unique_root("push-noremote");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("push-noremote-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         create_worktree_at(&root_str, "p", "pp", "main", &app_data).unwrap();
@@ -2603,7 +2672,7 @@ mod tests {
         let root = unique_root("wf-squash");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("wf-squash-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         let info = create_worktree_at(&root_str, "p", "sq", "main", &app_data).unwrap();
@@ -2642,7 +2711,7 @@ mod tests {
         let root = unique_root("wf-noop");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("wf-noop-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         create_worktree_at(&root_str, "p", "noop", "main", &app_data).unwrap();
@@ -2663,7 +2732,7 @@ mod tests {
         let root = unique_root("wf-pushed");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("wf-pushed-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         let info = create_worktree_at(&root_str, "p", "push", "main", &app_data).unwrap();
@@ -2691,7 +2760,7 @@ mod tests {
         let root = unique_root("wf-shipped");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("wf-shipped-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         let info = create_worktree_at(&root_str, "p", "ship", "main", &app_data).unwrap();
@@ -2723,7 +2792,7 @@ mod tests {
         let root = unique_root("wf-lag");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("wf-lag-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
 
@@ -2759,7 +2828,7 @@ mod tests {
         let root = unique_root("land");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("land-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap(); // main is checked out at root
         // ensure_project_repo leaves .gitignore UNTRACKED; commit it so the root (our land target)
@@ -2813,7 +2882,7 @@ mod tests {
         let root = unique_root("land-conflict");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("land-conflict-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         // A base file both sides will edit differently → a guaranteed merge conflict.
@@ -2865,7 +2934,7 @@ mod tests {
         let root = unique_root("wf-parent");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("wf-parent-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
 
@@ -2897,7 +2966,7 @@ mod tests {
         let root = unique_root("md-sync");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("md-sync-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
         let info = create_worktree_at(&root_str, "p", "md1", "main", &app_data).unwrap();
@@ -2945,7 +3014,7 @@ mod tests {
         let root = unique_root("cut-base");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("cut-base-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         // Move HEAD onto an unrelated branch with a divergent commit.
         git(&root_str, &["checkout", "-b", "scratch"]).unwrap();
@@ -2963,7 +3032,7 @@ mod tests {
     fn resolve_default_branch_uses_current_branch_with_no_remote() {
         let root = unique_root("rdb-noremote");
         let root_str = root.to_string_lossy().to_string();
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         // ensure_project_repo's first commit lands on whatever `git init` defaults to.
         let current = git(&root_str, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
         assert_eq!(resolve_default_branch(&root_str), current);
@@ -2974,7 +3043,7 @@ mod tests {
     fn resolve_default_branch_prefers_local_main() {
         let root = unique_root("rdb-main");
         let root_str = root.to_string_lossy().to_string();
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         // Create a `main` branch even if the repo initialized on `master`.
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         assert_eq!(resolve_default_branch(&root_str), "main");
@@ -2987,7 +3056,7 @@ mod tests {
         // auto-detection; a whitespace-only value falls through to auto-detect.
         let root = unique_root("rdb-config");
         let root_str = root.to_string_lossy().to_string();
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         assert_eq!(resolve_default_branch(&root_str), "main");
 
@@ -3008,7 +3077,7 @@ mod tests {
     fn effective_base_falls_back_to_local_when_remote_unreachable() {
         let root = unique_root("eb-offline");
         let root_str = root.to_string_lossy().to_string();
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         // A remote that cannot be fetched.
         git(&root_str, &["remote", "add", "origin", "file:///nonexistent/repo.git"]).unwrap();
@@ -3023,12 +3092,12 @@ mod tests {
     fn ensure_project_repo_is_idempotent_on_empty_and_existing() {
         let root = unique_root("idem");
         let root_str = root.to_string_lossy().to_string();
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         // HEAD exists (born) so worktrees are possible.
         assert!(git(&root_str, &["rev-parse", "HEAD"]).is_ok());
         // Running again is a no-op (no second commit, no error).
         let head1 = git(&root_str, &["rev-parse", "HEAD"]).unwrap();
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         let head2 = git(&root_str, &["rev-parse", "HEAD"]).unwrap();
         assert_eq!(head1, head2, "no extra commit on re-run");
         let _ = std::fs::remove_dir_all(&root);
@@ -3039,7 +3108,7 @@ mod tests {
         let root = unique_root("worker-cut");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("worker-cut-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
 
         // Parent agent "build1" gets a worktree off HEAD, then makes a unique commit on its branch.
         let parent = create_worktree_at(&root_str, "p", "build1", "HEAD", &app_data).unwrap();
@@ -3068,7 +3137,7 @@ mod tests {
         let root = unique_root("worker-prep");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("worker-prep-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
 
         let parent = create_worktree_at(&root_str, "p", "build1", "HEAD", &app_data).unwrap();
         std::fs::write(Path::new(&parent.path).join("PARENT_MARK.txt"), "x").unwrap();
@@ -3091,7 +3160,7 @@ mod tests {
         let root = unique_root("worker-empty");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("worker-empty-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
 
         for bad in ["", "   "] {
             let err = create_worktree_from_local(&root_str, "p", "w1", bad, &app_data)
@@ -3109,7 +3178,7 @@ mod tests {
         let root = unique_root("worker-nobase");
         let root_str = root.to_string_lossy().to_string();
         let app_data = unique_root("worker-nobase-appdata");
-        ensure_project_repo(root_str.clone()).unwrap();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
 
         let err = create_worktree_from_local(&root_str, "p", "w1", "sparkle/agent-missing", &app_data)
             .err()

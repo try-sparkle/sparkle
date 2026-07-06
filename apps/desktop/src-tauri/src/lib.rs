@@ -212,6 +212,7 @@ pub fn run() {
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
+            pty::pty_set_paused,
             preflight::claude_preflight,
             preflight::claude_version,
             preflight::claude_session_info,

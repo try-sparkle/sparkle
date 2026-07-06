@@ -13,15 +13,20 @@ describe("settleRepaintPlan", () => {
     expect(settleRepaintPlan(true, true)).toEqual({ action: "full", poisoned: false });
   });
 
-  it("keeps the flag set and only does a cheap refresh when poisoned but NOT paintable", () => {
-    // A settle that fires while still hidden must not waste a full repaint nor drop the flag —
-    // the next paintable settle/resize still needs to drain it.
-    expect(settleRepaintPlan(true, false)).toEqual({ action: "refresh", poisoned: true });
+  it("SKIPS painting a hidden pane but keeps the flag set (poisoned, not paintable)", () => {
+    // A settle that fires while still hidden must not waste any paint on an off-screen pane, and
+    // must not drop the flag — the become-active reveal (or the next paintable settle) drains it.
+    expect(settleRepaintPlan(true, false)).toEqual({ action: "skip", poisoned: true });
   });
 
-  it("does a cheap refresh when not poisoned (the normal streaming path)", () => {
+  it("does a cheap refresh when paintable and not poisoned (the normal streaming path)", () => {
     expect(settleRepaintPlan(false, true)).toEqual({ action: "refresh", poisoned: false });
-    expect(settleRepaintPlan(false, false)).toEqual({ action: "refresh", poisoned: false });
+  });
+
+  it("SKIPS painting an off-screen pane even when not poisoned (no wasted refresh while hidden)", () => {
+    // Bead sparkle-6x3g: with many background agents streaming, a refresh on an invisible pane is
+    // pure wasted DOM work. Nothing to paint while hidden — skip regardless of the poisoned flag.
+    expect(settleRepaintPlan(false, false)).toEqual({ action: "skip", poisoned: false });
   });
 });
 

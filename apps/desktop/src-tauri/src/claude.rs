@@ -109,14 +109,28 @@ fn resolve_session_config_dir(explicit: Option<&str>, env: Option<PathBuf>) -> O
 /// absent, we fall back to Sparkle's own process env (the pre-accounts behavior). The env value
 /// keeps its `OsString` form through to the `PathBuf` (no lossy conversion); an empty
 /// `CLAUDE_CONFIG_DIR=` is treated as unset so the `$HOME/.claude` fallback still applies.
-#[tauri::command]
-pub fn claude_has_session(worktree_path: String, config_dir: Option<String>) -> bool {
+/// Sync core of [`claude_has_session`] (resolves config/home from the env, then probes the
+/// transcript dir). `pub(crate)` so `preflight::claude_session_info` — which already runs on a
+/// blocking task — can call it directly rather than the async command.
+pub(crate) fn claude_has_session_sync(worktree_path: &str, config_dir: Option<&str>) -> bool {
     let env = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    let config_dir = resolve_session_config_dir(config_dir.as_deref(), env);
+    let config_dir = resolve_session_config_dir(config_dir, env);
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    claude_has_session_in(config_dir.as_deref(), home.as_deref(), &worktree_path)
+    claude_has_session_in(config_dir.as_deref(), home.as_deref(), worktree_path)
+}
+
+#[tauri::command]
+pub async fn claude_has_session(worktree_path: String, config_dir: Option<String>) -> bool {
+    // `async` + `spawn_blocking`: the `read_dir` transcript-directory probe is filesystem I/O that
+    // must not stall the UI thread. Best-effort, like the sync original — a panicked task (JoinError)
+    // degrades to "no session" rather than surfacing an error the caller has no branch for.
+    tauri::async_runtime::spawn_blocking(move || {
+        claude_has_session_sync(&worktree_path, config_dir.as_deref())
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// The most-recently-modified `<uuid>.jsonl` transcript in `dir`, or None. A worktree accrues one
@@ -222,13 +236,23 @@ fn agent_session_title_in(
 /// for auto-naming the agent off its ACTUAL work rather than its (often thin) first prompt. Returns
 /// None until Claude Code has written a title (a few lines into the first turn) or for non-Claude
 /// agents. Best-effort — never errors; the caller leaves the current name as-is on None.
-#[tauri::command]
-pub fn agent_session_title(worktree_path: String) -> Option<String> {
+/// Sync core of [`agent_session_title`]. `pub(crate)` for parity with the other session helpers.
+pub(crate) fn agent_session_title_sync(worktree_path: &str) -> Option<String> {
     let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    agent_session_title_in(config_dir.as_deref(), home.as_deref(), &worktree_path)
+    agent_session_title_in(config_dir.as_deref(), home.as_deref(), worktree_path)
+}
+
+#[tauri::command]
+pub async fn agent_session_title(worktree_path: String) -> Option<String> {
+    // `async` + `spawn_blocking`: reading (and tail-scanning) a potentially multi-MB transcript is
+    // filesystem I/O that must not stall the UI thread. Best-effort — a panicked task degrades to
+    // None, exactly like the sync original's any-failure-yields-None contract.
+    tauri::async_runtime::spawn_blocking(move || agent_session_title_sync(&worktree_path))
+        .await
+        .unwrap_or_default()
 }
 
 /// Pure form of [`claude_latest_session_id`]: the newest transcript's session id (its filename
@@ -251,14 +275,26 @@ fn claude_latest_session_id_in(
 /// then falls back to `--continue`. Mirrors [`claude_has_session`]'s config/home resolution: an
 /// explicit account `config_dir` wins over Sparkle's process `CLAUDE_CONFIG_DIR` (empty treated as
 /// unset), else `$HOME/.claude`.
-#[tauri::command]
-pub fn claude_latest_session_id(worktree_path: String, config_dir: Option<String>) -> Option<String> {
+/// Sync core of [`claude_latest_session_id`]. `pub(crate)` so `preflight::claude_session_info`
+/// (already on a blocking task) can call it directly rather than the async command.
+pub(crate) fn claude_latest_session_id_sync(worktree_path: &str, config_dir: Option<&str>) -> Option<String> {
     let env = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    let config_dir = resolve_session_config_dir(config_dir.as_deref(), env);
+    let config_dir = resolve_session_config_dir(config_dir, env);
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    claude_latest_session_id_in(config_dir.as_deref(), home.as_deref(), &worktree_path)
+    claude_latest_session_id_in(config_dir.as_deref(), home.as_deref(), worktree_path)
+}
+
+#[tauri::command]
+pub async fn claude_latest_session_id(worktree_path: String, config_dir: Option<String>) -> Option<String> {
+    // `async` + `spawn_blocking`: the `read_dir` transcript-directory scan is filesystem I/O that
+    // must not stall the UI thread. Best-effort — a panicked task degrades to None.
+    tauri::async_runtime::spawn_blocking(move || {
+        claude_latest_session_id_sync(&worktree_path, config_dir.as_deref())
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ import { copyToClipboard } from "../clipboard";
 import { C, CHAT_USER_BUBBLE, xtermTheme } from "../theme/colors";
 import { useResolvedTheme } from "../theme/theme";
 import type { AgentTabStatus } from "../types";
-import { spawnPty, writePty, killPty, resizePty, onPtyOutput, onPtyExit, ignorePtyGone } from "../pty";
+import { spawnPty, writePty, killPty, resizePty, setPtyPaused, onPtyOutput, onPtyExit, ignorePtyGone } from "../pty";
 import { StatusEngine } from "../engine/statusEngine";
 import { snapshotScreen } from "../engine/screenSnapshot";
 import { registerScrollback, serializeScrollback } from "../services/terminalScrollback";
@@ -22,7 +22,8 @@ import { wheelToScrollLines } from "./terminalScroll";
 import { resolveTerminalOverlay } from "./terminalOverlay";
 import { makeLineScanState, scanSubmittedLines } from "./terminalSubmit";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
-import { isMeasuredSize, spawnSize, convergeStep, CONVERGE_MAX_FRAMES } from "./terminalSize";
+import { isMeasuredSize, spawnSize } from "./terminalSize";
+import { PtyFlowController } from "./terminalFlow";
 import { SelectionPopup } from "./SelectionPopup";
 import { recoverFromWebglContextLoss, forceFullRepaint, settleRepaintPlan } from "./terminalWebgl";
 import { detectRateLimitReset } from "../services/rateLimitWatch";
@@ -558,7 +559,9 @@ export function Terminal({
     const applyRepaintPlan = () => {
       const plan = settleRepaintPlan(poisonedRef.current, isPaintable());
       if (plan.action === "full") forceFullRepaint(webglRef.current, term);
-      else term.refresh(0, term.rows - 1);
+      else if (plan.action === "refresh") term.refresh(0, term.rows - 1);
+      // "skip": the pane is hidden (not paintable) — don't spend a refresh on an off-screen pane
+      // (wasted with many background agents streaming). The become-active reveal repaints it on show.
       poisonedRef.current = plan.poisoned;
     };
 
@@ -576,6 +579,19 @@ export function Terminal({
       }, 80);
     };
 
+    // PTY read backpressure (): count bytes written-but-not-yet-parsed by xterm and, past
+    // the high-water mark, pause the PTY reader (the child then blocks on its own write) until the
+    // backlog drains below the low-water mark. Bounds xterm + IPC memory under a runaway-verbose
+    // child without dropping bytes or touching normal interactive output. See terminalFlow.ts.
+    // Serialize pause/resume onto a single promise chain: Tauri may service sync commands
+    // concurrently, so firing two independent invokes could let a `false` land before an
+    // earlier `true` and park the reader forever. Chaining guarantees the Rust side sees them
+    // in issue order (roborev nit on ).
+    let flowChain: Promise<void> = Promise.resolve();
+    const flow = new PtyFlowController((paused) => {
+      flowChain = flowChain.then(() => setPtyPaused(agentId, paused)).catch(ignorePtyGone);
+    });
+
     (async () => {
       const offOut = await onPtyOutput((e) => {
         if (e.id !== agentId) return;
@@ -587,7 +603,11 @@ export function Terminal({
         gotOutputRef.current = true;
         setFirstOutput(true);
         setSpawnFail(null); // output means it's alive — clear any prior failed/exited state
-        term.write(e.chunk);
+        // Flow control: register the chunk BEFORE writing, then release it when xterm finishes
+        // parsing (the write callback). string length is a fine byte proxy for the watermarks.
+        const chunkLen = e.chunk.length;
+        flow.onEnqueue(chunkLen);
+        term.write(e.chunk, () => flow.onParsed(chunkLen));
         engine.ingest(e.chunk);
         watchRateLimit(e.chunk);
         // Remember output that streamed in while we couldn't paint, so the next paintable settle
@@ -733,17 +753,20 @@ export function Terminal({
     else detachWebgl();
   }, [active, attachWebgl, detachWebgl]);
 
-  // Re-fit when this tab becomes the active one (was display:none). Focus goes to the
-  // composer, not the terminal — all input lives in the composer overlay.
+  // Re-fit + repaint when this tab becomes the active one. Focus goes to the composer, not the
+  // terminal — all input lives in the composer overlay.
   //
-  // A backgrounded pane is display:none, so on reveal the browser may take a FRAME OR TWO to lay
-  // out its box. The old code fit + synced exactly once, on the next frame — when that frame
-  // hadn't laid out yet, syncPtySize early-returned (0-width), the PTY kept its stale/fallback
-  // size while xterm later fit to the real width, and the CLI's baked wraps landed at the wrong
-  // column: the "renders, then stays wonky for multiple seconds until it fixes itself" report.
-  // So we now RETRY across frames (convergeStep) until the container is genuinely measured, then
-  // sync the true size once and force the reveal repaint. CONVERGE_MAX_FRAMES bounds the loop; the
-  // ResizeObserver remains the long-term backstop if a pane never lays out within the budget.
+  // Every pane stays LAID OUT at full size even while backgrounded (visibility:hidden, not
+  // display:none — see paneVisibility.ts), so its box is already measured the instant it's revealed.
+  // That retired the old multi-frame size-convergence loop (a backgrounded display:none pane used to
+  // take a frame or two to lay out on reveal, so we had to retry fit()/syncPtySize across frames
+  // until the box appeared): there is no 0-width reveal window to race against anymore. A single
+  // fit + size-sync is enough; syncPtySize itself no-ops if the box is somehow still unmeasured, and
+  // the ResizeObserver remains the long-term backstop for any late layout.
+  //
+  // The repaint IS still needed: while hidden this pane ran on the DOM renderer (its WebGL context is
+  // released when backgrounded — see attach/detachWebgl), so on reveal WebGL re-attaches with an
+  // EMPTY model and only forceFullRepaint (clearTextureAtlas) rasterizes the buffered output into it.
   useEffect(() => {
     if (!active) return;
     const fit = fitRef.current;
@@ -758,41 +781,22 @@ export function Terminal({
     // never queue a paint inside the teardown window.
     let cancelled = false;
     let handle = 0;
-    let framesLeft = CONVERGE_MAX_FRAMES;
-    let focused = false;
-    const tick = () => {
+    handle = requestAnimationFrame(() => {
       if (cancelled || disposedRef.current) return;
       // safeFit() bails if disposed and swallows the not-laid-out / torn-down-core throw itself.
       safeFit();
-      // Focus the composer once on reveal (independent of whether the box has laid out yet).
-      if (!focused) {
-        focused = true;
-        onRequestFocusRef.current?.();
-      }
-      const laidOut = !!term.element && term.element.clientWidth > 0;
-      const action = convergeStep(laidOut, isMeasuredSize(laidOut, term), framesLeft);
-      if (action === "wait") {
-        framesLeft -= 1;
-        handle = requestAnimationFrame(tick);
-        return;
-      }
-      if (action === "give-up") return;
-      // action === "sync": the pane is genuinely laid out — push the true size to the PTY so its
-      // wrap column matches xterm, then force a full repaint of the now-visible viewport.
+      onRequestFocusRef.current?.();
+      // Push the true size to the PTY so its wrap column matches xterm (no-op while unmeasured).
       syncPtySize(agentId, term);
       // Defer the repaint one frame so the just-resized canvas has valid char dimensions before we
       // clear the WebGL model; otherwise the renderer bails (no valid dims) and wastes the clear.
-      // While this pane was display:none its output streamed into the buffer, and cells the WebGL
-      // renderer cached as "drawn" (canvas at 0 size) are SKIPPED by a bare term.refresh() — so
-      // forceFullRepaint (clearTextureAtlas) is the only thing that genuinely redraws them. See
-      // forceFullRepaint in terminalWebgl.ts. disposedRef guards the deferred frame (#231/#258).
+      // disposedRef guards the deferred frame (#231/#258).
       handle = requestAnimationFrame(() => {
         if (cancelled || disposedRef.current) return;
         forceFullRepaint(webglRef.current, term);
         poisonedRef.current = false; // the reveal repaint cleared any cache-poisoned cells
       });
-    };
-    handle = requestAnimationFrame(tick);
+    });
     return () => {
       cancelled = true;
       if (handle) cancelAnimationFrame(handle);

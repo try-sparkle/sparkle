@@ -427,9 +427,12 @@ pub async fn claude_session_info(
     config_dir: Option<String>,
 ) -> ClaudeSessionInfo {
     tauri::async_runtime::spawn_blocking(move || {
-        let latest =
-            crate::claude::claude_latest_session_id(worktree_path.clone(), config_dir.clone());
-        let has_session = crate::claude::claude_has_session(worktree_path, config_dir);
+        let latest = crate::claude::claude_latest_session_id_sync(
+            &worktree_path,
+            config_dir.as_deref(),
+        );
+        let has_session =
+            crate::claude::claude_has_session_sync(&worktree_path, config_dir.as_deref());
         ClaudeSessionInfo { has_session, latest_session_id: latest }
     })
     .await

@@ -27,32 +27,6 @@ export function isMeasuredSize(laidOut: boolean, size: TermSize): boolean {
   return laidOut && size.cols >= MIN_PLAUSIBLE_COLS && size.rows >= MIN_PLAUSIBLE_ROWS;
 }
 
-// Max animation frames the reveal size-convergence loop (Terminal.tsx) will wait for a
-// display:none→flex pane to produce a laid-out box before giving up. ~1s at 60fps: generous for a
-// slow reveal (a heavy transcript redraw can delay layout several frames), bounded so the loop can
-// never spin forever. The ResizeObserver remains the long-term backstop after this gives up.
-export const CONVERGE_MAX_FRAMES = 60;
-
-/**
- * Per-frame decision for the reveal size-convergence loop. A backgrounded pane is display:none, so
- * when it becomes active the browser may take a frame or two to lay out its box — firing fit()/
- * syncPtySize exactly once (the old behavior) loses the race when that frame hasn't laid out yet,
- * leaving the PTY at a stale/fallback size while xterm later fits to the real width: the CLI's
- * baked wraps then land at the wrong column ("stays wonky for multiple seconds" until an incidental
- * resize finally reconciles). So we keep WAITING across frames until the container is genuinely
- * measured, then SYNC once and stop. Pure so the "wait until laid out, then sync once, bounded"
- * contract is unit-tested without rAF/xterm.
- */
-export function convergeStep(
-  laidOut: boolean,
-  measured: boolean,
-  framesLeft: number,
-): "sync" | "wait" | "give-up" {
-  if (laidOut && measured) return "sync";
-  if (framesLeft <= 0) return "give-up";
-  return "wait";
-}
-
 /**
  * The size to SPAWN a PTY with: the measured fit when it's trustworthy, else safe defaults so a
  * CLI never starts life wrapping into a thin column. The real size is synced once the container

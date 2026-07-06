@@ -15,9 +15,45 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 struct PtySession {
-    writer: Box<dyn Write + Send>,
+    /// The child's stdin writer, behind its OWN lock so a (potentially blocking) `pty_write` locks
+    /// only this session — never the global `sessions` map. A big paste into a stalled child would
+    /// otherwise freeze spawn/write/resize/kill for EVERY terminal (sparkle-4orh). `MasterPty`'s
+    /// writer is `!Clone`, so it lives here in an `Arc<Mutex<..>>` that `pty_write` clones out under
+    /// a brief global-lock hold, then writes with only this handle locked.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Read-backpressure gate (): while paused, the reader thread stops read()ing the
+    /// master so the kernel PTY buffer fills and the child's own write() blocks — end-to-end
+    /// backpressure driven by the frontend's flow controller (see `pty_set_paused`).
+    pause: Arc<PauseState>,
+}
+
+/// Cooperative pause gate shared between a session's reader thread and `pty_set_paused`. The reader
+/// parks on the condvar while `paused` is true (no busy-wait); `set(false)` wakes it. Poison-tolerant
+/// like the rest of this module so a panic elsewhere can't wedge a reader forever.
+struct PauseState {
+    paused: Mutex<bool>,
+    cvar: Condvar,
+}
+
+impl PauseState {
+    fn new() -> Self {
+        Self { paused: Mutex::new(false), cvar: Condvar::new() }
+    }
+    /// Block the calling (reader) thread while paused; returns immediately when not paused.
+    fn wait_while_paused(&self) {
+        let mut paused = self.paused.lock().unwrap_or_else(|e| e.into_inner());
+        while *paused {
+            paused = self.cvar.wait(paused).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    /// Set the paused flag and wake the reader (a resume must unpark it; a pause notify is harmless).
+    fn set(&self, value: bool) {
+        let mut paused = self.paused.lock().unwrap_or_else(|e| e.into_inner());
+        *paused = value;
+        self.cvar.notify_all();
+    }
 }
 
 #[derive(Default)]
@@ -266,7 +302,16 @@ pub async fn pty_spawn(
                 }
             };
 
-            Ok((PtySession { writer, master: pair.master, killer }, reader, child))
+            Ok((
+                PtySession {
+                    writer: Arc::new(Mutex::new(writer)),
+                    master: pair.master,
+                    killer,
+                    pause: Arc::new(PauseState::new()),
+                },
+                reader,
+                child,
+            ))
         },
     )
     .await
@@ -275,6 +320,8 @@ pub async fn pty_spawn(
     let mut reader = reader;
     let mut child = child;
 
+    // Share the session's pause gate with its reader thread before the session moves into the map.
+    let read_pause = session.pause.clone();
     app.state::<PtyManager>()
         .sessions
         .lock()
@@ -348,6 +395,11 @@ pub async fn pty_spawn(
             cvar.notify_one();
         };
         'read: loop {
+            // Backpressure: block here while the frontend has paused us (its xterm write buffer is
+            // above the high-water mark). Not read()ing lets the kernel PTY buffer fill so the child
+            // blocks on its next write — bounding memory end-to-end (). Returns instantly
+            // when not paused, so interactive output is unaffected.
+            read_pause.wait_while_paused();
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -412,13 +464,38 @@ pub async fn pty_spawn(
     Ok(())
 }
 
+/// Clone out a session's per-session writer handle under a BRIEF hold of the global `sessions` lock,
+/// so the caller does the (potentially blocking) write with only that handle locked — never the
+/// global map. This is the core of sparkle-4orh; split out so the lock discipline is unit-testable.
+fn acquire_writer(
+    sessions: &Mutex<HashMap<String, PtySession>>,
+    id: &str,
+) -> Result<Arc<Mutex<Box<dyn Write + Send>>>, String> {
+    let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(guard.get(id).ok_or(NO_SUCH_PTY)?.writer.clone())
+}
+
 /// Write to a PTY's stdin — e.g. an approval decision ("y\n" / "n\n") or user input.
 #[tauri::command]
 pub fn pty_write(manager: State<PtyManager>, id: String, data: String) -> Result<(), String> {
-    let mut sessions = manager.sessions.lock().unwrap_or_else(|e| e.into_inner());
-    let session = sessions.get_mut(&id).ok_or(NO_SUCH_PTY)?;
-    session.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
-    session.writer.flush().map_err(|e| e.to_string())?;
+    // Take this session's OWN writer handle, releasing the global `sessions` lock BEFORE the write.
+    // A large paste into a stalled child then blocks only this writer, leaving spawn/write/resize/
+    // kill for every other terminal responsive (sparkle-4orh).
+    let writer = acquire_writer(&manager.sessions, &id)?;
+    let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
+    writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Pause or resume the PTY reader for flow control (). The frontend calls this when its
+/// xterm write backlog crosses the high/low-water marks. Only touches this session's pause gate, so
+/// it never blocks other terminals. Benign "no such pty" race is swallowed frontend-side.
+#[tauri::command]
+pub fn pty_set_paused(manager: State<PtyManager>, id: String, paused: bool) -> Result<(), String> {
+    let sessions = manager.sessions.lock().unwrap_or_else(|e| e.into_inner());
+    let session = sessions.get(&id).ok_or(NO_SUCH_PTY)?;
+    session.pause.set(paused);
     Ok(())
 }
 
@@ -445,6 +522,9 @@ pub fn pty_resize(
 pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
     tracing::info!(%id, "pty_kill");
     if let Some(mut session) = manager.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
+        // If the reader is parked (paused) it won't observe the kill's EOF and would never run its
+        // teardown (remove + pty:exit). Resume it first so it wakes, reads EOF, and cleans up.
+        session.pause.set(false);
         let _ = session.killer.kill();
     }
     Ok(())
@@ -453,12 +533,15 @@ pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        guard_resize_size, guard_spawn_size, validate_spawn_inner, PtyManager, MIN_PTY_COLS,
-        MIN_PTY_ROWS, SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
+        acquire_writer, guard_resize_size, guard_spawn_size, validate_spawn_inner, PauseState,
+        PtyManager, PtySession, MIN_PTY_COLS, MIN_PTY_ROWS, SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
     };
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -601,5 +684,107 @@ mod tests {
         assert!(
             validate_spawn_inner(&base, "/bin/zsh", Some(sibling.to_str().unwrap())).is_err()
         );
+    }
+
+    // ── sparkle-4orh: per-session write lock ──────────────────────────────────────────────────
+    /// Holding a session's per-session writer lock (as `pty_write` does across a blocking write)
+    /// must NOT keep the global `sessions` map locked — otherwise a big paste into a stalled child
+    /// would freeze spawn/write/resize/kill for every other terminal. Uses a real PTY + `/bin/cat`
+    /// so it exercises the actual `PtySession` / `acquire_writer` path; skips if no PTY is available.
+    #[test]
+    fn per_session_writer_lock_frees_the_global_map() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let sys = native_pty_system();
+        let Ok(pair) =
+            sys.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        else {
+            return; // no PTY in this environment — skip
+        };
+        let Ok(mut child) = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+            return;
+        };
+        let killer = child.clone_killer();
+        let writer = pair.master.take_writer().expect("take_writer");
+        let session = PtySession {
+            writer: Arc::new(Mutex::new(writer)),
+            master: pair.master,
+            killer,
+            pause: Arc::new(PauseState::new()),
+        };
+        let sessions: Mutex<HashMap<String, PtySession>> = Mutex::new(HashMap::new());
+        sessions.lock().unwrap().insert("a".to_string(), session);
+
+        // Simulate an in-flight blocking write: hold THIS session's writer lock.
+        let handle = acquire_writer(&sessions, "a").expect("writer handle");
+        let held = handle.lock().unwrap_or_else(|e| e.into_inner());
+
+        // The global map must still be immediately lockable — the whole point of sparkle-4orh.
+        assert!(
+            sessions.try_lock().is_ok(),
+            "global sessions lock must be free while a session's writer is held"
+        );
+        // A missing session still reports NO_SUCH_PTY through the same helper.
+        assert!(acquire_writer(&sessions, "missing").is_err());
+
+        drop(held);
+        let removed = sessions.lock().unwrap_or_else(|e| e.into_inner()).remove("a");
+        if let Some(mut s) = removed {
+            let _ = s.killer.kill();
+            let _ = child.wait();
+        }
+    }
+
+    // ── : read-backpressure pause gate ─────────────────────────────────────────────
+    /// A parked reader stays parked while paused and proceeds the instant it's resumed — the
+    /// mechanism `pty_set_paused` / `pty_kill` rely on.
+    #[test]
+    fn pause_state_blocks_while_paused_and_wakes_on_resume() {
+        let ps = Arc::new(PauseState::new());
+        ps.set(true);
+        let woke = Arc::new(AtomicBool::new(false));
+        let ps2 = ps.clone();
+        let woke2 = woke.clone();
+        let h = std::thread::spawn(move || {
+            ps2.wait_while_paused();
+            woke2.store(true, Ordering::SeqCst);
+        });
+        // Let the thread park on the condvar; it must not have proceeded past the pause.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!woke.load(Ordering::SeqCst), "reader must stay parked while paused");
+        ps.set(false); // resume
+        h.join().unwrap();
+        assert!(woke.load(Ordering::SeqCst), "reader must proceed after resume");
+    }
+
+    /// When not paused, `wait_while_paused` returns immediately (interactive output is unaffected).
+    #[test]
+    fn pause_state_does_not_block_when_not_paused() {
+        let ps = PauseState::new();
+        ps.wait_while_paused(); // returns at once
+        ps.set(true);
+        ps.set(false);
+        ps.wait_while_paused(); // still returns at once after a resume
+    }
+
+    /// `pty_kill` on a paused session sets `pause.set(false)` BEFORE `killer.kill()` so a reader
+    /// parked on the pause gate wakes, then reads the child's EOF and runs teardown. This pins that
+    /// kill-while-paused ordering contract ().
+    #[test]
+    fn kill_order_wakes_a_reader_parked_on_the_pause_gate() {
+        let pause = Arc::new(PauseState::new());
+        pause.set(true);
+        let woke = Arc::new(AtomicBool::new(false));
+        let p2 = pause.clone();
+        let w2 = woke.clone();
+        let reader = std::thread::spawn(move || {
+            p2.wait_while_paused(); // the real reader parks here before each read()
+            w2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!woke.load(Ordering::SeqCst), "a paused reader must stay parked");
+        // Exactly what pty_kill does to the removed session before killing the child:
+        pause.set(false);
+        reader.join().unwrap();
+        assert!(woke.load(Ordering::SeqCst), "kill's resume must wake the parked reader");
     }
 }

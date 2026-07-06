@@ -29,21 +29,25 @@ pub fn append_note(project_path: String, text: String, timestamp: String) -> Res
 /// `.zshrc`/`.zprofile` startup `cd` calls overriding the inherited working directory.
 /// Returns bd's raw `--json` stdout (the created issue, or an `{"error": …}` object).
 #[tauri::command]
-pub fn create_bead(project_path: String, title: String, body: String) -> Result<String, String> {
-    let output = Command::new("/bin/zsh")
-        .arg("-l")
-        .arg("-c")
-        .arg(r#"cd "$3" && bd create "$1" -d "$2" --json"#)
-        .arg("sparkle")    // $0
-        .arg(&title)       // $1
-        .arg(&body)        // $2
-        .arg(&project_path) // $3
-        .output()
-        .map_err(|e| format!("failed to run bd: {e}"))?;
+pub async fn create_bead(project_path: String, title: String, body: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = Command::new("/bin/zsh")
+            .arg("-l")
+            .arg("-c")
+            .arg(r#"cd "$3" && bd create "$1" -d "$2" --json"#)
+            .arg("sparkle")    // $0
+            .arg(&title)       // $1
+            .arg(&body)        // $2
+            .arg(&project_path) // $3
+            .output()
+            .map_err(|e| format!("failed to run bd: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    select_bd_result(output.status.success(), &stdout, &stderr)
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        select_bd_result(output.status.success(), &stdout, &stderr)
+    })
+    .await
+    .map_err(|e| format!("bd task failed: {e}"))?
 }
 
 /// Decide what to return from `create_bead` given bd's process result. Extracted as a pure
@@ -214,38 +218,46 @@ pub fn copy_capture_asset(
 /// issue in every status. Runs through a login shell so the GUI app inherits the user's PATH (where
 /// `bd` lives); the project path is a positional arg, never interpolated.
 #[tauri::command]
-pub fn list_beads(project_path: String) -> Result<String, String> {
-    let output = Command::new("/bin/zsh")
-        .arg("-l")
-        .arg("-c")
-        .arg(r#"cd "$1" && bd list --all --limit 0 --json"#)
-        .arg("sparkle")     // $0
-        .arg(&project_path) // $1
-        .output()
-        .map_err(|e| format!("failed to run bd: {e}"))?;
+pub async fn list_beads(project_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = Command::new("/bin/zsh")
+            .arg("-l")
+            .arg("-c")
+            .arg(r#"cd "$1" && bd list --all --limit 0 --json"#)
+            .arg("sparkle")     // $0
+            .arg(&project_path) // $1
+            .output()
+            .map_err(|e| format!("failed to run bd: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    select_bd_raw(output.status.success(), &stdout, &stderr)
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        select_bd_raw(output.status.success(), &stdout, &stderr)
+    })
+    .await
+    .map_err(|e| format!("bd task failed: {e}"))?
 }
 
 /// Show a single bead via `bd show "$1" --json`. Returns bd's raw JSON stdout. `id` is a
 /// positional arg ($1), never interpolated into the script.
 #[tauri::command]
-pub fn bead_show(project_path: String, id: String) -> Result<String, String> {
-    let output = Command::new("/bin/zsh")
-        .arg("-l")
-        .arg("-c")
-        .arg(r#"cd "$2" && bd show "$1" --json"#)
-        .arg("sparkle")     // $0
-        .arg(&id)           // $1
-        .arg(&project_path) // $2
-        .output()
-        .map_err(|e| format!("failed to run bd: {e}"))?;
+pub async fn bead_show(project_path: String, id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = Command::new("/bin/zsh")
+            .arg("-l")
+            .arg("-c")
+            .arg(r#"cd "$2" && bd show "$1" --json"#)
+            .arg("sparkle")     // $0
+            .arg(&id)           // $1
+            .arg(&project_path) // $2
+            .output()
+            .map_err(|e| format!("failed to run bd: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    select_bd_raw(output.status.success(), &stdout, &stderr)
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        select_bd_raw(output.status.success(), &stdout, &stderr)
+    })
+    .await
+    .map_err(|e| format!("bd task failed: {e}"))?
 }
 
 /// Assemble the `bd create` shell script and the positional args it references. Every value
@@ -298,7 +310,7 @@ fn build_create_bead_command(
 /// on a caught bd error).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn create_bead_full(
+pub async fn create_bead_full(
     project_path: String,
     title: String,
     body: String,
@@ -307,48 +319,57 @@ pub fn create_bead_full(
     deps: String,
     labels: String,
 ) -> Result<String, String> {
-    let (script, args) =
-        build_create_bead_command(&project_path, &title, &body, &issue_type, &parent, &deps, &labels);
-    let mut cmd = Command::new("/bin/zsh");
-    cmd.arg("-l").arg("-c").arg(&script).arg("sparkle"); // $0
-    for a in &args {
-        cmd.arg(a);
-    }
-    let output = cmd.output().map_err(|e| format!("failed to run bd: {e}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let (script, args) =
+            build_create_bead_command(&project_path, &title, &body, &issue_type, &parent, &deps, &labels);
+        let mut cmd = Command::new("/bin/zsh");
+        cmd.arg("-l").arg("-c").arg(&script).arg("sparkle"); // $0
+        for a in &args {
+            cmd.arg(a);
+        }
+        let output = cmd.output().map_err(|e| format!("failed to run bd: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    select_bd_result(output.status.success(), &stdout, &stderr)
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        select_bd_result(output.status.success(), &stdout, &stderr)
+    })
+    .await
+    .map_err(|e| format!("bd task failed: {e}"))?
 }
 
 /// Add a dependency: `bd dep add "$1" "$2"` — `blocked_id` depends on (is blocked by) `blocker_id`.
 /// Both ids are positional args, never interpolated.
 #[tauri::command]
-pub fn bead_dep_add(
+pub async fn bead_dep_add(
     project_path: String,
     blocked_id: String,
     blocker_id: String,
 ) -> Result<String, String> {
-    let output = Command::new("/bin/zsh")
-        .arg("-l")
-        .arg("-c")
-        .arg(r#"cd "$3" && bd dep add "$1" "$2""#)
-        .arg("sparkle")     // $0
-        .arg(&blocked_id)   // $1
-        .arg(&blocker_id)   // $2
-        .arg(&project_path) // $3
-        .output()
-        .map_err(|e| format!("failed to run bd: {e}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = Command::new("/bin/zsh")
+            .arg("-l")
+            .arg("-c")
+            .arg(r#"cd "$3" && bd dep add "$1" "$2""#)
+            .arg("sparkle")     // $0
+            .arg(&blocked_id)   // $1
+            .arg(&blocker_id)   // $2
+            .arg(&project_path) // $3
+            .output()
+            .map_err(|e| format!("failed to run bd: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    select_bd_action(output.status.success(), &stdout, &stderr)
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        select_bd_action(output.status.success(), &stdout, &stderr)
+    })
+    .await
+    .map_err(|e| format!("bd task failed: {e}"))?
 }
 
 /// Claim a bead — mark it in_progress. `bd update <id> --claim`. Idempotent server-side, so the
 /// app can fire it on every entry into a "building" stage without churn.
-#[tauri::command]
-pub fn bead_claim(project_path: String, id: String) -> Result<String, String> {
+/// Sync core of [`bead_claim`]; a plain fn so the async command offloads it via `spawn_blocking`
+/// and the tests can drive the id-validation guard directly.
+fn bead_claim_inner(project_path: String, id: String) -> Result<String, String> {
     if !valid_bead_id(&id) {
         return Err(format!("invalid bead id: {id}"));
     }
@@ -366,30 +387,42 @@ pub fn bead_claim(project_path: String, id: String) -> Result<String, String> {
     select_bd_action(output.status.success(), &stdout, &stderr)
 }
 
+#[tauri::command]
+pub async fn bead_claim(project_path: String, id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || bead_claim_inner(project_path, id))
+        .await
+        .map_err(|e| format!("bd task failed: {e}"))?
+}
+
 /// Close a bead (mark done). `bd close <id>`. Idempotent server-side.
 #[tauri::command]
-pub fn bead_close(project_path: String, id: String) -> Result<String, String> {
+pub async fn bead_close(project_path: String, id: String) -> Result<String, String> {
     if !valid_bead_id(&id) {
         return Err(format!("invalid bead id: {id}"));
     }
-    let output = Command::new("/bin/zsh")
-        .arg("-l")
-        .arg("-c")
-        .arg(r#"cd "$2" && bd close "$1""#)
-        .arg("sparkle") // $0
-        .arg(&id) // $1
-        .arg(&project_path) // $2
-        .output()
-        .map_err(|e| format!("failed to run bd: {e}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    select_bd_action(output.status.success(), &stdout, &stderr)
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = Command::new("/bin/zsh")
+            .arg("-l")
+            .arg("-c")
+            .arg(r#"cd "$2" && bd close "$1""#)
+            .arg("sparkle") // $0
+            .arg(&id) // $1
+            .arg(&project_path) // $2
+            .output()
+            .map_err(|e| format!("failed to run bd: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        select_bd_action(output.status.success(), &stdout, &stderr)
+    })
+    .await
+    .map_err(|e| format!("bd task failed: {e}"))?
 }
 
 /// Add or remove a label on a bead: `bd label add|remove "$2" "$3"`. `action` is validated to be
 /// exactly "add" or "remove"; id and label are positional args, never interpolated.
-#[tauri::command]
-pub fn bead_label(
+/// Sync core of [`bead_label`]; a plain fn so the async command offloads it via `spawn_blocking`
+/// and the tests can drive the action/id validation guards directly.
+fn bead_label_inner(
     project_path: String,
     action: String,
     id: String,
@@ -418,6 +451,18 @@ pub fn bead_label(
     select_bd_action(output.status.success(), &stdout, &stderr)
 }
 
+#[tauri::command]
+pub async fn bead_label(
+    project_path: String,
+    action: String,
+    id: String,
+    label: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || bead_label_inner(project_path, action, id, label))
+        .await
+        .map_err(|e| format!("bd task failed: {e}"))?
+}
+
 /// A bead id is safe to pass as a positional operand only if it can't be mistaken for a flag. Even
 /// though it's already an argv arg (not shell-interpolated), an id beginning with `-` would be parsed
 /// by `bd` as an OPTION, not an issue id. Restrict to bd's id charset and forbid a leading dash.
@@ -430,8 +475,9 @@ fn valid_bead_id(id: &str) -> bool {
 /// Permanently delete a bead via `bd delete "$1" --force` — used by the close-agent Discard path.
 /// Destructive and irreversible; the caller MUST gate it behind an explicit user confirmation. `id`
 /// is a positional arg ($1), never interpolated into the script.
-#[tauri::command]
-pub fn delete_bead(project_path: String, id: String) -> Result<String, String> {
+/// Sync core of [`delete_bead`]; a plain fn so the async command offloads it via `spawn_blocking`
+/// and the tests can drive the id-validation guard directly.
+fn delete_bead_inner(project_path: String, id: String) -> Result<String, String> {
     if !valid_bead_id(&id) {
         return Err(format!("invalid bead id: {id}"));
     }
@@ -450,6 +496,13 @@ pub fn delete_bead(project_path: String, id: String) -> Result<String, String> {
     select_bd_action(output.status.success(), &stdout, &stderr)
 }
 
+#[tauri::command]
+pub async fn delete_bead(project_path: String, id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || delete_bead_inner(project_path, id))
+        .await
+        .map_err(|e| format!("bd task failed: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,8 +517,8 @@ mod tests {
         assert!(!valid_bead_id("a b")); // space
         assert!(!valid_bead_id("a;b")); // metachar
         // The id-taking commands reject a flag-like id before shelling out.
-        assert!(bead_claim("/tmp".into(), "-s".into()).is_err());
-        assert!(delete_bead("/tmp".into(), "--force".into()).is_err());
+        assert!(bead_claim_inner("/tmp".into(), "-s".into()).is_err());
+        assert!(delete_bead_inner("/tmp".into(), "--force".into()).is_err());
     }
 
     #[test]
@@ -670,7 +723,7 @@ mod tests {
 
     #[test]
     fn bead_label_rejects_invalid_action() {
-        let r = bead_label("/proj".into(), "delete".into(), "sparkle-x".into(), "ui".into());
+        let r = bead_label_inner("/proj".into(), "delete".into(), "sparkle-x".into(), "ui".into());
         assert!(r.is_err());
     }
 

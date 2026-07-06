@@ -73,6 +73,13 @@ export function resizePty(id: string, cols: number, rows: number): Promise<void>
   return invoke<void>("pty_resize", { id, cols, rows }).catch(ignoreExitedPty);
 }
 
+/** Pause or resume the PTY's reader for flow control (). Fire-and-forget: the frontend
+ *  calls this when its xterm write backlog crosses the high/low-water marks (see terminalFlow.ts);
+ *  the benign "no such pty" teardown race is swallowed like the other PTY ops. */
+export function setPtyPaused(id: string, paused: boolean): Promise<void> {
+  return invoke<void>("pty_set_paused", { id, paused }).catch(ignoreExitedPty);
+}
+
 export function killPty(id: string): Promise<void> {
   return invoke("pty_kill", { id });
 }

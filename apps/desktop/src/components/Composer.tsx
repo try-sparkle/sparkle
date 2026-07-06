@@ -1192,6 +1192,11 @@ export function Composer({
                 flex: 1,
                 minHeight: 0,
                 resize: "none",
+                // When the user has hand-sized the box SHORTER than its content (userSized drag —
+                // ), the textarea is pinned by flex to a height below its scrollHeight, so
+                // the draft must SCROLL inside the smaller box rather than overflow it. Set overflow-y
+                // explicitly so this never depends on the UA's default textarea overflow behavior.
+                overflowY: "auto",
                 boxSizing: "border-box",
                 // Transparent so the mirror's ghost suffix shows through behind the real text.
                 background: "transparent",

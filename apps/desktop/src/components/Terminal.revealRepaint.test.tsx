@@ -101,7 +101,6 @@ vi.mock("../theme/theme", () => ({ useResolvedTheme: () => "dark" }));
 
 import { Terminal } from "./Terminal";
 import { resizePty } from "../pty";
-import { CONVERGE_MAX_FRAMES } from "./terminalSize";
 
 const baseProps = {
   agentId: "agent-1",
@@ -168,79 +167,39 @@ describe("Terminal reveal repaint", () => {
     expect(clearTextureAtlas).not.toHaveBeenCalled();
   });
 
-  it("keeps retrying across frames until a slow display:none→flex reveal lays out, then syncs + repaints", () => {
-    // The core "stays wonky for multiple seconds" race: the pane becomes active but its box hasn't
-    // laid out yet for the first frames. The OLD code fit + synced exactly once and lost — leaving
-    // the PTY at a stale size (wrong wrap column) until an incidental resize fixed it. The reveal
-    // loop must WAIT across frames and only sync + repaint once the box genuinely lays out.
-    const queue: FrameRequestCallback[] = [];
-    const step = () => {
-      const batch = queue.splice(0, queue.length);
-      for (const cb of batch) cb(0);
-    };
-    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
-      queue.push(cb);
-      return queue.length;
-    });
-    vi.stubGlobal("cancelAnimationFrame", () => {});
-
-    widthCtl.value = 0; // revealed but NOT laid out yet
+  it("on reveal, syncs the PTY size once and force-repaints once (single-shot — no convergence loop)", () => {
+    // Every pane stays laid out at full size even while backgrounded (visibility:hidden, not
+    // display:none — paneVisibility.ts), so on reveal the box is ALREADY measured. There is no
+    // 0-width reveal window to race against, so the old multi-frame convergence loop is gone: a
+    // single fit + size-sync + repaint is all that's needed.
+    widthCtl.value = 720; // laid out (the visibility:hidden invariant)
     const { rerender } = render(<Terminal {...baseProps} active={false} />);
-    step(); // drain mount-time frames
     clearTextureAtlas.mockClear();
     vi.mocked(resizePty).mockClear();
 
-    rerender(<Terminal {...baseProps} active={true} />); // schedules the reveal tick
+    rerender(<Terminal {...baseProps} active={true} />);
 
-    // A few frames pass with the box still collapsed: no size pushed, no repaint — just retries.
-    step();
-    step();
-    step();
-    expect(resizePty).not.toHaveBeenCalled();
-    expect(clearTextureAtlas).not.toHaveBeenCalled();
-
-    // Now the pane finally lays out. The next tick must sync the true size and (next frame) repaint.
-    widthCtl.value = 720;
-    step(); // tick sees laidOut → syncPtySize + schedules the deferred repaint
-    step(); // deferred repaint frame runs forceFullRepaint
-
-    expect(resizePty).toHaveBeenCalled();
-    expect(clearTextureAtlas).toHaveBeenCalled();
+    // Exactly one size push and one repaint — no per-frame retry loop.
+    expect(resizePty).toHaveBeenCalledTimes(1);
+    expect(clearTextureAtlas).toHaveBeenCalledTimes(1);
   });
 
-  it("gives up (bounded) when a revealed pane never lays out — no endless rAFs, no size push", () => {
-    // Belt-and-suspenders: a pane that stays collapsed past the frame budget (pathological — e.g.
-    // it's revealed but immediately re-hidden) must STOP retrying rather than spin forever, and
-    // must never push a (stale/0-width) size or repaint. The ResizeObserver remains the backstop.
-    const queue: FrameRequestCallback[] = [];
-    let scheduled = 0;
-    const step = () => {
-      const batch = queue.splice(0, queue.length);
-      for (const cb of batch) cb(0);
-    };
-    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
-      scheduled += 1;
-      queue.push(cb);
-      return queue.length;
-    });
-    vi.stubGlobal("cancelAnimationFrame", () => {});
-
-    widthCtl.value = 0; // revealed but NEVER lays out
+  it("on reveal, repaints to populate the freshly re-attached WebGL but guards the size push when unmeasured", () => {
+    // Defensive corner (should not happen under visibility:hidden): if the box somehow isn't laid
+    // out on the reveal frame, we STILL force-repaint — the pane's WebGL context was released while
+    // backgrounded, so it re-attaches EMPTY and only a full repaint draws the buffered output into
+    // it. But we must NOT push a stale/0-width size to the PTY (that re-creates the thin-column
+    // wrap); syncPtySize no-ops on an unmeasured box and the ResizeObserver syncs the real size once
+    // it lays out.
+    widthCtl.value = 0; // revealed but (defensively) not laid out this frame
     const { rerender } = render(<Terminal {...baseProps} active={false} />);
-    step(); // drain mount-time frames
     clearTextureAtlas.mockClear();
     vi.mocked(resizePty).mockClear();
-    scheduled = 0;
 
-    rerender(<Terminal {...baseProps} active={true} />); // schedules the reveal tick
+    rerender(<Terminal {...baseProps} active={true} />);
 
-    // Run well past the budget. The loop must stop scheduling once framesLeft is exhausted.
-    for (let i = 0; i < CONVERGE_MAX_FRAMES + 5; i++) step();
-
-    expect(queue.length).toBe(0); // converged to a stop — nothing left pending
-    expect(scheduled).toBeLessThanOrEqual(CONVERGE_MAX_FRAMES + 1); // bounded by the budget
-    expect(resizePty).not.toHaveBeenCalled(); // never pushed a size for an unmeasured pane
-    expect(clearTextureAtlas).not.toHaveBeenCalled(); // never repainted
+    expect(resizePty).not.toHaveBeenCalled(); // size push guarded while unmeasured
+    expect(clearTextureAtlas).toHaveBeenCalled(); // reveal still repaints (populate fresh WebGL)
   });
 
   it("cancels the pending reveal rAFs on unmount so no paint reaches a disposed terminal", () => {
