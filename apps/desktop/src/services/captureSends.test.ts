@@ -1,14 +1,20 @@
+// @vitest-environment jsdom
+//
 // Ownership routing for capture://send. The event is broadcast to every window; exactly ONE
 // window may act on a payload. Source of truth is the window registry (windowRegistry.ts):
 // the window whose label === findWindowForProject(projectId) owns it; an orphan project (no
 // registered window) falls to main. These tests drive routeCaptureSend with a fake registry.
-import { describe, it, expect, vi } from "vitest";
+// (jsdom env so the dispatchBuild tests below can drive the real zustand stores.)
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   routeCaptureSend,
   shouldHandleCaptureSend,
+  dispatchBuild,
   type CaptureRouteDeps,
 } from "./captureSends";
 import type { CaptureSendPayload } from "../capture/types";
+import type { Project } from "../types";
+import { useProjectStore } from "../stores/projectStore";
 
 const payload = (projectId: string): CaptureSendPayload => ({
   mode: "think",
@@ -142,5 +148,79 @@ describe("shouldHandleCaptureSend (stale-owner self-heal)", () => {
     };
     await expect(shouldHandleCaptureSend(payload("p1"), d)).resolves.toBe(false);
     expect(d.evictWindow).not.toHaveBeenCalled();
+  });
+});
+
+// Build-agent selection: the Build options menu (CaptureApp) drives WHICH build agent a capture
+// lands in via the payload's forceNewAgent / targetAgentId fields — the fix for "Build did not
+// create a new build agent" (the old code always reused the first existing build agent).
+describe("dispatchBuild agent selection", () => {
+  const buildPayload = (over: Partial<CaptureSendPayload> = {}): CaptureSendPayload => ({
+    mode: "build",
+    projectId: "proj-1",
+    text: "narration",
+    attachments: [{ path: "/tmp/shot.png", dataUrl: "data:image/png;base64,AA" }],
+    ...over,
+  });
+
+  const projectWithBuilds = (): Project[] =>
+    [
+      {
+        id: "proj-1",
+        name: "Alpha",
+        rootPath: "/tmp/alpha",
+        defaultBranch: "main",
+        createdAt: "2026-01-01",
+        selectedAgentId: null,
+        agents: [
+          { id: "b1", name: "Build 1", kind: "build", agents: undefined },
+          { id: "b2", name: "Build 2", kind: "build" },
+          { id: "t1", name: "Think", kind: "think" },
+        ],
+      },
+    ] as unknown as Project[];
+
+  const selectedId = () =>
+    useProjectStore.getState().projects.find((p) => p.id === "proj-1")?.selectedAgentId;
+  const buildCount = () =>
+    useProjectStore
+      .getState()
+      .projects.find((p) => p.id === "proj-1")!
+      .agents.filter((a) => a.kind === "build").length;
+
+  beforeEach(() => {
+    useProjectStore.setState({ projects: projectWithBuilds() });
+  });
+
+  it("forceNewAgent → ALWAYS spawns a fresh build agent (never reuses an existing one)", () => {
+    dispatchBuild(buildPayload({ forceNewAgent: true }));
+    expect(buildCount()).toBe(3); // b1 + b2 + the new one
+    const sel = selectedId();
+    expect(sel).not.toBe("b1");
+    expect(sel).not.toBe("b2");
+  });
+
+  it("targetAgentId → routes into that EXACT existing build agent (no new agent)", () => {
+    dispatchBuild(buildPayload({ targetAgentId: "b2" }));
+    expect(buildCount()).toBe(2);
+    expect(selectedId()).toBe("b2");
+  });
+
+  it("no routing fields → legacy reuse of the FIRST existing build agent", () => {
+    dispatchBuild(buildPayload());
+    expect(buildCount()).toBe(2);
+    expect(selectedId()).toBe("b1");
+  });
+
+  it("targetAgentId that no longer exists → falls back to the first build agent (no crash)", () => {
+    dispatchBuild(buildPayload({ targetAgentId: "gone" }));
+    expect(buildCount()).toBe(2);
+    expect(selectedId()).toBe("b1");
+  });
+
+  it("forceNewAgent wins even if a targetAgentId is also present", () => {
+    dispatchBuild(buildPayload({ forceNewAgent: true, targetAgentId: "b2" }));
+    expect(buildCount()).toBe(3);
+    expect(selectedId()).not.toBe("b2");
   });
 });

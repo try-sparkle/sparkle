@@ -56,7 +56,8 @@ describe("CaptureApp", () => {
     expect(screen.getByAltText("Captured screenshot")).toBeTruthy();
     expect(screen.getByText("Think ❯")).toBeTruthy();
     expect(screen.getByText("Plan ❯")).toBeTruthy();
-    expect(screen.getByText("Build ❯")).toBeTruthy();
+    // Build now opens an options menu, so it's badged with a ▾ affordance, not the ❯ send glyph.
+    expect(screen.getByText("Build ▾")).toBeTruthy();
   });
 
   it("defaults the project switcher to the last-focused project", () => {
@@ -69,14 +70,14 @@ describe("CaptureApp", () => {
     expect((screen.getByLabelText("Project") as HTMLSelectElement).value).toBe("proj-2");
   });
 
-  it("send emits the full payload (text may be empty) and hides the window", () => {
+  it("Think sends the full payload (text may be empty) and hides the window", () => {
     render(<CaptureApp />);
     fireShot();
 
-    fireEvent.click(screen.getByText("Build ❯"));
+    fireEvent.click(screen.getByText("Think ❯"));
 
     expect(emitCaptureSend).toHaveBeenCalledWith({
-      mode: "build",
+      mode: "think",
       projectId: "proj-1", // no last-focused record → first project
       text: "",
       attachments: [{ path: SHOT.path, dataUrl: SHOT.dataUrl }],
@@ -86,12 +87,85 @@ describe("CaptureApp", () => {
     expect(screen.queryByTestId("capture-scrim")).toBeNull();
   });
 
+  it("Build opens the options menu (does NOT send); 'New build agent' sends with forceNewAgent", () => {
+    render(<CaptureApp />);
+    fireShot();
+
+    fireEvent.click(screen.getByText("Build ▾"));
+    // Menu is open, nothing sent yet.
+    expect(emitCaptureSend).not.toHaveBeenCalled();
+    expect(screen.getByTestId("build-menu")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("build-menu-new"));
+    expect(emitCaptureSend).toHaveBeenCalledWith({
+      mode: "build",
+      projectId: "proj-1",
+      text: "",
+      attachments: [{ path: SHOT.path, dataUrl: SHOT.dataUrl }],
+      forceNewAgent: true,
+    });
+    expect(hideCaptureWindow).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("capture-scrim")).toBeNull();
+  });
+
+  it("Build menu lists existing build agents by display name; picking one routes targetAgentId", () => {
+    const projWithBuilds = [
+      {
+        id: "proj-1",
+        name: "Alpha",
+        agents: [
+          { id: "b1", kind: "build", name: "Build 1", autoNameVariants: null },
+          {
+            id: "b2",
+            kind: "build",
+            name: "fallback name",
+            autoNameVariants: { title: "Fix login", description: "" },
+          },
+          { id: "t1", kind: "think", name: "Ideation", autoNameVariants: null },
+        ],
+      },
+    ] as unknown as Project[];
+    useProjectStore.setState({ projects: projWithBuilds });
+    render(<CaptureApp />);
+    fireShot();
+
+    fireEvent.click(screen.getByText("Build ▾"));
+    // Only build agents are listed (the think agent is not), and autoNameVariants.title wins.
+    expect(screen.queryByText("Ideation")).toBeNull();
+    expect(screen.getByText("Build 1")).toBeTruthy();
+    expect(screen.getByText("Fix login")).toBeTruthy();
+    expect(screen.queryByText("fallback name")).toBeNull();
+
+    fireEvent.click(screen.getByText("Fix login"));
+    expect(emitCaptureSend).toHaveBeenCalledWith({
+      mode: "build",
+      projectId: "proj-1",
+      text: "",
+      attachments: [{ path: SHOT.path, dataUrl: SHOT.dataUrl }],
+      targetAgentId: "b2",
+    });
+    expect(hideCaptureWindow).toHaveBeenCalledTimes(1);
+  });
+
+  it("clicking the Build menu backdrop closes the menu without closing the takeover", () => {
+    render(<CaptureApp />);
+    fireShot();
+    fireEvent.click(screen.getByText("Build ▾"));
+    expect(screen.getByTestId("build-menu")).toBeTruthy();
+    fireEvent.mouseDown(screen.getByTestId("build-menu-backdrop"));
+    expect(screen.queryByTestId("build-menu")).toBeNull();
+    expect(hideCaptureWindow).not.toHaveBeenCalled();
+    expect(screen.getByTestId("capture-scrim")).toBeTruthy();
+  });
+
   it("send buttons are disabled with no project to select", () => {
     useProjectStore.setState({ projects: [] });
     render(<CaptureApp />);
     fireShot();
-    expect((screen.getByText("Build ❯") as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(screen.getByText("Build ❯"));
+    expect((screen.getByText("Build ▾") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByText("Build ▾"));
+    // Disabled Build must not open the menu nor send.
+    expect(screen.queryByTestId("build-menu")).toBeNull();
     expect(emitCaptureSend).not.toHaveBeenCalled();
   });
 
@@ -123,22 +197,44 @@ describe("CaptureApp", () => {
     expect(screen.queryByTestId("capture-scrim")).toBeNull();
   });
 
-  it("scrim click follows the same discard rule as Esc", () => {
+  it("scrim click closes immediately with an empty textarea", () => {
     render(<CaptureApp />);
     fireShot();
     fireEvent.mouseDown(screen.getByTestId("capture-scrim"));
     expect(hideCaptureWindow).toHaveBeenCalledTimes(1);
   });
 
-  it("scrim click with narration shows the confirm instead of hiding", () => {
+  it("scrim click ALWAYS closes immediately — no confirm even with narration", () => {
     render(<CaptureApp />);
     fireShot();
     fireEvent.change(screen.getByPlaceholderText(/Narrate what you captured/), {
       target: { value: "note to self" },
     });
     fireEvent.mouseDown(screen.getByTestId("capture-scrim"));
+    expect(hideCaptureWindow).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Discard capture?")).toBeNull();
+    expect(screen.queryByTestId("capture-scrim")).toBeNull();
+  });
+
+  it("a click bubbling up from the card does NOT close the modal", () => {
+    render(<CaptureApp />);
+    fireShot();
+    // A mousedown on the card (not the scrim itself) must not trigger the scrim's close.
+    fireEvent.mouseDown(screen.getByTestId("capture-card"));
     expect(hideCaptureWindow).not.toHaveBeenCalled();
-    expect(screen.getByText("Discard capture?")).toBeTruthy();
+    expect(screen.getByTestId("capture-scrim")).toBeTruthy();
+  });
+
+  it("the corner Cancel button closes immediately, even with narration (no confirm)", () => {
+    render(<CaptureApp />);
+    fireShot();
+    fireEvent.change(screen.getByPlaceholderText(/Narrate what you captured/), {
+      target: { value: "keep or not" },
+    });
+    fireEvent.click(screen.getByTestId("capture-cancel"));
+    expect(hideCaptureWindow).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Discard capture?")).toBeNull();
+    expect(screen.queryByTestId("capture-scrim")).toBeNull();
   });
 
   it("a re-capture keeps unsent narration but resets the shot", () => {

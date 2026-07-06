@@ -113,13 +113,24 @@ function dispatchThink(payload: CaptureSendPayload): void {
   useUiStore.getState().setWorkMode("think");
 }
 
-/** Build: reuse-or-create the project's build agent (mirrors sendToBuild's selection), set the
- *  Build composer draft (consumed on mount/focus, NOT auto-sent), and switch to Build. */
-function dispatchBuild(payload: CaptureSendPayload): void {
+/** Build: route the capture into a build agent per the payload's Build-menu selection, set the
+ *  Build composer draft (consumed on mount/focus, NOT auto-sent), and switch to Build.
+ *
+ *  Agent selection (the Build options menu in CaptureApp drives which branch fires):
+ *   - `forceNewAgent` → ALWAYS spawn a fresh build agent (the "New build agent" entry). This is
+ *     the fix for "Build did not create a new build agent": the old code auto-reused the first
+ *     existing build agent, so a new capture always landed in the same agent.
+ *   - `targetAgentId` (a still-present build agent) → route into that EXACT agent the user picked.
+ *   - neither → legacy reuse-or-create: the first existing build agent, or a fresh one if none. */
+export function dispatchBuild(payload: CaptureSendPayload): void {
   const store = useProjectStore.getState();
   const project = store.projects.find((p) => p.id === payload.projectId);
   if (!project) return;
-  const existing = project.agents.find((a) => a.kind === "build");
+  const picked =
+    !payload.forceNewAgent && payload.targetAgentId
+      ? project.agents.find((a) => a.id === payload.targetAgentId && a.kind === "build")
+      : undefined;
+  const existing = payload.forceNewAgent ? undefined : picked ?? project.agents.find((a) => a.kind === "build");
   const agentId = existing ? existing.id : store.addAgent(payload.projectId, { kind: "build" });
   useUiStore.getState().setActiveSpecial(null);
   store.selectAgent(payload.projectId, agentId);

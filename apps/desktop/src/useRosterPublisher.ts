@@ -31,6 +31,21 @@ function lastActivityAt(a: AgentTab, interaction: Record<string, number>): numbe
   return touch > 0 ? touch : null;
 }
 
+// How many recent prompts to carry (the tray shows a breadcrumb of the most recent few) and the
+// per-prompt character cap so the relayed payload stays small — the tray applies its own
+// word-level truncation on top for display.
+const RECENT_PROMPTS_MAX = 4;
+const RECENT_PROMPT_CHARS = 80;
+
+/** The most recent (~4) user prompts, oldest→newest, whitespace-collapsed and length-capped. Each
+ *  keeps its promptHistory id so a tray click can scroll the terminal to that exact turn. */
+function recentPrompts(a: AgentTab): { id: string; text: string }[] {
+  return (a.promptHistory ?? []).slice(-RECENT_PROMPTS_MAX).map((e) => {
+    const text = e.text.replace(/\s+/g, " ").trim();
+    return { id: e.id, text: text.length > RECENT_PROMPT_CHARS ? text.slice(0, RECENT_PROMPT_CHARS) : text };
+  });
+}
+
 /** Projects open in the given window label. Exported so tests can call the real predicate. */
 export function windowProjects(projects: Project[], label: string): Project[] {
   return projects.filter((p) => findWindowForProject(p.id) === label);
@@ -59,6 +74,7 @@ export function buildRoster(
           parent_id: a.parentId,
           workflow_stage: workflowStage[a.id] ?? null,
           last_activity_at: lastActivityAt(a, interaction),
+          recent_prompts: recentPrompts(a),
         };
       }),
     })),

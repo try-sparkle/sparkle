@@ -53,6 +53,8 @@ export async function summarizeAttention(screen: string): Promise<string | null>
 export interface FocusAgentPayload {
   projectId: string;
   agentId: string;
+  /** Optional: after focusing, scroll the agent's terminal to this promptHistory entry (tray breadcrumb). */
+  promptId?: string;
 }
 
 /** Subscribe to a notification click. The backend broadcasts this to every window; the caller

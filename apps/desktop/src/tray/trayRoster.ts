@@ -1,5 +1,9 @@
 // Shared types for the menu-bar tray popover. Mirrors the Rust TrayRosterOut (tray.rs) and the
 // mobile RosterAgent/STATUS_RANK so the desktop popover reads identically to the phone Dashboard.
+export interface TrayRecentPrompt {
+  id: string;
+  text: string;
+}
 export interface TrayAgent {
   id: string;
   name: string;
@@ -10,6 +14,7 @@ export interface TrayAgent {
   parent_id: string | null;
   workflow_stage?: string | null;
   last_activity_at?: number | null;
+  recent_prompts?: TrayRecentPrompt[]; // most recent (~4) user prompts, oldest→newest; breadcrumb
 }
 export interface TrayProject { id: string; name: string; agents: TrayAgent[]; }
 export interface Counts { red: number; grey: number; green: number; }

@@ -60,6 +60,12 @@ export interface AttentionPayload {
   suggested_replies: SuggestedReply[];
   created_at: string;
 }
+/** A recent user prompt for the tray breadcrumb: the promptHistory entry id (so a click can scroll
+ *  the terminal to that exact turn) + a short, whitespace-collapsed slice of its text. */
+export interface RecentPromptWire {
+  id: string;
+  text: string;
+}
 export interface RosterAgentPayload {
   id: string;
   name: string;
@@ -70,6 +76,7 @@ export interface RosterAgentPayload {
   parent_id: string | null;
   workflow_stage?: string | null;
   last_activity_at?: number | null; // epoch ms of the user's last touch; drives the elapsed timer
+  recent_prompts?: RecentPromptWire[]; // most recent (~4) user prompts, oldest→newest; tray breadcrumb
 }
 export interface RosterPayload {
   projects: Array<{ id: string; name: string; agents: RosterAgentPayload[] }>;

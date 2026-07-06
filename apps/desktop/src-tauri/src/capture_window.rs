@@ -25,8 +25,15 @@ pub const CAPTURE_LABEL: &str = "capture";
 /// Focus-retry contract: the retry loop runs `FOCUS_RETRY_TICKS` times at
 /// `FOCUS_RETRY_INTERVAL` apart (the warn below derives its duration from these —
 /// change them together, the message stays honest).
-const FOCUS_RETRY_TICKS: u32 = 8;
-const FOCUS_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+///
+/// Kept deliberately SHORT (4 × 150ms ≈ 0.6s of retries after the initial synchronous
+/// `set_focus`). The old 8 × 250ms (≈2s) window was the felt jank on show: each tick calls
+/// `activateIgnoringOtherApps`, and dev smoke logs showed runs where the loop spent the full
+/// two seconds re-activating / focus-fighting (probe readings flipping key→not-key→key). The
+/// loop still exits the instant focus is acquired (below), so this only bounds the pathological
+/// "activation was swallowed" case — 0.6s is ample to recover a genuinely-swallowed activation.
+const FOCUS_RETRY_TICKS: u32 = 4;
+const FOCUS_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Monotone show generation: bumped by every `show_capture_window`. A retry thread
 /// captures its generation at spawn and exits the moment a newer show supersedes it,
@@ -98,11 +105,20 @@ pub fn show_capture_window(app: AppHandle, shot: CaptureShot) -> Result<(), Stri
         let _ = win.set_size(area.size);
     }
 
+    let show_start = std::time::Instant::now();
     win.show().map_err(|e| format!("show capture window: {e}"))?;
     // Makes the window KEY (dictation acceptance criterion): makeKeyAndOrderFront +
     // activateIgnoringOtherApps under the hood, so keystrokes land here immediately.
     win.set_focus()
         .map_err(|e| format!("focus capture window: {e}"))?;
+    // Both felt-lag sources in one line: `show_ms` = time to make the takeover visible + key
+    // (the window chrome the user sees), `payload_bytes` = size of the base64 `data:` preview
+    // about to cross the IPC bridge to the webview (the image that fills in a beat later).
+    tracing::info!(
+        show_ms = show_start.elapsed().as_millis() as u64,
+        payload_bytes = shot.data_url.len(),
+        "capture: window shown + focused; delivering shot to webview"
+    );
     // Becoming key is asynchronous, and macOS focus-stealing prevention can swallow the
     // one-shot activation when another app is being interacted with at that instant
     // (observed in dev smoke: one run keyed on the first try, one never keyed). Retry
@@ -114,7 +130,7 @@ pub fn show_capture_window(app: AppHandle, shot: CaptureShot) -> Result<(), Stri
     {
         let win = win.clone();
         std::thread::spawn(move || {
-            for _ in 0..FOCUS_RETRY_TICKS {
+            for tick in 1..=FOCUS_RETRY_TICKS {
                 std::thread::sleep(FOCUS_RETRY_INTERVAL);
                 if SHOW_GEN.load(Ordering::SeqCst) != gen
                     || FOCUSED_GEN.load(Ordering::SeqCst) >= gen
@@ -124,6 +140,7 @@ pub fn show_capture_window(app: AppHandle, shot: CaptureShot) -> Result<(), Stri
                 }
                 if win.is_focused().unwrap_or(false) {
                     FOCUSED_GEN.store(gen, Ordering::SeqCst);
+                    tracing::debug!(tick, "capture window acquired key focus via retry");
                     return;
                 }
                 let _ = win.set_focus();

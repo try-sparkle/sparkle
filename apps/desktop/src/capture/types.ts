@@ -13,4 +13,12 @@ export interface CaptureSendPayload {
   projectId: string;
   text: string;                       // narration transcript / typed text
   attachments: CaptureAttachment[];   // length 1 in v1
+  // Build-only routing (mode === "build"), set by the Build options menu in CaptureApp. Ignored
+  // for think/plan. `forceNewAgent` wins over `targetAgentId`: it makes dispatchBuild ALWAYS spawn
+  // a fresh build agent instead of reusing an existing one ("New build agent"). `targetAgentId`
+  // routes the capture into that EXACT existing build agent (an entry the user picked from the
+  // menu) rather than dispatchBuild's default first-build-agent auto-reuse. Neither set → the
+  // legacy reuse-or-create fallback.
+  forceNewAgent?: boolean;
+  targetAgentId?: string;
 }

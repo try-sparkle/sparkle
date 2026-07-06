@@ -98,8 +98,8 @@ export function TrayApp() {
         <TrayDashboard
           roster={roster}
           now={now}
-          onOpen={(projectId, agentId) => {
-            emitFocusAgent({ projectId, agentId });
+          onOpen={(projectId, agentId, promptId) => {
+            emitFocusAgent({ projectId, agentId, promptId });
             hide();
           }}
         />

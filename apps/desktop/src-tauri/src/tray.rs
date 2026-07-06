@@ -3,6 +3,12 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RecentPrompt {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RosterAgentSlice {
     pub id: String,
     pub name: String,
@@ -13,6 +19,10 @@ pub struct RosterAgentSlice {
     pub parent_id: Option<String>,
     pub workflow_stage: Option<String>,
     pub last_activity_at: Option<i64>,
+    // Most recent user prompts (oldest→newest) for the tray breadcrumb. Defaulted so older windows
+    // that don't publish it still deserialize.
+    #[serde(default)]
+    pub recent_prompts: Vec<RecentPrompt>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -84,6 +94,7 @@ mod tests {
             id: id.into(), name: id.into(), kind: "build".into(),
             status: status.into(), status_color: "#000".into(), status_label: "x".into(),
             parent_id: None, workflow_stage: None, last_activity_at: None,
+            recent_prompts: Vec::new(),
         }
     }
     fn proj(id: &str, agents: Vec<RosterAgentSlice>) -> RosterProjectSlice {

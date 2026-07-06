@@ -27,6 +27,7 @@ import {
   type EpicChildView,
 } from "../services/planView";
 import { WorkflowLine } from "./WorkflowLine";
+import { FiUsers } from "react-icons/fi";
 import { stageMeta, stageLineColor, type WorkflowStageId } from "../engine/workflowStage";
 import type { AgentTab } from "../types";
 import { getConfig, onConfigChanged } from "../services/config";
@@ -453,7 +454,8 @@ function Card({
         </div>
         {workers.length > 0 && (
           <div style={{ color: C.teal, fontSize: 11, lineHeight: 1.4 }}>
-            ⚙ {workers.length === 1 ? "1 worker" : `${workers.length} workers`}: {workers.join(", ")}
+            <FiUsers size={11} style={{ verticalAlign: "-2px", marginRight: 3 }} aria-hidden />
+            {workers.length === 1 ? "1 worker" : `${workers.length} workers`}: {workers.join(", ")}
           </div>
         )}
         {/* Unified Think→Plan→Build progress: the blue logo-gradient line + its stage label. */}

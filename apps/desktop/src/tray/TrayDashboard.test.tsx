@@ -37,12 +37,37 @@ describe("TrayDashboard", () => {
     expect(screen.getAllByText("Needs you").length).toBeGreaterThan(0);
   });
 
-  it("calls onOpen with project+agent id when a row is clicked", () => {
+  it("calls onOpen with project+agent id (no prompt) when a row is clicked", () => {
     const onOpen = vi.fn();
     render(<TrayDashboard roster={roster} now={Date.now()} onOpen={onOpen} />);
-    // Click the AgentRow name span for Builder
+    // Click the AgentRow name span for Builder (no recent_prompts → fallback title, no scroll target)
     fireEvent.click(screen.getByText("Builder"));
-    expect(onOpen).toHaveBeenCalledWith("p1", "b1");
+    expect(onOpen).toHaveBeenCalledWith("p1", "b1", undefined);
+  });
+
+  it("renders a recent-prompts breadcrumb and jumps to the clicked prompt", () => {
+    const onOpen = vi.fn();
+    const r: TrayRoster = {
+      counts: { red: 0, grey: 0, green: 1 },
+      projects: [
+        { id: "p1", name: "Alpha", agents: [
+          { id: "b1", name: "Builder", kind: "build", status: "working", status_color: "#34c759", status_label: "Working", parent_id: null,
+            recent_prompts: [
+              { id: "t1", text: "fix the login bug now" },
+              { id: "t2", text: "add dark mode toggle please" },
+            ] },
+        ] },
+      ],
+    };
+    render(<TrayDashboard roster={r} now={Date.now()} onOpen={onOpen} />);
+    // Each crumb shows ~4 words + ellipsis; the agent's title ("Builder") is replaced by the breadcrumb.
+    expect(screen.queryByText("Builder")).toBeNull();
+    // Clicking the most-recent crumb jumps to that prompt id (t2).
+    fireEvent.click(screen.getByText("add dark mode toggle…"));
+    expect(onOpen).toHaveBeenCalledWith("p1", "b1", "t2");
+    // Clicking an earlier crumb jumps to its id (t1).
+    fireEvent.click(screen.getByText("fix the login bug…"));
+    expect(onOpen).toHaveBeenCalledWith("p1", "b1", "t1");
   });
 
   it("calls onOpen with project+agent id when a Needs-you pending card is clicked", () => {

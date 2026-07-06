@@ -23,6 +23,7 @@ import {
 } from "./engine/attention";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useSettingsStore } from "./stores/settingsStore";
+import { useScrollIntentStore } from "./stores/scrollIntentStore";
 import { useProjectStore } from "./stores/projectStore";
 import { useUiStore } from "./stores/uiStore";
 import { revealModeForKind } from "./engine/workMode";
@@ -288,9 +289,16 @@ export function useAttentionNotifications(): void {
   useEffect(() => {
     const handle = (p: FocusAgentPayload) => {
       const { projectId: mine, isMain: main, replace: setProject } = ctx.current;
+      // If the click carried a specific prompt (tray breadcrumb), queue a scroll to that turn; the
+      // target agent's AgentPane consumes it once its terminal is mounted + PTY-ready. Missing/
+      // scrolled-out markers (or think agents with no terminal) simply open without scrolling.
+      const jumpToPrompt = () => {
+        if (p.promptId) useScrollIntentStore.getState().request(p.agentId, p.promptId);
+      };
       if (p.projectId === mine) {
         void bringToFront();
         selectAndOpen(p.projectId, p.agentId);
+        jumpToPrompt();
         return;
       }
       // Orphaned project (no window currently shows it) — the main window adopts it. Otherwise
@@ -298,6 +306,7 @@ export function useAttentionNotifications(): void {
       if (findWindowForProject(p.projectId) == null && main) {
         setProject(p.projectId);
         selectAndOpen(p.projectId, p.agentId);
+        jumpToPrompt();
         void bringToFront();
       }
     };
