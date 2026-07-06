@@ -5,7 +5,13 @@
 // MUST be started before the PTY spawns (claude's MCP child connects to the socket at startup) and
 // stopped when the build agent closes.
 import { invoke } from "@tauri-apps/api/core";
-import { buildClaudeExec, buildOrchestratorMcpConfig, SHELL } from "./claudeSpawn";
+import {
+  buildClaudeExec,
+  buildMergedMcpConfig,
+  controlMcpServers,
+  orchestratorMcpServers,
+  SHELL,
+} from "./claudeSpawn";
 
 export interface BridgeInfo {
   socketPath: string;
@@ -41,6 +47,33 @@ export function orchestratorMcpPaths(): Promise<McpPaths> {
   return invoke<McpPaths>("orchestrator_mcp_paths");
 }
 
+// --- App-level sparkle-control bridge (singleton, shared by ALL agent kinds) -------------------
+// Unlike the per-build-agent orchestration bridge above, there is exactly ONE control bridge for the
+// whole app. start_control_bridge is an idempotent singleton on the Rust side, so calling it at boot
+// (controlListener) and again per-spawn (to fetch the socket+token for MCP injection) both return the
+// same socket + token.
+
+/** Start (idempotently) the singleton app-level control bridge; returns its socket + token. */
+export function startControlBridge(): Promise<BridgeInfo> {
+  return invoke<BridgeInfo>("start_control_bridge");
+}
+
+/** Stop the app-level control bridge (rarely needed — the singleton normally lives for the app). */
+export function stopControlBridge(): Promise<void> {
+  return invoke<void>("stop_control_bridge");
+}
+
+/** Reply to a `control:request` round-trip op. MUST be called EXACTLY once per reqId (the bridge
+ *  wraps `result` into the socket response; a frontend failure is conveyed as `{ error }`). */
+export function controlRespond(reqId: string, result: unknown): Promise<void> {
+  return invoke<void>("control_respond", { reqId, result });
+}
+
+/** Resolve the node binary + the bundled sparkle-control server.js absolute paths. */
+export function controlMcpPaths(): Promise<McpPaths> {
+  return invoke<McpPaths>("control_mcp_paths");
+}
+
 /** Pure assembler: given a started bridge + resolved paths, produce the build agent's PTY spawn.
  *  No initialPrompt — the user drives the build agent from the composer. */
 export function assembleBuildSpawn(opts: {
@@ -60,13 +93,34 @@ export function assembleBuildSpawn(opts: {
   /** This build agent's chosen Claude model (services/models.ts id). Undefined/"default" →
    *  no --model flag (inherit the user's Claude Code default). */
   model?: string;
+  /** App-level sparkle-control MCP wiring. When present, its server is MERGED into the same
+   *  --mcp-config as the orchestrator server (never dropping the orchestrator) so a Build agent can
+   *  both fan out workers AND drive its own UI. `agentId` (this build agent's AgentTab.id) is the
+   *  caller identity injected as SPARKLE_AGENT_ID. Absent → orchestrator-only (prior behavior). */
+  control?: { bridge: BridgeInfo; paths: McpPaths; agentId: string };
 }): { command: string; args: string[]; cwd: string } {
-  const mcpConfig = buildOrchestratorMcpConfig({
-    nodePath: opts.paths.nodePath,
-    serverPath: opts.paths.serverPath,
-    socketPath: opts.bridge.socketPath,
-    token: opts.bridge.token,
-  });
+  // Always load the orchestrator server; MERGE the control server in when wired, so BOTH ride in the
+  // single --mcp-config claude accepts (dropping either would silently disable those tools).
+  const servers: Array<Record<string, unknown>> = [
+    orchestratorMcpServers({
+      nodePath: opts.paths.nodePath,
+      serverPath: opts.paths.serverPath,
+      socketPath: opts.bridge.socketPath,
+      token: opts.bridge.token,
+    }),
+  ];
+  if (opts.control) {
+    servers.push(
+      controlMcpServers({
+        nodePath: opts.control.paths.nodePath,
+        serverPath: opts.control.paths.serverPath,
+        socketPath: opts.control.bridge.socketPath,
+        token: opts.control.bridge.token,
+        agentId: opts.control.agentId,
+      }),
+    );
+  }
+  const mcpConfig = buildMergedMcpConfig(servers);
   const exec = buildClaudeExec(opts.claudePath, opts.resume, {
     mcpConfig,
     strictMcpConfig: true,

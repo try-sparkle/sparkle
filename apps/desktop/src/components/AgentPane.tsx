@@ -12,14 +12,18 @@ import { resolveDefaultBranch } from "../services/branchStatus";
 import { useAiFeature } from "../services/aiGate";
 import { recordTrialSend } from "../services/trialMeter";
 import { checkClaude, claudeSessionInfo } from "../preflight";
-import { buildClaudeExec, SHELL } from "../services/claudeSpawn";
+import { buildClaudeExec, buildControlMcpConfig, SHELL } from "../services/claudeSpawn";
 import { shouldResetReusedSlotIdentity } from "../services/slotIdentity";
-import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult, orchestrationPersona } from "../services/buildAgent";
+import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult, orchestrationPersona, sparkleControlProtocol } from "../services/buildAgent";
 import {
   startOrchestrationBridge,
   orchestratorMcpPaths,
   assembleBuildSpawn,
   stopOrchestrationBridge,
+  startControlBridge,
+  controlMcpPaths,
+  type BridgeInfo,
+  type McpPaths,
 } from "../services/orchestrationLaunch";
 import { purgeBuildAgent } from "../services/orchestrationListener";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -415,6 +419,35 @@ export function AgentPane({
         useProjectStore.getState().resetAutoName(project.id, agent.id);
         useRuntimeStore.getState().resetProgress(agent.id);
       }
+      // App-level sparkle-control MCP wiring, injected into EVERY agent kind's claude spawn so any
+      // in-app Claude can drive the Sparkle UI (rename itself, narrate its activity, read state).
+      // start_control_bridge is an idempotent singleton — controlListener already started it at boot;
+      // we call it again here only to fetch this spawn's socket+token. Best-effort: a control-bridge
+      // failure must NEVER block the agent from starting, so on any error we spawn WITHOUT the
+      // control tools this once (the agent still runs; it just can't self-report until next launch).
+      // SPARKLE_AGENT_ID = agent.id, the anti-spoofing caller identity for per-agent ops.
+      let control: { bridge: BridgeInfo; paths: McpPaths; agentId: string } | undefined;
+      try {
+        const [controlBridge, controlPaths] = await Promise.all([
+          startControlBridge(),
+          controlMcpPaths(),
+        ]);
+        control = { bridge: controlBridge, paths: controlPaths, agentId: agent.id };
+      } catch (e) {
+        console.warn("[control] sparkle-control MCP wiring unavailable; spawning without it", e);
+      }
+      // For non-Build kinds (worker / generic) we ADD the control server WITHOUT --strict-mcp-config,
+      // so the user's own global MCP servers still load alongside it. (Build agents go through
+      // assembleBuildSpawn, which is strict and merges control into the orchestrator config.)
+      const controlMcpConfig = control
+        ? buildControlMcpConfig({
+            nodePath: control.paths.nodePath,
+            serverPath: control.paths.serverPath,
+            socketPath: control.bridge.socketPath,
+            token: control.bridge.token,
+            agentId: control.agentId,
+          })
+        : undefined;
       let exec: string;
       if (agent.kind === "worker") {
         // The persona's parentBranch is the PARENT build agent's branch (what the worker was cut
@@ -436,6 +469,9 @@ export function AgentPane({
           configDir,
           resumeSessionId,
           model: agent.model,
+          // Add the app-level sparkle-control MCP (undefined when the bridge was unavailable → no
+          // flag). No strictMcpConfig, so the worker keeps the user's own global MCP servers too.
+          mcpConfig: controlMcpConfig,
           // Workers run unattended in an isolated worktree: auto-approve every tool call so an
           // approval prompt can't silently deadlock the worker (and its waiting orchestrator).
           dangerouslySkipPermissions: true,
@@ -484,6 +520,10 @@ export function AgentPane({
               configDir,
               resumeSessionId,
               model: agent.model,
+              // Merge the app-level sparkle-control MCP into the SAME --mcp-config as the orchestrator
+              // server (never dropping the orchestrator), so a Build agent both fans out workers AND
+              // drives its own UI. Omitted when the control bridge was unavailable this spawn.
+              control,
             }),
             resuming: resume,
           });
@@ -498,7 +538,18 @@ export function AgentPane({
           throw e;
         }
       } else {
-        exec = buildClaudeExec(claude.path, resume, { configDir, resumeSessionId, model: agent.model });
+        // Generic (non-Build/worker) claude agent: inject the sparkle-control MCP + its discovery
+        // snippet so it too can drive the UI. No strictMcpConfig → the user's global MCP still loads.
+        // Only append the "you can drive the UI" prose when the control MCP actually loaded — if the
+        // bridge was unavailable this spawn (controlMcpConfig undefined), advertising tools that
+        // aren't there just yields confusing "tool not found" attempts.
+        exec = buildClaudeExec(claude.path, resume, {
+          configDir,
+          resumeSessionId,
+          model: agent.model,
+          mcpConfig: controlMcpConfig,
+          appendSystemPrompt: controlMcpConfig ? sparkleControlProtocol() : undefined,
+        });
       }
       setSpawn({
         command: SHELL,

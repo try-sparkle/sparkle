@@ -62,6 +62,9 @@ interface ProjectState {
    *  Claude Code default). Persisted only — delivering the change to a live PTY is the caller's
    *  job (services/agentModel.ts). */
   setAgentModel: (projectId: string, agentId: string, model: string | undefined) => void;
+  /** Set the agent's live "what I'm building now" activity narration (sparkle-control MCP
+   *  set_agent_activity). Free-text; empty string clears the line. Persisted like the name. */
+  setAgentActivity: (projectId: string, agentId: string, activity: string) => void;
   /** Bind the epic an orchestrator is building (set at sendToBuild handoff — drives the sidebar
    *  epic pill immediately, before any of its workers bind to a bead). */
   setAgentEpicId: (projectId: string, agentId: string, epicId: string) => void;
@@ -492,6 +495,16 @@ export const useProjectStore = create<ProjectState>()(
               ...a,
               model: isDefaultModel(model) ? undefined : model,
             })),
+          ),
+        })),
+
+      setAgentActivity: (projectId, agentId, activity) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            // Trim so a whitespace-only report clears the line; store the string verbatim otherwise.
+            // Unlike renameAgent this NEVER pins the name or touches auto-naming — activity is a
+            // separate, always-live secondary field.
+            mapAgent(p, agentId, (a) => ({ ...a, activity: activity.trim() })),
           ),
         })),
 

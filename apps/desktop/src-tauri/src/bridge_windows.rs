@@ -72,3 +72,44 @@ pub fn orchestration_respond(
 ) -> Result<(), String> {
     Err(UNSUPPORTED.to_string())
 }
+
+// ----------------------------------------------------------------------------
+// sparkle-control (singleton app-level bridge) — Windows stub.
+//
+// Mirrors the Unix `ControlBridgeManager` + the four `#[tauri::command]`s wired in `lib.rs` so the
+// rest of the crate stays platform-agnostic. Like the orchestration bridge, the control bridge is a
+// Unix-domain socket and is a Phase-2 follow-up on Windows.
+
+/// Same name + `Default`/`Send`/`Sync`/`'static` shape as the Unix `ControlBridgeManager`, so
+/// `lib.rs`'s `.manage(bridge::ControlBridgeManager::default())` is unchanged. Holds no state on
+/// Windows because the bridge never starts.
+#[derive(Default)]
+pub struct ControlBridgeManager;
+
+#[tauri::command]
+pub fn start_control_bridge(
+    _app: AppHandle,
+    _manager: State<ControlBridgeManager>,
+) -> Result<BridgeInfo, String> {
+    Err(UNSUPPORTED.to_string())
+}
+
+#[tauri::command]
+pub fn stop_control_bridge(_manager: State<ControlBridgeManager>) -> Result<(), String> {
+    // Idempotent on Unix; a no-op here since nothing was ever started.
+    Ok(())
+}
+
+#[tauri::command]
+pub fn control_respond(
+    _manager: State<ControlBridgeManager>,
+    _req_id: String,
+    _result: Value,
+) -> Result<(), String> {
+    Err(UNSUPPORTED.to_string())
+}
+
+#[tauri::command]
+pub fn control_mcp_paths(_app: AppHandle) -> Result<McpPaths, String> {
+    Err(UNSUPPORTED.to_string())
+}

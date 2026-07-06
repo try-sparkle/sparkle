@@ -20,6 +20,27 @@ export const KEYCHAIN_SAFETY_RULE = [
   "  nothing. A PreToolUse hook also blocks these commands — do not try to work around it.",
 ].join("\n");
 
+/** Shared persona snippet (sparkle-control MCP) appended to EVERY agent kind's system prompt so the
+ *  in-app Claude discovers it can drive the Sparkle UI first-person. The tools themselves come from
+ *  the injected `sparkle-control` MCP server; this prose is the "when to reach for them" layer (the
+ *  companion skill in .agents/skills/sparkle-control documents them in full). Kept deliberately short
+ *  — it rides in --append-system-prompt for build/think/worker alike. */
+export function sparkleControlProtocol(): string {
+  return [
+    "CONTROLLING THE SPARKLE UI (sparkle-control MCP)",
+    "- You are running inside the Sparkle desktop app and can drive your own UI via the",
+    "  `sparkle-control` MCP tools. Use them to keep the human oriented — you are the ground truth",
+    "  for what you're doing, so tell the app first-person rather than making it guess.",
+    "- `set_agent_activity({ activity })`: call this whenever you START a new sub-task, with a short",
+    "  present-tense line of what you're building now (e.g. \"Wiring the control listener\"). It shows",
+    "  as your live status under your name. Keep it current as your focus shifts.",
+    "- `rename_agent({ name })`: give yourself a clear 2-4 word name describing your mission.",
+    "- `get_state()`: read the current agents, their statuses, and the theme.",
+    "- `set_theme(...)`, `get_config()` / `set_config(...)`: adjust appearance / app config ONLY when",
+    "  the user explicitly asks — never change theme or config on your own initiative.",
+  ].join("\n");
+}
+
 export interface WorkerResult {
   schemaVersion: 1;
   taskId: string;
@@ -92,6 +113,8 @@ export function workerPersona(opts: { parentBranch: string; resultPath: string }
     '    "filesChanged": ["path", ...], "summary": "<one-paragraph what you did>",',
     '    "notes": "<optional caveats / follow-ups>" }',
     "Create the .sparkle directory if needed. Then stop.",
+    "",
+    sparkleControlProtocol(),
   ].join("\n");
 }
 
@@ -210,6 +233,8 @@ export function orchestrationPersona(opts: {
     "  worker did, what merged cleanly, and anything left for them to land to `main` themselves.",
     "",
     KEYCHAIN_SAFETY_RULE,
+    "",
+    sparkleControlProtocol(),
     // Bind the orchestrator to a specific beads epic when one was handed off (Send to Build).
     ...(opts.epicId ? ["", beadsProtocol({ epicId: opts.epicId })] : []),
   ].join("\n");

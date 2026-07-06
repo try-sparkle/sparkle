@@ -2062,6 +2062,26 @@ const AgentRow = memo(function AgentRow({
               </div>
             </div>
           )}
+          {/* The agent's live first-person "what I'm building now" narration, self-reported via the
+              sparkle-control MCP set_agent_activity op. A subtle muted secondary line under the name,
+              truncated to one line so a long report can't grow the strip over the rows beneath. */}
+          {a.activity?.trim() && (
+            <div
+              title={a.activity}
+              style={{
+                color: C.muted,
+                fontSize: 11,
+                lineHeight: 1.3,
+                marginTop: 1,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                maxWidth: "100%",
+              }}
+            >
+              {a.activity}
+            </div>
+          )}
           {/* The thin progress line under the title. Collapsed it's just the line (no text);
               expanded (on hover) it grows a status label to the RIGHT of the bar describing the
               current stage — the same bar+readout in both states, so the hover card keeps the

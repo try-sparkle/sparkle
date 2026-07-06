@@ -45,7 +45,8 @@
     "resources": [
       "resources/worktree-guard.mjs",
       "resources/sparkle-hook.mjs",
-      "resources/mcp-orchestrator-server.js"
+      "resources/mcp-orchestrator-server.js",
+      "resources/mcp-control-server.js"
     ],
     "icon": ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"],
     "macOS": {

@@ -81,6 +81,7 @@ pub fn run() {
         .manage(sparkle_improve::SparkleImproveManager::default())
         .manage(dictation::DictationState::default())
         .manage(bridge::BridgeManager::default())
+        .manage(bridge::ControlBridgeManager::default())
         .manage(auth::DeepLinkPending::default())
         .manage(auth::PendingSignIn::default())
         .manage(attention::BadgeCounts::default())
@@ -278,6 +279,10 @@ pub fn run() {
             bridge::stop_orchestration_bridge,
             bridge::orchestration_respond,
             bridge::orchestrator_mcp_paths,
+            bridge::start_control_bridge,
+            bridge::stop_control_bridge,
+            bridge::control_respond,
+            bridge::control_mcp_paths,
             notes::append_note,
             notes::create_bead,
             notes::write_prd,

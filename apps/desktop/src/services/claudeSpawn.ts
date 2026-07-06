@@ -149,16 +149,71 @@ export function buildOrchestratorMcpConfig(opts: {
   socketPath: string;
   token: string;
 }): string {
-  return JSON.stringify({
-    mcpServers: {
-      "sparkle-orchestrator": {
-        command: opts.nodePath,
-        args: [opts.serverPath],
-        env: {
-          SPARKLE_BRIDGE_SOCKET: opts.socketPath,
-          SPARKLE_BRIDGE_TOKEN: opts.token,
-        },
+  return JSON.stringify({ mcpServers: orchestratorMcpServers(opts) });
+}
+
+/** One MCP server entry per `claude --mcp-config` — a partial `mcpServers` map. Split out from the
+ *  wrapper so a Build agent can MERGE the orchestrator + control servers into a single --mcp-config
+ *  (Object.assign the maps) rather than dropping one. */
+export function orchestratorMcpServers(opts: {
+  nodePath: string;
+  serverPath: string;
+  socketPath: string;
+  token: string;
+}): Record<string, unknown> {
+  return {
+    "sparkle-orchestrator": {
+      command: opts.nodePath,
+      args: [opts.serverPath],
+      env: {
+        SPARKLE_BRIDGE_SOCKET: opts.socketPath,
+        SPARKLE_BRIDGE_TOKEN: opts.token,
       },
     },
-  });
+  };
+}
+
+/** Args for the app-level `sparkle-control` MCP server. Unlike the orchestrator bridge (one socket
+ *  per Build agent, identity derived from the socket), the control bridge is a SINGLETON shared by
+ *  every agent kind — so the caller's identity is injected explicitly as `SPARKLE_AGENT_ID` (that
+ *  agent's AgentTab.id), which the server stamps as `callerAgentId` on every op. The socket + token
+ *  ride in the child's env only (never exported into the agent's shell), same as the orchestrator. */
+export interface ControlMcpOpts {
+  nodePath: string;
+  serverPath: string;
+  socketPath: string;
+  token: string;
+  /** The spawning agent's AgentTab.id — the anti-spoofing caller identity for per-agent ops. */
+  agentId: string;
+}
+
+/** The `sparkle-control` MCP server entry (a partial `mcpServers` map). The server name
+ *  ("sparkle-control") matches the McpServer name in apps/mcp-control. */
+export function controlMcpServers(opts: ControlMcpOpts): Record<string, unknown> {
+  return {
+    "sparkle-control": {
+      command: opts.nodePath,
+      args: [opts.serverPath],
+      env: {
+        SPARKLE_CONTROL_SOCKET: opts.socketPath,
+        SPARKLE_CONTROL_TOKEN: opts.token,
+        SPARKLE_AGENT_ID: opts.agentId,
+      },
+    },
+  };
+}
+
+/** Inline JSON for `claude --mcp-config` that launches ONLY the sparkle-control MCP server (a stdio
+ *  child) wired to the app-level control bridge. Used for agent kinds that get no orchestrator MCP
+ *  (Think/worker/generic). Mirrors {@link buildOrchestratorMcpConfig}; the same `ps aux` visibility
+ *  caveat applies to the bridge token passed on the command line. */
+export function buildControlMcpConfig(opts: ControlMcpOpts): string {
+  return JSON.stringify({ mcpServers: controlMcpServers(opts) });
+}
+
+/** Merge several MCP server maps into one `claude --mcp-config` JSON string. A Build agent uses this
+ *  to load BOTH the sparkle-orchestrator and the sparkle-control servers from a single --mcp-config,
+ *  so neither is dropped. Later maps win on a name collision (there are none between our servers). */
+export function buildMergedMcpConfig(servers: Array<Record<string, unknown>>): string {
+  return JSON.stringify({ mcpServers: Object.assign({}, ...servers) });
 }

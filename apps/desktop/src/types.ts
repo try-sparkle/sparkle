@@ -45,6 +45,11 @@ export interface AgentTab {
   // restarts; the scroll-to-conversation markers are session-only (see Terminal), so an entry from
   // a previous session still shows in the list but reports "scrolled out" when clicked.
   promptHistory: PromptHistoryEntry[];
+  // The agent's live, first-person "what I'm building now" narration, set by the agent itself via
+  // the sparkle-control MCP `set_agent_activity` op. A short free-text line shown muted + truncated
+  // under the agent name (see AgentSidebar / FittedAgentName). Optional so legacy records need no
+  // migration; undefined/empty renders nothing.
+  activity?: string;
   task?: string; // for workers: the one-shot task the build agent assigned; drives the worker persona
   parentBranch?: string; // for workers: the parent build agent's branch at spawn time (stable, not re-resolved)
   beadId?: string; // for workers: the bead this worker implements, when spawned from a Plan epic (Think→Plan→Build linkage)

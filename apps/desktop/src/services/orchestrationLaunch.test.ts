@@ -61,4 +61,29 @@ describe("assembleBuildSpawn", () => {
     expect(assembleBuildSpawn(base).args[2]).not.toContain("--model");
     expect(assembleBuildSpawn({ ...base, model: "default" }).args[2]).not.toContain("--model");
   });
+
+  it("merges the sparkle-control server into the SAME --mcp-config as the orchestrator (never drops it)", () => {
+    const exec = assembleBuildSpawn({
+      ...base,
+      control: {
+        bridge: { socketPath: "/tmp/control.sock", token: "ctltok" },
+        paths: { nodePath: "/opt/homebrew/bin/node", serverPath: "/res/mcp-control-server.js" },
+        agentId: "build-1",
+      },
+    }).args[2];
+    // Both servers ride in one --mcp-config; the orchestrator is NOT dropped.
+    expect(exec).toContain("sparkle-orchestrator");
+    expect(exec).toContain("sparkle-control");
+    expect(exec).toContain("/res/mcp-control-server.js");
+    expect(exec).toContain("ctltok");
+    expect(exec).toContain("build-1");
+    // Still exactly one --mcp-config flag.
+    expect(exec!.match(/--mcp-config/g)).toHaveLength(1);
+  });
+
+  it("emits only the orchestrator server when no control wiring is provided (back-compat)", () => {
+    const exec = assembleBuildSpawn(base).args[2];
+    expect(exec).toContain("sparkle-orchestrator");
+    expect(exec).not.toContain("sparkle-control");
+  });
 });

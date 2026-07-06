@@ -19,6 +19,7 @@ import {
 } from "../windowContext";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { startOrchestrationListener } from "../services/orchestrationListener";
+import { startControlListener } from "../services/controlListener";
 import { killProjectAgents, planWindowClose } from "../services/windowClose";
 import { windowTitleFor } from "../services/projectWindows";
 import { clearWindowProject } from "../services/windowRegistry";
@@ -118,6 +119,33 @@ export function Workspace() {
       cleanup?.();
     };
   }, []);
+
+  // Start the app-level sparkle-control listener singleton (mirrors the orchestration listener
+  // above, but is app-global — one control bridge shared by ALL agent kinds, not per-Build-agent).
+  // Its own singleton guard makes this safe under StrictMode / HMR double-mount; the `unmounted`
+  // flag tears it down exactly once if we unmount before the start promise resolves. Started here at
+  // app boot — NOT per-pane — so the control surface exists regardless of whether any agent runs.
+  //
+  // MAIN-WINDOW ONLY: the control bridge is an app-level SINGLETON and Tauri emits "control:request"
+  // app-globally, so if every window registered a listener, N windows would each dispatch the same
+  // request and each call control_respond — violating "reply EXACTLY once per reqId". The
+  // in-process start guard only dedupes within one window; gating to the main window dedupes across
+  // them (the project store is cross-window-synced, so the main window can service any agent).
+  useEffect(() => {
+    if (!isMainWindow) return;
+    let cleanup: (() => void) | undefined;
+    let unmounted = false;
+    void startControlListener()
+      .then((c) => {
+        if (unmounted) c();
+        else cleanup = c;
+      })
+      .catch((e: unknown) => console.error("[control] listener failed to start:", e));
+    return () => {
+      unmounted = true;
+      cleanup?.();
+    };
+  }, [isMainWindow]);
 
   // Intercept the window's close (red traffic light) so we can ask keep-vs-kill before closing.
   useEffect(() => {

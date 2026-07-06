@@ -550,6 +550,306 @@ fn handle_request_line_ctx(
     }
 }
 
+// ============================================================================
+// sparkle-control: a SINGLETON, app-level control bridge.
+//
+// Where the orchestration bridge above is strictly per-Build-agent (one socket + token per build
+// agent, identity derived from *which socket you connected to*), the control bridge is the opposite
+// shape: ONE socket + ONE token per app launch, shared by ALL agent kinds (Think, Build, worker).
+// It lets the user's own Claude Code drive the desktop UI first-person (name itself, narrate what
+// it's building, adjust theme/config) via a sibling `sparkle-control` MCP.
+//
+// Because the socket is shared, identity CANNOT be derived from the connection. Instead every op
+// carries an explicit `callerAgentId` in the request JSON (the MCP server stamps it from its
+// per-agent SPARKLE_AGENT_ID env var). The bridge passes `callerAgentId` through to the frontend
+// event verbatim; it does NOT trust any id nested inside `payload`, and it does NOT attempt to
+// derive identity from the socket. Anti-spoofing is preserved by injecting SPARKLE_AGENT_ID into
+// each agent's control-MCP env at spawn (frontend's job), not by anything on this shared socket.
+//
+// All 6 ops (get_state, rename_agent, set_agent_activity, set_theme, get_config, set_config) are
+// frontend round-trips: the bridge emits a `control:request` event, blocks on the shared pending
+// rendezvous, and returns whatever `control_respond` resolves. This reuses the exact
+// register_pending/wait_pending/resolve_pending primitives + ROUNDTRIP_TIMEOUT as the orchestrator.
+
+/// The 6 allow-listed control ops. Anything else is rejected with "unknown op" (the bridge enforces
+/// the allowlist — the skill only *advises*; see the PRD safety-gating note).
+const CONTROL_OPS: &[&str] = &[
+    "get_state",
+    "rename_agent",
+    "set_agent_activity",
+    "set_theme",
+    "get_config",
+    "set_config",
+];
+
+/// Fields the bridge owns on the wire; everything else in the request becomes the op `payload`.
+const CONTROL_RESERVED_FIELDS: &[&str] = &["id", "token", "op", "callerAgentId"];
+
+struct ControlBridgeHandle {
+    socket_path: PathBuf,
+    token: String,
+    shutdown: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+}
+
+/// Singleton state for the app-level control bridge. `inner` caches the one live handle (None until
+/// the first `start_control_bridge`); `pending` is the shared reqId→reply rendezvous map, cloned
+/// into every serve thread exactly like `BridgeManager::pending`.
+#[derive(Default)]
+pub struct ControlBridgeManager {
+    inner: Mutex<Option<ControlBridgeHandle>>,
+    pending: PendingMap,
+}
+
+/// Singleton app-level control socket path: `sparkle-ctrl-<16hex>.sock` in the per-user temp dir
+/// (`$TMPDIR`, 0700 on macOS). Short random suffix keeps the path under macOS's ~104-byte
+/// `sun_path` cap — the same constraint that forces the orchestrator socket into temp_dir.
+fn control_socket_path(hex: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("sparkle-ctrl-{hex}.sock"))
+}
+
+/// Start (or return the cached) singleton control bridge. Idempotent: the first call binds the
+/// socket, spawns the accept loop, and caches {socketPath, token}; every subsequent call returns
+/// the SAME socket + token while the accept loop is alive. If the loop died (fatal-error branch),
+/// the stale handle is torn down and a fresh one is bound. `app` is `Option<AppHandle>` so unit
+/// tests (no Tauri runtime) can pass `None`; production passes `Some(app)`.
+pub fn start_control_bridge_at(
+    app: Option<AppHandle>,
+    manager: &ControlBridgeManager,
+) -> Result<(PathBuf, String), String> {
+    // Hold the lock across check → bind → cache so two concurrent starts can't both bind (the loser
+    // would orphan a thread whose shutdown flag stop_control_bridge could never signal). The accept
+    // thread never takes this lock, so holding it here can't deadlock.
+    let mut guard = manager.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = guard.as_ref() {
+        if h.alive.load(Ordering::SeqCst) {
+            return Ok((h.socket_path.clone(), h.token.clone()));
+        }
+        // Dead loop — treat as stale: signal any lingering accept thread to exit (so a later
+        // stop_control_bridge isn't the only thing that could set it), remove the socket file,
+        // and fall through to rebind.
+        h.shutdown.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&h.socket_path);
+        *guard = None;
+    }
+    // Generate token + random socket suffix BEFORE bind so a failure here leaves no socket file.
+    let token = generate_token()?;
+    let suffix: String = generate_token()?.chars().take(16).collect();
+    let sock = control_socket_path(&suffix);
+    let _ = std::fs::remove_file(&sock); // clear any stale socket
+    let listener = UnixListener::bind(&sock).map_err(|e| format!("bind {sock:?}: {e}"))?;
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| { let _ = std::fs::remove_file(&sock); format!("chmod control socket: {e}") })?;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let alive = Arc::new(AtomicBool::new(true));
+
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| { let _ = std::fs::remove_file(&sock); format!("set_nonblocking: {e}") })?;
+    let token_t = token.clone();
+    let shutdown_t = shutdown.clone();
+    let alive_t = alive.clone();
+    let app_t = app.clone();
+    let pending_t = manager.pending.clone();
+    std::thread::spawn(move || loop {
+        if shutdown_t.load(Ordering::SeqCst) {
+            alive_t.store(false, Ordering::SeqCst);
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let token_c = token_t.clone();
+                let app_c = app_t.clone();
+                let pending_c = pending_t.clone();
+                std::thread::spawn(move || serve_control_conn(stream, &token_c, app_c, pending_c));
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionAborted
+                       || e.kind() == std::io::ErrorKind::Interrupted => {
+                continue;
+            }
+            Err(e) => {
+                eprintln!("[control-bridge] accept loop exiting on fatal error: {e}");
+                alive_t.store(false, Ordering::SeqCst);
+                break;
+            }
+        }
+    });
+
+    *guard = Some(ControlBridgeHandle { socket_path: sock.clone(), token: token.clone(), shutdown, alive });
+    Ok((sock, token))
+}
+
+/// Signal shutdown, remove the socket file, and clear the cached handle. Idempotent no-op if the
+/// bridge was never started.
+fn stop_control_bridge_inner(manager: &ControlBridgeManager) {
+    if let Some(h) = manager.inner.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        h.shutdown.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&h.socket_path);
+    }
+}
+
+/// Read newline-delimited control requests on one connection; write one response per request.
+/// Unlike the orchestrator's `serve_conn`, there is NO per-connection identity context — the shared
+/// socket carries identity in each request's `callerAgentId` field instead.
+fn serve_control_conn(stream: UnixStream, token: &str, app: Option<AppHandle>, pending: PendingMap) {
+    stream.set_nonblocking(false).ok();
+    let peer = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut writer = peer;
+    let reader = BufReader::new(stream);
+    for line in reader.lines() {
+        let line = match line { Ok(l) => l, Err(_) => break };
+        if line.trim().is_empty() { continue; }
+        let resp = handle_control_request_line(&line, token, &app, &pending);
+        if writeln!(writer, "{resp}").is_err() { break; }
+    }
+}
+
+/// Build the op `payload` = the request object minus the bridge-owned reserved fields
+/// (`id`/`token`/`op`/`callerAgentId`). Everything the MCP server spread into the request top level
+/// (per the frozen wire protocol `{ id, token, op, callerAgentId, ...payload }`) is forwarded to the
+/// frontend event verbatim. Any `callerAgentId` a malicious payload tries to smuggle is stripped
+/// here — the authoritative one comes from the top-level field extracted separately.
+fn build_control_payload(req: &Value) -> Value {
+    let mut map = serde_json::Map::new();
+    if let Some(obj) = req.as_object() {
+        for (k, v) in obj {
+            if CONTROL_RESERVED_FIELDS.contains(&k.as_str()) { continue; }
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    Value::Object(map)
+}
+
+/// Pure request handler for the control bridge: one request JSON line → one response JSON line.
+/// Validates the token, checks the op against the allowlist, extracts `callerAgentId` + `payload`,
+/// then round-trips through the frontend. No socket IO, so it is directly unit-testable.
+fn handle_control_request_line(
+    line: &str,
+    token: &str,
+    app: &Option<AppHandle>,
+    pending: &PendingMap,
+) -> String {
+    let req: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return json!({ "id": Value::Null, "ok": false, "error": format!("bad json: {e}") }).to_string(),
+    };
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    if req.get("token").and_then(|t| t.as_str()) != Some(token) {
+        return json!({ "id": id, "ok": false, "error": "unauthorized" }).to_string();
+    }
+    let op = match req.get("op").and_then(|o| o.as_str()) {
+        Some(o) => o,
+        None => return json!({ "id": id, "ok": false, "error": "missing op" }).to_string(),
+    };
+    if !CONTROL_OPS.contains(&op) {
+        return json!({ "id": id, "ok": false, "error": "unknown op" }).to_string();
+    }
+    // Authoritative identity is the TOP-LEVEL callerAgentId only; never anything nested in payload.
+    let caller_agent_id = req.get("callerAgentId").and_then(|c| c.as_str()).unwrap_or("").to_string();
+    let payload = build_control_payload(&req);
+    handle_control_op(id, op, &caller_agent_id, payload, app, pending)
+}
+
+/// Emit the `control:request` event and block on the rendezvous until `control_respond` resolves it
+/// (or ROUNDTRIP_TIMEOUT fires). Register the reqId BEFORE emitting so a fast frontend reply can't
+/// race ahead of registration.
+fn handle_control_op(
+    id: Value,
+    op: &str,
+    caller_agent_id: &str,
+    payload: Value,
+    app: &Option<AppHandle>,
+    pending: &PendingMap,
+) -> String {
+    let app = match app {
+        Some(a) => a,
+        None => return json!({ "id": id, "ok": false, "error": "no app handle" }).to_string(),
+    };
+    let req_id = match generate_token() {
+        Ok(t) => t,
+        Err(e) => return json!({ "id": id, "ok": false, "error": format!("reqId gen: {e}") }).to_string(),
+    };
+    // Owner = the calling agent, so a control-bridge teardown can release this agent's blocked ops
+    // (mirrors the orchestrator's per-owner resolve; main added the owner-id param to register_pending).
+    let rx = register_pending(pending, &req_id, caller_agent_id);
+    let event = json!({
+        "reqId": req_id,
+        "op": op,
+        "callerAgentId": caller_agent_id,
+        "payload": payload,
+    });
+    if let Err(e) = app.emit("control:request", event) {
+        resolve_pending(pending, &req_id, Value::Null); // clean up the entry we just registered
+        return json!({ "id": id, "ok": false, "error": format!("emit failed: {e}") }).to_string();
+    }
+    match wait_pending(rx, pending, &req_id, ROUNDTRIP_TIMEOUT) {
+        Some(val) => json!({ "id": id, "ok": true, "result": val }).to_string(),
+        None => json!({ "id": id, "ok": false, "error": "frontend round-trip timeout" }).to_string(),
+    }
+}
+
+/// Start (or return the cached) singleton app-level control bridge (Tauri command). Idempotent:
+/// repeat calls return the SAME socket + token for the life of the app launch.
+#[tauri::command]
+pub fn start_control_bridge(
+    app: AppHandle,
+    manager: State<ControlBridgeManager>,
+) -> Result<BridgeInfo, String> {
+    let (sock, token) = start_control_bridge_at(Some(app.clone()), &manager)?;
+    Ok(BridgeInfo { socket_path: sock.to_string_lossy().to_string(), token })
+}
+
+/// Stop the singleton control bridge (Tauri command).
+#[tauri::command]
+pub fn stop_control_bridge(manager: State<ControlBridgeManager>) -> Result<(), String> {
+    stop_control_bridge_inner(&manager);
+    Ok(())
+}
+
+/// Deliver a frontend response back to the control op blocking on `req_id` (Tauri command). Called
+/// by the frontend after handling a `control:request` event.
+#[tauri::command]
+pub fn control_respond(
+    manager: State<ControlBridgeManager>,
+    req_id: String,
+    result: Value,
+) -> Result<(), String> {
+    resolve_pending(&manager.pending, &req_id, result);
+    Ok(())
+}
+
+/// Resolve the node binary + the bundled `mcp-control-server.js` (Tauri command). Mirrors
+/// `orchestrator_mcp_paths` but for the sparkle-control server bundle.
+#[tauri::command]
+pub fn control_mcp_paths(app: AppHandle) -> Result<McpPaths, String> {
+    let node_path = crate::preflight::resolve_node_path_cached()
+        .ok_or_else(|| "node not found (install Node.js; needed to run sparkle-control)".to_string())?;
+    let server = app
+        .path()
+        .resolve(
+            "resources/mcp-control-server.js",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("control server.js missing: {e}"))?;
+    if !server.exists() {
+        return Err(format!(
+            "control server.js not bundled at {} (run apps/desktop build to copy it)",
+            server.display()
+        ));
+    }
+    Ok(McpPaths {
+        node_path,
+        server_path: server.to_string_lossy().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,5 +1272,144 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["result"]["present"], false);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- sparkle-control (singleton app-level) bridge ----
+
+    #[test]
+    fn control_socket_path_is_short_and_temp_based() {
+        let p = control_socket_path("deadbeefdeadbeef");
+        assert_eq!(p, std::env::temp_dir().join("sparkle-ctrl-deadbeefdeadbeef.sock"));
+        assert!(p.to_string_lossy().len() < 104, "control socket path must fit macOS sun_path");
+    }
+
+    #[test]
+    fn control_rejects_bad_token() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let resp = handle_control_request_line(
+            r#"{"id":"1","token":"WRONG","op":"get_state","callerAgentId":"a1"}"#,
+            "RIGHT", &None, &pending,
+        );
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["id"], "1");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "unauthorized");
+    }
+
+    #[test]
+    fn control_missing_and_unknown_op() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let missing: serde_json::Value = serde_json::from_str(
+            &handle_control_request_line(r#"{"id":"2","token":"T"}"#, "T", &None, &pending),
+        ).unwrap();
+        assert_eq!(missing["error"], "missing op");
+        let unknown: serde_json::Value = serde_json::from_str(
+            &handle_control_request_line(r#"{"id":"3","token":"T","op":"rm_rf"}"#, "T", &None, &pending),
+        ).unwrap();
+        assert_eq!(unknown["error"], "unknown op");
+        // No pending entries were registered by rejected requests.
+        assert!(pending.lock().unwrap().is_empty(), "rejected requests must not register pending entries");
+    }
+
+    #[test]
+    fn control_all_six_ops_are_allowlisted() {
+        for op in ["get_state", "rename_agent", "set_agent_activity", "set_theme", "get_config", "set_config"] {
+            assert!(CONTROL_OPS.contains(&op), "{op} must be in the control allowlist");
+        }
+        assert_eq!(CONTROL_OPS.len(), 6, "exactly the 6 frozen-contract ops");
+    }
+
+    #[test]
+    fn control_payload_strips_reserved_and_spoofed_fields() {
+        // A malicious request nests a callerAgentId inside the spread payload AND at top level.
+        let req: serde_json::Value = serde_json::from_str(
+            r#"{"id":"1","token":"T","op":"rename_agent","callerAgentId":"real","name":"Neo","targetAgentId":"t9"}"#,
+        ).unwrap();
+        let payload = build_control_payload(&req);
+        // Reserved fields never leak into payload.
+        assert!(payload.get("id").is_none());
+        assert!(payload.get("token").is_none());
+        assert!(payload.get("op").is_none());
+        assert!(payload.get("callerAgentId").is_none(), "callerAgentId must not ride inside payload");
+        // Op data passes through.
+        assert_eq!(payload["name"], "Neo");
+        assert_eq!(payload["targetAgentId"], "t9");
+    }
+
+    #[test]
+    fn control_op_without_app_handle_errors() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let resp = handle_control_request_line(
+            r#"{"id":"7","token":"T","op":"set_theme","callerAgentId":"a1","theme":"dark"}"#,
+            "T", &None, &pending,
+        );
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["id"], "7");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "no app handle");
+        // Reached the round-trip path but bailed before registering a pending entry.
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn start_control_bridge_at_is_idempotent_singleton() {
+        let mgr = ControlBridgeManager::default();
+        let (sock1, token1) = start_control_bridge_at(None, &mgr).unwrap();
+        let (sock2, token2) = start_control_bridge_at(None, &mgr).unwrap();
+        assert_eq!(sock1, sock2, "singleton: same socket path across calls");
+        assert_eq!(token1, token2, "singleton: same token across calls");
+        // 0600 perms on the socket file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sock1).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "control socket must be owner-only");
+        }
+        stop_control_bridge_inner(&mgr);
+        assert!(!sock1.exists(), "socket file removed on stop");
+    }
+
+    #[test]
+    fn control_listener_authed_and_bad_token_over_socket() {
+        let mgr = ControlBridgeManager::default();
+        let (sock, token) = start_control_bridge_at(None, &mgr).unwrap();
+
+        // Bad token → unauthorized (no app handle needed, fails before the round-trip).
+        let mut s = UnixStream::connect(&sock).unwrap();
+        writeln!(s, r#"{{"id":"1","token":"NOPE","op":"get_state","callerAgentId":"a"}}"#).unwrap();
+        let mut r = BufReader::new(s);
+        let mut resp = String::new();
+        r.read_line(&mut resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "unauthorized");
+
+        // Authed but None app handle in tests → "no app handle" (proves auth + dispatch path work).
+        let mut s2 = UnixStream::connect(&sock).unwrap();
+        let req = format!(r#"{{"id":"2","token":"{token}","op":"get_state","callerAgentId":"a"}}"#);
+        writeln!(s2, "{req}").unwrap();
+        let mut r2 = BufReader::new(s2);
+        let mut resp2 = String::new();
+        r2.read_line(&mut resp2).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&resp2).unwrap();
+        assert_eq!(v2["ok"], false);
+        assert_eq!(v2["error"], "no app handle");
+
+        stop_control_bridge_inner(&mgr);
+        assert!(UnixStream::connect(&sock).is_err(), "must not connect after stop");
+    }
+
+    #[test]
+    fn control_stale_dead_handle_is_rebound() {
+        let mgr = ControlBridgeManager::default();
+        let (_sock1, token1) = start_control_bridge_at(None, &mgr).unwrap();
+        {
+            let guard = mgr.inner.lock().unwrap();
+            let h = guard.as_ref().expect("handle must exist after start");
+            h.alive.store(false, Ordering::SeqCst); // simulate a fatal accept-loop exit
+        }
+        let (_sock2, token2) = start_control_bridge_at(None, &mgr).unwrap();
+        assert_ne!(token1, token2, "a fresh rebind must produce a new token, not the stale one");
+        stop_control_bridge_inner(&mgr);
     }
 }

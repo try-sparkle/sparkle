@@ -17,26 +17,47 @@ fn main() {
     // it ever did, the stub fails loud (process.exit(1) at runtime + the cargo:warning below), so
     // the failure is detectable rather than silent — not worth a partial size-threshold guard that
     // still wouldn't close the gap.
-    let resource = Path::new("resources/mcp-orchestrator-server.js");
-    if !resource.exists() {
-        if let Some(parent) = resource.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    // Both MCP server bundles get the same cold-clone-determinism treatment. The orchestrator's
+    // real bundle is staged by scripts/copy-mcp-server.mjs (pnpm pre(dev|build)); the control
+    // server's real bundle is produced by apps/mcp-control and MUST be staged into
+    // resources/mcp-control-server.js by the same/an equivalent copy hook (see TODO below). Both
+    // resource paths are gitignored, so these stubs cause no git churn.
+    //
+    // TODO(sparkle-control staging): resources/mcp-control-server.js has NO copy hook yet. The real
+    // artifact must be produced by `apps/mcp-control` (built as `pnpm --filter @sparkle/mcp-control
+    // build` → dist/server.js) and copied into apps/desktop/src-tauri/resources/mcp-control-server.js
+    // by extending apps/desktop/scripts/copy-mcp-server.mjs (or adding a sibling copy script wired
+    // into the same predev/prebuild hooks). That file lives in apps/desktop/scripts which is OUTSIDE
+    // this worker's file-ownership, so it could not be wired here. Until that lands, `tauri dev`
+    // resolves this fail-loud stub at runtime and `tauri build` would BUNDLE the stub — the copy
+    // hook must overwrite it first, exactly like the orchestrator server.
+    for (resource_rel, label) in [
+        ("resources/mcp-orchestrator-server.js", "mcp-orchestrator-server.js"),
+        ("resources/mcp-control-server.js", "mcp-control-server.js"),
+    ] {
+        let resource = Path::new(resource_rel);
+        if !resource.exists() {
+            if let Some(parent) = resource.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(
+                resource,
+                format!(
+                    "// placeholder — real {label} bundle is produced by the pnpm pre(dev|build) copy \
+                     hook (scripts/copy-mcp-server.mjs and its control-server equivalent)\nprocess.exit(1);\n"
+                ),
+            );
+            // Fail loud in build logs. For `tauri dev` the resource is disk-resolved at runtime, so the
+            // copy hook overwrites this stub before use. But `tauri build` EMBEDS bundle.resources at
+            // compile time, so if cargo wins the race against the pnpm prebuild hook this stub could be
+            // packaged — shipping the fail-loud `process.exit(1)` instead of the real server. Surfacing
+            // it here makes a stub-bundled production build visible (the stub also exits non-zero at run).
+            println!(
+                "cargo:warning={label} was missing; wrote a fail-loud placeholder. \
+                 A production `tauri build` must run the pnpm prebuild copy hook first \
+                 or it will bundle the stub instead of the real server."
+            );
         }
-        let _ = std::fs::write(
-            resource,
-            "// placeholder — real mcp-orchestrator bundle is produced by \
-             scripts/copy-mcp-server.mjs (pnpm pre(dev|build) hook)\nprocess.exit(1);\n",
-        );
-        // Fail loud in build logs. For `tauri dev` the resource is disk-resolved at runtime, so the
-        // copy hook overwrites this stub before use. But `tauri build` EMBEDS bundle.resources at
-        // compile time, so if cargo wins the race against the pnpm prebuild hook this stub could be
-        // packaged — shipping the fail-loud `process.exit(1)` instead of the 716KB server. Surfacing
-        // it here makes a stub-bundled production build visible (the stub also exits non-zero at run).
-        println!(
-            "cargo:warning=mcp-orchestrator-server.js was missing; wrote a fail-loud placeholder. \
-             A production `tauri build` must run `pnpm prebuild` (scripts/copy-mcp-server.mjs) first \
-             or it will bundle the stub instead of the real server."
-        );
     }
 
     // macOS only: compile the tiny ObjC category that forces Notification Center banners to

@@ -4,6 +4,10 @@ import {
   buildClaudeLoginExec,
   shellQuote,
   buildOrchestratorMcpConfig,
+  buildControlMcpConfig,
+  buildMergedMcpConfig,
+  controlMcpServers,
+  orchestratorMcpServers,
 } from "./claudeSpawn";
 
 const PATH_PREFIX = `export PATH="$HOME/.local/bin:$PATH"; `;
@@ -289,5 +293,44 @@ describe("buildOrchestratorMcpConfig", () => {
     });
     expect(json).not.toContain("\n");
     expect(json).not.toContain("'"); // no single quotes → shellQuote wraps cleanly
+  });
+});
+
+describe("buildControlMcpConfig (sparkle-control MCP)", () => {
+  it("builds a sparkle-control stdio server with socket/token/agent-id in its env block", () => {
+    const json = buildControlMcpConfig({
+      nodePath: "/opt/homebrew/bin/node",
+      serverPath: "/res/resources/mcp-control-server.js",
+      socketPath: "/tmp/sparkle-control.sock",
+      token: "s3cr3t",
+      agentId: "agent-42",
+    });
+    const srv = JSON.parse(json).mcpServers["sparkle-control"];
+    expect(srv.command).toBe("/opt/homebrew/bin/node");
+    expect(srv.args).toEqual(["/res/resources/mcp-control-server.js"]);
+    expect(srv.env.SPARKLE_CONTROL_SOCKET).toBe("/tmp/sparkle-control.sock");
+    expect(srv.env.SPARKLE_CONTROL_TOKEN).toBe("s3cr3t");
+    expect(srv.env.SPARKLE_AGENT_ID).toBe("agent-42");
+  });
+
+  it("produces a single-line, single-quote-free JSON string", () => {
+    const json = buildControlMcpConfig({
+      nodePath: "/n", serverPath: "/s", socketPath: "/sock", token: "t", agentId: "a",
+    });
+    expect(json).not.toContain("\n");
+    expect(json).not.toContain("'");
+  });
+});
+
+describe("buildMergedMcpConfig (Build agent: orchestrator + control in one --mcp-config)", () => {
+  it("keeps BOTH servers when merging the orchestrator and control maps", () => {
+    const merged = buildMergedMcpConfig([
+      orchestratorMcpServers({ nodePath: "/n", serverPath: "/orch.js", socketPath: "/o.sock", token: "ot" }),
+      controlMcpServers({ nodePath: "/n", serverPath: "/ctl.js", socketPath: "/c.sock", token: "ct", agentId: "a1" }),
+    ]);
+    const servers = JSON.parse(merged).mcpServers;
+    expect(Object.keys(servers).sort()).toEqual(["sparkle-control", "sparkle-orchestrator"]);
+    expect(servers["sparkle-orchestrator"].env.SPARKLE_BRIDGE_TOKEN).toBe("ot");
+    expect(servers["sparkle-control"].env.SPARKLE_AGENT_ID).toBe("a1");
   });
 });
