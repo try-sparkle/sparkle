@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, realpathSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // Import the pure predicate straight from the shipped guard script.
-import { isInside } from "../../src-tauri/resources/worktree-guard.mjs";
+import { isInside, blocksKeychainCommand } from "../../src-tauri/resources/worktree-guard.mjs";
 
 describe("isInside (lexical, no filesystem)", () => {
   const root = "/wt/proj/agent";
@@ -91,5 +91,43 @@ describe("isInside (real symlinks on disk)", () => {
     symlinkSync("b", join(root, "a"));
     symlinkSync("a", join(root, "b"));
     expect(isInside(root, join(root, "a", "x"))).toBe(false);
+  });
+});
+
+// The keychain guard (sparkle-0ezz): block an agent shelling out to the macOS `security` CLI against
+// the app's ai.sparkle.desktop keychain item (which holds desktop-token + trial-device-token). The app
+// reads these in-process via keyring and never triggers the OS prompt; only an agent running `security`
+// does. We can't suppress Apple's dialog, so we stop the command from running.
+describe("blocksKeychainCommand", () => {
+  it("blocks `security find-generic-password -s ai.sparkle.desktop`", () => {
+    expect(blocksKeychainCommand("security find-generic-password -s ai.sparkle.desktop")).toBe(true);
+  });
+
+  it("blocks the fuller real invocation (flags, account, absolute path, -w)", () => {
+    expect(
+      blocksKeychainCommand("/usr/bin/security find-generic-password -w -s ai.sparkle.desktop -a desktop-token"),
+    ).toBe(true);
+    expect(
+      blocksKeychainCommand("security add-generic-password -s ai.sparkle.desktop -a trial-device-token -w secret"),
+    ).toBe(true);
+    // Also inside a pipeline / after a separator (not just at the very start of the line).
+    expect(blocksKeychainCommand("echo hi && security delete-generic-password -s ai.sparkle.desktop")).toBe(true);
+  });
+
+  it("does NOT block unrelated commands", () => {
+    // Ordinary shell work.
+    expect(blocksKeychainCommand("git commit -m 'security review of the login flow'")).toBe(false);
+    expect(blocksKeychainCommand("ls -la && echo ai.sparkle.desktop")).toBe(false);
+    expect(blocksKeychainCommand("npm run test")).toBe(false);
+    // `security` against a DIFFERENT keychain service is not our item — leave it alone.
+    expect(blocksKeychainCommand("security find-generic-password -s some.other.service")).toBe(false);
+    // `security` without a generic-password subcommand isn't the targeted access pattern.
+    expect(blocksKeychainCommand("security list-keychains")).toBe(false);
+    // The service name mentioned but no `security` binary invoked.
+    expect(blocksKeychainCommand("grep ai.sparkle.desktop generic-password.txt")).toBe(false);
+    // Substring "security" inside another word must not trigger the invocation match.
+    expect(blocksKeychainCommand("run-security-scan --target ai.sparkle.desktop generic-password")).toBe(false);
+    // Non-string input is safely ignored.
+    expect(blocksKeychainCommand(undefined)).toBe(false);
   });
 });

@@ -21,10 +21,14 @@ const TIER2 = [
 // Stop phrase: "sparkle stop" — REQUIRES the "sparkle" carrier token AND a
 // following "stop"-like token (a 2-gram). Bare "stop" is a common dictation word,
 // so it must never end capture on its own; bare "sparkle" is harmless mid-prompt.
-const STOP_WORD = "stop";
-// Curated mishearings of the "stop" token (the 2-gram's second half). Kept tight;
-// the "sparkle" carrier requirement is the primary false-stop guard.
-const STOP_VARIANTS = new Set(["stop", "stahp", "staap", "stope", "stawp", "stomp"]);
+// Curated ASR mishearings of the "stop" token (the 2-gram's second half). This set is the ONLY
+// thing that counts as a stop token — there is deliberately no fuzzy (Levenshtein/phonetic) net on
+// top of it, because "stop" is only 3-4 letters and every loose net admits ordinary near-words:
+// lev(_, "stop") <= 1 pulls in "top"/"shop"/"step", and the "STP" Double-Metaphone code is shared by
+// "step". Those turned "make the sparkle top bar bigger" into a destructive mid-dictation stop
+// (sparkle-mun0). Entries are unambiguous non-words (no common English word), and "stomp" (a real,
+// far-off word) was removed for the same reason. The true "stop" is matched exactly and stays reliable.
+const STOP_VARIANTS = new Set(["stop", "stahp", "staap", "stope", "stawp", "stopp"]);
 
 const CANON = "sparkle";
 const CANON_MP = doubleMetaphone(CANON)[0]; // primary Double Metaphone code, computed at runtime
@@ -121,17 +125,23 @@ export function matchesWake(segment: string): boolean {
   return false;
 }
 
-/** True when a token is the "sparkle" carrier — reusing the wake matcher's trusted
- *  phonetic (Double Metaphone) + Levenshtein(≤2) nets, so every "sparkle" mishearing
- *  the wake path accepts (sparkly, sparkel, sparcle, …) also works as the stop carrier. */
+/** True when a token is the "sparkle" carrier of a "sparkle stop" 2-gram. The phonetic (Double
+ *  Metaphone) net still admits every real "sparkle" mishearing the wake path accepts — sparkly,
+ *  sparkel, sparcle all share the "SPRKL" code — but the Levenshtein fallback is TIGHTER here than on
+ *  the wake path (≤1, not ≤2). The wake carrier can be generous because a stray wake only *starts*
+ *  listening; a stray STOP destroys in-flight capture, so the stop carrier must not fire on a merely
+ *  2-edit-away word like "spark" (MP "SPRK", not "SPRKL"), which would let "…add a spark, stop…"
+ *  end capture. Canonical "sparkle" is distance 0, so the real stop word stays reliable (sparkle-mun0). */
 function isSparkleToken(tok: string): boolean {
-  return doubleMetaphone(tok)[0] === CANON_MP || lev(tok, CANON) <= 2;
+  return doubleMetaphone(tok)[0] === CANON_MP || lev(tok, CANON, 1) <= 1;
 }
 
-/** True when a token is a "stop"-like word: a curated mishearing or a TIGHT
- *  Levenshtein(≤1) near-miss of "stop". Kept narrow so the 2-gram doesn't widen. */
+/** True when a token is a "stop"-like word. EXACT membership of the curated STOP_VARIANTS set only —
+ *  no Levenshtein/phonetic fuzz — because any fuzz on a 3-4 letter word admits ordinary near-words
+ *  ("top", "shop", "step") that then destructively end capture mid-dictation (sparkle-mun0). The set
+ *  already carries the plausible ASR mishearings, so exactness costs nothing in real reliability. */
 function isStopToken(tok: string): boolean {
-  return STOP_VARIANTS.has(tok) || lev(tok, STOP_WORD, 1) <= 1;
+  return STOP_VARIANTS.has(tok);
 }
 
 export function matchesStop(segment: string): boolean {

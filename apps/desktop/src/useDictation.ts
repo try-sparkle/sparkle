@@ -44,6 +44,11 @@ interface DictationOptions {
 interface DictationController {
   toggle: () => Promise<void>;
   cleanup: () => void;
+  /** Drive the per-WINDOW OS-focus transition for THIS window (not the app-level `dictation://focus`,
+   *  which never fires on a window-to-window switch — see dictation.rs `set_focused`). Wired to the
+   *  DOM `window` focus/blur events in a real webview; exposed so the multi-window ownership handoff is
+   *  unit-testable in the (window-less) node env. `false` = this window lost OS focus; `true` = regained. */
+  notifyWindowFocus: (focused: boolean) => void;
 }
 
 /**
@@ -66,6 +71,61 @@ export async function createDictationController(
 
   const { setStatus, setLevel, setSpeaking, setError, setModelProgress } =
     useDictationStore.getState();
+
+  // --- Per-window cloud-stream ownership (sparkle-ozvr) ------------------------------------------
+  // The billable Deepgram relay is a single backend resource, but it is logically OWNED by the one
+  // window that drove the wake word — i.e. the window whose OWN per-window store has `phase: "active"`.
+  // Committed partials route by focus (isWindowActive), but ownership lived only in the old window's
+  // store, and `dictation://focus` fires only on APP-level focus flips — never on a window-to-window
+  // switch (dictation.rs keeps `focused` true while any Sparkle window is up). So saying "Hey Sparkle"
+  // in window A then switching to window B left A's relay streaming (and billing) until a stop word or
+  // timeout, while B (still PASSIVE) inserted nothing. Fix: tie the relay's lifetime to whether the
+  // owner window is the focused dictation target — tear it down when the owner loses focus, and resume
+  // it when the owner regains focus (the session follows its window).
+  //
+  // `true` once this window has torn its relay down and is waiting to resume on refocus. Guards resume
+  // so it only fires after a real teardown (never spuriously re-opens an already-running stream).
+  let streamTornDown = false;
+
+  // Close THIS window's relay when it stops being the focused dictation target. Only the OWNER (its own
+  // phase is ACTIVE) has a billable stream to close; a passive/background window is a no-op. Phase is
+  // intentionally RETAINED so refocusing the owner resumes without a re-said wake word.
+  const tearDownOwnedStream = () => {
+    const store = useDictationStore.getState();
+    if (store.phase !== "active") return;
+    invoke("stop_cloud_stream").catch(() => {});
+    streamTornDown = true;
+    store.setInterim("");
+    store.setLevel(0);
+    store.setSpeaking(false);
+  };
+
+  // Resume THIS window's relay when it (re)gains focus mid-session. Guarded so ONLY the focused
+  // (isWindowActive) window that owns a torn-down ACTIVE session reopens the stream — a backgrounded
+  // stale-active window must never grab the single cloud stream on an app-level refocus. The short
+  // cooldown de-dupes the DOM-focus and app-level `dictation://focus` signals that both fire when the
+  // whole app is re-focused (only one reopen).
+  let lastResumeAt = 0;
+  const maybeResumeOwnedStream = () => {
+    if (!streamTornDown) return;
+    const now = Date.now();
+    if (now - lastResumeAt < 300) return;
+    const store = useDictationStore.getState();
+    if (!isWindowActive() || !store.enabled || store.status === "error" || store.phase !== "active") {
+      return;
+    }
+    lastResumeAt = now;
+    streamTornDown = false;
+    store.setStatus("listening");
+    onResumeActive?.();
+  };
+
+  // Per-WINDOW OS-focus transition (DOM window focus/blur), the signal the app-level event misses on a
+  // window-to-window switch. Exposed on the controller so it is unit-testable without a real webview.
+  const notifyWindowFocus = (focused: boolean) => {
+    if (focused) maybeResumeOwnedStream();
+    else tearDownOwnedStream();
+  };
 
   // Register event listeners — each `listen()` returns an unsubscribe fn.
   const unsubscribes = await Promise.all([
@@ -129,6 +189,9 @@ export async function createDictationController(
     ),
 
     listen<number>("dictation://level", (e) => {
+      // Multi-window: broadcast to EVERY window, but only the focused one drives the waveform — without
+      // this gate a background window animates its meter off another window's capture (sparkle-ozvr).
+      if (!isWindowActive()) return;
       // Capture started — clear any lingering model-download progress. This fires ~25×/sec, so
       // only write when there's actually progress to clear; an unconditional set(null) would churn
       // the store (and every subscriber) 25 times a second for a no-op.
@@ -143,6 +206,9 @@ export async function createDictationController(
     // The waveform animates only while this is true, so the meter sits flat in silence instead
     // of wiggling on ambient noise. `level` still drives bar HEIGHT; this gates the MOTION.
     listen<boolean>("dictation://speaking", (e) => {
+      // Same multi-window gate as the level meter: only the focused window animates its waveform, so a
+      // background window doesn't wiggle off another window's voice-activity edges (sparkle-ozvr).
+      if (!isWindowActive()) return;
       setSpeaking(e.payload);
     }),
 
@@ -163,6 +229,8 @@ export async function createDictationController(
       const store = useDictationStore.getState();
       if (!e.payload) {
         invoke("stop_cloud_stream").catch(() => {});
+        // The relay is now closed; arm the owner-resume guard so refocus reopens it exactly once.
+        streamTornDown = true;
         store.setInterim("");
         store.setLevel(0);
         // Capture is paused — no more frames, so clear the VAD flag ourselves (the backend
@@ -171,8 +239,10 @@ export async function createDictationController(
         if (store.status !== "error") store.setStatus("idle");
       } else if (store.enabled && store.status !== "error") {
         store.setStatus("listening");
-        // Mid-dictation when focus left → resume the cloud stream now, no wake word needed.
-        if (store.phase === "active") onResumeActive?.();
+        // Mid-dictation when focus left → resume the cloud stream now, no wake word needed. Routed
+        // through the owner guard so only the FOCUSED window (not a background stale-active one)
+        // reopens the single stream, and so it can't double-open with the DOM-focus signal.
+        maybeResumeOwnedStream();
       }
     }),
 
@@ -184,7 +254,25 @@ export async function createDictationController(
     }),
   ]);
 
-  const cleanup = () => unsubscribes.forEach((u) => u());
+  // Wire the per-window OS focus/blur to the ownership handoff. Each Tauri window is its own webview,
+  // so its DOM `window` focus/blur fires on window-to-window switches WITHIN the app — the gap the
+  // app-level `dictation://focus` never covers (sparkle-ozvr). Guarded for the window-less test/node
+  // env (tests drive `notifyWindowFocus` directly instead).
+  const hasWindow = typeof window !== "undefined" && typeof window.addEventListener === "function";
+  const onWinBlur = () => notifyWindowFocus(false);
+  const onWinFocus = () => notifyWindowFocus(true);
+  if (hasWindow) {
+    window.addEventListener("blur", onWinBlur);
+    window.addEventListener("focus", onWinFocus);
+  }
+
+  const cleanup = () => {
+    unsubscribes.forEach((u) => u());
+    if (hasWindow) {
+      window.removeEventListener("blur", onWinBlur);
+      window.removeEventListener("focus", onWinFocus);
+    }
+  };
 
   const toggle = async () => {
     const state = useDictationStore.getState();
@@ -210,7 +298,7 @@ export async function createDictationController(
     }
   };
 
-  return { toggle, cleanup };
+  return { toggle, cleanup, notifyWindowFocus };
 }
 
 // ---------------------------------------------------------------------------

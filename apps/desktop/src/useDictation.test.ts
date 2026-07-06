@@ -429,6 +429,8 @@ describe("dictation://focus (window-focus capture gate)", () => {
     const onResumeActive = vi.fn();
     const c = await createDictationController({ onSegment: vi.fn(), onResumeActive });
     useDictationStore.setState({ status: "idle", phase: "active", enabled: true });
+    // Tab-away first tears the relay down (arms the owner-resume guard), then focus returns.
+    emit("dictation://focus", false);
     emit("dictation://focus", true);
     expect(useDictationStore.getState().status).toBe("listening");
     expect(onResumeActive).toHaveBeenCalledTimes(1);
@@ -458,6 +460,120 @@ describe("dictation://focus (window-focus capture gate)", () => {
     expect(useDictationStore.getState().status).toBe("error");
     emit("dictation://focus", true);
     expect(useDictationStore.getState().status).toBe("error");
+  });
+});
+
+describe("per-window cloud-stream ownership on window-to-window switch (sparkle-ozvr)", () => {
+  // The app-level dictation://focus never fires on a window-to-window switch (dictation.rs keeps the
+  // app "focused" while any Sparkle window is up), so the OLD owner window's billable relay used to
+  // keep streaming after the user moved to another window. notifyWindowFocus() is the per-window OS
+  // focus signal (wired to DOM window focus/blur in the real webview) that closes that gap.
+  beforeEach(() => {
+    invoke.mockClear();
+    for (const k of Object.keys(listeners)) delete listeners[k];
+    useDictationStore.setState({
+      status: "listening",
+      level: 0.6,
+      speaking: true,
+      interim: "live preview",
+      phase: "active",
+      enabled: true,
+      error: null,
+    });
+  });
+
+  it("the OWNER window losing focus tears down its billable relay (stops server metering)", async () => {
+    const ctrl = await createDictationController({ onSegment: vi.fn() });
+    invoke.mockClear();
+    ctrl.notifyWindowFocus(false);
+    const s = useDictationStore.getState();
+    // The billable Deepgram relay is closed so it can't keep metering in the now-unfocused window.
+    expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
+    expect(s.interim).toBe("");
+    expect(s.level).toBe(0);
+    expect(s.speaking).toBe(false);
+    // Phase is RETAINED so refocusing the owner resumes without re-saying the wake word.
+    expect(s.phase).toBe("active");
+    ctrl.cleanup();
+  });
+
+  it("a PASSIVE (non-owner) window losing focus is a no-op (never opened a relay)", async () => {
+    useDictationStore.setState({ phase: "passive" });
+    const ctrl = await createDictationController({ onSegment: vi.fn() });
+    invoke.mockClear();
+    ctrl.notifyWindowFocus(false);
+    expect(invoke).not.toHaveBeenCalledWith("stop_cloud_stream");
+    ctrl.cleanup();
+  });
+
+  it("the owner regaining focus resumes its relay without a wake word", async () => {
+    const onResumeActive = vi.fn();
+    const ctrl = await createDictationController({ onSegment: vi.fn(), onResumeActive });
+    ctrl.notifyWindowFocus(false); // switch away → torn down
+    ctrl.notifyWindowFocus(true); // switch back → resumes
+    expect(onResumeActive).toHaveBeenCalledTimes(1);
+    expect(useDictationStore.getState().status).toBe("listening");
+    ctrl.cleanup();
+  });
+
+  it("a torn-down owner resumes only ONCE even if focus fires repeatedly (dedupe)", async () => {
+    const onResumeActive = vi.fn();
+    const ctrl = await createDictationController({ onSegment: vi.fn(), onResumeActive });
+    ctrl.notifyWindowFocus(false);
+    ctrl.notifyWindowFocus(true);
+    ctrl.notifyWindowFocus(true); // duplicate focus signal (e.g. DOM + app-level) → no second reopen
+    expect(onResumeActive).toHaveBeenCalledTimes(1);
+    ctrl.cleanup();
+  });
+
+  it("a BACKGROUND window does NOT grab the stream on an app-level refocus (only the focused one)", async () => {
+    // Models the app tabbing away and back while a stale-active window sits in the background: its
+    // isWindowActive() is false, so the broadcast dictation://focus must not make it reopen the relay.
+    const onResumeActive = vi.fn();
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      onResumeActive,
+      isWindowActive: () => false,
+    });
+    emit("dictation://focus", false); // arms the resume guard
+    emit("dictation://focus", true); // app refocus, broadcast to every window
+    expect(onResumeActive).not.toHaveBeenCalled();
+    ctrl.cleanup();
+  });
+
+  it("DOM-focus and app-level focus firing together on app-return reopen the stream only once", async () => {
+    const onResumeActive = vi.fn();
+    const ctrl = await createDictationController({ onSegment: vi.fn(), onResumeActive });
+    emit("dictation://focus", false); // tab-away arms the guard
+    ctrl.notifyWindowFocus(true); // DOM focus resumes + disarms
+    emit("dictation://focus", true); // app-level focus finds nothing left to do
+    expect(onResumeActive).toHaveBeenCalledTimes(1);
+    ctrl.cleanup();
+  });
+});
+
+describe("multi-window level/speaking gate (background windows must not animate — sparkle-ozvr)", () => {
+  beforeEach(() => {
+    for (const k of Object.keys(listeners)) delete listeners[k];
+    useDictationStore.setState({ level: 0, speaking: false, modelProgress: null });
+  });
+
+  it("a background window ignores dictation://level and dictation://speaking", async () => {
+    const ctrl = await createDictationController({ onSegment: vi.fn(), isWindowActive: () => false });
+    emit("dictation://level", 0.9);
+    emit("dictation://speaking", true);
+    expect(useDictationStore.getState().level).toBe(0);
+    expect(useDictationStore.getState().speaking).toBe(false);
+    ctrl.cleanup();
+  });
+
+  it("the focused window still drives level and speaking", async () => {
+    const ctrl = await createDictationController({ onSegment: vi.fn(), isWindowActive: () => true });
+    emit("dictation://level", 0.9);
+    emit("dictation://speaking", true);
+    expect(useDictationStore.getState().level).toBe(0.9);
+    expect(useDictationStore.getState().speaking).toBe(true);
+    ctrl.cleanup();
   });
 });
 

@@ -1829,8 +1829,11 @@ pub fn merge_guard_settings(existing: Option<&str>, guard_cmd: &str) -> String {
     if !root.is_object() {
         root = json!({});
     }
+    // Bash is included so the guard also sees shell commands: it blocks a `security`-CLI invocation
+    // against the ai.sparkle.desktop keychain (sparkle-0ezz) in addition to its Edit/Write file-path
+    // containment. The guard script exits 0 for any Bash command that isn't the keychain pattern.
     let hook_entry = json!({
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [ { "type": "command", "command": guard_cmd } ]
     });
     let obj = root.as_object_mut().unwrap();
@@ -2497,7 +2500,10 @@ mod tests {
         assert!(hooks.is_array() && !hooks.as_array().unwrap().is_empty(), "guard hook added");
         let cmd = hooks[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("worktree-guard.mjs"));
-        assert!(hooks[0]["matcher"].as_str().unwrap().contains("Edit"));
+        let matcher = hooks[0]["matcher"].as_str().unwrap();
+        assert!(matcher.contains("Edit"));
+        // Bash is matched too so the keychain guard (sparkle-0ezz) sees shell commands.
+        assert!(matcher.contains("Bash"));
     }
 
     #[test]

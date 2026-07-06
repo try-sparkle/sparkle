@@ -75,6 +75,42 @@ describe("matchesStop — requires 'sparkle' carrier + 'stop' (2-gram)", () => {
   }
 });
 
+describe("matchesStop — near-match words after 'sparkle' must NOT falsely stop (sparkle-mun0)", () => {
+  // Regression: a too-loose stop-token net (lev<=1 / shared "STP" metaphone) let ordinary words
+  // that merely rhyme with "stop" end capture when they happened to follow the "sparkle" carrier —
+  // e.g. "make the sparkle top bar bigger" destructively ended dictation and lost the rest.
+  for (const s of [
+    "make the sparkle top bar bigger", // "top": lev 1 from "stop" — the original false positive
+    "sparkle top",
+    "put the sparkle shop link here", // "shop"
+    "sparkle shop",
+    "add a sparkle step to the flow", // "step": shares the "STP" metaphone code with "stop"
+    "sparkle step",
+    "make the sparkle stomp animation", // "stomp": a real, far word (removed from the variant set)
+    "sparkle stomp",
+  ]) {
+    it(`does NOT stop on "${s}"`, () => expect(matchesStop(s)).toBe(false));
+  }
+
+  // A merely-2-edits-away carrier ("spark", not phonetically "sparkle") must not carry a real stop.
+  it("does NOT stop on 'add a spark stop the animation'", () =>
+    expect(matchesStop("add a spark stop the animation")).toBe(false));
+
+  // …but the real stop phrase and its curated mishearings still reliably end capture.
+  for (const s of [
+    "sparkle stop",
+    "hey sparkle stop",
+    "Sparkle, stop.",
+    "sparkly stop",
+    "sparkel stop", // 2-edit spelling, still phonetically "SPRKL"
+    "sparkle stahp",
+    "sparkle stope",
+    "okay that is the plan sparkle stop",
+  ]) {
+    it(`still stops on "${s}"`, () => expect(matchesStop(s)).toBe(true));
+  }
+});
+
 describe("stripWakePrefix / stripStopSuffix — same-segment remainder", () => {
   it("strips the wake prefix, keeps the remainder", () =>
     expect(stripWakePrefix("hey sparkle add a login button")).toBe("add a login button"));

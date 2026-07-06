@@ -1,10 +1,16 @@
 // Claude Code PreToolUse guard: refuse any file-write whose resolved path escapes the agent's
 // worktree. Invoked as `node worktree-guard.mjs <worktree-root>` with the tool payload on stdin.
 //
-// NOTE: this is a best-effort guardrail, NOT a security sandbox. It only inspects Edit/Write/
-// NotebookEdit file paths — it does NOT constrain the Bash tool, which can write anywhere the
-// user can. True isolation comes from the per-agent worktree+branch model; this hook just
-// stops a well-behaved agent from accidentally editing outside its lane.
+// NOTE: this is a best-effort guardrail, NOT a security sandbox. Its file-path containment check
+// only inspects Edit/Write/MultiEdit/NotebookEdit paths — it does NOT otherwise constrain the Bash
+// tool, which can write anywhere the user can. True isolation comes from the per-agent worktree+branch
+// model; this hook just stops a well-behaved agent from accidentally editing outside its lane.
+//
+// It ALSO carries one narrow Bash guard (sparkle-0ezz): it blocks a `security`-CLI invocation against
+// the app's `ai.sparkle.desktop` keychain item. Workers auto-approve their own shell commands, so an
+// agent shelling out to `security find-generic-password -s ai.sparkle.desktop` would pop a scary
+// "security wants to use your confidential information" OS prompt at the user. The app never shells out
+// (it reads that item in-process via keyring); only an agent does, so we stop the command from running.
 import { relative, sep, isAbsolute, dirname } from "node:path";
 import { lstatSync, readlinkSync } from "node:fs";
 
@@ -81,6 +87,25 @@ export function isInside(root, target) {
   return rel === "" || (!rel.startsWith("..") && !rel.startsWith(`..${sep}`));
 }
 
+/** True iff `command` (a Bash tool's command string) shells out to the macOS `security` CLI against
+ *  the app's generic-password keychain item. We require ALL THREE signals so we block the confidential
+ *  `ai.sparkle.desktop` access without snagging unrelated commands: (a) the `security` binary is invoked
+ *  as a command word (bare or via an absolute path, not merely the substring "security" inside another
+ *  word like "security-review"); (b) a `*-generic-password` subcommand; (c) the `ai.sparkle.desktop`
+ *  service name. Apple's OS dialog can't be suppressed, so the goal is to stop the command from running. */
+export function blocksKeychainCommand(command) {
+  if (typeof command !== "string") return false;
+  // (a) `security` invoked as a command word: at a start/separator boundary, optionally path-prefixed
+  // (e.g. `/usr/bin/security`), followed by whitespace or end — so "insecurity"/"security-scan" miss.
+  const invokesSecurity = /(^|[\s;&|()`'"])([^\s;&|()`'"]*\/)?security(\s|$)/.test(command);
+  if (!invokesSecurity) return false;
+  // (b) any *-generic-password subcommand (find/add/delete/set-generic-password).
+  const genericPassword = /generic-password/.test(command);
+  // (c) targeting the app's keychain service.
+  const appService = /ai\.sparkle\.desktop/.test(command);
+  return genericPassword && appService;
+}
+
 async function main() {
   const root = process.argv[2];
   if (!root) process.exit(0); // misconfigured guard must not block work
@@ -93,6 +118,17 @@ async function main() {
     process.exit(0);
   }
   const input = payload?.tool_input ?? {};
+  // Keychain guard (sparkle-0ezz): a Bash command that runs the `security` CLI against the
+  // ai.sparkle.desktop keychain item is refused outright — exit 2 blocks the tool call before it runs.
+  if (blocksKeychainCommand(input.command)) {
+    process.stderr.write(
+      "Blocked: refusing to run the macOS `security` CLI against the ai.sparkle.desktop keychain. " +
+        "Sparkle stores its desktop-token / trial-device-token there and reads them in-process via " +
+        "keyring; shelling out to `security` triggers a scary OS confidential-information prompt and " +
+        "is never necessary. Do not touch this keychain item.\n",
+    );
+    process.exit(2); // exit code 2 → Claude Code blocks the tool call
+  }
   const target = input.file_path ?? input.notebook_path;
   if (!target) process.exit(0); // nothing path-like to guard
   // Fail CLOSED on any unexpected error: only exit code 2 blocks the tool, so an exception that

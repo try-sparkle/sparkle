@@ -5,6 +5,21 @@
 /** Path, relative to a worker's worktree, where it writes its structured result as its final act. */
 export const WORKER_RESULT_RELPATH = ".sparkle/result.json";
 
+/** Shared safety rule (sparkle-0ezz): keep every agent away from the macOS keychain / `security`
+ *  CLI. An agent that shells out to `security` against the app's keychain item triggers a scary
+ *  "security wants to use your confidential information" OS prompt; the app itself never does this
+ *  (it reads the item in-process via keyring). Appended to BOTH the worker and orchestrator personas
+ *  so the constraint holds for every kind of agent. A PreToolUse hook enforces it as a hard backstop. */
+export const KEYCHAIN_SAFETY_RULE = [
+  "KEYCHAIN / macOS `security` CLI — HANDS OFF",
+  "- NEVER run the macOS `security` CLI (`security find-generic-password`, `security",
+  "  add-generic-password`, any `*-generic-password` subcommand), and NEVER read, write, or delete the",
+  "  `ai.sparkle.desktop` keychain item. That item holds Sparkle's desktop-token + trial-device-token;",
+  "  the app reads them IN-PROCESS via keyring and never shells out. Running `security` against it pops a",
+  '  scary macOS "security wants to use your confidential information" prompt at the user and gains you',
+  "  nothing. A PreToolUse hook also blocks these commands — do not try to work around it.",
+].join("\n");
+
 export interface WorkerResult {
   schemaVersion: 1;
   taskId: string;
@@ -65,6 +80,8 @@ export function workerPersona(opts: { parentBranch: string; resultPath: string }
     "- When something is ambiguous, make the most reasonable assumption, keep going, and record the",
     "  assumption (and anything you deliberately skipped) in the `notes` field of your result. Ship a",
     "  `partial` result with clear notes rather than blocking on a question.",
+    "",
+    KEYCHAIN_SAFETY_RULE,
     "",
     "FINISHING — THIS IS REQUIRED",
     "As your FINAL act, after committing, write a JSON result file to this exact path:",
@@ -191,6 +208,8 @@ export function orchestrationPersona(opts: {
     "REPORTING",
     "- When all units are integrated, report the CONSOLIDATED outcome to the user: what each",
     "  worker did, what merged cleanly, and anything left for them to land to `main` themselves.",
+    "",
+    KEYCHAIN_SAFETY_RULE,
     // Bind the orchestrator to a specific beads epic when one was handed off (Send to Build).
     ...(opts.epicId ? ["", beadsProtocol({ epicId: opts.epicId })] : []),
   ].join("\n");

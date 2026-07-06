@@ -5,6 +5,7 @@ import {
   workerMission,
   orchestrationPersona,
   beadsProtocol,
+  KEYCHAIN_SAFETY_RULE,
   WORKER_RESULT_RELPATH,
 } from "./buildAgent";
 
@@ -77,6 +78,13 @@ describe("workerPersona", () => {
     expect(p).toMatch(/do not ask/i);
     expect(p).toMatch(/assumption/i);
     expect(p).toMatch(/notes/i);
+  });
+  it("forbids the macOS `security` CLI / touching the ai.sparkle.desktop keychain", () => {
+    // sparkle-0ezz: an agent shelling out to `security` against the app keychain pops a scary OS prompt.
+    expect(p).toContain(KEYCHAIN_SAFETY_RULE);
+    expect(p).toMatch(/security/);
+    expect(p).toContain("ai.sparkle.desktop");
+    expect(p).toMatch(/never/i);
   });
 });
 
@@ -164,6 +172,13 @@ describe("orchestrationPersona", () => {
     // An errored worker must not be merged as if it succeeded.
     expect(p).toMatch(/do not merge|not.*merge/i);
   });
+
+  it("forbids the macOS `security` CLI / touching the ai.sparkle.desktop keychain", () => {
+    // sparkle-0ezz: same keychain-safety rule the worker carries, enforced on the orchestrator too.
+    expect(p).toContain(KEYCHAIN_SAFETY_RULE);
+    expect(p).toContain("ai.sparkle.desktop");
+    expect(p).toMatch(/generic-password/);
+  });
 });
 
 describe("beadsProtocol", () => {
@@ -186,5 +201,14 @@ describe("beadsProtocol", () => {
     // orchestrator is explicitly told NOT to run them by hand so the board can't drift.
     expect(p).toMatch(/do not run/i);
     expect(p).toMatch(/automatically/i);
+  });
+});
+
+describe("KEYCHAIN_SAFETY_RULE", () => {
+  it("names the security CLI, the generic-password surface, and the app keychain item", () => {
+    expect(KEYCHAIN_SAFETY_RULE).toMatch(/security/);
+    expect(KEYCHAIN_SAFETY_RULE).toMatch(/generic-password/);
+    expect(KEYCHAIN_SAFETY_RULE).toContain("ai.sparkle.desktop");
+    expect(KEYCHAIN_SAFETY_RULE).toMatch(/NEVER/);
   });
 });
