@@ -6,7 +6,9 @@ import { parseWindowLabelFromSearch } from "./services/projectWindows.url";
 import {
   subscribeWindowStatus,
   getOtherWindowsSnapshot,
+  getOtherWindowsGroupsSnapshot,
   type OtherWindowAgent,
+  type OtherWindowGroup,
 } from "./services/windowStatus";
 
 /** This window's opaque label, derived from the URL the same way CurrentProjectProvider does (the
@@ -29,4 +31,16 @@ export function useOtherWindowsRedAgentsFor(selfLabel: string): OtherWindowAgent
 /** The public selector: red agents from other open windows, for THIS window. */
 export function useOtherWindowsRedAgents(): OtherWindowAgent[] {
   return useOtherWindowsRedAgentsFor(selfWindowLabel());
+}
+
+/** Parameterized grouped form (explicit self label) — exported for tests that drive a known label. */
+export function useOtherWindowsRedGroupsFor(selfLabel: string): OtherWindowGroup[] {
+  const getSnapshot = useCallback(() => getOtherWindowsGroupsSnapshot(selfLabel), [selfLabel]);
+  return useSyncExternalStore(subscribeWindowStatus, getSnapshot, getSnapshot);
+}
+
+/** The grouped selector: ONE row per other open window (representative agent + total red count),
+ *  for THIS window. Backs the collapsed cross-window attention block with its "+N" badge. */
+export function useOtherWindowsRedGroups(): OtherWindowGroup[] {
+  return useOtherWindowsRedGroupsFor(selfWindowLabel());
 }

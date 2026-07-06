@@ -141,6 +141,11 @@ export function useAttentionNotifications(): void {
   const prevProject = useRef<string | null>(null);
   // agentId -> the attention_id we sent the phone, so we can resolve it when it clears.
   const attentionIds = useRef<Record<string, string>>({});
+  // agentId -> epoch ms it entered the red tier. Stamped on the FIRST red tick, reused on later
+  // ticks (so the timestamp is "when it went red", not "when we last recomputed"), and pruned to the
+  // currently-red set each run so an agent that leaves red and returns gets a FRESH timestamp. Read
+  // cross-window as the `since` that picks each window's most-recently-red representative row.
+  const redSince = useRef<Record<string, number>>({});
 
   // Badge + notification side-effects, recomputed whenever status, the owned agent set, or the
   // notify prefs change. The badge stays strictly waiting/approval (countAttention); the banner
@@ -152,15 +157,18 @@ export function useAttentionNotifications(): void {
     // Publish THIS window's red (needs-attention) agents to the cross-window status channel so other
     // windows can surface them at the top of their sidebar. Uses the red-color set
     // (waiting|approval|errored), same tier as the relay. Empty set deletes our entry.
-    publishWindowRedAgents(
-      label,
-      projectId ?? "",
-      projectName,
-      agents.flatMap((a) => {
-        const st = status[a.id];
-        return isRedStatus(st) ? [{ id: a.id, name: displayName(a), status: st }] : [];
-      }),
-    );
+    const nextRedSince: Record<string, number> = {};
+    const redList = agents.flatMap((a) => {
+      const st = status[a.id];
+      if (!isRedStatus(st)) return [];
+      // Reuse the existing stamp if this agent was already red; else it just entered red now.
+      const since = redSince.current[a.id] ?? Date.now();
+      nextRedSince[a.id] = since;
+      return [{ id: a.id, name: displayName(a), status: st, since }];
+    });
+    // Prune to only currently-red ids so a later return-to-red gets a fresh Date.now() above.
+    redSince.current = nextRedSince;
+    publishWindowRedAgents(label, projectId ?? "", projectName, redList);
 
     const sameProject = prevProject.current === projectId;
     if (sameProject) {

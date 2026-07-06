@@ -22,17 +22,25 @@ const ROW_PAD_X = 10;
 export function OtherWindowAgentRow({
   agent,
   onClick,
+  extraCount = 0,
 }: {
   agent: OtherWindowAgent;
   onClick: () => void;
+  // Number of OTHER red agents in this same window (total − 1). > 0 renders a "+{extraCount}" badge
+  // to the right of the project pill; 0 renders just the pill (a single-red-agent window).
+  extraCount?: number;
 }) {
   const [hover, setHover] = useState(false);
+  const extra = extraCount > 0 ? extraCount : 0;
   return (
     <div
       onClick={onClick}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      title={`${agent.projectName} — ${agent.agentName} (needs attention in another window)`}
+      title={
+        `${agent.projectName} — ${agent.agentName} (needs attention in another window)` +
+        (extra > 0 ? ` · +${extra} more in this window` : "")
+      }
       style={{
         display: "flex",
         flexDirection: "column",
@@ -46,29 +54,61 @@ export function OtherWindowAgentRow({
         background: hover ? ROW_ACTIVE_BUBBLE : "transparent",
       }}
     >
-      {/* Project pill — left edge aligned to the leading glyph slot below (so it sits just above the
-          StatusDot). alignSelf:flex-start keeps it hugging its text rather than stretching. */}
-      <span
+      {/* Project pill + optional "+N" badge — left edge aligned to the leading glyph slot below (so
+          the pill sits just above the StatusDot). alignSelf:flex-start keeps the row hugging its
+          content rather than stretching; the badge sits immediately to the pill's right. */}
+      <div
         style={{
           alignSelf: "flex-start",
+          display: "flex",
+          alignItems: "center",
+          gap: 5,
           maxWidth: "100%",
-          boxSizing: "border-box",
-          padding: "1px 7px",
-          borderRadius: PILL_RADIUS,
-          background: PILL_BG,
-          color: PILL_TEXT,
-          fontFamily: FONT.ui,
-          fontSize: 10,
-          fontWeight: FONT_WEIGHT.bold,
-          lineHeight: 1.5,
-          letterSpacing: 0.2,
-          whiteSpace: "nowrap",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
+          minWidth: 0,
         }}
       >
-        {agent.projectName}
-      </span>
+        <span
+          style={{
+            // minWidth:0 is required for the ellipsis to engage now that the pill is a flex child
+            // (flex items won't shrink below min-content without it) sitting beside the +N badge.
+            minWidth: 0,
+            maxWidth: "100%",
+            boxSizing: "border-box",
+            padding: "1px 7px",
+            borderRadius: PILL_RADIUS,
+            background: PILL_BG,
+            color: PILL_TEXT,
+            fontFamily: FONT.ui,
+            fontSize: 10,
+            fontWeight: FONT_WEIGHT.bold,
+            lineHeight: 1.5,
+            letterSpacing: 0.2,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {agent.projectName}
+        </span>
+        {extra > 0 && (
+          <span
+            // Subordinate to the pill: small, muted secondary ink, no fill. Counts the OTHER red
+            // agents collapsed into this one window row.
+            style={{
+              flexShrink: 0,
+              color: C.muted,
+              fontFamily: FONT.ui,
+              fontSize: 10,
+              fontWeight: FONT_WEIGHT.semibold,
+              letterSpacing: 0.2,
+              lineHeight: 1.5,
+              whiteSpace: "nowrap",
+            }}
+          >
+            +{extra}
+          </span>
+        )}
+      </div>
 
       {/* Leading red status dot + agent name. */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>

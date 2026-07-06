@@ -26,6 +26,7 @@ import {
   clearWindowStatus,
   resetWindowStatus,
   readOtherWindowsRedAgents,
+  readOtherWindowsRedGroups,
   type WindowStatusMap,
 } from "./windowStatus";
 import { setWindowProject } from "./windowRegistry";
@@ -183,6 +184,84 @@ describe("readOtherWindowsRedAgents", () => {
       agentId: "c1",
       agentName: "Alpha",
       status: "waiting",
+      since: 0, // publishWindowRedAgents above didn't stamp a `since` → coerced to 0
     });
+  });
+
+  it("carries the published `since` through and coerces a missing/invalid one to 0", () => {
+    setWindowProject("win-B", "projB");
+    publishWindowRedAgents("win-B", "projB", "Proj B", [
+      { id: "s1", name: "Stamped", status: "waiting", since: 1234 },
+      // Simulate an old-build blob item with no `since`.
+      { id: "s2", name: "Legacy", status: "waiting" } as never,
+    ]);
+    const got = readOtherWindowsRedAgents("main");
+    const s1 = got.find((x) => x.agentId === "s1");
+    const s2 = got.find((x) => x.agentId === "s2");
+    expect(s1?.since).toBe(1234);
+    expect(s2?.since).toBe(0);
+  });
+});
+
+describe("readOtherWindowsRedGroups", () => {
+  it("collapses a window with N>1 red agents to ONE group with count=N and the most-recent representative", () => {
+    setWindowProject("win-B", "projB");
+    publishWindowRedAgents("win-B", "projB", "Proj B", [
+      { id: "b1", name: "Older", status: "waiting", since: 100 },
+      { id: "b2", name: "Newest", status: "waiting", since: 300 },
+      { id: "b3", name: "Middle", status: "waiting", since: 200 },
+    ]);
+    const groups = readOtherWindowsRedGroups("main");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.count).toBe(3);
+    // Representative = the largest `since`.
+    expect(groups[0]?.agent.agentId).toBe("b2");
+    expect(groups[0]?.windowLabel).toBe("win-B");
+    expect(groups[0]?.projectName).toBe("Proj B");
+  });
+
+  it("gives a single-red-agent window count=1 (badge would be 0)", () => {
+    setWindowProject("win-B", "projB");
+    publishWindowRedAgents("win-B", "projB", "Proj B", [
+      { id: "b1", name: "Solo", status: "waiting", since: 100 },
+    ]);
+    const groups = readOtherWindowsRedGroups("main");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.count).toBe(1);
+    expect(groups[0]?.agent.agentId).toBe("b1");
+  });
+
+  it("sorts groups by attentionRank, then representative `since` desc, then projectName", () => {
+    setWindowProject("win-B", "projB");
+    setWindowProject("win-C", "projC");
+    setWindowProject("win-D", "projD");
+    // win-B: errored (rank 1) — should sort LAST despite a very recent timestamp.
+    publishWindowRedAgents("win-B", "projB", "Proj B", [
+      { id: "b1", name: "Berr", status: "errored", since: 999 },
+    ]);
+    // win-C: waiting (rank 0), representative since=200.
+    publishWindowRedAgents("win-C", "projC", "Proj C", [
+      { id: "c1", name: "Cwait", status: "waiting", since: 200 },
+    ]);
+    // win-D: approval (rank 0), representative since=500 → most recent rank-0 → first.
+    publishWindowRedAgents("win-D", "projD", "Proj D", [
+      { id: "d1", name: "Dappr", status: "approval", since: 500 },
+    ]);
+    const groups = readOtherWindowsRedGroups("main");
+    expect(groups.map((g) => g.windowLabel)).toEqual(["win-D", "win-C", "win-B"]);
+  });
+
+  it("tolerates items missing `since` (treated as 0) when picking the representative", () => {
+    setWindowProject("win-B", "projB");
+    publishWindowRedAgents("win-B", "projB", "Proj B", [
+      // Both effectively since=0; tie breaks by attentionRank then agentName. "Aaa" wins on name.
+      { id: "b1", name: "Zzz", status: "waiting" } as never,
+      { id: "b2", name: "Aaa", status: "waiting" } as never,
+    ]);
+    const groups = readOtherWindowsRedGroups("main");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.count).toBe(2);
+    expect(groups[0]?.agent.since).toBe(0);
+    expect(groups[0]?.agent.agentId).toBe("b2"); // "Aaa" < "Zzz"
   });
 });

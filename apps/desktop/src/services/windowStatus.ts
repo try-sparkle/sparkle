@@ -21,6 +21,10 @@ export interface WindowRedAgent {
   id: string;
   name: string;
   status: AgentTabStatus;
+  /** Epoch ms when this agent entered the red tier — used to pick the most-recently-red
+   *  representative when collapsing a window's red agents to one row. Blobs from windows on
+   *  OLDER builds omit it; readers treat a missing/invalid value as 0 (see `sinceOf`). */
+  since?: number;
 }
 
 /** One window's entry in the shared map: the project it shows + its currently-red agents. */
@@ -40,6 +44,25 @@ export interface OtherWindowAgent {
   agentId: string;
   agentName: string;
   status: AgentTabStatus;
+  /** Epoch ms when the agent entered the red tier (0 when the publishing window was on an older
+   *  build that didn't stamp it). Drives the "most recent" representative pick in the grouped view. */
+  since: number;
+}
+
+/** One OTHER open window collapsed to a single sidebar row: the representative (most-recently-red)
+ *  agent plus the TOTAL count of red agents in that window. The sidebar renders `agent` and shows a
+ *  "+{count - 1}" badge when count > 1. */
+export interface OtherWindowGroup {
+  windowLabel: string;
+  projectId: string;
+  projectName: string;
+  agent: OtherWindowAgent;
+  count: number;
+}
+
+/** Coerce a possibly-missing/invalid `since` (old blobs, non-numbers, NaN) to a comparable 0. */
+function sinceOf(since: unknown): number {
+  return typeof since === "number" && Number.isFinite(since) ? since : 0;
 }
 
 function readMap(store: KV): WindowStatusMap {
@@ -139,6 +162,17 @@ function attentionRank(status: AgentTabStatus): number {
   return status === "waiting" || status === "approval" ? 0 : 1;
 }
 
+// Which of two red agents is the better "most-recently-red" representative for its window's collapsed
+// row: newest `since` wins, then lower attentionRank, then agentName — a total order so the pick is
+// stable when timestamps tie or are absent (old blobs → since 0). Negative ⇒ `a` outranks `b`.
+function compareRep(a: OtherWindowAgent, b: OtherWindowAgent): number {
+  return (
+    b.since - a.since ||
+    attentionRank(a.status) - attentionRank(b.status) ||
+    a.agentName.localeCompare(b.agentName)
+  );
+}
+
 /** Read the shared map, drop the caller's own entry and any entry whose window is no longer open
  *  (cross-checked against the windowRegistry), flatten to one row per red agent, and sort by
  *  attention rank, then project name, then agent name. */
@@ -164,6 +198,7 @@ export function readOtherWindowsRedAgents(
         agentId: a.id,
         agentName: a.name,
         status: a.status,
+        since: sinceOf(a.since),
       });
     }
   }
@@ -174,6 +209,50 @@ export function readOtherWindowsRedAgents(
       a.agentName.localeCompare(b.agentName),
   );
   return out;
+}
+
+/** Collapse the flat cross-window red list to ONE group per OTHER window. Each group's visible row
+ *  is the representative — the agent with the LARGEST `since` (most recently entered red); ties break
+ *  by attentionRank then agentName so the pick is deterministic when timestamps are equal or absent
+ *  (old blobs). `count` is the TOTAL red agents in that window, so the sidebar renders "+{count - 1}".
+ *  Groups sort by representative attentionRank, then representative `since` DESC (most recent first),
+ *  then projectName. Reuses readOtherWindowsRedAgents so the own-label / open-window / malformed-blob
+ *  filtering stays in one place. */
+export function readOtherWindowsRedGroups(
+  selfLabel: string,
+  store: KV = defaultStore(),
+): OtherWindowGroup[] {
+  const flat = readOtherWindowsRedAgents(selfLabel, store);
+  const byWindow = new Map<string, OtherWindowAgent[]>();
+  for (const a of flat) {
+    const list = byWindow.get(a.windowLabel);
+    if (list) list.push(a);
+    else byWindow.set(a.windowLabel, [a]);
+  }
+  const groups: OtherWindowGroup[] = [];
+  for (const [windowLabel, agents] of byWindow) {
+    // Representative = most recently red; deterministic tie-break (attentionRank, then agentName) so
+    // equal/absent timestamps don't flap the visible row between renders. reduce keeps the "better"
+    // one — negative compareRep means `a` outranks the incumbent.
+    const rep = agents.reduce((best, a) => (compareRep(a, best) < 0 ? a : best));
+    groups.push({
+      windowLabel,
+      projectId: rep.projectId,
+      projectName: rep.projectName,
+      agent: rep,
+      count: agents.length,
+    });
+  }
+  groups.sort(
+    (a, b) =>
+      attentionRank(a.agent.status) - attentionRank(b.agent.status) ||
+      b.agent.since - a.agent.since ||
+      a.projectName.localeCompare(b.projectName) ||
+      // Final total-order tiebreak: two OTHER windows on the SAME project with equal rank and equal
+      // `since` (e.g. both 0 from old-build blobs) would otherwise fall back to Map insertion order.
+      a.windowLabel.localeCompare(b.windowLabel),
+  );
+  return groups;
 }
 
 // ---------------------------------------------------------------------------
@@ -212,5 +291,17 @@ export function getOtherWindowsSnapshot(selfLabel: string): OtherWindowAgent[] {
   const prev = snapCache.get(selfLabel);
   if (prev && prev.key === key) return prev.value;
   snapCache.set(selfLabel, { key, value });
+  return value;
+}
+
+// Same STABLE-reference contract as getOtherWindowsSnapshot, but for the grouped view. Separate
+// cache so the two snapshots don't clobber each other's keys; JSON-of-value key busts on any change.
+const groupsSnapCache = new Map<string, { key: string; value: OtherWindowGroup[] }>();
+export function getOtherWindowsGroupsSnapshot(selfLabel: string): OtherWindowGroup[] {
+  const value = readOtherWindowsRedGroups(selfLabel);
+  const key = JSON.stringify(value);
+  const prev = groupsSnapCache.get(selfLabel);
+  if (prev && prev.key === key) return prev.value;
+  groupsSnapCache.set(selfLabel, { key, value });
   return value;
 }

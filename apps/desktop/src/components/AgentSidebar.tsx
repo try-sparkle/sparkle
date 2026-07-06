@@ -49,7 +49,7 @@ import { applyModelToRunningAgent } from "../services/agentModel";
 import { WorkflowLine } from "./WorkflowLine";
 import { HistorySearch } from "./HistorySearch";
 import { OtherWindowAgentRow } from "./OtherWindowAgentRow";
-import { useOtherWindowsRedAgents } from "../useOtherWindowsRedAgents";
+import { useOtherWindowsRedGroups } from "../useOtherWindowsRedAgents";
 import type { OtherWindowAgent } from "../services/windowStatus";
 import { emitFocusAgent } from "../services/attention";
 import { findWindowForProject } from "../services/windowRegistry";
@@ -319,8 +319,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
 
-  // Red agents in OTHER open windows — surfaced as a block at the top of the sidebar.
-  const otherWindowRedAgents = useOtherWindowsRedAgents();
+  // Red agents in OTHER open windows — surfaced as a block at the top of the sidebar, COLLAPSED to
+  // one row per window (representative = most recently red; "+N" badge = the rest in that window).
+  const otherWindowRedGroups = useOtherWindowsRedGroups();
   // Clicking such a row raises the owning window and selects the agent. Same three-way router as
   // HistorySearch.onResultClick: same project → focus in place; another OPEN window → emitFocusAgent
   // (the live path, since these only come from open windows); no window → open one (covers the rare
@@ -1100,13 +1101,14 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             when the overflowing list pins it to the top — with a short list the button renders
             below the last row instead); hidden when there are none. Click raises the owning window
             and selects the agent. */}
-        {otherWindowRedAgents.length > 0 && (
+        {otherWindowRedGroups.length > 0 && (
           <div style={{ paddingTop: 2, paddingBottom: 6, marginBottom: 4, borderBottom: `1px solid ${CHAT_USER_BUBBLE}` }}>
-            {otherWindowRedAgents.map((a) => (
+            {otherWindowRedGroups.map((group) => (
               <OtherWindowAgentRow
-                key={`${a.windowLabel}:${a.agentId}`}
-                agent={a}
-                onClick={() => onOtherWindowAgentClick(a)}
+                key={group.windowLabel}
+                agent={group.agent}
+                extraCount={group.count - 1}
+                onClick={() => onOtherWindowAgentClick(group.agent)}
               />
             ))}
           </div>
