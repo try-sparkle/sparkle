@@ -16,6 +16,8 @@
 // or break the send path, so callers fire-and-forget.
 import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore } from "../stores/projectStore";
+import { reportNamingOutcome } from "./selfReportObservability";
+import type { NamingOutcome } from "../stores/selfReportMetrics";
 import type { AgentKind, AgentName } from "../types";
 
 // Common filler words ignored when comparing two prompts — so "please fix the test" and
@@ -77,22 +79,40 @@ function similarity(a: Set<string>, b: Set<string>): number {
 // Below this overlap, a new prompt counts as "different work" and earns a re-name.
 const RENAME_SIMILARITY_THRESHOLD = 0.4;
 
-/** Exported for unit testing: should this prompt trigger a (re)naming call? */
-export function shouldRename(opts: {
+/** The inputs the step-3 prompt heuristic reads. Shared by {@link renameDecision} and its
+ *  {@link shouldRename} boolean wrapper so the single-source-of-truth intent extends to the signature. */
+export interface RenameOpts {
   namePinned: boolean;
   autoNameBasis: string | null;
   prompt: string;
-}): boolean {
+}
+
+/** The step-3 prompt heuristic (pin / thin / tactical / similarity), returning the LABEL for why it
+ *  would (not) spend a naming call — the SINGLE source of truth both {@link shouldRename} and
+ *  {@link namingOutcome} derive from, so the boolean decision and its observed label can never drift.
+ *  `"rename"` means a paid call is warranted; `"self_named"` / `"skipped_thin"` are the two reasons to
+ *  skip (an already-pinned name vs nothing worth naming). Pure. */
+function renameDecision(opts: RenameOpts): "self_named" | "skipped_thin" | "rename" {
   const words = contentWords(opts.prompt);
+  // An already-pinned name (self-report or user) wins — never re-name over it.
+  if (opts.namePinned) return "self_named";
   // Need at least a little substance — don't burn a call on "ok" / "continue" / "yes".
-  if (opts.namePinned || words.size < 2) return false;
+  if (words.size < 2) return "skipped_thin";
   // Skip prompts that are entirely an operational command or an ack — no work to name, no call.
   // (Anything subtler is caught by the model's own SKIP judgment in naming.rs.)
-  if (isTacticalOnly(words)) return false;
+  if (isTacticalOnly(words)) return "skipped_thin";
   // First substantive prompt for this agent: always name it.
-  if (!opts.autoNameBasis) return true;
+  if (!opts.autoNameBasis) return "rename";
   // Otherwise only re-name when the work has clearly shifted.
-  return similarity(words, contentWords(opts.autoNameBasis)) < RENAME_SIMILARITY_THRESHOLD;
+  return similarity(words, contentWords(opts.autoNameBasis)) < RENAME_SIMILARITY_THRESHOLD
+    ? "rename"
+    : "skipped_thin";
+}
+
+/** Exported for unit testing: should this prompt trigger a (re)naming call? Derives from the single
+ *  source of truth {@link renameDecision}. */
+export function shouldRename(opts: RenameOpts): boolean {
+  return renameDecision(opts) === "rename";
 }
 
 /**
@@ -128,7 +148,8 @@ export function isSelfNamingAgent(agent: { kind: AgentKind }): boolean {
  * `promptCount` is the agent's promptHistory length INCLUDING the just-submitted prompt (the caller
  * appends the prompt before naming), so the agent's first-ever submit is promptCount === 1.
  */
-export function shouldHaikuName(opts: {
+/** The full option set shared by {@link namingOutcome} and {@link shouldHaikuName}. */
+export interface NamingDecisionOpts {
   kind: AgentKind;
   namePinned: boolean;
   aiTitle: string | null | undefined;
@@ -140,14 +161,43 @@ export function shouldHaikuName(opts: {
   // self-report opportunity. Without this, the first-turn deferral below would permanently swallow
   // a worker's only naming call and it would stay "Worker N" until it self-names.
   bypassFirstTurnDefer?: boolean;
-}): boolean {
+}
+
+/**
+ * Classify a naming trigger into exactly one {@link NamingOutcome}, walking the SAME ladder (in the
+ * same order) as {@link shouldHaikuName}. This is pure observation — it changes no naming behavior;
+ * it just LABELS which branch fired so we can measure self-report vs paid-Haiku coverage (Phase 2c,
+ * sparkle-rl84). By construction the outcome is `"paid_haiku_fallback"` for exactly the inputs where
+ * `shouldHaikuName` returns true, so the two never disagree (see the unit tests).
+ *
+ * The non-fallback branches partition the "no paid call" space:
+ *  - `ai_title`          — Claude Code's own session title wins outright (ladder step 1).
+ *  - `deferred_first_turn` — a self-reporting build/worker's first prompt (ladder step 2).
+ *  - `self_named`        — the agent pinned its own name (rename_agent) or the user did.
+ *  - `skipped_thin`      — nothing worth a call: too-thin, tactical/ack-only, or work hasn't shifted.
+ */
+export function namingOutcome(opts: NamingDecisionOpts): NamingOutcome {
   // (1) Claude Code's whole-conversation title wins outright.
-  if (opts.aiTitle) return false;
+  if (opts.aiTitle) return "ai_title";
   // (2) A self-reporting agent hasn't had a chance to self-name on its first prompt — defer,
   //     unless this is the worker's one-shot spawn-time naming (see bypassFirstTurnDefer).
-  if (!opts.bypassFirstTurnDefer && isSelfNamingAgent(opts) && opts.promptCount < 2) return false;
-  // (3) Everything else follows the existing prompt heuristic (pinned/thin/tactical/similarity).
-  return shouldRename({ namePinned: opts.namePinned, autoNameBasis: opts.autoNameBasis, prompt: opts.prompt });
+  if (!opts.bypassFirstTurnDefer && isSelfNamingAgent(opts) && opts.promptCount < 2) {
+    return "deferred_first_turn";
+  }
+  // (3) The existing prompt heuristic — delegated to renameDecision (the single source of truth that
+  //     shouldRename also uses). Its "rename" verdict is our paid fallback; its skip labels pass through.
+  const step3 = renameDecision({
+    namePinned: opts.namePinned,
+    autoNameBasis: opts.autoNameBasis,
+    prompt: opts.prompt,
+  });
+  return step3 === "rename" ? "paid_haiku_fallback" : step3;
+}
+
+export function shouldHaikuName(opts: NamingDecisionOpts): boolean {
+  // Derived from the single source of truth so the decision and its observed label can never drift:
+  // a paid call happens for exactly the inputs namingOutcome labels "paid_haiku_fallback".
+  return namingOutcome(opts) === "paid_haiku_fallback";
 }
 
 // Agents with a naming call currently in flight. Guards against a rapid double-submit firing
@@ -173,21 +223,27 @@ export async function maybeAutoName(
   // first turn to self-name before we ever spend a paid call; otherwise fall through to the prompt
   // heuristic. promptHistory already includes the just-submitted prompt (appendPrompt ran first),
   // so a self-reporting agent's first-ever submit reads as promptCount === 1 and is deferred.
-  if (
-    !shouldHaikuName({
-      kind: agent.kind,
-      namePinned: agent.namePinned,
-      aiTitle: agent.aiTitle,
-      autoNameBasis: agent.autoNameBasis,
-      promptCount: (agent.promptHistory ?? []).length,
-      prompt,
-      bypassFirstTurnDefer: opts?.bypassFirstTurnDefer,
-    })
-  ) {
+  // Classify the branch ONCE (observation only — same ladder, no behavior change): a paid call fires
+  // for exactly the inputs labeled "paid_haiku_fallback".
+  const outcome = namingOutcome({
+    kind: agent.kind,
+    namePinned: agent.namePinned,
+    aiTitle: agent.aiTitle,
+    autoNameBasis: agent.autoNameBasis,
+    promptCount: (agent.promptHistory ?? []).length,
+    prompt,
+    bypassFirstTurnDefer: opts?.bypassFirstTurnDefer,
+  });
+  if (outcome !== "paid_haiku_fallback") {
+    // Every non-paid branch (aiTitle / self-named / deferred / skipped) is a self-report win or a
+    // no-op — record it and stop before spending a credit.
+    reportNamingOutcome(outcome, agent.kind);
     return;
   }
-  if (inFlight.has(agentId)) return; // a naming call for this agent is already running
+  if (inFlight.has(agentId)) return; // a naming call for this agent is already running (already tallied)
   inFlight.add(agentId);
+  // Tally the paid fallback only once we actually commit to invoking (past the in-flight guard).
+  reportNamingOutcome("paid_haiku_fallback", agent.kind);
   try {
     const name = await invoke<AgentName>("generate_agent_name", { prompt });
     // The title is the canonical `name`; the sidebar truncates it to fit and reveals the title +

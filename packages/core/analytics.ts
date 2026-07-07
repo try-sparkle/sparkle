@@ -38,6 +38,20 @@ export const ANALYTICS_EVENTS = {
   BUILD_STARTED: "build_started",
   BUILD_MERGED: "build_merged",
   APPROVAL_ACTIONED: "approval_actioned",
+
+  // ── Self-report observability (Phase 2c gate, sparkle-rl84) ───────────────
+  // Measures how reliably in-app Claude agents SELF-REPORT via the sparkle-control
+  // MCP tools versus falling back to the paid Haiku paths. Every prop on these
+  // events is a NON-IDENTIFYING enum/count (op name, agent kind, outcome/source
+  // enum, status) — NEVER agent names, activity text, prompts, paths, or branches.
+  // PostHog masking only covers autocapture/replay, not explicit props, so the
+  // taxonomy itself is the privacy guarantee here.
+  /** A Claude agent successfully invoked a sparkle-control tool (primary self-report). */
+  SELF_REPORT_CONTROL_OP: "self_report_control_op",
+  /** The outcome of an auto-naming trigger (self-report/aiTitle vs paid Haiku fallback). */
+  AGENT_NAMING_OUTCOME: "agent_naming_outcome",
+  /** What supplied a needs-you notification body (self-report vs paid Haiku vs generic). */
+  ATTENTION_BODY_SOURCE: "attention_body_source",
 } as const;
 
 export type AnalyticsEvent =

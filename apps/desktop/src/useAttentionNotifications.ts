@@ -43,6 +43,8 @@ import {
   type FocusAgentPayload,
 } from "./services/attention";
 import { emitAttention, emitResolved } from "./services/relayClient";
+import { reportAttentionSource } from "./services/selfReportObservability";
+import type { AttentionSource } from "./stores/selfReportMetrics";
 import { getAgentScrollback } from "./services/terminalScrollback";
 import { suggestedRepliesFor } from "./services/suggestions/attentionReplies";
 import { safeUnlisten } from "./services/safeUnlisten";
@@ -137,6 +139,19 @@ export function selfReportBody(
   if (!stamp || stamp.at <= 0) return null; // unknown age → treat as stale
   if (now - stamp.at > ACTIVITY_FRESH_MS) return null; // stale narration → Haiku fallback
   return text;
+}
+
+/** Classify what actually supplied a needs-you notification body (Phase-2c gate, sparkle-rl84):
+ *  a fresh self-report wins; else the paid Haiku ask-summary if it produced a body; else the generic
+ *  reason copy. `selfReported` is selfReportBody's result; `haikuBody` is the trimmed
+ *  summarize_attention output (null if not called / empty / failed). Pure — no identifying data. */
+export function attentionBodySource(
+  selfReported: string | null,
+  haikuBody: string | null,
+): AttentionSource {
+  if (selfReported != null) return "self_report";
+  if (haikuBody != null) return "paid_haiku";
+  return "generic_fallback";
 }
 
 /** Bring this window to the foreground (notification click landed here). */
@@ -279,14 +294,27 @@ export function useAttentionNotifications(): void {
           // or no screen) doesn't second-guess the just-validated `st`.
           let summary: string | null = selfReported;
           let awaited = false;
+          // Phase-2c gate: track whether the PAID Haiku summary actually produced a usable body, so
+          // we can classify the body source (self-report vs paid vs generic) below — observation only.
+          let haikuBody: string | null = null;
           if (summary == null && (st === "waiting" || st === "approval")) {
             const screenText = useRuntimeStore.getState().attentionScreen[id];
             if (screenText) {
               awaited = true;
               const trimmed = (await summarizeAttention(screenText))?.trim();
-              if (trimmed) summary = trimmed;
+              if (trimmed) {
+                summary = trimmed;
+                haikuBody = trimmed;
+              }
             }
           }
+          // Record which source supplied the body, once per DISPATCHED needs-you event (privacy-safe
+          // enums only: source, status, kind — never the body text itself). Population = events that
+          // reached at least one channel: red statuses always fire the phone relay here (even when the
+          // LOCAL banner is suppressed because you're already looking at the agent), and the `!relay &&
+          // suppressed` case already `continue`d above, so it never reaches this line. So this counts
+          // "of needs-you events we surfaced somewhere," NOT "of banners visibly shown on this Mac."
+          reportAttentionSource(attentionBodySource(selfReported, haikuBody), st, agent.kind);
 
           // Phone relay (separate device — fires regardless of local suppression). Only when we
           // actually awaited the summary do we re-check that the agent is STILL red: that await is the

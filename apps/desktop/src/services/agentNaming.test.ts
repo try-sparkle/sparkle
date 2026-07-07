@@ -3,8 +3,16 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 
-import { shouldRename, isSelfNamingAgent, shouldHaikuName, maybeAutoName } from "./agentNaming";
+import {
+  shouldRename,
+  isSelfNamingAgent,
+  shouldHaikuName,
+  maybeAutoName,
+  namingOutcome,
+  type NamingDecisionOpts,
+} from "./agentNaming";
 import { useProjectStore } from "../stores/projectStore";
+import { useSelfReportMetrics } from "../stores/selfReportMetrics";
 import type { AgentTab, Project } from "../types";
 
 describe("shouldRename heuristic", () => {
@@ -155,6 +163,89 @@ describe("shouldHaikuName precedence (Phase 2a demotion, sparkle-q1rq)", () => {
   });
 });
 
+describe("namingOutcome — labels the branch (Phase 2c observation, sparkle-rl84)", () => {
+  const base: NamingDecisionOpts = {
+    kind: "worker",
+    namePinned: false,
+    aiTitle: null,
+    autoNameBasis: null,
+    promptCount: 2, // past the first-turn defer by default, so non-defer branches are reachable
+    prompt: "fix the login redirect bug",
+  };
+
+  it("ai_title — a Claude Code session title wins outright", () => {
+    expect(namingOutcome({ ...base, aiTitle: "Login Redirect Fix" })).toBe("ai_title");
+  });
+
+  it("deferred_first_turn — a self-reporting agent's first prompt", () => {
+    expect(namingOutcome({ ...base, kind: "worker", promptCount: 1 })).toBe("deferred_first_turn");
+    expect(namingOutcome({ ...base, kind: "build", promptCount: 1 })).toBe("deferred_first_turn");
+  });
+
+  it("self_named — the agent (or user) pinned its own name", () => {
+    expect(namingOutcome({ ...base, namePinned: true })).toBe("self_named");
+  });
+
+  it("skipped_thin — too-thin, tactical-only, or unchanged work", () => {
+    expect(namingOutcome({ ...base, prompt: "yes" })).toBe("skipped_thin"); // < 2 content words
+    expect(namingOutcome({ ...base, prompt: "push to production" })).toBe("skipped_thin"); // tactical
+    expect(
+      namingOutcome({
+        ...base,
+        autoNameBasis: "fix the login redirect bug",
+        prompt: "please also fix the login redirect on mobile",
+      }),
+    ).toBe("skipped_thin"); // work hasn't shifted
+  });
+
+  it("paid_haiku_fallback — a substantive prompt that actually earns a call", () => {
+    expect(namingOutcome({ ...base, promptCount: 2 })).toBe("paid_haiku_fallback"); // later prompt, no signals
+    expect(namingOutcome({ ...base, kind: "shell", promptCount: 1 })).toBe("paid_haiku_fallback");
+    expect(
+      namingOutcome({ ...base, kind: "worker", promptCount: 0, bypassFirstTurnDefer: true }),
+    ).toBe("paid_haiku_fallback"); // worker spawn-time one-shot
+  });
+
+  it("labels paid_haiku_fallback for exactly the ladder invariant: no aiTitle, not deferred, shouldRename", () => {
+    // NOT a tautology: shouldHaikuName is DEFINED as namingOutcome(...) === "paid_haiku_fallback", so we
+    // instead reconstruct the invariant from its independent parts — the two upstream guards (aiTitle /
+    // first-turn defer) composed with the public shouldRename heuristic. This catches a divergence in how
+    // namingOutcome composes the guards or delegates step 3.
+    const kinds: NamingDecisionOpts["kind"][] = ["build", "worker", "think", "shell"];
+    const prompts = ["fix the login redirect bug", "yes", "push to production", "ok"];
+    for (const kind of kinds) {
+      for (const namePinned of [false, true]) {
+        for (const aiTitle of [null, "Title"]) {
+          for (const autoNameBasis of [null, "add dark mode toggle"]) {
+            for (const promptCount of [0, 1, 2, 3]) {
+              for (const bypassFirstTurnDefer of [false, true]) {
+                for (const prompt of prompts) {
+                  const opts: NamingDecisionOpts = {
+                    kind,
+                    namePinned,
+                    aiTitle,
+                    autoNameBasis,
+                    promptCount,
+                    prompt,
+                    bypassFirstTurnDefer,
+                  };
+                  const deferred =
+                    !bypassFirstTurnDefer && isSelfNamingAgent({ kind }) && promptCount < 2;
+                  const expectedPaid =
+                    !aiTitle && !deferred && shouldRename({ namePinned, autoNameBasis, prompt });
+                  expect(namingOutcome(opts) === "paid_haiku_fallback").toBe(expectedPaid);
+                  // And shouldHaikuName stays wired to the same verdict.
+                  expect(shouldHaikuName(opts)).toBe(expectedPaid);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+});
+
 // ── maybeAutoName end-to-end: does the paid `generate_agent_name` invoke fire or not? ──
 function agentTab(over: Partial<AgentTab>): AgentTab {
   return {
@@ -199,6 +290,21 @@ describe("maybeAutoName — paid call gating for self-reporting agents", () => {
   beforeEach(() => {
     invoke.mockReset();
     invoke.mockResolvedValue({ title: "Some Name", description: "" });
+    useSelfReportMetrics.getState().reset();
+  });
+
+  it("tallies the deferred outcome when a first-prompt self-reporting agent is deferred", async () => {
+    seed(agentTab({ kind: "worker", promptHistory: history(1) }));
+    await maybeAutoName("p1", "a1", "fix the login redirect bug");
+    expect(useSelfReportMetrics.getState().namingOutcomes.deferred_first_turn).toBe(1);
+    expect(useSelfReportMetrics.getState().namingOutcomes.paid_haiku_fallback).toBe(0);
+  });
+
+  it("tallies the paid_haiku_fallback outcome exactly once when it actually invokes", async () => {
+    seed(agentTab({ kind: "worker", promptHistory: history(2) }));
+    await maybeAutoName("p1", "a1", "fix the login redirect bug");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(useSelfReportMetrics.getState().namingOutcomes.paid_haiku_fallback).toBe(1);
   });
 
   it("self-reporting worker WITH aiTitle → does NOT call generate_agent_name", async () => {

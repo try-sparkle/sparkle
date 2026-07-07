@@ -37,7 +37,8 @@ const invokeMock = vi.fn(async (cmd: string, args?: unknown) => {
 });
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...(a as [string, unknown])) }));
 
-import { startControlListener, type ControlRequest } from "./controlListener";
+import { startControlListener, isControlOpSuccess, type ControlRequest } from "./controlListener";
+import { useSelfReportMetrics } from "../stores/selfReportMetrics";
 
 const fire = (req: ControlRequest) => firedHandler!({ payload: req });
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -209,5 +210,50 @@ describe("controlListener", () => {
     await flush();
     expect(lastReply()).toEqual({ ok: true });
     expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!.activity).toBe("fell back to me");
+  });
+
+  // ── Phase-2c self-report tally (sparkle-rl84) ──────────────────────────────────────────────
+  it("tallies a successful control op (rename_agent) as a self-report signal", async () => {
+    useSelfReportMetrics.getState().reset();
+    fire({ reqId: "m1", op: "rename_agent", callerAgentId: callerId, payload: { targetAgentId: otherId, name: "Sub Task" } });
+    await flush();
+    expect(useSelfReportMetrics.getState().controlOps.rename_agent).toBe(1);
+  });
+
+  it("does NOT tally a FAILED op (rejected rename)", async () => {
+    useSelfReportMetrics.getState().reset();
+    fire({ reqId: "m2", op: "rename_agent", callerAgentId: callerId, payload: { name: "   " } }); // blank → ok:false
+    await flush();
+    expect(useSelfReportMetrics.getState().controlOps.rename_agent).toBe(0);
+  });
+
+  it("does NOT tally an unknown op", async () => {
+    useSelfReportMetrics.getState().reset();
+    fire({ reqId: "m3", op: "frobnicate", callerAgentId: callerId, payload: {} });
+    await flush();
+    const ops = useSelfReportMetrics.getState().controlOps;
+    expect(Object.values(ops).every((n) => n === 0)).toBe(true);
+  });
+});
+
+describe("isControlOpSuccess", () => {
+  it("treats an explicit { ok: true } as success and { ok: false } as failure", () => {
+    expect(isControlOpSuccess({ ok: true })).toBe(true);
+    expect(isControlOpSuccess({ ok: false, error: "nope" })).toBe(false);
+  });
+
+  it("treats an { error } reply as failure", () => {
+    expect(isControlOpSuccess({ error: "unknown op frobnicate" })).toBe(false);
+  });
+
+  it("treats a read op's field-less payload (get_state / get_config) as success", () => {
+    expect(isControlOpSuccess({ agents: [], theme: "auto" })).toBe(true);
+    expect(isControlOpSuccess({ config: {} })).toBe(true);
+  });
+
+  it("treats a non-object result as failure", () => {
+    expect(isControlOpSuccess(undefined)).toBe(false);
+    expect(isControlOpSuccess(null)).toBe(false);
+    expect(isControlOpSuccess("ok")).toBe(false);
   });
 });

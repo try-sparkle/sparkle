@@ -19,9 +19,24 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore, type ThemePref } from "../stores/uiStore";
 import { getConfig, setConfigValue } from "./config";
+import { reportControlOp } from "./selfReportObservability";
+import type { ControlOp } from "../stores/selfReportMetrics";
 import type { AgentTab } from "../types";
 
 const EVENT = "control:request";
+
+/** The ops we tally as self-report signals (must match ControlOp). Any op outside this set (an
+ *  unknown op → the dispatch default) is never counted. */
+const TALLIED_OPS = new Set<ControlOp>([
+  "rename_agent",
+  "set_agent_activity",
+  "set_theme",
+  "get_config",
+  "set_config",
+  "get_state",
+]);
+/** The per-agent ops whose target may differ from the caller (rename/activity default to caller). */
+const PER_AGENT_OPS = new Set<ControlOp>(["rename_agent", "set_agent_activity"]);
 
 /** The Tauri event payload the Rust bridge emits for every sparkle-control op (frozen contract). */
 export interface ControlRequest {
@@ -148,6 +163,33 @@ async function handleSetConfig(req: ControlRequest): Promise<Record<string, unkn
   return { ok: true };
 }
 
+/** Did a handler's result represent a successful op? A `{ error }` reply (unknown op, thrown error)
+ *  is a failure; an explicit `{ ok }` reply follows its flag; the read ops (get_state / get_config)
+ *  carry neither field and always succeed when they return. Pure. */
+export function isControlOpSuccess(result: unknown): boolean {
+  if (!result || typeof result !== "object") return false;
+  const r = result as Record<string, unknown>;
+  if ("error" in r) return false;
+  if ("ok" in r) return r.ok === true;
+  return true;
+}
+
+/** Phase-2c self-report signal (sparkle-rl84): on a SUCCESSFUL sparkle-control op, tally it (op +
+ *  caller/target kinds — all non-identifying enums). rename_agent / set_agent_activity are the
+ *  primary self-report signals we're measuring against the paid fallbacks. */
+function reportControlOpSuccess(req: ControlRequest, result: unknown): void {
+  if (!isControlOpSuccess(result)) return;
+  if (!TALLIED_OPS.has(req.op as ControlOp)) return;
+  const op = req.op as ControlOp;
+  const callerKind = findAgent(req.callerAgentId)?.agent.kind;
+  // For per-agent ops the target may be a different agent; for the rest the op targets the app, so
+  // there's no distinct target — mirror the caller kind (never anything identifying).
+  const targetKind = PER_AGENT_OPS.has(op)
+    ? findAgent(resolveTargetId(req))?.agent.kind
+    : callerKind;
+  reportControlOp(op, callerKind, targetKind);
+}
+
 /** Dispatch one op and reply EXACTLY once. Any thrown error becomes an `{ error }` reply so a
  *  handler failure can't leave the bridge blocked for its full timeout. */
 async function dispatch(req: ControlRequest): Promise<void> {
@@ -175,6 +217,7 @@ async function dispatch(req: ControlRequest): Promise<void> {
       default:
         result = { error: `unknown op ${req.op}` };
     }
+    reportControlOpSuccess(req, result);
     await respond(req.reqId, result);
   } catch (e) {
     await respond(req.reqId, { error: errMsg(e) });
