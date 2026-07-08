@@ -7,7 +7,71 @@ import {
   sparklePersona,
   sparkleMissionPrompt,
   sparkleChatOnlyMissionPrompt,
+  sparkleAgentIdFor,
+  sparkleOpenSetWhitelist,
+  SPARKLE_AGENT_ID,
 } from "./sparkleAgent";
+
+describe("sparkleOpenSetWhitelist — cross-window open-set reconcile", () => {
+  const MAIN = SPARKLE_AGENT_ID;
+  const WIN_A = `${SPARKLE_AGENT_ID}-win-aaaa`;
+  const WIN_B = `${SPARKLE_AGENT_ID}-win-bbbb`;
+
+  it("a SECONDARY window preserves every open Sparkle id (never evicts another window's live pane)", () => {
+    // Window A boots while the main window AND window B are live — their ids must survive reconcile.
+    const kept = sparkleOpenSetWhitelist({
+      isMainWindow: false,
+      ownId: WIN_A,
+      openIds: ["proj-agent-1", MAIN, WIN_B],
+    });
+    expect(kept).toContain(MAIN); // main window's live pane not evicted
+    expect(kept).toContain(WIN_B); // window B's live pane not evicted
+    expect(kept).toContain(WIN_A); // own id, even if not yet in the set
+    expect(kept).not.toContain("proj-agent-1"); // only Sparkle-namespace ids
+  });
+
+  it("own id is included even when absent from the open set (first open)", () => {
+    expect(sparkleOpenSetWhitelist({ isMainWindow: false, ownId: WIN_A, openIds: [] })).toEqual([WIN_A]);
+  });
+
+  it("the MAIN window's cold boot prunes DEAD secondary ids (only its canonical id survives)", () => {
+    // At cold start only the main window is live (multi-window restore deferred), so leftover
+    // per-window ids from last session are dead and must be dropped to avoid unbounded growth.
+    const kept = sparkleOpenSetWhitelist({
+      isMainWindow: true,
+      ownId: MAIN,
+      openIds: [MAIN, WIN_A, WIN_B],
+    });
+    expect(kept).toEqual([MAIN]);
+    expect(kept).not.toContain(WIN_A);
+    expect(kept).not.toContain(WIN_B);
+  });
+});
+
+describe("sparkleAgentIdFor — per-window identity", () => {
+  it("main window uses the canonical id (shared with the hourly pass)", () => {
+    expect(sparkleAgentIdFor("main")).toBe(SPARKLE_AGENT_ID);
+  });
+
+  it("a secondary window gets a distinct id derived from its label", () => {
+    const id = sparkleAgentIdFor("win-abc123");
+    expect(id).toBe(`${SPARKLE_AGENT_ID}-win-abc123`);
+    expect(id).not.toBe(SPARKLE_AGENT_ID);
+  });
+
+  it("distinct windows get distinct ids (so distinct worktrees)", () => {
+    expect(sparkleAgentIdFor("win-a")).not.toBe(sparkleAgentIdFor("win-b"));
+  });
+
+  it("every id satisfies the Rust worktree validate_id allowlist [A-Za-z0-9_-]", () => {
+    // The id is joined into a filesystem path and a git branch name; anything outside this set is
+    // rejected by validate_id in worktree.rs. Real labels are "main" / "win-<uuid>".
+    for (const label of ["main", "win-01234567-89ab-cdef-0123-456789abcdef"]) {
+      expect(sparkleAgentIdFor(label)).toMatch(/^[A-Za-z0-9_-]+$/);
+      expect(sparkleAgentIdFor(label).length).toBeLessThanOrEqual(128);
+    }
+  });
+});
 
 const LOG_DIR = "/app-data/logs/sparkle";
 const REPO = "/app-data/";

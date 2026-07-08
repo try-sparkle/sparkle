@@ -6,13 +6,55 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { SparkleImprovementConsent } from "../stores/settingsStore";
 
-/** Fixed, reserved agent id. Lives in the same runtime maps (status/openAgentIds) as normal
- *  agents but is never part of any project's `agents` array — the double-underscore namespace
- *  keeps it from ever colliding with a real UUID. */
+/** The CANONICAL reserved agent id — the main window's Sparkle instance and the hourly headless
+ *  improvement pass both use it, so they share one worktree (preserving the "one claude per
+ *  worktree" mutual-exclusion invariant). Lives in the same runtime maps (status/openAgentIds) as
+ *  normal agents but is never part of any project's `agents` array — the double-underscore
+ *  namespace keeps it from ever colliding with a real UUID. */
 export const SPARKLE_AGENT_ID = "__sparkle_self__";
 export const SPARKLE_AGENT_NAME = "Sparkle";
 /** Synthetic project id used only to namespace this agent's worktree under app-data. */
 export const SPARKLE_PROJECT_ID = "sparkle-self";
+
+/** Per-window Sparkle agent id. Improve Sparkle is no longer a global singleton: each window runs
+ *  its own independent copy (own worktree + `sparkle/agent-<id>` branch + conversation, all cut
+ *  from the single app-owned OSS clone). The MAIN window keeps the canonical id so its interactive
+ *  pane still shares a worktree with the hourly background pass; every secondary window
+ *  (`win-<uuid>`) gets a distinct id and thus a distinct, isolated worktree.
+ *
+ *  The result must satisfy the Rust worktree `validate_id` allowlist (`[A-Za-z0-9_-]`, ≤128 chars)
+ *  since it is joined into a path and a branch name — window labels ("main" / "win-<uuid>") and the
+ *  canonical id already do, and joining them with a single `-` keeps every byte in the allowlist. */
+export function sparkleAgentIdFor(windowLabel: string): string {
+  return windowLabel === "main" ? SPARKLE_AGENT_ID : `${SPARKLE_AGENT_ID}-${windowLabel}`;
+}
+
+/** True for any id in the app-owned Sparkle namespace (canonical or per-window). */
+export function isSparkleAgentId(id: string): boolean {
+  return id === SPARKLE_AGENT_ID || id.startsWith(`${SPARKLE_AGENT_ID}-`);
+}
+
+/** Which Sparkle-namespace ids a window's boot reconcile must keep in the SHARED (cross-window)
+ *  `openAgentIds` set. `reconcile()` is a non-merging whole-array filter, so anything not returned
+ *  here is dropped from the persisted set for every window.
+ *
+ *  - Main window: it boots at cold start as the ONLY live window (multi-window session restore is
+ *    deferred, bead ), so any `__sparkle_self__-win-*` id lingering from a previous
+ *    session is DEAD — keep only its own (canonical) id and let the rest be pruned. This stops the
+ *    persisted set from growing unboundedly with per-window ids across sessions (the JS-side mirror
+ *    of the Rust worktree reaper).
+ *  - Secondary window: it boots mid-session while the main window (and other secondaries) may be
+ *    live, so it must PRESERVE every open Sparkle id — dropping another window's live id would
+ *    unmount its pane and kill its PTY. */
+export function sparkleOpenSetWhitelist(opts: {
+  isMainWindow: boolean;
+  ownId: string;
+  openIds: string[];
+}): string[] {
+  const { isMainWindow, ownId, openIds } = opts;
+  if (isMainWindow) return [ownId];
+  return [...new Set([ownId, ...openIds.filter(isSparkleAgentId)])];
+}
 
 export interface SparkleWorkspace {
   /** App-owned clone of the OSS Sparkle repo — the agent's worktree is cut from this. */

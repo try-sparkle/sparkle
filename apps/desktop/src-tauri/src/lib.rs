@@ -273,6 +273,7 @@ pub fn run() {
             worktree::read_worker_manifest,
             worktree::scan_worker_manifests,
             sparkle_agent::ensure_sparkle_repo,
+            sparkle_agent::reap_secondary_sparkle_worktrees,
             dictation::start_dictation,
             dictation::stop_dictation,
             dictation::start_cloud_stream,

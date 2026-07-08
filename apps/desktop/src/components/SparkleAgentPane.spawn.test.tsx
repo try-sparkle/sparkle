@@ -48,7 +48,7 @@ const LOG_DIR = "/app-data/logs/sparkle";
 
 /** Render the pane, wait for prepare() to hand the spawn to Terminal, return the exec string. */
 async function spawned(): Promise<{ exec: string; resuming: boolean }> {
-  render(<SparkleAgentPane visible />);
+  render(<SparkleAgentPane visible agentId="__sparkle_self__" />);
   await waitFor(() => expect(captured.props.length).toBeGreaterThan(0));
   const props = captured.props[captured.props.length - 1]!;
   // args = ["-l", "-c", "<exec string>"] — the exec string is what claude actually runs with.

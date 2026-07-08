@@ -1,4 +1,5 @@
 import { lazy, Suspense, useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, getAllWindows } from "@tauri-apps/api/window";
 import { C, FONT, FONT_WEIGHT, ON_BRAND_FILL_DARK } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
@@ -11,7 +12,7 @@ import { AgentSidebar, NewBuildAgentButton } from "./AgentSidebar";
 import { TopBar } from "./TopBar";
 import { OfflineBanner } from "./OfflineBanner";
 import { ClosePrompt } from "./ClosePrompt";
-import { SPARKLE_AGENT_ID } from "../services/sparkleAgent";
+import { sparkleAgentIdFor, sparkleOpenSetWhitelist } from "../services/sparkleAgent";
 import {
   useCurrentProjectId,
   useIsMainWindow,
@@ -20,7 +21,6 @@ import {
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { startOrchestrationListener } from "../services/orchestrationListener";
 import { startControlListener } from "../services/controlListener";
-import { onRevealSparkle } from "../services/sparkleReveal";
 import { killProjectAgents, planWindowClose } from "../services/windowClose";
 import { windowTitleFor } from "../services/projectWindows";
 import { clearWindowProject } from "../services/windowRegistry";
@@ -71,6 +71,9 @@ export function Workspace() {
   const open = useRuntimeStore((s) => s.open);
   const reconcile = useRuntimeStore((s) => s.reconcile);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
+  // Improve Sparkle is per-window: this window's own Sparkle copy is keyed by this id (the main
+  // window keeps the canonical id, secondary windows get their own). See services/sparkleAgent.
+  const sparkleAgentId = sparkleAgentIdFor(currentWindowLabel);
   const [settingsProject, setSettingsProject] = useState<Project | null>(null);
   const [closing, setClosing] = useState(false);
   const zoomIn = useUiStore((s) => s.zoomIn);
@@ -89,13 +92,21 @@ export function Workspace() {
     // runtimeStore.openAgentIds is shared across windows, so a window-scoped reconcile would
     // evict other windows' live PTYs from the persisted open set. Keep it global.
     const validIds = projects.flatMap((p) => p.agents.map((a) => a.id));
-    // The Sparkle agent is app-owned (never in a project's `agents`), so whitelist its id or
-    // reconcile would drop it from the persisted open set on every boot.
-    reconcile([...validIds, SPARKLE_AGENT_ID]);
-    // If the Sparkle view was active at last quit, re-mount its pane so it resumes. The Sparkle
-    // singleton is owned by the main window only (gated below) so it never double-mounts across
-    // windows; don't re-open it in a secondary project window.
-    if (isMainWindow && useUiStore.getState().activeSpecial === "sparkle") open(SPARKLE_AGENT_ID);
+    // The Sparkle agent is app-owned (never in a project's `agents`). Improve Sparkle is now
+    // per-window, so the SHARED open set can hold several Sparkle ids at once (one per window, all in
+    // the `__sparkle_self__` namespace) and reconcile() is a non-merging whole-array filter. The
+    // whitelist rules are subtle (preserve other windows' LIVE ids, but prune dead per-window ids on
+    // main's cold boot so the persisted set doesn't grow unboundedly) — see sparkleOpenSetWhitelist.
+    const sparkleWhitelist = sparkleOpenSetWhitelist({
+      isMainWindow,
+      ownId: sparkleAgentId,
+      openIds: useRuntimeStore.getState().openAgentIds,
+    });
+    reconcile([...validIds, ...sparkleWhitelist]);
+    // If the Sparkle view was active at last quit, re-mount THIS window's pane so it resumes. Each
+    // window has its own copy now, keyed by its own id — so this is correct in every window, not
+    // just the main one.
+    if (useUiStore.getState().activeSpecial === "sparkle") open(sparkleAgentId);
     // Run once on mount; the persisted open set is reconciled against the hydrated projects.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -153,18 +164,17 @@ export function Workspace() {
     };
   }, [isMainWindow]);
 
-  // Reveal the Sparkle singleton when ANOTHER window's "Improve Sparkle" row asks for it. The pane
-  // is main-window-only (gated below), so a secondary/project window can't show it itself: it focuses
-  // this window and broadcasts SPARKLE_REVEAL_EVENT, which we honor here by flipping activeSpecial and
-  // ensuring the pane is open. MAIN-WINDOW ONLY (emit reaches every window incl. the emitter) — mirrors
-  // the control-listener gate above. See services/sparkleReveal.
+  // Reap orphaned per-window Sparkle worktrees. Improve Sparkle is per-window: each secondary
+  // window (`win-<uuid>`) cuts its own Sparkle worktree, but secondary windows are never restored
+  // across an app restart (multi-window session restore is deferred, bead ), so their
+  // worktrees would accumulate forever. Sweep them on boot — MAIN-WINDOW ONLY and once, which at
+  // cold start is the only live window (so no in-use secondary worktree can be clobbered). The
+  // canonical (main) worktree is always preserved. Best-effort: a failure just leaves stale dirs.
   useEffect(() => {
     if (!isMainWindow) return;
-    const unlistenPromise = onRevealSparkle(() => {
-      useUiStore.getState().setActiveSpecial("sparkle");
-      useRuntimeStore.getState().open(SPARKLE_AGENT_ID);
-    });
-    return () => void safeUnlisten(unlistenPromise);
+    void invoke("reap_secondary_sparkle_worktrees").catch((e) =>
+      console.debug("reap_secondary_sparkle_worktrees failed", e),
+    );
   }, [isMainWindow]);
 
   // Intercept the window's close (red traffic light) so we can ask keep-vs-kill before closing.
@@ -232,10 +242,11 @@ export function Workspace() {
     }
   }
   const activeIsOpen = activeAgentId !== null && openAgentIds.includes(activeAgentId);
-  // The Sparkle self-improvement agent is a global singleton. Gate it to the main window so it
-  // never double-mounts across windows.
-  const sparkleActive = isMainWindow && activeSpecial === "sparkle";
-  const sparkleOpen = isMainWindow && openAgentIds.includes(SPARKLE_AGENT_ID);
+  // Improve Sparkle is per-window: each window shows/hides its OWN copy (activeSpecial lives in
+  // the per-window uiStore, and the pane is keyed by this window's sparkleAgentId), so no
+  // main-window gate is needed — distinct ids mean distinct worktrees/PTYs, never a double-mount.
+  const sparkleActive = activeSpecial === "sparkle";
+  const sparkleOpen = openAgentIds.includes(sparkleAgentId);
   // The read-only Tasks board (bead sparkle-hiju.10) is a project-scoped special view: it covers
   // the agent panes for the current project, the same slot Sparkle uses. Only meaningful with a
   // project open.
@@ -303,7 +314,7 @@ export function Workspace() {
 
           {sparkleOpen && (
             <Suspense fallback={<PaneFallback />}>
-              <SparkleAgentPane visible={sparkleActive} />
+              <SparkleAgentPane visible={sparkleActive} agentId={sparkleAgentId} />
             </Suspense>
           )}
 

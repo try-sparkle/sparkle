@@ -48,6 +48,8 @@ vi.mock("../services/windowRegistry", () => ({
 }));
 vi.mock("../services/sparkleAgent", () => ({
   SPARKLE_AGENT_ID: "sparkle",
+  sparkleAgentIdFor: (label: string) => (label === "main" ? "sparkle" : `sparkle-${label}`),
+  sparkleOpenSetWhitelist: (o: { ownId: string }) => [o.ownId],
 }));
 
 // --- child components: stub out so their own Tauri/API calls don't interfere ---

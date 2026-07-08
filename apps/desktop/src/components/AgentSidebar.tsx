@@ -33,12 +33,8 @@ import type { BranchStatus } from "../services/branchStatus";
 import { shouldPromptOnClose, selectionAfterClose } from "../engine/closeAgent";
 import { shipAgent, saveAgent, discardAgentGit } from "../services/closeAgentActions";
 import { refreshAgentTitle } from "../services/sessionTitle";
-import { SPARKLE_AGENT_ID } from "../services/sparkleAgent";
-import {
-  handleImproveSparkleClick,
-  focusMainWindow,
-  emitRevealSparkle,
-} from "../services/sparkleReveal";
+import { sparkleAgentIdFor } from "../services/sparkleAgent";
+import { handleImproveSparkleClick } from "../services/sparkleReveal";
 import { parseWindowLabelFromSearch } from "../services/projectWindows.url";
 import { consentPillLabel, sparkleBarState, type SparkleBarState } from "./sparkleRowStatus";
 import { useBeadsStore } from "../stores/beadsStore";
@@ -315,13 +311,14 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
-  // Whether this sidebar lives in the main window — derived from the same URL primitive the
-  // windowContext provider uses (label param absent → main), read directly so this leaf doesn't
-  // require the provider (keeps the component render-testable). The label is fixed for a window's
-  // life, so this is stable across renders. Drives where an "Improve Sparkle" click reveals the
-  // main-window-only Sparkle singleton (see onSelectSparkle / services/sparkleReveal).
-  const isMainWindow =
-    parseWindowLabelFromSearch(typeof window !== "undefined" ? window.location.search : "") === null;
+  // This window's opaque label — derived from the same URL primitive the windowContext provider
+  // uses (label param absent → "main"), read directly so this leaf doesn't require the provider
+  // (keeps the component render-testable). Fixed for a window's life, so it's stable across
+  // renders. Improve Sparkle is per-window: this window's own copy is keyed by
+  // sparkleAgentIdFor(windowLabel) (see onSelectSparkle / services/sparkleReveal).
+  const windowLabel =
+    parseWindowLabelFromSearch(typeof window !== "undefined" ? window.location.search : "") ?? "main";
+  const sparkleAgentId = sparkleAgentIdFor(windowLabel);
 
   // Red agents in OTHER open windows — surfaced as a block at the top of the sidebar, COLLAPSED to
   // one row per window (representative = most recently red; "+N" badge = the rest in that window).
@@ -536,21 +533,16 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     if (next) open(next);
   };
   // Stable so the memoized SparkleAgentRow doesn't re-render on unrelated status flips (sparkle-alrm.3).
-  // The Sparkle pane is a main-window-only singleton (Workspace gates it on isMainWindow). Clicking
-  // the row in the main window reveals it in place; clicking from a secondary/project window focuses
-  // the main window and asks it to reveal Sparkle — otherwise the click would be a silent no-op
-  // (activeSpecial set locally where no gated-in pane honors it). See services/sparkleReveal.
+  // Improve Sparkle is per-window: reveal THIS window's own copy in place (its own worktree/branch/
+  // conversation keyed by sparkleAgentId). No cross-window focus/broadcast. See services/sparkleReveal.
   const onSelectSparkle = useCallback(() => {
     handleImproveSparkleClick({
-      isMainWindow,
       activateLocal: () => {
         setActiveSpecial("sparkle");
-        open(SPARKLE_AGENT_ID);
+        open(sparkleAgentId);
       },
-      focusMain: () => void focusMainWindow(),
-      emitReveal: emitRevealSparkle,
     });
-  }, [isMainWindow, setActiveSpecial, open]);
+  }, [setActiveSpecial, open, sparkleAgentId]);
   // Land an agent's work into its integration target: a worker → its orchestrator's branch; a build
   // agent → the project's default branch. A local --no-ff merge (see Rust land_agent_branch); the
   // tracker then advances to On Main on the next poll. Best-effort feedback via console for now
@@ -1246,7 +1238,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           no project open), can't be closed — it works on Sparkle itself, not the user's project. */}
       <SparkleAgentRow
         active={activeSpecial === "sparkle"}
-        status={status[SPARKLE_AGENT_ID] ?? "stopped"}
+        status={status[sparkleAgentId] ?? "stopped"}
         onSelect={onSelectSparkle}
       />
 

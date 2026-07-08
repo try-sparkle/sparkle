@@ -23,6 +23,15 @@ use tauri::{AppHandle, Manager};
 /// The open-source Sparkle client the self-improvement agent files PRs against.
 const SPARKLE_REPO_URL: &str = "https://github.com/drodio/sparkle.git";
 
+/// Synthetic project id namespacing the Sparkle agent's worktrees under app-data. MUST match
+/// `SPARKLE_PROJECT_ID` in `src/services/sparkleAgent.ts`.
+const SPARKLE_PROJECT_ID: &str = "sparkle-self";
+
+/// The CANONICAL Sparkle agent id — the main window's interactive pane and the hourly headless
+/// pass share it (one worktree). MUST match `SPARKLE_AGENT_ID` in `src/services/sparkleAgent.ts`.
+/// Improve Sparkle is per-window; every OTHER (secondary) window uses `__sparkle_self__-<label>`.
+const SPARKLE_CANONICAL_AGENT_ID: &str = "__sparkle_self__";
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SparkleWorkspace {
@@ -127,6 +136,86 @@ pub async fn ensure_sparkle_repo(app: AppHandle) -> Result<SparkleWorkspace, Str
     })
 }
 
+/// Core (AppHandle-free, testable): remove every PER-WINDOW Sparkle worktree under
+/// `<app_data>/worktrees/sparkle-self` whose agent id is NOT the canonical one, returning how many
+/// were removed. Improve Sparkle is per-window — each secondary window (`win-<uuid>`) cuts its own
+/// worktree — but secondary windows are never restored across an app restart (multi-window session
+/// restore is deferred), so their worktrees would accumulate forever. The canonical worktree (shared
+/// by the main window's pane and the hourly pass) is always preserved. Idempotent: a missing
+/// worktrees dir is a no-op (`Ok(0)`), and per-entry failures are skipped so one bad dir can't
+/// strand the rest. For each reaped worktree we also drop its `sparkle/agent-<id>` branch (which
+/// `remove_worktree_at` intentionally leaves behind) so refs don't pile up in the shared clone, and
+/// we force-remove any leftover directory whose git metadata is already gone (a crash orphan that
+/// `git worktree remove` reports as "not a working tree" without deleting). `removed` counts only
+/// directories actually gone from disk afterward, so the returned count never over-reports.
+pub fn reap_secondary_sparkle_worktrees_at(app_data: &Path) -> Result<u32, String> {
+    // The clone whose worktrees these are — `remove_worktree_at` runs `git worktree remove` against it.
+    let repo = app_data.join(SPARKLE_PROJECT_ID).join("repo");
+    let repo_str = repo.to_string_lossy().to_string();
+
+    let wt_dir = app_data.join("worktrees").join(SPARKLE_PROJECT_ID);
+    let entries = match std::fs::read_dir(&wt_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(0), // dir absent (no Sparkle worktrees yet) → nothing to reap
+    };
+
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == SPARKLE_CANONICAL_AGENT_ID {
+            continue; // keep the canonical (main-window + hourly-pass) worktree
+        }
+        let dir = wt_dir.join(&name);
+        // Reuse the exact removal path agents use (validates the id, force-removes the worktree,
+        // idempotent). Best-effort — a validation/removal failure just falls through to the disk
+        // fallback below rather than aborting the whole sweep.
+        let _ = crate::worktree::remove_worktree_at(&repo_str, SPARKLE_PROJECT_ID, &name, app_data);
+        // Crash-orphan fallback: `git worktree remove` returns Ok for a dir it doesn't recognize as
+        // a worktree WITHOUT deleting it. If the dir is still on disk, force-remove it so a
+        // metadata-less orphan (the exact case that produces accumulation) is actually cleaned.
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // Drop the per-window branch too (`remove_worktree_at` keeps it, which is right for a real
+        // agent that may resume — but a reaped secondary window never restores, bead , so
+        // its branch would only accumulate as a dead ref in the clone). INVARIANT: a secondary
+        // window's meaningful output is a PUSHED PR; this force-delete discards only local-only
+        // commits in an app-internal, never-restored clone that nothing else can reach. We log the
+        // branch as it goes so the (rare) loss isn't fully silent. Best-effort.
+        let branch = format!("sparkle/agent-{name}");
+        tracing::info!(%branch, "reaping orphaned per-window Sparkle branch");
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&repo_str).args(["branch", "-D", &branch]);
+        apply_noninteractive(&mut cmd);
+        let _ = cmd.output();
+        // Count only if the directory is genuinely gone now, so the tally never over-reports.
+        if !dir.exists() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Reap orphaned per-window Sparkle worktrees (see [`reap_secondary_sparkle_worktrees_at`]). Called
+/// once on main-window boot, which at cold start is the only live window — so no in-use secondary
+/// worktree can be clobbered. Returns the number removed.
+///
+/// `async` + `spawn_blocking`: `git worktree remove --force` deletes whole dirs from disk (seconds
+/// each); offloading keeps the window responsive.
+#[tauri::command]
+pub async fn reap_secondary_sparkle_worktrees(app: AppHandle) -> Result<u32, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no app data dir: {e}"))?;
+    tauri::async_runtime::spawn_blocking(move || reap_secondary_sparkle_worktrees_at(&app_data))
+        .await
+        .map_err(|e| format!("reap task failed to run: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +245,68 @@ mod tests {
 
         let got = ensure_sparkle_repo_at(&app_data).expect("reuse existing clone");
         assert_eq!(got, repo.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn reaps_secondary_worktrees_and_keeps_canonical() {
+        // Stand up a real clone + two Sparkle worktrees off it (canonical + one per-window
+        // secondary), then assert the reap removes ONLY the secondary and leaves the canonical.
+        let app_data = unique_dir("reap");
+        let repo = app_data.join("sparkle-self").join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |cwd: &Path, args: &[&str]| {
+            assert!(
+                Command::new("git").arg("-C").arg(cwd).args(args).status().unwrap().success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&repo, &["init"]);
+        run(&repo, &["config", "user.email", "t@t.local"]);
+        run(&repo, &["config", "user.name", "t"]);
+        run(&repo, &["commit", "--allow-empty", "-m", "seed"]);
+
+        // Worktrees live under <app_data>/worktrees/sparkle-self/<agent_id> (worktree_path layout).
+        // Branch names follow the real convention `sparkle/agent-<dir name>` so the reaper's
+        // branch-cleanup path is exercised (it derives the branch from the dir name).
+        let wt_dir = app_data.join("worktrees").join(SPARKLE_PROJECT_ID);
+        std::fs::create_dir_all(&wt_dir).unwrap();
+        let canonical = wt_dir.join(SPARKLE_CANONICAL_AGENT_ID);
+        let sec_name = format!("{SPARKLE_CANONICAL_AGENT_ID}-win-abc123");
+        let secondary = wt_dir.join(&sec_name);
+        let canon_branch = format!("sparkle/agent-{SPARKLE_CANONICAL_AGENT_ID}");
+        let sec_branch = format!("sparkle/agent-{sec_name}");
+        run(&repo, &["worktree", "add", "-b", &canon_branch, canonical.to_str().unwrap()]);
+        run(&repo, &["worktree", "add", "-b", &sec_branch, secondary.to_str().unwrap()]);
+        // A crash orphan: a leftover dir with NO git worktree metadata (git won't delete it).
+        let orphan = wt_dir.join(format!("{SPARKLE_CANONICAL_AGENT_ID}-win-orphan"));
+        std::fs::create_dir_all(&orphan).unwrap();
+        assert!(canonical.exists() && secondary.exists() && orphan.exists());
+
+        let branch_exists = |b: &str| {
+            Command::new("git")
+                .arg("-C").arg(&repo)
+                .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}")])
+                .status().unwrap().success()
+        };
+
+        let removed = reap_secondary_sparkle_worktrees_at(&app_data).expect("reap");
+        assert_eq!(removed, 2, "both the secondary worktree and the crash orphan are reaped");
+        assert!(canonical.exists(), "canonical worktree is preserved");
+        assert!(!secondary.exists(), "secondary worktree is removed from disk");
+        assert!(!orphan.exists(), "crash-orphan dir (no git metadata) is force-removed");
+        assert!(branch_exists(&canon_branch), "canonical branch is preserved");
+        assert!(!branch_exists(&sec_branch), "secondary branch is deleted so refs don't accumulate");
+
+        // Idempotent: a second sweep finds nothing left to reap.
+        assert_eq!(reap_secondary_sparkle_worktrees_at(&app_data).expect("reap again"), 0);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn reap_is_noop_when_worktrees_dir_absent() {
+        let app_data = unique_dir("reap-empty");
+        assert_eq!(reap_secondary_sparkle_worktrees_at(&app_data).expect("noop"), 0);
         let _ = std::fs::remove_dir_all(&app_data);
     }
 }

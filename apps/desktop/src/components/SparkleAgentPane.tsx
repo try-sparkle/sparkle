@@ -9,7 +9,6 @@ import {
   sparklePersona,
   sparkleMissionPrompt,
   sparkleChatOnlyMissionPrompt,
-  SPARKLE_AGENT_ID,
   SPARKLE_PROJECT_ID,
 } from "../services/sparkleAgent";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -42,8 +41,13 @@ interface SpawnCmd {
  * log dir to the agent (--add-dir, for review), and launches `claude` with the improvement
  * persona + an opening mission prompt so the user immediately sees it working. See
  * services/sparkleAgent.ts.
+ *
+ * `agentId` is this WINDOW's Sparkle id (sparkleAgentIdFor(windowLabel)). Improve Sparkle is
+ * per-window — each window runs its own copy off a distinct worktree/branch cut from the single
+ * shared clone — so the id keys this pane's worktree, PTY, and status independently of other
+ * windows'. Closing the pane keeps the worktree, so reopening in the same window resumes.
  */
-export function SparkleAgentPane({ visible }: { visible: boolean }) {
+export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agentId: string }) {
   const [phase, setPhase] = useState<Phase>("preparing");
   const [errorMsg, setErrorMsg] = useState("");
   const [spawn, setSpawn] = useState<SpawnCmd | null>(null);
@@ -70,7 +74,7 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
       const wt = await createAgentWorktree(
         ws.repoPath,
         SPARKLE_PROJECT_ID,
-        SPARKLE_AGENT_ID,
+        agentId,
         ws.defaultBranch,
       );
       try {
@@ -116,7 +120,7 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
 
   useEffect(() => {
     void prepare();
-    // Prepare once; this pane is a singleton for the app's life.
+    // Prepare once on mount; this window's Sparkle id is fixed for the pane's life.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -159,7 +163,7 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
         <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
           <div style={{ position: "absolute", inset: 0, padding: 6 }}>
             <Terminal
-              agentId={SPARKLE_AGENT_ID}
+              agentId={agentId}
               projectId={SPARKLE_PROJECT_ID}
               projectRootPath={spawn.projectRootPath}
               command={spawn.command}
@@ -167,14 +171,14 @@ export function SparkleAgentPane({ visible }: { visible: boolean }) {
               cwd={spawn.cwd}
               resuming={spawn.resuming}
               active={visible}
-              onStatus={(s) => setStatus(SPARKLE_AGENT_ID, s)}
+              onStatus={(s) => setStatus(agentId, s)}
               onReady={() => setPtyReady(true)}
               onRequestFocus={() => composerInputRef.current?.focus()}
               focusRef={termFocusRef}
             />
           </div>
           <Composer
-            agentId={SPARKLE_AGENT_ID}
+            agentId={agentId}
             active={visible}
             disabled={!ptyReady}
             inputRef={composerInputRef}
