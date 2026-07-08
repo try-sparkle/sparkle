@@ -429,19 +429,9 @@ interface RuntimeState {
   // RESETS to a new cycle (deriveLiveStage drops back to Committed when fresh work lands on a branch
   // that already shipped). PERSISTED alongside workflowStage so the ✓ survives a relaunch.
   workflowShipped: Record<string, boolean>;
-  // Worker ids the human has PINNED from an orchestrator's hover card — surfaced as their own
-  // indented SubAgentRow that persists regardless of status until un-pinned (vs an auto-surfaced
-  // red worker, which vanishes when it's no longer red). Live-only: NOT persisted (a pin is a
-  // transient "keep an eye on this" affordance; it clears on relaunch). Pruned when a worker
-  // closes / is spun down; the sidebar also defensively ignores ids with no live worker.
-  pinnedWorkerIds: string[];
 
   open: (agentId: string) => void;
   close: (agentId: string) => void;
-  /** Pin a worker so it surfaces as its own row until un-pinned. Idempotent. */
-  pinWorker: (workerId: string) => void;
-  /** Un-pin a worker (removes it from the surfaced rows unless it's also red). */
-  unpinWorker: (workerId: string) => void;
   /** Clear an agent's live status + branch status + workflow stage/shipped watermark WITHOUT
    *  removing it from the open set. Called when a slot starts a FRESH run (nothing to resume) so a
    *  reused worktree doesn't inherit the prior occupant's progress (incl. the sticky "shipped ✓").
@@ -501,21 +491,6 @@ export const useRuntimeStore = create<RuntimeState>()(
       branchStatus: {},
       workflowStage: {},
       workflowShipped: {},
-      pinnedWorkerIds: [],
-
-      pinWorker: (workerId) =>
-        set((s) =>
-          s.pinnedWorkerIds.includes(workerId)
-            ? s
-            : { pinnedWorkerIds: [...s.pinnedWorkerIds, workerId] },
-        ),
-
-      unpinWorker: (workerId) =>
-        set((s) =>
-          s.pinnedWorkerIds.includes(workerId)
-            ? { pinnedWorkerIds: s.pinnedWorkerIds.filter((id) => id !== workerId) }
-            : s,
-        ),
 
       open: (agentId) =>
         set((s) => {
@@ -545,10 +520,6 @@ export const useRuntimeStore = create<RuntimeState>()(
             branchStatus,
             workflowStage,
             workflowShipped,
-            // Drop any pin for this agent — a spun-down/closed worker must not leave a ghost row.
-            pinnedWorkerIds: s.pinnedWorkerIds.includes(agentId)
-              ? s.pinnedWorkerIds.filter((id) => id !== agentId)
-              : s.pinnedWorkerIds,
           };
         }),
 

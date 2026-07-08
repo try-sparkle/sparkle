@@ -145,9 +145,9 @@ describe("AgentSidebar — drag to pin", () => {
     const worker = { ...mkAgent("w1", "Worker"), kind: "worker" as const, parentId: "a1" };
     seed([mkAgent("a1", "Alpha"), worker]);
     render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
-    // Workers are no longer standalone rows: each shows as a bare indented progress line under its
-    // orchestrator (no name/timer collapsed), so the worker's name isn't in the collapsed DOM…
-    expect(screen.queryByText("Worker")).toBeNull();
-    expect(draggableCards()).toHaveLength(1); // …and only the orchestrator's card is draggable
+    // Workers are not standalone rows: each renders as a named inline line under its orchestrator,
+    // so the worker's name IS in the collapsed DOM…
+    expect(screen.getByText("Worker")).toBeTruthy();
+    expect(draggableCards()).toHaveLength(1); // …but only the orchestrator's card is draggable
   });
 });

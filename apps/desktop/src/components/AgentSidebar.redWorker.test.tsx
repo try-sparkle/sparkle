@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 //
-// A RED worker (waiting / approval / errored) is promoted OUT of its orchestrator's inline roll-up
-// into its own selectable row, so the human can reach it and unblock it. These tests pin that:
-//   1. a red worker's name is visible in the collapsed sidebar (NO hover needed) — the whole point,
-//      since a non-red inline worker's name only appears on the orchestrator's hover card;
+// EVERY worker renders as a named, clickable inline line under its orchestrator (no pop-out row).
+// A worker that needs attention (waiting / approval / errored) keeps that same inline line, with its
+// name inked red and its status carried in the line's label; it also bubbles red to its orchestrator
+// so the head row + TopBar dot go red. These tests pin that:
+//   1. a worker's name is visible in the collapsed sidebar (NO hover needed) — healthy OR red;
 //   2. clicking it selects + opens THAT worker (mounts its pane/REPL);
-//   3. a non-red worker is NOT promoted (stays in the roll-up);
-//   4. the red worker also bubbles red to its orchestrator (so the orchestrator surfaces the block).
+//   3. an unstarted/stranded worker still renders inline (its name is reachable to start it).
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -64,16 +64,16 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-describe("AgentSidebar — red worker promotion", () => {
-  it("shows a red worker as its own row WITHOUT hovering the orchestrator", () => {
+describe("AgentSidebar — inline worker lines", () => {
+  it("shows a red worker's inline line WITHOUT hovering the orchestrator", () => {
     const { project } = seed("errored");
     render(<AgentSidebar project={project} />);
-    // Collapsed (no hover): a non-red inline worker's name would be absent here — a red one is a row.
+    // Collapsed (no hover): the worker's name is an inline line, carrying its Errored status.
     expect(screen.getByRole("button", { name: /Fix The Parser — Errored/i })).toBeTruthy();
     expect(screen.getByText("Fix The Parser")).toBeTruthy();
   });
 
-  it("clicking the promoted row selects + opens THAT worker", () => {
+  it("clicking an inline worker line selects + opens THAT worker", () => {
     const { project, open } = seed("waiting");
     render(<AgentSidebar project={project} />);
     fireEvent.click(screen.getByRole("button", { name: /Fix The Parser — Needs you/i }));
@@ -82,18 +82,18 @@ describe("AgentSidebar — red worker promotion", () => {
     expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("w1");
   });
 
-  it("does NOT promote a non-red (working) worker — it stays in the roll-up", () => {
+  it("shows a healthy (working) worker's name inline too — no hover needed", () => {
     const { project } = seed("working");
     render(<AgentSidebar project={project} />);
-    // No standalone worker row while it's healthy; its name is hover-only inline detail.
-    expect(screen.queryByRole("button", { name: /Fix The Parser/i })).toBeNull();
-    expect(screen.queryByText("Fix The Parser")).toBeNull();
+    // Every worker is a named inline line now, healthy ones included.
+    expect(screen.getByRole("button", { name: /Fix The Parser — /i })).toBeTruthy();
+    expect(screen.getByText("Fix The Parser")).toBeTruthy();
   });
 
-  it("does NOT promote an UNSTARTED/stranded worker (it needs Start, and auto-open heals it)", () => {
-    // Strand: worktree cut, parent open, but the worker never mounted → NO live status entry. The
-    // composed status map paints it a synthetic "approval", but promotion keys off the worker's own
-    // LIVE status, so it must stay in the roll-up (not pop out as an open+answer RedWorkerRow).
+  it("renders an UNSTARTED/stranded worker inline so it stays reachable (click to start)", () => {
+    // Strand: worktree cut, parent open, but the worker never mounted → NO live status entry. It
+    // still renders as an inline named line (the composed status paints it a synthetic attention),
+    // so the human can click to open + start it.
     const orchestrator = mkAgent("a1", "Alpha");
     const worker = mkAgent("w1", "Fix The Parser", {
       kind: "worker", parentId: "a1", baseBranch: "main", worktreePath: "/wt/w1",
@@ -104,14 +104,18 @@ describe("AgentSidebar — red worker promotion", () => {
       agents: [orchestrator, worker],
     };
     useProjectStore.setState({ projects: [project] } as never);
+    const open = vi.fn();
     useRuntimeStore.setState({
       branchStatus: {}, workflowStage: {},
       status: {}, // no live status for w1 → it's a strand
       openAgentIds: ["a1"], // parent open, worker NOT open
-      open: vi.fn(),
+      open,
       pollBranchStatus: vi.fn(() => Promise.resolve()),
     } as never);
     render(<AgentSidebar project={project} />);
-    expect(screen.queryByRole("button", { name: /Fix The Parser/i })).toBeNull();
+    const line = screen.getByRole("button", { name: /Fix The Parser — /i });
+    expect(line).toBeTruthy();
+    fireEvent.click(line);
+    expect(open).toHaveBeenCalledWith("w1");
   });
 });

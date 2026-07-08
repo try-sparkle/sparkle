@@ -130,7 +130,7 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
     expect(screen.getAllByText(/up to date with main/i).length).toBeGreaterThan(0);
   });
 
-  it("renders one bare line per worker collapsed, and one detail block per worker on hover", () => {
+  it("renders one named line per worker collapsed, and one detail block per worker on hover", () => {
     const orchestrator = mkAgent("a1", "Alpha");
     const w1 = mkAgent("w1", "WorkerOne", { kind: "worker", parentId: "a1", baseBranch: "main" });
     const w2 = mkAgent("w2", "WorkerTwo", { kind: "worker", parentId: "a1", baseBranch: "main" });
@@ -147,16 +147,17 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
     render(<AgentSidebar project={project} />);
 
     // Collapsed: each WorkflowLine is role="img" / "Workflow stage: …". One for the orchestrator's
-    // own head line + one per worker = 3. Worker NAMES stay out of the collapsed DOM (bare lines).
+    // own head line + one per worker = 3. Each worker's NAME now shows on its inline line too.
     const linesCollapsed = screen.getAllByRole("img", { name: /Workflow stage:/i });
     expect(linesCollapsed).toHaveLength(3);
-    expect(screen.queryByText("WorkerOne")).toBeNull();
-    expect(screen.queryByText("WorkerTwo")).toBeNull();
-
-    // Hovered: the overlay stacks one detail block per worker — each worker's title now appears.
-    hoverOrchestrator();
     expect(screen.getByText("WorkerOne")).toBeTruthy();
     expect(screen.getByText("WorkerTwo")).toBeTruthy();
+
+    // Hovered: the overlay stacks one detail block per worker — each worker's title appears there too
+    // (once inline + once in the card), so there are now two matches per name.
+    hoverOrchestrator();
+    expect(screen.getAllByText("WorkerOne").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("WorkerTwo").length).toBeGreaterThanOrEqual(1);
   });
 
   it("shows each worker's progress bar (with stage label) in its detail block on hover", () => {

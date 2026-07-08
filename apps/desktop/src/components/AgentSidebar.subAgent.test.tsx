@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 //
-// Sub-agent surfacing: a worker surfaces as its own indented SubAgentRow when it needs attention
-// (auto) OR when the human pins it from the orchestrator's hover card (manual, with a ✕). Plus the
-// hover-card reachability wiring: the card's own scroll doesn't dismiss it, and hovering a surfaced
-// sub-row opens the orchestrator's card (no flicker).
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+// Inline sub-agent lines: EVERY worker renders as a named, clickable line under its orchestrator
+// (no pop-out row, no pinning) — its name shows collapsed (no hover needed) and clicking it opens
+// that worker. Plus the hover-card reachability wiring: the card's own scroll doesn't dismiss it,
+// and hovering an inline worker line keeps the orchestrator's card open (no flicker).
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -35,8 +35,8 @@ function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentT
   };
 }
 
-// Orchestrator a1 + one worker w1 in a given status, with an optional pin.
-function seed(opts: { workerStatus: AgentTabStatus; pinned?: boolean }): {
+// Orchestrator a1 + one worker w1 in a given status.
+function seed(opts: { workerStatus: AgentTabStatus }): {
   project: Project;
   open: ReturnType<typeof vi.fn>;
 } {
@@ -51,12 +51,10 @@ function seed(opts: { workerStatus: AgentTabStatus; pinned?: boolean }): {
   };
   useProjectStore.setState({ projects: [project] } as never);
   const open = vi.fn();
-  // Real pinWorker/unpinWorker (state merges), overridden `open` so we can assert selection.
   useRuntimeStore.setState({
     branchStatus: {}, workflowStage: {},
     status: { w1: opts.workerStatus } as Record<string, AgentTabStatus>,
     openAgentIds: ["a1", "w1"],
-    pinnedWorkerIds: opts.pinned ? ["w1"] : [],
     open,
     pollBranchStatus: vi.fn(() => Promise.resolve()),
   } as never);
@@ -65,51 +63,40 @@ function seed(opts: { workerStatus: AgentTabStatus; pinned?: boolean }): {
 
 beforeEach(() => {
   useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
-  useRuntimeStore.setState({ pinnedWorkerIds: [] } as never);
 });
 afterEach(cleanup);
 
-describe("AgentSidebar — sub-agent surfacing (pin + attention)", () => {
-  it("surfaces a PINNED (non-red) worker as a row WITH a ✕, and unpinning removes it", () => {
-    const { project } = seed({ workerStatus: "working", pinned: true });
+describe("AgentSidebar — inline sub-agent lines", () => {
+  it("shows EVERY worker's name inline (no hover), even a healthy one, and never a pop-out ✕", () => {
+    const { project } = seed({ workerStatus: "working" });
     render(<AgentSidebar project={project} />);
-    // Pinned → its name is a row even though it's healthy (would otherwise be a hover-only bar).
+    // A healthy worker's name is visible collapsed — the whole point (was hover-only before).
     expect(screen.getByRole("button", { name: /Fix The Parser — /i })).toBeTruthy();
-    const x = screen.getByRole("button", { name: /Unpin Fix The Parser/i });
-    fireEvent.click(x);
-    // ✕ un-pins → store drops it → row (and ✕) disappear.
-    expect(useRuntimeStore.getState().pinnedWorkerIds).toEqual([]);
-    expect(screen.queryByRole("button", { name: /Unpin Fix The Parser/i })).toBeNull();
+    expect(screen.getByText("Fix The Parser")).toBeTruthy();
+    // No pin/unpin affordance survives.
+    expect(screen.queryByRole("button", { name: /Unpin/i })).toBeNull();
   });
 
-  it("a PINNED + RED worker renders once and still shows its ✕", () => {
-    const { project } = seed({ workerStatus: "errored", pinned: true });
+  it("clicking an inline worker line selects + opens THAT worker", () => {
+    const { project, open } = seed({ workerStatus: "working" });
     render(<AgentSidebar project={project} />);
-    // Exactly one row for the worker (not one for attention + one for pin).
-    expect(screen.getAllByRole("button", { name: /Fix The Parser — Errored/i })).toHaveLength(1);
-    expect(screen.getByRole("button", { name: /Unpin Fix The Parser/i })).toBeTruthy();
-  });
-
-  it("clicking a worker's name in the hover card PINS + opens it", () => {
-    const { project, open } = seed({ workerStatus: "working", pinned: false });
-    render(<AgentSidebar project={project} />);
-    // Not surfaced yet (healthy, unpinned) — no standalone row.
-    expect(screen.queryByRole("button", { name: /Unpin Fix The Parser/i })).toBeNull();
-    // Hover the orchestrator to reveal its card, which lists the worker name as a clickable control.
-    const headRow = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
-    fireEvent.mouseEnter(headRow);
-    const card = screen.getByTestId("agent-hover-card");
-    fireEvent.click(within(card).getByRole("button", { name: /Open and pin Fix The Parser/i }));
-    // Pin recorded + worker opened/selected.
-    expect(useRuntimeStore.getState().pinnedWorkerIds).toContain("w1");
+    fireEvent.click(screen.getByRole("button", { name: /Fix The Parser — /i }));
     expect(open).toHaveBeenCalledWith("w1");
     expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("w1");
+  });
+
+  it("a worker that needs attention keeps its inline line (status in the label), still no pop-out", () => {
+    const { project } = seed({ workerStatus: "errored" });
+    render(<AgentSidebar project={project} />);
+    // One inline line for the worker, carrying its status (the name also inks red via statusInk).
+    expect(screen.getAllByRole("button", { name: /Fix The Parser — Errored/i })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: /Unpin/i })).toBeNull();
   });
 });
 
 describe("AgentSidebar — hover-card reachability", () => {
   it("scrolling INSIDE the card does not dismiss it; a window scroll does", () => {
-    const { project } = seed({ workerStatus: "working", pinned: false });
+    const { project } = seed({ workerStatus: "working" });
     render(<AgentSidebar project={project} />);
     const headRow = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
     fireEvent.mouseEnter(headRow);
@@ -124,7 +111,7 @@ describe("AgentSidebar — hover-card reachability", () => {
   });
 
   it("wheel over a SCROLLABLE card detail is kept by the card (2b); a short one forwards to the list", () => {
-    const { project } = seed({ workerStatus: "working", pinned: false });
+    const { project } = seed({ workerStatus: "working" });
     render(<AgentSidebar project={project} />);
     const headRow = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
     fireEvent.mouseEnter(headRow);
@@ -156,9 +143,9 @@ describe("AgentSidebar — hover-card reachability", () => {
   });
 
   it("keeps the collapsed sub-agent lines visible while the head's card is open (no flicker)", () => {
-    const { project } = seed({ workerStatus: "working", pinned: false });
-    // A non-surfaced (healthy, unpinned) worker with a stage renders a bare collapsed progress line
-    // under the head. This is the line the user hovers; hovering it must NOT flicker the card.
+    const { project } = seed({ workerStatus: "working" });
+    // A worker with a stage renders a named collapsed line under the head. This is the line the user
+    // hovers; hovering it must NOT flicker the card.
     useRuntimeStore.setState({ workflowStage: { w1: "building_saved" } } as never);
     render(<AgentSidebar project={project} />);
 
@@ -183,16 +170,13 @@ describe("AgentSidebar — hover-card reachability", () => {
     expect(screen.getByTestId("agent-hover-card")).toBeTruthy();
   });
 
-  it("hovering a surfaced sub-agent row opens the orchestrator's hover card", () => {
-    const { project } = seed({ workerStatus: "errored", pinned: false });
+  it("hovering the inline worker lines opens the orchestrator's hover card", () => {
+    const { project } = seed({ workerStatus: "errored" });
     render(<AgentSidebar project={project} />);
     // No card yet.
     expect(screen.queryByTestId("agent-hover-card")).toBeNull();
-    // The red worker is surfaced as its own row; hovering it must open the parent's card.
-    const subRow = screen
-      .getByRole("button", { name: /Fix The Parser — Errored/i })
-      .closest("div")!.parentElement as HTMLElement;
-    fireEvent.mouseEnter(subRow);
+    // The worker lives inline under the head; hovering that lines container opens the parent's card.
+    fireEvent.mouseEnter(screen.getByTestId("collapsed-worker-lines"));
     expect(screen.getByTestId("agent-hover-card")).toBeTruthy();
   });
 });

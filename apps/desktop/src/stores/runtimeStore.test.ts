@@ -624,37 +624,6 @@ describe("runtimeStore — programmatic bead writes on stage transitions (review
   });
 });
 
-describe("runtimeStore — pinned workers (sub-agent surfacing)", () => {
-  it("pinWorker is idempotent and unpinWorker removes", async () => {
-    const useRuntimeStore = await freshStore();
-    const { pinWorker, unpinWorker } = useRuntimeStore.getState();
-    pinWorker("w1");
-    pinWorker("w1"); // idempotent
-    pinWorker("w2");
-    expect(useRuntimeStore.getState().pinnedWorkerIds).toEqual(["w1", "w2"]);
-    unpinWorker("w1");
-    expect(useRuntimeStore.getState().pinnedWorkerIds).toEqual(["w2"]);
-    unpinWorker("nope"); // no-op on an id that isn't pinned
-    expect(useRuntimeStore.getState().pinnedWorkerIds).toEqual(["w2"]);
-  });
-
-  it("close() prunes a worker's pin (spin-down leaves no ghost row)", async () => {
-    const useRuntimeStore = await freshStore();
-    const { pinWorker, close } = useRuntimeStore.getState();
-    pinWorker("w1");
-    pinWorker("w2");
-    close("w1"); // spinDownWorker calls runtimeStore.close(workerId)
-    expect(useRuntimeStore.getState().pinnedWorkerIds).toEqual(["w2"]);
-  });
-
-  it("does NOT persist pinnedWorkerIds (a pin clears on relaunch)", async () => {
-    const useRuntimeStore = await freshStore();
-    useRuntimeStore.getState().pinWorker("w1");
-    const persisted = JSON.parse(localStorage.getItem(STORE_KEY) as string);
-    expect(persisted.state.pinnedWorkerIds).toBeUndefined();
-  });
-});
-
 describe("runtimeStore — multi-window open-set merge ()", () => {
   it("open() UNIONs against the shared persisted set instead of clobbering another window's ids", async () => {
     const useRuntimeStore = await freshStore();
