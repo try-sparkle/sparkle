@@ -7,7 +7,7 @@ import type { Phase } from "../voice/wakeMachine";
 import { useDictationStore } from "../stores/dictationStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { WAKE_PHRASE, STOP_PHRASE } from "../voice/dictationCopy";
-import { useMicToggle, micVisual, MicGlyph } from "./MicButton";
+import { useMicToggle, micVisual, MicGlyph, MicMenu, useHoverMenu } from "./MicButton";
 
 // Many thin slivers (was 28 fat bars) so the meter reads as a dense, lively waveform
 // rather than a row of chunky blocks. The rAF loop stays cheap even at this count —
@@ -116,6 +116,9 @@ export function LogoWaveform() {
   const listening = status === "listening";
 
   const [micHover, setMicHover] = useState(false);
+  // Hovering the ring reveals the three-option pill (MicMenu). It opens DOWNWARD (over the waveform
+  // strip) since the ring is pinned near the top of the sidebar.
+  const menu = useHoverMenu();
   const raf = useRef(0);
   // Live audio level + the VAD `speaking` flag held in refs, fed by a TRANSIENT store
   // subscription. The `dictation://level` stream emits once per audio frame; subscribing to it
@@ -219,7 +222,8 @@ export function LogoWaveform() {
   // Orb blob colors track the WAVEFORM: brand cyan/blue while ACTIVELY dictating, but SHADES OF
   // GRAY while merely listening for the wake word (passive) — matching the gray bars, so the glow
   // doesn't imply "active" before the wake word is heard. The grays are derived from the themed
-  // muted token (the same color the bars use) so they flip correctly in light/dark mode.
+  // muted token (the same color the bars use) so they flip correctly in light/dark mode. (Only the
+  // mic GLYPH goes green when active — the waveform + orb stay blue by design.)
   const grayLight = `color-mix(in srgb, ${C.muted} 60%, white)`;
   const grayDark = `color-mix(in srgb, ${C.muted} 70%, black)`;
   const orbColors = active
@@ -348,8 +352,16 @@ export function LogoWaveform() {
           type="button"
           data-hint="mic"
           onClick={mic.onClick}
-          onMouseEnter={() => setMicHover(true)}
-          onMouseLeave={() => setMicHover(false)}
+          // Two hover concerns share this button: the direction-aware glyph recolor (micHover) and
+          // opening the three-option pill (menu.hoverProps). Fire both on each enter/leave.
+          onMouseEnter={() => {
+            setMicHover(true);
+            menu.hoverProps.onMouseEnter();
+          }}
+          onMouseLeave={() => {
+            setMicHover(false);
+            menu.hoverProps.onMouseLeave();
+          }}
           aria-label={mic.ariaLabel}
           title={mic.title}
           style={{
@@ -381,6 +393,12 @@ export function LogoWaveform() {
               against forest here too. */}
           <MicGlyph variant={micVis.variant} size={20} surfaceColor={C.forest} />
         </button>
+
+        {/* Three-option hover pill, centered under the ring. Opens downward over the waveform strip
+            (the ring is pinned near the top of the sidebar, so there's no room above). */}
+        {menu.open && (
+          <MicMenu placement="down" onChoose={menu.close} hoverProps={menu.hoverProps} />
+        )}
       </div>
 
       {error ? (
