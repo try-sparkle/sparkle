@@ -8,6 +8,7 @@ import { initLogger } from "./logger";
 import { startJankMonitor } from "./perfTrace";
 import { initAnalytics } from "./analytics";
 import { usageTelemetry } from "./services/usageTelemetry";
+import { flushCrashReports } from "./services/crashReporter";
 import { disableNativeTooltips } from "./disableNativeTooltips";
 import { resolveThemeFromStorage } from "./theme/theme";
 import { useHistoryStore } from "./stores/historyStore";
@@ -92,6 +93,10 @@ if (!isTray && !isCapture) {
   window.addEventListener("beforeunload", () => {
     void usageTelemetry.trackSessionEnd();
   });
+  // Flush any crash reports captured on a previous run (panic hook / native fatal-signal handler in
+  // Rust). Fire-and-forget: Rust enforces the consent gate (uploads only on "always"; otherwise the
+  // reports stay on the user's disk). Main webview only — the tray/capture views share the install.
+  void flushCrashReports();
 }
 
 // Show-on-ready (bead sparkle-alrm.5, #10). The main window is created hidden ("visible": false

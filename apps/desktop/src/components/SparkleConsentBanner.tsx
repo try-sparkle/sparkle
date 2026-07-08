@@ -36,6 +36,7 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
           "Once per hour, we use a small amount of your Claude Code subscription to evaluate your logs.",
           "If we see failures or performance issues, we automatically craft a PR to submit to the Sparkle OSS project to improve it",
           'On "Always" mode, these PRs will be submitted automatically. No action required from you.',
+          "On 'Always', we also securely upload scrubbed crash reports and your recent logs (last ~hour) so we can find and fix crashes fast — always anonymized, never any PII, secrets, or code.",
           "We scrub the PR for anything sensitive: No PII, secrets, code snippets, etc will be sent",
         ],
       };
@@ -44,6 +45,7 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
         lead: "Sparkle will not evaluate your logs.",
         bullets: [
           "Your logs stay on your device — the improvement agent won't read them or craft any PRs.",
+          "Crash reports are still captured locally to your device, but never uploaded — crash reports are only sent on 'Always'.",
           "You can switch this back on at any time.",
         ],
       };
@@ -55,6 +57,7 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
           "Once per hour, we use a small amount of your Claude Code subscription to evaluate your logs.",
           "If we see failures or performance issues, we automatically craft a proposed PR to submit upon your approval to the Sparkle OSS project to improve it",
           "You review and approve every PR before it is submitted",
+          "Crash reports are captured locally either way, but only uploaded on 'Always' — on this setting they stay on your device.",
           "We scrub the PR for anything sensitive: No PII, secrets, code snippets, etc will be sent",
         ],
       };
@@ -103,7 +106,7 @@ export function SparkleConsentBanner() {
       >
         <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
           <span style={{ fontStyle: "italic", fontWeight: FONT_WEIGHT.semibold, fontSize: 13.5 }}>
-            Can we use your anonymous logs to automatically improve Sparkle?
+            Can we use your anonymous logs &amp; crash reports to automatically improve Sparkle?
           </span>
           {/* Disclosure toggle: a real button so the detail is reachable by click/tap (not just
               hover/focus) — important for touch users and for informed consent. */}

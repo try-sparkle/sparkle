@@ -20,6 +20,7 @@ mod chief;
 mod claude;
 mod claude_chat;
 mod cloud;
+mod crash;
 mod config;
 mod connectivity;
 mod delivery;
@@ -112,6 +113,13 @@ pub fn run() {
                 // Logging is best-effort: a failure here must not stop the app from booting.
                 Err(e) => eprintln!("failed to initialize logging: {e}"),
             }
+            // Install crash/panic capture immediately after logging (before any other init) so a
+            // panic or fatal signal during startup itself is still captured. The panic hook CHAINS
+            // to the existing hook (audio.rs' catch_unwind firewall is unchanged); the native signal
+            // handler catches crashes a panic hook can't (e.g. a CoreAudio abort). Always-on and
+            // best-effort — it only writes to the user's own disk here; upload is consent-gated in
+            // the `flush_crash_reports` command.
+            crash::install(app.handle());
             // Auth hand-off: forward an incoming sparkle://auth?code=… deep link to the webview
             // as a "deep-link" event; AuthGate redeems the one-time code (spec §3.1, §8).
             {
@@ -320,6 +328,7 @@ pub fn run() {
             auth::desktop_auto_topup_get,
             auth::desktop_auto_topup_set,
             auth::desktop_take_pending_deeplink,
+            crash::flush_crash_reports,
             support::read_recent_logs,
             support::support_metadata,
             support::support_chat_send,

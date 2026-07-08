@@ -126,6 +126,40 @@ pub(crate) fn should_install_cloud(
     same_generation && still_current && capture_present && !already_active
 }
 
+/// What `start_dictation` should do when its (slow, lock-free) model load finishes and it re-takes
+/// the session lock. Three outcomes, decided purely so the resurrect-race matrix is unit-testable
+/// without an AppHandle, a 482MB model download, or threads:
+///   - `AbortMutedDuringLoad`: the stop epoch advanced — a `stop_dictation` landed while we loaded
+///     (the user muted mid-download). Abort: leave the mic muted, drop the freshly loaded
+///     transcriber. `armed` alone can't detect this (the stop already set it false), which is
+///     exactly why the epoch exists.
+///   - `AlreadyArmed`: a racing `start_dictation` armed the session while we loaded. Discard our
+///     transcriber and just reconcile — never overwrite the live one without finalize().
+///   - `Arm`: a clean fresh arm — install the transcriber and bring capture up.
+///
+/// Epoch is checked FIRST: if a stop AND a racing re-arm both happened during the load, the other
+/// start owns a fresh live session, so aborting (touch nothing, drop our transcriber) is the safe
+/// outcome either way.
+///
+/// CALLER CONTRACT: both `current_epoch` and `armed` MUST be read from the SAME locked critical
+/// section that then acts on the result, so the decision and the install are atomic.
+#[derive(Debug, PartialEq)]
+pub(crate) enum StartAfterLoad {
+    AbortMutedDuringLoad,
+    AlreadyArmed,
+    Arm,
+}
+
+pub(crate) fn start_after_load(sampled_epoch: u64, current_epoch: u64, armed: bool) -> StartAfterLoad {
+    if current_epoch != sampled_epoch {
+        StartAfterLoad::AbortMutedDuringLoad
+    } else if armed {
+        StartAfterLoad::AlreadyArmed
+    } else {
+        StartAfterLoad::Arm
+    }
+}
+
 /// Decide the engine for an active-dictation stream. Cloud requires the setting on AND a signed-in
 /// user (a Sparkle bearer to authenticate to the relay). `credits_ok` is now enforced
 /// SERVER-side — the relay refuses the WS upgrade when the user isn't entitled or can't afford the
@@ -208,6 +242,14 @@ pub struct DictationSession {
     /// the window-focus event (lib.rs) and polled at arm time. The cpal capture is live only while
     /// `armed && focused` — so we never capture audio while the user is looking at another app.
     focused: bool,
+    /// Monotonic counter bumped by every `stop_dictation`. `start_dictation` samples it BEFORE the
+    /// slow, lock-free model load (~482MB on a fresh install) and re-checks it after acquiring the
+    /// lock: if a stop landed during the load (the user muted mid-download), the sampled value is
+    /// stale and the start aborts instead of re-arming the mic the user just muted. Closes the
+    /// "resurrect" race that `if sess.armed` alone can't (a stop leaves `armed` false, which the
+    /// arm path would otherwise flip back to true). Guarded by the session Mutex; a plain counter
+    /// is enough since it's only ever read/written while holding that lock.
+    stop_epoch: u64,
 }
 
 /// `.0` is the session; `.1` is a monotonic focus generation used to coalesce window-to-window
@@ -414,14 +456,18 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
     // first). Don't reload the model or swap the cloud Arcs — just refresh focus and reconcile so a
     // capture paused while unfocused resumes. This also preserves the old double-start guarantee:
     // we never drop a live transcriber without finalize().
-    {
+    //
+    // While here (and still holding the lock), sample the stop epoch so we can detect a
+    // stop_dictation that lands during the slow model load below (the "resurrect" race).
+    let stop_epoch_at_start = {
         let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
         if sess.armed {
             sess.focused = any_window_focused(&app);
             DictationState::reconcile_locked(&mut sess, &app);
             return Ok(());
         }
-    }
+        sess.stop_epoch
+    };
 
     // Not yet armed: load the on-device model (slow, no lock held) before claiming the session.
     let root = app.path().app_data_dir().map_err(|e| e.to_string())?.join("models");
@@ -430,12 +476,23 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
     let transcriber = Arc::new(Mutex::new(ParakeetTdt::new(&paths)?));
 
     let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
-    // A racing start_dictation may have armed while we loaded the model. If so, discard our freshly
-    // loaded transcriber (it drops here) rather than overwriting the live one without finalize().
-    if sess.armed {
-        sess.focused = any_window_focused(&app);
-        DictationState::reconcile_locked(&mut sess, &app);
-        return Ok(());
+    // Re-check under the lock now the (slow) load is done. Both inputs are read from THIS critical
+    // section so the decision and the arm-or-abort are atomic (see `start_after_load`).
+    match start_after_load(stop_epoch_at_start, sess.stop_epoch, sess.armed) {
+        StartAfterLoad::AbortMutedDuringLoad => {
+            // The user muted mid-download: a stop advanced the epoch after we sampled it. Do NOT
+            // re-arm (that's the resurrect race) — our freshly loaded transcriber drops here.
+            tracing::info!(target: "dictation", "start_dictation aborted: a stop landed during model load (mic stays muted)");
+            return Ok(());
+        }
+        StartAfterLoad::AlreadyArmed => {
+            // A racing start_dictation armed while we loaded. Discard our transcriber and just
+            // reconcile rather than overwriting the live one without finalize().
+            sess.focused = any_window_focused(&app);
+            DictationState::reconcile_locked(&mut sess, &app);
+            return Ok(());
+        }
+        StartAfterLoad::Arm => {}
     }
     sess.transcriber = Some(transcriber);
     // Fresh cloud generation for this arm — new Arcs so start_cloud_stream's ptr_eq/epoch guards
@@ -584,6 +641,9 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
     let (transcriber, cloud_session) = {
         let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
         sess.armed = false;             // disarm so a later focus event can't resurrect the mic
+        // Advance the stop epoch so an in-flight start_dictation still loading the model observes
+        // that a stop landed during its load and aborts instead of re-arming a muted mic.
+        sess.stop_epoch = sess.stop_epoch.wrapping_add(1);
         sess.capture = None;            // drop Capture -> stops the cpal stream (no more frames)
         sess.cloud_active.store(false, Ordering::Relaxed);
         sess.cloud_epoch.fetch_add(1, Ordering::Relaxed); // invalidate any in-flight start_cloud_stream
@@ -605,7 +665,8 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 mod tests {
     use super::{
         capture_should_be_live, choose_engine, frame_speaking, segment_fingerprint,
-        should_emit_blur, should_install_cloud, DictationState, Engine,
+        should_emit_blur, should_install_cloud, start_after_load, DictationState, Engine,
+        StartAfterLoad,
     };
 
     #[test]
@@ -692,6 +753,36 @@ mod tests {
         assert!(!should_install_cloud(true, true, true, true), "a racing start already opened one");
         // All-false (e.g. stopped + restarted + already active) also rejects — makes the AND total.
         assert!(!should_install_cloud(false, false, false, true));
+    }
+
+    #[test]
+    fn start_after_load_aborts_when_a_stop_landed_during_the_model_load() {
+        // The resurrect race (two fresh-install users crashed on it): fresh install → mic OFF, so
+        // the user's first click is ON → start_dictation blocks on a 482MB model download. The user
+        // then unclicks the mic mid-download → stop_dictation disarms AND bumps the epoch. When the
+        // load finishes, start must see the epoch moved and ABORT — not re-arm a muted mic. `armed`
+        // is already false here (the stop cleared it), which is precisely why the epoch is needed.
+        assert_eq!(
+            start_after_load(0, 1, false),
+            StartAfterLoad::AbortMutedDuringLoad,
+            "a stop during the load (epoch advanced) must abort even though armed is false"
+        );
+        // Even if a racing start re-armed after that stop, the epoch still advanced → abort and
+        // leave the other start's fresh session untouched.
+        assert_eq!(
+            start_after_load(0, 1, true),
+            StartAfterLoad::AbortMutedDuringLoad,
+            "epoch is checked first: a stop+re-arm during the load still aborts this start"
+        );
+    }
+
+    #[test]
+    fn start_after_load_reconciles_on_a_racing_start_and_arms_on_a_clean_load() {
+        // Epoch unchanged + a racing start_dictation already armed → don't overwrite the live
+        // transcriber without finalize(); just reconcile.
+        assert_eq!(start_after_load(3, 3, true), StartAfterLoad::AlreadyArmed);
+        // Epoch unchanged + not armed → the clean fresh-arm path installs the transcriber.
+        assert_eq!(start_after_load(3, 3, false), StartAfterLoad::Arm);
     }
 
     #[test]

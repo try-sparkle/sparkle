@@ -432,13 +432,19 @@ export function useAmbientVoice(): void {
         });
     } else {
       // Muting the mic tears down dictation in Rust, which closes any relay stream (stopping
-      // server-side metering).
+      // server-side metering). The Rust stop also bumps the stop epoch so an in-flight
+      // start_dictation still downloading the model aborts instead of resurrecting a live capture
+      // under a muted UI (see dictation.rs). Reset ALL runtime UI state here so muting can never
+      // leave a desynced view: clear status/level/speaking/phase/interim AND any lingering
+      // model-download progress (a mute mid-download would otherwise keep the "Downloading…" pill
+      // up; the aborted start emits no further capture events to clear it).
       invoke("stop_dictation").catch(() => {});
       store.setStatus("idle");
       store.setLevel(0);
       store.setSpeaking(false);
       store.setPhase("passive");
       store.setInterim("");
+      store.setModelProgress(null);
     }
     return () => { activeRun = false; };
   }, [enabled]);

@@ -1,4 +1,6 @@
 //! Microphone capture via cpal → 16 kHz mono f32 frames + RMS level.
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat};
 
@@ -65,6 +67,15 @@ fn process_typed<T>(
 #[allow(dead_code)]
 pub struct Capture {
     stream: cpal::Stream,
+    /// Teardown gate for the native-crash fix. Flipped to false at the very START of `Drop`,
+    /// BEFORE the cpal `Stream` is paused/dropped, so any frame the CoreAudio IOThread is about to
+    /// dispatch during teardown early-returns at the top of the callback instead of reaching into
+    /// the transcriber / cloud / app state that `stop_dictation` is concurrently tearing down.
+    /// Shared (an `Arc` clone lives inside the callback closure) so it outlives the pause; the
+    /// closure itself is only freed by the subsequent `Stream` drop (CoreAudio Dispose), which
+    /// synchronizes with the IOThread. Field order matters: `stream` is declared first so it drops
+    /// (and drains the IOThread) before `active`, keeping the flag alive across the whole teardown.
+    active: Arc<AtomicBool>,
 }
 
 /// Panic firewall (). cpal invokes the audio data callbacks from CoreAudio's
@@ -77,9 +88,26 @@ pub struct Capture {
 /// default panic hook still records the panic to the unified log. Capture::start funnels every
 /// sample-format callback through it.
 fn firewall_frame_handler(
+    active: Arc<AtomicBool>,
     mut on_frame: impl FnMut(Vec<f32>) + Send + 'static,
 ) -> impl FnMut(Vec<f32>) + Send + 'static {
     move |frame: Vec<f32>| {
+        // Teardown gate (macOS native-crash fix). `Capture::drop` flips `active` false BEFORE it
+        // pauses/drops the cpal Stream. `stream.pause()` does NOT guarantee the CoreAudio IOThread
+        // isn't mid-dispatching a render callback, and that callback would otherwise touch the
+        // transcriber/cloud/app state `stop_dictation` is tearing down in parallel — a data race
+        // the panic firewall below cannot catch (a native SIGABRT/SIGSEGV, not a Rust unwind). By
+        // bailing here the callback becomes an inert no-op the instant teardown begins. Acquire
+        // pairs with the Release store in `Drop` so the flip is observed promptly. The closure
+        // (and its captured `Arc<AtomicBool>`) is only freed by the later Stream drop (Dispose),
+        // which synchronizes with the IOThread, so this load never dereferences freed memory.
+        if !active.load(Ordering::Acquire) {
+            return;
+        }
+        // Suppress crash-record persistence for a panic we're about to CATCH here: the panic hook
+        // still logs it, but a recovered frame panic must not be written/uploaded as a "crash" (the
+        // app isn't going down). The guard resets when this frame returns. See crash::suppress_crash_records.
+        let _suppress = crate::crash::suppress_crash_records();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_frame(frame)));
     }
 }
@@ -101,9 +129,13 @@ impl Capture {
         let sample_format = cfg.sample_format();
         let stream_config = cfg.into();
 
+        // The teardown gate the frame handler checks and `Capture::drop` flips (native-crash fix).
+        let active = Arc::new(AtomicBool::new(true));
+
         // Funnel the handler through the panic firewall so a panic on the audio thread is
-        // contained, not propagated into CoreAudio's extern "C" callback (see the fn doc).
-        let mut on_frame = firewall_frame_handler(on_frame);
+        // contained, not propagated into CoreAudio's extern "C" callback (see the fn doc). The
+        // firewall also honors the teardown gate so a callback racing teardown becomes a no-op.
+        let mut on_frame = firewall_frame_handler(active.clone(), on_frame);
 
         // Build an input stream, dispatching on the device's native sample format
         // so we never ask cpal to reinterpret bytes incorrectly.
@@ -149,12 +181,21 @@ impl Capture {
         .map_err(|e| e.to_string())?;
 
         stream.play().map_err(|e| e.to_string())?;
-        Ok(Capture { stream })
+        Ok(Capture { stream, active })
     }
 }
 
 impl Drop for Capture {
     fn drop(&mut self) {
+        // Order is load-bearing for the native-crash fix. FIRST disarm the frame handler so any
+        // callback the CoreAudio IOThread dispatches from here on early-returns (see
+        // `firewall_frame_handler`) instead of touching state being torn down. Release pairs with
+        // the Acquire load in the handler. THEN pause the stream; the cpal `Stream` field then
+        // drops (after this body returns) and its CoreAudio Dispose synchronizes with the IOThread,
+        // so the callback closure is never freed mid-execution. Double-drop is impossible (Rust
+        // ownership) and concurrent `stop_dictation` calls are serialized by the session Mutex —
+        // dropping an already-`None` capture is a no-op — so this path is idempotent by construction.
+        self.active.store(false, Ordering::Release);
         let _ = self.stream.pause();
     }
 }
@@ -189,7 +230,8 @@ mod tests {
         use std::sync::Arc;
         let ran = Arc::new(AtomicBool::new(false));
         let ran_inner = ran.clone();
-        let mut firewalled = firewall_frame_handler(move |_frame: Vec<f32>| {
+        let active = Arc::new(AtomicBool::new(true));
+        let mut firewalled = firewall_frame_handler(active, move |_frame: Vec<f32>| {
             ran_inner.store(true, Ordering::SeqCst);
             panic!("simulated poisoned-mutex / FFI panic");
         });
@@ -202,6 +244,33 @@ mod tests {
         std::panic::set_hook(prev);
         // The handler ran (and panicked); reaching this line proves the firewall contained it.
         assert!(ran.load(Ordering::SeqCst), "the firewalled handler should have been invoked");
+    }
+
+    // Regression guard for the macOS native-crash fix: once `Capture::drop` flips the teardown
+    // gate false (BEFORE pausing/dropping the cpal Stream), any frame the CoreAudio IOThread still
+    // dispatches must NOT reach the inner handler — it becomes an inert no-op so it can't touch the
+    // transcriber/cloud/app state being torn down. Exercises the SHIPPED `firewall_frame_handler`,
+    // so removing the gate (or the ordered store in Drop) fails this test.
+    #[test]
+    fn frame_handler_is_a_noop_after_teardown_gate_flips() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let active = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = calls.clone();
+        let mut firewalled = firewall_frame_handler(active.clone(), move |_frame: Vec<f32>| {
+            calls_inner.fetch_add(1, Ordering::SeqCst);
+        });
+        firewalled(vec![0.1, 0.2, 0.3]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "runs while the capture is active");
+        // Mirror Capture::drop: disarm the gate before the (elided) pause/drop.
+        active.store(false, Ordering::Release);
+        firewalled(vec![0.4, 0.5, 0.6]);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a frame delivered after teardown began must be dropped, not run against torn-down state"
+        );
     }
 
     #[test]

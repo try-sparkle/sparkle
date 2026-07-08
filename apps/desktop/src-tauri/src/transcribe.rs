@@ -139,8 +139,13 @@ impl Transcriber for ParakeetTdt {
         if let Some(tail) = self.window.drain() {
             // Zero-pad the partial (<512) tail to a full 512-sample window before
             // handing it to the VAD, which requires exactly 512-sample chunks.
+            // WindowBuffer::drain only ever returns a sub-512 remainder today, but clamp
+            // defensively so a future windowing change can never turn the mute path (this is
+            // reached from stop_dictation → finalize) into a hard slice-length panic: copy at
+            // most 512 samples and truncate the source to match.
             let mut padded = [0f32; 512];
-            padded[..tail.len()].copy_from_slice(&tail);
+            let n = tail.len().min(512);
+            padded[..n].copy_from_slice(&tail[..n]);
             self.vad.lock().unwrap_or_else(|p| p.into_inner()).accept_waveform(&padded);
         }
         self.vad.lock().unwrap_or_else(|p| p.into_inner()).flush();
