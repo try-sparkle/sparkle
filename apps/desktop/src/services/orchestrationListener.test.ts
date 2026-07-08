@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { useProjectStore } from "../stores/projectStore";
+import {
+  useProjectStore,
+  markWorkerTearingDown,
+  clearWorkerTearingDown,
+} from "../stores/projectStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { listen } from "@tauri-apps/api/event";
@@ -420,6 +424,45 @@ describe("orchestrationListener", () => {
     const result = (args as { result: { spunDown?: boolean; error?: string } }).result;
     expect(result.error).toBeUndefined();
     expect(result.spunDown).toBe(true);
+  });
+
+  it("reconcile does NOT re-adopt a worker that is mid-teardown, even though its manifest still exists (the 'x closes the worker but the row comes back' bug)", async () => {
+    // The worker's row was just closed (removeAgent) but its background worktree+manifest reap hasn't
+    // finished — so its manifest is still on disk AND its parent build agent still lives. Without the
+    // teardown tombstone, reconcile would see "manifest present, record absent, parent alive" and
+    // re-adopt it — resurrecting the row the user just closed. The tombstone must suppress that until
+    // the manifest is gone.
+    const tearingId = "worker-mid-teardown";
+    const manifest = [
+      {
+        workerId: tearingId,
+        buildAgentId: buildId,
+        projectId,
+        branch: "sparkle/agent-td",
+        worktree: "/wt/td",
+        task: "closing",
+        createdAt: "2026-07-08T00:00:00.000Z",
+      },
+    ];
+
+    markWorkerTearingDown(tearingId);
+    scanWorkerManifestsMock.mockResolvedValueOnce(manifest);
+    fire({ reqId: "ltd", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+    await flush();
+    // NOT re-adopted while tombstoned.
+    expect(
+      useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents.some((a) => a.id === tearingId),
+    ).toBe(false);
+
+    // Once teardown completes (manifest would normally be gone too), the shield lifts — proving the
+    // tombstone, not some other filter, was what suppressed the adopt.
+    clearWorkerTearingDown(tearingId);
+    scanWorkerManifestsMock.mockResolvedValueOnce(manifest);
+    fire({ reqId: "ltd2", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+    await flush();
+    expect(
+      useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents.some((a) => a.id === tearingId),
+    ).toBe(true);
   });
 
   it("reconcile does NOT resurrect a worker whose parent build agent is gone", async () => {

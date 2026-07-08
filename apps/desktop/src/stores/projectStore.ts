@@ -351,6 +351,32 @@ export function acknowledgePendingAdds(ids: Iterable<string>): void {
   for (const id of ids) pendingLocalAdds.delete(id);
 }
 
+/** Ids of WORKERS whose teardown is in flight: the store record is already removed (the row was
+ *  dropped optimistically the instant × was clicked) but the on-disk worktree + `.sparkle/worker.json`
+ *  manifest are still being reaped in the background. While an id lives here, the disk reconcile
+ *  (orchestrationListener.reconcileWorkersFromDisk) must NOT re-adopt it from its not-yet-deleted
+ *  manifest — doing so was the "× closes the worker but the row comes back" resurrection. Cleared the
+ *  moment the worktree (and thus its manifest) is gone. Module-scoped: one set per window. Symmetric
+ *  with pendingLocalAdds (which shields a just-ADDED row); this shields a just-REMOVED one. */
+const workersTearingDown = new Set<string>();
+
+/** Mark a worker as mid-teardown so the disk reconcile won't resurrect its row before its manifest
+ *  is deleted. Pair every call with clearWorkerTearingDown once the worktree is reaped. */
+export function markWorkerTearingDown(id: string): void {
+  workersTearingDown.add(id);
+}
+
+/** Stop shielding a worker id once its worktree + manifest are gone (or teardown gave up). */
+export function clearWorkerTearingDown(id: string): void {
+  workersTearingDown.delete(id);
+}
+
+/** True while a worker's row is removed but its on-disk manifest may still exist — the reconcile
+ *  must skip these so it can't re-adopt a deliberately-closed worker. Exported for tests. */
+export function isWorkerTearingDown(id: string): boolean {
+  return workersTearingDown.has(id);
+}
+
 /** Rehydration merge that NEVER drops a live worker (sparkle-3tqv). Every rehydrate — startup and,
  *  crucially, cross-window (crossWindowSync.ts rehydrates from the shared localStorage blob on
  *  every remote change) — replaces the in-memory `projects` with the persisted snapshot. If another

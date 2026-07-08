@@ -14,6 +14,9 @@ vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 vi.mock("../services/worktree", () => ({ removeAgentWorkspace: vi.fn(() => Promise.resolve()) }));
 import { removeAgentWorkspace } from "../services/worktree";
+// killPty shells out to a Tauri command that doesn't exist under jsdom; stub it so the teardown's
+// background reap is deterministic and never rejects into the test.
+vi.mock("../pty", () => ({ killPty: vi.fn(() => Promise.resolve()) }));
 
 const { refreshAgentBranch, landAgentBranch, pushAgentBranch, openAgentPr, deleteAgentBranch } =
   vi.hoisted(() => ({
@@ -82,6 +85,20 @@ function openClosePrompt() {
   fireEvent.click(screen.getByLabelText("Close agent"));
 }
 
+// A build agent with NO unmerged work at risk (clean tree, 0 commits ahead): shouldPromptOnClose is
+// false, so clicking × silently tears it down (no Ship/Save/Discard modal) — the common case for a
+// finished agent whose work already landed.
+function silentCloseProject(): Project {
+  const project = buildAgentProject();
+  useRuntimeStore.setState({
+    branchStatus: { a1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 } },
+    status: {},
+    workflowStage: {},
+    pollBranchStatus: vi.fn(() => Promise.resolve()),
+  } as never);
+  return project;
+}
+
 const agentsNow = () => useProjectStore.getState().projects[0]!.agents.map((a) => a.id);
 
 beforeEach(() => {
@@ -115,6 +132,26 @@ describe("AgentSidebar — persistent close on the active row", () => {
     render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
     // The × is reserved for the active row (or the open detail card) — a resting inactive row has none.
     expect(screen.queryByLabelText("Close agent")).toBeNull();
+  });
+});
+
+describe("AgentSidebar — silent close removes the row without waiting on git", () => {
+  it("drops the build-agent row IMMEDIATELY even while worktree removal is still in flight", () => {
+    // Regression: closing a build agent used to `await removeAgentWorkspace` (serialized on the shared
+    // per-repo lock) BEFORE calling removeAgent, so when a concurrent agent held that lock the closed
+    // row lingered in the sidebar — and its pane re-appeared, since it was still selectedAgentId — until
+    // the lock drained ("X closes the terminal but the row stays / comes back"). The row removal must be
+    // optimistic: gone the instant you click ×, with the git cleanup reaped in the background.
+    vi.mocked(removeAgentWorkspace).mockReset().mockReturnValue(new Promise<void>(() => {})); // never resolves
+    silentCloseProject();
+    const p = useProjectStore.getState().projects[0]!;
+    useProjectStore.setState({ projects: [{ ...p, selectedAgentId: "a1" }] } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
+    fireEvent.click(screen.getByLabelText("Close agent"));
+    // No await, no waitFor: the store must already have dropped the row synchronously with the click,
+    // NOT after the hanging removeAgentWorkspace settles.
+    expect(agentsNow()).not.toContain("a1");
   });
 });
 

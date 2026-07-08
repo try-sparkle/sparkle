@@ -12,7 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { safeUnlisten } from "./safeUnlisten";
 import { spawnWorker, spinDownWorker } from "./workerSpawn";
 import { scanWorkerManifests, type WorkerManifest } from "./worktree";
-import { useProjectStore } from "../stores/projectStore";
+import { useProjectStore, isWorkerTearingDown } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { workersNeedingOpen } from "../engine/workerAttention";
@@ -193,6 +193,11 @@ export async function reconcileWorkersFromDisk(projectId?: string): Promise<numb
       const project = useProjectStore.getState().projects.find((p) => p.id === target.id);
       if (!project) continue;
       if (project.agents.some((a) => a.id === m.workerId)) continue; // record already present
+      // Never re-adopt a worker whose row was just closed but whose worktree/manifest is still being
+      // reaped in the background (spinDownWorker tombstones it): the record is gone from `agents` and
+      // the manifest hasn't been deleted YET, which is exactly the shape this loop would otherwise
+      // treat as an evicted worker to restore — resurrecting the row the user just closed.
+      if (isWorkerTearingDown(m.workerId)) continue;
       // Only adopt under a build agent that still exists: never resurrect a worker whose
       // orchestrator was deliberately closed (that worktree is orphaned — a separate concern).
       if (!project.agents.some((a) => a.id === m.buildAgentId)) continue;

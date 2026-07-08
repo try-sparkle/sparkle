@@ -20,7 +20,7 @@ vi.mock("./worktree", async (orig) => ({
   removeAgentWorkspace: (...a: unknown[]) => removeWsMock(...a),
 }));
 
-import { useProjectStore } from "../stores/projectStore";
+import { useProjectStore, isWorkerTearingDown } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { spawnWorker, spinDownWorker } from "./workerSpawn";
 
@@ -246,6 +246,51 @@ describe("spinDownWorker", () => {
     expect(runtimeCloseMock).toHaveBeenCalledWith(workerId); // runtime entry closed
     const agents = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
     expect(agents.some((a) => a.id === workerId)).toBe(false); // tab gone
+  });
+
+  it("drops the worker row SYNCHRONOUSLY, before the worktree reap resolves (row can't linger on a contended repo lock)", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" });
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId });
+    store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
+
+    // removeAgentWorkspace serializes on the shared repo lock; simulate a contended lock by making it
+    // never resolve. The OLD ordering awaited it BEFORE removeAgent, so the row lingered for as long
+    // as the lock was held. The fix drops the row synchronously and reaps in the background.
+    let releaseReap!: () => void;
+    removeWsMock.mockReturnValue(new Promise<void>((r) => (releaseReap = () => r(undefined))));
+
+    const pending = spinDownWorker({ projectId, workerId }); // NB: not awaited — reap is still stuck
+
+    // Row is already gone and the id is tombstoned, even though removeAgentWorkspace hasn't resolved.
+    const agentsNow = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
+    expect(agentsNow.some((a) => a.id === workerId)).toBe(false);
+    expect(isWorkerTearingDown(workerId)).toBe(true);
+
+    releaseReap(); // let the background reap finish
+    await pending;
+    // Tombstone clears once the worktree (and its manifest) is gone, so a legit orphan can reconcile later.
+    expect(isWorkerTearingDown(workerId)).toBe(false);
+    expect(removeWsMock).toHaveBeenCalledWith("/tmp/demo", projectId, workerId);
+  });
+
+  it("clears the tombstone even if the worktree reap rejects (never shields a ghost id forever)", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" });
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId });
+    store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
+
+    removeWsMock.mockRejectedValue(new Error("git failed"));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await spinDownWorker({ projectId, workerId });
+
+    expect(isWorkerTearingDown(workerId)).toBe(false);
+    warnSpy.mockRestore();
   });
 
   it("is a no-op for an unknown project or worker id (idempotent)", async () => {

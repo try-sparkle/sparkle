@@ -1,7 +1,11 @@
 // Programmatically spawn a worker agent under a build agent: register the tab, cut its worktree
 // from the parent's local branch, and persist the worktree. The PTY launch happens when the
 // worker tab opens (AgentPane), driven by the worker persona + the stored task.
-import { useProjectStore } from "../stores/projectStore";
+import {
+  useProjectStore,
+  markWorkerTearingDown,
+  clearWorkerTearingDown,
+} from "../stores/projectStore";
 import { type WorktreeInfo, killPty } from "../pty";
 import { prepareWorkerWorkspace, removeAgentWorkspace, writeWorkerManifest } from "./worktree";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -121,21 +125,44 @@ export async function spawnWorker(args: {
   return { workerId, branch: info.branch, worktree: info.path };
 }
 
-/** Tear down a finished worker: kill its PTY, remove its worktree (branch is kept), drop its tab
- *  and runtime entry. Idempotent for sequential calls — a worker already gone is a no-op.
- *  Worker-only: a non-worker id is a no-op, because removeAgent cascades to a build's workers and
- *  would orphan their PTYs/worktrees (this fn only tears down the single passed id). */
+/** Tear down a finished worker: drop its tab + runtime entry IMMEDIATELY, then reap its PTY and
+ *  worktree (branch is kept) in the background. Idempotent for sequential calls — a worker already
+ *  gone is a no-op. Worker-only: a non-worker id is a no-op, because removeAgent cascades to a
+ *  build's workers and would orphan their PTYs/worktrees (this fn only tears down the single id).
+ *
+ *  Ordering matters (the "× closes the worker but the row comes back" bug): removeAgentWorkspace
+ *  serializes on the shared per-root repo lock (worktree.withRepoLock), so AWAITING it BEFORE
+ *  removeAgent — as this did originally — left the just-closed worker row lingering in the sidebar
+ *  (and the orchestration self-heal, ensureWorkersOpen, re-opened it) for as long as a concurrent
+ *  agent held that lock. Mirrors the build-agent close (AgentSidebar.teardownAgent): drop the row
+ *  synchronously, reap OS/git resources after. Because a worker's on-disk manifest (unlike a closed
+ *  build agent's) can still be re-adopted by reconcileWorkersFromDisk while its parent lives, the id
+ *  is tombstoned (markWorkerTearingDown) across the reap so the reconcile can't resurrect the row
+ *  before the manifest is deleted; the tombstone clears once the worktree (and its manifest) is gone.
+ *  Returns after the reap so callers that need the worktree actually gone (handleSpinDown's slot
+ *  accounting relies only on the synchronous removeAgent, but the MCP reply should reflect a real
+ *  teardown) still await completion. */
 export async function spinDownWorker(args: { projectId: string; workerId: string }): Promise<void> {
   const project = useProjectStore.getState().projects.find((p) => p.id === args.projectId);
   if (!project) return;
   const worker = project.agents.find((a) => a.id === args.workerId);
   if (!worker || worker.kind !== "worker") return;
-  // Errors are swallowed so a partially-gone worker still finishes teardown; warn so a failed
-  // PTY kill / worktree removal (e.g. a transient git error leaving an orphan on disk) is visible.
-  await killPty(args.workerId).catch((e) => console.warn("spinDownWorker: killPty failed", e));
-  await removeAgentWorkspace(project.rootPath, args.projectId, args.workerId).catch((e) =>
-    console.warn("spinDownWorker: removeAgentWorkspace failed", e),
-  );
+  // Optimistic teardown: drop the row + runtime entry NOW so a contended repo lock can't leave the
+  // row lingering. Tombstone the id first so a reconcile that races the background reap can't
+  // re-adopt it from its not-yet-deleted manifest.
+  markWorkerTearingDown(args.workerId);
   useRuntimeStore.getState().close(args.workerId);
   useProjectStore.getState().removeAgent(args.projectId, args.workerId);
+  // Reap OS/git resources after the UI is already updated. Errors are swallowed so a partially-gone
+  // worker still finishes teardown; warn so a failed PTY kill / worktree removal (e.g. a transient
+  // git error leaving an orphan on disk) is visible. Clear the tombstone only once the worktree —
+  // and thus its manifest — is gone, so the reconcile is shielded for the whole window.
+  try {
+    await killPty(args.workerId).catch((e) => console.warn("spinDownWorker: killPty failed", e));
+    await removeAgentWorkspace(project.rootPath, args.projectId, args.workerId).catch((e) =>
+      console.warn("spinDownWorker: removeAgentWorkspace failed", e),
+    );
+  } finally {
+    clearWorkerTearingDown(args.workerId);
+  }
 }
