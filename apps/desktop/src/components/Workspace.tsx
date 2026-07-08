@@ -20,6 +20,7 @@ import {
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { startOrchestrationListener } from "../services/orchestrationListener";
 import { startControlListener } from "../services/controlListener";
+import { onRevealSparkle } from "../services/sparkleReveal";
 import { killProjectAgents, planWindowClose } from "../services/windowClose";
 import { windowTitleFor } from "../services/projectWindows";
 import { clearWindowProject } from "../services/windowRegistry";
@@ -145,6 +146,20 @@ export function Workspace() {
       unmounted = true;
       cleanup?.();
     };
+  }, [isMainWindow]);
+
+  // Reveal the Sparkle singleton when ANOTHER window's "Improve Sparkle" row asks for it. The pane
+  // is main-window-only (gated below), so a secondary/project window can't show it itself: it focuses
+  // this window and broadcasts SPARKLE_REVEAL_EVENT, which we honor here by flipping activeSpecial and
+  // ensuring the pane is open. MAIN-WINDOW ONLY (emit reaches every window incl. the emitter) — mirrors
+  // the control-listener gate above. See services/sparkleReveal.
+  useEffect(() => {
+    if (!isMainWindow) return;
+    const unlistenPromise = onRevealSparkle(() => {
+      useUiStore.getState().setActiveSpecial("sparkle");
+      useRuntimeStore.getState().open(SPARKLE_AGENT_ID);
+    });
+    return () => void safeUnlisten(unlistenPromise);
   }, [isMainWindow]);
 
   // Intercept the window's close (red traffic light) so we can ask keep-vs-kill before closing.
