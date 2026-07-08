@@ -207,21 +207,69 @@ pub(crate) fn handle_event(
 }
 
 /// Sibling of `handle_event`: on a `result` event, capture whether it reported FAILURE — its
-/// `subtype` (when not `"success"`) and its `is_error` flag — so a non-zero exit with empty
-/// stderr can be turned into a specific error message instead of a bare fallback. Kept as a
-/// separate function (rather than folded into `handle_event`) so the shared parser's signature,
-/// which `sparkle_improve.rs` also depends on, stays unchanged.
-pub(crate) fn capture_result_status(ev: &Value, subtype: &mut Option<String>, is_error: &mut bool) {
+/// `subtype` (when not `"success"`), its `is_error` flag, and (crucially) claude's OWN
+/// human-readable error text — so a non-zero exit with empty stderr surfaces the REAL reason
+/// instead of a bare synthesized fallback. Kept as a separate function (rather than folded into
+/// `handle_event`) so the shared parser's signature, which `sparkle_improve.rs` also depends on,
+/// stays unchanged.
+///
+/// The error text is the fix for "the Think tab still shows a dead-end error": on a failed
+/// result, `claude -p --output-format stream-json` reports the reason in an `errors[]` array
+/// (a stale `--resume`, a usage-limit / API error, an auth failure, …); some error subtypes
+/// instead carry it in `result` or `api_error_status`. The previous code read only `subtype` +
+/// `is_error` and threw the actual message away, so an empty-stderr failure degraded to the
+/// generic "stream reported an error result". We now capture the richest available source into
+/// `detail`; the first result event to carry one wins (later events don't clobber it).
+pub(crate) fn capture_result_status(
+    ev: &Value,
+    subtype: &mut Option<String>,
+    is_error: &mut bool,
+    detail: &mut Option<String>,
+) {
     if ev.get("type").and_then(Value::as_str) != Some("result") {
         return;
     }
-    if ev.get("is_error").and_then(Value::as_bool) == Some(true) {
+    let this_is_error = ev.get("is_error").and_then(Value::as_bool) == Some(true);
+    if this_is_error {
         *is_error = true;
     }
     if let Some(st) = ev.get("subtype").and_then(Value::as_str) {
         if st != "success" && !st.is_empty() {
             *subtype = Some(st.to_string());
         }
+    }
+    if detail.is_none() {
+        // 1. `errors[]` — claude's structured error list; the primary carrier (join non-empty).
+        let from_errors = ev
+            .get("errors")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .filter(|s| !s.is_empty());
+        // 2. `result` — only on an ACTUAL error result (on success it's the assistant's reply,
+        //    captured separately by `handle_event`); some subtypes put the reason here.
+        // 3. `api_error_status` — a best-effort string fallback for raw API errors.
+        *detail = from_errors
+            .or_else(|| {
+                ev.get("result")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| this_is_error && !s.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                ev.get("api_error_status")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            });
     }
 }
 
@@ -245,6 +293,10 @@ struct TurnOutcome {
     result_subtype: Option<String>,
     /// Whether the stream carried a `result` event with `is_error == true`.
     is_error: bool,
+    /// Claude's OWN human-readable error text, lifted from the failed `result` event's `errors[]`
+    /// array (or `result`/`api_error_status`). This is the real reason a turn failed — a stale
+    /// resume, a usage-limit / API error, etc. — and is the preferred message when stderr is empty.
+    error_detail: Option<String>,
 }
 
 /// Decide whether a FAILED turn should be retried once WITHOUT `--resume`. A stale
@@ -257,26 +309,33 @@ fn should_retry_without_resume(ok: bool, resume_session_id: Option<&str>) -> boo
     !ok && matches!(resume_session_id, Some(sid) if !sid.is_empty())
 }
 
-/// Build the `claude_chat:error` message for a failed turn. Prefers the child's own stderr
-/// (its real diagnostics) when non-empty; otherwise synthesizes a SPECIFIC message from the
-/// exit code and any non-`"success"` `result` subtype / `is_error` flag the stream carried,
-/// replacing the old bare `"claude exited without a successful result"` fallback. Appends
-/// `— retried without --resume` whenever a resume-retry was attempted. Pure so it can be
+/// Build the `claude_chat:error` message for a failed turn. Message priority, most-useful first:
+///  1. the child's own stderr (its real diagnostics) when non-empty;
+///  2. `error_detail` — claude's OWN error text lifted from the failed result event's `errors[]`
+///     (the fix for empty-stderr failures that used to dead-end on a generic message);
+///  3. a synthesized message from the exit code + any non-`"success"` subtype / `is_error` flag.
+/// Appends `— retried without --resume` whenever a resume-retry was attempted. Pure so it can be
 /// unit-tested.
 fn build_error_message(
     stderr: &str,
     exit_code: Option<i32>,
     result_subtype: Option<&str>,
     is_error: bool,
+    error_detail: Option<&str>,
     retried_without_resume: bool,
 ) -> String {
     let mut msg = {
         let stderr = stderr.trim();
+        let detail = error_detail.map(str::trim).filter(|s| !s.is_empty());
         if !stderr.is_empty() {
             // Prefer the child's own diagnostics verbatim.
             stderr.to_string()
+        } else if let Some(detail) = detail {
+            // No stderr, but the stream carried claude's own error text — surface THAT (the real
+            // reason: stale resume, usage-limit / API error, …) instead of a generic fallback.
+            detail.to_string()
         } else {
-            // No stderr: say exactly what we observed instead of the old bare fallback.
+            // Nothing to quote: say exactly what we observed instead of the old bare fallback.
             let mut m = match exit_code {
                 Some(code) => format!("claude exited (code {code}) with no output"),
                 None => "claude exited (killed by signal) with no output".to_string(),
@@ -379,6 +438,7 @@ fn run_reader(
     let mut acc = String::new();
     let mut result_subtype: Option<String> = None;
     let mut is_error = false;
+    let mut error_detail: Option<String> = None;
     let mut line: Vec<u8> = Vec::new();
     loop {
         line.clear();
@@ -404,9 +464,10 @@ fn run_reader(
                             ChatDelta { id: id.to_string(), text: txt.to_string() },
                         );
                     });
-                    // Alongside the parse: note a self-diagnosed failure so a non-zero exit
-                    // with empty stderr still yields a specific error message.
-                    capture_result_status(&ev, &mut result_subtype, &mut is_error);
+                    // Alongside the parse: note a self-diagnosed failure (subtype/is_error) and
+                    // lift claude's own error text so a non-zero exit with empty stderr surfaces
+                    // the REAL reason, not a generic fallback.
+                    capture_result_status(&ev, &mut result_subtype, &mut is_error, &mut error_detail);
                 } else {
                     tracing::debug!(id = %id, "claude_chat: skipped non-JSON stdout line");
                 }
@@ -440,6 +501,7 @@ fn run_reader(
             stderr: String::new(),
             result_subtype,
             is_error,
+            error_detail,
         };
     };
     let status = child.wait();
@@ -448,7 +510,17 @@ fn run_reader(
     // Prefer the clean final `result` text; fall back to the accumulated deltas.
     let text = if !final_text.is_empty() { final_text } else { acc };
     let stderr = stderr_handle.join().unwrap_or_default();
-    TurnOutcome { owned: true, ok, exit_code, session_id, text, stderr, result_subtype, is_error }
+    TurnOutcome {
+        owned: true,
+        ok,
+        exit_code,
+        session_id,
+        text,
+        stderr,
+        result_subtype,
+        is_error,
+        error_detail,
+    }
 }
 
 /// Emit the terminal event for a decided (owned) turn: `claude_chat:done` on success or
@@ -472,7 +544,17 @@ fn emit_outcome(app: &AppHandle, id: &str, outcome: TurnOutcome, retried_without
             outcome.exit_code,
             outcome.result_subtype.as_deref(),
             outcome.is_error,
+            outcome.error_detail.as_deref(),
             retried_without_resume,
+        );
+        // Log the failure so this class of Think error is diagnosable from logs alone (no
+        // screenshot needed). The message is claude's error reason / exit code — it carries no
+        // prompt and no secret, so it's safe to log (unlike the built script, which we never log).
+        tracing::warn!(
+            id = %id,
+            exit_code = ?outcome.exit_code,
+            retried_without_resume,
+            "claude_chat turn failed: {message}"
         );
         let _ = app.emit("claude_chat:error", ChatError { id: id.to_string(), message });
     }
@@ -578,9 +660,10 @@ pub async fn claude_chat_send(
                 }
                 Err(e) => {
                     // Couldn't even spawn the retry; surface the original failure, noting the
-                    // attempt. Fold the spawn error in only when the first run had no stderr.
+                    // attempt. Fold the spawn error in only when the first run gave us nothing
+                    // better to show — neither stderr NOR claude's own error text.
                     let mut original = outcome;
-                    if original.stderr.trim().is_empty() {
+                    if original.stderr.trim().is_empty() && original.error_detail.is_none() {
                         original.stderr = e;
                     }
                     emit_outcome(&read_app, &read_id, original, true);
@@ -721,12 +804,15 @@ mod tests {
 
     #[test]
     fn capture_result_status_flags_only_non_success_results() {
-        // A successful `result` event flags nothing.
+        // A successful `result` event flags nothing, and captures no error detail (its `result`
+        // string is the assistant's reply, not an error).
         let mut subtype = None;
         let mut is_error = false;
-        capture_result_status(&result_event("s", "hi"), &mut subtype, &mut is_error);
+        let mut detail = None;
+        capture_result_status(&result_event("s", "hi"), &mut subtype, &mut is_error, &mut detail);
         assert_eq!(subtype, None);
         assert!(!is_error);
+        assert_eq!(detail, None);
 
         // A non-success subtype + is_error are both captured.
         let ev = serde_json::json!({
@@ -734,16 +820,79 @@ mod tests {
         });
         let mut subtype = None;
         let mut is_error = false;
-        capture_result_status(&ev, &mut subtype, &mut is_error);
+        let mut detail = None;
+        capture_result_status(&ev, &mut subtype, &mut is_error, &mut detail);
         assert_eq!(subtype.as_deref(), Some("error_during_execution"));
         assert!(is_error);
 
         // A non-`result` event is ignored entirely.
         let mut subtype = None;
         let mut is_error = false;
-        capture_result_status(&text_delta_event("x"), &mut subtype, &mut is_error);
+        let mut detail = None;
+        capture_result_status(&text_delta_event("x"), &mut subtype, &mut is_error, &mut detail);
         assert_eq!(subtype, None);
         assert!(!is_error);
+        assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn capture_result_status_lifts_claude_error_text() {
+        // The real shape a failed `claude -p --output-format stream-json` result carries: the
+        // human-readable reason lives in an `errors[]` array (captured from a live smoke test of
+        // a stale `--resume`). This is what used to be thrown away, dead-ending the Think tab.
+        let ev = serde_json::json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": true,
+            "errors": ["Error: --resume requires a valid session ID or session title."],
+        });
+        let mut subtype = None;
+        let mut is_error = false;
+        let mut detail = None;
+        capture_result_status(&ev, &mut subtype, &mut is_error, &mut detail);
+        assert_eq!(
+            detail.as_deref(),
+            Some("Error: --resume requires a valid session ID or session title.")
+        );
+
+        // Multiple errors are joined; empty/blank entries are dropped.
+        let ev = serde_json::json!({
+            "type": "result", "is_error": true, "errors": ["first", "  ", "second"]
+        });
+        let mut subtype = None;
+        let mut is_error = false;
+        let mut detail = None;
+        capture_result_status(&ev, &mut subtype, &mut is_error, &mut detail);
+        assert_eq!(detail.as_deref(), Some("first; second"));
+
+        // No `errors[]` but an error result with a `result` string => that's the detail.
+        let ev = serde_json::json!({
+            "type": "result", "subtype": "error_max_turns", "is_error": true,
+            "result": "Reached the maximum number of turns."
+        });
+        let mut subtype = None;
+        let mut is_error = false;
+        let mut detail = None;
+        capture_result_status(&ev, &mut subtype, &mut is_error, &mut detail);
+        assert_eq!(detail.as_deref(), Some("Reached the maximum number of turns."));
+
+        // The FIRST result event to carry a detail wins; a later one doesn't clobber it.
+        let mut subtype = None;
+        let mut is_error = false;
+        let mut detail = None;
+        capture_result_status(
+            &serde_json::json!({ "type": "result", "is_error": true, "errors": ["kept"] }),
+            &mut subtype,
+            &mut is_error,
+            &mut detail,
+        );
+        capture_result_status(
+            &serde_json::json!({ "type": "result", "is_error": true, "errors": ["ignored"] }),
+            &mut subtype,
+            &mut is_error,
+            &mut detail,
+        );
+        assert_eq!(detail.as_deref(), Some("kept"));
     }
 
     #[test]
@@ -761,38 +910,73 @@ mod tests {
 
     #[test]
     fn error_message_prefers_stderr_then_synthesizes_specifics() {
-        // Non-empty stderr is preferred verbatim (trimmed).
-        let m = build_error_message("  boom: no conversation found  ", Some(1), None, false, false);
+        // Non-empty stderr is preferred verbatim (trimmed), even over a detail.
+        let m = build_error_message(
+            "  boom: no conversation found  ", Some(1), None, false, Some("detail"), false,
+        );
         assert_eq!(m, "boom: no conversation found");
 
         // Empty stderr => synthesize a specific message from the exit code...
-        let m = build_error_message("", Some(7), None, false, false);
+        let m = build_error_message("", Some(7), None, false, None, false);
         assert_eq!(m, "claude exited (code 7) with no output");
 
         // ...plus the result subtype when the stream self-diagnosed a failure...
-        let m = build_error_message("", Some(1), Some("error_during_execution"), true, false);
+        let m = build_error_message("", Some(1), Some("error_during_execution"), true, None, false);
         assert!(m.contains("claude exited (code 1) with no output"), "got: {m}");
         assert!(m.contains("result subtype 'error_during_execution'"), "got: {m}");
 
         // ...and the is_error hint when there's no subtype.
-        let m = build_error_message("", Some(1), None, true, false);
+        let m = build_error_message("", Some(1), None, true, None, false);
         assert!(m.contains("stream reported an error result"), "got: {m}");
 
         // A missing exit code (killed by signal) is phrased as such.
-        let m = build_error_message("", None, None, false, false);
+        let m = build_error_message("", None, None, false, None, false);
         assert!(m.contains("killed by signal"), "got: {m}");
+    }
+
+    #[test]
+    fn error_message_surfaces_claude_detail_when_stderr_empty() {
+        // The regression this fix targets: stderr is empty and the stream self-reported an error,
+        // but claude's OWN reason was captured. Surface that reason, NOT the generic fallback.
+        let m = build_error_message(
+            "",
+            Some(1),
+            None,
+            true,
+            Some("Claude usage limit reached. Your limit resets at 5:00pm."),
+            false,
+        );
+        assert_eq!(m, "Claude usage limit reached. Your limit resets at 5:00pm.");
+        // The old dead-end message must NOT appear when we have real detail.
+        assert!(!m.contains("stream reported an error result"), "got: {m}");
+
+        // Detail also beats a synthesized subtype line.
+        let m = build_error_message(
+            "", Some(1), Some("error_during_execution"), true, Some("the real reason"), false,
+        );
+        assert_eq!(m, "the real reason");
+
+        // A blank detail is ignored — we fall through to the synthesized message.
+        let m = build_error_message("", Some(1), None, true, Some("   "), false);
+        assert!(m.contains("stream reported an error result"), "got: {m}");
     }
 
     #[test]
     fn error_message_appends_retry_note_when_retried() {
         // The retry note is appended for a synthesized message...
-        let m = build_error_message("", Some(1), Some("error_during_execution"), false, true);
+        let m = build_error_message(
+            "", Some(1), Some("error_during_execution"), false, None, true,
+        );
         assert!(m.contains("claude exited (code 1) with no output"), "got: {m}");
         assert!(m.contains("result subtype 'error_during_execution'"), "got: {m}");
         assert!(m.ends_with("— retried without --resume"), "got: {m}");
 
-        // ...and also when we fell back to preferring stderr.
-        let m = build_error_message("boom", Some(1), None, false, true);
+        // ...when we fell back to preferring stderr...
+        let m = build_error_message("boom", Some(1), None, false, None, true);
         assert_eq!(m, "boom — retried without --resume");
+
+        // ...and when we surfaced claude's own detail.
+        let m = build_error_message("", Some(1), None, true, Some("stale session"), true);
+        assert_eq!(m, "stale session — retried without --resume");
     }
 }
