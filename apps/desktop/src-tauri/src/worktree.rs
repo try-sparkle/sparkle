@@ -189,6 +189,42 @@ fn ready_repos() -> &'static Mutex<HashSet<String>> {
     READY.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// If `<path>/.git` is a gitfile (an orphaned worktree/submodule pointer) whose target gitdir no
+/// longer exists, rename it aside so a fresh `git init` can succeed. A real `.git` *directory*, or a
+/// gitfile whose target still exists (a live worktree/submodule), is left completely untouched — the
+/// caller only reaches here after `git rev-parse --git-dir` already failed, so a healthy repo never
+/// gets this far. Best-effort: any I/O error leaves `.git` as-is and lets `git init` report the fault.
+fn clear_dangling_gitfile(path: &str) {
+    let dot_git = Path::new(path).join(".git");
+    // Only a regular file is a gitfile; a real `.git` directory (or symlink) is never touched.
+    match std::fs::symlink_metadata(&dot_git) {
+        Ok(meta) if meta.is_file() => {}
+        _ => return,
+    }
+    let Ok(contents) = std::fs::read_to_string(&dot_git) else { return };
+    // gitfile format is a first line `gitdir: <path>`. Read only that line so a valid but
+    // multi-line file can't smuggle an embedded newline into the target and get mis-resolved.
+    let Some(target) = contents.lines().next().and_then(|l| l.strip_prefix("gitdir:")).map(str::trim) else { return };
+    if target.is_empty() {
+        return;
+    }
+    // Relative targets resolve against the directory that holds `.git`.
+    let target_path = Path::new(target);
+    let resolved = if target_path.is_absolute() {
+        target_path.to_path_buf()
+    } else {
+        Path::new(path).join(target_path)
+    };
+    if resolved.exists() {
+        return; // live worktree/submodule — do not disturb it.
+    }
+    // Dangling pointer: move it aside rather than hard-deleting, so nothing is silently destroyed.
+    let aside = Path::new(path).join(".git.orphaned");
+    // Clear any prior salvage (file OR directory) so the rename can't fail on a name collision.
+    let _ = std::fs::remove_file(&aside).or_else(|_| std::fs::remove_dir_all(&aside));
+    let _ = std::fs::rename(&dot_git, &aside);
+}
+
 /// Ensure `<path>` is a git repo with a committable identity, at least one commit,
 /// and `.sparkle/` ignored. Idempotent. Cached per root for the session (see [`ready_repos`]).
 /// Sync core of [`ensure_project_repo`] (the git-subprocess work). Kept as a plain fn so the
@@ -202,6 +238,13 @@ fn ensure_project_repo_inner(path: String) -> Result<(), String> {
 
     // 1. Make it a repo if it isn't one yet.
     if git(&path, &["rev-parse", "--git-dir"]).is_err() {
+        // An orphaned worktree — a `.git` *file* (gitfile) pointing at a worktree/submodule
+        // admin dir that no longer exists — leaves the files intact but unreachable by git.
+        // A plain `git init` then follows the dangling pointer and dies with
+        // "fatal: not a git repository: <gitdir>", surfacing as "Couldn't start this agent".
+        // Move the dead pointer aside first so we can initialize a fresh standalone repo from
+        // the surviving files. Live worktrees pass the rev-parse check above and never reach here.
+        clear_dangling_gitfile(&path);
         git(&path, &["init"])?;
     }
 
@@ -2129,6 +2172,46 @@ mod tests {
 
     fn branch_exists(root: &str, branch: &str) -> bool {
         git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+    }
+
+    // Regression: opening a project directory that is an ORPHANED git worktree — a `.git`
+    // gitfile pointing at a `.git/worktrees/<name>` admin dir that has since been pruned — used to
+    // dead-end with "git init failed: fatal: not a git repository: <gitdir>" because `git init`
+    // follows the dangling pointer. ensure_project_repo_inner must recover it into a fresh repo.
+    #[test]
+    fn ensure_project_repo_recovers_orphaned_worktree() {
+        let root = unique_root("orphan-worktree");
+        let r = root.to_str().unwrap().to_string();
+        // Simulate the survivor: real files plus a `.git` gitfile whose target no longer exists.
+        std::fs::write(format!("{r}/keep.txt"), "user data").unwrap();
+        let dead_gitdir = format!("{r}/nonexistent/.git/worktrees/gone");
+        std::fs::write(format!("{r}/.git"), format!("gitdir: {dead_gitdir}\n")).unwrap();
+
+        // Precondition: this is exactly the state that made `git init` fail.
+        assert!(git(&r, &["rev-parse", "--git-dir"]).is_err(), "orphaned worktree must not resolve");
+        assert!(git(&r, &["init"]).is_err(), "plain init follows the dead pointer and fails");
+
+        // The fix recovers it into a real standalone repo with a born HEAD.
+        ensure_project_repo_inner(r.clone()).expect("orphaned worktree should be recovered");
+        assert!(git(&r, &["rev-parse", "HEAD"]).is_ok(), "recovered repo has a born HEAD");
+        assert!(Path::new(&r).join(".git").is_dir(), ".git is now a real repo directory");
+        assert!(Path::new(&r).join(".git.orphaned").exists(), "dead pointer preserved, not destroyed");
+        assert!(Path::new(&r).join("keep.txt").exists(), "user files are untouched");
+    }
+
+    // A LIVE worktree (its admin dir still exists) must be left completely alone — the helper only
+    // fires after rev-parse fails, but guard against ever disturbing a healthy `.git` gitfile.
+    #[test]
+    fn clear_dangling_gitfile_leaves_live_worktree_alone() {
+        let root = unique_root("live-worktree");
+        let r = root.to_str().unwrap().to_string();
+        let live_gitdir = format!("{r}/real-admin-dir");
+        std::fs::create_dir_all(&live_gitdir).unwrap();
+        std::fs::write(format!("{r}/.git"), format!("gitdir: {live_gitdir}\n")).unwrap();
+
+        clear_dangling_gitfile(&r);
+        assert!(Path::new(&r).join(".git").is_file(), "live gitfile must remain in place");
+        assert!(!Path::new(&r).join(".git.orphaned").exists(), "nothing should be moved aside");
     }
 
     // sparkle-zlic: the batched status command computes every agent in one pass and, crucially,
