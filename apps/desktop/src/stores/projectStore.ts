@@ -404,6 +404,13 @@ export function mergePreservingLiveWorkers(
     const present = new Set(pp.agents.map((a) => a.id));
     const survivors = cur.agents.filter((a) => {
       if (present.has(a.id)) return false; // already in the snapshot — nothing to re-attach
+      // A worker whose row is mid-teardown must NOT be re-attached — its removal is deliberate and
+      // its manifest is being reaped; re-attaching it here is the cross-window twin of the reconcile
+      // resurrection ("× closes the worker but the row comes back").
+      if (isWorkerTearingDown(a.id)) {
+        console.debug("[orchestration] blocked merge re-attach of tearing-down worker", a.id);
+        return false;
+      }
       // (1) A live worker with a cut worktree whose parent still exists (sparkle-3tqv): a snapshot
       //     that predates the spawn must not evict it — its worktree + manifest are live on disk.
       if (a.kind === "worker" && !!a.worktreePath && pp.agents.some((x) => x.id === a.parentId)) {
@@ -728,6 +735,13 @@ export const useProjectStore = create<ProjectState>()(
       adoptWorker: (projectId, worker) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) => {
+            // Never re-adopt a worker whose row is mid-teardown (× just closed it; its manifest is
+            // still being reaped). Store-level guard so EVERY caller is covered, not just the disk
+            // reconcile — this is the "× closes the worker but the row comes back" resurrection.
+            if (isWorkerTearingDown(worker.id)) {
+              console.debug("[orchestration] blocked adopt of tearing-down worker", worker.id);
+              return p;
+            }
             // Idempotent: an existing record wins — never clobber live in-memory state (e.g. a
             // name the user already saw) with the disk snapshot.
             if (p.agents.some((a) => a.id === worker.id)) return p;

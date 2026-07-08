@@ -294,6 +294,13 @@ function ensureWorkersOpen(): void {
   const openIds = new Set(rt.openAgentIds);
   for (const project of projects) {
     for (const worker of workersNeedingOpen(project.agents, rt.status, openIds)) {
+      // A worker mid-teardown (× just closed it; manifest still being reaped) can momentarily still
+      // look "stranded" — in the roster, not open, no status — before removeAgent has fully
+      // propagated. Re-opening it here is what resurrected the just-closed row; skip tombstoned ids.
+      if (isWorkerTearingDown(worker.id)) {
+        console.debug("[orchestration] skip re-open of tearing-down worker", worker.id);
+        continue;
+      }
       console.debug("[orchestration] re-opening stranded worker", worker.id);
       rt.open(worker.id);
       openIds.add(worker.id); // keep the local view current so a strand isn't opened twice
