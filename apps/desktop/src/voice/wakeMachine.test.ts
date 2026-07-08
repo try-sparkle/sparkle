@@ -54,3 +54,22 @@ describe("advance — passive boundary", () => {
     });
   });
 });
+
+describe("advance — custom wake config", () => {
+  const cfg = { wakeWord: "Hey Jarvis", stopWord: "Jarvis, halt" };
+  it("wakes on the custom word and inserts the remainder", () => {
+    expect(advance("passive", "hey jarvis do the thing", cfg)).toEqual({
+      phase: "active", insert: "do the thing", transitioned: true,
+    });
+  });
+  it("does NOT wake on the old default word once remapped", () => {
+    expect(advance("passive", "hey sparkle do the thing", cfg)).toEqual({
+      phase: "passive", insert: null, transitioned: false,
+    });
+  });
+  it("stops on the custom stop word and inserts the pre-stop remainder", () => {
+    expect(advance("active", "ship it jarvis halt", cfg)).toEqual({
+      phase: "passive", insert: "ship it", transitioned: true,
+    });
+  });
+});

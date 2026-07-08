@@ -15,6 +15,7 @@ export type CategoryId =
   | "workers"
   | "accounts"
   | "mobile"
+  | "voice"
   | "advanced";
 
 export const COMPOSER_MIN = 64;

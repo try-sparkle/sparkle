@@ -11,6 +11,11 @@ import type { AgentTabStatus } from "../types";
 // Type-only import: erased at compile time, so the store stays free of the Tauri runtime dep
 // (services/config pulls in @tauri-apps) and remains testable under jsdom.
 import type { EffectiveConfig } from "../services/config";
+import {
+  DEFAULT_WAKE_WORD,
+  DEFAULT_STOP_WORD,
+  DEFAULT_PAUSE_ON_SUBMIT,
+} from "../voice/voiceDefaults";
 
 // --- Status-change notifications -------------------------------------------------------------
 // Which agent statuses fire a Notification Center banner when an agent crosses INTO them. The
@@ -219,6 +224,15 @@ interface SettingsState {
   driftBehindNudge: number;
   driftAheadNudge: number;
   driftChangedLines: number;
+  /** Custom wake word (default "Hey Sparkle"). Mirrors [voice].wake_word; the always-listening
+   *  matcher (useDictation → wakeMachine) uses it. Config-mirrored, NOT persisted — re-read from
+   *  the file each launch. */
+  wakeWord: string;
+  /** Custom stop word (default "Sparkle, stop"). Mirrors [voice].stop_word. */
+  stopWord: string;
+  /** When true (default), submitting a prompt drops active dictation back to passive wake-word
+   *  listening (mic stays on). When false, dictation keeps listening. Mirrors [voice].pause_on_submit. */
+  pauseOnSubmit: boolean;
   /** Non-fatal warnings from the last config load (malformed layer, ignored per-project keys). */
   configWarnings: string[];
 
@@ -239,6 +253,12 @@ interface SettingsState {
   setAiFeature: (key: AiFeatureKey, on: boolean) => void;
   /** Bulk-set every AI feature (the All / Off segments). */
   setAllAiFeatures: (on: boolean) => void;
+  /** Optimistically set the custom wake word (configActions persists it to [voice].wake_word). */
+  setWakeWord: (word: string) => void;
+  /** Optimistically set the custom stop word (configActions persists it to [voice].stop_word). */
+  setStopWord: (word: string) => void;
+  /** Optimistically set the pause-on-submit toggle (configActions persists [voice].pause_on_submit). */
+  setPauseOnSubmit: (on: boolean) => void;
   /** Set the Sparkle self-improvement consent mode (the banner's Always/Case by case/Never control). */
   setSparkleImprovementConsent: (mode: SparkleImprovementConsent) => void;
   /** Record when an hourly improvement pass was last attempted (see improvementLastRunAt). */
@@ -275,6 +295,9 @@ export const useSettingsStore = create<SettingsState>()(
       driftBehindNudge: 10,
       driftAheadNudge: 15,
       driftChangedLines: 1000,
+      wakeWord: DEFAULT_WAKE_WORD,
+      stopWord: DEFAULT_STOP_WORD,
+      pauseOnSubmit: DEFAULT_PAUSE_ON_SUBMIT,
       configWarnings: [],
 
       setChiefPat: (pat) => set({ chiefPat: pat.trim() }),
@@ -293,6 +316,9 @@ export const useSettingsStore = create<SettingsState>()(
           aiComposer: on,
           aiSuggestedActions: on,
         }),
+      setWakeWord: (wakeWord) => set({ wakeWord }),
+      setStopWord: (stopWord) => set({ stopWord }),
+      setPauseOnSubmit: (pauseOnSubmit) => set({ pauseOnSubmit }),
       setSparkleImprovementConsent: (mode) => set({ sparkleImprovementConsent: mode }),
       setImprovementLastRunAt: (at) => set({ improvementLastRunAt: at }),
 
@@ -336,6 +362,12 @@ export const useSettingsStore = create<SettingsState>()(
           driftBehindNudge: config.workflow.drift.behind_nudge,
           driftAheadNudge: config.workflow.drift.ahead_nudge,
           driftChangedLines: config.workflow.drift.changed_lines,
+          // Voice controls. Trim + `|| default` treats an absent [voice] block (older backend) AND
+          // an empty/whitespace word alike — a blank custom word would otherwise take the generic
+          // matcher's custom path with an empty phrase and never wake.
+          wakeWord: (config.voice?.wake_word ?? "").trim() || DEFAULT_WAKE_WORD,
+          stopWord: (config.voice?.stop_word ?? "").trim() || DEFAULT_STOP_WORD,
+          pauseOnSubmit: config.voice?.pause_on_submit ?? DEFAULT_PAUSE_ON_SUBMIT,
           configWarnings: warnings,
         });
       },

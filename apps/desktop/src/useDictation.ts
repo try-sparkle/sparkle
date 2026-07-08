@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useDictationStore } from "./stores/dictationStore";
+import { useSettingsStore } from "./stores/settingsStore";
 import { useAiFeature, aiFeatureNow } from "./services/aiGate";
 import { useAuthStore } from "./stores/authStore";
 import { advance, type Advance } from "./voice/wakeMachine";
@@ -355,8 +356,10 @@ export function useAmbientVoice(): void {
   const lastTransitionAt = useRef(0);
   const onSegment = useRef((seg: string) => {
     const store = useDictationStore.getState();
+    // Read the configured words fresh each segment so a remap in Settings takes effect live.
+    const { wakeWord, stopWord } = useSettingsStore.getState();
     const now = Date.now();
-    const r = advance(store.phase, seg);
+    const r = advance(store.phase, seg, { wakeWord, stopWord });
     // 750ms cooldown: ignore a *transition* that lands right after another one,
     // but still route inserts that don't change phase.
     if (r.transitioned && now - lastTransitionAt.current < 750) return;

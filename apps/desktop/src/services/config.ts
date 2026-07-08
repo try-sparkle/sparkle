@@ -33,6 +33,13 @@ export interface FreshnessConfig {
   stale_build_block_commits: number;
   require_fresh_branch: boolean;
 }
+/** Voice controls (machine-wide; ignored in a per-project file). The wake/stop words and the
+ *  submit-listening behavior, editable in the ⋯ Settings → "Voice controls" pane. */
+export interface VoiceConfig {
+  wake_word: string;
+  stop_word: string;
+  pause_on_submit: boolean;
+}
 /** Menu-bar capture flow (machine-wide; ignored in a per-project file). */
 export interface CaptureConfig {
   popover_shortcut: string;
@@ -65,6 +72,9 @@ export interface SparkleConfig {
   ai: AiConfig;
   freshness: FreshnessConfig;
   capture: CaptureConfig;
+  // Optional so callers must guard: an older Rust backend (predating [voice]) omits it at runtime.
+  // The current backend always sends it, but the type stays honest about the config-changed payload.
+  voice?: VoiceConfig;
   /** Per-project "Done" stage definition (Definable Done & Delivered feature). */
   done: DoneConfig;
   /** Per-project "Delivered" stage definition + detected production-ship signal. */

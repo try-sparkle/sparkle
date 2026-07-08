@@ -6,6 +6,8 @@ import {
   matchesStop,
   stripWakePrefix,
   stripStopSuffix,
+  DEFAULT_WAKE_CONFIG,
+  type WakeConfig,
 } from "./wakeWords";
 
 export type Phase = "passive" | "active";
@@ -18,17 +20,21 @@ export interface Advance {
   transitioned: boolean;
 }
 
-export function advance(phase: Phase, segment: string): Advance {
+export function advance(
+  phase: Phase,
+  segment: string,
+  config: WakeConfig = DEFAULT_WAKE_CONFIG,
+): Advance {
   if (phase === "passive") {
-    if (matchesWake(segment)) {
-      const remainder = stripWakePrefix(segment).trim();
+    if (matchesWake(segment, config)) {
+      const remainder = stripWakePrefix(segment, config).trim();
       return { phase: "active", insert: remainder || null, transitioned: true };
     }
     return { phase: "passive", insert: null, transitioned: false };
   }
   // active
-  if (matchesStop(segment)) {
-    const remainder = stripStopSuffix(segment).trim();
+  if (matchesStop(segment, config)) {
+    const remainder = stripStopSuffix(segment, config).trim();
     return { phase: "passive", insert: remainder || null, transitioned: true };
   }
   return { phase: "active", insert: segment.trim() || null, transitioned: false };

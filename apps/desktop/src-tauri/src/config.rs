@@ -92,6 +92,22 @@ pub struct CaptureConfig {
     pub popover_shortcut: String,
 }
 
+/// Voice controls. Machine-wide (like [workers]/[ai]/[capture]): the wake/stop words and the
+/// submit-listening behavior are per-user preferences, so a per-project value is ignored with a
+/// warning. The DEFAULT words drive the tuned "sparkle" wake engine byte-for-byte; a custom word
+/// switches the matcher to a generic fuzzy path (see voice/wakeWords.ts).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VoiceConfig {
+    /// Spoken phrase that wakes dictation (default "Hey Sparkle").
+    pub wake_word: String,
+    /// Spoken phrase that ends active dictation (default "Sparkle, stop").
+    pub stop_word: String,
+    /// When a prompt is submitted, drop from active dictation back to passive wake-word listening
+    /// (the mic stays on). Default true = pause listening on submit.
+    pub pause_on_submit: bool,
+}
+
 /// One criterion in a stage definition. `kind` is "auto" (Sparkle observes it via `signal`)
 /// or "manual" (a human ticks it). `signal` is a known AutoSignal id, required iff kind="auto".
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -131,6 +147,7 @@ pub struct SparkleConfig {
     pub ai: AiConfig,
     pub freshness: FreshnessConfig,
     pub capture: CaptureConfig,
+    pub voice: VoiceConfig,
     /// Per-project "Done" stage definition (see the Definable Done & Delivered feature).
     pub done: DoneConfig,
     /// Per-project "Delivered" stage definition + detected production-ship signal.
@@ -171,6 +188,11 @@ impl Default for SparkleConfig {
                 require_fresh_branch: true,
             },
             capture: CaptureConfig { popover_shortcut: "ctrl+shift+r".into() },
+            voice: VoiceConfig {
+                wake_word: "Hey Sparkle".into(),
+                stop_word: "Sparkle, stop".into(),
+                pause_on_submit: true,
+            },
             // Undefined by default: every project starts with no Done/Delivered definition until
             // the user defines one (see the Definable Done & Delivered feature).
             done: DoneConfig { description: None, criteria: Vec::new() },
@@ -241,6 +263,13 @@ struct PartialCapture {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialVoice {
+    wake_word: Option<String>,
+    stop_word: Option<String>,
+    pause_on_submit: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialStageCriterion {
     text: Option<String>,
     kind: Option<String>,
@@ -270,6 +299,7 @@ struct PartialConfig {
     ai: Option<PartialAi>,
     freshness: Option<PartialFreshness>,
     capture: Option<PartialCapture>,
+    voice: Option<PartialVoice>,
     done: Option<PartialDone>,
     delivered: Option<PartialDelivered>,
 }
@@ -335,6 +365,19 @@ fn apply_freshness(into: &mut FreshnessConfig, p: Option<PartialFreshness>) {
 fn apply_capture(into: &mut CaptureConfig, p: Option<PartialCapture>) {
     if let Some(PartialCapture { popover_shortcut: Some(v) }) = p {
         into.popover_shortcut = v;
+    }
+}
+
+fn apply_voice(into: &mut VoiceConfig, p: Option<PartialVoice>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.wake_word {
+        into.wake_word = v;
+    }
+    if let Some(v) = p.stop_word {
+        into.stop_word = v;
+    }
+    if let Some(v) = p.pause_on_submit {
+        into.pause_on_submit = v;
     }
 }
 
@@ -442,6 +485,7 @@ fn build_effective(
                 apply_ai(&mut cfg.ai, p.ai);
                 apply_freshness(&mut cfg.freshness, p.freshness);
                 apply_capture(&mut cfg.capture, p.capture);
+                apply_voice(&mut cfg.voice, p.voice);
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
             }
@@ -474,6 +518,13 @@ fn build_effective(
                         "[capture] in a per-project .sparkle/config.toml is ignored — the \
                          global shortcut is a machine-wide setting; set it in the global \
                          config.toml"
+                            .to_string(),
+                    );
+                }
+                if p.voice.is_some() {
+                    warnings.push(
+                        "[voice] in a per-project .sparkle/config.toml is ignored — the wake/stop \
+                         words are a machine-wide preference; set them in the global config.toml"
                             .to_string(),
                     );
                 }
@@ -640,6 +691,21 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 # be parsed or the combo is taken by another app, Sparkle logs a warning and runs without
 # a shortcut (the menu-bar icon still works).
 popover_shortcut = "ctrl+shift+r"
+
+# --- Voice controls (per-machine; ignored in a project file) ----------------------------
+# The spoken wake/stop words and what happens to dictation when you submit a prompt. Edit these
+# here or in the ⋯ Settings → "Voice controls" pane. The DEFAULT words below run Sparkle's tuned
+# "Hey Sparkle" recognition engine; changing them switches to a generic fuzzy matcher (a
+# distinctive, multi-syllable phrase recognizes best).
+[voice]
+# Spoken phrase that starts dictation.
+wake_word = "Hey Sparkle"
+# Spoken phrase that ends active dictation.
+stop_word = "Sparkle, stop"
+# true  = submitting a prompt drops from active dictation back to passive wake-word listening
+#         (the mic stays on; say the wake word again to resume).
+# false = keep listening — stay in active dictation after a submit.
+pause_on_submit = true
 
 # --- Branch/build freshness guardrails (repo-scoped; overridable in a project file) ----
 # These stop work from being done on — or a DMG from being shipped from — a branch that has
@@ -1204,6 +1270,36 @@ mod tests {
         let (cfg, warns, _) = effective(None, Some(p));
         assert_eq!(cfg.capture.popover_shortcut, "ctrl+shift+r");
         assert!(warns.iter().any(|w| w.contains("[capture]")));
+    }
+
+    #[test]
+    fn voice_defaults_and_overrides() {
+        // Absent [voice] section → the built-in wake/stop words + pause-on-submit default.
+        let (cfg, _, _) = effective(None, None);
+        assert_eq!(cfg.voice.wake_word, "Hey Sparkle");
+        assert_eq!(cfg.voice.stop_word, "Sparkle, stop");
+        assert!(cfg.voice.pause_on_submit);
+
+        // Global layer overrides each field independently.
+        let g = r#"
+            [voice]
+            wake_word = "Hey Jarvis"
+            stop_word = "Jarvis, halt"
+            pause_on_submit = false
+        "#;
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.voice.wake_word, "Hey Jarvis");
+        assert_eq!(cfg.voice.stop_word, "Jarvis, halt");
+        assert!(!cfg.voice.pause_on_submit);
+
+        // A partial override leaves the untouched fields at their defaults.
+        let g2 = "[voice]\nwake_word = \"Computer\"\n";
+        let (cfg, _, _) = effective(Some(g2), None);
+        assert_eq!(cfg.voice.wake_word, "Computer");
+        assert_eq!(cfg.voice.stop_word, "Sparkle, stop");
+        assert!(cfg.voice.pause_on_submit);
     }
 
     #[test]

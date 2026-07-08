@@ -7,6 +7,7 @@ import {
   AI_FEATURE_FIELD,
   type AiFeatureFlags,
 } from "./settingsStore";
+import type { EffectiveConfig } from "../services/config";
 
 describe("effectiveChiefPat — PAT resolution order", () => {
   it("prefers a user-entered (stored) PAT, trimmed", () => {
@@ -246,6 +247,7 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
           require_fresh_branch: true,
         },
         capture: { popover_shortcut: "ctrl+shift+r" },
+        voice: { wake_word: "Hey Jarvis", stop_word: "Jarvis, halt", pause_on_submit: false },
         done: { description: null, criteria: [] },
         delivered: {
           description: null,
@@ -275,5 +277,110 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
       true,
     ]);
     expect(s.configWarnings).toEqual(["w1", "w2"]);
+    // Voice mirror
+    expect(s.wakeWord).toBe("Hey Jarvis");
+    expect(s.stopWord).toBe("Jarvis, halt");
+    expect(s.pauseOnSubmit).toBe(false);
+  });
+
+  it("falls back to the default voice words when the config has no [voice] block", () => {
+    // Simulate an older backend that predates the [voice] section (voice omitted at runtime).
+    const eff = {
+      config: {
+        workflow: {
+          require_pr: true,
+          worktree_isolation: true,
+          default_branch: "",
+          born_fresh_from_base: true,
+          delete_merged_branch: true,
+          drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
+        },
+        workers: { max_concurrent: 5 },
+        ai: {
+          auto_rename: true,
+          voice_dictation: true,
+          brainstorm: true,
+          composer: true,
+          suggested_actions: true,
+        },
+        freshness: {
+          staleness_warn_commits: 25,
+          stale_build_block_commits: 25,
+          require_fresh_branch: true,
+        },
+        capture: { popover_shortcut: "ctrl+shift+r" },
+        done: { description: null, criteria: [] },
+        delivered: {
+          description: null,
+          detected_method: null,
+          confidence: null,
+          confidence_note: null,
+          learned: false,
+          criteria: [],
+        },
+      },
+      warnings: [],
+    } satisfies EffectiveConfig; // `voice` is optional, so omitting it typechecks (older backend)
+    useSettingsStore.getState().hydrateFromConfig(eff);
+    const s = useSettingsStore.getState();
+    expect(s.wakeWord).toBe("Hey Sparkle");
+    expect(s.stopWord).toBe("Sparkle, stop");
+    expect(s.pauseOnSubmit).toBe(true);
+  });
+
+  it("treats an empty/whitespace configured word as the default", () => {
+    useSettingsStore.getState().hydrateFromConfig({
+      config: {
+        workflow: {
+          require_pr: true,
+          worktree_isolation: true,
+          default_branch: "",
+          born_fresh_from_base: true,
+          delete_merged_branch: true,
+          drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
+        },
+        workers: { max_concurrent: 5 },
+        ai: {
+          auto_rename: true,
+          voice_dictation: true,
+          brainstorm: true,
+          composer: true,
+          suggested_actions: true,
+        },
+        freshness: {
+          staleness_warn_commits: 25,
+          stale_build_block_commits: 25,
+          require_fresh_branch: true,
+        },
+        capture: { popover_shortcut: "ctrl+shift+r" },
+        voice: { wake_word: "   ", stop_word: "", pause_on_submit: false },
+        done: { description: null, criteria: [] },
+        delivered: {
+          description: null,
+          detected_method: null,
+          confidence: null,
+          confidence_note: null,
+          learned: false,
+          criteria: [],
+        },
+      },
+      warnings: [],
+    });
+    const s = useSettingsStore.getState();
+    expect(s.wakeWord).toBe("Hey Sparkle"); // whitespace-only → default
+    expect(s.stopWord).toBe("Sparkle, stop"); // empty → default
+    expect(s.pauseOnSubmit).toBe(false); // a real boolean is still honored
+  });
+});
+
+describe("voice setters", () => {
+  it("setWakeWord / setStopWord / setPauseOnSubmit update the store", () => {
+    useSettingsStore.getState().setWakeWord("Computer");
+    useSettingsStore.getState().setStopWord("Computer, stop");
+    useSettingsStore.getState().setPauseOnSubmit(false);
+    const s = useSettingsStore.getState();
+    expect(s.wakeWord).toBe("Computer");
+    expect(s.stopWord).toBe("Computer, stop");
+    expect(s.pauseOnSubmit).toBe(false);
   });
 });

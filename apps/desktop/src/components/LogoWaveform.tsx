@@ -6,6 +6,8 @@ import { TbMicrophone, TbMicrophoneOff } from "react-icons/tb";
 import { C, DANGER } from "../theme/colors";
 import type { Phase } from "../voice/wakeMachine";
 import { useDictationStore } from "../stores/dictationStore";
+import { useSettingsStore } from "../stores/settingsStore";
+import { WAKE_PHRASE, STOP_PHRASE } from "../voice/dictationCopy";
 
 // Many thin slivers (was 28 fat bars) so the meter reads as a dense, lively waveform
 // rather than a row of chunky blocks. The rAF loop stays cheap even at this count —
@@ -77,13 +79,15 @@ export function captionFor(
   phase: Phase,
   enabled: boolean,
   listening: boolean,
+  wakeWord: string = WAKE_PHRASE,
+  stopWord: string = STOP_PHRASE,
 ): string | null {
   if (!enabled) return null;
   if (!listening)
     return "Listening paused: Will auto-resume when you re-focus on this project.";
   return phase === "passive"
-    ? "Listening for the wake word: Just say Hey Sparkle to talk to me"
-    : "Actively listening: Just say Sparkle, stop to finish";
+    ? `Listening for the wake word: Just say ${wakeWord} to talk to me`
+    : `Actively listening: Just say ${stopWord} to finish`;
 }
 
 /**
@@ -93,6 +97,8 @@ export function captionFor(
  */
 export function LogoWaveform() {
   const phase = useDictationStore((s) => s.phase);
+  const wakeWord = useSettingsStore((s) => s.wakeWord);
+  const stopWord = useSettingsStore((s) => s.stopWord);
   const enabled = useDictationStore((s) => s.enabled);
   const status = useDictationStore((s) => s.status);
   const error = useDictationStore((s) => s.error);
@@ -188,7 +194,7 @@ export function LogoWaveform() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, listening]);
 
-  const caption = captionFor(phase, enabled, listening);
+  const caption = captionFor(phase, enabled, listening, wakeWord, stopWord);
   // Visual "active sweep" only when capture is genuinely live; phase alone isn't
   // enough (we could be in active phase but focus-paused).
   const liveActive = listening && phase === "active";
@@ -424,7 +430,7 @@ export function LogoWaveform() {
                 color: C.teal,
               }}
             >
-              {phase === "passive" ? "Hey Sparkle" : "Sparkle, stop"}
+              {phase === "passive" ? wakeWord : stopWord}
             </span>{" "}
             {phase === "passive" ? "to talk to me" : "to finish"}
           </span>

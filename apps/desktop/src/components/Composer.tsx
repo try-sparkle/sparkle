@@ -66,30 +66,30 @@ import { isComposerToggleKey } from "./composerToggle";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { arrowOverflowDirection } from "./composerArrowOverflow";
 import { useDictationStore } from "../stores/dictationStore";
+import { useSettingsStore } from "../stores/settingsStore";
+import { maybePauseOnSubmit } from "../services/dictationControls";
 import {
   STOP_PHRASE,
   MIC_HOT_PREFIX,
   MIC_HOT_SUFFIX,
-  MIC_HOT_PLACEHOLDER,
-  WAKE_PHRASE,
   WAKE_PREFIX,
   WAKE_SUFFIX,
-  WAKE_PLACEHOLDER,
+  micHotPlaceholder,
+  wakePlaceholder,
 } from "../voice/dictationCopy";
 import { log } from "../logger";
 
 const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140);
 
 // Mic-hot ("audio is active") copy lives in voice/dictationCopy.ts so the Think composer reads
-// the exact same wording (single source of truth). The overlay below paints STOP_PHRASE as a
-// gradient; the native-textarea fallback reuses MIC_HOT_PLACEHOLDER verbatim.
+// the exact same wording (single source of truth). The overlay below paints the stop phrase as a
+// styled span; the native-textarea fallback reuses micHotPlaceholder(stopWord) verbatim.
 
-/** The stop phrase ("Sparkle, stop") in solid brand blue (C.teal #2f6bff), matching the
- *  "Hey Sparkle" phrase. (The cyan→blue gradient fade was dropped per design feedback.) */
-function StopPhrase() {
-  return (
-    <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{STOP_PHRASE}</span>
-  );
+/** The stop phrase (default "Sparkle, stop", or the user's custom word) in solid brand blue
+ *  (C.teal #2f6bff), matching the wake phrase. (The cyan→blue gradient fade was dropped per
+ *  design feedback.) */
+function StopPhrase({ phrase = STOP_PHRASE }: { phrase?: string }) {
+  return <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{phrase}</span>;
 }
 
 /** Simple camera glyph for the screen-capture button. Inherits color via currentColor. */
@@ -200,6 +200,10 @@ export function Composer({
   const phase = useDictationStore((s) => s.phase);
   const liveActive = audioActive && phase === "active";
   const livePassive = audioActive && phase === "passive";
+  // Configured wake/stop words so every dictation hint reflects a user's remap (default words
+  // reproduce the original copy exactly).
+  const wakeWord = useSettingsStore((s) => s.wakeWord);
+  const stopWord = useSettingsStore((s) => s.stopWord);
 
   // Inline ghost-text autocomplete. `history` is the global list of past prompts; `caretAtEnd`
   // gates the suggestion so it only appears when the caret is at the very end of the text
@@ -717,6 +721,9 @@ export function Composer({
     await submitPrompt(agentId, payload);
     // Consume a trial prompt only now that it's actually delivered (no-op for entitled users).
     void recordTrialSend();
+    // "Pause listening on submit" (default): if actively dictating, drop back to passive wake-word
+    // listening now that the prompt is sent. No-op under "Keep listening" or when not dictating.
+    maybePauseOnSubmit();
   };
 
   const send = async () => {
@@ -1180,10 +1187,10 @@ export function Composer({
                   : showRichPlaceholder
                   ? "" // the styled overlay below renders this state's placeholder
                   : liveActive
-                  ? MIC_HOT_PLACEHOLDER
+                  ? micHotPlaceholder(stopWord)
                   : livePassive
-                  ? WAKE_PLACEHOLDER
-                  : "Just say Hey Sparkle and I'll start listening as you talk."
+                  ? wakePlaceholder(wakeWord)
+                  : `Just say ${wakeWord} and I'll start listening as you talk.`
               }
               spellCheck={false}
               style={{
@@ -1261,7 +1268,7 @@ export function Composer({
                 // focused hint below — that hint remains live only when the mic is muted.
                 <>
                   {MIC_HOT_PREFIX}
-                  <StopPhrase />
+                  <StopPhrase phrase={stopWord} />
                   {MIC_HOT_SUFFIX}
                 </>
               ) : livePassive ? (
@@ -1270,7 +1277,7 @@ export function Composer({
                 // the typing hint, so like the mic-hot copy it stays put on focus.
                 <>
                   {WAKE_PREFIX}
-                  <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{WAKE_PHRASE}</span>
+                  <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{wakeWord}</span>
                   {WAKE_SUFFIX}
                 </>
               ) : focused ? (
@@ -1278,7 +1285,7 @@ export function Composer({
               ) : (
                 <>
                   Just say{" "}
-                  <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>Hey Sparkle</span>{" "}
+                  <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{wakeWord}</span>{" "}
                   and I&apos;ll start listening as you talk.
                 </>
               )}

@@ -2,6 +2,20 @@
 // No React, no Tauri — fully unit-testable. See the design spec
 // (docs/superpowers/specs/2026-06-24-hey-sparkle-always-listening-design.md).
 import { doubleMetaphone } from "double-metaphone";
+import { DEFAULT_WAKE_WORD, DEFAULT_STOP_WORD } from "./voiceDefaults";
+
+/** User-configurable wake/stop words. When a word equals its built-in default, the tuned
+ *  "sparkle" engine runs (unchanged); otherwise the generic per-token fuzzy matcher is used.
+ *  Wake and stop are evaluated independently, so customizing one leaves the other on its
+ *  own path. */
+export interface WakeConfig {
+  wakeWord: string;
+  stopWord: string;
+}
+export const DEFAULT_WAKE_CONFIG: WakeConfig = {
+  wakeWord: DEFAULT_WAKE_WORD,
+  stopWord: DEFAULT_STOP_WORD,
+};
 
 // Tier 1: nonsense / domain ASR artifacts — accepted ANYWHERE (no carrier needed).
 const TIER1 = [
@@ -98,7 +112,7 @@ function demotesToTier2(token: string): boolean {
   return TIER2_SINGLE_BASES.has(stripTrailingS(token));
 }
 
-export function matchesWake(segment: string): boolean {
+function matchesWakeDefault(segment: string): boolean {
   const tokens = tokenize(segment);
   if (tokens.length === 0) return false;
   const precededByHey = (i: number) => i > 0 && tokens[i - 1] === "hey";
@@ -144,7 +158,7 @@ function isStopToken(tok: string): boolean {
   return STOP_VARIANTS.has(tok);
 }
 
-export function matchesStop(segment: string): boolean {
+function matchesStopDefault(segment: string): boolean {
   return stopStartIndex(tokenize(segment)) >= 0;
 }
 
@@ -184,7 +198,7 @@ function stopStartIndex(tokens: string[]): number {
 }
 
 /** Return the normalized text AFTER the wake phrase (the same-segment remainder). */
-export function stripWakePrefix(segment: string): string {
+function stripWakePrefixDefault(segment: string): string {
   const tokens = tokenize(segment);
   const start = wakeStartIndex(tokens);
   if (start < 0) return normalize(segment);
@@ -210,9 +224,90 @@ export function stripWakePrefix(segment: string): string {
 }
 
 /** Return the normalized text BEFORE the stop phrase (the same-segment remainder). */
-export function stripStopSuffix(segment: string): string {
+function stripStopSuffixDefault(segment: string): string {
   const tokens = tokenize(segment);
   const start = stopStartIndex(tokens);
   if (start < 0) return normalize(segment);
   return tokens.slice(0, start).join(" ").trim();
+}
+
+// ── Generic (custom-word) matcher ──────────────────────────────────────────────
+// Used whenever a configured word differs from its built-in default. Matches the
+// user's typed phrase as a CONTIGUOUS run of tokens, each fuzzily compared (see
+// tokenFuzzyEq for the length-gated exact/phonetic/edit-distance rules). This is
+// deliberately simpler/looser than the tuned "sparkle" engine; the Voice controls
+// pane warns that accuracy varies by word (short words especially).
+
+// Route on VALUE equality (normalized): a word equal to its built-in default runs the tuned
+// engine, a different word runs the generic matcher. Typing the default phrase ("Hey Sparkle")
+// into the config is therefore intentionally indistinguishable from leaving it unset — both get
+// the tuned engine, which is strictly more accurate than the generic path, so this is the
+// desired behavior, not a footgun.
+const isDefaultWake = (cfg: WakeConfig) => normalize(cfg.wakeWord) === normalize(DEFAULT_WAKE_WORD);
+const isDefaultStop = (cfg: WakeConfig) => normalize(cfg.stopWord) === normalize(DEFAULT_STOP_WORD);
+
+/** True when transcript token `t` is a fuzzy match for phrase token `p`.
+ *  Length-gated so short words don't over-match. Both fuzzy nets misbehave at short lengths:
+ *  the Levenshtein net matches every 1-edit neighbor ("cat"→bat/car/rat), and Double-Metaphone
+ *  codes collide densely ("cat"/"cot"/"cut"/"kit" all code "KT"). So a phrase token of ≤4 chars
+ *  requires an EXACT match; only 5+ char words get the phonetic + edit-distance (≤2) nets. A ≤2
+ *  char transcript token is also excluded from the fuzzy nets (metaphone is unreliable that short). */
+function tokenFuzzyEq(t: string, p: string): boolean {
+  if (t === p) return true;
+  if (p.length <= 4 || t.length <= 2) return false;
+  const mpP = doubleMetaphone(p)[0];
+  const mpT = doubleMetaphone(t)[0];
+  if (mpP && mpT && mpP === mpT) return true;
+  return lev(t, p, 2) <= 2;
+}
+
+/** Index where `phrase` first matches `tokens` as a contiguous fuzzy run, else -1. */
+function phraseMatchIndex(tokens: string[], phrase: string[]): number {
+  if (phrase.length === 0 || tokens.length < phrase.length) return -1;
+  for (let i = 0; i + phrase.length <= tokens.length; i++) {
+    let ok = true;
+    for (let j = 0; j < phrase.length; j++) {
+      const t = tokens[i + j];
+      const p = phrase[j];
+      if (t === undefined || p === undefined || !tokenFuzzyEq(t, p)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
+// ── Public API: branch on default-vs-custom, per word ───────────────────────────
+
+/** True when the segment contains the configured wake word. */
+export function matchesWake(segment: string, config: WakeConfig = DEFAULT_WAKE_CONFIG): boolean {
+  if (isDefaultWake(config)) return matchesWakeDefault(segment);
+  return phraseMatchIndex(tokenize(segment), tokenize(config.wakeWord)) >= 0;
+}
+
+/** True when the segment contains the configured stop word. */
+export function matchesStop(segment: string, config: WakeConfig = DEFAULT_WAKE_CONFIG): boolean {
+  if (isDefaultStop(config)) return matchesStopDefault(segment);
+  return phraseMatchIndex(tokenize(segment), tokenize(config.stopWord)) >= 0;
+}
+
+/** Return the normalized text AFTER the configured wake phrase (same-segment remainder). */
+export function stripWakePrefix(segment: string, config: WakeConfig = DEFAULT_WAKE_CONFIG): string {
+  if (isDefaultWake(config)) return stripWakePrefixDefault(segment);
+  const tokens = tokenize(segment);
+  const phrase = tokenize(config.wakeWord);
+  const idx = phraseMatchIndex(tokens, phrase);
+  if (idx < 0) return normalize(segment);
+  return tokens.slice(idx + phrase.length).join(" ").trim();
+}
+
+/** Return the normalized text BEFORE the configured stop phrase (same-segment remainder). */
+export function stripStopSuffix(segment: string, config: WakeConfig = DEFAULT_WAKE_CONFIG): string {
+  if (isDefaultStop(config)) return stripStopSuffixDefault(segment);
+  const tokens = tokenize(segment);
+  const idx = phraseMatchIndex(tokens, tokenize(config.stopWord));
+  if (idx < 0) return normalize(segment);
+  return tokens.slice(0, idx).join(" ").trim();
 }

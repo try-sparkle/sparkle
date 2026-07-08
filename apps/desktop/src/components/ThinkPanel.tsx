@@ -5,7 +5,7 @@ import type { Project } from "../types";
 import { useSettingsStore, effectiveChiefPat, aiFeatureMode } from "../stores/settingsStore";
 import { useHandoffStore } from "../stores/handoffStore";
 import { useDictationStore } from "../stores/dictationStore";
-import { MIC_HOT_PLACEHOLDER, WAKE_PLACEHOLDER } from "../voice/dictationCopy";
+import { micHotPlaceholder, wakePlaceholder } from "../voice/dictationCopy";
 import {
   ensureChiefProject,
   startChat,
@@ -864,6 +864,8 @@ export function ThinkPanel({
   const phase = useDictationStore((s) => s.phase);
   const liveActive = audioActive && phase === "active";
   const livePassive = audioActive && phase === "passive";
+  const wakeWord = useSettingsStore((s) => s.wakeWord);
+  const stopWord = useSettingsStore((s) => s.stopWord);
   const interim = useDictationStore((s) => (visible ? s.interim : ""));
 
   useEffect(() => {
@@ -1048,9 +1050,9 @@ export function ThinkPanel({
                 }}
                 placeholder={
                   liveActive
-                    ? MIC_HOT_PLACEHOLDER
+                    ? micHotPlaceholder(stopWord)
                     : livePassive
-                    ? WAKE_PLACEHOLDER
+                    ? wakePlaceholder(wakeWord)
                     : `Talk to Sparkle about ${project.name}…  (type @ for voices)`
                 }
                 rows={2}

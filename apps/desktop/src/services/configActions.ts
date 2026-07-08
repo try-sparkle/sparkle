@@ -8,6 +8,11 @@
 // next hydrate reconciles with the file.
 import { setConfigValue, setConfigValues } from "./config";
 import { useSettingsStore, type AiFeatureKey } from "../stores/settingsStore";
+import {
+  DEFAULT_WAKE_WORD,
+  DEFAULT_STOP_WORD,
+  DEFAULT_PAUSE_ON_SUBMIT,
+} from "../voice/voiceDefaults";
 
 /** Menu feature key → its dotted config path under [ai]. */
 const AI_CONFIG_PATH: Record<AiFeatureKey, string> = {
@@ -50,6 +55,57 @@ export async function setDeleteMergedBranch(on: boolean): Promise<void> {
     await setConfigValue("workflow.delete_merged_branch", on);
   } catch (e) {
     console.warn("config write failed (delete merged branch)", e);
+  }
+}
+
+/** Set the custom wake word: optimistic store update, then persist to config.toml. A blank/
+ *  whitespace word falls back to the default (an empty custom phrase would never wake). */
+export async function setWakeWord(word: string): Promise<void> {
+  const w = word.trim() || DEFAULT_WAKE_WORD;
+  useSettingsStore.getState().setWakeWord(w);
+  try {
+    await setConfigValue("voice.wake_word", w);
+  } catch (e) {
+    console.warn("config write failed (wake word)", e);
+  }
+}
+
+/** Set the custom stop word: optimistic store update, then persist to config.toml. A blank/
+ *  whitespace word falls back to the default. */
+export async function setStopWord(word: string): Promise<void> {
+  const w = word.trim() || DEFAULT_STOP_WORD;
+  useSettingsStore.getState().setStopWord(w);
+  try {
+    await setConfigValue("voice.stop_word", w);
+  } catch (e) {
+    console.warn("config write failed (stop word)", e);
+  }
+}
+
+/** Toggle "pause listening on submit": optimistic store update, then persist to config.toml. */
+export async function setPauseOnSubmit(on: boolean): Promise<void> {
+  useSettingsStore.getState().setPauseOnSubmit(on);
+  try {
+    await setConfigValue("voice.pause_on_submit", on);
+  } catch (e) {
+    console.warn("config write failed (pause on submit)", e);
+  }
+}
+
+/** Reset the three voice settings to their built-in defaults in ONE atomic write. */
+export async function resetVoiceSettings(): Promise<void> {
+  const s = useSettingsStore.getState();
+  s.setWakeWord(DEFAULT_WAKE_WORD);
+  s.setStopWord(DEFAULT_STOP_WORD);
+  s.setPauseOnSubmit(DEFAULT_PAUSE_ON_SUBMIT);
+  try {
+    await setConfigValues({
+      "voice.wake_word": DEFAULT_WAKE_WORD,
+      "voice.stop_word": DEFAULT_STOP_WORD,
+      "voice.pause_on_submit": DEFAULT_PAUSE_ON_SUBMIT,
+    });
+  } catch (e) {
+    console.warn("config write failed (voice reset)", e);
   }
 }
 

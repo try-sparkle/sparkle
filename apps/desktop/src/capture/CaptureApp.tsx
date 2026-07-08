@@ -10,7 +10,8 @@ import { useDictationStore } from "../stores/dictationStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { StatusDot } from "../components/StatusDot";
-import { MIC_HOT_PLACEHOLDER, WAKE_PLACEHOLDER } from "../voice/dictationCopy";
+import { micHotPlaceholder, wakePlaceholder } from "../voice/dictationCopy";
+import { useSettingsStore } from "../stores/settingsStore";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { chooseLayout } from "./captureLayout";
@@ -96,6 +97,8 @@ export function CaptureApp() {
   const phase = useDictationStore((s) => s.phase);
   const liveActive = audioActive && phase === "active";
   const livePassive = audioActive && phase === "passive";
+  const wakeWord = useSettingsStore((s) => s.wakeWord);
+  const stopWord = useSettingsStore((s) => s.stopWord);
   const interim = useDictationStore((s) => (active ? s.interim : ""));
 
   useEffect(() => {
@@ -292,9 +295,9 @@ export function CaptureApp() {
             rows={3}
             placeholder={
               liveActive
-                ? MIC_HOT_PLACEHOLDER
+                ? micHotPlaceholder(stopWord)
                 : livePassive
-                ? WAKE_PLACEHOLDER
+                ? wakePlaceholder(wakeWord)
                 : "Narrate what you captured, or type it here…"
             }
             style={{

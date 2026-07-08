@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties, type ComponentType } from "react";
-import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone } from "react-icons/fi";
+import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic } from "react-icons/fi";
 import { C, ROW_ACTIVE_BUBBLE } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { openSignIn, signOut } from "../services/sparkleApi";
@@ -15,6 +15,7 @@ import { AdvancedConfigMenu } from "./AdvancedConfigMenu";
 import { MobileDevicesPane } from "./MobileDevicesPane";
 import { KeyboardShortcutsMenu } from "./KeyboardShortcutsMenu";
 import { CreditsPanel } from "./CreditsPanel";
+import { VoiceControlsMenu } from "./VoiceControlsMenu";
 
 // The ⋯ settings dialog. A focused, centered dialog with a left rail of categories driving a
 // single right pane (the "macOS System Settings" pattern), replacing the old 80vw×80vh stack
@@ -43,6 +44,7 @@ const CATEGORIES: Category[] = [
   { id: "workers", label: "Workers", Icon: FiCpu, blurb: "How many agents an orchestrator runs in parallel." },
   { id: "accounts", label: "Accounts", Icon: FiUsers, blurb: "Your Sparkle and Claude accounts." },
   { id: "mobile", label: "Mobile", Icon: FiSmartphone, blurb: "Pair your phone with this Mac and manage paired devices." },
+  { id: "voice", label: "Voice controls", Icon: FiMic, blurb: "Wake word, stop word, and what happens when you submit." },
   { id: "advanced", label: "Advanced", Icon: FiSliders, blurb: "Edit the configuration file directly." },
 ];
 
@@ -144,6 +146,8 @@ function PaneBody({
       return <AccountsPane onManageAccounts={onManageAccounts} />;
     case "mobile":
       return <MobileDevicesPane />;
+    case "voice":
+      return <VoiceControlsMenu />;
     case "advanced":
       return <AdvancedConfigMenu />;
   }
