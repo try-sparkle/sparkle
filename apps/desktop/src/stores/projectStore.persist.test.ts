@@ -15,7 +15,12 @@ describe("debouncedLocalStorage (sparkle-pngb)", () => {
   });
 
   it("coalesces a burst of writes into ONE localStorage.setItem after the debounce window", () => {
-    const setSpy = vi.spyOn(localStorage, "setItem");
+    // Spy on Storage.prototype, NOT the localStorage instance. `setItem` is an inherited prototype
+    // method, not an own property of the instance; `vi.spyOn(localStorage, "setItem")` only patches
+    // the instance and, on some jsdom/Node builds (e.g. Node 22 in CI), the real prototype method is
+    // still what runs — so the write succeeds but the instance spy records 0 calls, failing this
+    // assertion in CI while passing on other Node versions. Spying the prototype is version-robust.
+    const setSpy = vi.spyOn(Storage.prototype, "setItem");
     const { storage } = debouncedLocalStorage(PROJECTS_PERSIST_DEBOUNCE_MS);
     storage.setItem("k", "1");
     storage.setItem("k", "2");
