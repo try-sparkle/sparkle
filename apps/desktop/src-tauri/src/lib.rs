@@ -28,6 +28,7 @@ mod history;
 mod hooks;
 mod judge;
 mod logging;
+mod mac_panel;
 mod model;
 mod model_catalog;
 mod naming;

@@ -196,7 +196,7 @@ const POPOVER_H: f64 = 560.0;
 /// Create the hidden popover window and register the menu-bar icon. Called once in setup.
 pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     // Hidden, borderless popover. Lives for the whole session; we only show/hide it.
-    let _ = WebviewWindowBuilder::new(
+    let win = WebviewWindowBuilder::new(
         app,
         TRAY_LABEL,
         WebviewUrl::App("index.html?view=tray".into()),
@@ -210,6 +210,10 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     .skip_taskbar(true)
     .visible(false)
     .build()?;
+    // Make the popover a non-activating panel so opening it (toggle_popover) floats it over the
+    // user's front app WITHOUT activating Sparkle — otherwise activateIgnoringOtherApps would
+    // raise the main workspace window over whatever the user was about to capture.
+    crate::mac_panel::make_nonactivating_panel(&win);
 
     // Right-click menu: a single "Quit Sparkle" item (the only true way to fully exit the app).
     // show_menu_on_left_click(false) keeps LEFT-click toggling the popover while RIGHT-click
@@ -268,7 +272,10 @@ pub(crate) fn toggle_popover(app: &AppHandle) {
         use tauri_plugin_positioner::{Position, WindowExt};
         let _ = win.move_window(Position::TrayBottomCenter);
         let _ = win.show();
-        let _ = win.set_focus();
+        // Make the popover key WITHOUT activating the app (it is a non-activating panel — see
+        // init_tray). Using set_focus() here would activateIgnoringOtherApps and raise every
+        // Sparkle window over the user's front app, which is exactly what we must not do.
+        crate::mac_panel::present_key(&win);
     }
 }
 

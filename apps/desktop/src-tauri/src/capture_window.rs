@@ -8,11 +8,12 @@
 //! (enabled in Cargo.toml + tauri.conf.json for this window; other windows are opaque
 //! and unaffected).
 //!
-//! Key-focus contract (dictation is focus-gated): borderless windows CAN become key
-//! under tao — its NSWindow subclass overrides `canBecomeKeyWindow` via the `focusable`
-//! flag (default true) — and `set_focus()` does `makeKeyAndOrderFront` +
-//! `activateIgnoringOtherApps`, so `show()` → `set_focus()` makes this window key even
-//! when Sparkle is in the background.
+//! Key-focus contract (dictation is focus-gated): this window is reclassed to a
+//! non-activating `NSPanel` (see objc/panel.m + mac_panel.rs), so it can become key —
+//! accepting typing / the dictation caret — WITHOUT `activateIgnoringOtherApps`. We make it
+//! key via `mac_panel::present_key` (`makeKeyAndOrderFront:`), NOT Tauri's `set_focus()`,
+//! precisely so showing the takeover never raises Sparkle over the app the user just
+//! captured. The user's front app stays frontmost while keystrokes route to this panel.
 //!
 //! Spec: docs/superpowers/specs/2026-07-01-menubar-capture-design.md §3.
 
@@ -27,22 +28,22 @@ pub const CAPTURE_LABEL: &str = "capture";
 /// change them together, the message stays honest).
 ///
 /// Kept deliberately SHORT (4 × 150ms ≈ 0.6s of retries after the initial synchronous
-/// `set_focus`). The old 8 × 250ms (≈2s) window was the felt jank on show: each tick calls
-/// `activateIgnoringOtherApps`, and dev smoke logs showed runs where the loop spent the full
-/// two seconds re-activating / focus-fighting (probe readings flipping key→not-key→key). The
-/// loop still exits the instant focus is acquired (below), so this only bounds the pathological
-/// "activation was swallowed" case — 0.6s is ample to recover a genuinely-swallowed activation.
+/// make-key). The old 8 × 250ms (≈2s) window was the felt jank on show: each tick re-issues a
+/// make-key, and dev smoke logs showed runs where the loop spent the full two seconds
+/// focus-fighting (probe readings flipping key→not-key→key). The loop still exits the instant
+/// focus is acquired (below), so this only bounds the pathological "make-key was swallowed"
+/// case — 0.6s is ample to recover a genuinely-swallowed make-key.
 const FOCUS_RETRY_TICKS: u32 = 4;
 const FOCUS_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Monotone show generation: bumped by every `show_capture_window`. A retry thread
 /// captures its generation at spawn and exits the moment a newer show supersedes it,
-/// so a quick hide→re-show never leaves two threads fighting over `set_focus`.
+/// so a quick hide→re-show never leaves two threads fighting over make-key.
 static SHOW_GEN: AtomicU64 = AtomicU64::new(0);
 /// The show generation during which the window was last observed key (via the real
 /// `Focused(true)` window event, or a poll reading). Once `FOCUSED_GEN >= gen` the
 /// retry loop stops permanently for that show: "keyed, then the user deliberately
-/// switched away" must never be answered with another `activateIgnoringOtherApps`.
+/// switched away" must never be answered with another make-key.
 static FOCUSED_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// One captured screenshot, as produced by `capture_screen_region()` (screenshot.rs).
@@ -70,6 +71,10 @@ pub fn init_capture_window(app: &AppHandle) -> tauri::Result<()> {
     .resizable(false)
     .visible(false)
     .build()?;
+    // Make the takeover a non-activating panel: show_capture_window can then make it key (so
+    // typing / dictation land in the composer) WITHOUT activateIgnoringOtherApps raising Sparkle
+    // over the app the user just captured. See objc/panel.m and the key-focus contract above.
+    crate::mac_panel::make_nonactivating_panel(&win);
     // Latch key-status per show: the event is authoritative (a 250ms poll can miss a
     // key-then-Cmd+Tab that fits inside one tick), and the retry loop reads the latch.
     win.on_window_event(|event| {
@@ -107,10 +112,11 @@ pub fn show_capture_window(app: AppHandle, shot: CaptureShot) -> Result<(), Stri
 
     let show_start = std::time::Instant::now();
     win.show().map_err(|e| format!("show capture window: {e}"))?;
-    // Makes the window KEY (dictation acceptance criterion): makeKeyAndOrderFront +
-    // activateIgnoringOtherApps under the hood, so keystrokes land here immediately.
-    win.set_focus()
-        .map_err(|e| format!("focus capture window: {e}"))?;
+    // Makes the window KEY (dictation acceptance criterion) WITHOUT activating the app: it is a
+    // non-activating panel (init_capture_window), so makeKeyAndOrderFront: routes keystrokes here
+    // while the app the user just captured stays frontmost. This deliberately does NOT
+    // activateIgnoringOtherApps — that would raise Sparkle over the user's work.
+    crate::mac_panel::present_key(&win);
     // Both felt-lag sources in one line: `show_ms` = time to make the takeover visible + key
     // (the window chrome the user sees), `payload_bytes` = size of the base64 `data:` preview
     // about to cross the IPC bridge to the webview (the image that fills in a beat later).
@@ -119,13 +125,13 @@ pub fn show_capture_window(app: AppHandle, shot: CaptureShot) -> Result<(), Stri
         payload_bytes = shot.data_url.len(),
         "capture: window shown + focused; delivering shot to webview"
     );
-    // Becoming key is asynchronous, and macOS focus-stealing prevention can swallow the
-    // one-shot activation when another app is being interacted with at that instant
-    // (observed in dev smoke: one run keyed on the first try, one never keyed). Retry
-    // briefly on a helper thread. The retry exists ONLY to compensate for a swallowed
-    // initial activation: it stops permanently once this show has been key at least once
-    // (FOCUSED_GEN latch — never wrestle a user who deliberately switched away), and it
-    // exits when a newer show supersedes it (SHOW_GEN).
+    // Becoming key is asynchronous, and a non-activating panel occasionally does not take key on
+    // the first makeKeyAndOrderFront: when another app is being interacted with at that instant
+    // (observed in dev smoke: one run keyed on the first try, one never keyed). Retry briefly on
+    // a helper thread. The retry exists ONLY to compensate for a swallowed initial make-key: it
+    // stops permanently once this show has been key at least once (FOCUSED_GEN latch — never
+    // wrestle a user who deliberately switched away), and it exits when a newer show supersedes
+    // it (SHOW_GEN). Each retry is make-key-without-activating, so it never yanks the app forward.
     let gen = SHOW_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     {
         let win = win.clone();
@@ -143,7 +149,7 @@ pub fn show_capture_window(app: AppHandle, shot: CaptureShot) -> Result<(), Stri
                     tracing::debug!(tick, "capture window acquired key focus via retry");
                     return;
                 }
-                let _ = win.set_focus();
+                crate::mac_panel::present_key(&win);
             }
             // One more interval so the LAST set_focus gets checked before we complain —
             // otherwise a retry that lands on the final tick is reported as a failure.

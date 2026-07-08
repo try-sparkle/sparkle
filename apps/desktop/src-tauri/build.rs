@@ -65,14 +65,21 @@ fn main() {
     // (build.rs itself runs on the host) so a non-macOS target build skips it cleanly.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rerun-if-changed=objc/force_present.m");
+        // panel.m: reclasses the tray popover + capture windows to non-activating NSPanels so the
+        // Capture flow never activates Sparkle over the user's front app (see objc/panel.m).
+        println!("cargo:rerun-if-changed=objc/panel.m");
         // The NSUserNotification deprecation warning is silenced in-file via a #pragma in
         // force_present.m (survives independent of these build flags), so no -Wno flag here.
         cc::Build::new()
             .file("objc/force_present.m")
+            .file("objc/panel.m")
             .flag("-fobjc-arc")
             .compile("sparkle_notify_present");
         // Foundation is already linked transitively, but make the category's dependency explicit.
         println!("cargo:rustc-link-lib=framework=Foundation");
+        // AppKit provides NSWindow/NSPanel (panel.m). Already linked transitively via tao; the
+        // explicit link keeps panel.m's dependency honest.
+        println!("cargo:rustc-link-lib=framework=AppKit");
     }
 
     // bnvs (sparkle-bnvs): embed the git SHA of the source this binary was built from so the
