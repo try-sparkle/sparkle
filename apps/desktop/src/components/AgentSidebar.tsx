@@ -2097,29 +2097,11 @@ const AgentRow = memo(function AgentRow({
               <WorkflowLine stage={trackerStage} expanded={expanded} shipped={shipped} />
             </div>
           )}
-          {/* Collapsed: one bare indented progress line per worker, directly under the
-              orchestrator's own line. No name / timer / "committed" text — each line's fill +
-              color alone says how far that worker has gotten. Indented an extra 16px past the
-              orchestrator's line so the head-vs-worker hierarchy reads at a glance. */}
-          {!expanded && workers.some((w) => w.stage) && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 3, marginLeft: 16 }}>
-              {workers.map((w) =>
-                w.stage ? (
-                  <WorkflowLine key={w.id} stage={w.stage} expanded={false} shipped={w.shipped} />
-                ) : null,
-              )}
-              {beadHover && (
-                <DetailLine label="Bead">
-                  <span style={{ color: C.muted, fontSize: 11 }}>{beadHover}</span>
-                </DetailLine>
-              )}
-              {epicHover && (
-                <DetailLine label="Epic">
-                  <span style={{ color: C.muted, fontSize: 11 }}>{epicHover}</span>
-                </DetailLine>
-              )}
-            </div>
-          )}
+          {/* NOTE: the collapsed per-worker progress lines used to live here, but they now render as
+              a sibling of this strip in the in-flow row (see the row's JSX below) so they can stay
+              visible — as a stable hover surface — while the stand-in hover card is open. Rendering
+              them here is fine for the overlay too (it always passes expanded), which is why this
+              block was `!expanded`-gated; extracting it just makes that split explicit. */}
         </div>
       </div>
     </>
@@ -2268,22 +2250,69 @@ const AgentRow = memo(function AgentRow({
           // !editing (like dragProps) so the rename <input> keeps normal text selection.
           userSelect: orderedIndex != null && !editing ? "none" : undefined,
           // Active = the terminal's own color (merges into it); the hover state's CHAT_USER_BUBBLE
-          // lives on the unified card, not here.
-          background: isActive ? C.forest : "transparent",
+          // lives on the unified card, not here. Cleared while the card is open (showOverlay) so the
+          // row reads as empty behind the stand-in card — only the dimmed worker lines below show.
+          background: !showOverlay && isActive ? C.forest : "transparent",
           marginBottom: 2,
-          // Hidden while the unified card is open: the card stands in for the row (anchored at the
-          // same spot) and widens into the terminal area, so the name + progress bar render exactly
-          // once. visibility:hidden keeps the row's layout slot, so the rows below never jump.
-          visibility: showOverlay ? "hidden" : "visible",
+          // NOTE: visibility is NOT toggled on the whole row anymore — only the strip content below
+          // is hidden while the card is open. The collapsed worker lines must stay visible (and keep
+          // receiving hover) so the card doesn't flicker shut when the cursor is over them.
         }}
       >
-        {CardHeader({ expanded: false, ownsInput: editing })}
+        {/* Strip content (glyph + name + own progress bar): the overlay card stands in for exactly
+            this, so hide it while the card is open. visibility:hidden keeps its layout slot, so the
+            worker lines below (and the rows beneath) never jump. */}
+        <div style={{ visibility: showOverlay ? "hidden" : "visible" }}>
+          {CardHeader({ expanded: false, ownsInput: editing })}
+        </div>
+        {/* Collapsed: one bare indented progress line per non-surfaced worker, directly under the
+            orchestrator's own line — each line's fill + color alone says how far that worker has
+            gotten. Kept VISIBLE but DIMMED while the card is open (showOverlay) so it stays a stable
+            hover surface: the card's transparent lower-left would otherwise let the cursor fall
+            through the instant these lines vanished, dropping the hover and flickering the card shut.
+            Staying visible means hovering a sub-agent line just keeps the head's card open. */}
+        {workers.some((w) => w.stage) && (
+          <div
+            data-testid="collapsed-worker-lines"
+            onMouseEnter={show}
+            onMouseLeave={hide}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 3,
+              marginTop: 3,
+              // Align under the orchestrator's name: glyph slot width + the header's 8px gap + the
+              // worker step's own 16px indent (matches the pre-extraction nesting exactly).
+              marginLeft: glyphWidth + 8 + 16,
+              opacity: showOverlay ? 0.45 : 1,
+              transition: "opacity 120ms ease",
+            }}
+          >
+            {workers.map((w) =>
+              w.stage ? (
+                <WorkflowLine key={w.id} stage={w.stage} expanded={false} shipped={w.shipped} />
+              ) : null,
+            )}
+            {beadHover && (
+              <DetailLine label="Bead">
+                <span style={{ color: C.muted, fontSize: 11 }}>{beadHover}</span>
+              </DetailLine>
+            )}
+            {epicHover && (
+              <DetailLine label="Epic">
+                <span style={{ color: C.muted, fontSize: 11 }}>{epicHover}</span>
+              </DetailLine>
+            )}
+          </div>
+        )}
         {/* CONCAVE corner fillets where the active tab opens into the terminal. Each is a small box
             just above / below the tab's right edge; a radial-gradient paints the terminal color
             (C.forest) everywhere EXCEPT a quarter-disc cut from the corner nearest the sidebar, so
             the forest flares outward into the terminal with a smooth inward (concave) curve — an
-            "opening", not a convex button corner. pointerEvents:none so they never eat clicks. */}
-        {isActive && (
+            "opening", not a convex button corner. pointerEvents:none so they never eat clicks.
+            Suppressed while the card is open (showOverlay): the row is no longer visibility:hidden,
+            so — unlike before — these would otherwise show through beside the stand-in card. */}
+        {isActive && !showOverlay && (
           <>
             <div
               aria-hidden

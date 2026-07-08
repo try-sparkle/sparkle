@@ -109,18 +109,22 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
     expect(refreshAgentBranch).toHaveBeenCalledWith("/tmp/demo", "p1", "w1", "main", false);
   });
 
-  it("hides the in-flow column row on hover so the unified card stands in for it (no duplicate)", () => {
+  it("hides the in-flow strip content on hover so the unified card stands in for it (no duplicate)", () => {
     const project = seedOrchestratorWithWorker({ ahead: 0, behind: 0 } as BranchStatus);
     render(<AgentSidebar project={project} />);
     const row = document.querySelector<HTMLElement>('[draggable="true"]');
     if (!row) throw new Error("orchestrator row not found");
-    expect(row.style.visibility).not.toBe("hidden");
+    // The strip content (name + own progress bar) is the row's first child; that — not the whole
+    // row — is what the card stands in for and what gets hidden on hover. The row itself stays
+    // visible so the collapsed worker lines below can remain a stable hover surface (flicker fix).
+    const strip = row.firstElementChild as HTMLElement;
+    expect(strip.style.visibility).not.toBe("hidden");
 
-    // On hover the column row is HIDDEN (visibility:hidden — keeps its layout slot so rows below
-    // don't jump) while the single unified card, anchored at the same spot and widening into the
-    // terminal area, stands in for it. This is what keeps the name + progress bar from duplicating.
+    // On hover the strip is HIDDEN (visibility:hidden — keeps its layout slot so rows below don't
+    // jump) while the single unified card, anchored at the same spot and widening into the terminal
+    // area, stands in for it. This is what keeps the name + progress bar from duplicating.
     fireEvent.mouseEnter(row);
-    expect(row.style.visibility).toBe("hidden");
+    expect(strip.style.visibility).toBe("hidden");
     // And the detail renders in the card — the Status line is present (the orchestrator's own + the
     // worker's both read "Up to date with main").
     expect(screen.getAllByText(/up to date with main/i).length).toBeGreaterThan(0);

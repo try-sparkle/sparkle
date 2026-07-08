@@ -155,6 +155,34 @@ describe("AgentSidebar — hover-card reachability", () => {
     expect(list.scrollTop).toBe(40);
   });
 
+  it("keeps the collapsed sub-agent lines visible while the head's card is open (no flicker)", () => {
+    const { project } = seed({ workerStatus: "working", pinned: false });
+    // A non-surfaced (healthy, unpinned) worker with a stage renders a bare collapsed progress line
+    // under the head. This is the line the user hovers; hovering it must NOT flicker the card.
+    useRuntimeStore.setState({ workflowStage: { w1: "building_saved" } } as never);
+    render(<AgentSidebar project={project} />);
+
+    // The collapsed sub-agent line exists before any hover.
+    expect(screen.getByTestId("collapsed-worker-lines")).toBeTruthy();
+
+    // Open the orchestrator's hover card.
+    const headRow = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
+    fireEvent.mouseEnter(headRow);
+    expect(screen.getByTestId("agent-hover-card")).toBeTruthy();
+
+    // The fix: the sub-agent lines stay rendered AND are not inside a visibility:hidden subtree, so
+    // the cursor never loses its hover target. (Pre-fix they lived inside the row that goes
+    // visibility:hidden, so this ancestor walk would find a hidden ancestor and the card flickered.)
+    const lines = screen.getByTestId("collapsed-worker-lines");
+    for (let el: HTMLElement | null = lines; el; el = el.parentElement) {
+      expect(el.style.visibility).not.toBe("hidden");
+    }
+
+    // Hovering the sub-agent lines keeps the head's card open rather than dismissing it.
+    fireEvent.mouseEnter(lines);
+    expect(screen.getByTestId("agent-hover-card")).toBeTruthy();
+  });
+
   it("hovering a surfaced sub-agent row opens the orchestrator's hover card", () => {
     const { project } = seed({ workerStatus: "errored", pinned: false });
     render(<AgentSidebar project={project} />);
