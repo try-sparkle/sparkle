@@ -566,20 +566,30 @@ fn handle_request_line_ctx(
 // derive identity from the socket. Anti-spoofing is preserved by injecting SPARKLE_AGENT_ID into
 // each agent's control-MCP env at spawn (frontend's job), not by anything on this shared socket.
 //
-// All 6 ops (get_state, rename_agent, set_agent_activity, set_theme, get_config, set_config) are
-// frontend round-trips: the bridge emits a `control:request` event, blocks on the shared pending
-// rendezvous, and returns whatever `control_respond` resolves. This reuses the exact
-// register_pending/wait_pending/resolve_pending primitives + ROUNDTRIP_TIMEOUT as the orchestrator.
+// ALL control ops (the Phase-1 self-report/config set + the Phase-3 breadth ops: pin/unpin/model/
+// ordering/zoom/navigate) are frontend round-trips: the bridge emits a `control:request` event,
+// blocks on the shared pending rendezvous, and returns whatever `control_respond` resolves. This
+// reuses the exact register_pending/wait_pending/resolve_pending primitives + ROUNDTRIP_TIMEOUT as
+// the orchestrator — so a new op is just a name added to CONTROL_OPS + a frontend dispatch case.
 
-/// The 6 allow-listed control ops. Anything else is rejected with "unknown op" (the bridge enforces
-/// the allowlist — the skill only *advises*; see the PRD safety-gating note).
+/// The allow-listed control ops. Anything else is rejected with "unknown op". This is only the
+/// COARSE existence gate — the finer free-vs-privileged safety tier is enforced frontend-side in
+/// controlListener's CONTROL_OP_TIERS (the skill only *advises*; see the PRD safety-gating note).
 const CONTROL_OPS: &[&str] = &[
+    // Phase 1 (self-report + read/config).
     "get_state",
     "rename_agent",
     "set_agent_activity",
     "set_theme",
     "get_config",
     "set_config",
+    // Phase 3 (breadth: ordering/zoom/model/navigation).
+    "pin_agent",
+    "unpin_agent",
+    "set_agent_model",
+    "set_agent_ordering",
+    "set_zoom",
+    "navigate",
 ];
 
 /// Fields the bridge owns on the wire; everything else in the request becomes the op `payload`.
@@ -1312,11 +1322,16 @@ mod tests {
     }
 
     #[test]
-    fn control_all_six_ops_are_allowlisted() {
-        for op in ["get_state", "rename_agent", "set_agent_activity", "set_theme", "get_config", "set_config"] {
+    fn control_all_ops_are_allowlisted() {
+        for op in [
+            // Phase 1.
+            "get_state", "rename_agent", "set_agent_activity", "set_theme", "get_config", "set_config",
+            // Phase 3 breadth ops.
+            "pin_agent", "unpin_agent", "set_agent_model", "set_agent_ordering", "set_zoom", "navigate",
+        ] {
             assert!(CONTROL_OPS.contains(&op), "{op} must be in the control allowlist");
         }
-        assert_eq!(CONTROL_OPS.len(), 6, "exactly the 6 frozen-contract ops");
+        assert_eq!(CONTROL_OPS.len(), 12, "exactly the frozen Phase-1 + Phase-3 control ops");
     }
 
     #[test]

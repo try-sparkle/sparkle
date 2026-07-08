@@ -17,7 +17,15 @@ export type ControlOp =
   | "set_theme"
   | "get_config"
   | "set_config"
-  | "get_state";
+  | "get_state"
+  // Phase-3 breadth ops (pin/order/zoom/model/navigate). Tallied like the rest so the counter
+  // typechecks and any future coverage readout can see them.
+  | "pin_agent"
+  | "unpin_agent"
+  | "set_agent_model"
+  | "set_agent_ordering"
+  | "set_zoom"
+  | "navigate";
 
 /** The mutually-exclusive result of one auto-naming trigger (see agentNaming.namingOutcome). */
 export type NamingOutcome =
@@ -54,6 +62,12 @@ const emptyControlOps = (): Record<ControlOp, number> => ({
   get_config: 0,
   set_config: 0,
   get_state: 0,
+  pin_agent: 0,
+  unpin_agent: 0,
+  set_agent_model: 0,
+  set_agent_ordering: 0,
+  set_zoom: 0,
+  navigate: 0,
 });
 
 const emptyNamingOutcomes = (): Record<NamingOutcome, number> => ({

@@ -17,6 +17,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 //     reply for each reqId; get_config/set_config_value stand in for the real Rust config commands. ---
 const controlResponds: Array<{ reqId: string; result: unknown }> = [];
 const setConfigCalls: Array<{ path: string; value: unknown }> = [];
+const setConfigValuesCalls: Array<{ values: Record<string, unknown> }> = [];
 const invokeMock = vi.fn(async (cmd: string, args?: unknown) => {
   switch (cmd) {
     case "start_control_bridge":
@@ -30,6 +31,9 @@ const invokeMock = vi.fn(async (cmd: string, args?: unknown) => {
       return { config: { workers: { max_concurrent: 4 } }, warnings: [] };
     case "set_config_value":
       setConfigCalls.push(args as { path: string; value: unknown });
+      return undefined;
+    case "set_config_values":
+      setConfigValuesCalls.push(args as { values: Record<string, unknown> });
       return undefined;
     default:
       return undefined;
@@ -56,6 +60,7 @@ describe("controlListener", () => {
     unlistenMock.mockClear();
     controlResponds.length = 0;
     setConfigCalls.length = 0;
+    setConfigValuesCalls.length = 0;
     useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
     useRuntimeStore.setState({ status: {} } as never);
     useUiStore.getState().setThemePref("auto");
@@ -183,6 +188,12 @@ describe("controlListener", () => {
     expect(useUiStore.getState().themePref).toBe("auto"); // unchanged
   });
 
+  it("allows a FREE op (get_config) from an unattended worker caller (reads are not gated)", async () => {
+    fire({ reqId: "free1", op: "get_config", callerAgentId: otherId, payload: {} });
+    await flush();
+    expect(lastReply()).toEqual({ config: { workers: { max_concurrent: 4 } } });
+  });
+
   it("denies set_config from an unattended worker caller (no write happens)", async () => {
     fire({ reqId: "w2", op: "set_config", callerAgentId: otherId, payload: { path: "workers.max_concurrent", value: 9 } });
     await flush();
@@ -210,6 +221,131 @@ describe("controlListener", () => {
     await flush();
     expect(lastReply()).toEqual({ ok: true });
     expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!.activity).toBe("fell back to me");
+  });
+
+  // ── Phase-3 breadth ops ────────────────────────────────────────────────────────────────────
+  it("get_state additively reports models, agentOrdering, and zoom", async () => {
+    useUiStore.getState().setAgentOrdering("manual");
+    useUiStore.getState().setZoom(1.3);
+    fire({ reqId: "gs2", op: "get_state", callerAgentId: callerId, payload: {} });
+    await flush();
+    const res = lastReply() as { models: string[]; agentOrdering: string; zoom: number };
+    expect(Array.isArray(res.models)).toBe(true);
+    expect(res.models).toContain("claude-opus-4-8"); // curated catalog fallback id
+    expect(res.agentOrdering).toBe("manual");
+    expect(res.zoom).toBe(1.3);
+  });
+
+  it("set_config accepts an OBJECT value and flattens it to dotted keys via set_config_values", async () => {
+    fire({
+      reqId: "sc-obj",
+      op: "set_config",
+      callerAgentId: callerId,
+      payload: { path: "workflow.drift", value: { behind_nudge: 3, ahead_nudge: 2 } },
+    });
+    await flush();
+    expect(lastReply()).toEqual({ ok: true });
+    expect(setConfigValuesCalls.at(-1)!.values).toEqual({
+      "workflow.drift.behind_nudge": 3,
+      "workflow.drift.ahead_nudge": 2,
+    });
+  });
+
+  it("pin_agent pins the target's row and denies a worker caller", async () => {
+    fire({ reqId: "pin1", op: "pin_agent", callerAgentId: callerId, payload: { targetAgentId: otherId, index: 2 } });
+    await flush();
+    expect(lastReply()).toEqual({ ok: true });
+    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === otherId)!;
+    expect(agent.pinnedIndex).toBe(2);
+    expect(agent.namePinned).toBe(true);
+
+    // A worker caller is privileged-denied.
+    fire({ reqId: "pin2", op: "pin_agent", callerAgentId: otherId, payload: { index: 0 } });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
+  });
+
+  it("pin_agent rejects a non-integer index", async () => {
+    fire({ reqId: "pin3", op: "pin_agent", callerAgentId: callerId, payload: { index: -1 } });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
+  });
+
+  it("unpin_agent releases the target's row (build caller allowed)", async () => {
+    useProjectStore.getState().pinAgentAt(projectId, otherId, 1);
+    fire({ reqId: "unpin1", op: "unpin_agent", callerAgentId: callerId, payload: { targetAgentId: otherId } });
+    await flush();
+    expect(lastReply()).toEqual({ ok: true });
+    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === otherId)!;
+    expect(agent.pinnedIndex).toBe(null);
+    expect(agent.namePinned).toBe(false);
+  });
+
+  it("set_agent_model sets a catalog model and rejects an unknown one", async () => {
+    fire({ reqId: "sm1", op: "set_agent_model", callerAgentId: callerId, payload: { model: "claude-opus-4-8" } });
+    await flush();
+    expect(lastReply()).toEqual({ ok: true });
+    expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!.model).toBe("claude-opus-4-8");
+
+    fire({ reqId: "sm2", op: "set_agent_model", callerAgentId: callerId, payload: { model: "not-a-real-model" } });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
+  });
+
+  it("set_agent_model is denied for a worker caller", async () => {
+    fire({ reqId: "sm3", op: "set_agent_model", callerAgentId: otherId, payload: { model: "claude-opus-4-8" } });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
+  });
+
+  it("set_agent_ordering switches the sidebar mode (build caller), denies a worker", async () => {
+    useUiStore.getState().setAgentOrdering("attention");
+    fire({ reqId: "ord1", op: "set_agent_ordering", callerAgentId: callerId, payload: { mode: "manual" } });
+    await flush();
+    expect(lastReply()).toEqual({ ok: true });
+    expect(useUiStore.getState().agentOrdering).toBe("manual");
+
+    fire({ reqId: "ord2", op: "set_agent_ordering", callerAgentId: otherId, payload: { mode: "attention" } });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
+    expect(useUiStore.getState().agentOrdering).toBe("manual"); // unchanged by the denied worker
+  });
+
+  it("set_zoom sets and clamps the zoom (build caller)", async () => {
+    fire({ reqId: "z1", op: "set_zoom", callerAgentId: callerId, payload: { zoom: 5 } });
+    await flush();
+    expect(lastReply()).toEqual({ ok: true });
+    expect(useUiStore.getState().zoom).toBe(1.8); // clamped to ZOOM_MAX
+
+    fire({ reqId: "z2", op: "set_zoom", callerAgentId: callerId, payload: { zoom: "big" } });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
+  });
+
+  it("navigate sets a special view and denies a worker caller", async () => {
+    fire({ reqId: "nav1", op: "navigate", callerAgentId: callerId, payload: { view: "board" } });
+    await flush();
+    expect(lastReply()).toEqual({ ok: true });
+    expect(useUiStore.getState().activeSpecial).toBe("board");
+
+    fire({ reqId: "nav2", op: "navigate", callerAgentId: otherId, payload: { view: "sparkle" } });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
+  });
+
+  it("navigate to an agent opens+selects it and clears the special view", async () => {
+    useUiStore.getState().setActiveSpecial("board");
+    fire({ reqId: "nav3", op: "navigate", callerAgentId: callerId, payload: { view: "agent", agentId: otherId } });
+    await flush();
+    expect(lastReply()).toEqual({ ok: true });
+    expect(useUiStore.getState().activeSpecial).toBe(null);
+    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe(otherId);
+  });
+
+  it("navigate to an agent requires a known agentId", async () => {
+    fire({ reqId: "nav4", op: "navigate", callerAgentId: callerId, payload: { view: "agent", agentId: "ghost" } });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
   });
 
   // ── Phase-2c self-report tally (sparkle-rl84) ──────────────────────────────────────────────

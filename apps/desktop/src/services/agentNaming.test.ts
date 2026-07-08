@@ -337,3 +337,60 @@ describe("maybeAutoName — paid call gating for self-reporting agents", () => {
     expect(invoke).toHaveBeenCalledWith("generate_agent_name", { prompt: "fix the login redirect bug" });
   });
 });
+
+// ── The ordering invariant itself (sparkle-y2tv) ──────────────────────────────────────────────
+// This suite differs from the ones above: it does NOT hand-seed a promptHistory length. Instead it
+// drives the REAL projectStore `appendPrompt` and the REAL `maybeAutoName`, in the SAME order the
+// live call site uses (AgentPane.tsx: appendPrompt at :778 → maybeAutoName at :787). The whole point
+// is that promptHistory.length must GROW (append) before the naming read runs — that ordering is the
+// contract. So we intentionally do not mock projectStore here.
+describe("appendPrompt→maybeAutoName ordering invariant (sparkle-y2tv)", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    invoke.mockResolvedValue({ title: "Some Name", description: "" });
+    useSelfReportMetrics.getState().reset();
+  });
+
+  const prompt1 = "fix the login redirect bug";
+  const prompt2 = "add a CSV export button to the reports page";
+
+  it("append-first ordering: 1st submit defers (promptCount 1), 2nd submit pays (promptCount 2)", async () => {
+    // A worker with a genuinely empty history — no self-name, no aiTitle yet.
+    seed(agentTab({ kind: "worker", promptHistory: [], namePinned: false, aiTitle: null }));
+
+    // ── First submit ── append BEFORE naming, exactly as AgentPane does.
+    useProjectStore.getState().appendPrompt("p1", "a1", prompt1);
+    await maybeAutoName("p1", "a1", prompt1);
+    // append-first ⇒ promptCount === 1 ⇒ the self-reporting worker gets its turn to self-name: no paid call.
+    expect(invoke).not.toHaveBeenCalled();
+    expect(useSelfReportMetrics.getState().namingOutcomes.deferred_first_turn).toBe(1);
+    expect(useSelfReportMetrics.getState().namingOutcomes.paid_haiku_fallback).toBe(0);
+
+    // ── Second submit ── same agent, still unnamed/untitled. Append BEFORE naming again.
+    useProjectStore.getState().appendPrompt("p1", "a1", prompt2);
+    await maybeAutoName("p1", "a1", prompt2);
+    // append-first ⇒ promptCount === 2 ⇒ past the first-turn defer ⇒ the paid last-resort fallback fires ONCE.
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("generate_agent_name", { prompt: prompt2 });
+    expect(useSelfReportMetrics.getState().namingOutcomes.paid_haiku_fallback).toBe(1);
+  });
+
+  it("negative guard: reversed order (name BEFORE append) mis-defers the 2nd turn — the off-by-one the invariant prevents", async () => {
+    // Reproduce the reversed-order bug for what SHOULD be the second turn. In the correct flow the
+    // second submit appends prompt2 first (promptHistory.length → 2) and then names → paid fallback.
+    // Here we simulate a caller that named BEFORE appending the second prompt: only prompt1 is in
+    // history (length 1) when maybeAutoName reads it, so the read is one turn behind. namingOutcome
+    // therefore still sees promptCount 1 (< 2) and DEFERS instead of paying — the exact off-by-one
+    // that pushes the paid fallback out by a full turn and leaves the worker unnamed longer than
+    // designed. This test locks in WHY the append-must-precede-name ordering matters.
+    seed(agentTab({ kind: "worker", promptHistory: [], namePinned: false, aiTitle: null }));
+
+    useProjectStore.getState().appendPrompt("p1", "a1", prompt1); // turn 1's prompt is in history…
+    // …but for turn 2 we (wrongly) name BEFORE appending prompt2 — the read sees length 1, not 2.
+    await maybeAutoName("p1", "a1", prompt2);
+
+    expect(invoke).not.toHaveBeenCalled(); // mis-deferred — no paid call, when the correct order pays.
+    expect(useSelfReportMetrics.getState().namingOutcomes.deferred_first_turn).toBe(1);
+    expect(useSelfReportMetrics.getState().namingOutcomes.paid_haiku_fallback).toBe(0);
+  });
+});

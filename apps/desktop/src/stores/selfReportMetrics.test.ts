@@ -71,7 +71,11 @@ describe("useSelfReportMetrics — session-scoped increments", () => {
       for (const v of Object.values(rec)) expect(typeof v).toBe("number");
     }
     expect(Object.keys(s.controlOps).sort()).toEqual(
-      ["get_config", "get_state", "rename_agent", "set_agent_activity", "set_config", "set_theme"].sort(),
+      [
+        "get_config", "get_state", "rename_agent", "set_agent_activity", "set_config", "set_theme",
+        // Phase-3 breadth ops.
+        "pin_agent", "unpin_agent", "set_agent_model", "set_agent_ordering", "set_zoom", "navigate",
+      ].sort(),
     );
   });
 });
