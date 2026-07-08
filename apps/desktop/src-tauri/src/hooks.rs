@@ -433,6 +433,27 @@ mod tests {
     }
 
     #[test]
+    fn emitter_merge_preserves_the_guard_permissions_allowlist() {
+        // The launch sequence writes the guard first (which seeds permissions.allow) then merges
+        // the event emitter into the SAME settings.local.json. The emitter merge must not drop the
+        // allowlist — otherwise interactive agents would start prompting for Sparkle's own tools.
+        let after_guard =
+            crate::worktree::merge_guard_settings(None, "node /abs/worktree-guard.mjs /wt/a");
+        let after_emitter = merge_event_hooks(Some(&after_guard), "node /abs/sparkle-hook.mjs /log");
+        let v: Value = serde_json::from_str(&after_emitter).unwrap();
+        let rules: Vec<&str> = v["permissions"]["allow"]
+            .as_array()
+            .expect("allowlist survives the emitter merge")
+            .iter()
+            .filter_map(|e| e.as_str())
+            .collect();
+        assert!(rules.contains(&"mcp__sparkle-control"), "sparkle-control still allowed");
+        assert!(rules.contains(&"mcp__sparkle-orchestrator"), "sparkle-orchestrator still allowed");
+        // And the emitter itself landed, so both writers coexist.
+        assert!(emitter_present(&v, "PreToolUse"));
+    }
+
+    #[test]
     fn log_path_within_confines_reads_to_hook_events_dir() {
         let tmp = std::env::temp_dir().join(format!("sparkle-hooks-log-{}", std::process::id()));
         let base = tmp.join("hook-events");

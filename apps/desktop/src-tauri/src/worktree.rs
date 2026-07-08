@@ -1820,6 +1820,59 @@ pub async fn assert_workspace_integrity(worktree: String) -> Result<(), String> 
         .map_err(|e| format!("assert_workspace_integrity task failed: {e}"))?
 }
 
+/// Tools that Sparkle pre-approves in every worktree's `.claude/settings.local.json` so
+/// interactive agents (Think/Build/generic) stop prompting for them. Two buckets:
+///   1. Sparkle's OWN control-plane MCP servers — the app driving itself should never ask the
+///      human for permission (that's the friction shown in the set_agent_activity prompt). A bare
+///      `mcp__<server>` rule allows every tool the server exposes.
+///   2. Read-only operations agents perform constantly — reading files, searching, fetching the
+///      web, and *reading* browser state. Nothing here mutates the world.
+/// Deliberately EXCLUDED (still prompt on interactive agents): Bash, Edit, Write, MultiEdit,
+/// NotebookEdit, and any browser tool that acts (navigate/computer/form_input). Workers already
+/// run with `--dangerously-skip-permissions`, so for them this list is a harmless no-op.
+const SPARKLE_ALLOWED_TOOLS: &[&str] = &[
+    // Sparkle's own control plane.
+    "mcp__sparkle-control",
+    "mcp__sparkle-orchestrator",
+    // Read-only built-ins.
+    "Read",
+    "Grep",
+    "Glob",
+    "WebFetch",
+    "WebSearch",
+    // Read-only browser inspection (claude-in-chrome), for non-strict agents that load it.
+    "mcp__claude-in-chrome__read_page",
+    "mcp__claude-in-chrome__get_page_text",
+    "mcp__claude-in-chrome__read_console_messages",
+    "mcp__claude-in-chrome__read_network_requests",
+    "mcp__claude-in-chrome__tabs_context_mcp",
+];
+
+/// Merge Sparkle's pre-approved allowlist into `permissions.allow`, preserving any rules the user
+/// already added and de-duplicating by rule string (idempotent across re-runs).
+fn merge_allowed_tools(root: &mut Value) {
+    let obj = root.as_object_mut().unwrap();
+    let permissions = obj.entry("permissions").or_insert_with(|| json!({}));
+    if !permissions.is_object() {
+        *permissions = json!({});
+    }
+    let allow = permissions
+        .as_object_mut()
+        .unwrap()
+        .entry("allow")
+        .or_insert_with(|| json!([]));
+    if !allow.is_array() {
+        *allow = json!([]);
+    }
+    let arr = allow.as_array_mut().unwrap();
+    for tool in SPARKLE_ALLOWED_TOOLS {
+        let already = arr.iter().any(|e| e.as_str() == Some(*tool));
+        if !already {
+            arr.push(json!(tool));
+        }
+    }
+}
+
 /// Merge the PreToolUse guard hook into existing settings JSON (or a fresh object), preserving
 /// any keys the user already has.
 pub fn merge_guard_settings(existing: Option<&str>, guard_cmd: &str) -> String {
@@ -1860,6 +1913,8 @@ pub fn merge_guard_settings(existing: Option<&str>, guard_cmd: &str) -> String {
             .unwrap_or(false)
     });
     arr.push(hook_entry);
+    // Pre-approve Sparkle's own MCP tools + read-only ops so interactive agents stop prompting.
+    merge_allowed_tools(&mut root);
     serde_json::to_string_pretty(&root).unwrap()
 }
 
@@ -2504,6 +2559,57 @@ mod tests {
         assert!(matcher.contains("Edit"));
         // Bash is matched too so the keychain guard (sparkle-0ezz) sees shell commands.
         assert!(matcher.contains("Bash"));
+    }
+
+    #[test]
+    fn merge_guard_seeds_sparkle_allowlist() {
+        // A fresh worktree (no prior settings) gets the pre-approved allow rules so interactive
+        // agents stop prompting for Sparkle's own MCP tools and read-only ops.
+        let merged = merge_guard_settings(None, "node /abs/worktree-guard.mjs /wt/a");
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let allow = v["permissions"]["allow"].as_array().expect("allow array");
+        let rules: Vec<&str> = allow.iter().filter_map(|e| e.as_str()).collect();
+        // Sparkle's control plane is allowed (this is the friction in the screenshot).
+        assert!(rules.contains(&"mcp__sparkle-control"));
+        assert!(rules.contains(&"mcp__sparkle-orchestrator"));
+        // Read-only ops are allowed.
+        assert!(rules.contains(&"Read"));
+        assert!(rules.contains(&"WebFetch"));
+        // Mutating tools are NOT pre-approved — they must still prompt on interactive agents.
+        assert!(!rules.contains(&"Bash"));
+        assert!(!rules.contains(&"Edit"));
+        assert!(!rules.contains(&"Write"));
+    }
+
+    #[test]
+    fn merge_guard_allowlist_is_idempotent_and_preserves_user_rules() {
+        // A user-added rule plus a pre-existing Sparkle rule: re-merging must keep the user's rule
+        // and must not duplicate any Sparkle rule.
+        let existing = r#"{
+            "permissions": { "allow": ["Bash(git status:*)", "mcp__sparkle-control"] }
+        }"#;
+        let once = merge_guard_settings(Some(existing), "node /abs/worktree-guard.mjs /wt/a");
+        let twice = merge_guard_settings(Some(&once), "node /abs/worktree-guard.mjs /wt/a");
+        let v: serde_json::Value = serde_json::from_str(&twice).unwrap();
+        let rules: Vec<&str> = v["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.as_str())
+            .collect();
+        // User's custom rule survives.
+        assert!(rules.contains(&"Bash(git status:*)"), "user rule preserved");
+        // Sparkle rules present exactly once each despite two merges + a pre-existing copy.
+        assert_eq!(
+            rules.iter().filter(|r| **r == "mcp__sparkle-control").count(),
+            1,
+            "no duplicate sparkle-control rule"
+        );
+        assert_eq!(
+            rules.iter().filter(|r| **r == "mcp__sparkle-orchestrator").count(),
+            1,
+            "no duplicate sparkle-orchestrator rule"
+        );
     }
 
     #[test]
