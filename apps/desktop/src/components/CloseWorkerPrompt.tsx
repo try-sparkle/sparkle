@@ -21,8 +21,8 @@ export function CloseWorkerPrompt({
         Close this worker?
       </div>
       <div style={{ color: C.muted, fontSize: 13, lineHeight: 1.5, marginBottom: 20 }}>
-        Your code has been pushed to main. We recommend you close this worker, but you can keep it
-        open if you prefer.
+        This worker's work has landed on main, so this worker is now redundant. We recommend closing
+        it — your other agents keep running — but you can keep it open if you prefer.
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
         {/* Green-stroke button: the recommended (and safe) action. */}

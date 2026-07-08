@@ -147,13 +147,17 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
       bump("merged");
   }
 
-  // A worker is "Merged with Main" ONLY once the orchestrator's work (which carries this worker's,
-  // via the orchestrator branch) has actually reached main — independent of the worker's own PR
-  // probe (`ws`). Being merged into the orchestrator's branch alone (orchestrator not yet on main)
-  // is NOT yet on main, so it must not claim "Merged with Main". The gate is committedSeen, NOT bs:
-  // committedSeen is true only when authored work actually exists (bs.ahead, ws.aheadOfBase, or the
-  // prior watermark), so a no-worktree/no-op worker never skips the build stages to read as landed.
-  if (kind === "worker" && committedSeen && parentReachedMain) bump("merged");
+  // A worker is "Merged with Main" ONLY once BOTH are true: (a) this worker's OWN branch is actually
+  // in the parent/orchestrator branch (`inParent`, or the squash `landed` case where its work is
+  // already there but its tip isn't an ancestor), AND (b) the parent orchestrator's work has itself
+  // reached main (`parentReachedMain`). Requiring `inParent`/`landed` is what stops a FRESHLY spawned
+  // worker — one that has only just made its first commit and was never integrated — from falsely
+  // reading as merged just because the parent had EVER reached main (which is sticky/monotonic): that
+  // was the "Close this worker? Your code has been pushed to main" false pop-up. The committedSeen
+  // gate (bs.ahead, ws.aheadOfBase, or the prior watermark) additionally keeps a no-op worker from
+  // skipping the build stages to read as landed.
+  const ownWorkInParent = (ws?.inParent ?? false) || (ws?.landed ?? false);
+  if (kind === "worker" && committedSeen && ownWorkInParent && parentReachedMain) bump("merged");
 
   // Shipped is the authoritative top — only meaningful once real work landed.
   if (input.shipped && committedSeen) bump("shipped");

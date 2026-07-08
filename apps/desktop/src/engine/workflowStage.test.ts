@@ -189,8 +189,24 @@ describe("progress-line fill + color", () => {
 });
 
 describe("deriveLiveStage — worker path", () => {
-  it("reaches Merged only once the orchestrator's work reached main", () => {
-    expect(deriveLiveStage({ kind: "worker", bs: bs(1), parentReachedMain: true })).toBe("merged");
+  it("reaches Merged once its OWN work is in the parent AND the orchestrator's work reached main", () => {
+    expect(
+      deriveLiveStage({
+        kind: "worker",
+        bs: bs(1),
+        ws: ws({ inParent: true }),
+        parentReachedMain: true,
+      }),
+    ).toBe("merged");
+  });
+  // Regression (the "Close this worker? Your code has been pushed to main" false pop-up): a freshly
+  // spawned worker that has only made its first commit — never integrated into the parent — must NOT
+  // read as Merged just because the parent has EVER reached main. Requires this worker's own branch
+  // to actually be in the parent (inParent/landed), not merely parentReachedMain.
+  it("does NOT reach Merged when its own work is NOT yet in the parent, even if the parent reached main", () => {
+    expect(deriveLiveStage({ kind: "worker", bs: bs(1), parentReachedMain: true })).toBe(
+      "building_saved",
+    );
   });
   it("does NOT reach Merged with no committed work, even if the parent reached main (committedSeen gate)", () => {
     expect(deriveLiveStage({ kind: "worker", bs: bs(0), parentReachedMain: true })).toBe(
@@ -207,17 +223,27 @@ describe("deriveLiveStage — worker path", () => {
       "building_saved",
     );
   });
-  it("ignores the squash `landed` signal too (a build-agent signal, not a worker's)", () => {
+  it("a squash-landed worker (its work in the parent via `landed`) reaches Merged once the parent is on main", () => {
+    expect(
+      deriveLiveStage({
+        kind: "worker",
+        bs: bs(1),
+        ws: ws({ landed: true }),
+        parentReachedMain: true,
+      }),
+    ).toBe("merged");
+  });
+  it("the squash `landed` signal alone (parent not on main) is NOT Merged with Main", () => {
     expect(deriveLiveStage({ kind: "worker", bs: bs(1), ws: ws({ landed: true }) })).toBe(
       "building_saved",
     );
   });
-  it("off-base authored work (aheadOfBase) still gates landing when the parent reaches main", () => {
+  it("off-base authored work (aheadOfBase) that is in the parent still lands when the parent reaches main", () => {
     expect(
       deriveLiveStage({
         kind: "worker",
         bs: bs(0),
-        ws: ws({ aheadOfBase: 1 }),
+        ws: ws({ aheadOfBase: 1, inParent: true }),
         parentReachedMain: true,
       }),
     ).toBe("merged");

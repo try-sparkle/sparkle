@@ -13,7 +13,7 @@ describe("CloseWorkerPrompt", () => {
   it("renders the recommendation copy and both actions", () => {
     render(<CloseWorkerPrompt onClose={vi.fn()} onKeep={vi.fn()} />);
     expect(screen.getByText("Close this worker?")).toBeTruthy();
-    expect(screen.getByText(/pushed to main/i)).toBeTruthy();
+    expect(screen.getByText(/landed on main/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Close worker" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "keep it open" })).toBeTruthy();
   });
