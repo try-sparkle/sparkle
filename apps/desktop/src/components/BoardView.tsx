@@ -562,7 +562,7 @@ function StartControls({
         title={
           startDisabled
             ? "decomposing…"
-            : "Start this epic — claim it and hand it to the Build orchestrator"
+            : "Build It — claim this epic and hand it to the Build orchestrator"
         }
         style={{
           background: startDisabled ? C.deepForest : C.teal,
@@ -576,7 +576,7 @@ function StartControls({
           fontFamily: '"IBM Plex Sans", sans-serif',
         }}
       >
-        Start
+        Build It
       </button>
       {isDecomposing && (
         <button
@@ -714,26 +714,74 @@ function DetailOverlay({
   onClose: () => void;
 }) {
   const [buildErr, setBuildErr] = useState("");
+  const [buildBusy, setBuildBusy] = useState(false);
   const isEpic = bead.type === "epic";
+  const isTask = bead.type === "task";
   const status: EpicStatus | null = isEpic ? epicStatus(allBeads, bead.id) : null;
   const workers = workersForBead(agents, bead.id);
-  // The epic body carries "PRD file: <path>" (see tasks.ts); pull it back out for the handoff.
-  const prdPath = /PRD file:\s*(\S+)/.exec(bead.description)?.[1] ?? "";
+  // The project's checkout root, needed to claim beads before the Build handoff (same as
+  // StartControls). Looked up from the store since DetailOverlay only receives the projectId.
+  const rootPath = useProjectStore(
+    (s) => s.projects.find((p) => p.id === projectId)?.rootPath ?? null,
+  );
+  // The epic body carries "PRD file: <path>" (see tasks.ts / parsePrdRef); pull it back out with the
+  // robust parser — null for a PRD-less epic, which NO LONGER blocks the handoff (sendToBuild seeds
+  // off `bd show <epicId>` instead).
+  const prdPath = parsePrdRef(bead.description)?.relPath ?? null;
+  // Sibling epics that share this epic's PRD → offer a "Build all N epics in this PRD" when >1.
+  const prdEpics = prdPath
+    ? allBeads.filter((b) => b.type === "epic" && parsePrdRef(b.description)?.relPath === prdPath)
+    : [];
 
-  // "Build It": hand this epic to the Build orchestrator, which spawns one worker per child bead.
-  function handleBuildIt() {
+  // "Build It" (epic): claim this epic (→ in_progress), then hand it to the Build orchestrator,
+  // which fans one worker out per child task. A PRD-less epic is fine now — no hard block.
+  async function handleBuildIt() {
+    if (buildBusy) return;
     setBuildErr("");
-    // Guard a missing PRD link: without it sendToBuild would seed the orchestrator with an empty
-    // "read the PRD at  …" path and silently succeed. Surface it instead of a broken handoff.
-    if (!prdPath) {
-      setBuildErr("This epic has no linked PRD — regenerate it from Think first.");
-      return;
-    }
+    setBuildBusy(true);
     try {
+      if (rootPath) await claimBead(rootPath, bead.id); // match StartControls' claim+handoff
       sendToBuild({ projectId, epicId: bead.id, prdPath });
       onClose();
     } catch (e) {
       setBuildErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBuildBusy(false);
+    }
+  }
+
+  // "Build It" (single task): claim this bead, then hand it to the orchestrator in task mode — build
+  // THIS one bead on a single isolated worker branch, no fan-out.
+  async function handleBuildTask() {
+    if (buildBusy) return;
+    setBuildErr("");
+    setBuildBusy(true);
+    try {
+      if (rootPath) await claimBead(rootPath, bead.id);
+      sendToBuild({ projectId, epicId: bead.id, prdPath, mode: "task" });
+      onClose();
+    } catch (e) {
+      setBuildErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBuildBusy(false);
+    }
+  }
+
+  // "Build all N epics in this PRD": claim + hand off every epic sharing this PRD, in turn.
+  async function handleBuildAllPrd() {
+    if (buildBusy) return;
+    setBuildErr("");
+    setBuildBusy(true);
+    try {
+      for (const epic of prdEpics) {
+        if (rootPath) await claimBead(rootPath, epic.id);
+        sendToBuild({ projectId, epicId: epic.id, prdPath });
+      }
+      onClose();
+    } catch (e) {
+      setBuildErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBuildBusy(false);
     }
   }
 
@@ -827,7 +875,8 @@ function DetailOverlay({
             </span>
             <button
               onClick={handleBuildIt}
-              title="Hand this epic to the Build orchestrator — it spawns one worker per task"
+              disabled={buildBusy}
+              title="Build It — claim this epic and hand it to the Build orchestrator, which spawns one worker per task"
               style={{
                 background: C.teal,
                 color: C.cream,
@@ -836,11 +885,60 @@ function DetailOverlay({
                 padding: "6px 16px",
                 fontSize: 13,
                 fontWeight: FONT_WEIGHT.semibold,
-                cursor: "pointer",
+                cursor: buildBusy ? "default" : "pointer",
+                opacity: buildBusy ? 0.7 : 1,
                 fontFamily: '"IBM Plex Sans", sans-serif',
               }}
             >
-              Build It
+              {buildBusy ? "Building…" : "Build It"}
+            </button>
+            {/* When this epic shares its PRD with sibling epics, offer to build them all at once. */}
+            {prdEpics.length > 1 && (
+              <button
+                onClick={handleBuildAllPrd}
+                disabled={buildBusy}
+                title={`Claim and build all ${prdEpics.length} epics that share this PRD`}
+                style={{
+                  background: "transparent",
+                  color: C.teal,
+                  border: `1px solid ${C.teal}`,
+                  borderRadius: 8,
+                  padding: "6px 16px",
+                  fontSize: 13,
+                  fontWeight: FONT_WEIGHT.semibold,
+                  cursor: buildBusy ? "default" : "pointer",
+                  opacity: buildBusy ? 0.7 : 1,
+                  fontFamily: '"IBM Plex Sans", sans-serif',
+                }}
+              >
+                {`Build all ${prdEpics.length} epics in this PRD`}
+              </button>
+            )}
+            {buildErr && <span style={{ color: C.sienna, fontSize: 12 }}>{buildErr}</span>}
+          </div>
+        )}
+
+        {/* Task-level Build It: build THIS single bead on one isolated worker branch (no fan-out). */}
+        {isTask && (
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <button
+              onClick={handleBuildTask}
+              disabled={buildBusy}
+              title="Build It — build this single task on one isolated worker branch, then verify and integrate it"
+              style={{
+                background: C.teal,
+                color: C.cream,
+                border: "none",
+                borderRadius: 8,
+                padding: "6px 16px",
+                fontSize: 13,
+                fontWeight: FONT_WEIGHT.semibold,
+                cursor: buildBusy ? "default" : "pointer",
+                opacity: buildBusy ? 0.7 : 1,
+                fontFamily: '"IBM Plex Sans", sans-serif',
+              }}
+            >
+              {buildBusy ? "Building…" : "Build It"}
             </button>
             {buildErr && <span style={{ color: C.sienna, fontSize: 12 }}>{buildErr}</span>}
           </div>

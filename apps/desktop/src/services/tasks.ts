@@ -24,7 +24,21 @@ export interface TaskPlan {
   decisions?: string[];
 }
 
-/** System prompt for the Claude-direct structured plan extraction. */
+/**
+ * Multi-epic plan — the shape `generateTasks` now asks the model for. A PRD decomposes into ONE OR
+ * MORE coherent epics, each with its own self-contained task list (with per-epic `dependsOn` indices
+ * that are LOCAL to that epic's tasks). A focused PRD stays a single epic — this is a strict
+ * superset of `TaskPlan`, so the one-epic path behaves exactly as before. Kept SEPARATE from
+ * `TaskPlan`: the auto-decompose watcher (decomposeEpic) still uses TaskPlan/TASK_PLAN_SYSTEM.
+ */
+export interface EpicPlan {
+  epics: { title: string; description: string; tasks: PlannedTask[] }[];
+  /** Key product/technical decisions worth remembering across future think sessions. */
+  decisions?: string[];
+}
+
+/** System prompt for the Claude-direct structured plan extraction (single epic — used by the
+ *  auto-decompose watcher). */
 export const TASK_PLAN_SYSTEM = [
   "You convert a Product Requirements Document into an executable work plan.",
   "Read the PRD and output a JSON object with this exact shape:",
@@ -37,6 +51,24 @@ export const TASK_PLAN_SYSTEM = [
   "and technical decisions to remember. Output ONLY the JSON — no prose, no code fences.",
 ].join(" ");
 
+/** System prompt for the multi-epic plan extraction used by generateTasks. Instructs the model to
+ *  split a PRD into 1..N epics, only using more than one when the PRD genuinely spans independent
+ *  deliverables — a focused PRD stays a single epic. */
+export const EPIC_PLAN_SYSTEM = [
+  "You convert a Product Requirements Document into an executable work plan of one or more epics.",
+  "Read the PRD and output a JSON object with this exact shape:",
+  '{ "epics": [ { "title": string, "description": string,',
+  ' "tasks": [ { "title": string, "description": string, "dependsOn": number[] } ] } ],',
+  ' "decisions": string[] }.',
+  "Split the PRD into 1 to N coherent epics. Use MORE THAN ONE epic ONLY when the PRD genuinely",
+  "spans independent deliverables that could each ship on their own; PREFER a SINGLE epic for a",
+  "focused PRD. Give each epic between 2 and 12 self-contained tasks a single engineer can complete",
+  "and verify. Within an epic, `dependsOn` lists the array indices of tasks IN THAT SAME EPIC that",
+  "must finish before this one starts — indices are LOCAL to that epic's task list (omit or use []",
+  "when independent). `decisions` captures the key product and technical decisions to remember.",
+  "Output ONLY the JSON — no prose, no code fences.",
+].join(" ");
+
 const FRONTMATTER_RE = /^---\n([\s\S]*?)\n---/;
 
 function renderTasksArray(tasks: string[]): string {
@@ -44,28 +76,40 @@ function renderTasksArray(tasks: string[]): string {
 }
 
 /**
- * Rewrite a PRD's leading YAML frontmatter `epic`/`tasks` fields with the freshly-created ids.
- * Pure (no I/O). If a leading `---` block exists, its `epic:`/`tasks:` lines are replaced (and
- * added when missing); if there is no frontmatter block, a minimal one is prepended.
+ * Rewrite a PRD's leading YAML frontmatter `epic`/`tasks` (and optionally `epics`) fields with the
+ * freshly-created ids. Pure (no I/O). If a leading `---` block exists, the matching lines are
+ * replaced (and added when missing); if there is no frontmatter block, a minimal one is prepended.
+ *
+ * `epic:` (the first epic) and `tasks:` (all child tasks) are ALWAYS written so nothing that reads
+ * the old fields breaks. `epics:` (the full epic-id list) is written only when the caller passes it —
+ * additive, so the single-field callers (decomposeEpic, the unit tests) stay byte-for-byte the same.
  */
 export function updateFrontmatter(
   markdown: string,
-  patch: { epic: string; tasks: string[] },
+  patch: { epic: string; tasks: string[]; epics?: string[] },
 ): string {
   const epicLine = `epic: ${JSON.stringify(patch.epic)}`;
   const tasksLine = `tasks: ${renderTasksArray(patch.tasks)}`;
+  const epicsLine = patch.epics ? `epics: ${renderTasksArray(patch.epics)}` : null;
 
   const m = FRONTMATTER_RE.exec(markdown);
   if (!m) {
     // No frontmatter — prepend a minimal block.
-    const block = ["---", epicLine, tasksLine, "---"].join("\n");
+    const block = ["---", epicLine, tasksLine, ...(epicsLine ? [epicsLine] : []), "---"].join("\n");
     return `${block}\n\n${markdown.replace(/^\s+/, "")}`;
   }
 
   const lines = m[1]!.split("\n");
   let sawEpic = false;
   let sawTasks = false;
+  let sawEpics = false;
   const rewritten = lines.map((line) => {
+    // Check `epics:` before `epic:` — `/^epic:/` wouldn't match "epics:" anyway, but order makes
+    // the intent explicit. When the caller omits `epics`, an existing `epics:` line is left as-is.
+    if (epicsLine !== null && /^epics:/.test(line)) {
+      sawEpics = true;
+      return epicsLine;
+    }
     if (/^epic:/.test(line)) {
       sawEpic = true;
       return epicLine;
@@ -78,6 +122,7 @@ export function updateFrontmatter(
   });
   if (!sawEpic) rewritten.push(epicLine);
   if (!sawTasks) rewritten.push(tasksLine);
+  if (epicsLine !== null && !sawEpics) rewritten.push(epicsLine);
 
   const newBlock = `---\n${rewritten.join("\n")}\n---`;
   return markdown.replace(FRONTMATTER_RE, newBlock);
@@ -118,20 +163,73 @@ export interface GenerateArgs {
 }
 
 export interface GenerateResult {
+  /** Every epic bead created for this PRD, in plan order. */
+  epicIds: string[];
+  /** = epicIds[0]. Kept for backward compatibility with the many consumers that read a single
+   *  epic id (sendToBuild, capturePlan, the Plan view). */
   epicId: string;
+  /** All child task ids across every epic, flattened in epic order. */
   taskIds: string[];
   updatedPrdContent: string;
 }
 
-/** Reject plans with no tasks or a title-less task BEFORE any bead is created — structuredJson
- *  returns untyped LLM output, and a task with a missing title would create an "undefined" bead. */
-function validatePlanTasks(plan: TaskPlan): void {
+/** Reject task lists with no tasks or a title-less task BEFORE any bead is created — structuredJson
+ *  returns untyped LLM output, and a task with a missing title would create an "undefined" bead.
+ *  Structural `{ tasks }` param so it validates both a TaskPlan and a single EpicPlan epic. */
+function validatePlanTasks(plan: { tasks: PlannedTask[] }): void {
   if (!Array.isArray(plan.tasks) || plan.tasks.length === 0) {
     throw new Error("Task plan was empty or malformed (need an epic and at least one task).");
   }
   if (plan.tasks.some((t) => !t?.title || !t.title.trim())) {
     throw new Error("Task plan has a task with no title — refusing to create malformed beads.");
   }
+}
+
+/** Reject a multi-epic plan with no epics, a title-less epic, or any epic that fails the per-epic
+ *  task validation — again BEFORE any bead is created. Reuses validatePlanTasks per epic. */
+function validateEpicPlan(plan: EpicPlan): void {
+  if (!Array.isArray(plan.epics) || plan.epics.length === 0) {
+    throw new Error("Task plan was empty or malformed (need an epic and at least one task).");
+  }
+  for (const epic of plan.epics) {
+    if (!epic?.title || !epic.title.trim()) {
+      throw new Error("Task plan was empty or malformed (need an epic and at least one task).");
+    }
+    validatePlanTasks(epic);
+  }
+}
+
+/** Coerce raw structuredJson output into an EpicPlan. Accepts the native multi-epic shape (an
+ *  `epics` array) or a legacy single-epic `{ epic, tasks }` shape (which some prompts/models still
+ *  emit), wrapping the latter into a one-element `epics` list. Anything else yields an empty plan so
+ *  validateEpicPlan throws the standard error. Missing epic titles/descriptions are normalized to
+ *  "" and left for validation to reject / the body builder to tolerate — matching the old flow. */
+function toEpicPlan(raw: unknown): EpicPlan {
+  const p = raw as
+    | {
+        epics?: EpicPlan["epics"];
+        epic?: { title?: string; description?: string };
+        tasks?: PlannedTask[];
+        decisions?: string[];
+      }
+    | null
+    | undefined;
+  if (p && Array.isArray(p.epics)) {
+    return { epics: p.epics, decisions: p.decisions };
+  }
+  if (p && p.epic) {
+    return {
+      epics: [
+        {
+          title: p.epic.title ?? "",
+          description: p.epic.description ?? "",
+          tasks: Array.isArray(p.tasks) ? p.tasks : [],
+        },
+      ],
+      decisions: p.decisions,
+    };
+  }
+  return { epics: [] };
 }
 
 /** Create the plan's child task beads under `epicId` (sequentially, so ids line up with plan
@@ -142,7 +240,7 @@ async function createChildTasks(
   deps: Pick<GenerateDeps, "createBeadFull" | "beadDepAdd">,
   projectPath: string,
   epicId: string,
-  plan: TaskPlan,
+  plan: { tasks: PlannedTask[] },
 ): Promise<string[]> {
   const taskIds: string[] = [];
   for (const t of plan.tasks) {
@@ -178,32 +276,42 @@ export async function generateTasks(
   deps: GenerateDeps,
   args: GenerateArgs,
 ): Promise<GenerateResult> {
-  const plan = await deps.structuredJson<TaskPlan>(TASK_PLAN_SYSTEM, args.prdContent);
-  if (!plan?.epic?.title) {
-    throw new Error("Task plan was empty or malformed (need an epic and at least one task).");
+  const plan = toEpicPlan(await deps.structuredJson<EpicPlan>(EPIC_PLAN_SYSTEM, args.prdContent));
+  validateEpicPlan(plan);
+
+  // 2-4. One epic bead per plan epic, each with its own children + LOCAL dependency edges. Every
+  //      epic body carries the SAME `PRD file:` back-link so all epics link to the one PRD (the
+  //      PRD-level "Build all epics" filter relies on it); the `epicBodyExtra` line (e.g. the
+  //      capture screenshot ref) applies to the FIRST epic only.
+  const epicIds: string[] = [];
+  const taskIds: string[] = [];
+  for (let e = 0; e < plan.epics.length; e++) {
+    const epic = plan.epics[e]!;
+    const epicBody =
+      `${epic.description ?? ""}\n\nPRD file: ${args.prdRelPath}` +
+      (e === 0 && args.epicBodyExtra ? `\n${args.epicBodyExtra}` : "");
+    const epicId = await deps.createBeadFull(
+      args.projectPath,
+      epic.title,
+      epicBody,
+      "epic",
+      "",
+      "",
+      "think-build-loop",
+    );
+    epicIds.push(epicId);
+    const childIds = await createChildTasks(deps, args.projectPath, epicId, epic);
+    taskIds.push(...childIds);
   }
-  validatePlanTasks(plan);
+  const primaryEpicId = epicIds[0]!;
 
-  // 2. Epic — carries the PRD path so any bead can jump back to its spec (and the capture
-  //    screenshot reference, when the caller passes one).
-  const epicBody =
-    `${plan.epic.description ?? ""}\n\nPRD file: ${args.prdRelPath}` +
-    (args.epicBodyExtra ? `\n${args.epicBodyExtra}` : "");
-  const epicId = await deps.createBeadFull(
-    args.projectPath,
-    plan.epic.title,
-    epicBody,
-    "epic",
-    "",
-    "",
-    "think-build-loop",
-  );
-
-  // 3-4. Children + dependency edges under the fresh epic.
-  const taskIds = await createChildTasks(deps, args.projectPath, epicId, plan);
-
-  // 5. Write the epic + task ids back into the PRD frontmatter.
-  const updatedPrdContent = updateFrontmatter(args.prdContent, { epic: epicId, tasks: taskIds });
+  // 5. Write the epic ids + flattened task ids back into the PRD frontmatter. `epic:`/`tasks:` keep
+  //    their existing meaning (first epic / all tasks); `epics:` is the full epic-id list.
+  const updatedPrdContent = updateFrontmatter(args.prdContent, {
+    epic: primaryEpicId,
+    tasks: taskIds,
+    epics: epicIds,
+  });
   await deps.writePrd(args.projectPath, args.prdFilename, updatedPrdContent);
 
   // 6. Best-effort enrichment — never throw out of here.
@@ -218,13 +326,13 @@ export async function generateTasks(
   }
   if (deps.attachLabel && args.prdAssetId) {
     try {
-      await deps.attachLabel(args.prdAssetId, epicId);
+      await deps.attachLabel(args.prdAssetId, primaryEpicId);
     } catch {
       // labeling the PRD asset is an enrichment, not the work graph
     }
   }
 
-  return { epicId, taskIds, updatedPrdContent };
+  return { epicIds, epicId: primaryEpicId, taskIds, updatedPrdContent };
 }
 
 // ── decomposeEpic — child tasks for an EXISTING epic (spec §7 auto-decompose) ──────────────────

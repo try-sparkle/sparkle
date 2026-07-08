@@ -798,10 +798,14 @@ export function ThinkPanel({
         { pat, chiefProjectId: chiefProjectId!, projectPath: project.rootPath, transcript: buildTranscript(messages) },
       );
       if (planSeqRef.current !== seq) return; // user cancelled while we were working — drop the result
-      // The Think agent becomes the epic — the through-line into Plan and Build.
+      // The Think agent becomes the (first) epic — the through-line into Plan and Build.
       useProjectStore.getState().renameAgent(project.id, agentId, res.epicTitle);
+      const epicCount = res.epicIds.length;
+      const taskCount = res.taskIds.length;
       setNotice(
-        `Plan ready — epic ${res.epicId} with ${res.taskIds.length} task(s). Opening the Plan tab…`,
+        `Created ${epicCount} epic${epicCount === 1 ? "" : "s"} with ${taskCount} task${
+          taskCount === 1 ? "" : "s"
+        }. Opening the Plan tab…`,
       );
       // Hand off: take the user to the Plan tab where the epic + beads are waiting.
       useUiStore.getState().setWorkMode("plan");

@@ -12,6 +12,7 @@ describe("turnIntoPlan (composition)", () => {
       content: "---\nepic: null\n---\n\n# Build the mobile app\n",
     }));
     const generate = vi.fn(async () => ({
+      epicIds: ["epic-1"],
       epicId: "epic-1",
       taskIds: ["epic-1.1", "epic-1.2"],
       updatedPrdContent: "updated",
@@ -36,6 +37,7 @@ describe("turnIntoPlan (composition)", () => {
       prdRelPath: "PRD/2026-06-27-mobile-app.md",
     });
     expect(res).toEqual({
+      epicIds: ["epic-1"],
       epicId: "epic-1",
       epicTitle: "Build the mobile app",
       taskIds: ["epic-1.1", "epic-1.2"],

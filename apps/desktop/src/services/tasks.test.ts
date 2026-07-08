@@ -5,9 +5,11 @@ import {
   decomposeEpic,
   parsePrdRef,
   TASK_PLAN_SYSTEM,
+  EPIC_PLAN_SYSTEM,
   type GenerateDeps,
   type DecomposeDeps,
   type TaskPlan,
+  type EpicPlan,
 } from "./tasks";
 
 describe("updateFrontmatter", () => {
@@ -219,6 +221,130 @@ describe("generateTasks", () => {
 
   it("exports a usable system prompt", () => {
     expect(TASK_PLAN_SYSTEM).toContain("dependsOn");
+  });
+});
+
+// ── generateTasks: the native multi-epic EpicPlan path ───────────────────────────────────────────
+
+/** A generateTasks deps set whose structuredJson returns a multi-epic EpicPlan. Each epic bead gets
+ *  a distinct id (ep-1, ep-2, …) and its children id off that epic (ep-1.1, ep-2.1, …), so the
+ *  flattened taskIds + per-epic parenting are observable. */
+function makeMultiEpicDeps(plan: EpicPlan, over: Partial<GenerateDeps> = {}) {
+  const structuredJson = vi.fn().mockResolvedValue(plan);
+  let epics = 0;
+  const childCounters: Record<string, number> = {};
+  const createBeadFull = vi.fn().mockImplementation(
+    async (_p: string, _t: string, _b: string, type: string, parent: string) => {
+      if (type === "epic") {
+        const id = `ep-${++epics}`;
+        childCounters[id] = 0;
+        return id;
+      }
+      childCounters[parent] = (childCounters[parent] ?? 0) + 1;
+      return `${parent}.${childCounters[parent]}`;
+    },
+  );
+  const beadDepAdd = vi.fn().mockResolvedValue(undefined);
+  const writePrd = vi.fn().mockResolvedValue("PRD/x.md");
+  const deps: GenerateDeps = {
+    structuredJson: structuredJson as unknown as GenerateDeps["structuredJson"],
+    createBeadFull,
+    beadDepAdd,
+    writePrd,
+    ...over,
+  };
+  return { deps, structuredJson, createBeadFull, beadDepAdd, writePrd };
+}
+
+describe("generateTasks (multi-epic EpicPlan)", () => {
+  const twoEpicPlan: EpicPlan = {
+    epics: [
+      {
+        title: "Epic One",
+        description: "first deliverable",
+        tasks: [
+          { title: "A0", description: "a0" },
+          { title: "A1", description: "a1", dependsOn: [0] },
+        ],
+      },
+      {
+        title: "Epic Two",
+        description: "second deliverable",
+        tasks: [
+          { title: "B0", description: "b0" },
+          { title: "B1", description: "b1", dependsOn: [0] },
+          { title: "B2", description: "b2", dependsOn: [0, 1] },
+        ],
+      },
+    ],
+    decisions: ["split by deliverable"],
+  };
+
+  it("prompts with EPIC_PLAN_SYSTEM and creates one bead per epic with its own children", async () => {
+    const { deps, structuredJson, createBeadFull, beadDepAdd } = makeMultiEpicDeps(twoEpicPlan);
+    const res = await generateTasks(deps, args);
+
+    expect(structuredJson).toHaveBeenCalledWith(EPIC_PLAN_SYSTEM, args.prdContent);
+
+    // Two epic beads, each with the SAME PRD back-link; children parented to their own epic.
+    expect(createBeadFull).toHaveBeenNthCalledWith(
+      1, "/repo", "Epic One", expect.stringContaining("PRD file: PRD/2026-06-27-foo.md"),
+      "epic", "", "", "think-build-loop",
+    );
+    expect(createBeadFull).toHaveBeenNthCalledWith(2, "/repo", "A0", "a0", "task", "ep-1", "", "");
+    expect(createBeadFull).toHaveBeenNthCalledWith(3, "/repo", "A1", "a1", "task", "ep-1", "", "");
+    expect(createBeadFull).toHaveBeenNthCalledWith(
+      4, "/repo", "Epic Two", expect.stringContaining("PRD file: PRD/2026-06-27-foo.md"),
+      "epic", "", "", "think-build-loop",
+    );
+    expect(createBeadFull).toHaveBeenNthCalledWith(5, "/repo", "B0", "b0", "task", "ep-2", "", "");
+
+    // Result surfaces every epic; epicId stays = epicIds[0]; taskIds flattened in epic order.
+    expect(res.epicIds).toEqual(["ep-1", "ep-2"]);
+    expect(res.epicId).toBe("ep-1");
+    expect(res.taskIds).toEqual(["ep-1.1", "ep-1.2", "ep-2.1", "ep-2.2", "ep-2.3"]);
+
+    // Dependency indices are LOCAL to each epic: A1→A0 within ep-1; B1→B0, B2→B0/B1 within ep-2.
+    expect(beadDepAdd).toHaveBeenCalledWith("/repo", "ep-1.2", "ep-1.1");
+    expect(beadDepAdd).toHaveBeenCalledWith("/repo", "ep-2.2", "ep-2.1");
+    expect(beadDepAdd).toHaveBeenCalledWith("/repo", "ep-2.3", "ep-2.1");
+    expect(beadDepAdd).toHaveBeenCalledWith("/repo", "ep-2.3", "ep-2.2");
+    expect(beadDepAdd).toHaveBeenCalledTimes(4);
+  });
+
+  it("writes epic:/tasks:/epics: back into the frontmatter", async () => {
+    const { deps, writePrd } = makeMultiEpicDeps(twoEpicPlan);
+    await generateTasks(deps, args);
+    const [, , content] = writePrd.mock.calls[0]!;
+    expect(content).toContain('epic: "ep-1"');
+    expect(content).toContain('epics: ["ep-1", "ep-2"]');
+    expect(content).toContain('tasks: ["ep-1.1", "ep-1.2", "ep-2.1", "ep-2.2", "ep-2.3"]');
+  });
+
+  it("applies epicBodyExtra to the FIRST epic only", async () => {
+    const { deps, createBeadFull } = makeMultiEpicDeps(twoEpicPlan);
+    await generateTasks(deps, { ...args, epicBodyExtra: "Screenshot: PRD/assets/shot.png" });
+    const firstEpicBody = createBeadFull.mock.calls[0]![2] as string;
+    const secondEpicBody = createBeadFull.mock.calls[3]![2] as string;
+    expect(firstEpicBody.endsWith("Screenshot: PRD/assets/shot.png")).toBe(true);
+    expect(secondEpicBody).not.toContain("Screenshot:");
+    expect(secondEpicBody.endsWith("PRD file: PRD/2026-06-27-foo.md")).toBe(true);
+  });
+
+  it("rejects an EpicPlan with no epics", async () => {
+    const { deps } = makeMultiEpicDeps({ epics: [] });
+    await expect(generateTasks(deps, args)).rejects.toThrow(/empty or malformed/);
+  });
+
+  it("rejects an epic that has no tasks", async () => {
+    const { deps, createBeadFull } = makeMultiEpicDeps({
+      epics: [
+        { title: "Full", description: "", tasks: [{ title: "T", description: "" }] },
+        { title: "Empty", description: "", tasks: [] },
+      ],
+    });
+    await expect(generateTasks(deps, args)).rejects.toThrow(/empty or malformed/);
+    expect(createBeadFull).not.toHaveBeenCalled();
   });
 });
 

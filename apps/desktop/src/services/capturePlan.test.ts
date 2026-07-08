@@ -60,6 +60,7 @@ describe("sendCaptureToPlan", () => {
       content: "# X",
     } satisfies SynthesizeResult);
     const generate = vi.fn().mockResolvedValue({
+      epicIds: ["sparkle-ep"],
       epicId: "sparkle-ep",
       taskIds: ["sparkle-ep.1"],
       updatedPrdContent: "# X",

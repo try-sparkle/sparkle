@@ -74,14 +74,19 @@ export function CardCriteria({
             e.stopPropagation();
             setOpen((v) => !v);
           }}
-          title={`Criteria for “${label}” — ${met}/${total} met`}
+          title={`Acceptance criteria that must be met before this card can move to “${label}” — ${met} of ${total} met`}
           aria-expanded={open}
           style={progressChip}
         >
+          <FiCheck
+            size={11}
+            color={evaluation.allMet ? C.successInk : C.muted}
+            aria-hidden
+          />
           <span style={{ color: evaluation.allMet ? C.successInk : C.muted, fontWeight: FONT_WEIGHT.semibold }}>
-            {met}/{total}
+            {met} of {total}
           </span>
-          <span style={{ color: C.muted, opacity: 0.85 }}>{label.toLowerCase()}</span>
+          <span style={{ color: C.muted, opacity: 0.85 }}>· {label} criteria</span>
           {open ? <FiChevronUp size={12} aria-hidden /> : <FiChevronDown size={12} aria-hidden />}
         </button>
         {evaluation.allMet && (
@@ -93,6 +98,7 @@ export function CardCriteria({
 
       {open && (
         <ul style={critList}>
+          <li style={critHeader}>{`Acceptance criteria for “${label}”`}</li>
           {evaluation.criteria.map((c, i) => {
             const done = c.state === "met";
             return (
@@ -173,6 +179,15 @@ const critList: CSSProperties = {
   gap: 6,
   background: C.deepForest,
   borderRadius: 6,
+};
+
+const critHeader: CSSProperties = {
+  fontSize: 10.5,
+  fontWeight: FONT_WEIGHT.semibold,
+  color: C.muted,
+  textTransform: "uppercase",
+  letterSpacing: 0.4,
+  paddingBottom: 2,
 };
 
 const critItem: CSSProperties = {

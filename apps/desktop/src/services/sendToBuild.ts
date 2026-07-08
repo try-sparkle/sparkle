@@ -13,12 +13,33 @@ export interface SendToBuildArgs {
    *  backlog epic Started before a PRD exists) — the seed then points the orchestrator at the epic
    *  bead itself instead of blocking on a PRD that isn't there. */
   prdPath: string | null;
+  /** What kind of bead we're handing off. "epic" (the default) tells the orchestrator to fan the
+   *  epic's child tasks out across workers; "task" tells it to build THIS ONE bead on a single
+   *  isolated worker branch without fanning out. `epicId` still names the target bead in both. */
+  mode?: "epic" | "task";
 }
 
-/** Build the orchestrator's seed prompt: the epic id, where the spec lives (the PRD when there is
- *  one, else the epic bead's own description), and the marching order to execute the epic's
- *  children under the beads protocol. */
+/** Build the orchestrator's seed prompt. For an epic: point at the spec (the PRD when there is one,
+ *  else the epic bead's own description) and tell it to fan the epic's children out across workers.
+ *  For a single task: tell it to build THAT one bead on one isolated worker branch — no fan-out.
+ *  Both keep the beads protocol addendum so the work graph stays in sync. */
 function buildSeedPrompt(args: SendToBuildArgs): string {
+  if (args.mode === "task") {
+    const spec = args.prdPath
+      ? `read the PRD at ${args.prdPath} for surrounding context, then`
+      : "then";
+    return [
+      `Build bead ${args.epicId} (a single task).`,
+      "",
+      `Run \`bd show ${args.epicId}\` to read it, ${spec} implement it on ONE isolated worker`,
+      "branch, verify it, and integrate that branch. Do not fan out into children — this is a single",
+      "unit of work, not an epic.",
+      "",
+      "Follow the beads protocol below to keep the work graph in sync as you go:",
+      "",
+      beadsProtocol({ epicId: args.epicId }),
+    ].join("\n");
+  }
   const spec = args.prdPath
     ? `First, read the PRD at ${args.prdPath} to understand the goal, constraints, and acceptance`
     : `First, run \`bd show ${args.epicId}\` and read the epic's description for the goal and`;

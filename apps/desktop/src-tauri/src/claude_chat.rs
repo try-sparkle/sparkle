@@ -206,10 +206,287 @@ pub(crate) fn handle_event(
     }
 }
 
+/// Sibling of `handle_event`: on a `result` event, capture whether it reported FAILURE — its
+/// `subtype` (when not `"success"`) and its `is_error` flag — so a non-zero exit with empty
+/// stderr can be turned into a specific error message instead of a bare fallback. Kept as a
+/// separate function (rather than folded into `handle_event`) so the shared parser's signature,
+/// which `sparkle_improve.rs` also depends on, stays unchanged.
+pub(crate) fn capture_result_status(ev: &Value, subtype: &mut Option<String>, is_error: &mut bool) {
+    if ev.get("type").and_then(Value::as_str) != Some("result") {
+        return;
+    }
+    if ev.get("is_error").and_then(Value::as_bool) == Some(true) {
+        *is_error = true;
+    }
+    if let Some(st) = ev.get("subtype").and_then(Value::as_str) {
+        if st != "success" && !st.is_empty() {
+            *subtype = Some(st.to_string());
+        }
+    }
+}
+
+/// Structured outcome of ONE headless `claude` run (one child, its stdout read to EOF and the
+/// child reaped). Returned by `run_reader` so the caller can decide whether to retry and how to
+/// phrase a failure. `owned` is false when the session map no longer held our token by the time
+/// we reached EOF (a newer same-id send superseded us, or `claude_chat_cancel` removed us): the
+/// frontend already initiated teardown, so the caller must stay silent and NOT retry.
+struct TurnOutcome {
+    owned: bool,
+    ok: bool,
+    /// The child's exit code, or `None` if it was killed by a signal / the code was unavailable.
+    exit_code: Option<i32>,
+    /// The session id captured from the stream (used for the `done` event's `sessionId`).
+    session_id: String,
+    /// Clean final `result` text if present, else the accumulated deltas.
+    text: String,
+    /// Drained stderr (already `join`ed); the preferred error message when non-empty.
+    stderr: String,
+    /// A non-`"success"` `result` subtype the stream carried, if any (self-diagnosed failure).
+    result_subtype: Option<String>,
+    /// Whether the stream carried a `result` event with `is_error == true`.
+    is_error: bool,
+}
+
+/// Decide whether a FAILED turn should be retried once WITHOUT `--resume`. A stale
+/// `--resume <sid>` — a session id no longer in the cwd's `claude` history — is the #1
+/// real-world cause of a non-zero exit with empty stderr (the first turn, which had no resume,
+/// works; a later turn resumes a now-gone session and `claude` exits non-zero). So: retry iff
+/// the turn FAILED *and* it carried a non-empty resume session id. A first turn with no resume
+/// id, and any successful turn, never retries. Pure so it can be unit-tested.
+fn should_retry_without_resume(ok: bool, resume_session_id: Option<&str>) -> bool {
+    !ok && matches!(resume_session_id, Some(sid) if !sid.is_empty())
+}
+
+/// Build the `claude_chat:error` message for a failed turn. Prefers the child's own stderr
+/// (its real diagnostics) when non-empty; otherwise synthesizes a SPECIFIC message from the
+/// exit code and any non-`"success"` `result` subtype / `is_error` flag the stream carried,
+/// replacing the old bare `"claude exited without a successful result"` fallback. Appends
+/// `— retried without --resume` whenever a resume-retry was attempted. Pure so it can be
+/// unit-tested.
+fn build_error_message(
+    stderr: &str,
+    exit_code: Option<i32>,
+    result_subtype: Option<&str>,
+    is_error: bool,
+    retried_without_resume: bool,
+) -> String {
+    let mut msg = {
+        let stderr = stderr.trim();
+        if !stderr.is_empty() {
+            // Prefer the child's own diagnostics verbatim.
+            stderr.to_string()
+        } else {
+            // No stderr: say exactly what we observed instead of the old bare fallback.
+            let mut m = match exit_code {
+                Some(code) => format!("claude exited (code {code}) with no output"),
+                None => "claude exited (killed by signal) with no output".to_string(),
+            };
+            if let Some(st) = result_subtype {
+                m.push_str(&format!("; result subtype '{st}'"));
+            } else if is_error {
+                m.push_str("; stream reported an error result");
+            }
+            m
+        }
+    };
+    if retried_without_resume {
+        msg.push_str(" — retried without --resume");
+    }
+    msg
+}
+
+/// Drain a child's stderr on its own thread so a full stderr pipe can't deadlock the child.
+/// The caller `join`s the returned handle to get the complete text (only needed on failure).
+fn drain_stderr(stderr: std::process::ChildStderr) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut s);
+        s
+    })
+}
+
+/// Spawn the user's `claude` for ONE turn and register it in the session map under a fresh
+/// token, returning the child's stdout/stderr pipes and that token. On a same-id collision the
+/// existing in-flight child is superseded (killed + reaped), matching the module's
+/// same-id-supersedes rule; its reader will EOF, find a different token, and stay silent.
+/// Never logs the built script (it embeds the user's prompt / possible secrets), matching
+/// pty.rs's caution.
+fn spawn_turn(
+    app: &AppHandle,
+    id: &str,
+    prompt: &str,
+    real_cwd: &std::path::Path,
+    claude_path: &str,
+    resume_session_id: Option<&str>,
+) -> Result<(std::process::ChildStdout, std::process::ChildStderr, u64), String> {
+    let script = build_claude_exec(claude_path, prompt, resume_session_id);
+    tracing::info!(
+        id = %id, %claude_path, cwd = %real_cwd.display(),
+        resume = resume_session_id.map(|s| !s.is_empty()).unwrap_or(false),
+        "claude_chat spawn"
+    );
+
+    let mut cmd = Command::new(SHELL);
+    cmd.args(["-l", "-c", &script]);
+    cmd.current_dir(real_cwd);
+    // No stdin: `-p` is one-shot, and a null stdin guarantees nothing can block on input.
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("claude_chat_send: spawn failed: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "claude_chat_send: child has no stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "claude_chat_send: child has no stderr".to_string())?;
+
+    let token = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let superseded = {
+        let manager = app.state::<ClaudeChatManager>();
+        let mut sessions = lock_sessions(&manager.sessions);
+        sessions.insert(id.to_string(), ChatSession { child, token })
+    };
+    if let Some(mut old) = superseded {
+        tracing::info!(id = %id, "claude_chat_send superseded an in-flight turn; killing the old child");
+        let _ = old.child.kill();
+        let _ = old.child.wait();
+    }
+    Ok((stdout, stderr, token))
+}
+
+/// Run one already-spawned turn to completion on the CURRENT thread: read the child's NDJSON
+/// stdout to EOF (emitting `claude_chat:delta` for each text chunk), then — ONLY if the session
+/// map still holds OUR token — reap the child and return a structured `TurnOutcome`. When the
+/// map no longer holds our token (superseded or cancelled), returns `owned: false` and the
+/// caller stays silent. Factored out of `claude_chat_send` so the retry path can call it a
+/// second time (for the fresh, no-`--resume` run) without duplicating the parse/reap logic.
+fn run_reader(
+    app: &AppHandle,
+    id: &str,
+    token: u64,
+    stdout: std::process::ChildStdout,
+    stderr_handle: std::thread::JoinHandle<String>,
+) -> TurnOutcome {
+    let mut reader = BufReader::new(stdout);
+    let mut session_id = String::new();
+    let mut final_text = String::new();
+    let mut acc = String::new();
+    let mut result_subtype: Option<String> = None;
+    let mut is_error = false;
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                // Split on the newline BYTE: 0x0A never appears inside a UTF-8 multibyte
+                // sequence, so a complete NDJSON line is always whole valid UTF-8 — line
+                // buffering subsumes the partial-multibyte concern pty.rs handles by hand.
+                let text = String::from_utf8_lossy(&line);
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // Login profiles can echo non-JSON noise before `exec claude`; skip anything
+                // that isn't a JSON event rather than treating it as a failure — but log it
+                // at debug so a future claude stream-format change (which would otherwise
+                // present as a silent blank reply) is diagnosable (roborev).
+                if let Ok(ev) = serde_json::from_str::<Value>(trimmed) {
+                    handle_event(&ev, &mut session_id, &mut final_text, &mut acc, &mut |txt| {
+                        let _ = app.emit(
+                            "claude_chat:delta",
+                            ChatDelta { id: id.to_string(), text: txt.to_string() },
+                        );
+                    });
+                    // Alongside the parse: note a self-diagnosed failure so a non-zero exit
+                    // with empty stderr still yields a specific error message.
+                    capture_result_status(&ev, &mut result_subtype, &mut is_error);
+                } else {
+                    tracing::debug!(id = %id, "claude_chat: skipped non-JSON stdout line");
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Reap + decide the outcome — but ONLY if the map still holds OUR turn (token match).
+    // If a newer same-id send superseded us, that send already took and reaped our child,
+    // and the map now carries its token; if claude_chat_cancel removed us, the entry is
+    // gone. In both cases the frontend initiated the teardown, so we stay silent (owned:false)
+    // and leave the live turn's entry untouched.
+    let child = {
+        let manager = app.state::<ClaudeChatManager>();
+        let mut sessions = lock_sessions(&manager.sessions);
+        match sessions.get(id) {
+            Some(s) if s.token == token => sessions.remove(id).map(|s| s.child),
+            _ => None,
+        }
+    };
+    let Some(mut child) = child else {
+        // Superseded / cancelled: join the stderr drain so its thread isn't leaked, then bow out.
+        let _ = stderr_handle.join();
+        return TurnOutcome {
+            owned: false,
+            ok: false,
+            exit_code: None,
+            session_id,
+            text: String::new(),
+            stderr: String::new(),
+            result_subtype,
+            is_error,
+        };
+    };
+    let status = child.wait();
+    let ok = matches!(&status, Ok(s) if s.success());
+    let exit_code = status.ok().and_then(|s| s.code());
+    // Prefer the clean final `result` text; fall back to the accumulated deltas.
+    let text = if !final_text.is_empty() { final_text } else { acc };
+    let stderr = stderr_handle.join().unwrap_or_default();
+    TurnOutcome { owned: true, ok, exit_code, session_id, text, stderr, result_subtype, is_error }
+}
+
+/// Emit the terminal event for a decided (owned) turn: `claude_chat:done` on success or
+/// `claude_chat:error` on failure, with a specific message. `retried_without_resume` annotates
+/// a failure that already fell back to a fresh session.
+fn emit_outcome(app: &AppHandle, id: &str, outcome: TurnOutcome, retried_without_resume: bool) {
+    if outcome.ok {
+        // A successful exit with no text is unusual (e.g. a tool-only turn or a claude
+        // stream-format change). It's still a valid `done` — ThinkPanel renders an empty
+        // reply gracefully — but log it so a regression isn't an undiagnosable blank.
+        if outcome.text.trim().is_empty() {
+            tracing::debug!(id = %id, "claude_chat: successful turn produced no assistant text");
+        }
+        let _ = app.emit(
+            "claude_chat:done",
+            ChatDone { id: id.to_string(), session_id: outcome.session_id, text: outcome.text },
+        );
+    } else {
+        let message = build_error_message(
+            &outcome.stderr,
+            outcome.exit_code,
+            outcome.result_subtype.as_deref(),
+            outcome.is_error,
+            retried_without_resume,
+        );
+        let _ = app.emit("claude_chat:error", ChatError { id: id.to_string(), message });
+    }
+}
+
 /// Run the user's own headless `claude` for one Think turn. Returns immediately; the child
 /// and its stdout reader run on background threads. Streams arrive as Tauri events keyed by
 /// `id`: `claude_chat:delta {id, text}` (incremental), `claude_chat:done {id, sessionId,
 /// text}` on success, `claude_chat:error {id, message}` on failure / non-zero exit.
+///
+/// Stale-session self-heal: the #1 real-world cause of a non-zero exit with empty stderr is a
+/// stale `--resume <sid>` (a session id no longer in the cwd's history). So when a turn that
+/// carried a resume id fails, we RE-RUN the same prompt ONCE more WITHOUT `--resume` (a fresh
+/// session) and use that run's outcome. A first turn with no resume id never retries.
 ///
 /// `claude_path` is resolved on the FRONTEND via preflight (`checkClaude`) and passed in, so
 /// path resolution stays in one place (preflight.rs). `cwd` is the project root.
@@ -238,161 +515,79 @@ pub async fn claude_chat_send(
         return Err("claude_chat_send: cwd must be provided".into());
     }
 
-    // Spawn the child (and reap any superseded one) off the main thread; hand stdout/stderr + the
-    // turn token back so the reader/stderr threads can be wired up on the async side below.
+    // Spawn the first child (and reap any superseded one) off the main thread; hand stdout/stderr,
+    // the turn token, and the resolved cwd back so the reader thread (and any retry spawn) can be
+    // wired up below. Failing here (bad cwd / spawn error) returns Err to the frontend fast.
     let blk_app = app.clone();
     let blk_id = id.clone();
-    let (stdout, stderr, token) = tauri::async_runtime::spawn_blocking(
-        move || -> Result<(std::process::ChildStdout, std::process::ChildStderr, u64), String> {
+    let blk_prompt = prompt.clone();
+    let blk_claude = claude_path.clone();
+    let blk_resume = resume_session_id.clone();
+    let (stdout, stderr, token, real_cwd) = tauri::async_runtime::spawn_blocking(
+        move || -> Result<(std::process::ChildStdout, std::process::ChildStderr, u64, std::path::PathBuf), String> {
             // Canonicalize so we spawn into the resolved real path (closing a check-vs-use window)
             // and so a bogus cwd fails fast here rather than as an opaque spawn error.
             let real_cwd = std::fs::canonicalize(&cwd)
                 .map_err(|e| format!("claude_chat_send: invalid cwd: {e}"))?;
-
-            let script = build_claude_exec(&claude_path, &prompt, resume_session_id.as_deref());
-            // Log id/path/cwd but never the built script: it embeds the user's prompt (and could
-            // carry a secret), matching pty.rs's "args may contain prompt text" caution.
-            tracing::info!(
-                id = %blk_id, %claude_path, cwd = %real_cwd.display(),
-                resume = resume_session_id.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
-                "claude_chat_send"
-            );
-
-            let mut cmd = Command::new(SHELL);
-            cmd.args(["-l", "-c", &script]);
-            cmd.current_dir(&real_cwd);
-            // No stdin: `-p` is one-shot, and a null stdin guarantees nothing can block on input.
-            cmd.stdin(Stdio::null());
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-
-            let mut child = cmd
-                .spawn()
-                .map_err(|e| format!("claude_chat_send: spawn failed: {e}"))?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| "claude_chat_send: child has no stdout".to_string())?;
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| "claude_chat_send: child has no stderr".to_string())?;
-
-            // Register this turn under a fresh token. If an entry already exists for this id, a
-            // prior turn is still in flight (same-id reuse / rapid re-send): this send SUPERSEDES
-            // it — we take the old child out (atomically, under the lock) and kill+reap it below.
-            // Its reader will EOF, find a different token in the map, and stay silent (see the
-            // reader's reap).
-            let token = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
-            let superseded = {
-                let manager = blk_app.state::<ClaudeChatManager>();
-                let mut sessions = lock_sessions(&manager.sessions);
-                sessions.insert(blk_id.clone(), ChatSession { child, token })
-            };
-            if let Some(mut old) = superseded {
-                tracing::info!(id = %blk_id, "claude_chat_send superseded an in-flight turn; killing the old child");
-                let _ = old.child.kill();
-                let _ = old.child.wait();
-            }
-            Ok((stdout, stderr, token))
+            let (stdout, stderr, token) = spawn_turn(
+                &blk_app,
+                &blk_id,
+                &blk_prompt,
+                &real_cwd,
+                &blk_claude,
+                blk_resume.as_deref(),
+            )?;
+            Ok((stdout, stderr, token, real_cwd))
         },
     )
     .await
     .map_err(|e| format!("claude_chat_send task failed: {e}"))??;
 
-    // Drain stderr on its own thread so a full stderr pipe can't deadlock the child, and join
-    // it before reading so an error message is complete. Only used on the failure path.
-    let stderr_handle = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = BufReader::new(stderr).read_to_string(&mut s);
-        s
-    });
-
-    // Reader thread: parse NDJSON line-by-line, emit deltas, then decide the outcome on EOF.
+    // Reader thread: run the first turn to a decided outcome, then — if it failed WITH a resume
+    // id — self-heal by re-running once WITHOUT `--resume` and using that outcome instead.
     let read_app = app.clone();
     let read_id = id.clone();
-    let read_token = token;
+    let read_prompt = prompt.clone();
+    let read_claude = claude_path.clone();
+    let read_resume = resume_session_id.clone();
     std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut session_id = String::new();
-        let mut final_text = String::new();
-        let mut acc = String::new();
-        let mut line: Vec<u8> = Vec::new();
-        loop {
-            line.clear();
-            match reader.read_until(b'\n', &mut line) {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    // Split on the newline BYTE: 0x0A never appears inside a UTF-8 multibyte
-                    // sequence, so a complete NDJSON line is always whole valid UTF-8 — line
-                    // buffering subsumes the partial-multibyte concern pty.rs handles by hand.
-                    let text = String::from_utf8_lossy(&line);
-                    let trimmed = text.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    // Login profiles can echo non-JSON noise before `exec claude`; skip anything
-                    // that isn't a JSON event rather than treating it as a failure — but log it
-                    // at debug so a future claude stream-format change (which would otherwise
-                    // present as a silent blank reply) is diagnosable (roborev).
-                    if let Ok(ev) = serde_json::from_str::<Value>(trimmed) {
-                        handle_event(
-                            &ev,
-                            &mut session_id,
-                            &mut final_text,
-                            &mut acc,
-                            &mut |txt| {
-                                let _ = read_app.emit(
-                                    "claude_chat:delta",
-                                    ChatDelta { id: read_id.clone(), text: txt.to_string() },
-                                );
-                            },
-                        );
-                    } else {
-                        tracing::debug!(id = %read_id, "claude_chat: skipped non-JSON stdout line");
-                    }
-                }
-                Err(_) => break,
-            }
+        let stderr_handle = drain_stderr(stderr);
+        let outcome = run_reader(&read_app, &read_id, token, stdout, stderr_handle);
+        // Superseded / cancelled mid-turn: the frontend already tore down. Stay silent, no retry.
+        if !outcome.owned {
+            return;
         }
 
-        // Reap + decide the outcome — but ONLY if the map still holds OUR turn (token match).
-        // If a newer same-id send superseded us, that send already took and reaped our child,
-        // and the map now carries its token; if claude_chat_cancel removed us, the entry is
-        // gone. In both cases the frontend initiated the teardown, so we stay silent (no
-        // done/error) and leave the live turn's entry untouched.
-        let child = {
-            let manager = read_app.state::<ClaudeChatManager>();
-            let mut sessions = lock_sessions(&manager.sessions);
-            match sessions.get(&read_id) {
-                Some(s) if s.token == read_token => sessions.remove(&read_id).map(|s| s.child),
-                _ => None,
-            }
-        };
-        let Some(mut child) = child else { return };
-        let ok = matches!(child.wait(), Ok(status) if status.success());
-        // Prefer the clean final `result` text; fall back to the accumulated deltas.
-        let text = if !final_text.is_empty() { final_text } else { acc };
-
-        if ok {
-            // A successful exit with no text is unusual (e.g. a tool-only turn or a claude
-            // stream-format change). It's still a valid `done` — ThinkPanel renders an empty
-            // reply gracefully — but log it so a regression isn't an undiagnosable blank.
-            if text.trim().is_empty() {
-                tracing::debug!(id = %read_id, "claude_chat: successful turn produced no assistant text");
-            }
-            let _ = read_app.emit(
-                "claude_chat:done",
-                ChatDone { id: read_id.clone(), session_id, text },
+        if should_retry_without_resume(outcome.ok, read_resume.as_deref()) {
+            // Stale `--resume` is the likely culprit. Re-run the same prompt once with a fresh
+            // session (no `--resume`) and use THAT outcome. (A stale resume typically fails
+            // immediately with no deltas, so the retry streams a clean reply from scratch.)
+            tracing::info!(
+                id = %read_id,
+                "claude_chat_send: turn failed with a resume session id; retrying once without --resume (stale-session self-heal)"
             );
+            match spawn_turn(&read_app, &read_id, &read_prompt, &real_cwd, &read_claude, None) {
+                Ok((stdout2, stderr2, token2)) => {
+                    let stderr_handle2 = drain_stderr(stderr2);
+                    let retry = run_reader(&read_app, &read_id, token2, stdout2, stderr_handle2);
+                    // Superseded / cancelled during the retry: stay silent like any owned turn.
+                    if !retry.owned {
+                        return;
+                    }
+                    emit_outcome(&read_app, &read_id, retry, true);
+                }
+                Err(e) => {
+                    // Couldn't even spawn the retry; surface the original failure, noting the
+                    // attempt. Fold the spawn error in only when the first run had no stderr.
+                    let mut original = outcome;
+                    if original.stderr.trim().is_empty() {
+                        original.stderr = e;
+                    }
+                    emit_outcome(&read_app, &read_id, original, true);
+                }
+            }
         } else {
-            let stderr_text = stderr_handle.join().unwrap_or_default();
-            let message = if !stderr_text.trim().is_empty() {
-                stderr_text.trim().to_string()
-            } else {
-                "claude exited without a successful result".to_string()
-            };
-            let _ = read_app.emit("claude_chat:error", ChatError { id: read_id.clone(), message });
+            emit_outcome(&read_app, &read_id, outcome, false);
         }
     });
 
@@ -522,5 +717,82 @@ mod tests {
         assert!(acc.is_empty());
         assert!(session_id.is_empty());
         assert!(final_text.is_empty());
+    }
+
+    #[test]
+    fn capture_result_status_flags_only_non_success_results() {
+        // A successful `result` event flags nothing.
+        let mut subtype = None;
+        let mut is_error = false;
+        capture_result_status(&result_event("s", "hi"), &mut subtype, &mut is_error);
+        assert_eq!(subtype, None);
+        assert!(!is_error);
+
+        // A non-success subtype + is_error are both captured.
+        let ev = serde_json::json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true
+        });
+        let mut subtype = None;
+        let mut is_error = false;
+        capture_result_status(&ev, &mut subtype, &mut is_error);
+        assert_eq!(subtype.as_deref(), Some("error_during_execution"));
+        assert!(is_error);
+
+        // A non-`result` event is ignored entirely.
+        let mut subtype = None;
+        let mut is_error = false;
+        capture_result_status(&text_delta_event("x"), &mut subtype, &mut is_error);
+        assert_eq!(subtype, None);
+        assert!(!is_error);
+    }
+
+    #[test]
+    fn should_retry_only_on_failure_with_a_resume_id() {
+        // Non-zero exit + a real resume id => retry once without --resume.
+        assert!(should_retry_without_resume(false, Some("sess-123")));
+        // Non-zero exit but NO resume id (a first turn) => never retry.
+        assert!(!should_retry_without_resume(false, None));
+        // An empty resume id is treated as no resume => never retry.
+        assert!(!should_retry_without_resume(false, Some("")));
+        // A successful turn never retries, resume id or not.
+        assert!(!should_retry_without_resume(true, Some("sess-123")));
+        assert!(!should_retry_without_resume(true, None));
+    }
+
+    #[test]
+    fn error_message_prefers_stderr_then_synthesizes_specifics() {
+        // Non-empty stderr is preferred verbatim (trimmed).
+        let m = build_error_message("  boom: no conversation found  ", Some(1), None, false, false);
+        assert_eq!(m, "boom: no conversation found");
+
+        // Empty stderr => synthesize a specific message from the exit code...
+        let m = build_error_message("", Some(7), None, false, false);
+        assert_eq!(m, "claude exited (code 7) with no output");
+
+        // ...plus the result subtype when the stream self-diagnosed a failure...
+        let m = build_error_message("", Some(1), Some("error_during_execution"), true, false);
+        assert!(m.contains("claude exited (code 1) with no output"), "got: {m}");
+        assert!(m.contains("result subtype 'error_during_execution'"), "got: {m}");
+
+        // ...and the is_error hint when there's no subtype.
+        let m = build_error_message("", Some(1), None, true, false);
+        assert!(m.contains("stream reported an error result"), "got: {m}");
+
+        // A missing exit code (killed by signal) is phrased as such.
+        let m = build_error_message("", None, None, false, false);
+        assert!(m.contains("killed by signal"), "got: {m}");
+    }
+
+    #[test]
+    fn error_message_appends_retry_note_when_retried() {
+        // The retry note is appended for a synthesized message...
+        let m = build_error_message("", Some(1), Some("error_during_execution"), false, true);
+        assert!(m.contains("claude exited (code 1) with no output"), "got: {m}");
+        assert!(m.contains("result subtype 'error_during_execution'"), "got: {m}");
+        assert!(m.ends_with("— retried without --resume"), "got: {m}");
+
+        // ...and also when we fell back to preferring stderr.
+        let m = build_error_message("boom", Some(1), None, false, true);
+        assert_eq!(m, "boom — retried without --resume");
     }
 }

@@ -25,6 +25,9 @@ export interface TurnIntoPlanArgs {
 }
 
 export interface TurnIntoPlanResult {
+  /** Every epic the PRD decomposed into (usually one). */
+  epicIds: string[];
+  /** = epicIds[0]. Kept for the callers that route a single epic to the Plan/Build steps. */
   epicId: string;
   /** The epic title (from the PRD's h1) — also the Think agent's auto-name basis. */
   epicTitle: string;
@@ -55,7 +58,11 @@ export async function turnIntoPlan(
     prdContent: prd.content,
     prdRelPath: prd.path,
   });
+  // `?? [gen.epicId]` tolerates a generate backend that predates the epicIds field (e.g. a test
+  // double returning the old shape) — the real generateTasks always supplies epicIds.
+  const epicIds = gen.epicIds ?? [gen.epicId];
   return {
+    epicIds,
     epicId: gen.epicId,
     epicTitle: prd.title,
     taskIds: gen.taskIds,
