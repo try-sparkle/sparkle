@@ -78,6 +78,7 @@ import {
   wakePlaceholder,
 } from "../voice/dictationCopy";
 import { log } from "../logger";
+import { ComposerMic } from "./MicButton";
 
 const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140);
 
@@ -192,6 +193,11 @@ export function Composer({
   // while capture is focus-paused, so keying off it falsely claims "I'm listening" when nothing
   // is being captured. When armed but not actually listening we fall back to the wake-word copy.
   const audioActive = useDictationStore((s) => s.status === "listening");
+  // Master mute: `enabled` false means the mic is OFF (ambient listening is opt-in). When the mic
+  // is off the composer must make NO voice promise at all — no "Just say Hey Sparkle", no typing
+  // hint that references speaking — so the placeholder goes fully blank. Distinct from `enabled`
+  // true + idle status (armed but focus-paused), which still shows the honest wake-word copy.
+  const micEnabled = useDictationStore((s) => s.enabled);
   // Capture being live is NOT the same as actively dictating. Split the mic-hot copy by PHASE so
   // the composer tells the truth: only the "active" phase (wake word heard) gets the "I'm
   // listening, say Sparkle, stop" copy; the "passive" phase (still waiting for "Hey Sparkle")
@@ -1103,6 +1109,10 @@ export function Composer({
 
       {!minimized && (
       <div style={{ flex: 1, minHeight: 0, display: "flex", gap: 8, padding: "0 10px 10px", alignItems: "stretch" }}>
+        {/* Bare mic to the LEFT of the input box — same behavior as the top waveform ring, shown
+            only while the mic is on (paused/active), top-aligned so it stays beside the first line
+            when the box grows. Hidden entirely when the mic is off. */}
+        <ComposerMic />
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 6, position: "relative" }}>
           <AttachmentRow
             textBlocks={textBlocks}
@@ -1190,7 +1200,9 @@ export function Composer({
                   ? micHotPlaceholder(stopWord)
                   : livePassive
                   ? wakePlaceholder(wakeWord)
-                  : `Just say ${wakeWord} and I'll start listening as you talk.`
+                  : micEnabled
+                  ? `Just say ${wakeWord} and I'll start listening as you talk.`
+                  : "" // mic off (master mute) — no voice prompt at all
               }
               spellCheck={false}
               style={{
@@ -1280,6 +1292,10 @@ export function Composer({
                   <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{wakeWord}</span>
                   {WAKE_SUFFIX}
                 </>
+              ) : !micEnabled ? (
+                // Mic is off (master mute): the composer makes no voice promise, so it shows no
+                // placeholder at all — neither the wake-word prompt nor the speaking-focused hint.
+                null
               ) : focused ? (
                 "…or type your command here (speaking is 3x faster)"
               ) : (

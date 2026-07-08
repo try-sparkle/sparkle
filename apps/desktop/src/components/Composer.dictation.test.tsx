@@ -261,13 +261,20 @@ describe("Composer — placeholder reflects audio state", () => {
     expect(body).not.toContain("or type your command here");
   });
 
-  it("falls back to the wake-word prompt when the mic is muted", () => {
+  it("shows NO placeholder text at all when the mic is OFF (master mute)", () => {
+    // Mic off (enabled === false) → the composer must make no voice promise. It shows neither the
+    // wake-word prompt nor any speaking hint, so the box reads completely blank.
     act(() => useDictationStore.setState({ enabled: false, status: "idle" }));
     renderComposer();
     const body = document.body.textContent ?? "";
-    expect(body).toContain("Hey Sparkle");
+    expect(body).not.toContain("Hey Sparkle");
+    expect(body).not.toContain("Just say");
+    expect(body).not.toContain("start listening as you talk");
     expect(body).not.toContain("I'm listening, so just start talking.");
-    expect(body).not.toContain("Sparkle, stop"); // the gradient cue is mic-hot-only
+    expect(body).not.toContain("Sparkle, stop");
+    // The native textarea placeholder is likewise empty (no voice prompt leaks through it).
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(ta.placeholder).toBe("");
   });
 
   // Regression (issue 2): armed but not actually capturing (focus-paused) keeps `enabled` true
@@ -281,8 +288,10 @@ describe("Composer — placeholder reflects audio state", () => {
     expect(body).not.toContain("I'm listening, so just start talking.");
   });
 
-  it("shows the muted focused typing hint only when the mic is muted", () => {
-    act(() => useDictationStore.setState({ enabled: false, status: "idle" }));
+  it("shows the focused typing hint when the mic is ON but capture is paused (armed, focused)", () => {
+    // Mic armed (enabled true) but not actively capturing (status idle). Focusing the box swaps the
+    // wake-word prompt for the typing hint — the mic is on, so a voice-referencing hint is honest.
+    act(() => useDictationStore.setState({ enabled: true, status: "idle" }));
     renderComposer();
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
     fireEvent.mouseDown(ta);
@@ -290,6 +299,19 @@ describe("Composer — placeholder reflects audio state", () => {
     expect(document.activeElement).toBe(ta);
     const body = document.body.textContent ?? "";
     expect(body).toContain("or type your command here");
+  });
+
+  it("shows NO focused typing hint when the mic is OFF (no voice promise at all)", () => {
+    // Mic off + focused: not even the typing hint (it references speaking) — the box stays blank.
+    act(() => useDictationStore.setState({ enabled: false, status: "idle" }));
+    renderComposer();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.mouseDown(ta);
+    fireEvent.focus(ta);
+    expect(document.activeElement).toBe(ta);
+    const body = document.body.textContent ?? "";
+    expect(body).not.toContain("or type your command here");
+    expect(body).not.toContain("Hey Sparkle");
   });
 
   // Regression (issue 1): a live cloud interim preview paints into the same top-left slot as the

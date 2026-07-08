@@ -1,13 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { TbMicrophone, TbMicrophoneOff } from "react-icons/tb";
 // Themed tokens (muted/forest/cream flip on data-theme); brand teal/accent pass through as
 // constants. Import from ../theme/colors — like Composer — so the waveform stays legible in
 // light mode (the @sparkle/ui C.muted is a dark-mode-only literal).
-import { C, DANGER } from "../theme/colors";
+import { C } from "../theme/colors";
 import type { Phase } from "../voice/wakeMachine";
 import { useDictationStore } from "../stores/dictationStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { WAKE_PHRASE, STOP_PHRASE } from "../voice/dictationCopy";
+import { useMicToggle, micVisual, MicGlyph } from "./MicButton";
 
 // Many thin slivers (was 28 fat bars) so the meter reads as a dense, lively waveform
 // rather than a row of chunky blocks. The rAF loop stays cheap even at this count —
@@ -104,7 +104,10 @@ export function LogoWaveform() {
   const error = useDictationStore((s) => s.error);
   const modelProgress = useDictationStore((s) => s.modelProgress);
   const togglePhase = useDictationStore((s) => s.togglePhase);
-  const setEnabled = useDictationStore((s) => s.setEnabled);
+  // The mic ring's state, click cycle, and aria come from the SAME shared source as the composer
+  // mic (MicButton), so the two controls behave identically. The ring only adds its own container
+  // chrome (disc, glow, orb, waveform) around the shared glyph.
+  const mic = useMicToggle();
 
   // `enabled` is the user's intent (armed). `listening` is whether capture is
   // ACTUALLY live — the backend only records while a Sparkle window is focused, so
@@ -202,17 +205,15 @@ export function LogoWaveform() {
   // and takes effect once capture resumes.
   const active = phase === "active";
 
-  // Mic tint by mode: the DARK BLUE of the logo "eye" (C.teal = #2f6bff) while we're
-  // listening for the wake word (passive), the lighter teal/cyan while ACTIVELY dictating.
-  // Muted → gray. The HOVER cue is direction-aware: an ENABLED mic goes RED (destructive "click to
-  // mute"), a MUTED mic goes TEAL (constructive "click to turn on") — matching what the click does
-  // and the aria-label. Color animates back to gray/teal on leave.
-  const hoverColor = enabled ? DANGER : C.teal;
-  const micColor = micHover ? hoverColor : !enabled ? C.muted : active ? C.accentInk : C.teal;
-  const micBorder = micHover ? hoverColor : !enabled ? C.muted : active ? C.accent : C.teal;
-  // Show the slashed "mute" glyph whenever the click would turn the mic OFF on hover (enabled),
-  // or when it's already muted. Only the resting, enabled mic shows the open-mic glyph.
-  const showMutedIcon = micHover || !enabled;
+  // Mic tint + icon come from the shared tri-state mapping (MicButton.micVisual), so the ring and
+  // the composer mic look and behave the same:
+  //   off    → gray slash    (hover teal "click to turn on")
+  //   paused → orange mic+pause bars (hover red slash "click to turn off")
+  //   active → live open mic (hover orange mic+pause bars "click to pause")
+  // The ring paints both its glyph color AND its border from micVis.color.
+  const micVis = micVisual(mic.state, micHover);
+  const micColor = micVis.color;
+  const micBorder = micVis.color;
   // The pulsating orb glow is driven directly by the rAF loop (paintOrb), so there's no
   // render-time energy to compute here.
   // Orb blob colors track the WAVEFORM: brand cyan/blue while ACTIVELY dictating, but SHADES OF
@@ -341,15 +342,16 @@ export function LogoWaveform() {
           ))}
         </button>
 
-        {/* Mic ring — floats over the center of the waveform. Click = mute toggle. */}
+        {/* Mic ring — floats over the center of the waveform. Click cycles off→paused→off, and
+            pauses (never turns off) an actively-dictating mic. See MicButton.useMicToggle. */}
         <button
           type="button"
           data-hint="mic"
-          onClick={() => setEnabled(!enabled)}
+          onClick={mic.onClick}
           onMouseEnter={() => setMicHover(true)}
           onMouseLeave={() => setMicHover(false)}
-          aria-label={enabled ? "Mute microphone" : "Unmute microphone"}
-          title={enabled ? "Mute" : "Unmute"}
+          aria-label={mic.ariaLabel}
+          title={mic.title}
           style={{
             position: "absolute",
             left: "50%",
@@ -364,9 +366,8 @@ export function LogoWaveform() {
             background: `color-mix(in srgb, ${C.forest} 62%, transparent)`,
             backdropFilter: "blur(2px)",
             WebkitBackdropFilter: "blur(2px)",
-            // Dark-blue while listening for the wake word, lighter teal while dictating; gray
-            // when muted. Hover → red when enabled ("click to mute") or teal when muted ("click to
-            // turn on"). See micColor/hoverColor above.
+            // Border tracks the glyph color from the shared tri-state mapping (see micVis above):
+            // orange when paused, live tint when active, gray/teal when off, red on a paused hover.
             border: `1.5px solid ${micBorder}`,
             boxShadow:
               enabled && liveActive ? "0 0 12px rgba(52,224,240,0.6)" : "none",
@@ -376,7 +377,9 @@ export function LogoWaveform() {
             transition: "box-shadow 120ms ease, border-color 120ms ease, color 120ms ease",
           }}
         >
-          {showMutedIcon ? <TbMicrophoneOff size={20} /> : <TbMicrophone size={20} />}
+          {/* The ring's disc is a forest-tinted translucent surface, so the pause bars separate
+              against forest here too. */}
+          <MicGlyph variant={micVis.variant} size={20} surfaceColor={C.forest} />
         </button>
       </div>
 

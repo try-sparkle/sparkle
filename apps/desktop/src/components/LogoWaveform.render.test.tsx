@@ -72,40 +72,81 @@ describe("LogoWaveform — honest listening", () => {
     expect(wakeHintButton()).toBeNull();
   });
 
-  it("mic hover cue is direction-aware: RED to mute when enabled, TEAL to turn on when muted", () => {
+  it("mic hover cue is direction-aware: paused rests ORANGE→RED on hover; off rests gray→TEAL", () => {
     // Probe jsdom's normalized form of each hex so the assertions are format-agnostic.
     const probe = document.createElement("span");
     probe.style.color = DANGER;
     const RED = probe.style.color;
     probe.style.color = C.teal;
     const TEAL = probe.style.color;
+    probe.style.color = C.amber;
+    const ORANGE = probe.style.color;
 
-    // Enabled (armed + capturing): rests on a non-red brand tint, turns RED on hover
-    // (telegraphing the destructive "click to mute"). Also swaps to the slashed glyph.
+    // Paused (on, waiting for the wake word): rests ORANGE (the pause affordance), turns RED on
+    // hover — telegraphing the destructive "click to turn off".
     useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
     render(<LogoWaveform />);
-    const micOn = screen.getByRole("button", { name: "Mute microphone" });
-    expect(micOn.style.color).not.toBe(RED);
+    const micOn = screen.getByRole("button", { name: "Turn off microphone" });
+    expect(micOn.style.color).toBe(ORANGE);
     fireEvent.mouseEnter(micOn);
     expect(micOn.style.color).toBe(RED);
     cleanup();
 
-    // Muted: rests gray, turns TEAL (not red) on hover — the constructive "click to turn on" cue.
+    // Off: rests gray, turns TEAL (not red) on hover — the constructive "click to turn on" cue.
     useDictationStore.setState({ enabled: false, status: "idle" });
     render(<LogoWaveform />);
-    const micOff = screen.getByRole("button", { name: "Unmute microphone" });
-    const mutedRest = micOff.style.color;
-    expect(mutedRest).not.toBe(TEAL); // rests gray, proving the teal is hover-driven
+    const micOff = screen.getByRole("button", { name: "Turn on microphone" });
+    const offRest = micOff.style.color;
+    expect(offRest).not.toBe(TEAL); // rests gray, proving the teal is hover-driven
     fireEvent.mouseEnter(micOff);
     expect(micOff.style.color).toBe(TEAL);
     expect(micOff.style.color).not.toBe(RED);
   });
 
-  it("muted → no caption at all, mic offers to unmute", () => {
+  it("active mic rests on the live tint and turns ORANGE (pause) on hover, never red", () => {
+    const probe = document.createElement("span");
+    probe.style.color = C.amber;
+    const ORANGE = probe.style.color;
+    probe.style.color = DANGER;
+    const RED = probe.style.color;
+
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
+    render(<LogoWaveform />);
+    const micActive = screen.getByRole("button", { name: "Pause listening" });
+    expect(micActive.style.color).not.toBe(ORANGE); // rests on the live tint
+    expect(micActive.style.color).not.toBe(RED); // active never shows the destructive red
+    fireEvent.mouseEnter(micActive);
+    expect(micActive.style.color).toBe(ORANGE); // hover = "click to pause"
+  });
+
+  it("clicking the mic while ACTIVE pauses (phase→passive) instead of turning it off", () => {
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
+    render(<LogoWaveform />);
+    fireEvent.click(screen.getByRole("button", { name: "Pause listening" }));
+    // Paused, NOT off: enabled stays true, phase drops to passive.
+    expect(useDictationStore.getState().enabled).toBe(true);
+    expect(useDictationStore.getState().phase).toBe("passive");
+  });
+
+  it("clicking the mic while PAUSED turns it off", () => {
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
+    render(<LogoWaveform />);
+    fireEvent.click(screen.getByRole("button", { name: "Turn off microphone" }));
+    expect(useDictationStore.getState().enabled).toBe(false);
+  });
+
+  it("clicking the mic while OFF turns it back on (to paused)", () => {
+    useDictationStore.setState({ enabled: false, status: "idle" });
+    render(<LogoWaveform />);
+    fireEvent.click(screen.getByRole("button", { name: "Turn on microphone" }));
+    expect(useDictationStore.getState().enabled).toBe(true);
+  });
+
+  it("muted → no caption at all, mic offers to turn on", () => {
     useDictationStore.setState({ enabled: false, status: "idle" });
     render(<LogoWaveform />);
     expect(screen.queryByText(/Listening paused/)).toBeNull();
     expect(wakeHintButton()).toBeNull();
-    expect(screen.getByRole("button", { name: "Unmute microphone" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Turn on microphone" })).toBeTruthy();
   });
 });
