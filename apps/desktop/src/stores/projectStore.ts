@@ -6,6 +6,7 @@ import { persist, createJSONStorage, type StateStorage } from "zustand/middlewar
 import type { AgentKind, AgentName, AgentTab, Project } from "../types";
 import { isDefaultModel } from "../services/models";
 import { usageTelemetry } from "../services/usageTelemetry";
+import { perfSpan, perfStart } from "../perfTrace";
 
 // Cap on how many prompts we keep per agent so the persisted localStorage record stays bounded.
 // The oldest entries fall off; the most recent PROMPT_HISTORY_LIMIT are kept.
@@ -281,7 +282,10 @@ export function debouncedLocalStorage(delayMs: number): { storage: StateStorage;
     if (pending.size === 0) return;
     for (const [k, v] of pending) {
       try {
-        localStorage.setItem(k, v);
+        // Time the synchronous main-thread write of the (potentially multi-MB) persisted blob — a
+        // known past hotspot (sparkle-pngb). `bytes` shows whether a bloated projects blob (lots of
+        // agents × promptHistory) is what's stalling writes (perfTrace).
+        perfSpan("persist.setItem", () => localStorage.setItem(k, v), { key: k, bytes: v.length });
       } catch {
         /* quota exceeded / storage disabled — drop this write rather than throw out of persist */
       }
@@ -332,6 +336,21 @@ export function flushProjectsPersist(): void {
   flushProjectsPersistImpl();
 }
 
+/** Ids of agents added locally in THIS window but not yet confirmed present in a persisted snapshot.
+ *  A concurrent writer's last-writer-wins rehydrate (another window, or a broadcast that predates the
+ *  add) can carry a snapshot that lacks a just-clicked agent; while its id lives here the merge
+ *  protects it from the whole-array replace. Ids are cleared the instant a snapshot carrying them
+ *  arrives (acknowledged = propagated) and on local removal — so this never resurrects a deliberately
+ *  removed agent, only shields the brief not-yet-propagated window. Module-scoped: one set per window. */
+const pendingLocalAdds = new Set<string>();
+const EMPTY_PENDING_ADDS: ReadonlySet<string> = new Set<string>();
+
+/** Drop ids from the pending-add set once they no longer need protection — because a persisted
+ *  snapshot now carries them (propagated) or they were removed locally. Exported for tests. */
+export function acknowledgePendingAdds(ids: Iterable<string>): void {
+  for (const id of ids) pendingLocalAdds.delete(id);
+}
+
 /** Rehydration merge that NEVER drops a live worker (sparkle-3tqv). Every rehydrate — startup and,
  *  crucially, cross-window (crossWindowSync.ts rehydrates from the shared localStorage blob on
  *  every remote change) — replaces the in-memory `projects` with the persisted snapshot. If another
@@ -347,6 +366,7 @@ export function flushProjectsPersist(): void {
 export function mergePreservingLiveWorkers(
   persistedState: unknown,
   currentState: ProjectState,
+  pendingAdds: ReadonlySet<string> = EMPTY_PENDING_ADDS,
 ): ProjectState {
   const persisted = (persistedState ?? undefined) as Partial<ProjectState> | undefined;
   const merged = { ...currentState, ...(persisted ?? {}) } as ProjectState;
@@ -356,13 +376,21 @@ export function mergePreservingLiveWorkers(
     const cur = currentProjects.find((c) => c.id === pp.id);
     if (!cur) return pp;
     const present = new Set(pp.agents.map((a) => a.id));
-    const survivors = cur.agents.filter(
-      (a) =>
-        a.kind === "worker" &&
-        !!a.worktreePath &&
-        !present.has(a.id) &&
-        pp.agents.some((x) => x.id === a.parentId),
-    );
+    const survivors = cur.agents.filter((a) => {
+      if (present.has(a.id)) return false; // already in the snapshot — nothing to re-attach
+      // (1) A live worker with a cut worktree whose parent still exists (sparkle-3tqv): a snapshot
+      //     that predates the spawn must not evict it — its worktree + manifest are live on disk.
+      if (a.kind === "worker" && !!a.worktreePath && pp.agents.some((x) => x.id === a.parentId)) {
+        return true;
+      }
+      // (2) A just-created local agent (any kind) not yet flushed + propagated: a concurrent writer's
+      //     last-writer-wins snapshot predates it, so the whole-array replace would drop the brand-new
+      //     row ("New Build Agent doesn't create a row"). Protect exactly the not-yet-acknowledged
+      //     window — pendingAdds is cleared the moment a snapshot carrying the id arrives — so a
+      //     genuinely-removed agent (never pending, or already acknowledged) is NOT resurrected.
+      if (pendingAdds.has(a.id)) return true;
+      return false;
+    });
     return survivors.length > 0 ? { ...pp, agents: [...pp.agents, ...survivors] } : pp;
   });
   return merged;
@@ -440,6 +468,9 @@ export const useProjectStore = create<ProjectState>()(
         const id = uuid();
         const kind: AgentKind = opts?.kind ?? "build";
         const parentId = opts?.parentId ?? null;
+        // Shield this brand-new agent from a concurrent writer's last-writer-wins rehydrate until a
+        // persisted snapshot carrying it comes back (see pendingLocalAdds / mergePreservingLiveWorkers).
+        pendingLocalAdds.add(id);
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) => {
             const agent: AgentTab = {
@@ -516,11 +547,18 @@ export const useProjectStore = create<ProjectState>()(
           })),
         })),
 
-      removeAgent: (projectId, agentId) =>
+      removeAgent: (projectId, agentId) => {
+        // Close waterfall: from this removal to the pane's unmount cleanup (ended in AgentPane's
+        // unmount, keyed "close:<id>") — captures the cost the user feels when closing an agent.
+        perfStart(`close:${agentId}`, "close");
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) => {
             // Closing a build agent also closes its workers (they belong to it). Their
             // worktrees are cleaned up separately by the caller for each removed id.
+            const removed = p.agents.filter((a) => a.id === agentId || a.parentId === agentId);
+            // A locally-removed agent must stop being protected as a pending add, or a rehydrate
+            // could resurrect the row the user just closed.
+            acknowledgePendingAdds(removed.map((a) => a.id));
             const agents = p.agents.filter(
               (a) => a.id !== agentId && a.parentId !== agentId,
             );
@@ -530,7 +568,8 @@ export const useProjectStore = create<ProjectState>()(
                 : (agents[0]?.id ?? null);
             return { ...p, agents, selectedAgentId };
           }),
-        })),
+        }));
+      },
 
       renameAgent: (projectId, agentId, name, pinnedIndex) =>
         set((s) => ({
@@ -641,13 +680,17 @@ export const useProjectStore = create<ProjectState>()(
           ),
         })),
 
-      selectAgent: (projectId, agentId) =>
+      selectAgent: (projectId, agentId) => {
+        // Switch waterfall: from this selection to the target pane actually painting (ended in
+        // AgentPane's visibility effect, keyed "switch:<id>"). Only real selections, not deselects.
+        if (agentId) perfStart(`switch:${agentId}`, "switch");
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) => ({
             ...p,
             selectedAgentId: agentId,
           })),
-        })),
+        }));
+      },
 
       setAgentWorktree: (projectId, agentId, path, branch) =>
         set((s) => ({
@@ -722,10 +765,21 @@ export const useProjectStore = create<ProjectState>()(
       // "brainstorm" agent kind to "think" (the Think rename). v8 backfills pinnedIndex: null
       // (manual reorder anchor) without touching namePinned.
       version: 8,
-      migrate: (persisted, version) => migratePersisted(persisted, version) as ProjectState,
+      migrate: (persisted, version) =>
+        perfSpan("persist.migrate", () => migratePersisted(persisted, version), { version }) as ProjectState,
       // sparkle-3tqv: a protective merge so no rehydrate (startup or cross-window) can evict a
-      // worker whose worktree is live on disk.
-      merge: (persisted, current) => mergePreservingLiveWorkers(persisted, current),
+      // worker whose worktree is live on disk — extended to also shield a just-added agent from a
+      // concurrent writer's stale snapshot (pendingLocalAdds) so "New Build Agent" never loses its row.
+      merge: (persisted, current) => {
+        // Any pending add the incoming snapshot now carries has propagated — stop protecting it, so a
+        // later genuine removal isn't overridden. Done before the merge (which re-reads the set).
+        const persistedProjects =
+          (persisted as Partial<ProjectState> | undefined)?.projects ?? [];
+        acknowledgePendingAdds(persistedProjects.flatMap((p) => p.agents.map((a) => a.id)));
+        return perfSpan("persist.merge", () =>
+          mergePreservingLiveWorkers(persisted, current, pendingLocalAdds),
+        );
+      },
     },
   ),
 );

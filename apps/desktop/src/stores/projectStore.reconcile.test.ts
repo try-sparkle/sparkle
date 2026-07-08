@@ -107,3 +107,43 @@ describe("mergePreservingLiveWorkers (sparkle-3tqv)", () => {
     expect(merged.selectedProjectId).toBe("p1");
   });
 });
+
+// A just-clicked "New Build Agent" is added in memory (kind:"build", worktreePath:null) BEFORE it
+// is flushed + propagated. A concurrent writer (another window, or a broadcast that predates it)
+// can persist a snapshot that lacks it; the default whole-array replace then EVICTS the brand-new
+// row — the "clicking New Build Agent doesn't create a row most of the time" report. The worker
+// clause can't cover it (no worktree, no parent). The pendingAdds set protects exactly the
+// not-yet-acknowledged window, without resurrecting agents that were deliberately removed elsewhere.
+describe("mergePreservingLiveWorkers — pending local adds", () => {
+  it("preserves a just-created build agent that the persisted snapshot predates", () => {
+    const build = agent({ id: "b1", kind: "build", branch: "main" });
+    const fresh = agent({ id: "b2", kind: "build", worktreePath: null }); // just clicked, no worktree
+    const current = currentState([project("p1", [build, fresh])]);
+    // Snapshot from a concurrent writer that never saw b2 (last-writer-wins).
+    const persisted = { projects: [project("p1", [build])], selectedProjectId: "p1" };
+
+    const merged = mergePreservingLiveWorkers(persisted, current, new Set(["b2"]));
+    expect(merged.projects[0]!.agents.map((a) => a.id).sort()).toEqual(["b1", "b2"]);
+  });
+
+  it("does NOT resurrect an agent missing from the snapshot when it is not a pending add", () => {
+    // Same shape, but b2 is NOT pending (e.g. it was already acknowledged, then deleted elsewhere).
+    const build = agent({ id: "b1", kind: "build", branch: "main" });
+    const stale = agent({ id: "b2", kind: "build", worktreePath: null });
+    const current = currentState([project("p1", [build, stale])]);
+    const persisted = { projects: [project("p1", [build])], selectedProjectId: "p1" };
+
+    const merged = mergePreservingLiveWorkers(persisted, current, new Set());
+    expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1"]);
+  });
+
+  it("never duplicates a pending add already present in the snapshot", () => {
+    const build = agent({ id: "b1", kind: "build", branch: "main" });
+    const fresh = agent({ id: "b2", kind: "build" });
+    const current = currentState([project("p1", [build, fresh])]);
+    const persisted = { projects: [project("p1", [build, fresh])], selectedProjectId: "p1" };
+
+    const merged = mergePreservingLiveWorkers(persisted, current, new Set(["b2"]));
+    expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1", "b2"]);
+  });
+});

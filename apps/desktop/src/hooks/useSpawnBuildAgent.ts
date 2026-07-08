@@ -11,6 +11,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { createBeadFull } from "../services/tasks";
 import { log } from "../logger";
+import { perfStart } from "../perfTrace";
 import type { Project } from "../types";
 
 /** True when a createBeadFull rejection is the EXPECTED "this project has no beads DB" case rather
@@ -37,6 +38,9 @@ export function useSpawnBuildAgent(project: Project | null): () => string | null
     const proj = project;
     setActiveSpecial(null); // creating an agent leaves the special (Sparkle/board) view
     const id = addAgent(proj.id, { kind: "build" });
+    // Start the spawn-latency waterfall the instant the click adds the agent — AgentPane.prepare()
+    // and Terminal add the remaining milestones through to "pty ready" under the same key (perfTrace).
+    perfStart(id, "spawn", { kind: "build" });
     selectAgent(proj.id, id);
     open(id);
     // Title the bead with the agent's (default) name so beads stay distinguishable on the board

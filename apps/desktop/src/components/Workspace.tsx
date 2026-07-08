@@ -27,6 +27,7 @@ import { clearWindowProject } from "../services/windowRegistry";
 import { clearWindowRoster } from "../services/attention";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { useImprovementScheduler } from "../useImprovementScheduler";
+import { perfRender } from "../perfTrace";
 
 // Code-split the heavy, not-always-visible surfaces so a cold start doesn't ship them in the
 // initial chunk (bead sparkle-alrm.5, #9). AgentPane pulls the terminal (xterm + webgl), the
@@ -58,6 +59,10 @@ function PaneFallback() {
  * the *visible conversation* via `claude --resume <id>` (AgentPane.prepare, bead sparkle-wwg7) —
  * Claude repaints the transcript; we do not replay raw PTY bytes. */
 export function Workspace() {
+  // Workspace subscribes to the whole `projects` array, so it re-renders on EVERY projectStore write
+  // (status flips, activity, prompt appends…) and re-renders the live pane list under it. This counter
+  // exposes that render rate — the top-level driver of pane re-render thrash (perfTrace).
+  perfRender("Workspace", "main");
   const projects = useProjectStore((s) => s.projects);
   const currentProjectId = useCurrentProjectId();
   const isMainWindow = useIsMainWindow();

@@ -5,6 +5,7 @@ import { App } from "./App";
 import { TrayApp } from "./tray/TrayApp";
 import { CaptureApp } from "./capture/CaptureApp";
 import { initLogger } from "./logger";
+import { startJankMonitor } from "./perfTrace";
 import { initAnalytics } from "./analytics";
 import { usageTelemetry } from "./services/usageTelemetry";
 import { disableNativeTooltips } from "./disableNativeTooltips";
@@ -30,6 +31,12 @@ initLogger();
 const view = new URLSearchParams(window.location.search).get("view");
 const isTray = view === "tray";
 const isCapture = view === "capture";
+
+// Main-thread stall detector (perfTrace): logs every frame gap > threshold as a "jank stall" so a
+// reproduction of the slowness surfaces exactly when the app froze and for how long, to correlate
+// against the spawn/switch/close/render lines. Only in the real app view — the hidden capture and
+// the tiny tray webviews aren't where the slowness lives and would just add noise.
+if (!isTray && !isCapture) startJankMonitor();
 
 // Analytics (PostHog) — masked session replay + autocapture + lifecycle events.
 // No-ops when no key is configured. Started after the logger so init errors surface.

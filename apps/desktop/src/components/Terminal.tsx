@@ -29,6 +29,7 @@ import { recoverFromWebglContextLoss, forceFullRepaint, settleRepaintPlan } from
 import { detectRateLimitReset } from "../services/rateLimitWatch";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { PH_NO_CAPTURE_CLASS } from "@sparkle/core";
+import { perfMark, perfSpan } from "../perfTrace";
 
 // Terminal font size at 100%. The ⋯-menu "Text size" control (and Cmd +/-) multiplies
 // this by the `zoom` factor, so it scales the terminal text only — not the UI chrome.
@@ -228,16 +229,26 @@ export function Terminal({
     // WebGL renderer enables customGlyphs (the default DOM renderer does not), giving crisp,
     // exactly-aligned box-drawing. Fall back silently to the DOM renderer if WebGL is unavailable.
     try {
-      const webgl = new WebglAddon();
-      // On a lost GPU context the default renderer must take over and the screen must be repainted,
-      // else it stays blank/stale until the next PTY write. recoverFromWebglContextLoss disposes the
-      // addon, nulls the ref (so the re-theme effect doesn't touch a disposed addon), and refreshes.
-      webgl.onContextLoss(() => {
-        recoverFromWebglContextLoss(webgl, termRef.current, () => {
-          webglRef.current = null;
-        });
-      });
-      term.loadAddon(webgl);
+      // Time WebGL attach — a new GPU context per pane reveal (switching agents). If this shows up in
+      // the jank window, context churn is the switch cost (perfTrace).
+      const webgl = perfSpan(
+        "Terminal.attachWebgl",
+        () => {
+          const w = new WebglAddon();
+          // On a lost GPU context the default renderer must take over and the screen must be
+          // repainted, else it stays blank/stale until the next PTY write.
+          // recoverFromWebglContextLoss disposes the addon, nulls the ref (so the re-theme effect
+          // doesn't touch a disposed addon), and refreshes.
+          w.onContextLoss(() => {
+            recoverFromWebglContextLoss(w, termRef.current, () => {
+              webglRef.current = null;
+            });
+          });
+          term.loadAddon(w);
+          return w;
+        },
+        { agentId },
+      );
       webglRef.current = webgl;
       // NOTE: we deliberately do NOT force a repaint here. attachWebgl is only ever called when this
       // pane is (becoming) active, and the become-active reveal effect below OWNS the repaint — it
@@ -312,6 +323,10 @@ export function Terminal({
       }),
     );
     term.open(container);
+    // Spawn waterfall milestone (perfTrace): xterm core + addons constructed and attached to the DOM.
+    // Keyed by agentId — appends to the "spawn" trace started at the click; no-op for a boot-restored
+    // pane with no active trace.
+    perfMark(agentId, "xterm constructed");
     // NOTE: the WebGL renderer is NOT loaded here anymore. It is attached lazily — only while this
     // pane is the visible/active one — by attachWebgl (via the mount-time call below and the
     // visibility effect further down), and disposed when the pane is hidden. This caps the app at

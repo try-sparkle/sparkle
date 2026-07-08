@@ -5,6 +5,7 @@
 import { emit, listen } from "@tauri-apps/api/event";
 import { useProjectStore, PROJECTS_PERSIST_KEY, flushProjectsPersist } from "../stores/projectStore";
 import { useDictationStore, DICTATION_PERSIST_KEY } from "../stores/dictationStore";
+import { perfSpan, perfSpanAsync } from "../perfTrace";
 
 const inTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -57,7 +58,12 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>): void {
     // therefore harmless: the emitter rehydrates once against the blob it just wrote (idempotent)
     // and does not re-emit.
     applyingRemote = true;
-    void Promise.resolve(spec.store.persist.rehydrate()).finally(() => {
+    // Time the full rehydrate (getItem read + JSON.parse + migrate + merge + state write) — this
+    // runs on EVERY remote structural change, so a big projects blob makes cross-window sync a
+    // recurring main-thread cost. perfTrace: `grep 'perf.*rehydrate'`.
+    void perfSpanAsync(`rehydrate ${spec.event}`, () =>
+      Promise.resolve(spec.store.persist.rehydrate()),
+    ).finally(() => {
       last = spec.signature();
       applyingRemote = false;
     });
@@ -79,7 +85,10 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>): void {
     // blob stays authoritative, so the worst case is a transiently stale view in another window —
     // acceptable, and far cheaper than risking the re-broadcast loop.
     if (applyingRemote || !hydrated) return;
-    const now = spec.signature();
+    // signature() JSON.stringifies a reduced projects shape on EVERY store mutation (status flips,
+    // activity, prompt appends…). Time it — if it shows up, the change-detection itself is a cost
+    // multiplier under a write storm (perfTrace).
+    const now = perfSpan(`signature ${spec.event}`, () => spec.signature());
     if (now === last) return;
     last = now;
     // Structural change is about to fan out to other windows — make sure the debounced projects

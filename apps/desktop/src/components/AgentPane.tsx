@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import {
@@ -49,6 +49,7 @@ import { useDragVisionHint } from "../hooks/useDragVisionHint";
 import { Onboarding } from "./Onboarding";
 import { ThinkPanel } from "./ThinkPanel";
 import { paneVisibilityStyle } from "./paneVisibility";
+import { perfRender, perfMark, perfEnd, perfCancel } from "../perfTrace";
 
 type Phase = "preparing" | "ready" | "no-claude" | "error";
 
@@ -80,7 +81,7 @@ interface SpawnCmd {
   resuming: boolean;
 }
 
-export function AgentPane({
+function AgentPaneInner({
   project,
   agent,
   visible,
@@ -89,6 +90,11 @@ export function AgentPane({
   agent: AgentTab;
   visible: boolean;
 }) {
+  // Re-render counter (perfTrace): with many panes open, a background pane that re-renders on every
+  // unrelated store write is the render-thrash fingerprint — `grep 'perf.*render AgentPane'` and watch
+  // the count. Called every render (cheap Map bump + debug line).
+  perfRender("AgentPane", agent.id, { visible });
+
   const [phase, setPhase] = useState<Phase>("preparing");
   const [errorMsg, setErrorMsg] = useState("");
   const [spawn, setSpawn] = useState<SpawnCmd | null>(null);
@@ -315,6 +321,7 @@ export function AgentPane({
       // An empty agentBase is tolerated by the Rust effective_base fallback.
       const agentBase = agent.baseBranch ?? base ?? "";
       const wt = await prepareAgentWorkspace(project.rootPath, project.id, agent.id, agentBase);
+      perfMark(agent.id, "worktree ready");
       setAgentWorktree(project.id, agent.id, wt.path, wt.branch);
 
       // Defense in depth: install the write-guard, then refuse to spawn a broken sandbox.
@@ -361,6 +368,7 @@ export function AgentPane({
         .getState()
         .pollBranchStatus(project.rootPath, project.id, agent.id, agentBase);
       const claude = await claudeP;
+      perfMark(agent.id, "claude checked");
       if (!claude.installed || !claude.path) {
         setPhase("no-claude");
         return;
@@ -369,6 +377,7 @@ export function AgentPane({
       // No accounts configured → chosen is null → configDir undefined → spawn exactly as before.
       // Best-effort: chooseAccountForAgent never throws (it swallows IPC errors to empty state).
       const { chosen, state } = await accountP;
+      perfMark(agent.id, "account resolved");
       setAccounts(state.accounts);
       setIdentities(state.identities);
       setChosenAccount(chosen);
@@ -400,6 +409,7 @@ export function AgentPane({
       } catch {
         sessionDetectionConfident = false;
       }
+      perfMark(agent.id, "session detected");
       // Record whether this is a fresh launch so the worker exit handler can
       // distinguish a first-run (which should produce result.json) from a
       // reopened/resumed session (where result.json was already consumed earlier).
@@ -485,6 +495,7 @@ export function AgentPane({
         // during worktree-prep, Claude-check, or bridge-start is captured — the guard below fires
         // for unmounts that happen anywhere in the early async path, not just at the bridge await.
         const bridge = await startOrchestrationBridge(project.id, agent.id, launchToken);
+        perfMark(agent.id, "bridge started");
         // Guard: check our token — a mismatch means this run was superseded while we awaited.
         if (myRun !== prepareRunRef.current) {
           void stopOrchestrationBridge(agent.id, launchToken).catch((e) =>
@@ -527,6 +538,7 @@ export function AgentPane({
             }),
             resuming: resume,
           });
+          perfMark(agent.id, "spawn assembled (build)");
           setPhase("ready");
           return;
         } catch (e) {
@@ -557,6 +569,7 @@ export function AgentPane({
         cwd: wt.path,
         resuming: resume,
       });
+      perfMark(agent.id, "spawn assembled");
       setPhase("ready");
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
@@ -565,9 +578,17 @@ export function AgentPane({
   };
 
   useEffect(() => {
+    // Spawn waterfall: the click (useSpawnBuildAgent) started the "spawn" trace for this id; record
+    // how long from click to this pane actually mounting + prepare() kicking off.
+    perfMark(agent.id, "pane mount");
     void prepare();
     // Stop tailing the event log when the pane unmounts (tab/agent closed).
     return () => {
+      // Close waterfall: removeAgent started a "close:<id>" trace; this pane unmounting is the end
+      // of the visible close cost. A no-op if the unmount wasn't a user close (e.g. project switch).
+      perfEnd(`close:${agent.id}`, "unmounted");
+      // Drop any still-open spawn trace so a pane closed mid-prepare can't leak its start entry.
+      perfCancel(agent.id);
       // Increment the generation counter to invalidate any in-flight prepare() run. If
       // startOrchestrationBridge resolves AFTER this cleanup runs, the build branch's token
       // comparison (myRun !== prepareRunRef.current) will detect the staleness and stop the bridge.
@@ -640,6 +661,16 @@ export function AgentPane({
     });
   }, [scrollIntent, visible, ptyReady, agent.id, consumeScrollIntent]);
 
+  // Switch waterfall end (perfTrace): when this pane becomes the visible one, close its "switch:<id>"
+  // trace after the next paint — capturing click→pane-visible latency (the cost of switching agents).
+  // No-op when no switch was in flight (perfEnd ignores an unstarted key), e.g. a re-render that keeps
+  // the same pane visible.
+  useEffect(() => {
+    if (!visible) return;
+    const raf = requestAnimationFrame(() => perfEnd(`switch:${agent.id}`, "painted"));
+    return () => cancelAnimationFrame(raf);
+  }, [visible, agent.id]);
+
   return (
     <div
       style={{
@@ -707,7 +738,10 @@ export function AgentPane({
               resuming={spawn.resuming}
               active={visible}
               onStatus={(s) => routerRef.current!.fromScreen(s)}
-              onReady={() => setPtyReady(true)}
+              onReady={() => {
+                perfEnd(agent.id, "pty ready"); // final milestone of the spawn waterfall
+                setPtyReady(true);
+              }}
               onRateLimit={handleRateLimit}
               onExit={() => {
                 // NOTE (Plan-1 limitation): this block fires only when the PTY process actually
@@ -812,6 +846,34 @@ export function AgentPane({
     </div>
   );
 }
+
+/** Skip a re-render when nothing THIS pane depends on changed. A projectStore write for a SIBLING
+ *  agent (a status flip, an activity narration, a prompt append) mints a new `projects` array + a new
+ *  project object (mapProject/mapAgent) and re-renders Workspace — which, unmemoized, re-rendered
+ *  EVERY mounted pane (terminal + composer) on every such write. But mapAgent replaces only the
+ *  touched agent's object, so this pane's own `agent` ref is preserved, and the only `project` fields
+ *  this pane's render (and ThinkPanel) read are the four scalars below. So when `agent` and `visible`
+ *  and those scalars are unchanged, the pane's output is identical and we can safely bail. `agent`
+ *  referential equality already re-renders on this pane's own updates; `visible` re-renders on switch.
+ *  Internal store subscriptions (composerMinimized, scrollIntent, AI gates) are unaffected — memo only
+ *  gates PARENT-driven re-renders, not the component's own subscriptions. */
+export function arePanePropsEqual(
+  a: { project: Project; agent: AgentTab; visible: boolean },
+  b: { project: Project; agent: AgentTab; visible: boolean },
+): boolean {
+  return (
+    a.agent === b.agent &&
+    a.visible === b.visible &&
+    a.project.id === b.project.id &&
+    a.project.rootPath === b.project.rootPath &&
+    a.project.name === b.project.name &&
+    a.project.defaultBranch === b.project.defaultBranch
+  );
+}
+
+/** The live pane. Memoized (see arePanePropsEqual) so N open panes don't all re-render on every
+ *  sibling-agent store write — the main render-thrash source when many agents are open. */
+export const AgentPane = memo(AgentPaneInner, arePanePropsEqual);
 
 /**
  * Small pill in the pane's top-right showing the Claude account this agent runs under. Click to
