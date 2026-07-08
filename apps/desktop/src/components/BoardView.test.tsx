@@ -307,7 +307,10 @@ describe("BoardView — Build It (epic handoff)", () => {
     render(<BoardView project={project} />);
     fireEvent.click(screen.getByText("Build the app")); // open the epic's detail overlay
     expect(screen.getByText("not started")).toBeTruthy(); // rollup of an epic with no children
-    fireEvent.click(screen.getByText("Build It"));
+    // The backlog card ALSO carries a "Build It" (renamed from Start), so scope the click to the
+    // overlay's status row — the "not started" pill and the overlay's Build It button are siblings.
+    const statusRow = screen.getByText("not started").parentElement as HTMLElement;
+    fireEvent.click(within(statusRow).getByText("Build It"));
     expect(sendToBuild).toHaveBeenCalledWith({
       projectId: "p1",
       epicId: "p1-e1",
@@ -315,13 +318,15 @@ describe("BoardView — Build It (epic handoff)", () => {
     });
   });
 
-  it("blocks Build It with an error when the epic has no linked PRD", () => {
+  it("hands off a PRD-less epic with prdPath null (no longer blocks)", () => {
+    // The "no linked PRD" hard block was removed (unify Build It affordances): a PRD-less epic now
+    // hands off with prdPath null and sendToBuild seeds off `bd show <epicId>` instead of blocking.
     snapshot = epicSnapshot("no PRD link in this body");
     render(<BoardView project={project} />);
     fireEvent.click(screen.getByText("Build the app"));
-    fireEvent.click(screen.getByText("Build It"));
-    expect(sendToBuild).not.toHaveBeenCalled();
-    expect(screen.getByText(/no linked PRD/i)).toBeTruthy();
+    const statusRow = screen.getByText("not started").parentElement as HTMLElement;
+    fireEvent.click(within(statusRow).getByText("Build It"));
+    expect(sendToBuild).toHaveBeenCalledWith({ projectId: "p1", epicId: "p1-e1", prdPath: null });
   });
 });
 
@@ -357,7 +362,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
   it("claims the epic then hands off to Build with the parsed PRD path", async () => {
     startSnapshot({});
     render(<BoardView project={project} />);
-    fireEvent.click(screen.getByText("Start"));
+    fireEvent.click(screen.getByText("Build It"));
     await waitFor(() => expect(sendToBuild).toHaveBeenCalled());
     expect(claimBead).toHaveBeenCalledWith("/tmp/demo", "p1-e1");
     expect(sendToBuild).toHaveBeenCalledWith({
@@ -372,7 +377,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
   it("passes prdPath null for a PRD-less epic instead of blocking", async () => {
     startSnapshot({ description: "no prd reference" });
     render(<BoardView project={project} />);
-    fireEvent.click(screen.getByText("Start"));
+    fireEvent.click(screen.getByText("Build It"));
     await waitFor(() => expect(sendToBuild).toHaveBeenCalled());
     expect(sendToBuild).toHaveBeenCalledWith({ projectId: "p1", epicId: "p1-e1", prdPath: null });
   });
@@ -380,7 +385,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
   it("disables Start (tooltip decomposing…) while the epic has zero children", () => {
     startSnapshot({ withChild: false });
     render(<BoardView project={project} />);
-    const start = screen.getByText("Start") as HTMLButtonElement;
+    const start = screen.getByText("Build It") as HTMLButtonElement;
     expect(start.disabled).toBe(true);
     expect(start.title).toContain("decomposing…");
     fireEvent.click(start);
@@ -391,7 +396,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
   it("disables Start and shows a click-to-clear badge while labeled decomposing", async () => {
     startSnapshot({ labels: ["decomposing"] });
     render(<BoardView project={project} />);
-    expect((screen.getByText("Start") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText("Build It") as HTMLButtonElement).disabled).toBe(true);
     // The badge itself clears the label (the user's way out of a stuck decompose).
     fireEvent.click(screen.getByText("decomposing…"));
     await waitFor(() =>
@@ -408,7 +413,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
     );
   });
 
-  it("shows Start only on backlog epic cards (not tasks, not other columns)", () => {
+  it("shows Build It only on backlog epic cards (not tasks, not other columns)", () => {
     snapshot = {
       beads: [],
       board: {
@@ -420,7 +425,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
       loadedAt: Date.now(),
     };
     render(<BoardView project={project} />);
-    expect(screen.queryByText("Start")).toBeNull();
+    expect(screen.queryByText("Build It")).toBeNull();
   });
 });
 
@@ -485,13 +490,13 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
       loadedAt: Date.now(),
     };
     render(<BoardView project={project} />);
-    // Compact progress chip appears (0 of 1 met) — no Mark control yet.
-    await waitFor(() => expect(screen.getByText("0/1")).toBeTruthy());
+    // Compact progress chip appears ("0 of 1" met) — no Mark control yet.
+    await waitFor(() => expect(screen.getByText("0 of 1")).toBeTruthy());
     expect(screen.queryByText("Mark as Done")).toBeNull();
     // Expand the popover, tick the manual criterion → allMet → the Mark control appears.
-    fireEvent.click(screen.getByText("0/1"));
+    fireEvent.click(screen.getByText("0 of 1"));
     fireEvent.click(screen.getAllByRole("checkbox")[0]!);
-    await waitFor(() => expect(screen.getByText("1/1")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("1 of 1")).toBeTruthy());
     expect(screen.getByText("Mark as Done")).toBeTruthy();
   });
 
@@ -508,8 +513,8 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
       loadedAt: Date.now(),
     };
     render(<BoardView project={project} />);
-    await waitFor(() => expect(screen.getByText("0/1")).toBeTruthy());
-    fireEvent.click(screen.getByText("0/1")); // expand popover
+    await waitFor(() => expect(screen.getByText("0 of 1")).toBeTruthy());
+    fireEvent.click(screen.getByText("0 of 1")); // expand popover
     fireEvent.click(screen.getAllByRole("checkbox")[0]!); // tick the manual criterion → allMet
     fireEvent.click(await screen.findByText("Mark as Done"));
     await waitFor(() => expect(closeBead).toHaveBeenCalledWith("/tmp/demo", "p1-m1"));
@@ -530,8 +535,8 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
       loadedAt: Date.now(),
     };
     render(<BoardView project={project} />);
-    await waitFor(() => expect(screen.getByText("0/1")).toBeTruthy());
-    fireEvent.click(screen.getByText("0/1"));
+    await waitFor(() => expect(screen.getByText("0 of 1")).toBeTruthy());
+    fireEvent.click(screen.getByText("0 of 1"));
     fireEvent.click(screen.getAllByRole("checkbox")[0]!);
     fireEvent.click(await screen.findByText("Mark as Delivered"));
     await waitFor(() => expect(markBeadDelivered).toHaveBeenCalledWith("/tmp/demo", "p1-d9"));
