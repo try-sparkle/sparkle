@@ -81,7 +81,7 @@ describe("AgentRow — ModelPill wiring", () => {
     const project = mkProject([mkAgent()]);
     seedProject(project);
     render(<AgentSidebar project={project} />);
-    fireEvent.mouseOver(screen.getByText(TITLE)); // open the hover card
+    fireEvent.click(screen.getByText(TITLE)); // open the hover card
     fireEvent.click(screen.getByTestId("model-pill").querySelector("button")!);
     fireEvent.click(screen.getByText("Opus 4.8"));
     expect(agentModel()).toBe("claude-opus-4-8");
@@ -92,24 +92,24 @@ describe("AgentRow — ModelPill wiring", () => {
     const project = mkProject([mkAgent({ model: "claude-opus-4-8" })]);
     seedProject(project);
     render(<AgentSidebar project={project} />);
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE));
     fireEvent.click(screen.getByTestId("model-pill").querySelector("button")!);
     fireEvent.click(screen.getByText("Default (Claude Code setting)"));
     expect(agentModel()).toBeUndefined();
     expect(applyModelToRunningAgent).toHaveBeenCalledWith("a1", "default");
   });
 
-  it("interacting with the pill neither selects the card nor closes the hover overlay", () => {
+  it("interacting with the pill keeps the card open and doesn't hijack selection", () => {
     const project = mkProject([mkAgent()]);
     seedProject(project);
     render(<AgentSidebar project={project} />);
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE)); // opening the card selects a1
     fireEvent.click(screen.getByTestId("model-pill").querySelector("button")!);
     fireEvent.click(screen.getByText("Sonnet 5"));
-    // The card is still open (the pill lives only on the hover card) and the click never
-    // reached the row's select handler.
+    // The card is still open (the pill's clicks stopPropagation, so they never close it) and the
+    // selection is still the agent whose card we opened — the pill didn't change it.
     expect(screen.getByTestId("agent-hover-card")).toBeTruthy();
-    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBeNull();
+    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a1");
   });
 
   it("the pill renders only for claude-terminal kinds — a shell row's card has none", () => {
@@ -125,12 +125,12 @@ describe("AgentRow — ModelPill wiring", () => {
     const project = mkProject([worker, shell]);
     seedProject(project);
     render(<AgentSidebar project={project} />);
-    fireEvent.mouseOver(screen.getByText("Shell Row"));
+    fireEvent.click(screen.getByText("Shell Row"));
     expect(screen.getByTestId("agent-hover-card")).toBeTruthy(); // card open…
     expect(screen.queryByTestId("model-pill")).toBeNull(); // …but no pill for a shell tab
     // (Once hovered, the name renders twice — hidden in-flow row + overlay — hence getAllByText.)
     fireEvent.mouseOut(screen.getAllByText("Shell Row")[0]!);
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE));
     expect(screen.getByTestId("model-pill")).toBeTruthy(); // the worker card has one
   });
 });

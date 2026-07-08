@@ -63,12 +63,12 @@ function seedOrchestratorWithWorker(bs: BranchStatus): Project {
   return project;
 }
 
-// Expanding = hovering the orchestrator's in-flow row, which mounts the slide-out overlay (a portal)
-// carrying each worker's detail block + Status pill.
-function hoverOrchestrator() {
+// Expanding = CLICKING the orchestrator's in-flow row, which mounts the detail card (a portal)
+// carrying each worker's detail block + Status pill. (Hovering only activates the terminal now.)
+function openOrchestratorCard() {
   const card = document.querySelector<HTMLElement>('[draggable="true"]');
   if (!card) throw new Error("orchestrator card not found");
-  fireEvent.mouseEnter(card);
+  fireEvent.click(card);
 }
 
 beforeEach(() => useUiStore.setState({ collapsedOrchestrators: {} }));
@@ -82,7 +82,7 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
   it("the worker's green 'ahead' pill lands THAT worker into its orchestrator's branch", () => {
     const project = seedOrchestratorWithWorker({ ahead: 2, behind: 0 } as BranchStatus);
     render(<AgentSidebar project={project} />);
-    hoverOrchestrator();
+    openOrchestratorCard();
 
     // The worker-specific copy ("…this worker's orchestrator") only renders for an inline worker.
     const pill = screen.getByRole("button", { name: /merge into this worker's orchestrator/i });
@@ -97,7 +97,7 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
   it("the worker's 'behind' pill rebases THAT worker on its own id + base branch", () => {
     const project = seedOrchestratorWithWorker({ ahead: 0, behind: 3 } as BranchStatus);
     render(<AgentSidebar project={project} />);
-    hoverOrchestrator();
+    openOrchestratorCard();
 
     // The behind pill is the calm, informational "Update available …" control (no longer alarm-red).
     const pill = screen.getByRole("button", { name: /update available · 3 behind main — click to catch up/i });
@@ -109,29 +109,29 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
     expect(refreshAgentBranch).toHaveBeenCalledWith("/tmp/demo", "p1", "w1", "main", false);
   });
 
-  it("hides the in-flow strip content on hover so the unified card stands in for it (no duplicate)", () => {
+  it("hides the in-flow strip content when the card opens so it stands in for it (no duplicate)", () => {
     const project = seedOrchestratorWithWorker({ ahead: 0, behind: 0 } as BranchStatus);
     render(<AgentSidebar project={project} />);
     const row = document.querySelector<HTMLElement>('[draggable="true"]');
     if (!row) throw new Error("orchestrator row not found");
     // The strip content (name + own progress bar) is the row's first child; that — not the whole
-    // row — is what the card stands in for and what gets hidden on hover. The row itself stays
-    // visible so the collapsed worker lines below can remain a stable hover surface (flicker fix).
+    // row — is what the card stands in for and what gets hidden when the card opens. The row keeps
+    // its layout slot so the rows beneath never jump.
     const strip = row.firstElementChild as HTMLElement;
     expect(strip.style.visibility).not.toBe("hidden");
 
-    // On hover the strip is HIDDEN (visibility:hidden — keeps its layout slot so rows below don't
-    // jump) while the single unified card, anchored at the same spot and widening into the terminal
-    // area, stands in for it. This is what keeps the name + progress bar from duplicating.
-    fireEvent.mouseEnter(row);
+    // Clicking opens the card: the strip is HIDDEN (visibility:hidden — keeps its layout slot so rows
+    // below don't jump) while the single card, anchored at the same spot and widening into the
+    // terminal area, stands in for it. This is what keeps the name + progress bar from duplicating.
+    fireEvent.click(row);
     expect(strip.style.visibility).toBe("hidden");
     // And the detail renders in the card — the Status line is present (the orchestrator's own + the
     // worker's both read "Up to date with main").
     expect(screen.getAllByText(/up to date with main/i).length).toBeGreaterThan(0);
   });
 
-  it("renders one named line per worker collapsed, and one detail block per worker on hover", () => {
-    const orchestrator = mkAgent("a1", "Alpha");
+  it("lists no workers collapsed; opening the card reveals one detail block per worker", () => {
+    const orchestrator = mkAgent("a1", "Alpha", { namePinned: true }); // pinned so the head keeps "Alpha"
     const w1 = mkAgent("w1", "WorkerOne", { kind: "worker", parentId: "a1", baseBranch: "main" });
     const w2 = mkAgent("w2", "WorkerTwo", { kind: "worker", parentId: "a1", baseBranch: "main" });
     const project: Project = {
@@ -146,31 +146,27 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
     } as never);
     render(<AgentSidebar project={project} />);
 
-    // Collapsed: each WorkflowLine is role="img" / "Workflow stage: …". One for the orchestrator's
-    // own head line + one per worker = 3. Each worker's NAME now shows on its inline line too.
-    const linesCollapsed = screen.getAllByRole("img", { name: /Workflow stage:/i });
-    expect(linesCollapsed).toHaveLength(3);
-    expect(screen.getByText("WorkerOne")).toBeTruthy();
-    expect(screen.getByText("WorkerTwo")).toBeTruthy();
+    // Collapsed: neither worker name is in the column — only the pinned head "Alpha".
+    expect(screen.getByText("Alpha")).toBeTruthy();
+    expect(screen.queryByText("WorkerOne")).toBeNull();
+    expect(screen.queryByText("WorkerTwo")).toBeNull();
 
-    // Hovered: the overlay stacks one detail block per worker — each worker's title appears there too
-    // (once inline + once in the card), so there are now two matches per name.
-    hoverOrchestrator();
-    expect(screen.getAllByText("WorkerOne").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText("WorkerTwo").length).toBeGreaterThanOrEqual(1);
+    // Clicked: the card stacks one detail block per worker, each a clickable "Open <name>" line.
+    openOrchestratorCard();
+    expect(screen.getByRole("button", { name: /Open WorkerOne/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Open WorkerTwo/i })).toBeTruthy();
   });
 
-  it("shows each worker's progress bar (with stage label) in its detail block on hover", () => {
+  it("shows each worker's progress bar (with stage label) in its detail block once the card opens", () => {
     const project = seedOrchestratorWithWorker({ ahead: 0, behind: 0 } as BranchStatus);
     render(<AgentSidebar project={project} />);
-    // Collapsed bars render the line only — NO worded status label (that's hover-only). So the
-    // "Building locally (Unsaved)…" stage detail is absent until hover, for orchestrator + worker.
+    // Collapsed: the head shows only its rollup bar (no worded label) and no worker bar at all, so the
+    // "Building locally (Unsaved)…" stage detail is absent entirely.
     expect(screen.queryAllByText(/unsaved/i)).toHaveLength(0);
 
-    hoverOrchestrator();
-    // On hover the worker's bar moves DOWN into its detail block (below the worker name) and is
-    // EXPANDED — so it now carries the stage status label, the same hover readout the orchestrator's
-    // own strip bar gets. The "…Unsaved…" detail therefore appears twice: orchestrator + worker.
-    expect(screen.getAllByText(/unsaved/i).length).toBeGreaterThanOrEqual(2);
+    openOrchestratorCard();
+    // In the card the worker's bar renders EXPANDED in its detail block (below the worker name), so it
+    // now carries the stage status label — the same readout the orchestrator's own strip bar gets.
+    expect(screen.getAllByText(/unsaved/i).length).toBeGreaterThanOrEqual(1);
   });
 });

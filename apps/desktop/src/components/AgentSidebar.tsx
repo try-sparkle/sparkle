@@ -1189,11 +1189,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
                 : rollup
                   ? rollup.stage
                   : stageOf(top.id);
-            // The orchestrator's head row owns ALL its workers: each renders as a named, clickable
-            // inline line below the head (collapsed — see CollapsedWorkerLine), and as a stacked
-            // detail block on the head's hover overlay (expanded) — see AgentRow's `workers` prop.
-            // There is no separate pop-out row; a worker that needs attention shows its inline name in
-            // red and still bubbles red up to this head row + the TopBar dot.
+            // The orchestrator's head row owns ALL its workers, passed via AgentRow's `workers` prop.
+            // Collapsed, the head shows only its own title (auto-promoted from its representative
+            // worker) + this rollup bar — no inline worker rows. Every worker renders as a stacked
+            // detail block inside the CLICK-opened detail card (see CardDetail / WorkerNameButton).
+            // A worker that needs attention still bubbles red up to this head row + the TopBar dot, so
+            // it's noticed without being expanded.
             return <div key={top.id}>{renderRow(top, headStage, orderedIndex)}</div>;
           });
         })()}
@@ -1442,68 +1443,23 @@ function WorkerNameButton({ w }: { w: WorkerDetail }) {
   );
 }
 
-// A sub-agent (worker) rendered inline beneath its orchestrator: its NAME (in status ink — red when
-// it needs you) on the left, its own cyan→blue WorkflowLine bar on the right, on one compact line.
-// This is the SOLE representation of a worker in the column now — there is no separate pop-out row.
-// Clicking the line selects + opens that worker (mounts its pane/REPL); stopPropagation keeps the
-// click off the orchestrator row's own onClick. Hovering still bubbles to the collapsed-lines
-// container, which drives the orchestrator's hover card — so the parent card behaves as before.
-function CollapsedWorkerLine({ w }: { w: WorkerDetail }) {
-  const [hover, setHover] = useState(false);
-  // Same light-mode-legible ink the head rows use; red/amber (attention) pass through unchanged, so a
-  // worker that needs you shows a red name here.
-  const nameColor = statusInk(w.statusColor);
-  return (
-    <div
-      role="button"
-      tabIndex={0}
-      aria-label={`${w.autoTitle || w.name} — ${AGENT_STATUS[w.status].label}`}
-      onClick={(e) => {
-        e.stopPropagation();
-        w.onOpen();
-      }}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          e.stopPropagation();
-          w.onOpen();
-        }
-      }}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-        minWidth: 0,
-        padding: "1px 4px",
-        borderRadius: 6,
-        cursor: "pointer",
-        background: w.active ? CHAT_USER_BUBBLE : hover ? CHAT_USER_BUBBLE : "transparent",
-      }}
-    >
-      <span
-        style={{
-          flex: 1,
-          minWidth: 0,
-          color: nameColor,
-          fontSize: 12,
-          fontWeight: w.active ? FONT_WEIGHT.semibold : FONT_WEIGHT.regular,
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
-        }}
-      >
-        {w.autoTitle || w.name}
-      </span>
-      {/* The worker's own progress bar, kept narrow so the name stays the prominent element. */}
-      {w.stage && (
-        <div style={{ flex: "0 0 auto", width: 72 }}>
-          <WorkflowLine stage={w.stage} shipped={w.shipped} />
-        </div>
-      )}
-    </div>
-  );
+// The worker whose title/progress best represents the whole build for the collapsed head row: the
+// LEAST-ADVANCED worker — the same one the head's rollup progress bar reflects — so the promoted head
+// title and that bar describe the same piece of work. A null stage sorts as "not started" (fraction
+// 0). Ties break to the FIRST worker in insertion order: the strict `<` below only replaces `rep` on
+// a STRICTLY smaller fraction, so equal-fraction workers keep the earliest one. Returns null for an
+// empty list. Used to auto-promote an orchestrator's generic "Build N" name to describe the real work.
+function representativeWorker(workers: WorkerDetail[]): WorkerDetail | null {
+  let rep: WorkerDetail | null = null;
+  let repFrac = Infinity;
+  for (const w of workers) {
+    const f = w.stage ? stageFraction(w.stage) : 0;
+    if (f < repFrac) {
+      rep = w;
+      repFrac = f;
+    }
+  }
+  return rep;
 }
 
 /**
@@ -1684,6 +1640,13 @@ const AgentRow = memo(function AgentRow({
     if (hideTimer.current) clearTimeout(hideTimer.current);
     hideTimer.current = window.setTimeout(() => setHover(false), 60);
   };
+  // Click opens the detail card ("modal"). Hovering the row already activated its terminal (see the
+  // row's onMouseEnter), but a fast click that beats that still needs to select — so activate first,
+  // then open the card. Hover no longer opens the card; only a deliberate click does.
+  const openCard = () => {
+    onSelect();
+    show();
+  };
   useEffect(
     () => () => {
       if (hideTimer.current) clearTimeout(hideTimer.current);
@@ -1784,10 +1747,20 @@ const AgentRow = memo(function AgentRow({
   const handleRefresh = (e: React.MouseEvent) => refreshBranch(a.id, a.baseBranch ?? "", e);
 
   // The auto-name title (shown truncated when collapsed) and its one-sentence description (revealed
-  // on hover). Legacy/manual agents have no title → fall back to the canonical `name`.
-  const autoTitle = a.autoNameVariants?.title?.trim() || null;
+  // in the detail card). Legacy/manual agents have no title → fall back to the canonical `name`.
+  // Auto-promotion: an orchestrator still on its generic "Build N" default (no work-derived title of
+  // its own, and not manually pinned) borrows its representative worker's title/description, so the
+  // ONE collapsed row describes the real work instead of a slot number. The representative is the
+  // same least-advanced worker the rollup progress bar reflects, so the head name and bar stay in
+  // sync. Its own auto-title, once earned, always wins; a manual rename (namePinned) is never
+  // overridden.
+  const ownAutoTitle = a.autoNameVariants?.title?.trim() || null;
+  const promotedWorker =
+    a.kind === "build" && !ownAutoTitle && !a.namePinned ? representativeWorker(workers) : null;
+  const autoTitle = ownAutoTitle || promotedWorker?.autoTitle || promotedWorker?.name || null;
   const fullTitle = autoTitle || a.name;
-  const description = a.autoNameVariants?.description?.trim() || "";
+  const description =
+    a.autoNameVariants?.description?.trim() || promotedWorker?.description || "";
   // Overall completion for the hover "Progress" line: the same fraction the thin line fills to.
   const progressPct = trackerStage ? Math.round(stageFraction(trackerStage) * 100) : null;
 
@@ -2055,20 +2028,18 @@ const AgentRow = memo(function AgentRow({
               <WorkflowLine stage={trackerStage} expanded={expanded} shipped={shipped} />
             </div>
           )}
-          {/* NOTE: the collapsed per-worker progress lines used to live here, but they now render as
-              a sibling of this strip in the in-flow row (see the row's JSX below) so they can stay
-              visible — as a stable hover surface — while the stand-in hover card is open. Rendering
-              them here is fine for the overlay too (it always passes expanded), which is why this
-              block was `!expanded`-gated; extracting it just makes that split explicit. */}
+          {/* NOTE: the per-worker progress lines no longer render in the collapsed column row — the
+              head shows only its own rollup bar there. Every worker is revealed on CLICK, as a stacked
+              detail block in CardDetail below (the row's onClick opens the card). */}
         </div>
       </div>
     </>
   );
 
-  // The card's DETAIL region — this row's Location / Status / Progress, then one stacked block per
-  // inline worker. Rendered ONLY in the unified hover card, offset to the terminal side so it drops
-  // below the strip without covering the column rows beneath it (the L-shape). Collapsed, none of
-  // this shows; the column row keeps just the bare per-worker progress lines (in CardHeader above).
+  // The card's DETAIL region — this row's Location / Status / Progress, its bead/epic linkage, then
+  // one stacked block per worker. Rendered ONLY in the detail card (opened by a click on the row),
+  // offset to the terminal side so it drops below the strip without covering the column rows beneath
+  // it (the L-shape). Collapsed, none of this shows — the column row keeps just the title + rollup bar.
   const CardDetail = () => (
     <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
       <AgentDetailLines
@@ -2084,6 +2055,18 @@ const AgentRow = memo(function AgentRow({
         onLand={onLand}
         onRefresh={handleRefresh}
       />
+      {/* Bead/epic linkage — a worker shows the bead it's on; an orchestrator its epic. Moved here
+          from the (now removed) collapsed worker-lines block so the collapsed row stays title + bar. */}
+      {beadHover && (
+        <DetailLine label="Bead">
+          <span style={{ color: C.muted, fontSize: 11 }}>{beadHover}</span>
+        </DetailLine>
+      )}
+      {epicHover && (
+        <DetailLine label="Epic">
+          <span style={{ color: C.muted, fontSize: 11 }}>{epicHover}</span>
+        </DetailLine>
+      )}
       {/* One stacked detail block per worker — as if every worker had been expanded onto this single
           orchestrator card. Each shows the worker's own title/description, its OWN progress bar (with
           the stage status label, just like the orchestrator's), then its Location / Status / Progress.
@@ -2185,8 +2168,8 @@ const AgentRow = memo(function AgentRow({
         ref={rowRef}
         data-hint="agent"
         {...dragProps}
-        onClick={onSelect}
-        onMouseEnter={show}
+        onClick={openCard}
+        onMouseEnter={onSelect}
         onMouseLeave={hide}
         style={{
           position: "relative",
@@ -2209,12 +2192,12 @@ const AgentRow = memo(function AgentRow({
           userSelect: orderedIndex != null && !editing ? "none" : undefined,
           // Active = the terminal's own color (merges into it); the hover state's CHAT_USER_BUBBLE
           // lives on the unified card, not here. Cleared while the card is open (showOverlay) so the
-          // row reads as empty behind the stand-in card — only the dimmed worker lines below show.
+          // row reads as empty behind the stand-in card.
           background: !showOverlay && isActive ? C.forest : "transparent",
           marginBottom: 2,
-          // NOTE: visibility is NOT toggled on the whole row anymore — only the strip content below
-          // is hidden while the card is open. The collapsed worker lines must stay visible (and keep
-          // receiving hover) so the card doesn't flicker shut when the cursor is over them.
+          // NOTE: visibility is NOT toggled on the whole row anymore — only the strip content below is
+          // hidden (visibility:hidden) while the card is open, so its layout slot is preserved and the
+          // rows beneath never jump.
         }}
       >
         {/* Strip content (glyph + name + own progress bar): the overlay card stands in for exactly
@@ -2223,45 +2206,10 @@ const AgentRow = memo(function AgentRow({
         <div style={{ visibility: showOverlay ? "hidden" : "visible" }}>
           {CardHeader({ expanded: false, ownsInput: editing })}
         </div>
-        {/* Collapsed: one named, clickable indented line per worker, directly under the orchestrator's
-            own line — the worker's name (red when it needs you) beside its own progress bar. Clicking a
-            line opens that worker; this is the SOLE representation of a worker in the column (no pop-out
-            row). Kept VISIBLE but DIMMED while the card is open (showOverlay) so it stays a stable hover
-            surface: the card's transparent lower-left would otherwise let the cursor fall through the
-            instant these lines vanished, dropping the hover and flickering the card shut. Staying
-            visible means hovering a sub-agent line just keeps the head's card open. */}
-        {(workers.length > 0 || beadHover || epicHover) && (
-          <div
-            data-testid="collapsed-worker-lines"
-            onMouseEnter={show}
-            onMouseLeave={hide}
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: 2,
-              marginTop: 3,
-              // Align under the orchestrator's name: glyph slot width + the header's 8px gap + the
-              // worker step's own 16px indent (matches the pre-extraction nesting exactly).
-              marginLeft: glyphWidth + 8 + 16,
-              opacity: showOverlay ? 0.45 : 1,
-              transition: "opacity 120ms ease",
-            }}
-          >
-            {workers.map((w) => (
-              <CollapsedWorkerLine key={w.id} w={w} />
-            ))}
-            {beadHover && (
-              <DetailLine label="Bead">
-                <span style={{ color: C.muted, fontSize: 11 }}>{beadHover}</span>
-              </DetailLine>
-            )}
-            {epicHover && (
-              <DetailLine label="Epic">
-                <span style={{ color: C.muted, fontSize: 11 }}>{epicHover}</span>
-              </DetailLine>
-            )}
-          </div>
-        )}
+        {/* Collapsed the row shows ONLY the head strip above: the orchestrator's title (auto-promoted
+            from its representative worker) and its single rollup progress bar summarizing every worker.
+            The individual workers — and the bead/epic detail — are revealed on CLICK, in the detail
+            card (see CardDetail); they no longer render inline here. */}
         {/* CONCAVE corner fillets where the active tab opens into the terminal. Each is a small box
             just above / below the tab's right edge; a radial-gradient paints the terminal color
             (C.forest) everywhere EXCEPT a quarter-disc cut from the corner nearest the sidebar, so

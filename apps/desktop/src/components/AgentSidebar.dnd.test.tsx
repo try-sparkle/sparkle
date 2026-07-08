@@ -87,20 +87,20 @@ describe("AgentSidebar — drag to pin", () => {
     expect(screen.queryAllByTestId("agent-drop-target")).toHaveLength(0);
   });
 
-  it("keeps a grabbable drag handle on hover — the unified card's strip carries dragProps", () => {
-    // Regression guard: the in-flow row goes visibility:hidden on hover (the unified L-card stands
-    // in over it). If only the row were draggable, hovering — the very state you'd start a drag
-    // from — would leave nothing grabbable and silently kill drag-to-reorder. So dragProps is on the
-    // card strip too. Here: hover a row, then start a drag from the NEW draggable (the portal strip)
+  it("keeps a grabbable drag handle when the card is open — the card's strip carries dragProps", () => {
+    // Regression guard: the in-flow row goes visibility:hidden when its card opens (the L-card stands
+    // in over it). If only the row were draggable, an open card — a state you might start a drag from —
+    // would leave nothing grabbable and silently kill drag-to-reorder. So dragProps is on the card
+    // strip too. Here: open a row's card, then start a drag from the NEW draggable (the portal strip)
     // and confirm it initiates a reorder (drop targets appear).
     const project = seed();
     render(<AgentSidebar project={project} />);
     const before = draggableCards();
     expect(before).toHaveLength(3);
 
-    fireEvent.mouseEnter(before[0]!); // open the unified card over the first row
+    fireEvent.click(before[0]!); // open the unified card over the first row
     const after = draggableCards();
-    expect(after.length).toBeGreaterThan(before.length); // the card strip adds a grab on hover
+    expect(after.length).toBeGreaterThan(before.length); // the card strip adds a grab when open
     const strip = after.find((el) => !before.includes(el))!;
     expect(strip).toBeTruthy();
 
@@ -123,7 +123,7 @@ describe("AgentSidebar — drag to pin", () => {
     try {
       render(<AgentSidebar project={project} />);
       const row = draggableCards()[0]!;
-      fireEvent.mouseEnter(row);
+      fireEvent.click(row);
       const card = document.querySelector<HTMLElement>('[data-testid="agent-hover-card"]')!;
       expect(card).toBeTruthy();
       // Shifted up: top ≤ innerHeight - 16 - MIN_CARD_H = 400 - 16 - 180 = 204 (well above the row's 380).

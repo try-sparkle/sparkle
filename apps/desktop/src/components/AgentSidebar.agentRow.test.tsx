@@ -99,7 +99,7 @@ describe("AgentRow — rename input is a single instance across hover", () => {
 
     // Hover the collapsed row → the slide-out overlay mounts and reveals the Location line (an
     // overlay-only element). (mouseOver is how React's onMouseEnter is triggered in jsdom.)
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE));
     expect(screen.getByText("/tmp/demo/.worktrees/a1")).toBeTruthy();
 
     // Double-click the overlay's title to rename → the overlay is suppressed and the in-flow row
@@ -132,7 +132,7 @@ describe("AgentRow — rename input is a single instance across hover", () => {
 describe("AgentRow — Status line behind/ahead pill", () => {
   // The pill now lives on the hover card's "Status" line (not in the collapsed row), so each test
   // opens the slide-out first. mouseOver triggers React's onMouseEnter in jsdom.
-  const openOverlay = () => fireEvent.mouseOver(screen.getByText(TITLE));
+  const openOverlay = () => fireEvent.click(screen.getByText(TITLE));
 
   it("renders the behind pill as a clickable catch-up button", () => {
     seedBranch("a1", bs({ behind: 4 }));
@@ -174,7 +174,7 @@ describe("AgentRow — clickable path", () => {
   it("clicking the expanded path reveals the worktree folder in Finder", () => {
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
     // Path only shows in the hover-expanded overlay.
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE));
     fireEvent.click(screen.getByText("/tmp/demo/.worktrees/a1"));
     expect(revealItemInDir).toHaveBeenCalledWith("/tmp/demo/.worktrees/a1");
   });
@@ -187,7 +187,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     expect(screen.getByText(TITLE)).toBeTruthy();
     expect(document.body.textContent).not.toContain(DESCRIPTION);
     // Hover → the overlay reveals "Title:  description".
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE));
     expect(document.body.textContent).toContain(DESCRIPTION);
   });
 
@@ -197,7 +197,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     // taller over the column rows beneath it. (Earlier the description lived in the drop-down; the
     // single-line-ellipsis approach lets it sit beside the title without the column-growth bug.)
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE));
     const card = screen.getByTestId("agent-hover-card");
     const strip = (Array.from(card.children) as HTMLElement[])[0]!;
     expect(strip.textContent).toContain(TITLE);
@@ -219,7 +219,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     expect(row.style.background).toBe("var(--c-forest)");
     expect(row.style.marginRight).toBe("-8px");
     // Hover → the card is the terminal color with NO drop-shadow (it merges into the terminal).
-    fireEvent.mouseEnter(row);
+    fireEvent.click(row);
     const card = screen.getByTestId("agent-hover-card");
     expect(["none", ""]).toContain(card.style.filter);
     const strip = (Array.from(card.children) as HTMLElement[])[0]!;
@@ -231,7 +231,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
 
   it("omits the description span entirely when the description is empty", () => {
     render(<AgentSidebar project={mkProject([mkAgent({ autoNameVariants: { title: TITLE, description: "" } })])} />);
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE));
     expect(screen.getByText("/tmp/demo/.worktrees/a1")).toBeTruthy(); // overlay is open…
     // …but with no description there is no leading "colon-space-space" run anywhere in the card.
     expect(document.body.textContent).not.toContain(":  ");
@@ -240,14 +240,14 @@ describe("AgentRow — hover card title + description and detail lines", () => {
   it("Status line reads 'Up to date' when the branch is neither ahead nor behind", () => {
     seedBranch("a1", bs({ ahead: 0, behind: 0 }));
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE));
     expect(document.body.textContent).toContain("Up to date with main");
   });
 
   it("Progress line shows percent-only (no worker count) for a leaf agent", () => {
     seedBranch("a1", bs({ behind: 1 })); // behind copy avoids the word 'worker' in the Status line
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE));
     const body = document.body.textContent ?? "";
     expect(body).toMatch(/% complete\./);
     expect(body).not.toContain("% complete overall"); // leaf → no "overall"
@@ -270,7 +270,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     });
     useRuntimeStore.setState({ branchStatus: { b1: bs({ behind: 1 }), w1: bs({ behind: 1 }) }, status: {} });
     render(<AgentSidebar project={mkProject([build, worker])} />);
-    fireEvent.mouseOver(screen.getByText("Orchestrator"));
+    fireEvent.click(screen.getByText("Orchestrator"));
     expect(document.body.textContent).toMatch(/1 worker\. \d+% complete overall\./);
   });
 });
@@ -328,7 +328,7 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
     });
     list.scrollTo = scrollTo as typeof list.scrollTo;
 
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE));
 
     expect(scrollTo).toHaveBeenCalledTimes(1);
     const opts = scrollTo.mock.calls[0]![0]!;
@@ -344,7 +344,7 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
     const scrollTo = vi.fn();
     list.scrollTo = scrollTo as typeof list.scrollTo;
 
-    fireEvent.mouseOver(screen.getByText(TITLE));
+    fireEvent.click(screen.getByText(TITLE));
 
     expect(scrollTo).not.toHaveBeenCalled();
   });
@@ -359,10 +359,10 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
     list.scrollTo = scrollTo as typeof list.scrollTo;
 
     const row = screen.getByText(TITLE);
-    fireEvent.mouseOver(row); // reveal → scrolls up to 196 (baseline captured as 0)
+    fireEvent.click(row); // open the card → reveal scrolls up to 196 (baseline captured as 0)
     expect(scrollTo).toHaveBeenCalledTimes(1);
 
-    fireEvent.mouseOut(row); // un-hover → after the close + restore debounce, ease back to baseline 0
+    fireEvent.mouseOut(row); // leave → after the close + restore debounce, ease back to baseline 0
     await vi.waitFor(
       () => {
         const last = scrollTo.mock.calls.at(-1)![0]!;
@@ -385,7 +385,7 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
     });
     list.scrollTo = scrollTo as typeof list.scrollTo;
 
-    fireEvent.mouseOver(screen.getByText(TITLE)); // reveal → scrolls up to 196
+    fireEvent.click(screen.getByText(TITLE)); // reveal → scrolls up to 196
     expect(screen.getByText("/tmp/demo/.worktrees/a1")).toBeTruthy(); // card open
     expect(scrollTo).toHaveBeenCalledTimes(1);
 
@@ -415,7 +415,7 @@ describe("AgentSidebar — two-finger scroll works while a hover card is open", 
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
     const list = screen.getByTestId("agent-list-scroll");
     list.getBoundingClientRect = () => LIST_RECT;
-    fireEvent.mouseOver(screen.getByText(TITLE)); // open the hover card
+    fireEvent.click(screen.getByText(TITLE)); // open the hover card
     return { list, card: screen.getByTestId("agent-hover-card") };
   };
 

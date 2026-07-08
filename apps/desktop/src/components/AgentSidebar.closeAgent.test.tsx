@@ -73,10 +73,12 @@ function buildAgentProject(beadId?: string): Project {
 }
 
 function openClosePrompt() {
+  // The × shows persistently on the ACTIVE row (and clicking it stopPropagations, so no card opens);
+  // select the agent so the affordance is present, then click it. (Hovering no longer expands a row.)
+  const p = useProjectStore.getState().projects[0]!;
+  useProjectStore.setState({ projects: [{ ...p, selectedAgentId: "a1" }] } as never);
+  useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
   render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
-  const card = document.querySelector<HTMLElement>('[draggable="true"]');
-  if (!card) throw new Error("agent card not found");
-  fireEvent.mouseEnter(card);
   fireEvent.click(screen.getByLabelText("Close agent"));
 }
 
@@ -106,12 +108,13 @@ describe("AgentSidebar — persistent close on the active row", () => {
     expect(screen.getByLabelText("Close agent")).toBeTruthy();
   });
 
-  it("does NOT show the Close button on a non-active row until hovered", () => {
+  it("does NOT show the Close button on an inactive, un-interacted row", () => {
     const project = buildAgentProject();
     useProjectStore.setState({ projects: [{ ...project, selectedAgentId: null }] } as never);
     useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
     render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
-    expect(screen.queryByLabelText("Close agent")).toBeNull(); // hover-gated for inactive rows
+    // The × is reserved for the active row (or the open detail card) — a resting inactive row has none.
+    expect(screen.queryByLabelText("Close agent")).toBeNull();
   });
 });
 

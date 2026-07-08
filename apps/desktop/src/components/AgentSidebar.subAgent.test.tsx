@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 //
-// Inline sub-agent lines: EVERY worker renders as a named, clickable line under its orchestrator
-// (no pop-out row, no pinning) — its name shows collapsed (no hover needed) and clicking it opens
-// that worker. Plus the hover-card reachability wiring: the card's own scroll doesn't dismiss it,
-// and hovering an inline worker line keeps the orchestrator's card open (no flicker).
+// The collapsed sidebar row shows ONLY the orchestrator's head: its title (auto-promoted from its
+// representative worker when it has no work-derived title of its own) and its single rollup progress
+// bar. Its workers are revealed by CLICKING the row, which opens the detail card; each worker there is
+// a clickable line that opens that worker. Hovering a row just activates its terminal — it does NOT
+// open the card. These tests pin that contract, plus the card's scroll/wheel reachability wiring.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -35,12 +36,14 @@ function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentT
   };
 }
 
-// Orchestrator a1 + one worker w1 in a given status.
+// Orchestrator a1 + one worker w1 in a given status. The orchestrator's name is PINNED so it keeps
+// its own label ("Alpha") — otherwise the head auto-promotes its representative worker's title and
+// there'd be no "Alpha" to target. (Auto-promotion itself is covered by its own test below.)
 function seed(opts: { workerStatus: AgentTabStatus }): {
   project: Project;
   open: ReturnType<typeof vi.fn>;
 } {
-  const orchestrator = mkAgent("a1", "Alpha");
+  const orchestrator = mkAgent("a1", "Alpha", { namePinned: true });
   const worker = mkAgent("w1", "Fix The Parser", {
     kind: "worker", parentId: "a1", baseBranch: "main", worktreePath: "/wt/w1",
   });
@@ -61,45 +64,145 @@ function seed(opts: { workerStatus: AgentTabStatus }): {
   return { project, open };
 }
 
+// Click the orchestrator's head row to open its detail card (the "modal").
+function openHeadCard() {
+  const head = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
+  fireEvent.click(head);
+  return head;
+}
+
 beforeEach(() => {
   useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
 });
 afterEach(cleanup);
 
-describe("AgentSidebar — inline sub-agent lines", () => {
-  it("shows EVERY worker's name inline (no hover), even a healthy one, and never a pop-out ✕", () => {
+describe("AgentSidebar — workers live in the click-opened detail card", () => {
+  it("does NOT render workers in the collapsed row — only after the row is clicked", () => {
     const { project } = seed({ workerStatus: "working" });
     render(<AgentSidebar project={project} />);
-    // A healthy worker's name is visible collapsed — the whole point (was hover-only before).
-    expect(screen.getByRole("button", { name: /Fix The Parser — /i })).toBeTruthy();
-    expect(screen.getByText("Fix The Parser")).toBeTruthy();
-    // No pin/unpin affordance survives.
+    // Collapsed: the head shows, but the worker's name/button is not in the column.
+    expect(screen.getByText("Alpha")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Open Fix The Parser/i })).toBeNull();
+    // Click the head → the card mounts and the worker appears as a clickable line.
+    openHeadCard();
+    expect(screen.getByTestId("agent-hover-card")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Open Fix The Parser/i })).toBeTruthy();
+    // No pin/unpin affordance on the worker line.
     expect(screen.queryByRole("button", { name: /Unpin/i })).toBeNull();
   });
 
-  it("clicking an inline worker line selects + opens THAT worker", () => {
+  it("clicking a worker line in the card selects + opens THAT worker", () => {
     const { project, open } = seed({ workerStatus: "working" });
     render(<AgentSidebar project={project} />);
-    fireEvent.click(screen.getByRole("button", { name: /Fix The Parser — /i }));
+    openHeadCard();
+    fireEvent.click(screen.getByRole("button", { name: /Open Fix The Parser/i }));
     expect(open).toHaveBeenCalledWith("w1");
     expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("w1");
   });
 
-  it("a worker that needs attention keeps its inline line (status in the label), still no pop-out", () => {
-    const { project } = seed({ workerStatus: "errored" });
+  it("a worker that needs attention is still reachable in the card and stays clickable", () => {
+    const { project, open } = seed({ workerStatus: "errored" });
     render(<AgentSidebar project={project} />);
-    // One inline line for the worker, carrying its status (the name also inks red via statusInk).
-    expect(screen.getAllByRole("button", { name: /Fix The Parser — Errored/i })).toHaveLength(1);
-    expect(screen.queryByRole("button", { name: /Unpin/i })).toBeNull();
+    openHeadCard();
+    const line = screen.getByRole("button", { name: /Open Fix The Parser/i });
+    expect(line).toBeTruthy();
+    fireEvent.click(line);
+    expect(open).toHaveBeenCalledWith("w1");
+  });
+
+  it("auto-promotes a generic-named orchestrator's title to its representative worker's title", () => {
+    // Unpinned orchestrator still on its "Build 7" default → the collapsed head borrows the worker's
+    // title, so the ONE row describes the real work rather than a slot number.
+    const orchestrator = mkAgent("a1", "Build 7");
+    const worker = mkAgent("w1", "Fix The Parser", {
+      kind: "worker", parentId: "a1", baseBranch: "main", worktreePath: "/wt/w1",
+    });
+    const project: Project = {
+      id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
+      createdAt: new Date(0).toISOString(), selectedAgentId: null,
+      agents: [orchestrator, worker],
+    };
+    useProjectStore.setState({ projects: [project] } as never);
+    useRuntimeStore.setState({
+      branchStatus: {}, workflowStage: {},
+      status: { w1: "working" }, openAgentIds: ["a1", "w1"],
+      open: vi.fn(), pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    render(<AgentSidebar project={project} />);
+    // The generic name is gone from the head; the worker's title stands in.
+    expect(screen.getByText("Fix The Parser")).toBeTruthy();
+    expect(screen.queryByText("Build 7")).toBeNull();
+  });
+
+  // Build a generic-named orchestrator with two workers at the given stages. `stage*` are
+  // WorkflowStageId overrides (≥ building_unsaved, the undefined-branch floor, so they're honored).
+  function seedTwoWorkers(stage1: string, stage2: string): Project {
+    const orchestrator = mkAgent("a1", "Build 7"); // generic, unpinned → eligible for promotion
+    const w1 = mkAgent("w1", "First worker", {
+      kind: "worker", parentId: "a1", baseBranch: "main", worktreePath: "/wt/w1",
+    });
+    const w2 = mkAgent("w2", "Second worker", {
+      kind: "worker", parentId: "a1", baseBranch: "main", worktreePath: "/wt/w2",
+    });
+    const project: Project = {
+      id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
+      createdAt: new Date(0).toISOString(), selectedAgentId: null,
+      agents: [orchestrator, w1, w2],
+    };
+    useProjectStore.setState({ projects: [project] } as never);
+    useRuntimeStore.setState({
+      branchStatus: {},
+      workflowStage: { w1: stage1, w2: stage2 },
+      status: { w1: "working", w2: "working" }, openAgentIds: ["a1", "w1", "w2"],
+      open: vi.fn(), pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    return project;
+  }
+
+  it("promotes the LEAST-ADVANCED worker's title when several workers differ", () => {
+    // w2 (building_saved) trails w1 (pushed) → the head borrows w2, matching the rollup bar's stage.
+    const project = seedTwoWorkers("pushed", "building_saved");
+    render(<AgentSidebar project={project} />);
+    expect(screen.getByText("Second worker")).toBeTruthy();
+    expect(screen.queryByText("First worker")).toBeNull(); // the further-along worker isn't promoted
+    expect(screen.queryByText("Build 7")).toBeNull();
+  });
+
+  it("breaks a stage tie by insertion order (first worker wins)", () => {
+    const project = seedTwoWorkers("pushed", "pushed"); // equal stages → first in insertion order
+    render(<AgentSidebar project={project} />);
+    expect(screen.getByText("First worker")).toBeTruthy();
+    expect(screen.queryByText("Second worker")).toBeNull();
   });
 });
 
-describe("AgentSidebar — hover-card reachability", () => {
+describe("AgentSidebar — hover vs. click", () => {
+  it("hovering a row activates its terminal (selects) WITHOUT opening the card", () => {
+    const { project, open } = seed({ workerStatus: "working" });
+    render(<AgentSidebar project={project} />);
+    const head = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
+    fireEvent.mouseEnter(head);
+    // Hover selects + opens the terminal…
+    expect(open).toHaveBeenCalledWith("a1");
+    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a1");
+    // …but does NOT pop the detail card.
+    expect(screen.queryByTestId("agent-hover-card")).toBeNull();
+  });
+
+  it("clicking a row opens the detail card", () => {
+    const { project } = seed({ workerStatus: "working" });
+    render(<AgentSidebar project={project} />);
+    expect(screen.queryByTestId("agent-hover-card")).toBeNull();
+    openHeadCard();
+    expect(screen.getByTestId("agent-hover-card")).toBeTruthy();
+  });
+});
+
+describe("AgentSidebar — detail-card reachability", () => {
   it("scrolling INSIDE the card does not dismiss it; a window scroll does", () => {
     const { project } = seed({ workerStatus: "working" });
     render(<AgentSidebar project={project} />);
-    const headRow = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
-    fireEvent.mouseEnter(headRow);
+    openHeadCard();
     const detail = document.querySelector("[data-hovercard-detail]") as HTMLElement;
     expect(detail).toBeTruthy();
     // A scroll originating inside the card's detail = reading the list, not scrolling it away.
@@ -113,8 +216,7 @@ describe("AgentSidebar — hover-card reachability", () => {
   it("wheel over a SCROLLABLE card detail is kept by the card (2b); a short one forwards to the list", () => {
     const { project } = seed({ workerStatus: "working" });
     render(<AgentSidebar project={project} />);
-    const headRow = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
-    fireEvent.mouseEnter(headRow);
+    openHeadCard();
     const detail = document.querySelector("[data-hovercard-detail]") as HTMLElement;
     expect(detail).toBeTruthy();
     const list = screen.getByTestId("agent-list-scroll") as HTMLElement;
@@ -140,43 +242,5 @@ describe("AgentSidebar — hover-card reachability", () => {
     setDetailBox(100, 100);
     wheelOverDetail();
     expect(list.scrollTop).toBe(40);
-  });
-
-  it("keeps the collapsed sub-agent lines visible while the head's card is open (no flicker)", () => {
-    const { project } = seed({ workerStatus: "working" });
-    // A worker with a stage renders a named collapsed line under the head. This is the line the user
-    // hovers; hovering it must NOT flicker the card.
-    useRuntimeStore.setState({ workflowStage: { w1: "building_saved" } } as never);
-    render(<AgentSidebar project={project} />);
-
-    // The collapsed sub-agent line exists before any hover.
-    expect(screen.getByTestId("collapsed-worker-lines")).toBeTruthy();
-
-    // Open the orchestrator's hover card.
-    const headRow = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
-    fireEvent.mouseEnter(headRow);
-    expect(screen.getByTestId("agent-hover-card")).toBeTruthy();
-
-    // The fix: the sub-agent lines stay rendered AND are not inside a visibility:hidden subtree, so
-    // the cursor never loses its hover target. (Pre-fix they lived inside the row that goes
-    // visibility:hidden, so this ancestor walk would find a hidden ancestor and the card flickered.)
-    const lines = screen.getByTestId("collapsed-worker-lines");
-    for (let el: HTMLElement | null = lines; el; el = el.parentElement) {
-      expect(el.style.visibility).not.toBe("hidden");
-    }
-
-    // Hovering the sub-agent lines keeps the head's card open rather than dismissing it.
-    fireEvent.mouseEnter(lines);
-    expect(screen.getByTestId("agent-hover-card")).toBeTruthy();
-  });
-
-  it("hovering the inline worker lines opens the orchestrator's hover card", () => {
-    const { project } = seed({ workerStatus: "errored" });
-    render(<AgentSidebar project={project} />);
-    // No card yet.
-    expect(screen.queryByTestId("agent-hover-card")).toBeNull();
-    // The worker lives inline under the head; hovering that lines container opens the parent's card.
-    fireEvent.mouseEnter(screen.getByTestId("collapsed-worker-lines"));
-    expect(screen.getByTestId("agent-hover-card")).toBeTruthy();
   });
 });
