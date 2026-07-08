@@ -1490,6 +1490,11 @@ function representativeWorker(workers: WorkerDetail[]): WorkerDetail | null {
 // fresh reference every render and loops the store. Reuse one array.
 const NO_BEADS: Bead[] = [];
 
+// How long the pointer must dwell on a row before hovering it activates that terminal. Short enough
+// to feel instant when you mean it; long enough that a cursor merely crossing the column on its way
+// elsewhere never activates the rows it transits. A click never waits on this (see openCard).
+const HOVER_INTENT_MS = 90;
+
 type AgentRowProps = {
   project: Project;
   a: AgentTab;
@@ -1620,6 +1625,11 @@ const AgentRow = memo(function AgentRow({
 
   const rowRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<number | null>(null);
+  // Hover-intent gate: activating the terminal on the very first mouseenter means a cursor merely
+  // transiting the column (on its way somewhere else) activates every row it crosses, landing on
+  // whichever it happened to leave last. A short dwell requirement fixes that — the pointer must
+  // linger HOVER_INTENT_MS on one row before it commits. A click bypasses it entirely (openCard).
+  const hoverTimer = useRef<number | null>(null);
   // Set true the instant Escape is pressed so the input's trailing blur (which fires when the field
   // unmounts in this Chromium webview) discards instead of committing — Escape must always cancel.
   const cancelNextBlur = useRef(false);
@@ -1655,16 +1665,40 @@ const AgentRow = memo(function AgentRow({
     if (hideTimer.current) clearTimeout(hideTimer.current);
     hideTimer.current = window.setTimeout(() => setHover(false), 60);
   };
-  // Click opens the detail card ("modal"). Hovering the row already activated its terminal (see the
-  // row's onMouseEnter), but a fast click that beats that still needs to select — so activate first,
-  // then open the card. Hover no longer opens the card; only a deliberate click does.
+  // Arm the hover-intent gate: only after the pointer has dwelled HOVER_INTENT_MS on THIS row does
+  // it commit to activating the terminal. A cursor sweeping through the column re-arms per row and
+  // never dwells long enough on any one, so a mere transit no longer activates anything.
+  const armSelect = () => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current);
+    hoverTimer.current = window.setTimeout(() => {
+      hoverTimer.current = null;
+      onSelect();
+    }, HOVER_INTENT_MS);
+  };
+  const disarmSelect = () => {
+    if (hoverTimer.current) {
+      clearTimeout(hoverTimer.current);
+      hoverTimer.current = null;
+    }
+  };
+  // Leaving the row cancels any pending hover-commit (so a transit never lands) and starts the
+  // card's close delay.
+  const onRowLeave = () => {
+    disarmSelect();
+    hide();
+  };
+  // Click opens the detail card ("modal"). It bypasses the hover-intent dwell entirely: a deliberate
+  // click should select + open NOW, so cancel any armed hover-commit and select immediately, then
+  // open the card. Hover no longer opens the card; only a deliberate click does.
   const openCard = () => {
+    disarmSelect();
     onSelect();
     show();
   };
   useEffect(
     () => () => {
       if (hideTimer.current) clearTimeout(hideTimer.current);
+      if (hoverTimer.current) clearTimeout(hoverTimer.current);
     },
     [],
   );
@@ -2184,8 +2218,8 @@ const AgentRow = memo(function AgentRow({
         data-hint="agent"
         {...dragProps}
         onClick={openCard}
-        onMouseEnter={onSelect}
-        onMouseLeave={hide}
+        onMouseEnter={armSelect}
+        onMouseLeave={onRowLeave}
         style={{
           position: "relative",
           display: "flex",
