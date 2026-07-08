@@ -159,6 +159,46 @@ describe("deriveLiveStage — monotonic watermark + new cycle", () => {
   });
 });
 
+// Trust-live-signal (sparkle bug-2): after a relaunch the runtime stage store is empty (prev
+// undefined) and a squash-landed branch has ahead→0 AND aheadOfBase→0, so the git/watermark
+// committedSeen sources are all false and the reachability→merged bump was gated out — the row
+// falsely collapsed to "Building Locally (Unsaved) — closing loses this work". An EXPLICIT action
+// signal (pushed to remote, or any PR) proves real committed work existed, so it now establishes
+// committedSeen too — WITHOUT re-opening the no-op-branch hole, since a no-op branch is never
+// pushed and never has a PR (unlike inLocalMain/landed, which are trivially true for it).
+describe("deriveLiveStage — live signals establish committedSeen after relaunch", () => {
+  it("pushed + reachable-in-main, no watermark, ahead→0 → merged (not unsaved)", () => {
+    expect(
+      deriveLiveStage({ kind: "build", bs: bs(0), ws: ws({ inOriginMain: true }), pushed: true }),
+    ).toBe("merged");
+  });
+  it("an open PR proves committed work → reachability lands it merged post-relaunch", () => {
+    expect(
+      deriveLiveStage({
+        kind: "build",
+        bs: bs(0),
+        ws: ws({ inLocalMain: true, prState: "open" }),
+      }),
+    ).toBe("merged");
+  });
+  it("worker: pushed establishes committedSeen so an integrated worker reads merged post-relaunch", () => {
+    expect(
+      deriveLiveStage({
+        kind: "worker",
+        bs: bs(0),
+        ws: ws({ inParent: true }),
+        pushed: true,
+        parentReachedMain: true,
+      }),
+    ).toBe("merged");
+  });
+  it("still gated: a no-op branch (landed/inLocalMain, but never pushed, no PR) stays unsaved", () => {
+    expect(
+      deriveLiveStage({ kind: "build", bs: bs(0), ws: ws({ inLocalMain: true, landed: true }) }),
+    ).toBe("building_unsaved");
+  });
+});
+
 describe("rollup + dominant", () => {
   it("rollup headline = least-advanced; counts cover all 9 ids", () => {
     const r = rollupStages(["merged", "building_saved", "pushed"]);

@@ -122,10 +122,20 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
   // build signal, so the planning floor (Thought/Spec'd/Planned) decides where the unit sits.
   let idx = bs ? stageIndex(gitDerivedStage(bs)) : -1;
   const prevIdx = prev ? stageIndex(prev) : -1;
+  // "Real committed work has existed at some point" — the gate that stops a no-op branch (trivially
+  // tree-identical to main, hence inLocalMain/landed) from reading as merged. Sourced from git ahead,
+  // the persisted watermark, OR authored-vs-base commits. After a relaunch the stage store is empty
+  // (no watermark) and a squash-landed branch has ahead→0 AND aheadOfBase→0, which used to collapse a
+  // genuinely-landed row back to "Building Locally (Unsaved) — closing loses this work". So we also
+  // trust EXPLICIT action signals: a branch that was PUSHED to its remote or ever had a PR must have
+  // carried real work — and, unlike inLocalMain/landed, neither is ever true for a no-op branch, so
+  // the no-op guard stays intact (sparkle bug-2, trust-live-signal).
   const committedSeen =
     idx >= stageIndex("building_saved") ||
     prevIdx >= stageIndex("building_saved") ||
-    (ws?.aheadOfBase ?? 0) > 0;
+    (ws?.aheadOfBase ?? 0) > 0 ||
+    input.pushed === true ||
+    ws?.prState != null;
 
   const bump = (id: WorkflowStageId) => {
     idx = Math.max(idx, stageIndex(id));

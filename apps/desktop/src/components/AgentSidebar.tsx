@@ -26,6 +26,8 @@ import { useInteractionStore } from "../stores/interactionStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useAiFeatureVisible } from "../services/aiGate";
 import { removeAgentWorkspace } from "../services/worktree";
+import { spinDownWorker } from "../services/workerSpawn";
+import { killPty } from "../pty";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
 import { shouldPromptOnClose, selectionAfterClose } from "../engine/closeAgent";
@@ -64,7 +66,6 @@ import { resolveStage, rollupStages, stageFraction, stageIndex, LINE_FROM, LINE_
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
 import { NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
-import { CloseWorkerPrompt } from "./CloseWorkerPrompt";
 import { CloseAgentPrompt } from "./CloseAgentPrompt";
 import { BalanceBadge } from "./BalanceBadge";
 
@@ -623,12 +624,27 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // Tear an agent down: drop it (and its workers) from the stores and remove their worktrees. The
   // BRANCH is intentionally kept (remove_worktree_at), so this is the "Save" outcome — Discard adds
   // an explicit branch+bead delete on top (onDiscardClose).
-  const teardownAgent = (id: string) => {
+  const teardownAgent = async (id: string) => {
     if (!project) return;
+    const agent = project.agents.find((a) => a.id === id);
+    // A worker owns its OWN PTY and an on-disk manifest/worktree (.sparkle/worker.json). spinDownWorker
+    // is the correct ORDERED teardown — kill PTY → await worktree+manifest removal → close runtime →
+    // drop the row — so the terminal process actually dies AND no lingering manifest survives for the
+    // periodic reconcile to resurrect the row from (sparkle bug-1b/bug-3). The old path below skipped
+    // killPty and fire-and-forgot the worktree removal, so the PTY stayed alive and the row reappeared.
+    if (agent?.kind === "worker") {
+      await spinDownWorker({ projectId: project.id, workerId: id });
+      reselectAfterClose(id);
+      return;
+    }
+    // Build agent (plus any workers it still owns): kill each PTY and AWAIT its worktree removal BEFORE
+    // dropping the rows, so no live PTY leaks and no worktree/manifest is left behind to be reconciled
+    // back after the row is gone. Mirrors windowClose.killProjectAgents' kill→close→remove ordering.
     const childIds = project.agents.filter((a) => a.parentId === id).map((a) => a.id);
     for (const cid of [id, ...childIds]) {
+      await killPty(cid).catch(() => {});
       close(cid);
-      void removeAgentWorkspace(project.rootPath, project.id, cid).catch(() => {});
+      await removeAgentWorkspace(project.rootPath, project.id, cid).catch(() => {});
     }
     removeAgent(project.id, id);
     reselectAfterClose(id);
@@ -637,7 +653,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // other case (already merged, no real work, workers/think/shell) closes silently. See
   // engine/closeAgent.shouldPromptOnClose.
   const requestClose = (id: string) => {
-    if (!project) return teardownAgent(id);
+    if (!project) return void teardownAgent(id);
     const agent = project.agents.find((a) => a.id === id);
     if (!agent) return;
     // Read branch/workflow FRESH from the store rather than the render-scope maps: AgentRow is now
@@ -646,7 +662,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const rt = useRuntimeStore.getState();
     const stage = resolveStage(rt.branchStatus[id], rt.workflowStage[id]);
     if (shouldPromptOnClose(agent.kind, stage, rt.branchStatus[id])) setClosePromptId(id);
-    else teardownAgent(id);
+    else void teardownAgent(id);
   };
 
   // ── Close-agent Ship / Save / Discard (sparkle-o341) ───────────────────────────────────────────
@@ -672,7 +688,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     } catch (e) {
       console.warn("ship-on-close failed (agent kept):", e);
     }
-    teardownAgent(id);
+    await teardownAgent(id);
   };
 
   // Save for later: back the branch up to the remote (best-effort), keep the bead; teardownAgent
@@ -682,7 +698,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     setClosePromptId(null);
     if (!id || !project) return;
     await saveAgent(project.rootPath, id);
-    teardownAgent(id);
+    await teardownAgent(id);
   };
 
   // Discard: drop the agent + its workers from the store, delete their worktrees + branches and ALL
@@ -703,17 +719,14 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     reselectAfterClose(id);
   };
 
-  // "Close this worker?" nudge. When a worker's branch reaches Merged, its work is in main and the
-  // worker is redundant — pop a one-time modal recommending (not forcing) closing it. State:
-  //  - mergePromptId: which worker the modal is currently asking about (null = no modal).
-  //  - promptedIds: workers we've already asked about this session, so we never re-nag.
-  //  - seenStageRef: last-observed stage per worker. We prompt ONLY on a live non-merged→merged
-  //    EDGE, never merely because a worker "is merged": first sight (incl. a worker already Merged
-  //    at mount) seeds silently, and a later poll that re-confirms Merged is not an edge either.
-  //  - pendingRef: workers that crossed the edge but haven't been shown yet (e.g. a second worker
-  //    that merged while the first modal was still up) — drained one at a time as the modal frees.
-  const [mergePromptId, setMergePromptId] = useState<string | null>(null);
-  const [promptedIds, setPromptedIds] = useState<Set<string>>(() => new Set());
+  // NOTE: workers are deliberately NOT modal-prompted. A worker lives BELOW an orchestrator, which
+  // owns its full lifecycle (spawn → integrate → spin down) so the human never has to think about,
+  // or even know about, individual workers existing. The old "Close this worker?" nudge fired off a
+  // sticky parent-reached-main watermark and popped up (often wrongly, while the orchestrator was
+  // still pushing) over whatever pane was visible — exactly the intrusion this design avoids. Workers
+  // are closed by the orchestrator's spin-down, or manually via a row's × (→ teardownAgent →
+  // spinDownWorker). See CloseAgentPrompt below for the Build-agent Ship/Save/Discard choice, which
+  // is still shown — but only on an explicit user close of a top-level agent, never auto-popped.
   // Manual reorder drag state (spec: manual-agent-reorder-pin). The id of the top-level agent
   // currently being dragged by its grip; drop pins it at the target row via pinAgentAt.
   const pinAgentAt = useProjectStore((s) => s.pinAgentAt);
@@ -726,8 +739,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     if (dragId && project && dragId !== targetId) pinAgentAt(project.id, dragId, index);
     setDragId(null);
   };
-  const seenStageRef = useRef<Record<string, WorkflowStageId>>({});
-  const pendingRef = useRef<string[]>([]);
 
   // Whether the agent list overflows its viewport. Drives where the "+ New … Agent" button lives:
   // a short list gets it BELOW the last row; once the list is tall enough to scroll, it pins to the
@@ -881,60 +892,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       isAutoScrolling: () => autoTargetRef.current != null,
     };
   }, []);
-  useEffect(() => {
-    if (!project) return;
-    const seen = seenStageRef.current;
-    const present = new Set<string>();
-    for (const a of project.agents) {
-      if (a.kind !== "worker") continue;
-      present.add(a.id);
-      // Wait for this worker's first REAL polled datum before seeding. The live stores aren't
-      // persisted (see runtimeStore), so on a fresh launch they're empty at mount and
-      // resolveStage(undefined, undefined) would yield a non-merged DEFAULT. Seeding that and
-      // then receiving a first poll of "merged" would look like a live edge and nag about a
-      // worker that was already merged before launch. Skipping until real data arrives makes
-      // that first poll the SEED, not an edge.
-      const hasData = branchStatus[a.id] !== undefined || workflowStage[a.id] !== undefined;
-      if (!hasData) continue;
-      const stage = resolveStage(branchStatus[a.id], workflowStage[a.id]);
-      const prev = seen[a.id];
-      seen[a.id] = stage;
-      // Only a live edge INTO merged qualifies. `prev === undefined` is the worker's first real
-      // datum (seed only — this is what keeps an already-Merged worker quiet, whether it was
-      // merged at mount or by the first poll); `prev === "merged"` is a re-confirm, not an edge.
-      // Queue the id unless we've already shown or queued it.
-      const edge = prev !== undefined && prev !== "merged" && stage === "merged";
-      if (edge && !promptedIds.has(a.id) && !pendingRef.current.includes(a.id)) {
-        pendingRef.current.push(a.id);
-      }
-    }
-    // Forget closed workers in the stage map + queue so a recycled id can't carry a stale stage
-    // and a closed worker can't linger unshown. (promptedIds is intentionally NOT pruned: it's a
-    // small session-scoped set, worker ids are UUIDs and never reused, and retaining it guarantees
-    // a worker we've already asked about is never asked again.)
-    for (const id of Object.keys(seen)) if (!present.has(id)) delete seen[id];
-    pendingRef.current = pendingRef.current.filter((id) => present.has(id));
-    // Show the next queued worker when no modal is up. Marking it promptedIds here makes the ask
-    // one-time even if it stays Merged across later polls.
-    if (!mergePromptId && pendingRef.current.length > 0) {
-      const id = pendingRef.current.shift() as string;
-      setMergePromptId(id);
-      setPromptedIds((s) => new Set(s).add(id));
-    }
-  }, [project, branchStatus, workflowStage, promptedIds, mergePromptId]);
-  // Drop a pending prompt if its worker was closed out from under it (e.g. via the row's × button),
-  // so a stale id can't block the modal. (Queued-but-unshown ids are pruned in the effect above.)
-  useEffect(() => {
-    if (mergePromptId && project && !project.agents.some((a) => a.id === mergePromptId)) {
-      setMergePromptId(null);
-    }
-  }, [project, mergePromptId]);
-  const onMergePromptClose = () => {
-    const id = mergePromptId;
-    setMergePromptId(null);
-    if (id) teardownAgent(id); // a merged worker is safe to close outright
-  };
-  const onMergePromptKeep = () => setMergePromptId(null);
   // Keep the chevron coherent with what the main pane shows. The pane renders the SELECTED agent by
   // its kind (think → ThinkPanel, else terminal), so the active mode must match the selected agent's
   // kind — otherwise a cross-kind select (Ask-Sparkle from a build terminal, a notification/history
@@ -1283,11 +1240,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
 
       {/* Bottom-left: version + "Show logs". Pinned under the agent list. */}
       <StatusBar />
-
-      {/* "Close this worker?" nudge, shown when a worker's branch reaches Merged. */}
-      {mergePromptId && (
-        <CloseWorkerPrompt onClose={onMergePromptClose} onKeep={onMergePromptKeep} />
-      )}
 
       {/* Ship / Save / Discard, shown when closing a Build agent with unmerged work at risk. */}
       {closingAgent && (
