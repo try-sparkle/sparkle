@@ -12,6 +12,7 @@ import {
 } from "../services/beads";
 import { DECOMPOSE_FAILED_LABEL, DECOMPOSING_LABEL } from "../services/epicDecompose";
 import { parsePrdRef } from "../services/tasks";
+import { safeUnlisten } from "../services/safeUnlisten";
 import { useBeadsStore } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -123,7 +124,9 @@ export function BoardView({ project }: { project: Project }) {
       .catch(() => {});
     return () => {
       cancelled = true;
-      unlisten?.();
+      // Route teardown through safeUnlisten so the benign Tauri "listeners map already torn
+      // down" race (window close / rapid remount) can't surface as an unhandled rejection.
+      void safeUnlisten(unlisten);
     };
   }, [project.rootPath]);
 

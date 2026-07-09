@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { computeSuggestions, deriveContextTags } from "./engine";
+import { computeSuggestions, deriveContextTags, SuggestionOfflineError } from "./engine";
 import { useSuggestionStore } from "../../stores/suggestionStore";
 
 const base = { agentId: "a1", aiEnabled: true, entitled: true };
@@ -44,6 +44,21 @@ describe("computeSuggestions", () => {
     const unent = await computeSuggestions({ ...base, entitled: false, scrollback: "Done. Committed abc.", callHaiku });
     expect(off.buttons).toEqual([]);
     expect(unent.buttons).toEqual([]);
+    expect(callHaiku).not.toHaveBeenCalled();
+  });
+
+  it("throws SuggestionOfflineError and skips Haiku when offline (no doomed network call)", async () => {
+    const callHaiku = vi.fn();
+    await expect(
+      computeSuggestions({ ...base, online: false, scrollback: "Done. Committed abc.", callHaiku }),
+    ).rejects.toBeInstanceOf(SuggestionOfflineError);
+    expect(callHaiku).not.toHaveBeenCalled();
+  });
+
+  it("still returns local heuristics when offline (they need no network)", async () => {
+    const callHaiku = vi.fn();
+    const set = await computeSuggestions({ ...base, online: false, scrollback: "Continue? (y/n) ", callHaiku });
+    expect(set.buttons.map((b) => b.label)).toEqual(["Approve", "Deny"]);
     expect(callHaiku).not.toHaveBeenCalled();
   });
 

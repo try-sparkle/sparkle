@@ -311,7 +311,8 @@ pub fn sparkle_improve_run(
                 }
             };
             let Some(mut child) = child else { return };
-            let ok = matches!(child.wait(), Ok(status) if status.success());
+            let wait_result = child.wait();
+            let ok = matches!(wait_result, Ok(ref status) if status.success());
             let text = if !final_text.is_empty() { final_text } else { acc };
 
             if ok {
@@ -319,10 +320,18 @@ pub fn sparkle_improve_run(
                 let _ = read_app.emit("sparkle_improve:done", ImproveDone { session_id, text });
             } else {
                 let stderr_text = stderr_handle.join().unwrap_or_default();
+                // When the child dies with NO stderr, the bare "exited without a successful
+                // result" line left the recurring hourly-pass failures undiagnosable. Append the
+                // exit status (code, or on unix the terminating signal) so an ordinary error exit
+                // is distinguishable from an OOM/SIGKILL or a SIGTERM reap. It's just an integer —
+                // no user data.
                 let message = if !stderr_text.trim().is_empty() {
                     stderr_text.trim().to_string()
                 } else {
-                    "claude exited without a successful result".to_string()
+                    format!(
+                        "claude exited without a successful result ({})",
+                        describe_exit_status(&wait_result)
+                    )
                 };
                 tracing::warn!(%message, "sparkle_improve: pass failed");
                 let _ = read_app.emit("sparkle_improve:error", ImproveError { message });
@@ -346,6 +355,30 @@ pub fn sparkle_improve_cancel(manager: State<SparkleImproveManager>) -> Result<(
         kill_pass_group(&mut pass.child);
     }
     Ok(())
+}
+
+/// Render a failed child's exit status into a compact, PII-free phrase for the failure
+/// message. The hourly pass's `claude` child frequently dies with EMPTY stderr, which left the
+/// "pass failed" WARN with no clue why; the exit code — or, on unix, the terminating signal —
+/// distinguishes an ordinary error exit from an OOM/SIGKILL (137) or a SIGTERM (143) reap, which
+/// is exactly what triage of a recurring failure needs. It carries no user data, just an integer.
+fn describe_exit_status(status: &std::io::Result<std::process::ExitStatus>) -> String {
+    match status {
+        Ok(s) => {
+            if let Some(code) = s.code() {
+                return format!("exit code {code}");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = s.signal() {
+                    return format!("killed by signal {sig}");
+                }
+            }
+            "terminated abnormally".to_string()
+        }
+        Err(e) => format!("could not reap the process: {e}"),
+    }
 }
 
 #[cfg(test)]
@@ -440,5 +473,27 @@ mod tests {
         std::os::unix::fs::symlink("/", &escape).unwrap();
         let err = validate_run_inner(&base, "/bin/claude", escape.to_str().unwrap(), log);
         assert!(err.unwrap_err().contains("outside the managed worktrees"));
+    }
+
+    #[test]
+    fn describe_exit_status_reports_code_and_reap_error() {
+        use std::process::Command;
+        // An ordinary non-zero exit surfaces the code.
+        let s = Command::new("sh").args(["-c", "exit 3"]).status();
+        assert_eq!(describe_exit_status(&s), "exit code 3");
+        // A failed reap never panics and yields a non-empty phrase.
+        let err: std::io::Result<std::process::ExitStatus> =
+            Err(std::io::Error::other("boom"));
+        assert!(describe_exit_status(&err).contains("could not reap"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn describe_exit_status_reports_signal_when_killed() {
+        use std::process::Command;
+        // No exit code when killed by a signal — the signal number must be surfaced instead,
+        // so an OOM/SIGKILL is distinguishable from a clean error exit.
+        let s = Command::new("sh").args(["-c", "kill -9 $$"]).status();
+        assert_eq!(describe_exit_status(&s), "killed by signal 9");
     }
 }

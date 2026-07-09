@@ -7,7 +7,14 @@ import { renderHook, act } from "@testing-library/react";
 // commits that hash, and — without the settle-watcher — never looks at the terminal again. These
 // tests drive that exact sequence with a MUTABLE scrollback + fake timers.
 const computeSuggestions = vi.fn();
-vi.mock("./engine", () => ({ computeSuggestions: (...a: unknown[]) => computeSuggestions(...a) }));
+// The hook imports SuggestionOfflineError for its `instanceof` offline branch, so the mock must
+// re-export it even though these settle tests never exercise the offline path. vi.hoisted so the
+// class exists when the (hoisted) vi.mock factory runs.
+const { SuggestionOfflineError } = vi.hoisted(() => ({ SuggestionOfflineError: class extends Error {} }));
+vi.mock("./engine", () => ({
+  computeSuggestions: (...a: unknown[]) => computeSuggestions(...a),
+  SuggestionOfflineError,
+}));
 let scrollback = "";
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => scrollback }));
 vi.mock("../aiGate", () => ({ useAiFeature: () => true }));

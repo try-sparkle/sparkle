@@ -30,6 +30,7 @@ import {
   type PrereqRow,
 } from "../setupState";
 import { buildClaudeLoginExec, SHELL } from "../services/claudeSpawn";
+import { safeUnlisten } from "../services/safeUnlisten";
 import { Terminal } from "./Terminal";
 
 /** How often we re-probe git after triggering the (user-driven, slow) CLT installer. */
@@ -115,7 +116,9 @@ export function SetupChecklist({ onReady }: { onReady: () => void }) {
 
     return () => {
       alive = false;
-      void unlistenP.then((un) => un());
+      // safeUnlisten awaits the listen() promise so a listener that resolves AFTER this
+      // cleanup still gets torn down, and swallows the benign Tauri teardown race.
+      void safeUnlisten(unlistenP);
       if (gitPollRef.current) clearInterval(gitPollRef.current);
     };
   }, [detect]);

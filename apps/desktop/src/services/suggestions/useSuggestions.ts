@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { computeSuggestions } from "./engine";
+import { computeSuggestions, SuggestionOfflineError } from "./engine";
 import { getAgentScrollback } from "../terminalScrollback";
 import { useAiFeature } from "../aiGate";
 import { useRuntimeStore } from "../../stores/runtimeStore";
+import { useConnectionStore } from "../../stores/connectionStore";
 import { pushSuggestions } from "../relayClient";
 import { closeBuildAgentButton } from "./controlButtons";
 import { log } from "../../logger";
@@ -100,6 +101,10 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // "are learned (Haiku) actions live?" signal. Heuristic buttons show regardless (computeSuggestions
   // returns them before this gate), so passing it as aiEnabled keeps heuristics on when AI is off.
   const learnedOn = useAiFeature("suggestedActions");
+  // "Are we actually reachable?" (browser online AND the Rust reachability probe agree). When
+  // offline we skip the learned Haiku call, which could only DNS-fail; when it flips back true this
+  // is an effect dep, so the deferred compute for the still-blocked state re-runs on reconnect.
+  const isOnline = useConnectionStore((s) => s.isOnline);
   const status = useRuntimeStore((s) => s.status[agentId]);
   const isYourTurn = status !== undefined && YOUR_TURN.has(status);
   // Once the agent has shipped/landed, the only action is to close it — show the green control
@@ -156,7 +161,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
     // so a transient gateway blip can clear before the next attempt.
     let retryDelay = 0;
     log.debug("suggestions", "compute", { agentId, chars: scrollback.length, learnedOn });
-    void computeSuggestions({ agentId, scrollback, aiEnabled: learnedOn, entitled: true })
+    void computeSuggestions({ agentId, scrollback, aiEnabled: learnedOn, entitled: true, online: isOnline })
       .then((set) => {
         // Commit the hash ONLY when we actually apply the result. If the composer went non-empty
         // mid-compute (alive === false), drop the result, leave lastHash unchanged, and bump
@@ -185,6 +190,14 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         pushedNonEmpty.current = set.buttons.length > 0;
       })
       .catch((err: unknown) => {
+        // Offline is NOT a failure of THIS state — the same compute will succeed once we reconnect.
+        // Leave lastHash unadvanced (so it recomputes) but DON'T spend the retry budget, DON'T warn,
+        // and DON'T bump retryTick (which would spin every render while offline). The isOnline effect
+        // dep re-runs this compute when connectivity returns.
+        if (err instanceof SuggestionOfflineError) {
+          log.debug("suggestions", "compute deferred (offline)", { agentId });
+          return;
+        }
         // The compute rejected — leave lastHash unadvanced and re-trigger so this state can retry,
         // but only up to MAX_COMPUTE_ATTEMPTS for the SAME failing state, so a persistent rejection
         // can't spin into an unbounded loop of paid computes. A genuine state change resets this.
@@ -233,7 +246,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         retryTimer.current = null;
       }
     };
-  }, [agentId, isYourTurn, composerEmpty, learnedOn, retryTick, shipped, retire]);
+  }, [agentId, isYourTurn, composerEmpty, learnedOn, retryTick, shipped, retire, isOnline]);
 
   // Settle-watcher. The your-turn status flip (Claude's Stop hook) RACES the final terminal paint
   // into xterm, so the compute above frequently hashes a mid-paint — or, right after a pane mount,
@@ -250,6 +263,10 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
     let prevTickHash: string | null = null;
     const id = window.setInterval(() => {
       if (computing.current) return;
+      // Offline: the compute would only defer again — don't bump retryTick every tick. The isOnline
+      // effect dep re-runs the compute on reconnect. Read the store live so the running interval
+      // (its deps don't include isOnline) sees the current connectivity without restarting.
+      if (!useConnectionStore.getState().isOnline) return;
       // A null provider means the terminal is UNMOUNTED, not that the terminal is empty — don't
       // spend a compute on no content (or clobber good buttons with the empty result). Ticks
       // resume once the provider registers, which still covers the mount race.

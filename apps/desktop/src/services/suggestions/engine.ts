@@ -19,7 +19,21 @@ export interface ComputeOpts {
   scrollback: string;
   aiEnabled: boolean;
   entitled: boolean;
+  // Whether the network is reachable. When explicitly false we skip the (guaranteed-to-fail)
+  // learned Haiku call entirely and throw SuggestionOfflineError instead of DNS-erroring per attempt.
+  // Optional/undefined is treated as online, so callers that don't know stay on the normal path.
+  online?: boolean;
   callHaiku?: HaikuFn;
+}
+
+// Thrown when the learned (networked) tier is asked to run while the app knows it's offline. It's a
+// RETRYABLE condition — distinct from a real API failure — so the hook can defer to reconnect
+// instead of burning its bounded retry budget and logging a scary warning on a connectivity blip.
+export class SuggestionOfflineError extends Error {
+  constructor() {
+    super("suggestions: offline, learned compute deferred");
+    this.name = "SuggestionOfflineError";
+  }
 }
 
 export { deriveContextTags };
@@ -74,6 +88,10 @@ export async function computeSuggestions(opts: ComputeOpts): Promise<SuggestionS
 
   // Tier 2: learned actions — fail closed.
   if (!opts.aiEnabled || !opts.entitled) return { agentId, buttons: [] };
+
+  // Offline: the Haiku call can only DNS-fail. Skip it and signal a retryable-on-reconnect state
+  // rather than making (and logging) a doomed request. Heuristics above already returned if present.
+  if (opts.online === false) throw new SuggestionOfflineError();
 
   const tags = deriveContextTags(scrollback);
   const history = useSuggestionStore.getState().topByContext(tags, 8);
