@@ -15,8 +15,8 @@ import {
   PACKS,
   fetchAutoTopup,
   fetchHistory,
+  historyLabel,
   lastCheckoutUrl,
-  reasonLabel,
   saveAutoTopup,
   startCardSetup,
   startTopup,
@@ -453,12 +453,17 @@ function HistoryBlock() {
         const credit = e.deltaCents >= 0;
         // U+2212 minus (not a hyphen) so debits read as amounts, matching the design copy.
         const amount = `${credit ? "+" : "−"}$${(Math.abs(e.deltaCents) / 100).toFixed(2)}`;
+        const label = historyLabel(e);
         return (
           <div key={e.id} style={historyRow}>
             <span style={{ color: C.muted, width: 76, flex: "none" }}>
               {new Date(e.createdAt).toLocaleDateString()}
             </span>
-            <span style={{ color: C.cream, flex: 1, minWidth: 0 }}>{reasonLabel(e.reason)}</span>
+            {/* Clip to one line — a long AI `purpose` ("AI: …") must not wrap the row; full text on
+                hover. Keeps the date | label | amount three-column layout unchanged. */}
+            <span style={historyLabelCell} title={label}>
+              {label}
+            </span>
             <span style={{ color: credit ? C.teal : DANGER, fontVariantNumeric: "tabular-nums" }}>
               {amount}
             </span>
@@ -606,4 +611,15 @@ const historyRow: CSSProperties = {
   gap: 10,
   fontSize: 12,
   fontFamily: '"IBM Plex Sans", sans-serif',
+};
+
+// The middle (reason/description) column: takes the slack and clips to a single line so a long AI
+// `purpose` ellipsizes instead of wrapping the row.
+const historyLabelCell: CSSProperties = {
+  color: C.cream,
+  flex: 1,
+  minWidth: 0,
+  whiteSpace: "nowrap",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
 };

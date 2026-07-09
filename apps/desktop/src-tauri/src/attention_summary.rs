@@ -96,6 +96,7 @@ fn call_summarize(base: &str, token: &str, screen: &str) -> Result<String, Strin
         screen,
         SUMMARY_MAX_TOKENS,
         CLASSIFY_READ_TIMEOUT,
+        Some("Summarizing what an agent needs"), // metering description shown in the credit history
     )?;
     let text = extract_text(&json).ok_or_else(|| "summarize returned no text".to_string())?;
     let cleaned = clean_summary(&text);

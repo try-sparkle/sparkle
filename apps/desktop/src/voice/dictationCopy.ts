@@ -25,12 +25,14 @@ export function micHotPlaceholder(stopPhrase: string = STOP_PHRASE): string {
 export const MIC_HOT_PLACEHOLDER = micHotPlaceholder();
 
 // PASSIVE phase (capturing, but listening for the wake word — NOT yet dictating). Mirrors the
-// sidebar caption so the composer's status is honest: it is not in active dictation, it is
-// waiting for "Hey Sparkle". The "(or you can type here instead)" tail subsumes the typing hint,
+// sidebar caption so the composer's status is honest: it is not in active dictation, it is waiting
+// for "Hey Sparkle", which reads as "Mic paused. Say Hey Sparkle to activate." Here "paused" means
+// "not actively dictating yet", not "mic off" — the live wake phrase in the same line makes that
+// clear. The "(or you can type here instead)" tail subsumes the typing hint,
 // like the mic-hot copy does, so it stays put on focus.
 export const WAKE_PHRASE = DEFAULT_WAKE_WORD;
-export const WAKE_PREFIX = "Listening for the wake word. Just say ";
-export const WAKE_SUFFIX = " to talk to me (or you can type here instead).";
+export const WAKE_PREFIX = "Mic paused. Say ";
+export const WAKE_SUFFIX = " to activate (or you can type here instead).";
 /** Assemble the passive placeholder around the CONFIGURED wake word. Defaults to WAKE_PHRASE so
  *  `wakePlaceholder()` === the old WAKE_PLACEHOLDER constant (back-compat). */
 export function wakePlaceholder(wakeWord: string = WAKE_PHRASE): string {

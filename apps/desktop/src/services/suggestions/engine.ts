@@ -95,7 +95,7 @@ export async function computeSuggestions(opts: ComputeOpts): Promise<SuggestionS
 
   const tags = deriveContextTags(scrollback);
   const history = useSuggestionStore.getState().topByContext(tags, 8);
-  const call = opts.callHaiku ?? ((sys, user) => chatOnce(sys, user, 512));
+  const call = opts.callHaiku ?? ((sys, user) => chatOnce(sys, user, 512, "Suggesting next actions"));
 
   const user = [
     `Recent terminal output:\n${lastLines(scrollback, SCROLLBACK_LINES)}`,

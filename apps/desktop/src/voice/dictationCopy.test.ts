@@ -19,7 +19,7 @@ describe("dictationCopy — dynamic placeholders", () => {
     expect(p).toContain("Hey Jarvis");
     expect(p).not.toContain(WAKE_PHRASE); // the default phrase is gone
     // Same framing as the default, just a different phrase.
-    expect(p.startsWith("Listening for the wake word")).toBe(true);
+    expect(p.startsWith("Mic paused. Say")).toBe(true);
   });
 
   it("micHotPlaceholder embeds the given stop phrase", () => {

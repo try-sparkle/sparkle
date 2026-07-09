@@ -33,6 +33,7 @@
 import { useAuthStore } from "../stores/authStore";
 import { useSettingsStore, AI_FEATURE_FIELD, type AiFeatureKey } from "../stores/settingsStore";
 import type { Me } from "./entitlement";
+import { OutOfCreditsError } from "./credits";
 
 /** Paid-entitlement check (the one-time $99). Still used by the paywall (deriveAuthView) and the
  *  anonymous-trial send meter (trialMeter). NOT the per-feature AI gate — that is credit-based
@@ -50,6 +51,16 @@ export function hasAiCredits(me: Me | null): boolean {
 
 export function useHasAiCredits(): boolean {
   return useAuthStore((s) => hasAiCredits(s.me));
+}
+
+/** Hard client-side credit gate: throw {@link OutOfCreditsError} when the signed-in user has no
+ *  positive credit balance, so every AI call routed through this guard fails FAST locally (no server
+ *  round-trip) the moment credits hit zero. Reuses the same error the server's 402 maps to, so
+ *  callers surface the existing "Out of AI credits" upsell path either way. Carries the live balance
+ *  (0 for a null `me`) for the "you have $X" UI. */
+export function assertAiCredits(): void {
+  const me = useAuthStore.getState().me;
+  if (!hasAiCredits(me)) throw new OutOfCreditsError(me?.balanceCents ?? 0);
 }
 
 /** A feature is effectively on only when its setting is on AND the user has credits. */

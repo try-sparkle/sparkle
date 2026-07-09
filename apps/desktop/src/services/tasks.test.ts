@@ -284,7 +284,12 @@ describe("generateTasks (multi-epic EpicPlan)", () => {
     const { deps, structuredJson, createBeadFull, beadDepAdd } = makeMultiEpicDeps(twoEpicPlan);
     const res = await generateTasks(deps, args);
 
-    expect(structuredJson).toHaveBeenCalledWith(EPIC_PLAN_SYSTEM, args.prdContent);
+    expect(structuredJson).toHaveBeenCalledWith(
+      EPIC_PLAN_SYSTEM,
+      args.prdContent,
+      undefined,
+      "Planning tasks from your prompt",
+    );
 
     // Two epic beads, each with the SAME PRD back-link; children parented to their own epic.
     expect(createBeadFull).toHaveBeenNthCalledWith(
@@ -410,7 +415,12 @@ describe("decomposeEpic", () => {
 
     expect(readPrd).toHaveBeenCalledWith("/repo", "2026-07-01-foo.md");
     // The plan is prompted from the PRD markdown, not the epic body.
-    expect(structuredJson).toHaveBeenCalledWith(TASK_PLAN_SYSTEM, prdMarkdown);
+    expect(structuredJson).toHaveBeenCalledWith(
+      TASK_PLAN_SYSTEM,
+      prdMarkdown,
+      undefined,
+      expect.stringContaining("epic into tasks"),
+    );
     // NO epic bead is created — children only, parented to the existing epic id.
     expect(createBeadFull).toHaveBeenCalledTimes(2);
     expect(createBeadFull).toHaveBeenNthCalledWith(1, "/repo", "T0", "first", "task", "sparkle-ep", "", "");
@@ -470,7 +480,12 @@ describe("decomposeEpic", () => {
     const { deps, structuredJson, writePrd } = makeDecomposeDeps({ readPrd });
     await decomposeEpic(deps, { projectPath: "/repo", epic: epicWithPrd });
     // Planned from the first read…
-    expect(structuredJson).toHaveBeenCalledWith(TASK_PLAN_SYSTEM, planningCopy);
+    expect(structuredJson).toHaveBeenCalledWith(
+      TASK_PLAN_SYSTEM,
+      planningCopy,
+      undefined,
+      expect.stringContaining("epic into tasks"),
+    );
     // …but the write-back patches the FRESH copy.
     const [, , content] = writePrd.mock.calls[0]!;
     expect(content).toContain("# v2 (edited mid-plan)");

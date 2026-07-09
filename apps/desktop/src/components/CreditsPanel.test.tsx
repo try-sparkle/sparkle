@@ -377,6 +377,25 @@ describe("history block", () => {
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
   });
 
+  it("shows 'AI: <description>' when a debit row carries a metering purpose, and the static label when it doesn't", async () => {
+    fetchHistoryMock.mockResolvedValue({
+      entries: [
+        {
+          id: "1",
+          createdAt: "2026-06-30T10:00:00Z",
+          reason: "anthropic_debit",
+          deltaCents: -12,
+          description: "Renamed agent to 'Fix OAuth loop'",
+        },
+        // No description → falls back to the static reason label.
+        { id: "2", createdAt: "2026-06-29T10:00:00Z", reason: "anthropic_debit", deltaCents: -8, description: null },
+      ],
+    });
+    render(<CreditsPanel />);
+    expect(await screen.findByText("AI: Renamed agent to 'Fix OAuth loop'")).toBeTruthy();
+    expect(screen.getByText("AI (Claude)")).toBeTruthy();
+  });
+
   it("Load more appends the next page while nextCursor is present", async () => {
     fetchHistoryMock.mockResolvedValueOnce({
       entries: [

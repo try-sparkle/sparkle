@@ -1,14 +1,30 @@
+// @vitest-environment jsdom
 // apps/desktop/src/services/anthropic.test.ts
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
 
 import { chatOnce, structuredJson, extractJson } from "./anthropic";
 import { OutOfCreditsError } from "./credits";
+import { useAuthStore } from "../stores/authStore";
+
+/** chatOnce/structuredJson now enforce a hard local credit gate, so the network-path tests need a
+ *  funded, signed-in account or the gate throws before invoke is ever reached. */
+const fund = (balanceCents: number) =>
+  useAuthStore.setState({
+    me: { clerkUserId: "u", entitled: true, balanceCents, tokenVersion: 1 },
+    tokenPresent: true,
+    loading: false,
+  });
+
+beforeEach(() => {
+  fund(500);
+});
 
 afterEach(() => {
   invokeMock.mockReset();
+  useAuthStore.setState({ me: null, tokenPresent: false, loading: false });
 });
 
 describe("chatOnce", () => {
@@ -57,6 +73,48 @@ describe("chatOnce", () => {
     expect(err).toBeInstanceOf(OutOfCreditsError);
     expect((err as OutOfCreditsError).balanceCents).toBe(0);
   });
+
+  it("forwards an optional purpose into the invoke body (metering-only)", async () => {
+    invokeMock.mockResolvedValue("ok");
+    await chatOnce("sys", "usr", 256, "Renamed agent to 'Fix OAuth loop'");
+    expect(invokeMock).toHaveBeenCalledWith("anthropic_chat", {
+      system: "sys",
+      user: "usr",
+      maxTokens: 256,
+      purpose: "Renamed agent to 'Fix OAuth loop'",
+    });
+  });
+
+  it("omits purpose from the invoke body when none is passed (byte-identical legacy shape)", async () => {
+    invokeMock.mockResolvedValue("ok");
+    await chatOnce("sys", "usr", 256);
+    const [, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect("purpose" in args).toBe(false);
+  });
+});
+
+describe("hard credit gate (fail fast, no network)", () => {
+  it("chatOnce throws OutOfCreditsError with the live balance and never calls invoke at zero credits", async () => {
+    fund(0);
+    const err = await chatOnce("sys", "usr").catch((e) => e);
+    expect(err).toBeInstanceOf(OutOfCreditsError);
+    expect((err as OutOfCreditsError).balanceCents).toBe(0);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("chatOnce throws OutOfCreditsError when signed out (no me)", async () => {
+    useAuthStore.setState({ me: null, tokenPresent: false, loading: false });
+    const err = await chatOnce("sys", "usr").catch((e) => e);
+    expect(err).toBeInstanceOf(OutOfCreditsError);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("structuredJson throws OutOfCreditsError before building the prompt at zero credits", async () => {
+    fund(0);
+    const err = await structuredJson("sys", "usr").catch((e) => e);
+    expect(err).toBeInstanceOf(OutOfCreditsError);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("extractJson", () => {
@@ -90,6 +148,13 @@ describe("structuredJson", () => {
     expect(args.system).toContain("base prompt");
     expect(args.system).toContain("ONLY valid");
     expect(args.maxTokens).toBe(2048);
+  });
+
+  it("threads an optional purpose through to the invoke body", async () => {
+    invokeMock.mockResolvedValue('{"ok":true}');
+    await structuredJson("base", "usr", 2048, "Decomposed epic 'Billing'");
+    const [, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(args.purpose).toBe("Decomposed epic 'Billing'");
   });
 
   it("parses a clean JSON reply", async () => {

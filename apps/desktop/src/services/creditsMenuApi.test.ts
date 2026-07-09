@@ -13,6 +13,7 @@ import {
   PACKS,
   fetchAutoTopup,
   fetchHistory,
+  historyLabel,
   lastCheckoutUrl,
   reasonLabel,
   saveAutoTopup,
@@ -54,6 +55,51 @@ describe("reasonLabel", () => {
 
   it("passes unknown reasons through verbatim (forward-compatible)", () => {
     expect(reasonLabel("future_debit_kind")).toBe("future_debit_kind");
+  });
+});
+
+describe("historyLabel", () => {
+  it("renders '<tag>: <description>' when the row carries a description", () => {
+    expect(
+      historyLabel({ reason: "anthropic_debit", description: "Renamed agent to 'Fix OAuth loop'" }),
+    ).toBe("AI: Renamed agent to 'Fix OAuth loop'");
+  });
+
+  it("falls back to the static reason label when description is null/absent/blank", () => {
+    expect(historyLabel({ reason: "anthropic_debit", description: null })).toBe("AI (Claude)");
+    expect(historyLabel({ reason: "anthropic_debit" })).toBe("AI (Claude)");
+    expect(historyLabel({ reason: "anthropic_debit", description: "   " })).toBe("AI (Claude)");
+    expect(historyLabel({ reason: "credit_topup", description: null })).toBe("Top-up");
+  });
+
+  it("uses a compact tag per reason, falling back to the full reasonLabel for untagged reasons", () => {
+    expect(historyLabel({ reason: "chief_debit", description: "Interview synthesis" })).toBe(
+      "Chief: Interview synthesis",
+    );
+    expect(historyLabel({ reason: "deepgram_debit", description: "Transcribed a voice note" })).toBe(
+      "Dictation: Transcribed a voice note",
+    );
+    // An unknown/untagged reason with a description uses reasonLabel(reason) (verbatim) as the tag.
+    expect(historyLabel({ reason: "future_kind", description: "did a thing" })).toBe(
+      "future_kind: did a thing",
+    );
+  });
+
+  it("truncates a very long description with an ellipsis so the row stays one line", () => {
+    const long = "x".repeat(300);
+    const out = historyLabel({ reason: "anthropic_debit", description: long });
+    expect(out.startsWith("AI: ")).toBe(true);
+    expect(out.endsWith("…")).toBe(true);
+    // "AI: " (4) + 120 codepoints.
+    expect([...out].length).toBeLessThanOrEqual(4 + 120);
+  });
+
+  it("truncates by codepoints so a surrogate pair (emoji) is never split", () => {
+    const emoji = "😀".repeat(300); // each is a non-BMP surrogate pair
+    const out = historyLabel({ reason: "anthropic_debit", description: emoji });
+    // No lone surrogate / replacement char leaked into the output.
+    expect(out).not.toContain("�");
+    expect(/[\uD800-\uDFFF]/.test(out.replace(/😀/g, ""))).toBe(false);
   });
 });
 

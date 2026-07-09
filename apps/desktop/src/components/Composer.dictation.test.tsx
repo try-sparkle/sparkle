@@ -238,7 +238,7 @@ describe("Composer — placeholder reflects audio state", () => {
     act(() => useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" }));
     renderComposer();
     const body = document.body.textContent ?? "";
-    expect(body).toContain("Listening for the wake word.");
+    expect(body).toContain("Mic paused.");
     expect(body).toContain("Hey Sparkle");
     expect(body).toContain("or you can type here instead");
     // It must NOT read as active dictation.
@@ -327,6 +327,22 @@ describe("Composer — placeholder reflects audio state", () => {
     // …but neither placeholder co-renders on top of them.
     expect(body).not.toContain("I'm listening, so just start talking.");
     expect(body).not.toContain("Hey Sparkle");
+  });
+
+  it("shows the out-of-credits notice (with a Refill link) when the shared flag is set", () => {
+    // The notice is shared transient state, so the composer renders it in place of the mic
+    // placeholder exactly when the sidebar does — both surfaces stay in sync.
+    act(() => useDictationStore.setState({ enabled: false, status: "idle", outOfCreditsNotice: true }));
+    renderComposer();
+    const body = document.body.textContent ?? "";
+    expect(body).toContain("You are out of credits.");
+    expect(body).toContain("to activate voice.");
+    // The overlay is aria-hidden (a decorative placeholder stand-in), so query by text, not role.
+    // The accessible path to Refill lives in the sidebar notice (LogoWaveform), covered separately.
+    expect(screen.getByText("Refill")).toBeTruthy();
+    // It replaces the wake-word placeholder — the two must not co-render.
+    expect(body).not.toContain("Hey Sparkle");
+    act(() => useDictationStore.getState().clearOutOfCreditsNotice());
   });
 });
 

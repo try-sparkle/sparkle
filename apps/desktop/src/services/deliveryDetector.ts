@@ -276,6 +276,8 @@ async function enrichWithHaiku(
   const out = await structuredJson<{ note?: string; criteria?: StageCriterion[] }>(
     ENRICH_SYSTEM,
     user,
+    undefined,
+    "Checking delivery criteria",
   );
   const note = typeof out.note === "string" && out.note.trim() ? out.note.trim() : base.note;
   const criteria = overlayCriteriaText(base.criteria, out.criteria);

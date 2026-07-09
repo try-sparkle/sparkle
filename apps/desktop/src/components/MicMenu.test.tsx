@@ -11,9 +11,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MicMenu, micVisual } from "./MicButton";
 import { C, DANGER } from "../theme/colors";
 import { useDictationStore } from "../stores/dictationStore";
+import { useAuthStore } from "../stores/authStore";
 
 beforeEach(() => {
   useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
+  // Arming the mic now requires credits (see MicButton.shouldBlockMicArm). Seed a credited user so
+  // the explicit setActive/setMuted picks actually arm; the out-of-credits path is covered separately.
+  useAuthStore.setState({ me: { clerkUserId: "u1", entitled: true, balanceCents: 500, tokenVersion: 1 } });
 });
 afterEach(() => cleanup());
 
@@ -84,6 +88,27 @@ describe("MicMenu — clicking an option drives the store straight to that state
     render(<MicMenu onChoose={() => { chosen += 1; }} />);
     fireEvent.click(screen.getByRole("menuitemradio", { name: "Set microphone to off" }));
     expect(chosen).toBe(1);
+  });
+
+  it("LISTENING while OUT OF CREDITS is refused: mic stays off, notice shown", () => {
+    useAuthStore.setState({ me: null }); // no credits
+    useDictationStore.setState({ enabled: false, status: "idle", phase: "passive", outOfCreditsNotice: false });
+    render(<MicMenu />);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Set microphone to listening" }));
+    // The arm was refused — the mic never enabled — and the shared notice is now up.
+    expect(useDictationStore.getState().enabled).toBe(false);
+    expect(useDictationStore.getState().outOfCreditsNotice).toBe(true);
+    useDictationStore.getState().clearOutOfCreditsNotice(); // tidy the pending 5s timer
+  });
+
+  it("MUTED while OUT OF CREDITS is refused: mic stays off, notice shown", () => {
+    useAuthStore.setState({ me: { clerkUserId: "u", entitled: true, balanceCents: 0, tokenVersion: 1 } });
+    useDictationStore.setState({ enabled: false, status: "idle", phase: "active", outOfCreditsNotice: false });
+    render(<MicMenu />);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Set microphone to muted" }));
+    expect(useDictationStore.getState().enabled).toBe(false);
+    expect(useDictationStore.getState().outOfCreditsNotice).toBe(true);
+    useDictationStore.getState().clearOutOfCreditsNotice();
   });
 });
 

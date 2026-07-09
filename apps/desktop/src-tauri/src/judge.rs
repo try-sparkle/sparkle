@@ -102,6 +102,7 @@ fn call_judge(base: &str, token: &str, task: &str, response: &str) -> Result<Str
         &user,
         JUDGE_MAX_TOKENS,
         CLASSIFY_READ_TIMEOUT,
+        Some("Checking whether an agent needs you"), // metering description shown in the credit history
     )?;
     extract_text(&json).ok_or_else(|| "judge returned no text".to_string())
 }

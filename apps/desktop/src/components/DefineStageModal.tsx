@@ -357,7 +357,12 @@ export function DefineStageModal({ stageKey, projectName, projectRoot, onClose }
     setBusy(true);
     setError(undefined);
     try {
-      const parsed = await structuredJson<StageDefinition>(systemPrompt(stageKey), trimmed);
+      const parsed = await structuredJson<StageDefinition>(
+        systemPrompt(stageKey),
+        trimmed,
+        undefined,
+        `Defining the "${stageKey}" stage`,
+      );
       const normalized = normalizeParsed(parsed);
       const finalDef =
         stageKey === "delivered" ? await finalizeDelivered(normalized) : normalized;

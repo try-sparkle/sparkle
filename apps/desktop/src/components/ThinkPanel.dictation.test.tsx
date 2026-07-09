@@ -170,7 +170,7 @@ describe("ThinkPanel — dictation wiring", () => {
     act(() => useDictationStore.setState({ status: "listening", phase: "passive" }));
     render(<ThinkPanel project={project} agentId="a1" visible />);
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
-    expect(ta.placeholder).toContain("Listening for the wake word.");
+    expect(ta.placeholder).toContain("Mic paused.");
     expect(ta.placeholder).toContain("Hey Sparkle");
     expect(ta.placeholder).not.toContain("I'm listening, so just start talking.");
   });

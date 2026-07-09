@@ -18,7 +18,7 @@ export interface VoiceDef {
 }
 
 export interface GenerateVoicesDeps {
-  structuredJson: <T>(system: string, user: string, maxTokens?: number) => Promise<T>;
+  structuredJson: <T>(system: string, user: string, maxTokens?: number, purpose?: string) => Promise<T>;
   /** Register (idempotently) a persona skill in Chief; resolves to the skill name. */
   ensureVoice: (name: string, instructions: string) => Promise<string>;
 }
@@ -55,6 +55,8 @@ export async function generateVoices(
   const plan = await deps.structuredJson<{ voices: VoiceDef[] }>(
     VOICES_SYSTEM,
     `Project library summary:\n${args.corpusSummary}\n\nConversation so far:\n${args.conversation}`,
+    undefined,
+    "Generating expert voices",
   );
   const voices = (plan?.voices ?? [])
     // Drop malformed entries — a voice with no name or no instructions can't be @mentioned or run.

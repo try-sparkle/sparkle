@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { LogoWaveform } from "./LogoWaveform";
 import { useDictationStore } from "../stores/dictationStore";
+import { useAuthStore } from "../stores/authStore";
 import { C, DANGER } from "../theme/colors";
 
 // jsdom has no rAF by the time the effect runs in some setups; stub a no-op so the live
@@ -23,24 +24,29 @@ beforeEach(() => {
     status: "idle",
     error: null,
     modelProgress: null,
+    outOfCreditsNotice: false,
   });
+  // Arming the mic now requires credits (MicButton.shouldBlockMicArm) and the sidebar force-offs an
+  // armed mic when the balance is empty. Seed a credited user so the honest-listening cases behave
+  // as before; the out-of-credits behavior is exercised in its own describe block below.
+  useAuthStore.setState({ me: { clerkUserId: "u1", entitled: true, balanceCents: 500, tokenVersion: 1 } });
 });
 afterEach(() => cleanup());
 
 describe("LogoWaveform — honest listening", () => {
   // The waveform strip button shares the "Activate Sparkle voice" aria-label, and the live
-  // caption now splits across TWO lines / many nodes ("Listening for the wake word" +
-  // "Just say" / <span>Hey Sparkle</span> / "to talk to me"). Match the BUTTON whose text carries
+  // caption now splits across TWO lines / many nodes ("Mic paused." +
+  // "Say" / <span>Hey Sparkle</span> / "to activate"). Match the BUTTON whose text carries
   // both the status line and the wake phrase — a stable signal that can't be fooled by the bare
   // word "Sparkle" turning up elsewhere (an aria-label or title).
   const wakeHintButton = () =>
     screen.queryByText((_content, el) => {
       if (el?.tagName !== "BUTTON") return false;
       const t = el.textContent?.replace(/\s+/g, " ").trim() ?? "";
-      return /Listening for the wake word/.test(t) && /Hey Sparkle/.test(t);
+      return /Mic paused\./.test(t) && /Hey Sparkle/.test(t);
     });
 
-  it("armed + actually listening → shows the live wake hint, not 'Mic paused'", () => {
+  it("armed + actually listening → shows the live wake hint, not 'Listening paused'", () => {
     useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
     render(<LogoWaveform />);
     expect(wakeHintButton()).not.toBeNull();
@@ -148,5 +154,48 @@ describe("LogoWaveform — honest listening", () => {
     expect(screen.queryByText(/Listening paused/)).toBeNull();
     expect(wakeHintButton()).toBeNull();
     expect(screen.getByRole("button", { name: "Turn on microphone" })).toBeTruthy();
+  });
+});
+
+describe("LogoWaveform — out of credits", () => {
+  it("clicking the OFF mic while out of credits does NOT arm it — shows the credits notice", () => {
+    useAuthStore.setState({ me: null }); // no credits
+    useDictationStore.setState({ enabled: false, status: "idle", outOfCreditsNotice: false });
+    render(<LogoWaveform />);
+    fireEvent.click(screen.getByRole("button", { name: "Turn on microphone" }));
+    // Refused: the mic never armed, and the shared notice is up in the sidebar.
+    expect(useDictationStore.getState().enabled).toBe(false);
+    expect(useDictationStore.getState().outOfCreditsNotice).toBe(true);
+    expect(screen.getByText("You are out of credits.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Refill" })).toBeTruthy();
+    useDictationStore.getState().clearOutOfCreditsNotice(); // tidy the pending 5s timer
+  });
+
+  it("renders the two-line notice whenever the shared flag is set (both surfaces stay in sync)", () => {
+    useAuthStore.setState({ me: null }); // still out of credits, so the notice isn't auto-cleared
+    useDictationStore.setState({ enabled: false, status: "idle", outOfCreditsNotice: true });
+    render(<LogoWaveform />);
+    expect(screen.getByText("You are out of credits.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Refill" })).toBeTruthy();
+    // The normal paused/wake caption must not co-render.
+    expect(screen.queryByText(/Mic paused/)).toBeNull();
+    useDictationStore.getState().clearOutOfCreditsNotice();
+  });
+
+  it("safety: an armed mic is forced off when the balance is empty", () => {
+    // Credits ran out mid-session while the mic was on. The sidebar effect releases it so voice
+    // detection can't keep running without credits.
+    useAuthStore.setState({ me: null });
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
+    render(<LogoWaveform />);
+    expect(useDictationStore.getState().enabled).toBe(false);
+  });
+
+  it("a lingering notice is dropped once credits arrive (never sits next to a usable mic)", () => {
+    // beforeEach seeds a credited user, so the effect should clear the notice on mount.
+    useDictationStore.setState({ enabled: false, status: "idle", outOfCreditsNotice: true });
+    render(<LogoWaveform />);
+    expect(useDictationStore.getState().outOfCreditsNotice).toBe(false);
+    expect(screen.queryByText("You are out of credits.")).toBeNull();
   });
 });

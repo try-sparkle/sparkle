@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { aiEnhancementsEnabled, hasAiCredits, aiFeatureNow } from "./aiGate";
+import { aiEnhancementsEnabled, hasAiCredits, aiFeatureNow, assertAiCredits } from "./aiGate";
+import { OutOfCreditsError } from "./credits";
 import { useAuthStore } from "../stores/authStore";
 import { useSettingsStore } from "../stores/settingsStore";
 
@@ -41,6 +42,32 @@ describe("hasAiCredits — the AI-feature unlock signal", () => {
   });
   it("true with a positive balance — even if not entitled", () => {
     expect(hasAiCredits({ clerkUserId: "u", entitled: false, balanceCents: 1, tokenVersion: 1 })).toBe(true);
+  });
+});
+
+describe("assertAiCredits — the hard local gate", () => {
+  it("throws OutOfCreditsError carrying the live balance at zero credits", () => {
+    account({ balanceCents: 0, entitled: true });
+    expect(() => assertAiCredits()).toThrow(OutOfCreditsError);
+    const err = (() => {
+      try {
+        assertAiCredits();
+      } catch (e) {
+        return e as OutOfCreditsError;
+      }
+    })();
+    expect(err).toBeInstanceOf(OutOfCreditsError);
+    expect(err?.balanceCents).toBe(0);
+  });
+
+  it("throws when signed out (no me)", () => {
+    useAuthStore.setState({ me: null, tokenPresent: false, loading: false });
+    expect(() => assertAiCredits()).toThrow(OutOfCreditsError);
+  });
+
+  it("does NOT throw when the user has a positive balance", () => {
+    account({ balanceCents: 500 });
+    expect(() => assertAiCredits()).not.toThrow();
   });
 });
 

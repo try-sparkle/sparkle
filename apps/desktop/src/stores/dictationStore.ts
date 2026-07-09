@@ -6,6 +6,17 @@ import type { Phase } from "../voice/wakeMachine";
  *  sync service can rehydrate on the browser `storage` event. */
 export const DICTATION_PERSIST_KEY = "sparkle-dictation";
 
+/** How long the "out of credits" mic notice stays up before we auto-deactivate the mic and clear
+ *  it. Voice spends credits, so an arm attempt while the balance is empty is refused: we flash this
+ *  notice, then after this delay force the mic off (belt-and-braces: it was never armed) and drop
+ *  the notice. Exported so tests can advance fake timers by exactly this amount. */
+export const OUT_OF_CREDITS_NOTICE_MS = 5000;
+
+// Single pending auto-clear timer for the out-of-credits notice. Module-level (not stored in the
+// zustand state) so a fresh attempt can cancel-and-restart the 5s countdown without threading a
+// timer id through the store — see showOutOfCreditsNotice/clearOutOfCreditsNotice.
+let outOfCreditsTimer: ReturnType<typeof setTimeout> | null = null;
+
 type Status = "idle" | "listening" | "error";
 
 interface ModelProgress {
@@ -38,6 +49,11 @@ interface DictationState {
   enabled: boolean;
   /** passive = hearing but not typing; active = routing speech to the box. */
   phase: Phase;
+  /** Transient: the "You are out of credits. Refill to activate voice." notice is showing. Set
+   *  when the user tries to ARM the mic while out of credits (the arm is refused instead). Both mic
+   *  surfaces (composer + top-left bar) subscribe to it, so the message shows in both at once. Runtime
+   *  only — never persisted (partialize keeps just `enabled`), so it can't survive a relaunch. */
+  outOfCreditsNotice: boolean;
   /** The active composer's append fn, or null. Set via registerInsert. */
   insertTarget: ((text: string) => void) | null;
 
@@ -55,6 +71,12 @@ interface DictationState {
   setEnabled: (v: boolean) => void;
   setPhase: (p: Phase) => void;
   togglePhase: () => void;
+  /** Refuse-to-arm feedback: show the out-of-credits notice and start (or restart) the 5s
+   *  auto-deactivate countdown. Does NOT arm the mic — the caller skips setEnabled(true) entirely.
+   *  When the timer fires it forces `enabled: false` (safety) and clears the notice. */
+  showOutOfCreditsNotice: () => void;
+  /** Clear the notice immediately and cancel any pending auto-deactivate timer. */
+  clearOutOfCreditsNotice: () => void;
   registerInsert: (fn: ((text: string) => void) | null) => void;
   insert: (text: string) => void;
 }
@@ -71,6 +93,7 @@ export const useDictationStore = create<DictationState>()(
 
       enabled: false, // opt-in: no mic-permission prompt / model load on a fresh cold start
       phase: "passive",
+      outOfCreditsNotice: false,
       insertTarget: null,
 
       setStatus: (status) => set({ status }),
@@ -87,6 +110,23 @@ export const useDictationStore = create<DictationState>()(
       setEnabled: (enabled) => set({ enabled }),
       setPhase: (phase) => set({ phase }),
       togglePhase: () => set((s) => ({ phase: s.phase === "passive" ? "active" : "passive" })),
+      showOutOfCreditsNotice: () => {
+        set({ outOfCreditsNotice: true });
+        // Cancel any in-flight countdown so each new attempt gets a fresh 5s of notice.
+        if (outOfCreditsTimer) clearTimeout(outOfCreditsTimer);
+        outOfCreditsTimer = setTimeout(() => {
+          outOfCreditsTimer = null;
+          // Force the mic off (belt-and-braces: an arm attempt never armed it) and drop the notice.
+          set({ enabled: false, outOfCreditsNotice: false });
+        }, OUT_OF_CREDITS_NOTICE_MS);
+      },
+      clearOutOfCreditsNotice: () => {
+        if (outOfCreditsTimer) {
+          clearTimeout(outOfCreditsTimer);
+          outOfCreditsTimer = null;
+        }
+        set({ outOfCreditsNotice: false });
+      },
       registerInsert: (insertTarget) => set({ insertTarget }),
       insert: (text) => {
         const fn = get().insertTarget;

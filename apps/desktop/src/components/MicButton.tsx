@@ -2,6 +2,18 @@ import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { TbMicrophone, TbMicrophoneOff } from "react-icons/tb";
 import { C, DANGER } from "../theme/colors";
 import { useDictationStore } from "../stores/dictationStore";
+import { useAuthStore } from "../stores/authStore";
+import { hasAiCredits } from "../services/aiGate";
+import type { Me } from "../services/entitlement";
+import type { Phase } from "../voice/wakeMachine";
+
+/** Should an attempt to ARM the mic be refused because the user is out of credits? Voice spends
+ *  credits, so arming (turning the mic on / setting a listening intent) with an empty balance is
+ *  blocked and the out-of-credits notice is shown instead. Pure so the decision is unit-testable;
+ *  the caller pairs it with dictationStore.showOutOfCreditsNotice for the effect. */
+export function shouldBlockMicArm(me: Me | null): boolean {
+  return !hasAiCredits(me);
+}
 
 // Shared microphone control. The top waveform ring (LogoWaveform) and the composer-left mic must
 // behave IDENTICALLY, so the whole behavior — state derivation, click cycle, icon/color mapping —
@@ -21,6 +33,23 @@ import { useDictationStore } from "../stores/dictationStore";
 
 export type MicState = "off" | "paused" | "active";
 
+/** THE single source of truth for the mic's tri-state, derived purely from the three dictation-store
+ *  fields. Every mic surface — the top ring (LogoWaveform), the composer-left mic (ComposerMic), and
+ *  any status text — MUST route through this so they can never disagree about what state the mic is
+ *  in. Keeping the derivation in one pure, tested function (rather than re-inlining `!enabled ? …`
+ *  at each call site) is the guardrail that keeps the two controls in lockstep.
+ *
+ *  liveActive (capture genuinely live AND active phase) is the only "active" — phase alone isn't
+ *  enough, since we can sit in the active phase while focus-paused (status idle). */
+export function deriveMicState(
+  enabled: boolean,
+  status: "idle" | "listening" | "error",
+  phase: Phase,
+): MicState {
+  const liveActive = status === "listening" && phase === "active";
+  return !enabled ? "off" : liveActive ? "active" : "paused";
+}
+
 /** The icon shape the glyph should draw. `open` = live mic, `slash` = muted mic, `pause` = the
  *  orange "mic + two pause bars" affordance. */
 export type MicVariant = "open" | "slash" | "pause";
@@ -38,16 +67,26 @@ export function useMicToggle(): {
   const phase = useDictationStore((s) => s.phase);
   const setEnabled = useDictationStore((s) => s.setEnabled);
   const setPhase = useDictationStore((s) => s.setPhase);
+  const showOutOfCreditsNotice = useDictationStore((s) => s.showOutOfCreditsNotice);
+  const clearOutOfCreditsNotice = useDictationStore((s) => s.clearOutOfCreditsNotice);
 
-  // liveActive mirrors LogoWaveform: capture is genuinely live AND we're in the active phase.
-  // phase alone isn't enough — we can be in the active phase while focus-paused (status idle).
-  const liveActive = status === "listening" && phase === "active";
-  const state: MicState = !enabled ? "off" : liveActive ? "active" : "paused";
+  // Single source of truth (deriveMicState) so this control and every other mic surface agree.
+  const state: MicState = deriveMicState(enabled, status, phase);
 
   const onClick = () => {
-    if (state === "off")
+    if (state === "off") {
+      // Arming the mic spends credits — refuse it while out of credits, showing the notice instead
+      // of enabling. Read the balance at click time (no reactive subscription needed here).
+      if (shouldBlockMicArm(useAuthStore.getState().me)) {
+        showOutOfCreditsNotice();
+        return;
+      }
+      // A successful arm cancels any pending refuse-timer + clears a stale notice, so a
+      // refill-then-rearm within the 5s window can't be force-disarmed (and the notice can't
+      // linger next to an armed mic).
+      clearOutOfCreditsNotice();
       setEnabled(true); // off → paused (arm the mic; it resumes wake-word listening)
-    else if (state === "active")
+    } else if (state === "active")
       setPhase("passive"); // active → paused (stop dictating, stay listening — never turn off)
     else setEnabled(false); // paused → off
   };
@@ -80,23 +119,38 @@ export function useMicActions(): {
   const phase = useDictationStore((s) => s.phase);
   const setEnabled = useDictationStore((s) => s.setEnabled);
   const setPhase = useDictationStore((s) => s.setPhase);
+  const showOutOfCreditsNotice = useDictationStore((s) => s.showOutOfCreditsNotice);
+  const clearOutOfCreditsNotice = useDictationStore((s) => s.clearOutOfCreditsNotice);
 
   const intent: MicState = !enabled ? "off" : phase === "active" ? "active" : "paused";
 
   return {
     intent,
     // Arm the mic AND route speech to the box (green "listening"). If focus-paused, phase-active
-    // takes effect once capture resumes — same contract as togglePhase-while-paused.
+    // takes effect once capture resumes — same contract as togglePhase-while-paused. Refused (notice
+    // instead) while out of credits, since arming spends credits.
     setActive: () => {
+      if (shouldBlockMicArm(useAuthStore.getState().me)) {
+        showOutOfCreditsNotice();
+        return;
+      }
+      // Cancel any pending refuse-timer + clear a stale notice on a successful arm (see useMicToggle).
+      clearOutOfCreditsNotice();
       setEnabled(true);
       setPhase("active");
     },
-    // Arm but don't dictate (orange "muted" — on, waiting for the wake word).
+    // Arm but don't dictate (orange "muted" — on, waiting for the wake word). Same out-of-credits
+    // refusal as setActive.
     setMuted: () => {
+      if (shouldBlockMicArm(useAuthStore.getState().me)) {
+        showOutOfCreditsNotice();
+        return;
+      }
+      clearOutOfCreditsNotice();
       setEnabled(true);
       setPhase("passive");
     },
-    // Release the mic entirely (red "off").
+    // Release the mic entirely (red "off"). Always allowed — turning OFF never spends credits.
     setOff: () => setEnabled(false),
   };
 }

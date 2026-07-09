@@ -8,6 +8,8 @@ import { useDictationStore } from "../stores/dictationStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { WAKE_PHRASE, STOP_PHRASE } from "../voice/dictationCopy";
 import { useMicToggle, micVisual, MicGlyph, MicMenu, useHoverMenu } from "./MicButton";
+import { useHasAiCredits } from "../services/aiGate";
+import { SidebarOutOfCreditsNotice } from "./OutOfCreditsNotice";
 
 // Many thin slivers (was 28 fat bars) so the meter reads as a dense, lively waveform
 // rather than a row of chunky blocks. The rAF loop stays cheap even at this count —
@@ -68,12 +70,17 @@ export function nextBars(
 }
 
 /**
- * The hint caption under the waveform.
+ * The hint caption under the waveform. Two DISTINCT "paused-like" states are worded on purpose so
+ * they never collapse into one another:
  *  - Muted (mic released) → null.
- *  - Armed AND actually capturing → the passive/active wake hints.
- *  - Armed but NOT capturing (focus-paused) → an honest "Listening paused…" that tells
- *    the user it auto-resumes on re-focus — we must not claim "Just say Hey Sparkle…"
- *    when the backend isn't hearing anything.
+ *  - Armed AND actually capturing, PASSIVE phase (hearing, waiting for the wake word) → the product
+ *    copy "Mic paused. Say <wake> to activate". "Paused" here means "not actively dictating yet",
+ *    NOT "mic off" — the wake phrase in the same line makes clear the mic is live and listening.
+ *  - Armed AND actually capturing, ACTIVE phase → the "Actively listening… <stop> to finish" hint.
+ *  - Armed but NOT capturing (focus-paused) → the honest "Listening paused: will auto-resume…" —
+ *    deliberately different wording ("Listening paused" vs "Mic paused") so a focus-paused mic is
+ *    never confused with the live wake-word state, and we never claim "Say Hey Sparkle…" when the
+ *    backend isn't actually hearing anything.
  */
 export function captionFor(
   phase: Phase,
@@ -86,7 +93,7 @@ export function captionFor(
   if (!listening)
     return "Listening paused: Will auto-resume when you re-focus on this project.";
   return phase === "passive"
-    ? `Listening for the wake word: Just say ${wakeWord} to talk to me`
+    ? `Mic paused. Say ${wakeWord} to activate`
     : `Actively listening: Just say ${stopWord} to finish`;
 }
 
@@ -108,6 +115,22 @@ export function LogoWaveform() {
   // mic (MicButton), so the two controls behave identically. The ring only adds its own container
   // chrome (disc, glow, orb, waveform) around the shared glyph.
   const mic = useMicToggle();
+  // The out-of-credits notice is shared transient state, so it shows here AND in the composer at
+  // once. When set, it takes priority over the normal mic caption below.
+  const outOfCreditsNotice = useDictationStore((s) => s.outOfCreditsNotice);
+  const setEnabled = useDictationStore((s) => s.setEnabled);
+  const clearOutOfCreditsNotice = useDictationStore((s) => s.clearOutOfCreditsNotice);
+  const hasCredits = useHasAiCredits();
+
+  // Safety net: if the mic is somehow armed while the balance is empty (e.g. credits ran out mid
+  // session), force it off so voice detection can't keep running without credits. The primary
+  // block is at the arm attempt (MicButton), which never enables the mic in the first place.
+  // Conversely, once credits arrive, drop any lingering refuse-notice so it can't sit next to a
+  // now-usable mic waiting out its 5s timer.
+  useEffect(() => {
+    if (!hasCredits && enabled) setEnabled(false);
+    else if (hasCredits && outOfCreditsNotice) clearOutOfCreditsNotice();
+  }, [hasCredits, enabled, outOfCreditsNotice, setEnabled, clearOutOfCreditsNotice]);
 
   // `enabled` is the user's intent (armed). `listening` is whether capture is
   // ACTUALLY live — the backend only records while a Sparkle window is focused, so
@@ -401,7 +424,11 @@ export function LogoWaveform() {
         )}
       </div>
 
-      {error ? (
+      {outOfCreditsNotice ? (
+        // Out of credits: an arm attempt was refused. Show the two-line notice in place of the
+        // normal caption (auto-clears after 5s via dictationStore).
+        <SidebarOutOfCreditsNotice />
+      ) : error ? (
         <div style={{ marginTop: 4, color: C.muted, fontSize: 10, textAlign: "center" }}>
           Mic unavailable — check System Settings → Privacy → Microphone.
         </div>
@@ -438,11 +465,11 @@ export function LogoWaveform() {
         >
           {/* Line 1 — current status. Same slot/styling in both phases. */}
           <span style={{ display: "block", fontWeight: 600 }}>
-            {phase === "passive" ? "Listening for the wake word" : "Actively listening"}
+            {phase === "passive" ? "Mic paused." : "Actively listening"}
           </span>
           {/* Line 2 — the spoken command, with the key phrase in the waveform gradient. */}
           <span style={{ display: "block" }}>
-            Just say{" "}
+            {phase === "passive" ? "Say" : "Just say"}{" "}
             <span
               style={{
                 fontWeight: 600,
@@ -453,7 +480,7 @@ export function LogoWaveform() {
             >
               {phase === "passive" ? wakeWord : stopWord}
             </span>{" "}
-            {phase === "passive" ? "to talk to me" : "to finish"}
+            {phase === "passive" ? "to activate" : "to finish"}
           </span>
         </button>
       ) : caption ? (

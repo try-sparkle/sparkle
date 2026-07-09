@@ -67,6 +67,10 @@ pub async fn anthropic_chat(
     system: String,
     user: String,
     max_tokens: u32,
+    // Optional, metering-only human description of WHY this call was made (e.g. "Renamed agent to
+    // 'Fix OAuth loop'"). Forwarded in the proxy body so the server persists it into the credit
+    // ledger (`meta.description`); it is NEVER sent to the vendor. Back-compat: a missing key → None.
+    purpose: Option<String>,
 ) -> Result<String, String> {
     let user = user.trim().to_string();
     if user.is_empty() {
@@ -90,6 +94,7 @@ pub async fn anthropic_chat(
             &user,
             max_tokens,
             CHAT_READ_TIMEOUT,
+            purpose.as_deref(),
         )?;
         extract_text(&json).ok_or_else(|| "anthropic chat returned no text".to_string())
     })
@@ -97,14 +102,22 @@ pub async fn anthropic_chat(
     .map_err(|e| format!("join error: {e}"))?
 }
 
+/// Cap on the metering `purpose` string forwarded to the server (wire contract: <= 200 chars).
+/// Defence in depth — the server validates this too, but a hostile renderer must not be able to
+/// bloat the ledger `meta.description` from the desktop side.
+const MAX_PURPOSE_CHARS: usize = 200;
+
 /// Build the JSON body POSTed to the orchestration `/ai/anthropic` route. Pure so the shape is
 /// pinned by unit tests without a network call. Matches the server's `anthropicBody` zod schema:
-/// `{ model, max_tokens, messages:[{role,content}], system? }`. `system` is omitted when empty.
+/// `{ model, max_tokens, messages:[{role,content}], system?, purpose? }`. `system` is omitted when
+/// empty; `purpose` (an optional metering-only description persisted into the credit ledger, NEVER
+/// sent to the vendor) is omitted when None/blank and truncated to `MAX_PURPOSE_CHARS`.
 pub(crate) fn build_proxy_body(
     model: &str,
     system: &str,
     user: &str,
     max_tokens: u32,
+    purpose: Option<&str>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -113,6 +126,13 @@ pub(crate) fn build_proxy_body(
     });
     if !system.trim().is_empty() {
         body["system"] = serde_json::Value::String(system.to_string());
+    }
+    if let Some(p) = purpose {
+        let p = p.trim();
+        if !p.is_empty() {
+            let clipped: String = p.chars().take(MAX_PURPOSE_CHARS).collect();
+            body["purpose"] = serde_json::Value::String(clipped);
+        }
     }
     body
 }
@@ -150,8 +170,11 @@ pub(crate) fn call_anthropic_proxy(
     user: &str,
     max_tokens: u32,
     read_timeout: Duration,
+    // Optional metering-only description; forwarded in the body (persisted to the ledger), never to
+    // the vendor. Classify callers (naming/judge/attention) pass None; the chat sink threads it.
+    purpose: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    let body = build_proxy_body(model, system, user, max_tokens);
+    let body = build_proxy_body(model, system, user, max_tokens, purpose);
     let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {e}"))?;
     let url = format!("{}/ai/anthropic", base_url.trim_end_matches('/'));
 
@@ -247,16 +270,43 @@ mod tests {
 
     #[test]
     fn build_proxy_body_shapes_the_request_and_omits_empty_system() {
-        let b = build_proxy_body("claude-haiku-4-5", "you are terse", "hi", 256);
+        let b = build_proxy_body("claude-haiku-4-5", "you are terse", "hi", 256, None);
         assert_eq!(b["model"], "claude-haiku-4-5");
         assert_eq!(b["max_tokens"], 256);
         assert_eq!(b["system"], "you are terse");
         assert_eq!(b["messages"][0]["role"], "user");
         assert_eq!(b["messages"][0]["content"], "hi");
+        // No purpose passed → the key is omitted entirely.
+        assert!(b.get("purpose").is_none());
 
         // An empty/whitespace system is omitted entirely (not sent as "").
-        let b2 = build_proxy_body("claude-haiku-4-5", "   ", "hi", 8);
+        let b2 = build_proxy_body("claude-haiku-4-5", "   ", "hi", 8, None);
         assert!(b2.get("system").is_none());
+    }
+
+    #[test]
+    fn build_proxy_body_forwards_and_bounds_purpose() {
+        // A real purpose is forwarded verbatim under the `purpose` key (metering-only).
+        let b = build_proxy_body(
+            "claude-sonnet-4-6",
+            "sys",
+            "hi",
+            256,
+            Some("Renamed agent to 'Fix OAuth loop'"),
+        );
+        assert_eq!(b["purpose"], "Renamed agent to 'Fix OAuth loop'");
+
+        // A blank/whitespace purpose is omitted (same treatment as an empty system).
+        let blank = build_proxy_body("m", "sys", "hi", 8, Some("   "));
+        assert!(blank.get("purpose").is_none());
+
+        // An over-long purpose is clipped to MAX_PURPOSE_CHARS (defence in depth vs the server cap).
+        let long = "x".repeat(500);
+        let clipped = build_proxy_body("m", "sys", "hi", 8, Some(&long));
+        assert_eq!(
+            clipped["purpose"].as_str().map(|s| s.chars().count()),
+            Some(MAX_PURPOSE_CHARS)
+        );
     }
 
     #[test]
@@ -335,6 +385,7 @@ mod tests {
             "hello",
             256,
             Duration::from_secs(5),
+            Some("Renamed agent to 'Fix OAuth loop'"),
         )
         .expect("proxy call should succeed");
         let req = handle.join().expect("server thread");
@@ -342,6 +393,11 @@ mod tests {
         // We hit the right route, with the user's bearer, as a POST.
         assert!(req.starts_with("POST /ai/anthropic "), "unexpected request line: {req:?}");
         assert!(req.contains("Authorization: Bearer tok-abc"), "missing bearer: {req:?}");
+        // The metering purpose reaches the request BODY (server persists it into the ledger).
+        assert!(
+            req.contains("Renamed agent to 'Fix OAuth loop'"),
+            "purpose missing from request body: {req:?}"
+        );
         // The response passes through (text + the injected balance).
         assert_eq!(extract_text(&json), Some("named it".to_string()));
         assert_eq!(json.get("balanceCents").and_then(serde_json::Value::as_i64), Some(4200));
@@ -353,7 +409,7 @@ mod tests {
             "402 Payment Required",
             r#"{"error":"insufficient_credits","balanceCents":15}"#,
         );
-        let err = call_anthropic_proxy(&base, "tok", "claude-haiku-4-5", "", "hi", 8, Duration::from_secs(5))
+        let err = call_anthropic_proxy(&base, "tok", "claude-haiku-4-5", "", "hi", 8, Duration::from_secs(5), None)
             .expect_err("402 must be an Err");
         let _ = handle.join();
         assert_eq!(err, "insufficient_credits:15");

@@ -31,6 +31,10 @@ export interface LedgerEntry {
   createdAt: string;
   reason: string;
   deltaCents: number;
+  /** Optional human description surfaced from the ledger row's `meta.description` (the metering-only
+   *  `purpose` threaded through the AI proxy — e.g. "Renamed agent to 'Fix OAuth loop'"). The server
+   *  sends `description: string | null`; absent/null falls back to the static reason label. */
+  description?: string | null;
 }
 
 // The checkout URL from the most recent startTopup/startCardSetup whose browser launch FAILED —
@@ -118,4 +122,40 @@ const REASON_LABELS: Record<string, string> = {
 /** Human label for a ledger reason; unknown reasons pass through verbatim. */
 export function reasonLabel(reason: string): string {
   return REASON_LABELS[reason] ?? reason;
+}
+
+// Compact reason tags used ONLY when a row carries a human `description` — the label then reads
+// "<tag>: <description>" (e.g. "AI: Renamed agent to 'Fix OAuth loop'"), keeping the row terse.
+// Reasons without a compact tag fall back to their full reasonLabel() as the tag.
+const REASON_TAGS: Record<string, string> = {
+  anthropic_debit: "AI",
+  chief_debit: "Chief",
+  deepgram_debit: "Dictation",
+};
+
+/** Longest description we inline before ellipsizing, so one history row stays one line even before
+ *  the CSS clip kicks in (belt-and-braces with the row's overflow styling). */
+const MAX_DESCRIPTION_CHARS = 120;
+
+function truncateDescription(desc: string): string {
+  const t = desc.trim();
+  // Count/slice by codepoints (not UTF-16 units) so an emoji/surrogate pair is never split into a
+  // lone unit — matches the Rust side's `chars().take(...)` truncation on non-BMP input.
+  const cps = [...t];
+  return cps.length > MAX_DESCRIPTION_CHARS
+    ? `${cps.slice(0, MAX_DESCRIPTION_CHARS - 1).join("").trimEnd()}…`
+    : t;
+}
+
+/** Display label for a ledger row. When the row carries a human `description` (the metering `purpose`
+ *  the server persisted into `meta.description`), render "<tag>: <description>" — e.g.
+ *  "AI: Renamed agent to 'Fix OAuth loop'". With no description, fall back to the static reason
+ *  label ("AI (Claude)", "Chief", "Cloud dictation", …). */
+export function historyLabel(entry: Pick<LedgerEntry, "reason" | "description">): string {
+  const desc = entry.description?.trim();
+  if (desc) {
+    const tag = REASON_TAGS[entry.reason] ?? reasonLabel(entry.reason);
+    return `${tag}: ${truncateDescription(desc)}`;
+  }
+  return reasonLabel(entry.reason);
 }

@@ -280,6 +280,7 @@ fn call_anthropic(base: &str, token: &str, prompt: &str) -> Result<AgentName, St
         prompt,
         256,
         crate::ai::CLASSIFY_READ_TIMEOUT,
+        Some("Naming an agent"), // metering description shown in the credit history
     )?;
     let text = crate::ai::extract_text(&json)
         .ok_or_else(|| "naming returned no text".to_string())?;

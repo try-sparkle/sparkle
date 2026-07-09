@@ -129,7 +129,7 @@ export function updateFrontmatter(
 }
 
 export interface GenerateDeps {
-  structuredJson: <T>(system: string, user: string, maxTokens?: number) => Promise<T>;
+  structuredJson: <T>(system: string, user: string, maxTokens?: number, purpose?: string) => Promise<T>;
   createBeadFull: (
     projectPath: string,
     title: string,
@@ -276,7 +276,9 @@ export async function generateTasks(
   deps: GenerateDeps,
   args: GenerateArgs,
 ): Promise<GenerateResult> {
-  const plan = toEpicPlan(await deps.structuredJson<EpicPlan>(EPIC_PLAN_SYSTEM, args.prdContent));
+  const plan = toEpicPlan(
+    await deps.structuredJson<EpicPlan>(EPIC_PLAN_SYSTEM, args.prdContent, undefined, "Planning tasks from your prompt"),
+  );
   validateEpicPlan(plan);
 
   // 2-4. One epic bead per plan epic, each with its own children + LOCAL dependency edges. Every
@@ -398,7 +400,12 @@ export async function decomposeEpic(
   }
   const planInput = prdContent ?? `# ${epic.title}\n\n${epic.description}`;
 
-  const plan = await deps.structuredJson<TaskPlan>(TASK_PLAN_SYSTEM, planInput);
+  const plan = await deps.structuredJson<TaskPlan>(
+    TASK_PLAN_SYSTEM,
+    planInput,
+    undefined,
+    `Breaking down the "${epic.title}" epic into tasks`,
+  );
   if (!plan || typeof plan !== "object") {
     throw new Error("Task plan was empty or malformed (need an epic and at least one task).");
   }

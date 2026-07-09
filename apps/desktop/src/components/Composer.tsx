@@ -79,6 +79,7 @@ import {
 } from "../voice/dictationCopy";
 import { log } from "../logger";
 import { ComposerMic } from "./MicButton";
+import { ComposerOutOfCreditsNotice } from "./OutOfCreditsNotice";
 
 const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140);
 
@@ -206,6 +207,10 @@ export function Composer({
   const phase = useDictationStore((s) => s.phase);
   const liveActive = audioActive && phase === "active";
   const livePassive = audioActive && phase === "passive";
+  // Shared out-of-credits notice: set when the user tries to arm the mic with an empty balance
+  // (the arm is refused). When true it replaces the normal mic placeholder here and shows in the
+  // top-left bar at the same time. Auto-clears after 5s (dictationStore).
+  const outOfCreditsNotice = useDictationStore((s) => s.outOfCreditsNotice);
   // Configured wake/stop words so every dictation hint reflects a user's remap (default words
   // reproduce the original copy exactly).
   const wakeWord = useSettingsStore((s) => s.wakeWord);
@@ -1188,7 +1193,9 @@ export function Composer({
               onBlur={() => setFocused(false)}
               disabled={disabled}
               placeholder={
-                dropActive
+                outOfCreditsNotice
+                  ? "" // the styled overlay below renders the out-of-credits notice
+                  : dropActive
                   ? "Drop the file here to attach it…"
                   : disabled
                   ? "Starting your agent…"
@@ -1274,7 +1281,12 @@ export function Composer({
                 lineHeight: 1.4,
               }}
             >
-              {liveActive ? (
+              {outOfCreditsNotice ? (
+                // Out of credits: an arm attempt was refused. Replace the mic placeholder with the
+                // credits notice (the "Refill" link re-enables pointer events on itself so it stays
+                // clickable inside this pointerEvents:none overlay).
+                <ComposerOutOfCreditsNotice />
+              ) : liveActive ? (
                 // The mic-hot copy intentionally subsumes the typing hint ("…or start typing
                 // here instead"), so it stays put on focus rather than swapping to the muted
                 // focused hint below — that hint remains live only when the mic is muted.
