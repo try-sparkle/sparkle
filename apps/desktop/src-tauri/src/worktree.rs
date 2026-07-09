@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -109,6 +109,96 @@ fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Wall-clock ceiling for the NETWORK-touching subprocesses (`git fetch`, `gh`). On a network
+/// partition such a child otherwise hangs for the OS default (~75s+ TCP timeout), and since
+/// `project_agents_status` runs these per changed agent on a ~30s poll, stuck children pile up on
+/// Tauri's blocking pool. Only the network touches go through this deadline — local ref reads
+/// (rev-parse, status of local worktrees, merge-base) are unaffected and stay on the plain `git()`.
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Run `cmd` to completion but ABORT it after `timeout`, killing the child and returning an Err.
+/// std-only (no tokio, per the backend constraint): the child stays owned here so we can kill it,
+/// two reader threads drain stdout/stderr concurrently (so a chatty child can't deadlock on a full
+/// pipe while we wait), and we poll `try_wait` until the deadline (std has no wait-with-timeout).
+fn output_with_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
+
+    // Move each pipe into its own reader thread. read_to_end blocks until the write end closes
+    // (child exit or kill), so a large output is fully drained rather than deadlocking the child.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout_pipe {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr_pipe {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Deadline hit: kill and reap the child, then join the readers (which EOF once
+                    // the child's pipes close) so no threads leak, and report the timeout.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = out_reader.join();
+                    let _ = err_reader.join();
+                    return Err(format!("timed out after {}s", timeout.as_secs()));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                return Err(format!("wait failed: {e}"));
+            }
+        }
+    };
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    Ok(std::process::Output { status, stdout, stderr })
+}
+
+/// Like [`git`], but for the NETWORK-touching invocations (a `fetch`): bounds the wall-clock via
+/// [`output_with_timeout`] so a partition can't hang the child for the OS default. Same
+/// non-interactive env and stdout/stderr-on-failure semantics as `git`; a timeout reads as an Err
+/// (which every caller already treats as "offline/degrade — fall back to the local ref").
+fn git_networked(cwd: &str, args: &[&str]) -> Result<String, String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(cwd).args(args);
+    apply_noninteractive(&mut cmd);
+    let output = output_with_timeout(cmd, NETWORK_TIMEOUT)
+        .map_err(|e| format!("git {} failed: {e}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if stderr.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            stderr
+        };
+        Err(format!("git {} failed: {msg}", args.join(" ")))
+    }
+}
+
 /// Resolve the project's logical integration branch name. An explicit `[workflow].default_branch`
 /// from the editable config (per-project file beats global) wins; otherwise auto-detect in order:
 /// origin/HEAD symref → local `main` → local `master` → the branch currently checked out at `root`.
@@ -163,7 +253,8 @@ fn effective_base(root: &str, branch: &str, fetch: bool) -> String {
     if has_origin {
         if fetch {
             // Best-effort; ignore failure and fall through to the existence check below.
-            let _ = git(root, &["fetch", "origin", branch]);
+            // Network touch → bounded wall-clock so a partition can't hang this for the OS default.
+            let _ = git_networked(root, &["fetch", "origin", branch]);
         }
         let remote_ref = format!("origin/{branch}");
         if git(root, &["rev-parse", "--verify", "--quiet", &remote_ref]).is_ok() {
@@ -724,8 +815,9 @@ fn probe_pr(root: &str, branch: &str) -> (Option<String>, Option<u64>, Option<St
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
     apply_noninteractive(&mut cmd);
-    let Ok(output) = cmd.output() else {
-        return none; // gh not installed / failed to spawn
+    // Network touch → bounded wall-clock; a timeout reads as failure (all-None), like gh being absent.
+    let Ok(output) = output_with_timeout(cmd, NETWORK_TIMEOUT) else {
+        return none; // gh not installed / failed to spawn / timed out
     };
     if !output.status.success() {
         return none;
@@ -804,8 +896,9 @@ fn probe_pr_by_commit(root: &str, tip: &str) -> (Option<String>, Option<u64>, Op
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
     apply_noninteractive(&mut cmd);
-    let Ok(output) = cmd.output() else {
-        return none; // gh not installed / failed to spawn
+    // Network touch → bounded wall-clock; a timeout reads as failure (all-None), like gh being absent.
+    let Ok(output) = output_with_timeout(cmd, NETWORK_TIMEOUT) else {
+        return none; // gh not installed / failed to spawn / timed out
     };
     if !output.status.success() {
         return none; // un-pushed tip (404), not authed, no network, …
@@ -855,7 +948,8 @@ fn maybe_refresh_origin(root: &str, default_branch: &str) {
         }
         map.insert(root.to_string(), now);
     }
-    let _ = git(root, &["fetch", "--quiet", "--no-tags", "origin", default_branch]);
+    // Network touch → bounded wall-clock (see git_networked); an offline/partition fetch fails fast.
+    let _ = git_networked(root, &["fetch", "--quiet", "--no-tags", "origin", default_branch]);
 }
 
 /// Kick a background, throttled refresh of `origin/<base>` off the worktree-create critical path.
@@ -2079,6 +2173,12 @@ pub fn remove_worktree_at(
 ) -> Result<(), String> {
     let wt = worktree_path(app_data, project_id, agent_id)?;
     let wt_str = wt.to_string_lossy().to_string();
+    // Evict this worktree's batch-poll status fingerprint (keyed by worktree path). Otherwise the
+    // entry lingers for the app's lifetime for a removed agent — and if a future agent ever reused
+    // the same path, a stale fingerprint could wrongly skip its first real recompute.
+    if let Ok(mut cache) = status_cache().lock() {
+        cache.remove(&wt_str);
+    }
     match git(root, &["worktree", "remove", "--force", &wt_str]) {
         Ok(_) => Ok(()),
         Err(e) => {

@@ -10,12 +10,13 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use crate::audio::{rms_level, Capture};
-use crate::cloud::DeepgramSession;
+use crate::cloud::{CloudAudioSender, DeepgramSession};
 use crate::model;
-use crate::transcribe::{ParakeetTdt, Transcriber};
+use crate::transcribe::{Decoder, ParakeetTdt, Transcriber};
 
 /// Monotonic id stamped on every emitted partial so the log can prove whether a
 /// duplicate in the prompt bar came from the backend emitting the same text twice
@@ -218,9 +219,95 @@ pub(crate) fn should_emit_blur(my_gen: u64, latest_gen: u64, any_focused_now: bo
 /// above the observed gap while staying imperceptible.
 const FOCUS_BLUR_COALESCE_MS: u64 = 120;
 
+/// Bounded capacity of the decode queue between the realtime capture callback and the decode
+/// worker. Each item is one closed VAD segment (≤ the VAD's 8 s max_speech_duration of 16 kHz
+/// audio). The worker decodes far faster than segments close in ordinary speech, so this rarely
+/// fills; if it does (a burst, or a slow machine), the callback DROPS the newest segment
+/// (`try_send` → `Full`) rather than block the CoreAudio IOThread — bounded, lossy backpressure is
+/// the safe tradeoff on the realtime thread. 32 segments is minutes of speech of headroom.
+const DECODE_QUEUE_CAP: usize = 32;
+
+/// Owns the on-device decode worker thread and the bounded channel it drains. The realtime capture
+/// callback pushes closed-segment samples through the channel (non-blocking, drop-on-full); the
+/// worker runs `Decoder::transcribe` on its OWN thread and emits the SAME `dictation://partial`
+/// events (source `"accept"`) the old inline path emitted — moving the hundreds-of-ms decode OFF
+/// `com.apple.audio.IOThread` so it can't overrun the capture ring buffer.
+///
+/// Lifetime is tied to the `Capture`: both are built together in `build_capture` and stored side by
+/// side in the session. The channel's Sender lives only inside the capture callback, so once the
+/// `Capture` is dropped (which disposes the cpal stream and frees the closure) the channel closes,
+/// the worker drains any queued segments and exits, and dropping this joins it. Callers MUST drop
+/// the `Capture` BEFORE dropping the `DecodeWorker` so the join is bounded.
+struct DecodeWorker {
+    handle: Option<std::thread::JoinHandle<()>>,
+    /// Set true before a fast/abandon teardown (app exit): the worker then skips decoding any
+    /// still-queued segments and just drains to the channel close, so the join is near-instant.
+    abort: Arc<AtomicBool>,
+}
+
+impl DecodeWorker {
+    /// Spawn the worker and return the (bounded) sender the capture callback pushes segments into.
+    fn spawn(decoder: Arc<Decoder>, app: AppHandle) -> (SyncSender<Vec<f32>>, DecodeWorker) {
+        let (tx, rx) = sync_channel::<Vec<f32>>(DECODE_QUEUE_CAP);
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_worker = abort.clone();
+        let handle = std::thread::Builder::new()
+            .name("parakeet-decode".into())
+            .spawn(move || {
+                // Blocks in `recv` until the capture callback's Sender is dropped (channel close),
+                // at which point the `for` loop ends and the thread exits. Each segment is decoded
+                // off the realtime thread and emitted exactly as the inline `accept` path did.
+                for samples in rx {
+                    if abort_worker.load(Ordering::Acquire) {
+                        continue; // fast teardown: skip decode, just drain to the close
+                    }
+                    // Panic firewall parity with the audio-thread handler: a panic inside the FFI
+                    // decode (a poisoned recognizer mutex, a malformed segment) must not kill the
+                    // worker — that would silently stop on-device transcription for the rest of the
+                    // session. catch_unwind keeps the worker alive across one bad segment; the panic
+                    // hook still logs it, but suppress_crash_records keeps it from being uploaded as
+                    // a "crash" since we recover here.
+                    let _suppress = crate::crash::suppress_crash_records();
+                    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        decoder.transcribe(&samples).trim().to_string()
+                    }));
+                    match decoded {
+                        Ok(text) if !text.is_empty() => emit_partial(&app, "accept", text),
+                        Ok(_) => {}
+                        Err(_) => tracing::warn!(
+                            target: "dictation",
+                            "decode worker recovered from a panic; segment dropped"
+                        ),
+                    }
+                }
+            })
+            .expect("spawn parakeet-decode worker");
+        (tx, DecodeWorker { handle: Some(handle), abort })
+    }
+
+    /// Signal the worker to abandon any queued decodes and exit ASAP (app-exit fast teardown).
+    fn abort(&self) {
+        self.abort.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for DecodeWorker {
+    fn drop(&mut self) {
+        // Join so no decode/emit outlives teardown. Bounded: the channel is already closed by the
+        // time we get here (the Capture — sole Sender holder — was dropped first), so the worker
+        // only has to finish its current segment (or, if aborting, nothing) before `recv` ends.
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct DictationSession {
     capture: Option<Capture>,
+    /// The on-device decode worker paired with `capture` (both built in `build_capture`). Dropped
+    /// AFTER `capture` on every teardown so the channel is closed before the join (see DecodeWorker).
+    decode_worker: Option<DecodeWorker>,
     transcriber: Option<Arc<Mutex<ParakeetTdt>>>,
     /// The live Deepgram stream, present only while actively dictating with cloud enabled.
     /// Shared with the capture callback so frames can be routed to it without rebuilding the
@@ -229,6 +316,13 @@ pub struct DictationSession {
     /// When true, the capture callback streams frames to `cloud` instead of the on-device model.
     /// Read on every audio frame; toggled by start/stop_cloud_stream.
     cloud_active: Arc<AtomicBool>,
+    /// A detached sender for the CURRENT cloud session's audio channel, so the realtime callback can
+    /// route frames to the relay WITHOUT locking `cloud` (the teardown mutex) on the audio thread.
+    /// Swapped in lockstep with `cloud`: `Some` exactly while a session is installed (set on install,
+    /// kept across warm-standby pause/resume, cleared when the session is taken). The callback reads
+    /// it with `try_lock` so it NEVER blocks; the tiny critical section (a clone/`Option` swap) makes
+    /// a lost `try_lock` astronomically rare (and merely drops one frame, like any start/stop race).
+    cloud_tx: Arc<Mutex<Option<CloudAudioSender>>>,
     /// Monotonic token bumped on every start_cloud_stream attempt and on every stop. start_cloud_stream
     /// captures it before the (blocking) Deepgram handshake and re-checks it after: if it changed, a
     /// stop/again raced the handshake and the freshly-opened session must be discarded rather than
@@ -270,7 +364,15 @@ impl DictationState {
     /// . Unlike stop_dictation this skips finalize(): at exit the trailing segment is
     /// moot and we want the fastest possible teardown. Idempotent and poison-tolerant.
     pub fn stop_capture(&self) {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).capture = None;
+        let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        // Fast teardown: tell the decode worker to abandon any queued segments, then drop the
+        // Capture (closes the decode channel) and drop the worker (joins near-instantly since it's
+        // aborting). Order matters — Capture holds the sole channel Sender, so it must drop first.
+        if let Some(w) = sess.decode_worker.as_ref() {
+            w.abort();
+        }
+        sess.capture = None;
+        sess.decode_worker = None;
     }
 
     /// Build or release the cpal capture to match `armed && focused` (the only states that decide
@@ -287,11 +389,12 @@ impl DictationState {
                 match build_capture(
                     app.clone(),
                     transcriber,
-                    sess.cloud.clone(),
                     sess.cloud_active.clone(),
+                    sess.cloud_tx.clone(),
                 ) {
-                    Ok(cap) => {
+                    Ok((cap, worker)) => {
                         sess.capture = Some(cap);
+                        sess.decode_worker = Some(worker);
                         tracing::info!(target: "dictation", "capture resumed (window focused)");
                     }
                     Err(e) => {
@@ -300,7 +403,16 @@ impl DictationState {
                 }
             }
         } else if !desired && sess.capture.is_some() {
-            sess.capture = None; // drop -> stops the cpal stream and releases the OS mic
+            // Tell the worker to abandon its queued backlog BEFORE dropping it: this drop joins the
+            // worker thread while the caller still holds the session lock, so without the abort the
+            // join would block for the decode duration of up to DECODE_QUEUE_CAP queued segments,
+            // stalling other session ops on window blur. A paused capture's trailing partials are
+            // moot — same rationale as stop_capture (which also aborts first).
+            if let Some(w) = sess.decode_worker.as_ref() {
+                w.abort();
+            }
+            sess.capture = None; // drop -> stops the cpal stream, releases the OS mic, closes the decode channel
+            sess.decode_worker = None; // worker joins near-instantly (aborting) instead of draining the backlog
             tracing::info!(target: "dictation", "capture paused (window unfocused or muted)");
         }
     }
@@ -351,7 +463,13 @@ impl DictationState {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(FOCUS_BLUR_COALESCE_MS));
             if should_emit_blur(my_gen, focus_gen.load(Ordering::SeqCst), any_window_focused(&app)) {
-                app.state::<DictationState>().set_focused(&app, false);
+                // The app may be tearing down by the time this deferred body runs — `state::<T>()`
+                // PANICS if the DictationState was already removed during shutdown (
+                // teardown window). `try_state` returns None instead, so we simply bail: a blur that
+                // never lands during exit is harmless (the mic is being released anyway).
+                if let Some(state) = app.try_state::<DictationState>() {
+                    state.set_focused(&app, false);
+                }
             }
         });
     }
@@ -366,23 +484,36 @@ fn any_window_focused(app: &AppHandle) -> bool {
         .any(|w| w.is_focused().unwrap_or(false))
 }
 
-/// Build the cpal capture stream and wire its callback to the transcription pipeline. Shared by
-/// start_dictation (fresh arm) and the focus reconciler (resume), so the routing logic — cloud
+/// Build the cpal capture stream and wire its callback to the transcription pipeline, plus the
+/// dedicated decode worker that runs the heavy on-device transducer OFF the realtime thread. Shared
+/// by start_dictation (fresh arm) and the focus reconciler (resume), so the routing logic — cloud
 /// frames while actively dictating, else the on-device wake-word model — lives in exactly one place.
+///
+/// Returns `(Capture, DecodeWorker)`: the caller stores BOTH in the session and, on teardown, drops
+/// the Capture first (closing the decode channel) then the DecodeWorker (a bounded join). The audio
+/// callback now does ONLY cheap, bounded work — level meter, VAD windowing, and non-blocking channel
+/// pushes — so it never overruns the CoreAudio capture ring buffer with a synchronous decode.
 fn build_capture(
     app: AppHandle,
     transcriber: Arc<Mutex<ParakeetTdt>>,
-    cloud_slot: Arc<Mutex<Option<DeepgramSession>>>,
     cloud_active: Arc<AtomicBool>,
-) -> Result<Capture, String> {
+    cloud_tx: Arc<Mutex<Option<CloudAudioSender>>>,
+) -> Result<(Capture, DecodeWorker), String> {
     let app_cb = app.clone();
+    // Spawn the decode worker BEFORE the stream so the callback's very first closed segment has a
+    // live channel to push into. The worker holds an independent `Arc<Decoder>` clone, so its
+    // decode locks only the recognizer — never the `transcriber` mutex the audio callback holds for
+    // the VAD — and thus can't stall a capture frame.
+    let decoder = transcriber.lock().unwrap_or_else(|p| p.into_inner()).decoder();
+    let (decode_tx, worker) = DecodeWorker::spawn(decoder, app.clone());
     // Last emitted speech-detection state, so we emit `dictation://speaking` only on the
     // rising/falling EDGE rather than ~60×/sec. Fresh per capture (starts false), so a newly
     // (re)built capture begins "silent" and the waveform stays flat until real speech lands.
     let mut last_speaking = false;
-    // NOTE: transcriber is locked on every CoreAudio callback frame. The lock must stay short-held
-    // (accept() only, no I/O). finalize() is always called *after* Capture is dropped (stop_dictation),
-    // so the slow finalize path never contends with a live callback frame.
+    // NOTE: the transcriber is locked on every CoreAudio callback frame, but ONLY for the cheap VAD
+    // windowing / segment extraction (`accept_segments`) — the hundreds-of-ms transducer decode runs
+    // on the decode worker, never here. finalize() is always called *after* Capture (and the worker)
+    // are gone (stop_dictation), so the slow finalize path never contends with a live callback frame.
     tracing::info!(target: "dictation", "build_capture: capture starting");
     // Throttle the level meter to ~25 Hz. CoreAudio fires this callback far faster (one frame per
     // buffer, tens of Hz), but the meter only feeds the waveform animation — emitting every frame
@@ -392,7 +523,7 @@ fn build_capture(
     // underflow; this can't underflow on macOS uptime clocks, but the idiom is the robust one).
     let now0 = std::time::Instant::now();
     let mut last_level_emit = now0.checked_sub(LEVEL_EMIT_INTERVAL).unwrap_or(now0);
-    Capture::start(move |frame: Vec<f32>| {
+    let capture = Capture::start(move |frame: Vec<f32>| {
         let now = std::time::Instant::now();
         if now.duration_since(last_level_emit) >= LEVEL_EMIT_INTERVAL {
             last_level_emit = now;
@@ -414,19 +545,38 @@ fn build_capture(
         // ignores `vad_detected` there), so what we pass is moot.
         let cloud = cloud_active.load(Ordering::Relaxed);
         let vad_detected = if cloud {
-            if let Some(s) = cloud_slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                s.send_audio(&frame);
+            // #2: route to the relay WITHOUT locking the `cloud` teardown mutex. `try_lock` on the
+            // dedicated sender slot NEVER blocks the audio thread: if a start/stop is mid-swap we
+            // simply drop this frame (the same tens-of-ms transition window that already drops
+            // frames), rather than contend with start/stop_cloud_stream/stop_dictation.
+            if let Ok(guard) = cloud_tx.try_lock() {
+                if let Some(s) = guard.as_ref() {
+                    s.send_audio(&frame);
+                }
             }
             false // unused when cloud == true
         } else {
+            // #1: on the audio thread do ONLY the cheap VAD windowing / segment detection. Closed
+            // segments are shipped to the decode worker over a bounded channel; the transducer
+            // decode + `dictation://partial` emit happen there, off `com.apple.audio.IOThread`.
             let mut guard = transcriber.lock().unwrap_or_else(|p| p.into_inner());
-            let segs = guard.accept(&frame);
+            let segs = guard.accept_segments(&frame);
             // Read the VAD flag while we still hold the transcriber lock (cheap, no I/O), then
-            // release before emitting the (possibly many) partials.
+            // release before touching the channel.
             let spk = guard.speaking();
             drop(guard);
-            for seg in segs {
-                emit_partial(&app_cb, "accept", seg);
+            for samples in segs {
+                // Non-blocking, drop-on-full: the audio thread must never block. A full queue
+                // (worker fell behind) drops the newest segment; a disconnected channel (worker
+                // gone during teardown) is a silent no-op.
+                match decode_tx.try_send(samples) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => tracing::warn!(
+                        target: "dictation",
+                        "decode queue full; dropping a segment (decoder fell behind)"
+                    ),
+                    Err(TrySendError::Disconnected(_)) => {}
+                }
             }
             spk
         };
@@ -438,7 +588,8 @@ fn build_capture(
     })
     .inspect_err(|e| {
         let _ = app.emit("dictation://error", e.clone());
-    })
+    })?;
+    Ok((capture, worker))
 }
 
 // SAFETY: cpal::Stream on CoreAudio is !Send, guarded behind a Mutex.
@@ -500,6 +651,9 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
     sess.cloud = Arc::new(Mutex::new(None));
     sess.cloud_active = Arc::new(AtomicBool::new(false));
     sess.cloud_epoch = Arc::new(AtomicU64::new(0));
+    // Fresh sender slot too — it mirrors `cloud`, so it must be reset with the generation (a stale
+    // sender from a prior arm must never survive into a new one).
+    sess.cloud_tx = Arc::new(Mutex::new(None));
     sess.armed = true;
     sess.focused = any_window_focused(&app);
     // Builds the capture now iff a window is focused; otherwise the focus event brings it up later.
@@ -521,7 +675,7 @@ pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool 
     // Capture, under one lock, the state we need to (a) decide whether to open a stream and
     // (b) safely install it after the blocking handshake. The Arcs are captured by IDENTITY so we
     // can later confirm (via ptr_eq) the session generation didn't change.
-    let (cloud_slot, cloud_active, cloud_epoch) = {
+    let (cloud_slot, cloud_active, cloud_epoch, cloud_tx) = {
         let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
         if sess.cloud_active.load(Ordering::Relaxed) {
             return false; // idempotent — a repeated wake transition shouldn't open a second socket
@@ -546,6 +700,7 @@ pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool 
             sess.cloud.clone(),
             sess.cloud_active.clone(),
             sess.cloud_epoch.clone(),
+            sess.cloud_tx.clone(),
         )
     };
     // Cloud dictation now runs through the orchestration relay on the user's Sparkle bearer (the
@@ -583,6 +738,11 @@ pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool 
                     cloud_active.load(Ordering::Relaxed),
                 );
                 if install {
+                    // Publish the detached audio sender BEFORE flipping cloud_active true, so the
+                    // first frame the callback routes on the cloud path finds a live sender in the
+                    // slot (mirrors `cloud`; cleared when the session is taken on stop). Set it
+                    // while the session is still owned here (audio_sender() only clones the tx).
+                    *cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(session.audio_sender());
                     *cloud_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
                     cloud_active.store(true, Ordering::Relaxed); // callback now routes to Deepgram
                     None
@@ -625,9 +785,15 @@ pub fn stop_cloud_stream(state: State<DictationState>) {
         // after warm expiry — or a worker that already died) takes + finishes the leftover instead.
         let keep_warm = was_active && cloud.as_ref().map(|s| s.is_alive()).unwrap_or(false);
         if keep_warm {
+            // Warm standby: the session (and thus its sender in cloud_tx) is kept for reuse — leave
+            // the slot as-is. cloud_active is already false, so the callback routes on-device and
+            // won't touch the slot until a resume flips it back.
             cloud.as_ref().unwrap().pause();
             None
         } else {
+            // Taking the session down: drop the callback's sender handle too, keeping cloud_tx a
+            // faithful mirror of `cloud` (Some iff a session is installed).
+            *sess.cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = None;
             cloud.take()
         }
     }; // release locks before the (slower) finish()/join
@@ -638,19 +804,26 @@ pub fn stop_cloud_stream(state: State<DictationState>) {
 
 #[tauri::command]
 pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
-    let (transcriber, cloud_session) = {
+    let (transcriber, cloud_session, worker) = {
         let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
         sess.armed = false;             // disarm so a later focus event can't resurrect the mic
         // Advance the stop epoch so an in-flight start_dictation still loading the model observes
         // that a stop landed during its load and aborts instead of re-arming a muted mic.
         sess.stop_epoch = sess.stop_epoch.wrapping_add(1);
-        sess.capture = None;            // drop Capture -> stops the cpal stream (no more frames)
+        sess.capture = None;            // drop Capture -> stops the cpal stream (no more frames) AND closes the decode channel
+        let worker = sess.decode_worker.take(); // join below, AFTER releasing the lock (drains queued decodes)
         sess.cloud_active.store(false, Ordering::Relaxed);
         sess.cloud_epoch.fetch_add(1, Ordering::Relaxed); // invalidate any in-flight start_cloud_stream
+        *sess.cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = None; // drop the callback's cloud sender handle
         let cloud_session = sess.cloud.lock().unwrap_or_else(|p| p.into_inner()).take(); // tear down any live cloud stream
-        (sess.transcriber.take(), cloud_session)
-    };                                  // release the session lock before the (slower) finalize
+        (sess.transcriber.take(), cloud_session, worker)
+    };                                  // release the session lock before the (slower) join/finalize
     tracing::info!(target: "dictation", "stop_dictation: capture dropped, finalizing");
+    // Join the decode worker BEFORE finalize. The capture (sole channel Sender) was dropped above,
+    // so the channel is closed: the worker drains any queued accept-path segments — emitting their
+    // `dictation://partial`s — then exits. Joining here guarantees those land BEFORE finalize's
+    // trailing segment and the closing `dictation://final`, preserving the old in-order emit.
+    drop(worker);
     // Flush the cloud stream first (if dictation was stopped mid-cloud) for its trailing final.
     if let Some(s) = cloud_session {
         s.finish();

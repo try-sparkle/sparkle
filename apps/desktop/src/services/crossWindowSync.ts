@@ -6,6 +6,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { useProjectStore, PROJECTS_PERSIST_KEY, flushProjectsPersist } from "../stores/projectStore";
 import { useDictationStore, DICTATION_PERSIST_KEY } from "../stores/dictationStore";
 import { perfSpan, perfSpanAsync } from "../perfTrace";
+import { safeUnlisten } from "./safeUnlisten";
 
 const inTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -32,8 +33,12 @@ interface SyncSpec {
   flush?: () => void;
 }
 
-/** Wire one persisted store for cross-window consistency, pushing teardown fns into `unsubs`. */
-function wire(spec: SyncSpec, unsubs: Array<() => void>): void {
+/** Wire one persisted store for cross-window consistency, pushing teardown fns into `unsubs`.
+ *  `isTorndown` reports whether the caller's teardown has already run: `listen(...)` resolves
+ *  asynchronously, so a handle that arrives after teardown must be unlistened on the spot rather
+ *  than pushed into an `unsubs` the forEach already walked — otherwise the listener leaks and
+ *  fires rehydrate() for the life of the webview (mirrors improvementPass's `track`). */
+function wire(spec: SyncSpec, unsubs: Array<() => void>, isTorndown: () => boolean): void {
   let applyingRemote = false;
   let last = spec.signature();
 
@@ -76,7 +81,10 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>): void {
   unsubs.push(() => window.removeEventListener("storage", onStorage));
 
   if (inTauri()) {
-    void listen(spec.event, () => rehydrate()).then((u) => unsubs.push(u));
+    void listen(spec.event, () => rehydrate()).then((u) => {
+      if (isTorndown()) void safeUnlisten(u);
+      else unsubs.push(u);
+    });
   }
 
   const unsubStore = spec.store.subscribe(() => {
@@ -125,6 +133,8 @@ function dictationSignature(): string {
 export function subscribeToCrossWindowSync(): () => void {
   if (typeof window === "undefined") return () => {};
   const unsubs: Array<() => void> = [];
+  let torndown = false;
+  const isTorndown = () => torndown;
 
   wire(
     {
@@ -135,6 +145,7 @@ export function subscribeToCrossWindowSync(): () => void {
       flush: flushProjectsPersist,
     },
     unsubs,
+    isTorndown,
   );
   wire(
     {
@@ -144,7 +155,14 @@ export function subscribeToCrossWindowSync(): () => void {
       signature: dictationSignature,
     },
     unsubs,
+    isTorndown,
   );
 
-  return () => unsubs.forEach((u) => u());
+  return () => {
+    // Mark torndown BEFORE walking `unsubs` so any `listen(...)` still in flight unlistens itself
+    // in its own `.then` instead of pushing into an array we've already drained. safeUnlisten both
+    // swallows the benign Tauri handlerId race and stops a throw from aborting the loop mid-teardown.
+    torndown = true;
+    unsubs.forEach((u) => void safeUnlisten(u));
+  };
 }

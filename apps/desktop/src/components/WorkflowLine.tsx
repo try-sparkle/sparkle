@@ -4,6 +4,7 @@
 // along the work is. Collapsed it's just the line (no text). Expanded (row hovered) a status label
 // sits to its right, inked the color the line has reached at that stage. Stage logic lives in
 // engine/workflowStage.ts; this is purely presentational.
+import { memo } from "react";
 import { stageFraction, stageLineColor, stageMeta, LINE_FROM } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { C } from "../theme/colors";
@@ -16,7 +17,10 @@ const TRACK_BG = "rgba(138,160,196,0.22)";
 // legible on the light-mode sidebar (darker green) instead of the too-light brand green as text.
 const SHIPPED_COLOR = C.successInk;
 
-export function WorkflowLine({
+// memo: all props are primitives, so the default shallow compare bails correctly. Defense-in-depth —
+// the parent AgentRow is itself memoized (agentRowPropsEqual), so this only re-renders when the row
+// does; the memo keeps an unrelated prop change on the row from repainting an unchanged progress line.
+export const WorkflowLine = memo(function WorkflowLine({
   stage,
   expanded = false,
   shipped = false,
@@ -100,4 +104,4 @@ export function WorkflowLine({
       )}
     </div>
   );
-}
+});

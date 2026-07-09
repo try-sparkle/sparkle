@@ -147,10 +147,13 @@ impl DeepgramSession {
         Ok(DeepgramSession { audio_tx: tx, worker: Some(worker), suppress_ended, alive })
     }
 
-    /// Push one 16 kHz mono frame to the relay. Converts to PCM16 here (cheap) so the caller's
-    /// audio callback stays minimal. Silently no-ops if the worker has already exited.
-    pub fn send_audio(&self, frame: &[f32]) {
-        let _ = self.audio_tx.send(AudioMsg::Frame(f32_to_pcm16le(frame)));
+    /// A cheap, cloneable handle to just this session's audio channel. The realtime capture
+    /// callback holds one of these so it can push frames WITHOUT locking the `DeepgramSession`
+    /// slot mutex (`cloud`) that start/stop_cloud_stream/stop_dictation contend on — see
+    /// `CloudAudioSender`. The handle keeps the send channel alive; the worker (and its socket)
+    /// are unaffected by the handle's lifetime, so dropping it never closes a live stream.
+    pub fn audio_sender(&self) -> CloudAudioSender {
+        CloudAudioSender { audio_tx: self.audio_tx.clone() }
     }
 
     /// Drop into warm standby: Finalize the current utterance (so its trailing text still commits)
@@ -198,6 +201,27 @@ impl Drop for DeepgramSession {
         // Safety net for the path that drops without finish() (e.g. an error teardown): signal
         // close so the worker exits, but DON'T join here — a Drop must not block the caller.
         let _ = self.audio_tx.send(AudioMsg::Close);
+    }
+}
+
+/// A detached, cloneable sender for a cloud session's audio channel. Exists so the realtime
+/// capture callback can route frames to the relay WITHOUT ever locking the `DeepgramSession` slot
+/// mutex (the "teardown mutex") — holding that on the CoreAudio IOThread contends with
+/// start/stop_cloud_stream/stop_dictation. Sending is non-blocking (the underlying mpsc channel is
+/// unbounded, so `send` never blocks the caller) and silently no-ops once the worker has exited.
+/// Owning one does NOT keep the worker/socket alive — only the send half — so dropping it (e.g.
+/// when the callback tears down) can't strand or prolong a stream.
+#[derive(Clone)]
+pub struct CloudAudioSender {
+    audio_tx: Sender<AudioMsg>,
+}
+
+impl CloudAudioSender {
+    /// Push one 16 kHz mono frame to the relay. Converts to PCM16 here (cheap, lock-free) — same as
+    /// `DeepgramSession::send_audio`, but callable off the session slot so the audio thread stays
+    /// lock-light. No-ops if the worker already exited.
+    pub fn send_audio(&self, frame: &[f32]) {
+        let _ = self.audio_tx.send(AudioMsg::Frame(f32_to_pcm16le(frame)));
     }
 }
 

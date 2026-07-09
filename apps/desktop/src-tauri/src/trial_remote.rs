@@ -133,8 +133,11 @@ fn send_trial_reinit_on_404(path: &str) -> Result<ureq::Response, TrialCallError
 
 /// Ensure a device token exists (mint on first run) and return the current server-side usage:
 /// `{ promptsUsed, remaining, cap }`.
+/// `async` so Tauri runs this off the main thread (mirrors auth.rs desktop_me): the retry chain can
+/// serialize several 15s `ureq` timeouts (mint + call, then re-mint + call on an unknown-token 404),
+/// which as a sync command would freeze the UI for the whole duration.
 #[tauri::command]
-pub fn trial_remote_status() -> Result<Value, String> {
+pub async fn trial_remote_status() -> Result<Value, String> {
     match send_trial_reinit_on_404("/trial/status") {
         Ok(resp) => {
             let text = resp.into_string().map_err(|e| e.to_string())?;
@@ -149,8 +152,10 @@ pub fn trial_remote_status() -> Result<Value, String> {
 /// Consume one trial prompt against the SERVER counter. Returns the orchestration JSON verbatim on
 /// success (`{ ok: true, promptsUsed, remaining, cap }`), or a stable `{ ok: false, remaining: 0,
 /// cap }` at the cap (mirrors desktop_consume's 402 shape) so the UI can gate without parsing HTTP.
+/// `async` so Tauri runs this off the main thread (see trial_remote_status): the same re-mint retry
+/// chain can serialize several 15s `ureq` timeouts, which as a sync command would freeze the UI.
 #[tauri::command]
-pub fn trial_remote_consume() -> Result<Value, String> {
+pub async fn trial_remote_consume() -> Result<Value, String> {
     match send_trial_reinit_on_404("/trial/consume") {
         Ok(resp) => {
             let text = resp.into_string().map_err(|e| e.to_string())?;

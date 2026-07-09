@@ -43,7 +43,7 @@ export function TrayApp() {
     let alive = true;
     void getTrayRoster().then((r) => { if (alive && r) { setRoster(r); paintTrayIcon(r); } });
     const un = onTrayRosterChanged((r) => { setRoster(r); paintTrayIcon(r); });
-    return () => { alive = false; safeUnlisten(un); };
+    return () => { alive = false; void safeUnlisten(un); };
   }, []);
 
   // Shared 1s clock so every elapsed timer ticks together.

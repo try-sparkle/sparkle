@@ -7,6 +7,7 @@ import { useAiFeature, aiFeatureNow } from "./services/aiGate";
 import { useAuthStore } from "./stores/authStore";
 import { advance, type Advance } from "./voice/wakeMachine";
 import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDictation";
+import { safeUnlisten } from "./services/safeUnlisten";
 
 /**
  * The cloud-stream command (if any) a wake-machine transition implies. Pure so the
@@ -268,7 +269,11 @@ export async function createDictationController(
   }
 
   const cleanup = () => {
-    unsubscribes.forEach((u) => u());
+    // safeUnlisten (not a bare `u()`): a window-close during teardown can tear down Tauri's
+    // listeners map first, and a raw unlisten then throws the benign "handlerId" race. Routing
+    // each call through it also means a throw can't abort the loop and leak the remaining
+    // dictation listeners OR the window blur/focus removals below (sparkle teardown-leak sweep).
+    unsubscribes.forEach((u) => void safeUnlisten(u));
     if (hasWindow) {
       window.removeEventListener("blur", onWinBlur);
       window.removeEventListener("focus", onWinFocus);

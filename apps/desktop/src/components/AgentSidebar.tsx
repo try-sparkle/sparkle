@@ -906,16 +906,33 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const next = reconcileWorkMode(selKind, mode, activeSpecial !== null, aiBrainstorm);
     if (next) setMode(next);
   }, [project, aiBrainstorm, mode, activeSpecial, setMode]);
-  // Top-level agents (group heads + orphaned workers), matching the list's isTopLevel logic. Used so
-  // the per-mode empty hints key off the SAME set the list renders — never "No X agents" beside rows.
-  const topLevelAgents = project
-    ? (() => {
-        const buildIds = new Set(
-          project.agents.filter((a) => a.kind === "build").map((a) => a.id),
-        );
-        return project.agents.filter((a) => !a.parentId || !buildIds.has(a.parentId));
-      })()
-    : [];
+  // Top-level agents (group heads + orphaned workers), matching the list's isTopLevel logic, PLUS a
+  // parentId→children bucket built in the SAME single pass. Both are memoized on `project` so a PTY
+  // status tick (which never touches the agent SET, only runtimeStore.status) reuses them instead of
+  // re-filtering every render — and the per-orchestrator worker lookup in the list below becomes an
+  // O(1) map hit rather than an O(agents) `.filter` per top-level agent. Children keep project.agents
+  // insertion order (identical to the old per-row `.filter`), so worker row order is byte-for-byte
+  // unchanged. topLevelAgents is still used so the per-mode empty hints key off the SAME set the list
+  // renders — never "No X agents" beside rows.
+  const { topLevelAgents, childrenByParent } = useMemo(() => {
+    if (!project)
+      return {
+        topLevelAgents: [] as AgentTab[],
+        childrenByParent: new Map<string, AgentTab[]>(),
+      };
+    const childrenByParent = new Map<string, AgentTab[]>();
+    const buildIds = new Set<string>();
+    for (const a of project.agents) {
+      if (a.kind === "build") buildIds.add(a.id);
+      if (a.parentId) {
+        const arr = childrenByParent.get(a.parentId);
+        if (arr) arr.push(a);
+        else childrenByParent.set(a.parentId, [a]);
+      }
+    }
+    const topLevelAgents = project.agents.filter((a) => !a.parentId || !buildIds.has(a.parentId));
+    return { topLevelAgents, childrenByParent };
+  }, [project]);
 
   // The ordered top-level stack the list renders. Memoized (sparkle-alrm.3) so it only re-sorts when
   // the agent set, overlaid status, mode, or ordering actually change — not on every unrelated
@@ -1096,10 +1113,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           // tracked by id (project.selectedAgentId), so re-sorting never changes which agent is open.
           // `ordered` is memoized in the component body above (sparkle-alrm.3).
           return ordered.map((top, orderedIndex) => {
-            const workers =
-              top.kind === "build"
-                ? project.agents.filter((w) => w.parentId === top.id)
-                : [];
+            // O(1) lookup into the memoized parentId→children bucket (built once above), in place of
+            // an O(agents) `.filter` per orchestrator. Same set, same insertion order — see childrenByParent.
+            const workers = top.kind === "build" ? childrenByParent.get(top.id) ?? [] : [];
             // The orchestrator's chevron rolls up its workers (overall = least-advanced worker);
             // with no workers it just shows its own git stage. A worker/think/shell row shows
             // its own. (Think has no worktree, so it resolves to the harmless start stage and

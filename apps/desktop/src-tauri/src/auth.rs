@@ -180,11 +180,14 @@ pub fn desktop_sign_out() -> Result<(), String> {
 /// code planted by a malicious page carries a state we never issued — rejected here, so its code is
 /// never sent to the server. On a match we present the PKCE `verifier`, which the server checks
 /// against the challenge bound into the code.
+/// `async` so Tauri runs the blocking `ureq` call off the main thread — this fires during sign-in,
+/// where a stalled network (up to `HTTP_TIMEOUT` = 15s) would otherwise freeze the UI (see
+/// desktop_me/desktop_consume above for the rationale).
 #[tauri::command]
-pub fn desktop_exchange_code(
+pub async fn desktop_exchange_code(
     code: String,
     state: String,
-    pending: tauri::State<PendingSignIn>,
+    pending: tauri::State<'_, PendingSignIn>,
 ) -> Result<(), String> {
     // Take-then-compare: burn the pending sign-in up front so even a valid state can't be replayed,
     // and so a forged callback can't leave a stale pending entry lying around.
@@ -217,8 +220,10 @@ pub fn desktop_exchange_code(
 
 /// Mint a short 6-char pairing code to sign a phone in (POST /pair/code, authed). Returns the
 /// code string for display ("Pair phone"). The phone types it to get its own bearer.
+/// `async` so Tauri runs the blocking `ureq` call off the main thread (avoids a 15s UI freeze on a
+/// stalled network — see desktop_me above).
 #[tauri::command]
-pub fn desktop_pair_code() -> Result<String, String> {
+pub async fn desktop_pair_code() -> Result<String, String> {
     let token = read_token().ok_or_else(|| "not signed in".to_string())?;
     let url = format!("{}/pair/code", base_url());
     let resp = ureq::post(&url)
@@ -242,8 +247,10 @@ pub const DEVICES_UNSUPPORTED: &str = "devices_unsupported";
 /// List the devices paired to this account (GET /devices, authed). Returns the relay JSON
 /// verbatim (`{ devices: [{ id, name, platform, createdAt, lastSeenAt, current }] }`); the UI
 /// owns the shape.
+/// `async` so Tauri runs the blocking `ureq` call off the main thread (avoids a 15s UI freeze on a
+/// stalled network — see desktop_me above).
 #[tauri::command]
-pub fn list_paired_devices() -> Result<Value, String> {
+pub async fn list_paired_devices() -> Result<Value, String> {
     let token = read_token().ok_or_else(|| "not signed in".to_string())?;
     let url = format!("{}/devices", base_url());
     match ureq::get(&url)
@@ -276,8 +283,10 @@ fn is_valid_device_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// `async` so Tauri runs the blocking `ureq` call off the main thread (avoids a 15s UI freeze on a
+/// stalled network — see desktop_me above).
 #[tauri::command]
-pub fn revoke_paired_device(id: String) -> Result<(), String> {
+pub async fn revoke_paired_device(id: String) -> Result<(), String> {
     if !is_valid_device_id(&id) {
         return Err("invalid device id".to_string());
     }
@@ -390,8 +399,10 @@ pub async fn desktop_consume(
 
 /// Refund a specific prior debit by ledger id (refund-on-throw). Server-bounded to the caller's
 /// own debit + idempotent, so it cannot mint credits.
+/// `async` (like its debit partner `desktop_consume`) so Tauri runs the blocking `ureq` call off
+/// the main thread — a stalled network (up to `HTTP_TIMEOUT` = 15s) would otherwise freeze the UI.
 #[tauri::command]
-pub fn desktop_refund(ledger_id: String) -> Result<(), String> {
+pub async fn desktop_refund(ledger_id: String) -> Result<(), String> {
     let token = read_token().ok_or_else(|| "not signed in".to_string())?;
     let url = format!("{}/credits/refund", base_url());
     let body = json!({ "ledgerId": ledger_id }).to_string();
@@ -407,8 +418,10 @@ pub fn desktop_refund(ledger_id: String) -> Result<(), String> {
 /// Redeem a promo/override code. On success the server grants entitlement + credits; the caller
 /// then re-fetches `/me`. A 400 (server rejected the code) maps to a stable "invalid_code" string
 /// so the UI can show a friendly message; other failures bubble up verbatim.
+/// `async` so Tauri runs the blocking `ureq` call off the main thread (avoids a 15s UI freeze on a
+/// stalled network — see desktop_me above).
 #[tauri::command]
-pub fn desktop_redeem_promo(code: String) -> Result<(), String> {
+pub async fn desktop_redeem_promo(code: String) -> Result<(), String> {
     let token = read_token().ok_or_else(|| "not signed in".to_string())?;
     let url = format!("{}/billing/promo", base_url());
     let body = json!({ "code": code }).to_string();

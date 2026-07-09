@@ -2,6 +2,7 @@
 //! (CORS), so we check from Rust with `ureq` — mirroring naming.rs. Any HTTP *response* (even an
 //! error status) means the network path is up; only a transport failure (DNS/connect/timeout)
 //! counts as offline. (bead )
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// A tiny, unauthenticated, widely-reachable endpoint that returns 204 No Content — cheap to hit
@@ -18,12 +19,21 @@ pub async fn probe_connectivity() -> bool {
         .unwrap_or(false)
 }
 
+/// A ureq `Agent` is a cheap-to-clone handle over a shared connection pool, so build it once and
+/// reuse it across every heartbeat rather than tearing down and re-creating the pool each probe.
+/// The connect/read timeouts (baked into the agent) are preserved.
+fn probe_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(3))
+            .timeout_read(Duration::from_secs(3))
+            .build()
+    })
+}
+
 fn probe_blocking() -> bool {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(3))
-        .timeout_read(Duration::from_secs(3))
-        .build();
-    match agent.head(PROBE_URL).call() {
+    match probe_agent().head(PROBE_URL).call() {
         Ok(_) => true,                          // server answered → online
         Err(ureq::Error::Status(_, _)) => true, // answered with an error status → still online
         Err(ureq::Error::Transport(_)) => false, // DNS/connect/timeout → offline

@@ -1,5 +1,5 @@
 //! On-device STT: Silero VAD segments → Parakeet-TDT offline transducer.
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use sherpa_onnx::{
     OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
     SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
@@ -8,7 +8,11 @@ use crate::model::ModelPaths;
 
 pub trait Transcriber: Send {
     /// Feed a frame of 16 kHz mono f32. Returns text for any VAD segments that closed
-    /// during this call (usually 0 or 1) — the near-streaming partials.
+    /// during this call (usually 0 or 1) — the near-streaming partials. This is the SYNCHRONOUS
+    /// convenience path (VAD windowing + inline decode); the live capture path deliberately does
+    /// NOT use it — it calls `accept_segments` and decodes off the realtime thread (see
+    /// dictation.rs). Kept for the offline fixture test and as the trait's streaming contract.
+    #[allow(dead_code)] // only the (cfg(test)) fixture path decodes inline; production is off-thread
     fn accept(&mut self, frame: &[f32]) -> Vec<String>;
     /// End of dictation: flush the VAD and return text for any trailing segment(s).
     fn finalize(&mut self) -> Vec<String>;
@@ -42,8 +46,31 @@ impl WindowBuffer {
     }
 }
 
-pub struct ParakeetTdt {
+/// The heavy Parakeet transducer, split out from `ParakeetTdt` so the realtime capture callback
+/// can run the (cheap) VAD windowing while a dedicated worker thread runs the (hundreds-of-ms)
+/// decode — the two share nothing but an `Arc<Decoder>`, so decode never blocks the audio thread on
+/// the VAD lock. Its own poison-tolerant Mutex guards the recognizer; the worker and the `finalize`
+/// path lock only THIS, never the `ParakeetTdt` the audio callback holds.
+pub struct Decoder {
     recognizer: Mutex<OfflineRecognizer>,
+}
+
+impl Decoder {
+    /// Decode one closed VAD segment to text. Runs on the decode worker thread (during capture) or
+    /// on the stop thread (at finalize) — NEVER on the CoreAudio callback. Poison-tolerant lock
+    /// (): a panic elsewhere must not wedge dictation for the app's lifetime.
+    pub fn transcribe(&self, samples: &[f32]) -> String {
+        let rec = self.recognizer.lock().unwrap_or_else(|p| p.into_inner());
+        let stream = rec.create_stream();
+        stream.accept_waveform(16_000, samples);
+        rec.decode(&stream);
+        stream.get_result().map(|r| r.text).unwrap_or_default()
+    }
+}
+
+pub struct ParakeetTdt {
+    /// Shared, independently-lockable decoder so the worker can decode off the audio thread.
+    decoder: Arc<Decoder>,
     vad: Mutex<VoiceActivityDetector>,
     window: WindowBuffer,
 }
@@ -82,7 +109,18 @@ impl ParakeetTdt {
         let vad = VoiceActivityDetector::create(&vad_cfg, 30.0)
             .ok_or_else(|| "failed to create VoiceActivityDetector (check VAD model path)".to_string())?;
 
-        Ok(Self { recognizer: Mutex::new(recognizer), vad: Mutex::new(vad), window: WindowBuffer::default() })
+        Ok(Self {
+            decoder: Arc::new(Decoder { recognizer: Mutex::new(recognizer) }),
+            vad: Mutex::new(vad),
+            window: WindowBuffer::default(),
+        })
+    }
+
+    /// A cheap, cloneable handle to the heavy decoder for the decode worker thread. The worker
+    /// decodes closed segments off the realtime thread (see `dictation::DecodeWorker`), so the
+    /// audio callback only ever runs the VAD half of the pipeline.
+    pub fn decoder(&self) -> Arc<Decoder> {
+        self.decoder.clone()
     }
 
     /// Real-time "is the user speaking *right now*?" flag straight from the Silero VAD,
@@ -96,19 +134,27 @@ impl ParakeetTdt {
         self.vad.lock().unwrap_or_else(|p| p.into_inner()).detected()
     }
 
-    fn transcribe(&self, samples: &[f32]) -> String {
-        // Poison-tolerant lock (): a panic elsewhere on the audio thread must not
-        // wedge dictation for the app's lifetime — recover the guard and carry on.
-        let rec = self.recognizer.lock().unwrap_or_else(|p| p.into_inner());
-        let stream = rec.create_stream();
-        stream.accept_waveform(16_000, samples);
-        rec.decode(&stream);
-        stream.get_result().map(|r| r.text).unwrap_or_default()
+    /// Feed a frame and return the OWNED samples of any VAD segments that closed this call —
+    /// WITHOUT decoding them. This is the realtime-safe half of `accept`: it runs only the cheap
+    /// VAD windowing + segment extraction (no transducer decode), so it's safe to call while
+    /// holding the transcriber lock on the CoreAudio callback. The caller ships these buffers to
+    /// the decode worker, which runs `Decoder::transcribe` off the audio thread.
+    pub fn accept_segments(&mut self, frame: &[f32]) -> Vec<Vec<f32>> {
+        for w in self.window.push(frame) {
+            // API deviation: accept_waveform takes &[f32], not Vec<f32>
+            self.vad.lock().unwrap_or_else(|p| p.into_inner()).accept_waveform(&w);
+        }
+        self.drain_segment_samples()
     }
 
-    fn drain_segments(&self) -> Vec<String> {
+    /// Pull the samples of any VAD segments that have closed, WITHOUT decoding them (the heavy
+    /// decode runs on the worker / at finalize). Kept off the transcribe path so the realtime
+    /// callback never pays the transducer cost.
+    fn drain_segment_samples(&self) -> Vec<Vec<f32>> {
         let mut out = Vec::new();
-        let mut vad = self.vad.lock().unwrap_or_else(|p| p.into_inner());
+        // No decode happens here, so — unlike the old `drain_segments` — we hold the VAD lock across
+        // the whole (cheap) drain instead of releasing it per segment; nothing to release it for.
+        let vad = self.vad.lock().unwrap_or_else(|p| p.into_inner());
         // SAFETY: front() returns an owned SpeechSegment whose Drop calls
         // SherpaOnnxDestroySpeechSegment on the raw pointer returned by
         // SherpaOnnxVoiceActivityDetectorFront. That pointer may alias the VAD-internal
@@ -118,10 +164,7 @@ impl ParakeetTdt {
             let samples = seg.samples().to_vec();
             drop(seg);     // end the SpeechSegment's lifetime before pop()
             vad.pop();
-            drop(vad); // release before the (slower) transcribe call
-            let text = self.transcribe(&samples).trim().to_string();
-            if !text.is_empty() { out.push(text); }
-            vad = self.vad.lock().unwrap_or_else(|p| p.into_inner());
+            out.push(samples);
         }
         out
     }
@@ -129,11 +172,16 @@ impl ParakeetTdt {
 
 impl Transcriber for ParakeetTdt {
     fn accept(&mut self, frame: &[f32]) -> Vec<String> {
-        for w in self.window.push(frame) {
-            // API deviation: accept_waveform takes &[f32], not Vec<f32>
-            self.vad.lock().unwrap_or_else(|p| p.into_inner()).accept_waveform(&w);
-        }
-        self.drain_segments()
+        // Convenience/synchronous path (fixture test): VAD windowing then inline decode. The live
+        // capture path does NOT use this — it calls `accept_segments` and decodes off-thread — so
+        // the heavy decode never runs on the CoreAudio callback.
+        self.accept_segments(frame)
+            .into_iter()
+            .filter_map(|s| {
+                let text = self.decoder.transcribe(&s).trim().to_string();
+                (!text.is_empty()).then_some(text)
+            })
+            .collect()
     }
     fn finalize(&mut self) -> Vec<String> {
         if let Some(tail) = self.window.drain() {
@@ -149,7 +197,15 @@ impl Transcriber for ParakeetTdt {
             self.vad.lock().unwrap_or_else(|p| p.into_inner()).accept_waveform(&padded);
         }
         self.vad.lock().unwrap_or_else(|p| p.into_inner()).flush();
-        self.drain_segments()
+        // finalize() runs on the stop thread AFTER Capture (and the decode worker) are gone, so
+        // decoding the trailing segment(s) inline here can't contend with the audio callback.
+        self.drain_segment_samples()
+            .into_iter()
+            .filter_map(|s| {
+                let text = self.decoder.transcribe(&s).trim().to_string();
+                (!text.is_empty()).then_some(text)
+            })
+            .collect()
     }
 }
 

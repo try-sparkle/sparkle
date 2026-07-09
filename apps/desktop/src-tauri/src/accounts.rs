@@ -418,7 +418,15 @@ fn collect_usage_from_file(path: &Path, out: &mut Vec<(i64, u64)>) {
 /// are excluded); we accept that minor under-count rather than add canonicalized-path
 /// cycle tracking. Symlinked `.jsonl` *files*, however, are still counted — a symlinked
 /// transcript is real usage and a dir symlink has no `.jsonl` extension to match here.
-fn collect_usage_records(projects_root: &Path, out: &mut Vec<(i64, u64)>) {
+///
+/// `cutoff_epoch` (Unix seconds) is a fast pre-filter: a `.jsonl` whose last-modified time is older
+/// than it is skipped WITHOUT opening/parsing it. Because a transcript's records are only ever
+/// APPENDED (a record's timestamp ≤ the file's mtime), a file untouched since before `now - 7d`
+/// contains only out-of-window records — every one of which `bucket_tokens` would discard anyway —
+/// so skipping it changes no in-window total while avoiding streaming+parsing the whole file on the
+/// main thread. Pass `0` to disable the filter (stat every file in). A file whose mtime can't be
+/// read fails OPEN (is parsed), so we never under-count on a stat error.
+fn collect_usage_records(projects_root: &Path, cutoff_epoch: i64, out: &mut Vec<(i64, u64)>) {
     let Ok(entries) = std::fs::read_dir(projects_root) else {
         return;
     };
@@ -426,11 +434,26 @@ fn collect_usage_records(projects_root: &Path, out: &mut Vec<(i64, u64)>) {
         let Ok(ft) = entry.file_type() else { continue };
         let path = entry.path();
         if ft.is_dir() {
-            collect_usage_records(&path, out);
+            collect_usage_records(&path, cutoff_epoch, out);
         } else if path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
         {
+            // Skip transcripts untouched since before the 7d window (all their records are stale).
+            // Use std::fs::metadata (which FOLLOWS symlinks) rather than DirEntry::metadata (an
+            // lstat that returns the symlink node's own mtime): a symlinked transcript must be
+            // judged by its TARGET's mtime — the real file we'd otherwise parse — or a link node
+            // older than the window would wrongly skip a target being appended today (under-count).
+            // Fail open: if the stat/mtime read errors (e.g. broken symlink), we don't skip.
+            if cutoff_epoch > 0 {
+                if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+                    if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+                        if (dur.as_secs() as i64) < cutoff_epoch {
+                            continue;
+                        }
+                    }
+                }
+            }
             collect_usage_from_file(&path, out);
         }
     }
@@ -445,7 +468,9 @@ fn usage_for_account(acct: &Account, now: i64) -> AccountUsage {
     if let Some(root) =
         crate::claude::claude_projects_root(Some(Path::new(&acct.config_dir)), None)
     {
-        collect_usage_records(&root, &mut records);
+        // Only files touched within the trailing 7d window can hold in-window records; older ones
+        // are skipped by mtime before we open them (see collect_usage_records).
+        collect_usage_records(&root, now - WINDOW_7D, &mut records);
     }
     let (tokens_5h, tokens_7d) = bucket_tokens(&records, now);
     AccountUsage {
@@ -737,10 +762,76 @@ mod tests {
         std::os::unix::fs::symlink(&transcript, projects.join("linked.jsonl")).unwrap();
 
         let mut out = Vec::new();
-        collect_usage_records(&projects, &mut out); // must terminate, ignoring the dir symlink
+        // cutoff 0 = stat every file in (this test is about symlink handling, not the mtime filter).
+        collect_usage_records(&projects, 0, &mut out); // must terminate, ignoring the dir symlink
         let (t5, t7) = bucket_tokens(&out, epoch + 10);
         assert_eq!(t5, 40, "real transcript + symlinked transcript file both counted");
         assert_eq!(t7, 40, "dir symlink cycle skipped (no hang); file symlink counted");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mtime_filter_drives_the_symlinked_transcript_via_its_target() {
+        // The mtime pre-filter must stat a symlinked transcript through its TARGET (std::fs::metadata
+        // follows symlinks) rather than the link node. We can't independently age a symlink node with
+        // std, so we drive the filter through the symlink in BOTH directions: a target written "now"
+        // is COUNTED under a past cutoff and SKIPPED under a far-future cutoff — proving the symlink
+        // participates in the filter and that stat'ing it doesn't error.
+        let base = unique_dir("mtime-symlink");
+        let projects = base.join("projects").join("-tmp");
+        std::fs::create_dir_all(&projects).unwrap();
+        let ts = "2026-06-25T21:20:25.931Z";
+        let epoch = parse_iso8601_to_epoch(ts).unwrap();
+        let body = format!(
+            "{{\"timestamp\":\"{ts}\",\"type\":\"assistant\",\"message\":{{\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}}}\n",
+            ts = ts
+        );
+        let target = projects.join("real.jsonl");
+        std::fs::write(&target, body).unwrap();
+        std::os::unix::fs::symlink(&target, projects.join("linked.jsonl")).unwrap();
+
+        // Past cutoff (1970): the symlinked transcript is stat'd via its target (mtime ~ now) → counted.
+        let mut out = Vec::new();
+        collect_usage_records(&projects, 1, &mut out);
+        let (_t5, t7) = bucket_tokens(&out, epoch + 10);
+        assert_eq!(t7, 30, "target + symlink to it both counted under a past cutoff");
+
+        // Far-future cutoff (year ~2100): now < cutoff → both the real file and the symlink are skipped.
+        let mut out2 = Vec::new();
+        collect_usage_records(&projects, 4_102_444_800, &mut out2);
+        assert!(out2.is_empty(), "future cutoff skips the symlinked transcript via its target too");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn collect_usage_records_skips_files_older_than_cutoff() {
+        // The mtime pre-filter: a recently-written transcript is INCLUDED when the cutoff is in the
+        // past, and SKIPPED (never opened/parsed) when its mtime is older than the cutoff. We drive
+        // both branches with the cutoff (rather than back-dating the file) since the file's mtime is
+        // "now": a cutoff far in the future makes now < cutoff, exercising the skip deterministically.
+        let base = unique_dir("mtime-cutoff");
+        let projects = base.join("projects").join("-tmp-proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        let ts = "2026-06-25T21:20:25.931Z";
+        let body = format!(
+            "{{\"timestamp\":\"{ts}\",\"type\":\"assistant\",\"message\":{{\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":3}}}}}}\n",
+            ts = ts
+        );
+        std::fs::write(projects.join("sess.jsonl"), body).unwrap();
+
+        // Cutoff in the past (0) → the recent file is parsed; its 20 tokens are collected.
+        let mut included = Vec::new();
+        collect_usage_records(&projects, 0, &mut included);
+        assert_eq!(included.len(), 1, "recent file parsed when cutoff is in the past");
+
+        // Cutoff far in the future → the file's mtime (~now) is older than it, so it's skipped
+        // WITHOUT being opened — no records collected.
+        let mut skipped = Vec::new();
+        collect_usage_records(&projects, i64::MAX, &mut skipped);
+        assert!(skipped.is_empty(), "file older than cutoff is skipped before parsing");
 
         let _ = std::fs::remove_dir_all(&base);
     }

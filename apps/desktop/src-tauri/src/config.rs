@@ -649,19 +649,83 @@ pub fn current_effective() -> EffectiveConfig {
     cell().read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// One memoized `for_project` result plus the inputs it was derived from. The project file is
+/// re-read+re-parsed only when its (mtime, len) changes OR the global layer it was merged against
+/// changes — so a hot poll (`resolve_default_branch` → `for_project` on every batch tick) skips the
+/// disk read + TOML parse when nothing moved, without ever going stale on a real edit.
+struct ProjectCacheEntry {
+    mtime_ms: u128,
+    len: u64,
+    /// The global layer this result was merged against; when it changes (watcher reload) the memo
+    /// is invalidated so a global edit still propagates into the per-project view.
+    global_config: SparkleConfig,
+    effective: EffectiveConfig,
+}
+
+fn project_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, ProjectCacheEntry>> {
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, ProjectCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// (mtime_ms, len) of `path`, or (0, 0) when it's absent/unreadable. A missing project file is a
+/// stable, valid key: as long as it stays missing the memo holds; creating it changes `len`/mtime.
+fn file_stamp(path: &Path) -> (u128, u64) {
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| {
+            let mtime_ms = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            (mtime_ms, m.len())
+        })
+        .unwrap_or((0, 0))
+}
+
 /// Effective config for a specific project: the cached global layer with that project's
-/// `.sparkle/config.toml` overlaid (its `[workflow]` only). Reads the project file fresh.
+/// `.sparkle/config.toml` overlaid (its `[workflow]` only). Memoized on the project file's
+/// (mtime, len) + the global layer's identity, so a hot poll only re-reads+re-parses the file when
+/// something actually changed (the disk read + TOML parse dominated this call on every batch tick).
 pub fn for_project(repo_root: &str) -> EffectiveConfig {
     // One snapshot of the cached global layer, so the config and its warnings can't be spliced
     // across a concurrent watcher reload.
     let global = current_effective();
-    let project_text = read_if_exists(&project_path(repo_root));
+    let path = project_path(repo_root);
+    let (mtime_ms, len) = file_stamp(&path);
+
+    // Fast path: the project file and the global layer are both unchanged since we last computed.
+    if let Ok(cache) = project_cache().lock() {
+        if let Some(e) = cache.get(repo_root) {
+            if e.mtime_ms == mtime_ms && e.len == len && e.global_config == global.config {
+                return e.effective.clone();
+            }
+        }
+    }
+
+    let project_text = read_if_exists(&path);
     // `global.config` already has defaults+global folded in, so pass only the project layer here.
-    let (cfg, mut warnings, _) = build_effective(global.config, None, project_text.as_deref());
+    let (cfg, mut warnings, _) =
+        build_effective(global.config.clone(), None, project_text.as_deref());
     // Carry forward any standing global warnings so the UI sees them in a project context too.
     let mut all = global.warnings;
     all.append(&mut warnings);
-    EffectiveConfig { config: cfg, warnings: all }
+    let effective = EffectiveConfig { config: cfg, warnings: all };
+
+    if let Ok(mut cache) = project_cache().lock() {
+        cache.insert(
+            repo_root.to_string(),
+            ProjectCacheEntry {
+                mtime_ms,
+                len,
+                global_config: global.config,
+                effective: effective.clone(),
+            },
+        );
+    }
+    effective
 }
 
 // ============================ comment-preserving writes ===========================
