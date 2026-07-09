@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, getAllWindows } from "@tauri-apps/api/window";
-import { C, FONT, FONT_WEIGHT, ON_BRAND_FILL_DARK } from "../theme/colors";
+import { C, FONT, FONT_WEIGHT, ON_BRAND_FILL, ON_BRAND_FILL_DARK } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -361,7 +361,7 @@ export function Workspace() {
                 onClick={() => open(activeAgentId)}
                 style={{
                   background: C.teal,
-                  color: C.cream,
+                  color: ON_BRAND_FILL,
                   border: "none",
                   borderRadius: 8,
                   padding: "10px 20px",

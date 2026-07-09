@@ -1,4 +1,4 @@
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { ModalShell } from "./ModalShell";
 
 /** Asks where to open a project: swap this window's project, or spin up a new window.
@@ -38,7 +38,7 @@ export function OpenTargetDialog({
           onClick={() => onChoose("new")}
           style={{
             background: C.teal,
-            color: C.cream,
+            color: ON_BRAND_FILL,
             border: "none",
             borderRadius: 8,
             padding: "11px 14px",

@@ -1,5 +1,5 @@
 import { useMemo, useState, type MouseEvent } from "react";
-import { C, FONT_WEIGHT } from "../../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import { TextPill } from "./TextPill";
 import { TextPillModal } from "./TextPillModal";
 import { AttachmentTile } from "./AttachmentTile";
@@ -119,7 +119,7 @@ export function AttachmentRow({
             padding: "0 12px",
             borderRadius: 15,
             background: C.teal,
-            color: C.cream,
+            color: ON_BRAND_FILL,
             border: "none",
             cursor: bulkBusy ? "default" : "pointer",
             fontFamily: '"IBM Plex Sans", sans-serif',

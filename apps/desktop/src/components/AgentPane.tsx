@@ -1,5 +1,5 @@
 import { memo, useEffect, useRef, useState } from "react";
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import {
   prepareAgentWorkspace,
@@ -1066,7 +1066,7 @@ function PrimaryButton({
       onClick={onClick}
       style={{
         background: C.teal,
-        color: C.cream,
+        color: ON_BRAND_FILL,
         border: "none",
         borderRadius: 8,
         padding: "9px 18px",

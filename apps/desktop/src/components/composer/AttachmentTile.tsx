@@ -1,5 +1,5 @@
 import { useState, type MouseEvent } from "react";
-import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../../theme/colors";
+import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import { FileIcon } from "./icons";
 import type { Attachment } from "./attachments";
 
@@ -98,7 +98,9 @@ export function AttachmentTile({
             height: 18,
             borderRadius: 4,
             background: selected ? C.teal : C.forest,
-            color: C.cream,
+            // Selected = constant blue teal fill (light text needed in both themes); unselected =
+            // themed forest (white in light), where the themed navy ink is the legible choice.
+            color: selected ? ON_BRAND_FILL : C.cream,
             border: `1px solid ${selected ? C.teal : C.muted}`,
             cursor: "pointer",
             fontSize: 12,
@@ -124,7 +126,7 @@ export function AttachmentTile({
           height: 18,
           borderRadius: 9,
           background: C.sienna,
-          color: C.cream,
+          color: ON_BRAND_FILL,
           border: "none",
           cursor: "pointer",
           fontSize: 12,

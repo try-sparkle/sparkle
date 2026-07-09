@@ -10,7 +10,7 @@ import {
   FiTerminal,
 } from "react-icons/fi";
 import type { IconType } from "react-icons";
-import { C, FONT_WEIGHT, DANGER } from "../theme/colors";
+import { C, FONT_WEIGHT, DANGER, ON_BRAND_FILL } from "../theme/colors";
 import {
   checkPrereqs,
   checkClaudeSignedIn,
@@ -441,7 +441,7 @@ function errText(e: unknown): string {
 
 const primaryBtn: React.CSSProperties = {
   background: C.teal,
-  color: C.cream,
+  color: ON_BRAND_FILL,
   border: "none",
   borderRadius: 8,
   padding: "8px 16px",

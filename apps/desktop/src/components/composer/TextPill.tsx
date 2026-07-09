@@ -1,4 +1,4 @@
-import { C, FONT_WEIGHT } from "../../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import type { TextBlock } from "./attachments";
 
 /** Collapsed pasted-text block. Click the body to open the full-text modal; × removes it. */
@@ -51,7 +51,7 @@ export function TextPill({
           height: 18,
           borderRadius: 9,
           background: C.sienna,
-          color: C.cream,
+          color: ON_BRAND_FILL,
           border: "none",
           cursor: "pointer",
           fontSize: 12,

@@ -1,4 +1,4 @@
-import { C, FONT_WEIGHT } from "../../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import { ModalOverlay } from "./ModalOverlay";
 import type { TextBlock } from "./attachments";
 
@@ -86,7 +86,7 @@ export function TextPillModal({
           onClick={onShowAsText}
           style={{
             background: C.teal,
-            color: C.cream,
+            color: ON_BRAND_FILL,
             border: "none",
             borderRadius: 8,
             padding: "9px 16px",

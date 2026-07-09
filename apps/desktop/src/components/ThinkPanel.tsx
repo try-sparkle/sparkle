@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { TbBulb } from "react-icons/tb";
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import type { Project } from "../types";
 import { useSettingsStore, effectiveChiefPat, aiFeatureMode } from "../stores/settingsStore";
 import { useHandoffStore } from "../stores/handoffStore";
@@ -1101,7 +1101,12 @@ export function ThinkPanel({
                 : input.trim() || attachedShots.length > 0
                 ? C.teal
                 : C.forest,
-              color: C.cream,
+              // Send/Stop text sits on a constant brand fill (teal/sienna) in the active and
+              // sending states — use ON_BRAND_FILL so it stays light in BOTH themes (C.cream flips
+              // to navy in light mode). The idle/disabled state is on themed `forest` (white in
+              // light), where the themed navy ink is the legible choice.
+              color:
+                sending || input.trim() || attachedShots.length > 0 ? ON_BRAND_FILL : C.cream,
               border: "none",
               borderRadius: 8,
               padding: "0 18px",
@@ -1173,7 +1178,7 @@ function CaptureShotPill({ att, onRemove }: { att: Attachment; onRemove: () => v
           height: 18,
           borderRadius: 4,
           background: C.sienna,
-          color: C.cream,
+          color: ON_BRAND_FILL,
           border: "none",
           cursor: "pointer",
           fontSize: 12,
@@ -1222,7 +1227,9 @@ const Bubble = memo(function Bubble({ msg }: { msg: ChatMsg }) {
         <div
           style={{
             background: mine ? C.teal : C.deepForest,
-            color: C.cream,
+            // My own bubble is the constant blue teal fill — keep its text light in both themes;
+            // others' bubbles sit on themed deepForest where C.cream flips correctly.
+            color: mine ? ON_BRAND_FILL : C.cream,
             border: mine ? "none" : `1px solid ${C.forest}`,
             borderLeft: mine ? "none" : `3px solid ${accent}`,
             borderRadius: 12,
@@ -1231,7 +1238,7 @@ const Bubble = memo(function Bubble({ msg }: { msg: ChatMsg }) {
           }}
         >
           {msg.pending && !msg.text ? (
-            <span style={{ color: C.cream, fontSize: 14 }}>…</span>
+            <span style={{ color: mine ? ON_BRAND_FILL : C.cream, fontSize: 14 }}>…</span>
           ) : mine ? (
             <span style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
               <MentionText text={msg.text} stripAt />

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import type { Project } from "../types";
 import {
   childrenOf,
@@ -882,7 +882,7 @@ function DetailOverlay({
               title="Build It — claim this epic and hand it to the Build orchestrator, which spawns one worker per task"
               style={{
                 background: C.teal,
-                color: C.cream,
+                color: ON_BRAND_FILL,
                 border: "none",
                 borderRadius: 8,
                 padding: "6px 16px",
@@ -930,7 +930,7 @@ function DetailOverlay({
               title="Build It — build this single task on one isolated worker branch, then verify and integrate it"
               style={{
                 background: C.teal,
-                color: C.cream,
+                color: ON_BRAND_FILL,
                 border: "none",
                 borderRadius: 8,
                 padding: "6px 16px",

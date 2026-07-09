@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import type { Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -220,7 +220,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
             disabled={busy || !nameValid}
             style={{
               background: C.teal,
-              color: C.cream,
+              color: ON_BRAND_FILL,
               border: "none",
               borderRadius: 8,
               padding: "9px 18px",

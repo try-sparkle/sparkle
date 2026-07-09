@@ -6,7 +6,7 @@
 // otherwise. If the agent has since been closed (deleted), the row reports "That agent has been
 // closed" instead of navigating.
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { C, DANGER, FONT_WEIGHT } from "../theme/colors";
+import { C, DANGER, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -124,7 +124,9 @@ const badgeStyle = (kind: HistoryHit["kind"]): CSSProperties => ({
   fontWeight: FONT_WEIGHT.semibold,
   padding: "1px 5px",
   borderRadius: 4,
-  color: C.cream,
+  // Badge always sits on a constant brand blue fill (accentMid or teal), so its text must stay
+  // light in both themes — C.cream would flip to navy in light mode and go low-contrast.
+  color: ON_BRAND_FILL,
   background: kind === "prompt" ? C.accentMid : C.teal,
 });
 

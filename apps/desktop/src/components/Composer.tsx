@@ -1337,7 +1337,7 @@ export function Composer({
           style={{
             alignSelf: "flex-end",
             background: C.teal,
-            color: C.cream,
+            color: ON_BRAND_FILL,
             border: "none",
             borderRadius: 8,
             padding: "9px 18px",

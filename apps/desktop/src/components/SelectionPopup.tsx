@@ -17,7 +17,7 @@ import {
   FiCheckSquare,
   FiCheck,
 } from "react-icons/fi";
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { popupPosition } from "./selectionPopupPosition";
 import {
   thinkWith,
@@ -280,7 +280,10 @@ function Grid({ actions }: { actions: Action[] }) {
             textAlign: "left",
             fontSize: 12,
             fontFamily: "inherit",
-            color: C.cream,
+            // Primary action sits on the constant blue teal fill — keep its text light in both
+            // themes (C.cream flips to navy in light). Non-primary is transparent/forest, where
+            // the themed ink is correct.
+            color: a.primary ? ON_BRAND_FILL : C.cream,
             background: a.primary ? C.teal : "transparent",
           }}
           onMouseEnter={(e) => {

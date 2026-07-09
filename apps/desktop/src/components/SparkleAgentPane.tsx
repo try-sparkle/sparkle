@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { createAgentWorktree, installWorktreeGuard, assertWorkspaceIntegrity } from "../services/worktree";
 import { checkClaude, claudeHasSession } from "../preflight";
 import { buildClaudeExec } from "../services/claudeSpawn";
@@ -215,7 +215,7 @@ function PrimaryButton({ children, onClick }: { children: React.ReactNode; onCli
       onClick={onClick}
       style={{
         background: C.teal,
-        color: C.cream,
+        color: ON_BRAND_FILL,
         border: "none",
         borderRadius: 8,
         padding: "9px 18px",
