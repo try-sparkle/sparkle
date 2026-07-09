@@ -1066,10 +1066,6 @@ fn branch_status_with_base(
 ) -> Result<BranchStatus, String> {
     let branch = format!("sparkle/agent-{agent_id}");
     let wt_str = wt.to_string_lossy().to_string();
-    let counts = git(root, &["rev-list", "--left-right", "--count", &format!("{base_ref}...{branch}")])?;
-    let mut it = counts.split_whitespace();
-    let behind: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let ahead: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     // `--no-optional-locks`: a plain `git status` refreshes and REWRITES the worktree index (to
     // update its stat cache), which would bump the index mtime our fingerprint keys on and defeat the
     // skip on the very next tick. This top-level flag tells git not to take the index lock / write it,
@@ -1079,6 +1075,19 @@ fn branch_status_with_base(
     } else {
         false
     };
+    // A brand-new/non-git agent polled before its first commit has no `sparkle/agent-<id>` ref yet;
+    // `rev-list <base>...<missing>` then hard-fails with "ambiguous argument ... unknown revision",
+    // which fails the WHOLE batch read for that agent and re-logs "batch branch status failed" every
+    // 30s poll for the app's lifetime. Mirror `agent_branch_status_at`'s guard (the #291 fix, lost in
+    // the batch refactor): return a zeroed status — still reflecting the worktree's dirty state — when
+    // the branch ref doesn't exist, so there's nothing to count against a ref that isn't there.
+    if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_err() {
+        return Ok(BranchStatus { ahead: 0, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0 });
+    }
+    let counts = git(root, &["rev-list", "--left-right", "--count", &format!("{base_ref}...{branch}")])?;
+    let mut it = counts.split_whitespace();
+    let behind: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ahead: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let numstat = git(root, &["diff", "--numstat", &format!("{base_ref}...{branch}")]).unwrap_or_default();
     let (mut files_changed, mut insertions, mut deletions) = (0u32, 0u32, 0u32);
     for line in numstat.lines().filter(|l| !l.trim().is_empty()) {
@@ -2891,6 +2900,38 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn batch_branch_status_zeroes_when_branch_ref_is_absent() {
+        // The batched 30s poll (branch_status_with_base) must carry the SAME absent-ref guard the
+        // single-agent path got in the #291 fix — it was lost when the poll was batched, so a
+        // brand-new agent (no `sparkle/agent-<id>` ref yet) made `rev-list <base>...<missing>` fail
+        // with "unknown revision", failing that agent's read and re-logging "batch branch status
+        // failed" every tick forever. It must return Ok with a zeroed, clean status instead.
+        let root = unique_root("batch-status-noref");
+        let root_str = root.to_string_lossy().to_string();
+        ensure_project_repo(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        // No worktree/branch for "s1" → refs/heads/sparkle/agent-s1 never exists.
+        assert!(
+            git(&root_str, &["rev-parse", "--verify", "--quiet", "refs/heads/sparkle/agent-s1"]).is_err(),
+            "precondition: agent branch ref absent",
+        );
+
+        // A non-existent worktree path (the agent hasn't been created) — dirty must read clean, not error.
+        let wt = root.join("nonexistent-wt");
+        let st = branch_status_with_base(&root_str, "s1", "main", &wt).unwrap();
+        assert_eq!(st.ahead, 0, "no ref ⇒ nothing ahead");
+        assert_eq!(st.behind, 0, "no ref ⇒ nothing behind");
+        assert!(!st.dirty, "no worktree ⇒ clean");
+        assert_eq!(st.files_changed, 0);
+        assert_eq!(st.insertions, 0);
+        assert_eq!(st.deletions, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

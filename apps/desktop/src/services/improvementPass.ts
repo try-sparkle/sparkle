@@ -12,6 +12,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { checkClaude } from "../preflight";
+import { safeUnlisten } from "./safeUnlisten";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import type { SparkleImprovementConsent } from "../stores/settingsStore";
 import type { AgentTabStatus } from "../types";
@@ -175,7 +176,10 @@ export async function runImprovementPass(consent: SparkleImprovementConsent): Pr
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        for (const u of unlisteners) u();
+        // safeUnlisten (not a bare `u()`): a window-close during a pass can tear down Tauri's
+        // listeners map before this runs, and a raw unlisten then throws the benign "handlerId"
+        // race as an unhandled rejection. Fire-and-forget — teardown order is unaffected.
+        for (const u of unlisteners) void safeUnlisten(u);
         deliver();
       };
       const settle = (v: { ok: boolean; text: string }) => finish(() => resolve(v));
@@ -192,7 +196,7 @@ export async function runImprovementPass(consent: SparkleImprovementConsent): Pr
       // `unlisteners` or that listener would leak for the life of the webview. A handle that
       // arrives after settlement is unlistened on the spot for the same reason.
       const track = (u: () => void) => {
-        if (settled) u();
+        if (settled) void safeUnlisten(u);
         else unlisteners.push(u);
       };
       Promise.all([

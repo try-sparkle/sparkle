@@ -12,6 +12,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { checkClaude } from "../preflight";
+import { safeUnlisten } from "./safeUnlisten";
 
 export interface ClaudeChatDelta {
   id: string;
@@ -54,7 +55,12 @@ export interface SendClaudeChatOptions {
 export async function sendClaudeChat(opts: SendClaudeChatOptions): Promise<() => void> {
   const unlistens: UnlistenFn[] = [];
   const cleanup = () => {
-    for (const u of unlistens) u();
+    // Route each unlisten through safeUnlisten: on a rapid unmount / window close the caller can
+    // fire this AFTER Tauri has torn down its internal listeners map, and a bare `u()` then throws
+    // the "handlerId" teardown race as an UNHANDLED rejection (ThinkPanel calls cleanup directly
+    // from effect teardown and Stop handlers, so it surfaces app-level). safeUnlisten swallows only
+    // that benign race; fire-and-forget keeps this a synchronous `() => void`.
+    for (const u of unlistens) void safeUnlisten(u);
     unlistens.length = 0;
   };
 

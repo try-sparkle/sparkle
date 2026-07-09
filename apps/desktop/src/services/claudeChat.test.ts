@@ -117,6 +117,24 @@ describe("sendClaudeChat", () => {
     expect(unlistenMock).toHaveBeenCalledTimes(3);
   });
 
+  it("swallows the Tauri 'handlerId' teardown race so cleanup never throws", async () => {
+    // On a rapid unmount / window close the unlisten fn can fire AFTER Tauri tore down its internal
+    // listeners map, throwing the benign "handlerId" race. cleanup() runs each unlisten through
+    // safeUnlisten, so that race must not surface (previously it propagated as an unhandled throw).
+    const cleanup = await sendClaudeChat(makeOpts());
+    unlistenMock.mockImplementation(() => {
+      throw new Error("undefined is not an object (evaluating 'listeners[eventId].handlerId')");
+    });
+    try {
+      expect(() => cleanup()).not.toThrow();
+      expect(unlistenMock).toHaveBeenCalledTimes(3);
+    } finally {
+      // Reset in finally so a failed assertion can't leak the throwing impl into later tests
+      // (beforeEach only mockClear()s, which keeps the implementation).
+      unlistenMock.mockReset();
+    }
+  });
+
   it("routes a synchronous invoke failure to onError and tears the listeners down", async () => {
     invokeMock.mockReturnValueOnce(Promise.reject(new Error("invalid cwd")));
     const opts = makeOpts();
