@@ -20,8 +20,15 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { create } from "zustand";
 import { useSettingsStore } from "../stores/settingsStore";
 
-/** Default poll cadence: every 6 hours, plus once at launch. */
-export const DEFAULT_UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+/** Default poll cadence: every 60 minutes, plus once at launch and whenever the app regains focus. */
+export const DEFAULT_UPDATE_INTERVAL_MS = 60 * 60 * 1000;
+
+/** Don't run another check within this window of the last one — guards the focus listener (and any
+ *  focus/visibility double-fire) from spamming the release feed on rapid app switching. */
+export const MIN_CHECK_GAP_MS = 5 * 60 * 1000;
+
+/** Wall-clock ms of the last check attempt (any trigger), for the MIN_CHECK_GAP_MS focus guard. */
+let lastCheckAt = 0;
 
 /**
  * UI-facing phase:
@@ -74,17 +81,26 @@ function inTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+/** Outcome of a single update check — lets the user-initiated "Check for updates" show feedback. */
+export type CheckOutcome = "update-available" | "up-to-date" | "error";
+
 /**
- * Run one update check and act on the result. Safe to call repeatedly (interval + launch).
- * Never throws: all failures (offline, manifest fetch, signature mismatch, install error) are
- * swallowed so the next interval retries cleanly.
+ * Run one update check and act on the result, RETURNING the outcome so a user-initiated check can
+ * show feedback ("Checking…" → up to date / available / failed). Background callers (launch,
+ * interval, focus) ignore the return. Never throws: offline / manifest-fetch / signature / install
+ * failures resolve to "error" (background callers just retry next interval).
  */
-export async function checkForUpdatesNow(): Promise<void> {
-  // Already installed and waiting for restart — re-checking would just re-download the same build.
-  if (useUpdaterStore.getState().phase === "ready") return;
+export async function checkForUpdates(): Promise<CheckOutcome> {
+  // Already found/staged this session — the banner is (or will be) showing it. Re-checking would
+  // re-download the same build (and, on the auto-apply-off path, leak the prior Update handle).
+  const phase = useUpdaterStore.getState().phase;
+  if (phase === "available" || phase === "ready") return "update-available";
   try {
+    // Stamp only a REAL check attempt (after the early-return guard), so the focus-refocus gap
+    // reflects actual network checks — a no-op early return doesn't suppress a genuine focus check.
+    lastCheckAt = Date.now();
     const update = await check();
-    if (!update) return; // No update available — no-op.
+    if (!update) return "up-to-date"; // No update available.
     const notes = update.body ?? null;
     const autoApply = useSettingsStore.getState().autoApplyUpdates;
     if (autoApply) {
@@ -104,9 +120,18 @@ export async function checkForUpdatesNow(): Promise<void> {
       pendingUpdate = update;
       useUpdaterStore.getState().setAvailable(update.version, notes);
     }
+    return "update-available";
   } catch {
-    // Silent: network/check/signature failures retry on the next interval. Never reaches the UI.
+    // Network/check/signature/install failure. Background callers retry next interval; a manual
+    // caller shows "Check failed". Never reaches the UI on its own.
+    return "error";
   }
+}
+
+/** Fire-and-forget wrapper for background callers (launch/interval/focus) that don't need the
+ *  outcome. Preserves the original void-returning API. */
+export async function checkForUpdatesNow(): Promise<void> {
+  await checkForUpdates();
 }
 
 /**
@@ -135,24 +160,35 @@ export async function applyUpdateAndRestart(): Promise<void> {
   }
 }
 
-// Guard against double-starts (e.g. React StrictMode double-mount) and hold the interval handle.
+// Guard against double-starts (e.g. React StrictMode double-mount) and hold the interval + focus
+// listener handles for cleanup.
 let started = false;
 let timer: ReturnType<typeof setInterval> | null = null;
+let onFocus: (() => void) | null = null;
 
 /**
- * Begin polling for updates: once at launch, then every `intervalMs` (default 6h). No-ops in dev
- * / the browser preview / when not packaged — the updater plugin and signed manifest only exist
- * in a real build, so running check() there only generates noise. Returns a cleanup that stops
- * the interval.
+ * Begin polling for updates: once at launch, every `intervalMs` (default 60min), AND whenever the
+ * app window regains focus — so a release cut while the app was backgrounded is noticed within
+ * seconds of the user returning, not up to a full interval later. The focus check is guarded by
+ * MIN_CHECK_GAP_MS so rapid alt-tabbing doesn't spam the feed. No-ops in dev / the browser preview
+ * / when not packaged — the updater plugin and signed manifest only exist in a real build, so
+ * running check() there only generates noise. Returns a cleanup that stops the interval and removes
+ * the focus listener.
  */
 export function startUpdater(intervalMs: number = DEFAULT_UPDATE_INTERVAL_MS): () => void {
   if (started || !inTauri() || import.meta.env.DEV) return () => {};
   started = true;
-  void checkForUpdatesNow();
-  timer = setInterval(() => void checkForUpdatesNow(), intervalMs);
+  void checkForUpdates();
+  timer = setInterval(() => void checkForUpdates(), intervalMs);
+  onFocus = () => {
+    if (Date.now() - lastCheckAt >= MIN_CHECK_GAP_MS) void checkForUpdates();
+  };
+  window.addEventListener("focus", onFocus);
   return () => {
     if (timer) clearInterval(timer);
     timer = null;
+    if (onFocus) window.removeEventListener("focus", onFocus);
+    onFocus = null;
     started = false;
   };
 }

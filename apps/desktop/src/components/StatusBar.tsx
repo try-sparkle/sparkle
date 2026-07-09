@@ -1,10 +1,33 @@
-import { useEffect, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { FiAlertTriangle, FiCheck, FiRefreshCw } from "react-icons/fi";
 import { C } from "../theme/colors";
 import { getAppVersion, getLogDir, revealLogs, log } from "../logger";
+import { checkForUpdates, type CheckOutcome } from "../services/updaterService";
 import { SupportModal } from "./SupportModal";
 
 const CHANGELOG_URL = "https://sparkle.ai/changelog";
+
+/** Shared style for the version-popover rows, so "Check for updates" and "Open logs" match. */
+const menuItemStyle: CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  width: "100%",
+  textAlign: "left",
+  background: "transparent",
+  border: "none",
+  padding: "6px 8px",
+  borderRadius: 4,
+  color: C.cream,
+  fontSize: 11,
+  fontFamily: '"IBM Plex Sans", sans-serif',
+  cursor: "pointer",
+};
+
+/** Manual "Check for updates" feedback, shown inline in the popover (not the global updater store,
+ *  which stays focused on update availability / the banner). */
+type CheckState = "idle" | "checking" | "uptodate" | "error";
 
 /**
  * Bottom-left footer: a clickable app version + a "Changelog" link. The version opens a
@@ -17,8 +40,12 @@ export function StatusBar() {
   const [version, setVersion] = useState<string>("");
   const [logDir, setLogDir] = useState<string>("");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [checkState, setCheckState] = useState<CheckState>("idle");
   const [supportOpen, setSupportOpen] = useState(false);
   const versionRef = useRef<HTMLDivElement>(null);
+  // Bumped on every popover open/close so an in-flight manual check whose promise resolves in a
+  // DIFFERENT session (popover closed, or closed and reopened) can't write its stale result.
+  const checkGenRef = useRef(0);
 
   useEffect(() => {
     getAppVersion()
@@ -46,10 +73,40 @@ export function StatusBar() {
     };
   }, [menuOpen]);
 
+  // Each open/close is a new session: invalidate any in-flight check's result and start every
+  // OPEN fresh ("Check for updates"), so a prior check's outcome never lingers on reopen.
+  useEffect(() => {
+    checkGenRef.current += 1;
+    if (menuOpen) setCheckState("idle");
+  }, [menuOpen]);
+
   const onShowLogs = () => {
     log.info("statusbar", "open logs in finder clicked");
     setMenuOpen(false);
     void revealLogs().catch((e) => log.error("statusbar", "reveal logs failed", e));
+  };
+
+  const onCheckForUpdates = async () => {
+    if (checkState === "checking") return; // guard double-clicks / re-entry
+    log.info("statusbar", "check for updates clicked");
+    setCheckState("checking");
+    const gen = checkGenRef.current; // this check belongs to the current open session
+    let outcome: CheckOutcome;
+    try {
+      outcome = await checkForUpdates();
+    } catch {
+      outcome = "error"; // checkForUpdates never throws, but belt-and-suspenders
+    }
+    // The popover closed (and maybe reopened) since this check started — its result is stale for
+    // the current session, so don't write it (it would show without a fresh check having run).
+    if (checkGenRef.current !== gen) return;
+    if (outcome === "update-available") {
+      // The update banner now surfaces it — close the popover so it isn't covered.
+      setCheckState("idle");
+      setMenuOpen(false);
+    } else {
+      setCheckState(outcome === "up-to-date" ? "uptodate" : "error");
+    }
   };
 
   const onChangelog = () => {
@@ -100,8 +157,8 @@ export function StatusBar() {
         </button>
         {menuOpen && (
           <div
-            // A single-action disclosure popover revealed by the version button's
-            // aria-expanded — no role (it's not a menu or a focus-trapping dialog).
+            // A small disclosure popover revealed by the version button's aria-expanded — no role
+            // (it's not a menu or a focus-trapping dialog).
             style={{
               position: "absolute",
               bottom: "calc(100% + 6px)",
@@ -116,21 +173,33 @@ export function StatusBar() {
             }}
           >
             <button
+              onClick={() => void onCheckForUpdates()}
+              disabled={checkState === "checking"}
+              title="Check for a newer Sparkle version"
+              style={{
+                ...menuItemStyle,
+                cursor: checkState === "checking" ? "default" : "pointer",
+              }}
+            >
+              {checkState === "uptodate" ? (
+                <FiCheck aria-hidden size={13} style={{ flex: "0 0 auto" }} />
+              ) : checkState === "error" ? (
+                <FiAlertTriangle aria-hidden size={13} style={{ flex: "0 0 auto" }} />
+              ) : (
+                <FiRefreshCw aria-hidden size={13} style={{ flex: "0 0 auto" }} />
+              )}
+              {checkState === "checking"
+                ? "Checking for updates…"
+                : checkState === "uptodate"
+                  ? "You're up to date"
+                  : checkState === "error"
+                    ? "Check failed — retry"
+                    : "Check for updates"}
+            </button>
+            <button
               onClick={onShowLogs}
               title={logDir ? `Open ${logDir} in Finder` : "Open the log folder in Finder"}
-              style={{
-                display: "block",
-                width: "100%",
-                textAlign: "left",
-                background: "transparent",
-                border: "none",
-                padding: "6px 8px",
-                borderRadius: 4,
-                color: C.cream,
-                fontSize: 11,
-                fontFamily: '"IBM Plex Sans", sans-serif',
-                cursor: "pointer",
-              }}
+              style={menuItemStyle}
             >
               Open logs in Finder →
             </button>

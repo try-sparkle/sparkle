@@ -15,9 +15,12 @@ vi.mock("@tauri-apps/plugin-process", () => ({
 }));
 
 import {
+  checkForUpdates,
   checkForUpdatesNow,
   applyUpdateAndRestart,
   useUpdaterStore,
+  DEFAULT_UPDATE_INTERVAL_MS,
+  MIN_CHECK_GAP_MS,
 } from "./updaterService";
 import { useSettingsStore } from "../stores/settingsStore";
 
@@ -91,6 +94,48 @@ describe("checkForUpdatesNow", () => {
     await checkForUpdatesNow();
 
     expect(check).not.toHaveBeenCalled();
+  });
+});
+
+describe("checkForUpdates (returns an outcome for the manual check)", () => {
+  it("no update → 'up-to-date', stays idle", async () => {
+    check.mockResolvedValue(null);
+    await expect(checkForUpdates()).resolves.toBe("up-to-date");
+    expect(useUpdaterStore.getState().phase).toBe("idle");
+  });
+
+  it("check throws → 'error' (never throws), stays idle", async () => {
+    check.mockRejectedValue(new Error("offline / signature mismatch"));
+    await expect(checkForUpdates()).resolves.toBe("error");
+    expect(useUpdaterStore.getState().phase).toBe("idle");
+  });
+
+  it("update found, auto-apply ON → 'update-available', phase 'ready'", async () => {
+    useSettingsStore.setState({ autoApplyUpdates: true });
+    check.mockResolvedValue(makeUpdate());
+    await expect(checkForUpdates()).resolves.toBe("update-available");
+    expect(useUpdaterStore.getState().phase).toBe("ready");
+  });
+
+  it("update found, auto-apply OFF → 'update-available', phase 'available'", async () => {
+    useSettingsStore.setState({ autoApplyUpdates: false });
+    check.mockResolvedValue(makeUpdate());
+    await expect(checkForUpdates()).resolves.toBe("update-available");
+    expect(useUpdaterStore.getState().phase).toBe("available");
+  });
+
+  it("already 'available' → 'update-available' WITHOUT re-checking (no re-download / handle leak)", async () => {
+    useUpdaterStore.getState().setAvailable("9.9.9", null);
+    check.mockResolvedValue(makeUpdate());
+    await expect(checkForUpdates()).resolves.toBe("update-available");
+    expect(check).not.toHaveBeenCalled();
+  });
+});
+
+describe("cadence constants", () => {
+  it("polls every 60 minutes; refocus checks are guarded by a 5-minute gap", () => {
+    expect(DEFAULT_UPDATE_INTERVAL_MS).toBe(60 * 60 * 1000);
+    expect(MIN_CHECK_GAP_MS).toBe(5 * 60 * 1000);
   });
 });
 
