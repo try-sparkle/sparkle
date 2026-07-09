@@ -39,6 +39,27 @@ const BASE_FONT_SIZE = 13;
 // context rather than sitting flush at the viewport top.
 const SCROLL_LEAD_IN_ROWS = 2;
 
+// After live output goes fully quiet, sweep the WebGL renderer once with a full, atlas-clearing
+// repaint. The 80ms settle path only does a bare term.refresh() (cheap, for the common visible-
+// streaming case), which the renderer's per-cell model cache SKIPS — so a cell that got mis-
+// rasterized mid-stream (the "WThe" artifact: a stray glyph left in a cell) survives every later
+// refresh() and stays wrong until a scroll / pane-switch / mouse-hover forces those rows to redraw.
+// This longer, separately-debounced sweep clears the texture atlas so stray glyphs self-heal within
+// ~half a second instead of persisting until the user mouses over them. The delay sits well past the
+// settle window so active streaming (chunks arriving <IDLE_SWEEP_MS apart) keeps pushing it out and
+// never pays the cold repaint — it fires ONCE, when output stops.
+const IDLE_SWEEP_MS = 500;
+
+// ...but only when enough output has accumulated since the last sweep to make a mis-rasterized cell
+// plausible. A stray glyph is a heavy-streaming artifact; a keystroke echo or a one-line status
+// update won't produce one. Without this gate the sweep would pay a full (comparatively heavy) atlas
+// clear after EVERY interactive lull — type → tiny echo → pause, repeat — repainting the visible
+// viewport on routine pauses for no benefit (roborev Low #35218). Bytes accumulate across sub-
+// threshold bursts (the counter only resets on an actual sweep), so small outputs still heal
+// eventually once their cumulative volume crosses the bar — just not on every trivial pause. ~one
+// screenful of a default terminal.
+const IDLE_SWEEP_MIN_BYTES = 2048;
+
 // Push the live xterm size to the PTY — but ONLY when it came from a genuinely laid-out
 // container. fit() on a display:none / pre-layout pane collapses to a tiny size (cols≈12), and
 // sending that to the PTY makes the agent CLI hard-wrap its output into a thin column that no
@@ -594,6 +615,28 @@ export function Terminal({
       }, 80);
     };
 
+    // Idle sweep: one full, atlas-clearing repaint after output goes quiet, to heal any stray glyph
+    // the cheap settle-refresh can't (a cell mis-rasterized mid-stream sticks under the WebGL per-
+    // cell cache — see IDLE_SWEEP_MS). On its OWN, longer-debounced timer so it fires once when
+    // streaming stops, not per chunk. Gated on IDLE_SWEEP_MIN_BYTES of accumulated output so routine
+    // interactive pauses don't pay the cold repaint. Skipped while the pane is hidden — the become-
+    // active reveal owns that repaint, and a full atlas clear on an off-screen pane is pure wasted
+    // GPU work (mirrors applyRepaintPlan's "skip"). disposedRef + forceFullRepaint's own try/catch
+    // keep a late timer off a torn-down term.
+    let idleSweepTimer: number | null = null;
+    let bytesSinceSweep = 0;
+    const scheduleIdleSweep = () => {
+      if (idleSweepTimer) window.clearTimeout(idleSweepTimer);
+      idleSweepTimer = window.setTimeout(() => {
+        if (disposedRef.current || !isPaintable()) return;
+        // Below the volume bar: leave bytesSinceSweep intact so it accrues across bursts and a
+        // series of small outputs still heals once cumulatively substantial — just not per pause.
+        if (bytesSinceSweep < IDLE_SWEEP_MIN_BYTES) return;
+        bytesSinceSweep = 0;
+        forceFullRepaint(webglRef.current, term);
+      }, IDLE_SWEEP_MS);
+    };
+
     // PTY read backpressure (): count bytes written-but-not-yet-parsed by xterm and, past
     // the high-water mark, pause the PTY reader (the child then blocks on its own write) until the
     // backlog drains below the low-water mark. Bounds xterm + IPC memory under a runaway-verbose
@@ -629,6 +672,8 @@ export function Terminal({
         // (or the become-active reveal) repaints it instead of leaving the top half blank.
         if (!isPaintable()) poisonedRef.current = true;
         scheduleSettleRepaint();
+        bytesSinceSweep += chunkLen;
+        scheduleIdleSweep();
       });
       const offExit = await onPtyExit((e) => {
         if (e.id !== agentId) return;
@@ -728,6 +773,7 @@ export function Terminal({
       container.removeEventListener("mouseup", onMouseUp);
       container.removeEventListener("mousedown", onMouseDown);
       if (settleRepaintTimer) window.clearTimeout(settleRepaintTimer);
+      if (idleSweepTimer) window.clearTimeout(idleSweepTimer);
       if (scrollRepaintTimer) window.clearTimeout(scrollRepaintTimer);
       if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
       for (const off of unlistens) void safeUnlisten(off);
