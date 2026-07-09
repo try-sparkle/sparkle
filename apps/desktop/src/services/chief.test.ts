@@ -20,6 +20,10 @@ import {
   ensureSkill,
   attachLabel,
   md5Hex,
+  pollForResponse,
+  isTerminalChiefFailureStatus,
+  isChiefQuotaError,
+  ChiefError,
 } from "./chief";
 
 // A minimal Response stand-in for the bits chief.ts reads (ok/status/text).
@@ -891,5 +895,92 @@ describe("attachLabel", () => {
     expect(calls[0]?.method).toBe("POST");
     expect(calls[0]?.url).toContain("/v1/assets/asset_9/labels");
     expect(JSON.parse(String(calls[0]?.body))).toEqual({ name: "needs-review" });
+  });
+});
+
+describe("isTerminalChiefFailureStatus — conservative known-failure set", () => {
+  it("returns true for known terminal-failure statuses (case/space-insensitive)", () => {
+    for (const s of ["failed", "ERROR", " errored ", "cancelled", "Canceled", "rejected", "denied", "aborted"]) {
+      expect(isTerminalChiefFailureStatus(s), `for: ${JSON.stringify(s)}`).toBe(true);
+    }
+  });
+
+  it("returns false for in-progress / unknown / empty statuses (never abort a working turn)", () => {
+    for (const s of [undefined, "", "processing", "pending", "running", "queued", "complete", "ready", "weird"]) {
+      expect(isTerminalChiefFailureStatus(s), `for: ${JSON.stringify(s)}`).toBe(false);
+    }
+  });
+});
+
+describe("isChiefQuotaError — credit/quota/limit detection", () => {
+  it("flags HTTP 402 and 429 ChiefErrors", () => {
+    expect(isChiefQuotaError(new ChiefError("payment required", 402))).toBe(true);
+    expect(isChiefQuotaError(new ChiefError("quota exceeded", 429))).toBe(true);
+  });
+
+  it("flags credit/quota/limit language regardless of status", () => {
+    for (const m of ["quota exceeded", "insufficient credits", "usage limit reached", "rate limit hit", "out of credits"]) {
+      expect(isChiefQuotaError(new ChiefError(m, 400)), `for: ${m}`).toBe(true);
+    }
+  });
+
+  it("does not flag an ordinary ChiefError or a non-ChiefError", () => {
+    expect(isChiefQuotaError(new ChiefError("Chief took too long to respond. Please try again."))).toBe(false);
+    expect(isChiefQuotaError(new Error("quota exceeded"))).toBe(false);
+    expect(isChiefQuotaError("quota exceeded")).toBe(false);
+  });
+});
+
+describe("pollForResponse — status-aware failure detection", () => {
+  it("returns the response as soon as it appears", async () => {
+    const bodies = [
+      { message_id: "m1", status: "processing" },
+      { message_id: "m1", status: "complete", response: "Here is the answer." },
+    ];
+    let i = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => jsonResponse(bodies[Math.min(i++, bodies.length - 1)]),
+    );
+    await expect(
+      pollForResponse("pat", "project_x", "chat_1", "m1", { intervalMs: 1 }),
+    ).resolves.toBe("Here is the answer.");
+  });
+
+  it("throws the real reason immediately on a terminal-failure status (no timeout wait)", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => jsonResponse({ message_id: "m1", status: "failed" }),
+    );
+    // A tiny timeout proves we DON'T wait it out: the status short-circuits first.
+    await expect(
+      pollForResponse("pat", "project_x", "chat_1", "m1", { intervalMs: 1, timeoutMs: 10_000 }),
+    ).rejects.toThrow(/couldn't finish this response.*status: failed/i);
+  });
+
+  it("folds a failure-detail field into the thrown error so quota detection still fires on the status path", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => jsonResponse({ message_id: "m1", status: "failed", error: "quota exceeded" }),
+    );
+    const err = await pollForResponse("pat", "project_x", "chat_1", "m1", { intervalMs: 1 }).catch((e) => e);
+    expect(err).toBeInstanceOf(ChiefError);
+    // Without folding the detail in, isChiefQuotaError would miss a credit/quota condition here.
+    expect(isChiefQuotaError(err)).toBe(true);
+  });
+
+  it("keeps polling through in-progress statuses until the timeout, then reports the timeout", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => jsonResponse({ message_id: "m1", status: "processing" }),
+    );
+    await expect(
+      pollForResponse("pat", "project_x", "chat_1", "m1", { intervalMs: 1, timeoutMs: 5 }),
+    ).rejects.toThrow(/took too long/i);
+  });
+
+  it("propagates an HTTP quota error from getMessage as a quota ChiefError", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => jsonResponse("quota exceeded", false, 429),
+    );
+    const err = await pollForResponse("pat", "project_x", "chat_1", "m1", { intervalMs: 1 }).catch((e) => e);
+    expect(err).toBeInstanceOf(ChiefError);
+    expect(isChiefQuotaError(err)).toBe(true);
   });
 });

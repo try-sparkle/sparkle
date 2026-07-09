@@ -18,6 +18,7 @@ import {
   sendClaudeChat,
   cancelClaudeChat,
   resolveClaudePath,
+  classifyClaudeChatError,
   type SendClaudeChatOptions,
 } from "./claudeChat";
 
@@ -184,5 +185,54 @@ describe("resolveClaudePath", () => {
       Promise.resolve({ installed: true, path: null, version: null }),
     );
     await expect(resolveClaudePath()).rejects.toThrow(/not installed/i);
+  });
+});
+
+describe("classifyClaudeChatError", () => {
+  it("classifies claude's own 'Not logged in · Please run /login' as auth + needsLogin", () => {
+    const c = classifyClaudeChatError("Not logged in · Please run /login");
+    expect(c.kind).toBe("auth");
+    expect(c.needsLogin).toBe(true);
+    // The cryptic "/login" hint is replaced by a Sparkle-native reconnect message.
+    expect(c.message).toMatch(/reconnect claude code/i);
+    expect(c.message).not.toMatch(/\/login/);
+  });
+
+  it("classifies other auth phrasings (invalid api key, unauthorized, 401, expired oauth) as auth", () => {
+    for (const raw of [
+      "Invalid API key · Please run /login",
+      "authentication_error: unauthorized",
+      "Error: 401 Unauthorized",
+      "Your OAuth token has expired",
+      "credentials are invalid",
+    ]) {
+      const c = classifyClaudeChatError(raw);
+      expect(c.kind, `for: ${raw}`).toBe("auth");
+      expect(c.needsLogin, `for: ${raw}`).toBe(true);
+    }
+  });
+
+  it("classifies a usage-limit failure as usageLimit and KEEPS claude's own text (has the reset time)", () => {
+    const raw = "Claude usage limit reached. Your limit resets at 5:00pm.";
+    const c = classifyClaudeChatError(raw);
+    expect(c.kind).toBe("usageLimit");
+    expect(c.needsLogin).toBe(false);
+    expect(c.message).toBe(raw); // verbatim — never lose the reset time
+  });
+
+  it("treats a generic failure as 'other' and surfaces the raw text unchanged", () => {
+    const raw = "claude exited (code 1) with no output; result subtype 'error_during_execution'";
+    const c = classifyClaudeChatError(raw);
+    expect(c.kind).toBe("other");
+    expect(c.needsLogin).toBe(false);
+    expect(c.message).toBe(raw);
+  });
+
+  it("does not misclassify an unrelated error mentioning 'token' as auth", () => {
+    // A stray 'token' in a non-auth context must NOT trip the auth path (which would wrongly show a
+    // reconnect button). Only real auth phrasings do.
+    const c = classifyClaudeChatError("Prompt exceeded the maximum token budget for this model");
+    expect(c.kind).toBe("other");
+    expect(c.needsLogin).toBe(false);
   });
 });

@@ -13,6 +13,7 @@ import {
   ensureSkill,
   createMemory,
   ChiefError,
+  isChiefQuotaError,
   type MemoryCategory,
   type ChiefScope,
   type ChatOptions,
@@ -30,7 +31,15 @@ import { aiFeatureLockedNow, useAiFeatureLocked } from "../services/aiGate";
 import { AiLockedNotice } from "./AiLockedNotice";
 import { useHistoryStore } from "../stores/historyStore";
 import type { HistoryEntry, HistoryKind } from "../services/history";
-import { sendClaudeChat, cancelClaudeChat, resolveClaudePath } from "../services/claudeChat";
+import {
+  sendClaudeChat,
+  cancelClaudeChat,
+  resolveClaudePath,
+  classifyClaudeChatError,
+} from "../services/claudeChat";
+import { buildClaudeLoginExec, SHELL } from "../services/claudeSpawn";
+import { checkClaudeSignedIn, refreshPreflight } from "../preflight";
+import { Terminal } from "./Terminal";
 import { chiefInterject } from "../services/chiefParticipant";
 import { answerAsVoice } from "../services/voiceAnswer";
 import { Markdown } from "./Markdown";
@@ -262,6 +271,13 @@ export function ThinkPanel({
   const [planning, setPlanning] = useState(false);
   const [claudePath, setClaudePath] = useState<string | null>(null);
   const [claudeReady, setClaudeReady] = useState<"checking" | "ok" | "missing">("checking");
+  // Set when a Sparkle turn fails because the user's Claude Code sign-in is missing/expired (see
+  // classifyClaudeChatError). Drives the inline "Reconnect Claude Code" affordance below the
+  // transcript; cleared on a successful turn or a confirmed re-sign-in. `showLoginTerminal` mounts
+  // the actual `claude login` PTY (mirrors SetupChecklist's LoginStep, using the DEFAULT config —
+  // the Think tab runs the user's default `claude`, not a named account dir).
+  const [needsClaudeLogin, setNeedsClaudeLogin] = useState(false);
+  const [showLoginTerminal, setShowLoginTerminal] = useState(false);
 
   // The current Claude Code session id — captured from each `done` event and passed back as
   // `--resume` on the next turn so the conversation is continuous.
@@ -453,6 +469,11 @@ export function ThinkPanel({
           buf = "";
           patchMsg(replyId, { text: finalText, pending: false });
           if (capture && finalText.trim()) recordTurn("response", finalText);
+          // A good reply means Claude Code is authenticated again — retire the whole reconnect
+          // affordance (both the flag AND a possibly-open login terminal, so a later auth failure
+          // starts from the button again rather than jumping straight into a stale terminal).
+          setNeedsClaudeLogin(false);
+          setShowLoginTerminal(false);
           handleSettle();
           // After Sparkle answers, let Chief decide whether to pop in (background, best-effort) —
           // unless Chief is already answering this turn explicitly.
@@ -463,8 +484,16 @@ export function ThinkPanel({
         },
         onError: (message) => {
           cancelFlush();
-          patchMsg(replyId, { text: `_Sparkle error: ${message}_`, pending: false });
-          setError(message);
+          // Translate claude's raw failure into a Sparkle-user-facing reason: an auth failure
+          // ("Not logged in · Please run /login") becomes a reconnect message + affordance rather
+          // than a cryptic terminal hint; a usage-limit keeps claude's own text (has the reset time).
+          const cls = classifyClaudeChatError(message);
+          patchMsg(replyId, { text: `_Sparkle error: ${cls.message}_`, pending: false });
+          setError(cls.message);
+          setNeedsClaudeLogin(cls.needsLogin);
+          // A fresh auth error always starts the affordance from the button, never a stale mounted
+          // login terminal left open by an earlier, un-confirmed reconnect attempt.
+          setShowLoginTerminal(false);
           handleSettle();
           resolve();
         },
@@ -482,8 +511,16 @@ export function ThinkPanel({
         })
         .catch((e) => {
           cancelFlush();
-          patchMsg(replyId, { text: `_Sparkle error: ${friendlyError(e)}_`, pending: false });
-          setError(friendlyError(e));
+          // A synchronous spawn/invoke failure — classify the RAW error message (not the already-
+          // humanized string) so an auth failure here surfaces the same reconnect affordance as the
+          // streamed path. For a non-auth/non-usage error, fall back to friendlyError's own mapping.
+          const raw = e instanceof Error ? e.message : String(e);
+          const cls = classifyClaudeChatError(raw);
+          const message = cls.kind === "other" ? friendlyError(e) : cls.message;
+          patchMsg(replyId, { text: `_Sparkle error: ${message}_`, pending: false });
+          setError(message);
+          setNeedsClaudeLogin(cls.needsLogin);
+          setShowLoginTerminal(false); // fresh error → start from the button (see onError note)
           resolve();
         });
     });
@@ -672,6 +709,28 @@ export function ThinkPanel({
     setMessages((prev) =>
       prev.map((m) => (m.pending ? { ...m, pending: false, text: m.text || "_(stopped)_" } : m)),
     );
+  };
+
+  // After the `claude login` terminal exits (or the user clicks "I've signed in"), verify Claude
+  // Code actually recorded an authenticated identity before dismissing the reconnect UI — the exit
+  // alone doesn't prove success (the user may have quit or failed). Only a confirmed sign-in clears
+  // the affordance; otherwise we keep it up so they can retry. Mirrors SetupChecklist's onExit.
+  const verifyReconnect = async () => {
+    let signedIn = false;
+    try {
+      await refreshPreflight(); // drop any cached path so we re-probe the freshly-signed-in state
+      signedIn = await checkClaudeSignedIn();
+    } catch {
+      signedIn = false; // a probe failure is treated as "not confirmed" — keep the reconnect UI up
+    }
+    if (signedIn) {
+      setNeedsClaudeLogin(false);
+      setShowLoginTerminal(false);
+      setError("");
+      setNotice("Reconnected to Claude Code — send your message again.");
+    } else {
+      setError("Still not signed in to Claude Code. Finish signing in, then try again.");
+    }
   };
 
   const pickerRows = () => {
@@ -938,6 +997,71 @@ export function ThinkPanel({
       {notice && !error && (
         <div style={{ padding: "8px 16px", color: C.muted, fontSize: 12 }}>{notice}</div>
       )}
+      {/* Claude Code sign-in recovery: when a Sparkle turn failed on an auth error, offer an inline
+          reconnect so the user fixes it here (Sparkle runs their own `claude` under their login —
+          this is NOT a Sparkle-credits problem). Mirrors SetupChecklist's LoginStep, default config. */}
+      {needsClaudeLogin && !claudePath && (
+        // Auth error but we couldn't resolve the binary — advise WITHOUT a dead reconnect button.
+        <div style={{ padding: "0 16px 8px", color: C.muted, fontSize: 12 }}>
+          Claude Code wasn’t found — install/sign in from setup, then try again.
+        </div>
+      )}
+      {needsClaudeLogin && claudePath && (
+        <div style={{ padding: "0 16px 8px" }}>
+          {!showLoginTerminal ? (
+            <button
+              onClick={() => setShowLoginTerminal(true)}
+              style={{
+                background: C.teal,
+                color: C.cream,
+                border: `1px solid ${C.teal}`,
+                borderRadius: 8,
+                padding: "6px 16px",
+                fontSize: 13,
+                fontWeight: FONT_WEIGHT.semibold,
+                cursor: "pointer",
+              }}
+            >
+              Reconnect Claude Code
+            </button>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ height: 260, border: `1px solid ${C.forest}`, borderRadius: 8, overflow: "hidden", padding: 6 }}>
+                <Terminal
+                  agentId="think-claude-login"
+                  projectId="think-login"
+                  projectRootPath=""
+                  command={SHELL}
+                  args={["-l", "-c", buildClaudeLoginExec(claudePath)]}
+                  active
+                  onStatus={() => {}}
+                  onExit={() => void verifyReconnect()}
+                />
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => void verifyReconnect()}
+                  style={{
+                    background: C.teal, color: C.cream, border: `1px solid ${C.teal}`,
+                    borderRadius: 8, padding: "6px 16px", fontSize: 13, fontWeight: FONT_WEIGHT.semibold, cursor: "pointer",
+                  }}
+                >
+                  I’ve signed in
+                </button>
+                <button
+                  onClick={() => setShowLoginTerminal(false)}
+                  style={{
+                    background: C.forest, color: C.cream, border: `1px solid ${C.forest}`,
+                    borderRadius: 8, padding: "6px 16px", fontSize: 13, fontWeight: FONT_WEIGHT.medium, cursor: "pointer",
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
       {showLockedNotice && thinkLocked && (
         <div style={{ padding: "0 16px 8px" }}>
           <AiLockedNotice label="Buy Sparkle to think with AI." />
@@ -1195,6 +1319,14 @@ function CaptureShotPill({ att, onRemove }: { att: Attachment; onRemove: () => v
 function friendlyError(e: unknown): string {
   if (e instanceof AiDisabledError) return "AI features are off — turn them on in the ⋯ menu.";
   if (e instanceof OutOfCreditsError) return "Out of AI credits. Add more to keep thinking.";
+  // A Chief credit/quota/usage-limit condition (HTTP 402/429 or quota-language body) — say so
+  // plainly rather than leaking a raw status line, while keeping Chief's own text when it has some.
+  if (isChiefQuotaError(e)) {
+    const detail = e instanceof ChiefError ? e.message.trim() : "";
+    return detail
+      ? `Chief is out of credits or hit a usage limit — ${detail}`
+      : "Chief is out of credits or hit a usage limit.";
+  }
   if (e instanceof ChiefError) return e.message;
   if (e instanceof Error) return e.message;
   return String(e);

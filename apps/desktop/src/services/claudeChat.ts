@@ -122,3 +122,63 @@ function toMessage(e: unknown): string {
   const m = (e as { message?: unknown })?.message;
   return typeof m === "string" ? m : String(e);
 }
+
+/** How a failed Claude Code turn should be presented to a Think-tab user. */
+export type ClaudeErrorKind = "auth" | "usageLimit" | "other";
+
+export interface ClassifiedClaudeError {
+  kind: ClaudeErrorKind;
+  /** The message to show. For `auth`/`usageLimit` it's already humanized for a Sparkle user; for
+   *  `other` it's the raw text (claude's own diagnostics) unchanged. */
+  message: string;
+  /** True only for `auth`: the user must (re)sign-in to Claude Code, so the caller shows the
+   *  inline "Reconnect Claude Code" affordance. */
+  needsLogin: boolean;
+}
+
+// Claude Code's own auth failures. The Think tab runs the user's OWN `claude` binary under THEIR
+// login (Sparkle never holds the token), so "Not logged in · Please run /login" et al. mean the
+// user's Claude Code sign-in is missing/expired — NOT that Sparkle is out of credits. The remedy
+// is to reconnect Claude Code, so we translate the raw CLI text (which tells them to run `/login`,
+// a terminal command with no home in the Think tab) into a Sparkle-native message + a reconnect
+// button. Kept broad but specific: real Claude auth-error phrasings, not generic words like "token".
+const CLAUDE_AUTH_RE =
+  /\bnot logged in\b|please run \/login|please log ?in|\blog in to claude\b|invalid api key|invalid x-api-key|authentication_error|authentication failed|\bunauthorized\b|oauth[^.]*expired|credentials?[^.]*(expired|invalid|missing)|no api key|missing api key/i;
+
+// Claude subscription/usage-limit exhaustion — the closest thing to "out of credits" on the Claude
+// side. Claude's own text carries the reset time ("Claude usage limit reached. Your limit resets at
+// 5:00pm."), so we surface it VERBATIM rather than replacing it; only the classification changes.
+// Bare numeric HTTP codes are intentionally NOT matched (a stray "401"/"429" in unrelated
+// diagnostics — "Processed 429 items" — must not trip these); we key on the named phrasings instead.
+const CLAUDE_USAGE_RE = /usage limit|rate limit|too many requests|\bquota\b|usage cap|credit balance (is )?too low/i;
+
+/**
+ * Classify a raw Claude Code failure message (as delivered on `claude_chat:error` or a thrown
+ * spawn error) into a Sparkle-user-facing presentation. Pure so it can be unit-tested and reused.
+ *
+ *  - `auth`       → the user's Claude Code sign-in is missing/expired. We show a clear reconnect
+ *                   message and flag `needsLogin` so the caller renders the reconnect affordance.
+ *  - `usageLimit` → Claude's usage limit was hit. We keep claude's OWN text (it has the reset time).
+ *  - `other`      → anything else: surface the raw diagnostics unchanged (the historical behavior).
+ */
+export function classifyClaudeChatError(raw: string): ClassifiedClaudeError {
+  const text = (raw ?? "").trim();
+  if (CLAUDE_AUTH_RE.test(text)) {
+    return {
+      kind: "auth",
+      message:
+        "Your Claude Code sign-in isn't active (Sparkle runs Claude under your own login and never sees your credentials). Reconnect Claude Code to keep thinking.",
+      needsLogin: true,
+    };
+  }
+  if (CLAUDE_USAGE_RE.test(text)) {
+    // Keep claude's own message when it said something (it carries the reset time); otherwise a
+    // clean fallback so the user still learns the real reason.
+    return {
+      kind: "usageLimit",
+      message: text || "Claude usage limit reached. Please try again later.",
+      needsLogin: false,
+    };
+  }
+  return { kind: "other", message: text, needsLogin: false };
+}

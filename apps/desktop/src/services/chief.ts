@@ -506,6 +506,12 @@ interface ChiefMessage {
   response?: string;
   prompt?: string;
   status?: string;
+  // Best-effort failure detail a terminal-status message MIGHT carry (Chief's schema is
+  // undocumented here, so these are optional and read defensively). Surfacing whichever is present
+  // lets quota/credit language reach `isChiefQuotaError` on the status path, not just the HTTP path.
+  error?: string;
+  humane?: string;
+  reason?: string;
 }
 
 /** Fetch a single message. `response` is absent until the assistant has produced output. */
@@ -521,9 +527,48 @@ export async function getMessage(
   return (await parseOrThrow(res)) as ChiefMessage;
 }
 
+// Message `status` values that mean the turn FAILED and will never produce a `response`. Chief's
+// status vocabulary isn't documented, so this is a deliberately CONSERVATIVE known-failure set:
+// anything not listed here (incl. any in-progress or unknown status) is treated as "still working"
+// and keeps polling. Detecting these lets us surface a real failure IMMEDIATELY instead of masking
+// it as the generic 90s "took too long" timeout — the defect where an out-of-credits / server-side
+// error degraded into a misleading timeout because the poll only ever looked at `response`.
+const CHIEF_TERMINAL_FAILURE_STATUSES = new Set([
+  "failed",
+  "error",
+  "errored",
+  "cancelled",
+  "canceled",
+  "rejected",
+  "denied",
+  "aborted",
+]);
+
+/** True when a message `status` is a KNOWN terminal-failure state (case/space-insensitive). Unknown
+ *  or in-progress statuses return false so the poll never aborts a turn that's still working. */
+export function isTerminalChiefFailureStatus(status: string | undefined): boolean {
+  return !!status && CHIEF_TERMINAL_FAILURE_STATUSES.has(status.trim().toLowerCase());
+}
+
+/**
+ * Whether a thrown Chief error looks like a credit/quota/usage-limit condition — an HTTP 402
+ * (payment required) or 429 (rate limited), or a body whose text says as much (e.g. Storytell's
+ * bare `"quota exceeded"`). Lets the UI say "out of credits / usage limit" plainly instead of
+ * leaking a raw status line. Only a `ChiefError` can carry the status code we key on.
+ */
+export function isChiefQuotaError(e: unknown): boolean {
+  if (!(e instanceof ChiefError)) return false;
+  if (e.status === 402 || e.status === 429) return true;
+  return /quota|out of credit|insufficient|usage limit|rate limit|too many requests|billing|payment required/i.test(
+    e.message,
+  );
+}
+
 /**
  * Poll a message until its `response` text appears (the documented completion signal), then
- * return it. Gives up after ~`timeoutMs` and throws, so the UI can show a friendly error.
+ * return it. Three exits: the response (success), a KNOWN terminal-failure `status` (throw the
+ * real reason immediately — see {@link isTerminalChiefFailureStatus}), or the `timeoutMs` wall.
+ * An HTTP error from `getMessage` (e.g. a 402/429 quota) already propagates out as a `ChiefError`.
  */
 export async function pollForResponse(
   pat: string,
@@ -540,6 +585,18 @@ export async function pollForResponse(
     const msg = await getMessage(pat, projectId, chatId, messageId);
     if (typeof msg.response === "string" && msg.response.length > 0) {
       return msg.response;
+    }
+    // A self-diagnosed terminal failure: stop waiting and surface the real reason now, rather than
+    // spinning out the full timeout and reporting a misleading "took too long". Fold in any failure
+    // detail the message carries so quota/credit language still reaches `isChiefQuotaError` — the
+    // status path shouldn't be blind to "out of credits" the way it would be with a bare status.
+    if (isTerminalChiefFailureStatus(msg.status)) {
+      const detail = (msg.error ?? msg.humane ?? msg.reason ?? "").trim();
+      throw new ChiefError(
+        detail
+          ? `Chief couldn't finish this response (status: ${msg.status}): ${detail}`
+          : `Chief couldn't finish this response (status: ${msg.status}).`,
+      );
     }
     if (Date.now() - start > timeoutMs) {
       throw new ChiefError("Chief took too long to respond. Please try again.");

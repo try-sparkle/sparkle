@@ -12,14 +12,33 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const startChat = vi.fn(() => Promise.resolve({ chat_id: "c1", message_id: "m1" }));
 const pollForResponse = vi.fn(() => Promise.resolve("Chief says hi"));
 const ensureSkill = vi.fn(() => Promise.resolve("architect"));
-vi.mock("../services/chief", () => ({
-  ensureChiefProject: vi.fn(() => Promise.resolve("chief-proj")),
-  startChat: (...a: unknown[]) => startChat(...(a as [])),
-  pollForResponse: (...a: unknown[]) => pollForResponse(...(a as [])),
-  ensureSkill: (...a: unknown[]) => ensureSkill(...(a as [])),
-  createMemory: vi.fn(() => Promise.resolve({})),
-  ChiefError: class ChiefError extends Error {},
-}));
+vi.mock("../services/chief", () => {
+  // Declared INSIDE the factory: vi.mock is hoisted above top-level consts, so a class referenced
+  // here must live here too (else "Cannot access 'X' before initialization").
+  class ChiefError extends Error {
+    constructor(
+      message: string,
+      readonly status?: number,
+    ) {
+      super(message);
+      this.name = "ChiefError";
+    }
+  }
+  return {
+    ensureChiefProject: vi.fn(() => Promise.resolve("chief-proj")),
+    startChat: (...a: unknown[]) => startChat(...(a as [])),
+    pollForResponse: (...a: unknown[]) => pollForResponse(...(a as [])),
+    ensureSkill: (...a: unknown[]) => ensureSkill(...(a as [])),
+    createMemory: vi.fn(() => Promise.resolve({})),
+    ChiefError,
+    // Real-ish quota classifier so the friendlyError mapping is exercised, not stubbed away.
+    isChiefQuotaError: (e: unknown) =>
+      e instanceof ChiefError &&
+      (e.status === 402 ||
+        e.status === 429 ||
+        /quota|out of credit|usage limit|insufficient/i.test(e.message)),
+  };
+});
 vi.mock("../services/anthropic", () => ({ structuredJson: vi.fn(() => Promise.resolve({})) }));
 
 // The headless Claude Code engine. sendClaudeChat drives onDelta/onDone synchronously so a "turn"
@@ -30,10 +49,33 @@ const sendClaudeChat = vi.fn((opts: any) => {
   opts.onDone({ sessionId: "sess-1", text: "Hello world" });
   return Promise.resolve(() => {});
 });
-vi.mock("../services/claudeChat", () => ({
-  resolveClaudePath: vi.fn(() => Promise.resolve("/usr/local/bin/claude")),
-  sendClaudeChat: (...a: unknown[]) => sendClaudeChat(...(a as [any])),
-  cancelClaudeChat: vi.fn(() => Promise.resolve()),
+// Keep the REAL classifyClaudeChatError (a pure fn) so the auth→reconnect wiring is genuinely tested.
+vi.mock("../services/claudeChat", async () => {
+  const actual = await vi.importActual<typeof import("../services/claudeChat")>("../services/claudeChat");
+  return {
+    resolveClaudePath: vi.fn(() => Promise.resolve("/usr/local/bin/claude")),
+    sendClaudeChat: (...a: unknown[]) => sendClaudeChat(...(a as [any])),
+    cancelClaudeChat: vi.fn(() => Promise.resolve()),
+    classifyClaudeChatError: actual.classifyClaudeChatError,
+  };
+});
+// The reconnect affordance mounts a real `claude login` PTY + probes preflight; stub both so the
+// wiring is testable without xterm / a real binary.
+vi.mock("./Terminal", () => ({
+  Terminal: (p: { onExit?: () => void }) => (
+    <button data-testid="login-terminal-exit" onClick={() => p.onExit?.()}>
+      login-terminal
+    </button>
+  ),
+}));
+vi.mock("../services/claudeSpawn", () => ({
+  SHELL: "/bin/zsh",
+  buildClaudeLoginExec: () => "exec claude login",
+}));
+const checkClaudeSignedIn = vi.fn(() => Promise.resolve(true));
+vi.mock("../preflight", () => ({
+  checkClaudeSignedIn: (...a: unknown[]) => checkClaudeSignedIn(...(a as [])),
+  refreshPreflight: vi.fn(() => Promise.resolve()),
 }));
 
 const chiefInterject = vi.fn((): Promise<string | null> => Promise.resolve(null));
@@ -391,5 +433,68 @@ describe("ThinkPanel — routing + wiring", () => {
     expect(answerAsVoice).not.toHaveBeenCalled();
     // The typed text is preserved so the user can send it for real after buying.
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("help me think");
+  });
+});
+
+describe("ThinkPanel — Sparkle auth failure surfaces a clear reason + reconnect", () => {
+  it("translates 'Not logged in · Please run /login' into a reconnect message + button (no raw /login hint)", async () => {
+    sendClaudeChat.mockImplementationOnce((opts: any) => {
+      opts.onError("Not logged in · Please run /login");
+      return Promise.resolve(() => {});
+    });
+    render(<ThinkPanel project={project} agentId="a1" visible />);
+    await waitReady();
+    typeAndSend("hello there");
+    // The reconnect button appears...
+    const btn = await screen.findByRole("button", { name: /reconnect claude code/i });
+    expect(btn).toBeTruthy();
+    // ...and the cryptic terminal-only "/login" hint is NOT shown to the user.
+    expect(screen.queryByText(/please run \/login/i)).toBeNull();
+  });
+
+  it("clicking Reconnect mounts the login terminal; a confirmed sign-in clears the affordance", async () => {
+    checkClaudeSignedIn.mockResolvedValue(true);
+    sendClaudeChat.mockImplementationOnce((opts: any) => {
+      opts.onError("Not logged in · Please run /login");
+      return Promise.resolve(() => {});
+    });
+    render(<ThinkPanel project={project} agentId="a1" visible />);
+    await waitReady();
+    typeAndSend("hello there");
+    fireEvent.click(await screen.findByRole("button", { name: /reconnect claude code/i }));
+    // The login terminal (stubbed) mounts; firing its onExit runs the sign-in verification.
+    fireEvent.click(await screen.findByTestId("login-terminal-exit"));
+    await waitFor(() => expect(checkClaudeSignedIn).toHaveBeenCalled());
+    // A confirmed sign-in retires the reconnect UI and prompts a retry.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /reconnect claude code/i })).toBeNull(),
+    );
+    await screen.findByText(/reconnected to claude code/i);
+  });
+
+  it("classifies an auth failure on the REJECTED-promise (spawn) path too, showing the reconnect button", async () => {
+    // A synchronous spawn/invoke failure surfaces via the .catch path, not onError — it must
+    // classify identically so an auth failure there also offers reconnect.
+    sendClaudeChat.mockImplementationOnce(() =>
+      Promise.reject(new Error("Not logged in · Please run /login")),
+    );
+    render(<ThinkPanel project={project} agentId="a1" visible />);
+    await waitReady();
+    typeAndSend("hello there");
+    expect(await screen.findByRole("button", { name: /reconnect claude code/i })).toBeTruthy();
+    expect(screen.queryByText(/please run \/login/i)).toBeNull();
+  });
+
+  it("a usage-limit failure keeps claude's own text (with the reset time) and shows NO reconnect button", async () => {
+    sendClaudeChat.mockImplementationOnce((opts: any) => {
+      opts.onError("Claude usage limit reached. Your limit resets at 5:00pm.");
+      return Promise.resolve(() => {});
+    });
+    render(<ThinkPanel project={project} agentId="a1" visible />);
+    await waitReady();
+    typeAndSend("hello there");
+    // The message legitimately appears in both the chat bubble and the error line — assert ≥1.
+    expect((await screen.findAllByText(/usage limit reached.*resets at 5:00pm/i)).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: /reconnect claude code/i })).toBeNull();
   });
 });
