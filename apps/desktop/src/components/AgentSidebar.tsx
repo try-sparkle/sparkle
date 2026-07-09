@@ -42,6 +42,8 @@ import { beadLabel, epicForBuild, epicPillFor } from "../services/planView";
 import { type Bead } from "../services/beads";
 import { orderedTopLevelAgents, firstVisibleAgentId } from "../engine/agentOrdering";
 import { withUnstartedWorkerAttention, withRedWorkerAttention } from "../engine/workerAttention";
+import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
+import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode } from "../engine/workMode";
 import { selectAndOpen } from "../useAttentionNotifications";
 import { StatusDot } from "./StatusDot";
@@ -305,6 +307,28 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const s1 = withUnstartedWorkerAttention(project.agents, liveStatus, new Set(openAgentIds));
     return withRedWorkerAttention(project.agents, s1);
   }, [project, liveStatus, openAgentIds]);
+  // Advance each agent's alert-episode record on every change to the overlaid (pre-dismissal) status
+  // — the input the "Dismiss Alert" feature reads. Runs AFTER the worker-attention overlays so a
+  // worker's bubbled red counts as the orchestrator's episode too: a dismissed orchestrator re-alerts
+  // when the bubbled red *signature changes kind* (e.g. a worker goes waiting→errored). Note the
+  // limit — episodes key on the red kind, not worker identity — so a DIFFERENT worker later going red
+  // with the SAME kind leaves the bubbled signature unchanged and does not re-alert; acceptable, since
+  // the orchestrator-level signal ("a worker needs you, <kind>") hasn't changed. advanceAlerts writes
+  // only on a real red-tier transition, so this is not a per-tick persist. No-ops before a project.
+  const advanceAlerts = useProjectStore((s) => s.advanceAlerts);
+  const dismissAlert = useProjectStore((s) => s.dismissAlert);
+  const reenableAlert = useProjectStore((s) => s.reenableAlert);
+  useEffect(() => {
+    if (project) advanceAlerts(project.id, status);
+  }, [project?.id, status, advanceAlerts]);
+  // The status map the ROW COLOR and the SORT ORDER read: the overlaid status with dismissed red
+  // alarms de-escalated to their non-red tier (waiting/approval→idle, errored→stopped). Kept separate
+  // from `status` so the OTHER consumers of red (cross-window publishing, dock notifications, the
+  // alert-button state) still see the true, un-dismissed status.
+  const effectiveStatus = useMemo(
+    () => (project ? withDismissedAlerts(project.agents, status) : status),
+    [project, status],
+  );
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
   const workflowShipped = useRuntimeStore((s) => s.workflowShipped);
@@ -936,11 +960,16 @@ export function AgentSidebar({ project }: { project: Project | null }) {
 
   // The ordered top-level stack the list renders. Memoized (sparkle-alrm.3) so it only re-sorts when
   // the agent set, overlaid status, mode, or ordering actually change — not on every unrelated
-  // re-render. Shared with the TopBar dot cluster via orderedTopLevelAgents so the two never drift.
+  // re-render. Sorts on `effectiveStatus` (dismissed reds de-escalated) so a dismissed row drops out
+  // of the red zone. Shares orderedTopLevelAgents + the same attention-ordering and dismissal overlays
+  // with the TopBar dot cluster, so the two stay in lockstep for those (see TopBar effStatus for the
+  // one pre-existing gap: TopBar omits withRedWorkerAttention's worker→orchestrator red bubble).
   const ordered = useMemo(
     () =>
-      project ? orderedTopLevelAgents(project.agents, status, mode, agentOrdering === "attention") : [],
-    [project, status, mode, agentOrdering],
+      project
+        ? orderedTopLevelAgents(project.agents, effectiveStatus, mode, agentOrdering === "attention")
+        : [],
+    [project, effectiveStatus, mode, agentOrdering],
   );
 
   // The active mode's "+ New … Agent" button (null in Plan / no project / Think gated off).
@@ -1157,12 +1186,19 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               trackerStage: WorkflowStageId | null,
               rowIndex?: number,
             ) => {
-          const st = status[a.id] ?? "stopped";
+          // The EFFECTIVE status (dismissed reds de-escalated) drives the whole row's appearance —
+          // color, glyph, tooltip — so a dismissed row reads calm. The TRUE status is read separately
+          // below only to decide the Dismiss/Re-enable button state.
+          const st = effectiveStatus[a.id] ?? "stopped";
+          const trueSt = status[a.id] ?? "stopped";
           // Resolve the status color to a light-mode-legible TEXT ink: the brand gray (idle,
           // blocked, done, stopped) and the brand green (working) are too light on the white
           // light sidebar, so statusInk darkens both in light mode while keeping them brand-color
           // in dark; red/amber pass through. (See statusInk — it tracks the AGENT_STATUS taxonomy.)
           const color = statusInk(AGENT_STATUS[st].color);
+          // The alert toggle to show on this row's expanded card: "dismiss" when it's truly red and
+          // not yet dismissed, "reenable" when red-underneath but dismissed, null otherwise.
+          const alertControl = alertControlKind(a.alert, trueSt);
           const isActive = !activeSpecial && project.selectedAgentId === a.id;
           const bs = branchStatus[a.id];
           // The ✓ on the head row reflects the whole build: itself OR any worker that has shipped.
@@ -1180,6 +1216,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               isActive={isActive}
               st={st}
               statusColor={color}
+              alertControl={alertControl}
+              onDismissAlert={() => dismissAlert(project.id, a.id, trueSt)}
+              onReenableAlert={() => reenableAlert(project.id, a.id)}
               bs={bs}
               trackerStage={trackerStage}
               shipped={rowShipped}
@@ -1505,6 +1544,13 @@ type AgentRowProps = {
   isActive: boolean;
   st: AgentTabStatus;
   statusColor: string;
+  /** The alert toggle to show on this row's expanded card: "dismiss" (truly red, not dismissed),
+   *  "reenable" (red-underneath but dismissed), or null (not red). Computed from the TRUE status. */
+  alertControl: "dismiss" | "reenable" | null;
+  /** Acknowledge this row's red alert (recolor + drop out of the red zone; status untouched). */
+  onDismissAlert: () => void;
+  /** Clear a dismissal so the row goes red again. */
+  onReenableAlert: () => void;
   bs?: BranchStatus;
   trackerStage: WorkflowStageId | null;
   /** This agent has reached On Main at least once → render a sticky ✓ on the progress line. */
@@ -1577,6 +1623,7 @@ function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
     prev.isActive === next.isActive &&
     prev.st === next.st &&
     prev.statusColor === next.statusColor &&
+    prev.alertControl === next.alertControl &&
     prev.bs === next.bs &&
     prev.trackerStage === next.trackerStage &&
     prev.shipped === next.shipped &&
@@ -1595,6 +1642,9 @@ const AgentRow = memo(function AgentRow({
   isActive,
   st,
   statusColor,
+  alertControl,
+  onDismissAlert,
+  onReenableAlert,
   bs,
   trackerStage,
   shipped,
@@ -2014,6 +2064,16 @@ const AgentRow = memo(function AgentRow({
                     </span>
                   )}
                 </div>
+                {/* Alert toggle, to the RIGHT of the full name (only on the expanded card, only when
+                    the row is red-underneath). See AlertToggleButton. */}
+                {alertControl && (
+                  <AlertToggleButton
+                    kind={alertControl}
+                    statusColor={statusColor}
+                    onDismiss={onDismissAlert}
+                    onReenable={onReenableAlert}
+                  />
+                )}
                 {epicPill}
                 {pinChip}
               </div>

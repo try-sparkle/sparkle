@@ -3,7 +3,13 @@
 // restores everything. Live process/status state is NOT here (see runtimeStore).
 import { create } from "zustand";
 import { persist, createJSONStorage, type StateStorage } from "zustand/middleware";
-import type { AgentKind, AgentName, AgentTab, Project } from "../types";
+import type { AgentKind, AgentName, AgentTab, AgentTabStatus, Project } from "../types";
+import {
+  advanceAlertRecord,
+  dismissedRecord,
+  reenabledRecord,
+  EMPTY_ALERT,
+} from "../engine/alertDismissal";
 import { isDefaultModel } from "../services/models";
 import { usageTelemetry } from "../services/usageTelemetry";
 import { perfSpan, perfStart } from "../perfTrace";
@@ -100,6 +106,19 @@ interface ProjectState {
   pinAgentAt: (projectId: string, agentId: string, index: number) => void;
   /** Release a pin: clear the name freeze AND the row anchor (re-enables auto-naming + sort). */
   unpinAgent: (projectId: string, agentId: string) => void;
+  /** Advance every agent's alert-episode record for the current (pre-dismissal) status map
+   *  (engine/alertDismissal.ts). Called from the sidebar whenever the overlaid status map changes;
+   *  writes ONLY when some record actually changed — which is only on a red-tier transition, not on
+   *  every status tick — so it doesn't churn the persisted blob. */
+  advanceAlerts: (projectId: string, statusMap: Record<string, AgentTabStatus>) => void;
+  /** Dismiss an agent's current red alert: the row recolors to its non-alerting tone and drops out
+   *  of the red zone, WITHOUT changing its true status. Re-alerts automatically on a new/different
+   *  red episode (a fresh question, an error, a re-entered red). `status` is the agent's current TRUE
+   *  (pre-dismissal) status — threaded so the episode is recorded even if `advanceAlerts` hasn't run
+   *  yet, otherwise the next advance would treat it as a fresh episode and discard the dismissal. */
+  dismissAlert: (projectId: string, agentId: string, status: AgentTabStatus) => void;
+  /** Re-enable a dismissed alert: clears the dismissal so the row goes red again immediately. */
+  reenableAlert: (projectId: string, agentId: string) => void;
   /** Select an agent, or pass `null` to clear selection (routes the main pane to the blank state). */
   selectAgent: (projectId: string, agentId: string | null) => void;
   setAgentWorktree: (projectId: string, agentId: string, path: string, branch: string) => void;
@@ -474,7 +493,7 @@ export function mergePreservingLiveWorkers(
 
 export const useProjectStore = create<ProjectState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       projects: [],
       selectedProjectId: null,
 
@@ -760,6 +779,49 @@ export const useProjectStore = create<ProjectState>()(
           projects: mapProject(s.projects, projectId, (p) =>
             // Release both: name auto-renames again and the row rejoins the attention sort.
             mapAgent(p, agentId, (a) => ({ ...a, namePinned: false, pinnedIndex: null })),
+          ),
+        })),
+
+      advanceAlerts: (projectId, statusMap) => {
+        // Compute FIRST and bail without set() when nothing changed. Called on every overlaid-status
+        // change (potentially per tick), and a bare `set` would hand every projects consumer a new
+        // array reference each time even with identical contents — so the no-change fast path here is
+        // what keeps this from churning the sidebar. Only a real red-tier transition falls through.
+        const project = get().projects.find((p) => p.id === projectId);
+        if (!project) return;
+        let changed = false;
+        const agents = project.agents.map((a) => {
+          const next = advanceAlertRecord(a.alert, statusMap[a.id]);
+          // advanceAlertRecord returns the SAME ref when the red signature didn't change, and the
+          // shared EMPTY_ALERT sentinel for a never-alerted, still-non-red agent — skip both so a
+          // non-red agent never gets an empty record persisted onto it.
+          if (next === a.alert || next === EMPTY_ALERT) return a;
+          changed = true;
+          return { ...a, alert: next };
+        });
+        if (!changed) return;
+        set((s) => ({
+          projects: s.projects.map((p) => (p.id === projectId ? { ...p, agents } : p)),
+        }));
+      },
+
+      dismissAlert: (projectId, agentId, status) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            // Record the current episode FIRST (advanceAlertRecord is a no-op when it's already
+            // recorded), then dismiss it — so a dismiss that lands before advanceAlerts has seen this
+            // red status still seeds seq/lastRed and survives the next advance instead of re-alerting.
+            mapAgent(p, agentId, (a) => ({
+              ...a,
+              alert: dismissedRecord(advanceAlertRecord(a.alert, status)),
+            })),
+          ),
+        })),
+
+      reenableAlert: (projectId, agentId) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) => ({ ...a, alert: reenabledRecord(a.alert) })),
           ),
         })),
 

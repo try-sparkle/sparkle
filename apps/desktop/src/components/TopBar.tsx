@@ -7,6 +7,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { orderedTopLevelAgents } from "../engine/agentOrdering";
 import { withUnstartedWorkerAttention } from "../engine/workerAttention";
+import { withDismissedAlerts } from "../engine/alertDismissal";
 import { pickProjectFolder, basename } from "../services/dialog";
 import { openProjectInWindow, defaultDeps, type OpenMode } from "../services/projectWindows";
 import { findWindowForProject } from "../services/windowRegistry";
@@ -153,8 +154,15 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   // fact that it's blocking its orchestrator. Overlay RED on it and its parent before computing any
   // dot/summary color, so the block surfaces at the top. Per-project (openAgentIds is global).
   const openSet = useMemo(() => new Set(openAgentIds), [openAgentIds]);
+  // The dot cluster tracks the sidebar rows. It shares the unstarted-worker red overlay and the
+  // dismissed-alert de-escalation (withDismissedAlerts) with the sidebar, so dismissing an alert drops
+  // the row out of the red zone in BOTH places in lockstep, and its dot recolors with it. ONE
+  // deliberate gap: the sidebar's status pipeline also bubbles a *started* worker's red up to its
+  // orchestrator via withRedWorkerAttention (AgentSidebar.tsx), which is NOT applied here — so a
+  // worker-bubbled orchestrator dot can still order/color differently. That divergence is pre-existing
+  // (predates dismissals) and out of scope for this overlay.
   const effStatus = (p: Project): Record<string, AgentTabStatus> =>
-    withUnstartedWorkerAttention(p.agents, statusMap, openSet);
+    withDismissedAlerts(p.agents, withUnstartedWorkerAttention(p.agents, statusMap, openSet));
   const workMode = useUiStore((s) => s.workMode);
   const agentOrdering = useUiStore((s) => s.agentOrdering);
   const [recentOpen, setRecentOpen] = useState(false);

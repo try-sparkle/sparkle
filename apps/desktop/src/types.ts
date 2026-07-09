@@ -30,6 +30,19 @@ export interface PromptHistoryEntry {
   at: number;
 }
 
+// Per-agent alert-episode record backing the "Dismiss Alert" affordance (engine/alertDismissal.ts,
+// spec: docs/superpowers/specs/2026-07-09-dismiss-alert-design.md). A row is RED purely because its
+// status is waiting|approval|errored; dismissing acknowledges that red WITHOUT resolving it. A plain
+// boolean can't distinguish "the alert I dismissed" from "a fresh problem", so we track episodes:
+// `seq` counts red episodes entered, `lastRed` is the last red signature (seeds restart), and
+// `dismissedSeq` is the episode the user acknowledged. Suppressed iff red now AND dismissedSeq===seq;
+// any new episode bumps seq past dismissedSeq → re-alert. Optional so legacy records need no migration.
+export interface AgentAlertRecord {
+  seq: number;
+  lastRed: "waiting" | "approval" | "errored" | null;
+  dismissedSeq: number | null;
+}
+
 export interface AgentTab {
   id: string;
   name: string;
@@ -82,6 +95,9 @@ export interface AgentTab {
   // agent is pinned to this row index and does NOT attention-sort; unpinned agents flow
   // around it. Set together with `namePinned` on drag/rename; cleared together on unpin.
   pinnedIndex: number | null;
+  // The alert-episode record backing "Dismiss Alert" (AgentAlertRecord above). Undefined until the
+  // agent first enters a red status; advanced by projectStore.advanceAlerts on red transitions.
+  alert?: AgentAlertRecord;
 }
 
 export interface Project {
