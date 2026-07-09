@@ -248,6 +248,7 @@ pub fn run() {
             attachments::copy_files_to_dir,
             worktree::ensure_project_repo,
             worktree::prewarm_spawn,
+            worktree::warm_worktree_pool,
             worktree::create_agent_worktree,
             worktree::create_worker_worktree,
             worktree::remove_agent_worktree,

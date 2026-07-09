@@ -72,6 +72,14 @@ export function ensureProjectRepo(path: string): Promise<void> {
   return invoke("ensure_project_repo", { path });
 }
 
+/** Warm this project's pre-warmed worktree pool up to the configured size (off the main thread), so
+ *  a later agent spawn can CLAIM a ready worktree instead of paying `git worktree add` on the
+ *  critical path. No-op when `[worktree_pool].enabled = false`. Fire-and-forget: never throws, never
+ *  blocks — the pool is a pure optimization. Called on project open/activation. */
+export function warmWorktreePool(root: string, projectId: string, baseBranch: string): Promise<void> {
+  return invoke("warm_worktree_pool", { root, projectId, baseBranch });
+}
+
 /** Create (or reuse) an isolated worktree for an agent, cut from `baseBranch` (the project's
  *  logical integration branch). Returns its path + branch. */
 export function createAgentWorktree(

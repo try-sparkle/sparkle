@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -350,15 +350,39 @@ pub fn create_worktree_at(
     .is_ok();
 
     if branch_exists {
+        // RESUME: the branch already exists (a reopened agent whose worktree dir was removed). Re-
+        // attach it directly — NOT via the pool, whose slots are fresh detached checkouts that would
+        // discard the branch's existing commits. Under the per-repo lock so a background warm can't
+        // collide on index.lock.
+        let gl = repo_git_lock(root);
+        let _lock = gl.lock().unwrap_or_else(|e| e.into_inner());
         git(root, &["worktree", "add", &wt_str, &branch])?;
     } else {
-        // Cut IMMEDIATELY from the last-known integration base (no blocking network fetch on the
-        // spawn critical path — an unreachable remote must never stall opening an agent). A
-        // background, throttled fetch then refreshes `origin/<base>` so the NEXT agent's cut and
-        // this branch's later refresh see a fresh tip.
+        // FAST PATH: claim a pre-warmed parked worktree if one is available and still cut from the
+        // current base. The claim moves it to `wt` and cuts `branch` there — an identical result to
+        // the slow path below, minus the multi-second tree materialization.
+        if let Some(info) = try_claim_pooled_worktree(root, project_id, agent_id, base_branch, app_data) {
+            // Preserve the slow path's cadence: kick the throttled `origin/<base>` refresh (so a
+            // fully-warmed workflow, where every spawn claims, still nudges the fetch), then refill
+            // the slot we just consumed. Both off the critical path.
+            spawn_background_origin_refresh(root, base_branch);
+            spawn_pool_topup(root, project_id, base_branch, app_data);
+            return Ok(info);
+        }
+        // SLOW PATH (pool disabled / empty / stale): cut IMMEDIATELY from the last-known integration
+        // base (no blocking network fetch on the spawn critical path — an unreachable remote must
+        // never stall opening an agent). A background, throttled fetch then refreshes `origin/<base>`
+        // so the NEXT agent's cut and this branch's later refresh see a fresh tip. Held under the
+        // per-repo lock so a background warm can't collide on index.lock.
         let base = effective_base(root, base_branch, false);
-        git(root, &["worktree", "add", "-b", &branch, &wt_str, &base])?;
+        {
+            let gl = repo_git_lock(root);
+            let _lock = gl.lock().unwrap_or_else(|e| e.into_inner());
+            git(root, &["worktree", "add", "-b", &branch, &wt_str, &base])?;
+        }
         spawn_background_origin_refresh(root, base_branch);
+        // Seed/refill the pool so the NEXT spawn in this fan-out can claim instead of cutting inline.
+        spawn_pool_topup(root, project_id, base_branch, app_data);
     }
 
     Ok(WorktreeInfo { path: wt_str, branch })
@@ -849,6 +873,313 @@ fn spawn_background_origin_refresh(root: &str, base_branch: &str) {
         };
         maybe_refresh_origin(&root, &logical);
     });
+}
+
+// ── Pre-warmed worktree pool (sparkle worktree-pool) ─────────────────────────────────────────────
+//
+// `git worktree add -b <branch> <path> <base>` is slow because it MATERIALIZES the whole working
+// tree (measured at 86-98% of every build-agent spawn, 2s uncontended and up to 16s queued behind
+// other worktree ops). But creating a branch in an ALREADY-materialized worktree whose files equal
+// the base tree is O(1). So at idle we park a few detached-HEAD worktrees checked out at the base
+// commit under a SEPARATE app-data subtree; a spawn then CLAIMS one — `git worktree move` it to the
+// agent path + `git checkout -b sparkle/agent-<id>` — both near-instant ref ops. The claim returns
+// the IDENTICAL `WorktreeInfo` the slow path would, so nothing downstream can tell the difference.
+//
+// The pool is a PURE optimization: disabled by config, empty, cut from a since-moved base, or any
+// git failure ⇒ transparently fall back to the original `git worktree add` in `create_worktree_at`.
+
+/// A parked pool worktree's on-disk root: `<app_data>/worktree-pool/<project_id>/<slot-id>`. This is
+/// a SEPARATE subtree from agent worktrees (`worktrees/<project_id>/<agent_id>`) on purpose — every
+/// scanner that enumerates agent worktrees (heal_agent_hooks, scan_worker_manifests, the Sparkle
+/// self-improve reaper) walks `worktrees/<project_id>/…` and would otherwise have to special-case a
+/// pool entry; keeping pool slots out of that tree entirely means none of them ever see a slot.
+fn pool_dir(app_data: &Path, project_id: &str) -> Result<PathBuf, String> {
+    validate_id("project_id", project_id)?;
+    Ok(app_data.join("worktree-pool").join(project_id))
+}
+
+/// One parked, detached-HEAD worktree checked out at `base_commit`, ready to be claimed.
+#[derive(Clone)]
+struct PoolSlot {
+    path: PathBuf,
+    /// The commit the slot was warmed at. Re-checked against the CURRENT effective base at claim
+    /// time so a slot cut from a since-advanced base is discarded rather than handed out.
+    base_commit: String,
+}
+
+/// In-memory pool state, keyed by project_id. Guarded by this mutex ONLY for the brief push/pop;
+/// the slow `git worktree add` runs outside it (under the per-repo git lock) so warming never blocks
+/// a claim that just needs to pop a slot.
+fn pools() -> &'static Mutex<HashMap<String, Vec<PoolSlot>>> {
+    static POOLS: OnceLock<Mutex<HashMap<String, Vec<PoolSlot>>>> = OnceLock::new();
+    POOLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-repo-root serialization for index/ref-mutating git worktree ops (add/move/remove/prune/
+/// checkout -b). The frontend `withRepoLock` already serializes FRONTEND-initiated ops among
+/// themselves; this additionally serializes the BACKGROUND warm/top-up thread against them, so a
+/// warm's `git worktree add` can never collide with a concurrent claim/create/worker-cut on
+/// `index.lock`. A plain per-root mutex — held only around the git call, never nested — so there is
+/// no deadlock risk with the frontend chain.
+fn repo_git_lock(root: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard.entry(root.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
+
+/// Projects whose leftover pool dirs have been swept this session (startup cleanup, once per project).
+fn pool_cleaned() -> &'static Mutex<HashSet<String>> {
+    static CLEANED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    CLEANED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Projects with a top-up currently in flight, so a mount storm / burst of claims doesn't stack
+/// redundant warmers (each would race to the same `size` target and over-warm).
+fn topup_in_flight() -> &'static Mutex<HashSet<String>> {
+    static INFLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    INFLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Remove parked worktrees left behind by a CRASHED prior session and prune stale git admin entries.
+/// Runs at most ONCE per project per session, and (because the in-memory pool boots empty) always
+/// BEFORE the first warm — so it can only ever delete leftovers, never a slot this session created.
+/// Idempotent + best-effort: any I/O or git error is ignored.
+fn cleanup_pool_once(root: &str, project_id: &str, app_data: &Path) {
+    {
+        let mut set = pool_cleaned().lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(project_id.to_string()) {
+            return; // already swept this session
+        }
+    }
+    let gl = repo_git_lock(root);
+    let _lock = gl.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(dir) = pool_dir(app_data, project_id) {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    let ps = p.to_string_lossy().to_string();
+                    // Deregister it as a worktree (no-op if git doesn't know it), then delete the dir.
+                    let _ = git(root, &["worktree", "remove", "--force", &ps]);
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+            }
+        }
+    }
+    // Clear git's admin records for any now-missing worktrees (pool leftovers or reaped agents).
+    let _ = git(root, &["worktree", "prune"]);
+}
+
+/// A filesystem-safe random slot id (32 hex chars). Uses `rand` (already a dependency) so we need no
+/// time/uuid crate and two concurrent warms can't collide on a name.
+fn new_slot_id() -> String {
+    let a: u64 = rand::random();
+    let b: u64 = rand::random();
+    format!("{a:016x}{b:016x}")
+}
+
+/// Warm ONE parked worktree: `git worktree add --detach <pool>/<slot> <base_commit>`, then record it
+/// in the in-memory pool. Takes the per-repo git lock only around the add. The base is resolved
+/// no-network (same commit `create_worktree_at` would cut from today), so warming never blocks on a
+/// fetch. Err on any resolve/add failure (the caller stops topping up rather than spinning).
+fn warm_one_slot(
+    root: &str,
+    project_id: &str,
+    base_branch: &str,
+    app_data: &Path,
+) -> Result<(), String> {
+    let base = effective_base(root, base_branch, false);
+    let base_commit =
+        git(root, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")])?;
+    if base_commit.is_empty() {
+        return Err("pool warm: base commit did not resolve".into());
+    }
+    let dir = pool_dir(app_data, project_id)?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create pool dir: {e}"))?;
+    let slot_path = dir.join(new_slot_id());
+    let slot_str = slot_path.to_string_lossy().to_string();
+    {
+        let gl = repo_git_lock(root);
+        let _lock = gl.lock().unwrap_or_else(|e| e.into_inner());
+        git(root, &["worktree", "add", "--detach", &slot_str, &base_commit])?;
+    }
+    pools()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(project_id.to_string())
+        .or_default()
+        .push(PoolSlot { path: slot_path, base_commit });
+    Ok(())
+}
+
+/// Bring the pool up to the configured size, warming ONE worktree at a time. No-op when the feature
+/// is disabled, `size == 0`, or the pool is already full. Sweeps crashed-session leftovers first.
+/// Blocking core of [`warm_worktree_pool`] and the post-claim/post-cut refill — always run off the
+/// critical path (a background thread or `spawn_blocking`), never inline on a spawn.
+fn topup_pool_blocking(root: &str, project_id: &str, base_branch: &str, app_data: &Path) {
+    let cfg = crate::config::for_project(root).config.worktree_pool;
+    if !cfg.enabled || cfg.size == 0 {
+        return;
+    }
+    cleanup_pool_once(root, project_id, app_data);
+    // At most one top-up per project at a time.
+    {
+        let mut set = topup_in_flight().lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(project_id.to_string()) {
+            return;
+        }
+    }
+    // RAII: clear the in-flight flag on EVERY exit — normal return AND an unwind out of a git helper
+    // — so a mid-warm panic can't leave the project permanently marked "in flight", which would
+    // silently disable pool warming for the rest of the session (the slow-path cut would still work,
+    // masking it). Guarantees the manual `.remove()` this replaced can never be skipped.
+    struct InFlightGuard(String);
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            topup_in_flight().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+        }
+    }
+    let _in_flight = InFlightGuard(project_id.to_string());
+    let target = cfg.size as usize;
+    loop {
+        let have = pools()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(project_id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if have >= target {
+            break;
+        }
+        if let Err(e) = warm_one_slot(root, project_id, base_branch, app_data) {
+            tracing::debug!(%project_id, error = %e, "pool warm failed; leaving pool short");
+            break; // don't spin on a persistent failure
+        }
+    }
+}
+
+/// Kick a pool top-up on a background thread so it never blocks the spawn that triggered it. Fired
+/// on project open (via [`warm_worktree_pool`]) and after each successful claim / inline cut, so a
+/// consumed or seeded slot is refilled while the user's fan-out continues.
+fn spawn_pool_topup(root: &str, project_id: &str, base_branch: &str, app_data: &Path) {
+    let root = root.to_string();
+    let project_id = project_id.to_string();
+    let base_branch = base_branch.to_string();
+    let app_data = app_data.to_path_buf();
+    std::thread::spawn(move || {
+        topup_pool_blocking(&root, &project_id, &base_branch, &app_data);
+    });
+}
+
+/// Try to satisfy an agent-worktree request from the parked pool. Pops a slot, verifies it is still
+/// cut from the CURRENT effective base and clean, then `git worktree move`s it to the agent path and
+/// `git checkout -b`s the agent branch on it — both near-instant ref ops. Returns the SAME
+/// `WorktreeInfo` the slow path would (files == base tree, branch `sparkle/agent-<id>`). Any miss
+/// (disabled, empty, stale base, dirty, an existing branch, or any git failure) returns None so the
+/// caller transparently falls back to `git worktree add`. A rejected slot is pruned in passing.
+fn try_claim_pooled_worktree(
+    root: &str,
+    project_id: &str,
+    agent_id: &str,
+    base_branch: &str,
+    app_data: &Path,
+) -> Option<WorktreeInfo> {
+    if !crate::config::for_project(root).config.worktree_pool.enabled {
+        return None;
+    }
+    let branch = format!("sparkle/agent-{agent_id}");
+    // Resolve the agent path FIRST — before consuming a slot — so an invalid id returns None without
+    // popping (and then leaking) a parked worktree. (In practice create_worktree_at already resolved
+    // this same path at its top, so the Err arm is unreachable here; resolving up front keeps the
+    // slot-consuming code strictly after the only fallible-without-a-slot step.)
+    let target = worktree_path(app_data, project_id, agent_id).ok()?;
+    let target_str = target.to_string_lossy().to_string();
+
+    // Pop the most-recently-warmed slot (LIFO — most likely to still match the current base).
+    let slot = {
+        let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
+        map.get_mut(project_id).and_then(|v| v.pop())
+    }?;
+    let slot_str = slot.path.to_string_lossy().to_string();
+
+    // Hold the per-repo git lock across the WHOLE verify → move → branch sequence, and resolve the
+    // current effective base INSIDE it, so a background fetch can't advance the base between the
+    // staleness check and the move — the "never hand out the wrong base" guarantee holds against the
+    // lock, not a read taken before it.
+    let gl = repo_git_lock(root);
+    let _lock = gl.lock().unwrap_or_else(|e| e.into_inner());
+
+    // What would the slow path cut from RIGHT NOW? If the base advanced since we warmed (e.g. a
+    // background fetch moved origin/<base>), the slot is stale — discard it, never hand it out.
+    let base = effective_base(root, base_branch, false);
+    let current_base_commit = git(root, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")])
+        .unwrap_or_default();
+
+    // Validity + staleness guard: a real worktree, still detached at the commit we recorded, that
+    // commit still the current effective base, and a clean tree. Anything else ⇒ discard + fall back.
+    let head = git(&slot_str, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let clean = git(&slot_str, &["status", "--porcelain"]).map(|s| s.is_empty()).unwrap_or(false);
+    let valid_worktree = git(&slot_str, &["rev-parse", "--is-inside-work-tree"]).is_ok();
+    let usable = !current_base_commit.is_empty()
+        && head == slot.base_commit
+        && slot.base_commit == current_base_commit
+        && clean
+        && valid_worktree;
+    if !usable {
+        let _ = git(root, &["worktree", "remove", "--force", &slot_str]);
+        let _ = std::fs::remove_dir_all(&slot.path);
+        let _ = git(root, &["worktree", "prune"]);
+        return None;
+    }
+
+    // Never claim onto a branch that already exists — that's a RESUME, which must go through the
+    // branch-reattach path in create_worktree_at (a fresh `checkout -b` would fail or discard work).
+    if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok() {
+        let _ = git(root, &["worktree", "remove", "--force", &slot_str]);
+        let _ = std::fs::remove_dir_all(&slot.path);
+        return None;
+    }
+
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Move the parked tree to the agent path (git rewrites its admin gitdir), then create + check out
+    // the agent branch on it. HEAD is detached at the base commit, so `checkout -b` cuts the branch
+    // there — files already equal the base tree, so nothing is materialized.
+    if git(root, &["worktree", "move", &slot_str, &target_str]).is_err() {
+        let _ = git(root, &["worktree", "remove", "--force", &slot_str]);
+        let _ = std::fs::remove_dir_all(&slot.path);
+        let _ = git(root, &["worktree", "prune"]);
+        return None;
+    }
+    if git(&target_str, &["checkout", "-b", &branch]).is_err() {
+        // Moved but the branch didn't attach — tear the half-built worktree down so the caller's
+        // `git worktree add` fallback starts from a clean slate at the agent path.
+        let _ = git(root, &["worktree", "remove", "--force", &target_str]);
+        let _ = git(root, &["worktree", "prune"]);
+        return None;
+    }
+    Some(WorktreeInfo { path: target_str, branch })
+}
+
+/// Warm this project's parked worktree pool up to the configured size, off the main thread. Call on
+/// project open/activation so a later agent spawn can claim a ready worktree instead of paying
+/// `git worktree add` on the critical path. No-op when `[worktree_pool].enabled = false`. Never
+/// errors on a warm miss — the pool is a pure optimization.
+#[tauri::command]
+pub async fn warm_worktree_pool(
+    app: AppHandle,
+    root: String,
+    project_id: String,
+    base_branch: String,
+) -> Result<(), String> {
+    let app_data = app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        topup_pool_blocking(&root, &project_id, &base_branch, &app_data);
+    })
+    .await
+    .map_err(|e| format!("warm_worktree_pool task failed: {e}"))
 }
 
 /// Prewarm what the first agent spawn needs so it's already hot: the claude + node path caches, and
@@ -2506,6 +2837,185 @@ mod tests {
         let _ = std::fs::remove_dir_all(&app_data);
     }
 
+    // ── Pre-warmed worktree pool (worktree-pool) ────────────────────────────────────────────────
+
+    /// The detached HEAD sha of a worktree (for asserting a parked slot sits at the base commit).
+    fn head_sha(wt: &str) -> String {
+        git(wt, &["rev-parse", "HEAD"]).unwrap()
+    }
+
+    // Warming parks a DETACHED-HEAD worktree at the effective base, under the SEPARATE
+    // `worktree-pool/<project>` subtree (never `worktrees/<project>`), and records it in the pool.
+    #[test]
+    fn warm_parks_a_detached_worktree_at_base() {
+        let r = init_repo("pool-warm");
+        let app_data = unique_root("pool-warm-appdata");
+        let base_commit = git(&r, &["rev-parse", "main"]).unwrap();
+
+        warm_one_slot(&r, "pw", "main", &app_data).expect("warm one slot");
+
+        // Recorded in the in-memory pool at the base commit.
+        let slot = {
+            let map = pools().lock().unwrap();
+            map.get("pw").and_then(|v| v.last()).cloned()
+        }
+        .expect("a slot was parked");
+        assert_eq!(slot.base_commit, base_commit);
+        // It's a real worktree, detached at the base, and lives under worktree-pool/ (NOT worktrees/).
+        assert!(Path::new(&slot.path).is_dir());
+        assert_eq!(head_sha(&slot.path.to_string_lossy()), base_commit);
+        assert!(slot.path.starts_with(app_data.join("worktree-pool").join("pw")));
+        assert!(!slot.path.starts_with(app_data.join("worktrees")));
+        // Detached HEAD: no branch is checked out.
+        assert!(git(&slot.path.to_string_lossy(), &["symbolic-ref", "-q", "HEAD"]).is_err());
+
+        let _ = git(&r, &["worktree", "remove", "--force", &slot.path.to_string_lossy()]);
+    }
+
+    // Claiming a parked slot moves it to the agent path on `sparkle/agent-<id>`, with files == base
+    // tree — an identical result to the slow `git worktree add -b` path.
+    #[test]
+    fn claim_moves_pooled_worktree_to_agent_path_on_branch() {
+        let r = init_repo("pool-claim");
+        let app_data = unique_root("pool-claim-appdata");
+        // A tracked file in the base so we can assert the claimed tree materializes it.
+        std::fs::write(format!("{r}/base.txt"), "base content").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-q", "-m", "base file"]).unwrap();
+        let base_commit = git(&r, &["rev-parse", "main"]).unwrap();
+
+        warm_one_slot(&r, "pc", "main", &app_data).unwrap();
+        let info = try_claim_pooled_worktree(&r, "pc", "a1", "main", &app_data)
+            .expect("claim should succeed from a fresh pool");
+
+        // Exactly what create_worktree_at would return: the canonical agent path + branch.
+        let expected = worktree_path(&app_data, "pc", "a1").unwrap();
+        assert_eq!(info.path, expected.to_string_lossy());
+        assert_eq!(info.branch, "sparkle/agent-a1");
+        // On the right branch, at the base commit, with the base tree materialized.
+        assert_eq!(git(&info.path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(), "sparkle/agent-a1");
+        assert_eq!(head_sha(&info.path), base_commit);
+        assert_eq!(std::fs::read_to_string(format!("{}/base.txt", info.path)).unwrap(), "base content");
+        // The pool is now empty (the slot was consumed), and the old pool path is gone.
+        assert_eq!(pools().lock().unwrap().get("pc").map(|v| v.len()).unwrap_or(0), 0);
+
+        let _ = git(&r, &["worktree", "remove", "--force", &info.path]);
+    }
+
+    // A slot cut from a base that has since MOVED is rejected (not handed out) and pruned — the
+    // caller then falls back to a correct fresh cut.
+    #[test]
+    fn claim_rejects_stale_base_and_prunes() {
+        let r = init_repo("pool-stale");
+        let app_data = unique_root("pool-stale-appdata");
+        warm_one_slot(&r, "ps", "main", &app_data).unwrap();
+        let parked = pools().lock().unwrap().get("ps").unwrap().last().unwrap().path.clone();
+
+        // Advance main AFTER warming, so the parked slot is now cut from a stale base.
+        std::fs::write(format!("{r}/new.txt"), "moved on").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-q", "-m", "advance main"]).unwrap();
+
+        // The claim must refuse the stale slot (⇒ caller falls back).
+        assert!(try_claim_pooled_worktree(&r, "ps", "a2", "main", &app_data).is_none());
+        // The stale slot is discarded from memory AND disk.
+        assert_eq!(pools().lock().unwrap().get("ps").map(|v| v.len()).unwrap_or(0), 0);
+        assert!(!parked.exists(), "stale parked worktree dir should be pruned");
+        // No agent worktree was created from the wrong base.
+        assert!(!worktree_path(&app_data, "ps", "a2").unwrap().exists());
+    }
+
+    // The disabled flag makes claim a no-op (always falls back), and create_worktree_at still works
+    // end-to-end via the slow path.
+    #[test]
+    fn disabled_flag_falls_back_to_slow_path() {
+        let r = init_repo("pool-disabled");
+        let app_data = unique_root("pool-disabled-appdata");
+        // Disable the pool for THIS repo via a per-project .sparkle/config.toml.
+        std::fs::create_dir_all(format!("{r}/.sparkle")).unwrap();
+        std::fs::write(format!("{r}/.sparkle/config.toml"), "[worktree_pool]\nenabled = false\n").unwrap();
+
+        // Even with a parked slot present, a disabled pool never claims it.
+        warm_one_slot(&r, "pd", "main", &app_data).unwrap();
+        assert!(try_claim_pooled_worktree(&r, "pd", "a3", "main", &app_data).is_none());
+        assert_eq!(pools().lock().unwrap().get("pd").map(|v| v.len()).unwrap_or(0), 1, "slot left intact");
+
+        // create_worktree_at still produces a correct worktree via the slow path.
+        let info = create_worktree_at(&r, "pd", "a3", "main", &app_data).unwrap();
+        assert_eq!(info.branch, "sparkle/agent-a3");
+        assert_eq!(info.path, worktree_path(&app_data, "pd", "a3").unwrap().to_string_lossy());
+        assert_eq!(git(&info.path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(), "sparkle/agent-a3");
+
+        let leftover = pools().lock().unwrap().get("pd").unwrap().last().unwrap().path.clone();
+        let _ = git(&r, &["worktree", "remove", "--force", &info.path]);
+        let _ = git(&r, &["worktree", "remove", "--force", &leftover.to_string_lossy()]);
+    }
+
+    // create_worktree_at claims from a warm pool transparently: same result as the slow path, and it
+    // does NOT go through `git worktree add -b` (the pooled slot is reused instead).
+    #[test]
+    fn create_worktree_at_claims_from_warm_pool() {
+        let r = init_repo("pool-e2e");
+        let app_data = unique_root("pool-e2e-appdata");
+        // Pin size=0 so the post-claim background refill is a deterministic no-op — the pool stays
+        // empty after the single parked slot is consumed, so the len==0 assertion below can't race a
+        // refill thread. (enabled stays true by default, so the claim itself still fires.)
+        std::fs::create_dir_all(format!("{r}/.sparkle")).unwrap();
+        std::fs::write(format!("{r}/.sparkle/config.toml"), "[worktree_pool]\nsize = 0\n").unwrap();
+        let base_commit = git(&r, &["rev-parse", "main"]).unwrap();
+        warm_one_slot(&r, "pe", "main", &app_data).unwrap();
+        assert_eq!(pools().lock().unwrap().get("pe").unwrap().len(), 1);
+
+        let info = create_worktree_at(&r, "pe", "a4", "main", &app_data).unwrap();
+        assert_eq!(info.branch, "sparkle/agent-a4");
+        assert_eq!(info.path, worktree_path(&app_data, "pe", "a4").unwrap().to_string_lossy());
+        assert_eq!(head_sha(&info.path), base_commit);
+        // The slot was consumed by the claim.
+        assert_eq!(pools().lock().unwrap().get("pe").map(|v| v.len()).unwrap_or(0), 0);
+
+        let _ = git(&r, &["worktree", "remove", "--force", &info.path]);
+    }
+
+    // Startup cleanup removes a leftover parked worktree from a "crashed" prior session and is a
+    // no-op on the second call (idempotent, once-per-project).
+    #[test]
+    fn cleanup_sweeps_crashed_pool_leftovers_once() {
+        let r = init_repo("pool-clean");
+        let app_data = unique_root("pool-clean-appdata");
+        // Simulate a crash survivor: a real parked worktree on disk with NO in-memory record.
+        let base_commit = git(&r, &["rev-parse", "main"]).unwrap();
+        let dir = pool_dir(&app_data, "pcl").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let orphan = dir.join(new_slot_id());
+        git(&r, &["worktree", "add", "--detach", &orphan.to_string_lossy(), &base_commit]).unwrap();
+        assert!(orphan.exists());
+
+        cleanup_pool_once(&r, "pcl", &app_data);
+        assert!(!orphan.exists(), "leftover parked worktree should be swept");
+        // Second call is a guarded no-op (does not error, nothing to do).
+        cleanup_pool_once(&r, "pcl", &app_data);
+    }
+
+    // topup_pool_blocking fills the pool up to the configured size and never over-warms.
+    #[test]
+    fn topup_fills_to_configured_size() {
+        let r = init_repo("pool-topup");
+        let app_data = unique_root("pool-topup-appdata");
+        std::fs::create_dir_all(format!("{r}/.sparkle")).unwrap();
+        std::fs::write(format!("{r}/.sparkle/config.toml"), "[worktree_pool]\nsize = 3\n").unwrap();
+
+        topup_pool_blocking(&r, "pt", "main", &app_data);
+        assert_eq!(pools().lock().unwrap().get("pt").map(|v| v.len()).unwrap_or(0), 3);
+
+        // Re-running is a no-op once full (still exactly 3, not 6).
+        topup_pool_blocking(&r, "pt", "main", &app_data);
+        assert_eq!(pools().lock().unwrap().get("pt").unwrap().len(), 3);
+
+        for slot in pools().lock().unwrap().get("pt").unwrap().clone() {
+            let _ = git(&r, &["worktree", "remove", "--force", &slot.path.to_string_lossy()]);
+        }
+    }
+
     #[test]
     fn worktree_path_is_outside_the_project_root() {
         use std::path::Path;
@@ -2911,7 +3421,9 @@ mod tests {
         // failed" every tick forever. It must return Ok with a zeroed, clean status instead.
         let root = unique_root("batch-status-noref");
         let root_str = root.to_string_lossy().to_string();
-        ensure_project_repo(root_str.clone()).unwrap();
+        // Use the sync core (mirrors the idempotent test below); `ensure_project_repo` is the async
+        // Tauri command and can't be `.unwrap()`-ed directly in a sync `#[test]`.
+        ensure_project_repo_inner(root_str.clone()).unwrap();
         git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
         git(&root_str, &["checkout", "main"]).unwrap();
 

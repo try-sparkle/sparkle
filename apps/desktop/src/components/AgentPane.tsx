@@ -7,6 +7,7 @@ import {
   installAgentHooks,
   assertWorkspaceIntegrity,
   prewarmProjectCaches,
+  warmWorktreePool,
 } from "../services/worktree";
 import { resolveDefaultBranch } from "../services/branchStatus";
 import { useAiFeature, useAiFeatureVisible } from "../services/aiGate";
@@ -293,6 +294,11 @@ function AgentPaneInner({
     // Warm the spawn caches for this project (claude/node paths, account state, background origin
     // fetch) once per root — fire-and-forget, so later agents on this project skip the cold resolves.
     prewarmProjectCaches(project.rootPath);
+    // Warm the pre-warmed worktree pool for this project (off the main thread) so a subsequent agent
+    // spawn can CLAIM a ready worktree instead of paying `git worktree add` on the critical path.
+    // Fire-and-forget + self-throttling (a no-op once the pool is full or the feature is disabled).
+    // Rust resolves the base itself, so an as-yet-unresolved defaultBranch is fine here.
+    void warmWorktreePool(project.rootPath, project.id, project.defaultBranch ?? "").catch(() => {});
     setPhase("preparing");
     setErrorMsg("");
     setPtyReady(false);

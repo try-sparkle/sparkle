@@ -82,6 +82,20 @@ pub struct FreshnessConfig {
     pub require_fresh_branch: bool,
 }
 
+/// Pre-warmed git worktree pool. At idle, Sparkle parks a few detached-HEAD worktrees checked out
+/// to the base commit; a spawn then CLAIMS one (a near-instant `git worktree move` + branch create)
+/// instead of paying the multi-second `git worktree add` on the critical path. Repo-scoped +
+/// per-project overridable (like [freshness]) so a big repo can tune its own pool depth. A pure
+/// optimization: disabling it, an empty pool, or any claim failure all fall back to the old cut.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WorktreePoolConfig {
+    /// Master switch. false = never pre-warm; every spawn cuts its worktree inline (the old path).
+    pub enabled: bool,
+    /// How many parked worktrees to keep ready per project. 0 disables warming (⇒ always falls back).
+    pub size: u32,
+}
+
 /// Menu-bar capture flow. Machine-wide (like [workers]/[ai]): the OS registers ONE global
 /// hotkey per machine, so a per-project value is meaningless and ignored with a warning.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -146,6 +160,7 @@ pub struct SparkleConfig {
     pub workers: WorkersConfig,
     pub ai: AiConfig,
     pub freshness: FreshnessConfig,
+    pub worktree_pool: WorktreePoolConfig,
     pub capture: CaptureConfig,
     pub voice: VoiceConfig,
     /// Per-project "Done" stage definition (see the Definable Done & Delivered feature).
@@ -187,6 +202,8 @@ impl Default for SparkleConfig {
                 stale_build_block_commits: 25,
                 require_fresh_branch: true,
             },
+            // Pre-warm a small pool by default so the common fan-out spawn skips `git worktree add`.
+            worktree_pool: WorktreePoolConfig { enabled: true, size: 2 },
             capture: CaptureConfig { popover_shortcut: "ctrl+shift+r".into() },
             voice: VoiceConfig {
                 wake_word: "Hey Sparkle".into(),
@@ -258,6 +275,12 @@ struct PartialFreshness {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialWorktreePool {
+    enabled: Option<bool>,
+    size: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialCapture {
     popover_shortcut: Option<String>,
 }
@@ -298,6 +321,7 @@ struct PartialConfig {
     workers: Option<PartialWorkers>,
     ai: Option<PartialAi>,
     freshness: Option<PartialFreshness>,
+    worktree_pool: Option<PartialWorktreePool>,
     capture: Option<PartialCapture>,
     voice: Option<PartialVoice>,
     done: Option<PartialDone>,
@@ -359,6 +383,16 @@ fn apply_freshness(into: &mut FreshnessConfig, p: Option<PartialFreshness>) {
     }
     if let Some(v) = p.require_fresh_branch {
         into.require_fresh_branch = v;
+    }
+}
+
+fn apply_worktree_pool(into: &mut WorktreePoolConfig, p: Option<PartialWorktreePool>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.enabled {
+        into.enabled = v;
+    }
+    if let Some(v) = p.size {
+        into.size = v;
     }
 }
 
@@ -452,6 +486,15 @@ fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
         warnings.push("[workers].max_concurrent must be >= 1; using 1".to_string());
         cfg.workers.max_concurrent = 1;
     }
+    // Cap the pool so a fat-fingered size can't spawn a huge burst of parked worktrees (each a real
+    // checkout on disk). 16 is far above any sane fan-out; anything higher is almost certainly a typo.
+    if cfg.worktree_pool.size > 16 {
+        warnings.push(format!(
+            "[worktree_pool].size ({}) is very high; capping at 16",
+            cfg.worktree_pool.size
+        ));
+        cfg.worktree_pool.size = 16;
+    }
     // Incoherent if a build would be blocked before staleness is even warned about.
     let f = &cfg.freshness;
     if f.stale_build_block_commits < f.staleness_warn_commits {
@@ -484,6 +527,7 @@ fn build_effective(
                 apply_workers(&mut cfg.workers, p.workers);
                 apply_ai(&mut cfg.ai, p.ai);
                 apply_freshness(&mut cfg.freshness, p.freshness);
+                apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_capture(&mut cfg.capture, p.capture);
                 apply_voice(&mut cfg.voice, p.voice);
                 apply_done(&mut cfg.done, p.done);
@@ -533,6 +577,7 @@ fn build_effective(
                 // per-project BY DESIGN — they describe how *this* repo ships).
                 apply_workflow(&mut cfg.workflow, p.workflow);
                 apply_freshness(&mut cfg.freshness, p.freshness);
+                apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
             }
@@ -721,6 +766,19 @@ stale_build_block_commits = 25
 # Advisory reminder that new work should start from a fresh-from-origin/main branch
 # (e.g. scripts/new-feature.sh), not an inherited stale one.
 require_fresh_branch      = true
+
+# --- Pre-warmed worktree pool (repo-scoped; overridable in a project file) --------------
+# The slow part of spawning an agent is `git worktree add`, which materializes the whole working
+# tree (seconds — and longer when several spawns queue behind each other). Instead, Sparkle keeps a
+# few worktrees pre-checked-out at the base commit while you're idle; a spawn then just MOVES one
+# into place and creates the agent's branch (near-instant). This is a pure speedup: if it's off, the
+# pool is empty, or the base has moved, Sparkle transparently falls back to the normal cut.
+[worktree_pool]
+# false = never pre-warm; every agent cuts its own worktree inline (the original behavior).
+enabled = true
+# How many ready worktrees to keep parked per project. Higher = more spawns skip the wait, at the
+# cost of that many extra checkouts on disk. 0 disables warming. Capped at 16 defensively.
+size    = 2
 
 # --- What "Done" and "Delivered" mean for THIS project (repo-scoped) --------------------
 # These two sections let each project define its own Plan/Tasks board semantics. They are
@@ -1245,6 +1303,45 @@ mod tests {
         // Untouched freshness field keeps its default; no "ignored" warning (unlike [workers]/[ai]).
         assert_eq!(cfg.freshness.stale_build_block_commits, 25);
         assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn worktree_pool_defaults_overrides_and_cap() {
+        // Absent [worktree_pool] → the built-in defaults (enabled, size 2).
+        let (cfg, _, _) = effective(None, None);
+        assert!(cfg.worktree_pool.enabled);
+        assert_eq!(cfg.worktree_pool.size, 2);
+
+        // Global override, field by field.
+        let g = "[worktree_pool]\nenabled = false\nsize = 4\n";
+        let (cfg, _, _) = effective(Some(g), None);
+        assert!(!cfg.worktree_pool.enabled);
+        assert_eq!(cfg.worktree_pool.size, 4);
+
+        // Per-project overridable (like [freshness]); no "ignored" warning.
+        let p = "[worktree_pool]\nsize = 3\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert_eq!(cfg.worktree_pool.size, 3);
+        assert!(cfg.worktree_pool.enabled, "untouched field keeps its default");
+        assert!(warns.is_empty());
+
+        // An absurd size is capped (with a warning) rather than spawning a burst of checkouts.
+        let g = "[worktree_pool]\nsize = 999\n";
+        let (cfg, warns, _) = effective(Some(g), None);
+        assert_eq!(cfg.worktree_pool.size, 16);
+        assert!(warns.iter().any(|w| w.contains("worktree_pool")));
+
+        // Boundary: exactly 16 is the max allowed — unchanged, no warning (the cap is `> 16`).
+        let g = "[worktree_pool]\nsize = 16\n";
+        let (cfg, warns, _) = effective(Some(g), None);
+        assert_eq!(cfg.worktree_pool.size, 16);
+        assert!(!warns.iter().any(|w| w.contains("worktree_pool")));
+
+        // size = 0 is a valid "disable warming" value — accepted as-is, no floor, no warning.
+        let g = "[worktree_pool]\nsize = 0\n";
+        let (cfg, warns, _) = effective(Some(g), None);
+        assert_eq!(cfg.worktree_pool.size, 0);
+        assert!(!warns.iter().any(|w| w.contains("worktree_pool")));
     }
 
     #[test]
