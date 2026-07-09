@@ -106,6 +106,24 @@ export async function redeemPromo(code: string): Promise<void> {
   await invoke("desktop_redeem_promo", { code });
 }
 
+/** Result of redeeming an admin-issued coupon (POST /billing/coupon). A `credit_grant` coupon has
+ *  already added `grantedCents` to the balance server-side; a `discount` coupon grants nothing here
+ *  — it carries a Stripe promotion code the user applies at checkout. */
+export interface CouponRedeemResult {
+  type: "credit_grant" | "discount";
+  grantedCents?: number;
+  balanceCents?: number;
+  promotionCode?: string | null;
+}
+
+/** Redeem an admin-issued coupon (the `/admin coupons` system) via /billing/coupon. Resolves with
+ *  the coupon result on success; rejects with the server's stable code — "invalid_or_expired"
+ *  (unknown/expired/capped) or "already_redeemed" — or another message on failure. Distinct from
+ *  redeemPromo, which targets the single-code PROMO_CODE override. */
+export async function redeemCoupon(code: string): Promise<CouponRedeemResult> {
+  return await invoke<CouponRedeemResult>("desktop_redeem_coupon", { code });
+}
+
 /** Fetch entitlement + balance. Returns null on any auth/network failure (caller treats as
  *  signed-out). */
 export async function fetchMe(): Promise<Me | null> {

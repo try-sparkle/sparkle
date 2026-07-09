@@ -325,6 +325,7 @@ pub fn run() {
             auth::desktop_consume,
             auth::desktop_refund,
             auth::desktop_redeem_promo,
+            auth::desktop_redeem_coupon,
             auth::desktop_topup_checkout,
             auth::desktop_credit_history,
             auth::desktop_auto_topup_get,

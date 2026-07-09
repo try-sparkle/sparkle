@@ -436,6 +436,32 @@ pub async fn desktop_redeem_promo(code: String) -> Result<(), String> {
     }
 }
 
+/// Redeem an admin-issued coupon (POST /billing/coupon — the `/admin coupons` system, distinct from
+/// the single-code `/billing/promo` override). Returns the coupon result JSON verbatim on success —
+/// `{type:"credit_grant", grantedCents, balanceCents}` (credits granted) or `{type:"discount", …}`
+/// (a Stripe promo code to apply at checkout) — so the UI can react to the two kinds. Non-2xx maps
+/// to the server's stable `error` code via server_error (e.g. "invalid_or_expired",
+/// "already_redeemed"), mirroring desktop_topup_checkout's error style, so JS can string-match it.
+/// `async` so Tauri runs the blocking ureq call off the main thread (see desktop_redeem_promo).
+#[tauri::command]
+pub async fn desktop_redeem_coupon(code: String) -> Result<Value, String> {
+    let token = read_token().ok_or_else(|| "not signed in".to_string())?;
+    let url = format!("{}/billing/coupon", base_url());
+    let body = json!({ "code": code }).to_string();
+    let req = ureq::post(&url)
+        .timeout(HTTP_TIMEOUT)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json");
+    match req.send_string(&body) {
+        Ok(resp) => json_response(resp),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(server_error("coupon", code, &text))
+        }
+        Err(e) => Err(format!("coupon redeem failed: {e}")),
+    }
+}
+
 // ---- Credits menu (design spec: docs/superpowers/specs/2026-07-01-credits-menu-design.md) ----
 // Pure request-shape helpers below are unit-tested; the commands are thin ureq shells that follow
 // desktop_me/desktop_redeem_promo's bearer + error-mapping style.
