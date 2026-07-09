@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import {
@@ -141,6 +141,13 @@ function AgentPaneInner({
   // minimizes (or on ⌘J) without the user clicking the terminal.
   const termFocusRef = useRef<(() => void) | null>(null);
   const composerMinimized = useUiStore((s) => s.composerMinimized);
+  // Flip the composer's minimized state — the action behind a plain click in the terminal body
+  // (a third trigger alongside ⌘J and the drag handle). Reads live store state so it stays a stable
+  // identity while always toggling from the current value; focus follows via the effect below.
+  const toggleComposerMinimized = useCallback(() => {
+    const s = useUiStore.getState();
+    s.setComposerMinimized(!s.composerMinimized);
+  }, []);
   // AI feature gates (Use AI Features menu). The composer RENDERS whenever the feature is enabled
   // (visible gate = settings flag only), NOT gated on AI credits — a trial/no-credits user must still
   // SEE and type into the composer; the paywall is enforced at send (Composer.send → trialSendAllowed
@@ -796,6 +803,9 @@ function AgentPaneInner({
               // wired on the NO-composer path (matching the composer's own metering on the AI path);
               // recordTrialSend also self-gates, no-opping for entitled users.
               onSubmitLine={aiComposer ? undefined : () => void recordTrialSend()}
+              // A plain click in the terminal toggles the composer (minimize to uncover the lines it
+              // floats over, restore to type). Only wired when the composer exists to be toggled.
+              onToggleComposer={aiComposer ? toggleComposerMinimized : undefined}
               focusRef={termFocusRef}
               apiRef={terminalApiRef}
             />

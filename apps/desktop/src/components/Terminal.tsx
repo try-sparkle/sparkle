@@ -17,6 +17,7 @@ import { useInteractionStore } from "../stores/interactionStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { isComposerToggleKey } from "./composerToggle";
 import { isCopySelectionKey } from "./copySelectionKey";
+import { shouldToggleComposerOnClick } from "./terminalClickToggle";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
 import { resolveTerminalOverlay } from "./terminalOverlay";
@@ -115,6 +116,7 @@ export function Terminal({
   onRateLimit,
   onRequestFocus,
   onSubmitLine,
+  onToggleComposer,
   focusRef,
   apiRef,
   resuming = false,
@@ -147,6 +149,12 @@ export function Terminal({
   // (a carriage return in USER input) — one call per submitted line. The parent uses this to meter
   // free-trial prompts for trial users who type into the raw terminal (no composer). Best-effort.
   onSubmitLine?: () => void;
+  // Called when the user gives the terminal body a plain click (no drag, no text selection), to
+  // toggle the composer's minimized state — a third trigger alongside ⌘J and the drag handle.
+  // Provided ONLY when the composer feature is on (otherwise there's nothing to toggle), so its
+  // presence also gates the behavior. Flipping the store's composerMinimized drives focus-follow,
+  // so this handler doesn't manage focus itself.
+  onToggleComposer?: () => void;
   // The parent sets this to an imperative focus() so it can move focus into the terminal
   // (e.g. on ⌘J / when the composer minimizes) without the user clicking it.
   focusRef?: RefObject<(() => void) | null>;
@@ -177,6 +185,10 @@ export function Terminal({
   // Latest onSubmitLine, read by the (agentId-keyed) onData handler without re-subscribing.
   const onSubmitLineRef = useRef(onSubmitLine);
   onSubmitLineRef.current = onSubmitLine;
+  // Latest onToggleComposer, read by the (agentId-keyed) container mouse handlers without
+  // re-subscribing. Null when the composer feature is off — the click handler no-ops then.
+  const onToggleComposerRef = useRef(onToggleComposer);
+  onToggleComposerRef.current = onToggleComposer;
   const zoom = useUiStore((s) => s.zoom);
   const resolvedTheme = useResolvedTheme();
   // Brief "Copied to clipboard" flash shown after a mouse selection is copied.
@@ -726,17 +738,42 @@ export function Terminal({
       if (!disposed) setSpawnFail("failed");
     });
 
+    // Where the current press started, so mouseup can tell a stationary click from a drag.
+    let downAt = { x: 0, y: 0 };
     // Copy-on-select: when the user finishes a mouse selection, copy it to the clipboard
     // and flash a confirmation so the (otherwise invisible) copy is obvious. A plain click
-    // leaves an empty selection — nothing is copied and no toast shows.
+    // leaves an empty selection — nothing is copied and no toast shows; instead it toggles the
+    // composer (minimize to uncover the lines it floats over, restore to type again).
     const onMouseUp = (e: MouseEvent) => {
       const sel = copySelectionToClipboard();
-      if (!sel) return;
-      // Open the action popup at the cursor regardless of clipboard timing.
-      setPopup({ x: e.clientX, y: e.clientY, text: sel });
+      if (sel) {
+        // Open the action popup at the cursor regardless of clipboard timing.
+        setPopup({ x: e.clientX, y: e.clientY, text: sel });
+        return;
+      }
+      // No selection => a plain click (or a drag that selected nothing). Only a genuine stationary
+      // left-click toggles the composer; a drag must never flip it, and neither may a click a
+      // mouse-tracking TUI is capturing (that click is the app's). Gated on onToggleComposer being
+      // wired (composer feature on); term.hasSelection() is false here since copy returned null.
+      const mouseTracking = term.modes.mouseTrackingMode !== "none";
+      if (
+        shouldToggleComposerOnClick(
+          e.button,
+          downAt,
+          { x: e.clientX, y: e.clientY },
+          term.hasSelection(),
+          mouseTracking,
+        )
+      ) {
+        onToggleComposerRef.current?.();
+      }
     };
-    // A new drag (mousedown) dismisses any open popup before the next selection.
-    const onMouseDown = () => setPopup(null);
+    // A new drag (mousedown) dismisses any open popup before the next selection, and records the
+    // press origin for the click/drag discrimination above.
+    const onMouseDown = (e: MouseEvent) => {
+      setPopup(null);
+      downAt = { x: e.clientX, y: e.clientY };
+    };
     container.addEventListener("mouseup", onMouseUp);
     container.addEventListener("mousedown", onMouseDown);
 
