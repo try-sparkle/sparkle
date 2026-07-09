@@ -103,7 +103,11 @@ export async function computeSuggestions(opts: ComputeOpts): Promise<SuggestionS
     // parses to valid JSON of the wrong SHAPE sanitizes to [] and resolves (treated as "model
     // offered nothing usable"), while non-JSON rethrows — both outcomes are bounded and logged,
     // and distinguishing them would add a branch for a rare flavor of model misbehavior.
-    log.warn("suggestions", "learned compute failed", {
+    // Log at DEBUG, not WARN: the rethrow below reaches the hook's own catch, which logs the SAME
+    // error at WARN ("compute failed") with the retry-budget context. Warning here too would emit
+    // two WARN lines per failure — during an AI backend hiccup/outage that doubles the noise and
+    // buries real signal. Keep this line for the unique `tags` diagnostic it carries, at debug.
+    log.debug("suggestions", "learned compute failed", {
       agentId,
       tags,
       error: err instanceof Error ? err.message : String(err),
