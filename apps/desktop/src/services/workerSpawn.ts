@@ -1,11 +1,7 @@
 // Programmatically spawn a worker agent under a build agent: register the tab, cut its worktree
 // from the parent's local branch, and persist the worktree. The PTY launch happens when the
 // worker tab opens (AgentPane), driven by the worker persona + the stored task.
-import {
-  useProjectStore,
-  markWorkerTearingDown,
-  clearWorkerTearingDown,
-} from "../stores/projectStore";
+import { useProjectStore } from "../stores/projectStore";
 import { type WorktreeInfo, killPty } from "../pty";
 import { prepareWorkerWorkspace, removeAgentWorkspace, writeWorkerManifest } from "./worktree";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -136,9 +132,9 @@ export async function spawnWorker(args: {
  *  (and the orchestration self-heal, ensureWorkersOpen, re-opened it) for as long as a concurrent
  *  agent held that lock. Mirrors the build-agent close (AgentSidebar.teardownAgent): drop the row
  *  synchronously, reap OS/git resources after. Because a worker's on-disk manifest (unlike a closed
- *  build agent's) can still be re-adopted by reconcileWorkersFromDisk while its parent lives, the id
- *  is tombstoned (markWorkerTearingDown) across the reap so the reconcile can't resurrect the row
- *  before the manifest is deleted; the tombstone clears once the worktree (and its manifest) is gone.
+ *  build agent's) can still be re-adopted by reconcileWorkersFromDisk while its parent lives,
+ *  removeAgent tombstones the id (pendingLocalRemovals) so the reconcile can't resurrect the row
+ *  before the manifest is deleted.
  *  Returns after the reap so callers that need the worktree actually gone (handleSpinDown's slot
  *  accounting relies only on the synchronous removeAgent, but the MCP reply should reflect a real
  *  teardown) still await completion. */
@@ -147,22 +143,18 @@ export async function spinDownWorker(args: { projectId: string; workerId: string
   if (!project) return;
   const worker = project.agents.find((a) => a.id === args.workerId);
   if (!worker || worker.kind !== "worker") return;
-  // Optimistic teardown: drop the row + runtime entry NOW so a contended repo lock can't leave the
-  // row lingering. Tombstone the id first so a reconcile that races the background reap can't
-  // re-adopt it from its not-yet-deleted manifest.
-  markWorkerTearingDown(args.workerId);
+  // Drop the ROW + close the pane FIRST, so the sidebar updates instantly instead of waiting on the
+  // slow git worktree removal below (~1-2s, and far worse for a build agent tearing down N workers).
+  // Removing the row synchronously up front is what makes the × feel immediate. It's safe because
+  // removeAgent now TOMBSTONES the id (pendingLocalRemovals), so the disk reconcile can't re-adopt
+  // this worker from its still-present manifest during the teardown window (sparkle-close-resurrect).
   useRuntimeStore.getState().close(args.workerId);
   useProjectStore.getState().removeAgent(args.projectId, args.workerId);
-  // Reap OS/git resources after the UI is already updated. Errors are swallowed so a partially-gone
-  // worker still finishes teardown; warn so a failed PTY kill / worktree removal (e.g. a transient
-  // git error leaving an orphan on disk) is visible. Clear the tombstone only once the worktree —
-  // and thus its manifest — is gone, so the reconcile is shielded for the whole window.
-  try {
-    await killPty(args.workerId).catch((e) => console.warn("spinDownWorker: killPty failed", e));
-    await removeAgentWorkspace(project.rootPath, args.projectId, args.workerId).catch((e) =>
-      console.warn("spinDownWorker: removeAgentWorkspace failed", e),
-    );
-  } finally {
-    clearWorkerTearingDown(args.workerId);
-  }
+  // Then the slow disk teardown — still AWAITED so the orchestrator's spin_down reply only resolves
+  // once the PTY is dead and the worktree is gone. Errors are swallowed so a partially-gone worker
+  // still finishes; warn so a failed kill / removal (a transient git error leaving an orphan) shows.
+  await killPty(args.workerId).catch((e) => console.warn("spinDownWorker: killPty failed", e));
+  await removeAgentWorkspace(project.rootPath, args.projectId, args.workerId).catch((e) =>
+    console.warn("spinDownWorker: removeAgentWorkspace failed", e),
+  );
 }

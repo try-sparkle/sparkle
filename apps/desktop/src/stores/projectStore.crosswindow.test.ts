@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { useProjectStore } from "./projectStore";
+import { useProjectStore, acknowledgeRemovals, isLocallyRemoved } from "./projectStore";
 
 beforeEach(() => {
   useProjectStore.setState({ projects: [], selectedProjectId: null });
@@ -20,5 +20,74 @@ describe("touchProjectOpened", () => {
     const after = useProjectStore.getState().projects[0]?.lastOpenedAt ?? "";
     expect(after > old).toBe(true);
     expect(useProjectStore.getState().selectedProjectId).toBe("other");
+  });
+});
+
+// A worker closed via its row's × (removeAgent) must NOT be re-adopted by the disk reconcile
+// (reconcileWorkersFromDisk → adoptWorker) while its on-disk manifest is still being torn down.
+// removeAgent tombstones the id; adoptWorker refuses a tombstoned id until the removal propagates.
+describe("removal tombstone blocks re-adoption", () => {
+  it("adoptWorker refuses a just-removed worker id", () => {
+    const store = useProjectStore.getState();
+    const pid = store.addProject("P", "/tmp/p");
+    const buildId = store.addAgent(pid, { kind: "build" });
+    // Give the build agent a branch so a worker can hang off it, then adopt a worker on disk.
+    useProjectStore.getState().setAgentWorktree(pid, buildId, "/wt/b", "sparkle/agent-b");
+    const wid = "worker-1";
+    useProjectStore
+      .getState()
+      .adoptWorker(pid, { id: wid, parentId: buildId, worktreePath: "/wt/w1", branch: "wb" });
+    expect(useProjectStore.getState().projects[0]!.agents.some((a) => a.id === wid)).toBe(true);
+
+    // User closes the worker row → tombstoned.
+    useProjectStore.getState().removeAgent(pid, wid);
+    // A reconcile pass whose disk manifest still exists tries to re-adopt it — must be refused.
+    useProjectStore
+      .getState()
+      .adoptWorker(pid, { id: wid, parentId: buildId, worktreePath: "/wt/w1", branch: "wb" });
+    expect(useProjectStore.getState().projects[0]!.agents.some((a) => a.id === wid)).toBe(false);
+
+    // Once the removal propagates (acknowledged), the id may be adopted again.
+    acknowledgeRemovals([wid]);
+    useProjectStore
+      .getState()
+      .adoptWorker(pid, { id: wid, parentId: buildId, worktreePath: "/wt/w1", branch: "wb" });
+    expect(useProjectStore.getState().projects[0]!.agents.some((a) => a.id === wid)).toBe(true);
+  });
+
+  it("closing a build agent cascade-removes AND tombstones every child worker id", () => {
+    // The build-agent optimistic teardown (AgentSidebar) drops the parent's row then relies on
+    // removeAgent's cascade to drop + tombstone the workers, so a background worktree-removal that
+    // leaves a manifest on disk can't be reconciled back into a row (sparkle-close-resurrect).
+    const store = useProjectStore.getState();
+    const pid = store.addProject("P", "/tmp/p");
+    const buildId = store.addAgent(pid, { kind: "build" });
+    useProjectStore.getState().setAgentWorktree(pid, buildId, "/wt/b", "sparkle/agent-b");
+    const w1 = "child-1";
+    const w2 = "child-2";
+    for (const id of [w1, w2]) {
+      useProjectStore
+        .getState()
+        .adoptWorker(pid, { id, parentId: buildId, worktreePath: `/wt/${id}`, branch: id });
+    }
+    expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(3);
+
+    // Close the build agent (parent id only — removeAgent cascades to its workers).
+    useProjectStore.getState().removeAgent(pid, buildId);
+
+    // All three rows gone synchronously.
+    expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0);
+    // Parent AND both children tombstoned, so a lingering-manifest reconcile can't re-adopt them.
+    expect(isLocallyRemoved(buildId)).toBe(true);
+    expect(isLocallyRemoved(w1)).toBe(true);
+    expect(isLocallyRemoved(w2)).toBe(true);
+    for (const id of [w1, w2]) {
+      useProjectStore
+        .getState()
+        .adoptWorker(pid, { id, parentId: buildId, worktreePath: `/wt/${id}`, branch: id });
+    }
+    expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0); // still refused
+
+    acknowledgeRemovals([buildId, w1, w2]);
   });
 });

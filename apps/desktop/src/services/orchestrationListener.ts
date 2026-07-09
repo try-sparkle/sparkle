@@ -12,7 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { safeUnlisten } from "./safeUnlisten";
 import { spawnWorker, spinDownWorker } from "./workerSpawn";
 import { scanWorkerManifests, type WorkerManifest } from "./worktree";
-import { useProjectStore, isWorkerTearingDown } from "../stores/projectStore";
+import { useProjectStore, isLocallyRemoved } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { workersNeedingOpen } from "../engine/workerAttention";
@@ -193,11 +193,10 @@ export async function reconcileWorkersFromDisk(projectId?: string): Promise<numb
       const project = useProjectStore.getState().projects.find((p) => p.id === target.id);
       if (!project) continue;
       if (project.agents.some((a) => a.id === m.workerId)) continue; // record already present
-      // Never re-adopt a worker whose row was just closed but whose worktree/manifest is still being
-      // reaped in the background (spinDownWorker tombstones it): the record is gone from `agents` and
-      // the manifest hasn't been deleted YET, which is exactly the shape this loop would otherwise
-      // treat as an evicted worker to restore — resurrecting the row the user just closed.
-      if (isWorkerTearingDown(m.workerId)) continue;
+      // Never re-adopt a worker the user just closed manually: its manifest lingers on disk until
+      // the worktree teardown completes, but the tombstone means the row must stay gone
+      // (sparkle-close-resurrect). adoptWorker also refuses it — this just skips the wasted work.
+      if (isLocallyRemoved(m.workerId)) continue;
       // Only adopt under a build agent that still exists: never resurrect a worker whose
       // orchestrator was deliberately closed (that worktree is orphaned — a separate concern).
       if (!project.agents.some((a) => a.id === m.buildAgentId)) continue;
@@ -294,11 +293,11 @@ function ensureWorkersOpen(): void {
   const openIds = new Set(rt.openAgentIds);
   for (const project of projects) {
     for (const worker of workersNeedingOpen(project.agents, rt.status, openIds)) {
-      // A worker mid-teardown (× just closed it; manifest still being reaped) can momentarily still
-      // look "stranded" — in the roster, not open, no status — before removeAgent has fully
-      // propagated. Re-opening it here is what resurrected the just-closed row; skip tombstoned ids.
-      if (isWorkerTearingDown(worker.id)) {
-        console.debug("[orchestration] skip re-open of tearing-down worker", worker.id);
+      // A worker the user just closed can momentarily still look "stranded" — in a stale snapshot's
+      // roster, not open, no status — before the removal propagates. Re-opening it here would
+      // resurrect the just-closed row, so skip any id tombstoned as locally-removed (the merge
+      // filter normally keeps it out of the roster entirely; this is defense-in-depth).
+      if (isLocallyRemoved(worker.id)) {
         continue;
       }
       console.debug("[orchestration] re-opening stranded worker", worker.id);

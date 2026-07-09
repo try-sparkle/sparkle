@@ -147,3 +147,51 @@ describe("mergePreservingLiveWorkers — pending local adds", () => {
     expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1", "b2"]);
   });
 });
+
+// The SYMMETRIC hazard to pending adds: a locally-CLOSED agent that a concurrent writer's stale
+// snapshot still carries. The user clicks × → removeAgent drops the row here → but another window
+// (e.g. the hidden capture webview) broadcasts a snapshot that predates the removal, and the default
+// whole-array replace RE-ADDS the just-closed agent — the "× closes the terminal but the row comes
+// back" report. A removal tombstone (pendingRemovals) filters the id out of the incoming snapshot
+// until the removal has propagated (a snapshot arrives without it).
+describe("mergePreservingLiveWorkers — pending local removals (tombstones)", () => {
+  it("does NOT resurrect a locally-removed build agent a stale snapshot still carries", () => {
+    const keep = agent({ id: "b1", kind: "build", branch: "main" });
+    // b2 was just closed: gone from memory, but the stale persisted snapshot still lists it.
+    const current = currentState([project("p1", [keep])]);
+    const persisted = {
+      projects: [project("p1", [keep, agent({ id: "b2", kind: "build" })])],
+      selectedProjectId: "p1",
+    };
+
+    const merged = mergePreservingLiveWorkers(persisted, current, new Set(), new Set(["b2"]));
+    expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1"]);
+  });
+
+  it("also filters a tombstoned worker the stale snapshot carries", () => {
+    const build = agent({ id: "b1", kind: "build", branch: "main" });
+    const current = currentState([project("p1", [build])]);
+    const persisted = {
+      projects: [
+        project("p1", [
+          build,
+          agent({ id: "w1", kind: "worker", parentId: "b1", worktreePath: "/wt/w1" }),
+        ]),
+      ],
+      selectedProjectId: "p1",
+    };
+
+    const merged = mergePreservingLiveWorkers(persisted, current, new Set(), new Set(["w1"]));
+    expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1"]);
+  });
+
+  it("does NOT filter agents that are not tombstoned", () => {
+    const build = agent({ id: "b1", kind: "build", branch: "main" });
+    const other = agent({ id: "b2", kind: "build" });
+    const current = currentState([project("p1", [build, other])]);
+    const persisted = { projects: [project("p1", [build, other])], selectedProjectId: "p1" };
+
+    const merged = mergePreservingLiveWorkers(persisted, current, new Set(), new Set(["bX"]));
+    expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1", "b2"]);
+  });
+});

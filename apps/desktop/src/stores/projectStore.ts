@@ -351,30 +351,52 @@ export function acknowledgePendingAdds(ids: Iterable<string>): void {
   for (const id of ids) pendingLocalAdds.delete(id);
 }
 
-/** Ids of WORKERS whose teardown is in flight: the store record is already removed (the row was
- *  dropped optimistically the instant × was clicked) but the on-disk worktree + `.sparkle/worker.json`
- *  manifest are still being reaped in the background. While an id lives here, the disk reconcile
- *  (orchestrationListener.reconcileWorkersFromDisk) must NOT re-adopt it from its not-yet-deleted
- *  manifest — doing so was the "× closes the worker but the row comes back" resurrection. Cleared the
- *  moment the worktree (and thus its manifest) is gone. Module-scoped: one set per window. Symmetric
- *  with pendingLocalAdds (which shields a just-ADDED row); this shields a just-REMOVED one. */
-const workersTearingDown = new Set<string>();
+/** Ids of agents REMOVED locally in THIS window but whose removal may not have propagated to the
+ *  shared persisted blob yet. The exact mirror of pendingLocalAdds: while an id lives here the merge
+ *  FILTERS it out of any incoming snapshot, so a concurrent writer's stale snapshot that still
+ *  carries the just-closed agent can't resurrect its row ("× closes the terminal but the row comes
+ *  back", sparkle-close-resurrect). It also gates adoptWorker so the disk reconcile can't re-adopt a
+ *  worker mid-teardown (its manifest lingers until the worktree is removed). Held until the id is
+ *  deliberately re-created (addAgent clears it) — see registerLocalRemovals for why it is NOT cleared
+ *  on propagation. Bounded by MAX_TOMBSTONES. Module-scoped: one set per window. */
+const pendingLocalRemovals = new Set<string>();
 
-/** Mark a worker as mid-teardown so the disk reconcile won't resurrect its row before its manifest
- *  is deleted. Pair every call with clearWorkerTearingDown once the worktree is reaped. */
-export function markWorkerTearingDown(id: string): void {
-  workersTearingDown.add(id);
+/** Bound the tombstone set so a very long session (thousands of closes) can't grow it without limit.
+ *  Ids are agent uuids, so the only entries that ever MATCH an incoming snapshot are ones a stale
+ *  window is still broadcasting; once every window has converged past a removal, its tombstone is
+ *  dead weight. Evicting the OLDEST first (Set preserves insertion order) drops the longest-settled
+ *  entries. CAVEAT: this holds only when the worktree removal SUCCEEDED. removeAgentWorkspace is
+ *  best-effort (errors swallowed), so a persistent git failure leaves the manifest on disk; then the
+ *  tombstone is the sole thing stopping reconcileWorkersFromDisk from re-adopting the orphan, and
+ *  evicting it after 500 further closes could re-expose that one row. That needs a persistent git
+ *  failure AND 500+ closes in a single session AND a reconcile pass — vanishingly unlikely, and the
+ *  cap is the lesser evil vs. an unbounded set. If it ever bites, gate eviction on confirmed cleanup. */
+const MAX_TOMBSTONES = 500;
+
+/** Register ids as locally removed so the merge/adopt paths suppress them. Unlike pendingLocalAdds,
+ *  a removal tombstone is NOT cleared when a fresh snapshot arrives: doing so would reopen the race
+ *  where a still-stale window (e.g. the hidden capture webview) re-broadcasts the closed agent AFTER
+ *  the self-echo cleared the tombstone, resurrecting the row. A uuid is never legitimately re-added
+ *  except by a deliberate local re-create (addAgent clears it), so keeping the tombstone is safe. */
+export function registerLocalRemovals(ids: Iterable<string>): void {
+  for (const id of ids) pendingLocalRemovals.add(id);
+  while (pendingLocalRemovals.size > MAX_TOMBSTONES) {
+    const oldest = pendingLocalRemovals.values().next().value;
+    if (oldest === undefined) break;
+    pendingLocalRemovals.delete(oldest);
+  }
 }
 
-/** Stop shielding a worker id once its worktree + manifest are gone (or teardown gave up). */
-export function clearWorkerTearingDown(id: string): void {
-  workersTearingDown.delete(id);
+/** Drop ids from the removal tombstone — because the id is being re-created locally (addAgent) or
+ *  a test is resetting state. Exported for tests. */
+export function acknowledgeRemovals(ids: Iterable<string>): void {
+  for (const id of ids) pendingLocalRemovals.delete(id);
 }
 
-/** True while a worker's row is removed but its on-disk manifest may still exist — the reconcile
- *  must skip these so it can't re-adopt a deliberately-closed worker. Exported for tests. */
-export function isWorkerTearingDown(id: string): boolean {
-  return workersTearingDown.has(id);
+/** True while an id is tombstoned (locally removed, not yet re-created). The disk reconcile consults
+ *  this so it doesn't waste a no-op adoptWorker on a worker the user just closed. */
+export function isLocallyRemoved(id: string): boolean {
+  return pendingLocalRemovals.has(id);
 }
 
 /** Rehydration merge that NEVER drops a live worker (sparkle-3tqv). Every rehydrate — startup and,
@@ -393,6 +415,7 @@ export function mergePreservingLiveWorkers(
   persistedState: unknown,
   currentState: ProjectState,
   pendingAdds: ReadonlySet<string> = EMPTY_PENDING_ADDS,
+  pendingRemovals: ReadonlySet<string> = EMPTY_PENDING_ADDS,
 ): ProjectState {
   const persisted = (persistedState ?? undefined) as Partial<ProjectState> | undefined;
   const merged = { ...currentState, ...(persisted ?? {}) } as ProjectState;
@@ -400,17 +423,21 @@ export function mergePreservingLiveWorkers(
   const incoming = persisted?.projects ?? currentProjects;
   merged.projects = incoming.map((pp) => {
     const cur = currentProjects.find((c) => c.id === pp.id);
+    // Removal tombstone (sparkle-close-resurrect): an agent closed locally in THIS window but still
+    // carried by a concurrent writer's stale snapshot must NOT be re-added by the whole-array
+    // replace ("× closes the terminal but the row comes back"). Filter tombstoned ids out of the
+    // incoming snapshot BEFORE anything else — symmetric to pendingLocalAdds, which shields the
+    // opposite direction. The tombstone persists until the id is re-created (registerLocalRemovals),
+    // so a still-stale window re-broadcasting the closed agent stays suppressed.
+    const ppAgents =
+      pendingRemovals.size > 0
+        ? pp.agents.filter((a) => !pendingRemovals.has(a.id))
+        : pp.agents;
+    pp = ppAgents === pp.agents ? pp : { ...pp, agents: ppAgents };
     if (!cur) return pp;
     const present = new Set(pp.agents.map((a) => a.id));
     const survivors = cur.agents.filter((a) => {
       if (present.has(a.id)) return false; // already in the snapshot — nothing to re-attach
-      // A worker whose row is mid-teardown must NOT be re-attached — its removal is deliberate and
-      // its manifest is being reaped; re-attaching it here is the cross-window twin of the reconcile
-      // resurrection ("× closes the worker but the row comes back").
-      if (isWorkerTearingDown(a.id)) {
-        console.debug("[orchestration] blocked merge re-attach of tearing-down worker", a.id);
-        return false;
-      }
       // (1) A live worker with a cut worktree whose parent still exists (sparkle-3tqv): a snapshot
       //     that predates the spawn must not evict it — its worktree + manifest are live on disk.
       if (a.kind === "worker" && !!a.worktreePath && pp.agents.some((x) => x.id === a.parentId)) {
@@ -504,6 +531,9 @@ export const useProjectStore = create<ProjectState>()(
         // Shield this brand-new agent from a concurrent writer's last-writer-wins rehydrate until a
         // persisted snapshot carrying it comes back (see pendingLocalAdds / mergePreservingLiveWorkers).
         pendingLocalAdds.add(id);
+        // A fresh uuid can never collide with a tombstone, but clear defensively so a re-created id
+        // is never suppressed by a stale removal record.
+        acknowledgeRemovals([id]);
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) => {
             const agent: AgentTab = {
@@ -592,6 +622,10 @@ export const useProjectStore = create<ProjectState>()(
             // A locally-removed agent must stop being protected as a pending add, or a rehydrate
             // could resurrect the row the user just closed.
             acknowledgePendingAdds(removed.map((a) => a.id));
+            // ...and it must be TOMBSTONED, so a concurrent writer's stale snapshot (or the disk
+            // reconcile) that still carries it can't re-add the row before this removal propagates
+            // (sparkle-close-resurrect — "× closes the terminal but the row comes back").
+            registerLocalRemovals(removed.map((a) => a.id));
             const agents = p.agents.filter(
               (a) => a.id !== agentId && a.parentId !== agentId,
             );
@@ -735,16 +769,14 @@ export const useProjectStore = create<ProjectState>()(
       adoptWorker: (projectId, worker) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) => {
-            // Never re-adopt a worker whose row is mid-teardown (× just closed it; its manifest is
-            // still being reaped). Store-level guard so EVERY caller is covered, not just the disk
-            // reconcile — this is the "× closes the worker but the row comes back" resurrection.
-            if (isWorkerTearingDown(worker.id)) {
-              console.debug("[orchestration] blocked adopt of tearing-down worker", worker.id);
-              return p;
-            }
             // Idempotent: an existing record wins — never clobber live in-memory state (e.g. a
             // name the user already saw) with the disk snapshot.
             if (p.agents.some((a) => a.id === worker.id)) return p;
+            // Never re-adopt a worker the user just closed: its manifest lingers on disk until the
+            // worktree teardown finishes, and a reconcile in that window would otherwise resurrect
+            // the row the × removed (sparkle-close-resurrect). The tombstone is dropped only when the
+            // id is deliberately re-created (addAgent), so a stale reconcile can't defeat it.
+            if (pendingLocalRemovals.has(worker.id)) return p;
             const agent: AgentTab = {
               id: worker.id,
               name: defaultAgentName(p, "worker"),
@@ -817,7 +849,7 @@ export const useProjectStore = create<ProjectState>()(
           (persisted as Partial<ProjectState> | undefined)?.projects ?? [];
         acknowledgePendingAdds(persistedProjects.flatMap((p) => p.agents.map((a) => a.id)));
         return perfSpan("persist.merge", () =>
-          mergePreservingLiveWorkers(persisted, current, pendingLocalAdds),
+          mergePreservingLiveWorkers(persisted, current, pendingLocalAdds, pendingLocalRemovals),
         );
       },
     },

@@ -620,37 +620,32 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     if (!project) return;
     const agent = project.agents.find((a) => a.id === id);
     // A worker owns its OWN PTY and an on-disk manifest/worktree (.sparkle/worker.json). spinDownWorker
-    // now drops the row + runtime entry SYNCHRONOUSLY (before its first await) and reaps the PTY +
-    // worktree in the background, tombstoning the id so the periodic reconcile can't re-adopt it from
-    // its not-yet-deleted manifest. Fire it WITHOUT awaiting the reap so the row vanishes and the
-    // reselect runs immediately — AWAITING removeAgentWorkspace here (the old ordering) serialized on
-    // the shared repo lock and left the closed worker row lingering / re-appearing under contention
-    // ("× closes the worker but the row stays / comes back"). See spinDownWorker for the ordering.
+    // drops the row + closes the runtime SYNCHRONOUSLY up front, then kills the PTY and removes the
+    // worktree/manifest in the background — the terminal process dies AND no lingering manifest is
+    // left for the reconcile to resurrect the row from (removeAgent tombstones the id to guarantee
+    // that; sparkle-close-resurrect). Do NOT await it: the row is already gone before its first await,
+    // so reselecting immediately keeps the × instant instead of waiting on the ~1-2s worktree removal.
     if (agent?.kind === "worker") {
       void spinDownWorker({ projectId: project.id, workerId: id });
       reselectAfterClose(id);
       return;
     }
-    // Build agent (plus any workers it still owns): drop the rows FIRST (optimistic), then reap PTYs +
-    // worktrees in the BACKGROUND. removeAgentWorkspace serializes on the shared per-root repo lock
-    // (worktree.withRepoLock); when a concurrent agent holds that lock, AWAITING it before removeAgent
-    // left the just-closed row lingering in the sidebar — and its pane re-appearing, since it was still
-    // selectedAgentId — until the lock drained ("X closes the terminal but the row stays / comes back").
-    // Optimistic removal is safe HERE: removeAgent cascades to the child worker rows too, and
-    // reconcileWorkersFromDisk only re-adopts a worker whose PARENT build agent still exists — with the
-    // parent gone, no surviving worker manifest can resurrect a row. (The worker branch above closes a
-    // worker whose parent LIVES, so it additionally tombstones the id — see spinDownWorker — to block
-    // that re-adopt during its background reap.)
+    // Build agent (plus any workers it still owns). Drop the ROWS + close the panes FIRST so the
+    // sidebar updates instantly — a build agent with N workers otherwise means N sequential git
+    // worktree removals (~seconds each) before the row disappears, the "× closes the terminal but
+    // the row lingers/comes back" report. removeAgent cascades to the workers and TOMBSTONES every
+    // removed id (pendingLocalRemovals), so no disk reconcile or stale cross-window rehydrate can
+    // resurrect a row while the worktrees are still being torn down below (sparkle-close-resurrect).
     const childIds = project.agents.filter((a) => a.parentId === id).map((a) => a.id);
-    const ids = [id, ...childIds];
-    for (const cid of ids) close(cid);
+    const allIds = [id, ...childIds];
+    for (const cid of allIds) close(cid);
     removeAgent(project.id, id);
     reselectAfterClose(id);
-    // Reap the OS/git resources after the UI is already updated. Kill each PTY, then await its worktree
-    // removal (queued on the repo lock) — fire-and-forget, so a slow/queued git op never blocks the row
-    // removal. Mirrors windowClose.killProjectAgents' kill→remove pairing, minus the UI-blocking await.
+    // Background: kill each PTY and remove each worktree. NOT awaited on the interaction path — the
+    // rows are already gone; this only reclaims disk + processes. Sequential to avoid a git worktree
+    // lock storm. Best-effort (the BRANCHES are intentionally kept — this is the "Save" outcome).
     void (async () => {
-      for (const cid of ids) {
+      for (const cid of allIds) {
         await killPty(cid).catch(() => {});
         await removeAgentWorkspace(project.rootPath, project.id, cid).catch(() => {});
       }

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   useProjectStore,
-  markWorkerTearingDown,
-  clearWorkerTearingDown,
+  registerLocalRemovals,
+  acknowledgeRemovals,
 } from "../stores/projectStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -445,7 +445,7 @@ describe("orchestrationListener", () => {
       },
     ];
 
-    markWorkerTearingDown(tearingId);
+    registerLocalRemovals([tearingId]);
     scanWorkerManifestsMock.mockResolvedValueOnce(manifest);
     fire({ reqId: "ltd", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
     await flush();
@@ -456,7 +456,7 @@ describe("orchestrationListener", () => {
 
     // Once teardown completes (manifest would normally be gone too), the shield lifts — proving the
     // tombstone, not some other filter, was what suppressed the adopt.
-    clearWorkerTearingDown(tearingId);
+    acknowledgeRemovals([tearingId]);
     scanWorkerManifestsMock.mockResolvedValueOnce(manifest);
     fire({ reqId: "ltd2", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
     await flush();

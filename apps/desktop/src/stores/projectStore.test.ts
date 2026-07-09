@@ -2,9 +2,8 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   useProjectStore,
   migratePersisted,
-  mergePreservingLiveWorkers,
-  markWorkerTearingDown,
-  clearWorkerTearingDown,
+  registerLocalRemovals,
+  acknowledgeRemovals,
   PROMPT_HISTORY_LIMIT,
 } from "./projectStore";
 
@@ -553,9 +552,9 @@ describe("adoptWorker (sparkle-3xus disk reconcile)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
     const buildId = useProjectStore.getState().addAgent(pid, { kind: "build" });
 
-    // The user just closed this worker; its manifest is still on disk being reaped, so the id is
-    // tombstoned. A disk reconcile firing in that window must NOT bring the row back.
-    markWorkerTearingDown("w-teardown");
+    // The user just closed this worker; it's tombstoned as locally-removed. A disk reconcile firing
+    // before the id is re-created must NOT bring the row back.
+    registerLocalRemovals(["w-teardown"]);
     useProjectStore.getState().adoptWorker(pid, {
       id: "w-teardown",
       parentId: buildId,
@@ -564,9 +563,9 @@ describe("adoptWorker (sparkle-3xus disk reconcile)", () => {
     });
     expect(useProjectStore.getState().projects[0]!.agents.some((a) => a.id === "w-teardown")).toBe(false);
 
-    // Once the reap completes and the tombstone clears, a legitimate orphan CAN be adopted (e.g. a
-    // crash-recovery reconcile) — proving the tombstone, not some other filter, blocked it.
-    clearWorkerTearingDown("w-teardown");
+    // Once the tombstone is cleared (the id is deliberately re-created), a legitimate orphan CAN be
+    // adopted — proving the tombstone, not some other filter, blocked it.
+    acknowledgeRemovals(["w-teardown"]);
     useProjectStore.getState().adoptWorker(pid, {
       id: "w-teardown",
       parentId: buildId,
@@ -577,41 +576,3 @@ describe("adoptWorker (sparkle-3xus disk reconcile)", () => {
   });
 });
 
-describe("mergePreservingLiveWorkers — teardown tombstone", () => {
-  beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
-
-  it("does NOT re-attach a tombstoned worker that's missing from the incoming snapshot", () => {
-    // current holds a live worker (worktree cut, parent present) that the incoming snapshot lacks —
-    // normally mergePreservingLiveWorkers re-attaches it (sparkle-3tqv). But if it's mid-teardown,
-    // re-attaching is the cross-window twin of the reconcile resurrection, so it must be dropped.
-    const build = { id: "b1", name: "Build", kind: "build" as const, parentId: null };
-    const worker = {
-      id: "w1",
-      name: "Worker",
-      kind: "worker" as const,
-      parentId: "b1",
-      worktreePath: "/wt/w1",
-    };
-    const current = {
-      projects: [{ id: "p1", name: "P", rootPath: "/p", agents: [build, worker] }],
-    } as never;
-    // Snapshot from another window that predates nothing — it simply no longer has w1 (it was closed).
-    const persisted = {
-      projects: [{ id: "p1", name: "P", rootPath: "/p", agents: [build] }],
-    };
-
-    markWorkerTearingDown("w1");
-    const mergedDown = mergePreservingLiveWorkers(persisted, current) as {
-      projects: { agents: { id: string }[] }[];
-    };
-    expect(mergedDown.projects[0]!.agents.some((a) => a.id === "w1")).toBe(false);
-    clearWorkerTearingDown("w1");
-
-    // Without the tombstone, the live-worker-preservation still applies (regression guard that the
-    // tombstone is the ONLY thing suppressing it).
-    const mergedUp = mergePreservingLiveWorkers(persisted, current) as {
-      projects: { agents: { id: string }[] }[];
-    };
-    expect(mergedUp.projects[0]!.agents.some((a) => a.id === "w1")).toBe(true);
-  });
-});
