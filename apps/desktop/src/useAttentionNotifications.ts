@@ -299,7 +299,11 @@ export function useAttentionNotifications(): void {
           let haikuBody: string | null = null;
           if (summary == null && (st === "waiting" || st === "approval")) {
             const screenText = useRuntimeStore.getState().attentionScreen[id];
-            if (screenText) {
+            // Match the backend's own empty-check: `summarize_attention` trims the screen before
+            // deciding there's nothing to summarize, so a whitespace/newline-only snapshot would slip
+            // past a bare truthiness guard, cost an IPC round-trip, and come back as a "failed empty
+            // screen" non-error. Pre-trim here so we only summarize a screen with real content.
+            if (screenText?.trim()) {
               awaited = true;
               const trimmed = (await summarizeAttention(screenText))?.trim();
               if (trimmed) {
