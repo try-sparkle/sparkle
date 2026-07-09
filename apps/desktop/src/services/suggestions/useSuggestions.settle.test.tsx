@@ -107,14 +107,16 @@ describe("useSuggestions settle-watcher", () => {
     const { rerender } = renderHook(({ empty }) => useSuggestions("a1", empty), {
       initialProps: { empty: true },
     });
-    for (let i = 0; i < 6; i++) await act(async () => {});
+    // The failed-compute retries are spaced by a backoff timer (retryBackoffMs), so pump the fake
+    // clock in steps (one reject→timer→retry hop settles per step) until the budget is spent.
+    for (let i = 0; i < 6; i++) await settle();
     expect(computeSuggestions).toHaveBeenCalledTimes(MAX_COMPUTE_ATTEMPTS);
 
     // The user types and deletes: composerEmpty flips false → true, re-running the compute effect
     // for the SAME exhausted hash. The effect's budget gate must refuse it.
     rerender({ empty: false });
     rerender({ empty: true });
-    for (let i = 0; i < 4; i++) await act(async () => {});
+    for (let i = 0; i < 4; i++) await settle();
     expect(computeSuggestions).toHaveBeenCalledTimes(MAX_COMPUTE_ATTEMPTS);
   });
 
@@ -125,10 +127,11 @@ describe("useSuggestions settle-watcher", () => {
       .mockRejectedValue(new Error("persistent"));
     scrollback = "state A, settled";
     const { result } = renderHook(() => useSuggestions("a1", true));
-    // First attempt rejects, the catch-path retry succeeds → buttons render (the whole point of
-    // rethrowing engine failures instead of resolving []). The reject→retryTick→effect→resolve
-    // chain spans several microtask turns, so flush a few act() rounds.
-    for (let i = 0; i < 4; i++) await act(async () => {});
+    // First attempt rejects, then a backoff-delayed retry (retryBackoffMs) succeeds → buttons
+    // render (the whole point of rethrowing engine failures instead of resolving []). Pump the fake
+    // clock past the first-retry backoff to let that reject→timer→retry→resolve chain run.
+    await settle();
+    await settle();
     expect(result.current.buttons).toEqual([BTN]);
     expect(computeSuggestions).toHaveBeenCalledTimes(2);
 

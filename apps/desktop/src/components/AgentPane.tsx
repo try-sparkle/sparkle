@@ -761,7 +761,15 @@ function AgentPaneInner({
                   readWorkerResult(agent.worktreePath)
                     .then((raw) => {
                       if (!raw) {
-                        console.warn(`[worker ${agent.id}] exited with no result.json`);
+                        // No result.json here almost always means teardown, not a real failure:
+                        // cancelling/deleting an agent removes its worktree and kills the PTY, and
+                        // this exit listener can race in AFTER the worktree is gone, so the read
+                        // returns null. read_worker_result can't tell "worktree deleted" from
+                        // "result absent" — both are null — so this can't reliably flag a genuine
+                        // stranded worker anyway (that's surfaced structurally by workerAttention's
+                        // red overlay). Keep it at debug so a benign teardown doesn't bury real
+                        // signal in the WARN stream.
+                        console.debug(`[worker ${agent.id}] exited with no result.json`);
                         return;
                       }
                       const r = parseWorkerResult(raw);

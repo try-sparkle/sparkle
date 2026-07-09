@@ -24,6 +24,18 @@ describe("shouldForwardConsole", () => {
     expect(shouldForwardConsole("Failed to spawn agent: ENOENT")).toBe(true);
     expect(shouldForwardConsole("")).toBe(true);
   });
+
+  // xterm's WebglAddon logs "webglcontextrestored event received" (at WARN) on every self-recovering
+  // GPU context — dozens per loss/restore burst under GPU pressure. That auto-restore is pure good
+  // news needing no action, so it's kept out of the log file. Its diagnostic siblings stay forwarded.
+  it("drops xterm's benign webgl context-restored flood", () => {
+    expect(shouldForwardConsole("webglcontextrestored event received")).toBe(false);
+  });
+
+  it("keeps the diagnostically useful xterm webgl lines", () => {
+    expect(shouldForwardConsole("webglcontextlost event received")).toBe(true);
+    expect(shouldForwardConsole("webgl context not restored; firing onContextLoss")).toBe(true);
+  });
 });
 
 // The global unhandledrejection handler forwards every rejection at ERROR. Tauri's OWN injected

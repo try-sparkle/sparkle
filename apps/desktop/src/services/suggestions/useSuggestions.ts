@@ -49,6 +49,19 @@ export function withinRetryBudget(failures: number): boolean {
   return failures < MAX_COMPUTE_ATTEMPTS;
 }
 
+// Base delay before RETRYING a *failed* compute. The overwhelmingly common failure is a transient
+// AI-gateway blip ("ai request failed", HTTP 502) — retrying instantly fires all attempts within a
+// few milliseconds, so they land on the SAME blip and the whole state gives up (and hammers a
+// struggling gateway with rapid paid calls). A short, growing backoff spaces the attempts out so a
+// transient blip has time to clear before the next try. Kept modest so suggestions still feel live.
+export const RETRY_BACKOFF_MS = 700;
+
+/** Backoff (ms) before the next retry, given how many attempts have already failed (1 after the
+ *  first failure). Grows exponentially and is capped so it never stalls the UI. Pure, for testing. */
+export function retryBackoffMs(failures: number): number {
+  return Math.min(RETRY_BACKOFF_MS * 2 ** Math.max(0, failures - 1), 4000);
+}
+
 // How often the settle-watcher re-hashes the scrollback while the agent is blocked on the user.
 // Two consecutive identical hashes = the terminal has finished painting (settled).
 export const SETTLE_TICK_MS = 1200;
@@ -66,6 +79,9 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // discarded compute re-trigger the effect so a state we returned to still gets suggestions.
   const computing = useRef(false);
   const [retryTick, setRetryTick] = useState(0);
+  // Pending failure-retry timer (see retryBackoffMs). Held in a ref so the effect cleanup can cancel
+  // it when the state moves on before the backoff fires, and so we never stack overlapping timers.
+  const retryTimer = useRef<number | null>(null);
   // Consecutive-failure counter (+ the hash it's failing on) to bound retries per failing state.
   const failures = useRef(0);
   const lastFailHash = useRef<string | null>(null);
@@ -135,6 +151,10 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
     // is free to flush it on any microtask boundary), the effect re-runs while computing.current
     // is still true, early-returns, and the retry is silently dropped.
     let retryAfter = false;
+    // How long to wait before that retry. A superseded compute (composer toggled mid-flight)
+    // recomputes the CURRENT state immediately (0); a *failed* compute backs off (retryBackoffMs)
+    // so a transient gateway blip can clear before the next attempt.
+    let retryDelay = 0;
     log.debug("suggestions", "compute", { agentId, chars: scrollback.length, learnedOn });
     void computeSuggestions({ agentId, scrollback, aiEnabled: learnedOn, entitled: true })
       .then((set) => {
@@ -178,6 +198,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         if (!alive) return;
         if (withinRetryBudget(failures.current)) {
           retryAfter = true;
+          retryDelay = retryBackoffMs(failures.current);
         } else {
           // Budget exhausted: this settled state is known-uncomputable. Keeping the PREVIOUS
           // state's buttons through the transient retries was fine, but past the last retry
@@ -191,11 +212,26 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // ALWAYS clear the guard, so a rejected compute can never permanently lock out future
         // computes for this agent (the guard at the top of the effect keys off this flag).
         computing.current = false;
-        // Bump only now that the guard is clear — see retryAfter above.
-        if (retryAfter) setRetryTick((t) => t + 1);
+        // Bump only now that the guard is clear — see retryAfter above. A failed compute waits out
+        // its backoff first (retryDelay); a superseded one (retryDelay 0) re-triggers immediately.
+        // The timer id is parked in a ref so the effect cleanup can cancel a pending retry if the
+        // state moves on before it fires.
+        if (!retryAfter) return;
+        if (retryDelay <= 0) {
+          setRetryTick((t) => t + 1);
+          return;
+        }
+        retryTimer.current = window.setTimeout(() => {
+          retryTimer.current = null;
+          setRetryTick((t) => t + 1);
+        }, retryDelay);
       });
     return () => {
       alive = false;
+      if (retryTimer.current !== null) {
+        window.clearTimeout(retryTimer.current);
+        retryTimer.current = null;
+      }
     };
   }, [agentId, isYourTurn, composerEmpty, learnedOn, retryTick, shipped, retire]);
 

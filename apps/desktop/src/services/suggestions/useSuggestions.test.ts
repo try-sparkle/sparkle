@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { shouldRecompute, hashScrollback, withinRetryBudget } from "./useSuggestions";
+import {
+  shouldRecompute,
+  hashScrollback,
+  withinRetryBudget,
+  retryBackoffMs,
+  RETRY_BACKOFF_MS,
+} from "./useSuggestions";
 
 describe("withinRetryBudget (bounds persistent-rejection retries)", () => {
   it("allows retries below the cap (3) and stops at it", () => {
@@ -8,6 +14,22 @@ describe("withinRetryBudget (bounds persistent-rejection retries)", () => {
     expect(withinRetryBudget(2)).toBe(true);
     expect(withinRetryBudget(3)).toBe(false);
     expect(withinRetryBudget(4)).toBe(false);
+  });
+});
+
+describe("retryBackoffMs (spaces out failed-compute retries)", () => {
+  it("grows exponentially from the base delay", () => {
+    // `failures` = attempts already failed (1 after the first failure).
+    expect(retryBackoffMs(1)).toBe(RETRY_BACKOFF_MS);
+    expect(retryBackoffMs(2)).toBe(RETRY_BACKOFF_MS * 2);
+    expect(retryBackoffMs(3)).toBe(RETRY_BACKOFF_MS * 4);
+  });
+  it("never returns less than the base (guards failures <= 0)", () => {
+    expect(retryBackoffMs(0)).toBe(RETRY_BACKOFF_MS);
+    expect(retryBackoffMs(-5)).toBe(RETRY_BACKOFF_MS);
+  });
+  it("is capped so it never stalls the UI", () => {
+    expect(retryBackoffMs(100)).toBeLessThanOrEqual(4000);
   });
 });
 

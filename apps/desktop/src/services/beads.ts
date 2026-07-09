@@ -88,6 +88,18 @@ export async function beadShow(projectPath: string, id: string): Promise<Bead | 
 // replacing the LLM-advisory `bd` prose. Status uses bd's canonical verbs (claim/close/label);
 // callers fire them best-effort (a bead write must never break the agent flow). All injection-safe.
 
+/** True when a bd rejection is the EXPECTED "this project has no beads DB" case rather than a
+ *  genuine failure. Beads are optional: a project that never ran `bd init` makes every bd write
+ *  reject with "no beads database found", so callers use this to treat that as a normal, quiet
+ *  state (skip/latch) instead of loud, recurring error noise. Match on the stable bd substring so
+ *  real failures (bd crashed, bad output, permission errors) are NOT swallowed. Case-insensitive so
+ *  a future casing tweak in bd's wording ("No beads database found") can't silently regress a
+ *  caller back to noisy behavior — the substring itself is the documented stable contract. */
+export function isBeadsUnavailable(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return msg.toLowerCase().includes("no beads database found");
+}
+
 /** Extract the created bead's id from `create_bead`'s raw bd `--json` (the issue object, or an
  *  `{"error":…}` blob). Returns null on a bd error or unparseable output. Pure (exported for tests). */
 export function parseCreatedBeadId(raw: string): string | null {

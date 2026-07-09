@@ -10,22 +10,15 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { createBeadFull } from "../services/tasks";
+import { isBeadsUnavailable } from "../services/beads";
 import { log } from "../logger";
 import { perfStart } from "../perfTrace";
 import type { Project } from "../types";
 
-/** True when a createBeadFull rejection is the EXPECTED "this project has no beads DB" case rather
- *  than a genuine failure. A project that simply doesn't use beads makes `bd` reject with "no beads
- *  database found" on every build-agent spawn; logging that at WARN (with a stack) on each spawn
- *  buries real signal in the persistent log. Match on the stable bd substring so real failures
- *  (bd crashed, bad output, permission errors) still surface at WARN. */
-export function isBeadsUnavailable(e: unknown): boolean {
-  const msg = e instanceof Error ? e.message : String(e);
-  // Case-insensitive so a future casing tweak in bd's wording ("No beads database found") can't
-  // silently regress this to WARN — the very noise this guards against. The substring itself is
-  // the documented stable contract.
-  return msg.toLowerCase().includes("no beads database found");
-}
+// The "project has no beads DB" predicate lives with the bead service (its canonical home, and to
+// avoid a store→hook import cycle now that runtimeStore reuses it too). Re-exported here so existing
+// callers and tests that import it from this module keep working.
+export { isBeadsUnavailable };
 
 export function useSpawnBuildAgent(project: Project | null): () => string | null {
   const addAgent = useProjectStore((s) => s.addAgent);

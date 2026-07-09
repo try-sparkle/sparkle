@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Mock the bd shell-out wrappers so we exercise syncBeadLifecycle's STATEFUL behavior (watermark
-// advance-on-success retry, the create back-off latch, the shipped-seed no-reopen) without bd.
-vi.mock("../services/beads", () => ({
+// advance-on-success retry, the create back-off latch, the shipped-seed no-reopen) without bd. Keep
+// the real pure helper isBeadsUnavailable — the no-beads-DB latch depends on it.
+vi.mock("../services/beads", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/beads")>()),
   createBead: vi.fn(),
   claimBead: vi.fn(),
   closeBead: vi.fn(),
@@ -47,6 +49,30 @@ describe("syncBeadLifecycle — wrapper state", () => {
     expect(beads.createBead).toHaveBeenCalledTimes(1);
     await syncBeadLifecycle("p", "/root", agent, "building_saved", bs(1), false);
     expect(beads.createBead).toHaveBeenCalledTimes(1); // latched — not retried
+  });
+
+  it("latches a project with no beads DB so it stops shelling out to bd every poll", async () => {
+    // A project that never ran `bd init` rejects every write with "no beads database found".
+    vi.mocked(beads.claimBead).mockRejectedValue(new Error("no beads database found"));
+    const a = { id: "a-nodb-1", kind: "build", beadId: "bd-x", name: "X" };
+    const b = { id: "a-nodb-2", kind: "build", beadId: "bd-y", name: "Y" };
+    await syncBeadLifecycle("noDbProj", "/root", a, "building_saved", bs(1), false);
+    expect(beads.claimBead).toHaveBeenCalledTimes(1); // first write attempted, threw → project latched
+    // Same project, next poll and a different agent: both short-circuit before any bd shell-out.
+    await syncBeadLifecycle("noDbProj", "/root", a, "building_saved", bs(1), false);
+    await syncBeadLifecycle("noDbProj", "/root", b, "building_saved", bs(1), false);
+    expect(beads.claimBead).toHaveBeenCalledTimes(1); // no further bd calls for this project
+    // A DIFFERENT project is unaffected by the latch (it still attempts its own writes).
+    await syncBeadLifecycle("otherProj", "/root", a, "building_saved", bs(1), false);
+    expect(beads.claimBead).toHaveBeenCalledTimes(2);
+  });
+
+  it("does NOT latch on a genuine (non-no-DB) failure — those keep retrying", async () => {
+    vi.mocked(beads.claimBead).mockRejectedValue(new Error("bd offline"));
+    const a = { id: "a-genuine", kind: "build", beadId: "bd-z", name: "Z" };
+    await syncBeadLifecycle("liveProj", "/root", a, "building_saved", bs(1), false);
+    await syncBeadLifecycle("liveProj", "/root", a, "building_saved", bs(1), false);
+    expect(beads.claimBead).toHaveBeenCalledTimes(2); // not latched — retried next poll
   });
 
   it("does not reopen a shipped bead on relaunch (watermark seeded from the shipped ✓)", async () => {

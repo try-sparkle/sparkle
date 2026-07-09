@@ -27,14 +27,21 @@ const realConsole = {
 // Reentrancy guard: if invoke() ever logs to console on failure, we must not re-forward.
 let forwarding = false;
 
-// Known-benign, high-frequency messages emitted by Tauri's OWN JS runtime (not our code)
-// that would otherwise flood the persistent log and bury real signal. The chief offender
-// is "[TAURI] Couldn't find callback id N", which Tauri logs once per in-flight IPC
-// callback whenever the webview reloads while Rust is mid-async-operation — thousands of
-// lines per reload — and is harmless (Tauri transparently falls back). These are still
-// printed to the live console (devtools) via the real console methods; we just don't
-// forward them to the log file. Match on a stable substring of each message.
-const LOG_FORWARD_DENYLIST = ["Couldn't find callback id"];
+// Known-benign, high-frequency messages emitted by third-party runtimes (not our code) that
+// would otherwise flood the persistent log and bury real signal. These are still printed to the
+// live console (devtools) via the real console methods; we just don't forward them to the log
+// file. Match on a stable substring of each message.
+//
+//   - "[TAURI] Couldn't find callback id N": Tauri logs this once per in-flight IPC callback
+//     whenever the webview reloads while Rust is mid-async-operation — thousands of lines per
+//     reload — and it's harmless (Tauri transparently falls back).
+//   - "webglcontextrestored event received": xterm's WebglAddon logs this (at WARN) every time a
+//     lost GPU context comes BACK on its own — dozens per loss/restore burst under GPU pressure.
+//     A successful auto-restore is pure good news that needs no action, yet at WARN it pollutes
+//     the error-adjacent stream. We deliberately keep the addon's diagnostic siblings —
+//     "webglcontextlost event received" (frequency = GPU-pressure signal) and "context not
+//     restored; firing onContextLoss" (our DOM-renderer fallback actually engaged) — forwarded.
+const LOG_FORWARD_DENYLIST = ["Couldn't find callback id", "webglcontextrestored event received"];
 
 /** Whether an auto-captured console line should be forwarded to the persistent log. */
 export function shouldForwardConsole(message: string): boolean {

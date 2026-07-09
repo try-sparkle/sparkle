@@ -59,9 +59,10 @@ describe("useSuggestions concurrency guard", () => {
 
     renderHook(() => useSuggestions("a1", true));
 
-    // First compute rejects → catch bumps retryTick, finally clears the guard → effect re-runs and
-    // a SECOND compute fires. If the guard weren't reset, this would stay at 1 forever.
-    await waitFor(() => expect(computeSuggestions).toHaveBeenCalledTimes(2));
+    // First compute rejects → catch bumps retryTick after a backoff (retryBackoffMs), finally
+    // clears the guard → effect re-runs and a SECOND compute fires. If the guard weren't reset,
+    // this would stay at 1 forever. The timeout comfortably exceeds the first-retry backoff (700ms).
+    await waitFor(() => expect(computeSuggestions).toHaveBeenCalledTimes(2), { timeout: 3000 });
   });
 
   // NOTE: the *bound* on persistent-rejection retries is verified by the pure `withinRetryBudget`

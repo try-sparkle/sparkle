@@ -11,7 +11,13 @@ import type { WorkflowStageId } from "../engine/workflowStage";
 import { agentBranchStatus, agentWorkflowState, projectAgentsStatus } from "../services/branchStatus";
 import { deriveLiveStage, stageIndex } from "../engine/workflowStage";
 import { beadLifecycleActions, levelAfter, BEAD_LEVEL } from "../engine/beadLifecycle";
-import { createBead, claimBead, closeBead, markBeadDelivered } from "../services/beads";
+import {
+  createBead,
+  claimBead,
+  closeBead,
+  markBeadDelivered,
+  isBeadsUnavailable,
+} from "../services/beads";
 import { syncProjectMarkdown } from "../services/chiefSync";
 import { useSettingsStore, effectiveChiefPat } from "./settingsStore";
 import { useProjectStore } from "./projectStore";
@@ -214,6 +220,12 @@ const beadCreateFailed = new Set<string>();
 // (see syncBeadLifecycle) so a relaunch can't REOPEN an already-shipped bead by writing in_progress
 // onto a re-climbing cycle.
 const beadLevelFor = new Map<string, number>();
+// Projects whose bd write path is unavailable because they simply have no beads DB (bd is optional).
+// Beads are latched per PROJECT (not per agent) the first time a lifecycle write rejects with "no
+// beads database found": without this, every poll re-spawns a `bd` subprocess for every deliverable
+// agent that then fails the same way — pure waste plus recurring debug noise. Latched for the session
+// (like beadCreateFailed); creating the DB mid-session takes effect on the next relaunch.
+const beadsUnavailableProjects = new Set<string>();
 
 /** Forget an agent's bead-lifecycle bookkeeping when it's closed/removed, so these module maps don't
  *  grow unbounded over a long session (and a recycled id can't inherit a stale watermark/latch). */
@@ -228,6 +240,7 @@ export function __resetBeadLifecycleForTest(): void {
   beadLevelFor.clear();
   beadCreateFailed.clear();
   creatingBeadFor.clear();
+  beadsUnavailableProjects.clear();
 }
 
 /** Advance a deliverable agent's bead from its current workflow STAGE, monotonically and best-effort
@@ -243,6 +256,10 @@ export async function syncBeadLifecycle(
   bs: BranchStatus | undefined,
   shippedLatched: boolean,
 ): Promise<void> {
+  // This project has no beads DB — every bd write would just re-fail with "no beads database found".
+  // Skip the shell-outs entirely (latched below on the first such failure) so we don't spawn a bd
+  // subprocess per deliverable agent per poll for a project that doesn't use beads.
+  if (beadsUnavailableProjects.has(projectId)) return;
   const hasRealWork = !!bs && (bs.ahead > 0 || bs.dirty);
   // Seed the watermark from the persisted shipped ✓: if this agent's work ever reached main, its bead
   // is at least closed — so a relaunch that sees a re-climbing cycle (stage back at building) never
@@ -303,6 +320,16 @@ export async function syncBeadLifecycle(
       beadLevelFor.set(agent.id, Math.max(beadLevelFor.get(agent.id) ?? 0, levelAfter(action)));
     }
   } catch (e) {
+    // A project that never ran `bd init` rejects EVERY write with "no beads database found". Latch it
+    // so the top-of-function guard short-circuits future polls — log once per project, not per agent
+    // per poll. Genuine failures (bd crashed, offline) stay unlatched and keep retrying next poll.
+    if (isBeadsUnavailable(e)) {
+      if (!beadsUnavailableProjects.has(projectId)) {
+        beadsUnavailableProjects.add(projectId);
+        console.debug("syncBeadLifecycle: project has no beads database — bead sync disabled", projectId);
+      }
+      return;
+    }
     console.debug("syncBeadLifecycle failed for", agent.id, e);
   }
 }
