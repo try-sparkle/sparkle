@@ -9,7 +9,7 @@ import {
   prewarmProjectCaches,
 } from "../services/worktree";
 import { resolveDefaultBranch } from "../services/branchStatus";
-import { useAiFeature } from "../services/aiGate";
+import { useAiFeature, useAiFeatureVisible } from "../services/aiGate";
 import { recordTrialSend } from "../services/trialMeter";
 import { checkClaude, claudeSessionInfo } from "../preflight";
 import { buildClaudeExec, buildControlMcpConfig, SHELL } from "../services/claudeSpawn";
@@ -140,9 +140,14 @@ function AgentPaneInner({
   // minimizes (or on ⌘J) without the user clicking the terminal.
   const termFocusRef = useRef<(() => void) | null>(null);
   const composerMinimized = useUiStore((s) => s.composerMinimized);
-  // AI feature gates (Use AI Features menu). When the composer feature is off, we render the bare
-  // terminal instead of the composer overlay; when auto-rename is off, we skip the naming call.
-  const aiComposer = useAiFeature("composer");
+  // AI feature gates (Use AI Features menu). The composer RENDERS whenever the feature is enabled
+  // (visible gate = settings flag only), NOT gated on AI credits — a trial/no-credits user must still
+  // SEE and type into the composer; the paywall is enforced at send (Composer.send → trialSendAllowed
+  // + AuthGate's TrialChrome overlay), not by hiding the composer. Gating render on credits (the
+  // useAiFeature path) made the composer vanish entirely for no-credits users on Build agents
+  // (regression from 09f60a0c). When the composer feature is OFF, we render the bare terminal instead.
+  // Auto-rename stays the real usable gate (a background feature, no user-initiated moment).
+  const aiComposer = useAiFeatureVisible("composer");
   const aiAutoRename = useAiFeature("autoRename");
   // Imperative bridge to the terminal (e.g. arrow hand-off from the composer).
   const terminalApiRef = useRef<TerminalApi | null>(null);
