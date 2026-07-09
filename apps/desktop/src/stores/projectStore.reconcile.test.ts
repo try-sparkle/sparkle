@@ -195,3 +195,51 @@ describe("mergePreservingLiveWorkers — pending local removals (tombstones)", (
     expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1", "b2"]);
   });
 });
+
+// Nav-bug fix (Unit A): clicking "New Build Agent" selects the new row in memory, but a cross-window
+// rehydrate merges against a stale persisted snapshot that predates the new agent — so `pp` still
+// selects the OLD row. The pendingAdds clause keeps the new row, but `selectedAgentId` used to be
+// taken verbatim from `pp`, reverting selection to the previously-selected agent ("stays on a
+// different row"). The merge must preserve the LIVE selection whenever it still resolves in the
+// merged agent set, and only fall back to `pp`'s selection when the live selection is gone.
+describe("mergePreservingLiveWorkers — preserves live selectedAgentId", () => {
+  it("keeps the freshly-added agent selected when the stale snapshot selects the OLD row", () => {
+    const build = agent({ id: "b1", kind: "build", branch: "main" });
+    const fresh = agent({ id: "b2", kind: "build", worktreePath: null }); // just clicked "New Build Agent"
+    // Live state: the new agent b2 is the selected/active row.
+    const cur = currentState([project("p1", [build, fresh])]);
+    cur.projects[0].selectedAgentId = "b2";
+    // Concurrent writer's snapshot predates b2 and still selects the old row b1.
+    const persisted = { projects: [project("p1", [build])], selectedProjectId: "p1" };
+    expect(persisted.projects[0]!.selectedAgentId).toBe("b1");
+
+    const merged = mergePreservingLiveWorkers(persisted, cur, new Set(["b2"]));
+    expect(merged.projects[0]!.agents.map((a) => a.id).sort()).toEqual(["b1", "b2"]);
+    // The new row stays selected — NOT reverted to the stale snapshot's b1.
+    expect(merged.projects[0]!.selectedAgentId).toBe("b2");
+  });
+
+  it("falls back to the snapshot's selection when the live selection is a dangling id", () => {
+    const build = agent({ id: "b1", kind: "build", branch: "main" });
+    // Live state selects an agent that no longer exists anywhere (e.g. it was removed).
+    const cur = currentState([project("p1", [build])]);
+    cur.projects[0].selectedAgentId = "gone";
+    const persisted = { projects: [project("p1", [build])], selectedProjectId: "p1" };
+
+    const merged = mergePreservingLiveWorkers(persisted, cur);
+    expect(merged.projects[0]!.selectedAgentId).toBe("b1"); // the snapshot's valid selection
+  });
+
+  it("preserves an intentional live deselect (null) over the snapshot's stale selection", () => {
+    // selectAgent(projectId, null) is a supported deselect, distinct from "no opinion". A cross-window
+    // snapshot that still selects a row must NOT re-select it and override the deselected window.
+    const build = agent({ id: "b1", kind: "build", branch: "main" });
+    const cur = currentState([project("p1", [build])]);
+    cur.projects[0].selectedAgentId = null; // user deselected everything
+    const persisted = { projects: [project("p1", [build])], selectedProjectId: "p1" };
+    expect(persisted.projects[0]!.selectedAgentId).toBe("b1");
+
+    const merged = mergePreservingLiveWorkers(persisted, cur);
+    expect(merged.projects[0]!.selectedAgentId).toBeNull();
+  });
+});

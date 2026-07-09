@@ -12,6 +12,7 @@ import { openProjectInWindow, defaultDeps, type OpenMode } from "../services/pro
 import { findWindowForProject } from "../services/windowRegistry";
 import { resolveOpenTarget, type OpenTarget } from "../services/openTarget";
 import { OpenTargetDialog } from "./OpenTargetDialog";
+import { NewProjectDialog } from "./NewProjectDialog";
 import { ModalShell } from "./ModalShell";
 import { AccountsScreen } from "./AccountsScreen";
 import { AccountLoginModal } from "./AccountLoginModal";
@@ -158,6 +159,8 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const agentOrdering = useUiStore((s) => s.agentOrdering);
   const [recentOpen, setRecentOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  // The "New Project" dialog (folder / GitHub tabs). "New" opens this; "Open"/"Recent" are unchanged.
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
   // Deep-open: other components (e.g. BalanceBadge → Credits) request a settings category via
   // uiStore.openSettings; this TopBar owns the dialog, so it opens it there. Every close path
   // clears the request so a later request for the SAME category still re-triggers.
@@ -425,7 +428,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       <button
         data-hint="new"
         style={{ ...btn, borderColor: C.teal, background: C.teal, color: ON_BRAND_FILL }}
-        onClick={() => startOpen("New project — choose or create its folder")}
+        onClick={() => setNewProjectOpen(true)}
       >
         New
       </button>
@@ -456,6 +459,20 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       {/* Profile / auth-status control — sits just RIGHT of the ⋯ menu. Signed in → avatar;
           returning user → "Log in"; brand-new → "Sign up". All open the ⋯ menu's Accounts pane. */}
       <AuthStatusButton />
+
+      {newProjectOpen && (
+        <NewProjectDialog
+          onClose={() => setNewProjectOpen(false)}
+          // "From folder" runs today's exact New flow, byte-identical (startOpen → picker / choice).
+          onOpenFromFolder={() => startOpen("New project — choose or create its folder")}
+          // "Clone & Open" → create + open + select the cloned project, the SAME route resolveAndRoute
+          // uses for a freshly-picked folder (so the new project becomes selected). Clone deliberately
+          // opens in THIS window ("replace") rather than routing through the replace-vs-new prompt: the
+          // user just committed to a brand-new clone via a multi-step dialog, so dropping them straight
+          // into it (not asking a window-placement question) is the intended flow.
+          onCloned={(name, path) => resolveAndRoute({ kind: "new", name, path }, "replace")}
+        />
+      )}
 
       {pending && (
         <OpenTargetDialog

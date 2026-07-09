@@ -451,7 +451,23 @@ export function mergePreservingLiveWorkers(
       if (pendingAdds.has(a.id)) return true;
       return false;
     });
-    return survivors.length > 0 ? { ...pp, agents: [...pp.agents, ...survivors] } : pp;
+    const mergedAgents = survivors.length > 0 ? [...pp.agents, ...survivors] : pp.agents;
+    // Nav-bug fix (Unit A): `selectedAgentId` is LIVE per-window navigation state, not something a
+    // concurrent writer's snapshot should reset. A cross-window rehydrate that predates a just-added
+    // agent carries a stale `pp.selectedAgentId` (the previously-selected row); taking it verbatim
+    // reverts the user's selection right after they clicked "New Build Agent" — whose row survives
+    // via the pendingAdds/survivors clause above but is unknown to `pp`, so `pp` still selects the
+    // OLD row. Keep the live `cur.selectedAgentId` whenever it still resolves in the merged agent
+    // set; fall back to `pp`'s only when the live selection is a DANGLING non-null id (the selected
+    // agent was removed). A live `null` is an intentional deselect (`selectAgent(id, null)` — see the
+    // "not deselects" note in that action), NOT "no opinion", so it too is authoritative and must not
+    // be overwritten by a snapshot's stale selection. Mirrors ensureAgentPresent / adoptWorker, which
+    // likewise refuse to yank the user's active tab on a background reconcile.
+    const liveSelectionValid =
+      cur.selectedAgentId == null || mergedAgents.some((a) => a.id === cur.selectedAgentId);
+    const selectedAgentId = liveSelectionValid ? cur.selectedAgentId : pp.selectedAgentId;
+    if (mergedAgents === pp.agents && selectedAgentId === pp.selectedAgentId) return pp;
+    return { ...pp, agents: mergedAgents, selectedAgentId };
   });
   return merged;
 }

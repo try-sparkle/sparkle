@@ -88,15 +88,22 @@ describe("TopBar Open/New flow", () => {
     await waitFor(() => expect(pickProjectFolder).toHaveBeenCalledOnce());
   });
 
-  it("New asks first, then the folder picker fires after the mode is chosen", async () => {
+  it("New opens the New Project dialog; From folder then runs today's ask-first picker flow", async () => {
     render(<TopBar onOpenSettings={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: "New" }));
 
+    // New now opens the tabbed New Project dialog (not straight to the folder flow).
+    expect(screen.getByRole("tab", { name: "From folder" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "From GitHub" })).toBeTruthy();
+    expect(pickProjectFolder).not.toHaveBeenCalled();
+
+    // "From folder" is the default tab → choosing a folder runs the SAME startOpen path, which (a
+    // project is open) still asks replace-vs-new BEFORE the picker.
+    fireEvent.click(screen.getByRole("button", { name: "Choose a folder…" }));
     expect(screen.getByText(DIALOG_COPY)).toBeTruthy();
     expect(pickProjectFolder).not.toHaveBeenCalled();
 
-    // Exercise the OTHER mode branch ("new window") to prove the post-choice picker path is not
-    // special-cased per button.
+    // Exercise the "new window" branch to prove the post-choice picker path isn't special-cased.
     fireEvent.click(screen.getByRole("button", { name: "Open in new window" }));
     await waitFor(() => expect(pickProjectFolder).toHaveBeenCalledOnce());
   });

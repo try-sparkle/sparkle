@@ -25,6 +25,7 @@ mod config;
 mod connectivity;
 mod delivery;
 mod dictation;
+mod github;
 mod history;
 mod hooks;
 mod judge;
@@ -275,6 +276,10 @@ pub fn run() {
             worktree::scan_worker_manifests,
             sparkle_agent::ensure_sparkle_repo,
             sparkle_agent::reap_secondary_sparkle_worktrees,
+            github::github_status,
+            github::github_list_repos,
+            github::github_clone_repo,
+            github::github_default_project_dir,
             dictation::start_dictation,
             dictation::stop_dictation,
             dictation::start_cloud_stream,
