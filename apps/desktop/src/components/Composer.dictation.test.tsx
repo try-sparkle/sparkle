@@ -344,6 +344,18 @@ describe("Composer — placeholder reflects audio state", () => {
     expect(body).not.toContain("Hey Sparkle");
     act(() => useDictationStore.getState().clearOutOfCreditsNotice());
   });
+
+  it("clicking the composer Refill link deep-opens the Credits settings pane", () => {
+    // Guards the actual fix on THIS surface: the placeholder overlay must stack above the
+    // textarea (zIndex) so RefillLink's re-enabled pointer events receive the click. jsdom can't
+    // compute stacking, so we assert the click wiring reaches uiStore.openSettings("credits").
+    act(() => useUiStore.setState({ settingsRequest: null }));
+    act(() => useDictationStore.setState({ enabled: false, status: "idle", outOfCreditsNotice: true }));
+    renderComposer();
+    fireEvent.click(screen.getByText("Refill"));
+    expect(useUiStore.getState().settingsRequest).toBe("credits");
+    act(() => useDictationStore.getState().clearOutOfCreditsNotice());
+  });
 });
 
 describe("Composer — send wiring", () => {

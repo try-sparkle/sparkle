@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LogoWaveform } from "./LogoWaveform";
 import { useDictationStore } from "../stores/dictationStore";
 import { useAuthStore } from "../stores/authStore";
+import { useUiStore } from "../stores/uiStore";
 import { C, DANGER } from "../theme/colors";
 
 // jsdom has no rAF by the time the effect runs in some setups; stub a no-op so the live
@@ -169,6 +170,17 @@ describe("LogoWaveform — out of credits", () => {
     expect(screen.getByText("You are out of credits.")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Refill" })).toBeTruthy();
     useDictationStore.getState().clearOutOfCreditsNotice(); // tidy the pending 5s timer
+  });
+
+  it("clicking Refill deep-opens the ⋯ settings dialog on the Credits pane", () => {
+    useAuthStore.setState({ me: null });
+    useUiStore.setState({ settingsRequest: null });
+    useDictationStore.setState({ enabled: false, status: "idle", outOfCreditsNotice: true });
+    render(<LogoWaveform />);
+    fireEvent.click(screen.getByRole("button", { name: "Refill" }));
+    // The link requests the Credits category; TopBar consumes settingsRequest to open the dialog.
+    expect(useUiStore.getState().settingsRequest).toBe("credits");
+    useDictationStore.getState().clearOutOfCreditsNotice();
   });
 
   it("renders the two-line notice whenever the shared flag is set (both surfaces stay in sync)", () => {

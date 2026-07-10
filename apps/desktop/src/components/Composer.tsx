@@ -1265,6 +1265,12 @@ export function Composer({
               aria-hidden
               style={{
                 position: "absolute",
+                // Stack ABOVE the textarea (zIndex:1). The overlay itself is pointerEvents:none, so
+                // clicks on the placeholder still pass THROUGH to the textarea beneath (focus works);
+                // but the out-of-credits "Refill" link re-enables pointerEvents on itself, and it can
+                // only receive that click if the overlay isn't buried under the textarea. Without this
+                // the textarea swallowed the click and Refill looked clickable but did nothing.
+                zIndex: 2,
                 top: 9,
                 left: 11,
                 // Right-padding safety: when the single recommended pill overlays the trailing
