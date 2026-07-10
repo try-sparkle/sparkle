@@ -19,16 +19,18 @@ export const CHROME_HINTS: Record<string, string> = {
   recent: "r",
   open: "o",
   new: "n",
+  newbuild: "g", // "+ New Build Agent" sidebar button — g for "aGent" (n/b are taken).
   screenshot: "s",
   menu: ".",
   improve: "i",
   changelog: "c",
   account: "a",
+  credits: "d", // the balance pill beside the wordmark — d for "Dollars" (opens the Credits pane).
 };
 
 // Letters available to agents beyond the 9th, with the reserved chrome letters removed so an
-// overflow agent can never collide with a chrome control. Reserved: a b c i m n o p r s t →
-// pool = d e f g h j k l q u v w x y z (15 letters; with 1–9 that's 24 addressable agents).
+// overflow agent can never collide with a chrome control. Reserved: a b c d g i m n o p r s t →
+// pool = e f h j k l q u v w x y z (13 letters; with 1–9 that's 22 addressable agents).
 const RESERVED = new Set(Object.values(CHROME_HINTS));
 export const AGENT_OVERFLOW_POOL = "abcdefghijklmnopqrstuvwxyz"
   .split("")

@@ -243,3 +243,87 @@ describe("mergePreservingLiveWorkers — preserves live selectedAgentId", () => 
     expect(merged.projects[0]!.selectedAgentId).toBeNull();
   });
 });
+
+// A manual rename (renameAgent / the sparkle-control rename_agent op) sets namePinned=true and the
+// chosen name in memory, but the projects blob is persisted on a trailing 400ms debounce. A rehydrate
+// that fires before the write flushes carries the SAME agent still UNPINNED with its old auto-name;
+// taking the snapshot verbatim reverted both the name AND namePinned — which then re-opened the agent
+// to auto-naming, so the auto-title silently won ("rename_agent returns ok but the row keeps its old
+// name"). The merge must preserve a LIVE pinned identity when the incoming snapshot is not itself
+// pinned. A repeatedly-written field like `activity` survived this race; a one-shot name write did not.
+describe("mergePreservingLiveWorkers — preserves a live pinned name (rename revert)", () => {
+  it("keeps the live pinned name/variants over a stale UNPINNED snapshot", () => {
+    // In memory: the agent was just renamed — pinned, chosen name, variants cleared (see renameAgent).
+    const renamed = agent({
+      id: "b1",
+      kind: "build",
+      name: "Shortcuts & Credit Pill",
+      namePinned: true,
+      autoNameVariants: null,
+    });
+    const cur = currentState([project("p1", [renamed])]);
+    // Concurrent/pre-flush snapshot: same agent, still the old auto-name, unpinned, with variants.
+    const persisted = {
+      projects: [
+        project("p1", [
+          agent({
+            id: "b1",
+            kind: "build",
+            name: "Add keyboard shortcuts and reposition credit pill",
+            namePinned: false,
+            autoNameVariants: {
+              title: "Add keyboard shortcuts and reposition credit pill",
+              description: "",
+            },
+          }),
+        ]),
+      ],
+      selectedProjectId: "p1",
+    };
+
+    const merged = mergePreservingLiveWorkers(persisted, cur);
+    const b1 = merged.projects[0]!.agents.find((a) => a.id === "b1")!;
+    expect(b1.name).toBe("Shortcuts & Credit Pill");
+    expect(b1.namePinned).toBe(true);
+    expect(b1.autoNameVariants).toBeNull();
+  });
+
+  it("takes the snapshot's name when the snapshot is ALSO pinned (a deliberate cross-window rename wins)", () => {
+    // Both pinned but different: the persisted one is another window's already-flushed rename — the
+    // more recent deliberate choice — so it wins. We only shield the live name from an UNPINNED revert.
+    const cur = currentState([
+      project("p1", [
+        agent({ id: "b1", kind: "build", name: "Local Name", namePinned: true }),
+      ]),
+    ]);
+    const persisted = {
+      projects: [
+        project("p1", [
+          agent({ id: "b1", kind: "build", name: "Other Window Name", namePinned: true }),
+        ]),
+      ],
+      selectedProjectId: "p1",
+    };
+
+    const merged = mergePreservingLiveWorkers(persisted, cur);
+    expect(merged.projects[0]!.agents[0]!.name).toBe("Other Window Name");
+  });
+
+  it("does NOT override an UNPINNED live agent (normal auto-naming still takes the snapshot)", () => {
+    // The live agent is auto-nameable (not pinned); the snapshot's fresher auto-title must win as before.
+    const cur = currentState([
+      project("p1", [agent({ id: "b1", kind: "build", name: "Build 1", namePinned: false })]),
+    ]);
+    const persisted = {
+      projects: [
+        project("p1", [
+          agent({ id: "b1", kind: "build", name: "Fresh Auto Title", namePinned: false }),
+        ]),
+      ],
+      selectedProjectId: "p1",
+    };
+
+    const merged = mergePreservingLiveWorkers(persisted, cur);
+    expect(merged.projects[0]!.agents[0]!.name).toBe("Fresh Auto Title");
+  });
+});

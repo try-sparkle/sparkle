@@ -221,6 +221,7 @@ function NewAgentRow({
   sharedHover,
   onHoverChange,
   dndTarget,
+  dataHint,
 }: {
   icon: React.ReactNode;
   label: string;
@@ -231,12 +232,17 @@ function NewAgentRow({
   // Marks the button as a webview drag-drop target (see services/dndTargets.ts) so the
   // window-global drag handlers can hit-test the cursor against it with elementFromPoint.
   dndTarget?: string;
+  // Registers the button in the keyboard-hint overlay (see keyboardHints/hintTargets.ts). Only the
+  // sidebar instance passes this — the Workspace empty-state copy leaves it undefined so a single
+  // chiclet shows even when both buttons are on screen at once.
+  dataHint?: string;
 }) {
   const [hover, setHover] = useState(false);
   const lit = hover || !!sharedHover;
   return (
     <button
       data-dnd-target={dndTarget}
+      data-hint={dataHint}
       onClick={onClick}
       onMouseEnter={() => {
         setHover(true);
@@ -265,7 +271,13 @@ function NewAgentRow({
 // Also a drag-drop target: dropping files on it spawns a new build agent with the files attached
 // to ITS composer (useNewBuildAgentDrop), which lights buildAgentHover during the drag — so the
 // drag-over visual IS the normal hover visual, on both copies.
-export function NewBuildAgentButton({ onClick }: { onClick: () => void }) {
+export function NewBuildAgentButton({
+  onClick,
+  dataHint,
+}: {
+  onClick: () => void;
+  dataHint?: string;
+}) {
   const buildAgentHover = useUiStore((s) => s.buildAgentHover);
   const setBuildAgentHover = useUiStore((s) => s.setBuildAgentHover);
   // Clear the shared flag if this button unmounts while hovered — clicking the empty-state instance
@@ -281,6 +293,7 @@ export function NewBuildAgentButton({ onClick }: { onClick: () => void }) {
       sharedHover={buildAgentHover}
       onHoverChange={setBuildAgentHover}
       dndTarget={NEW_BUILD_AGENT_DND_TARGET}
+      dataHint={dataHint}
     />
   );
 }
@@ -446,7 +459,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       }
     };
     void tick();
-    const id = setInterval(() => void tick(), 30_000);
+    // 15s cadence: the same tick that advances the workflow chevrons also refreshes each agent's
+    // Claude Code session-title auto-name (line ~436), so a shorter interval mainly buys a fresher
+    // orchestrator name sooner ("Build N" → its real title in ~15s instead of ~30s). Kept modest —
+    // the `inFlight` guard skips a tick that's still running (the gh PR probe can take ~0.5s/agent)
+    // and pollProjectStatus fingerprint-skips idle agents, so halving the period stays cheap.
+    const id = setInterval(() => void tick(), 15_000);
     return () => clearInterval(id);
   }, [projectId]);
   // AI Brainstorming feature gate (Use AI Features menu). Off → hide the ✦ Brainstorm button.
@@ -989,7 +1007,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // Rendered in ONE of two slots in the scroll container below, chosen by listOverflows.
   const newAgentButton =
     project && mode === "build" ? (
-      <NewBuildAgentButton onClick={spawnBuildAgent} />
+      <NewBuildAgentButton onClick={spawnBuildAgent} dataHint="newbuild" />
     ) : project && mode === "think" && aiBrainstorm ? (
       <NewAgentRow
         icon={<TbBulb size={16} style={{ flexShrink: 0 }} />}

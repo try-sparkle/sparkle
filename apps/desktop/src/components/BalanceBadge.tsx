@@ -36,6 +36,7 @@ export function BalanceBadge() {
   return (
     <button
       type="button"
+      data-hint="credits"
       aria-label="Open credits"
       title="Remaining AI credits — click to manage"
       onClick={() => useUiStore.getState().openSettings("credits")}

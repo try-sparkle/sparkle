@@ -455,6 +455,31 @@ export function mergePreservingLiveWorkers(
     pp = ppAgents === pp.agents ? pp : { ...pp, agents: ppAgents };
     if (!cur) return pp;
     const present = new Set(pp.agents.map((a) => a.id));
+    // Pinned-identity preservation: a manual rename (renameAgent / the sparkle-control rename_agent op)
+    // sets namePinned=true + the chosen name in memory, but the projects blob is persisted on a trailing
+    // debounce (see the 400ms write below). A rehydrate that fires before the write flushes carries the
+    // SAME agent still UNPINNED with its old auto-name; taking it verbatim reverted the name AND cleared
+    // namePinned, which re-opened the agent to auto-naming so the auto-title silently won ("rename_agent
+    // returns ok but the row keeps its old name"). For an agent present in BOTH, when the LIVE copy is
+    // pinned and the incoming snapshot is NOT, keep the live name/namePinned/autoNameVariants. A snapshot
+    // that is itself pinned is a deliberate (already-flushed or cross-window) rename and wins, so we only
+    // shield the unpinned-revert case — symmetric to how the live selectedAgentId is preserved below.
+    const curById = new Map(cur.agents.map((a) => [a.id, a] as const));
+    let pinnedIdentityReconciled = false;
+    const reconciledAgents = pp.agents.map((a) => {
+      const live = curById.get(a.id);
+      if (live?.namePinned && !a.namePinned) {
+        pinnedIdentityReconciled = true;
+        return {
+          ...a,
+          name: live.name,
+          namePinned: true,
+          autoNameVariants: live.autoNameVariants,
+        };
+      }
+      return a;
+    });
+    const baseAgents = pinnedIdentityReconciled ? reconciledAgents : pp.agents;
     const survivors = cur.agents.filter((a) => {
       if (present.has(a.id)) return false; // already in the snapshot — nothing to re-attach
       // (1) A live worker with a cut worktree whose parent still exists (sparkle-3tqv): a snapshot
@@ -470,7 +495,7 @@ export function mergePreservingLiveWorkers(
       if (pendingAdds.has(a.id)) return true;
       return false;
     });
-    const mergedAgents = survivors.length > 0 ? [...pp.agents, ...survivors] : pp.agents;
+    const mergedAgents = survivors.length > 0 ? [...baseAgents, ...survivors] : baseAgents;
     // Nav-bug fix (Unit A): `selectedAgentId` is LIVE per-window navigation state, not something a
     // concurrent writer's snapshot should reset. A cross-window rehydrate that predates a just-added
     // agent carries a stale `pp.selectedAgentId` (the previously-selected row); taking it verbatim
