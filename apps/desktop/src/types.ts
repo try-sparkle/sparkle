@@ -109,6 +109,14 @@ export interface Project {
   lastOpenedAt?: string; // updated when selected — drives "Recent Projects" ordering
   agents: AgentTab[];
   selectedAgentId: string | null;
+  // The most-recently-opened BUILD agent, floated to the top of the non-alerting rows in the
+  // attention-ordered sidebar until a newer build agent is opened (see engine/agentOrdering.ts,
+  // FRESH_BUILD_RANK). It's live UI state (like selectedAgentId — the two are treated the same
+  // way in mergePreservingLiveWorkers) but, like selectedAgentId, IS persisted (the store has no
+  // partialize), so after a cold start the prior session's last-opened build agent stays boosted
+  // until any new one is opened — harmless and self-correcting. Optional so pre-existing persisted
+  // projects (missing the field) read as "no fresh agent".
+  freshBuildAgentId?: string | null;
 }
 
 export type { AgentTabStatus };

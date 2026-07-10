@@ -2,8 +2,10 @@ import { describe, it, expect } from "vitest";
 import {
   sortAgentsByAttention,
   orderAgents,
+  orderedTopLevelAgents,
   firstVisibleAgentId,
   STATUS_RANK,
+  FRESH_BUILD_RANK,
 } from "./agentOrdering";
 import type { AgentKind, AgentTabStatus } from "../types";
 
@@ -112,6 +114,68 @@ describe("sortAgentsByAttention", () => {
   });
 });
 
+describe("sortAgentsByAttention — fresh build agent boost", () => {
+  it("floats the fresh agent to the TOP of the non-red rows (above idle/done/working)", () => {
+    const agents = [a("idle1"), a("working1"), a("fresh"), a("done1")];
+    const status: Record<string, AgentTabStatus> = {
+      idle1: "idle",
+      working1: "working",
+      fresh: "working", // its real status is working (tier 2) — the boost overrides that
+      done1: "done",
+    };
+    // Without the boost, `fresh` (working, tier 2) would sink below idle/done.
+    expect(ids(sortAgentsByAttention(agents, status))).toEqual([
+      "idle1",
+      "done1",
+      "working1",
+      "fresh",
+    ]);
+    // With the boost it leads the non-red group.
+    expect(ids(sortAgentsByAttention(agents, status, "fresh"))).toEqual([
+      "fresh",
+      "idle1",
+      "done1",
+      "working1",
+    ]);
+  });
+
+  it("keeps the fresh agent BELOW red/needs-you rows", () => {
+    const agents = [a("red1"), a("fresh"), a("idle1")];
+    const status: Record<string, AgentTabStatus> = {
+      red1: "waiting",
+      fresh: "idle",
+      idle1: "idle",
+    };
+    // Red still wins the top; fresh leads the rest.
+    expect(ids(sortAgentsByAttention(agents, status, "fresh"))).toEqual(["red1", "fresh", "idle1"]);
+  });
+
+  it("does NOT demote a fresh agent that is itself red — it stays in the red tier", () => {
+    const agents = [a("red1"), a("fresh"), a("idle1")];
+    const status: Record<string, AgentTabStatus> = {
+      red1: "waiting",
+      fresh: "approval", // fresh AND red
+      idle1: "idle",
+    };
+    // FRESH_BUILD_RANK (0.5) must not push a red (rank 0) fresh agent below its red sibling.
+    const sorted = ids(sortAgentsByAttention(agents, status, "fresh"));
+    expect(sorted.slice(0, 2).sort()).toEqual(["fresh", "red1"]);
+    expect(sorted[2]).toBe("idle1");
+  });
+
+  it("no-ops when freshId is undefined or matches no agent (unchanged ordering)", () => {
+    const agents = [a("idle1"), a("working1")];
+    const status: Record<string, AgentTabStatus> = { idle1: "idle", working1: "working" };
+    expect(ids(sortAgentsByAttention(agents, status))).toEqual(["idle1", "working1"]);
+    expect(ids(sortAgentsByAttention(agents, status, "ghost"))).toEqual(["idle1", "working1"]);
+  });
+
+  it("FRESH_BUILD_RANK sits strictly between the red tier and the next tier", () => {
+    expect(STATUS_RANK.waiting).toBeLessThan(FRESH_BUILD_RANK);
+    expect(FRESH_BUILD_RANK).toBeLessThan(STATUS_RANK.idle);
+  });
+});
+
 type Row = { id: string; pinnedIndex: number | null };
 const mk = (id: string, pinnedIndex: number | null = null): Row => ({ id, pinnedIndex });
 const allWorking = (xs: string[]) =>
@@ -217,5 +281,45 @@ describe("firstVisibleAgentId", () => {
     expect(firstVisibleAgentId(agents, "build", "attention", status)).toBe("b2");
     // Manual ordering ignores status and keeps insertion order.
     expect(firstVisibleAgentId(agents, "build", "manual", status)).toBe("b1");
+  });
+
+  it("lands on the fresh build agent when one is set (top of the non-red rows)", () => {
+    const agents = [ag("b1", "build"), ag("b2", "build")];
+    const status: Record<string, AgentTabStatus> = { b1: "idle", b2: "working" };
+    // b2 (working) would normally sink below b1 (idle); the fresh boost puts it first.
+    expect(firstVisibleAgentId(agents, "build", "attention", status, "b2")).toBe("b2");
+    // A red row still outranks the fresh agent.
+    const status2: Record<string, AgentTabStatus> = { b1: "waiting", b2: "idle" };
+    expect(firstVisibleAgentId(agents, "build", "attention", status2, "b2")).toBe("b1");
+  });
+});
+
+describe("orderedTopLevelAgents — fresh boost end-to-end", () => {
+  type Ag = { id: string; kind: AgentKind; parentId: string | null; pinnedIndex: number | null };
+  const ag = (
+    id: string,
+    kind: AgentKind,
+    parentId: string | null = null,
+    pinnedIndex: number | null = null,
+  ): Ag => ({ id, kind, parentId, pinnedIndex });
+
+  it("puts the fresh build agent at the top of the non-red rows in Build mode", () => {
+    const agents = [ag("b1", "build"), ag("b2", "build"), ag("b3", "build")];
+    const status: Record<string, AgentTabStatus> = { b1: "waiting", b2: "idle", b3: "working" };
+    // b3 is fresh: below the red b1, above idle b2 (and above its own working tier).
+    expect(orderedTopLevelAgents(agents, status, "build", true, "b3").map((x) => x.id)).toEqual([
+      "b1",
+      "b3",
+      "b2",
+    ]);
+  });
+
+  it("ignores the fresh boost when attention ordering is off (manual = insertion order)", () => {
+    const agents = [ag("b1", "build"), ag("b2", "build")];
+    const status: Record<string, AgentTabStatus> = { b1: "working", b2: "working" };
+    expect(orderedTopLevelAgents(agents, status, "build", false, "b2").map((x) => x.id)).toEqual([
+      "b1",
+      "b2",
+    ]);
   });
 });

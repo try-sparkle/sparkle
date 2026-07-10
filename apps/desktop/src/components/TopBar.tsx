@@ -71,7 +71,13 @@ export function agentDots(
   workMode: "think" | "plan" | "build",
   attentionOrder: boolean,
 ): AgentDot[] {
-  const ordered = orderedTopLevelAgents(project.agents, statusMap, workMode, attentionOrder);
+  const ordered = orderedTopLevelAgents(
+    project.agents,
+    statusMap,
+    workMode,
+    attentionOrder,
+    project.freshBuildAgentId,
+  );
   const dots: AgentDot[] = [];
   for (const top of ordered) {
     dots.push({ id: top.id, status: statusMap[top.id] ?? "stopped", shape: "dot" });

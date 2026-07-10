@@ -46,7 +46,7 @@ function uuid(): string {
   return crypto.randomUUID();
 }
 
-interface ProjectState {
+export interface ProjectState {
   projects: Project[];
   selectedProjectId: string | null;
 
@@ -485,8 +485,23 @@ export function mergePreservingLiveWorkers(
     const liveSelectionValid =
       cur.selectedAgentId == null || mergedAgents.some((a) => a.id === cur.selectedAgentId);
     const selectedAgentId = liveSelectionValid ? cur.selectedAgentId : pp.selectedAgentId;
-    if (mergedAgents === pp.agents && selectedAgentId === pp.selectedAgentId) return pp;
-    return { ...pp, agents: mergedAgents, selectedAgentId };
+    // Same as selectedAgentId: freshBuildAgentId is LIVE per-window UI state. A stale snapshot that
+    // predates the just-opened build agent would otherwise revert the fresh-slot boost the instant
+    // it lands — the ordering analog of the nav-bug above. Keep the live value whenever it still
+    // resolves in the merged set (a live null is an intentional "no fresh agent", also authoritative);
+    // fall back to the snapshot's only when the live id is dangling (its agent was removed elsewhere).
+    const liveFreshValid =
+      cur.freshBuildAgentId == null || mergedAgents.some((a) => a.id === cur.freshBuildAgentId);
+    const freshBuildAgentId = liveFreshValid
+      ? (cur.freshBuildAgentId ?? null)
+      : (pp.freshBuildAgentId ?? null);
+    if (
+      mergedAgents === pp.agents &&
+      selectedAgentId === pp.selectedAgentId &&
+      freshBuildAgentId === (pp.freshBuildAgentId ?? null)
+    )
+      return pp;
+    return { ...pp, agents: mergedAgents, selectedAgentId, freshBuildAgentId };
   });
   return merged;
 }
@@ -509,6 +524,7 @@ export const useProjectStore = create<ProjectState>()(
           lastOpenedAt: now,
           agents: [],
           selectedAgentId: null,
+          freshBuildAgentId: null,
         };
         set((s) => ({ projects: [...s.projects, project], selectedProjectId: id }));
         return id;
@@ -599,7 +615,12 @@ export const useProjectStore = create<ProjectState>()(
               model: isDefaultModel(opts?.model) ? undefined : opts?.model,
               pinnedIndex: null,
             };
-            return { ...p, agents: [...p.agents, agent], selectedAgentId: id };
+            // A freshly-opened BUILD agent floats to the top of the non-alerting sidebar rows
+            // until a newer build agent is opened ("until you open a newer one" — the fresh slot
+            // is single-occupancy). Only build agents claim it; opening a worker/think agent must
+            // not steal the top build slot, so leave freshBuildAgentId untouched for those.
+            const freshBuildAgentId = kind === "build" ? id : p.freshBuildAgentId;
+            return { ...p, agents: [...p.agents, agent], selectedAgentId: id, freshBuildAgentId };
           }),
         }));
         // Anonymous funnel telemetry — every agent/worker tab creation flows through here.
@@ -668,7 +689,12 @@ export const useProjectStore = create<ProjectState>()(
               agents.some((a) => a.id === p.selectedAgentId)
                 ? p.selectedAgentId
                 : (agents[0]?.id ?? null);
-            return { ...p, agents, selectedAgentId };
+            // Drop the fresh-agent boost if the fresh agent was the one closed (or was a worker
+            // of a closed build agent) — a removed id must not keep phantom-boosting the sort.
+            const freshBuildAgentId = agents.some((a) => a.id === p.freshBuildAgentId)
+              ? p.freshBuildAgentId
+              : null;
+            return { ...p, agents, selectedAgentId, freshBuildAgentId };
           }),
         }));
       },

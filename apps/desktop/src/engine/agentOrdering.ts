@@ -31,10 +31,25 @@ export const STATUS_RANK: Record<AgentTabStatus, number> = {
 // guards against a future status landing here unmapped) sinks to the bottom.
 const STATUS_RANK_FALLBACK = 99;
 
-function rankOf(id: string, statusMap: Record<string, AgentTabStatus>): number {
+// The just-opened build agent floats to the TOP of the non-alerting group: below tier 0
+// (red / needs-you, rank 0) but above idle/done/working/dormant. A fractional rank between
+// tier 0 and tier 1 does exactly that without a fixed row index, so it tracks the bottom of
+// however many red rows exist at any moment. Only applied while the agent isn't itself red
+// (a red fresh agent already sits in tier 0 and must not be demoted below its red siblings).
+export const FRESH_BUILD_RANK = 0.5;
+
+function rankOf(
+  id: string,
+  statusMap: Record<string, AgentTabStatus>,
+  freshId?: string | null,
+): number {
   // Missing from the map → "stopped" (matches the sidebar's own default), bottom tier.
   const st = statusMap[id] ?? "stopped";
-  return STATUS_RANK[st] ?? STATUS_RANK_FALLBACK;
+  const base = STATUS_RANK[st] ?? STATUS_RANK_FALLBACK;
+  // Boost the freshly-opened build agent above the non-red tiers, but never above (or into
+  // the middle of) the red tier — `base > FRESH_BUILD_RANK` leaves a red agent (base 0) alone.
+  if (freshId != null && id === freshId && base > FRESH_BUILD_RANK) return FRESH_BUILD_RANK;
+  return base;
 }
 
 /**
@@ -48,12 +63,13 @@ function rankOf(id: string, statusMap: Record<string, AgentTabStatus>): number {
 export function sortAgentsByAttention<T extends { id: string }>(
   agents: readonly T[],
   statusMap: Record<string, AgentTabStatus>,
+  freshId?: string | null,
 ): T[] {
   // Decorate-sort-undecorate with the original index as the stable tiebreaker, since
   // Array.prototype.sort is only guaranteed stable in modern engines for adjacent equal
   // keys — being explicit keeps tier ties in insertion order regardless of engine.
   return agents
-    .map((agent, index) => ({ agent, index, rank: rankOf(agent.id, statusMap) }))
+    .map((agent, index) => ({ agent, index, rank: rankOf(agent.id, statusMap, freshId) }))
     .sort((a, b) => a.rank - b.rank || a.index - b.index)
     .map((d) => d.agent);
 }
@@ -63,15 +79,22 @@ export function sortAgentsByAttention<T extends { id: string }>(
  * Agents with a numeric `pinnedIndex` are anchored to that row; the rest attention-sort
  * (via sortAgentsByAttention) and fill the remaining rows around the anchors. Pure and
  * id-preserving — output is a permutation of the input, so selection (by id) is safe.
+ *
+ * Anchoring wins over the fresh-agent boost: a `freshId` that is ALSO pinned goes through the
+ * anchor path (its explicit row), so the FRESH_BUILD_RANK float is ignored for it. That's the
+ * intended precedence — a user's manual pin is a stronger signal than "just opened" — and in
+ * practice a brand-new agent is never pinned (addAgent sets pinnedIndex: null).
  */
 export function orderAgents<T extends { id: string; pinnedIndex: number | null }>(
   agents: readonly T[],
   statusMap: Record<string, AgentTabStatus>,
+  freshId?: string | null,
 ): T[] {
   const anchored = agents.filter((a) => a.pinnedIndex != null);
   const result: T[] = sortAgentsByAttention(
     agents.filter((a) => a.pinnedIndex == null),
     statusMap,
+    freshId,
   );
   // Insert anchors by ascending target index. Splicing into the growing result lands each
   // anchor at its requested row (clamped to the current length); ties resolve by anchored
@@ -99,12 +122,13 @@ export function orderedTopLevelAgents<
   statusMap: Record<string, AgentTabStatus>,
   workMode: "think" | "plan" | "build",
   attentionOrder: boolean,
+  freshId?: string | null,
 ): T[] {
   const buildIds = new Set(agents.filter((a) => a.kind === "build").map((a) => a.id));
   const topLevel = agents
     .filter((a) => !a.parentId || !buildIds.has(a.parentId))
     .filter((a) => (workMode === "think" ? a.kind === "think" : a.kind !== "think"));
-  return attentionOrder ? orderAgents(topLevel, statusMap) : topLevel;
+  return attentionOrder ? orderAgents(topLevel, statusMap, freshId) : topLevel;
 }
 
 /**
@@ -129,7 +153,14 @@ export function firstVisibleAgentId<
   mode: "think" | "plan" | "build",
   agentOrdering: "attention" | "manual",
   statusMap: Record<string, AgentTabStatus>,
+  freshId?: string | null,
 ): string | null {
-  const ordered = orderedTopLevelAgents(agents, statusMap, mode, agentOrdering === "attention");
+  const ordered = orderedTopLevelAgents(
+    agents,
+    statusMap,
+    mode,
+    agentOrdering === "attention",
+    freshId,
+  );
   return ordered[0]?.id ?? null;
 }

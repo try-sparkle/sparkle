@@ -551,8 +551,15 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       return;
     }
     // Switching INTO Build: move selection to the first Build row so the pane matches the chevron
-    // (or clear it → the empty Build state with "+ New Build Agent").
-    const next = firstVisibleAgentId(project.agents, "build", agentOrdering, status);
+    // (or clear it → the empty Build state with "+ New Build Agent"). Pass the fresh build agent so
+    // selection lands on the same top row the list renders.
+    const next = firstVisibleAgentId(
+      project.agents,
+      "build",
+      agentOrdering,
+      status,
+      project.freshBuildAgentId,
+    );
     selectAgent(project.id, next);
     if (next) open(next);
   };
@@ -967,7 +974,13 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const ordered = useMemo(
     () =>
       project
-        ? orderedTopLevelAgents(project.agents, effectiveStatus, mode, agentOrdering === "attention")
+        ? orderedTopLevelAgents(
+            project.agents,
+            effectiveStatus,
+            mode,
+            agentOrdering === "attention",
+            project.freshBuildAgentId,
+          )
         : [],
     [project, effectiveStatus, mode, agentOrdering],
   );
