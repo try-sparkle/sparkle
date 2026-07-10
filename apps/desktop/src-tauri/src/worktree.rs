@@ -230,6 +230,15 @@ pub fn resolve_default_branch(root: &str) -> String {
 /// fetched first when `fetch` is true. Any fetch failure (offline/auth/unreachable) or a
 /// missing remote-tracking ref falls back to the local `<branch>` — a command must never
 /// break just because the network is down. `branch` is always a logical name (never `origin/…`).
+///
+/// Guarantees a ref that actually RESOLVES, never a phantom name: `origin/<branch>` →
+/// local `<branch>` → detected default (local or `origin/<default>`) → `HEAD` → the original
+/// name (only when nothing resolves, e.g. an unborn HEAD). The last two fallbacks fire ONLY
+/// when the recorded base has drifted to something git can't resolve — a state in which the
+/// prior "return the name verbatim" behavior already hard-failed every caller. So for the
+/// status/rebase `rev-list` callers, a `HEAD` return is a graceful degradation (compare/cut
+/// against the current checkout) of a case that used to error outright, not a regression of a
+/// path that previously worked.
 fn effective_base(root: &str, branch: &str, fetch: bool) -> String {
     // Defensive: a legacy agent whose baseBranch was never persisted can send "" from the
     // frontend. An empty ref would feed `git rebase ""` / `rev-list "...<branch>"` and break the
@@ -261,6 +270,50 @@ fn effective_base(root: &str, branch: &str, fetch: bool) -> String {
             return remote_ref;
         }
     }
+    // The logical base may not exist as a LOCAL branch either — a recorded default that has since
+    // drifted from reality: the repo was renamed (`main` → `master`), the base branch was deleted,
+    // or the project was re-cloned with a different default. Handing a name that resolves to nothing
+    // straight to `git worktree add … <base>` fails with a cryptic `fatal: invalid reference: <name>`
+    // that a user installing Sparkle has no way to act on. Guarantee a resolvable commit-ish instead:
+    if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok() {
+        return branch.to_string();
+    }
+    // Requested base is a phantom. Fall back to the repo's ACTUAL default branch (origin/HEAD →
+    // local main → local master → checked-out branch), honoring it as either a local branch or a
+    // remote-tracking ref — a fresh clone's default frequently exists only as `origin/main` with no
+    // local counterpart yet, so a local-only check would wrongly skip it.
+    let detected = resolve_default_branch(root);
+    if detected != branch {
+        if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{detected}")]).is_ok() {
+            tracing::warn!(
+                requested = %branch, using = %detected,
+                "effective_base: recorded base branch not found; falling back to detected default"
+            );
+            return detected;
+        }
+        if has_origin {
+            let detected_remote = format!("origin/{detected}");
+            if git(root, &["rev-parse", "--verify", "--quiet", &detected_remote]).is_ok() {
+                tracing::warn!(
+                    requested = %branch, using = %detected_remote,
+                    "effective_base: recorded base branch not found; falling back to detected default (remote)"
+                );
+                return detected_remote;
+            }
+        }
+    }
+    // Neither the requested base nor a named default resolves (e.g. origin/HEAD points at a branch
+    // with no local counterpart, or an unusual layout). HEAD always resolves in a repo with a born
+    // commit — and the create path ensures one — so cutting the new branch from it beats erroring.
+    if git(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok() {
+        tracing::warn!(
+            requested = %branch,
+            "effective_base: no named base branch resolves; using HEAD as the cut point"
+        );
+        return "HEAD".to_string();
+    }
+    // Truly nothing resolves (unborn HEAD / empty repo). Return the original name and let the
+    // caller's born-HEAD handling or git's own error surface a clear, actionable failure.
     branch.to_string()
 }
 
@@ -270,6 +323,36 @@ pub async fn project_default_branch(root: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || Ok(resolve_default_branch(&root)))
         .await
         .map_err(|e| format!("project_default_branch task failed: {e}"))?
+}
+
+/// Reconcile a project's PERSISTED integration branch against reality (AppHandle-free, testable).
+/// A non-empty `recorded` that still resolves — local `refs/heads/<recorded>` OR a remote-tracking
+/// `refs/remotes/origin/<recorded>` — is honored verbatim, so a deliberate non-default choice (a
+/// feature integration branch set in Project settings) is never silently overwritten. Otherwise —
+/// empty, or a name that has drifted to something git can't resolve (repo renamed `main` → `master`,
+/// base branch deleted, re-cloned with a different default) — the repo's actual default is returned
+/// so the caller can re-persist a valid value. This is the STORE-healing companion to
+/// `effective_base`: `effective_base` fixes the cut point at spawn time, this stops the UI from
+/// lingering on a phantom base and keeps new agents from inheriting one. Always non-empty:
+/// `resolve_default_branch`'s terminal fallback is the literal `"main"`.
+pub fn reconcile_default_branch_at(root: &str, recorded: &str) -> String {
+    let trimmed = recorded.trim();
+    if !trimmed.is_empty() && validate_ref(trimmed).is_ok() {
+        let resolves = git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{trimmed}")]).is_ok()
+            || git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/origin/{trimmed}")]).is_ok();
+        if resolves {
+            return trimmed.to_string();
+        }
+    }
+    resolve_default_branch(root)
+}
+
+/// Tauri wrapper around [`reconcile_default_branch_at`]. Runs off the main thread (git subprocesses).
+#[tauri::command]
+pub async fn reconcile_default_branch(root: String, recorded: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(reconcile_default_branch_at(&root, &recorded)))
+        .await
+        .map_err(|e| format!("reconcile_default_branch task failed: {e}"))?
 }
 
 /// Roots whose repo has already been ensured this session. `ensure_project_repo` is idempotent but
@@ -2698,6 +2781,140 @@ mod tests {
         let after = project_agents_status_at(&r, "p1", &[input(false)], false, &app_data);
         assert!(after[0].changed, "a new commit re-evaluates");
         assert_eq!(after[0].branch.as_ref().unwrap().ahead, 2);
+    }
+
+    // Resilience: a recorded base branch that no longer exists (the repo was renamed
+    // `main` → `master`, or the base was deleted) must NOT be handed to git as a phantom ref.
+    // `effective_base` falls back to the repo's actual default; a base that DOES exist is
+    // returned unchanged.
+    #[test]
+    fn effective_base_recovers_from_a_drifted_recorded_base() {
+        let r = init_repo("eb-drift"); // one commit, on `main`
+        // Drift: the integration branch was renamed out from under the recorded default.
+        git(&r, &["branch", "-m", "main", "master"]).unwrap();
+        assert!(!branch_exists(&r, "main"), "precondition: main is gone");
+        assert!(branch_exists(&r, "master"), "precondition: master is the real default");
+
+        // The now-missing "main" resolves to the detected default instead of a bogus name.
+        assert_eq!(effective_base(&r, "main", false), "master");
+        // A base that still exists is returned verbatim.
+        assert_eq!(effective_base(&r, "master", false), "master");
+        // An empty/legacy base still auto-detects (unchanged behavior).
+        assert_eq!(effective_base(&r, "", false), "master");
+    }
+
+    // Store-healing: reconcile_default_branch_at keeps a still-valid recorded value (including a
+    // deliberate non-default), but heals a drifted/empty one to the repo's actual default.
+    #[test]
+    fn reconcile_default_branch_heals_drift_but_preserves_valid_choices() {
+        let r = init_repo("reconcile-drift"); // one commit, on `main`
+        // A recorded value that still exists is kept verbatim.
+        assert_eq!(reconcile_default_branch_at(&r, "main"), "main");
+        // A deliberate non-default branch that exists is preserved, NOT overwritten with the default.
+        git(&r, &["branch", "develop"]).unwrap();
+        assert_eq!(reconcile_default_branch_at(&r, "develop"), "develop");
+        // Drift: rename main → master so the recorded "main" no longer resolves → heal to master.
+        git(&r, &["branch", "-m", "main", "master"]).unwrap();
+        assert_eq!(reconcile_default_branch_at(&r, "main"), "master");
+        // An empty recorded value auto-detects the default.
+        assert_eq!(reconcile_default_branch_at(&r, ""), "master");
+        // A syntactically unsafe recorded value is never trusted; it heals to the default.
+        assert_eq!(reconcile_default_branch_at(&r, "--upload-pack=evil"), "master");
+    }
+
+    // A recorded value that resolves ONLY as a remote-tracking ref (origin/<name>, no local branch —
+    // the common fresh-clone shape) is still preserved verbatim, not overwritten with the default.
+    #[test]
+    fn reconcile_default_branch_preserves_a_remote_only_recorded_value() {
+        let upstream = init_repo("reconcile-remote-up"); // has `main`
+        git(&upstream, &["branch", "release"]).unwrap(); // a non-default integration branch upstream
+        let local_root = unique_root("reconcile-remote-local");
+        let l = local_root.to_str().unwrap().to_string();
+        git(&l, &["init", "-q"]).unwrap();
+        git(&l, &["config", "user.email", "t@t"]).unwrap();
+        git(&l, &["config", "user.name", "t"]).unwrap();
+        git(&l, &["remote", "add", "origin", &upstream]).unwrap();
+        git(&l, &["fetch", "-q", "origin"]).unwrap();
+        assert!(!branch_exists(&l, "release"), "no local branch, remote-tracking only");
+        assert!(git(&l, &["rev-parse", "--verify", "--quiet", "refs/remotes/origin/release"]).is_ok());
+
+        // "release" exists only as origin/release → preserved, NOT healed to a different default.
+        assert_eq!(reconcile_default_branch_at(&l, "release"), "release");
+    }
+
+    // Remote-only detected default: a fresh clone whose default exists solely as `origin/<default>`
+    // (no local branch yet). When the recorded base is a phantom, effective_base must cut from that
+    // remote-tracking ref rather than dropping to HEAD.
+    #[test]
+    fn effective_base_uses_remote_detected_default_when_local_missing() {
+        let upstream = init_repo("eb-remote-up"); // has `main`, one commit
+        let local_root = unique_root("eb-remote-local");
+        let l = local_root.to_str().unwrap().to_string();
+        git(&l, &["init", "-q"]).unwrap();
+        git(&l, &["config", "user.email", "t@t"]).unwrap();
+        git(&l, &["config", "user.name", "t"]).unwrap();
+        git(&l, &["remote", "add", "origin", &upstream]).unwrap();
+        git(&l, &["fetch", "-q", "origin"]).unwrap();
+        // origin/HEAD → origin/main, but fetch created NO local `main` branch.
+        git(&l, &["remote", "set-head", "origin", "main"]).unwrap();
+        assert!(!branch_exists(&l, "main"), "no local default branch exists");
+        assert!(git(&l, &["rev-parse", "--verify", "--quiet", "origin/main"]).is_ok());
+
+        // Recorded base "develop" resolves to nothing (no local, no origin/develop); the detected
+        // default "main" exists only as origin/main → cut from origin/main, never HEAD.
+        assert_eq!(effective_base(&l, "develop", false), "origin/main");
+    }
+
+    // Last-resort cascade: when neither the requested base NOR any named default branch resolves
+    // (detached HEAD, every branch deleted, no remote), `effective_base` cuts from `HEAD` rather
+    // than handing git a phantom name.
+    #[test]
+    fn effective_base_uses_head_when_no_named_base_resolves() {
+        let r = init_repo("eb-head"); // one commit, on `main`
+        let sha = git(&r, &["rev-parse", "HEAD"]).unwrap();
+        // Detach, then delete every named branch so nothing but HEAD resolves.
+        git(&r, &["checkout", "-q", "--detach", &sha]).unwrap();
+        git(&r, &["branch", "-D", "main"]).unwrap();
+        assert!(!branch_exists(&r, "main"));
+        assert!(!branch_exists(&r, "master"));
+        assert_eq!(effective_base(&r, "main", false), "HEAD");
+    }
+
+    // Degenerate case: an unborn HEAD (freshly `git init`'d, no commits). Nothing resolves, so the
+    // original logical name is returned for the caller's born-HEAD handling / git error to surface.
+    #[test]
+    fn effective_base_returns_original_name_in_an_unborn_repo() {
+        let root = unique_root("eb-unborn");
+        let r = root.to_str().unwrap().to_string();
+        git(&r, &["init", "-q"]).unwrap();
+        // A logical name that can't coincide with the auto-detected default, so the assertion holds
+        // regardless of this machine's `init.defaultBranch`.
+        assert_eq!(effective_base(&r, "feature-x", false), "feature-x");
+    }
+
+    // End-to-end: opening an agent whose persisted baseBranch drifted to a now-missing branch
+    // used to dead-end with `fatal: invalid reference: main`. It must instead cut the worktree
+    // from the repo's real default branch.
+    #[test]
+    fn create_worktree_survives_a_missing_recorded_base_branch() {
+        let r = init_repo("wt-drift"); // on `main`
+        let main_sha = git(&r, &["rev-parse", "main"]).unwrap();
+        git(&r, &["branch", "-m", "main", "master"]).unwrap();
+        let app_data = unique_root("wt-drift-appdata");
+
+        // Recorded baseBranch is the stale "main" — creation must survive it, not hard-fail.
+        let info = create_worktree_at(&r, "p1", "a1", "main", &app_data)
+            .expect("worktree creation must survive a drifted base branch");
+        assert!(
+            git(&info.path, &["rev-parse", "--is-inside-work-tree"]).is_ok(),
+            "a real worktree was created"
+        );
+        // The agent branch was cut from the surviving default (same tip main used to point at).
+        assert_eq!(
+            git(&info.path, &["rev-parse", "HEAD"]).unwrap(),
+            main_sha,
+            "new branch descends from the detected default branch's tip"
+        );
     }
 
     #[test]

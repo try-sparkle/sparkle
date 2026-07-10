@@ -9,7 +9,7 @@ import {
   prewarmProjectCaches,
   warmWorktreePool,
 } from "../services/worktree";
-import { resolveDefaultBranch } from "../services/branchStatus";
+import { reconcileDefaultBranch } from "../services/branchStatus";
 import { useAiFeature, useAiFeatureVisible } from "../services/aiGate";
 import { recordTrialSend } from "../services/trialMeter";
 import { checkClaude, claudeSessionInfo } from "../preflight";
@@ -326,14 +326,31 @@ function AgentPaneInner({
       // before accountP is consumed. The real `await accountP` below still observes any result.
       accountP.catch(() => {});
 
-      // Resolve + persist the project's integration branch once, then base this agent off it.
-      // Normalize a possibly-empty resolver result the same way the store does, so the worktree
-      // and poll layers don't see a value the store guard would have nulled.
+      // Resolve/heal the project's integration branch, then base this agent off it. Two paths keep
+      // the common open off the git hot path:
+      //  - Unset (first open / legacy project): detect + persist BEFORE spawn, awaited — same single
+      //    round-trip the code always did here, so no added latency for the common case.
+      //  - Already recorded: heal any drift in the BACKGROUND (non-gating). A persisted default that
+      //    drifted out of the repo (renamed main→master, base deleted, re-cloned) is corrected in the
+      //    store for the UI and future opens; the Rust effective_base fallback still fixes THIS spawn's
+      //    actual cut if the value is stale, so nothing needs to block on the reconcile.
+      // Normalize a possibly-empty result the same way the store does, so the worktree/poll layers
+      // never see a value the store guard would have nulled.
       let base = project.defaultBranch;
       if (!base) {
-        const resolved = (await resolveDefaultBranch(project.rootPath)).trim();
+        const resolved = (await reconcileDefaultBranch(project.rootPath, "")).trim();
         base = resolved || null;
         if (base) useProjectStore.getState().setDefaultBranch(project.id, base);
+      } else {
+        const recorded = base;
+        void reconcileDefaultBranch(project.rootPath, recorded)
+          .then((r) => {
+            const healed = r.trim();
+            if (healed && healed !== recorded) {
+              useProjectStore.getState().setDefaultBranch(project.id, healed);
+            }
+          })
+          .catch(() => {});
       }
       // An agent created before defaultBranch existed has a null baseBranch — backfill it.
       // An empty agentBase is tolerated by the Rust effective_base fallback.

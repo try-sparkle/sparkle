@@ -138,6 +138,15 @@ export function resolveDefaultBranch(root: string): Promise<string> {
   return invoke<string>("project_default_branch", { root });
 }
 
+/**
+ * Reconcile a project's persisted integration branch against the repo: keep `recorded` when it
+ * still resolves (a deliberate choice is preserved), otherwise return the repo's actual default so
+ * a drifted/renamed/empty value can be re-persisted. Pass "" for an unset default.
+ */
+export function reconcileDefaultBranch(root: string, recorded: string): Promise<string> {
+  return invoke<string>("reconcile_default_branch", { root, recorded });
+}
+
 /** Live ahead/behind/dirty/size for an agent vs its own baseBranch (no network). */
 export function agentBranchStatus(
   root: string,

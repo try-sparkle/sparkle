@@ -260,6 +260,7 @@ pub fn run() {
             hooks::heal_agent_hooks,
             hooks::read_events_since,
             worktree::project_default_branch,
+            worktree::reconcile_default_branch,
             worktree::agent_branch_status,
             worktree::agent_workflow_state,
             worktree::project_agents_status,
