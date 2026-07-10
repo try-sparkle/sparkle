@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useMemo, useState, type ReactNode
 import {
   computeInitialProjectId,
   parseAgentIdFromSearch,
+  parseProjectIdFromSearch,
   parseWindowLabelFromSearch,
 } from "./services/projectWindows.url";
 import { useProjectStore } from "./stores/projectStore";
@@ -21,6 +22,19 @@ interface Ctx {
 }
 
 const CurrentProjectContext = createContext<Ctx | null>(null);
+
+/** Deep-link: a window opened from a history-search "jump to agent" carries `?agent=`. Once the
+ *  window is on its project, select + mount that agent so it lands directly on it. A closed/unknown
+ *  agent id is silently ignored (the search row itself reports "closed"). Shared so BOTH the fast
+ *  path (project resolved at mount) and the late-hydration recovery below run it — otherwise a
+ *  jump-to-agent window that hydrates late would adopt its project but never open the agent. */
+function openDeepLinkAgent(projectId: string, agentId: string | null): void {
+  if (!agentId) return;
+  const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
+  if (!project?.agents.some((a) => a.id === agentId)) return;
+  useRuntimeStore.getState().open(agentId);
+  useProjectStore.getState().selectAgent(projectId, agentId);
+}
 
 /**
  * Supplies "this window's current project." A window's OPAQUE label comes from the `?label=`
@@ -66,17 +80,50 @@ export function CurrentProjectProvider({ children }: { children: ReactNode }) {
 
   const [projectId, setProjectId] = useState<string | null>(initial);
 
-  // Deep-link: a window opened from a history-search "jump to agent" carries `?agent=`. Once on
-  // its project, select + mount that agent so the window lands directly on it. Runs once on mount
-  // (the param is fixed for this window's life). A closed/unknown agent is silently ignored — the
-  // window just shows the project's default tab (the search row itself reports "closed").
+  // Late-hydration recovery for deep-linked windows. A secondary window is created with
+  // `?project=<id>` and its OS title is stamped from the OPENER's (already-populated) store, but
+  // zustand's `persist` applies THIS window's hydrated localStorage snapshot in a microtask — even
+  // with synchronous storage. So the one-shot `initial` memo above can run BEFORE the store
+  // hydrates, find the id absent, and strand the window at null forever: the macOS title shows the
+  // project name while the body says "No project open" (sparkle bug: created amforge, window still
+  // "No project open"). If this window was deep-linked to a project that simply hasn't landed yet,
+  // adopt it the instant it appears — via hydration OR a later cross-window sync. A genuinely stale
+  // id (project deleted / force-quit leftover) never appears, so the intended fall-back-to-no-project
+  // behavior is preserved. Only runs when `initial` failed to resolve an explicit param, and stops
+  // as soon as it resolves — so it never fights a later user Open/New/close in this window.
   useEffect(() => {
+    const paramId = parseProjectIdFromSearch(search);
+    if (!paramId || initial !== null) return;
     const agentId = parseAgentIdFromSearch(search);
-    if (!agentId || !initial) return;
-    const project = useProjectStore.getState().projects.find((p) => p.id === initial);
-    if (!project?.agents.some((a) => a.id === agentId)) return;
-    useRuntimeStore.getState().open(agentId);
-    useProjectStore.getState().selectAgent(initial, agentId);
+    // The project lands via a store `set`, and a single subscription catches every way it can:
+    // this window's own late persist hydration goes through setState (which is exactly why
+    // crossWindowSync guards `persist.rehydrate()` behind `applyingRemote` — the rehydrate set
+    // notifies subscribers), and a cross-window sync rehydrate does too. So no separate
+    // onFinishHydration listener is needed. A project always carries its full `agents` array, so
+    // the `?agent=` target is present the instant its project is — openDeepLinkAgent resolves it in
+    // the same tick, with no need to defer for a later-arriving agent.
+    let unsub: (() => void) | null = null;
+    const adoptIfPresent = (): boolean => {
+      if (!useProjectStore.getState().projects.some((p) => p.id === paramId)) return false;
+      // Detach BEFORE mutating: openDeepLinkAgent's selectAgent is itself a store `set`, so leaving
+      // the subscription attached would re-enter this callback and recurse infinitely.
+      unsub?.();
+      unsub = null;
+      setProjectId(paramId);
+      // Same jump-to-agent landing the fast path does — now that the project has arrived.
+      openDeepLinkAgent(paramId, agentId);
+      return true;
+    };
+    if (adoptIfPresent()) return;
+    unsub = useProjectStore.subscribe(() => adoptIfPresent());
+    return () => unsub?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Fast path: the project resolved synchronously at mount, so land its `?agent=` deep-link now.
+  // (The late-hydration recovery above owns the `initial === null` case.)
+  useEffect(() => {
+    if (initial) openDeepLinkAgent(initial, parseAgentIdFromSearch(search));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

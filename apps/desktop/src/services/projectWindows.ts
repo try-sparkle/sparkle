@@ -4,7 +4,7 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { projectWindowUrl } from "./projectWindows.url";
 import { clearWindowProject, findWindowForProject, setWindowProject } from "./windowRegistry";
-import { useProjectStore } from "../stores/projectStore";
+import { flushProjectsPersist, useProjectStore } from "../stores/projectStore";
 
 export type OpenMode = "replace" | "new";
 
@@ -104,6 +104,11 @@ export function defaultDeps(
       // entry so a later open doesn't focus a window that never came up.
       const label = `${WINDOW_LABEL_PREFIX}${crypto.randomUUID()}`;
       setWindowProject(label, projectId);
+      // Flush the debounced projects blob to real localStorage BEFORE the child boots, so its
+      // zustand `persist` hydration reads a snapshot that already contains this just-created project
+      // and resolves synchronously — otherwise the child can hydrate a stale blob and briefly (or,
+      // pre-recovery-effect, permanently) show "No project open" under its project-named title.
+      flushProjectsPersist();
       // Title the window after its project so the macOS Window menu is navigable with several
       // windows open. Workspace keeps the title in sync after mount (rename/Replace); this just
       // avoids a "Sparkle" flash before that effect runs.
