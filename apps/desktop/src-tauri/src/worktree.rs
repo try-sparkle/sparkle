@@ -834,6 +834,18 @@ pub struct BranchStatus {
     deletions: u32,
 }
 
+/// Status for an agent branch whose base ref can't be resolved: there's no base to diverge from,
+/// so count the branch's OWN commits as `ahead` (behind 0) and skip the base diff. `dirty` is passed
+/// through from the caller's worktree read. Shared by both the single-agent and batched status paths
+/// so their unresolvable-base guards can't drift apart.
+fn ahead_only_status(root: &str, branch: &str, dirty: bool) -> BranchStatus {
+    let ahead = git(root, &["rev-list", "--count", branch])
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    BranchStatus { ahead, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0 }
+}
+
 /// Core (AppHandle-free, testable): live ahead/behind + dirty + size of an agent branch vs its
 /// (no-fetch) effective base. The worktree lives OUTSIDE the project, under `app_data`.
 pub fn agent_branch_status_at(
@@ -873,6 +885,17 @@ pub fn agent_branch_status_at(
     .is_err()
     {
         return Ok(BranchStatus { ahead: 0, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0 });
+    }
+
+    // The agent branch exists, but its RESOLVED base may not: `effective_base` documents an
+    // unborn/HEAD-less fallback that can hand back a name git cannot resolve. `rev-list
+    // <unresolvable-base>...<branch>` then hard-fails with "fatal: ambiguous argument", failing the
+    // whole status read on EVERY 30s poll for the app's lifetime — spamming the log and never
+    // resolving. There's no divergence to measure against a base that doesn't exist, so report the
+    // branch's own commits as `ahead` (behind 0 — the born-off-nothing model), still reflecting the
+    // worktree's dirty state, instead of erroring.
+    if git(root, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")]).is_err() {
+        return Ok(ahead_only_status(root, &branch, dirty));
     }
 
     // `--left-right --count A...B` emits "<left>\t<right>": left = base-only = behind,
@@ -1765,6 +1788,15 @@ fn branch_status_with_base(
     // the branch ref doesn't exist, so there's nothing to count against a ref that isn't there.
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_err() {
         return Ok(BranchStatus { ahead: 0, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0 });
+    }
+    // The branch exists, but the RESOLVED base may not (`effective_base`'s documented unborn/HEAD-less
+    // fallback can return a name git can't resolve). `rev-list <unresolvable-base>...<branch>` then
+    // hard-fails with "fatal: ambiguous argument", failing the whole batch read for that agent and
+    // re-logging "batch branch status failed" every 30s tick for the app's lifetime. There's nothing to
+    // diverge from when the base doesn't exist, so report the branch's own commits as `ahead` (behind 0)
+    // instead of erroring — mirrors `agent_branch_status_at`'s base guard.
+    if git(root, &["rev-parse", "--verify", "--quiet", &format!("{base_ref}^{{commit}}")]).is_err() {
+        return Ok(ahead_only_status(root, &branch, dirty));
     }
     let counts = git(root, &["rev-list", "--left-right", "--count", &format!("{base_ref}...{branch}")])?;
     let mut it = counts.split_whitespace();
@@ -4045,6 +4077,86 @@ mod tests {
         assert_eq!(st.deletions, 0);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn batch_branch_status_survives_an_unresolvable_base_ref() {
+        // The agent branch EXISTS but its resolved base does not — `effective_base`'s documented
+        // unborn/HEAD-less fallback can hand back a name git can't resolve. Previously
+        // `rev-list <unresolvable-base>...<branch>` hard-failed with "fatal: ambiguous argument",
+        // failing that agent's read and re-logging "batch branch status failed" every 30s tick for
+        // the app's lifetime. It must return Ok, reporting the branch's own commits as `ahead`.
+        let root = unique_root("batch-status-ghostbase");
+        let root_str = root.to_string_lossy().to_string();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        // A real agent branch with commits of its own.
+        git(&root_str, &["checkout", "-q", "-b", "sparkle/agent-s1"]).unwrap();
+        std::fs::write(format!("{root_str}/w1.txt"), "a").unwrap();
+        git(&root_str, &["add", "."]).unwrap();
+        git(&root_str, &["commit", "-q", "-m", "w1"]).unwrap();
+        std::fs::write(format!("{root_str}/w2.txt"), "b").unwrap();
+        git(&root_str, &["add", "."]).unwrap();
+        git(&root_str, &["commit", "-q", "-m", "w2"]).unwrap();
+        git(&root_str, &["checkout", "-q", "main"]).unwrap();
+
+        let total: u32 = git(&root_str, &["rev-list", "--count", "sparkle/agent-s1"])
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(total > 0, "precondition: the agent branch has commits");
+
+        // A base ref that does not resolve — the failure mode observed in the logs.
+        let ghost = "sparkle/ghost-base-does-not-exist";
+        assert!(
+            git(&root_str, &["rev-parse", "--verify", "--quiet", &format!("{ghost}^{{commit}}")]).is_err(),
+            "precondition: ghost base does not resolve",
+        );
+
+        let wt = root.join("nonexistent-wt");
+        let st = branch_status_with_base(&root_str, "s1", ghost, &wt).unwrap();
+        assert_eq!(st.ahead, total, "unresolvable base ⇒ ahead = the branch's own commits");
+        assert_eq!(st.behind, 0, "unresolvable base ⇒ nothing to be behind");
+        assert!(!st.dirty, "no worktree ⇒ clean");
+        assert_eq!(st.files_changed, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_branch_status_tolerates_a_drifted_base_name() {
+        // Contract for the single-agent entry point: a recorded base NAME that doesn't exist must not
+        // error. Note this does NOT exercise the `ahead_only_status` guard directly — `effective_base`
+        // recovers a resolvable base (here the detected default `main`) whenever HEAD resolves, so the
+        // call flows through the normal `--left-right` path. The guard's own contract (base_ref that
+        // resolves to nothing ⇒ ahead = branch's own commits) is asserted exactly by the lower-level
+        // `batch_branch_status_survives_an_unresolvable_base_ref`; this test only pins the entry point's
+        // no-error tolerance of a drifted base name.
+        let root = unique_root("agent-status-drift-base");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("agent-status-drift-base-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        // A real agent branch exactly one commit ahead of `main`.
+        git(&root_str, &["checkout", "-q", "-b", "sparkle/agent-s1"]).unwrap();
+        std::fs::write(format!("{root_str}/w1.txt"), "a").unwrap();
+        git(&root_str, &["add", "."]).unwrap();
+        git(&root_str, &["commit", "-q", "-m", "w1"]).unwrap();
+        git(&root_str, &["checkout", "-q", "main"]).unwrap();
+
+        // The recorded base "sparkle/ghost-base" resolves to nothing; effective_base recovers the
+        // detected default `main`, so the call succeeds and measures against it (ahead == 1).
+        let st = agent_branch_status_at(&root_str, "p", "s1", "sparkle/ghost-base", &app_data).unwrap();
+        assert_eq!(st.ahead, 1, "drifted base name recovers to `main`; agent-s1 is 1 ahead");
+        assert_eq!(st.behind, 0, "nothing to be behind");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
     }
 
     #[test]
