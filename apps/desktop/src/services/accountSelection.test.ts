@@ -76,6 +76,28 @@ describe("accountSelection cache", () => {
     expect(pinned.chosen?.id).toBe("work");
   });
 
+  it("skips an account that is not signed in, even though it has the lowest usage (sparkle-gms0)", async () => {
+    // "def" has zero usage (no rows) so it would win auto-pick, but it has no authenticated
+    // identity — spawning under it drops the user at a login prompt. "work" is signed in and must
+    // win despite carrying real usage. This is the restart symptom: every agent asked to log in.
+    invoke.mockReset();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
+      if (cmd === "accounts_usage")
+        return Promise.resolve([{ id: "work", tokens5h: 10, tokens7d: 99_999, exhaustedUntil: null }]);
+      if (cmd === "accounts_identities")
+        return Promise.resolve([
+          { id: "def", email: null, organization: null }, // config dir exists, never logged in
+          { id: "work", email: "drodio@storytell.ai", organization: null },
+        ]);
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    invalidateAccountState();
+
+    const { chosen } = await chooseAccountForAgent("agent-2", { now: 6_000_000 });
+    expect(chosen?.id).toBe("work");
+  });
+
   it("an invalidate during an in-flight load discards that load's stale snapshot", async () => {
     // Deferred backend: the first load is in flight when we invalidate.
     let resolveList: (v: typeof ACCOUNTS) => void = () => {};

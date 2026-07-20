@@ -13,6 +13,7 @@ import {
   getIdentities,
   pickAccount,
   getPin,
+  signedInAccountIds,
   type Account,
   type Usage,
   type Identity,
@@ -80,7 +81,11 @@ export function invalidateAccountState(): void {
 
 /** Choose the account `agentId` should spawn under (honoring its manual pin) plus the loaded state
  *  (for the pane's account badge/dropdown). `chosen` is null only when no accounts exist — then the
- *  spawn omits CLAUDE_CONFIG_DIR and behaves exactly as before accounts existed. */
+ *  spawn omits CLAUDE_CONFIG_DIR and behaves exactly as before accounts existed.
+ *
+ *  The loaded identities gate auto-pick: only accounts actually `claude login`ed are candidates, so
+ *  a config dir that exists but was never signed into can't win on its (necessarily zero) usage and
+ *  strand the agent at a login prompt — sparkle-gms0. */
 export async function chooseAccountForAgent(
   agentId: string,
   opts: { force?: boolean; now?: number } = {},
@@ -88,6 +93,7 @@ export async function chooseAccountForAgent(
   const state = await loadAccountState(opts);
   const chosen = pickAccount(state.accounts, state.usage, {
     pinnedAccountId: getPin(agentId),
+    signedInIds: signedInAccountIds(state.identities),
     now: opts.now,
   });
   return { chosen, state };

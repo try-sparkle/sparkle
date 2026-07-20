@@ -19,6 +19,7 @@ import {
   EMPTY_ALERT,
 } from "../engine/alertDismissal";
 import { isDefaultModel } from "../services/models";
+import { clearPin } from "../services/accountStore";
 import { usageTelemetry } from "../services/usageTelemetry";
 import { perfSpan, perfStart } from "../perfTrace";
 
@@ -944,6 +945,10 @@ export const useProjectStore = create<ProjectState>()(
           // reconcile) that still carries it can't re-add the row before this removal propagates
           // (sparkle-close-resurrect — "× closes the terminal but the row comes back").
           registerLocalRemovals(doomed);
+          // Account pins outlive the session (persisted for sparkle-gms0), so a closed agent's pin
+          // would otherwise linger forever — and could keep naming a since-removed account. Uses
+          // the same `doomed` list, so a closed build agent's workers are cleared with it.
+          doomed.forEach((id) => clearPin(id));
           return {
           // The tombstone is also PERSISTED (sparkle-pckz): the union merge never infers deletion
           // from absence, so this is the only thing that carries the close to other windows.

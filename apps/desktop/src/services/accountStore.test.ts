@@ -17,6 +17,8 @@ import {
   setPin,
   clearPin,
   clearAllPins,
+  signedInAccountIds,
+  PINS_STORAGE_KEY,
   type Account,
   type Usage,
 } from "./accountStore";
@@ -243,5 +245,136 @@ describe("pin map", () => {
     clearAllPins();
     expect(getPin("a1")).toBeUndefined();
     expect(getPin("a2")).toBeUndefined();
+  });
+});
+
+describe("pin persistence across an app restart (sparkle-gms0)", () => {
+  // The bug: pins lived in a module-level Map, so restarting Sparkle dropped every pin, auto-pick
+  // resumed, and agents landed on a different (possibly never-logged-in) account. Re-importing the
+  // module after vi.resetModules() is the in-test stand-in for that restart.
+  beforeEach(() => clearAllPins());
+
+  it("a pin survives a module reload", async () => {
+    setPin("agent1", "acctX");
+    vi.resetModules();
+    const fresh = await import("./accountStore");
+    expect(fresh.getPin("agent1")).toBe("acctX");
+  });
+
+  it("clearPin removes the persisted copy, not just the in-memory one", async () => {
+    setPin("agent1", "acctX");
+    clearPin("agent1");
+    vi.resetModules();
+    const fresh = await import("./accountStore");
+    expect(fresh.getPin("agent1")).toBeUndefined();
+  });
+
+  it("clearAllPins clears the persisted copy too", async () => {
+    setPin("agent1", "acctX");
+    clearAllPins();
+    vi.resetModules();
+    const fresh = await import("./accountStore");
+    expect(fresh.getPin("agent1")).toBeUndefined();
+  });
+
+  it("observes a pin another window wrote, rather than serving a stale module cache", () => {
+    // Pins go through plain localStorage, which is shared across windows but broadcasts no event
+    // we subscribe to. Reading through to storage on every access keeps a second window's pin (or
+    // unpin) from being masked by this window's cached copy.
+    setPin("agent1", "acctX");
+    globalThis.localStorage.setItem(PINS_STORAGE_KEY, JSON.stringify({ agent1: "acctY" }));
+    expect(getPin("agent1")).toBe("acctY");
+  });
+
+  it("does not clobber another window's pin for a DIFFERENT agent on write", () => {
+    setPin("agent1", "acctX");
+    globalThis.localStorage.setItem(
+      PINS_STORAGE_KEY,
+      JSON.stringify({ agent1: "acctX", agent2: "acctFromOtherWindow" }),
+    );
+    setPin("agent3", "acctZ");
+    expect(getPin("agent2")).toBe("acctFromOtherWindow");
+    expect(getPin("agent3")).toBe("acctZ");
+  });
+
+  it("tolerates corrupt persisted JSON rather than throwing on load", async () => {
+    globalThis.localStorage.setItem(PINS_STORAGE_KEY, "{not valid json");
+    vi.resetModules();
+    const fresh = await import("./accountStore");
+    expect(fresh.getPin("anything")).toBeUndefined();
+  });
+
+  it("ignores non-string pin values in persisted data", async () => {
+    globalThis.localStorage.setItem(PINS_STORAGE_KEY, JSON.stringify({ good: "acctX", bad: 42 }));
+    vi.resetModules();
+    const fresh = await import("./accountStore");
+    expect(fresh.getPin("good")).toBe("acctX");
+    expect(fresh.getPin("bad")).toBeUndefined();
+  });
+});
+
+describe("signedInAccountIds", () => {
+  it("keeps only accounts with a real authenticated email", () => {
+    expect(
+      signedInAccountIds([
+        { id: "a", email: "drodio@storytell.ai", organization: null },
+        { id: "b", email: null, organization: null },
+      ]),
+    ).toEqual(["a"]);
+  });
+
+  it("returns empty for no identities at all", () => {
+    expect(signedInAccountIds([])).toEqual([]);
+  });
+});
+
+describe("pickAccount — signed-in filter (sparkle-gms0)", () => {
+  const NOW = 1_000_000;
+
+  it("never auto-picks an account that is not signed in, even at zero usage", () => {
+    // The regression this fixes: a config dir created but never `claude login`ed has NO transcripts,
+    // so its tokens7d is 0 — it wins the lowest-usage ranking for EVERY agent and drops the user at
+    // a login prompt on each one.
+    const accounts = [acct("live"), acct("neverLoggedIn")];
+    const u = [usage("live", { tokens7d: 5_000_000 }), usage("neverLoggedIn", { tokens7d: 0 })];
+    // Without the filter (caller supplied no identities) the zero-usage account still wins — the
+    // pre-fix behavior, kept so an identity-less caller is unaffected.
+    expect(pickAccount(accounts, u, { now: NOW })?.id).toBe("neverLoggedIn");
+    // With it, the signed-in account wins despite being the heaviest.
+    expect(pickAccount(accounts, u, { now: NOW, signedInIds: ["live"] })?.id).toBe("live");
+  });
+
+  it("ranks by lowest usage WITHIN the signed-in set", () => {
+    const accounts = [acct("hi"), acct("lo"), acct("unauthed")];
+    const u = [
+      usage("hi", { tokens7d: 900 }),
+      usage("lo", { tokens7d: 100 }),
+      usage("unauthed", { tokens7d: 0 }),
+    ];
+    expect(pickAccount(accounts, u, { now: NOW, signedInIds: ["hi", "lo"] })?.id).toBe("lo");
+  });
+
+  it("still excludes an exhausted account within the signed-in set", () => {
+    const accounts = [acct("a"), acct("b")];
+    const u = [usage("a", { exhaustedUntil: NOW + 60_000 }), usage("b", { tokens7d: 500 })];
+    expect(pickAccount(accounts, u, { now: NOW, signedInIds: ["a", "b"] })?.id).toBe("b");
+  });
+
+  it("falls back to every account when NONE is signed in, rather than blocking the spawn", () => {
+    // Degrading to the old behavior matters: a fresh install whose identities haven't loaded (or an
+    // IPC hiccup returning []) must still start an agent.
+    const accounts = [acct("a", { isDefault: true }), acct("b")];
+    expect(pickAccount(accounts, [], { now: NOW, signedInIds: [] })?.id).toBe("a");
+  });
+
+  it("a manual pin still wins even when that account is not signed in", () => {
+    // A human chose it on purpose — same precedence the pin already has over exhausted/near-cap.
+    const accounts = [acct("live"), acct("pinned")];
+    const chosen = pickAccount(accounts, [], {
+      now: NOW,
+      signedInIds: ["live"],
+      pinnedAccountId: "pinned",
+    });
+    expect(chosen?.id).toBe("pinned");
   });
 });

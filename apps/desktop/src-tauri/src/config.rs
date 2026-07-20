@@ -71,9 +71,9 @@ pub struct AiConfig {
     pub composer: bool,
     pub suggested_actions: bool,
     /// Master switch for Sparkle Auto-Approve (nudging + auto-answering Claude Code permission
-    /// prompts). Default true. By default every non-destructive category ([approvals] below) ships
-    /// `"always"`, so with this on a fresh install auto-answers skill/edit/tool/web/other prompts
-    /// (bash still asks). Off disables ALL nudging AND all auto-answering regardless of [approvals].
+    /// prompts). Default true. By default every category ([approvals] below) ships `"always"`, so
+    /// with this on a fresh install auto-answers skill/bash/edit/tool/web/other prompts. Off
+    /// disables ALL nudging AND all auto-answering regardless of [approvals].
     pub auto_approve: bool,
 }
 
@@ -82,12 +82,12 @@ pub struct AiConfig {
 /// Global `[approvals]` = all-projects rules; a project `.sparkle/config.toml [approvals]` overrides
 /// per category (project value beats global). See the design spec.
 ///
-/// DEFAULT (see `impl Default` below): everything EXCEPT `bash` ships `"always"`, so a fresh install
-/// never blocks on a skill / edit / tool-call / web-request / other permission prompt out of the box.
-/// `bash` deliberately stays ask-each-time — auto-approving commands also auto-approves destructive
-/// ones (`rm -rf`, …), so it's the one category a user must opt into explicitly. The master switch
-/// (`ai.auto_approve`, default on) still governs whether ANY of this fires; turning it off, or
-/// setting a category to `"never"`, restores the old ask-each-time behavior.
+/// DEFAULT (see `impl Default` below): EVERY category ships `"always"` — bash included — so a fresh
+/// install never blocks on a permission prompt out of the box. Auto-approving commands also
+/// auto-approves destructive ones (`rm -rf`, …); that is the accepted trade for agents that run
+/// unattended in throwaway worktrees. The master switch (`ai.auto_approve`, default on) still
+/// governs whether ANY of this fires; turning it off, or setting a category to `"never"`, restores
+/// ask-each-time behavior.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ApprovalsConfig {
@@ -101,13 +101,16 @@ pub struct ApprovalsConfig {
 
 impl Default for ApprovalsConfig {
     fn default() -> Self {
-        // Ship auto-approve ON for every non-destructive category so users aren't blocked by
-        // permission prompts out of the box. `bash` stays None (ask each time) because
-        // auto-approving commands would also auto-approve destructive ones.
+        // Ship auto-approve ON for EVERY category, bash included. Sparkle's whole point is agents
+        // that keep working unattended; a bash prompt with nobody watching is a silent stall, and
+        // bash is the category real work hits most (every test run, build, and git command).
+        // The trade is explicit: this also auto-approves DESTRUCTIVE commands (`rm -rf`, …). The
+        // mitigations are that agents work in throwaway per-agent worktrees, and that opting back
+        // out is one setting — `bash = "never"`, or the [ai].auto_approve master switch.
         let always = || Some("always".to_string());
         ApprovalsConfig {
             skill: always(),
-            bash: None,
+            bash: always(),
             edit: always(),
             mcp: always(),
             fetch: always(),
@@ -1172,16 +1175,16 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 #   "always" = auto-answer the plain "Yes" for that whole class of prompt (Sparkle stays
 #              authoritative — turning [ai].auto_approve off restores the prompts), or
 #   "never"  = keep asking, but stop nudging you to remember an answer for that class.
-# DEFAULTS (so you're never blocked out of the box): every category EXCEPT bash ships "always".
-# bash is the sole exception — it stays ask-each-time because auto-approving commands also
-# auto-approves DESTRUCTIVE ones (rm -rf, …); set bash = "always" only if you accept that.
+# DEFAULTS (so you're never blocked out of the box): EVERY category ships "always", bash included.
+# Note that auto-approving commands also auto-approves DESTRUCTIVE ones (rm -rf, …) — the trade
+# Sparkle accepts so agents run unattended in throwaway worktrees. Opt back out per category below.
 # Edit here or via ⋯ Settings → "Auto-approve". Global rules apply to every project; a project's
 # .sparkle/config.toml [approvals] overrides per category (project wins).
 # Categories: skill (skills) · bash (commands) · edit (file edits) · mcp (tool calls) ·
 # fetch (web requests) · other (other prompts).
 # [approvals]
-# bash  = "always"   # opt bash in too (accepts destructive commands)
-# fetch = "never"    # or turn a category back to ask-each-time
+# bash  = "never"    # opt bash back out — go back to confirming every command yourself
+# fetch = "never"    # or turn any other category back to ask-each-time
 
 # --- Opinionated tools (per-machine; ignored in a project file) -------------------------
 # The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
@@ -2225,9 +2228,10 @@ mod tests {
     }
 
     #[test]
-    fn approvals_default_ships_on_except_bash() {
-        // A fresh install auto-approves every non-destructive category out of the box, so users
-        // aren't blocked by permission prompts. bash stays ask-each-time (destructive).
+    fn approvals_default_ships_on_for_every_category() {
+        // A fresh install auto-approves EVERY category out of the box — including bash — so an
+        // agent is never blocked mid-run by a permission prompt with nobody watching. Opting back
+        // out is a per-category `"never"` (or the [ai].auto_approve master switch).
         let (cfg, _, _) = effective(None, None);
         assert_eq!(cfg.approvals, ApprovalsConfig::default());
         assert_eq!(cfg.approvals.skill.as_deref(), Some("always"));
@@ -2235,7 +2239,20 @@ mod tests {
         assert_eq!(cfg.approvals.mcp.as_deref(), Some("always"));
         assert_eq!(cfg.approvals.fetch.as_deref(), Some("always"));
         assert_eq!(cfg.approvals.other.as_deref(), Some("always"));
-        assert_eq!(cfg.approvals.bash, None, "bash is the one category that must stay ask-each-time");
+        assert_eq!(
+            cfg.approvals.bash.as_deref(),
+            Some("always"),
+            "bash ships auto-approve ON; opt out with bash = \"never\""
+        );
+    }
+
+    #[test]
+    fn approvals_bash_can_be_opted_back_out() {
+        // The escape hatch for the new default: an explicit "never" must beat it, at either layer.
+        let (cfg, _, _) = effective(Some("[approvals]\nbash = \"never\"\n"), None);
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("never"), "global opt-out wins");
+        let (cfg, _, _) = effective(None, Some("[approvals]\nbash = \"never\"\n"));
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("never"), "project opt-out wins");
     }
 
     #[test]
@@ -2304,11 +2321,16 @@ mod tests {
         let (cfg, _, _) = build_effective(SparkleConfig::default(), g_text.as_deref(), p_text.as_deref());
         assert_eq!(cfg.approvals.bash.as_deref(), Some("always"), "falls back to global");
 
-        // Clear the global rule → fully unset.
+        // Clear the global rule too → no file layer left, so the built-in default answers (which
+        // now ships bash auto-approve ON, not unset).
         unset_value(&dir, "approvals.bash").unwrap();
         let g_text = read_if_exists(&global_path(&dir));
         let (cfg, _, _) = build_effective(SparkleConfig::default(), g_text.as_deref(), None);
-        assert_eq!(cfg.approvals.bash, None, "fully cleared");
+        assert_eq!(
+            cfg.approvals.bash.as_deref(),
+            Some("always"),
+            "both file layers cleared → falls back to the built-in default"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

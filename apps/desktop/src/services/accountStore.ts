@@ -160,24 +160,48 @@ export const DEFAULT_NEAR_CAP: NearCap = {
 
 export interface PickOptions {
   /** Manual per-agent override. If set and it names an existing account, that account wins
-   *  unconditionally (even if exhausted/near-cap) — a human chose it on purpose. */
+   *  unconditionally (even if exhausted/near-cap/not signed in) — a human chose it on purpose. */
   pinnedAccountId?: string;
   /** Soft window ceilings; defaults to {@link DEFAULT_NEAR_CAP}. */
   nearCap?: NearCap;
+  /** Ids of accounts that are actually `claude login`ed (see {@link signedInAccountIds}). When
+   *  supplied and at least one listed account matches, auto-pick considers ONLY these. Omit (or pass
+   *  a set matching no account) to skip the filter entirely — see the rationale on `pickAccount`. */
+  signedInIds?: readonly string[];
   /** Current time (epoch ms), injectable for tests. Defaults to `Date.now()`. */
   now?: number;
+}
+
+/** The ids of accounts with a REAL authenticated identity — i.e. actually `claude login`ed. An
+ *  account whose config dir exists but was never logged into reports `email: null`
+ *  ({@link Identity}). Feed this to {@link PickOptions.signedInIds}.
+ *
+ *  `email != null` is the authoritative signed-in signal, not a heuristic: the Rust side derives it
+ *  from `<configDir>/.claude.json`'s `oauthAccount.emailAddress`, and a missing/empty
+ *  `oauthAccount` OR a missing/empty `emailAddress` all yield None (accounts.rs `read_identity`).
+ *  It is the same field the first-run gate's `claude_signed_in` keys on. Deliberately NOT widened
+ *  to `organization`, which accounts.rs can leave None even for a completed login. */
+export function signedInAccountIds(identities: Identity[]): string[] {
+  return identities.filter((i) => i.email != null).map((i) => i.id);
 }
 
 /** Choose the account a new job should run under. PURE — no IO.
  *
  *  Order (design spec §"Per-job account selection"):
  *    1. A valid `pinnedAccountId` override wins outright.
- *    2. Otherwise drop accounts that are exhausted (`exhaustedUntil` in the future) or near a
- *       window cap, then pick the LOWEST `tokens7d` (tie-break: lowest `tokens5h`).
+ *    2. Otherwise keep only SIGNED-IN accounts (when `signedInIds` is supplied), then drop those
+ *       that are exhausted (`exhaustedUntil` in the future) or near a window cap, then pick the
+ *       LOWEST `tokens7d` (tie-break: lowest `tokens5h`).
  *    3. If that leaves nothing, fall back to the default account (else the first account) — we
  *       never return null while any account exists; the hard rate-limit is the real backstop.
  *  Returns null only for an empty account list. Accounts with no usage row are treated as having
- *  the most headroom (zero tokens, not exhausted). */
+ *  the most headroom (zero tokens, not exhausted).
+ *
+ *  The signed-in filter exists because those two rules compose into a trap (sparkle-gms0): an
+ *  account dir that was created but never `claude login`ed has no transcripts, so its tally is
+ *  zero — the most headroom of all — and it would win auto-pick for EVERY agent, spawning each one
+ *  into a login prompt. It degrades safely: if no listed account is signed in (identities not
+ *  loaded yet, or an IPC hiccup returning []), the filter is skipped rather than blocking spawns. */
 export function pickAccount(
   accounts: Account[],
   usage: Usage[],
@@ -185,12 +209,18 @@ export function pickAccount(
 ): Account | null {
   if (accounts.length === 0) return null;
 
-  const { pinnedAccountId, nearCap = DEFAULT_NEAR_CAP, now = Date.now() } = opts;
+  const { pinnedAccountId, nearCap = DEFAULT_NEAR_CAP, signedInIds, now = Date.now() } = opts;
 
   if (pinnedAccountId) {
     const pinned = accounts.find((a) => a.id === pinnedAccountId);
     if (pinned) return pinned;
   }
+
+  // Signed-in accounts only — unless that would eliminate everything, in which case we keep the
+  // full list so a spawn still happens (better a login prompt than a dead agent).
+  const signedIn = signedInIds ? new Set(signedInIds) : null;
+  const authed = signedIn ? accounts.filter((a) => signedIn.has(a.id)) : [];
+  const eligible = authed.length > 0 ? authed : accounts;
 
   const usageById = new Map(usage.map((u) => [u.id, u]));
   const ZERO: Usage = { id: "", tokens5h: 0, tokens7d: 0, exhaustedUntil: null };
@@ -199,15 +229,15 @@ export function pickAccount(
   const isExhausted = (u: Usage) => u.exhaustedUntil != null && u.exhaustedUntil > now;
   const isNearCap = (u: Usage) => u.tokens5h >= nearCap.tokens5h || u.tokens7d >= nearCap.tokens7d;
 
-  const candidates = accounts.filter((a) => {
+  const candidates = eligible.filter((a) => {
     const u = usageFor(a);
     return !isExhausted(u) && !isNearCap(u);
   });
 
   if (candidates.length === 0) {
     // Everyone is exhausted / near-cap: fall back rather than block. Prefer the default account.
-    // accounts is non-empty (guarded above), so accounts[0] is defined.
-    return accounts.find((a) => a.isDefault) ?? (accounts[0] as Account);
+    // eligible is non-empty (accounts is guarded above), so eligible[0] is defined.
+    return eligible.find((a) => a.isDefault) ?? (eligible[0] as Account);
   }
 
   // Lowest 7d tally wins; tie-break on lowest 5h. Stable — equal entries keep input order.
@@ -220,28 +250,77 @@ export function pickAccount(
   });
 }
 
-// ── In-memory pin map (agentId → accountId) ───────────────────────────────────────────────────
-// A manual per-agent override the integrator (Worker C) reads before each spawn and passes to
-// `pickAccount({ pinnedAccountId })`. Phase 1 keeps this in memory only (resets on app restart);
-// persisting it is explicitly out of scope per the task.
-const pinMap = new Map<string, string>();
+// ── Persisted pin map (agentId → accountId) ───────────────────────────────────────────────────
+// A manual per-agent override the spawn-path integrator reads before each spawn and passes to
+// `pickAccount({ pinnedAccountId })`.
+//
+// This was in-memory only in Phase 1, which turned out to be the whole of sparkle-gms0: restarting
+// Sparkle dropped every pin, auto-pick resumed, and each agent could land on a DIFFERENT account
+// than before the restart — including one never logged into — so every agent demanded a fresh
+// login. Agent ids are stable across restarts (AgentTab.id is persisted by projectStore), so
+// keying the persisted map by agentId is sound.
+//
+// localStorage (not a zustand store) because the pin API is a plain function surface consumed
+// outside React; every access is wrapped so a disabled/full/corrupt store degrades to auto-pick
+// rather than throwing on the spawn path.
+
+/** localStorage key holding the agentId → accountId pin map. Exported for tests. */
+export const PINS_STORAGE_KEY = "sparkle.accountPins.v1";
+
+function readPins(): Map<string, string> {
+  try {
+    const raw = globalThis.localStorage?.getItem(PINS_STORAGE_KEY);
+    if (!raw) return new Map();
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
+    // Drop non-string values defensively — a hand-edited or older blob must not yield a pin whose
+    // "account id" is a number/object, which would silently never match an account.
+    return new Map(
+      Object.entries(parsed as Record<string, unknown>).filter(
+        (e): e is [string, string] => typeof e[1] === "string",
+      ),
+    );
+  } catch {
+    return new Map(); // unparseable / storage unavailable → no pins, everything auto-picks
+  }
+}
+
+function writePins(map: Map<string, string>): void {
+  try {
+    globalThis.localStorage?.setItem(PINS_STORAGE_KEY, JSON.stringify(Object.fromEntries(map)));
+  } catch {
+    // Storage unavailable or over quota. The in-memory map still holds for this session; the pin
+    // just won't survive a restart. Never let this break a spawn.
+  }
+}
+
+// Every operation reads through to storage rather than caching a module-level Map. localStorage is
+// shared across windows but we subscribe to no `storage` event, so a cached copy would let this
+// window mask a pin (or unpin) another window just wrote — and a read-modify-write over a stale
+// copy would drop the other window's edits entirely. These calls happen at spawn time and on a
+// manual pin, i.e. rarely, so a JSON round-trip per access costs nothing worth optimizing.
 
 /** The account this agent is pinned to, or undefined if it auto-picks. */
 export function getPin(agentId: string): string | undefined {
-  return pinMap.get(agentId);
+  return readPins().get(agentId);
 }
 
 /** Pin `agentId` to `accountId` (manual override for all of this agent's future spawns). */
 export function setPin(agentId: string, accountId: string): void {
-  pinMap.set(agentId, accountId);
+  const m = readPins();
+  m.set(agentId, accountId);
+  writePins(m);
 }
 
-/** Clear an agent's pin (revert it to auto-pick). */
+/** Clear an agent's pin (revert it to auto-pick). Called when an agent is closed, so persisted
+ *  pins don't accumulate for agents that no longer exist. */
 export function clearPin(agentId: string): void {
-  pinMap.delete(agentId);
+  const m = readPins();
+  if (!m.delete(agentId)) return; // nothing pinned → don't rewrite storage
+  writePins(m);
 }
 
 /** Drop all pins (e.g. on full reset). Exposed mainly for tests/teardown. */
 export function clearAllPins(): void {
-  pinMap.clear();
+  writePins(new Map());
 }
