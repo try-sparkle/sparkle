@@ -14,14 +14,31 @@ import type { SuggestionButton } from "../services/suggestions/types";
 import {
   closeBuildAgentButton,
   landToMainButton,
+  mergePrButton,
+  openPrButton,
   pushToOriginMainButton,
 } from "../services/suggestions/controlButtons";
 
-/** The only workflow signal the CTA actually reads. Narrower than `WorkflowState` on purpose: a full
- *  WorkflowState still satisfies it structurally, while a caller that subscribes to just this field
- *  (rather than the whole object, which the poll rebuilds every tick) can keep a stable identity —
- *  see useSuggestions, where the object's churn used to abort in-flight paid computes. */
-export type CtaSignals = Pick<WorkflowState, "hasRemote">;
+/**
+ * How work is expected to reach the integration branch.
+ *
+ * - `pr_first` — a pull request IS the gate. Committed work is proposed as a PR and merged by the
+ *   user. The default, mirroring `[workflow] require_pr` (which defaults true in config.rs).
+ * - `direct` — work is landed straight onto the integration branch, no PR required.
+ *
+ * This used to be prose in a comment here ("this repo lands directly and a PR isn't a gate") rather
+ * than a value, which is precisely why open PRs accumulated: the primary action routed around them,
+ * while `require_pr` sat in the config defaulting to true with nothing reading it. Making the policy
+ * a parameter is what lets the setting actually govern behavior — and keeps both flows tested.
+ */
+export type DeliveryPolicy = "pr_first" | "direct";
+
+/** The workflow signals the CTA actually reads. Narrower than `WorkflowState` on purpose: a full
+ *  WorkflowState still satisfies it structurally, while a caller that subscribes to just these
+ *  fields (rather than the whole object, which the poll rebuilds every tick) can keep a stable
+ *  identity — see useSuggestions, where the object's churn used to abort in-flight paid computes.
+ *  `prState`/`prNumber` joined `hasRemote` when the PR became a gate under `pr_first`. */
+export type CtaSignals = Pick<WorkflowState, "hasRemote" | "prState" | "prNumber">;
 
 export interface Cta {
   /** The one action to lead with — the filled pill. */
@@ -49,6 +66,10 @@ export interface CtaOpts {
   /** Whether the agent is blocked awaiting an ANSWER from the user — a prose question or a terminal
    *  widget (see services/suggestions/pendingQuestion.ts). When true the stage action steps aside. */
   questionPending?: boolean;
+  /** How work reaches the integration branch. Defaults to `pr_first`, mirroring `[workflow]
+   *  require_pr`'s own default so the engine's default and the config's default agree. Callers
+   *  resolve the effective value from config (global, overridable per repo). */
+  policy?: DeliveryPolicy;
 }
 
 export function deriveCta(
@@ -57,7 +78,7 @@ export function deriveCta(
   computed: SuggestionButton[],
   opts: CtaOpts = {},
 ): Cta | null {
-  const stageAction = primaryFor(stage, ws);
+  const stageAction = primaryFor(stage, ws, opts.policy ?? "pr_first");
   if (!stageAction) return null;
 
   // The agent asked the user something. The stage describes the BRANCH ("this work has landed");
@@ -101,13 +122,27 @@ export function deriveCta(
 function primaryFor(
   stage: WorkflowStageId,
   ws: CtaSignals | null | undefined,
+  policy: DeliveryPolicy,
 ): SuggestionButton | null {
   // Nothing committed yet — there's no work to land, so don't crowd out ordinary suggestions.
   if (stageIndex(stage) < stageIndex("building_saved")) return null;
 
-  // Un-landed committed work, whether or not it's pushed or has a PR open. An open PR still gets
-  // Land rather than "Merge PR": this repo lands directly (scripts/land.sh) and a PR isn't a gate.
-  if (stageIndex(stage) < stageIndex("merged_local")) return landToMainButton();
+  // Un-landed committed work, whether or not it's pushed or has a PR open.
+  if (stageIndex(stage) < stageIndex("merged_local")) {
+    // `pr_first` makes the PR the gate. It requires POSITIVE evidence of a remote for the same
+    // reason the merged_local branch below does: `hasRemote` reads false both for a genuinely
+    // remoteless repo AND for any non-probing fast poll, and those are indistinguishable here. A
+    // policy that demanded a PR on absent evidence would strand a local-only agent at an action it
+    // can never complete, so we fall back to landing directly — the policy expresses a preference,
+    // never a trap.
+    if (policy === "pr_first" && ws?.hasRemote === true) {
+      // Only an OPEN PR is the live gate. A merged/closed one belongs to a finished cycle; treating
+      // it as the gate would tell the agent to merge something already merged (the tracker resets
+      // for a new cycle — see the tip-relative probe in worktree.rs).
+      return ws.prState === "open" ? mergePrButton(ws.prNumber) : openPrButton();
+    }
+    return landToMainButton();
+  }
 
   if (stage === "merged_local") {
     // On local main but not origin. Only ask for a push when we have POSITIVE evidence of a remote:

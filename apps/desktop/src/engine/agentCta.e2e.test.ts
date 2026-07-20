@@ -19,7 +19,7 @@
 // while the seam between them was wrong — which is exactly how the reported bug shipped.
 import { describe, it, expect } from "vitest";
 import { deriveLiveStage } from "./workflowStage";
-import { deriveCta } from "./agentCta";
+import { deriveCta, type CtaOpts } from "./agentCta";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
 import type { WorkflowStageId } from "./workflowStage";
 
@@ -61,18 +61,37 @@ const WS_DEFAULTS: Required<WorkflowState> = {
 const wsOf = (over: Partial<WorkflowState>): WorkflowState => ({ ...WS_DEFAULTS, ...over });
 
 /** The full pipeline the composer runs each poll: git signals → live stage → CTA label. */
-function labelFor(ws: WorkflowState, ahead: number, prev: WorkflowStageId | null) {
+function labelFor(
+  ws: WorkflowState,
+  ahead: number,
+  prev: WorkflowStageId | null,
+  opts: CtaOpts = {},
+) {
   const stage = deriveLiveStage({ kind: "build", bs: bs(ahead), ws, prev });
-  return { stage, label: deriveCta(stage, ws, [])?.primary.label };
+  return { stage, label: deriveCta(stage, ws, [], opts)?.primary.label };
 }
 
 describe("e2e: real-git signals → stage → the button the user sees", () => {
   // Step 1 of the Rust walk: ahead_of_base=1, nothing landed, origin exists.
-  it("committed on its branch, nothing landed → Land to Main", () => {
+  // POLICY (2026-07-20): with a remote present, the default `pr_first` proposes a PR instead of
+  // landing directly. `direct` still lands — asserted alongside so both policies stay covered by a
+  // real-git fixture, not just the unit tests.
+  it("committed on its branch, nothing landed → Open Pull Request (pr_first default)", () => {
     const { stage, label } = labelFor(
       wsOf({ aheadOfBase: 1, landed: false, pushed: false, hasRemote: true }),
       1,
       null,
+    );
+    expect(stage).toBe("building_saved");
+    expect(label).toBe("Open Pull Request");
+  });
+
+  it("committed on its branch under `direct` → Land to Main", () => {
+    const { stage, label } = labelFor(
+      wsOf({ aheadOfBase: 1, landed: false, pushed: false, hasRemote: true }),
+      1,
+      null,
+      { policy: "direct" },
     );
     expect(stage).toBe("building_saved");
     expect(label).toBe("Land to Main");
@@ -123,14 +142,15 @@ describe("e2e: real-git signals → stage → the button the user sees", () => {
   // now has fresh un-landed commits. The old code read the workflowShipped watermark, which had
   // latched on the earlier cycle and could never clear, so it showed Close over un-landed work.
   // deriveLiveStage's new-cycle detection drops the stage back; the CTA follows it.
-  it("prior cycle landed + fresh un-landed commits → Land to Main, not Close", () => {
-    const { stage, label } = labelFor(
-      wsOf({ aheadOfBase: 3, hasRemote: true }),
-      3,
-      "merged", // the earlier cycle reached origin main
-    );
-    expect(stage).toBe("building_saved");
-    expect(label).toBe("Land to Main");
+  it("prior cycle landed + fresh un-landed commits → a delivery action, not Close", () => {
+    const args = [wsOf({ aheadOfBase: 3, hasRemote: true }), 3, "merged" as const] as const;
+    // The point of this regression test is that a NEW cycle is not treated as finished. Which
+    // delivery action it offers is policy; that it offers one (never Close) is the invariant.
+    const prFirst = labelFor(...args);
+    const direct = labelFor(...args, { policy: "direct" });
+    expect(prFirst.stage).toBe("building_saved");
+    expect(prFirst.label).toBe("Open Pull Request");
+    expect(direct.label).toBe("Land to Main");
   });
 
   // A remoteless repo (Rust: has_remote=false) must never be stranded at Push with Close

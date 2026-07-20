@@ -33,6 +33,7 @@ vi.mock("./approvalsRuntime", () => ({ maybeAutoApprove: () => null }));
 import { useSuggestions } from "./useSuggestions";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useConnectionStore } from "../../stores/connectionStore";
+import { useSettingsStore } from "../../stores/settingsStore";
 import type { WorkflowState } from "../branchStatus";
 import type { WorkflowStageId } from "../../engine/workflowStage";
 
@@ -67,6 +68,56 @@ beforeEach(() => {
   useConnectionStore.setState({ isOnline: true });
 });
 afterEach(cleanup);
+
+describe("useSuggestions — the delivery policy actually governs", () => {
+  // These are the tests that matter most for this feature, because the bug being fixed was NOT a
+  // wrong policy — it was a policy that existed in config and governed nothing. `require_pr` has
+  // shipped defaulted-true, plumbed Rust → services/config.ts → settingsStore, since the config file
+  // landed, while agentCta hardcoded the opposite behavior. Asserting the pure engine honors a
+  // `policy` argument would NOT have caught that; only driving it from the real setting does.
+  beforeEach(() => {
+    useSettingsStore.setState({ requirePr: true });
+  });
+
+  it("require_pr = true (the default) makes an open PR the primary action", async () => {
+    seed({
+      stage: "pull_request",
+      workflowState: ws({ hasRemote: true, prState: "open", prNumber: 503 }),
+    });
+    const { result } = renderHook(() => useSuggestions("a1", true));
+    await waitFor(() => {
+      expect(result.current.buttons[0]?.label).toBe("Merge PR #503");
+    });
+  });
+
+  it("require_pr = false restores direct landing over the very same signals", async () => {
+    useSettingsStore.setState({ requirePr: false });
+    seed({
+      stage: "pull_request",
+      workflowState: ws({ hasRemote: true, prState: "open", prNumber: 503 }),
+    });
+    const { result } = renderHook(() => useSuggestions("a1", true));
+    await waitFor(() => {
+      expect(result.current.buttons[0]?.label).toBe("Land to Main");
+    });
+  });
+
+  it("require_pr = true with no PR yet offers to open one", async () => {
+    seed({ stage: "pushed", workflowState: ws({ hasRemote: true }) });
+    const { result } = renderHook(() => useSuggestions("a1", true));
+    await waitFor(() => {
+      expect(result.current.buttons[0]?.label).toBe("Open Pull Request");
+    });
+  });
+
+  it("require_pr = true on a REMOTELESS repo still lands — the policy is never a trap", async () => {
+    seed({ stage: "building_saved", workflowState: ws({ hasRemote: false }) });
+    const { result } = renderHook(() => useSuggestions("a1", true));
+    await waitFor(() => {
+      expect(result.current.buttons[0]?.label).toBe("Land to Main");
+    });
+  });
+});
 
 describe("useSuggestions — stage-driven CTA", () => {
   // REGRESSION — founder screenshot, 2026-07-15: an agent that had landed EARLIER work ("like the

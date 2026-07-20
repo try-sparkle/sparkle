@@ -42,6 +42,41 @@ export function landToMainButton(): SuggestionButton {
   };
 }
 
+/** The "Open Pull Request" CTA under the `pr_first` delivery policy, shown for committed work that
+ *  has no PR yet. A prompt for the same reason as landToMainButton: the agent pushes (if needed) and
+ *  opens the PR through the project's own contracts, rather than the app shelling out to `gh`. */
+export function openPrButton(): SuggestionButton {
+  return {
+    id: "cta:openPr",
+    label: "Open Pull Request",
+    value: "Open a pull request for this branch.",
+    kind: "prompt",
+    source: "control",
+  };
+}
+
+/** The "Merge PR" CTA under the `pr_first` delivery policy — the human gate on main. Carries the PR
+ *  number when known so the label names the thing being merged instead of an anonymous "the PR"
+ *  (an agent can have several branches in flight). A prompt, so the agent verifies checks actually
+ *  passed before merging rather than the app merging blind — `gh pr merge --auto` silently degrades
+ *  to an immediate merge on repos without auto-merge enabled, which is exactly the failure this
+ *  gate exists to prevent. */
+export function mergePrButton(prNumber?: number | null): SuggestionButton {
+  return {
+    id: "cta:mergePr",
+    // `!= null`, not truthiness: the distinction being drawn is KNOWN vs UNKNOWN, and 0 is a known
+    // value. GitHub never issues PR #0 so truthiness is harmless today, but encoding "unknown" as
+    // "falsy" is the kind of near-miss that stops being harmless the moment the domain changes.
+    label: prNumber != null ? `Merge PR #${prNumber}` : "Merge Pull Request",
+    value:
+      prNumber != null
+        ? `Merge pull request #${prNumber} into main, once its checks have passed.`
+        : "Merge this branch's pull request into main, once its checks have passed.",
+    kind: "prompt",
+    source: "control",
+  };
+}
+
 /** The "Push to Origin Main" CTA, shown once work is on LOCAL main but not yet on origin. Also a
  *  prompt, for the same reason as landToMainButton. */
 export function pushToOriginMainButton(): SuggestionButton {

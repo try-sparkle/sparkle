@@ -4,6 +4,7 @@ import { getAgentScrollback } from "../terminalScrollback";
 import { useAiFeature } from "../aiGate";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useConnectionStore } from "../../stores/connectionStore";
+import { useSettingsStore } from "../../stores/settingsStore";
 import { pushSuggestions } from "../relayClient";
 import { deriveCta } from "../../engine/agentCta";
 import { maybeAutoApprove } from "./approvalsRuntime";
@@ -150,6 +151,15 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // dep array and abort an in-flight (paid Haiku) compute mid-poll, discarding the result and
   // re-running it — a real cost, since the compute is a metered call.
   const hasRemote = useRuntimeStore((s) => s.workflowState[agentId]?.hasRemote);
+  // The PR signals, selected as primitives for the same identity-churn reason as `hasRemote` above.
+  // They joined CtaSignals when the PR became the gate under the `pr_first` delivery policy.
+  const prState = useRuntimeStore((s) => s.workflowState[agentId]?.prState);
+  const prNumber = useRuntimeStore((s) => s.workflowState[agentId]?.prNumber);
+  // The delivery policy, from the editable config mirror (`[workflow] require_pr`, default true).
+  // This is the line that makes the setting LOAD-BEARING: require_pr has shipped defaulted-true and
+  // fully plumbed since the config file landed, while the CTA hardcoded the opposite policy — so the
+  // documented default and the actual behavior disagreed, and open PRs were routed around.
+  const requirePr = useSettingsStore((s) => s.requirePr);
 
   // Suppresses the CTA after `clear()` (the user just acted on it) until the next compute or turn.
   // Without this the render-time merge would immediately re-add the very pill they just clicked.
@@ -168,10 +178,19 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // of that dep array is what stops a poll from cancelling an in-flight paid compute.
   const applyCta = useCallback(
     (computed: SuggestionButton[]): SuggestionButton[] => {
-      const cta = stage ? deriveCta(stage, { hasRemote }, computed, { questionPending }) : null;
+      // `?? null` because the optional-chained selectors yield `undefined` before any workflow poll
+      // has applied, while CtaSignals models "no PR" as null. Both mean "not a live PR" to the
+      // policy, so they collapse here rather than teaching the pure engine about undefined.
+      const signals = { hasRemote, prState: prState ?? null, prNumber: prNumber ?? null };
+      const cta = stage
+        ? deriveCta(stage, signals, computed, {
+            questionPending,
+            policy: requirePr ? "pr_first" : "direct",
+          })
+        : null;
       return cta ? [cta.primary, ...cta.alternates] : computed;
     },
-    [stage, hasRemote, questionPending],
+    [stage, hasRemote, prState, prNumber, questionPending, requirePr],
   );
 
   useEffect(() => {

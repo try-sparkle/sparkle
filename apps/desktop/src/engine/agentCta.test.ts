@@ -33,14 +33,102 @@ describe("deriveCta", () => {
   });
 
   it.each(["building_saved", "pushed", "pull_request"] as const)(
-    "%s offers Land to Main",
+    "%s offers Land to Main when there is no positive remote evidence",
     (stage) => {
+      // `ws()` leaves hasRemote undefined. Even under the default pr_first policy that must fall
+      // back to Land: a PR is impossible without a remote, and demanding one would strand the agent.
       expect(deriveCta(stage, ws(), [])?.primary.label).toBe("Land to Main");
     },
   );
 
-  it("an open PR still offers Land, not Merge PR — this repo lands directly", () => {
-    const cta = deriveCta("pull_request", ws({ prState: "open" }), []);
+  describe("delivery policy", () => {
+    const remote = (over: Partial<WorkflowState> = {}) => ws({ hasRemote: true, ...over });
+
+    it("pr_first is the DEFAULT — it mirrors `[workflow] require_pr`, which defaults true", () => {
+      // Guards the whole point of this change: the configured default and the implemented
+      // behavior were opposites, and nothing read the flag.
+      expect(deriveCta("pushed", remote(), [])?.primary.label).toBe("Open Pull Request");
+    });
+
+    it("pr_first with an OPEN pr makes merging the primary action", () => {
+      const cta = deriveCta("pull_request", remote({ prState: "open", prNumber: 503 }), []);
+      expect(cta?.primary.label).toBe("Merge PR #503");
+    });
+
+    it("pr_first names the PR number so an agent with several branches is unambiguous", () => {
+      const withNum = deriveCta("pull_request", remote({ prState: "open", prNumber: 42 }), []);
+      const noNum = deriveCta("pull_request", remote({ prState: "open" }), []);
+      expect(withNum?.primary.label).toBe("Merge PR #42");
+      expect(noNum?.primary.label).toBe("Merge Pull Request");
+    });
+
+    it.each(["building_saved", "pushed"] as const)(
+      "pr_first at %s (no PR yet) offers Open Pull Request",
+      (stage) => {
+        expect(deriveCta(stage, remote(), [])?.primary.label).toBe("Open Pull Request");
+      },
+    );
+
+    it("pr_first FALLS BACK to Land without positive remote evidence", () => {
+      // hasRemote is false both for a genuinely remoteless repo AND for any non-probing fast poll,
+      // so absent evidence must never strand the agent at an impossible action.
+      expect(deriveCta("pushed", ws({ hasRemote: false }), [])?.primary.label).toBe("Land to Main");
+      expect(deriveCta("pushed", ws(), [])?.primary.label).toBe("Land to Main");
+      expect(deriveCta("pushed", null, [])?.primary.label).toBe("Land to Main");
+    });
+
+    it("a merged/closed PR is not a gate — pr_first offers to open a new one", () => {
+      // Re-opened work after a merge starts a NEW cycle; a stale merged PR must not read as the
+      // live gate, or the agent would be told to merge something already merged.
+      expect(
+        deriveCta("pushed", remote({ prState: "merged", prNumber: 7 }), [])?.primary.label,
+      ).toBe("Open Pull Request");
+      expect(
+        deriveCta("pushed", remote({ prState: "closed", prNumber: 7 }), [])?.primary.label,
+      ).toBe("Open Pull Request");
+    });
+
+    it("direct policy preserves the original behavior at every pre-land stage", () => {
+      for (const stage of ["building_saved", "pushed", "pull_request"] as const) {
+        const cta = deriveCta(stage, remote({ prState: "open", prNumber: 9 }), [], {
+          policy: "direct",
+        });
+        expect(cta?.primary.label).toBe("Land to Main");
+      }
+    });
+
+    it("policy does not affect the terminal stages", () => {
+      for (const policy of ["pr_first", "direct"] as const) {
+        expect(
+          deriveCta("merged", remote({ inOriginMain: true }), [], { policy })?.primary.label,
+        ).toBe("Close Build Agent");
+        expect(
+          deriveCta("merged_local", remote({ inLocalMain: true }), [], { policy })?.primary.label,
+        ).toBe("Push to Origin Main");
+      }
+    });
+
+    it("the PR CTAs are prompts, so the agent runs the project's own contracts", () => {
+      // Not control actions: the app must not shell out to `gh` and merge blind. `gh pr merge
+      // --auto` silently degrades to an immediate merge where auto-merge is disabled, so the
+      // check-verification has to happen in the agent, not in a fire-and-forget app action.
+      const open = deriveCta("pushed", remote(), [])?.primary;
+      const merge = deriveCta("pull_request", remote({ prState: "open" }), [])?.primary;
+      expect(open?.kind).toBe("prompt");
+      expect(merge?.kind).toBe("prompt");
+      expect(merge?.value).toContain("checks");
+    });
+  });
+
+  // POLICY CHANGE (2026-07-20): this used to assert "an open PR still offers Land, not Merge PR —
+  // this repo lands directly". That was the `direct` policy hardcoded into the engine, and it is
+  // why open PRs piled up: the primary action routed around them. `require_pr` already defaulted to
+  // true in config and nothing read it. Under the default `pr_first` policy an open PR is now the
+  // gate. The old behavior is still reachable and still tested — via `policy: "direct"` below.
+  it("an open PR under `direct` still offers Land (the pre-2026-07-20 behavior)", () => {
+    const cta = deriveCta("pull_request", ws({ prState: "open", hasRemote: true }), [], {
+      policy: "direct",
+    });
     expect(cta?.primary.label).toBe("Land to Main");
   });
 
