@@ -10,6 +10,15 @@ import { safeUnlisten } from "./safeUnlisten";
 
 const inTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+/** Minimum gap between two rehydrates of the same store. A structural change fans out one event per
+ *  mutation, so a burst (spawning agents, a branch of rapid status flips) can deliver events far
+ *  faster than a rehydrate is worth doing: each one re-reads and re-parses the whole persisted blob
+ *  and writes the store, re-rendering every subscriber. Rehydrate always reads the CURRENT blob, so
+ *  collapsing N events in a window into one run is equivalent to running only the last — the
+ *  intermediate runs would each be overwritten by the next. 50ms caps the cost at ~20 rehydrates/s
+ *  while staying well under the ~100ms that reads as instant for cross-window liveness. */
+const REHYDRATE_COALESCE_MS = 50;
+
 /** A persisted store wired for cross-window liveness. `rehydrate()` is provided by zustand's
  *  `persist` middleware; `signature()` is a coarse hash of just the fields other windows care
  *  about, so high-churn fields (lastPrompt, mic level, …) never trigger a broadcast. */
@@ -56,7 +65,15 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>, isTorndown: () => boole
     );
   }
 
-  const rehydrate = () => {
+  // Leading-edge throttle state. An isolated event (the common case) rehydrates immediately, so
+  // cross-window latency is unchanged; events arriving while one is in flight or inside the
+  // cooldown collapse into a single trailing run, so no update is ever dropped — only merged.
+  let running = false;
+  let cooldown: ReturnType<typeof setTimeout> | null = null;
+  let pending = false;
+
+  const runRehydrate = () => {
+    running = true;
     // `applyingRemote` guards the store subscriber so the state-write that `persist.rehydrate()`
     // performs does not get mistaken for a local mutation and re-broadcast — that would loop
     // forever (Tauri `emit` echoes to the emitter and fans out to every window). Self-echo is
@@ -71,8 +88,35 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>, isTorndown: () => boole
     ).finally(() => {
       last = spec.signature();
       applyingRemote = false;
+      running = false;
+      // A rehydrate in flight when teardown lands resolves afterwards; don't arm a cooldown timer
+      // for a webview that's already gone.
+      if (isTorndown()) return;
+      cooldown = setTimeout(() => {
+        cooldown = null;
+        if (!pending) return;
+        pending = false;
+        runRehydrate();
+      }, REHYDRATE_COALESCE_MS);
     });
   };
+
+  const rehydrate = () => {
+    if (running || cooldown !== null) {
+      pending = true;
+      return;
+    }
+    runRehydrate();
+  };
+
+  // Drop any scheduled trailing rehydrate on teardown: the cooldown timer outlives the listeners,
+  // so without this a burst that ends right as the webview closes would fire one more rehydrate
+  // against a torn-down store.
+  unsubs.push(() => {
+    if (cooldown !== null) clearTimeout(cooldown);
+    cooldown = null;
+    pending = false;
+  });
 
   const onStorage = (e: StorageEvent) => {
     if (e.key === spec.persistKey) rehydrate();
