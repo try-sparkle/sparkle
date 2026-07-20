@@ -114,30 +114,58 @@ let jankRunning = false;
 // main-thread stall lasts this long; anything above it is a wake, not a freeze.
 const SUSPEND_MS = 30_000;
 
+/** How to account for one inter-frame gap. `stall` warns, `resume` records a wake, `ignore` drops it. */
+export type JankVerdict = "stall" | "resume" | "ignore";
+
+/** Classify one rAF inter-frame gap. Pure, so the hidden-window accounting below is testable.
+ *
+ *  `wasHiddenSinceLastTick` — NOT `document.hidden` sampled now. rAF is paused while the window is
+ *  hidden/occluded, so the tick that observes a background gap only ever runs *after* the window is
+ *  visible again, when `document.hidden` has already flipped back to false. Sampling it at tick time
+ *  therefore always reads "visible" and can never suppress the very gap it was meant to suppress —
+ *  the whole background interval got logged as one bogus multi-second stall. The caller latches the
+ *  hidden state via `visibilitychange` instead, which is the only signal that survives the pause. */
+export function classifyJankGap(
+  gapMs: number,
+  thresholdMs: number,
+  wasHiddenSinceLastTick: boolean,
+): JankVerdict {
+  if (gapMs < thresholdMs) return "ignore";
+  if (wasHiddenSinceLastTick) return "ignore";
+  return gapMs >= SUSPEND_MS ? "resume" : "stall";
+}
+
 /** Start a requestAnimationFrame loop that logs any inter-frame gap exceeding `thresholdMs` — i.e.
- *  every time the main thread was blocked long enough to drop frames (the visible "freeze"). Idle
- *  when the window is hidden (rAF is throttled/paused then, which would be a false positive), and
- *  gaps above `SUSPEND_MS` are logged as a resume rather than a stall (the machine was asleep). This
- *  is the single most useful instrument for "the app is slow": it catches EVERY stall, whatever the
- *  cause, so we can then correlate the timestamp against the spawn/switch/close/span/render lines.
- *  Idempotent; safe to call from multiple mounts. */
+ *  every time the main thread was blocked long enough to drop frames (the visible "freeze"). Gaps
+ *  accrued while the window was hidden are dropped (rAF is paused then, so the gap measures
+ *  backgrounded time, not a freeze), and gaps above `SUSPEND_MS` are logged as a resume rather than
+ *  a stall (the machine was asleep). This is the single most useful instrument for "the app is
+ *  slow": it catches EVERY stall, whatever the cause, so we can then correlate the timestamp against
+ *  the spawn/switch/close/span/render lines. Idempotent; safe to call from multiple mounts. */
 export function startJankMonitor(thresholdMs = 150): void {
   if (jankRunning || typeof requestAnimationFrame !== "function") return;
   jankRunning = true;
   let last = perfNow();
+  // Latched by the visibilitychange listener and cleared by the next tick that consumes it — see
+  // classifyJankGap for why tick-time `document.hidden` is the wrong signal.
+  let hiddenSinceLastTick = typeof document !== "undefined" && document.hidden;
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) hiddenSinceLastTick = true;
+    });
+  }
   log.info("perf", "jank monitor started", { thresholdMs, heapMb: heapMb() });
   const tick = () => {
     const now = perfNow();
     const gap = now - last;
     last = now;
-    // Skip gaps accrued while hidden — rAF is paused/throttled in the background, not a real stall.
-    if (gap >= thresholdMs && (typeof document === "undefined" || !document.hidden)) {
-      if (gap >= SUSPEND_MS) {
-        // Resume from suspend, not a freeze — record it (still useful to correlate) without the warn.
-        log.debug("perf", "resume after suspend", { ms: Math.round(gap) });
-      } else {
-        log.warn("perf", "jank stall", { ms: Math.round(gap), heapMb: heapMb() });
-      }
+    const verdict = classifyJankGap(gap, thresholdMs, hiddenSinceLastTick);
+    hiddenSinceLastTick = typeof document !== "undefined" && document.hidden;
+    if (verdict === "resume") {
+      // Resume from suspend, not a freeze — record it (still useful to correlate) without the warn.
+      log.debug("perf", "resume after suspend", { ms: Math.round(gap) });
+    } else if (verdict === "stall") {
+      log.warn("perf", "jank stall", { ms: Math.round(gap), heapMb: heapMb() });
     }
     requestAnimationFrame(tick);
   };
