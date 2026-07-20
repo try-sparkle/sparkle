@@ -41,7 +41,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::claude_chat::{handle_event, shell_quote};
+use crate::claude_chat::{capture_result_status, handle_event, shell_quote};
 
 /// Login shell, as `zsh -l -c 'exec …'` — matches `pty.rs` / `claude_chat.rs` / `claudeSpawn.ts`.
 const SHELL: &str = "/bin/zsh";
@@ -275,6 +275,12 @@ pub fn sparkle_improve_run(
             let mut final_text = String::new();
             let mut acc = String::new();
             let mut line: Vec<u8> = Vec::new();
+            // Failure fields off the `result` event. `handle_event` deliberately ignores these
+            // (its signature is shared with the chat engine), so capture them alongside it —
+            // otherwise an empty-stderr failure throws away the only account of what went wrong.
+            let mut result_subtype: Option<String> = None;
+            let mut is_error = false;
+            let mut error_detail: Option<String> = None;
             loop {
                 line.clear();
                 match reader.read_until(b'\n', &mut line) {
@@ -289,6 +295,12 @@ pub fn sparkle_improve_run(
                             // No delta consumer for the hourly pass — the closure only feeds
                             // `acc`, the fallback if the stream ends without a `result` event.
                             handle_event(&ev, &mut session_id, &mut final_text, &mut acc, &mut |_| {});
+                            capture_result_status(
+                                &ev,
+                                &mut result_subtype,
+                                &mut is_error,
+                                &mut error_detail,
+                            );
                         } else {
                             tracing::debug!("sparkle_improve: skipped non-JSON stdout line");
                         }
@@ -318,19 +330,13 @@ pub fn sparkle_improve_run(
                 let _ = read_app.emit("sparkle_improve:done", ImproveDone { session_id, text });
             } else {
                 let stderr_text = stderr_handle.join().unwrap_or_default();
-                // When the child dies with NO stderr, the bare "exited without a successful
-                // result" line left the recurring hourly-pass failures undiagnosable. Append the
-                // exit status (code, or on unix the terminating signal) so an ordinary error exit
-                // is distinguishable from an OOM/SIGKILL or a SIGTERM reap. It's just an integer —
-                // no user data.
-                let message = if !stderr_text.trim().is_empty() {
-                    stderr_text.trim().to_string()
-                } else {
-                    format!(
-                        "claude exited without a successful result ({})",
-                        describe_exit_status(&wait_result)
-                    )
-                };
+                let message = failure_message(
+                    &stderr_text,
+                    result_subtype.as_deref(),
+                    is_error,
+                    error_detail.as_deref(),
+                    &wait_result,
+                );
                 tracing::warn!(%message, "sparkle_improve: pass failed");
                 let _ = read_app.emit("sparkle_improve:error", ImproveError { message });
             }
@@ -377,6 +383,44 @@ fn describe_exit_status(status: &std::io::Result<std::process::ExitStatus>) -> S
         }
         Err(e) => format!("could not reap the process: {e}"),
     }
+}
+
+/// Build the `sparkle_improve:error` message for a failed pass. Priority, most-useful first —
+/// the same order `claude_chat::build_error_message` uses for the Think tab, so a failure reads
+/// the same wherever it surfaces:
+///  1. the child's own stderr (its real diagnostics) when non-empty;
+///  2. `detail` — claude's OWN error text lifted off the failed `result` event by
+///     `capture_result_status` (a usage limit, an API/auth error, …). This is the fix for the
+///     recurring empty-stderr exit-1 pass, which used to dead-end on (3) alone;
+///  3. the synthesized exit-status phrase, now naming any non-`"success"` subtype / `is_error`
+///     flag so a max-turns stop is distinguishable from a crash.
+/// Pure, so the precedence is unit-testable without spawning a real pass.
+fn failure_message(
+    stderr: &str,
+    result_subtype: Option<&str>,
+    is_error: bool,
+    detail: Option<&str>,
+    status: &std::io::Result<std::process::ExitStatus>,
+) -> String {
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        return stderr.to_string();
+    }
+    if let Some(detail) = detail.map(str::trim).filter(|s| !s.is_empty()) {
+        return detail.to_string();
+    }
+    // Keep the long-standing fallback wording — it's what the existing log history reads like —
+    // and append whatever the stream managed to tell us.
+    let mut m = format!(
+        "claude exited without a successful result ({})",
+        describe_exit_status(status)
+    );
+    if let Some(st) = result_subtype {
+        m.push_str(&format!("; result subtype '{st}'"));
+    } else if is_error {
+        m.push_str("; stream reported an error result");
+    }
+    m
 }
 
 #[cfg(test)]
@@ -493,5 +537,93 @@ mod tests {
         // so an OOM/SIGKILL is distinguishable from a clean error exit.
         let s = Command::new("sh").args(["-c", "kill -9 $$"]).status();
         assert_eq!(describe_exit_status(&s), "killed by signal 9");
+    }
+
+    /// A non-zero exit status to hang the synthesized-fallback tests off of.
+    fn failed_status() -> std::io::Result<std::process::ExitStatus> {
+        Command::new("sh").args(["-c", "exit 1"]).status()
+    }
+
+    #[test]
+    fn failure_message_prefers_stderr_over_everything() {
+        // The child's own diagnostics are the most useful thing we have — quote them verbatim
+        // rather than the stream's detail or a synthesized phrase.
+        let m = failure_message(
+            "  boom: real stderr\n",
+            Some("error_during_execution"),
+            true,
+            Some("claude's detail"),
+            &failed_status(),
+        );
+        assert_eq!(m, "boom: real stderr");
+    }
+
+    #[test]
+    fn failure_message_surfaces_claude_detail_when_stderr_empty() {
+        // The recurring hourly failure: exit 1 with EMPTY stderr. The stream carried claude's
+        // OWN reason — surface THAT instead of the bare exit-status fallback.
+        let m = failure_message(
+            "",
+            Some("error_during_execution"),
+            true,
+            Some("Claude usage limit reached"),
+            &failed_status(),
+        );
+        assert_eq!(m, "Claude usage limit reached");
+        assert!(!m.contains("without a successful result"), "got: {m}");
+    }
+
+    #[test]
+    fn failure_message_falls_back_to_exit_status_and_names_the_subtype() {
+        // Nothing to quote: keep the existing fallback wording (log continuity) but append the
+        // non-success subtype, which distinguishes e.g. a max-turns stop from a crash.
+        let m = failure_message("", Some("error_max_turns"), true, None, &failed_status());
+        assert!(m.contains("claude exited without a successful result (exit code 1)"), "got: {m}");
+        assert!(m.contains("error_max_turns"), "got: {m}");
+    }
+
+    #[test]
+    fn failure_message_notes_an_error_result_with_no_subtype() {
+        // is_error with no subtype still beats saying nothing about the stream.
+        let m = failure_message("", None, true, None, &failed_status());
+        assert!(m.contains("stream reported an error result"), "got: {m}");
+    }
+
+    #[test]
+    fn failure_message_is_bare_fallback_when_stream_said_nothing() {
+        // Child died before emitting any result event (crash/auth failure) — unchanged behavior.
+        let m = failure_message("", None, false, None, &failed_status());
+        assert_eq!(m, "claude exited without a successful result (exit code 1)");
+    }
+
+    #[test]
+    fn failure_message_ignores_blank_detail_and_falls_through() {
+        // A whitespace-only detail must not win over the synthesized fallback.
+        let m = failure_message("", None, false, Some("   "), &failed_status());
+        assert_eq!(m, "claude exited without a successful result (exit code 1)");
+    }
+
+    #[test]
+    fn a_failed_result_event_reaches_the_message_instead_of_being_dropped() {
+        // The actual regression guard: drive the SEAM the reader loop uses — the same NDJSON
+        // `result` shape a failed `claude -p --output-format stream-json` emits — through
+        // capture_result_status into failure_message. Before this wiring the pass parsed this
+        // event, kept nothing from it, and reported only "(exit code 1)".
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["Claude usage limit reached"]}"#;
+        let ev: Value = serde_json::from_str(line).unwrap();
+
+        let (mut session_id, mut final_text, mut acc) = (String::new(), String::new(), String::new());
+        let (mut subtype, mut is_error, mut detail) = (None, false, None);
+        handle_event(&ev, &mut session_id, &mut final_text, &mut acc, &mut |_| {});
+        capture_result_status(&ev, &mut subtype, &mut is_error, &mut detail);
+
+        let m = failure_message(
+            "",
+            subtype.as_deref(),
+            is_error,
+            detail.as_deref(),
+            &failed_status(),
+        );
+        assert_eq!(m, "Claude usage limit reached");
     }
 }

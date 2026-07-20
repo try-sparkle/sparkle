@@ -507,16 +507,46 @@ fn may_write_hook(exists: bool, contents: Option<&str>, marker: &str) -> bool {
     }
 }
 
-/// Copy the vendored roborev git hooks into `<repo_root>/.git/hooks`, mode 0755. Idempotent, and
+/// Resolve the directory git actually reads hooks from for the repo at `repo_root`.
+///
+/// `<repo_root>/.git` is a DIRECTORY only in a normal clone. In a linked worktree it is a gitlink
+/// *file* pointing at the real gitdir, so joining `.git/hooks` yields a path under a regular file —
+/// `create_dir_all` there fails with ENOTDIR and hook install never happens. `--git-common-dir`
+/// returns the shared gitdir in both layouts, so a worktree correctly resolves to its parent repo's
+/// hooks.
+///
+/// KNOWN LIMITATION: this is where git runs hooks from *unless* `core.hooksPath` is set, which
+/// redirects them elsewhere; hooks we install here are then never executed. We deliberately do NOT
+/// resolve via `--git-path hooks` (which would honour `core.hooksPath`), because that config is
+/// frequently set GLOBALLY to a directory shared by every repo on the machine — installing into it
+/// would silently affect repos the user never opened in this app. Confining our writes to this
+/// repo's own gitdir is the safer failure: ineffective, not invasive.
+///
+/// Git may answer with a path relative to `repo_root` (typically a bare `.git`), so a relative
+/// answer is re-anchored. If git can't be run at all we fall back to the literal `.git/hooks` —
+/// correct for the normal-clone majority and no worse than the previous behaviour.
+fn hooks_dir_for(repo_root: &str) -> PathBuf {
+    let common = git(repo_root, &["rev-parse", "--git-common-dir"])
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    match common {
+        Some(dir) if dir.is_absolute() => dir.join("hooks"),
+        Some(dir) => Path::new(repo_root).join(dir).join("hooks"),
+        None => Path::new(repo_root).join(".git").join("hooks"),
+    }
+}
+
+/// Copy the vendored roborev git hooks into the repo's hooks dir, mode 0755. Idempotent, and
 /// NON-DESTRUCTIVE: a pre-existing hook that is not ours (no vendored marker) is left untouched
 /// (see `may_write_hook`) — since `[tools].roborev` defaults on and this runs for every project,
 /// silently overwriting a user's own `post-commit`/`post-rewrite` would be data loss. Each script is
 /// resolved from the app bundle's `resources/roborev/<name>` and `.exists()`-guarded, so a dev build
 /// with un-bundled resources degrades to a clear Err rather than a panic. Git worktrees share the
-/// common-dir hooks, so installing into the project repo's `.git/hooks` transparently covers every
-/// `.sparkle/` agent worktree cut from it.
+/// common-dir hooks (see `hooks_dir_for`), so installing once transparently covers every
+/// `.sparkle/` agent worktree cut from the repo — and works when `repo_root` IS such a worktree.
 pub fn install_repo_hooks(app: &AppHandle, repo_root: &str) -> Result<(), String> {
-    let hooks_dir = Path::new(repo_root).join(".git").join("hooks");
+    let hooks_dir = hooks_dir_for(repo_root);
     std::fs::create_dir_all(&hooks_dir)
         .map_err(|e| format!("cannot create {hooks_dir:?}: {e}"))?;
 
@@ -557,12 +587,12 @@ pub fn install_repo_hooks(app: &AppHandle, repo_root: &str) -> Result<(), String
     Ok(())
 }
 
-/// Remove the roborev git hooks from `<repo_root>/.git/hooks`, but ONLY when a hook's contents mark
+/// Remove the roborev git hooks from the repo's hooks dir, but ONLY when a hook's contents mark
 /// it as ours (the vendored marker substring) — a user's own same-named hook is left untouched. A
 /// missing hook is a no-op. Idempotent. Best-effort per file: an unreadable/undeletable hook is
 /// skipped rather than aborting the sweep.
 pub fn remove_repo_hooks(repo_root: &str) -> Result<(), String> {
-    let hooks_dir = Path::new(repo_root).join(".git").join("hooks");
+    let hooks_dir = hooks_dir_for(repo_root);
     for (name, marker) in ROBOREV_HOOKS {
         let hook = hooks_dir.join(name);
         // Only touch a hook that EXISTS and whose contents identify it as ours.
@@ -2832,6 +2862,51 @@ mod tests {
         // Idempotent: a second sweep (nothing of ours left) is a clean no-op.
         remove_repo_hooks(&root_str).unwrap();
         assert!(theirs.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A linked worktree's `.git` is a gitlink FILE, so the old `<root>/.git/hooks` join produced a
+    /// path under a regular file and every install failed with ENOTDIR — roborev review silently
+    /// never installed for worktree-rooted projects. `hooks_dir_for` must resolve a worktree to its
+    /// parent repo's shared hooks dir, which is where git actually runs hooks from.
+    #[test]
+    fn hooks_dir_for_resolves_a_worktree_to_the_shared_hooks_dir() {
+        let root = unique_root("hooks-dir-worktree");
+        let main = root.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let main_str = main.to_string_lossy().to_string();
+
+        // A real repo with one commit, so a worktree can be cut from it.
+        for args in [
+            vec!["init", "-q"],
+            // Identity is required to commit; git does not validate the shape, so keep these
+            // free of anything resembling a real address.
+            vec!["config", "user.email", "sparkle-test"],
+            vec!["config", "user.name", "sparkle-test"],
+            vec!["commit", "-q", "--allow-empty", "-m", "seed"],
+        ] {
+            git(&main_str, &args).unwrap();
+        }
+
+        // Normal clone: hooks live in the repo's own .git/hooks.
+        assert_eq!(hooks_dir_for(&main_str), main.join(".git").join("hooks"));
+
+        let wt = root.join("wt");
+        let wt_str = wt.to_string_lossy().to_string();
+        git(&main_str, &["worktree", "add", "-q", &wt_str, "-b", "side"]).unwrap();
+
+        // Precondition: this is the layout that used to break — .git is a file, not a directory.
+        assert!(wt.join(".git").is_file(), "a linked worktree's .git must be a gitlink file");
+
+        // The worktree resolves to the SHARED hooks dir, and creating it succeeds (the ENOTDIR fix).
+        let resolved = hooks_dir_for(&wt_str);
+        assert_eq!(
+            std::fs::canonicalize(resolved.parent().unwrap()).unwrap(),
+            std::fs::canonicalize(main.join(".git")).unwrap(),
+            "worktree hooks must resolve under the parent repo's gitdir"
+        );
+        std::fs::create_dir_all(&resolved).expect("hooks dir must be creatable (was ENOTDIR)");
 
         let _ = std::fs::remove_dir_all(&root);
     }

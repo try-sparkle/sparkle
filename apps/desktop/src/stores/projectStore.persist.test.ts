@@ -73,6 +73,60 @@ describe("debouncedLocalStorage (sparkle-pngb)", () => {
     expect(storage.getItem("k")).toBe("from-window-B");
   });
 
+  it("skips a redundant write when disk already holds a byte-identical value (sparkle-noop-persist)", () => {
+    // The projects blob is re-persisted on many mutations that don't change its serialized form, so
+    // the same string was written to localStorage repeatedly. Substitute a counting mock and confirm
+    // a flush whose value already matches disk performs NO real setItem.
+    const store = new Map<string, string>();
+    let setItemCalls = 0;
+    vi.stubGlobal("localStorage", {
+      getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+      setItem: (k: string, v: string) => {
+        setItemCalls += 1;
+        store.set(k, v);
+      },
+      removeItem: (k: string) => void store.delete(k),
+      clear: () => store.clear(),
+      key: () => null,
+      get length() {
+        return store.size;
+      },
+    });
+
+    const { storage } = debouncedLocalStorage(PROJECTS_PERSIST_DEBOUNCE_MS);
+    storage.setItem("k", "same");
+    vi.advanceTimersByTime(PROJECTS_PERSIST_DEBOUNCE_MS);
+    expect(setItemCalls).toBe(1); // first write lands
+
+    // A subsequent persist of the identical value must not touch localStorage again.
+    storage.setItem("k", "same");
+    vi.advanceTimersByTime(PROJECTS_PERSIST_DEBOUNCE_MS);
+    expect(setItemCalls).toBe(1); // still one — the no-op was elided
+
+    // A genuinely changed value is still written.
+    storage.setItem("k", "changed");
+    vi.advanceTimersByTime(PROJECTS_PERSIST_DEBOUNCE_MS);
+    expect(setItemCalls).toBe(2);
+    expect(localStorage.getItem("k")).toBe("changed");
+  });
+
+  it("does NOT skip when another window changed disk after our last write (cross-window safe)", () => {
+    // The skip compares against LIVE localStorage, so a value that merely equals what WE last wrote
+    // is still re-written if disk has since diverged — otherwise a window could fail to persist its
+    // own state over a cross-window change it hasn't absorbed.
+    const { storage } = debouncedLocalStorage(PROJECTS_PERSIST_DEBOUNCE_MS);
+    storage.setItem("k", "ours");
+    vi.advanceTimersByTime(PROJECTS_PERSIST_DEBOUNCE_MS);
+    expect(localStorage.getItem("k")).toBe("ours");
+
+    // Another window overwrites the shared blob.
+    localStorage.setItem("k", "from-window-B");
+    // We persist "ours" again; because disk now holds a different value, the write must happen.
+    storage.setItem("k", "ours");
+    vi.advanceTimersByTime(PROJECTS_PERSIST_DEBOUNCE_MS);
+    expect(localStorage.getItem("k")).toBe("ours");
+  });
+
   it("removeItem drops any pending write and deletes the key", () => {
     const { storage } = debouncedLocalStorage(PROJECTS_PERSIST_DEBOUNCE_MS);
     localStorage.setItem("k", "on-disk");

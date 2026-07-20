@@ -4,8 +4,37 @@ import {
   hashScrollback,
   withinRetryBudget,
   retryBackoffMs,
+  isTerminalComputeError,
   RETRY_BACKOFF_MS,
 } from "./useSuggestions";
+
+describe("isTerminalComputeError (skips retries that can't succeed)", () => {
+  // The message shape the proxy/anthropic layer actually throws.
+  const proxy = (code: number) => `Claude request failed: ai request failed (HTTP ${code})`;
+
+  it("treats a 4xx as permanent — an identical retry only wastes a paid call", () => {
+    expect(isTerminalComputeError(proxy(404))).toBe(true);
+    expect(isTerminalComputeError(proxy(400))).toBe(true);
+    expect(isTerminalComputeError(proxy(401))).toBe(true);
+  });
+
+  it("keeps retrying the codes that mean 'try again later'", () => {
+    expect(isTerminalComputeError(proxy(408))).toBe(false);
+    expect(isTerminalComputeError(proxy(429))).toBe(false);
+  });
+
+  it("keeps retrying 5xx — that's the transient gateway blip the backoff exists for", () => {
+    expect(isTerminalComputeError(proxy(500))).toBe(false);
+    expect(isTerminalComputeError(proxy(502))).toBe(false);
+    expect(isTerminalComputeError(proxy(503))).toBe(false);
+  });
+
+  it("retries anything with no HTTP status (transport errors, unknown rejections)", () => {
+    expect(isTerminalComputeError("Claude request failed: ai request failed")).toBe(false);
+    expect(isTerminalComputeError("bad JSON: unexpected token")).toBe(false);
+    expect(isTerminalComputeError("")).toBe(false);
+  });
+});
 
 describe("withinRetryBudget (bounds persistent-rejection retries)", () => {
   it("allows retries below the cap (3) and stops at it", () => {

@@ -427,6 +427,16 @@ export function debouncedLocalStorage(delayMs: number): { storage: StateStorage;
     if (pending.size === 0) return;
     for (const [k, v] of pending) {
       try {
+        // Skip a redundant write when the value already on disk is byte-identical to what we'd write
+        // (sparkle-noop-persist). The whole projects blob is re-persisted on many mutations that
+        // don't change its serialized form (status ticks, reselecting the already-active tab, …), so
+        // the same ~190KB string was re-written to localStorage over and over — pure synchronous
+        // main-thread cost with no observable effect (and no cross-window storage event worth
+        // firing, since disk already holds it). Compare against LIVE localStorage rather than a
+        // cached last-written copy: that keeps the skip correct across windows — we only elide a
+        // write when the shared on-disk truth ALREADY equals our value, never when another window
+        // has since changed it.
+        if (localStorage.getItem(k) === v) continue;
         // Time the synchronous main-thread write of the (potentially multi-MB) persisted blob — a
         // known past hotspot (sparkle-pngb). `bytes` shows whether a bloated projects blob (lots of
         // agents × promptHistory) is what's stalling writes (perfTrace).

@@ -109,8 +109,23 @@ describe("useSuggestions concurrency guard", () => {
     await waitFor(() => expect(computeSuggestions).toHaveBeenCalledTimes(2));
   });
 
-  // NOTE: the *bound* on persistent-rejection retries is verified by the pure `withinRetryBudget`
-  // unit test in useSuggestions.test.ts. A full hook-level persistent-reject simulation was
-  // intentionally omitted — driving repeated promise rejections through act() deadlocks this
-  // runner — and the budget logic is the only new piece, so the pure test covers it deterministically.
+  it("does not retry a permanent (4xx) rejection — it can only fail the same way", async () => {
+    computeSuggestions.mockRejectedValue(
+      new Error("Claude request failed: ai request failed (HTTP 404)"),
+    );
+
+    renderHook(() => useSuggestions("a1", true));
+
+    // Exactly one compute: the terminal branch burns the whole budget up front, so no retry is
+    // scheduled. Wait past the first-retry backoff (700ms) — a retry, if one were scheduled, would
+    // have fired by now and pushed this to 2.
+    await waitFor(() => expect(computeSuggestions).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(computeSuggestions).toHaveBeenCalledTimes(1);
+  });
+
+  // NOTE: the *bound* on retryABLE persistent rejections is verified by the pure `withinRetryBudget`
+  // unit test in useSuggestions.test.ts. A full hook-level simulation of that path was intentionally
+  // omitted — driving repeated promise rejections through act() deadlocks this runner. The terminal
+  // (non-retryable) path above needs no such driving, so it IS covered end-to-end here.
 });

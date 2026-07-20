@@ -53,6 +53,24 @@ export function withinRetryBudget(failures: number): boolean {
   return failures < MAX_COMPUTE_ATTEMPTS;
 }
 
+/**
+ * Whether a rejected compute is PERMANENT for this request — i.e. an identical retry is guaranteed
+ * to fail the same way, so spending the retry budget on it only buys wasted (paid) calls, extra
+ * gateway load, and duplicate warnings. The proxy surfaces its status as `... (HTTP <code>)`.
+ *
+ * 4xx means "this request is wrong" (bad route, bad body, bad/expired auth) and nothing about
+ * re-sending it changes that — EXCEPT 408 (Request Timeout) and 429 (Too Many Requests), which are
+ * explicitly "try this again later" and keep the normal backoff. 5xx stays retryable: it's the
+ * transient-gateway-blip case the backoff exists for.
+ */
+export function isTerminalComputeError(message: string): boolean {
+  const m = /\(HTTP (\d{3})\)/.exec(message);
+  if (!m) return false;
+  const code = Number(m[1]);
+  if (code === 408 || code === 429) return false;
+  return code >= 400 && code < 500;
+}
+
 // Base delay before RETRYING a *failed* compute. The overwhelmingly common failure is a transient
 // AI-gateway blip ("ai request failed", HTTP 502) — retrying instantly fires all attempts within a
 // few milliseconds, so they land on the SAME blip and the whole state gives up (and hammers a
@@ -248,10 +266,17 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // can't spin into an unbounded loop of paid computes. A genuine state change resets this.
         failures.current += 1;
         lastFailHash.current = nextHash;
+        const message = err instanceof Error ? err.message : String(err);
+        // A permanent rejection (see isTerminalComputeError) can't be retried into a success, so
+        // burn the whole budget at once: the retry branch below then falls through to the terminal
+        // path, and the effect's own budget guard refuses any later re-trigger for this same hash.
+        const terminal = isTerminalComputeError(message);
+        if (terminal) failures.current = MAX_COMPUTE_ATTEMPTS;
         log.warn("suggestions", "compute failed", {
           agentId,
           failures: failures.current,
-          error: err instanceof Error ? err.message : String(err),
+          terminal,
+          error: message,
         });
         if (!alive) return;
         if (withinRetryBudget(failures.current)) {
