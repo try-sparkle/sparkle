@@ -60,8 +60,10 @@ pub fn worktree_path(app_data: &Path, project_id: &str, agent_id: &str) -> Resul
 }
 
 /// Resolve Sparkle's per-user app-data dir (e.g. ~/Library/Application Support/ai.sparkle.desktop).
+/// Routes through `dev_identity` so DEBUG builds get the isolated `-dev` sibling and never mutate
+/// production workspace state.
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path().app_data_dir().map_err(|e| format!("no app data dir: {e}"))
+    crate::dev_identity::app_data_dir(app)
 }
 
 /// Public wrapper around `app_data_dir` for use by other modules (e.g. bridge.rs).
@@ -89,7 +91,7 @@ fn apply_noninteractive(cmd: &mut Command) {
 
 /// carrying stderr (falling back to stdout) on failure.
 fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(crate::preflight::git_program());
     cmd.arg("-C").arg(cwd).args(args);
     apply_noninteractive(&mut cmd);
     let output = cmd
@@ -120,7 +122,10 @@ const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
 /// std-only (no tokio, per the backend constraint): the child stays owned here so we can kill it,
 /// two reader threads drain stdout/stderr concurrently (so a chatty child can't deadlock on a full
 /// pipe while we wait), and we poll `try_wait` until the deadline (std has no wait-with-timeout).
-fn output_with_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::Output, String> {
+pub(crate) fn output_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
     use std::io::Read;
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -181,7 +186,7 @@ fn output_with_timeout(mut cmd: Command, timeout: Duration) -> Result<std::proce
 /// non-interactive env and stdout/stderr-on-failure semantics as `git`; a timeout reads as an Err
 /// (which every caller already treats as "offline/degrade — fall back to the local ref").
 fn git_networked(cwd: &str, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(crate::preflight::git_program());
     cmd.arg("-C").arg(cwd).args(args);
     apply_noninteractive(&mut cmd);
     let output = output_with_timeout(cmd, NETWORK_TIMEOUT)
@@ -447,11 +452,144 @@ fn ensure_project_repo_inner(path: String) -> Result<(), String> {
 /// Ensure `<path>` is a git repo with a committable identity, at least one commit, and `.sparkle/`
 /// ignored. Idempotent. `async` + `spawn_blocking` so the 3-4 git subprocesses the first agent per
 /// project pays never stall the UI thread.
+///
+/// After the repo is ensured, best-effort installs the roborev per-commit review hooks into the
+/// repo's `.git/hooks` when `[tools].roborev` is on — so every commit (including those in the
+/// `.sparkle/` agent worktrees, which share the common-dir hooks) gets reviewed. Hook installation
+/// NEVER fails the command: a missing bundled resource / copy error is logged and swallowed. The
+/// `app` arg is injected by Tauri; the JS `invoke("ensure_project_repo", { path })` is unchanged.
 #[tauri::command]
-pub async fn ensure_project_repo(path: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || ensure_project_repo_inner(path))
+pub async fn ensure_project_repo(app: AppHandle, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_project_repo_inner(path.clone())?;
+        // Best-effort roborev hook wiring, gated on BOTH the machine-wide [tools].roborev toggle AND
+        // the one-time consent having been resolved — so we never review (or touch .git/hooks in) a
+        // user's repo before they've answered the consent prompt, matching the daemon-ensure gate in
+        // lib.rs. On Enable the frontend sweeps install_repo_hooks over existing projects. Kept OUT
+        // of ensure_project_repo_inner so its direct-call unit tests stay hook-free.
+        let cfg = crate::config::for_project(&path).config;
+        if cfg.tools.roborev && cfg.roborev.consent_prompted {
+            if let Err(e) = install_repo_hooks(&app, &path) {
+                tracing::warn!(%path, error = %e, "roborev hook install failed (non-fatal)");
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("ensure_project_repo task failed: {e}"))?
+}
+
+/// The two git hooks roborev drives, and the marker substring the vendored copy of each carries.
+/// `remove_repo_hooks` uses the marker to ensure it only ever deletes a hook that is OURS, never a
+/// user's own same-named hook. The markers are stable comment lines in the bundled scripts.
+// The marker is a DISTINCTIVE line the vendored script carries (not the bare phrase "roborev
+// post-commit", which a user's own hook could mention in a comment) so ownership detection can't
+// misfire on a foreign hook.
+const ROBOREV_HOOKS: &[(&str, &str)] = &[
+    ("post-commit", "seed-owned wrapper"),
+    ("post-rewrite", "vendored copy owned by the Sparkle app"),
+];
+
+/// Decide whether it is safe to write our vendored hook over what is at `dest`. NEVER clobber a
+/// user's own same-named hook: write only when nothing is there, or when a readable existing file is
+/// already OURS (carries the vendored marker). CRITICAL: `exists` and `contents` are separate — a
+/// git hook can be a compiled binary or a non-UTF-8 / unreadable script, where reading-as-text fails
+/// (`contents == None`) even though the file IS present. Collapsing that into "absent" would silently
+/// overwrite the foreign hook — the exact data loss this guards against — so a present-but-unreadable
+/// hook is treated as foreign and preserved. Pure, so the rule is unit-tested without the resolver.
+fn may_write_hook(exists: bool, contents: Option<&str>, marker: &str) -> bool {
+    if !exists {
+        return true; // nothing there — safe to install
+    }
+    match contents {
+        Some(c) => c.contains(marker), // readable → ours (refresh) iff the vendored marker is present
+        None => false,                 // present but unreadable (binary / permission) → foreign, preserve
+    }
+}
+
+/// Copy the vendored roborev git hooks into `<repo_root>/.git/hooks`, mode 0755. Idempotent, and
+/// NON-DESTRUCTIVE: a pre-existing hook that is not ours (no vendored marker) is left untouched
+/// (see `may_write_hook`) — since `[tools].roborev` defaults on and this runs for every project,
+/// silently overwriting a user's own `post-commit`/`post-rewrite` would be data loss. Each script is
+/// resolved from the app bundle's `resources/roborev/<name>` and `.exists()`-guarded, so a dev build
+/// with un-bundled resources degrades to a clear Err rather than a panic. Git worktrees share the
+/// common-dir hooks, so installing into the project repo's `.git/hooks` transparently covers every
+/// `.sparkle/` agent worktree cut from it.
+pub fn install_repo_hooks(app: &AppHandle, repo_root: &str) -> Result<(), String> {
+    let hooks_dir = Path::new(repo_root).join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks_dir)
+        .map_err(|e| format!("cannot create {hooks_dir:?}: {e}"))?;
+
+    for (name, marker) in ROBOREV_HOOKS {
+        let src = app
+            .path()
+            .resolve(
+                format!("resources/roborev/{name}"),
+                tauri::path::BaseDirectory::Resource,
+            )
+            .map_err(|e| format!("bundled roborev {name} hook missing: {e}"))?;
+        if !src.exists() {
+            return Err(format!(
+                "bundled roborev {name} hook not found at {} (run apps/desktop build to bundle it)",
+                src.display()
+            ));
+        }
+        let dest = hooks_dir.join(name);
+        // Never clobber a user's own hook: skip if a foreign hook already sits here. Pass existence
+        // separately from readable contents so a present-but-unreadable (binary/perm) hook is NOT
+        // mistaken for "absent" and overwritten.
+        if !may_write_hook(dest.exists(), std::fs::read_to_string(&dest).ok().as_deref(), marker) {
+            tracing::info!(
+                hook = %name, repo = %repo_root,
+                "preserving a pre-existing non-roborev {name} hook (not overwriting)"
+            );
+            continue;
+        }
+        std::fs::copy(&src, &dest)
+            .map_err(|e| format!("copying roborev {name} hook to {dest:?} failed: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod roborev {name} hook failed: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove the roborev git hooks from `<repo_root>/.git/hooks`, but ONLY when a hook's contents mark
+/// it as ours (the vendored marker substring) — a user's own same-named hook is left untouched. A
+/// missing hook is a no-op. Idempotent. Best-effort per file: an unreadable/undeletable hook is
+/// skipped rather than aborting the sweep.
+pub fn remove_repo_hooks(repo_root: &str) -> Result<(), String> {
+    let hooks_dir = Path::new(repo_root).join(".git").join("hooks");
+    for (name, marker) in ROBOREV_HOOKS {
+        let hook = hooks_dir.join(name);
+        // Only touch a hook that EXISTS and whose contents identify it as ours.
+        let Ok(contents) = std::fs::read_to_string(&hook) else {
+            continue; // missing or unreadable — nothing of ours to remove
+        };
+        if contents.contains(marker) {
+            let _ = std::fs::remove_file(&hook); // best-effort; a failure just leaves it in place
+        }
+    }
+    Ok(())
+}
+
+/// Thin Tauri wrapper: install the roborev hooks into `path`'s repo (frontend toggle-on sweep).
+#[tauri::command]
+pub async fn install_repo_hooks_cmd(app: AppHandle, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || install_repo_hooks(&app, &path))
         .await
-        .map_err(|e| format!("ensure_project_repo task failed: {e}"))?
+        .map_err(|e| format!("install_repo_hooks task failed: {e}"))?
+}
+
+/// Thin Tauri wrapper: remove the roborev hooks from `path`'s repo (frontend toggle-off sweep).
+#[tauri::command]
+pub async fn remove_repo_hooks_cmd(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || remove_repo_hooks(&path))
+        .await
+        .map_err(|e| format!("remove_repo_hooks task failed: {e}"))?
 }
 
 /// Append `.sparkle/` to `<root>/.gitignore` if not already ignored. Idempotent.
@@ -788,6 +926,11 @@ pub struct WorkflowState {
     /// EDGE: a squash-landed branch's tip isn't an ancestor of the tagged release, so this reads false
     /// for squashed work (the merge/`landed` signal still lights "Merged"); tip-relative on purpose.
     shipped: bool,
+    /// The repo has an `origin` remote. Gated on `probe_pr_state` (same as the PR probe), so a
+    /// fast/local poll reports false — the frontend stores this stickily and treats a false from a
+    /// non-probing tick as "unknown", never as "no remote". Without this, a remoteless repo can
+    /// never reach `in_origin_main` and would strand at "Push to Origin Main" with Close unreachable.
+    has_remote: bool,
     /// Best-effort GitHub PR state for this branch via `gh`, if one is found: "open" | "merged" |
     /// "closed". None when gh is absent/unauthed, there's no remote, or no PR matches the branch.
     pr_state: Option<String>,
@@ -801,7 +944,7 @@ fn ref_contains(root: &str, target: &str, commit: &str) -> bool {
     if target.trim().is_empty() {
         return false;
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(crate::preflight::git_program());
     cmd.arg("-C").arg(root).args(["merge-base", "--is-ancestor", commit, target]);
     // A missing target ref makes git print "fatal: Not a valid object name" to stderr; null the
     // child stdio so that expected, frequent case (e.g. no origin/main) doesn't spam app logs.
@@ -1461,6 +1604,7 @@ pub fn agent_workflow_state_at(
         landed,
         pushed,
         shipped,
+        has_remote: has_origin,
         pr_state,
         pr_number,
         pr_url,
@@ -1660,6 +1804,9 @@ fn workflow_state_shared(
         landed,
         pushed,
         shipped,
+        // `has_origin` already folds in the caller's probe gate (see this fn's doc comment), so this
+        // carries the same "false means no-remote OR not-probed" ambiguity as the per-agent path.
+        has_remote: has_origin,
         pr_state,
         pr_number,
         pr_url,
@@ -1935,7 +2082,7 @@ pub fn refresh_agent_branch_at(
     }
 
     let base = effective_base(root, base_branch, true); // fetch fresh tip
-    let mut rebase = Command::new("git");
+    let mut rebase = Command::new(crate::preflight::git_program());
     rebase.arg("-C").arg(&wt).args(["rebase", &base]);
     apply_noninteractive(&mut rebase);
     match rebase.output() {
@@ -2054,7 +2201,7 @@ pub fn land_agent_branch_at(
         return err("dirty", vec![]);
     }
     let msg = format!("Land {branch} into {target}");
-    let mut merge = Command::new("git");
+    let mut merge = Command::new(crate::preflight::git_program());
     merge.arg("-C").arg(&wt).args(["merge", "--no-ff", &branch, "-m", &msg]);
     apply_noninteractive(&mut merge);
     match merge.output() {
@@ -2658,6 +2805,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// `remove_repo_hooks` deletes ONLY hooks whose contents carry our vendored marker, and never
+    /// clobbers a user's own same-named hook. (The `install_repo_hooks` copy path needs an AppHandle
+    /// resource resolver, so it's exercised via the app; the safety-critical marker guard is pure.)
+    #[test]
+    fn remove_repo_hooks_only_deletes_our_marked_hooks() {
+        let root = unique_root("roborev-hooks");
+        let root_str = root.to_string_lossy().to_string();
+        let hooks = root.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+
+        // Ours: carries the vendored marker → must be removed.
+        let ours = hooks.join("post-commit");
+        std::fs::write(&ours, "#!/bin/sh\n# roborev post-commit — seed-owned wrapper\n").unwrap();
+        // The user's OWN post-rewrite hook (no marker) → must be preserved.
+        let theirs = hooks.join("post-rewrite");
+        std::fs::write(&theirs, "#!/bin/sh\necho my own hook\n").unwrap();
+
+        remove_repo_hooks(&root_str).unwrap();
+
+        assert!(!ours.exists(), "our marked post-commit hook should be removed");
+        assert!(theirs.exists(), "a user's unmarked post-rewrite hook must be left untouched");
+
+        // Idempotent: a second sweep (nothing of ours left) is a clean no-op.
+        remove_repo_hooks(&root_str).unwrap();
+        assert!(theirs.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The INSTALL-side safety rule (the fix for the clobber regression): we may write our hook only
+    /// when there's nothing there, or when the existing file is already ours — never over a user's
+    /// own same-named hook. Pure, so it's pinned without the bundle resource resolver.
+    #[test]
+    fn may_write_hook_never_clobbers_a_foreign_hook() {
+        let marker = "seed-owned wrapper"; // the distinctive marker line in the vendored post-commit
+        // Absent → safe to install.
+        assert!(may_write_hook(false, None, marker), "no existing hook → safe to install");
+        // Present + readable + ours → safe to refresh.
+        assert!(
+            may_write_hook(true, Some("#!/bin/sh\n# roborev post-commit — seed-owned wrapper\n"), marker),
+            "our own hook → safe to refresh"
+        );
+        // Present + readable + foreign → preserve.
+        assert!(
+            !may_write_hook(true, Some("#!/bin/sh\necho my own precommit\n"), marker),
+            "a user's foreign hook → must NOT be overwritten"
+        );
+        // Present + readable + merely MENTIONS roborev in a comment (but not our marker) → foreign.
+        assert!(
+            !may_write_hook(true, Some("#!/bin/sh\n# I run roborev post-commit myself\ntrue\n"), marker),
+            "a foreign hook that only mentions roborev → must NOT be misclassified as ours"
+        );
+        // Present but UNREADABLE (binary hook / permission error → contents None) → foreign, preserve.
+        // This is the key regression: `exists=true, contents=None` must NOT be treated as absent.
+        assert!(
+            !may_write_hook(true, None, marker),
+            "a present-but-unreadable (binary/perm) hook → must NOT be overwritten"
+        );
+        // Empty-but-present foreign file is still foreign.
+        assert!(!may_write_hook(true, Some(""), marker));
     }
 
     /// Spawn `sh -c <script>` in a PTY with the given cwd, read stdout to EOF, return it.
@@ -3797,6 +4006,214 @@ mod tests {
         assert!(s2.landed, "a normal --no-ff merge is reachable, so landed is trivially true too");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// A repo with no `origin` must report has_remote=false so the UI never strands the user at
+    /// "Push to Origin Main" with Close unreachable. Uses the real fixture shape (unique_root +
+    /// ensure_project_repo_inner + create_worktree_at) so the branch exists and we exercise the
+    /// full computation rather than the tip-missing `WorkflowState::default()` early return.
+    #[test]
+    fn workflow_state_reports_has_remote_false_without_origin() {
+        let root = unique_root("hr-noremote");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("hr-noremote-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        create_worktree_at(&root_str, "p", "hr1", "main", &app_data).unwrap();
+
+        // probe_pr_state=true, so the `git remote get-url origin` lookup DOES run — and finds nothing.
+        let st = agent_workflow_state_at(&root_str, "hr1", "", true).unwrap();
+        assert!(!st.has_remote, "no origin remote ⇒ has_remote must be false");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// has_origin is gated on probe_pr_state to avoid a `git remote` spawn on fast polls, so a
+    /// non-probing call reports false EVEN WITH a real origin. The FRONTEND must treat this as
+    /// "unknown", not "no remote" — see the sticky store note in runtimeStore.
+    #[test]
+    fn workflow_state_has_remote_is_false_when_probe_is_off() {
+        let root = unique_root("hr-probeoff");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("hr-probeoff-appdata");
+        let origin = unique_root("hr-probeoff-remote");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let o = origin.to_str().unwrap();
+        git(o, &["init", "--bare", "-q"]).unwrap();
+        git(&root_str, &["remote", "add", "origin", o]).unwrap();
+        git(&root_str, &["push", "-q", "origin", "main"]).unwrap();
+        create_worktree_at(&root_str, "p", "hr2", "main", &app_data).unwrap();
+
+        // A real origin EXISTS, but the fast/local poll doesn't probe → reported false.
+        let off = agent_workflow_state_at(&root_str, "hr2", "", false).unwrap();
+        assert!(!off.has_remote, "probe off ⇒ has_remote false even though origin exists");
+
+        // …and the probing poll sees it. This is the pair that proves `false` is genuinely
+        // ambiguous (no-remote vs not-probed) and why the frontend latches an observed true.
+        let on = agent_workflow_state_at(&root_str, "hr2", "", true).unwrap();
+        assert!(on.has_remote, "probing poll against a repo with origin ⇒ has_remote true");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    /// The full expected `WorkflowState` shape at one step of the e2e walk. Mirrors the TS fixture
+    /// (`agentCta.e2e.test.ts`'s `wsOf`) field for field.
+    struct Shape {
+        in_local_main: bool,
+        in_origin_main: bool,
+        in_parent: bool,
+        ahead_of_base: u32,
+        landed: bool,
+        pushed: bool,
+        shipped: bool,
+        has_remote: bool,
+        pr_state: Option<&'static str>,
+        pr_number: Option<u64>,
+        pr_url: Option<&'static str>,
+    }
+
+    impl Shape {
+        /// The baseline for this fixture: a build agent (no parent), against a repo with an origin,
+        /// probing, with no release tag and no PR anywhere in the walk.
+        fn nothing_landed() -> Self {
+            Shape {
+                in_local_main: false,
+                in_origin_main: false,
+                in_parent: false,
+                ahead_of_base: 0,
+                landed: false,
+                pushed: false,
+                shipped: false,
+                has_remote: true,
+                pr_state: None,
+                pr_number: None,
+                pr_url: None,
+            }
+        }
+    }
+
+    /// Assert a `WorkflowState` matches `want` field for field — `Shape` models the whole struct,
+    /// so a caller can express any state (a future step that opens a PR included).
+    ///
+    /// The destructuring is the point: with no `..` rest pattern, ADDING a field to WorkflowState
+    /// fails to compile HERE, so it can't land without someone deciding what this walk should pin.
+    /// Precisely: E0027 forces the new field to be MENTIONED, not asserted — a pattern can still
+    /// bind `_new_field: _` — and it binds only the Rust side; the TS fixture is held by its own
+    /// `Required<WorkflowState>` defaults literal. Both force a decision, neither reads minds.
+    ///
+    /// Worth the machinery because hand-adding one assertion per field is exactly what let `shipped`
+    /// — the strongest signal in the ladder (deriveLiveStage bumps straight to "shipped" on it) —
+    /// go unpinned through two review rounds.
+    fn assert_workflow_shape(got: &WorkflowState, want: Shape, step: &str) {
+        let WorkflowState {
+            in_local_main,
+            in_origin_main,
+            in_parent,
+            ahead_of_base,
+            landed,
+            pushed,
+            shipped,
+            has_remote,
+            pr_state,
+            pr_number,
+            pr_url,
+        } = got;
+        assert_eq!(*in_local_main, want.in_local_main, "{step}: in_local_main");
+        assert_eq!(*in_origin_main, want.in_origin_main, "{step}: in_origin_main");
+        assert_eq!(*in_parent, want.in_parent, "{step}: in_parent");
+        assert_eq!(*ahead_of_base, want.ahead_of_base, "{step}: ahead_of_base");
+        assert_eq!(*landed, want.landed, "{step}: landed");
+        assert_eq!(*pushed, want.pushed, "{step}: pushed");
+        // No release tag exists in this fixture. Pinned because deriveLiveStage treats `shipped` as
+        // the TOP of the ladder — a tip_in_release/is_semver_tag regression reading true here would
+        // silently outrank Land/Push/Close and neither half of the pair would notice.
+        assert_eq!(*shipped, want.shipped, "{step}: shipped");
+        assert_eq!(*has_remote, want.has_remote, "{step}: has_remote");
+        // pr_state is read by deriveLiveStage, so drift here would change the button.
+        assert_eq!(pr_state.as_deref(), want.pr_state, "{step}: pr_state");
+        assert_eq!(*pr_number, want.pr_number, "{step}: pr_number");
+        assert_eq!(pr_url.as_deref(), want.pr_url, "{step}: pr_url");
+    }
+
+    /// END-TO-END, against real git: walk a build agent through commit → land on LOCAL main →
+    /// push main to origin, pinning the WHOLE `WorkflowState` shape at each step (see
+    /// `assert_workflow_shape` — no enumeration here, because a hand-maintained list of fields is
+    /// what went stale twice already). The TS half, `agentCta.e2e.test.ts`, transcribes these same
+    /// values and asserts what the UI does with them. That transcription IS the seam, so a field
+    /// drifting from its default has to fail HERE rather than leave the TS fixture silently wrong.
+    /// (The TS fixture is held by its own `Required<WorkflowState>` literal — this walk can't force
+    /// it; the two halves are compiler-forced independently.)
+    ///
+    /// The middle step is the founder's screenshot-2 state ("Landed on main… Nothing is pushed
+    /// yet") — the one that used to read as plain `merged` and get a Close pill.
+    #[test]
+    fn workflow_state_walks_committed_then_local_land_then_origin_push() {
+        let root = unique_root("e2e-stages");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("e2e-stages-appdata");
+        let origin = unique_root("e2e-stages-remote");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let o = origin.to_str().unwrap();
+        git(o, &["init", "--bare", "-q"]).unwrap();
+        git(&root_str, &["remote", "add", "origin", o]).unwrap();
+        git(&root_str, &["push", "-q", "origin", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "e1", "main", &app_data).unwrap();
+
+        // 1. Committed on its own branch, nothing landed → the frontend reads building_saved → Land.
+        std::fs::write(Path::new(&info.path).join("w.txt"), "work\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+        // Every field the TS fixture (agentCta.e2e.test.ts `wsOf`) models is pinned here, so a shape
+        // change in Rust fails THIS test rather than leaving the hand-transcribed TS fixture
+        // silently stale — the transcription is the seam, so it's the thing worth pinning.
+        let s1 = agent_workflow_state_at(&root_str, "e1", "", true).unwrap();
+        assert_workflow_shape(
+            &s1,
+            Shape { ahead_of_base: 1, ..Shape::nothing_landed() },
+            "committed on its branch, nothing landed",
+        );
+
+        // 2. Landed on LOCAL main only — the founder's screenshot 2. The distinguishing signal is
+        //    in_local_main=true while in_origin_main=false; before the split these collapsed into
+        //    one `merged` stage and the composer offered Close over unpushed work.
+        //
+        //    Two values here are counter-intuitive: `landed` is true (a --no-ff merge is reachable,
+        //    so the squash signal is trivially true too), and ahead_of_base is 1 rather than 0 —
+        //    it's measured against the ref the branch was cut from, which is `origin/main` when that
+        //    ref exists, and origin doesn't have the work yet.
+        git(&root_str, &["merge", "--no-ff", "sparkle/agent-e1", "-m", "land e1"]).unwrap();
+        let s2 = agent_workflow_state_at(&root_str, "e1", "", true).unwrap();
+        assert_workflow_shape(
+            &s2,
+            Shape { in_local_main: true, landed: true, ahead_of_base: 1, ..Shape::nothing_landed() },
+            "landed on local main, nothing pushed (founder screenshot 2)",
+        );
+
+        // 3. Pushed to origin → in_origin_main flips true → the work is genuinely done → Close.
+        git(&root_str, &["push", "-q", "origin", "main"]).unwrap();
+        let s3 = agent_workflow_state_at(&root_str, "e1", "", true).unwrap();
+        assert_workflow_shape(
+            &s3,
+            Shape {
+                in_local_main: true,
+                in_origin_main: true,
+                landed: true,
+                ahead_of_base: 0,
+                ..Shape::nothing_landed()
+            },
+            "pushed to origin main",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+        let _ = std::fs::remove_dir_all(&origin);
     }
 
     #[test]

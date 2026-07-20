@@ -77,6 +77,12 @@ pub struct ParakeetTdt {
 
 impl ParakeetTdt {
     pub fn new(m: &ModelPaths) -> Result<Self, String> {
+        // The chokepoint: every path to ONNX Runtime goes through here, so this is where we can
+        // guarantee it never sees an incomplete file. Not defensive programming for its own sake
+        // — ORT reacts to a malformed .onnx by throwing a C++ exception across the FFI boundary,
+        // which is an unrecoverable process abort, not an error we could handle below.
+        crate::model::verify(m)?;
+
         let mut rc = OfflineRecognizerConfig::default();
         rc.model_config.transducer = OfflineTransducerModelConfig {
             encoder: Some(m.encoder.to_string_lossy().into_owned()),
@@ -212,6 +218,33 @@ impl Transcriber for ParakeetTdt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The crash regression, end to end. Before the guard in `new`, this exact setup — a model
+    /// dir whose encoder is truncated — reached ONNX Runtime, which threw a C++ exception across
+    /// the FFI boundary and took the whole process out with SIGABRT. `catch_unwind` could not
+    /// have saved it, so if this test ever regresses it does not fail, it ABORTS the test runner.
+    /// That's the tell: a green run here means a corrupt model is a recoverable `Err`.
+    #[test]
+    fn new_rejects_a_corrupt_model_instead_of_aborting_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = crate::model::model_paths(dir.path());
+        for (f, size) in [
+            (&m.encoder, 4096u64), // truncated: a download that died mid-flight
+            (&m.decoder, 7_257_753),
+            (&m.joiner, 1_739_080),
+            (&m.tokens, 9_384),
+            (&m.vad, 643_854),
+        ] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::File::create(f).unwrap().set_len(size).unwrap();
+        }
+
+        // `ParakeetTdt` isn't Debug, so unwrap the Result by hand.
+        let Err(err) = ParakeetTdt::new(&m) else {
+            panic!("a truncated encoder must not reach sherpa-onnx");
+        };
+        assert!(err.contains("encoder.int8.onnx"), "error should name the bad file: {err}");
+    }
 
     #[test]
     fn window_buffer_emits_full_512_windows_and_retains_remainder() {

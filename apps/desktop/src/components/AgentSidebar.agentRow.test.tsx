@@ -284,18 +284,23 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
   const NEEDED = 200; // strip.offsetHeight (80) + detail.scrollHeight (120)
   let savedInnerHeight: number;
 
-  const stubLayout = (innerHeight: number) => {
+  const stubLayout = (innerHeight: number, detailContent = 120) => {
     savedInnerHeight = window.innerHeight;
     Object.defineProperty(window, "innerHeight", { configurable: true, value: innerHeight });
-    // Every element reports a low row (top: 380) so the captured rect.top sits near the bottom.
-    HTMLElement.prototype.getBoundingClientRect = () =>
-      ({ left: 10, top: 380, width: 200, right: 210, bottom: 420, height: 40, x: 10, y: 380, toJSON: () => {} }) as DOMRect;
-    // The scroll container reports a tall, scrollable list; the card halves report fixed heights.
     const isList = (el: HTMLElement) => el.getAttribute?.("data-testid") === "agent-list-scroll";
+    // The ROW reports a low rect (top: 380) so the captured rect.top sits near the bottom, while the
+    // LIST container starts at the top of the sidebar (top: 0). That gap is the headroom the reveal
+    // may consume: it must never scroll the row above the list's top (380 − 0 = 380px of headroom).
+    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      return isList(this)
+        ? ({ left: 0, top: 0, width: 200, right: 200, bottom: 300, height: 300, x: 0, y: 0, toJSON: () => {} } as DOMRect)
+        : ({ left: 10, top: 380, width: 200, right: 210, bottom: 420, height: 40, x: 10, y: 380, toJSON: () => {} } as DOMRect);
+    };
+    // The scroll container reports a tall, scrollable list; the card halves report fixed heights.
     Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
       configurable: true,
       get(this: HTMLElement) {
-        return isList(this) ? 1000 : 120; // list room vs. detail content
+        return isList(this) ? 1000 : detailContent; // list room vs. detail content
       },
     });
     Object.defineProperty(HTMLElement.prototype, "clientHeight", {
@@ -335,6 +340,30 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
     expect(opts.behavior).toBe("smooth"); // slow, not jarring
     expect(opts.top).toBeGreaterThan(0); // scrolled the top rows up out of view
     expect(opts.top).toBe(380 + NEEDED + 16 - 400); // exactly the overflow
+  });
+
+  it("caps the reveal at the list's top so a tall many-worker card never drags the row off-screen", () => {
+    // Regression: a card far taller than the viewport (many subworkers → detail 2000px) overflows by
+    // 2000 + 80 + 16 + 380 − 400 = 2076px. The naive reveal asked the list to scroll by the FULL
+    // overflow (clamped only to the list's 700px max scroll), dragging the clicked row clean off the
+    // TOP of the list — which visually deselects it and, once the auto-scroll settles, closes the
+    // card. The reveal must instead cap at the row-top-to-list-top distance (380 − 0 = 380); the
+    // card's own maxH + detail overflow scroll cover the remainder (the subworkers scroll INSIDE the
+    // card). So the row's top lands exactly at the list top and stays visible.
+    stubLayout(400, 2000);
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    const list = screen.getByTestId("agent-list-scroll");
+    const scrollTo = vi.fn((opts: ScrollToOptions) => {
+      list.scrollTop = opts.top ?? 0;
+    });
+    list.scrollTo = scrollTo as typeof list.scrollTo;
+
+    fireEvent.click(screen.getByText(TITLE));
+
+    expect(scrollTo).toHaveBeenCalledTimes(1);
+    const opts = scrollTo.mock.calls[0]![0]!;
+    expect(opts.top).toBe(380); // capped at row.top − list.top, NOT the 700px list max scroll
+    expect(screen.getByText("/tmp/demo/.worktrees/a1")).toBeTruthy(); // card stayed open
   });
 
   it("does NOT move the column when the card already fits", () => {

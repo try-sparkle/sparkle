@@ -4,6 +4,7 @@ import {
   isSelfPromptLine,
   StreamFailureDetector,
   STALL_REPEAT_THRESHOLD,
+  SELF_PROMPT_REPEAT_THRESHOLD,
 } from "./streamFailure";
 
 describe("isApiErrorLine", () => {
@@ -45,7 +46,9 @@ describe("isApiErrorLine", () => {
 });
 
 describe("isSelfPromptLine", () => {
-  it("matches the self-ping churn the agent emits when wedged", () => {
+  // isSelfPromptLine stays a PURE phrase-matcher (other modules/tests import it) — a single match is
+  // reported true here; whether a single match is a WEDGE is the detector's repetition-gate call.
+  it("matches the self-ping churn phrases the agent emits when wedged", () => {
     expect(isSelfPromptLine("Are you there?")).toBe(true);
     expect(isSelfPromptLine("Hey, Sparkler. Are you there?")).toBe(true);
     expect(isSelfPromptLine("Are you still there")).toBe(true);
@@ -63,9 +66,30 @@ describe("StreamFailureDetector", () => {
     expect(d.observe("API Error: Rate limited")).toBe(true);
   });
 
-  it("trips immediately on a self-prompt ping", () => {
+  it("does NOT trip on a SINGLE self-prompt ping (Bug A: a lone utterance / prose quote is not a wedge)", () => {
     const d = new StreamFailureDetector();
-    expect(d.observe("Are you there?")).toBe(true);
+    expect(d.observe("Are you there?")).toBe(false);
+  });
+
+  it("trips once a self-prompt phrase REPEATS to the threshold (a real self-ping loop)", () => {
+    const d = new StreamFailureDetector();
+    let tripped = false;
+    for (let i = 0; i < SELF_PROMPT_REPEAT_THRESHOLD; i++) tripped = d.observe("Are you there?");
+    expect(tripped).toBe(true);
+  });
+
+  it("counts DISTINCT self-prompt phrasings toward the same repeat gate", () => {
+    const d = new StreamFailureDetector();
+    // Two different wedge pings in a row (not the same string) still constitute a loop.
+    expect(d.observe("Are you there?")).toBe(false);
+    expect(d.observe("Hey, Sparkler.")).toBe(SELF_PROMPT_REPEAT_THRESHOLD <= 2);
+  });
+
+  it("reset() clears the self-prompt counter so a later lone utterance doesn't trip", () => {
+    const d = new StreamFailureDetector();
+    d.observe("Are you there?"); // 1 — under threshold
+    d.reset(); // progress resumed
+    expect(d.observe("Are you there?")).toBe(false); // counter restarted — single again
   });
 
   it("trips after enough identical short repeats (a churn loop)", () => {

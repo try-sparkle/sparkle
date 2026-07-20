@@ -148,13 +148,17 @@ describe("pickAccount", () => {
   });
 });
 
-describe("getUsage snake_case → camelCase mapping", () => {
+describe("getUsage — reads the REAL camelCase wire shape and converts seconds→ms", () => {
   beforeEach(() => invoke.mockReset());
 
-  it("maps tokens_5h/tokens_7d, converts exhausted_until seconds→ms, and defaults null", async () => {
+  // These fixture keys are the ones `AccountUsage` actually serializes (pinned by the Rust test
+  // `account_usage_serializes_camel_case_keys`). This suite used to mock snake_case rows Rust never
+  // emits, so it certified a mapper that read `undefined` for every tally — the bars showed 0 for
+  // every account while the tests stayed green.
+  it("maps tokens5h/tokens7d, converts exhaustedUntil seconds→ms, and defaults null", async () => {
     invoke.mockResolvedValue([
-      { id: "a", tokens_5h: 11, tokens_7d: 22, exhausted_until: 1234 }, // seconds from Rust
-      { id: "b", tokens_5h: 0, tokens_7d: 0, exhausted_until: null },
+      { id: "a", tokens5h: 11, tokens7d: 22, exhaustedUntil: 1234 }, // seconds from Rust
+      { id: "b", tokens5h: 0, tokens7d: 0, exhaustedUntil: null },
     ]);
     const out = await getUsage();
     expect(invoke).toHaveBeenCalledWith("accounts_usage");

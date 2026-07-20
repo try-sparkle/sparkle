@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 //
 // Improvement A (integration): the trial counter + Unlock now render INSIDE the TopBar row, to the
-// LEFT of the Recent/Open/New/⋯ action cluster, instead of as a floating pill that covered them.
+// LEFT of the Recent/Open/⋯ action cluster, instead of as a floating pill that covered them.
 // This mounts the real TopBar in trial mode and asserts (1) the indicator is in the bar, ordered
 // before the action buttons, and (2) its Unlock routes through the shared paywall handler.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -106,7 +106,7 @@ afterEach(() => {
 });
 
 describe("TopBar — in-bar trial indicator", () => {
-  it("renders the counter inside the bar, ordered before the Recent/Open/New buttons", () => {
+  it("renders the counter inside the bar, ordered before the Recent/Open buttons", () => {
     tokenlessTrial(3);
     render(<TopBar onOpenSettings={vi.fn()} />);
     const counter = screen.getByText(/97 prompts left/);

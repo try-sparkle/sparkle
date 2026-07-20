@@ -43,12 +43,13 @@ const ORDER: WorkflowStageId[] = [
   "building_saved",
   "pushed",
   "pull_request",
+  "merged_local",
   "merged",
   "shipped",
 ];
 
-describe("the 9-stage model", () => {
-  it("has the nine stages in the canonical order", () => {
+describe("the 10-stage model", () => {
+  it("has the ten stages in the canonical order", () => {
     expect(WORKFLOW_STAGES.map((s) => s.id)).toEqual(ORDER);
   });
   it("every stage has friendly label + detail + color", () => {
@@ -108,35 +109,41 @@ describe("deriveLiveStage — build signals", () => {
       "merged",
     );
   });
-  it("reachability into main → merged, but only once real work is seen", () => {
+  it("reachability into main → landed, but only once real work is seen", () => {
     expect(deriveLiveStage({ kind: "build", bs: bs(0), ws: ws({ inLocalMain: true }) })).toBe(
       "building_unsaved",
     );
+    // Re-aimed for the merged_local split: LOCAL main alone is merged_local, not merged. The
+    // committedSeen gate this test guards is unchanged — only the stage it lands on is stricter.
     expect(deriveLiveStage({ kind: "build", bs: bs(1), ws: ws({ inLocalMain: true }) })).toBe(
-      "merged",
+      "merged_local",
     );
   });
   it("shipped is the top, gated on real work", () => {
     expect(deriveLiveStage({ kind: "build", bs: bs(1), shipped: true })).toBe("shipped");
     expect(deriveLiveStage({ kind: "build", bs: bs(0), shipped: true })).toBe("building_unsaved");
   });
-  it("squash-merge: tip not an ancestor (landed) but work present → merged", () => {
+  it("squash-merge: tip not an ancestor (landed) but work present → merged_local", () => {
     // The branch's commits still exist on its ref post-squash, so aheadOfBase stays >0 (committedSeen)
     // while inLocalMain/inOriginMain are false. `landed` (tree-identical to main) is the squash signal.
+    // Re-aimed for the split: `landed` cannot distinguish local main from origin main, so it settles
+    // at the cautious merged_local — the CTA then offers Push rather than a premature Close.
     expect(
       deriveLiveStage({ kind: "build", bs: bs(0), ws: ws({ landed: true, aheadOfBase: 2 }) }),
-    ).toBe("merged");
+    ).toBe("merged_local");
     // committedSeen can also come from this tick's own commits.
-    expect(deriveLiveStage({ kind: "build", bs: bs(1), ws: ws({ landed: true }) })).toBe("merged");
+    expect(deriveLiveStage({ kind: "build", bs: bs(1), ws: ws({ landed: true }) })).toBe(
+      "merged_local",
+    );
   });
   it("a no-op branch is trivially tree-identical (landed) but stays unsaved (committedSeen gate)", () => {
     expect(deriveLiveStage({ kind: "build", bs: bs(0), ws: ws({ landed: true }) })).toBe(
       "building_unsaved",
     );
   });
-  it("normal merge after relaunch: persisted watermark keeps committedSeen → merged, not unsaved", () => {
+  it("normal merge after relaunch: persisted watermark keeps committedSeen → landed, not unsaved", () => {
     // Post-merge ahead→0 and aheadOfBase→0; without a persisted `prev` this collapsed to unsaved.
-    // The persisted watermark (building_saved) restores committedSeen so inLocalMain → merged.
+    // The persisted watermark (building_saved) restores committedSeen so inLocalMain → merged_local.
     expect(
       deriveLiveStage({
         kind: "build",
@@ -144,7 +151,7 @@ describe("deriveLiveStage — build signals", () => {
         ws: ws({ inLocalMain: true }),
         prev: "building_saved",
       }),
-    ).toBe("merged");
+    ).toBe("merged_local");
   });
 });
 
@@ -172,16 +179,16 @@ describe("deriveLiveStage — live signals establish committedSeen after relaunc
       deriveLiveStage({ kind: "build", bs: bs(0), ws: ws({ inOriginMain: true }), pushed: true }),
     ).toBe("merged");
   });
-  it("an open PR proves committed work → reachability lands it merged post-relaunch", () => {
+  it("an open PR proves committed work → reachability lands it post-relaunch", () => {
     expect(
       deriveLiveStage({
         kind: "build",
         bs: bs(0),
         ws: ws({ inLocalMain: true, prState: "open" }),
       }),
-    ).toBe("merged");
+    ).toBe("merged_local"); // re-aimed: local main only, so merged_local
   });
-  it("worker: pushed establishes committedSeen so an integrated worker reads merged post-relaunch", () => {
+  it("worker: pushed establishes committedSeen so an integrated worker reads landed post-relaunch", () => {
     expect(
       deriveLiveStage({
         kind: "worker",
@@ -190,7 +197,7 @@ describe("deriveLiveStage — live signals establish committedSeen after relaunc
         pushed: true,
         parentReachedMain: true,
       }),
-    ).toBe("merged");
+    ).toBe("merged_local"); // re-aimed: a worker's parent-integration is a LOCAL merge
   });
   it("still gated: a no-op branch (landed/inLocalMain, but never pushed, no PR) stays unsaved", () => {
     expect(
@@ -200,7 +207,7 @@ describe("deriveLiveStage — live signals establish committedSeen after relaunc
 });
 
 describe("rollup + dominant", () => {
-  it("rollup headline = least-advanced; counts cover all 9 ids", () => {
+  it("rollup headline = least-advanced; counts cover all 10 ids", () => {
     const r = rollupStages(["merged", "building_saved", "pushed"]);
     expect(r?.stage).toBe("building_saved"); // slowest unit
     expect(r?.total).toBe(3);
@@ -216,9 +223,9 @@ describe("rollup + dominant", () => {
 });
 
 describe("progress-line fill + color", () => {
-  it("fraction climbs 1/9 … 9/9 across the stages", () => {
-    expect(stageFraction("thought")).toBeCloseTo(1 / 9);
-    expect(stageFraction("building_saved")).toBeCloseTo(5 / 9);
+  it("fraction climbs 1/10 … 10/10 across the stages", () => {
+    expect(stageFraction("thought")).toBeCloseTo(1 / 10);
+    expect(stageFraction("building_saved")).toBeCloseTo(5 / 10);
     expect(stageFraction("shipped")).toBeCloseTo(1);
   });
   it("line color interpolates the logo gradient teal→blue", () => {
@@ -230,6 +237,8 @@ describe("progress-line fill + color", () => {
 
 describe("deriveLiveStage — worker path", () => {
   it("reaches Merged once its OWN work is in the parent AND the orchestrator's work reached main", () => {
+    // Re-aimed for the split: integrating into the parent branch is a LOCAL merge, so the worker
+    // rolls up to merged_local rather than claiming its work is on origin main.
     expect(
       deriveLiveStage({
         kind: "worker",
@@ -237,7 +246,7 @@ describe("deriveLiveStage — worker path", () => {
         ws: ws({ inParent: true }),
         parentReachedMain: true,
       }),
-    ).toBe("merged");
+    ).toBe("merged_local");
   });
   // Regression (the "Close this worker? Your code has been pushed to main" false pop-up): a freshly
   // spawned worker that has only made its first commit — never integrated into the parent — must NOT
@@ -271,7 +280,7 @@ describe("deriveLiveStage — worker path", () => {
         ws: ws({ landed: true }),
         parentReachedMain: true,
       }),
-    ).toBe("merged");
+    ).toBe("merged_local");
   });
   it("the squash `landed` signal alone (parent not on main) is NOT Merged with Main", () => {
     expect(deriveLiveStage({ kind: "worker", bs: bs(1), ws: ws({ landed: true }) })).toBe(
@@ -286,6 +295,117 @@ describe("deriveLiveStage — worker path", () => {
         ws: ws({ aheadOfBase: 1, inParent: true }),
         parentReachedMain: true,
       }),
+    ).toBe("merged_local");
+  });
+});
+
+// The split that makes the CTA honest (founder screenshot 2, 2026-07-15): `merged` used to bump on
+// inLocalMain || inOriginMain || landed, so "landed but unpushed" and "landed and pushed" were the
+// same stage — which is how a Close pill appeared over work that still needed pushing.
+describe("merged_local vs merged", () => {
+  it("landed on LOCAL main only is merged_local, not merged", () => {
+    expect(
+      deriveLiveStage({
+        kind: "build",
+        bs: bs(0),
+        ws: ws({ inLocalMain: true, aheadOfBase: 3 }),
+        prev: "building_saved",
+      }),
+    ).toBe("merged_local");
+  });
+
+  it("landed on ORIGIN main is merged", () => {
+    expect(
+      deriveLiveStage({
+        kind: "build",
+        bs: bs(0),
+        ws: ws({ inLocalMain: true, inOriginMain: true, aheadOfBase: 3 }),
+        prev: "building_saved",
+      }),
     ).toBe("merged");
+  });
+
+  it("a GitHub-merged PR is merged (origin has it by definition)", () => {
+    expect(
+      deriveLiveStage({
+        kind: "build",
+        bs: bs(0),
+        ws: ws({ prState: "merged", aheadOfBase: 3 }),
+        prev: "building_saved",
+      }),
+    ).toBe("merged");
+  });
+
+  it("merged_local sits between pull_request and merged", () => {
+    expect(stageIndex("pull_request")).toBeLessThan(stageIndex("merged_local"));
+    expect(stageIndex("merged_local")).toBeLessThan(stageIndex("merged"));
+  });
+
+  it("the ladder is ten stages and shipped still fills the bar", () => {
+    expect(WORKFLOW_STAGES).toHaveLength(10);
+    expect(stageIndex("shipped")).toBe(9);
+    expect(stageFraction("shipped")).toBe(1);
+  });
+
+  // New-cycle detection must trigger for work that landed only LOCALLY too, or an agent that landed
+  // locally and then started fresh work would stay pinned at merged_local.
+  it("a new cycle after a LOCAL-only land resets to building_saved", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs(2), prev: "merged_local", ws: ws({}) })).toBe(
+      "building_saved",
+    );
+  });
+
+  it("a new cycle after an ORIGIN land still resets to building_saved", () => {
+    // The pre-split behavior, re-pinned: lowering `landedBefore` to merged_local must not stop
+    // new-cycle detection from firing for work that had reached origin.
+    expect(deriveLiveStage({ kind: "build", bs: bs(2), prev: "merged", ws: ws({}) })).toBe(
+      "building_saved",
+    );
+  });
+});
+
+// A worker's tip lives in its PARENT's branch, never in the default branch, so it can never observe
+// origin main itself — it inherits the fact from the parent's stage. Without that inheritance a
+// worker caps at merged_local forever, so its bead never closes (beadLifecycle closes at >= merged)
+// and the sidebar ✓ never lights. Found by roborev review #37964 on the merged_local split.
+describe("worker rollup: local parent vs origin parent", () => {
+  const integratedWorker = (parentOnOriginMain: boolean) =>
+    deriveLiveStage({
+      kind: "worker",
+      bs: bs(1),
+      ws: ws({ inParent: true }),
+      parentReachedMain: true,
+      parentOnOriginMain,
+    });
+
+  it("caps at merged_local while the parent is only on LOCAL main", () => {
+    expect(integratedWorker(false)).toBe("merged_local");
+  });
+
+  it("reaches the full merged once the parent's work is on ORIGIN main", () => {
+    expect(integratedWorker(true)).toBe("merged");
+  });
+
+  it("parentOnOriginMain alone can't promote a worker whose work isn't in the parent yet", () => {
+    expect(
+      deriveLiveStage({
+        kind: "worker",
+        bs: bs(1),
+        parentReachedMain: true,
+        parentOnOriginMain: true,
+      }),
+    ).toBe("building_saved");
+  });
+
+  it("parentOnOriginMain still respects the committedSeen gate", () => {
+    expect(
+      deriveLiveStage({
+        kind: "worker",
+        bs: bs(0),
+        ws: ws({ inParent: true }),
+        parentReachedMain: true,
+        parentOnOriginMain: true,
+      }),
+    ).toBe("building_unsaved");
   });
 });

@@ -5,10 +5,12 @@ import { useAiFeature } from "../aiGate";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useConnectionStore } from "../../stores/connectionStore";
 import { pushSuggestions } from "../relayClient";
-import { closeBuildAgentButton } from "./controlButtons";
+import { deriveCta } from "../../engine/agentCta";
+import { maybeAutoApprove } from "./approvalsRuntime";
 import { log } from "../../logger";
 import type { AgentTabStatus } from "../../types";
 import type { SuggestionButton } from "./types";
+import type { ApprovalCategory } from "./approvalCategories";
 
 // Statuses where it's the user's turn — the agent finished a turn or is blocked on input. We
 // compute suggestions on entry to one of these (the "blocked on user" trigger from the spec).
@@ -75,6 +77,12 @@ export const SETTLE_TICK_MS = 1200;
 export function useSuggestions(agentId: string, composerEmpty: boolean) {
   const [buttons, setButtons] = useState<SuggestionButton[]>([]);
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+  // The category we last auto-answered for this agent (drives the inline "Auto-approved {label} ·
+  // Manage" note), or null. Cleared whenever normal buttons are shown or the state moves on.
+  const [autoApproved, setAutoApproved] = useState<ApprovalCategory | null>(null);
+  // Signatures of picker instances already auto-answered, so a re-rendered/settled scrollback can't
+  // re-send the keystroke. Per-agent (this hook instance owns one agent). See maybeAutoApprove.
+  const handledSigs = useRef<Set<string>>(new Set());
   const lastHash = useRef<string | null>(null);
   // Guards against a duplicate concurrent (paid) compute while one is in flight. `retryTick` lets a
   // discarded compute re-trigger the effect so a state we returned to still gets suggestions.
@@ -92,7 +100,11 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
 
   // Retire this agent's buttons on the phone (and drop the host's id→value map) so a phone can't
   // click a suggestion the desktop has stopped showing. No-op if nothing non-empty was pushed.
+  // Signature of the last set pushed to the phone; retire() resets it so a set can be re-pushed
+  // after a clear. Declared before `retire` (which writes it) though the push effect below reads it.
+  const lastPushedRef = useRef<string>("");
   const retire = useCallback(() => {
+    lastPushedRef.current = "";
     if (!pushedNonEmpty.current) return;
     pushedNonEmpty.current = false;
     pushSuggestions({ agent_id: agentId, buttons: [] });
@@ -107,33 +119,36 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   const isOnline = useConnectionStore((s) => s.isOnline);
   const status = useRuntimeStore((s) => s.status[agentId]);
   const isYourTurn = status !== undefined && YOUR_TURN.has(status);
-  // Once the agent has shipped/landed, the only action is to close it — show the green control
-  // button and skip suggestion compute entirely.
-  const shipped = useRuntimeStore((s) => !!s.workflowShipped[agentId]);
+  // The LIVE stage — deliberately NOT `workflowShipped`, which is a latch-once watermark that trips
+  // the first time work reaches main and clears only on close. Reading it here is what made an agent
+  // that landed an earlier cycle offer "Close Build Agent" over fresh un-landed work. The watermark
+  // still exists for the bead lifecycle and the "landed at least once" marker, whose ever-landed
+  // semantics are correct — it's just wrong for "what should you do right now".
+  const stage = useRuntimeStore((s) => s.workflowStage[agentId]);
+  // Select the one PRIMITIVE deriveCta reads (CtaSignals), not the WorkflowState object.
+  // `setWorkflowState` builds a fresh object every applied poll, so subscribing to the object would
+  // hand this hook a new reference each tick. That identity churn used to reach the compute effect's
+  // dep array and abort an in-flight (paid Haiku) compute mid-poll, discarding the result and
+  // re-running it — a real cost, since the compute is a metered call.
+  const hasRemote = useRuntimeStore((s) => s.workflowState[agentId]?.hasRemote);
+
+  // Suppresses the CTA after `clear()` (the user just acted on it) until the next compute or turn.
+  // Without this the render-time merge would immediately re-add the very pill they just clicked.
+  const [ctaCleared, setCtaCleared] = useState(false);
+
+  // Stage-derived primary + computed alternates. deriveCta returns null when there's nothing to
+  // nudge (no committed work yet), in which case the ordinary suggestions stand on their own.
+  // NOTE this is used only at RENDER (see `shown`), never inside the compute effect — keeping it out
+  // of that dep array is what stops a poll from cancelling an in-flight paid compute.
+  const applyCta = useCallback(
+    (computed: SuggestionButton[]): SuggestionButton[] => {
+      const cta = stage ? deriveCta(stage, { hasRemote }, computed) : null;
+      return cta ? [cta.primary, ...cta.alternates] : computed;
+    },
+    [stage, hasRemote],
+  );
 
   useEffect(() => {
-    if (!shipped) {
-      // Leaving the shipped state: clear the local Close button and retire the phone's copy so it
-      // can't keep showing a stale Close (a subsequent empty compute wouldn't push, so without this
-      // the phone would hold the green button). The compute effect then takes over.
-      retire();
-      return;
-    }
-    const btn = closeBuildAgentButton();
-    setButtons([btn]);
-    setDismissed(new Set());
-    lastHash.current = null; // so leaving the shipped state recomputes suggestions fresh
-    // Push once per entry into shipped (idempotent on the host map); the retire above clears it on
-    // exit, so flips never leave a stale button.
-    pushSuggestions({
-      agent_id: agentId,
-      buttons: [{ id: btn.id, label: btn.label, value: btn.value }],
-    });
-    pushedNonEmpty.current = true;
-  }, [shipped, agentId, retire]);
-
-  useEffect(() => {
-    if (shipped) return; // the shipped effect owns the button set
     if (!isYourTurn) return;
     // A compute for the current state is already in flight — don't fire a duplicate (which, when
     // learned actions are on, is a redundant paid Haiku call). The in-flight one will either apply
@@ -175,19 +190,37 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         lastFailHash.current = null;
         lastHash.current = nextHash;
         setDismissed(new Set());
+        // Sparkle Auto-Approve: if this settled state is a classifiable permission prompt whose
+        // effective rule is "always" (and the feature is on), the local classifier types the plain
+        // "Yes" ONCE (signature de-duped) INSTEAD of surfacing buttons. Retire any phone copy and
+        // show the inline "Auto-approved" note. The keystroke comes only from the local heuristic
+        // tier, never the learned tier — the existing raw-keystroke trust boundary is preserved.
+        const autoCat = maybeAutoApprove(agentId, scrollback, handledSigs.current);
+        if (autoCat) {
+          setAutoApproved(autoCat);
+          setButtons([]);
+          // Use retire() rather than open-coding it: it already no-ops when nothing non-empty was
+          // pushed, AND it resets lastPushedRef. Open-coding left that signature stale, so a later
+          // compute in the SAME your-turn yielding the same button ids would hit the sig guard and
+          // never re-send the phone the set the desktop is showing.
+          retire();
+          log.debug("suggestions", "auto-approved", { agentId, category: autoCat });
+          return;
+        }
+        setAutoApproved(null);
+        setCtaCleared(false); // a fresh state — the CTA is relevant again
+        // Store the RAW computed set; the CTA is merged over it at RENDER time (see `shown` below).
+        // Storing the merged list here instead would freeze the CTA at compute time: the workflow
+        // stage advances on the ~15-30s poll, long after the scrollback settled, and this effect
+        // refuses to re-run for an unchanged hash — so a landing agent would keep offering "Land to
+        // Main" after it had already reached local main.
+        //
+        // The relay push does NOT happen here: the render-time effect below is the SINGLE owner of
+        // pushes. Pushing from both meant every successful compute relayed two identical events, and
+        // a push from here could never cover a CTA that changed with the stage rather than the
+        // scrollback.
         setButtons(set.buttons);
         log.debug("suggestions", "computed", { agentId, buttons: set.buttons.length });
-        // Mirror the buttons to a watching phone (no-op if the relay isn't connected). Skip an
-        // empty push when nothing non-empty was ever pushed — there's nothing to clear, and we
-        // don't want a chatty empty `suggestions` event on every your-turn transition that yields
-        // no buttons. An empty result AFTER a non-empty one still pushes, to retire the old set.
-        if (set.buttons.length > 0 || pushedNonEmpty.current) {
-          pushSuggestions({
-            agent_id: agentId,
-            buttons: set.buttons.map(({ id, label, value }) => ({ id, label, value })),
-          });
-        }
-        pushedNonEmpty.current = set.buttons.length > 0;
       })
       .catch((err: unknown) => {
         // Offline is NOT a failure of THIS state — the same compute will succeed once we reconnect.
@@ -246,7 +279,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         retryTimer.current = null;
       }
     };
-  }, [agentId, isYourTurn, composerEmpty, learnedOn, retryTick, shipped, retire, isOnline]);
+  }, [agentId, isYourTurn, composerEmpty, learnedOn, retryTick, retire, isOnline]);
 
   // Settle-watcher. The your-turn status flip (Claude's Stop hook) RACES the final terminal paint
   // into xterm, so the compute above frequently hashes a mid-paint — or, right after a pane mount,
@@ -259,7 +292,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // budget is honored so the watcher can't resurrect an unbounded retry loop the .catch above
   // deliberately capped.
   useEffect(() => {
-    if (shipped || !isYourTurn || !composerEmpty) return;
+    if (!isYourTurn || !composerEmpty) return;
     let prevTickHash: string | null = null;
     const id = window.setInterval(() => {
       if (computing.current) return;
@@ -280,18 +313,27 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       setRetryTick((t) => t + 1);
     }, SETTLE_TICK_MS);
     return () => window.clearInterval(id);
-  }, [agentId, isYourTurn, composerEmpty, shipped]);
+  }, [agentId, isYourTurn, composerEmpty]);
 
-  // When the agent goes back to working (no longer the user's turn) and hasn't shipped, drop the
-  // stale buttons — the terminal state has moved on, so retire the phone's copy too. (When shipped,
-  // the shipped effect owns the button set and we keep the Close button.)
+  // When the agent goes back to working (no longer the user's turn), drop the stale buttons — the
+  // terminal state has moved on, so retire the phone's copy too. The CTA rides on the computed set
+  // (it's merged in at render), so clearing here correctly takes the CTA down with it: a working
+  // agent shouldn't be offered "Land to Main" mid-turn.
   useEffect(() => {
-    if (!isYourTurn && !shipped) {
+    if (!isYourTurn) {
       setButtons([]);
+      setAutoApproved(null); // the prompt is gone — drop any lingering auto-approved note
+      // Reset the auto-answer dedupe when the agent goes back to working: the signature guard is
+      // only meant to stop a SINGLE settled screen from re-sending the keystroke while it re-hashes
+      // during one your-turn. A later, genuinely-distinct prompt for the same command (e.g. the same
+      // `rm -rf build/` run twice) hashes identically, so if the set persisted across turns that
+      // second REAL prompt would be suppressed WITHOUT being answered — leaving the agent blocked.
+      handledSigs.current.clear();
       lastHash.current = null;
+      setCtaCleared(false); // the next your-turn starts with a fresh CTA
       retire();
     }
-  }, [isYourTurn, shipped, retire]);
+  }, [isYourTurn, retire]);
 
   // NOTE: we deliberately do NOT retire() when the desktop composer merely goes non-empty (the user
   // starts typing). The desktop hides its row, but the phone is an independent surface and the agent
@@ -301,6 +343,11 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   const dismiss = useCallback((id: string) => setDismissed((d) => new Set(d).add(id)), []);
   const clear = useCallback(() => {
     setButtons([]);
+    setAutoApproved(null);
+    // The user just acted on the row; the CTA must go down with the rest of it. Without this the
+    // render-time merge would re-add the very pill they clicked (buttons is empty, but deriveCta
+    // builds its primary from the stage alone). Reset on the next compute or turn change.
+    setCtaCleared(true);
     // Commit the CURRENT scrollback hash rather than nulling: the agent often stays your-turn
     // (settled) for a beat after a suggestion click, and a null lastHash would let the settle-
     // watcher immediately recompute — resurrecting the very buttons the user just acted on (and
@@ -309,5 +356,53 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
     retire();
   }, [agentId, retire]);
 
-  return { buttons: buttons.filter((b) => !dismissed.has(b.id)), dismiss, clear };
+  // The CTA is merged HERE, at render, over whatever the last compute produced — not baked into
+  // `buttons` — so the pill tracks the live stage as the poll advances it (building_saved →
+  // merged_local → merged) without needing the scrollback to change.
+  //
+  // The `isYourTurn` gate is load-bearing, NOT a shortcut: deriveCta builds its primary from the
+  // stage alone, so applyCta([]) is NON-empty. SuggestionRow is gated only on the composer being
+  // empty (suggestionRowVisible), not on your-turn — so without this gate a build agent that is
+  // actively WORKING with committed work would render a "Land to Main" pill mid-turn. The same gate
+  // is what makes `clear()` and the not-your-turn reset actually take the CTA down with them.
+  //
+  // Suppressed on the auto-approve path too: that state deliberately shows only the inline
+  // "Auto-approved" note (the compute path clears the buttons), and a CTA beside it would contradict
+  // that. And after `clear()` (the user just clicked the pill) until the next compute or turn.
+  const showCta = isYourTurn && !autoApproved && !ctaCleared;
+  // Dismissal is applied AFTER the merge: deriveCta unconditionally prepends its primary, so
+  // filtering first left the pill's × advertising an action it couldn't perform (click × → the
+  // identical pill re-renders). Filtering here lets × drop the CTA and fall back to the alternates.
+  const merged = showCta ? applyCta(buttons) : buttons;
+  const shown = merged.filter((b) => !dismissed.has(b.id));
+  // Computed at render so the push effect can depend on a STABLE string rather than `shown`, which
+  // .filter() rebuilds every render — the same identity churn just removed from the compute effect.
+  const shownSig = shown.map((b) => b.id).join("|");
+
+  // SINGLE owner of relay pushes. The compute path deliberately doesn't push: two owners meant every
+  // successful compute relayed the same set twice, and a compute-time push can't cover a CTA that
+  // changes with the STAGE (a 15-30s poll) rather than the scrollback. Keyed on the button-id
+  // signature so an unchanged set never re-pushes.
+  useEffect(() => {
+    // Never push a non-empty set once the turn is over. On the your-turn→working transition React
+    // commits a render where isYourTurn is already false but `buttons` still holds the old set
+    // (setButtons([]) hasn't flushed). Effects run in declaration order, so the reset effect above
+    // retires first — and without this guard THIS effect would immediately re-push that stale set,
+    // undoing the retire and re-arming taps on the phone for a turn the agent has moved on from.
+    if (!isYourTurn && shown.length > 0) return;
+    if (shownSig === lastPushedRef.current) return;
+    // Nothing to clear: don't emit a chatty empty `suggestions` event on every your-turn transition
+    // that yields no buttons. An empty set AFTER a non-empty one still pushes, to retire the old one.
+    if (shown.length === 0 && !pushedNonEmpty.current) return;
+    lastPushedRef.current = shownSig;
+    pushedNonEmpty.current = shown.length > 0;
+    pushSuggestions({
+      agent_id: agentId,
+      buttons: shown.map(({ id, label, value }) => ({ id, label, value })),
+    });
+    // `shown` is read through the closure; `shownSig` is the identity-stable trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, shownSig, isYourTurn]);
+
+  return { buttons: shown, dismiss, clear, autoApproved };
 }

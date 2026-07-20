@@ -26,6 +26,7 @@ import {
   useCurrentWindowLabel,
 } from "../windowContext";
 import { StatusDot } from "./StatusDot";
+import { RECENT_HINT, RECENT_SWITCH_HINT } from "../keyboardHints/hintTargets";
 import { useAuthStore } from "../stores/authStore";
 import { useTrialStore } from "../stores/trialStore";
 import { deriveAuthView } from "../services/entitlement";
@@ -121,8 +122,8 @@ const btn: CSSProperties = {
 
 /**
  * Top bar: the current project (name colored by the majority of its agents' statuses, with
- * a per-agent dot cluster, click to open settings) plus the Open / Recent / New project
- * actions on the same row.
+ * a per-agent dot cluster, click to open settings) plus the Recent / Open project
+ * actions on the same row (Open covers both opening an existing folder and creating/cloning a new one).
  */
 export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => void }) {
   // Trial counter + Unlock, shown in-row (left of the action cluster) only while in trial mode.
@@ -173,8 +174,12 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const agentOrdering = useUiStore((s) => s.agentOrdering);
   const [recentOpen, setRecentOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
-  // The "New Project" dialog (folder / GitHub tabs). "New" opens this; "Open"/"Recent" are unchanged.
+  // The unified "Open a Project" dialog (folder / GitHub tabs). The single "Open" button opens this;
+  // its "From folder" tab runs the same picker flow the old standalone "Open" button did, and its
+  // "From GitHub" tab clones. "Recent" is unchanged.
   const [newProjectOpen, setNewProjectOpen] = useState(false);
+  // The "Open" button reveals its full intent on hover ("Open (or Create) a Project Folder").
+  const [openHover, setOpenHover] = useState(false);
   // Deep-open: other components (e.g. BalanceBadge → Credits) request a settings category via
   // uiStore.openSettings; this TopBar owns the dialog, so it opens it there. Every close path
   // clears the request so a later request for the SAME category still re-triggers.
@@ -322,7 +327,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       {/* Push the actions to the right. */}
       <div style={{ flex: 1 }} />
 
-      {/* Trial counter + Unlock — in-row, to the LEFT of the Recent/Open/New/⋯ + auth-status
+      {/* Trial counter + Unlock — in-row, to the LEFT of the Recent/Open/⋯ + auth-status
           cluster, so it can never cover them. Only in trial mode; hides once the trial is spent. */}
       {inTrial && <TrialIndicator onUnlock={onTrialUnlock} signInFailedUrl={trialFailedUrl} />}
 
@@ -371,6 +376,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
                 return (
                   <div
                     key={p.id}
+                    data-hint={RECENT_HINT}
                     onClick={() => {
                       setRecentOpen(false);
                       openOrAsk({ kind: "existing", id: p.id });
@@ -402,10 +408,13 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
                     </span>
                     {openElsewhere && (
                       <button
+                        data-hint={RECENT_SWITCH_HINT}
                         onClick={(e) => {
                           // Don't let the row's open-handler fire too — Switch only raises the
                           // existing window. openProjectInWindow focuses an already-open project
-                          // regardless of mode, so this never spawns a duplicate.
+                          // regardless of mode, so this never spawns a duplicate. This also makes
+                          // the keyboard hint safe: activating the switch chiclet fires el.click()
+                          // on THIS button, and the row's open-here handler must not also run.
                           e.stopPropagation();
                           setRecentOpen(false);
                           route(p.id, "new");
@@ -435,16 +444,22 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
         )}
       </div>
 
-      <button data-hint="open" style={btn} onClick={() => startOpen("Open a project — choose its folder")}>
-        Open
-      </button>
-
+      {/* One entry point for getting a project into Sparkle: opens the folder / GitHub dialog.
+          Reads "Open" at rest and expands to its full intent on hover. */}
       <button
-        data-hint="new"
+        data-hint="open"
+        // Stable accessible name: the VISIBLE label expands on hover/focus (compact "Open" at rest,
+        // full intent on hover — a deliberate design choice), but assistive tech always hears the
+        // full description, so the name doesn't churn under a screen reader.
+        aria-label="Open (or Create) a Project Folder"
         style={{ ...btn, borderColor: C.teal, background: C.teal, color: ON_BRAND_FILL }}
+        onMouseEnter={() => setOpenHover(true)}
+        onMouseLeave={() => setOpenHover(false)}
+        onFocus={() => setOpenHover(true)}
+        onBlur={() => setOpenHover(false)}
         onClick={() => setNewProjectOpen(true)}
       >
-        New
+        {openHover ? "Open (or Create) a Project Folder" : "Open"}
       </button>
 
       {/* ⋯ menu: opens the categorized settings dialog (SettingsDialog). */}
@@ -477,8 +492,8 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       {newProjectOpen && (
         <NewProjectDialog
           onClose={() => setNewProjectOpen(false)}
-          // "From folder" runs today's exact New flow, byte-identical (startOpen → picker / choice).
-          onOpenFromFolder={() => startOpen("New project — choose or create its folder")}
+          // "From folder" runs the same picker/choice flow the old standalone Open button did.
+          onOpenFromFolder={() => startOpen("Open or create a project folder")}
           // "Clone & Open" → create + open + select the cloned project, the SAME route resolveAndRoute
           // uses for a freshly-picked folder (so the new project becomes selected). Clone deliberately
           // opens in THIS window ("replace") rather than routing through the replace-vs-new prompt: the

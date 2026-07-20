@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { TbMicrophone, TbMicrophoneOff } from "react-icons/tb";
+import { FiDownloadCloud } from "react-icons/fi";
 import { C, DANGER } from "../theme/colors";
 import { useDictationStore } from "../stores/dictationStore";
 import { useAuthStore } from "../stores/authStore";
@@ -20,39 +21,67 @@ export function shouldBlockMicArm(me: Me | null): boolean {
 // lives here and both render sites consume it. Keeping it in one place means the two mics can't
 // drift.
 //
-// The mic has three user-facing states, all derived from the existing dictation store (no new
+// The mic has four user-facing states, all derived from the existing dictation store (no new
 // state added):
-//   off    = !enabled                       — mic released, nothing captured
-//   paused = enabled && !liveActive          — on, but waiting for the wake word (or focus-paused)
-//   active = enabled && status listening && phase active — actively dictating right now
+//   off       = !enabled                      — mic released, nothing captured
+//   preparing = enabled && a model download in flight — armed, but voice can't work YET
+//   paused    = enabled && !liveActive         — on, but waiting for the wake word (or focus-paused)
+//   active    = enabled && status listening && phase active — actively dictating right now
 //
 // A click never jumps straight from active to off: it PAUSES first. The full cycle:
 //   off → setEnabled(true) → paused
 //   active → setPhase("passive") → paused   (stays on; stops dictating)
 //   paused → setEnabled(false) → off
+// Preparing clicks like paused (→ off), so the user can always back out of a long first-run
+// download rather than being stuck watching it.
 
-export type MicState = "off" | "paused" | "active";
+export type MicState = "off" | "preparing" | "paused" | "active";
 
-/** THE single source of truth for the mic's tri-state, derived purely from the three dictation-store
+/** What the user ASKED for, as offered by the hover pill: the three states they can choose between.
+ *  Deliberately narrower than MicState — "preparing" is something the app reports, never something
+ *  a user can pick, so the pill's options can't accidentally grow a fourth entry. */
+export type MicIntent = Exclude<MicState, "preparing">;
+
+/** THE single source of truth for the mic's state, derived purely from the dictation-store
  *  fields. Every mic surface — the top ring (LogoWaveform), the composer-left mic (ComposerMic), and
  *  any status text — MUST route through this so they can never disagree about what state the mic is
  *  in. Keeping the derivation in one pure, tested function (rather than re-inlining `!enabled ? …`
  *  at each call site) is the guardrail that keeps the two controls in lockstep.
  *
  *  liveActive (capture genuinely live AND active phase) is the only "active" — phase alone isn't
- *  enough, since we can sit in the active phase while focus-paused (status idle). */
+ *  enough, since we can sit in the active phase while focus-paused (status idle).
+ *
+ *  `modelProgress` (the store field; non-null ONLY while the backend is fetching the voice model)
+ *  is what makes the first-run wait honest. useDictation sets status "listening" optimistically,
+ *  BEFORE start_dictation — which on a cold start blocks for minutes on a ~482 MB download — so
+ *  without this the mic drew the healthy "paused" glyph for the whole wait and the composer invited
+ *  the user to say the wake word at a model that wasn't on disk yet. It outranks "active" because a
+ *  missing model can't dictate no matter what phase the user selects. Optional (defaults to null)
+ *  so a WARM start — model already present, no progress events, every existing call site — derives
+ *  exactly what it always did.
+ *
+ *  Deliberately NOT handled here: `status === "error"`. A failed mic derives "paused", and the
+ *  failure is surfaced by the caption (LogoWaveform) and the composer notice instead — both of
+ *  which name the actual cause and offer the remedy, which a glyph cannot. Adding an error VARIANT
+ *  would be a reasonable follow-up (the glyph still rests amber during a failure), but it would
+ *  also change what a click does in that state, so it is out of scope here rather than overlooked. */
 export function deriveMicState(
   enabled: boolean,
   status: "idle" | "listening" | "error",
   phase: Phase,
+  modelProgress: { done: number; total: number | null } | null = null,
 ): MicState {
+  if (!enabled) return "off";
+  if (modelProgress !== null) return "preparing";
   const liveActive = status === "listening" && phase === "active";
-  return !enabled ? "off" : liveActive ? "active" : "paused";
+  return liveActive ? "active" : "paused";
 }
 
 /** The icon shape the glyph should draw. `open` = live mic, `slash` = muted mic, `pause` = the
- *  orange "mic + two pause bars" affordance. */
-export type MicVariant = "open" | "slash" | "pause";
+ *  orange "mic + two pause bars" affordance, `loading` = the mic is armed but the voice model is
+ *  still coming down (a cloud-download glyph, deliberately NOT a mic shape — the point is that it
+ *  cannot be mistaken for a ready mic at a glance). */
+export type MicVariant = "open" | "slash" | "pause" | "loading";
 
 /** Reads the dictation store and exposes the mic's current state plus the tri-state click cycle.
  *  Both mics call this, so the click actions and semantics are guaranteed the same. */
@@ -65,13 +94,14 @@ export function useMicToggle(): {
   const enabled = useDictationStore((s) => s.enabled);
   const status = useDictationStore((s) => s.status);
   const phase = useDictationStore((s) => s.phase);
+  const modelProgress = useDictationStore((s) => s.modelProgress);
   const setEnabled = useDictationStore((s) => s.setEnabled);
   const setPhase = useDictationStore((s) => s.setPhase);
   const showOutOfCreditsNotice = useDictationStore((s) => s.showOutOfCreditsNotice);
   const clearOutOfCreditsNotice = useDictationStore((s) => s.clearOutOfCreditsNotice);
 
   // Single source of truth (deriveMicState) so this control and every other mic surface agree.
-  const state: MicState = deriveMicState(enabled, status, phase);
+  const state: MicState = deriveMicState(enabled, status, phase, modelProgress);
 
   const onClick = () => {
     if (state === "off") {
@@ -88,16 +118,28 @@ export function useMicToggle(): {
       setEnabled(true); // off → paused (arm the mic; it resumes wake-word listening)
     } else if (state === "active")
       setPhase("passive"); // active → paused (stop dictating, stay listening — never turn off)
-    else setEnabled(false); // paused → off
+    else setEnabled(false); // paused (or preparing) → off
   };
 
+  // Preparing gets its own label rather than reusing the paused one: to a screen reader (and to
+  // anyone hovering) an armed-but-still-downloading mic must not sound like a ready one. It still
+  // names the action it performs ("turn off microphone") since that's what a click does.
   const ariaLabel =
     state === "off"
       ? "Turn on microphone"
       : state === "active"
       ? "Pause listening"
+      : state === "preparing"
+      ? "Setting up voice — turn off microphone"
       : "Turn off microphone";
-  const title = state === "off" ? "Turn on" : state === "active" ? "Pause" : "Turn off";
+  const title =
+    state === "off"
+      ? "Turn on"
+      : state === "active"
+      ? "Pause"
+      : state === "preparing"
+      ? "Setting up voice…"
+      : "Turn off";
 
   return { state, onClick, ariaLabel, title };
 }
@@ -110,7 +152,7 @@ export function useMicToggle(): {
  *  while focus-paused — click "listening" and the pill keeps that option checked even if capture
  *  hasn't resumed yet (the resting mic glyph still honestly shows paused until it does). */
 export function useMicActions(): {
-  intent: MicState;
+  intent: MicIntent;
   setActive: () => void;
   setMuted: () => void;
   setOff: () => void;
@@ -122,7 +164,7 @@ export function useMicActions(): {
   const showOutOfCreditsNotice = useDictationStore((s) => s.showOutOfCreditsNotice);
   const clearOutOfCreditsNotice = useDictationStore((s) => s.clearOutOfCreditsNotice);
 
-  const intent: MicState = !enabled ? "off" : phase === "active" ? "active" : "paused";
+  const intent: MicIntent = !enabled ? "off" : phase === "active" ? "active" : "paused";
 
   return {
     intent,
@@ -203,6 +245,11 @@ export function useHoverMenu(closeDelayMs = 220): {
  *  Exported so the ring can also color its BORDER to match the glyph. */
 export function micVisual(state: MicState, hovered: boolean): { color: string; variant: MicVariant } {
   if (state === "off") return { color: hovered ? C.teal : C.muted, variant: "slash" };
+  // preparing: a muted download glyph at rest — muted (not amber) and not a mic shape, so it can't
+  // be mistaken for the ready/paused mic it used to be drawn as. Hover matches what a click does
+  // (turn off), same as paused.
+  if (state === "preparing")
+    return hovered ? { color: DANGER, variant: "slash" } : { color: C.muted, variant: "loading" };
   if (state === "paused")
     return hovered ? { color: DANGER, variant: "slash" } : { color: C.amber, variant: "pause" };
   // active
@@ -277,6 +324,11 @@ export function MicGlyph({
 }) {
   if (variant === "slash") return <TbMicrophoneOff size={size} />;
   if (variant === "pause") return <MicPauseIcon size={size} surfaceColor={surfaceColor} />;
+  // The one-time voice-model fetch. `sparkle-pulse` (index.css) is the app's existing "working on
+  // it" opacity breathe — reused rather than invented so the glyph reads as in-progress, and so it
+  // stays a plain opacity fade (no motion) for anyone sensitive to movement.
+  if (variant === "loading")
+    return <FiDownloadCloud size={size} className="sparkle-pulse" aria-hidden />;
   return <TbMicrophone size={size} />;
 }
 
@@ -284,7 +336,7 @@ export function MicGlyph({
 // off. Each carries the glyph shape, its identity color, and the action key into useMicActions.
 // (Colors mirror micVisual's resting palette: successInk green / amber / DANGER red.)
 const MIC_OPTIONS: {
-  key: MicState;
+  key: MicIntent;
   variant: MicVariant;
   color: string;
   label: string;
@@ -318,7 +370,7 @@ export function MicMenu({
   hoverProps?: { onMouseEnter: () => void; onMouseLeave: () => void };
 }) {
   const { intent, setActive, setMuted, setOff } = useMicActions();
-  const run: Record<MicState, () => void> = { active: setActive, paused: setMuted, off: setOff };
+  const run: Record<MicIntent, () => void> = { active: setActive, paused: setMuted, off: setOff };
   return (
     <div
       role="menu"

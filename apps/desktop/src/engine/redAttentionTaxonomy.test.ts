@@ -57,9 +57,12 @@ describe("RED needs-you taxonomy (sparkle-vgub / sparkle-blpf / sparkle-pqxh)", 
     expect(mightNeedFollowup("Once you confirm, I'll lay out the remaining sections.")).toBe(true);
   });
 
-  it("self-prompt / churn loop → RED (errored), not green", () => {
+  it("self-prompt / churn loop (REPEATED pings) → RED (errored), not green", () => {
     const { engine, last } = makeEngine();
-    engine.ingest("Are you still there? Hey, Sparkler.\n");
+    // Bug A: a self-prompt is a wedge only once it REPEATS with no progress (a single occurrence is
+    // a legitimate user utterance / prose quote). Two pings on discrete lines make the loop.
+    engine.ingest("Are you still there?\n");
+    engine.ingest("Hey, Sparkler.\n");
     expect(last()).toBe("errored");
     expect(needsAttention(last())).toBe(true);
     // And the generic unknown-churn backstop: the same short line repeating with no progress.

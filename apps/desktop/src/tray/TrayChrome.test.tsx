@@ -37,20 +37,21 @@ beforeEach(() => vi.clearAllMocks());
 afterEach(() => cleanup());
 
 describe("TrayHeader", () => {
-  it("renders the Sparkle logo and the Recent/Open/New actions", async () => {
+  it("renders the Sparkle logo and the Recent/Open actions (New merged into Open)", async () => {
     const { TrayHeader } = await import("./TrayChrome");
     render(<TrayHeader onAction={() => {}} onCapture={() => {}} />);
     expect(screen.getByAltText("Sparkle")).toBeTruthy();
     expect(screen.getByText("Open")).toBeTruthy();
-    expect(screen.getByText("New")).toBeTruthy();
+    // "New" was merged into the single "Open" button — it no longer renders on its own.
+    expect(screen.queryByText("New")).toBeNull();
     expect(screen.getByText("Recent ▾")).toBeTruthy();
   });
 
-  it("opens a new project window via the picker, then signals onAction", async () => {
+  it("opens a project window via the picker, then signals onAction", async () => {
     const onAction = vi.fn();
     const { TrayHeader } = await import("./TrayChrome");
     render(<TrayHeader onAction={onAction} onCapture={() => {}} />);
-    fireEvent.click(screen.getByText("New"));
+    fireEvent.click(screen.getByText("Open"));
     await waitFor(() => expect(openProjectInWindow).toHaveBeenCalledWith("p1", "new", expect.anything()));
     expect(pickProjectFolder).toHaveBeenCalled();
     expect(onAction).toHaveBeenCalled();

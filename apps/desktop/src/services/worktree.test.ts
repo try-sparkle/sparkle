@@ -7,6 +7,7 @@ import {
   prepareAgentWorkspace,
   prepareWorkerWorkspace,
   removeAgentWorkspace,
+  prewarmProjectCaches,
 } from "./worktree";
 
 describe("worktree service", () => {
@@ -30,6 +31,30 @@ describe("worktree service", () => {
     expect(invoke).toHaveBeenCalledWith("remove_agent_worktree", {
       root: "/root-rm", projectId: "p", agentId: "a",
     });
+  });
+
+  it("prewarmProjectCaches git-inits the folder (ensure_project_repo) so in-place work is versioned", async () => {
+    // The hazel-eco fix: opening a project must make its folder a git repo even before any BUILD
+    // agent spawns, so Think/Chief/Shell work that runs in-place lands in a version-controlled tree.
+    invoke.mockResolvedValue(undefined);
+    const root = "/root-prewarm-ensure"; // unique root — the module's `prewarmed` guard is per-session
+    prewarmProjectCaches(root);
+    await new Promise((r) => setTimeout(r, 0)); // let the repo-lock microtask chain flush
+    expect(invoke).toHaveBeenCalledWith("ensure_project_repo", { path: root });
+    expect(invoke).toHaveBeenCalledWith("prewarm_spawn", { root });
+  });
+
+  it("prewarmProjectCaches only ensures the repo once per root (idempotent, no index.lock storm)", async () => {
+    invoke.mockResolvedValue(undefined);
+    const root = "/root-prewarm-once";
+    prewarmProjectCaches(root);
+    await new Promise((r) => setTimeout(r, 0));
+    const firstEnsures = invoke.mock.calls.filter((c) => c[0] === "ensure_project_repo").length;
+    expect(firstEnsures).toBe(1);
+    invoke.mockClear();
+    prewarmProjectCaches(root); // second touch of the same root
+    await new Promise((r) => setTimeout(r, 0));
+    expect(invoke).not.toHaveBeenCalledWith("ensure_project_repo", { path: root });
   });
 
   it("serializes worktree removal behind an in-flight prepare on the same root (no index.lock race)", async () => {

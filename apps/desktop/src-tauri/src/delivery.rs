@@ -79,7 +79,7 @@ pub struct DeliveryEvidence {
 /// (missing git, not a repo, etc.). Delivery detection is best-effort: a git error is "no evidence",
 /// never a hard failure.
 fn git_ok(cwd: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(crate::preflight::git_program());
     cmd.arg("-C").arg(cwd).args(args);
     // Never let git block on an interactive credential/host-key prompt (mirrors worktree.rs).
     cmd.env("GIT_TERMINAL_PROMPT", "0");

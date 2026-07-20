@@ -269,6 +269,9 @@ describe("createDictationController (hook logic without renderHook)", () => {
   });
 
   it("dictation://level clears modelProgress (capture started)", () => {
+    // 482 MB is the COMPRESSED tarball's content-length — what the byte stream (and therefore this
+    // progress pair) actually counts. The unpacked model is ~631 MB on disk; don't "correct" this
+    // to that number, it would no longer match what the backend reports.
     useDictationStore.setState({
       modelProgress: { done: 480_000_000, total: 482_000_000 },
     });

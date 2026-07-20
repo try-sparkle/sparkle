@@ -195,8 +195,16 @@ describe("MobileDevicesPane", () => {
       fireEvent.click(screen.getByRole("button", { name: /Get pairing code/ }));
       await vi.waitFor(() => expect(screen.getByTestId("pair-code")).toBeTruthy());
       expect(screen.getByText(/Code expires in/)).toBeTruthy();
-      await vi.advanceTimersByTimeAsync(CODE_TTL_MS + 1500);
-      expect(screen.getByText(/This code has expired/)).toBeTruthy();
+      // Jump the CLOCK past the TTL, then fire a single tick of the 1s countdown interval.
+      // The pane derives "expired" from Date.now() each tick, so one tick after the jump is
+      // enough to observe it. Advancing the full 15min TTL instead (advanceTimersByTimeAsync)
+      // runs ~900 intervals, each re-rendering — that took >6s of real time and blew the 5s
+      // test timeout whenever the machine was busy.
+      vi.setSystemTime(Date.now() + CODE_TTL_MS + 1500);
+      await vi.advanceTimersByTimeAsync(1000);
+      // waitFor the re-render: the tick's setNow() is a React state update, and the old
+      // advance-the-whole-TTL version only flushed it incidentally, via the ~900 awaits it did.
+      await vi.waitFor(() => expect(screen.getByText(/This code has expired/)).toBeTruthy());
     } finally {
       vi.useRealTimers();
     }

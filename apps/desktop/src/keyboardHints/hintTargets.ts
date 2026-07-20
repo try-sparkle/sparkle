@@ -9,6 +9,18 @@
 // (top to bottom), NOT by a fixed key, so they share one id and the labels are assigned positionally.
 export const AGENT_HINT = "agent";
 
+// The data-hint value used by rows in the Recent-projects dropdown. Like agents, these are labeled
+// positionally by on-screen order (top to bottom) rather than by a fixed key — but from the FULL
+// alphabet, because while the dropdown is open the overlay shows only these rows (see collectChiclets
+// in HintOverlay), so their letters can never collide with a chrome mnemonic.
+export const RECENT_HINT = "recent-item";
+
+// The data-hint value used by the "Switch" button inside a Recent row — the affordance that raises
+// the window ALREADY showing that project instead of opening it here. It draws from the same
+// sequential pool as the rows themselves (rows first, then switches), so with 13 rows the switches
+// pick up at "n". Sharing one stream is what keeps a row letter and a switch letter from colliding.
+export const RECENT_SWITCH_HINT = "recent-switch";
+
 // Fixed mnemonic key for each chrome control, keyed by its data-hint attribute value.
 // (The "." for the ⋯ overflow menu is a deliberate pun: three dots → the period key.)
 export const CHROME_HINTS: Record<string, string> = {
@@ -43,6 +55,13 @@ export function agentLabel(index: number): string | null {
   return AGENT_OVERFLOW_POOL[index - 9] ?? null;
 }
 
+// Labels for Recent-dropdown rows: the full a–z, one per row in list order. Returns null past the
+// 26th row (more distinct projects than letters — the tail simply gets no badge, matching agentLabel).
+export const RECENT_POOL = "abcdefghijklmnopqrstuvwxyz".split("");
+export function recentLabel(index: number): string | null {
+  return RECENT_POOL[index] ?? null;
+}
+
 export type HintInput = { hintId: string };
 export type LabeledHint<T extends HintInput> = T & { label: string | null };
 
@@ -51,10 +70,18 @@ export type LabeledHint<T extends HintInput> = T & { label: string | null };
 // mnemonic. A target with no resolvable label gets `label: null` (filtered out by the renderer).
 export function assignLabels<T extends HintInput>(targets: T[]): LabeledHint<T>[] {
   let agentIndex = 0;
+  let recentIndex = 0;
   return targets.map((t) => {
     if (t.hintId === AGENT_HINT) {
       const label = agentLabel(agentIndex);
       agentIndex += 1;
+      return { ...t, label };
+    }
+    // Rows and their Switch buttons share ONE sequential stream so their letters can't collide.
+    // The caller passes every row before any switch, so rows take a.. and switches continue after.
+    if (t.hintId === RECENT_HINT || t.hintId === RECENT_SWITCH_HINT) {
+      const label = recentLabel(recentIndex);
+      recentIndex += 1;
       return { ...t, label };
     }
     return { ...t, label: CHROME_HINTS[t.hintId] ?? null };

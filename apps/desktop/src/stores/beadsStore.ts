@@ -3,8 +3,25 @@
 // Timer handles live at module scope (not in store state) so the store stays serializable
 // and a re-render never touches the interval.
 import { create } from "zustand";
-import { listBeads, bucketBeads, type Bead, type Board } from "../services/beads";
+import {
+  listBeads,
+  bucketBeads,
+  ensureBeadsDb,
+  isBeadsUnavailable,
+  type Bead,
+  type Board,
+} from "../services/beads";
 import { runDecomposeWatcherForPoll } from "../services/epicDecompose";
+import { useSettingsStore } from "./settingsStore";
+
+/** Whether Beads ([tools].beads) is enabled right now. Off means the `bd` CLI is never invoked. */
+function beadsEnabled(): boolean {
+  try {
+    return useSettingsStore.getState().beadsEnabled;
+  } catch {
+    return true; // store unavailable (shouldn't happen) — default to the on-by-default state
+  }
+}
 
 /** Default poll interval. bd is local + cheap, but 5s keeps the board feeling live without
  *  hammering the CLI. */
@@ -32,6 +49,10 @@ interface BeadsState {
 
 // One interval per project, kept out of store state so timers never serialize / re-render.
 const timers = new Map<string, ReturnType<typeof setInterval>>();
+// Projects we've already attempted a one-shot `bd init` auto-heal for this session (see refresh).
+// Guards against re-initing every 5s poll, and against hammering `bd init` when it keeps failing
+// (e.g. `bd` not installed) — one attempt per project per app session. Kept out of store state.
+const autoInitAttempted = new Set<string>();
 // Per-project one-shot `visibilitychange` listener, armed when a poll tick is skipped because the
 // window is hidden. It re-syncs the board the instant the window is shown again, then removes
 // itself. Kept out of store state for the same reason as `timers`. Torn down by stopPolling.
@@ -59,6 +80,17 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
   error: {},
 
   refresh: async (projectId, projectPath) => {
+    // "Off means off": with [tools].beads disabled, never shell out to `bd`. This is the single
+    // chokepoint for the CLI (startPolling's immediate + interval + visibility-refresh paths all
+    // route through here), and it also gates the post-poll decompose watcher below. Drop any prior
+    // snapshot so a board reached in some edge case shows empty, not stale.
+    if (!beadsEnabled()) {
+      set((s) => ({
+        byProject: { ...s.byProject, [projectId]: undefined },
+        loading: { ...s.loading, [projectId]: false },
+      }));
+      return;
+    }
     set((s) => ({ loading: { ...s.loading, [projectId]: true } }));
     try {
       const beads = await listBeads(projectPath);
@@ -73,6 +105,38 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
       // it never throws, and the next poll picks up whatever labels/children it wrote.
       void runDecomposeWatcherForPoll(projectId, projectPath, board);
     } catch (e) {
+      // Brand-new project whose beads DB was never created: bd rejects every read with
+      // "no beads database found". Auto-init one (once per project this session) and retry the
+      // list so the board self-heals into an empty state instead of surfacing that raw error —
+      // "beads by default". Only the recognized "no DB" case triggers this; any other failure, or
+      // a still-failing retry, falls through to the normal error path below.
+      if (isBeadsUnavailable(e) && !autoInitAttempted.has(projectId)) {
+        autoInitAttempted.add(projectId);
+        try {
+          await ensureBeadsDb(projectPath);
+          const beads = await listBeads(projectPath);
+          const board = bucketBeads(beads);
+          set((s) => ({
+            byProject: { ...s.byProject, [projectId]: { beads, board, loadedAt: Date.now() } },
+            loading: { ...s.loading, [projectId]: false },
+            error: { ...s.error, [projectId]: undefined },
+          }));
+          void runDecomposeWatcherForPoll(projectId, projectPath, board);
+          return;
+        } catch (initErr) {
+          // Init (or the retried list) failed — e.g. `bd` isn't installed. Surface THIS error
+          // instead of the original "no DB" one, and clear loading. The one-shot guard above
+          // stays set so we don't hammer `bd init` on every subsequent poll.
+          set((s) => ({
+            loading: { ...s.loading, [projectId]: false },
+            error: {
+              ...s.error,
+              [projectId]: initErr instanceof Error ? initErr.message : String(initErr),
+            },
+          }));
+          return;
+        }
+      }
       // Best-effort: a bd/parse failure must not break the UI. Keep the last snapshot,
       // surface the message, and clear the loading flag.
       set((s) => ({
@@ -83,6 +147,7 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
   },
 
   startPolling: (projectId, projectPath, intervalMs = BEADS_POLL_INTERVAL_MS) => {
+    if (!beadsEnabled()) return; // Beads off: don't even arm a timer (refresh would no-op anyway)
     if (timers.has(projectId)) return; // already polling — idempotent
     // Fire immediately so the board isn't empty for a full interval, then on a cadence.
     void useBeadsStore.getState().refresh(projectId, projectPath);

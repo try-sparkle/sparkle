@@ -74,30 +74,24 @@ beforeEach(() => {
 
 const DIALOG_COPY = /Replace the project in this window/i;
 
-describe("TopBar Open/New flow", () => {
-  it("Open asks replace-vs-new-window BEFORE the folder picker", async () => {
+describe("TopBar Open flow", () => {
+  it("Open opens the unified dialog with both tabs; the picker has NOT fired yet", async () => {
     render(<TopBar onOpenSettings={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    // The single "Open" button now opens the tabbed folder/GitHub dialog (New + Open were merged).
+    fireEvent.click(screen.getByRole("button", { name: "Open (or Create) a Project Folder" }));
 
-    // The choice dialog must appear, and the native picker must NOT have fired yet.
-    expect(screen.getByText(DIALOG_COPY)).toBeTruthy();
-    expect(pickProjectFolder).not.toHaveBeenCalled();
-
-    // Only after choosing a mode does the folder picker run.
-    fireEvent.click(screen.getByRole("button", { name: "Replace current project" }));
-    await waitFor(() => expect(pickProjectFolder).toHaveBeenCalledOnce());
-  });
-
-  it("New opens the New Project dialog; From folder then runs today's ask-first picker flow", async () => {
-    render(<TopBar onOpenSettings={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "New" }));
-
-    // New now opens the tabbed New Project dialog (not straight to the folder flow).
     expect(screen.getByRole("tab", { name: "From folder" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "From GitHub" })).toBeTruthy();
+    // No standalone "New" button remains.
+    expect(screen.queryByRole("button", { name: "New" })).toBeNull();
     expect(pickProjectFolder).not.toHaveBeenCalled();
+  });
 
-    // "From folder" is the default tab → choosing a folder runs the SAME startOpen path, which (a
+  it("From folder runs the ask-first picker flow (choice BEFORE the native picker)", async () => {
+    render(<TopBar onOpenSettings={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Open (or Create) a Project Folder" }));
+
+    // "From folder" is the default tab → choosing a folder runs the startOpen path, which (a
     // project is open) still asks replace-vs-new BEFORE the picker.
     fireEvent.click(screen.getByRole("button", { name: "Choose a folder…" }));
     expect(screen.getByText(DIALOG_COPY)).toBeTruthy();

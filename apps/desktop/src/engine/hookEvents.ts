@@ -144,18 +144,43 @@ export class HookStatusEngine {
     }
   }
 
+  /** Does this event belong to the main agent's session? PURE — a query, never a latch, so a caller
+   *  can gate on it without accidentally locking onto whatever event it happens to pass. Adoption
+   *  is `adoptSession`'s job alone.
+   *
+   *  Exposed rather than kept inline in `ingest` so every consumer — status, hook liveness, and
+   *  history/judge dispatch — gates on the SAME decision instead of duplicating the rule. A
+   *  background `claude` in the same worktree must not drive any of them.
+   *
+   *  Accepts an event with no session_id (defensive, for older logs), and accepts anything while
+   *  the lock is unset — before adoption there is no "other" session to reject it in favour of.
+   *  That permissive branch is safe because the single real call path, `createHookEventHandler`,
+   *  adopts before it gates, so the lock is always already set by the same event. A caller that
+   *  gated WITHOUT adopting first would accept one foreign event; don't add one. */
+  isMainSession(ev: HookEvent): boolean {
+    if (!ev.session_id) return true;
+    if (this.mainSession === null) return true;
+    return ev.session_id === this.mainSession;
+  }
+
+  /** Adopt the first session_id seen as the main agent's. A COMMAND, named as one — the single
+   *  latch path, kept separate from the `isMainSession` query so the two can't be confused.
+   *  Idempotent after the first adopting call. `createHookEventHandler` — the real call path — calls
+   *  this once per event, before any gate; `ingest` also calls it so a direct `ingest()` (tests, or
+   *  any future caller wiring the engine on its own) still locks on correctly.
+   *
+   *  ASSUMPTION: the main agent's first post-EOF event precedes any background `claude` call it
+   *  later spawns — true at spawn, when nothing else is running yet. A re-prepare while a prior
+   *  background one-shot is still mid-flight could mis-lock onto that background session; this is
+   *  rare and accepted (a fresh spawn re-creates the engine and re-locks correctly). */
+  adoptSession(ev: HookEvent): void {
+    if (ev.session_id && this.mainSession === null) this.mainSession = ev.session_id;
+  }
+
   /** Feed one parsed hook event. Unknown events leave the status unchanged. */
   ingest(ev: HookEvent): void {
-    // Session lock: adopt the first session_id we see as the main agent's; drop any other
-    // session's events (events with no session_id at all are kept — defensive for older logs).
-    // ASSUMPTION: the main agent's first post-EOF event precedes any background `claude` call it
-    // later spawns — true at spawn, when nothing else is running yet. A re-prepare while a prior
-    // background one-shot is still mid-flight could mis-lock onto that background session; this is
-    // rare and accepted (a fresh spawn re-creates the engine and re-locks correctly).
-    if (ev.session_id) {
-      if (this.mainSession === null) this.mainSession = ev.session_id;
-      else if (ev.session_id !== this.mainSession) return;
-    }
+    this.adoptSession(ev);
+    if (!this.isMainSession(ev)) return;
 
     if (TURN_OPENERS.has(ev.event)) this.turnClosed = false;
     else if (TURN_CLOSERS.has(ev.event)) this.turnClosed = true;
@@ -179,4 +204,42 @@ export class HookStatusEngine {
     const next = hookEventToStatus(ev);
     if (next) this.set(next);
   }
+}
+
+/** Wiring for `createHookEventHandler` — the three consumers of a hook event, injected so the
+ *  handler is testable without AgentPane's worktree/PTY/store surface. */
+export interface HookEventHandlerDeps {
+  engine: HookStatusEngine;
+  /** `router.activate()` — "a real event arrived, hooks own the status now". Also stamps the
+   *  router's hook-liveness clock, which is why it MUST NOT see foreign sessions. */
+  activate: () => void;
+  /** Persist prompts/responses to history (and dispatch the followup judge). */
+  captureHistory: (ev: HookEvent) => void;
+}
+
+/**
+ * The watcher callback: what happens when one line lands in the per-agent hook log.
+ *
+ * Extracted from AgentPane so the ORDER encoded here — which is load-bearing three times over — is
+ * stated once and tested directly, rather than living inline in a component with no test harness:
+ *
+ *  1. `adoptSession` first, so the very first event of the run sets the lock.
+ *  2. The session gate SECOND, before anything else, so a background `claude` sharing this
+ *     worktree's log drives NOTHING. It must not reach `captureHistory` (its Stop would be read,
+ *     judged, and fromJudge("waiting")-ed onto this agent's row; its UserPromptSubmit would bump
+ *     the turn counter and make the turn-token guard discard a legitimate verdict), and it must not
+ *     reach `activate` (which stamps the hook-liveness clock — a chatty background session would
+ *     keep the clock fresh and defeat the status router's staleness watchdog precisely when the
+ *     main session's own stream is dead or mis-locked).
+ *  3. `activate` BEFORE `ingest`, because ingest drives the router's fromHook, which only emits once
+ *     hooks are live — activating after it would swallow the first event's status.
+ */
+export function createHookEventHandler(deps: HookEventHandlerDeps): (ev: HookEvent) => void {
+  return (ev) => {
+    deps.engine.adoptSession(ev);
+    if (!deps.engine.isMainSession(ev)) return;
+    deps.activate();
+    deps.engine.ingest(ev);
+    deps.captureHistory(ev);
+  };
 }

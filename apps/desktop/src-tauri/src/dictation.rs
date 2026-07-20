@@ -197,6 +197,31 @@ pub(crate) fn capture_should_be_live(armed: bool, focused: bool) -> bool {
     armed && focused
 }
 
+/// The capture transition to make given the desired vs. actual state — factored out of the reconcile
+/// so the decision can be taken UNDER the session lock while the action it names (build or tear down)
+/// is performed OUTSIDE it. That split is the fix for the sparkle-sfxu launch deadlock: `Capture::start`
+/// (CoreAudio init) and `is_focused()` both block on the main thread, so from a worker they must never
+/// run while the session Mutex — which the main thread's focus handler also takes — is held.
+///   - `Build`: the mic should be live (`capture_should_be_live`) and no capture is installed yet.
+///   - `Teardown`: the mic should NOT be live but a capture is still installed.
+///   - `Idle`: already in the desired state — nothing to do.
+///
+/// Pure so the desired×actual matrix is unit-testable without an audio device or a window.
+#[derive(Debug, PartialEq)]
+pub(crate) enum CapturePlan {
+    Idle,
+    Build,
+    Teardown,
+}
+
+pub(crate) fn plan_capture(should_be_live: bool, has_capture: bool) -> CapturePlan {
+    match (should_be_live, has_capture) {
+        (true, false) => CapturePlan::Build,
+        (false, true) => CapturePlan::Teardown,
+        _ => CapturePlan::Idle,
+    }
+}
+
 /// Whether a *deferred* blur should actually commit (release the mic + notify the frontend). We
 /// defer acting on "no Sparkle window focused" by a tick because, on a window-to-window switch,
 /// macOS delivers the old window's resignKey (`Focused(false)`) BEFORE the new window's becomeKey
@@ -357,6 +382,26 @@ pub struct DictationState(pub Arc<Mutex<DictationSession>>, pub Arc<AtomicU64>);
 #[allow(clippy::arc_with_non_send_sync)]
 impl Default for DictationState { fn default() -> Self { Self(Arc::new(Mutex::new(DictationSession::default())), Arc::new(AtomicU64::new(0))) } }
 
+/// The transition `take_reconcile_step` extracts under the lock for `reconcile_capture` to act on
+/// OUTSIDE it. Carries the owned data each action needs so the lock is released before any
+/// main-thread-dependent audio call (the sparkle-sfxu deadlock fix):
+///   - `Build`: the Arcs `build_capture` needs (the capture is built, then installed via a
+///     re-validated `install_capture`).
+///   - `Teardown`: the live capture + worker, taken OUT of the session so the caller drops them
+///     (pausing the cpal stream, joining the worker) with no lock held.
+enum ReconcileStep {
+    Idle,
+    Build {
+        transcriber: Arc<Mutex<ParakeetTdt>>,
+        cloud_active: Arc<AtomicBool>,
+        cloud_tx: Arc<Mutex<Option<CloudAudioSender>>>,
+    },
+    Teardown {
+        capture: Option<Capture>,
+        worker: Option<DecodeWorker>,
+    },
+}
+
 impl DictationState {
     /// Stop any in-flight capture by dropping the cpal stream, so CoreAudio stops invoking the
     /// audio callback. Called on app exit () to quiesce the audio IOThread BEFORE
@@ -382,8 +427,13 @@ impl DictationState {
     /// CoreAudio invoking the callback and releases the OS mic (the macOS recording indicator goes
     /// off) — true "not capturing", not merely discarded frames.
     fn reconcile_locked(sess: &mut DictationSession, app: &AppHandle) {
-        let desired = capture_should_be_live(sess.armed, sess.focused);
-        if desired && sess.capture.is_none() {
+        // Same decision as the worker-side reconcile — both derive it from `plan_capture` so the two
+        // paths can't drift on when to build vs. tear down (sparkle-sfxu review). Safe to build/tear
+        // down INLINE here because reconcile_locked runs only on the main thread (via set_focused),
+        // where is_focused() is serviced inline and Capture::start doesn't self-block.
+        match plan_capture(capture_should_be_live(sess.armed, sess.focused), sess.capture.is_some()) {
+            CapturePlan::Idle => {}
+            CapturePlan::Build => {
             // transcriber is always Some while armed; the guard is belt-and-suspenders.
             if let Some(transcriber) = sess.transcriber.clone() {
                 match build_capture(
@@ -402,7 +452,8 @@ impl DictationState {
                     }
                 }
             }
-        } else if !desired && sess.capture.is_some() {
+            }
+            CapturePlan::Teardown => {
             // Tell the worker to abandon its queued backlog BEFORE dropping it: this drop joins the
             // worker thread while the caller still holds the session lock, so without the abort the
             // join would block for the decode duration of up to DECODE_QUEUE_CAP queued segments,
@@ -414,6 +465,124 @@ impl DictationState {
             sess.capture = None; // drop -> stops the cpal stream, releases the OS mic, closes the decode channel
             sess.decode_worker = None; // worker joins near-instantly (aborting) instead of draining the backlog
             tracing::info!(target: "dictation", "capture paused (window unfocused or muted)");
+            }
+        }
+    }
+
+    /// Reconcile the cpal capture to `armed && focused` from ANY thread WITHOUT ever holding the
+    /// session lock across the main-thread-dependent work. This is the worker-safe counterpart to
+    /// `reconcile_locked` (which runs only on the main thread via `set_focused`, where `is_focused()`
+    /// is serviced inline and `Capture::start` doesn't self-block). Holding the lock across those
+    /// calls from an async-runtime worker was the sparkle-sfxu launch deadlock: the worker parked on
+    /// the main thread while the main thread parked on this very lock in the `Focused` handler.
+    ///
+    /// Three phases, and the lock is held for NONE of the blocking ones:
+    ///   1. Query focus with NO lock (`is_focused()` posts to + blocks on the main thread off-main).
+    ///   2. Decide + extract under the lock, then RELEASE (`take_reconcile_step`).
+    ///   3. Build / tear down with NO lock (`Capture::start` and the cpal-stream drop touch CoreAudio),
+    ///      then install under the lock with a re-validation (`install_capture`).
+    pub fn reconcile_capture(&self, app: &AppHandle) {
+        // Snapshot the focus GENERATION before the off-lock sample. `set_focused` (driven by the
+        // main-thread window-focus events) is the SOLE authority for `sess.focused`; our off-lock
+        // `any_window_focused()` merely SEEDS it at arm time (so the mic comes up without waiting for
+        // the first focus event) — and only when no focus event has spoken since we sampled. If the
+        // generation moved, a Focused event landed while `any_window_focused()` was blocked on the
+        // main thread, so our sample is stale and MUST NOT clobber the authoritative value. Without
+        // this the worker could write a stale `focused=true` over a fresh blur and leave the mic live
+        // while the window is unfocused (defeating the sparkle-9oz6 gate) — the TOCTOU roborev caught.
+        let focus_gen = self.1.load(Ordering::SeqCst);
+        let sampled_focus = any_window_focused(app);
+        match self.take_reconcile_step(sampled_focus, focus_gen) {
+            ReconcileStep::Idle => {}
+            // Drop OUTSIDE the lock: `Capture::drop` pauses the cpal stream and the worker join drains
+            // queued decodes — neither may run under the session lock. Order mirrors every teardown:
+            // the Capture (sole decode-channel Sender) drops first, then the worker joins.
+            ReconcileStep::Teardown { capture, worker } => {
+                drop(capture);
+                drop(worker);
+                tracing::info!(target: "dictation", "capture paused (window unfocused or muted)");
+            }
+            // Build OUTSIDE the lock (Capture::start's CoreAudio init blocks on the main thread), then
+            // install under the lock only if the arm intent is still current.
+            ReconcileStep::Build { transcriber, cloud_active, cloud_tx } => {
+                match build_capture(app.clone(), transcriber.clone(), cloud_active, cloud_tx) {
+                    Ok((capture, worker)) => self.install_capture(&transcriber, capture, worker),
+                    Err(e) => {
+                        let _ = app.emit("dictation://error", e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Phase 2 of `reconcile_capture`: under the lock, record focus, decide the transition via
+    /// `plan_capture`, and EXTRACT whatever the caller then acts on outside the lock — returning
+    /// (and thus releasing the lock) before any audio-device or window call. Never touches CoreAudio
+    /// or a window itself, so it cannot participate in the main-thread round-trip that deadlocked.
+    fn take_reconcile_step(&self, sampled_focus: bool, focus_gen: u64) -> ReconcileStep {
+        let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        // Seed focus from the off-lock sample ONLY if no focus event superseded it while we sampled
+        // (the generation is unchanged). If it moved, set_focused already wrote — or is about to write
+        // under this same lock — the authoritative value, so leave `sess.focused` alone rather than
+        // clobbering a fresh blur/gain with our stale sample. This makes set_focused the single writer
+        // that matters and closes the TOCTOU (sparkle-sfxu review round 2).
+        if self.1.load(Ordering::SeqCst) == focus_gen {
+            sess.focused = sampled_focus;
+        }
+        match plan_capture(capture_should_be_live(sess.armed, sess.focused), sess.capture.is_some()) {
+            // `transcriber` is always Some while armed; the guard mirrors reconcile_locked's
+            // belt-and-suspenders — a Build with nothing to build from is simply Idle.
+            CapturePlan::Build => match sess.transcriber.clone() {
+                Some(transcriber) => ReconcileStep::Build {
+                    transcriber,
+                    cloud_active: sess.cloud_active.clone(),
+                    cloud_tx: sess.cloud_tx.clone(),
+                },
+                None => ReconcileStep::Idle,
+            },
+            CapturePlan::Teardown => {
+                // Abort the decode worker's backlog BEFORE handing it back for the drop, so the join
+                // the caller does outside the lock is near-instant (same rationale as stop_capture).
+                if let Some(w) = sess.decode_worker.as_ref() {
+                    w.abort();
+                }
+                ReconcileStep::Teardown {
+                    capture: sess.capture.take(),
+                    worker: sess.decode_worker.take(),
+                }
+            }
+            CapturePlan::Idle => ReconcileStep::Idle,
+        }
+    }
+
+    /// Phase 3 of `reconcile_capture`: install a capture that was built OUTSIDE the lock, but only if
+    /// the arm intent is still EXACTLY current — re-validated under the lock because a `stop_dictation`,
+    /// a blur, or a racing start could have landed while we built (the same post-build re-check
+    /// `start_cloud_stream` does after its blocking handshake). `built_for` is the transcriber the
+    /// capture was built against; an `Arc::ptr_eq` mismatch means a stop+start swapped in a fresh
+    /// session generation, so this capture is stale and is dropped (outside the lock) rather than
+    /// installed against the new one.
+    fn install_capture(&self, built_for: &Arc<Mutex<ParakeetTdt>>, capture: Capture, worker: DecodeWorker) {
+        let discard = {
+            let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            let still_current = capture_should_be_live(sess.armed, sess.focused)
+                && sess.capture.is_none()
+                && sess.transcriber.as_ref().map(|t| Arc::ptr_eq(t, built_for)).unwrap_or(false);
+            if still_current {
+                sess.capture = Some(capture);
+                sess.decode_worker = Some(worker);
+                tracing::info!(target: "dictation", "capture resumed (window focused)");
+                None
+            } else {
+                // Abort before returning so the drop's join (done outside the lock) is near-instant.
+                worker.abort();
+                Some((capture, worker))
+            }
+        }; // release the lock before dropping the raced-out capture (its cpal-stream drop touches CoreAudio)
+        if let Some((capture, worker)) = discard {
+            tracing::info!(target: "dictation", "discarding a capture built during a stop/blur race");
+            drop(capture);
+            drop(worker);
         }
     }
 
@@ -598,33 +767,139 @@ fn build_capture(
 unsafe impl Send for DictationState {}
 unsafe impl Sync for DictationState {}
 
+/// Serializes the on-device model load process-wide. At most one download+verify+load runs at a
+/// time; a second start awaits it and then finds the model already present.
+///
+/// Two `start_dictation`s can now genuinely run their slow paths at once — two windows mounting, or
+/// two rapid mic clicks — because both see `armed == false` (the first hasn't armed yet, it's still
+/// loading) and neither takes the fast path. That is NEWLY reachable: while this command ran inline
+/// on the main thread the two were serialized by the event loop.
+///
+/// It is not merely wasteful (two 631MB downloads), it is UNSAFE without this lock. `model::ensure`
+/// stages into a per-call scratch dir, but every call promotes into the SAME final path, and
+/// `promote_asr` does `remove_dir_all(dest)` then `rename`. So load B can delete the tree that load
+/// A has just verified and is at that moment handing to sherpa-onnx. Landing in that remove→rename
+/// gap means ORT opens a missing or partial `.onnx`, which it answers with a C++ exception across
+/// the FFI boundary → std::terminate → an UNCATCHABLE SIGABRT (see model.rs's module docs). That is
+/// precisely the crash `verify_for_load` exists to prevent, and a concurrent promote defeats it: the
+/// hole is between that check and the open, so no amount of checking first can close it.
+///
+/// Hence the lock must span ensure + verify_for_load + `ParakeetTdt::new` — the whole
+/// verify-then-open sequence — not just the download. Narrowing it to `ensure` reopens the crash.
+///
+/// Taken only inside `spawn_blocking` (never across an await) and never together with the session
+/// lock, so it cannot deadlock against either. Poison-tolerant, like every other lock here: a
+/// panicked load must not brick the mic for the rest of the process's life.
+static MODEL_LOAD: Mutex<()> = Mutex::new(());
+
+/// The slow half of `start_dictation`, factored out so the serialization above is impossible to
+/// apply to only part of it. Blocking and lock-holding — callers MUST run it off the main thread.
+fn load_model(root: &std::path::Path, progress: impl Fn(u64, Option<u64>)) -> Result<ParakeetTdt, String> {
+    let _serialized = MODEL_LOAD.lock().unwrap_or_else(|p| p.into_inner());
+    // The loser of the race lands here once the winner has installed the model, so `ensure`
+    // short-circuits on the now-present files instead of re-downloading 631MB.
+    let paths = model::ensure(root, progress)?;
+    // Prove the files are intact before sherpa-onnx opens them. A corrupt .onnx doesn't fail — it
+    // aborts the process from C++, which no Rust error path can intercept. This turns that into an
+    // `Err` we propagate to `dictation://error`, and purges the bad model so the next click
+    // re-downloads it. Sound only because MODEL_LOAD means no other promote can run between this
+    // check and the open below.
+    model::verify_for_load(root, &paths)?;
+    ParakeetTdt::new(&paths)
+}
+
+/// Arm the mic, downloading + loading the on-device model first if this is a fresh install.
+///
+/// MUST stay `async fn`. A plain `#[tauri::command]` on a sync fn is `ExecutionContext::Blocking`
+/// in tauri-macros, which runs the body INLINE on the IPC thread — the main/event-loop thread. This
+/// body can take MINUTES on first run (631MB download + bzip2 + untar + a sherpa-onnx model load),
+/// and while it ran there, the menu bar, tray icon, window drag/resize, and every `invoke()` from
+/// every window stalled for the whole download: the first mic click beachballed the app, which
+/// users read as a crash and force-quit — never seeing that it was downloading. `async fn` forces
+/// `ExecutionContext::Async` (the body is spawned on the async runtime), and `spawn_blocking` then
+/// keeps the blocking work off the runtime's small worker pool too, so it can't starve other
+/// commands either. Same shape as `preflight::claude_preflight` — for work that is millions of
+/// times shorter than this.
 #[tauri::command]
-pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(), String> {
+pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -> Result<(), String> {
     // "Arm" the mic. The cpal capture itself is gated on focus by reconcile_locked: it comes up now
     // only if a Sparkle window is the active OS window, and is (re)built later by the focus event.
     //
     // Fast path: already armed (e.g. a second window mounting, or a re-arm after this window was the
     // first). Don't reload the model or swap the cloud Arcs — just refresh focus and reconcile so a
     // capture paused while unfocused resumes. This also preserves the old double-start guarantee:
-    // we never drop a live transcriber without finalize().
+    // we never drop a live transcriber without finalize(). Lock-only and await-free, so it stays as
+    // cheap as it was when this command ran inline.
     //
     // While here (and still holding the lock), sample the stop epoch so we can detect a
     // stop_dictation that lands during the slow model load below (the "resurrect" race).
+    //
+    // The guard is scoped to this block so the lock is released before the `.await`: the session
+    // Mutex is a std::sync::Mutex, and holding one across an await would both make this future
+    // !Send (it wouldn't compile as a command) and risk deadlocking the runtime.
     let stop_epoch_at_start = {
-        let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+        let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
         if sess.armed {
-            sess.focused = any_window_focused(&app);
-            DictationState::reconcile_locked(&mut sess, &app);
+            // Fast path (a second window mounting, or a re-arm): resume capture to match focus.
+            // Reconcile OFF the lock — is_focused()/Capture::start block on the main thread, and
+            // holding the session lock across them from this worker is the sparkle-sfxu deadlock.
+            drop(sess);
+            state.reconcile_capture(&app);
             return Ok(());
         }
         sess.stop_epoch
     };
 
+    // Ask macOS for the mic BEFORE the model download, not after.
+    //
+    // Two reasons, and the ordering is the whole point:
+    //
+    //  1. It is the only thing that catches a DENIED user at all. cpal/CoreAudio do not fail for
+    //     them — `Capture::start` returns Ok and then delivers buffers of zeros forever, so the mic
+    //     ring goes amber, the composer says "Say Hey Sparkle", and the app waits for a wake word it
+    //     can never hear, with no error anywhere. See mic_permission.rs's module docs.
+    //
+    //  2. The OS prompt is triggered by the FIRST mic access, which — before this — was
+    //     `stream.play()` at the very end of `reconcile_locked`, i.e. AFTER the multi-minute
+    //     first-run model download. So a new user clicked the mic, watched "Setting up voice" for
+    //     several minutes, and only then got a permission dialog, quite possibly behind another
+    //     window, about a click they'd long since moved on from. Prompting here asks while the
+    //     click is still the thing they just did — and it also means we don't spend minutes (and
+    //     482MB of someone's bandwidth) fetching a model for a user who is about to say No.
+    //
+    // `spawn_blocking` for the same reason the model load below uses it, and it is load-bearing
+    // here specifically: this call blocks for as long as the user takes to read the dialog, and the
+    // dialog is drawn by the main run loop. Blocking the main thread would deadlock against the
+    // very prompt we're waiting on. Its own spawn_blocking rather than folding into the load below,
+    // because that one holds MODEL_LOAD — we must not hold a process-wide lock across a dialog
+    // that is waiting on a human.
+    //
+    // The Authorized path (every existing user, the founder included) is one cached, process-local
+    // status read and then straight through: no prompt, no state change, no measurable latency.
+    tauri::async_runtime::spawn_blocking(crate::mic_permission::ensure_access_blocking)
+        .await
+        .map_err(|e| format!("microphone permission check failed: {e}"))??;
+
     // Not yet armed: load the on-device model (slow, no lock held) before claiming the session.
-    let root = app.path().app_data_dir().map_err(|e| e.to_string())?.join("models");
+    //
+    // NOTE: this await is what makes the "resurrect" race REAL rather than theoretical. While this
+    // command ran on the main thread, a stop_dictation could not land mid-load — it was queued
+    // behind us on that same thread — so the epoch guard below was unreachable defence. Now that the
+    // load is off-thread the event loop is live throughout, so stop_dictation (and a second
+    // start_dictation) genuinely can interleave here. `start_after_load` is the guard that makes
+    // that safe, and it is now load-bearing.
+    let root = crate::dev_identity::app_data_dir(&app)?.join("models");
     let app_for_progress = app.clone();
-    let paths = model::ensure(&root, move |done, total| { let _ = app_for_progress.emit("dictation://model-progress", (done, total)); })?;
-    let transcriber = Arc::new(Mutex::new(ParakeetTdt::new(&paths)?));
+    let transcriber = tauri::async_runtime::spawn_blocking(move || {
+        load_model(&root, move |done, total| {
+            let _ = app_for_progress.emit("dictation://model-progress", (done, total));
+        })
+    })
+    .await
+    // JoinError: the blocking task panicked. The panic hook already logged it; surface it as an
+    // ordinary Err so the mic click reports a failure instead of silently doing nothing.
+    .map_err(|e| format!("voice model load task failed: {e}"))??;
+    let transcriber = Arc::new(Mutex::new(transcriber));
 
     let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
     // Re-check under the lock now the (slow) load is done. Both inputs are read from THIS critical
@@ -638,9 +913,10 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
         }
         StartAfterLoad::AlreadyArmed => {
             // A racing start_dictation armed while we loaded. Discard our transcriber and just
-            // reconcile rather than overwriting the live one without finalize().
-            sess.focused = any_window_focused(&app);
-            DictationState::reconcile_locked(&mut sess, &app);
+            // reconcile rather than overwriting the live one without finalize(). Reconcile OFF the
+            // lock (drop the guard first) — the sparkle-sfxu deadlock rule.
+            drop(sess);
+            state.reconcile_capture(&app);
             return Ok(());
         }
         StartAfterLoad::Arm => {}
@@ -655,9 +931,14 @@ pub fn start_dictation(app: AppHandle, state: State<DictationState>) -> Result<(
     // sender from a prior arm must never survive into a new one).
     sess.cloud_tx = Arc::new(Mutex::new(None));
     sess.armed = true;
-    sess.focused = any_window_focused(&app);
+    // Release the session lock BEFORE reconcile_capture: it samples focus (is_focused) and builds
+    // the capture (Capture::start), both of which block on the main thread. Holding the lock across
+    // them from this async-runtime worker — while the main thread waits on the SAME lock in the
+    // Focused handler — was the sparkle-sfxu launch deadlock. reconcile_capture also re-validates the
+    // arm intent under the lock before installing, so a stop/blur landing in this gap is handled.
+    drop(sess);
     // Builds the capture now iff a window is focused; otherwise the focus event brings it up later.
-    DictationState::reconcile_locked(&mut sess, &app);
+    state.reconcile_capture(&app);
     Ok(())
 }
 
@@ -708,7 +989,17 @@ pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool 
     // frontend already gated on the live voice setting); a signed-out user has no bearer → stay
     // on-device. credits_ok is enforced by the relay (it refuses the upgrade when not entitled / can't
     // afford the first minute — a handshake failure we treat as fall-back-to-on-device), so we pass it
-    // true here. This is a sync Tauri command (its own thread), so the keychain read is fine inline.
+    // true here.
+    //
+    // CORRECTION (was: "this is a sync Tauri command (its own thread), so the keychain read is fine
+    // inline"): it is NOT on its own thread. A sync `#[tauri::command]` is `ExecutionContext::Blocking`
+    // in tauri-macros, which runs the body INLINE on the IPC/event-loop thread — the same mistake that
+    // made `start_dictation` beachball the app for its whole first-run download. The keychain read is
+    // sub-ms so it's harmless in practice, but the blocking `DeepgramSession::start` handshake below
+    // (~hundreds of ms of TLS+WS) does stall the event loop on every wake transition. Left as-is
+    // deliberately: fixing it means making this `async fn` + `spawn_blocking` like start_dictation,
+    // which changes this command's own race semantics (the ptr_eq/epoch guards below) and belongs in
+    // its own reviewable change, not smuggled into the start_dictation fix.
     let token = crate::auth::bearer_token();
     if choose_engine(true, token.is_some(), true) != Engine::Cloud {
         return false; // signed out → stay on the on-device model; don't consume an epoch on this path
@@ -836,10 +1127,10 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        capture_should_be_live, choose_engine, frame_speaking, segment_fingerprint,
-        should_emit_blur, should_install_cloud, start_after_load, DictationState, Engine,
-        StartAfterLoad,
+    use super::{AppHandle, State,
+        capture_should_be_live, choose_engine, frame_speaking, plan_capture, segment_fingerprint,
+        should_emit_blur, should_install_cloud, start_after_load, CapturePlan, DictationState,
+        Engine, ReconcileStep, StartAfterLoad,
     };
 
     #[test]
@@ -864,6 +1155,97 @@ mod tests {
         assert!(!capture_should_be_live(true, false), "armed but unfocused → released");
         assert!(!capture_should_be_live(false, true), "muted, even if focused → off");
         assert!(!capture_should_be_live(false, false), "muted + unfocused → off");
+    }
+
+    #[test]
+    fn plan_capture_builds_when_live_and_absent_and_tears_down_when_dead_and_present() {
+        // The capture transition reconcile must make, factored out so it can be DECIDED under the
+        // session lock and then ACTED ON outside it — the structural fix for the sparkle-sfxu launch
+        // deadlock, where Capture::start ran while the lock was held. Build only when the mic should
+        // be live and isn't yet; tear down only when it shouldn't be but still is; nothing otherwise.
+        assert_eq!(plan_capture(true, false), CapturePlan::Build, "should be live, none yet → build");
+        assert_eq!(plan_capture(false, true), CapturePlan::Teardown, "shouldn't be live, still is → tear down");
+        assert_eq!(plan_capture(true, true), CapturePlan::Idle, "already live → nothing");
+        assert_eq!(plan_capture(false, false), CapturePlan::Idle, "already off → nothing");
+    }
+
+    #[test]
+    fn take_reconcile_step_releases_the_session_lock_before_the_caller_acts() {
+        // The heart of the sparkle-sfxu fix. The v0.28.0 launch deadlock was start_dictation (on an
+        // async-runtime worker) holding the session Mutex across is_focused() / Capture::start, both
+        // of which block on the MAIN thread — which was itself blocked on this SAME Mutex in the
+        // WindowEvent::Focused handler. reconcile_capture now decides the transition under the lock
+        // (take_reconcile_step) and RELEASES it before the main-thread-dependent build/teardown.
+        // Assert on the real DictationState that the lock is free the instant the step returns — the
+        // exact property whose absence froze the app on launch (100% of stack samples on the mutex).
+        //
+        // COVERAGE NOTE: the terminal Build (Some transcriber) and Teardown branches extract owned
+        // `Capture`/`ParakeetTdt`, which have no portable constructor — `Capture::start` needs a real
+        // audio device and `ParakeetTdt::new` a 482MB model, absent in CI. That is exactly why the
+        // capture DECISION lives in the pure `plan_capture` (matrix-tested above), and the lock
+        // release is guaranteed by the guard's scope for EVERY branch. We still drive both reachable
+        // arms — the default (Idle) and the armed path that enters the `CapturePlan::Build` match arm
+        // — and assert the lock is free after each, so a future edit that holds the guard past the
+        // decision fails here regardless of which branch it takes.
+        let idle = DictationState::default();
+        let g = idle.1.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(idle.take_reconcile_step(true, g), ReconcileStep::Idle), "unarmed → nothing to do");
+        assert!(idle.0.try_lock().is_ok(), "Idle branch must release the session lock");
+
+        // Armed + focused enters the `CapturePlan::Build` arm; with no transcriber resident it falls
+        // to the belt-and-suspenders `None => Idle`, but it has exercised the Build arm's lock-scoped
+        // extraction and must likewise return with the lock free.
+        let armed = DictationState::default();
+        armed.0.lock().unwrap().armed = true;
+        let g = armed.1.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = armed.take_reconcile_step(true, g);
+        assert!(
+            armed.0.try_lock().is_ok(),
+            "take_reconcile_step must not hold the session lock when it returns — the build/teardown \
+             that follows blocks on the main thread and would deadlock against the focus handler"
+        );
+    }
+
+    #[test]
+    fn take_reconcile_step_does_not_clobber_a_focus_event_that_raced_the_off_lock_sample() {
+        use std::sync::atomic::Ordering;
+        // sparkle-sfxu review round 2. The worker samples focus OFF the lock (is_focused blocks on
+        // the main thread), so a real Focused event can land — authoritatively writing sess.focused
+        // via set_focused AND bumping the focus generation — after the sample but before
+        // take_reconcile_step re-takes the lock. The worker's now-stale sample must NOT overwrite that
+        // fresher value; if it did, the mic could go live while the window is actually unfocused,
+        // defeating the sparkle-9oz6 gate (mic never captures while you're in another app).
+        let state = DictationState::default();
+        state.0.lock().unwrap().armed = true;
+        // The worker read the generation here, then sampled focus = true (a window was focused then).
+        let sampled_gen = state.1.load(Ordering::SeqCst);
+        // ...but before the worker re-takes the lock, a blur lands: set_focused writes the
+        // authoritative focused = false and note_focus_event bumps the generation.
+        state.1.fetch_add(1, Ordering::SeqCst);
+        state.0.lock().unwrap().focused = false;
+        // The worker now finishes reconcile with its STALE sample (focus = true, gen = sampled_gen).
+        let step = state.take_reconcile_step(true, sampled_gen);
+        assert!(
+            !state.0.lock().unwrap().focused,
+            "a focus event that raced the off-lock sample must win — the stale sample must not clobber it"
+        );
+        assert!(
+            matches!(step, ReconcileStep::Idle),
+            "with focus authoritatively false, the reconcile must plan no capture build"
+        );
+    }
+
+    #[test]
+    fn take_reconcile_step_seeds_focus_from_the_sample_when_no_event_raced_it() {
+        use std::sync::atomic::Ordering;
+        // The other half of the guard: when NO focus event has spoken (generation unchanged), the
+        // off-lock sample is still the right seed — the arm-time path where the window is already
+        // focused and no Focused event will fire, so the mic must come up from the sample alone.
+        let state = DictationState::default();
+        state.0.lock().unwrap().armed = true;
+        let gen = state.1.load(Ordering::SeqCst);
+        let _ = state.take_reconcile_step(true, gen);
+        assert!(state.0.lock().unwrap().focused, "unraced sample seeds focus so the mic can arm on mount");
     }
 
     #[test]
@@ -956,6 +1338,185 @@ mod tests {
         assert_eq!(start_after_load(3, 3, true), StartAfterLoad::AlreadyArmed);
         // Epoch unchanged + not armed → the clean fresh-arm path installs the transcriber.
         assert_eq!(start_after_load(3, 3, false), StartAfterLoad::Arm);
+    }
+
+    /// The freeze guard itself, enforced by the compiler rather than at runtime — the two properties
+    /// that keep the 631MB first-run load off the main thread, both of which are quietly lost by an
+    /// innocent-looking edit:
+    ///
+    ///   - `start_dictation` RETURNS A FUTURE. Drop the `async` and tauri-macros silently reclassifies
+    ///     it as `ExecutionContext::Blocking`, running the whole download inline on the IPC/event-loop
+    ///     thread — the beachball this fix exists to remove. There's no warning; the app just freezes
+    ///     again on a machine that doesn't have the model yet (i.e. never on a developer's).
+    ///   - That future is `Send`. `respond_async_serialized` requires it, and the only realistic way
+    ///     to lose it is holding the session's `std::sync::Mutex` guard across the `.await` — which is
+    ///     precisely the mistake the epoch protocol cannot survive. This turns "don't hold the lock
+    ///     across an await" from a comment into a compile error.
+    #[test]
+    fn start_dictation_is_async_and_its_future_is_send() {
+        fn off_the_main_thread<'r, F: std::future::Future + Send>(
+            _: fn(AppHandle, State<'r, DictationState>) -> F,
+        ) {
+        }
+        off_the_main_thread(super::start_dictation);
+    }
+
+    /// The model load must be mutually exclusive process-wide. Two concurrent loads promote into the
+    /// SAME `root/ASR_DIR` via `remove_dir_all` + `rename`, so an unserialized second load can delete
+    /// the tree the first has just verified and is handing to sherpa-onnx — an uncatchable C++ abort,
+    /// not a recoverable error (see MODEL_LOAD). Newly reachable now that the loads run off-thread.
+    ///
+    /// Exclusion is the whole property, so that is what this asserts: while one load holds the guard,
+    /// a second cannot acquire it and must wait.
+    ///
+    /// Deliberately ONE test rather than two: `MODEL_LOAD` is a global, and cargo runs tests on
+    /// parallel threads, so a sibling test touching it would race this one's `try_lock` assertions
+    /// (and the poison check below would leak into it — `try_lock` on a poisoned mutex reports
+    /// `Poisoned`, not `WouldBlock`). Kept sequential here, so the ordering is deterministic.
+    #[test]
+    fn the_model_load_is_serialized_and_survives_a_panicked_load() {
+        use std::sync::TryLockError;
+        {
+            let _held = super::MODEL_LOAD.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                matches!(super::MODEL_LOAD.try_lock(), Err(TryLockError::WouldBlock)),
+                "a second load must WAIT for the first, never race its promote into the shared dest"
+            );
+        }
+        assert!(super::MODEL_LOAD.try_lock().is_ok(), "and the guard is released when a load finishes");
+
+        // A panicking load must not brick the mic for the rest of the process's lifetime. Every lock
+        // in this module is poison-tolerant for that reason (), and the guard gating EVERY
+        // first-run mic click is the last one that should wedge permanently.
+        let _ = std::panic::catch_unwind(|| {
+            let _g = super::MODEL_LOAD.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("model load blew up");
+        });
+        // `load_model` acquires exactly this way, so a later click still gets through.
+        drop(super::MODEL_LOAD.lock().unwrap_or_else(|p| p.into_inner()));
+    }
+
+    /// A stand-in for the only two `DictationSession` fields the arm decision reads, so a whole
+    /// start/stop interleaving can be driven deterministically — no AppHandle, no 631MB download, no
+    /// threads. Every method mirrors exactly what the real command does to those fields inside its
+    /// locked critical sections; the point is to pin the SEQUENCES, which `start_after_load`'s own
+    /// unit tests (single decisions, hand-picked inputs) can't express.
+    ///
+    /// This matters more than it used to. `start_dictation` is now an `async fn` whose model load
+    /// runs on a blocking thread, so the event loop stays live throughout: a stop_dictation, or a
+    /// second start_dictation, can genuinely land mid-load. Before, both were sync commands running
+    /// inline on the main thread, so they serialized and these interleavings were unreachable.
+    #[derive(Default)]
+    struct Guards {
+        stop_epoch: u64,
+        armed: bool,
+    }
+
+    impl Guards {
+        /// `start_dictation`'s first critical section. `None` = the armed fast path (return at once,
+        /// no load); `Some(epoch)` = the sampled stop epoch, carried across the slow load.
+        fn begin_start(&self) -> Option<u64> {
+            if self.armed {
+                return None;
+            }
+            Some(self.stop_epoch)
+        }
+
+        /// `stop_dictation`: disarm AND advance the epoch.
+        fn stop(&mut self) {
+            self.armed = false;
+            self.stop_epoch = self.stop_epoch.wrapping_add(1);
+        }
+
+        /// `start_dictation`'s second critical section, once its load returns.
+        fn finish_start(&mut self, sampled: u64) -> StartAfterLoad {
+            let decision = start_after_load(sampled, self.stop_epoch, self.armed);
+            if decision == StartAfterLoad::Arm {
+                self.armed = true;
+            }
+            decision
+        }
+    }
+
+    /// Two rapid mic clicks. Newly reachable: with the load off-thread, B's first critical section
+    /// runs while A is still downloading — and since A hasn't armed yet, B does NOT take the fast
+    /// path and starts its own load (model.rs's temp-dir sweep spares concurrent downloads for
+    /// exactly this reason). Whichever finishes second must find the session already armed and
+    /// DISCARD its transcriber rather than overwrite a live one without finalize().
+    #[test]
+    fn two_concurrent_starts_arm_exactly_once() {
+        let mut g = Guards::default();
+        let a = g.begin_start().expect("nothing armed yet, so A loads");
+        let b = g.begin_start().expect("A is still loading and hasn't armed, so B loads too");
+        assert_eq!(a, b, "both sampled the same epoch; no stop has happened");
+
+        assert_eq!(g.finish_start(a), StartAfterLoad::Arm, "the first to finish arms");
+        assert_eq!(
+            g.finish_start(b),
+            StartAfterLoad::AlreadyArmed,
+            "the second must NOT overwrite the live transcriber — no double-arm"
+        );
+        assert!(g.armed, "and the session ends armed exactly once");
+    }
+
+    /// The freeze bug's own scenario, now that it can actually happen: fresh install → first click
+    /// starts a minutes-long download → the user, seeing "nothing happening", clicks the mic off.
+    /// The load must not resurrect the mic they just muted.
+    #[test]
+    fn a_stop_during_the_load_leaves_the_mic_muted() {
+        let mut g = Guards::default();
+        let a = g.begin_start().expect("fresh install: not armed, so we load");
+        g.stop(); // user unclicks the mic mid-download
+        assert_eq!(g.finish_start(a), StartAfterLoad::AbortMutedDuringLoad);
+        assert!(!g.armed, "the mic must stay muted — this is the resurrect race");
+    }
+
+    /// start → stop → start, with the two loads finishing in EITHER order (nothing orders them:
+    /// they're independent blocking tasks). Exactly one arm must win, it must be the live one, and
+    /// the session must end armed either way.
+    #[test]
+    fn start_stop_start_arms_once_whichever_load_finishes_first() {
+        for b_finishes_first in [false, true] {
+            let mut g = Guards::default();
+            let a = g.begin_start().expect("first click loads");
+            g.stop(); // user mutes...
+            let b = g.begin_start().expect("...then clicks again; still not armed, so B loads");
+            assert_ne!(a, b, "B sampled AFTER the stop, so it carries a newer epoch");
+
+            let (first, second) = if b_finishes_first { (b, a) } else { (a, b) };
+            let decisions = [g.finish_start(first), g.finish_start(second)];
+
+            // A is always stale (it sampled before the stop) and must abort no matter when it lands;
+            // B is current and takes the clean arm.
+            let expected = if b_finishes_first {
+                [StartAfterLoad::Arm, StartAfterLoad::AbortMutedDuringLoad]
+            } else {
+                [StartAfterLoad::AbortMutedDuringLoad, StartAfterLoad::Arm]
+            };
+            assert_eq!(decisions, expected, "b_finishes_first={b_finishes_first}");
+            assert_eq!(
+                decisions.iter().filter(|d| **d == StartAfterLoad::Arm).count(),
+                1,
+                "exactly one arm, whatever the order"
+            );
+            assert!(g.armed, "the user's second click wins: the mic ends armed");
+        }
+    }
+
+    /// Once armed, a start takes the fast path: no epoch sampled, no load, no cloud-Arc swap — just
+    /// refresh focus + reconcile. Pins that a second window mounting can never re-download the model
+    /// or drop a live transcriber.
+    #[test]
+    fn an_armed_session_takes_the_fast_path_and_never_reloads() {
+        let mut g = Guards::default();
+        let a = g.begin_start().unwrap();
+        g.finish_start(a);
+        assert!(g.armed);
+
+        assert_eq!(g.begin_start(), None, "already armed → fast path, no model load");
+        // ...and a stop re-opens the slow path for the next click.
+        g.stop();
+        assert!(g.begin_start().is_some(), "after a stop, the next start loads again");
     }
 
     #[test]

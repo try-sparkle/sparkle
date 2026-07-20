@@ -26,3 +26,30 @@ export function closeBuildAgentButton(): SuggestionButton {
     source: "control",
   };
 }
+
+/** The "Land to Main" CTA. A PROMPT, not a control action: it tells the agent to land, so the
+ *  agent runs the project's contracts (tests, roborev triage, the progress doc) that a raw
+ *  `git merge` from the app would bypass. The agent asked "Want me to land it?" — this answers it.
+ *  `source: "control"` marks it as a stage-derived CTA (not a scrollback-computed suggestion), which
+ *  is what SuggestionRow keys its filled-pill styling off. */
+export function landToMainButton(): SuggestionButton {
+  return {
+    id: "cta:landToMain",
+    label: "Land to Main",
+    value: "Land this to main.",
+    kind: "prompt",
+    source: "control",
+  };
+}
+
+/** The "Push to Origin Main" CTA, shown once work is on LOCAL main but not yet on origin. Also a
+ *  prompt, for the same reason as landToMainButton. */
+export function pushToOriginMainButton(): SuggestionButton {
+  return {
+    id: "cta:pushToOriginMain",
+    label: "Push to Origin Main",
+    value: "Push main to origin.",
+    kind: "prompt",
+    source: "control",
+  };
+}

@@ -70,11 +70,7 @@ pub fn stage_resource_script(app: &AppHandle, name: &str) -> Result<PathBuf, Str
         .path()
         .resolve(format!("resources/{name}"), BaseDirectory::Resource)
         .map_err(|e| format!("{name} missing in bundle: {e}"))?;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir: {e}"))?
-        .join("bin");
+    let dir = crate::dev_identity::app_data_dir(app)?.join("bin");
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir bin: {e}"))?;
     let dst = dir.join(name);
     let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -181,10 +177,7 @@ fn log_key(worktree: &str) -> String {
 /// is the agent's UUID (worktrees live at `<app_data>/worktrees/<projectId>/<agentId>`), so it's
 /// a stable, collision-free key — and the log sits outside the worktree, invisible to git.
 pub fn event_log_path(app: &AppHandle, worktree: &str) -> Result<PathBuf, String> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir: {e}"))?;
+    let base = crate::dev_identity::app_data_dir(app)?;
     Ok(base
         .join("hook-events")
         .join(format!("{}.jsonl", log_key(worktree))))
@@ -214,11 +207,7 @@ fn confine_to_worktrees(worktrees_base: &Path, worktree: &str) -> Result<PathBuf
 #[tauri::command]
 pub fn install_agent_hooks(app: AppHandle, worktree: String) -> Result<String, String> {
     // Confine the write target to the managed worktrees dir — this file drives executable hooks.
-    let worktrees_base = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir: {e}"))?
-        .join("worktrees");
+    let worktrees_base = crate::dev_identity::app_data_dir(&app)?.join("worktrees");
     let worktree_dir = confine_to_worktrees(&worktrees_base, &worktree)?;
 
     // Stage the emitter to a stable app-data path (not the app bundle) so the command baked into
@@ -311,10 +300,7 @@ fn scan_and_heal(
 /// once everything already points at the stable path. Returns the number of worktrees healed.
 #[tauri::command]
 pub fn heal_agent_hooks(app: AppHandle) -> Result<u32, String> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir: {e}"))?;
+    let app_data = crate::dev_identity::app_data_dir(&app)?;
     let emitter = stage_resource_script(&app, "sparkle-hook.mjs")?;
     let guard = stage_resource_script(&app, "worktree-guard.mjs")?;
     scan_and_heal(
@@ -367,7 +353,7 @@ fn log_path_within(base: &Path, log_path: &str) -> bool {
 pub fn read_events_since(app: AppHandle, log_path: String, offset: u64) -> Result<EventsChunk, String> {
     // Confine reads to <app_data>/hook-events so a compromised renderer can't turn this into an
     // arbitrary-file read oracle. The legit path is always <app_data>/hook-events/<agentId>.jsonl.
-    let base = match app.path().app_data_dir().map(|d| d.join("hook-events")) {
+    let base = match crate::dev_identity::app_data_dir(&app).map(|d| d.join("hook-events")) {
         Ok(b) => b,
         Err(_) => return Ok(EventsChunk { lines: vec![], offset }),
     };
@@ -542,6 +528,55 @@ mod tests {
         assert!(leftovers.is_empty(), "no temp-file residue after writes");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reinstall_restores_a_clobbered_emitter_and_keeps_the_user_keys() {
+        // THE RECOVERY PATH for a mid-session emitter clobber (a permission grant, /permissions, or
+        // the agent editing .claude/settings.local.json drops the emitter and hook events stop
+        // cold). AgentPane re-runs install_agent_hooks on EVERY prepare, and this merge is what
+        // makes that a repair: the emitter comes back for every tracked event.
+        //
+        // Note `heal_agent_hooks` canNOT do this job — `needs_heal` requires the file to STILL
+        // contain EMITTER_MARKER, so it only re-points a stale path and skips a file the emitter
+        // was removed from entirely. Reinstall is strictly stronger for the target worktree, which
+        // is why prepare does not also call heal.
+        let clobbered = r#"{
+            "model": "opus",
+            "permissions": { "allow": ["Bash(ls:*)"] },
+            "hooks": { "PreToolUse": [ { "matcher": "*", "hooks": [ { "type": "command", "command": "node worktree-guard.mjs /wt" } ] } ] }
+        }"#;
+        let out = merge_event_hooks(Some(clobbered), "node /abs/sparkle-hook.mjs /log");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        for ev in TOOL_EVENTS.iter().chain(PLAIN_EVENTS.iter()) {
+            assert!(emitter_present(&v, ev), "emitter not restored for {ev}");
+        }
+        // The clobber-survivors are preserved — a repair must not cost the user their settings.
+        assert_eq!(v["model"], json!("opus"));
+        assert_eq!(v["permissions"]["allow"][0], json!("Bash(ls:*)"));
+        // ...including the unrelated guard hook sharing the PreToolUse array.
+        let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre.iter().any(|e| e["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("worktree-guard.mjs"))),
+            "the guard hook must survive the emitter restore"
+        );
+    }
+
+    #[test]
+    fn heal_cannot_restore_a_fully_removed_emitter() {
+        // Pins the asymmetry the test above depends on, so the reasoning behind "prepare reinstalls
+        // rather than heals" stays honest if heal_settings is ever changed.
+        let no_emitter = r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"node /abs/worktree-guard.mjs /wt"}]}]}}"#;
+        let healed = heal_settings(
+            no_emitter,
+            Path::new("/abs/sparkle-hook.mjs"),
+            "node /abs/sparkle-hook.mjs /log",
+            Path::new("/abs/worktree-guard.mjs"),
+            "node /abs/worktree-guard.mjs /wt",
+        );
+        assert!(healed.is_none(), "heal is a no-op once the emitter marker is gone");
     }
 
     #[test]

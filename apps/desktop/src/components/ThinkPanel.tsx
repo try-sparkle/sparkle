@@ -9,6 +9,7 @@ import { micHotPlaceholder, wakePlaceholder } from "../voice/dictationCopy";
 import {
   ensureChiefProject,
   startChat,
+  sendMessage,
   pollForResponse,
   ensureSkill,
   createMemory,
@@ -45,6 +46,9 @@ import { answerAsVoice } from "../services/voiceAnswer";
 import { Markdown } from "./Markdown";
 import { MentionPicker, type MentionPick } from "./MentionPicker";
 import { searchVoices, findVoice } from "../services/expertRoster";
+import { buildTranscript } from "../services/thinkTranscript";
+import { askChief, emptyThread, isSendFailure, type ChiefThreadState } from "../services/chiefThread";
+import { afterSuccess, afterSendFailure, NO_STREAK, type SendStreak } from "../services/chiefEscape";
 import { screenshotAttachment } from "./composer/attachmentsApi";
 import { composeThinkTurn } from "./thinkCompose";
 import type { Attachment } from "./composer/attachments";
@@ -67,14 +71,11 @@ interface ChatMsg {
 // One markdown instruction shared by both the in-bubble rendering and the engine prompt.
 const MD_HINT = "Respond in clean GitHub-flavored markdown.";
 
-// Build a plain transcript for the grounding/synthesis backends (Chief + Make a Plan). Mentions and
-// authorship are flattened to User/Assistant so the downstream prompts stay simple.
-function buildTranscript(msgs: ChatMsg[]): string {
-  return msgs
-    .filter((m) => !m.pending && m.text.trim())
-    .map((m) => `${m.author === "user" ? "User" : "Assistant"}: ${m.text}`)
-    .join("\n\n");
-}
+// The transcript handed to the Chief-backed lanes lives in services/thinkTranscript.ts: it labels
+// every speaker distinctly (Sparkle / Chief / @voice — never a flat "Assistant") so the
+// participants can actually follow each other, and it is bounded so a long conversation can't trip
+// Chief's undocumented prompt limit and come back as an opaque 400. See that module for the full
+// rationale (bead sparkle-xh4j). ChatMsg structurally satisfies TranscriptMsg.
 
 // --- @mention routing -----------------------------------------------------------------------
 // A message can be answered by MORE THAN ONE responder. The rule (confirmed with the founder):
@@ -384,6 +385,21 @@ export function ThinkPanel({
   // the Chief/voice polls that have no abort wired through.
   const turnSeqRef = useRef(0);
 
+  // The @chief lane's continuing Chief chat + the turns it has already been told about (see
+  // services/chiefThread.ts). A ref, not state: it must survive re-render without causing one, and
+  // nothing renders from it. askChief scopes it by Chief project id itself, so a project switch
+  // starts a clean chat rather than writing another project's chat.
+  const chiefThreadRef = useRef<ChiefThreadState>(emptyThread());
+  // Consecutive @chief SEND failures against ONE chat — backs the bounded escape in sendToChief's
+  // catch. The rules live in services/chiefEscape.ts (they're pure decisions about async
+  // interleavings, which is where they can actually be tested).
+  const chiefSendFailuresRef = useRef<SendStreak>(NO_STREAK);
+  // Bumped whenever the escape abandons a chat. An in-flight turn captures this before its await
+  // and only adopts its result if it hasn't moved — otherwise a turn that started before the
+  // abandonment would restore the very chat the escape just threw away, and the lane would stay
+  // wedged with the escape having fired for nothing.
+  const chiefThreadGenRef = useRef(0);
+
   // Monotonic plan token — the Make-a-Plan analogue of `turnSeqRef`. Bumped by `cancelPlan` so a
   // synthesis/generation that resolves AFTER the user backed out neither switches tabs nor clears the
   // (already reset) planning state. Gives the founder an escape hatch even if the network is slow —
@@ -548,24 +564,88 @@ export function ThinkPanel({
   const sendToChief = async (
     question: string,
     transcriptBefore: ChatMsg[],
-    { capture = true, turn }: { capture?: boolean; turn: number },
+    {
+      capture = true,
+      turn,
+      questionMsgId,
+    }: { capture?: boolean; turn: number; questionMsgId?: string },
   ) => {
     if (!chiefEnabled) {
       setError("Connect Chief to talk to it directly.");
       return;
     }
     const replyId = pushMsg({ author: "chief", text: "", pending: true });
+    const genAtStart = chiefThreadGenRef.current;
+    // The chat this turn will SEND on, captured before the await. A failure must be attributed to
+    // the chat it actually targeted, not to whatever is held by the time the catch runs — otherwise
+    // the attribution silently depends on the turn guard rather than on the keying itself.
+    const chatAtStart = chiefThreadRef.current.chatId;
     try {
       const scope: ChiefScope = { project_ids: [chiefProjectId!] };
       const opts: ChatOptions = { intelligence: "fast", scope };
-      const prompt = `${buildTranscript(transcriptBefore)}\n\nUser asks Chief directly: ${question}\n\n${MD_HINT}`;
-      const { chat_id, message_id } = await startChat(pat, chiefProjectId!, prompt, opts);
-      const reply = await pollForResponse(pat, chiefProjectId!, chat_id, message_id);
+      // Ask on the project's CONTINUING chat: Chief keeps its own history, so this turn carries only
+      // what it hasn't been told — including Sparkle's turns, which never reach Chief any other way.
+      const { reply, state } = await askChief(
+        { startChat, sendMessage, pollForResponse },
+        chiefThreadRef.current,
+        {
+          pat,
+          chiefProjectId: chiefProjectId!,
+          messages: transcriptBefore,
+          question,
+          // askChief's prompt restates the question, so naming its message keeps that turn from
+          // also being rendered into the transcript. Passed down from `dispatch` (which created it)
+          // rather than re-derived by position: if it ever named the WRONG message, that message
+          // would be both omitted from the transcript AND marked delivered — silently never
+          // conveyed, which is the exact hole this tracking exists to close.
+          questionMsgId,
+          opts,
+          suffix: MD_HINT,
+        },
+      );
+      // Adopt the thread while this turn is still current, OR while nothing else has claimed the
+      // ref. A superseded turn must not point the ref at its abandoned chat — but if it OPENED a
+      // chat and the ref is still empty, dropping it would orphan that chat and make the next turn
+      // re-seed the whole conversation, which is the payload this lane exists to avoid. The
+      // generation check keeps that second case from resurrecting a chat the escape abandoned.
+      if (
+        chiefThreadGenRef.current === genAtStart &&
+        (turnSeqRef.current === turn || chiefThreadRef.current.chatId === null)
+      ) {
+        chiefThreadRef.current = state;
+      }
+      // A resolved askChief means this chat accepted a message — evidence about the CHAT, which
+      // holds even if the user has since stopped the turn, so this runs before the guard.
+      chiefSendFailuresRef.current = afterSuccess(chiefSendFailuresRef.current, state.chatId);
       if (turnSeqRef.current !== turn) return; // stopped/superseded — don't overwrite or record
       patchMsg(replyId, { text: reply.trim() || "_(no response)_", pending: false });
       if (capture) recordTurn("response", reply);
     } catch (e) {
-      if (turnSeqRef.current !== turn) return;
+      if (turnSeqRef.current !== turn) return; // superseded — its outcome says nothing about now
+      // Bounded escape from a chat we can no longer send to. askChief only reopens on a 404/410,
+      // but Chief's error vocabulary is undocumented — if a dead chat ever reports as something
+      // else, every later turn would retry the same dead chat forever with no way back. After two
+      // consecutive SEND failures, abandon the chat: the next turn re-seeds a fresh one. Costs one
+      // full re-seed in exchange for the lane never wedging for the life of the panel.
+      //
+      // Only a failure that might mean the CHAT is unhealthy counts (see isSendFailure): a poll
+      // failure proves the chat is alive, a startChat failure means there was no chat to blame, and
+      // a 402/429/400 explains itself. Counting any of those would abandon a healthy chat and force
+      // exactly the full re-seed isChatGone's narrowing exists to avoid.
+      // `chatAtStart` is non-null whenever isSendFailure is — the tag is only ever applied on the
+      // live-chat send path — but the check makes that invariant local rather than assumed.
+      if (isSendFailure(e) && chatAtStart) {
+        const { streak, abandon } = afterSendFailure({
+          streak: chiefSendFailuresRef.current,
+          sentOn: chatAtStart,
+          heldChatId: chiefThreadRef.current.chatId,
+        });
+        chiefSendFailuresRef.current = streak;
+        if (abandon) {
+          chiefThreadRef.current = emptyThread();
+          chiefThreadGenRef.current += 1;
+        }
+      }
       patchMsg(replyId, { text: `_Chief error: ${friendlyError(e)}_`, pending: false });
       setError(friendlyError(e));
     }
@@ -662,6 +742,7 @@ export function ThinkPanel({
         return sendToChief(question || "What's your take on the conversation so far?", before, {
           capture,
           turn,
+          questionMsgId: userMsg.id,
         });
       }
       if (r.kind === "voice") {

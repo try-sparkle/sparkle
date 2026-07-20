@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { formatAgo, oneLine } from "./promptHistory";
+import { composerPrompts, formatAgo, oneLine } from "./promptHistory";
+import type { PromptHistoryEntry } from "../types";
 
 const SEC = 1000;
 const MIN = 60 * SEC;
@@ -31,5 +32,31 @@ describe("formatAgo", () => {
 describe("oneLine", () => {
   it("collapses whitespace and newlines and trims", () => {
     expect(oneLine("  fix   the\n\n login   bug \n")).toBe("fix the login bug");
+  });
+});
+
+describe("composerPrompts", () => {
+  const e = (id: string, source?: PromptHistoryEntry["source"]): PromptHistoryEntry => ({
+    id,
+    text: id,
+    at: 0,
+    source,
+  });
+
+  it("drops picker entries, keeps composer entries", () => {
+    const out = composerPrompts([e("a", "composer"), e("b", "picker"), e("c", "composer")]);
+    expect(out.map((x) => x.id)).toEqual(["a", "c"]);
+  });
+
+  it("treats a missing source as composer (pre-v10 legacy entries always show)", () => {
+    const out = composerPrompts([e("legacy"), e("pick", "picker")]);
+    expect(out.map((x) => x.id)).toEqual(["legacy"]);
+  });
+
+  it("is order-preserving and non-mutating", () => {
+    const input = [e("a", "composer"), e("b", "picker")];
+    const out = composerPrompts(input);
+    expect(out).not.toBe(input);
+    expect(input).toHaveLength(2); // original untouched
   });
 });

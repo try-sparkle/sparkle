@@ -5,9 +5,34 @@ import {
   workerMission,
   orchestrationPersona,
   beadsProtocol,
+  guardrailsProtocol,
+  sparkleControlProtocol,
   KEYCHAIN_SAFETY_RULE,
   WORKER_RESULT_RELPATH,
 } from "./buildAgent";
+
+describe("sparkleControlProtocol — rename_agent is the mandatory first tool call", () => {
+  it("demands rename_agent as the FIRST tool call, before any other work", () => {
+    // Naming defers a build/worker's first paid call (agentNaming.ts's deferred_first_turn branch)
+    // on the bet that the agent names itself. The old copy merely described rename_agent as
+    // available, so agents named themselves late or never and the sidebar sat on "Build 4" for many
+    // turns (founder screenshot, 2026-07-15).
+    const p = sparkleControlProtocol();
+    expect(p).toMatch(/FIRST tool call/);
+    expect(p).toMatch(/before any other/i);
+  });
+
+  it("the demand rides in every code-producing persona, not just the snippet", () => {
+    // The snippet is appended to both personas via --append-system-prompt; if it ever stops being
+    // included, the whole self-naming bet silently reverts to the deferred-forever behavior.
+    for (const persona of [
+      workerPersona({ parentBranch: "main", resultPath: ".sparkle/result.json" }),
+      orchestrationPersona({ ownBranch: "b", maxConcurrentWorkers: 3 }),
+    ]) {
+      expect(persona).toMatch(/FIRST tool call/);
+    }
+  });
+});
 
 describe("WORKER_RESULT_RELPATH", () => {
   it("is the .sparkle/result.json contract path", () => {
@@ -85,6 +110,39 @@ describe("workerPersona", () => {
     expect(p).toMatch(/security/);
     expect(p).toContain("ai.sparkle.desktop");
     expect(p).toMatch(/never/i);
+  });
+});
+
+describe("guardrailsProtocol", () => {
+  const g = guardrailsProtocol();
+  it("names the core quality gates: run tests/typecheck before commit, red = not done", () => {
+    expect(g).toMatch(/GUARDRAILS/);
+    expect(g).toMatch(/test/i);
+    expect(g).toMatch(/typecheck|lint|build/i);
+    expect(g).toMatch(/red/i);
+    expect(g).toMatch(/not done|before you commit/i);
+  });
+  it("is adaptive: a project with no tests is nudged, not hard-blocked", () => {
+    expect(g).toMatch(/no test setup/i);
+    expect(g).toMatch(/do not hard-block|not hard-block/i);
+  });
+});
+
+describe("guardrails gating in personas", () => {
+  it("workerPersona includes the guardrails snippet only when guardrails is on", () => {
+    const on = workerPersona({ parentBranch: "b", resultPath: "/r", guardrails: true });
+    const off = workerPersona({ parentBranch: "b", resultPath: "/r", guardrails: false });
+    const dflt = workerPersona({ parentBranch: "b", resultPath: "/r" });
+    expect(on).toContain(guardrailsProtocol());
+    expect(off).not.toContain(guardrailsProtocol());
+    // Absent opt (undefined) → off: the flag is opt-in from the caller's settings.
+    expect(dflt).not.toContain(guardrailsProtocol());
+  });
+  it("orchestrationPersona includes the guardrails snippet only when guardrails is on", () => {
+    const base = { ownBranch: "b", maxConcurrentWorkers: 4 };
+    expect(orchestrationPersona({ ...base, guardrails: true })).toContain(guardrailsProtocol());
+    expect(orchestrationPersona({ ...base, guardrails: false })).not.toContain(guardrailsProtocol());
+    expect(orchestrationPersona(base)).not.toContain(guardrailsProtocol());
   });
 });
 

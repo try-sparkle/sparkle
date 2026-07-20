@@ -8,6 +8,7 @@ import { migratePersistedUi } from "./composerPersist";
 // on a component file — SettingsDialog imports and re-exports it for its own consumers.
 export type CategoryId =
   | "ai"
+  | "tools"
   | "credits"
   | "notifications"
   | "appearance"
@@ -16,6 +17,7 @@ export type CategoryId =
   | "accounts"
   | "mobile"
   | "voice"
+  | "approvals"
   | "advanced";
 
 export const COMPOSER_MIN = 64;

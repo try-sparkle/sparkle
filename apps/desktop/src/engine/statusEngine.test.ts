@@ -228,12 +228,15 @@ describe("StatusEngine", () => {
     expect(last()).toBe("errored");
   });
 
-  it("goes errored on a self-prompt loop instead of staying working forever", () => {
+  it("goes errored on a self-prompt loop (REPEATED pings) instead of staying working forever", () => {
     const { engine, last } = makeEngine();
     engine.ingest(SPINNER);
     expect(last()).toBe("working");
-    // The wedged agent pings itself; the spinner keeps redrawing so the old logic stayed `working`.
-    engine.ingest("Are you there? Hey, Sparkler. Are you there?\n");
+    // Bug A: a SINGLE self-ping is no longer a wedge (it could be the user, or a prose quote), so the
+    // wedge signal is the phrase REPEATING with no progress. Each ping is its own completed line.
+    engine.ingest("Are you there?\n");
+    expect(last()).toBe("working"); // one ping — not yet a loop
+    engine.ingest("Hey, Sparkler. Are you there?\n"); // the loop repeats → wedge
     expect(last()).toBe("errored");
     engine.ingest(SPINNER);
     expect(last()).toBe("errored");
@@ -265,11 +268,13 @@ describe("StatusEngine", () => {
     expect(last()).toBe("errored");
   });
 
-  it("catches a self-prompt ping that sits in the unterminated partial (roborev 16176)", () => {
-    // Covers the isSelfPromptLine(partial) branch of the partial-buffer check.
+  it("does NOT flag a SINGLE self-prompt ping in the unterminated partial (Bug A)", () => {
+    // A self-prompt is a wedge only once it REPEATS, and repetition is counted off discrete
+    // completed lines — so a lone self-ping still sitting in the partial (no trailing newline) must
+    // NOT strand the tab red. (Formerly roborev 16176 tripped this on a single occurrence.)
     const { engine, last } = makeEngine();
-    engine.ingest("Are you there?"); // no newline
-    expect(last()).toBe("errored");
+    engine.ingest("Are you there?"); // no newline, single occurrence
+    expect(last()).not.toBe("errored");
   });
 
   it("does NOT flag line-initial 'API Error' narration sitting in the partial (roborev 16177)", () => {
@@ -343,5 +348,129 @@ describe("StatusEngine", () => {
     // Detection still fires after the flood: a question on a completed line wins.
     engine.ingest("Do you want to proceed? (y/n)\n");
     expect(last()).toBe("waiting");
+  });
+});
+
+// --- Bug A: a single user/agent utterance of a self-prompt phrase must NOT false-trip errored ---
+
+describe("StatusEngine — self-prompt false-positive guard (Bug A)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const SPINNER = "✻ Cogitating… (12s · esc to interrupt)";
+
+  it("does NOT go errored on a single 'Are you there? Give me an update.' line", () => {
+    // The USER legitimately says this (and it's echoed back into pty:output). One occurrence is not
+    // a wedge — the row stays working/idle, never red.
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    engine.ingest("Are you there? Give me an update.\n");
+    expect(last()).not.toBe("errored");
+    expect(last()).toBe("working");
+  });
+
+  it("does NOT go errored on a single 'Hey, Sparkler.' (the voice-UI wake phrase)", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    engine.ingest("Hey, Sparkler.\n");
+    expect(last()).not.toBe("errored");
+  });
+
+  it("does NOT go errored when the agent merely QUOTES the phrase once in prose", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    engine.ingest('I\'ll add a wake phrase so users can say "hey Sparkler" to start dictation.\n');
+    expect(last()).not.toBe("errored");
+    expect(last()).toBe("working");
+  });
+
+  it("STILL goes errored on a genuine repeated self-ping loop (Bug A preserved)", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    engine.ingest("Are you there?\n");
+    engine.ingest("Are you there?\n"); // repeats with no progress → wedge
+    expect(last()).toBe("errored");
+  });
+
+  it("STILL goes errored on a single real 'API Error:' banner (only self-prompt got the gate)", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    // Leading newline flushes the spinner redraw so the banner lands on its own completed line.
+    engine.ingest("\nAPI Error: 529 overloaded_error\n");
+    expect(last()).toBe("errored");
+  });
+});
+
+// --- Bug B: sticky errored must RECOVER when the user answers and the agent resumes working ---
+
+describe("StatusEngine — user-input recovery (Bug B, noteUserInput)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const SPINNER = "✻ Cogitating… (12s · esc to interrupt)";
+
+  it("recovers to working after the user answers, then a spinner tick (no tool event needed)", () => {
+    const { engine, last } = makeEngine();
+    // Put the engine into errored via a repeated self-ping loop.
+    engine.ingest("Are you there?\n");
+    engine.ingest("Are you there?\n");
+    expect(last()).toBe("errored");
+    // The user answers with a normal prose message — a NEW turn is starting.
+    engine.noteUserInput("Let's build it. Go ahead...");
+    // The agent resumes working: the live spinner comes back. It must go GREEN, not stay stuck red.
+    engine.ingest(SPINNER);
+    expect(last()).toBe("working");
+  });
+
+  it("recovers via a thinking/prose line then a spinner — proving it needs no tool event", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest("API Error: Rate limited\n"); // latch errored
+    expect(last()).toBe("errored");
+    engine.noteUserInput("let's build it. go ahead...");
+    // A pure thinking/prose turn emits NO classified tool event — only prose then the spinner.
+    engine.ingest("Twisting… almost done thinking\n");
+    engine.ingest(SPINNER);
+    expect(last()).toBe("working");
+  });
+
+  it("suppresses the ECHO of the user's own message so it never re-trips errored (Fix 2)", () => {
+    const { engine, last } = makeEngine();
+    engine.noteUserInput("Are you there? Give me an update.");
+    // The TUI echoes the submitted line back into pty:output — even twice — but it's the user's own
+    // words, not a wedge. Must NOT go errored.
+    engine.ingest("Are you there? Give me an update.\n");
+    engine.ingest("Are you there? Give me an update.\n");
+    expect(last()).not.toBe("errored");
+  });
+
+  it("does NOT let the user-input window permanently disable detection (wedge caught after it expires)", () => {
+    const { engine, last } = makeEngine();
+    engine.noteUserInput("go ahead and build it");
+    // Burn through the echo window with unrelated benign output (no further user input, no tool event).
+    for (let i = 0; i < 205; i++) engine.ingest(`log line number ${i}\n`);
+    // Now a GENUINE self-ping loop starts with no user present — it must still go red.
+    engine.ingest("Are you there?\n");
+    engine.ingest("Are you there?\n");
+    expect(last()).toBe("errored");
+  });
+
+  it("a TINY user message does not broadly suppress detection (substring gate, roborev)", () => {
+    // "go" is under the substring-match floor, so echo suppression falls back to exact equality —
+    // it must NOT skip a genuine self-ping loop just because those lines happen to contain "go".
+    const { engine, last } = makeEngine();
+    engine.noteUserInput("go");
+    engine.ingest("Are you there? going in circles?\n");
+    engine.ingest("Are you there? going in circles?\n"); // repeated self-ping → real wedge
+    expect(last()).toBe("errored");
+  });
+
+  it("clears a latched error even without immediately following output (flags lifted, spinner wins)", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest("API Error: overloaded\n");
+    expect(last()).toBe("errored");
+    engine.noteUserInput("retry please");
+    // Next tick is just the resuming spinner — with the sticky flag lifted, it classifies working.
+    engine.ingest(SPINNER);
+    expect(last()).toBe("working");
   });
 });

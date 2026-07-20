@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { useDictationStore } from "./dictationStore";
+import { useDictationStore, DICTATION_PERSIST_KEY } from "./dictationStore";
 
 const reset = () =>
   useDictationStore.setState({
@@ -47,6 +47,19 @@ describe("dictationStore — ambient fields", () => {
     expect(useDictationStore.getState().phase).toBe("active");
     useDictationStore.getState().setPhase("passive");
     expect(useDictationStore.getState().phase).toBe("passive");
+  });
+
+  it("persists phase to the shared blob so active/paused carries across windows", () => {
+    // The active/paused status the user selects must survive cross-window rehydration, exactly like
+    // `enabled` (on/off) already does. That means `phase` must land in the persisted localStorage
+    // blob (partialize), not stay window-local runtime state.
+    useDictationStore.getState().setPhase("active");
+    const raw = localStorage.getItem(DICTATION_PERSIST_KEY);
+    expect(raw).toBeTruthy();
+    expect(JSON.parse(raw!).state.phase).toBe("active");
+
+    useDictationStore.getState().setPhase("passive");
+    expect(JSON.parse(localStorage.getItem(DICTATION_PERSIST_KEY)!).state.phase).toBe("passive");
   });
 
   it("registerInsert(null) deregisters — insert() no longer calls old fn", () => {

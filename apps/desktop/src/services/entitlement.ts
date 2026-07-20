@@ -66,14 +66,17 @@ export function deriveAuthControl(input: {
   return input.trialStarted ? "returning" : "new";
 }
 
-/** The signed-in identity to display: first non-blank of name → email → clerkUserId, trimmed
- *  (the `Me` shape carries no username). Returns null when none is resolvable. Single source of
- *  truth so the avatar letter and the accessible label can never disagree — e.g. a whitespace-only
- *  name falls through to the email for BOTH, not just one. */
+/** The signed-in identity to display: the first non-blank of name → email, trimmed. Returns null
+ *  when neither resolves. The raw `clerkUserId` is deliberately NOT a fallback: surfacing an opaque
+ *  `user_…` id reads to the user as a "wonky username" (this is exactly what a degraded /me — a
+ *  Clerk profile lookup that soft-failed to null email+name — produced). Callers must treat null as
+ *  "signed in, identity not resolvable" and render a clean "Signed in" / neutral avatar, never the
+ *  id. Single source of truth so the avatar letter and the accessible label can never disagree —
+ *  e.g. a whitespace-only name falls through to the email for BOTH, not just one. */
 export function authIdentity(me: Me | null): string | null {
   // Trim each candidate BEFORE the `||`, so a blank/whitespace field falls through to the next
   // rather than being picked and then trimmed away.
-  return me?.name?.trim() || me?.email?.trim() || me?.clerkUserId?.trim() || null;
+  return me?.name?.trim() || me?.email?.trim() || null;
 }
 
 /** First letter (uppercased) of the signed-in identity for the avatar circle (see authIdentity).
@@ -84,6 +87,27 @@ export function avatarLetter(me: Me | null): string {
   // name, some CJK-extension glyphs) doesn't get sliced into a broken lone surrogate.
   const ch = Array.from(authIdentity(me) ?? "")[0] ?? "";
   return ch ? ch.toUpperCase() : "";
+}
+
+/**
+ * Stable sentinel Rust's `desktop_exchange_code` returns (auth.rs `NO_PENDING_SIGNIN`) when an auth
+ * callback arrives but this instance has no in-flight sign-in to bind it to — i.e. the user quit
+ * mid-sign-in and the returning `sparkle://auth?code=…` deep link relaunched a fresh process whose
+ * in-memory pending sign-in is empty. Kept byte-identical to the Rust constant.
+ */
+export const NO_PENDING_SIGNIN = "no_pending_signin";
+
+/**
+ * True when a failed code exchange was the recoverable "no pending sign-in" case (see
+ * {@link NO_PENDING_SIGNIN}) rather than a genuine state mismatch / expired code / server error.
+ * The Tauri invoke rejects with the Rust error string (sometimes wrapped in an Error), so accept
+ * either shape. Callers use this to offer a clean "start sign-in again" affordance instead of
+ * dead-ending silently.
+ */
+export function isNoPendingSignIn(err: unknown): boolean {
+  const msg =
+    typeof err === "string" ? err : ((err as { message?: string } | null)?.message ?? String(err));
+  return msg.includes(NO_PENDING_SIGNIN);
 }
 
 /**

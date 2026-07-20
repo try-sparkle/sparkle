@@ -16,7 +16,6 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-const KEYCHAIN_SERVICE: &str = "ai.sparkle.desktop";
 const KEYCHAIN_USER: &str = "trial-device-token";
 const DEFAULT_ORCHESTRATION_URL: &str = "http://localhost:3001";
 /// Bound every trial HTTP call so a hung/unreachable orchestration server can't wedge the Tauri
@@ -29,7 +28,9 @@ fn base_url() -> String {
 }
 
 fn entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| e.to_string())
+    // Dev-suffixed keychain service in debug builds (mirrors auth.rs; see dev_identity).
+    keyring::Entry::new(&crate::dev_identity::keychain_service(), KEYCHAIN_USER)
+        .map_err(|e| e.to_string())
 }
 
 fn read_device_token() -> Option<String> {

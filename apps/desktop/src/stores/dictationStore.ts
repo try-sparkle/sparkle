@@ -33,7 +33,16 @@ interface DictationState {
    *  ambient noise. Distinct from `level` (raw loudness, used only for bar HEIGHT). */
   speaking: boolean;
   error: string | null;
-  /** Non-null while the backend is downloading the whisper model (~482 MB). */
+  /** Non-null ONLY while the backend is downloading the whisper model — which makes it the one
+   *  signal that tells a cold first run apart from a warm start (an install that already has the
+   *  model never emits it). The mic surfaces derive their "preparing" state from exactly that (see
+   *  MicButton.deriveMicState), so an armed-but-not-yet-usable mic stops impersonating a ready one.
+   *
+   *  `done`/`total` count the COMPRESSED tarball as it streams (~482 MB — that's the response's
+   *  content-length), NOT the ~631 MB the model occupies once unpacked on disk. So 100% here means
+   *  "fully downloaded, unpack still to go", which is why the copy says "Setting up voice" rather
+   *  than "Downloading" — see voice/dictationCopy.ts. `total` is null when the server sends no
+   *  content-length, in which case there is no honest percentage to show. */
   modelProgress: ModelProgress | null;
   /** Live, un-committed transcript from the cloud streaming engine (Deepgram interim results).
    *  Shown as a ghosted preview that updates word-by-word; replaced in place on each interim and
@@ -47,7 +56,9 @@ interface DictationState {
    *  and synced across all windows, so a user who turns it on stays on across windows and relaunch
    *  (only the DEFAULT changed — existing persisted `enabled: true` preferences are untouched). */
   enabled: boolean;
-  /** passive = hearing but not typing; active = routing speech to the box. */
+  /** passive = hearing but not typing; active = routing speech to the box. Persisted and synced
+   *  across all windows (like `enabled`), so the active/paused status the user selects carries when
+   *  they focus a different project — reset to `passive` on a true cold start (see windowContext). */
   phase: Phase;
   /** Transient: the "You are out of credits. Refill to activate voice." notice is showing. Set
    *  when the user tries to ARM the mic while out of credits (the arm is refused instead). Both mic
@@ -136,9 +147,12 @@ export const useDictationStore = create<DictationState>()(
     {
       name: DICTATION_PERSIST_KEY,
       storage: createJSONStorage(() => localStorage),
-      // Only the master mute is a real setting; everything else (mic level, status, phase,
-      // download progress, the live insert callback) is per-session runtime that must not persist.
-      partialize: (s) => ({ enabled: s.enabled }),
+      // Persist the two user-facing mic settings so they carry across all windows (and relaunch):
+      // `enabled` (on/off) and `phase` (paused vs. actively listening). Everything else (mic level,
+      // status, download progress, the live insert callback) is per-session runtime that must not
+      // persist. NOTE: a persisted `phase: "active"` is reset to "passive" on a true cold start by
+      // the main window (see windowContext.tsx) so relaunching never resumes mid-dictation.
+      partialize: (s) => ({ enabled: s.enabled, phase: s.phase }),
     },
   ),
 );

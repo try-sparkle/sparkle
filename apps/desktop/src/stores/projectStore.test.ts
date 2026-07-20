@@ -43,6 +43,7 @@ describe("projectStore default/base branch", () => {
         agents: Array<{
           baseBranch: unknown;
           namePinned: unknown;
+          selfNamed: unknown;
           autoNameBasis: unknown;
           autoNameVariants: unknown;
         }>;
@@ -50,8 +51,13 @@ describe("projectStore default/base branch", () => {
     };
     expect(out.projects[0]!.defaultBranch).toBeNull();
     expect(out.projects[0]!.agents[0]!.baseBranch).toBeNull();
-    // A pre-existing name is treated as user-chosen, so it's pinned (won't auto-rename).
-    expect(out.projects[0]!.agents[0]!.namePinned).toBe(true);
+    // v2 treats a pre-existing name as user-chosen (namePinned) so auto-naming never rewrites it.
+    // v3 then defaults its kind to "build", which makes it match the v9 pel7-residue fingerprint
+    // (namePinned + no pinnedIndex + build kind) — v9 heals it to the same protection the fixed path
+    // uses: the name is KEPT and frozen via selfNamed, but the erroneous pin chip is dropped. So a
+    // migrated legacy record ends up unpinned+selfNamed, not namePinned — the name is still safe.
+    expect(out.projects[0]!.agents[0]!.namePinned).toBe(false);
+    expect(out.projects[0]!.agents[0]!.selfNamed).toBe(true);
     expect(out.projects[0]!.agents[0]!.autoNameBasis).toBeNull();
     // Width-fitted name variants are backfilled to null (display falls back to `name`).
     expect(out.projects[0]!.agents[0]!.autoNameVariants).toBeNull();
@@ -229,6 +235,25 @@ describe("projectStore prompt history", () => {
     // The oldest five fell off; the newest is retained.
     expect(hist[0]!.text).toBe("p5");
     expect(hist[hist.length - 1]!.text).toBe(`p${PROMPT_HISTORY_LIMIT + 4}`);
+  });
+
+  it("caps per source: a flood of picker answers never evicts real composer prompts", () => {
+    // roborev 39261: capping the UNION would let picker volume (the exact case this tagging targets)
+    // push composer prompts off the end, shrinking the breadcrumb. Cap each source independently.
+    const { pid, aid } = seed();
+    useProjectStore.getState().appendPrompt(pid, aid, "REAL TASK", "composer");
+    for (let i = 0; i < PROMPT_HISTORY_LIMIT + 50; i++) {
+      useProjectStore.getState().appendPrompt(pid, aid, `pick${i}`, "picker");
+    }
+    const hist = agentOf(aid).promptHistory;
+    const composer = hist.filter((e) => e.source === "composer");
+    const picker = hist.filter((e) => e.source === "picker");
+    // The lone real prompt survives the picker flood…
+    expect(composer.map((e) => e.text)).toEqual(["REAL TASK"]);
+    // …while picker entries are still bounded to the limit.
+    expect(picker).toHaveLength(PROMPT_HISTORY_LIMIT);
+    // Chronological order preserved: the composer prompt (appended first) stays at the front.
+    expect(hist[0]!.text).toBe("REAL TASK");
   });
 
   it("migrate (v5) backfills promptHistory as [] without seeding from lastPrompt", () => {
@@ -486,7 +511,14 @@ describe("setAgentEpicId", () => {
     expect(agents.find((a) => a.id === a1)!.epicId).toBe("epic-7");
     expect(agents.find((a) => a.id === a2)!.epicId).toBeUndefined();
   });
-  it("re-binding overwrites the previous epic (a re-used orchestrator moves to the new epic)", () => {
+  // setAgentEpicId is a DUMB SETTER: last write wins, no policy. That is deliberate — the decision
+  // about WHICH orchestrator may be bound to WHICH epic lives one level up in sendToBuild, which now
+  // enforces one-orchestrator-per-epic (bead sparkle-ctgd) by only ever reusing an agent already
+  // bound to the same epic. This test used to be titled "a re-used orchestrator moves to the new
+  // epic" and stood as the store-level blessing of that reuse; that rationale is gone, but the
+  // overwrite semantics stay, because rebinding is still legitimate (e.g. sendToBuild re-binds the
+  // SAME epic on an idempotent re-hit of "Build It", and adoptWorker/reconcile paths may re-set it).
+  it("re-binding overwrites the previous epic (last write wins — this setter holds no policy)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
     const a1 = useProjectStore.getState().addAgent(pid, { kind: "build" });
     useProjectStore.getState().setAgentEpicId(pid, a1, "epic-7");

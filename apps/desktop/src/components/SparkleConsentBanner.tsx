@@ -7,10 +7,19 @@ import { useSettingsStore, type SparkleImprovementConsent } from "../stores/sett
  * (below the pinned prompt) and lets the user choose how their anonymous logs may be used to
  * improve the open-source Sparkle client: Always (auto-submit), Case by case (review + approve
  * each PR — the default), or Never (don't evaluate logs at all). The choice is persisted in
- * settingsStore and gates the hourly log evaluation + PR submission.
+ * settingsStore and gates the hourly log evaluation + PR submission, AND the crash-report upload
+ * tiers enforced in Rust (src-tauri/src/crash.rs `upload_allowed` / `logs_allowed`):
+ *   - "never"        → nothing uploaded.
+ *   - "case_by_case" → the scrubbed crash report only (message + backtrace), no recent-logs tail.
+ *   - "always"       → the crash report plus the scrubbed ~1h recent-logs tail.
  *
  * The explanatory copy below the control changes with the selected mode so the user always sees
  * exactly what that mode does. consentCopy is pure + exported so the wording is unit-tested.
+ *
+ * THE COPY IS A PROMISE. Those bullets are the only place the user is told what leaves their
+ * machine, so they and the Rust gate are one contract: if the gate changes, the copy changes in the
+ * same commit. This banner once said crash reports were "only uploaded on 'Always'" while the gate
+ * said otherwise — the tests below pin each mode's wording precisely so that can't drift again.
  */
 
 const MODES: { value: SparkleImprovementConsent; label: string }[] = [
@@ -36,7 +45,8 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
           "Once per hour, we use a small amount of your Claude Code subscription to evaluate your logs.",
           "If we see failures or performance issues, we automatically craft a PR to submit to the Sparkle OSS project to improve it",
           'On "Always" mode, these PRs will be submitted automatically. No action required from you.',
-          "On 'Always', we also securely upload scrubbed crash reports and your recent logs (last ~hour) so we can find and fix crashes fast — always anonymized, never any PII, secrets, or code.",
+          "If Sparkle crashes, we securely upload a scrubbed crash report so we can find and fix the crash fast — the error message and backtrace only, anonymized, never any PII, secrets, or code.",
+          "On 'Always', that crash report also carries your recent logs (last ~hour), scrubbed the same way, which gives us the context around the crash.",
           "We scrub the PR for anything sensitive: No PII, secrets, code snippets, etc will be sent",
         ],
       };
@@ -45,7 +55,7 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
         lead: "Sparkle will not evaluate your logs.",
         bullets: [
           "Your logs stay on your device — the improvement agent won't read them or craft any PRs.",
-          "Crash reports are still captured locally to your device, but never uploaded — crash reports are only sent on 'Always'.",
+          "Crash reports are still captured locally to your device, but nothing is uploaded — on 'Never' we send no crash reports and no logs.",
           "You can switch this back on at any time.",
         ],
       };
@@ -57,7 +67,8 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
           "Once per hour, we use a small amount of your Claude Code subscription to evaluate your logs.",
           "If we see failures or performance issues, we automatically craft a proposed PR to submit upon your approval to the Sparkle OSS project to improve it",
           "You review and approve every PR before it is submitted",
-          "Crash reports are captured locally either way, but only uploaded on 'Always' — on this setting they stay on your device.",
+          "If Sparkle crashes, we securely upload a scrubbed crash report so we can find and fix the crash fast — the error message and backtrace only, anonymized, never any PII, secrets, or code.",
+          "Your recent logs are NOT sent on this setting — the crash report travels on its own. Uploading the last ~hour of logs alongside it is 'Always' only.",
           "We scrub the PR for anything sensitive: No PII, secrets, code snippets, etc will be sent",
         ],
       };

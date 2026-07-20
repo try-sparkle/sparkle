@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useRef } from "react";
 import { AuthGate } from "./components/AuthGate";
+import { ReadinessGate } from "./components/ReadinessGate";
 import { useAmbientVoice } from "./useDictation";
 import { useApplyTheme } from "./theme/theme";
 import { useConnectionMonitor } from "./connectionMonitor";
@@ -9,6 +10,7 @@ import { importDefault } from "./services/accountStore";
 import { startRelayHost, stopRelayHost } from "./services/relayClient";
 import { useSettingsStore } from "./stores/settingsStore";
 import { getConfig, onConfigChanged } from "./services/config";
+import { refreshRoborevAuth } from "./services/configActions";
 import { safeUnlisten } from "./services/safeUnlisten";
 import {
   CurrentProjectProvider,
@@ -18,11 +20,13 @@ import {
   useReplaceCurrentProject,
 } from "./windowContext";
 import { LastFocusedProjectTracker } from "./capture/LastFocusedProjectTracker";
+import { WindowSessionCapture } from "./WindowSessionCapture";
 import { initCaptureSendListener, type CaptureSendCtx } from "./services/captureSends";
 import { useAttentionNotifications } from "./useAttentionNotifications";
 import { useRosterPublisher } from "./useRosterPublisher";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { HintOverlay } from "./components/HintOverlay";
+import { RoborevConsentModal } from "./components/RoborevConsentModal";
 import { startUpdater } from "./services/updaterService";
 
 // The Workspace subtree pulls in the heavy authenticated UI — xterm, markdown rendering, modals,
@@ -197,7 +201,13 @@ export function App() {
     const hydrate = useSettingsStore.getState().hydrateFromConfig;
     void getConfig()
       .then((eff) => {
-        if (!cancelled) hydrate(eff);
+        if (cancelled) return;
+        hydrate(eff);
+        // Probe roborev's auth once the real flag is loaded. Must run AFTER hydrate (the store's
+        // pre-hydrate default would decide it for us) and only matters when roborev is on — see
+        // refreshRoborevAuth: the toggle defaults ON, so this launch path is the only thing that
+        // checks a fresh install or a restart. Fire-and-forget: it must never delay first paint.
+        void refreshRoborevAuth();
       })
       .catch((e) => console.warn("getConfig failed", e));
     // Keep the listen() promise; safeUnlisten awaits it on cleanup so a listener that resolves
@@ -213,8 +223,15 @@ export function App() {
     <CurrentProjectProvider>
       <RosterPublisher />
       <LastFocusedProjectTracker />
+      <WindowSessionCapture />
       <CaptureSendController />
-      <AuthGate>
+      {/* Proactive first-run readiness: walk a fresh user through git/node/claude + sign-in up
+          front. Invisible for an already-ready machine (renders children immediately, probes in the
+          background, only overlays the checklist when a prereq is confirmed missing). Wraps AuthGate
+          so it runs before/alongside the welcome/auth screen without disturbing Workspace's lazy
+          load for unauthenticated users. */}
+      <ReadinessGate>
+        <AuthGate>
         <AttentionController />
         <UpdateBanner />
         {/* Workspace is code-split (React.lazy); Suspense holds the first frame while its chunk
@@ -223,10 +240,14 @@ export function App() {
         <Suspense fallback={null}>
           <Workspace />
         </Suspense>
+        {/* One-time roborev consent modal — mounted once (not per-agent), self-gated on
+            settingsStore.roborevConsentOpen (flipped at the first reviewable commit). */}
+        <RoborevConsentModal />
         {/* Vimium-style keyboard hints: a clean ⌘ tap overlays gold chiclets on the primary
             controls. Mounted last so its portal sits above the whole UI. */}
         <HintOverlay />
-      </AuthGate>
+        </AuthGate>
+      </ReadinessGate>
     </CurrentProjectProvider>
   );
 }

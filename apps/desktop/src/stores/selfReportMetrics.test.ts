@@ -87,6 +87,9 @@ describe("namingCoverage", () => {
     deferred_first_turn: 0,
     paid_haiku_fallback: 0,
     skipped_thin: 0,
+    named_from_session_title_backfill: 0,
+    work_haiku_backstop: 0,
+    work_backstop_skipped: 0,
   };
 
   it("returns null pct when there is no naming signal (0/0)", () => {
@@ -105,6 +108,18 @@ describe("namingCoverage", () => {
     expect(c.covered).toBe(1);
     expect(c.paid).toBe(0);
     expect(c.pct).toBe(1); // 1 / (1 + 0)
+  });
+
+  it("groups the name-from-work outcomes: session-title backfill=covered, work Haiku backstop=paid, skip=neither", () => {
+    const c = namingCoverage({
+      ...base,
+      named_from_session_title_backfill: 3, // free Tier-1 win → covered
+      work_haiku_backstop: 1, // paid Tier-2 call → paid
+      work_backstop_skipped: 4, // no basis, default kept → excluded from both sides
+    });
+    expect(c.covered).toBe(3);
+    expect(c.paid).toBe(1);
+    expect(c.pct).toBeCloseTo(0.75, 5); // 3 / (3 + 1)
   });
 });
 

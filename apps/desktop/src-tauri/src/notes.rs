@@ -237,6 +237,59 @@ pub async fn list_beads(project_path: String) -> Result<String, String> {
     .map_err(|e| format!("bd task failed: {e}"))?
 }
 
+/// Ensure `project_path` has a beads database, creating one with `bd init` if none resolves yet.
+/// Idempotent and safe to call on every board open: it first probes `bd where` (which honors
+/// BEADS_DIR / parent-directory / redirect resolution, so a project that legitimately inherits a
+/// parent's beads workspace is left untouched) and only runs `bd init` when NO workspace resolves.
+/// `--non-interactive` avoids any prompt in the GUI-spawned (TTY-less) shell; `--quiet` keeps
+/// stdout clean; the issue prefix defaults to the project directory name. Runs through a login
+/// shell so the GUI app inherits the user's PATH (where `bd` lives); the project path is a
+/// positional arg ($1), never interpolated. Returns "exists" when a DB already resolved,
+/// "initialized" after a fresh `bd init`, and Err(..) only when `bd init` itself failed — a probe
+/// (`bd where`) failure is treated as "needs init", never fatal.
+#[tauri::command]
+pub async fn ensure_beads_db(project_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Probe: does bd already resolve a workspace here (own DB, a parent's, or a redirect)?
+        // `bd where` exits 0 when one resolves, non-zero when none does.
+        let probe = Command::new("/bin/zsh")
+            .arg("-l")
+            .arg("-c")
+            .arg(r#"cd "$1" && bd where"#)
+            .arg("sparkle")     // $0
+            .arg(&project_path) // $1
+            .output()
+            .map_err(|e| format!("failed to run bd: {e}"))?;
+        if probe.status.success() {
+            return Ok("exists".to_string());
+        }
+
+        // No workspace resolved — create one in the project root.
+        let init = Command::new("/bin/zsh")
+            .arg("-l")
+            .arg("-c")
+            .arg(r#"cd "$1" && bd init --non-interactive --quiet"#)
+            .arg("sparkle")     // $0
+            .arg(&project_path) // $1
+            .output()
+            .map_err(|e| format!("failed to run bd init: {e}"))?;
+        if init.status.success() {
+            return Ok("initialized".to_string());
+        }
+        let stderr = String::from_utf8_lossy(&init.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&init.stdout).trim().to_string();
+        Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "bd init failed".to_string()
+        })
+    })
+    .await
+    .map_err(|e| format!("bd task failed: {e}"))?
+}
+
 /// Show a single bead via `bd show "$1" --json`. Returns bd's raw JSON stdout. `id` is a
 /// positional arg ($1), never interpolated into the script.
 #[tauri::command]

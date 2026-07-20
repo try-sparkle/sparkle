@@ -9,9 +9,12 @@ import type { AgentKind, AgentTabStatus } from "../types";
 /** Whether closing an agent should pop the Ship/Save/Discard choice instead of silently tearing it
  *  down. Only a deliverable BUILD agent with UNMERGED work at risk prompts:
  *   - workers have their own "merged → close?" nudge, and think/shell have no worktree;
- *   - work that already landed (stage ≥ merged) is safe to close silently;
+ *   - work that already landed ON ORIGIN (stage ≥ merged) is safe to close silently;
  *   - an agent that never did real work (no commits, clean tree) has nothing at risk.
- *  So we prompt iff: kind === "build" AND stage < merged AND (commits ahead OR a dirty tree). */
+ *  So we prompt iff: kind === "build" AND stage < merged AND (commits ahead OR a dirty tree).
+ *  Note `merged` means ORIGIN main since the merged_local split, so work landed only on LOCAL main
+ *  now prompts. That's deliberate: unpushed work IS still at risk, which is the whole reason the
+ *  stage was split. */
 export function shouldPromptOnClose(
   kind: string,
   stage: WorkflowStageId,

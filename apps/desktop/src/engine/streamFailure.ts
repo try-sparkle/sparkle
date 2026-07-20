@@ -51,17 +51,28 @@ export function isApiErrorLine(line: string): boolean {
 }
 
 // Self-prompt / churn phrases the agent emits when it's wedged and pinging itself with no real work
-// to make. These appear ONLY in the stuck loop (a healthy agent never asks the user "are you
-// there?"), so a single occurrence is an unambiguous stall signal.
+// to make. The REAL wedge invariant is "a stuck agent REPEATS a self-ping in a loop with no
+// progress" — NOT "nobody ever says this phrase once". The USER legitimately says these (e.g. "Are
+// you there?", or "hey Sparkler" — the voice-UI wake phrase), and an agent may even QUOTE them in
+// prose; those single utterances get echoed into pty:output and must NOT paint a healthy agent RED.
+// So `isSelfPromptLine` stays a PURE phrase-matcher (other modules/tests import it), and the
+// REPETITION gate lives in `StreamFailureDetector.observe()`: a self-prompt phrase must recur
+// >= SELF_PROMPT_REPEAT_THRESHOLD times (with no intervening progress `reset()`) before it trips.
 const SELF_PROMPT_PATTERNS: readonly RegExp[] = [
   /are you (still )?there\b/i,
   /\bhey,?\s*sparkler\b/i,
 ];
 
-/** True when a single cleaned line is a self-prompt / churn ping. Pure. */
+/** True when a single cleaned line matches a self-prompt / churn ping phrase. Pure phrase-matcher —
+ *  a SINGLE match is NOT a wedge (the counting/repetition gate lives in StreamFailureDetector). */
 export function isSelfPromptLine(line: string): boolean {
   return SELF_PROMPT_PATTERNS.some((re) => re.test(line));
 }
+
+// How many times a self-prompt phrase must recur (no intervening progress reset) before it counts
+// as a wedge. Low enough to still catch a real self-ping loop fast, but > 1 so a single legitimate
+// utterance / prose quote of the phrase never trips a false RED (Bug A).
+export const SELF_PROMPT_REPEAT_THRESHOLD = 2;
 
 // A churn loop also shows up as the SAME short line repeating with no progress in between. Require
 // SEVERAL identical repeats so legitimately repeated short tool output (a handful of "Installing…"
@@ -84,10 +95,19 @@ export const STALL_SHORT_LINE_CHARS = 80;
 export class StreamFailureDetector {
   private lastLine = "";
   private repeats = 1;
+  // Running count of self-prompt phrase occurrences since the last progress reset(). A single
+  // occurrence is a legitimate user utterance / prose quote (Bug A) — only a REPEAT is a wedge.
+  private selfPrompts = 0;
 
   observe(line: string): boolean {
+    // A real API-error banner is unambiguous the moment it appears — single occurrence still trips.
     if (isApiErrorLine(line)) return true;
-    if (isSelfPromptLine(line)) return true;
+    // A self-prompt phrase only signals a wedge once it REPEATS with no intervening progress. Count
+    // it and trip only at the threshold, so one legitimate utterance never paints RED (Bug A).
+    if (isSelfPromptLine(line)) {
+      this.selfPrompts += 1;
+      return this.selfPrompts >= SELF_PROMPT_REPEAT_THRESHOLD;
+    }
     if (line === this.lastLine && line.length <= STALL_SHORT_LINE_CHARS) {
       this.repeats += 1;
       return this.repeats >= STALL_REPEAT_THRESHOLD;
@@ -97,10 +117,12 @@ export class StreamFailureDetector {
     return false;
   }
 
-  /** Reset the repeat counter — call when real progress resumes so post-recovery output starts
-   *  fresh and a stale pre-failure line can't combine with new output to look like churn. */
+  /** Reset the repeat + self-prompt counters — call when real progress resumes so post-recovery
+   *  output starts fresh and a stale pre-failure line (or an earlier lone self-ping) can't combine
+   *  with new output to look like churn. */
   reset(): void {
     this.lastLine = "";
     this.repeats = 1;
+    this.selfPrompts = 0;
   }
 }

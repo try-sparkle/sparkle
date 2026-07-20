@@ -6,6 +6,7 @@ import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { useSettingsStore } from "../stores/settingsStore";
 import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
 import { useNewBuildAgentDrop } from "../hooks/useNewBuildAgentDrop";
 import { AgentSidebar, NewBuildAgentButton } from "./AgentSidebar";
@@ -24,6 +25,7 @@ import { startControlListener } from "../services/controlListener";
 import { killProjectAgents, planWindowClose } from "../services/windowClose";
 import { windowTitleFor } from "../services/projectWindows";
 import { clearWindowProject } from "../services/windowRegistry";
+import { removeWindowSession } from "../services/windowSession";
 import { clearWindowRoster } from "../services/attention";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { useImprovementScheduler } from "../useImprovementScheduler";
@@ -249,8 +251,10 @@ export function Workspace() {
   const sparkleOpen = openAgentIds.includes(sparkleAgentId);
   // The read-only Tasks board (bead sparkle-hiju.10) is a project-scoped special view: it covers
   // the agent panes for the current project, the same slot Sparkle uses. Only meaningful with a
-  // project open.
-  const boardActive = activeSpecial === "board" && !!project;
+  // project open, and only when the Beads tool ([tools].beads) is enabled — off means the board is
+  // used nowhere (AgentSidebar hides the Plan chevron and reconciles mode away from it).
+  const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
+  const boardActive = activeSpecial === "board" && !!project && beadsEnabled;
 
   const finishClose = async (mode: "keep" | "kill") => {
     // Dismiss the prompt immediately so a second click on Keep/Kill (the handler awaits below)
@@ -274,6 +278,11 @@ export function Workspace() {
     if (plan.clearRegistry) {
       clearWindowProject(currentWindowLabel);
       clearWindowRoster(currentWindowLabel);
+      // Drop this window from the restore snapshot — an EXPLICIT close (this destroy path) means the
+      // user doesn't want it reopened next launch. Gated on clearRegistry so a HIDE (keep-agents last
+      // window, or main-while-others) keeps its entry and still restores. This is the only removal
+      // path: quit (Cmd+Q) never runs finishClose, so it leaves every entry intact ().
+      if (currentProjectId) removeWindowSession(currentProjectId);
     }
     if (plan.hide) await win.hide();
     else await win.destroy();

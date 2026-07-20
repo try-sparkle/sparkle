@@ -61,3 +61,49 @@ describe("projectStore pin mutators", () => {
     expect(agent().pinnedIndex).toBe(3);
   });
 });
+
+// selfNameAgent — the sparkle-control rename_agent path. It makes the name authoritative WITHOUT
+// pinning the row (regression sparkle-pel7: agents self-naming looked pinned and couldn't be unpinned).
+describe("projectStore selfNameAgent", () => {
+  beforeEach(seed);
+
+  it("sets the name + selfNamed but NEVER namePinned or pinnedIndex", () => {
+    useProjectStore.getState().selfNameAgent("p1", "a1", "Parser Builder");
+    expect(agent().name).toBe("Parser Builder");
+    expect(agent().selfNamed).toBe(true);
+    expect(agent().namePinned).toBe(false); // no pin chip
+    expect(agent().pinnedIndex).toBeNull(); // no row anchor
+  });
+
+  it("clears autoNameVariants so the chosen label shows verbatim", () => {
+    useProjectStore.setState({
+      projects: [
+        {
+          ...useProjectStore.getState().projects[0]!,
+          agents: [{ ...mkAgent(), autoNameVariants: { short: "S", medium: "M", long: "Stale Auto Name" } }],
+        },
+      ],
+    } as never);
+    useProjectStore.getState().selfNameAgent("p1", "a1", "Chosen Name");
+    expect(agent().autoNameVariants).toBeNull();
+  });
+
+  it("freezes the name against the background auto-namer", () => {
+    useProjectStore.getState().selfNameAgent("p1", "a1", "Chosen Name");
+    useProjectStore.getState().autoRenameAgent("p1", "a1", "Auto Guess", "some prompt");
+    expect(agent().name).toBe("Chosen Name"); // auto-namer must not clobber a self-name
+  });
+
+  it("is a no-op over a human pin (namePinned wins)", () => {
+    useProjectStore.getState().renameAgent("p1", "a1", "Human Choice", 0);
+    useProjectStore.getState().selfNameAgent("p1", "a1", "Agent Choice");
+    expect(agent().name).toBe("Human Choice");
+    expect(agent().namePinned).toBe(true);
+  });
+
+  it("ignores a blank name", () => {
+    useProjectStore.getState().selfNameAgent("p1", "a1", "   ");
+    expect(agent().name).toBe("A1");
+    expect(agent().selfNamed).toBeFalsy();
+  });
+});

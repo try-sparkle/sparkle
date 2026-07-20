@@ -33,6 +33,11 @@ import type { BranchStatus } from "../services/branchStatus";
 import { shouldPromptOnClose, selectionAfterClose } from "../engine/closeAgent";
 import { shipAgent, saveAgent, discardAgentGit } from "../services/closeAgentActions";
 import { refreshAgentTitle } from "../services/sessionTitle";
+import {
+  isNameFromWorkCandidate,
+  maybeNameFromWork,
+  WORK_BACKSTOP_WINDOW_TICKS,
+} from "../services/agentNaming";
 import { sparkleAgentIdFor } from "../services/sparkleAgent";
 import { handleImproveSparkleClick } from "../services/sparkleReveal";
 import { parseWindowLabelFromSearch } from "../services/projectWindows.url";
@@ -404,6 +409,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // and merged without the user touching anything. Reads fresh state from the stores inside the tick
   // so the effect only re-subscribes on project change, not on every status update.
   const projectId = project?.id;
+  // Per-agent count of CONSECUTIVE poll ticks a build/worker has been a name-from-work candidate
+  // (unpinned default + worktree, still no aiTitle / self-name). Drives the Tier-2 grace window: the
+  // paid Haiku backstop only fires once this reaches WORK_BACKSTOP_WINDOW_TICKS, giving Tier 1 (the
+  // free session-title backfill below) and the agent's own self-naming first crack. Reset the instant
+  // an agent stops being a candidate. A ref (not state) — it must survive re-renders without causing them.
+  const workBackstopTicksRef = useRef<Map<string, number>>(new Map());
   useEffect(() => {
     if (!projectId) return;
     // A slow tick (the gh PR probe can take ~0.5s/agent) must not overlap the next interval.
@@ -433,7 +444,45 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         // Auto-name each agent from Claude Code's own session title (ai-title in the transcript) —
         // the authoritative name once the first turn has summarized. Fire-and-forget, independent
         // of the branch-status poll below; the store action respects pins + de-dupes.
-        for (const a of all) void refreshAgentTitle(proj.id, a.id, a.worktreePath);
+        //
+        // TIER 1 (name-from-work, free): the title poll normally covers only OPEN agents, but a
+        // build/worker that did real work while its pane was CLOSED can be stuck on its "Build N"/
+        // "Worker N" default forever. So ALSO poll every CLOSED name-from-work candidate — its session
+        // title backfills the default for free. Marked `backfill` so the free win is tallied distinctly.
+        const titleTargets = new Map<string, { agent: (typeof proj.agents)[number]; backfill: boolean }>();
+        for (const a of all) titleTargets.set(a.id, { agent: a, backfill: false });
+        for (const a of proj.agents) {
+          if (titleTargets.has(a.id)) continue;
+          if (isNameFromWorkCandidate(a)) titleTargets.set(a.id, { agent: a, backfill: true });
+        }
+        for (const { agent: a, backfill } of titleTargets.values()) {
+          void refreshAgentTitle(
+            proj.id,
+            a.id,
+            a.worktreePath,
+            backfill ? { backfill: true, kind: a.kind } : undefined,
+          );
+        }
+        // TIER 2 (name-from-work, paid): a candidate that survives WORK_BACKSTOP_WINDOW_TICKS
+        // consecutive ticks without Tier 1 or self-naming rescuing it gets ONE Haiku call named from
+        // its actual WORK (maybeNameFromWork re-checks eligibility + fires once per agent). The tick
+        // counter gives Tier 1 first crack; a no-longer-candidate agent resets its window.
+        // Prune only the grace-window ticks (a harmless per-agent counter) for agents that dropped out
+        // of this project's loaded list. The once-per-agent PAID guard is intentionally NOT pruned here:
+        // it's a process-wide Set that must survive a transient drop (project switch/reload) so a
+        // reappearing agent isn't charged a second Haiku call — see agentNaming.workBackstopAttempted.
+        const workTicks = workBackstopTicksRef.current;
+        const liveIds = new Set(proj.agents.map((a) => a.id));
+        for (const id of [...workTicks.keys()]) if (!liveIds.has(id)) workTicks.delete(id); // drop gone agents
+        for (const a of proj.agents) {
+          if (!isNameFromWorkCandidate(a)) {
+            workTicks.delete(a.id); // rescued / renamed / no longer eligible → reset the grace window
+            continue;
+          }
+          const n = (workTicks.get(a.id) ?? 0) + 1;
+          workTicks.set(a.id, n);
+          if (n >= WORK_BACKSTOP_WINDOW_TICKS) void maybeNameFromWork(proj.id, a.id);
+        }
         // ONE batched Rust call for the whole project (sparkle-zlic) instead of the old ~3-4
         // subprocesses PER agent: shared repo discovery + skip of fingerprint-unchanged idle agents.
         // `force` recomputes actively-working agents so their dirty/ahead counts stay fresh; the
@@ -474,6 +523,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // only governs UI presence and work-mode reconciliation, never an AI action, so `visible` is
   // correct for every site it gates.
   const aiBrainstorm = useAiFeatureVisible("brainstorm");
+  // Beads tool gate ([tools].beads). Off → the Plan chevron (the read-only Tasks board entry) is
+  // hidden and no `bd` shell-out runs (see beadsStore). Mirrors the Think chevron's aiBrainstorm gate.
+  const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
   const [editing, setEditing] = useState<string | null>(null);
   // Which agent the Ship/Save/Discard close prompt is asking about (null = no prompt).
   const [closePromptId, setClosePromptId] = useState<string | null>(null);
@@ -955,6 +1007,17 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const next = reconcileWorkMode(selKind, mode, activeSpecial !== null, aiBrainstorm);
     if (next) setMode(next);
   }, [project, aiBrainstorm, mode, activeSpecial, setMode]);
+  // If Beads is turned off while the user is parked on the (now-hidden) Plan board, leave it — the
+  // board won't render and the Plan chevron is gone, so a stuck empty state would result otherwise.
+  // Also covers Plan mode without the board special (e.g. ThinkPanel's decompose hand-off sets
+  // workMode "plan" alone), so no code path can strand the user in a Plan mode they can't leave.
+  useEffect(() => {
+    if (beadsEnabled) return;
+    if (activeSpecial === "board" || mode === "plan") {
+      setActiveSpecial(null);
+      setMode("build");
+    }
+  }, [beadsEnabled, activeSpecial, mode, setActiveSpecial, setMode]);
   // Top-level agents (group heads + orphaned workers), matching the list's isTopLevel logic, PLUS a
   // parentId→children bucket built in the SAME single pass. Both are memoized on `project` so a PTY
   // status tick (which never touches the agent SET, only runtimeStore.status) reuses them instead of
@@ -1093,22 +1156,24 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               <span>Think</span>
             </button>
           )}
-          <button
-            data-hint="plan"
-            onClick={onPickPlan}
-            title="Plan mode — this project's read-only Tasks board"
-            // Full chevron when Think is present (notch left + point right); flat-left start when not.
-            style={createBtnStyle(FADE_1, FADE_2, ON_BRAND_FILL_DARK, aiBrainstorm, true, mode === "plan")}
-          >
-            <FaTasks size={14} style={{ flexShrink: 0 }} />
-            <span>Plan</span>
-          </button>
+          {beadsEnabled && (
+            <button
+              data-hint="plan"
+              onClick={onPickPlan}
+              title="Plan mode — this project's read-only Tasks board"
+              // Full chevron when Think is present (notch left + point right); flat-left start when not.
+              style={createBtnStyle(FADE_1, FADE_2, ON_BRAND_FILL_DARK, aiBrainstorm, true, mode === "plan")}
+            >
+              <FaTasks size={14} style={{ flexShrink: 0 }} />
+              <span>Plan</span>
+            </button>
+          )}
           <button
             data-hint="build"
             onClick={onPickBuild}
             title="Build mode — your Build orchestrator agents"
-            // Last in the strip: notched left (receives Plan's point), flat right. White ink.
-            style={createBtnStyle(FADE_2, FADE_3, ON_BRAND_FILL, true, false, mode === "build")}
+            // Last in the strip: notched left when anything precedes it (Think and/or Plan), flat right.
+            style={createBtnStyle(FADE_2, FADE_3, ON_BRAND_FILL, aiBrainstorm || beadsEnabled, false, mode === "build")}
           >
             <span style={{ fontSize: 26, lineHeight: 0, transform: "translateY(-3.5px)" }}>⚒</span>
             <span>Build</span>
@@ -1118,7 +1183,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
 
       {/* Full-text search across all projects' prompts & responses. Lives directly under the
           chevron strip; hidden in Plan mode (the sidebar is kept clear for the board). */}
-      {project && mode !== "plan" && <HistorySearch />}
+      {project && mode !== "plan" && <HistorySearch currentProjectId={project.id} />}
 
       <div
         ref={listScrollRef}
@@ -1835,7 +1900,16 @@ const AgentRow = memo(function AgentRow({
     const overflow = rect.top + neededH + REVEAL_MARGIN - window.innerHeight;
     if (overflow > 1) {
       didReveal.current = true;
-      sidebarScroll.scrollToReveal(overflow);
+      // Cap the reveal so it never drags the clicked row above the TOP of the list. A card far
+      // taller than the viewport (a many-subworker worker) overflows by more than the row's whole
+      // headroom; scrolling by that full overflow would pull the row clean off the top of the list —
+      // which visually deselects it and, once the auto-scroll settles, closes the card. Instead we
+      // scroll AT MOST the distance that brings the row's top up to the list's top edge, and let the
+      // card's own maxH + detail overflow scroll cover the remainder (the subworkers then scroll
+      // INSIDE the card rather than pushing the row away). See the reveal-cap test.
+      const listTop = sidebarScroll.containerRef.current?.getBoundingClientRect().top ?? 0;
+      const maxReveal = Math.max(0, rect.top - listTop);
+      sidebarScroll.scrollToReveal(Math.min(overflow, maxReveal));
     }
   }, [hover, rect, sidebarScroll]);
   // On un-hover, if we had auto-scrolled to reveal this card, ease the column back to where the user
@@ -1882,14 +1956,16 @@ const AgentRow = memo(function AgentRow({
   // The auto-name title (shown truncated when collapsed) and its one-sentence description (revealed
   // in the detail card). Legacy/manual agents have no title → fall back to the canonical `name`.
   // Auto-promotion: an orchestrator still on its generic "Build N" default (no work-derived title of
-  // its own, and not manually pinned) borrows its representative worker's title/description, so the
-  // ONE collapsed row describes the real work instead of a slot number. The representative is the
-  // same least-advanced worker the rollup progress bar reflects, so the head name and bar stay in
-  // sync. Its own auto-title, once earned, always wins; a manual rename (namePinned) is never
-  // overridden.
+  // its own, not manually pinned, and not self-named) borrows its representative worker's
+  // title/description, so the ONE collapsed row describes the real work instead of a slot number. The
+  // representative is the same least-advanced worker the rollup progress bar reflects, so the head
+  // name and bar stay in sync. Its own auto-title, once earned, always wins; a manual rename
+  // (namePinned) or an agent's self-chosen name (selfNamed) is never overridden.
   const ownAutoTitle = a.autoNameVariants?.title?.trim() || null;
   const promotedWorker =
-    a.kind === "build" && !ownAutoTitle && !a.namePinned ? representativeWorker(workers) : null;
+    a.kind === "build" && !ownAutoTitle && !a.namePinned && !a.selfNamed
+      ? representativeWorker(workers)
+      : null;
   const autoTitle = ownAutoTitle || promotedWorker?.autoTitle || promotedWorker?.name || null;
   const fullTitle = autoTitle || a.name;
   const description =

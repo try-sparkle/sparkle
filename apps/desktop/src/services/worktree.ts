@@ -65,6 +65,15 @@ export function prewarmProjectCaches(root: string): void {
   prewarmed.add(root);
   void prewarmSpawn(root).catch(() => {});
   void loadAccountState().catch(() => {});
+  // Make the folder a git repo up front (idempotent), not only on the first BUILD-agent spawn.
+  // This is what makes a freshly-created project "just work": a build agent can spawn immediately,
+  // AND in-place Think/Chief/Shell work — which runs in the project root with NO worktree — lands in
+  // a version-controlled folder instead of being unrecoverable if the app later loses track of the
+  // project (the hazel-eco case: a full app scaffolded in a folder that was never a git repo).
+  // Serialized on the SAME per-root lock as the agent-spawn ensureProjectRepo so the two can't
+  // collide on git's index.lock, and fully best-effort — a failure here never blocks the open (the
+  // build-spawn path re-ensures as a backstop).
+  void withRepoLock(root, () => ensureProjectRepo(root)).catch(() => {});
 }
 
 /** Make sure the project folder is a git repo with at least one commit (idempotent). */

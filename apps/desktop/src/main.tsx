@@ -13,6 +13,7 @@ import { disableNativeTooltips } from "./disableNativeTooltips";
 import { resolveThemeFromStorage } from "./theme/theme";
 import { useHistoryStore } from "./stores/historyStore";
 import { refreshModelCatalog } from "./services/models";
+import { parseSuppressSelfFocus } from "./services/projectWindows.url";
 import "@xterm/xterm/css/xterm.css";
 import "./index.css";
 
@@ -107,11 +108,16 @@ if (!isTray && !isCapture) {
 // show_capture_window; a boot-time self-show would flash the takeover at launch. The
 // `__TAURI_INTERNALS__` guard no-ops in the plain-browser dev/preview (no OS window to show).
 if (!isTray && !isCapture && "__TAURI_INTERNALS__" in window) {
+  // A restored, non-active window (`?focus=0`) must be SHOWN but not self-focused: session restore
+  // reopens several windows at once and focuses exactly one — the last-active — which the restore
+  // orchestrator sets explicitly. Without this, whichever restored window paints last would steal
+  // focus. All normally-opened windows (no param) still self-focus.
+  const suppressFocus = parseSuppressSelfFocus(window.location.search);
   const show = () => {
     const w = getCurrentWindow();
     void w
       .show()
-      .then(() => w.setFocus())
+      .then(() => (suppressFocus ? undefined : w.setFocus()))
       // Tell the Rust show-on-ready backstop the frontend completed its first show, so its 8s
       // last-resort net won't re-reveal a window the user may have since hidden to the tray. Chained
       // AFTER a successful show(): if show() rejects, the flag stays false and the backstop still

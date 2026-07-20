@@ -35,6 +35,16 @@ export interface WorkflowState {
   // "Shipped to Production" stage LIVE (previously unreachable). Optional for the same back-compat
   // reason. Tip-relative, so a squash-landed branch reads false here (see Rust `tip_in_release`).
   shipped?: boolean;
+  // The repo has an `origin` remote. Gated on `probePrState` in Rust (like the PR probe), so a
+  // fast/local poll reports false. Optional for the same back-compat reason as landed/pushed/shipped
+  // (a Rust build predating the field → falsy).
+  //
+  // ONLY `true` CARRIES INFORMATION. `false` is ambiguous and is NOT evidence of a remoteless repo:
+  // Rust sends false both for "probed, no origin" and "didn't probe", and those are indistinguishable
+  // at this boundary — so no amount of store-side bookkeeping can recover the difference. Read it as
+  // "not known to have a remote". runtimeStore latches an observed true for exactly this reason, and
+  // deriveCta requires `=== true` before asking for a push, failing safe to Close otherwise.
+  hasRemote?: boolean;
   prState: "open" | "merged" | "closed" | null; // GitHub PR state for the branch, if any
   prNumber: number | null;
   prUrl: string | null;

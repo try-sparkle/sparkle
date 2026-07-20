@@ -1,0 +1,79 @@
+#!/bin/sh
+# roborev post-commit — seed-owned wrapper around `roborev post-commit`.
+#
+# roborev enqueues a review for EVERY commit, and the seed sets core.hooksPath
+# GLOBALLY, so this hook also fires inside the throwaway git repos that test
+# suites build under the system temp dir and commit into. pytest's
+# tmp_path_factory roots those at <tmp>/pytest-of-<user>/..., and a suite that
+# commits real fixture data there (e.g. a backfill exporter under test) floods
+# the roborev DB with reviews that are pure noise and have to be closed by hand.
+#
+# Skip ONLY a confirmed pytest path. This is deliberately NARROWER than the
+# display-side _EPHEMERAL_ROOT_PREFIXES in _roborev_hooklib.py (/tmp, /var/folders,
+# …): verify.sh proves the live loop by committing in a generic `mktemp -d` repo
+# under /tmp and asserting the hook enqueued a review, so a blanket temp-dir skip
+# would break that proof. (The display filter still hides any such review from the
+# agent backlog.) If the toplevel can't be resolved we DELEGATE, never skip — so
+# the only divergence from roborev's unguarded stub is for confirmed pytest repos.
+#
+# Require BOTH a `pytest-of-<user>` and a `pytest-<N>` path component (pytest's
+# tmp_path_factory always produces both), not just a bare `pytest-of-` substring —
+# so a project merely named `pytest-of-tools` is still reviewed. In a `case` glob
+# `*` spans `/`, so the two components are NOT required to be adjacent; that's a
+# deliberately loose heuristic, not a precise layout match.
+#
+# Known, accepted narrowness (favoring verify.sh's live-loop proof over breadth):
+#   - a `pytest --basetemp=<dir>` run produces no `pytest-of-` component, so it is
+#     NOT skipped here — if such noise recurs, that's the gap, not a regression;
+#   - conversely, an (improbable) long-lived repo that happens to carry both a
+#     `pytest-of-*` and a later `pytest-*` path component is silently skipped.
+#   Both are deliberate trade-offs, not bugs.
+top=$(git rev-parse --show-toplevel 2>/dev/null || true)
+case "$top" in
+    */pytest-of-*/pytest-*) exit 0 ;;
+esac
+
+# Skip Sparkle's throwaway test-fixture repos, the JS/Rust-suite analogue of the
+# pytest guard above. Sparkle's Rust + TS test suites `git init` repos named
+# sparkle-{test,accounts,bridge}-* under a temp root, commit fixture data, then
+# delete them before the daemon can review — pure failed-counter + daemon-log
+# noise (the display filter in _roborev_hooklib.py already hides them from the
+# agent backlog, but they still inflate `roborev status` and the logs). Gated on
+# a temp root AND one of those exact name prefixes, so a genuine Sparkle checkout
+# (never under a temp root) can't be skipped, and verify.sh's generic `mktemp`
+# (tmp.XXXX) loop-proof repo is intentionally NOT matched. Same delegate-if-
+# unresolved posture as the pytest guard: an empty $top falls through, never skips.
+in_temp=""
+case "$top" in
+    /tmp/*|/private/tmp/*|/var/folders/*|/private/var/folders/*) in_temp=1 ;;
+esac
+# Consult TMPDIR only when it is actually set: an empty "${TMPDIR%/}"/* expands to
+# `/*`, and a case glob's `*` spans `/`, so `/*` matches EVERY absolute path — the
+# temp-root gate would be unconditionally true and skip a genuine checkout. TMPDIR
+# is commonly unset on Linux/CI. (Can't fold this into the single case above and
+# stay empty-safe: stripping TMPDIR's trailing slash and being safe-when-empty are
+# mutually exclusive in one glob, so the set-check lives on its own line.)
+_t="${TMPDIR:-}"; _t="${_t%/}"   # strip trailing slash FIRST, then require non-empty:
+# an unset TMPDIR *or* TMPDIR="/" both reduce to "" and must NOT become the `/*` glob
+# (which, case globs spanning `/`, would match every absolute path and skip real reviews).
+[ -n "$_t" ] && case "$top" in "$_t"/*) in_temp=1 ;; esac
+if [ -n "$in_temp" ]; then
+    case "${top##*/}" in
+        sparkle-test-*|sparkle-accounts-*|sparkle-bridge-*) exit 0 ;;
+    esac
+fi
+
+# NOTE: `roborev install-hook --force` (e.g. a roborev self-update) rewrites this
+# file back to the unguarded stub; re-run the seed install to restore the guard.
+#
+# Locate roborev the same way roborev's own install-hook stub does: the seed's
+# pinned user-scope path first, then PATH; a missing binary is a silent no-op.
+ROBOREV="$HOME/.local/bin/roborev"
+if [ ! -x "$ROBOREV" ]; then
+    ROBOREV=$(command -v roborev 2>/dev/null)
+    if [ -z "$ROBOREV" ] || [ ! -x "$ROBOREV" ]; then exit 0; fi
+fi
+# stderr suppressed and exit status passed straight through, matching roborev's own
+# generated stub — a post-commit hook stays silent (git ignores its exit code
+# anyway); enqueue health is surfaced via `roborev status`, not the hook.
+"$ROBOREV" post-commit 2>/dev/null

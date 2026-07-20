@@ -12,14 +12,15 @@ import { useProjectStore } from "../stores/projectStore";
 import type { Project } from "../types";
 
 // Capture WebviewWindow constructions so defaultDeps.createWindow is assertable without a webview.
+type CapturedOptions = { title?: string; x?: number; y?: number; width?: number; height?: number };
 const createdWindows = vi.hoisted(
-  () => [] as Array<{ label: string; options: { title?: string } }>,
+  () => [] as Array<{ label: string; options: CapturedOptions }>,
 );
 vi.mock("@tauri-apps/api/webviewWindow", () => ({
   WebviewWindow: class {
     // Match the surface defaultDeps consumes (getByLabel backs deps.getByLabel).
     static getByLabel = vi.fn(async () => null);
-    constructor(label: string, options: { title?: string }) {
+    constructor(label: string, options: CapturedOptions) {
       createdWindows.push({ label, options });
     }
     once() {
@@ -133,6 +134,22 @@ describe("defaultDeps.createWindow", () => {
     const deps = defaultDeps(vi.fn(), vi.fn(), "main");
     deps.createWindow("p-blank");
     expect(createdWindows[0]?.options.title).toBe("Sparkle");
+  });
+
+  it("opens at the default size and no explicit position when no geometry is given", () => {
+    useProjectStore.setState({ projects: [{ id: "p1", name: "Alpha" } as Project] });
+    const deps = defaultDeps(vi.fn(), vi.fn(), "main");
+    deps.createWindow("p1");
+    expect(createdWindows[0]?.options).toMatchObject({ width: 1200, height: 800 });
+    expect(createdWindows[0]?.options.x).toBeUndefined();
+    expect(createdWindows[0]?.options.y).toBeUndefined();
+  });
+
+  it("restore geometry flows into the window's logical size + position", () => {
+    useProjectStore.setState({ projects: [{ id: "p1", name: "Alpha" } as Project] });
+    const deps = defaultDeps(vi.fn(), vi.fn(), "main");
+    deps.createWindow("p1", undefined, { x: 42, y: 84, width: 1000, height: 700 });
+    expect(createdWindows[0]?.options).toMatchObject({ x: 42, y: 84, width: 1000, height: 700 });
   });
 });
 

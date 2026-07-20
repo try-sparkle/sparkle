@@ -6,6 +6,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock
 
 import {
   listBeads,
+  ensureBeadsDb,
   beadShow,
   columnFor,
   bucketBeads,
@@ -32,6 +33,19 @@ function bead(partial: Partial<Bead> & { id: string }): Bead {
     ...partial,
   };
 }
+
+describe("ensureBeadsDb", () => {
+  it("invokes the ensure_beads_db command with the project path and returns its status", async () => {
+    invokeMock.mockResolvedValue("initialized");
+    await expect(ensureBeadsDb("/proj")).resolves.toBe("initialized");
+    expect(invokeMock).toHaveBeenCalledWith("ensure_beads_db", { projectPath: "/proj" });
+  });
+
+  it("propagates a bd init failure as a rejection", async () => {
+    invokeMock.mockRejectedValue(new Error("bd: command not found"));
+    await expect(ensureBeadsDb("/proj")).rejects.toThrow("bd: command not found");
+  });
+});
 
 describe("listBeads", () => {
   it("parses + normalizes the bd --json array, tolerating varied/missing keys", async () => {

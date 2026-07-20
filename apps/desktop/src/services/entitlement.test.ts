@@ -4,6 +4,8 @@ import {
   avatarLetter,
   deriveAuthControl,
   deriveAuthView,
+  isNoPendingSignIn,
+  NO_PENDING_SIGNIN,
   parseAuthCode,
   parseAuthState,
   type Me,
@@ -108,10 +110,15 @@ describe("deriveAuthControl", () => {
 });
 
 describe("authIdentity", () => {
-  it("prefers name, then email, then clerkUserId, trimmed", () => {
+  it("prefers name, then email, trimmed", () => {
     expect(authIdentity(me({ name: "  Ada  ", email: "z@x.io" }))).toBe("Ada");
     expect(authIdentity(me({ name: null, email: " bob@x.io " }))).toBe("bob@x.io");
-    expect(authIdentity(me({ name: null, email: null, clerkUserId: " zeta " }))).toBe("zeta");
+  });
+  it("never surfaces the raw clerkUserId — a profile-less user reads as null, not user_…", () => {
+    // Regression: a degraded /me (Clerk profile lookup returns null email+name) must NOT fall back
+    // to the opaque `user_…` id, which read to the user as a "wonky username". The UI shows a clean
+    // "Signed in" / neutral avatar instead.
+    expect(authIdentity(me({ name: null, email: null, clerkUserId: "user_3Fuvxj" }))).toBeNull();
   });
   it("treats a blank/whitespace field as absent (falls through for BOTH letter and label)", () => {
     expect(authIdentity(me({ name: "   ", email: "bob@x.io" }))).toBe("bob@x.io");
@@ -128,13 +135,14 @@ describe("avatarLetter", () => {
   it("prefers name, uppercased", () => {
     expect(avatarLetter(me({ name: "ada", email: "z@x.io" }))).toBe("A");
   });
-  it("falls back to email, then clerkUserId", () => {
+  it("falls back to email, but never to the raw clerkUserId", () => {
     expect(avatarLetter(me({ name: null, email: "bob@x.io" }))).toBe("B");
-    expect(avatarLetter(me({ name: null, email: null, clerkUserId: "zeta" }))).toBe("Z");
+    // Only a clerkUserId → no letter (caller renders the neutral person glyph), not "U" from user_…
+    expect(avatarLetter(me({ name: null, email: null, clerkUserId: "user_zeta" }))).toBe("");
   });
   it("an empty-but-present field falls through (|| not ??)", () => {
     expect(avatarLetter(me({ name: "", email: "bob@x.io" }))).toBe("B");
-    expect(avatarLetter(me({ name: "", email: "", clerkUserId: "zeta" }))).toBe("Z");
+    expect(avatarLetter(me({ name: "", email: "", clerkUserId: "user_zeta" }))).toBe("");
   });
   it("reads the first code point of an astral identity (no broken surrogate)", () => {
     // The whole first code point comes back intact (𝔸 has no case mapping) — not a lone UTF-16
@@ -194,5 +202,25 @@ describe("parseAuthState", () => {
   it("returns '' for malformed input", () => {
     expect(parseAuthState("not a url")).toBe("");
     expect(parseAuthState("")).toBe("");
+  });
+});
+
+describe("isNoPendingSignIn", () => {
+  it("matches the exact Rust sentinel (bare string reject from a Tauri invoke)", () => {
+    expect(isNoPendingSignIn(NO_PENDING_SIGNIN)).toBe(true);
+    expect(isNoPendingSignIn("no_pending_signin")).toBe(true);
+  });
+  it("matches when the sentinel is wrapped in an Error (message shape)", () => {
+    expect(isNoPendingSignIn(new Error("no_pending_signin"))).toBe(true);
+  });
+  it("does NOT match a genuine state mismatch or other exchange failure", () => {
+    expect(isNoPendingSignIn("state mismatch")).toBe(false);
+    expect(isNoPendingSignIn("exchange failed: HTTP 400")).toBe(false);
+    expect(isNoPendingSignIn(new Error("state mismatch"))).toBe(false);
+  });
+  it("is safe on null/undefined/odd inputs", () => {
+    expect(isNoPendingSignIn(null)).toBe(false);
+    expect(isNoPendingSignIn(undefined)).toBe(false);
+    expect(isNoPendingSignIn({})).toBe(false);
   });
 });

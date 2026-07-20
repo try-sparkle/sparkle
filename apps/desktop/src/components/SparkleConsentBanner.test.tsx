@@ -33,6 +33,46 @@ describe("consentCopy — per-mode wording", () => {
   });
 });
 
+// These bullets are the ONLY place the user is told what leaves their machine, so they must match
+// the Rust gate in src-tauri/src/crash.rs (`upload_allowed` / `logs_allowed`) exactly. The pipeline
+// went dark because the copy said "crash reports are only sent on 'Always'" while the gate disagreed
+// — pin each mode's promise here so a future gate change can't silently make the app lie again.
+describe("consentCopy — crash-report promises match the Rust upload gate", () => {
+  /** The crash-report bullets for a mode (the copy that makes the upload promise). */
+  const crashBullets = (mode: Parameters<typeof consentCopy>[0]) =>
+    consentCopy(mode).bullets.filter((b) => /crash/i.test(b));
+
+  it("case_by_case says the crash report IS uploaded but the recent logs are NOT", () => {
+    const bullets = crashBullets("case_by_case");
+    // It uploads (matching upload_allowed("case_by_case") === true)...
+    expect(bullets.some((b) => b.includes("we securely upload a scrubbed crash report"))).toBe(true);
+    expect(bullets.some((b) => b.includes("message and backtrace only"))).toBe(true);
+    expect(bullets.some((b) => b.includes("never any PII, secrets, or code"))).toBe(true);
+    // ...but without the log tail (matching logs_allowed("case_by_case") === false).
+    const all = consentCopy("case_by_case").bullets.join(" ");
+    expect(all).toContain("Your recent logs are NOT sent on this setting");
+    // It must NOT claim crash reports stay on-device — the old lie this test exists to prevent.
+    expect(bullets.some((b) => /only uploaded on 'Always'|stay on your device/.test(b))).toBe(false);
+  });
+
+  it("always says the crash report AND the recent logs are uploaded", () => {
+    const bullets = crashBullets("always");
+    expect(bullets.some((b) => b.includes("we securely upload a scrubbed crash report"))).toBe(true);
+    // The log tail is the "Always"-only tier (logs_allowed("always") === true).
+    const all = consentCopy("always").bullets.join(" ");
+    expect(all).toContain("recent logs (last ~hour)");
+    expect(all).toContain("On 'Always'");
+  });
+
+  it("never says nothing is uploaded", () => {
+    const bullets = crashBullets("never");
+    expect(bullets.some((b) => b.includes("nothing is uploaded"))).toBe(true);
+    expect(bullets.some((b) => b.includes("no crash reports and no logs"))).toBe(true);
+    // No mode may promise an upload on "never" (upload_allowed("never") === false).
+    expect(bullets.some((b) => b.includes("we securely upload"))).toBe(false);
+  });
+});
+
 describe("SparkleConsentBanner", () => {
   it("defaults to Case by case selected (aria-pressed)", () => {
     render(<SparkleConsentBanner />);

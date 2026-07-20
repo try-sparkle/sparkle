@@ -93,13 +93,31 @@ describe("controlListener", () => {
     expect(worker).toMatchObject({ kind: "worker", parentId: callerId, status: "idle" });
   });
 
-  it("rename_agent defaults the target to the caller", async () => {
+  it("rename_agent defaults the target to the caller and self-names (authoritative, NOT pinned)", async () => {
     fire({ reqId: "r2", op: "rename_agent", callerAgentId: callerId, payload: { name: "Parser Builder" } });
     await flush();
     expect(lastReply()).toEqual({ ok: true });
     const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!;
     expect(agent.name).toBe("Parser Builder");
-    expect(agent.namePinned).toBe(true);
+    // An agent naming itself must NOT look pinned: no namePinned (→ no pin chip) and no row anchor.
+    // It is marked selfNamed so the auto-namer still won't clobber it. Regression sparkle-pel7.
+    expect(agent.selfNamed).toBe(true);
+    expect(agent.namePinned).toBe(false);
+    expect(agent.pinnedIndex).toBeNull();
+  });
+
+  it("rename_agent does NOT re-pin after the human unpins (sparkle-pel7)", async () => {
+    // Agent self-names → the human releases any pin → the agent self-names AGAIN. The row must stay
+    // unpinned throughout: the second self-name must not resurrect namePinned.
+    fire({ reqId: "rp1", op: "rename_agent", callerAgentId: callerId, payload: { name: "First Name" } });
+    await flush();
+    useProjectStore.getState().unpinAgent(projectId, callerId);
+    fire({ reqId: "rp2", op: "rename_agent", callerAgentId: callerId, payload: { name: "Second Name" } });
+    await flush();
+    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!;
+    expect(agent.name).toBe("Second Name");
+    expect(agent.namePinned).toBe(false);
+    expect(agent.pinnedIndex).toBeNull();
   });
 
   it("rename_agent honors an explicit targetAgentId", async () => {

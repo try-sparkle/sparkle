@@ -26,6 +26,32 @@ export interface AiConfig {
   brainstorm: boolean;
   composer: boolean;
   suggested_actions: boolean;
+  /** Master switch for Sparkle Auto-Approve (nudging + auto-answering). Default true. */
+  auto_approve: boolean;
+}
+/** Per-category Sparkle Auto-Approve rules. Each is `"always"` / `"never"` / null (absent = ask +
+ *  nudge). Serde serializes an absent rule as null. Mirrors ApprovalsConfig in config.rs. */
+export interface ApprovalsConfig {
+  skill: string | null;
+  bash: string | null;
+  edit: string | null;
+  mcp: string | null;
+  fetch: string | null;
+  other: string | null;
+}
+/** Opinionated non-AI tools (machine-wide; ignored in a per-project file). Each defaults on for a
+ *  new install; false means that tool is used nowhere in Sparkle. Surfaced in the "Tools" pane. */
+export interface ToolsConfig {
+  analytics: boolean;
+  beads: boolean;
+  github: boolean;
+  guardrails: boolean;
+  roborev: boolean;
+}
+/** roborev machine-wide state (the one-time consent flag), its own section so Rust can gate the
+ *  first-run modal on it. Machine-wide (like [tools]); ignored in a per-project file. */
+export interface RoborevConfig {
+  consent_prompted: boolean;
 }
 /** Branch/build freshness guardrails (read by the build script + session-start staleness hook). */
 export interface FreshnessConfig {
@@ -70,11 +96,20 @@ export interface SparkleConfig {
   workflow: WorkflowConfig;
   workers: WorkersConfig;
   ai: AiConfig;
+  // Optional so callers guard: an older Rust backend (predating [tools]) omits it. The current
+  // backend always sends it; hydrateFromConfig defaults each flag to on when absent.
+  tools?: ToolsConfig;
+  // Optional for the same back-compat reason as `tools?` above: a payload from a Rust backend
+  // predating [roborev] omits it. Callers read `config.roborev?.consent_prompted ?? false`.
+  roborev?: RoborevConfig;
   freshness: FreshnessConfig;
   capture: CaptureConfig;
   // Optional so callers must guard: an older Rust backend (predating [voice]) omits it at runtime.
   // The current backend always sends it, but the type stays honest about the config-changed payload.
   voice?: VoiceConfig;
+  /** Per-category Sparkle Auto-Approve rules. Optional so callers guard: an older Rust backend
+   *  (predating [approvals]) omits it; the current backend always sends it. */
+  approvals?: ApprovalsConfig;
   /** Per-project "Done" stage definition (Definable Done & Delivered feature). */
   done: DoneConfig;
   /** Per-project "Delivered" stage definition + detected production-ship signal. */
@@ -109,6 +144,25 @@ export function setConfigValues(
   values: Record<string, boolean | number | string>,
 ): Promise<void> {
   return invoke("set_config_values", { values });
+}
+
+/** Remove one dotted key from the GLOBAL file (comment-preserving). No-op if the key is absent. */
+export function unsetConfigValue(path: string): Promise<void> {
+  return invoke("unset_config_value", { path });
+}
+
+/** Set one dotted key in a PROJECT's `.sparkle/config.toml` (comment-preserving). */
+export function setProjectConfigValue(
+  projectRoot: string,
+  path: string,
+  value: boolean | number | string,
+): Promise<void> {
+  return invoke("set_project_config_value", { projectRoot, path, value });
+}
+
+/** Remove one dotted key from a PROJECT's `.sparkle/config.toml`. No-op if the file/key is absent. */
+export function unsetProjectConfigValue(projectRoot: string, path: string): Promise<void> {
+  return invoke("unset_project_config_value", { projectRoot, path });
 }
 
 /** Validate + overwrite the whole global file (raw editor Save). Rejects invalid TOML. */

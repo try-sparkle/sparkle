@@ -1,12 +1,22 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { FiAlertTriangle } from "react-icons/fi";
 // Themed tokens (muted/forest/cream flip on data-theme); brand teal/accent pass through as
 // constants. Import from ../theme/colors — like Composer — so the waveform stays legible in
 // light mode (the @sparkle/ui C.muted is a dark-mode-only literal).
-import { C } from "../theme/colors";
+import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Phase } from "../voice/wakeMachine";
+import { deriveMicPresentation } from "../voice/micPresentation";
 import { useDictationStore } from "../stores/dictationStore";
 import { useSettingsStore } from "../stores/settingsStore";
-import { WAKE_PHRASE, STOP_PHRASE } from "../voice/dictationCopy";
+import {
+  WAKE_PHRASE,
+  STOP_PHRASE,
+  modelPercent,
+  preparingCaption,
+  voiceErrorNotice,
+  MICROPHONE_SETTINGS_URL,
+} from "../voice/dictationCopy";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useMicToggle, micVisual, MicGlyph, MicMenu, useHoverMenu } from "./MicButton";
 import { useHasAiCredits } from "../services/aiGate";
 import { SidebarOutOfCreditsNotice } from "./OutOfCreditsNotice";
@@ -110,6 +120,10 @@ export function LogoWaveform() {
   const status = useDictationStore((s) => s.status);
   const error = useDictationStore((s) => s.error);
   const modelProgress = useDictationStore((s) => s.modelProgress);
+  // Map the raw backend payload to honest copy. `error` was previously used here as a BOOLEAN and
+  // its payload thrown away — this is the only consumer of it in the app, so the real cause of
+  // every voice failure was unreachable to the user (see the render branch below).
+  const errorNotice = useMemo(() => voiceErrorNotice(error), [error]);
   const togglePhase = useDictationStore((s) => s.togglePhase);
   // The mic ring's state, click cycle, and aria come from the SAME shared source as the composer
   // mic (MicButton), so the two controls behave identically. The ring only adds its own container
@@ -224,6 +238,18 @@ export function LogoWaveform() {
   }, [enabled, listening]);
 
   const caption = captionFor(phase, enabled, listening, wakeWord, stopWord);
+  // The ONE voice-state decision, shared with the composer (deriveMicPresentation). Both surfaces
+  // switch their caption/placeholder on this, so the top-left mic and the composer mic can never
+  // disagree about which state we're in. The wording each renders is still surface-local; only the
+  // STATE is shared. `errorNotice != null` is this surface's `hasError`.
+  const presentation = deriveMicPresentation({
+    enabled,
+    status,
+    phase,
+    modelProgress,
+    hasError: errorNotice !== null,
+    outOfCreditsNotice,
+  });
   // Visual "active sweep" only when capture is genuinely live; phase alone isn't
   // enough (we could be in active phase but focus-paused).
   const liveActive = listening && phase === "active";
@@ -424,26 +450,80 @@ export function LogoWaveform() {
         )}
       </div>
 
-      {outOfCreditsNotice ? (
+      {presentation === "outOfCredits" ? (
         // Out of credits: an arm attempt was refused. Show the two-line notice in place of the
         // normal caption (auto-clears after 5s via dictationStore).
         <SidebarOutOfCreditsNotice />
-      ) : error ? (
-        <div style={{ marginTop: 4, color: C.muted, fontSize: 10, textAlign: "center" }}>
-          Mic unavailable — check System Settings → Privacy → Microphone.
-        </div>
-      ) : enabled && modelProgress !== null ? (
+      ) : presentation === "error" && errorNotice ? (
+        // The REAL error, not a guess. This slot used to render one hardcoded sentence — "Mic
+        // unavailable — check System Settings → Privacy → Microphone" — for every failure, using
+        // `error` as a mere boolean and discarding the payload that was carefully plumbed here. So
+        // an offline first-run user, whose actual failure was the model download, was sent to check
+        // mic permissions they'd already granted, with no way to ever discover the true cause.
+        // voiceErrorNotice maps the payload to an honest headline + remedy (raw string when
+        // unrecognized). Styled to match the sibling notices in this slot: bold headline line, muted
+        // detail line, 11px (the old 10px was the smallest type in the app for the most important
+        // thing it had to say).
         <div style={{ marginTop: 4, color: C.muted, fontSize: 11, textAlign: "center" }}>
-          {(() => {
-            const pct = modelProgress.total
-              ? Math.round((modelProgress.done / modelProgress.total) * 100)
-              : null;
-            return pct !== null
-              ? `Downloading voice model… ${pct}%`
-              : "Downloading voice model…";
-          })()}
+          <span
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 4,
+              fontWeight: FONT_WEIGHT.semibold,
+              color: C.amber,
+            }}
+          >
+            <FiAlertTriangle size={11} aria-hidden style={{ flexShrink: 0 }} />
+            {errorNotice.headline}
+          </span>
+          <span style={{ display: "block" }}>{errorNotice.detail}</span>
+          {errorNotice.kind === "permission" ? (
+            // The one remedy in this slot that is a place rather than an act. macOS never
+            // re-prompts once it has recorded a denial, so the detail line's "Allow it in System
+            // Settings → …" is the user's only way out — and making them navigate four levels of
+            // System Settings by hand is where they give up. Mirrors the composer's button (the
+            // same notice renders in both surfaces; neither may be the only one that's actionable).
+            <button
+              type="button"
+              onClick={() => {
+                void openUrl(MICROPHONE_SETTINGS_URL).catch((e) =>
+                  console.warn("voice: open microphone settings failed", e),
+                );
+              }}
+              // Not shared with Composer's VOICE_ERROR_ACTION, deliberately (roborev 37737). Each
+              // button matches the notice it sits in, and those notices differ: Composer's is an
+              // inline run of text inside a pointerEvents:none placeholder overlay (hence bold, and
+              // hence that file's `pointerEvents: auto`), this one is a centered block under the
+              // sidebar caption (hence display/margin, and semibold to match the headline directly
+              // above it). Hoisting one object into a shared module to hold two buttons that agree
+              // on nothing but "transparent, teal, clickable" would couple the surfaces without
+              // making either follow the other.
+              style={{
+                display: "block",
+                margin: "4px auto 0",
+                background: "transparent",
+                border: "none",
+                padding: 0,
+                cursor: "pointer",
+                font: "inherit",
+                fontWeight: FONT_WEIGHT.semibold,
+                color: C.teal,
+              }}
+            >
+              Open System Settings
+            </button>
+          ) : null}
         </div>
-      ) : caption && listening ? (
+      ) : presentation === "preparing" ? (
+        // The one-time model fetch. "Setting up" rather than "Downloading" because the percentage
+        // tracks the COMPRESSED byte stream — it hits 100% with an unpack still to run, and
+        // "Downloading… 100%" sitting there would read as a hang.
+        <div style={{ marginTop: 4, color: C.muted, fontSize: 11, textAlign: "center" }}>
+          {preparingCaption(modelPercent(modelProgress))}
+        </div>
+      ) : presentation === "activeListening" || presentation === "passiveWaiting" ? (
         // Live: the caption doubles as a click target — clicking it toggles phase
         // (start/stop), mirroring the waveform's behavior.
         <button
@@ -483,11 +563,12 @@ export function LogoWaveform() {
             {phase === "passive" ? "to activate" : "to finish"}
           </span>
         </button>
-      ) : caption ? (
+      ) : presentation === "focusPaused" ? (
         // Armed but paused (focus lost): show the honest caption as plain text — not a
-        // wake hint, since saying "Hey Sparkle" right now wouldn't be heard.
+        // wake hint, since saying "Hey Sparkle" right now wouldn't be heard. `caption` here is
+        // captionFor's "Listening paused…" string (non-null because focusPaused ⇒ enabled).
         <div style={{ marginTop: 4, color: C.muted, fontSize: 11, textAlign: "center" }}>{caption}</div>
-      ) : null}
+      ) : null /* presentation === "off": disarmed, no caption */}
     </div>
   );
 }

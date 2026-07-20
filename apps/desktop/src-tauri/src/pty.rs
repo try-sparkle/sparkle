@@ -100,10 +100,8 @@ fn validate_spawn(
     command: &str,
     cwd: Option<&str>,
 ) -> Result<Option<PathBuf>, String> {
-    let worktrees = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("pty_spawn: no app data dir: {e}"))?
+    let worktrees = crate::dev_identity::app_data_dir(app)
+        .map_err(|e| format!("pty_spawn: {e}"))?
         .join("worktrees");
     validate_spawn_inner(&worktrees, command, cwd)
 }

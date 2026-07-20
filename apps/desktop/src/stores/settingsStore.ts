@@ -16,6 +16,12 @@ import {
   DEFAULT_STOP_WORD,
   DEFAULT_PAUSE_ON_SUBMIT,
 } from "../voice/voiceDefaults";
+import {
+  toApprovalMap,
+  type ApprovalCategory,
+  type ApprovalMap,
+  type ApprovalRule,
+} from "../services/suggestions/approvalCategories";
 
 // --- Status-change notifications -------------------------------------------------------------
 // Which agent statuses fire a Notification Center banner when an agent crosses INTO them. The
@@ -50,7 +56,8 @@ export type AiFeatureKey =
   | "voiceDictation"
   | "brainstorm"
   | "composer"
-  | "suggestedActions";
+  | "suggestedActions"
+  | "autoApprove";
 
 /** Derived state of the master segment: every feature on / off / a mix. */
 export type AiMode = "all" | "some" | "off";
@@ -63,6 +70,8 @@ export interface AiFeatureFlags {
   aiBrainstorm: boolean;
   aiComposer: boolean;
   aiSuggestedActions: boolean;
+  /** Sparkle Auto-Approve master toggle (nudging + auto-answering permission prompts). */
+  aiAutoApprove: boolean;
 }
 
 /** Map a menu feature key to its settings-store field name. The single source of this
@@ -73,6 +82,27 @@ export const AI_FEATURE_FIELD: Record<AiFeatureKey, keyof AiFeatureFlags> = {
   brainstorm: "aiBrainstorm",
   composer: "aiComposer",
   suggestedActions: "aiSuggestedActions",
+  autoApprove: "aiAutoApprove",
+};
+
+// --- Tools (the opinionated [tools] flags, surfaced in the ⋯ Settings → "Tools" pane) ---------
+// Non-AI, config-backed on/off tools. Each defaults ON; off means the tool is used nowhere in
+// Sparkle (analytics stops sending, the Beads board hides, GitHub import is hidden). Like the
+// workflow-mirror fields these are hydrated from config.toml and NOT persisted to localStorage.
+
+/** Stable identifiers for the config-backed [tools] flags. */
+export type ToolKey = "analytics" | "beads" | "github" | "guardrails" | "roborev";
+
+/** Map a tool key to its settings-store field name (the single source of that relationship). */
+export const TOOL_FIELD: Record<
+  ToolKey,
+  "analyticsEnabled" | "beadsEnabled" | "githubEnabled" | "guardrailsEnabled" | "roborevEnabled"
+> = {
+  analytics: "analyticsEnabled",
+  beads: "beadsEnabled",
+  github: "githubEnabled",
+  guardrails: "guardrailsEnabled",
+  roborev: "roborevEnabled",
 };
 
 // --- Chief sync state (replacing the legacy markdown-sync watermark) -----------------------
@@ -91,6 +121,7 @@ export function aiFeatureMode(f: AiFeatureFlags): AiMode {
     f.aiBrainstorm,
     f.aiComposer,
     f.aiSuggestedActions,
+    f.aiAutoApprove,
   ];
   if (vals.every(Boolean)) return "all";
   if (vals.every((v) => !v)) return "off";
@@ -151,8 +182,15 @@ export function effectiveChiefPat(stored: string, runtime = ""): string {
 //   - "always"       → evaluate hourly AND auto-submit scrubbed PRs (only if the privacy scan passes).
 //   - "case_by_case" → evaluate hourly and craft PRs, but the user reviews + approves each before submit.
 //   - "never"        → do not evaluate logs at all.
-// Default is the privacy-conservative "case_by_case": nothing leaves the machine without explicit
-// per-PR approval. The default lives here (not behind a migration) — the store's `merge` makes any
+// Default is the privacy-conservative "case_by_case": no PR leaves the machine without explicit
+// per-PR approval. Note this governs PRs only — it is NOT a blanket "nothing is transmitted" claim.
+// Crash reports are gated separately in crash.rs (`upload_allowed`/`logs_allowed`): "case_by_case"
+// uploads the scrubbed crash report (message + backtrace, no log tail) without per-crash approval,
+// and only "always" adds the ~200KB recent-logs tail. See SparkleConsentBanner's `consentCopy`,
+// which states this per mode — that copy and the Rust gate must not drift apart (they once did:
+// the gate required "always" while the default was "case_by_case", so crash reports were captured
+// but NEVER uploaded, and the crash table sat empty while real crashes went undiagnosed).
+// The default lives here (not behind a migration) — the store's `merge` makes any
 // pre-existing persisted blob that lacks this field inherit this default on read.
 export type SparkleImprovementConsent = "always" | "case_by_case" | "never";
 
@@ -189,6 +227,15 @@ interface SettingsState {
   aiComposer: boolean;
   /** Show one-click suggested action buttons in the composer (Haiku-learned actions). Off → only the free heuristic direct-answer buttons remain. */
   aiSuggestedActions: boolean;
+  /** Sparkle Auto-Approve master toggle. On (default) → nudges + auto-answers matching Claude Code
+   *  permission prompts per the [approvals] rules. Off → no nudging AND no auto-answering. Mirrors
+   *  [ai].auto_approve. */
+  aiAutoApprove: boolean;
+  /** GLOBAL (all-projects) auto-approve rules, mirrored from config.toml's `[approvals]`. Per-project
+   *  overrides live in approvalsStore (read via `get_config(root)`); this is the global layer used
+   *  as the effective value when no project is in context and as the "all projects" scope in the
+   *  approvals pane. Config-mirrored, NOT persisted. */
+  approvals: ApprovalMap;
   /** Auto-apply desktop updates: when on (default), a found update downloads + installs silently
    *  and applies on the next restart, with a quiet "ready" affordance. When off, the user gets a
    *  "Restart to apply / Later" prompt instead and nothing is installed until they choose. Read by
@@ -233,6 +280,36 @@ interface SettingsState {
   /** When true (default), submitting a prompt drops active dictation back to passive wake-word
    *  listening (mic stays on). When false, dictation keeps listening. Mirrors [voice].pause_on_submit. */
   pauseOnSubmit: boolean;
+  /** Usage analytics + masked session replay (PostHog). Off → analytics.ts sends nothing. Mirrors
+   *  [tools].analytics. Config-backed, NOT persisted — re-read from the file each launch. */
+  analyticsEnabled: boolean;
+  /** The in-repo work graph behind the Plan board (Beads / `bd`). Off → the board is hidden and no
+   *  `bd` shell-out runs. Mirrors [tools].beads. */
+  beadsEnabled: boolean;
+  /** Import a project straight from GitHub. Off → the GitHub import path is hidden. Mirrors
+   *  [tools].github. */
+  githubEnabled: boolean;
+  /** Opinionated quality guardrails for the code Sparkle's agents write. On (default) → the
+   *  guardrails workflow (test-first, run tests+typecheck before commit, never call a red build
+   *  "done") is appended to every coding agent's system prompt; off omits it. Mirrors
+   *  [tools].guardrails. */
+  guardrailsEnabled: boolean;
+  /** roborev — the per-commit AI code-review daemon. On (default) → the Tools toggle is on and
+   *  the daemon reviews each BUILD-agent commit; off → dormant. Mirrors [tools].roborev. Config-
+   *  backed, NOT persisted — re-read from the file each launch. */
+  roborevEnabled: boolean;
+  /** Whether the one-time roborev consent modal has already been shown. Set true the first time it
+   *  appears (whichever choice the user made) so it never appears again. Mirrors
+   *  [roborev].consent_prompted. Config-backed, NOT persisted. */
+  roborevConsentPrompted: boolean;
+  /** UI-only flag: is the roborev consent modal currently mounted/open? Not config-backed and not
+   *  persisted — a transient session flag flipped on at the first reviewable commit (runtimeStore)
+   *  and off when the modal resolves (RoborevConsentModal). */
+  roborevConsentOpen: boolean;
+  /** Why roborev can't actually review, from the last auth self-test — shown under the Roborev row.
+   *  UI-only (never persisted): it's re-probed each time the toggle is turned on. null = no problem
+   *  observed. This is what keeps a daemon that can't authenticate from *looking* like it's working. */
+  roborevAuthWarning: string | null;
   /** Non-fatal warnings from the last config load (malformed layer, ignored per-project keys). */
   configWarnings: string[];
 
@@ -251,6 +328,9 @@ interface SettingsState {
   setNotifyStatus: (status: AgentTabStatus, on: boolean) => void;
   /** Toggle one AI feature; the master segment re-derives automatically (aiFeatureMode). */
   setAiFeature: (key: AiFeatureKey, on: boolean) => void;
+  /** Optimistically set/clear a GLOBAL approval rule (configActions persists to [approvals]).
+   *  `rule` null removes the category from the global mirror. */
+  setGlobalApproval: (category: ApprovalCategory, rule: ApprovalRule | null) => void;
   /** Bulk-set every AI feature (the All / Off segments). */
   setAllAiFeatures: (on: boolean) => void;
   /** Optimistically set the custom wake word (configActions persists it to [voice].wake_word). */
@@ -259,6 +339,15 @@ interface SettingsState {
   setStopWord: (word: string) => void;
   /** Optimistically set the pause-on-submit toggle (configActions persists [voice].pause_on_submit). */
   setPauseOnSubmit: (on: boolean) => void;
+  /** Optimistically toggle one [tools] flag; configActions persists it to config.toml. */
+  setToolEnabled: (key: ToolKey, on: boolean) => void;
+  /** Mark the one-time roborev consent modal as shown (configActions persists
+   *  [roborev].consent_prompted). */
+  setRoborevConsentPrompted: (prompted: boolean) => void;
+  /** Open/close the roborev consent modal (UI-only; controls whether the modal is mounted). */
+  setRoborevConsentOpen: (open: boolean) => void;
+  /** Set (or clear, with null) the roborev auth self-test warning shown under the Roborev row. */
+  setRoborevAuthWarning: (warning: string | null) => void;
   /** Set the Sparkle self-improvement consent mode (the banner's Always/Case by case/Never control). */
   setSparkleImprovementConsent: (mode: SparkleImprovementConsent) => void;
   /** Record when an hourly improvement pass was last attempted (see improvementLastRunAt). */
@@ -281,6 +370,8 @@ export const useSettingsStore = create<SettingsState>()(
       aiBrainstorm: true,
       aiComposer: true,
       aiSuggestedActions: true,
+      aiAutoApprove: true,
+      approvals: {},
       autoApplyUpdates: true,
       notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
       sparkleImprovementConsent: DEFAULT_SPARKLE_CONSENT,
@@ -298,6 +389,14 @@ export const useSettingsStore = create<SettingsState>()(
       wakeWord: DEFAULT_WAKE_WORD,
       stopWord: DEFAULT_STOP_WORD,
       pauseOnSubmit: DEFAULT_PAUSE_ON_SUBMIT,
+      analyticsEnabled: true,
+      beadsEnabled: true,
+      githubEnabled: true,
+      guardrailsEnabled: true,
+      roborevEnabled: true,
+      roborevConsentPrompted: false,
+      roborevConsentOpen: false,
+      roborevAuthWarning: null,
       configWarnings: [],
 
       setChiefPat: (pat) => set({ chiefPat: pat.trim() }),
@@ -315,10 +414,22 @@ export const useSettingsStore = create<SettingsState>()(
           aiBrainstorm: on,
           aiComposer: on,
           aiSuggestedActions: on,
+          aiAutoApprove: on,
+        }),
+      setGlobalApproval: (category, rule) =>
+        set((s) => {
+          const next = { ...s.approvals };
+          if (rule) next[category] = rule;
+          else delete next[category];
+          return { approvals: next };
         }),
       setWakeWord: (wakeWord) => set({ wakeWord }),
       setStopWord: (stopWord) => set({ stopWord }),
       setPauseOnSubmit: (pauseOnSubmit) => set({ pauseOnSubmit }),
+      setToolEnabled: (key, on) => set({ [TOOL_FIELD[key]]: on } as Partial<SettingsState>),
+      setRoborevConsentPrompted: (prompted) => set({ roborevConsentPrompted: prompted }),
+      setRoborevConsentOpen: (open) => set({ roborevConsentOpen: open }),
+      setRoborevAuthWarning: (warning) => set({ roborevAuthWarning: warning }),
       setSparkleImprovementConsent: (mode) => set({ sparkleImprovementConsent: mode }),
       setImprovementLastRunAt: (at) => set({ improvementLastRunAt: at }),
 
@@ -353,6 +464,11 @@ export const useSettingsStore = create<SettingsState>()(
           aiBrainstorm: config.ai.brainstorm,
           aiComposer: config.ai.composer,
           aiSuggestedActions: config.ai.suggested_actions,
+          // Auto-approve master toggle (`?? true` covers an older backend predating [ai].auto_approve).
+          aiAutoApprove: config.ai.auto_approve ?? true,
+          // GLOBAL approval rules mirror. App.tsx hydrates from the global layer (no project root),
+          // so this stays the all-projects view; per-project overrides come from approvalsStore.
+          approvals: toApprovalMap(config.approvals),
           // Workflow rules (display / advanced).
           requirePr: config.workflow.require_pr,
           worktreeIsolation: config.workflow.worktree_isolation,
@@ -368,6 +484,16 @@ export const useSettingsStore = create<SettingsState>()(
           wakeWord: (config.voice?.wake_word ?? "").trim() || DEFAULT_WAKE_WORD,
           stopWord: (config.voice?.stop_word ?? "").trim() || DEFAULT_STOP_WORD,
           pauseOnSubmit: config.voice?.pause_on_submit ?? DEFAULT_PAUSE_ON_SUBMIT,
+          // Tools flags. `?? true` treats an absent [tools] block (older backend) as the on-by-default
+          // state, matching SparkleConfig::default() — a new install ships every tool on.
+          analyticsEnabled: config.tools?.analytics ?? true,
+          beadsEnabled: config.tools?.beads ?? true,
+          githubEnabled: config.tools?.github ?? true,
+          guardrailsEnabled: config.tools?.guardrails ?? true,
+          roborevEnabled: config.tools?.roborev ?? true,
+          // `?? false`: an absent [roborev] block (older backend) means we've never prompted, so a
+          // first reviewable commit still surfaces the one-time consent modal.
+          roborevConsentPrompted: config.roborev?.consent_prompted ?? false,
           configWarnings: warnings,
         });
       },
@@ -412,6 +538,7 @@ export const useSettingsStore = create<SettingsState>()(
         aiBrainstorm: s.aiBrainstorm,
         aiComposer: s.aiComposer,
         aiSuggestedActions: s.aiSuggestedActions,
+        aiAutoApprove: s.aiAutoApprove,
         autoApplyUpdates: s.autoApplyUpdates,
         notifyStatuses: s.notifyStatuses,
         sparkleImprovementConsent: s.sparkleImprovementConsent,

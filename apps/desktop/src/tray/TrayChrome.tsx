@@ -1,5 +1,5 @@
 // The fixed top/bottom chrome of the menu-bar popover, around the scrollable agent dashboard:
-//   - TrayHeader: the Sparkle logo + the $ balance pill, then a Recent / Open / New action row
+//   - TrayHeader: the Sparkle logo + the $ balance pill, then a Recent / Open action row
 //     that opens project windows (the same actions as the in-app TopBar, driven from the tray).
 //   - TrayFooter: a pinned "Quit Sparkle" button — the in-app way to fully exit (closing the
 //     main window only hides it behind the tray).
@@ -35,7 +35,7 @@ async function openExisting(projectId: string, afterOpen: () => void) {
   }
 }
 
-// Open / New both pop the folder picker; resolveOpenTarget decides whether the chosen folder is an
+// Open pops the folder picker; resolveOpenTarget decides whether the chosen folder is an
 // already-known project (reuse) or a new one (create on commit) — same logic as TopBar.startOpen.
 async function pickAndOpen(title: string, afterOpen: () => void) {
   const picked = await pickProjectFolder(title);
@@ -90,7 +90,7 @@ function CaptureIcon() {
   );
 }
 
-/** Logo + balance pill, plus the Recent / Open / New / Capture action row. `onAction` fires after
+/** Logo + balance pill, plus the Recent / Open / Capture action row. `onAction` fires after
  *  any open action so the caller can hide the popover; `onCapture` runs the capture flow (which
  *  hides the popover itself before the crosshairs, so it never fires `onAction`). `captureBusy`
  *  disables the Capture button while a capture is in flight (re-entrancy guard). */
@@ -130,14 +130,14 @@ export function TrayHeader({
         <button style={{ ...actionBtn, flex: 1 }} onClick={() => setRecentOpen((v) => !v)}>
           Recent ▾
         </button>
-        <button style={{ ...actionBtn, flex: 1 }} onClick={() => void pickAndOpen("Open a project — choose its folder", close)}>
-          Open
-        </button>
+        {/* One "Open" that both opens an existing folder and creates a new one (the picker's "New
+            Folder" button) — mirroring the main-window TopBar. GitHub cloning lives in the
+            main-window dialog; the compact tray popover stays folder-only. */}
         <button
           style={{ ...primaryBtn, flex: 1 }}
-          onClick={() => void pickAndOpen("New project — choose or create its folder", close)}
+          onClick={() => void pickAndOpen("Open or create a project folder", close)}
         >
-          New
+          Open
         </button>
       </div>
       <button

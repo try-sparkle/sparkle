@@ -4,6 +4,7 @@ import {
   parseProjectIdFromSearch,
   parseWindowLabelFromSearch,
   parseAgentIdFromSearch,
+  parseSuppressSelfFocus,
   computeInitialProjectId,
 } from "./projectWindows.url";
 
@@ -22,6 +23,20 @@ describe("projectWindows.url", () => {
     const search = url.slice(url.indexOf("?"));
     expect(parseProjectIdFromSearch(search)).toBe("abc-123");
     expect(parseAgentIdFromSearch(search)).toBe("agent-7");
+  });
+
+  it("marks a restored non-active window with ?focus=0 so it won't self-focus", () => {
+    const suppressed = projectWindowUrl("abc-123", "win-xyz", undefined, true);
+    expect(parseSuppressSelfFocus(suppressed.slice(suppressed.indexOf("?")))).toBe(true);
+    // Default (and the focus-target restored window) carry no focus param → self-focus as usual.
+    const normal = projectWindowUrl("abc-123", "win-xyz");
+    expect(parseSuppressSelfFocus(normal.slice(normal.indexOf("?")))).toBe(false);
+  });
+
+  it("parseSuppressSelfFocus is true only for focus=0", () => {
+    expect(parseSuppressSelfFocus("?focus=0")).toBe(true);
+    expect(parseSuppressSelfFocus("?focus=1")).toBe(false);
+    expect(parseSuppressSelfFocus("?project=p")).toBe(false);
   });
 
   it("parses the agent id, null when absent or empty", () => {

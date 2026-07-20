@@ -8,6 +8,7 @@ import { LogoWaveform } from "../components/LogoWaveform";
 import { useAmbientVoice } from "../useDictation";
 import { useDictationStore } from "../stores/dictationStore";
 import { useProjectStore } from "../stores/projectStore";
+import { useAuthStore } from "../stores/authStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { StatusDot } from "../components/StatusDot";
 import { micHotPlaceholder, wakePlaceholder } from "../voice/dictationCopy";
@@ -57,11 +58,26 @@ export function CaptureApp() {
   // start, so without the sync a project created later would never appear in the switcher.
   useEffect(() => subscribeToCrossWindowSync(), []);
 
+  // Load auth/credit balance for THIS webview. The capture window renders its own React root with
+  // NO AuthGate, so nothing else populates `me` here — it would sit at the initial `null`, making
+  // hasAiCredits() false and the mic falsely report "out of credits" (and LogoWaveform force-off
+  // the mic, so its status disagrees with the signed-in main window). Refresh on mount so `me` is
+  // populated before the takeover is ever shown; the takeover's own on-shot refresh (below) then
+  // catches a top-up done while this window was hidden. Balance stays live afterwards via the
+  // `dictation://cloud-balance` broadcast, which only updates when `me` is already non-null.
+  useEffect(() => {
+    void useAuthStore.getState().refresh();
+  }, []);
+
   // A new shot resets the whole session: v1 shows one shot (state stays an array — multi-shot
   // chaining is a planned follow-up) and re-resolves the default project to wherever the user
   // was last working at THIS capture, not at webview boot.
   useEffect(() => {
     const p = onCaptureShot((shot) => {
+      // The takeover is opening — re-read the balance so a top-up (or sign-in) done while this
+      // hidden window was idle is reflected before the user can touch the mic. Cheap and safe:
+      // refresh swallows every failure and just resolves to signed-out on error.
+      void useAuthStore.getState().refresh();
       setCaptures([shot]);
       // Unsent narration survives a re-capture: a stray hotkey press must not silently throw
       // away dictated text (the same principle as the discard confirm) — the user re-shooting

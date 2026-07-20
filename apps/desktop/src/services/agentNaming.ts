@@ -18,7 +18,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore } from "../stores/projectStore";
 import { reportNamingOutcome } from "./selfReportObservability";
 import type { NamingOutcome } from "../stores/selfReportMetrics";
-import type { AgentKind, AgentName } from "../types";
+import type { AgentKind, AgentName, PromptHistoryEntry } from "../types";
 
 // Common filler words ignored when comparing two prompts — so "please fix the test" and
 // "fix the test now" read as the same work.
@@ -227,7 +227,12 @@ export async function maybeAutoName(
   // for exactly the inputs labeled "paid_haiku_fallback".
   const outcome = namingOutcome({
     kind: agent.kind,
-    namePinned: agent.namePinned,
+    // `selfNamed` (the agent named itself via sparkle-control) is authoritative just like a manual
+    // pin: fold it into the pinned signal so we never spend a paid Haiku call over a name the agent
+    // already chose (bug sparkle-pel7). Telemetry note: `namingOutcome` sees only this single boolean,
+    // so a self-name is counted under the SAME label as a manual pin (renameDecision → "self_named"
+    // when step 3 is reached) — it is not distinguished from a human pin in the outcome metric.
+    namePinned: agent.namePinned || Boolean(agent.selfNamed),
     aiTitle: agent.aiTitle,
     autoNameBasis: agent.autoNameBasis,
     promptCount: (agent.promptHistory ?? []).length,
@@ -259,4 +264,214 @@ export async function maybeAutoName(
   } finally {
     inFlight.delete(agentId);
   }
+}
+
+// ── Name-from-work fallback (Tier 1 + Tier 2, sparkle name-from-work) ──────────────────────────
+// The composer-driven namers above only fire on a prompt SUBMIT and skip tactical prompts
+// (commit/push/test/build/run/continue…). So a build/worker agent that does substantial autonomous
+// work but is only handed tactical prompts — or no further composer prompts at all — never gets
+// renamed off its "Build N"/"Worker N" default. These two tiers run OFF the composer path (on the
+// sidebar poll tick) to close that gap:
+//   • Tier 1 (free)  — extend the aiTitle poll (sessionTitle.refreshAgentTitle) to also cover CLOSED
+//     default-named build/workers, so Claude Code's own session title backfills the name for free.
+//   • Tier 2 (paid)  — only if Tier 1 still produced nothing after a short window: ONE Haiku
+//     generate_agent_name call using the agent's actual WORK (first substantive prompt / activity)
+//     as basis, applied via autoRenameAgent (which re-checks precedence).
+// ADDITIVE: composer naming is untouched, and both tiers defer to the same precedence ladder
+// (namePinned > selfNamed > aiTitle) — a backstop name never overrides an authoritative one.
+
+/**
+ * How many CONSECUTIVE eligible poll ticks a stuck-default build/worker must survive before Tier 2
+ * (the paid Haiku backstop) fires. At the sidebar's ~15s tick this is a ~15s grace window. Sized for
+ * a persona that now names itself on its FIRST tool call (see sparkleControlProtocol): one tick still
+ * lets self-naming and the free Tier-1 session-title backfill win first, so the paid call stays a
+ * genuine last resort. Plain const (not config.toml): it's an internal timing knob, not a user-facing
+ * policy, and wiring it through the Rust config schema wasn't trivial.
+ */
+export const WORK_BACKSTOP_WINDOW_TICKS = 1;
+
+/** The default-name pattern per self-naming kind: "Build 3", "Worker 12" (see projectStore.defaultAgentName). */
+const DEFAULT_NAME_RE: Partial<Record<AgentKind, RegExp>> = {
+  build: /^Build \d+$/u,
+  worker: /^Worker \d+$/u,
+};
+
+/** True iff `name` is still the untouched kind default (e.g. "Worker 2") for a build/worker agent. Pure. */
+export function isUnpinnedDefaultName(kind: AgentKind, name: string): boolean {
+  const re = DEFAULT_NAME_RE[kind];
+  return re != null && re.test(name.trim());
+}
+
+/** The agent fields both fallback tiers read to decide eligibility. */
+export interface WorkNamingAgent {
+  kind: AgentKind;
+  name: string;
+  namePinned: boolean;
+  selfNamed?: boolean | null;
+  aiTitle?: string | null;
+  worktreePath: string | null;
+}
+
+/**
+ * Shared gate for BOTH fallback tiers: a build/worker still holding its UNPINNED DEFAULT name, not
+ * self-named, with no aiTitle, that HAS a worktree (proof it actually started real work). This is the
+ * set Tier 1 adds to the title poll AND the precondition Tier 2 re-checks before spending a call. Pure.
+ */
+export function isNameFromWorkCandidate(a: WorkNamingAgent): boolean {
+  if (!isSelfNamingAgent(a)) return false; // build/worker only (never think/shell)
+  if (!a.worktreePath) return false; // no worktree → hasn't done real work yet
+  if (a.namePinned || a.selfNamed) return false; // an authoritative name already won
+  if (a.aiTitle && a.aiTitle.trim()) return false; // Claude Code's own title already applied
+  return isUnpinnedDefaultName(a.kind, a.name);
+}
+
+/**
+ * Pick the best available WORK-based naming basis for the paid backstop, in priority order:
+ *  (1) the first SUBSTANTIVE (non-thin, non-tactical) recorded prompt — the agent's own task/work;
+ *  (2) the agent's live activity narration (set_agent_activity), if substantive;
+ * else `null` → skip and keep the default. Transcript/session-title is Tier 1's job (free), so by the
+ * time Tier 2 runs it has already returned nothing usable and isn't re-read here. Pure.
+ */
+export function workNamingBasis(
+  history: PromptHistoryEntry[] | undefined,
+  activity: string | undefined,
+): string | null {
+  for (const e of history ?? []) {
+    // Skip picker answers: they're recorded to advance promptCount, but a menu choice ("Use the
+    // default") is a poor name even when it survives the tactical filter, and the real task prompt
+    // sits earlier in the same history. The tactical check below catches most; this catches the rest.
+    if (e?.source === "picker") continue;
+    const text = (e?.text ?? "").trim();
+    const words = contentWords(text);
+    if (words.size >= 2 && !isTacticalOnly(words)) return text;
+  }
+  const act = (activity ?? "").trim();
+  if (act) {
+    const words = contentWords(act);
+    if (words.size >= 2 && !isTacticalOnly(words)) return act;
+  }
+  return null;
+}
+
+// Fire-once-per-agent guard for the Tier-2 paid backstop: once an agent's backstop reaches a TERMINAL
+// outcome — it produced a name, or it definitively had no basis to name from — it is never retried
+// this session. A TRANSIENT failure (throw, or an empty/malformed result) deliberately does NOT mark
+// the agent: marking before the outcome was known meant one blip (offline, signed out, keychain
+// locked, proxy 500) permanently pinned the agent at "Build N" for the whole session.
+// This is a MODULE-level (process-wide, cross-project) Set — its whole job is to survive an agent
+// transiently dropping out of a project's loaded agent list (project switch/reload) so a reappearing
+// agent is NOT re-charged a second paid call. We deliberately do NOT prune it against any single
+// project's live ids: it holds one small string per build/worker ever backstopped this session, which
+// resets on app launch — a negligible, session-bounded footprint (accepted per review 36146).
+const workBackstopAttempted = new Set<string>();
+
+/**
+ * Hard cap on paid `generate_agent_name` calls per agent when the backstop keeps failing without a
+ * terminal verdict. This BOUNDS the retryability above: a throw is not reliably a free
+ * infrastructure failure. `naming.rs` returns Err for the model's OWN judgments too — a bare SKIP
+ * sentinel (naming.rs:229), a reply that reads as conversational rather than a title, or no usable
+ * title — and those calls DID reach the model, so they were billed. Worse, they're deterministic
+ * for a fixed basis: the same basis re-judged next tick returns the same nothing. Without this cap
+ * such an agent would re-invoke on every ~15s tick for the whole session, billing each one, which
+ * is exactly the "genuine last resort" cost goal this tier exists to protect.
+ *
+ * Why a blunt count rather than classifying the error: the alternative is matching Rust's error
+ * STRINGS across the Tauri boundary, where a reworded message silently degrades back to the
+ * unbounded loop — an expensive way to be wrong. A small cap is robust to that drift and costs at
+ * most 3 Haiku calls in the pathological case.
+ *
+ * The budget is per-AGENT and deliberately ignores basis drift. `workNamingBasis` can fall back to
+ * the live `activity` narration, which changes as the agent works, so a per-basis budget would mint
+ * a fresh 3 calls for every new activity string — i.e. exactly the unbounded paid loop this cap
+ * exists to close. The accepted cost of keying per-agent: an agent whose early basis the model
+ * SKIPs three times is burned for the session even if it later accumulates work that would name
+ * cleanly. That is strictly better than the pre-fix behavior (burned on the FIRST failure), and the
+ * free tiers — self-naming and the Tier-1 session-title backfill — can still rescue it.
+ *
+ * Also accepted: a genuinely offline user spends the budget on free failures and is then burned
+ * (~45s of tolerance).
+ */
+export const MAX_WORK_BACKSTOP_ATTEMPTS = 3;
+
+/** Per-agent count of non-terminal backstop attempts, against MAX_WORK_BACKSTOP_ATTEMPTS. Same
+ *  module-level, session-bounded rationale as workBackstopAttempted. */
+const workBackstopFailures = new Map<string, number>();
+
+/** This agent's backstop is finished for the session — it named, or it definitively can't. Retires
+ *  BOTH structures together so they can't drift: once the Set holds an id, the counter for it is
+ *  dead weight (the fire-once guard short-circuits before it is ever read again). */
+function markTerminal(agentId: string): void {
+  workBackstopAttempted.add(agentId);
+  workBackstopFailures.delete(agentId);
+}
+
+/** Record one non-terminal (retryable) attempt, promoting the agent to TERMINAL once it has burned
+ *  through the cap — so retries can never become an unbounded paid loop. */
+function countRetryableAttempt(agentId: string): void {
+  const n = (workBackstopFailures.get(agentId) ?? 0) + 1;
+  workBackstopFailures.set(agentId, n);
+  if (n >= MAX_WORK_BACKSTOP_ATTEMPTS) markTerminal(agentId);
+}
+
+/**
+ * Tier 2 — the paid Haiku backstop. For an eligible build/worker (see {@link isNameFromWorkCandidate})
+ * that still holds an unpinned default after Tier 1 found no session title, spend ONE
+ * `generate_agent_name` call using the agent's WORK as basis (never a composer/tactical prompt).
+ * Succeeds AT MOST ONCE per agent. Applies via `autoRenameAgent`, which re-checks the precedence
+ * ladder (namePinned > selfNamed > aiTitle) at apply time, so a name that became authoritative
+ * mid-flight is never clobbered. Best-effort: a failure keeps the default silently (console.debug)
+ * and stays RETRYABLE on a later tick — only a terminal outcome burns the attempt.
+ */
+export async function maybeNameFromWork(projectId: string, agentId: string): Promise<void> {
+  if (workBackstopAttempted.has(agentId)) return; // already attempted this session (fire once)
+  const store = useProjectStore.getState();
+  const agent = store.projects.find((p) => p.id === projectId)?.agents.find((a) => a.id === agentId);
+  if (!agent) return;
+  if (!isNameFromWorkCandidate(agent)) return; // not eligible: pinned/self-named/titled/wrong-kind/no work
+  if (inFlight.has(agentId)) return; // a composer-path naming call is mid-flight — retry next tick
+  const basis = workNamingBasis(agent.promptHistory, agent.activity);
+  if (!basis) {
+    // TERMINAL: no substantive work to name from (all prompts tactical/thin, no activity). Re-scanning
+    // on a later tick would find the same nothing, so burn the attempt here and keep the default.
+    markTerminal(agentId);
+    reportNamingOutcome("work_backstop_skipped", agent.kind);
+    return;
+  }
+  inFlight.add(agentId);
+  try {
+    const name = await invoke<AgentName>("generate_agent_name", { prompt: basis });
+    const canonical = name?.title?.trim();
+    if (canonical) {
+      // TERMINAL: we produced a name, so never spend a second call for this agent.
+      markTerminal(agentId);
+      // Tally only a call that actually PRODUCED a name — a throw/empty result (no key, offline,
+      // model hiccup) spends nothing usable and must not depress naming coverage (namingCoverage
+      // counts this label as `paid`). This is intentionally stricter than the composer-path
+      // `paid_haiku_fallback`, which tallies the committed attempt.
+      reportNamingOutcome("work_haiku_backstop", agent.kind);
+      useProjectStore.getState().autoRenameAgent(projectId, agentId, canonical, basis, name);
+    } else {
+      // An empty/malformed result is treated as retryable (the model may have hiccuped) but STILL
+      // counts against the cap — this call reached the model and was billed.
+      countRetryableAttempt(agentId);
+    }
+  } catch (e) {
+    // Retryable — no API key yet, offline, keychain locked, proxy 500. Deliberately do NOT mark the
+    // attempt terminal: the old code marked it BEFORE the invoke, so a single blip permanently
+    // pinned the agent at its default for the whole app session (that Set is module-level and never
+    // pruned). Counted against the cap, because a throw is NOT reliably a free failure — naming.rs
+    // also returns Err for the model's own SKIP/unusable-title verdicts, which were billed and are
+    // deterministic for this basis. See MAX_WORK_BACKSTOP_ATTEMPTS.
+    countRetryableAttempt(agentId);
+    console.debug("work-backstop name skipped (retryable):", e);
+  } finally {
+    inFlight.delete(agentId);
+  }
+}
+
+/** Test-only: clear the once-per-agent + in-flight guards so each case starts from a clean slate. */
+export function __resetNamingGuards(): void {
+  workBackstopAttempted.clear();
+  workBackstopFailures.clear();
+  inFlight.clear();
 }

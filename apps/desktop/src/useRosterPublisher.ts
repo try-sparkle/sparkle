@@ -14,6 +14,7 @@ import { useRuntimeStore } from "./stores/runtimeStore";
 import { useInteractionStore } from "./stores/interactionStore";
 import { findWindowForProject, onWindowRegistryChange } from "./services/windowRegistry";
 import { useCurrentWindowLabel } from "./windowContext";
+import { composerPrompts } from "./components/promptHistory";
 import type { AgentTab, Project } from "./types";
 
 const DEFAULT_STATUS: AgentTabStatus = "stopped";
@@ -38,9 +39,11 @@ const RECENT_PROMPTS_MAX = 4;
 const RECENT_PROMPT_CHARS = 80;
 
 /** The most recent (~4) user prompts, oldest→newest, whitespace-collapsed and length-capped. Each
- *  keeps its promptHistory id so a tray click can scroll the terminal to that exact turn. */
+ *  keeps its promptHistory id so a tray click can scroll the terminal to that exact turn. Picker
+ *  answers are excluded (composerPrompts) — the tray breadcrumb, like the desktop one, is for real
+ *  messages, and a picker row's id has no scroll marker to jump to. */
 function recentPrompts(a: AgentTab): { id: string; text: string }[] {
-  return (a.promptHistory ?? []).slice(-RECENT_PROMPTS_MAX).map((e) => {
+  return composerPrompts(a.promptHistory ?? []).slice(-RECENT_PROMPTS_MAX).map((e) => {
     const text = e.text.replace(/\s+/g, " ").trim();
     return { id: e.id, text: text.length > RECENT_PROMPT_CHARS ? text.slice(0, RECENT_PROMPT_CHARS) : text };
   });

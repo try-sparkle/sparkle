@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Runtime};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -23,7 +23,7 @@ use tracing_subscriber::EnvFilter;
 /// Resolve the OS log directory for this app (creating it if needed).
 /// `pub(crate)` so the support module can tail the same unified log (support.rs).
 pub(crate) fn resolve_log_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
-    let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    let dir = crate::dev_identity::app_log_dir(app)?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
 }

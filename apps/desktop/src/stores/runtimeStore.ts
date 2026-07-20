@@ -334,6 +334,31 @@ export async function syncBeadLifecycle(
   }
 }
 
+/** The stage at which a commit first exists on the branch — the first thing roborev can review. */
+const REVIEWABLE_STAGE_INDEX = stageIndex("building_saved");
+
+/** One-time roborev consent trigger. roborev defaults ON, but a locked UX requires a single consent
+ *  modal at the FIRST reviewable commit. `applyWorkflowState` runs for every git-workflow agent (a
+ *  build orchestrator OR its workers — think/shell agents never reach a committed stage), so this
+ *  fires the tick ANY such agent's stage first crosses INTO building_saved (from a lower/none stage),
+ *  and only when roborev is on and we haven't prompted yet. `roborevConsentOpen` guards against
+ *  re-opening every subsequent tick until the user resolves the modal (which flips consent_prompted
+ *  true, closing this for good). Exported for unit testing the crossing + gating logic. */
+export function maybePromptRoborevConsent(
+  prev: WorkflowStageId | null,
+  next: WorkflowStageId,
+): void {
+  const crossedIntoCommitted =
+    stageIndex(next) >= REVIEWABLE_STAGE_INDEX &&
+    (prev == null || stageIndex(prev) < REVIEWABLE_STAGE_INDEX);
+  if (!crossedIntoCommitted) return;
+  const settings = useSettingsStore.getState();
+  if (!settings.roborevEnabled || settings.roborevConsentPrompted || settings.roborevConsentOpen) {
+    return;
+  }
+  settings.setRoborevConsentOpen(true);
+}
+
 /** Apply a freshly-fetched WorkflowState to an agent: derive its live stage, advance the stored stage
  *  if it moved forward, drive its bead lifecycle (create/claim/close/deliver), and latch the sticky
  *  shipped ✓. Extracted so the per-agent `refreshWorkflowStage` and the batched `pollProjectStatus`
@@ -345,13 +370,33 @@ async function applyWorkflowState(
   ws: WorkflowState,
 ): Promise<void> {
   const store = useRuntimeStore;
+  // Keep the RAW signals for the composer CTA (the monotonic stage watermark below can't tell
+  // "on local main" from "on origin main"). Latches an observed hasRemote — see setWorkflowState.
+  store.getState().setWorkflowState(agent.id, ws);
   const prev = store.getState().workflowStage[agent.id] ?? null;
   // A worker's "Merged" = its orchestrator's OWN work has reached main. Read the parent's stored
   // stage (set by its own poll — orchestrators are applied first each tick); eventually consistent.
+  // Pinned to `merged_local`, NOT `merged`: before the merged_local split, `merged` meant local OR
+  // origin main, and reaching LOCAL main was always enough to roll workers up. Comparing against the
+  // now-stricter origin-only `merged` would silently stop worker rollup in any repo that lands
+  // locally without pushing — a behavior regression the split must not introduce.
   let parentReachedMain = false;
+  let parentOnOriginMain = false;
   if (agent.kind === "worker" && agent.parentId) {
     const ps = store.getState().workflowStage[agent.parentId];
-    parentReachedMain = ps ? stageIndex(ps) >= stageIndex("merged") : false;
+    parentReachedMain = ps ? stageIndex(ps) >= stageIndex("merged_local") : false;
+    // …and whether the parent got all the way to ORIGIN main, which promotes the worker to the full
+    // `merged` (see the worker bump in deriveLiveStage). Without that promotion a worker caps at
+    // merged_local and its bead never closes.
+    //
+    // Read from the parent's LIVE WorkflowState, never its stage watermark. The watermark is sticky
+    // and monotonic, so a parent still pinned at merged/shipped from a PREVIOUS cycle would promote
+    // a freshly-integrated worker to `merged` — and that promotion has irreversible side effects the
+    // merged_local cap didn't: it latches workflowShipped (cleared only on close/reset) and closes
+    // the bead, for work that isn't on origin at all. The live signal falls back the moment the
+    // parent starts a new cycle, so it can't strand a worker in that state.
+    const pws = store.getState().workflowState[agent.parentId];
+    parentOnOriginMain = pws?.inOriginMain === true || pws?.prState === "merged";
   }
   const next = deriveLiveStage({
     kind: agent.kind,
@@ -359,6 +404,7 @@ async function applyWorkflowState(
     ws,
     prev,
     parentReachedMain,
+    parentOnOriginMain,
     // Live Pushed/Shipped signals from the Rust workflow state (sparkle-v7d0). Without these the
     // "Pushed" stage only lit via a PR probe and "Shipped" was unreachable; deriveLiveStage gates
     // both on committedSeen so a no-op branch can't skip stages.
@@ -368,6 +414,9 @@ async function applyWorkflowState(
     hasBead: !!agent.beadId,
   });
   if (next !== prev) store.getState().setWorkflowStage(agent.id, next);
+  // One-time roborev consent: the first time this agent's work reaches a reviewable commit
+  // (building_saved or beyond), surface the consent modal — see maybePromptRoborevConsent.
+  maybePromptRoborevConsent(prev, next);
   // Drive the agent's bead from its current stage (fire-and-forget; monotonic + idempotent).
   void syncBeadLifecycle(
     projectId,
@@ -378,6 +427,10 @@ async function applyWorkflowState(
     !!store.getState().workflowShipped[agent.id],
   );
   // Sticky "shipped" watermark: latch true the first time work reaches On Main (or beyond).
+  // Deliberately compares against `merged` (ORIGIN main), not `merged_local`: this watermark drives
+  // the bead lifecycle and the "landed at least once" ✓, which must mean the work is actually on the
+  // remote. merged_local sits BELOW merged in the ladder, so a local-only land correctly does not
+  // trip this — keep it that way if the stage order ever changes.
   if (
     stageIndex(next) >= stageIndex("merged") &&
     !store.getState().workflowShipped[agent.id]
@@ -456,6 +509,12 @@ interface RuntimeState {
   // RESETS to a new cycle (deriveLiveStage drops back to Committed when fresh work lands on a branch
   // that already shipped). PERSISTED alongside workflowStage so the ✓ survives a relaunch.
   workflowShipped: Record<string, boolean>;
+  // agentId -> the LIVE WorkflowState from the last poll (reachability + PR probe + hasRemote). The
+  // stage watermark above is monotonic and lossy by design; the composer CTA needs the raw signals
+  // to tell "on local main" from "on origin main" (engine/agentCta.deriveCta). Live-only (never
+  // persisted, like branchStatus): a relaunch re-polls within a tick, and a persisted `hasRemote`
+  // could outlive the repo it described. Cleared on close/resetProgress.
+  workflowState: Record<string, WorkflowState>;
 
   open: (agentId: string) => void;
   close: (agentId: string) => void;
@@ -471,6 +530,9 @@ interface RuntimeState {
   setBranchStatus: (agentId: string, s: BranchStatus) => void;
   setWorkflowStage: (agentId: string, stage: WorkflowStageId) => void;
   setWorkflowShipped: (agentId: string, shipped: boolean) => void;
+  /** Store an agent's live WorkflowState, LATCHING an observed `hasRemote: true` (see the field's
+   *  comment and Rust's probe gate). Every other field is taken from `ws` as-is. */
+  setWorkflowState: (agentId: string, ws: WorkflowState) => void;
   /** Fetch + store this agent's branch status. Best-effort: a transient git error is swallowed
    *  so the UI never breaks. */
   pollBranchStatus: (
@@ -518,6 +580,7 @@ export const useRuntimeStore = create<RuntimeState>()(
       branchStatus: {},
       workflowStage: {},
       workflowShipped: {},
+      workflowState: {},
 
       open: (agentId) =>
         set((s) => {
@@ -536,6 +599,7 @@ export const useRuntimeStore = create<RuntimeState>()(
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
+          const { [agentId]: _wstate, ...workflowState } = s.workflowState;
           // Read-modify-MERGE the shared persisted set, then drop ONLY this id (): the
           // union retains other live windows' open ids in the persisted write, so closing a3 here
           // can't clobber window B's b1 — while still removing a3 itself.
@@ -547,6 +611,7 @@ export const useRuntimeStore = create<RuntimeState>()(
             branchStatus,
             workflowStage,
             workflowShipped,
+            workflowState,
           };
         }),
 
@@ -560,8 +625,16 @@ export const useRuntimeStore = create<RuntimeState>()(
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
+          const { [agentId]: _wstate, ...workflowState } = s.workflowState;
           // Note: openAgentIds is intentionally untouched — the pane stays mounted for the new run.
-          return { status, attentionScreen, branchStatus, workflowStage, workflowShipped };
+          return {
+            status,
+            attentionScreen,
+            branchStatus,
+            workflowStage,
+            workflowShipped,
+            workflowState,
+          };
         }),
 
       setStatus: (agentId, status) =>
@@ -581,6 +654,17 @@ export const useRuntimeStore = create<RuntimeState>()(
 
       setWorkflowShipped: (agentId, shipped) =>
         set((st) => ({ workflowShipped: { ...st.workflowShipped, [agentId]: shipped } })),
+
+      setWorkflowState: (agentId, ws) =>
+        set((st) => {
+          // `hasRemote` is only computed on a PROBING poll (Rust gates it on probe_pr_state), so
+          // every fast tick reports false. Latch an observed true so the CTA doesn't flap between
+          // "Push to Origin Main" and "Close" on alternating polls. A repo genuinely LOSING its
+          // remote isn't worth tracking — re-observing false would be wrong here, not right.
+          const prevHasRemote = st.workflowState[agentId]?.hasRemote;
+          const merged: WorkflowState = { ...ws, hasRemote: ws.hasRemote || prevHasRemote || false };
+          return { workflowState: { ...st.workflowState, [agentId]: merged } };
+        }),
 
       pollBranchStatus: async (root, projectId, agentId, baseBranch) => {
         // A removed worktree never returns for the same agent id — skip it permanently ().

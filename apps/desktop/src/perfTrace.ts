@@ -107,9 +107,17 @@ export function perfRender(component: string, key: string, meta?: Record<string,
 // ── Global main-thread stall (jank) monitor ─────────────────────────────────────────────────────
 let jankRunning = false;
 
+// A gap this large isn't a dropped-frame stall — the process was suspended (machine asleep, lid
+// closed, or a paused debugger). rAF doesn't fire while suspended, so the first tick on resume sees
+// the entire sleep interval as one "gap". Logging that as jank is a false positive that floods the
+// perf log and buries genuine sub-second stalls, so we classify resumes separately. No running
+// main-thread stall lasts this long; anything above it is a wake, not a freeze.
+const SUSPEND_MS = 30_000;
+
 /** Start a requestAnimationFrame loop that logs any inter-frame gap exceeding `thresholdMs` — i.e.
  *  every time the main thread was blocked long enough to drop frames (the visible "freeze"). Idle
- *  when the window is hidden (rAF is throttled/paused then, which would be a false positive). This
+ *  when the window is hidden (rAF is throttled/paused then, which would be a false positive), and
+ *  gaps above `SUSPEND_MS` are logged as a resume rather than a stall (the machine was asleep). This
  *  is the single most useful instrument for "the app is slow": it catches EVERY stall, whatever the
  *  cause, so we can then correlate the timestamp against the spawn/switch/close/span/render lines.
  *  Idempotent; safe to call from multiple mounts. */
@@ -124,7 +132,12 @@ export function startJankMonitor(thresholdMs = 150): void {
     last = now;
     // Skip gaps accrued while hidden — rAF is paused/throttled in the background, not a real stall.
     if (gap >= thresholdMs && (typeof document === "undefined" || !document.hidden)) {
-      log.warn("perf", "jank stall", { ms: Math.round(gap), heapMb: heapMb() });
+      if (gap >= SUSPEND_MS) {
+        // Resume from suspend, not a freeze — record it (still useful to correlate) without the warn.
+        log.debug("perf", "resume after suspend", { ms: Math.round(gap) });
+      } else {
+        log.warn("perf", "jank stall", { ms: Math.round(gap), heapMb: heapMb() });
+      }
     }
     requestAnimationFrame(tick);
   };

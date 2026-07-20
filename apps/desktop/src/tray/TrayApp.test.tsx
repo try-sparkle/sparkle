@@ -28,12 +28,17 @@ vi.mock("../screenshot", () => ({
   showCaptureWindow: (shot: unknown) => showCaptureWindow(shot),
 }));
 
+// Imported statically, AFTER the vi.mock calls above (which vitest hoists). This used to be an
+// `await import("./TrayApp")` inside every test, which billed the cold module transform of TrayApp
+// and its dep tree to the FIRST test's 5s timeout -- ~5.3s on a loaded machine, so the suite failed
+// whenever the box was busy and passed only when a prior test file had already warmed the graph.
+import { TrayApp } from "./TrayApp";
+
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => cleanup());
 
 describe("TrayApp", () => {
   it("renders the empty state with no Tauri backend", async () => {
-    const { TrayApp } = await import("./TrayApp");
     render(<TrayApp />);
     await waitFor(() => expect(screen.getByText("No projects running.")).toBeTruthy());
   });
@@ -44,7 +49,6 @@ describe("TrayApp capture flow", () => {
 
   it("hides the popover, runs the crosshair picker, then shows the capture window with the shot", async () => {
     captureScreenRegion.mockResolvedValueOnce(shot);
-    const { TrayApp } = await import("./TrayApp");
     render(<TrayApp />);
     fireEvent.click(screen.getByRole("button", { name: "Capture" }));
     await waitFor(() => expect(showCaptureWindow).toHaveBeenCalledWith(shot));
@@ -54,7 +58,6 @@ describe("TrayApp capture flow", () => {
 
   it("does nothing further when the user cancels the crosshairs (null shot)", async () => {
     captureScreenRegion.mockResolvedValueOnce(null);
-    const { TrayApp } = await import("./TrayApp");
     render(<TrayApp />);
     const btn = screen.getByRole("button", { name: "Capture" }) as HTMLButtonElement;
     fireEvent.click(btn);
@@ -69,7 +72,6 @@ describe("TrayApp capture flow", () => {
   it("disables the button while a capture is in flight, re-enables after", async () => {
     let resolveShot!: (v: unknown) => void;
     captureScreenRegion.mockImplementationOnce(() => new Promise((r) => { resolveShot = r; }));
-    const { TrayApp } = await import("./TrayApp");
     render(<TrayApp />);
     const btn = screen.getByRole("button", { name: "Capture" }) as HTMLButtonElement;
     fireEvent.click(btn);
@@ -82,7 +84,6 @@ describe("TrayApp capture flow", () => {
 
   it("re-enables the button when the capture invoke rejects", async () => {
     captureScreenRegion.mockRejectedValueOnce(new Error("screencapture failed"));
-    const { TrayApp } = await import("./TrayApp");
     render(<TrayApp />);
     const btn = screen.getByRole("button", { name: "Capture" }) as HTMLButtonElement;
     fireEvent.click(btn);
@@ -93,7 +94,6 @@ describe("TrayApp capture flow", () => {
 
   it("re-shows the popover with a one-line error when the capture flow fails (spec §9)", async () => {
     captureScreenRegion.mockRejectedValueOnce(new Error("TCC denied"));
-    const { TrayApp } = await import("./TrayApp");
     render(<TrayApp />);
     fireEvent.click(screen.getByRole("button", { name: "Capture" }));
     await waitFor(() => expect(show).toHaveBeenCalled());
@@ -103,7 +103,6 @@ describe("TrayApp capture flow", () => {
   it("still settles when the popover re-show itself rejects", async () => {
     captureScreenRegion.mockRejectedValueOnce(new Error("TCC denied"));
     show.mockRejectedValueOnce(new Error("no window"));
-    const { TrayApp } = await import("./TrayApp");
     render(<TrayApp />);
     const btn = screen.getByRole("button", { name: "Capture" }) as HTMLButtonElement;
     fireEvent.click(btn);
@@ -115,7 +114,6 @@ describe("TrayApp capture flow", () => {
 
   it("clears the error line when a new capture attempt starts", async () => {
     captureScreenRegion.mockRejectedValueOnce(new Error("TCC denied"));
-    const { TrayApp } = await import("./TrayApp");
     render(<TrayApp />);
     const btn = screen.getByRole("button", { name: "Capture" }) as HTMLButtonElement;
     fireEvent.click(btn);

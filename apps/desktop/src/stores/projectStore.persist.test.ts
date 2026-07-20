@@ -12,28 +12,46 @@ describe("debouncedLocalStorage (sparkle-pngb)", () => {
   });
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   it("coalesces a burst of writes into ONE localStorage.setItem after the debounce window", () => {
-    // Spy on Storage.prototype, NOT the localStorage instance. `setItem` is an inherited prototype
-    // method, not an own property of the instance; `vi.spyOn(localStorage, "setItem")` only patches
-    // the instance and, on some jsdom/Node builds (e.g. Node 22 in CI), the real prototype method is
-    // still what runs — so the write succeeds but the instance spy records 0 calls, failing this
-    // assertion in CI while passing on other Node versions. Spying the prototype is version-robust.
-    const setSpy = vi.spyOn(Storage.prototype, "setItem");
+    // Count real writes by SUBSTITUTING the global `localStorage` with a plain mock, rather than
+    // spying on a Storage prototype method. This test previously ping-ponged between environments:
+    // spying the instance (`vi.spyOn(localStorage, "setItem")`) recorded 0 calls on Node 22 CI, so it
+    // was switched to spying `Storage.prototype` — which then records 0 on Node 26 + jsdom, because
+    // there `Object.getPrototypeOf(localStorage)` is `MemoryStorage`, not the global `Storage`, so
+    // `localStorage.setItem !== Storage.prototype.setItem` and the prototype spy never fires. A mock
+    // that `debouncedLocalStorage` writes through has no dependency on jsdom/Node Storage internals,
+    // so it counts coalesced writes correctly on every Node version.
+    const store = new Map<string, string>();
+    let setItemCalls = 0;
+    vi.stubGlobal("localStorage", {
+      getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+      setItem: (k: string, v: string) => {
+        setItemCalls += 1;
+        store.set(k, v);
+      },
+      removeItem: (k: string) => void store.delete(k),
+      clear: () => store.clear(),
+      key: () => null,
+      get length() {
+        return store.size;
+      },
+    });
+
     const { storage } = debouncedLocalStorage(PROJECTS_PERSIST_DEBOUNCE_MS);
     storage.setItem("k", "1");
     storage.setItem("k", "2");
     storage.setItem("k", "3");
     // Nothing written yet — the burst is buffered instead of N synchronous main-thread writes.
-    expect(setSpy).not.toHaveBeenCalled();
+    expect(setItemCalls).toBe(0);
     expect(localStorage.getItem("k")).toBeNull();
 
     vi.advanceTimersByTime(PROJECTS_PERSIST_DEBOUNCE_MS);
     // Exactly one real write, carrying the LAST value in the burst.
-    expect(setSpy).toHaveBeenCalledTimes(1);
+    expect(setItemCalls).toBe(1);
     expect(localStorage.getItem("k")).toBe("3");
-    setSpy.mockRestore();
   });
 
   it("flush() writes the pending value synchronously (used before a cross-window broadcast)", () => {

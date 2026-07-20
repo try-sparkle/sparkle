@@ -34,15 +34,25 @@ import { readWorkerResult } from "../pty";
 import { maybeAutoName } from "../services/agentNaming";
 import { judgeNeedsFollowup } from "../services/turnFollowup";
 import { invoke } from "@tauri-apps/api/core";
-import { HookStatusEngine, type HookEvent } from "../engine/hookEvents";
+import { HookStatusEngine, createHookEventHandler, type HookEvent } from "../engine/hookEvents";
 import { createStatusRouter, type StatusRouter } from "../engine/statusRouter";
 import { watchHookEvents, type HookWatcher } from "../services/hookWatcher";
 import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useUiStore } from "../stores/uiStore";
+import { useUiStore, COMPOSER_BAR } from "../stores/uiStore";
+import {
+  occludedRowCount,
+  classifyOccludedRows,
+  resolveAutoYield,
+  shouldShowHiddenChip,
+  measuredComposerHeight,
+  type Occlusion,
+  type YieldState,
+} from "../engine/composerOcclusion";
 import { useScrollIntentStore, applyScrollIntent } from "../stores/scrollIntentStore";
 import { PinnedPrompt } from "./PinnedPrompt";
+import { composerPrompts } from "./promptHistory";
 import { Terminal, type TerminalApi } from "./Terminal";
 import { Composer, type ComposerApi } from "./Composer";
 import { DragVisionHintPill } from "./DragVisionHintPill";
@@ -69,6 +79,15 @@ type Phase = "preparing" | "ready" | "no-claude" | "error";
  * string-embedded substitution, so trailing backslashes / unclosed quotes in the selection
  * can't escape into the surrounding script.
  */
+// Padding between the terminal's text box and the bottom of the stage the composer anchors to
+// (the wrapper's `padding: 6` below) — the composer's first 6px cover padding, not text.
+const TERMINAL_STAGE_PADDING = 6;
+// How often to re-read the rows under the composer. Fast enough that a menu is uncovered before
+// the user reaches for the mouse, cheap enough to be invisible (a handful of already-rendered
+// lines, no PTY traffic).
+const OCCLUSION_POLL_MS = 250;
+const EMPTY_OCCLUSION: Occlusion = { kind: "empty", hiddenLines: 0 };
+
 export function buildShellSpawnArgs(shell: string, cmd: string): string[] {
   return ["-l", "-c", 'eval "$1"; exec "$0" -l', shell, cmd];
 }
@@ -167,6 +186,64 @@ function AgentPaneInner({
   // keeps every background pane from popping its own pill for the same drag. With the composer ON,
   // Composer.tsx owns the drop (attaches the image), so this listener stands down (!aiComposer).
   const dragHint = useDragVisionHint(visible && !aiComposer && agent.kind !== "think");
+
+  // Composer occlusion watch. The composer floats over the terminal's bottom rows by design (it
+  // covers Claude's input line so typing lands here), but Claude draws its MENUS in that same
+  // region — so a resume/permission prompt could sit invisible underneath it. Poll what's actually
+  // painted under the overlay: auto-minimize for something the user must answer, and surface a
+  // "N lines hidden" chip for anything else real. All policy lives in engine/composerOcclusion.ts;
+  // this effect is just the sampling loop.
+  const [occlusion, setOcclusion] = useState<Occlusion>(EMPTY_OCCLUSION);
+  const yieldStateRef = useRef<YieldState>("idle");
+  useEffect(() => {
+    // Only the visible pane samples — a background tab's terminal is display:none (cellHeight 0)
+    // and nothing there is worth reacting to anyway.
+    if (!aiComposer || !visible || phase !== "ready" || !ptyReady) {
+      setOcclusion(EMPTY_OCCLUSION);
+      // Drop any latched yield: we stop observing here, so conditions can change unseen (the pane
+      // backgrounds, the PTY dies). Re-arming means the next tick decides from what's actually on
+      // screen instead of acting on a stale "I owe a restore".
+      yieldStateRef.current = "idle";
+      return;
+    }
+    const tick = () => {
+      const api = terminalApiRef.current;
+      if (!api) return;
+      const { cellHeight, rows } = api.cellMetrics();
+      const ui = useUiStore.getState();
+      // NOT simply "what does the composer cover right now" — once we've yielded we keep measuring
+      // against the OPEN height, or revealing the prompt would read as resolving it and we'd
+      // oscillate at the poll rate. See measuredComposerHeight.
+      const height = measuredComposerHeight({
+        minimized: ui.composerMinimized,
+        openHeight: ui.composerHeight,
+        barHeight: COMPOSER_BAR,
+        state: yieldStateRef.current,
+      });
+      const covered = occludedRowCount({
+        composerHeight: height,
+        cellHeight,
+        rows,
+        bottomInset: TERMINAL_STAGE_PADDING,
+      });
+      const next = classifyOccludedRows(api.readBottomRows(covered));
+      setOcclusion(next);
+      const move = resolveAutoYield({
+        occlusion: next,
+        minimized: ui.composerMinimized,
+        state: yieldStateRef.current,
+      });
+      if (!move) return;
+      yieldStateRef.current = move.state;
+      if (move.minimized !== ui.composerMinimized) ui.setComposerMinimized(move.minimized);
+    };
+    tick();
+    // Poll rather than hook the output stream: a menu can appear from a redraw with no new bytes,
+    // and reading a handful of already-rendered lines is far cheaper than re-classifying on every
+    // PTY chunk during a noisy turn.
+    const timer = window.setInterval(tick, OCCLUSION_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [aiComposer, visible, phase, ptyReady]);
 
   // Status routing: Claude Code's hook events are authoritative, but the screen scraper drives
   // until the first hook arrives (and for non-Claude programs that never emit one). The router
@@ -268,6 +345,12 @@ function AgentPaneInner({
   };
 
   const prepare = async () => {
+    // Prepare the project ONCE per root BEFORE the kind-specific early returns: warm the spawn
+    // caches and — critically — ensure the folder is a git repo. Think/Chief and Shell agents run
+    // in-place in the project root with no worktree, so without this an entire project could be
+    // built in a folder that never becomes a git repo and is unrecoverable if the app loses the
+    // project (the hazel-eco case). Idempotent + fire-and-forget (never throws, never blocks).
+    prewarmProjectCaches(project.rootPath);
     // Think agents are a Chief chat — no worktree, no PTY, nothing to prepare.
     if (agent.kind === "think") return;
     // Shell agents (Run-as-cmd) run a raw command in the project root, then drop into an
@@ -298,9 +381,8 @@ function AgentPaneInner({
     // (which runs outside prepare) presents the same token this run started the bridge with.
     const launchToken = crypto.randomUUID();
     bridgeLaunchTokenRef.current = launchToken;
-    // Warm the spawn caches for this project (claude/node paths, account state, background origin
-    // fetch) once per root — fire-and-forget, so later agents on this project skip the cold resolves.
-    prewarmProjectCaches(project.rootPath);
+    // (Spawn caches + repo git-init were already warmed at the top of prepare(), before the
+    // think/shell returns, so in-place sessions git-init too — see prewarmProjectCaches above.)
     // Warm the pre-warmed worktree pool for this project (off the main thread) so a subsequent agent
     // spawn can CLAIM a ready worktree instead of paying `git worktree add` on the critical path.
     // Fire-and-forget + self-throttling (a no-op once the pool is full or the feature is disabled).
@@ -382,12 +464,14 @@ function AgentPaneInner({
         });
         hookWatcherRef.current = watchHookEvents(
           logPath,
-          (ev) => {
-            router.activate(); // a real event arrived — hooks now own the status
-            hookEngine.ingest(ev);
-            // Persist prompts/responses to history (best-effort; never blocks/breaks status).
-            captureHistoryFromHook(ev);
-          },
+          // One session gate in front of every consumer — status, liveness, and history. See
+          // createHookEventHandler for why the ordering is load-bearing; it lives in engine/ so
+          // that ordering is tested directly rather than inline here.
+          createHookEventHandler({
+            engine: hookEngine,
+            activate: () => router.activate(),
+            captureHistory: captureHistoryFromHook,
+          }),
           // Start at EOF: the log is keyed by worktree and accumulates prior runs + background
           // one-shot `claude` sessions. We want status from THIS spawn's session, which the engine
           // locks onto from the first event it sees — so the stale backlog must not be replayed.
@@ -509,7 +593,11 @@ function AgentPaneInner({
         }
         const resultPath = `${wt.path}/${WORKER_RESULT_RELPATH}`;
         exec = buildClaudeExec(claude.path, resume, {
-          appendSystemPrompt: workerPersona({ parentBranch, resultPath }),
+          appendSystemPrompt: workerPersona({
+            parentBranch,
+            resultPath,
+            guardrails: useSettingsStore.getState().guardrailsEnabled,
+          }),
           initialPrompt: workerMission(agent.task ?? "", agent.id),
           configDir,
           resumeSessionId,
@@ -554,6 +642,7 @@ function AgentPaneInner({
           const persona = orchestrationPersona({
             ownBranch: wt.branch,
             maxConcurrentWorkers: useSettingsStore.getState().maxConcurrentWorkers,
+            guardrails: useSettingsStore.getState().guardrailsEnabled,
           });
           setSpawn({
             ...assembleBuildSpawn({
@@ -727,7 +816,9 @@ function AgentPaneInner({
         <>
       <PinnedPrompt
         prompt={agent.lastPrompt}
-        history={agent.promptHistory ?? []}
+        // Composer/seed prompts only — picker answers live in the raw history (for naming's
+        // promptCount) but are filtered out of every display surface. See composerPrompts.
+        history={composerPrompts(agent.promptHistory ?? [])}
         // "Send to Composer" only makes sense when the composer is mounted (AI feature on).
         onSendToComposer={
           aiComposer ? (text) => composerApiRef.current?.insertPrompt(text) : undefined
@@ -849,8 +940,18 @@ function AgentPaneInner({
               preparing={phase !== "ready" || !ptyReady}
               inputRef={composerInputRef}
               apiRef={composerApiRef}
+              // Terminal rows this overlay is currently hiding that AREN'T the input line it's
+              // meant to cover — drives the "N lines hidden" reveal chip. 0 = nothing to say.
+              hiddenBelow={shouldShowHiddenChip(occlusion) ? occlusion.hiddenLines : 0}
               onArrowOverflow={(dir) => terminalApiRef.current?.arrowFromComposer(dir)}
               onEnterOverflow={() => terminalApiRef.current?.enterFromComposer()}
+              // A send found this agent's PTY already gone. Clearing ptyReady flips the composer
+              // back to `preparing`, so once the respawned PTY reports ready the flush effect
+              // delivers the prompt the composer re-queued — the send survives the restart.
+              onRestartAgent={() => {
+                setPtyReady(false);
+                terminalApiRef.current?.restart();
+              }}
               onSubmitPrompt={(display, namingBasis) => {
                 // Record the DISPLAY string (typed text + 📄/📷/📎 markers) for the pinned header +
                 // history dropdown, and drop a terminal marker under the same id so "jump to this

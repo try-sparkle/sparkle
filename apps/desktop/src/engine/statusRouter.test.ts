@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { createStatusRouter } from "./statusRouter";
+import { createStatusRouter, HOOK_STALE_MS } from "./statusRouter";
 
 describe("createStatusRouter", () => {
   it("lets the screen scraper drive until hooks activate", () => {
@@ -261,6 +261,20 @@ describe("createStatusRouter", () => {
     expect(emit.mock.calls.map((c) => c[0])).toEqual(["idle", "waiting"]);
   });
 
+  it("a screen 'working' clears a judge verdict — the agent is demonstrably running", () => {
+    // The judge escalation had exactly one clear path: a non-idle HOOK event (statusRouter.ts:96).
+    // The scraper was structurally forbidden from clearing it, so a judge red outlived the very
+    // evidence that disproved it.
+    const emit = vi.fn();
+    const r = createStatusRouter(emit);
+    r.activate();
+    r.fromHook("idle");
+    r.fromJudge("waiting"); // → red
+    r.fromScreen("working"); // the agent is visibly running → the verdict is stale
+    r.fromScreen("idle"); // a later benign tick must NOT resurrect the red
+    expect(emit.mock.calls.map((c) => c[0])).toEqual(["idle", "waiting", "idle"]);
+  });
+
   it("activate() is idempotent and does not itself emit", () => {
     const emit = vi.fn();
     const r = createStatusRouter(emit);
@@ -270,5 +284,161 @@ describe("createStatusRouter", () => {
     r.fromHook("done");
     expect(emit).toHaveBeenCalledTimes(1);
     expect(emit).toHaveBeenLastCalledWith("done");
+  });
+});
+
+describe("hook-liveness watchdog", () => {
+  // REGRESSION — founder screenshot, 2026-07-15: the agent asked "Want me to start on the
+  // self-test?", the user answered "yes", and the agent resumed (transcript showed tool calls and a
+  // live "Sock-hopping… 22s · thinking" spinner) — but the row stayed RED.
+  //
+  // With live hooks this already works: "yes" → UserPromptSubmit → fromHook("working") →
+  // lastJudge = null → green. So a row stuck red PROVES hook events weren't being delivered.
+  // router.activate() fires on EVERY event arrival (AgentPane.tsx:386), so hooksLive latches true
+  // and a dead stream pins lastHook at "idle" forever.
+  const mkClock = () => {
+    let t = 0;
+    return {
+      now: () => t,
+      advance: (ms: number) => {
+        t += ms;
+      },
+    };
+  };
+
+  it("hands authority back to the scraper when hooks go silent while the screen says working", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("idle"); // last hook: a Stop
+    r.fromJudge("waiting"); // → red
+    c.advance(HOOK_STALE_MS + 1);
+    r.fromScreen("working"); // hooks are dead; the agent is demonstrably running
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle", "waiting", "working"]);
+  });
+
+  it("does NOT fire while hooks are fresh — hook authority is untouched", () => {
+    // A working agent with live hooks emits PreToolUse/PostToolUse constantly, so hooks cannot be
+    // silent for the window while it works. This is what makes the watchdog safe.
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("idle");
+    c.advance(HOOK_STALE_MS - 1);
+    r.fromScreen("working");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle"]); // hooks still own it
+  });
+
+  it("does NOT fire during a long single tool call — hooks are silent but NOT wedged", () => {
+    // The counter-example to "a working agent emits tool events continuously": ONE `cargo build` or
+    // test-suite run sits between its PreToolUse and PostToolUse for minutes. Hooks are legitimately
+    // silent way past the window while the screen correctly reports working. Silence alone must not
+    // trigger a handback, or the watchdog fires on healthy sessions and re-opens the false-green /
+    // false-red class that hook authority exists to suppress. lastHook is "working" here — it AGREES
+    // with the screen, so there is no contradiction and nothing to un-wedge.
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working"); // PreToolUse: a 5-minute build starts
+    c.advance(HOOK_STALE_MS * 10);
+    r.fromScreen("working"); // still building; hooks silent but alive
+    r.fromScreen("waiting"); // a transient screen misread must STILL be suppressed by hooks
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working"]);
+  });
+
+  it("does NOT fire during a long thinking block with no tool calls", () => {
+    // The founder's own screenshot showed "22s · thinking" — a no-tool-hook interval. A longer one
+    // must not be read as death either: lastHook is "working" from UserPromptSubmit.
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working"); // UserPromptSubmit
+    c.advance(HOOK_STALE_MS + 1);
+    r.fromScreen("working");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working"]);
+  });
+
+  it("a live stream's repeated same-status events keep it fresh despite engine dedup", () => {
+    // HookStatusEngine dedups, so a run of PreToolUse/PostToolUse (all → working) reaches fromHook
+    // ONCE. activate() fires on every event, so it is what carries liveness — if lastHookAt were
+    // stamped only in fromHook, a busy stream would look silent and a later idle+working
+    // contradiction could hand authority away while hooks were demonstrably alive.
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("idle");
+    // Events keep arriving every 10s, but all map to a status the engine already emitted.
+    for (let i = 0; i < 5; i++) {
+      c.advance(10_000);
+      r.activate(); // real event arrived; no fromHook call (deduped by the engine)
+    }
+    r.fromScreen("working"); // only 10s since the last EVENT → stream is alive → hooks keep authority
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle"]);
+  });
+
+  it("does NOT fire for a legitimately idle agent", () => {
+    // Post-Stop, awaiting the user: hooks are silent, but the screen reports idle, not working.
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("idle");
+    c.advance(HOOK_STALE_MS + 1);
+    r.fromScreen("idle");
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle"]);
+  });
+
+  it("a real hook event re-activates hook authority after a handback", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("idle");
+    c.advance(HOOK_STALE_MS + 1);
+    r.fromScreen("working"); // handback → working
+    r.activate(); // hooks resume (AgentPane calls this on every event)
+    r.fromHook("idle"); // and they say idle
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle", "working", "idle"]);
+  });
+
+  it("mid_turn_death_is_not_recovered — KNOWN GAP, pinned deliberately", () => {
+    // Documents a limitation rather than asserting desired behavior. If the stream dies MID-turn,
+    // lastHook is frozen at "working", the idle/working contradiction never forms, and the watchdog
+    // cannot fire — so resolve() answers "working" for every screen report and the row pins GREEN
+    // until reset() (a re-prepare), even across a real on-screen prompt.
+    //
+    // Why it is pinned rather than fixed: the only available signal is silence, and silence cannot
+    // distinguish a dead stream from a legitimate long tool call (see the long-tool-call test
+    // above). Any threshold that catches this also misfires on slow builds, trading a false green
+    // for a false red on healthy sessions. The gap predates this watchdog — the pre-watchdog router
+    // behaved identically — so nothing regressed; it is simply not covered.
+    //
+    // If this is ever fixed, DELETE this test — do not "make it pass".
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working"); // turn is open; the emitter is clobbered right about here
+    c.advance(HOOK_STALE_MS * 100);
+    r.fromScreen("waiting"); // a REAL prompt is on screen and the user is blocked
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working"]); // ...but the row stays green
+  });
+
+  it("reset() clears the hook timestamp", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("idle");
+    r.reset();
+    c.advance(HOOK_STALE_MS + 1);
+    r.activate();
+    r.fromScreen("working"); // no lastHookAt → watchdog can't fire on a stale ghost
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["idle"]);
   });
 });

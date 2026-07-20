@@ -11,11 +11,23 @@ import {
   type RefObject,
 } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { FiAlertTriangle, FiDownloadCloud, FiChevronDown } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
-import { submitPrompt, writePty } from "../pty";
+import { submitPrompt, writePty, PtyGoneError } from "../pty";
 import { SuggestionRow, SUGGESTION_PILL_ZONE } from "./composer/SuggestionRow";
 import { suggestionRowVisible } from "./composer/suggestionVisibility";
 import { useSuggestions } from "../services/suggestions/useSuggestions";
+import { ApprovalNudge } from "./composer/ApprovalNudge";
+import {
+  useSyncProjectApprovals,
+  effectiveApprovalRule,
+} from "../services/suggestions/approvalsRuntime";
+import { classifyApproval } from "../services/suggestions/approvalClassifier";
+import {
+  approvalCategoryLabel,
+  type ApprovalCategory,
+} from "../services/suggestions/approvalCategories";
+import { aiFeatureNow } from "../services/aiGate";
 import { deriveContextTags } from "../services/suggestions/contextTags";
 import { getAgentScrollback } from "../services/terminalScrollback";
 import { useSuggestionStore } from "../stores/suggestionStore";
@@ -76,7 +88,17 @@ import {
   WAKE_SUFFIX,
   micHotPlaceholder,
   wakePlaceholder,
+  preparingPlaceholder,
+  PREPARING_PREFIX,
+  PREPARING_SUFFIX,
+  PAUSED_COMPOSER_PLACEHOLDER,
+  modelPercent,
+  voiceErrorNotice,
+  MICROPHONE_SETTINGS_URL,
+  type VoiceErrorNotice,
 } from "../voice/dictationCopy";
+import { deriveMicPresentation } from "../voice/micPresentation";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { log } from "../logger";
 import { ComposerMic } from "./MicButton";
 import { ComposerOutOfCreditsNotice } from "./OutOfCreditsNotice";
@@ -92,6 +114,94 @@ const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140)
  *  design feedback.) */
 function StopPhrase({ phrase = STOP_PHRASE }: { phrase?: string }) {
   return <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{phrase}</span>;
+}
+
+/** The one-time voice-model download, shown in the composer's placeholder slot. Deliberately quiet
+ *  (same muted placeholder voice as the wake-word copy it replaces) — this is a wait, not a
+ *  problem. The download-cloud glyph matches the mic's own preparing glyph, so the two surfaces
+ *  read as one state. `pct` is null when the backend reports no content-length. */
+function ComposerPreparingNotice({ pct }: { pct: number | null }) {
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+      <FiDownloadCloud size={14} className="sparkle-pulse" aria-hidden style={{ flexShrink: 0 }} />
+      <span>
+        {PREPARING_PREFIX}
+        {pct !== null ? (
+          <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}> ({pct}%)</span>
+        ) : (
+          "…"
+        )}
+        {PREPARING_SUFFIX}
+      </span>
+    </span>
+  );
+}
+
+/** A dictation failure, rendered in the composer's placeholder slot — beside the mic the user
+ *  actually clicked. Headline names what broke; detail names the remedy (or, for an unrecognized
+ *  error, carries the raw backend string so the cause stays discoverable). Amber + an alert glyph
+ *  make it legible without shouting; a heavier treatment (modal/banner) would be out of proportion
+ *  for a mic that can simply be turned back on. Dismiss clears dictationStore.error, which also
+ *  returns status to idle (see setError). */
+/** Shared style for the inline actions in the voice-error notice — matches RefillLink's treatment
+ *  in the out-of-credits notice (the sibling control in this same slot). `pointerEvents: auto` is
+ *  required: the placeholder overlay these render inside is pointerEvents:none. */
+const VOICE_ERROR_ACTION: React.CSSProperties = {
+  pointerEvents: "auto",
+  background: "transparent",
+  border: "none",
+  padding: 0,
+  margin: 0,
+  cursor: "pointer",
+  font: "inherit",
+  fontWeight: FONT_WEIGHT.bold,
+  color: C.teal,
+};
+
+function ComposerVoiceError({ notice }: { notice: VoiceErrorNotice }) {
+  return (
+    <span style={{ display: "inline-flex", alignItems: "flex-start", gap: 6, color: C.amber }}>
+      <FiAlertTriangle size={14} aria-hidden style={{ flexShrink: 0, marginTop: 2 }} />
+      <span>
+        <span style={{ fontWeight: FONT_WEIGHT.bold }}>{notice.headline}</span>{" "}
+        <span style={{ color: C.muted }}>{notice.detail}</span>{" "}
+        {/* The separating space belongs INSIDE this branch, with the button it separates: hanging
+            it off the ternary would also emit it when the branch renders null, double-spacing the
+            non-permission notices (roborev 37737). */}
+        {notice.kind === "permission" ? (
+          // Only `permission` earns this: it is the one bucket whose remedy lives in a specific
+          // System Settings pane we can deep-link to, and macOS will never re-prompt, so telling
+          // the user to "turn the mic back on" alone would loop them straight back here. Reading a
+          // path out of a sentence and then hunting for it in System Settings is the step users
+          // actually drop out on; one click removes it. (A NotDetermined user never sees this —
+          // the backend prompts them instead. See mic_permission.rs's `decide`.)
+          <>
+            <button
+              type="button"
+              onClick={() => {
+                void openUrl(MICROPHONE_SETTINGS_URL).catch((e) =>
+                  // The pane failing to open must not also swallow the notice — the detail line
+                  // still spells out the path, so the user keeps a way through.
+                  console.warn("voice: open microphone settings failed", e),
+                );
+              }}
+              style={VOICE_ERROR_ACTION}
+            >
+              Open System Settings
+            </button>{" "}
+          </>
+        ) : null}
+        <button
+          type="button"
+          aria-label="Dismiss voice error"
+          onClick={() => useDictationStore.getState().setError(null)}
+          style={VOICE_ERROR_ACTION}
+        >
+          Dismiss
+        </button>
+      </span>
+    </span>
+  );
 }
 
 /** Simple camera glyph for the screen-capture button. Inherits color via currentColor. */
@@ -147,6 +257,8 @@ export function Composer({
   onSubmitPrompt,
   onArrowOverflow,
   onEnterOverflow,
+  hiddenBelow = 0,
+  onRestartAgent,
 }: {
   agentId: string;
   // Only the visible pane's composer reacts to native file drops (panes stay mounted).
@@ -173,6 +285,14 @@ export function Composer({
   // focus + a carriage return to the terminal to confirm whatever's highlighted there (e.g. the
   // menu option the user just arrowed to). Omit to keep Enter purely a (no-op) send.
   onEnterOverflow?: () => void;
+  // How many terminal rows this overlay is hiding that it ISN'T meant to cover (the input line it
+  // deliberately sits over never counts). Drives the reveal chip on the grab handle so hidden
+  // output is never silent. 0 = nothing to surface. See engine/composerOcclusion.ts.
+  hiddenBelow?: number;
+  // Called when a send lands on a PTY that has already exited: the agent needs respawning before
+  // anything can be delivered. The prompt is re-queued here first, so the parent only has to
+  // restart — the existing preparing→ready flush effect delivers it on the new PTY.
+  onRestartAgent?: () => void;
 }) {
   const [value, setValue] = useState("");
   // A prompt the user sent BEFORE the agent's PTY was ready (composed during `preparing`). Held
@@ -186,18 +306,21 @@ export function Composer({
   } | null>(null);
   // True while a native file (e.g. a log) is dragged over the window — drives the drop hint.
   const [dropActive, setDropActive] = useState(false);
-  // While focused, the placeholder switches from the "Hey Sparkle" voice prompt to a typing hint.
-  const [focused, setFocused] = useState(false);
+  // Inline status for a send that did NOT land (dead agent being restarted, or an outright
+  // failure). Non-null renders a live region above the box, so a dropped prompt is never silent.
+  // Cleared by the next successful delivery.
+  const [deliveryNotice, setDeliveryNotice] = useState<string | null>(null);
   // Mic hot ("audio is active") → the placeholder drops the wake-word prompt and invites the
   // user to just start talking, since Sparkle is already listening. Gate on the ACTUAL capture
   // state (status === "listening"), not the armed/mute intent (`enabled`): `enabled` stays true
   // while capture is focus-paused, so keying off it falsely claims "I'm listening" when nothing
-  // is being captured. When armed but not actually listening we fall back to the wake-word copy.
+  // is being captured. When armed but not actually listening we show the honest "Listening paused"
+  // copy (deriveMicPresentation === "focusPaused"), the same state the sidebar caption shows.
   const audioActive = useDictationStore((s) => s.status === "listening");
   // Master mute: `enabled` false means the mic is OFF (ambient listening is opt-in). When the mic
   // is off the composer must make NO voice promise at all — no "Just say Hey Sparkle", no typing
   // hint that references speaking — so the placeholder goes fully blank. Distinct from `enabled`
-  // true + idle status (armed but focus-paused), which still shows the honest wake-word copy.
+  // true + idle status (armed but focus-paused), which shows the honest "Listening paused" copy.
   const micEnabled = useDictationStore((s) => s.enabled);
   // Capture being live is NOT the same as actively dictating. Split the mic-hot copy by PHASE so
   // the composer tells the truth: only the "active" phase (wake word heard) gets the "I'm
@@ -205,12 +328,37 @@ export function Composer({
   // gets the wake-word copy that mirrors the sidebar. Bug fixed: previously ANY live capture
   // showed the active copy, so a passive (wake-word) session falsely read as "I'm listening".
   const phase = useDictationStore((s) => s.phase);
-  const liveActive = audioActive && phase === "active";
-  const livePassive = audioActive && phase === "passive";
+  // The one-time voice-model download (non-null ONLY while it's in flight — a warm install never
+  // emits it). Without this the composer had no idea the download existed: `status` is set to
+  // "listening" optimistically BEFORE start_dictation, which on a first run blocks for MINUTES, so
+  // every one of those minutes rendered the passive wake-word copy and invited the user to say
+  // "Hey Sparkle" at a model that wasn't on disk yet. `preparing` outranks BOTH live states below
+  // for the same reason: no model means no dictation, whatever phase the user has selected.
+  const modelProgress = useDictationStore((s) => s.modelProgress);
+  // The raw backend failure. Previously written to the store and read by exactly one 10px caption
+  // under the sidebar logo — a different region of the screen from the mic that was clicked — so a
+  // composer-mic user never saw why voice died. voiceErrorNotice maps it to an honest headline +
+  // remedy (and, for anything unrecognized, the raw string rather than a guess).
+  const voiceError = useDictationStore((s) => s.error);
+  const errorNotice = useMemo(() => voiceErrorNotice(voiceError), [voiceError]);
   // Shared out-of-credits notice: set when the user tries to arm the mic with an empty balance
   // (the arm is refused). When true it replaces the normal mic placeholder here and shows in the
   // top-left bar at the same time. Auto-clears after 5s (dictationStore).
   const outOfCreditsNotice = useDictationStore((s) => s.outOfCreditsNotice);
+  // THE voice-state decision, shared with the sidebar mic (deriveMicPresentation). Both the styled
+  // overlay AND the native placeholder below switch on this, and so does LogoWaveform's caption — so
+  // the composer mic can never disagree with the top-left mic about which state we're in. Each
+  // surface still supplies its own words; only the STATE is shared. `errorNotice != null` is this
+  // surface's `hasError`; the (idle vs error) distinction in the raw status is irrelevant here since
+  // a real error is already handled by hasError, so `audioActive` (status === "listening") suffices.
+  const micPresentation = deriveMicPresentation({
+    enabled: micEnabled,
+    status: audioActive ? "listening" : "idle",
+    phase,
+    modelProgress,
+    hasError: errorNotice !== null,
+    outOfCreditsNotice,
+  });
   // Configured wake/stop words so every dictation hint reflects a user's remap (default words
   // reproduce the original copy exactly).
   const wakeWord = useSettingsStore((s) => s.wakeWord);
@@ -296,7 +444,10 @@ export function Composer({
         caret = before.length + lead.length + text.length;
         return `${before}${inserted}${after}`;
       });
-      setMinimized(false); // dictated text lands in the box — make sure it's visible
+      // Do NOT force the composer open here. A composer the user minimized stays minimized during
+      // dictation (their explicit choice); the transcribed text still lands in the box and is there
+      // when they reopen it. (Reopening on every transcript is what made the toggle feel
+      // mic-dependent — see the terminal gesture-reclaim design, 2026-07-10.)
       inputRef?.current?.focus();
       // Selection must be set after React commits the new value, or it snaps back. Mirror the
       // exact rAF pattern acceptGhost uses (and re-sync the ghost mirror's scrollTop, since moving
@@ -335,7 +486,18 @@ export function Composer({
     buttons: suggestionButtons,
     dismiss: dismissSuggestion,
     clear: clearSuggestions,
+    autoApproved,
   } = useSuggestions(agentId, composerEmptyNow);
+  // The project that owns this agent — used to write "this project" auto-approve rules and to read
+  // the effective rule. useSyncProjectApprovals keeps the per-project effective cache fresh.
+  const approvalProjectRoot = useProjectStore(
+    (s) => s.projects.find((p) => p.agents.some((a) => a.id === agentId))?.rootPath ?? null,
+  );
+  useSyncProjectApprovals(approvalProjectRoot);
+  const openSettings = useUiStore((s) => s.openSettings);
+  // The auto-approve nudge shown after the user clicks an approve answer on a classifiable, not-yet-
+  // remembered permission prompt (spec §4). Null when no nudge is pending.
+  const [approvalNudge, setApprovalNudge] = useState<ApprovalCategory | null>(null);
   const [capturing, setCapturing] = useState(false);
   const height = useUiStore((s) => s.composerHeight);
   const setComposerHeight = useUiStore((s) => s.setComposerHeight);
@@ -715,21 +877,96 @@ export function Composer({
   const isComposerEmpty = () =>
     !value.trim() && attachments.length === 0 && textBlocks.length === 0;
 
+  // Park a prompt in the pending queue, merging with anything already queued (newest appended) so
+  // nothing is lost when several sends stack up before the PTY is ready. Shared by the cold-start
+  // path (`preparing`) and the dead-PTY restart path, so the two can never merge differently.
+  const queuePendingSend = (next: {
+    typed: string;
+    atts: Attachment[];
+    blocks: TextBlock[];
+    text: string;
+  }) => {
+    const prev = pendingSendRef.current;
+    pendingSendRef.current = prev
+      ? {
+          typed: `${prev.typed}\n${next.typed}`,
+          atts: [...prev.atts, ...next.atts],
+          blocks: [...prev.blocks, ...next.blocks],
+          text: `${prev.text}\n${next.text}`.trim(),
+        }
+      : next;
+  };
+
+  // Put an undelivered draft back in the box. Prepended (not assigned) so anything the user has
+  // typed since the failed send survives too.
+  const restoreDraft = (typed: string, atts: Attachment[], blocks: TextBlock[]) => {
+    setValue((cur) => (cur.trim() ? `${typed}\n${cur}` : typed));
+    setAttachments((cur) => [...atts, ...cur]);
+    setTextBlocks((cur) => [...blocks, ...cur]);
+  };
+
   // Shared delivery for both typed sends and prompt-kind suggestion clicks, so the trial/delivery
   // bookkeeping (payload/display build → parent callback → PTY → ghost-history → trial meter) can
   // never drift between the two paths. `typed` is the raw (untrimmed) text; naming/history use the
   // trimmed form. Callers are responsible for the trial-cap gate + clearing the box.
-  const deliverPrompt = async (typed: string, atts: Attachment[], blocks: TextBlock[]) => {
+  //
+  // `allowRestart` is what stops the dead-PTY self-heal from looping. It is a property of THIS
+  // call, not of the component: every fresh user action (typed send, prompt-suggestion click) may
+  // restart the agent once, and the automatic flush retry that follows may not — so if the
+  // respawned PTY is dead too, that retry gives up honestly instead of restarting again. Deciding
+  // it per call rather than via a shared latch means there is no cross-call state to go stale or
+  // to race between a user send and an in-flight retry.
+  const deliverPrompt = async (
+    typed: string,
+    atts: Attachment[],
+    blocks: TextBlock[],
+    { allowRestart = true }: { allowRestart?: boolean } = {},
+  ) => {
     const payload = buildSendPayload({ attachments: atts, textBlocks: blocks, typed });
     const display = buildDisplay({ attachments: atts, textBlocks: blocks, typed });
     const naming = typed.trim();
+    // Deliver FIRST, and only record history once the prompt has actually landed. Recording up
+    // front is what let a dead agent swallow prompts while the breadcrumb bar showed them as sent
+    // — the user saw their prompt in the history and the agent never received it.
+    try {
+      await submitPrompt(agentId, payload);
+    } catch (e) {
+      if (e instanceof PtyGoneError && allowRestart) {
+        // The agent's PTY has exited. Hold the prompt in the same queue used for a cold start and
+        // ask the parent to respawn: the preparing→ready flush effect delivers it on the new PTY,
+        // so "send to a stopped agent" just works instead of vanishing.
+        //
+        queuePendingSend({ typed, atts, blocks, text: naming });
+        log.warn("composer", "send hit a dead PTY — restarting agent and re-queueing", {
+          agentId,
+          chars: naming.length,
+        });
+        setDeliveryNotice("That agent had stopped. Restarting it and sending your prompt…");
+        onRestartAgent?.();
+      } else if (e instanceof PtyGoneError) {
+        // The restart didn't take (this is the retry). Stop, and hand the text back — the user is
+        // told the truth instead of watching a queue nobody will drain.
+        restoreDraft(typed, atts, blocks);
+        log.error("composer", "send hit a dead PTY again after restart — giving up", { agentId });
+        setDeliveryNotice("Couldn't reach that agent, even after restarting it. Your text is back in the box.");
+      } else {
+        // Unknown failure: hand the text back rather than swallowing it.
+        restoreDraft(typed, atts, blocks);
+        log.error("composer", "send failed — draft restored", {
+          agentId,
+          error: String((e as { message?: string })?.message ?? e),
+        });
+        setDeliveryNotice("Couldn't send that prompt — your text is back in the box.");
+      }
+      return;
+    }
+    setDeliveryNotice(null);
     // Remember the typed text (not the attachment-annotated display) so it can be offered as a
     // ghost-text suggestion next time — clicked prompts feed this exactly like typed ones.
     if (naming) recordPrompt(naming);
     // Pass the typed text as the naming basis, separate from the marker-decorated `display`.
     // Attachments-only sends carry an empty basis, so auto-naming is skipped.
     onSubmitPrompt(display, naming);
-    await submitPrompt(agentId, payload);
     // Consume a trial prompt only now that it's actually delivered (no-op for entitled users).
     void recordTrialSend();
     // "Pause listening on submit" (default): if actively dictating, drop back to passive wake-word
@@ -760,15 +997,7 @@ export function Composer({
     // any already queued so nothing is lost) and let the flush effect deliver it the instant the PTY
     // is ready — so the user could compose immediately instead of waiting on the workspace spin-up.
     if (preparing) {
-      const prev = pendingSendRef.current;
-      pendingSendRef.current = prev
-        ? {
-            typed: `${prev.typed}\n${typed}`,
-            atts: [...prev.atts, ...atts],
-            blocks: [...prev.blocks, ...blocks],
-            text: `${prev.text}\n${text}`.trim(),
-          }
-        : { typed, atts, blocks, text };
+      queuePendingSend({ typed, atts, blocks, text });
       log.info("composer", "queue prompt (agent starting)", {
         agentId,
         chars: text.length,
@@ -812,7 +1041,9 @@ export function Composer({
       attachments: queued.atts.length,
       textBlocks: queued.blocks.length,
     });
-    void deliverPrompt(queued.typed, queued.atts, queued.blocks);
+    // allowRestart:false — this IS the post-restart retry. If the respawned PTY is dead too, give
+    // up and hand the text back rather than restarting again (and again).
+    void deliverPrompt(queued.typed, queued.atts, queued.blocks, { allowRestart: false });
     // deliverPrompt is a fresh closure each render but reads only its args + stable refs; re-running
     // this on its identity would risk a double-flush, so key it solely on the preparing transition.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -836,7 +1067,32 @@ export function Composer({
       // Terminal-kind buttons come ONLY from the local heuristic detector and carry a bare control
       // keystroke (y/n, a menu digit) — interactive terminal input, not a metered "send". So they
       // intentionally bypass the trial-cap gate, exactly like typing into the terminal directly.
+      //
+      // Auto-approve nudge (spec §4): if the clicked button was the plain "Yes" on a classifiable
+      // permission prompt, the feature is on, and the category has no rule yet, offer to remember it.
+      // Read BEFORE writePty moves the terminal on. v1 fires only on the pill click (typed answers
+      // are a documented follow-up).
+      const classification = classifyApproval(getAgentScrollback(agentId) ?? "");
+      if (
+        classification &&
+        b.value === classification.approveOption &&
+        aiFeatureNow("autoApprove") &&
+        effectiveApprovalRule(approvalProjectRoot, classification.category) === undefined
+      ) {
+        setApprovalNudge(classification.category);
+      }
       await writePty(agentId, b.value);
+      // Record the answer as a "picker" prompt turn (additive to the PTY write, never a
+      // replacement). It's not a metered send and stays out of every DISPLAY surface (composerPrompts
+      // filters it), but it advances promptHistory.length — the promptCount the naming ladder reads
+      // (agentNaming: deferred_first_turn on promptCount < 2). Without it a picker-driven build agent
+      // sits at promptCount 1 forever and is never named. Store the human-readable LABEL, not the
+      // bare "1\n" keystroke. No-op if the agent's project has been unloaded (project switch
+      // mid-click) — appendPrompt maps over the matching project only, so a stale id changes nothing.
+      const projectId = useProjectStore
+        .getState()
+        .projects.find((p) => p.agents.some((a) => a.id === agentId))?.id;
+      if (projectId) useProjectStore.getState().appendPrompt(projectId, agentId, b.label, "picker");
     } else {
       if (!trialSendAllowed()) return;
       await deliverPrompt(b.value, [], []);
@@ -1056,6 +1312,55 @@ export function Composer({
         borderTop: minimized ? "none" : `1px solid ${C.barSurface}`,
       }}
     >
+      {/* Auto-approve nudge / confirmation toast + the "Auto-approved · Manage" note. Floated as an
+          absolute overlay ABOVE the composer (bottom:100%) so it never disturbs the height math. The
+          nudge takes precedence (a fresh pill click); otherwise the subtle auto-answered note shows. */}
+      {(approvalNudge || autoApproved) && (
+        <div style={{ position: "absolute", left: 10, right: 10, bottom: "calc(100% + 6px)", zIndex: 6 }}>
+          {approvalNudge ? (
+            <ApprovalNudge
+              category={approvalNudge}
+              projectRoot={approvalProjectRoot}
+              onDismiss={() => setApprovalNudge(null)}
+              onOpenOptions={() => openSettings("approvals")}
+            />
+          ) : autoApproved ? (
+            <div
+              role="status"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                padding: "4px 10px",
+                fontSize: 12,
+                color: C.muted,
+                fontFamily: '"IBM Plex Sans", sans-serif',
+              }}
+            >
+              <span>
+                Auto-approved {approvalCategoryLabel(autoApproved)}
+              </span>
+              <button
+                type="button"
+                onClick={() => openSettings("approvals")}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: C.accentInk,
+                  cursor: "pointer",
+                  fontSize: 12,
+                  fontFamily: '"IBM Plex Sans", sans-serif',
+                  textDecoration: "underline",
+                  padding: 0,
+                }}
+              >
+                Manage
+              </button>
+            </div>
+          ) : null}
+        </div>
+      )}
+
       {/* Persistent grab handle: open → thin pill (drag up taller, down to minimize); minimized
           → a little gradient pull tab (click or drag up to bring the message box back). ⌘J also toggles. */}
       <div
@@ -1107,6 +1412,41 @@ export function Composer({
             <span style={{ fontSize: 10 }}>▴</span>
             <span>Use the modern prompt box with voice</span>
           </div>
+        ) : hiddenBelow > 0 ? (
+          // Reveal chip: the composer is covering terminal output that isn't the input line it's
+          // meant to sit over. Without this, hidden output is completely silent — the user has no
+          // way to know a menu or message is behind the box. Clicking tucks the composer away.
+          // (An actionable prompt normally auto-minimizes before this shows; the chip is the
+          // backstop for everything auto-yield deliberately stays its hand on.)
+          <button
+            type="button"
+            // The handle owns a pointer-drag gesture; stop the press from starting a drag so a
+            // click here reads as "reveal", not a 0px resize.
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => setMinimized(true)}
+            title="The prompt box is covering terminal output — click to tuck it away (⌘J)"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+              padding: "1px 10px",
+              borderRadius: 999,
+              border: "none",
+              background: C.accent,
+              color: ON_BRAND_FILL,
+              fontFamily: '"IBM Plex Sans", sans-serif',
+              fontWeight: FONT_WEIGHT.semibold,
+              fontSize: 11,
+              lineHeight: 1.4,
+              whiteSpace: "nowrap",
+              cursor: "pointer",
+            }}
+          >
+            <FiChevronDown size={12} aria-hidden />
+            <span>
+              {hiddenBelow} {hiddenBelow === 1 ? "line" : "lines"} hidden below
+            </span>
+          </button>
         ) : (
           <div style={{ width: 36, height: 3, borderRadius: 2, background: C.muted, opacity: 0.6 }} />
         )}
@@ -1119,6 +1459,27 @@ export function Composer({
             when the box grows. Hidden entirely when the mic is off. */}
         <ComposerMic />
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 6, position: "relative" }}>
+          {/* A send that didn't land says so here. Silence was the bug: the prompt used to go
+              into the history bar and nowhere else. */}
+          {deliveryNotice && (
+            <div
+              role="status"
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 6,
+                // Amber + alert glyph, matching ComposerVoiceError — the sibling inline notice in
+                // this same box, so the two read as one treatment.
+                color: C.amber,
+                fontFamily: '"IBM Plex Sans", sans-serif',
+                fontSize: 12,
+                lineHeight: 1.3,
+              }}
+            >
+              <FiAlertTriangle size={13} aria-hidden style={{ flexShrink: 0, marginTop: 2 }} />
+              <span>{deliveryNotice}</span>
+            </div>
+          )}
           <AttachmentRow
             textBlocks={textBlocks}
             attachments={attachments}
@@ -1187,10 +1548,6 @@ export function Composer({
               onScroll={(e) => {
                 if (ghostRef.current) ghostRef.current.scrollTop = e.currentTarget.scrollTop;
               }}
-              // Swap to the typing hint on a real click, not on the mount auto-focus (which would
-              // otherwise hide the "Hey Sparkle" voice prompt before the user ever interacts).
-              onMouseDown={() => setFocused(true)}
-              onBlur={() => setFocused(false)}
               disabled={disabled}
               placeholder={
                 outOfCreditsNotice
@@ -1203,12 +1560,24 @@ export function Composer({
                   ? "" // the live dictation preview occupies the slot — no placeholder
                   : showRichPlaceholder
                   ? "" // the styled overlay below renders this state's placeholder
-                  : liveActive
+                  : // Everything from here down is the showRichPlaceholder === FALSE fallback (e.g.
+                  // an attachment is staged). In the common empty-composer case the overlay and the
+                  // role="status" error block below own these two states — which is also the a11y
+                  // contract: the error must be announced ONCE, so it must not be both a native
+                  // placeholder and a live region at the same time. Keep these branches after the
+                  // showRichPlaceholder one.
+                  // Voice-state fallback: the SAME micPresentation the styled overlay and the
+                  // sidebar caption use, so this native placeholder can't drift from either.
+                  micPresentation === "error" && errorNotice
+                  ? `${errorNotice.headline} ${errorNotice.detail}`
+                  : micPresentation === "preparing"
+                  ? preparingPlaceholder(modelPercent(modelProgress))
+                  : micPresentation === "activeListening"
                   ? micHotPlaceholder(stopWord)
-                  : livePassive
+                  : micPresentation === "passiveWaiting"
                   ? wakePlaceholder(wakeWord)
-                  : micEnabled
-                  ? `Just say ${wakeWord} and I'll start listening as you talk.`
+                  : micPresentation === "focusPaused"
+                  ? PAUSED_COMPOSER_PLACEHOLDER // armed but not capturing — honest, mirrors the sidebar
                   : "" // mic off (master mute) — no voice prompt at all
               }
               spellCheck={false}
@@ -1257,6 +1626,36 @@ export function Composer({
               onDismiss={dismissSuggestion}
             />
           </div>
+          {showRichPlaceholder && errorNotice && (
+            // Voice died — say so HERE, beside the mic the user actually clicked. (It used to be
+            // reported ONLY under the sidebar logo, in the smallest type in the app, as a single
+            // hardcoded "check Privacy → Microphone" sentence that was wrong for most failures.)
+            //
+            // Deliberately a SIBLING of the placeholder overlay below rather than a branch inside
+            // it: that overlay is aria-hidden (the native placeholder is what gets announced), and
+            // aria-hidden hides its whole subtree with no way for a descendant to opt back in — so
+            // a Dismiss button living in there would be invisible to a screen reader. This block is
+            // role="status" instead, so the failure is both seen AND announced. It occupies the same
+            // slot on the same terms (empty, enabled composer), so the two can never both paint.
+            <div
+              role="status"
+              style={{
+                position: "absolute",
+                zIndex: 2,
+                top: 9,
+                left: 11,
+                right: suggestionButtons.length > 0 ? SUGGESTION_PILL_ZONE : 11,
+                // Click-through like the placeholder overlay it stands in for, so the textarea
+                // underneath still focuses on click; Dismiss re-enables pointer events on itself.
+                pointerEvents: "none",
+                fontFamily: '"IBM Plex Sans", sans-serif',
+                fontSize: 14,
+                lineHeight: 1.4,
+              }}
+            >
+              <ComposerVoiceError notice={errorNotice} />
+            </div>
+          )}
           {showRichPlaceholder && (
             // Styled stand-in for the native placeholder so "Hey Sparkle" can be bold + blue.
             // Aligned to the textarea's first text line (1px border + 8px/10px padding) and
@@ -1287,21 +1686,29 @@ export function Composer({
                 lineHeight: 1.4,
               }}
             >
-              {outOfCreditsNotice ? (
+              {micPresentation === "outOfCredits" ? (
                 // Out of credits: an arm attempt was refused. Replace the mic placeholder with the
                 // credits notice (the "Refill" link re-enables pointer events on itself so it stays
                 // clickable inside this pointerEvents:none overlay).
                 <ComposerOutOfCreditsNotice />
-              ) : liveActive ? (
+              ) : micPresentation === "error" ? (
+                // The voice error paints in this slot too, but it is rendered by its own SIBLING
+                // block below rather than here — this overlay is aria-hidden, and its Dismiss
+                // control has to stay reachable. Render nothing here so the two can't double up.
+                null
+              ) : micPresentation === "preparing" ? (
+                // The one-time model download. Honest + quiet: it names the wait, shows progress
+                // when the backend gives a total, and points at the box the user can still type in.
+                <ComposerPreparingNotice pct={modelPercent(modelProgress)} />
+              ) : micPresentation === "activeListening" ? (
                 // The mic-hot copy intentionally subsumes the typing hint ("…or start typing
-                // here instead"), so it stays put on focus rather than swapping to the muted
-                // focused hint below — that hint remains live only when the mic is muted.
+                // here instead"), so it stays put on focus rather than swapping to a muted hint.
                 <>
                   {MIC_HOT_PREFIX}
                   <StopPhrase phrase={stopWord} />
                   {MIC_HOT_SUFFIX}
                 </>
-              ) : livePassive ? (
+              ) : micPresentation === "passiveWaiting" ? (
                 // Capturing but waiting for the wake word: tell the truth (not "I'm listening").
                 // Mirrors the sidebar caption; the "(or you can type here instead)" tail subsumes
                 // the typing hint, so like the mic-hot copy it stays put on focus.
@@ -1310,19 +1717,13 @@ export function Composer({
                   <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{wakeWord}</span>
                   {WAKE_SUFFIX}
                 </>
-              ) : !micEnabled ? (
-                // Mic is off (master mute): the composer makes no voice promise, so it shows no
-                // placeholder at all — neither the wake-word prompt nor the speaking-focused hint.
-                null
-              ) : focused ? (
-                "…or type your command here (speaking is 3x faster)"
-              ) : (
-                <>
-                  Just say{" "}
-                  <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{wakeWord}</span>{" "}
-                  and I&apos;ll start listening as you talk.
-                </>
-              )}
+              ) : micPresentation === "focusPaused" ? (
+                // Armed but NOT capturing (window unfocused/muted, or capture not started yet). The
+                // mic can't hear anything, so — exactly like the sidebar's "Listening paused" caption
+                // — say so instead of inviting the wake word. The copy already says "you can type
+                // here", so it also subsumes the old focused-only typing hint.
+                PAUSED_COMPOSER_PLACEHOLDER
+              ) : null /* micPresentation === "off": master mute — no voice promise at all */}
             </div>
           )}
         </div>

@@ -81,6 +81,134 @@ export function startCardSetup(): Promise<boolean> {
   return startCheckout("card_setup", null);
 }
 
+// ── Checkout failure diagnosis ──────────────────────────────────────────────────────────────
+// A failed credit purchase must diagnose itself instead of collapsing to one "try again". The Rust
+// `desktop_topup_checkout` command hands us a machine-readable error (a compact JSON string —
+// `{class, status, code}` — see auth.rs `checkout_error`); we turn it into a user-appropriate
+// guidance object. Everything below is PURE and unit-tested, and it DEGRADES GRACEFULLY: a sibling
+// worker is reshaping the server error body, so we key off `class`+`status` and never hard-depend on
+// the `code` string, and we fall back to string heuristics when the error isn't our structured JSON.
+
+/** Coarse failure buckets, each mapping to a distinct recovery path. */
+export type CheckoutErrorClass =
+  | "not_signed_in" // session/token gone → route to sign-in
+  | "offline" //        transport failure → tell them, let them retry
+  | "config" //         our-side problem (Stripe/permission/5xx) → retry won't help, point to support
+  | "generic"; //       anything else → a plain retry
+
+/** What the Credits pane should render for a failed checkout. */
+export interface CheckoutGuidance {
+  cls: CheckoutErrorClass;
+  /** The message to show the user. Never contains raw Stripe/internal text. */
+  message: string;
+  /** Surface the "Contact support" affordance — true only for the our-side `config` class. */
+  showSupport: boolean;
+  /** This is fixed by (re-)authenticating, not retrying — offer a sign-in path. */
+  needsSignIn: boolean;
+}
+
+/** Shape of the structured error the Rust command emits in its `Err` channel. */
+interface RawCheckoutError {
+  class?: string;
+  status?: number | null;
+  code?: string | null;
+}
+
+/** Best-effort parse of the Rust error into its structured form; null if it isn't our JSON. */
+function parseRawError(raw: unknown): RawCheckoutError | null {
+  if (raw && typeof raw === "object" && "class" in raw) return raw as RawCheckoutError;
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (!s.startsWith("{")) return null;
+  try {
+    const v = JSON.parse(s);
+    return v && typeof v === "object" ? (v as RawCheckoutError) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The error's string form, for the heuristic fallback (Error message, raw string, or JSON dump). */
+function rawErrorText(raw: unknown): string {
+  if (typeof raw === "string") return raw;
+  if (raw instanceof Error) return raw.message;
+  try {
+    return String(raw);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Classify a failed `desktop_topup_checkout` into a recovery bucket. Prefers the structured
+ * `{class, status}` from Rust; when the body is opaque (an evolving/failed server contract, or a
+ * plain string like "bad_pack") it degrades to conservative string heuristics.
+ */
+export function classifyCheckoutError(raw: unknown): CheckoutErrorClass {
+  const parsed = parseRawError(raw);
+  if (parsed?.class) {
+    if (parsed.class === "not_signed_in") return "not_signed_in";
+    if (parsed.class === "offline") return "offline";
+    if (parsed.class === "server") {
+      const status = typeof parsed.status === "number" ? parsed.status : undefined;
+      // 401 = token rejected → re-auth. 403 (the prod restricted-key StripePermissionError) and any
+      // 5xx are our-side config/outage problems. A missing status (e.g. 2xx-with-no-URL) is also our
+      // contract break. Benign 4xx (bad_pack, 404, 409) fall through to a plain retry.
+      if (status === 401) return "not_signed_in";
+      if (status === undefined || status === 403 || status >= 500) return "config";
+      return "generic";
+    }
+  }
+
+  // Heuristic fallback for an opaque error (never trust it over the structured signal above).
+  const text = rawErrorText(raw).toLowerCase();
+  if (/not signed in|unauthorized|no token|sign in|401/.test(text)) return "not_signed_in";
+  if (/offline|network|timed out|timeout|dns|connect|unreachable|transport/.test(text))
+    return "offline";
+  if (/permission|forbidden|stripe|misconfig|config|\b403\b|\b5\d\d\b|server error/.test(text))
+    return "config";
+  return "generic";
+}
+
+/** Turn a failed checkout into the exact guidance the Credits pane renders. Pure + unit-tested. */
+export function checkoutGuidance(raw: unknown): CheckoutGuidance {
+  const cls = classifyCheckoutError(raw);
+  switch (cls) {
+    case "not_signed_in":
+      return {
+        cls,
+        message: "Your session has expired. Sign in again to buy credits.",
+        showSupport: false,
+        needsSignIn: true,
+      };
+    case "offline":
+      return {
+        cls,
+        message: "You appear to be offline. Check your connection and try again.",
+        showSupport: false,
+        needsSignIn: false,
+      };
+    case "config":
+      return {
+        cls,
+        message:
+          "Payments are temporarily unavailable — this is a problem on Sparkle's side, not yours. " +
+          "Retrying won't help right now. Please contact support and we'll get it fixed.",
+        showSupport: true,
+        needsSignIn: false,
+      };
+    case "generic":
+    default:
+      return {
+        cls: "generic",
+        // Kept verbatim so the existing "server refuses the checkout" copy stays stable.
+        message: "Couldn't start checkout — try again.",
+        showSupport: false,
+        needsSignIn: false,
+      };
+  }
+}
+
 /** One page of the credit ledger (newest first). Omit `cursor` for the first page. */
 export function fetchHistory(cursor?: string): Promise<{ entries: LedgerEntry[]; nextCursor?: string }> {
   return invoke<{ entries: LedgerEntry[]; nextCursor?: string }>("desktop_credit_history", {

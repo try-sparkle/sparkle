@@ -8,6 +8,16 @@ import { flushProjectsPersist, useProjectStore } from "../stores/projectStore";
 
 export type OpenMode = "replace" | "new";
 
+/** Optional LOGICAL-pixel geometry for a newly created window. Used by session restore to reopen a
+ *  window where the user left it (); omitted for a normal "open in new window", which
+ *  takes the default size/position. */
+export interface WindowGeometry {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 /** Prefix for runtime-created (secondary) window labels. MUST stay covered by a glob in
  *  src-tauri/capabilities/default.json's `windows` list — a window whose label matches no
  *  capability gets ZERO permissions in Tauri v2, so invoke()/listen() silently fail (mic +
@@ -31,8 +41,9 @@ export interface ProjectWindowDeps {
   getByLabel(label: string): Promise<FocusableWindow | null>;
   /** Create a fresh window for the project. Owns generating the window's opaque label and
    *  registering it (labels are decoupled from project ids — see projectWindows.url). When
-   *  `agentId` is given, the new window deep-links to that agent on mount. */
-  createWindow(projectId: string, agentId?: string): void;
+   *  `agentId` is given, the new window deep-links to that agent on mount. When `geometry` is given
+   *  (session restore), the window opens at that logical size/position instead of the default. */
+  createWindow(projectId: string, agentId?: string, geometry?: WindowGeometry): void;
   currentLabel(): string;
   registry: {
     find(projectId: string): string | null;
@@ -89,6 +100,54 @@ export async function openProjectInWindow(
   return "replaced";
 }
 
+/** Create a fresh project window (real Tauri path). Owns generating the opaque label + registering
+ *  it, flushing the projects blob so the child hydrates synchronously, and titling the window. Used
+ *  by both the normal "open in new window" flow (defaultDeps) and session restore, which passes
+ *  `geometry` to reopen where the user left it and `suppressFocus` for every window except the one
+ *  it will explicitly focus. */
+export function createProjectWindow(
+  projectId: string,
+  agentId?: string,
+  geometry?: WindowGeometry,
+  suppressFocus = false,
+): void {
+  // Opaque, collision-proof label (decoupled from the project id). Register it before/with
+  // creation so a concurrent open finds it; on a creation failure ('tauri://error') evict the
+  // entry so a later open doesn't focus a window that never came up.
+  const label = `${WINDOW_LABEL_PREFIX}${crypto.randomUUID()}`;
+  setWindowProject(label, projectId);
+  // Flush the debounced projects blob to real localStorage BEFORE the child boots, so its
+  // zustand `persist` hydration reads a snapshot that already contains this just-created project
+  // and resolves synchronously — otherwise the child can hydrate a stale blob and briefly (or,
+  // pre-recovery-effect, permanently) show "No project open" under its project-named title.
+  flushProjectsPersist();
+  // Title the window after its project so the macOS Window menu is navigable with several
+  // windows open. Workspace keeps the title in sync after mount (rename/Replace); this just
+  // avoids a "Sparkle" flash before that effect runs.
+  const projectName = useProjectStore.getState().projects.find((p) => p.id === projectId)?.name;
+  const win = new WebviewWindow(label, {
+    url: projectWindowUrl(projectId, label, agentId, suppressFocus),
+    title: windowTitleFor(projectName),
+    // Session restore supplies logical geometry so the window reopens where the user left it
+    // (WebviewWindow options are logical pixels); otherwise fall back to the default size. The
+    // position is only set when restoring — a default-opened window centers via the OS.
+    width: geometry?.width ?? 1200,
+    height: geometry?.height ?? 800,
+    ...(geometry ? { x: geometry.x, y: geometry.y } : {}),
+    minWidth: 900,
+    minHeight: 600,
+  });
+  win
+    .once("tauri://error", (e) => {
+      console.error("Failed to create project window", label, e.payload);
+      clearWindowProject(label);
+    })
+    // A rejected once() registration (ACL/teardown race) must not surface as an uncaught
+    // rejection. Swallow + debug-log: worst case we miss the creation-failure eviction for
+    // this label, which a later open self-heals — far better than an unhandled rejection.
+    .catch((err) => console.debug("project-window error-listener registration failed", label, err));
+}
+
 /** Real Tauri-backed deps. `replaceCurrent`/`touchOpened`/`currentLabel` come from the caller
  *  (they need the window context + store). */
 export function defaultDeps(
@@ -98,39 +157,7 @@ export function defaultDeps(
 ): ProjectWindowDeps {
   return {
     getByLabel: (label) => WebviewWindow.getByLabel(label),
-    createWindow: (projectId, agentId) => {
-      // Opaque, collision-proof label (decoupled from the project id). Register it before/with
-      // creation so a concurrent open finds it; on a creation failure ('tauri://error') evict the
-      // entry so a later open doesn't focus a window that never came up.
-      const label = `${WINDOW_LABEL_PREFIX}${crypto.randomUUID()}`;
-      setWindowProject(label, projectId);
-      // Flush the debounced projects blob to real localStorage BEFORE the child boots, so its
-      // zustand `persist` hydration reads a snapshot that already contains this just-created project
-      // and resolves synchronously — otherwise the child can hydrate a stale blob and briefly (or,
-      // pre-recovery-effect, permanently) show "No project open" under its project-named title.
-      flushProjectsPersist();
-      // Title the window after its project so the macOS Window menu is navigable with several
-      // windows open. Workspace keeps the title in sync after mount (rename/Replace); this just
-      // avoids a "Sparkle" flash before that effect runs.
-      const projectName = useProjectStore.getState().projects.find((p) => p.id === projectId)?.name;
-      const win = new WebviewWindow(label, {
-        url: projectWindowUrl(projectId, label, agentId),
-        title: windowTitleFor(projectName),
-        width: 1200,
-        height: 800,
-        minWidth: 900,
-        minHeight: 600,
-      });
-      win
-        .once("tauri://error", (e) => {
-          console.error("Failed to create project window", label, e.payload);
-          clearWindowProject(label);
-        })
-        // A rejected once() registration (ACL/teardown race) must not surface as an uncaught
-        // rejection. Swallow + debug-log: worst case we miss the creation-failure eviction for
-        // this label, which a later open self-heals — far better than an unhandled rejection.
-        .catch((err) => console.debug("project-window error-listener registration failed", label, err));
-    },
+    createWindow: (projectId, agentId, geometry) => createProjectWindow(projectId, agentId, geometry),
     currentLabel: () => currentLabel,
     registry: {
       find: (pid) => findWindowForProject(pid),

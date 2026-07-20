@@ -15,7 +15,12 @@ vi.mock("../services/configActions", () => ({
   setMaxConcurrentWorkers: vi.fn().mockResolvedValue(undefined),
   setAutoApplyUpdates: vi.fn().mockResolvedValue(undefined),
   setNotifyStatus: vi.fn().mockResolvedValue(undefined),
+  setToolEnabled: vi.fn().mockResolvedValue(undefined),
 }));
+
+// The Tools pane's Learn-more links open the system browser via plugin-opener; mock so no IPC
+// fires when that pane mounts or a link is clicked.
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(() => Promise.resolve()) }));
 
 // The Accounts pane's Sparkle-account block calls these (Tauri IPC / system browser); mock
 // the two it fires so no IPC or browser launch happens under jsdom.
@@ -115,6 +120,62 @@ describe("SettingsDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: /Manage accounts/ }));
     expect(onManageAccounts).toHaveBeenCalledTimes(1);
   });
+
+  it("has a Tools category that opens the Tools pane", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Tools" }));
+    expect(heading("Tools")).toBeTruthy();
+    // The pane renders both groups.
+    expect(screen.getByText("Your tools")).toBeTruthy();
+    expect(screen.getByText("Built into Sparkle")).toBeTruthy();
+  });
+});
+
+// The rail search: filters the CATEGORIES by label OR their keyword set. A category with no
+// visible name match still surfaces via a contained tool's keyword (e.g. "github" → Tools).
+describe("SettingsDialog — rail search", () => {
+  const search = () => screen.getByLabelText("Search settings") as HTMLInputElement;
+  const railButton = (name: string) => screen.queryByRole("button", { name });
+
+  it("filters the rail to categories whose LABEL matches", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.change(search(), { target: { value: "notif" } });
+    expect(railButton("Notifications")).toBeTruthy();
+    expect(railButton("AI features")).toBeNull();
+    expect(railButton("Workers")).toBeNull();
+  });
+
+  it("surfaces a category via a CONTAINED item keyword, not just its label", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    // "github" isn't any category's label — it's a tool inside Tools. It must still surface Tools.
+    fireEvent.change(search(), { target: { value: "github" } });
+    expect(railButton("Tools")).toBeTruthy();
+    expect(railButton("AI features")).toBeNull();
+  });
+
+  it("surfaces BOTH Voice controls and Tools for 'voice' (label + keyword)", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.change(search(), { target: { value: "voice" } });
+    expect(railButton("Voice controls")).toBeTruthy(); // label match
+    expect(railButton("Tools")).toBeTruthy(); // Deepgram keyword match
+    expect(railButton("Workers")).toBeNull();
+  });
+
+  it("shows an empty state when nothing matches", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.change(search(), { target: { value: "zzzzznope" } });
+    expect(screen.getByText(/No settings match/)).toBeTruthy();
+    expect(railButton("AI features")).toBeNull();
+  });
+
+  it("restores the full rail when the query is cleared", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.change(search(), { target: { value: "notif" } });
+    expect(railButton("AI features")).toBeNull();
+    fireEvent.change(search(), { target: { value: "" } });
+    expect(railButton("AI features")).toBeTruthy();
+    expect(railButton("Tools")).toBeTruthy();
+  });
 });
 
 // The Sparkle-account block in the Accounts pane. State is driven by the real zustand auth
@@ -133,10 +194,12 @@ describe("SettingsDialog — Sparkle account", () => {
     name: "Ada Lovelace",
   };
 
-  it("shows the signed-in email and signs out via sparkleApi + store reset", async () => {
+  it("shows the signed-in identity (name, via the shared authIdentity) and signs out via sparkleApi + store reset", async () => {
     useAuthStore.setState({ loading: false, tokenPresent: true, me });
     openAccountsPane();
-    expect(screen.getByText("ada@example.com")).toBeTruthy();
+    // Uses the SAME authIdentity source as the TopBar avatar/label (name → email), so the pane and
+    // the top bar can't disagree; with a name present it shows the name, not the email.
+    expect(screen.getByText("Ada Lovelace")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
     await waitFor(() => expect(useAuthStore.getState().tokenPresent).toBe(false));
     expect(signOut).toHaveBeenCalledTimes(1);
@@ -179,18 +242,26 @@ describe("SettingsDialog — Sparkle account", () => {
     }
   });
 
-  it("falls back to name, then clerkUserId, when email is missing", () => {
-    useAuthStore.setState({ loading: false, tokenPresent: true, me: { ...me, email: null } });
+  it("falls back to email when name missing; shows plain 'Signed in' (never the raw clerkUserId) when neither resolves", () => {
+    // name blank → email is the next candidate.
+    useAuthStore.setState({
+      loading: false,
+      tokenPresent: true,
+      me: { ...me, name: null },
+    });
     openAccountsPane();
-    expect(screen.getByText("Ada Lovelace")).toBeTruthy();
+    expect(screen.getByText("ada@example.com")).toBeTruthy();
     cleanup();
+    // Neither name nor email (a degraded /me profile lookup) → NEVER surface the opaque `user_…`
+    // clerkUserId; the pane reads a clean "Signed in".
     useAuthStore.setState({
       loading: false,
       tokenPresent: true,
       me: { ...me, email: null, name: null },
     });
     openAccountsPane();
-    expect(screen.getByText("user_123")).toBeTruthy();
+    expect(screen.queryByText("user_123")).toBeNull();
+    expect(screen.getByText("Signed in")).toBeTruthy();
   });
 
   it("still offers Sign out when the token is present but /me failed (offline)", () => {

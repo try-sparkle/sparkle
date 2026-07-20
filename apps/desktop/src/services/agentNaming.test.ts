@@ -9,6 +9,12 @@ import {
   shouldHaikuName,
   maybeAutoName,
   namingOutcome,
+  isUnpinnedDefaultName,
+  isNameFromWorkCandidate,
+  workNamingBasis,
+  maybeNameFromWork,
+  __resetNamingGuards,
+  MAX_WORK_BACKSTOP_ATTEMPTS,
   type NamingDecisionOpts,
 } from "./agentNaming";
 import { useProjectStore } from "../stores/projectStore";
@@ -392,5 +398,284 @@ describe("appendPrompt→maybeAutoName ordering invariant (sparkle-y2tv)", () =>
     expect(invoke).not.toHaveBeenCalled(); // mis-deferred — no paid call, when the correct order pays.
     expect(useSelfReportMetrics.getState().namingOutcomes.deferred_first_turn).toBe(1);
     expect(useSelfReportMetrics.getState().namingOutcomes.paid_haiku_fallback).toBe(0);
+  });
+});
+
+// ── Name-from-work fallback (Tier 1 + Tier 2, sparkle name-from-work) ──────────────────────────
+// A build/worker that does real work but is only ever handed tactical prompts (or no further composer
+// prompts) never leaves its "Build N"/"Worker N" default via the composer path. These tiers run off
+// the poll tick to close that gap.
+
+describe("isUnpinnedDefaultName — the kind default pattern", () => {
+  it("matches Build N / Worker N", () => {
+    expect(isUnpinnedDefaultName("build", "Build 1")).toBe(true);
+    expect(isUnpinnedDefaultName("build", "Build 12")).toBe(true);
+    expect(isUnpinnedDefaultName("worker", "Worker 3")).toBe(true);
+  });
+  it("rejects a real (non-default) name", () => {
+    expect(isUnpinnedDefaultName("build", "Login redirect fix")).toBe(false);
+    expect(isUnpinnedDefaultName("worker", "Worker")).toBe(false); // no number
+    expect(isUnpinnedDefaultName("build", "Worker 1")).toBe(false); // wrong-kind label
+  });
+  it("is never true for non-self-naming kinds (think/shell have no name-from-work default)", () => {
+    expect(isUnpinnedDefaultName("think", "Think")).toBe(false);
+    expect(isUnpinnedDefaultName("shell", "Shell 1")).toBe(false);
+  });
+});
+
+describe("isNameFromWorkCandidate — shared eligibility gate for both tiers", () => {
+  const base = { kind: "build" as const, name: "Build 1", namePinned: false, worktreePath: "/wt/a1" };
+  it("build/worker on unpinned default WITH a worktree is a candidate", () => {
+    expect(isNameFromWorkCandidate(base)).toBe(true);
+    expect(isNameFromWorkCandidate({ ...base, kind: "worker", name: "Worker 2" })).toBe(true);
+  });
+  it("THINK / SHELL are never candidates", () => {
+    expect(isNameFromWorkCandidate({ ...base, kind: "think", name: "Think" })).toBe(false);
+    expect(isNameFromWorkCandidate({ ...base, kind: "shell", name: "Shell 1" })).toBe(false);
+  });
+  it("no worktree → not a candidate (hasn't done real work yet)", () => {
+    expect(isNameFromWorkCandidate({ ...base, worktreePath: null })).toBe(false);
+  });
+  it("pinned / self-named / already-titled → not a candidate", () => {
+    expect(isNameFromWorkCandidate({ ...base, namePinned: true })).toBe(false);
+    expect(isNameFromWorkCandidate({ ...base, selfNamed: true })).toBe(false);
+    expect(isNameFromWorkCandidate({ ...base, aiTitle: "Real Title" })).toBe(false);
+  });
+  it("a non-default (already renamed) name → not a candidate", () => {
+    expect(isNameFromWorkCandidate({ ...base, name: "Wire the control listener" })).toBe(false);
+  });
+});
+
+describe("workNamingBasis — pick the agent's WORK as naming basis", () => {
+  it("picks the FIRST substantive prompt, skipping tactical/thin ones", () => {
+    const h = [
+      { id: "0", text: "commit and push", at: 0 }, // tactical
+      { id: "1", text: "ok continue", at: 0 }, // thin
+      { id: "2", text: "refactor the billing webhook handler", at: 0 }, // substantive ✓
+      { id: "3", text: "add dark mode toggle", at: 0 },
+    ];
+    expect(workNamingBasis(h, undefined)).toBe("refactor the billing webhook handler");
+  });
+  it("falls back to the activity line when every prompt is tactical/thin", () => {
+    const h = [{ id: "0", text: "push to prod", at: 0 }, { id: "1", text: "run tests", at: 0 }];
+    expect(workNamingBasis(h, "Wiring the payment reconciliation job")).toBe(
+      "Wiring the payment reconciliation job",
+    );
+  });
+  it("returns null when there is nothing substantive to name from", () => {
+    expect(workNamingBasis([{ id: "0", text: "continue", at: 0 }], undefined)).toBeNull();
+    expect(workNamingBasis([], "  ")).toBeNull();
+    expect(workNamingBasis(undefined, undefined)).toBeNull();
+  });
+});
+
+describe("maybeNameFromWork — Tier 2 paid backstop", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    invoke.mockResolvedValue({ title: "Billing Webhook Refactor", description: "" });
+    useSelfReportMetrics.getState().reset();
+    __resetNamingGuards();
+  });
+
+  // Read the seeded agent's current name from the store (avoids unchecked index access on projects[0]).
+  const currentName = (): string | undefined =>
+    useProjectStore.getState().projects.find((p) => p.id === "p1")?.agents.find((a) => a.id === "a1")?.name;
+
+  const workAgent = (over: Partial<AgentTab> = {}): AgentTab =>
+    agentTab({
+      kind: "build",
+      name: "Build 1",
+      worktreePath: "/wt/a1",
+      promptHistory: [{ id: "0", text: "refactor the billing webhook handler", at: 0 }],
+      ...over,
+    });
+
+  it("eligible build agent (work done, unpinned default, no aiTitle, not self-named) → fires ONCE and applies the name", async () => {
+    seed(workAgent());
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("generate_agent_name", {
+      prompt: "refactor the billing webhook handler",
+    });
+    expect(currentName()).toBe("Billing Webhook Refactor");
+    expect(useSelfReportMetrics.getState().namingOutcomes.work_haiku_backstop).toBe(1);
+  });
+
+  it("fires AT MOST ONCE per agent across multiple ticks", async () => {
+    seed(workAgent());
+    await maybeNameFromWork("p1", "a1");
+    // Simulate the agent still (somehow) reading as a default across later ticks.
+    useProjectStore.setState((s) => ({
+      projects: s.projects.map((p) => ({
+        ...p,
+        agents: p.agents.map((a) => ({ ...a, name: "Build 1", aiTitle: null, autoNameBasis: null })),
+      })),
+    }));
+    await maybeNameFromWork("p1", "a1");
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  // Re-aimed (was: "…and is not retried (fire once)"). The no-retry half pinned the bug below; the
+  // tally half is real coverage and is kept.
+  it("a FAILED call is not tallied as work_haiku_backstop", async () => {
+    seed(workAgent());
+    invoke.mockRejectedValueOnce(new Error("offline"));
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(currentName()).toBe("Build 1"); // kept default
+    expect(useSelfReportMetrics.getState().namingOutcomes.work_haiku_backstop).toBe(0); // failure ≠ paid win
+  });
+
+  it("a TRANSIENT invoke failure leaves the backstop retryable", async () => {
+    // The attempt was marked BEFORE the invoke, so ONE transient failure (offline, signed out,
+    // keychain locked, proxy 500) permanently burned the agent's single backstop attempt. The Set is
+    // module-level and never pruned, so only an app restart recovered — an agent that was briefly
+    // offline during its window stayed "Build 4" for the whole session.
+    seed(workAgent());
+    invoke.mockRejectedValueOnce(new Error("offline"));
+    await maybeNameFromWork("p1", "a1");
+    expect(currentName()).toBe("Build 1"); // failed, as expected
+
+    invoke.mockResolvedValueOnce({ title: "Stripe Checkout", description: "" });
+    await maybeNameFromWork("p1", "a1"); // must be allowed to try again
+    expect(currentName()).toBe("Stripe Checkout");
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("an EMPTY/malformed result is transient too — the model hiccuped", async () => {
+    // Consistent with the throw path: nothing usable was produced, so nothing terminal happened.
+    seed(workAgent());
+    invoke.mockResolvedValueOnce({ title: "   ", description: "" });
+    await maybeNameFromWork("p1", "a1");
+    expect(currentName()).toBe("Build 1");
+
+    invoke.mockResolvedValueOnce({ title: "Stripe Checkout", description: "" });
+    await maybeNameFromWork("p1", "a1");
+    expect(currentName()).toBe("Stripe Checkout");
+  });
+
+  it("a SUCCESSFUL backstop is never retried — the paid call fires at most once", async () => {
+    seed(workAgent());
+    invoke.mockResolvedValueOnce({ title: "First Name", description: "" });
+    await maybeNameFromWork("p1", "a1");
+    // Simulate the agent still (somehow) reading as an eligible default on a later tick.
+    useProjectStore.setState((s) => ({
+      projects: s.projects.map((p) => ({
+        ...p,
+        agents: p.agents.map((a) => ({ ...a, name: "Build 1", aiTitle: null, autoNameBasis: null })),
+      })),
+    }));
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds retries: a PERSISTENTLY failing backstop stops after MAX_WORK_BACKSTOP_ATTEMPTS", async () => {
+    // Retrying transient failures must not become an unbounded PAID loop. naming.rs returns Err for
+    // the model's own judgments — a bare SKIP sentinel (naming.rs:229), a conversational reply, or
+    // no usable title — so a "throw" is not always free infrastructure failure: it can be a paid
+    // call whose verdict is deterministic for a fixed basis. Without a cap, maybeNameFromWork would
+    // re-invoke every ~15s tick forever (WORK_BACKSTOP_WINDOW_TICKS is 1) and bill each one.
+    seed(workAgent());
+    invoke.mockRejectedValue(new Error("naming skipped (operational or low-content prompt)"));
+    for (let i = 0; i < MAX_WORK_BACKSTOP_ATTEMPTS + 3; i++) await maybeNameFromWork("p1", "a1");
+    expect(invoke).toHaveBeenCalledTimes(MAX_WORK_BACKSTOP_ATTEMPTS);
+    expect(currentName()).toBe("Build 1");
+  });
+
+  it("bounds retries on the EMPTY-result path too — an empty title is a paid call", async () => {
+    seed(workAgent());
+    invoke.mockResolvedValue({ title: "  ", description: "" });
+    for (let i = 0; i < MAX_WORK_BACKSTOP_ATTEMPTS + 3; i++) await maybeNameFromWork("p1", "a1");
+    expect(invoke).toHaveBeenCalledTimes(MAX_WORK_BACKSTOP_ATTEMPTS);
+  });
+
+  it("a SUCCESS resets nothing but ends it — failures before a success don't burn the win", async () => {
+    // The realistic transient case the retry exists for: fail once, then succeed on the next tick.
+    seed(workAgent());
+    invoke.mockRejectedValueOnce(new Error("offline"));
+    await maybeNameFromWork("p1", "a1");
+    invoke.mockResolvedValueOnce({ title: "Stripe Checkout", description: "" });
+    await maybeNameFromWork("p1", "a1");
+    await maybeNameFromWork("p1", "a1"); // terminal now — no third call
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(currentName()).toBe("Stripe Checkout");
+  });
+
+  // NOTE: markTerminal()'s pruning of the failure counter is deliberately NOT tested. The property
+  // is structural, not behavioral — the fire-once Set short-circuits before the counter is ever read
+  // again, so a stale entry has no observable effect through the public API. Pinning it would need a
+  // test-only inspector of module internals, which the neighbouring workBackstopAttempted Set (whose
+  // same session-bounded footprint was accepted in review 36146) doesn't have either. One helper,
+  // three call sites, no drift to observe.
+
+  it("a no-basis skip is never retried — that outcome is terminal, not transient", async () => {
+    // All-tactical prompts + no activity → re-scanning a later tick would find the same nothing.
+    seed(workAgent({ promptHistory: [{ id: "0", text: "commit and push", at: 0 }], activity: undefined }));
+    await maybeNameFromWork("p1", "a1");
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).not.toHaveBeenCalled();
+    expect(useSelfReportMetrics.getState().namingOutcomes.work_backstop_skipped).toBe(1);
+  });
+
+  it("PINNED agent → no backstop", async () => {
+    seed(workAgent({ namePinned: true }));
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("SELF-NAMED agent → no backstop", async () => {
+    seed(workAgent({ selfNamed: true }));
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("agent WITH aiTitle → no Haiku call (aiTitle already won)", async () => {
+    seed(workAgent({ aiTitle: "Session Title Wins" }));
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).not.toHaveBeenCalled();
+    expect(currentName()).toBe("Build 1");
+  });
+
+  it("THINK / SHELL on a default name → NOT eligible", async () => {
+    seed(workAgent({ kind: "think", name: "Think" }));
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).not.toHaveBeenCalled();
+    __resetNamingGuards();
+    seed(workAgent({ kind: "shell", name: "Shell 1" }));
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("no worktree (no real work yet) → NOT eligible", async () => {
+    seed(workAgent({ worktreePath: null }));
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("no substantive basis (all prompts tactical, no activity) → skips, keeps default, tallies work_backstop_skipped", async () => {
+    seed(workAgent({ promptHistory: [{ id: "0", text: "commit and push", at: 0 }], activity: undefined }));
+    await maybeNameFromWork("p1", "a1");
+    expect(invoke).not.toHaveBeenCalled();
+    expect(currentName()).toBe("Build 1");
+    expect(useSelfReportMetrics.getState().namingOutcomes.work_backstop_skipped).toBe(1);
+  });
+
+  it("precedence: a name that becomes namePinned mid-flight is NOT overridden by the backstop", async () => {
+    seed(workAgent());
+    let resolveInvoke: (v: unknown) => void = () => {};
+    invoke.mockImplementationOnce(() => new Promise((r) => (resolveInvoke = r)));
+    const pending = maybeNameFromWork("p1", "a1");
+    // User pins a name while the Haiku call is in flight.
+    useProjectStore.setState((s) => ({
+      projects: s.projects.map((p) => ({
+        ...p,
+        agents: p.agents.map((a) => ({ ...a, name: "My Pinned Name", namePinned: true })),
+      })),
+    }));
+    resolveInvoke({ title: "Billing Webhook Refactor", description: "" });
+    await pending;
+    // autoRenameAgent respects the pin → the backstop name is dropped.
+    expect(currentName()).toBe("My Pinned Name");
   });
 });

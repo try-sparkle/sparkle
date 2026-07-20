@@ -8,8 +8,12 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Chief client boundary — no network. startChat/pollForResponse back the @chief path + synthesis.
+// Chief client boundary — no network. startChat opens the @chief chat (and backs synthesis);
+// sendMessage carries every FOLLOW-UP turn on that same chat (services/chiefThread.ts), so both
+// must be stubbed or the lane can't run.
 const startChat = vi.fn(() => Promise.resolve({ chat_id: "c1", message_id: "m1" }));
+// Rest-typed so the test can assert WHICH chat id and prompt a follow-up carried.
+const sendMessage = vi.fn((..._a: unknown[]) => Promise.resolve({ message_id: "m2" }));
 const pollForResponse = vi.fn(() => Promise.resolve("Chief says hi"));
 const ensureSkill = vi.fn(() => Promise.resolve("architect"));
 vi.mock("../services/chief", () => {
@@ -27,6 +31,7 @@ vi.mock("../services/chief", () => {
   return {
     ensureChiefProject: vi.fn(() => Promise.resolve("chief-proj")),
     startChat: (...a: unknown[]) => startChat(...(a as [])),
+    sendMessage: (...a: unknown[]) => sendMessage(...(a as [])),
     pollForResponse: (...a: unknown[]) => pollForResponse(...(a as [])),
     ensureSkill: (...a: unknown[]) => ensureSkill(...(a as [])),
     createMemory: vi.fn(() => Promise.resolve({})),
@@ -104,6 +109,9 @@ vi.mock("../services/tasks", () => ({
 vi.mock("../services/agentNaming", () => ({ maybeAutoName: vi.fn() }));
 vi.mock("../services/thinkBridge", () => ({ registerThink: () => () => {} }));
 
+// The MOCKED ChiefError class (declared in the vi.mock factory above) — the same class object
+// chiefThread's `e instanceof ChiefError` status checks compare against.
+import { ChiefError } from "../services/chief";
 import { ThinkPanel, routeMessage, activeMentionToken, splitMentions } from "./ThinkPanel";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useAuthStore } from "../stores/authStore";
@@ -259,6 +267,104 @@ describe("ThinkPanel — routing + wiring", () => {
     expect(sendClaudeChat).not.toHaveBeenCalled();
   });
 
+  it("a second @chief turn continues the SAME chat instead of opening a new one", async () => {
+    // The unit tests in chiefThread.test.ts can't see whether the component actually PERSISTS the
+    // returned thread state across turns — a thread ref rebuilt on each render would still satisfy
+    // them while silently reopening a chat per turn, which is the O(N^2) defect this fixes.
+    render(<ThinkPanel project={project} agentId="a1" visible />);
+    await waitReady();
+
+    typeAndSend("@chief what's the risk?");
+    await waitFor(() => expect(startChat).toHaveBeenCalledTimes(1));
+
+    typeAndSend("@chief and the mitigation?");
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+
+    expect(startChat).toHaveBeenCalledTimes(1); // still ONE chat, not two
+    expect(sendMessage.mock.calls[0]![2]).toBe("c1"); // the chat startChat opened
+
+    // The follow-up carries only the undelivered turns — the first question is already in Chief's
+    // own history and must not be re-sent.
+    const followUp = sendMessage.mock.calls[0]![3] as string;
+    expect(followUp).toContain("and the mitigation?");
+    expect(followUp).not.toContain("what's the risk?");
+  });
+
+  // The bounded escape lives in the component (the thread ref is component state), so the service
+  // tests can't see it. Same argument as the continuity test above.
+  it("abandons the chat after two consecutive send failures, then re-seeds", async () => {
+    render(<ThinkPanel project={project} agentId="a1" visible />);
+    await waitReady();
+
+    typeAndSend("@chief one?");
+    await waitFor(() => expect(startChat).toHaveBeenCalledTimes(1));
+
+    // A send failure with a status that does NOT explain itself — i.e. possibly a dead chat.
+    sendMessage.mockRejectedValueOnce(new ChiefError("gateway", 502));
+    typeAndSend("@chief two?");
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+
+    sendMessage.mockRejectedValueOnce(new ChiefError("gateway", 502));
+    typeAndSend("@chief three?");
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(2));
+
+    // Two strikes: the chat is abandoned, so the NEXT turn opens a fresh one.
+    startChat.mockClear();
+    typeAndSend("@chief four?");
+    await waitFor(() => expect(startChat).toHaveBeenCalledTimes(1));
+  });
+
+  it("does NOT abandon the chat over slow polls — a poll failure proves it is alive", async () => {
+    // The regression this guards: counting poll failures abandoned a healthy chat and pushed the
+    // next turn onto the full re-seed, the exact oversized payload the lane exists to avoid.
+    render(<ThinkPanel project={project} agentId="a1" visible />);
+    await waitReady();
+
+    typeAndSend("@chief one?");
+    await waitFor(() => expect(startChat).toHaveBeenCalledTimes(1));
+
+    pollForResponse.mockRejectedValueOnce(new ChiefError("Chief took too long", 408));
+    typeAndSend("@chief two?");
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+
+    pollForResponse.mockRejectedValueOnce(new ChiefError("Chief took too long", 408));
+    typeAndSend("@chief three?");
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(2));
+
+    startChat.mockClear();
+    typeAndSend("@chief four?");
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(3));
+
+    expect(startChat).not.toHaveBeenCalled(); // still the same chat — never abandoned
+    expect(sendMessage.mock.calls[2]![2]).toBe("c1");
+  });
+
+  it("does NOT abandon the chat over repeated out-of-credits — 402 is not chat death", async () => {
+    // Out of credits persists across turns by its nature, so counting it would abandon a live chat
+    // and re-seed a LARGER prompt than the delta that just failed.
+    render(<ThinkPanel project={project} agentId="a1" visible />);
+    await waitReady();
+
+    typeAndSend("@chief one?");
+    await waitFor(() => expect(startChat).toHaveBeenCalledTimes(1));
+
+    // Assert a GROWING count: `toHaveBeenCalled()` would be satisfied by the first iteration's
+    // call, so the second turn wouldn't wait for its own send to be issued and rejected — it would
+    // be superseded, its catch would return early, and the test would pass without the 402
+    // exclusion doing any work at all.
+    const questions = ["two?", "three?"];
+    for (const [i, q] of questions.entries()) {
+      sendMessage.mockRejectedValueOnce(new ChiefError("out of credits", 402));
+      typeAndSend(`@chief ${q}`);
+      await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(i + 1));
+    }
+
+    startChat.mockClear();
+    typeAndSend("@chief four?");
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(3));
+    expect(startChat).not.toHaveBeenCalled();
+  });
+
   it("@<voice> routes to that expert voice — Claude Code stays silent", async () => {
     render(<ThinkPanel project={project} agentId="a1" visible />);
     typeAndSend("@architect is this scalable?");
@@ -323,6 +429,7 @@ describe("ThinkPanel — routing + wiring", () => {
       aiBrainstorm: false,
       aiComposer: false,
       aiSuggestedActions: false,
+      aiAutoApprove: false,
     } as never);
     render(<ThinkPanel project={project} agentId="a1" visible />);
     typeAndSend("@chief what's the risk?");
@@ -339,6 +446,7 @@ describe("ThinkPanel — routing + wiring", () => {
       aiBrainstorm: false,
       aiComposer: false,
       aiSuggestedActions: false,
+      aiAutoApprove: false,
     } as never);
     render(<ThinkPanel project={project} agentId="a1" visible />);
     typeAndSend("@architect is this scalable?");
@@ -357,6 +465,7 @@ describe("ThinkPanel — routing + wiring", () => {
       aiBrainstorm: false,
       aiComposer: false,
       aiSuggestedActions: false,
+      aiAutoApprove: false,
     } as never);
     fireEvent.click(screen.getByText("Make a Plan"));
     await waitFor(() => expect(screen.getByText(/AI features are off/)).toBeTruthy());
@@ -405,6 +514,7 @@ describe("ThinkPanel — routing + wiring", () => {
       aiBrainstorm: false,
       aiComposer: false,
       aiSuggestedActions: false,
+      aiAutoApprove: false,
     } as never);
     render(<ThinkPanel project={project} agentId="a1" visible />);
     typeAndSend("@chief blocked but visible");

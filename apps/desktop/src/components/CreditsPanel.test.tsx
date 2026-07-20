@@ -23,10 +23,25 @@ vi.mock("../services/creditsMenuApi", async (importOriginal) => ({
   saveAutoTopup: (...a: unknown[]) => saveAutoTopupMock(...a),
 }));
 const openPaywallMock = vi.fn();
+const openSignInMock = vi.fn();
+const lastSignInUrlMock = vi.fn();
 vi.mock("../services/sparkleApi", () => ({
   openPaywall: () => openPaywallMock(),
+  openSignIn: () => openSignInMock(),
+  lastSignInUrl: () => lastSignInUrlMock(),
   PAYWALL_URL: "https://sparkle.ai/paywall",
   redeemPromo: vi.fn(), // PromoRedeem imports it at module load
+}));
+// SupportModal pulls in the whole support stack; stub it to a sentinel so we can assert the
+// config-error "Contact support" affordance actually opens it (automatic JSX runtime — no React import needed).
+vi.mock("./SupportModal", () => ({
+  SupportModal: ({ onClose }: { onClose: () => void }) => (
+    <div data-testid="support-modal">
+      <button type="button" onClick={onClose}>
+        close-support
+      </button>
+    </div>
+  ),
 }));
 
 import { CreditsPanel } from "./CreditsPanel";
@@ -148,6 +163,58 @@ describe("buying a pack", () => {
     expect((screen.getByRole("button", { name: "$25" }) as HTMLButtonElement).disabled).toBe(
       false,
     );
+  });
+
+  it("diagnoses the prod 403 config failure: our-side message, support link, buttons recover", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // The Rust command's structured error for the restricted-key StripePermissionError.
+    startTopupMock.mockRejectedValue(
+      JSON.stringify({ class: "server", status: 403, code: "stripe_permission" }),
+    );
+    render(<CreditsPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "$25" }));
+    // The message must communicate it's Sparkle's side and not surface the generic retry copy.
+    expect(await screen.findByText(/Sparkle's side/)).toBeTruthy();
+    expect(screen.queryByText("Couldn't start checkout — try again.")).toBeNull();
+    // Button state recovered (never a stuck spinner).
+    expect((screen.getByRole("button", { name: "$25" }) as HTMLButtonElement).disabled).toBe(false);
+    // "Contact support" opens the in-app support flow.
+    expect(screen.queryByTestId("support-modal")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Contact support" }));
+    expect(await screen.findByTestId("support-modal")).toBeTruthy();
+  });
+
+  it("shows an offline message (retryable, no support) on a transport failure", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    startTopupMock.mockRejectedValue(JSON.stringify({ class: "offline" }));
+    render(<CreditsPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "$25" }));
+    expect(await screen.findByText(/offline/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Contact support" })).toBeNull();
+    expect((screen.getByRole("button", { name: "$25" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("routes to the real sign-in flow (not just a refresh) when the session has expired", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    openSignInMock.mockResolvedValue(true);
+    startTopupMock.mockRejectedValue(JSON.stringify({ class: "not_signed_in" }));
+    render(<CreditsPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "$25" }));
+    const signIn = await screen.findByRole("button", { name: "Sign in" });
+    fireEvent.click(signIn);
+    // Must open the actual sign-in hand-off, not merely re-read a token we don't have.
+    await waitFor(() => expect(openSignInMock).toHaveBeenCalled());
+  });
+
+  it("surfaces the copy/paste sign-in URL when the browser can't launch during re-auth", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    openSignInMock.mockResolvedValue(false);
+    lastSignInUrlMock.mockReturnValue("https://sparkle.ai/desktop/callback?state=abc");
+    startTopupMock.mockRejectedValue(JSON.stringify({ class: "not_signed_in" }));
+    render(<CreditsPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "$25" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Sign in" }));
+    expect(await screen.findByText("https://sparkle.ai/desktop/callback?state=abc")).toBeTruthy();
   });
 
   it("disables every pack button while a launch is in flight", async () => {

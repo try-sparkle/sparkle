@@ -4,6 +4,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { noteUserInputForAgent } from "./engine/engineRegistry";
 
 export interface PtyOutput {
   id: string;
@@ -53,6 +54,28 @@ export function writePty(id: string, data: string): Promise<void> {
   return invoke<void>("pty_write", { id, data }).catch(ignoreExitedPty);
 }
 
+/** The agent's PTY is gone, so a write that the user explicitly asked for did NOT land.
+ *  Distinct from the swallowed teardown race above: callers that represent a deliberate user
+ *  action must surface this instead of pretending it succeeded. Carries the agent id so the
+ *  caller can offer/perform a restart. */
+export class PtyGoneError extends Error {
+  constructor(readonly id: string) {
+    super(`no such pty: ${id}`);
+    this.name = "PtyGoneError";
+  }
+}
+
+/** Strict write: a dead PTY is a REAL failure the caller must handle, not a swallowed no-op.
+ *  Any other error propagates unchanged. */
+async function writePtyStrict(id: string, data: string): Promise<void> {
+  try {
+    await invoke<void>("pty_write", { id, data });
+  } catch (e) {
+    if (isExitedPtyError(e)) throw new PtyGoneError(id);
+    throw e;
+  }
+}
+
 // Bracketed-paste wrappers: ESC[200~ … ESC[201~. ESC is char code 27 — constructed here so
 // the source contains no literal ESC byte. Pasting (vs. raw typing) lets the CLI treat a
 // multi-line prompt as one atomic block.
@@ -60,13 +83,45 @@ const ESC = String.fromCharCode(27);
 export const PASTE_START = `${ESC}[200~`;
 export const PASTE_END = `${ESC}[201~`;
 
+/** Gap between the bracketed paste and the carriage return, so the CLI has finished ingesting
+ *  the paste before the Enter arrives. */
+const SUBMIT_CR_DELAY_MS = 60;
+
+/** Per-agent submit chain, so two concurrent submits to the same agent can't interleave their
+ *  paste and CR writes (which would submit one prompt's text with the other's carriage return).
+ *  Mirrors the deliveryChain in services/agentModel.ts. */
+const submitChains = new Map<string, Promise<void>>();
+
+async function deliverSubmit(id: string, text: string): Promise<void> {
+  // Bug B: a user-submitted message is the strongest recovery signal — a new turn is starting, so
+  // any prior stall/error latched from earlier output is stale. Tell the StatusEngine BEFORE the
+  // text lands (and echoes back through pty:output) so a resuming agent goes green and its own echo
+  // isn't mistaken for a self-prompt wedge. No-op when no engine is registered for this id.
+  noteUserInputForAgent(id, text);
+  await writePtyStrict(id, `${PASTE_START}${text}${PASTE_END}`);
+  await new Promise((r) => setTimeout(r, SUBMIT_CR_DELAY_MS));
+  await writePtyStrict(id, "\r");
+}
+
 /** Submit a full prompt to an agent's PTY: deliver it as one bracketed paste, then (after a
  *  beat, so the CLI has finished ingesting the paste) a carriage return to send it. Shared by
- *  the composer and the connectivity re-query. */
-export async function submitPrompt(id: string, text: string): Promise<void> {
-  await writePty(id, `${PASTE_START}${text}${PASTE_END}`);
-  await new Promise((r) => setTimeout(r, 60));
-  await writePty(id, "\r");
+ *  the composer and the connectivity re-query.
+ *
+ *  REJECTS with PtyGoneError if the agent's PTY is dead. This is deliberate: the prompt did not
+ *  land, and silently resolving here is what let a dead agent swallow user prompts while the
+ *  composer recorded them into history as if they'd been delivered. Callers must handle it. */
+export function submitPrompt(id: string, text: string): Promise<void> {
+  const prev = submitChains.get(id) ?? Promise.resolve();
+  // A rejected predecessor must not wedge the chain for the next submit, so queue behind its
+  // settlement rather than its success.
+  const run = prev.then(() => deliverSubmit(id, text));
+  const tail = run.catch(() => {});
+  submitChains.set(id, tail);
+  // Drop the entry once this agent's queue drains, so the map doesn't grow per agent forever.
+  void tail.then(() => {
+    if (submitChains.get(id) === tail) submitChains.delete(id);
+  });
+  return run;
 }
 
 export function resizePty(id: string, cols: number, rows: number): Promise<void> {

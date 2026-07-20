@@ -170,14 +170,18 @@ function handleGetState(): {
   };
 }
 
-/** rename_agent → set THAT agent's name (defaults to the caller). Rejects an unknown/blank target. */
+/** rename_agent → set THAT agent's name (defaults to the caller). Rejects an unknown/blank target.
+ *  This is an AGENT naming itself (or a sub-agent it spawned), so it routes through `selfNameAgent`:
+ *  the name becomes authoritative (freezes auto-naming) but the row is NOT pinned — no pin chip, no
+ *  anchor. Using the manual `renameAgent` here (which sets namePinned) made every self-name look
+ *  pinned and un-unpinnable (the next self-name re-pinned it) — bug sparkle-pel7. */
 function handleRename(req: ControlRequest): Record<string, unknown> {
   const targetId = resolveTargetId(req);
   const name = req.payload.name;
   if (typeof name !== "string" || !name.trim()) return { ok: false, error: "name is required" };
   const found = findAgent(targetId);
   if (!found) return { ok: false, error: `unknown agent ${targetId}` };
-  useProjectStore.getState().renameAgent(found.projectId, targetId, name);
+  useProjectStore.getState().selfNameAgent(found.projectId, targetId, name);
   return { ok: true };
 }
 

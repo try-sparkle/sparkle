@@ -15,16 +15,17 @@
 //      restores the default handler and re-raises so the process still crashes normally.
 //
 // `flush_crash_reports` (a Tauri command, called fire-and-forget at launch) scans the crashes dir,
-// attaches a REDACTED recent-log window, redacts message + backtrace, and — ONLY when the user's
-// Sparkle-Improvement consent is "always" — POSTs each to the orchestration `/telemetry/crash`
-// ingest, deleting a report once the server 2xx-acknowledges it.
+// redacts message + backtrace, and — for any CONSENTING Sparkle-Improvement mode ("always" or the
+// default "case_by_case"; see `upload_allowed`) — POSTs each to the orchestration `/telemetry/crash`
+// ingest, deleting a report once the server 2xx-acknowledges it. The two consenting modes differ in
+// what rides along: only "always" attaches the REDACTED recent-log window (see `logs_allowed`).
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Runtime};
 
 use crate::support::redact_secrets;
 
@@ -88,7 +89,7 @@ pub struct CrashRecord {
 /// Install the panic hook + native signal handler. Best-effort: any failure logs and returns —
 /// crash capture never blocks the app from booting.
 pub fn install<R: Runtime>(app: &AppHandle<R>) {
-    let crashes_dir = match app.path().app_log_dir() {
+    let crashes_dir = match crate::dev_identity::app_log_dir(app) {
         Ok(dir) => dir.join("crashes"),
         Err(e) => {
             tracing::error!(target: "crash", "app_log_dir failed, crash capture disabled: {e}");
@@ -144,8 +145,8 @@ fn os_string() -> String {
 //
 // The panic hook runs on the panicking thread BEFORE the unwind reaches any `catch_unwind`. So a
 // panic the audio.rs frame firewall is about to catch-and-recover would still make the hook write a
-// crash-<uuid>.json record — a false "crash" that, on "always" consent, gets uploaded even though the
-// app never went down. To avoid that, a `catch_unwind` firewall wraps its recoverable region in
+// crash-<uuid>.json record — a false "crash" that, on any consenting mode, gets uploaded even though
+// the app never went down. To avoid that, a `catch_unwind` firewall wraps its recoverable region in
 // `suppress_crash_records()`: while the returned guard is alive on this thread, the hook still LOGS
 // the panic (so the Improvement Agent sees it) but does NOT persist a crash record.
 
@@ -205,7 +206,7 @@ fn install_panic_hook(dir: std::path::PathBuf, app_version: String, os: String, 
 
         // If a `catch_unwind` firewall on this thread will recover from this panic (e.g. the audio
         // frame handler), LOG it but do NOT persist a crash record — the app isn't going down, so a
-        // record here would be a false crash (and, on "always" consent, a false upload). Still chain
+        // record here would be a false crash (and, on a consenting mode, a false upload). Still chain
         // to the prior hook to preserve its behavior.
         if crash_records_suppressed() {
             prev(info);
@@ -556,7 +557,40 @@ extern "C" fn handle_fatal_signal(sig: libc::c_int) {
     }
 }
 
-// ── Flush: scan crashes dir, redact, upload (only on "always" consent) ────────────────────────────
+// ── Flush: scan crashes dir, redact, upload (on any consenting mode) ─────────────────────────────
+//
+// TWO TIERS, and the difference between them is real — keep it that way:
+//
+//   "never"        → nothing is uploaded. Reports stay on the user's disk.
+//   "case_by_case" → the crash REPORT ONLY: redacted message + backtrace, install_id, app_version,
+//                    os, arch, timestamps. NO recent-logs tail.
+//   "always"       → the crash report PLUS the redacted ~200KB recent-logs tail.
+//
+// Why "case_by_case" uploads at all: it is the DEFAULT (settingsStore.ts `DEFAULT_SPARKLE_CONSENT`),
+// and an always-only upload gate meant the crash pipeline received nothing from anyone who never
+// changed the default — i.e. essentially everyone. Capture worked; we were simply blind.
+//
+// The user-facing promise for each tier is the copy in SparkleConsentBanner.tsx `consentCopy()`.
+// These two predicates and that copy are one contract: if you change a gate here, change that copy
+// (and its test) in the same commit. The copy drifting out of sync with this gate is exactly the bug
+// that made this pipeline dark.
+
+/// Whether this consent value permits uploading a crash report at all.
+///
+/// FAILS CLOSED, and deliberately: only the two exactly-spelled consenting modes match. An unknown,
+/// empty, or miscased value (a future/renamed mode, a corrupt persisted blob, a frontend typo) is
+/// NOT consent and must never be treated as such — silence is the safe failure here, an unintended
+/// upload is not. The comparison is case-SENSITIVE for the same reason: "Always" is not a value this
+/// app writes, so seeing one means something is wrong, not that the user opted in.
+fn upload_allowed(consent: &str) -> bool {
+    matches!(consent, "always" | "case_by_case")
+}
+
+/// Whether this consent value additionally permits attaching the recent-logs tail. "always" ONLY —
+/// this is the privacy line between the two consenting tiers, and the promise the banner copy makes.
+fn logs_allowed(consent: &str) -> bool {
+    consent == "always"
+}
 
 /// Build the `/telemetry/crash` upload body for a record. Applies `redact_secrets` to the (possibly
 /// secret-bearing) message + backtrace; `recent_logs` is already redacted by the caller. `install_id`
@@ -603,9 +637,16 @@ fn list_pending_crashes(dir: &Path) -> Vec<std::path::PathBuf> {
 
 /// Core flush logic, factored out of the Tauri command so it unit-tests without a Tauri runtime.
 ///
-/// `post` returns true on a 2xx. When `consent != "always"` NOTHING is uploaded and NOTHING is
-/// deleted (`post` is never called) — the reports are left on disk. On a 2xx the local file is
-/// deleted so it isn't re-uploaded. Returns the number of reports successfully uploaded.
+/// `post` returns true on a 2xx. When the consent value is not a consenting mode (`upload_allowed`
+/// is false — "never", or any unrecognized value, which fails closed) NOTHING is uploaded and
+/// NOTHING is deleted (`post` is never called) — the reports are left on disk. On a 2xx the local
+/// file is deleted so it isn't re-uploaded. Returns the number of reports successfully uploaded.
+///
+/// `recent_logs` arrives already redacted from the caller, which also declines to even READ the log
+/// tail unless `logs_allowed` (so a non-"always" flush touches no logs at all). We nonetheless
+/// re-apply `logs_allowed` here rather than trusting the argument: this is the function the tests
+/// pin the privacy line against, so the "case_by_case sends no logs" invariant is enforced at the
+/// same place the body is built, and a future caller can't quietly leak a tail past it.
 fn flush_pending<P: Fn(&str) -> bool>(
     crashes_dir: &Path,
     install_id: &str,
@@ -615,8 +656,10 @@ fn flush_pending<P: Fn(&str) -> bool>(
     max_uploads: usize,
 ) -> usize {
     // Bound the dir on every flush, BEFORE the consent gate — so a host that never becomes reachable
-    // (consent == "always" but uploads keep failing) or a build that never uploads (consent != always)
-    // still can't let the crashes dir grow without limit across launches.
+    // (the user consents but uploads keep failing) or a user who never consents (uploads never
+    // happen at all) still can't let the crashes dir grow without limit across launches. Retention is
+    // a local-disk concern and is deliberately independent of consent: do NOT move this below the
+    // gate, or a "never" user's crashes dir grows forever.
     prune_crashes_dir(crashes_dir, MAX_RETAINED_CRASH_FILES);
 
     let pending = list_pending_crashes(crashes_dir);
@@ -624,17 +667,21 @@ fn flush_pending<P: Fn(&str) -> bool>(
         return 0;
     }
 
-    // Consent gate: capture is always-on, but upload requires explicit "always". Leave everything on
-    // disk otherwise.
-    if consent != "always" {
+    // Consent gate: capture is always-on, but upload requires a consenting mode ("always" or the
+    // default "case_by_case"). Anything else — "never", or an unrecognized value, which fails closed
+    // — leaves everything on disk.
+    if !upload_allowed(consent) {
         tracing::info!(
             target: "crash",
             count = pending.len(),
             consent = %consent,
-            "crash reports pending but consent is not 'always'; leaving them local (no upload)"
+            "crash reports pending but consent does not permit upload; leaving them local"
         );
         return 0;
     }
+
+    // The privacy line between the two consenting tiers: the recent-logs tail is "always"-only.
+    let recent_logs = if logs_allowed(consent) { recent_logs } else { "" };
 
     let total = pending.len();
     let mut uploaded = 0usize;
@@ -722,19 +769,20 @@ pub fn flush_crash_reports<R: Runtime>(app: AppHandle<R>, consent: String) {
 /// uploading), and delegates the consent gate + POST loop to `flush_pending`. Returns how many
 /// reports were uploaded.
 fn run_flush<R: Runtime>(app: &AppHandle<R>, consent: &str) -> Result<usize, String> {
-    let log_dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    let log_dir = crate::dev_identity::app_log_dir(app)?;
     let crashes_dir = log_dir.join("crashes");
     if !crashes_dir.exists() {
         return Ok(0);
     }
 
     // Anonymous key (same 32-hex install id usageTelemetry sends).
-    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let data_dir = crate::dev_identity::app_data_dir(app)?;
     let install_id = crate::trial::ensure_install_id_at(&data_dir.join("trial.json"))?.install_id;
 
-    // The recent-log window is only needed when we'll actually upload. read_recent_logs returns the
-    // ~200KB tail ALREADY REDACTED.
-    let recent_logs = if consent == "always" {
+    // The recent-log window rides along on "always" ONLY (`logs_allowed`) — on "case_by_case" we
+    // upload the crash report without it, so don't even read it. read_recent_logs returns the ~200KB
+    // tail ALREADY REDACTED. flush_pending re-applies the same gate as a backstop.
+    let recent_logs = if logs_allowed(consent) {
         crate::support::read_recent_logs(app.clone()).unwrap_or_default()
     } else {
         String::new()
@@ -818,11 +866,24 @@ mod tests {
     }
 
     #[test]
-    fn flush_does_not_upload_when_consent_is_not_always() {
+    fn flush_does_not_upload_without_a_consenting_mode() {
         let dir = tmp_dir();
         write_crash_record(&dir, &sample_record("keep-me", "boom", None)).unwrap();
 
-        for consent in ["case_by_case", "never", "", "Always"] {
+        // "never" is the explicit opt-out. The rest pin FAIL-CLOSED behavior: an empty value, a
+        // miscased one ("Always" / "Case_By_Case" are not values this app writes — a match here would
+        // be a bug, not consent), an unknown/future mode, and a whitespace-padded value must all
+        // upload NOTHING. An unrecognized value is never consent.
+        for consent in [
+            "never",
+            "",
+            "Always",
+            "ALWAYS",
+            "Case_By_Case",
+            "case-by-case",
+            "sometimes",
+            " always ",
+        ] {
             let posted = std::cell::Cell::new(false);
             let uploaded = flush_pending(
                 &dir,
@@ -830,7 +891,7 @@ mod tests {
                 "logs",
                 consent,
                 |_body| {
-                    posted.set(true); // must NEVER fire for a non-"always" consent
+                    posted.set(true); // must NEVER fire for a non-consenting value
                     true
                 },
                 MAX_UPLOADS_PER_FLUSH,
@@ -840,6 +901,114 @@ mod tests {
         }
         // The report is still on disk (nothing deleted).
         assert!(dir.join("crash-keep-me.json").exists(), "file was deleted without consent");
+    }
+
+    #[test]
+    fn consent_predicates_recognize_only_exact_modes() {
+        // The gate in one place: what may upload, and what may attach logs.
+        assert!(upload_allowed("always"));
+        assert!(upload_allowed("case_by_case")); // the DEFAULT mode uploads — this is the fix.
+        assert!(!upload_allowed("never"));
+        assert!(logs_allowed("always"));
+        assert!(!logs_allowed("case_by_case")); // the privacy line between the consenting tiers.
+        assert!(!logs_allowed("never"));
+        // Fail closed on anything not exactly spelled.
+        for bogus in ["", "Always", "CASE_BY_CASE", "case by case", "sometimes", " always"] {
+            assert!(!upload_allowed(bogus), "upload_allowed({bogus:?}) must fail closed");
+            assert!(!logs_allowed(bogus), "logs_allowed({bogus:?}) must fail closed");
+        }
+    }
+
+    #[test]
+    fn flush_uploads_report_without_logs_on_case_by_case() {
+        // The DEFAULT mode. It MUST upload (an always-only gate is what kept this pipeline dark), but
+        // it must NOT carry the recent-logs tail — that is the "always"-only tier, and the banner copy
+        // promises exactly this split.
+        let dir = tmp_dir();
+        write_crash_record(&dir, &sample_record("cbc", "boom-cbc", Some("bt-cbc"))).unwrap();
+
+        let bodies = std::cell::RefCell::new(Vec::<String>::new());
+        let uploaded = flush_pending(
+            &dir,
+            "iid",
+            "SECRET-LOG-TAIL-should-not-be-sent",
+            "case_by_case",
+            |body| {
+                bodies.borrow_mut().push(body.to_string());
+                true
+            },
+            MAX_UPLOADS_PER_FLUSH,
+        );
+
+        assert_eq!(uploaded, 1, "case_by_case must upload the crash report");
+        let bodies = bodies.borrow();
+        assert_eq!(bodies.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        // No log tail — the field is present (the server contract wants it) but empty, and the tail
+        // text appears nowhere in the body.
+        assert_eq!(v["recent_logs"], "", "case_by_case must not send the recent-logs tail");
+        assert!(
+            !bodies[0].contains("SECRET-LOG-TAIL"),
+            "log tail leaked into a case_by_case upload: {}",
+            bodies[0]
+        );
+        // The report itself IS sent: the crash fields the server needs are all there.
+        assert_eq!(v["crash_id"], "cbc");
+        assert_eq!(v["install_id"], "iid");
+        assert_eq!(v["message"], "boom-cbc");
+        assert_eq!(v["backtrace"], "bt-cbc");
+        assert_eq!(v["app_version"], "0.18.0");
+        assert_eq!(v["os"], "macOS 15.5");
+        assert_eq!(v["arch"], "aarch64");
+        assert_eq!(v["occurred_at"], 1_700_000_000_000u64);
+        // Acknowledged reports are deleted so they aren't re-sent next launch.
+        assert!(!dir.join("crash-cbc.json").exists());
+    }
+
+    #[test]
+    fn flush_uploads_report_with_logs_on_always() {
+        let dir = tmp_dir();
+        write_crash_record(&dir, &sample_record("alw", "boom-alw", None)).unwrap();
+
+        let bodies = std::cell::RefCell::new(Vec::<String>::new());
+        let uploaded = flush_pending(
+            &dir,
+            "iid",
+            "recent log tail here",
+            "always",
+            |body| {
+                bodies.borrow_mut().push(body.to_string());
+                true
+            },
+            MAX_UPLOADS_PER_FLUSH,
+        );
+
+        assert_eq!(uploaded, 1);
+        let v: serde_json::Value = serde_json::from_str(&bodies.borrow()[0]).unwrap();
+        assert_eq!(v["crash_id"], "alw");
+        assert_eq!(
+            v["recent_logs"], "recent log tail here",
+            "always must send the recent-logs tail"
+        );
+    }
+
+    #[test]
+    fn flush_prunes_crashes_dir_regardless_of_consent() {
+        // Retention is a LOCAL-DISK concern and runs BEFORE the consent gate on purpose: a "never"
+        // user (who never uploads, so files are never deleted by a 2xx) must still have a bounded
+        // crashes dir. This pins that ordering.
+        for consent in ["never", "", "case_by_case", "always"] {
+            let dir = tmp_dir();
+            for i in 0..(MAX_RETAINED_CRASH_FILES + 8) {
+                write_crash_record(&dir, &sample_record(&format!("x{i}"), "boom", None)).unwrap();
+            }
+            // Never acknowledge, so nothing is deleted by an upload — only prune can bound the dir.
+            flush_pending(&dir, "iid", "logs", consent, |_b| false, MAX_UPLOADS_PER_FLUSH);
+            assert!(
+                list_pending_crashes(&dir).len() <= MAX_RETAINED_CRASH_FILES,
+                "crashes dir unbounded at consent={consent:?}"
+            );
+        }
     }
 
     #[test]

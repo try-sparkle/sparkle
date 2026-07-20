@@ -6,7 +6,7 @@ import type { AgentTab } from "../types";
 import { rollupStages, type WorkflowStageId } from "../engine/workflowStage";
 
 /**
- * The unified 9-stage progress stage to show for a bead card. Prefers LIVE build progress (the
+ * The unified 10-stage progress stage to show for a bead card. Prefers LIVE build progress (the
  * least-advanced stage among the bead's worker agents) so the card reflects reality, then falls
  * back to mapping the bead's own status:
  *   - delivered (closed + delivered label)        → Shipped to Production

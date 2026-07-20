@@ -7,12 +7,16 @@ import {
 } from "./services/projectWindows.url";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
+import { useDictationStore } from "./stores/dictationStore";
 import {
   setWindowProject,
   clearWindowProject,
   resetWindowRegistry,
 } from "./services/windowRegistry";
 import { resetWindowStatus } from "./services/windowStatus";
+import { readWindowSessions } from "./services/windowSession";
+import { planWindowRestore } from "./services/windowRestore";
+import { runWindowRestore } from "./services/windowRestoreRun";
 
 interface Ctx {
   projectId: string | null;
@@ -50,26 +54,49 @@ export function CurrentProjectProvider({ children }: { children: ReactNode }) {
   const label = paramLabel ?? "main";
 
   // The window registry persists in localStorage and outlives the process, so on a cold start
-  // its entries are all stale (no windows exist yet). The main window — the only one at cold
-  // start (multi-window session restore is deferred, bead ) — clears it before
-  // registering itself, so stale `win-*` labels can't mis-route a focus-existing lookup.
+  // its entries are all stale (no windows exist yet). The main window clears it before registering
+  // itself, so stale `win-*` labels can't mis-route a focus-existing lookup — then replays the
+  // durable window-session snapshot to reopen the other project windows the user had open at quit
+  // (bead ). The snapshot lives under a SEPARATE key, so resetWindowRegistry doesn't
+  // touch it; read it before the reset regardless, then hand it to the restorer.
   useEffect(() => {
     if (isMain) {
+      const sessions = readWindowSessions();
       resetWindowRegistry();
       // Same cold-start reasoning for the cross-window status map: its entries outlive the process,
       // so a hard crash that skipped unload cleanup can leave ghost red-agent rows. Wipe them too.
       resetWindowStatus();
+      // Recreate the other windows + focus the last-active one. Fire-and-forget: a failure just
+      // leaves the single main window (the pre-restore behavior), never blocks boot.
+      void runWindowRestore(sessions);
+      // The mic's active/paused `phase` is now persisted + synced across windows, so it survives a
+      // relaunch. Reset a stale "active" back to "passive" on a true cold start — the main window is
+      // the only window then (multi-window restore is deferred, ), so this can't clobber
+      // a live window's shared phase. Keeps the opt-in safety posture: the mic stays hot per
+      // `enabled` but waits for a wake word rather than resuming mid-dictation. Must run AFTER the
+      // store hydrates, or the persisted value would overwrite the reset.
+      const resetMicPhase = () => useDictationStore.getState().setPhase("passive");
+      if (useDictationStore.persist.hasHydrated()) resetMicPhase();
+      else return useDictationStore.persist.onFinishHydration(resetMicPhase);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Initial project: param wins; else (main window) restore the last-selected/first project.
-  // Validate the result against the hydrated project list so a stale `?project=` id (project
-  // deleted in another window, or a leftover id after a force-quit) falls back to no-project
-  // instead of pinning the window to a phantom — the window then behaves like a fresh one
-  // (Open/New takes it over) rather than showing a confusing blank.
+  // Initial project: param wins; else (main window) the restored session's main project, else the
+  // last-selected/first project. Validate the result against the hydrated project list so a stale
+  // `?project=` id (project deleted in another window, or a leftover id after a force-quit) falls
+  // back to no-project instead of pinning the window to a phantom — the window then behaves like a
+  // fresh one (Open/New takes it over) rather than showing a confusing blank.
   const initial = useMemo(() => {
     const st = useProjectStore.getState();
+    // Session restore: the main window adopts the project it showed last session (). The
+    // selection is monitor-independent, so this synchronous plan (monitors=[]) yields the same
+    // mainProjectId the async runWindowRestore will compute — the two never diverge.
+    if (isMain) {
+      const liveIds = st.projects.map((p) => p.id);
+      const restoredMain = planWindowRestore(readWindowSessions(), liveIds, []).mainProjectId;
+      if (restoredMain) return restoredMain;
+    }
     const id = computeInitialProjectId(search, {
       selectedProjectId: st.selectedProjectId,
       firstProjectId: st.projects[0]?.id ?? null,
@@ -126,6 +153,20 @@ export function CurrentProjectProvider({ children }: { children: ReactNode }) {
     if (initial) openDeepLinkAgent(initial, parseAgentIdFromSearch(search));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Keep the cold-start restore hint in sync with the MAIN window's current project, so quitting
+  // and relaunching reopens the last project the user was on — not the first ("zero-zero") project.
+  // computeInitialProjectId reads selectedProjectId at mount; nothing else kept it current (it was
+  // only claimed on project CREATION), which is why a restart always fell back to projects[0].
+  // Only the main window claims it — secondary windows carry `?project=` and own their own project.
+  // Never write a null hint: a null projectId is either the pre-hydration mount race (the `initial`
+  // memo can resolve to null before this window's store snapshot lands — see the recovery block
+  // above) or a user-blanked window, and clobbering a valid persisted hint with null would lose the
+  // last project on the NEXT launch. Project deletion is handled separately by removeProject, which
+  // re-points selectedProjectId itself, so skipping the null write can't strand a deleted-project id.
+  useEffect(() => {
+    if (isMain && projectId) useProjectStore.getState().setSelectedProject(projectId);
+  }, [isMain, projectId]);
 
   // Register this window's current project so other windows can focus it. In an effect —
   // never write to localStorage during render.

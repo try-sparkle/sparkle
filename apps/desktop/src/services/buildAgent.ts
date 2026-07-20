@@ -34,10 +34,39 @@ export function sparkleControlProtocol(): string {
     "- `set_agent_activity({ activity })`: call this whenever you START a new sub-task, with a short",
     "  present-tense line of what you're building now (e.g. \"Wiring the control listener\"). It shows",
     "  as your live status under your name. Keep it current as your focus shifts.",
-    "- `rename_agent({ name })`: give yourself a clear 2-4 word name describing your mission.",
+    "- `rename_agent({ name })`: your FIRST tool call, before any other work — give yourself a clear",
+    '  2-4 word name describing your mission (e.g. "Stripe Checkout Flow"). The human is watching a',
+    "  list of agents; an unnamed one is unreadable to them. Do this before you read a file, run a",
+    "  command, or answer — it costs one call and it is the only thing that names you.",
     "- `get_state()`: read the current agents, their statuses, and the theme.",
     "- `set_theme(...)`, `get_config()` / `set_config(...)`: adjust appearance / app config ONLY when",
     "  the user explicitly asks — never change theme or config on your own initiative.",
+  ].join("\n");
+}
+
+/** Sparkle's opinionated quality workflow, appended to every code-producing agent's system prompt
+ *  when the `[tools].guardrails` flag is on (the default). Its job is to keep the code Sparkle writes
+ *  in the user's project from regressing — WITHOUT the user having to know to ask for it. Deliberately
+ *  adaptive: strict where the project already has tests, a firm nudge (never a hard block) where it
+ *  doesn't, so a beginner's throwaway project isn't turned into a dead end. Language-agnostic — it
+ *  refers to "the project's tests / typecheck / lint / build" rather than any specific tool. */
+export function guardrailsProtocol(): string {
+  return [
+    "GUARDRAILS — SHIP CODE THAT DOESN'T REGRESS (Sparkle quality opinionation)",
+    "- Working, tested code is the definition of done. BEFORE you commit or call a task complete, run",
+    "  the project's checks — its test suite plus any typecheck / lint / build it defines — and make",
+    "  them pass. A red suite means NOT done; fix it or report why, never paper over it.",
+    "- Prefer test-first: when you add or change behavior, write or extend a test that would FAIL",
+    "  without your change, then make it pass. Keep each change small and focused so it is easy to",
+    "  verify and to revert if it regresses.",
+    "- If the project has NO test setup yet, do not hard-block: still add at least one test covering",
+    "  the behavior you changed (a minimal runner is fine), and say so in your summary — tell the user",
+    "  tests were missing and what you added. Getting a first test in beats shipping none.",
+    "- Never claim something works (\"done\", \"fixed\", \"passing\") without having actually run it and",
+    "  watched it pass. Report the command you ran and its result, not an assumption.",
+    "- Guard against regressions beyond correctness: when you touch shared or foundational code, run",
+    "  the broader suite rather than just the nearest test, and stay alert to performance and stability",
+    "  regressions, not only wrong answers.",
   ].join("\n");
 }
 
@@ -82,8 +111,13 @@ export function parseWorkerResult(raw: string): WorkerResult {
   };
 }
 
-/** System prompt that turns a plain `claude` session into a single-task worker IC. */
-export function workerPersona(opts: { parentBranch: string; resultPath: string }): string {
+/** System prompt that turns a plain `claude` session into a single-task worker IC. When
+ *  `guardrails` is on (mirrors [tools].guardrails), the quality-workflow snippet is appended. */
+export function workerPersona(opts: {
+  parentBranch: string;
+  resultPath: string;
+  guardrails?: boolean;
+}): string {
   return [
     "You are a Sparkle WORKER agent — a focused individual contributor.",
     "",
@@ -115,6 +149,7 @@ export function workerPersona(opts: { parentBranch: string; resultPath: string }
     "Create the .sparkle directory if needed. Then stop.",
     "",
     sparkleControlProtocol(),
+    ...(opts.guardrails ? ["", guardrailsProtocol()] : []),
   ].join("\n");
 }
 
@@ -164,6 +199,7 @@ export function orchestrationPersona(opts: {
   ownBranch: string;
   maxConcurrentWorkers: number;
   epicId?: string;
+  guardrails?: boolean;
 }): string {
   return [
     "You are a Sparkle BUILD agent — the master ORCHESTRATOR.",
@@ -237,5 +273,6 @@ export function orchestrationPersona(opts: {
     sparkleControlProtocol(),
     // Bind the orchestrator to a specific beads epic when one was handed off (Send to Build).
     ...(opts.epicId ? ["", beadsProtocol({ epicId: opts.epicId })] : []),
+    ...(opts.guardrails ? ["", guardrailsProtocol()] : []),
   ].join("\n");
 }

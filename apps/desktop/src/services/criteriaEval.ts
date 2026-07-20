@@ -1,6 +1,6 @@
 // Evaluate one bead against a stage definition — the per-card criteria engine for Definable Done &
 // Delivered. Each criterion resolves to met / unmet / unknown; a stage is `allMet` when every
-// criterion is met. AUTO criteria REUSE the app's existing 9-stage workflow computation
+// criterion is met. AUTO criteria REUSE the app's existing 10-stage workflow computation
 // (engine/workflowStage.ts + services/planView.ts `beadStage`) rather than re-deriving any git
 // logic; MANUAL criteria read from the persisted tick store (criteriaStore.ts).
 // Spec: docs/superpowers/specs/2026-07-02-definable-done-delivered-design.md
@@ -29,7 +29,7 @@ export interface StageEvaluation {
 
 /**
  * Inputs an auto-signal evaluator needs, supplied by the caller from data the app already holds.
- * Nothing here re-computes git state: `stage` is the bead's rolled-up 9-stage stage (from
+ * Nothing here re-computes git state: `stage` is the bead's rolled-up 10-stage stage (from
  * `planView.beadStage` / `workflowStage.deriveLiveStage`), `workflowState` is the live PR probe
  * (`agent_workflow_state`), and `inRelease` is Unit 3's delivery-monitor verdict (wired later —
  * when absent, `in_release` falls back to the legacy `delivered` label / shipped stage).
@@ -37,7 +37,7 @@ export interface StageEvaluation {
 export interface EvalContext {
   /** Which stage is being evaluated — also names the manual-tick namespace in criteriaStore. */
   key: StageKey;
-  /** The bead's current 9-stage workflow stage. Drives `merged_to_main` and `pushed`; when absent
+  /** The bead's current 10-stage workflow stage. Drives `merged_to_main` and `pushed`; when absent
    *  those signals fall back to what the bead's own status can prove, else read `unknown`. */
   stage?: WorkflowStageId | null;
   /** Live PR/merge probe for the bead's branch. Drives `pr_merged`; absent → `unknown`. */
@@ -48,7 +48,7 @@ export interface EvalContext {
 }
 
 /** Has this bead's work reached/passed `merged`? A closed bead is merged-or-beyond; otherwise the
- *  9-stage stage decides. With no stage and an unclosed bead we can observe it is NOT merged. */
+ *  10-stage stage decides. With no stage and an unclosed bead we can observe it is NOT merged. */
 function reachedMerged(bead: Bead, ctx: EvalContext): boolean {
   if (bead.status === "closed") return true;
   if (ctx.stage) return stageIndex(ctx.stage) >= stageIndex("merged");
@@ -90,7 +90,7 @@ function evalAuto(signal: AutoSignal | undefined, bead: Bead, ctx: EvalContext):
 
 /**
  * Evaluate one bead against a stage definition. Auto criteria are observed via `evalAuto` (reusing
- * the 9-stage workflow computation); manual criteria read their tick from `criteriaStore`, keyed by
+ * the 10-stage workflow computation); manual criteria read their tick from `criteriaStore`, keyed by
  * (bead.id, ctx.key, criterionIndex). `allMet` requires a non-empty criteria list where every
  * criterion is `met` (an `unknown` or `unmet` blocks it).
  */

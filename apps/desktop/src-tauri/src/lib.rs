@@ -24,6 +24,7 @@ mod crash;
 mod config;
 mod connectivity;
 mod delivery;
+mod dev_identity;
 mod dictation;
 mod github;
 mod history;
@@ -31,6 +32,7 @@ mod hooks;
 mod judge;
 mod logging;
 mod mac_panel;
+mod mic_permission;
 mod model;
 mod model_catalog;
 mod naming;
@@ -144,7 +146,7 @@ pub fn run() {
             attention::init_application();
             // Stand up the local history store (prompts + responses, FTS5) in the app-data dir.
             // A failure here must not stop the app from booting — capture/search just won't work.
-            match app.path().app_data_dir() {
+            match dev_identity::app_data_dir(app.handle()) {
                 Ok(dir) => match history::HistoryDb::new(&dir) {
                     Ok(db) => {
                         app.manage(db);
@@ -196,6 +198,23 @@ pub fn run() {
                     ),
                 }
             }
+            // roborev daemon startup ensure. When the user has opted into roborev ([tools].roborev)
+            // AND already passed the one-time consent modal (roborev.consent_prompted), re-run the
+            // idempotent install so the launchd daemon is (re)loaded after a reboot — a fresh boot
+            // starts LaunchAgents, but this also self-heals a daemon that was booted-out or a binary
+            // that moved. Best-effort and OFF the startup path: spawned onto the async runtime so it
+            // never blocks boot; any error is swallowed (the onboarding flow surfaces install issues).
+            {
+                let eff = config::current_effective().config;
+                if eff.tools.roborev && eff.roborev.consent_prompted {
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = setup::install_roborev(handle).await {
+                            tracing::warn!(error = %e, "startup roborev ensure failed (non-fatal)");
+                        }
+                    });
+                }
+            }
             // Show-on-ready backstop (bead sparkle-alrm.5, #10). The main window is created hidden
             // ("visible": false) so no blank frame flashes before React paints; the frontend calls
             // show() on first paint (see main.tsx) and then invokes `notify_frontend_shown`. This
@@ -215,6 +234,29 @@ pub fn run() {
                     }
                 });
             }
+            // sparkle-i95d: rebind every persisted orchestration bridge at boot so a build agent's
+            // live-worker control (spawn_worker / list_workers) survives an app restart, instead of
+            // dangling on an orphaned socket until its pane happens to remount. Unix-only (the socket
+            // bridge is #[cfg(unix)]); best-effort — a failure just falls back to the prior lazy-
+            // rebind-on-prepare() behavior. Reuses each agent's stable token so a still-running MCP
+            // client keeps validating after the rebind.
+            #[cfg(unix)]
+            {
+                match worktree::app_data_dir_pub(app.handle()) {
+                    Ok(dir) => {
+                        let mgr = app.state::<bridge::BridgeManager>();
+                        let n = bridge::reconcile_bridges_at(
+                            Some(app.handle().clone()),
+                            mgr.inner(),
+                            &dir,
+                        );
+                        if n > 0 {
+                            tracing::info!(rebound = n, "orchestration bridges reconciled at boot");
+                        }
+                    }
+                    Err(e) => tracing::warn!("bridge reconcile skipped (app_data_dir): {e}"),
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -231,9 +273,13 @@ pub fn run() {
             preflight::node_preflight,
             preflight::git_preflight,
             preflight::prereqs_preflight,
+            preflight::roborev_preflight,
             setup::install_node,
             setup::install_claude_code,
             setup::install_git,
+            setup::install_roborev,
+            setup::deactivate_roborev,
+            setup::roborev_auth_selftest,
             claude_chat::claude_chat_send,
             claude_chat::claude_chat_cancel,
             sparkle_improve::sparkle_improve_run,
@@ -248,6 +294,8 @@ pub fn run() {
             attachments::copy_file_to,
             attachments::copy_files_to_dir,
             worktree::ensure_project_repo,
+            worktree::install_repo_hooks_cmd,
+            worktree::remove_repo_hooks_cmd,
             worktree::prewarm_spawn,
             worktree::warm_worktree_pool,
             worktree::create_agent_worktree,
@@ -306,6 +354,7 @@ pub fn run() {
             notes::read_prd,
             notes::copy_capture_asset,
             notes::list_beads,
+            notes::ensure_beads_db,
             notes::bead_show,
             notes::create_bead_full,
             notes::bead_dep_add,
@@ -364,6 +413,9 @@ pub fn run() {
             config::config_file_paths,
             config::set_config_value,
             config::set_config_values,
+            config::unset_config_value,
+            config::set_project_config_value,
+            config::unset_project_config_value,
             config::write_config_text,
             config::reset_config,
             config::read_config_text,

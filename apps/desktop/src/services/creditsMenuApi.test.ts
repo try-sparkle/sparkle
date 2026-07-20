@@ -11,6 +11,8 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: (...a: unknown[]) => open
 
 import {
   PACKS,
+  checkoutGuidance,
+  classifyCheckoutError,
   fetchAutoTopup,
   fetchHistory,
   historyLabel,
@@ -146,6 +148,80 @@ describe("startTopup / startCardSetup", () => {
       kind: "card_setup",
       pack: null,
     });
+  });
+});
+
+describe("classifyCheckoutError (structured Rust error → recovery bucket)", () => {
+  it("maps the prod 403 StripePermissionError to the our-side config bucket", () => {
+    // The real prod failure: restricted key lacking customer_write → checkout returns 403.
+    expect(
+      classifyCheckoutError(JSON.stringify({ class: "server", status: 403, code: "stripe_permission" })),
+    ).toBe("config");
+  });
+
+  it("treats 5xx and a URL-less 2xx (no status) as config too", () => {
+    expect(classifyCheckoutError(JSON.stringify({ class: "server", status: 502 }))).toBe("config");
+    expect(classifyCheckoutError(JSON.stringify({ class: "server", code: "missing_url" }))).toBe(
+      "config",
+    );
+  });
+
+  it("routes 401 and the not_signed_in class to sign-in", () => {
+    expect(classifyCheckoutError(JSON.stringify({ class: "not_signed_in" }))).toBe("not_signed_in");
+    expect(classifyCheckoutError(JSON.stringify({ class: "server", status: 401 }))).toBe(
+      "not_signed_in",
+    );
+  });
+
+  it("maps the offline class to offline", () => {
+    expect(classifyCheckoutError(JSON.stringify({ class: "offline" }))).toBe("offline");
+  });
+
+  it("treats a benign 4xx (e.g. bad_pack) as a plain retry", () => {
+    expect(
+      classifyCheckoutError(JSON.stringify({ class: "server", status: 409, code: "bad_pack" })),
+    ).toBe("generic");
+  });
+
+  it("degrades gracefully when the error is opaque (not our structured JSON)", () => {
+    // A plain server code string (evolving server contract) or Error still classifies conservatively.
+    expect(classifyCheckoutError("bad_pack")).toBe("generic");
+    expect(classifyCheckoutError("not signed in")).toBe("not_signed_in");
+    expect(classifyCheckoutError(new Error("network request timed out"))).toBe("offline");
+    expect(classifyCheckoutError("StripePermissionError: forbidden")).toBe("config");
+    expect(classifyCheckoutError(undefined)).toBe("generic");
+  });
+});
+
+describe("checkoutGuidance (bucket → user-facing guidance)", () => {
+  it("config guidance blames Sparkle, says retry won't help, and offers support (no raw Stripe text)", () => {
+    const g = checkoutGuidance(JSON.stringify({ class: "server", status: 403, code: "stripe_permission" }));
+    expect(g.cls).toBe("config");
+    expect(g.showSupport).toBe(true);
+    expect(g.needsSignIn).toBe(false);
+    expect(g.message).toMatch(/Sparkle's side/);
+    expect(g.message).toMatch(/won't help/i);
+    // Never leak internal/Stripe details to the user.
+    expect(g.message.toLowerCase()).not.toContain("stripe");
+    expect(g.message).not.toContain("403");
+  });
+
+  it("offline guidance lets the user retry and never shows support", () => {
+    const g = checkoutGuidance(JSON.stringify({ class: "offline" }));
+    expect(g.cls).toBe("offline");
+    expect(g.message).toMatch(/offline/i);
+    expect(g.showSupport).toBe(false);
+    expect(g.needsSignIn).toBe(false);
+  });
+
+  it("not-signed-in guidance offers a sign-in path", () => {
+    const g = checkoutGuidance(JSON.stringify({ class: "not_signed_in" }));
+    expect(g.needsSignIn).toBe(true);
+    expect(g.showSupport).toBe(false);
+  });
+
+  it("generic guidance keeps the stable 'try again' copy", () => {
+    expect(checkoutGuidance("bad_pack").message).toBe("Couldn't start checkout — try again.");
   });
 });
 

@@ -40,6 +40,7 @@ function emptyConfig(): SparkleConfig {
     workflow: {} as SparkleConfig["workflow"],
     workers: {} as SparkleConfig["workers"],
     ai: {} as SparkleConfig["ai"],
+    roborev: {} as SparkleConfig["roborev"],
     freshness: {} as SparkleConfig["freshness"],
     capture: {} as SparkleConfig["capture"],
     done: { description: null, criteria: [] },

@@ -1,6 +1,6 @@
 [package]
 name = "sparkle"
-version = "0.23.0"
+version = "0.31.0"
 edition = "2021"
 description = "Sparkle desktop (macOS)"
 
@@ -85,6 +85,42 @@ keyring = { version = "3", features = ["apple-native"] }
 # that renames the class fails loud at link, but one that switches to UNUserNotificationCenter
 # would silently turn the category into a dead no-op — so bumps must be a deliberate, reviewed step.
 mac-notification-sys = "=0.6.15"
+
+# AVFoundation, for the microphone's TCC authorization status (see mic_permission.rs). Nothing
+# else can answer "did the user actually grant the mic?" — cpal/CoreAudio happily hand a DENIED
+# user a stream that delivers silence forever, which is the bug this dependency exists to detect.
+#
+# We take the generated objc2 bindings over hand-rolled `msg_send!` because they make the two
+# tricky bits compile-checked rather than trusted: `AVAuthorizationStatus` arrives as a real enum
+# (a raw `msg_send!` returns an NSInteger we'd be matching against hand-copied magic numbers, and
+# mixing up Restricted=1/Denied=2 silently inverts the remedy we show), and the async
+# `requestAccess` completion handler gets a typed `block2` block instead of a hand-built block
+# literal. `objc2` 0.6 is already in our tree via wry, so this adds no new toolchain surface.
+#
+# default-features = false is load-bearing: the crate defaults to ~168 features (all of
+# AVFoundation). We compile the two we touch — AVCaptureDevice for the status/request calls, and
+# AVMediaFormat for the AVMediaTypeAudio constant that selects the microphone rather than the
+# camera. `block2` is the completion-handler ABI; `objc2` is only for `runtime::Bool` in its
+# signature.
+#
+# Caret, NOT `=`-pinned like mac-notification-sys above — the two cases are not alike. That pin
+# exists because we compile an Objective-C category against that crate's own class, a real
+# cross-crate ABI coupling. There is no equivalent here: the `Bool`/`RcBlock` values we build are
+# only ever handed to objc2-av-foundation, which depends on `objc2`/`block2` itself and so shares
+# whichever version cargo resolves, by construction. We never pass an objc2 type to wry, so there
+# is no boundary between our tree and wry's to keep in sync. Cargo unifies semver-compatible
+# ranges, so wry's requirement and ours collapse to one objc2 (0.6.4) and one block2 (0.6.2) —
+# verified in Cargo.lock, which this change grew by exactly one package. `=`-pinning would be
+# actively worse: it breaks resolution the day objc2-av-foundation needs a 0.6.x we forbade
+# (roborev 37736).
+objc2 = "0.6"
+block2 = "0.6"
+objc2-av-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "AVCaptureDevice",
+    "AVMediaFormat",
+] }
 
 # Windows: native Credential Manager backend for `keyring`. Notifications are handled without an
 # extra crate in attention.rs (see the #[cfg(not(target_os = "macos"))] path).

@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { HookStatusEngine, hookEventToStatus, parseHookLine } from "./hookEvents";
+import {
+  HookStatusEngine,
+  createHookEventHandler,
+  hookEventToStatus,
+  parseHookLine,
+} from "./hookEvents";
 
 describe("hookEventToStatus", () => {
   it("maps in-turn lifecycle events to working (green)", () => {
@@ -293,5 +298,109 @@ describe("HookStatusEngine — session scoping", () => {
     expect(onStatus).toHaveBeenLastCalledWith("working");
     expect(onStatus).not.toHaveBeenCalledWith("done");
     expect(onStatus).not.toHaveBeenCalledWith("idle");
+  });
+});
+
+describe("HookStatusEngine.isMainSession", () => {
+  // Exposed so AgentPane can gate history capture + judge dispatch on the SAME session decision
+  // ingest() already makes, rather than duplicating the rule.
+  it("rejects a foreign session once ingest has adopted the lock", () => {
+    // Adopt-then-gate, the order createHookEventHandler uses (AgentPane wires that, not ingest
+    // directly). ingest() adopts too, so driving the engine on its own still locks on correctly.
+    const e = new HookStatusEngine({ agentId: "a1", onStatus: vi.fn() });
+    e.ingest({ event: "UserPromptSubmit", session_id: "s1" }); // adopts s1
+    expect(e.isMainSession({ event: "Stop", session_id: "s1" })).toBe(true);
+    expect(e.isMainSession({ event: "Stop", session_id: "s2" })).toBe(false); // background claude
+  });
+
+  it("isMainSession is PURE — querying it never latches the lock", () => {
+    // The footgun this guards: if the query adopted, a caller checking a BACKGROUND event before the
+    // main agent's first event would lock the tab onto the background session for its whole life.
+    const e = new HookStatusEngine({ agentId: "a1", onStatus: vi.fn() });
+    expect(e.isMainSession({ event: "Stop", session_id: "bg" })).toBe(true); // no lock yet
+    e.ingest({ event: "UserPromptSubmit", session_id: "main" }); // adopts, via adoptSession
+    expect(e.isMainSession({ event: "Stop", session_id: "bg" })).toBe(false); // bg never owned it
+    expect(e.isMainSession({ event: "Stop", session_id: "main" })).toBe(true);
+  });
+
+  it("isMainSession accepts an event with no session_id (defensive, older logs)", () => {
+    const e = new HookStatusEngine({ agentId: "a1", onStatus: vi.fn() });
+    expect(e.isMainSession({ event: "Stop" })).toBe(true);
+  });
+
+  it("ingest() still enforces the lock through the shared method", () => {
+    // One definition of the rule: ingest must go through isMainSession, so gating a second consumer
+    // on it can never drift from what actually drives the status.
+    const onStatus = vi.fn();
+    const e = new HookStatusEngine({ agentId: "a1", onStatus });
+    e.ingest({ event: "UserPromptSubmit", session_id: "main" });
+    e.ingest({ event: "Stop", session_id: "bg" }); // background — must not gray the main agent
+    expect(onStatus).toHaveBeenLastCalledWith("working");
+    expect(onStatus).not.toHaveBeenCalledWith("idle");
+  });
+});
+
+describe("createHookEventHandler", () => {
+  const mk = () => {
+    const onStatus = vi.fn();
+    const engine = new HookStatusEngine({ agentId: "a1", onStatus });
+    const activate = vi.fn();
+    const captureHistory = vi.fn();
+    return {
+      onStatus,
+      activate,
+      captureHistory,
+      handle: createHookEventHandler({ engine, activate, captureHistory }),
+    };
+  };
+
+  it("drives every consumer for a main-session event", () => {
+    const h = mk();
+    h.handle({ event: "UserPromptSubmit", session_id: "main" });
+    expect(h.activate).toHaveBeenCalledTimes(1);
+    expect(h.captureHistory).toHaveBeenCalledTimes(1);
+    expect(h.onStatus).toHaveBeenLastCalledWith("working");
+  });
+
+  it("activates BEFORE ingest, so the first event's status is not swallowed", () => {
+    // router.fromHook only emits once hooks are live, so activating after ingest would drop the
+    // very first status of the run.
+    const order: string[] = [];
+    const engine = new HookStatusEngine({
+      agentId: "a1",
+      onStatus: () => order.push("status"),
+    });
+    const handle = createHookEventHandler({
+      engine,
+      activate: () => order.push("activate"),
+      captureHistory: () => order.push("capture"),
+    });
+    handle({ event: "UserPromptSubmit", session_id: "main" });
+    expect(order).toEqual(["activate", "status", "capture"]);
+  });
+
+  it("a background session's event drives NOTHING — not even liveness", () => {
+    // The liveness point is the subtle one: activate() stamps the status router's hook clock, so a
+    // chatty background `claude` sharing this worktree's log would keep the clock fresh and defeat
+    // the staleness watchdog exactly when the MAIN session's stream is dead or mis-locked.
+    const h = mk();
+    h.handle({ event: "UserPromptSubmit", session_id: "main" }); // adopts the lock
+    h.activate.mockClear();
+    h.captureHistory.mockClear();
+    h.onStatus.mockClear();
+
+    h.handle({ event: "Stop", session_id: "bg" });
+    h.handle({ event: "PreToolUse", session_id: "bg", tool: "Bash" });
+    expect(h.activate).not.toHaveBeenCalled();
+    expect(h.captureHistory).not.toHaveBeenCalled();
+    expect(h.onStatus).not.toHaveBeenCalled();
+  });
+
+  it("locks onto the first event's session, so a later foreign event is rejected", () => {
+    const h = mk();
+    h.handle({ event: "SessionStart", session_id: "main" });
+    h.handle({ event: "SessionEnd", session_id: "bg" }); // background one-shot ending
+    expect(h.onStatus).not.toHaveBeenCalledWith("done");
+    expect(h.captureHistory).toHaveBeenCalledTimes(1);
   });
 });

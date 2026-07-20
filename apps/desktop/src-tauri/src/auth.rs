@@ -33,6 +33,14 @@ pub struct PendingAuth {
     verifier: String,
 }
 
+/// Stable error sentinel returned by `desktop_exchange_code` when a callback arrives but this
+/// instance has no in-flight sign-in to match it against — the classic "quit mid-sign-in, the
+/// `sparkle://auth?code=…` deep link relaunches a fresh process whose in-memory `PendingSignIn` is
+/// empty" dead-end. The JS side (entitlement.ts `isNoPendingSignIn`) matches on this exact string to
+/// tell that recoverable case ("just start sign-in again") apart from a genuine state mismatch / a
+/// server rejection, and surface a clean "restart sign-in" affordance instead of failing silently.
+pub const NO_PENDING_SIGNIN: &str = "no_pending_signin";
+
 /// A high-entropy, URL-safe token of `nbytes` of OS randomness (base64url, unpadded).
 fn random_b64url(nbytes: usize) -> String {
     let mut buf = vec![0u8; nbytes];
@@ -85,7 +93,6 @@ pub fn desktop_take_pending_deeplink(state: tauri::State<DeepLinkPending>) -> Op
     state.0.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
-const KEYCHAIN_SERVICE: &str = "ai.sparkle.desktop";
 const KEYCHAIN_USER: &str = "desktop-token";
 const DEFAULT_ORCHESTRATION_URL: &str = "http://localhost:3001";
 /// Bound every auth/credit HTTP call so a black-holed orchestration host can't freeze the calling
@@ -109,7 +116,10 @@ pub(crate) fn bearer_token() -> Option<String> {
 }
 
 fn entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| e.to_string())
+    // Service name is dev-suffixed in debug builds (see dev_identity) so a dev build never touches
+    // the production app's keychain ACL — avoids the macOS confidential-info prompt.
+    keyring::Entry::new(&crate::dev_identity::keychain_service(), KEYCHAIN_USER)
+        .map_err(|e| e.to_string())
 }
 
 fn read_token() -> Option<String> {
@@ -196,7 +206,7 @@ pub async fn desktop_exchange_code(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
-        .ok_or_else(|| "no pending sign-in".to_string())?;
+        .ok_or_else(|| NO_PENDING_SIGNIN.to_string())?;
     if !state_matches(&pending_auth.state, &state) {
         return Err("state mismatch".to_string());
     }
@@ -499,18 +509,38 @@ fn auto_topup_body(enabled: bool, threshold_cents: i64, pack_id: &str) -> String
     json!({ "enabled": enabled, "thresholdCents": threshold_cents, "packId": pack_id }).to_string()
 }
 
+/// Pull the server's stable machine-readable `error` code out of a non-2xx JSON body, if present
+/// and non-empty (e.g. "bad_pack", "stripe_permission"). Returns None for an opaque/empty body so
+/// callers degrade gracefully — the server error shape is evolving and we must not hard-depend on it.
+fn parse_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .filter(|e| !e.is_empty())
+}
+
 /// Map a non-2xx body to the server's stable `error` code when parseable (so JS can string-match
 /// e.g. "bad_pack", mirroring desktop_redeem_promo's "invalid_code"), else a loud status+snippet.
 fn server_error(prefix: &str, code: u16, body: &str) -> String {
-    if let Ok(v) = serde_json::from_str::<Value>(body) {
-        if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
-            if !e.is_empty() {
-                return e.to_string();
-            }
-        }
+    if let Some(e) = parse_error_code(body) {
+        return e;
     }
     let snippet: String = body.chars().take(200).collect();
     format!("{prefix} failed: HTTP {code}: {snippet}")
+}
+
+/// Machine-readable, self-classifying error for the checkout command, so the Credits pane can show
+/// a failure-class-appropriate message (our-side config problem vs. offline vs. signed-out) instead
+/// of one generic "try again". Encoded as a compact JSON string in the command's `Err` channel — the
+/// only consumer is creditsMenuApi's startCheckout, which owns both ends of this contract.
+///
+/// `class` is the coarse bucket the JS keys off first: "not_signed_in" | "offline" | "server".
+/// `status` is the upstream HTTP status (for "server") so JS can distinguish a 403 permission/config
+/// failure or a 5xx from a benign 4xx. `code` carries the server's stable `error` string when it
+/// sent one, purely as a hint — the JS classifier never *requires* it (the sibling server worker is
+/// separately reshaping that body), so an opaque body still classifies correctly from class+status.
+fn checkout_error(class: &str, status: Option<u16>, code: Option<&str>) -> String {
+    json!({ "class": class, "status": status, "code": code }).to_string()
 }
 
 /// Parse a JSON response body, mapping transport/parse errors to strings.
@@ -525,7 +555,8 @@ fn json_response(resp: ureq::Response) -> Result<Value, String> {
 /// thread — these fire from the interactive Credits pane, where a 15s freeze would be felt.
 #[tauri::command]
 pub async fn desktop_topup_checkout(kind: String, pack: Option<String>) -> Result<String, String> {
-    let token = read_token().ok_or_else(|| "not signed in".to_string())?;
+    // No local token → the session is gone; JS routes to sign-in rather than showing "try again".
+    let token = read_token().ok_or_else(|| checkout_error("not_signed_in", None, None))?;
     let url = format!("{}/billing/checkout", base_url());
     let body = checkout_body(&kind, pack.as_deref());
     let req = ureq::post(&url)
@@ -534,17 +565,24 @@ pub async fn desktop_topup_checkout(kind: String, pack: Option<String>) -> Resul
         .set("Content-Type", "application/json");
     match req.send_string(&body) {
         Ok(resp) => {
-            let v = json_response(resp)?;
+            // A 2xx whose body we couldn't read/parse is most likely a transient blip (the server
+            // IS up and accepted the request), so steer the user to retry — not to support.
+            let v = json_response(resp).map_err(|_| checkout_error("offline", None, None))?;
             v.get("url")
                 .and_then(|u| u.as_str())
                 .map(|s| s.to_string())
-                .ok_or_else(|| "checkout response missing url".to_string())
+                // A 2xx with no URL is a server-side contract/config break, not something a retry fixes.
+                .ok_or_else(|| checkout_error("server", None, Some("missing_url")))
         }
+        // Any upstream HTTP status: pass the status + the server's stable code (if any) to JS. The
+        // prod 403 StripePermissionError (restricted key lacking customer_write) lands here and is
+        // classified as an our-side config problem — not a "try again" the user can escape.
         Err(ureq::Error::Status(code, resp)) => {
             let text = resp.into_string().unwrap_or_default();
-            Err(server_error("checkout", code, &text))
+            Err(checkout_error("server", Some(code), parse_error_code(&text).as_deref()))
         }
-        Err(e) => Err(format!("checkout failed: {e}")),
+        // Transport failure (DNS/connect/timeout) → treat as offline; a retry once connected is the fix.
+        Err(_) => Err(checkout_error("offline", None, None)),
     }
 }
 
@@ -644,6 +682,15 @@ mod auth_binding_tests {
         // regex (^[A-Za-z0-9_-]{43}$) accepts.
         assert_eq!(challenge.len(), 43);
         assert_eq!(random_b64url(32).len(), 43);
+    }
+
+    #[test]
+    fn no_pending_signin_sentinel_is_stable() {
+        // Cross-language contract: entitlement.ts `isNoPendingSignIn` matches on this EXACT string to
+        // recognize the "quit mid-sign-in, no in-flight sign-in to match the callback" case and offer
+        // a clean restart. Renaming the constant without updating the JS matcher would silently
+        // regress that recovery back to a dead-end — pin the wire value here so that can't happen.
+        assert_eq!(NO_PENDING_SIGNIN, "no_pending_signin");
     }
 
     #[test]
@@ -754,6 +801,35 @@ mod tests {
     #[test]
     fn server_error_prefers_stable_error_code() {
         assert_eq!(server_error("checkout", 409, r#"{"error":"bad_pack"}"#), "bad_pack");
+    }
+
+    #[test]
+    fn parse_error_code_extracts_nonempty_error_else_none() {
+        assert_eq!(parse_error_code(r#"{"error":"stripe_permission"}"#).as_deref(), Some("stripe_permission"));
+        // Empty string, missing field, and opaque bodies all yield None (degrade gracefully).
+        assert_eq!(parse_error_code(r#"{"error":""}"#), None);
+        assert_eq!(parse_error_code(r#"{"message":"nope"}"#), None);
+        assert_eq!(parse_error_code("<html>500</html>"), None);
+    }
+
+    #[test]
+    fn checkout_error_is_structured_json_the_js_classifier_reads() {
+        // 403 permission (the prod StripePermissionError) carries class+status+code so JS can
+        // classify it as an our-side config problem without depending on the exact body shape.
+        let v: Value =
+            serde_json::from_str(&checkout_error("server", Some(403), Some("stripe_permission")))
+                .unwrap();
+        assert_eq!(v["class"], "server");
+        assert_eq!(v["status"], 403);
+        assert_eq!(v["code"], "stripe_permission");
+
+        // Signed-out and offline carry no status/code but stay valid JSON with null fields.
+        let so: Value = serde_json::from_str(&checkout_error("not_signed_in", None, None)).unwrap();
+        assert_eq!(so["class"], "not_signed_in");
+        assert!(so["status"].is_null());
+        assert!(so["code"].is_null());
+        let off: Value = serde_json::from_str(&checkout_error("offline", None, None)).unwrap();
+        assert_eq!(off["class"], "offline");
     }
 
     #[test]

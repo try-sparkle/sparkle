@@ -20,6 +20,14 @@ export interface AgentName {
   description: string;
 }
 
+// Where a prompt-history entry came from. "composer" is a real user message (typed/voice send, or
+// the build seed) — the only kind shown in the pinned-header breadcrumb / tray. "picker" is an
+// answer to Claude Code's own in-terminal selection menu (AskUserQuestion), recorded ONLY so it
+// advances promptCount for the naming ladder; it is filtered OUT of every display surface because a
+// terse answer like "Unlisted — direct link only" would otherwise evict the real request from the
+// breadcrumb (the whole point of which is to surface what you last asked without scrolling).
+export type PromptSource = "composer" | "picker";
+
 // One entry in an agent's prompt history (the dropdown under the pinned header). `id` is the
 // key the Terminal stores its xterm marker under, so clicking an entry can scroll the terminal
 // back to where that prompt was sent. `text` is the display text (same as the transcript line);
@@ -28,6 +36,9 @@ export interface PromptHistoryEntry {
   id: string;
   text: string;
   at: number;
+  // Absent on records written before the picker-tagging change (persist v10 backfills them to
+  // "composer"); readers treat a missing value as "composer" so legacy entries always display.
+  source?: PromptSource;
 }
 
 // Per-agent alert-episode record backing the "Dismiss Alert" affordance (engine/alertDismissal.ts,
@@ -72,6 +83,14 @@ export interface AgentTab {
   // is the prompt the current auto-name was derived from, used to decide when the work has
   // shifted enough to re-name. Null until the first auto-name lands.
   namePinned: boolean;
+  // Set when the AGENT names ITSELF via the sparkle-control `rename_agent` MCP op (self-report
+  // naming, PRs #376/#380/#390). Like `namePinned` it makes the chosen name authoritative — it
+  // freezes the name against the background auto-namer, skips the paid Haiku fallback, and is
+  // preserved across a rehydrate merge. But it is NOT a human pin: it does NOT show the pin chip
+  // and does NOT anchor the sidebar row (that stays the exclusive job of `namePinned`/`pinnedIndex`),
+  // so an agent naming itself never looks pinned and never blocks the human's reorder. Optional so
+  // legacy records read as `undefined` (falsy = not self-named) with no migration step.
+  selfNamed?: boolean;
   autoNameBasis: string | null;
   // The title + description behind the current auto-name. Null until the first auto-name lands,
   // and for pinned/manually-named agents (which use `name` only). `name` stays the canonical

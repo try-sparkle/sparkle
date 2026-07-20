@@ -5,11 +5,12 @@
 // silently ignore a closed/unknown agent id (the search row reports "closed" instead). We assert
 // on the resulting store state rather than spying, so the test pins behavior, not call shape.
 import { act, cleanup, render } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CurrentProjectProvider, useCurrentProjectId } from "./windowContext";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
+import { useDictationStore } from "./stores/dictationStore";
 import type { AgentTab, Project } from "./types";
 
 function mkAgent(id: string): AgentTab {
@@ -45,10 +46,59 @@ function ProjectIdProbe() {
 beforeEach(() => {
   useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
   useRuntimeStore.setState({ openAgentIds: [] } as never);
+  useDictationStore.setState({ phase: "passive" });
 });
 afterEach(() => {
   cleanup();
   setSearch("");
+});
+
+// The mic's active/paused status is shared + persisted across windows. On a true cold start the
+// main window is the only window, so it resets a stale "active" (left over from a previous session)
+// back to "passive" — relaunching never resumes mid-dictation. A non-main window must NOT reset, or
+// opening a second window mid-session would clobber the live shared status.
+describe("CurrentProjectProvider — cold-start mic phase reset", () => {
+  it("main window resets a stale active phase to passive on cold start", () => {
+    useDictationStore.setState({ phase: "active" });
+    setSearch(""); // no ?label= → the main window
+    render(<CurrentProjectProvider>ok</CurrentProjectProvider>);
+    expect(useDictationStore.getState().phase).toBe("passive");
+  });
+
+  it("a non-main window does NOT reset the shared mic phase", () => {
+    useDictationStore.setState({ phase: "active" });
+    setSearch("?label=win-1"); // a secondary window
+    render(<CurrentProjectProvider>ok</CurrentProjectProvider>);
+    expect(useDictationStore.getState().phase).toBe("active");
+  });
+
+  it("main window defers the reset until hydration finishes when not yet hydrated", () => {
+    // Real localStorage hydrates synchronously in tests, so the sync (hasHydrated) branch is what
+    // the tests above exercise. Drive the async branch directly: stub the store as not-yet-hydrated
+    // and capture the onFinishHydration callback, then fire it. The reset must be deferred until the
+    // persisted value has landed — otherwise it would be overwritten by hydration.
+    useDictationStore.setState({ phase: "active" });
+    let finishHydration: (() => void) | undefined;
+    const hasHydrated = vi.spyOn(useDictationStore.persist, "hasHydrated").mockReturnValue(false);
+    const onFinish = vi
+      .spyOn(useDictationStore.persist, "onFinishHydration")
+      .mockImplementation((fn) => {
+        finishHydration = fn as () => void;
+        return () => {};
+      });
+
+    setSearch(""); // the main window
+    render(<CurrentProjectProvider>ok</CurrentProjectProvider>);
+    // Hydration still in flight → reset deferred, phase untouched so far.
+    expect(useDictationStore.getState().phase).toBe("active");
+
+    // Hydration settles → the deferred reset fires.
+    finishHydration?.();
+    expect(useDictationStore.getState().phase).toBe("passive");
+
+    hasHydrated.mockRestore();
+    onFinish.mockRestore();
+  });
 });
 
 describe("CurrentProjectProvider — ?agent= deep-link", () => {
@@ -134,5 +184,60 @@ describe("CurrentProjectProvider — late-hydration project recovery", () => {
     expect(getByTestId("pid").textContent).toBe("p1");
     expect(selectedAgentId()).toBe("a2");
     expect(useRuntimeStore.getState().isOpen("a2")).toBe(true);
+  });
+});
+
+// The main window (no `?label=`) is the one a cold start restores: computeInitialProjectId reads
+// selectedProjectId. So the main window must keep selectedProjectId synced with the project it
+// actually shows, or a relaunch reverts to the first ("zero-zero") project. Secondary windows carry
+// `?project=` and must NOT claim the shared hint.
+describe("CurrentProjectProvider — main-window restore hint", () => {
+  function seedTwo(): void {
+    const mk = (id: string): Project => ({
+      id, name: id, rootPath: `/tmp/${id}`, defaultBranch: null,
+      createdAt: new Date(0).toISOString(), selectedAgentId: null, agents: [],
+    });
+    useProjectStore.setState({ projects: [mk("p1"), mk("p2")] } as never);
+  }
+
+  it("main window claims its resolved project as the restore hint on mount", () => {
+    // No hint yet → main window resolves to the first project; it must then persist that as the hint.
+    seedTwo();
+    setSearch(""); // no ?label= → this IS the main window
+    const { getByTestId } = render(
+      <CurrentProjectProvider>
+        <ProjectIdProbe />
+      </CurrentProjectProvider>,
+    );
+    expect(getByTestId("pid").textContent).toBe("p1");
+    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
+  });
+
+  it("restores the last-selected project (not the first) on a fresh main window", () => {
+    // Simulate a prior session having left p2 as the selection; a relaunched main window reopens p2.
+    seedTwo();
+    useProjectStore.setState({ selectedProjectId: "p2" } as never);
+    setSearch("");
+    const { getByTestId } = render(
+      <CurrentProjectProvider>
+        <ProjectIdProbe />
+      </CurrentProjectProvider>,
+    );
+    expect(getByTestId("pid").textContent).toBe("p2");
+    expect(useProjectStore.getState().selectedProjectId).toBe("p2");
+  });
+
+  it("a secondary window does NOT overwrite the shared restore hint", () => {
+    seedTwo();
+    useProjectStore.setState({ selectedProjectId: "p1" } as never);
+    setSearch("?project=p2&label=win-1"); // secondary window showing p2
+    const { getByTestId } = render(
+      <CurrentProjectProvider>
+        <ProjectIdProbe />
+      </CurrentProjectProvider>,
+    );
+    expect(getByTestId("pid").textContent).toBe("p2");
+    // The hint stays pinned to the main window's project, untouched by the secondary window.
+    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
   });
 });

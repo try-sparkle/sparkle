@@ -88,7 +88,7 @@ export function TrayApp() {
     }
   };
 
-  // Pinned header (logo + balance + Recent/Open/New/Capture) and footer (Quit), with the agent
+  // Pinned header (logo + balance + Recent/Open/Capture) and footer (Quit), with the agent
   // dashboard scrolling between them. background on the root so the (deepForest) chrome and
   // (forest) list share one surface with no gaps.
   return (

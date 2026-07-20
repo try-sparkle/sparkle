@@ -27,7 +27,7 @@ export function CardCriteria({
   stageKey: StageKey;
   /** That stage's definition (caller guarantees it isDefined). */
   def: StageDefinition;
-  /** The card's current 9-stage stage — drives the auto signals (merged_to_main / pushed / …). */
+  /** The card's current 10-stage stage — drives the auto signals (merged_to_main / pushed / …). */
   stage: WorkflowStageId;
   /** Delivery-monitor verdict for this bead (Delivered only); undefined → honest fallback in eval. */
   inRelease?: boolean;

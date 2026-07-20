@@ -4,14 +4,14 @@
 //! before any work. This sub-plan (2a) serves `read_result`; later sub-plans add spawn/list/wait.
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -137,8 +137,15 @@ pub fn start_bridge_at(
             sock.display()
         ));
     }
-    // FIX B: generate token BEFORE bind so a failure here can't leave a socket file behind.
-    let token = generate_token()?;
+    // FIX B: resolve the token BEFORE bind so a failure here can't leave a socket file behind.
+    // sparkle-i95d: REUSE this agent's persisted token when it has one — so a rebind (a dead-handle
+    // rebind in THIS process, or a boot-time reconcile after an app restart) is transparent to an
+    // MCP client whose frozen env still holds the original token. Only mint a fresh token for an
+    // agent with none on record yet. Persisted below, after the bind + insert succeed.
+    let token = match persisted_bridge_token(app_data, build_agent_id) {
+        Some(t) => t,
+        None => generate_token()?,
+    };
     let _ = std::fs::remove_file(&sock); // clear any stale socket
     let listener = UnixListener::bind(&sock).map_err(|e| format!("bind {sock:?}: {e}"))?;
     // FIX B: clean up socket file on post-bind failures.
@@ -201,6 +208,10 @@ pub fn start_bridge_at(
             owner: launch_token.to_string(),
         },
     );
+    // sparkle-i95d: record the stable (project, token) AFTER a successful bind + insert, so a rebind
+    // (dead-handle in this process, or a boot reconcile after restart) reuses this exact token and a
+    // surviving MCP client keeps validating. Idempotent — a reused token just rewrites the same value.
+    persist_bridge_entry(app_data, build_agent_id, project_id, &token);
     Ok((sock, token))
 }
 
@@ -243,7 +254,10 @@ fn serve_conn(
 /// the bridge with: teardown happens ONLY when it matches the current owner (or is `None`, an
 /// unconditional stop). A stale run presenting an old token is a no-op — it can't tear down a
 /// NEWER launch's live bridge (the sub-second close-reopen / superseded-prepare race).
-pub fn stop_bridge(manager: &BridgeManager, build_agent_id: &str, launch_token: Option<&str>) {
+/// Returns `true` when this call actually tore the bridge down, `false` on a stale-token / absent
+/// no-op — so the caller (`stop_orchestration_bridge`) only forgets the persisted token on a REAL
+/// teardown, never on a sub-second close-reopen where the agent is coming back (sparkle-i95d).
+pub fn stop_bridge(manager: &BridgeManager, build_agent_id: &str, launch_token: Option<&str>) -> bool {
     let mut map = manager.bridges.lock().unwrap_or_else(|e| e.into_inner());
     // Only tear down when this caller owns the current bridge (or forces it with None).
     let owns = match (map.get(build_agent_id), launch_token) {
@@ -252,17 +266,21 @@ pub fn stop_bridge(manager: &BridgeManager, build_agent_id: &str, launch_token: 
         (None, _) => false,
     };
     if !owns {
-        return;
+        return false;
     }
-    if let Some(h) = map.remove(build_agent_id) {
+    let torn = if let Some(h) = map.remove(build_agent_id) {
         h.shutdown.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_file(&h.socket_path);
-    }
+        true
+    } else {
+        false
+    };
     // Drop the map lock BEFORE resolving pending ops so a woken accept thread can't contend on it.
     drop(map);
     // Release any blocked round-trip ops owned by this build agent so their accept threads return
     // immediately instead of waiting out the 600s timeout.
     resolve_pending_for_agent(&manager.pending, build_agent_id);
+    torn
 }
 
 /// The git SHA this binary was built from (sparkle-bnvs), embedded at compile time by build.rs.
@@ -307,6 +325,141 @@ pub fn generate_token() -> Result<String, String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+// --- sparkle-i95d: durable per-agent bridge registry ------------------------------------------
+// A build agent's bridge token used to be minted fresh on every bind and held only in memory, so an
+// app restart (which drops the in-memory BridgeManager and orphans the socket file) left a still-
+// running MCP client pointing at a dead socket AND — even once something rebound it — holding a token
+// the fresh bind had rotated away. Persisting `(project_id, token)` per build agent fixes both:
+//   * the token is now STABLE across rebinds (reused from disk), so a surviving client's frozen env
+//     keeps validating after a rebind; and
+//   * the host can enumerate every agent at boot and rebind its socket (reconcile_bridges_at) without
+//     waiting for the agent's pane to remount.
+// The file (`<app_data>/orch-bridges.json`, 0600 — the same owner-only posture as the socket) is
+// written best-effort: any IO/parse failure degrades to "no persisted state" (mint a fresh token,
+// reconcile nothing) rather than blocking bridge start.
+
+/// Serializes read-modify-write of the registry file so two agents starting concurrently can't
+/// lost-update each other's entries (the file is process-shared; the per-agent `bridges` lock only
+/// guards a single agent's start). Const-initialized so it needs no lazy setup.
+static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+/// Per-write uniquifier for the registry temp file. Callers already hold REGISTRY_LOCK (so writes are
+/// serialized), but keying the temp name on this counter as well means a future caller that forgets
+/// the lock still can't have two concurrent writes clobber the same temp path.
+static REGISTRY_TMP_CTR: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PersistedBridge {
+    project_id: String,
+    token: String,
+}
+
+fn bridge_registry_path(app_data: &Path) -> PathBuf {
+    app_data.join("orch-bridges.json")
+}
+
+/// Read the registry (build_agent_id → {project_id, token}). Best-effort: a missing or unparseable
+/// file is treated as empty, never an error.
+fn read_bridge_registry(app_data: &Path) -> HashMap<String, PersistedBridge> {
+    match std::fs::read_to_string(bridge_registry_path(app_data)) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Persist the registry atomically at 0600. The file holds every agent's bridge token in plaintext,
+/// so it must NEVER pass through a world-readable state: create a temp sibling with mode 0600 from
+/// the first byte (no write-then-chmod TOCTOU window), write + fsync, then rename over the target —
+/// which also gives readers an all-or-nothing view (no torn read). Best-effort — a failure just means
+/// we fall back to a fresh token / lazy rebind next time.
+fn write_bridge_registry(app_data: &Path, map: &HashMap<String, PersistedBridge>) {
+    let Ok(json) = serde_json::to_string(map) else { return };
+    let path = bridge_registry_path(app_data);
+    // pid guards against two app instances colliding; the per-write counter guards against any
+    // intra-process concurrency (defense-in-depth beyond REGISTRY_LOCK).
+    let tmp = path.with_file_name(format!(
+        "orch-bridges.json.tmp.{}.{}",
+        std::process::id(),
+        REGISTRY_TMP_CTR.fetch_add(1, Ordering::Relaxed),
+    ));
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp);
+    let Ok(mut f) = opened else { return };
+    if f.write_all(json.as_bytes()).is_ok() && f.sync_all().is_ok() {
+        // Clean the temp up on a rename failure too, so a failed swap can't accumulate orphans.
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// This build agent's previously-persisted token, if any. `None` → first bind for this agent (mint).
+fn persisted_bridge_token(app_data: &Path, build_agent_id: &str) -> Option<String> {
+    let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    read_bridge_registry(app_data).get(build_agent_id).map(|e| e.token.clone())
+}
+
+/// Record this agent's stable `(project, token)` so a later rebind or boot reconcile reuses it.
+fn persist_bridge_entry(app_data: &Path, build_agent_id: &str, project_id: &str, token: &str) {
+    let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = read_bridge_registry(app_data);
+    map.insert(
+        build_agent_id.to_string(),
+        PersistedBridge { project_id: project_id.to_string(), token: token.to_string() },
+    );
+    write_bridge_registry(app_data, &map);
+}
+
+/// Forget an agent's persisted bridge on a REAL teardown, so a closed agent isn't rebound at the
+/// next boot. Only called when stop actually tore the bridge down (not on a stale-token no-op stop).
+fn remove_persisted_bridge(app_data: &Path, build_agent_id: &str) {
+    let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = read_bridge_registry(app_data);
+    if map.remove(build_agent_id).is_some() {
+        write_bridge_registry(app_data, &map);
+    }
+}
+
+/// Forget the persisted token IFF the stop actually tore the bridge down. Extracted from
+/// `stop_orchestration_bridge` so the torn→forget wiring is unit-testable without a Tauri runtime:
+/// a stale-token no-op stop (torn=false, the sub-second close-reopen race) MUST keep the entry so the
+/// reopen reuses the same token; a real teardown (torn=true) forgets it so a closed agent isn't
+/// rebound at the next boot.
+fn forget_persisted_if_torn(app_data: &Path, build_agent_id: &str, torn: bool) {
+    if torn {
+        remove_persisted_bridge(app_data, build_agent_id);
+    }
+}
+
+/// sparkle-i95d: at app boot, rebind every persisted build agent's socket so live-worker control
+/// survives an app restart WITHOUT waiting for the agent's pane to remount. Best-effort per agent
+/// (one failure never aborts the rest). Each rebind reuses the persisted (stable) token, so a still-
+/// running MCP client's frozen env keeps validating; the owner is seeded to that token and the
+/// agent's next `prepare()` transfers ownership to its own launch token. Returns the count rebound.
+pub fn reconcile_bridges_at(app: Option<AppHandle>, manager: &BridgeManager, app_data: &Path) -> usize {
+    let registry = {
+        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        read_bridge_registry(app_data)
+    };
+    let mut rebound = 0usize;
+    for (build_agent_id, entry) in registry {
+        match start_bridge_at(app.clone(), manager, app_data, &entry.project_id, &build_agent_id, &entry.token) {
+            Ok(_) => {
+                rebound += 1;
+                append_orch_log(app_data, &format!("bridge_reconcile build={build_agent_id} project={}", entry.project_id));
+            }
+            Err(e) => append_orch_log(app_data, &format!("bridge_reconcile_failed build={build_agent_id} err={e}")),
+        }
+    }
+    rebound
+}
+
 /// Start the orchestration bridge for a build agent (Tauri command).
 #[tauri::command]
 pub fn start_orchestration_bridge(
@@ -334,9 +487,12 @@ pub fn stop_orchestration_bridge(
     build_agent_id: String,
     launch_token: String,
 ) -> Result<(), String> {
-    stop_bridge(&manager, &build_agent_id, Some(&launch_token));
+    let torn = stop_bridge(&manager, &build_agent_id, Some(&launch_token));
     if let Ok(app_data) = crate::worktree::app_data_dir_pub(&app) {
-        append_orch_log(&app_data, &format!("bridge_stop build={build_agent_id}"));
+        // sparkle-i95d: only forget the persisted token on a REAL teardown. A stale-token no-op stop
+        // (the sub-second close-reopen race) must keep the entry so the reopen reuses the same token.
+        forget_persisted_if_torn(&app_data, &build_agent_id, torn);
+        append_orch_log(&app_data, &format!("bridge_stop build={build_agent_id} torn={torn}"));
     }
     Ok(())
 }
@@ -1034,13 +1190,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&app_data);
     }
 
-    // FIX 2 — stale-handle rebind: if a handle's accept loop has died (alive=false), a subsequent
-    // start_bridge_at for the same id must rebind and return a FRESH token (not the stale one).
+    // FIX 2 + sparkle-i95d — stale-handle rebind: if a handle's accept loop has died (alive=false), a
+    // subsequent start_bridge_at for the same id must rebind and bring the socket back up. The token
+    // is now REUSED from the persisted registry (NOT rotated): a dead-loop rebind must stay transparent
+    // to an MCP client whose frozen env still holds the original token, exactly as a boot reconcile is.
     #[test]
-    fn stale_dead_handle_is_rebound() {
+    fn stale_dead_handle_is_rebound_with_stable_token() {
         let app_data = short_unique_dir("stale");
         let mgr = BridgeManager::default();
-        let (_sock1, token1) = start_bridge_at(None, &mgr, &app_data, "p", "stale-agent", "L1").unwrap();
+        let (sock1, token1) = start_bridge_at(None, &mgr, &app_data, "p", "stale-agent", "L1").unwrap();
 
         // Reach into the manager and flip alive to false — simulating a fatal accept-loop exit.
         {
@@ -1050,10 +1208,135 @@ mod tests {
         }
 
         // A second call for the same id must detect the dead handle, tear it down, and rebind.
-        let (_sock2, token2) = start_bridge_at(None, &mgr, &app_data, "p", "stale-agent", "L2").unwrap();
-        assert_ne!(token1, token2, "fresh bind must produce a new token, not the stale one");
+        let (sock2, token2) = start_bridge_at(None, &mgr, &app_data, "p", "stale-agent", "L2").unwrap();
+        assert_eq!(sock1, sock2, "rebind reuses the deterministic socket path");
+        assert_eq!(token1, token2, "rebind must REUSE the persisted token, not rotate it (sparkle-i95d)");
+        // The rebound socket is actually live again.
+        assert!(UnixStream::connect(&sock2).is_ok(), "rebound socket must accept connections");
 
         stop_bridge(&mgr, "stale-agent", None);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // sparkle-i95d — token stability across a simulated APP RESTART: a fresh BridgeManager (the
+    // in-memory map is gone, as after a process restart) binding the same agent against the same
+    // app_data must REUSE the persisted token, so a still-running MCP client's frozen env keeps
+    // validating once the socket is rebound.
+    #[test]
+    fn token_is_stable_across_process_restart() {
+        let app_data = short_unique_dir("i95d-stable");
+        // First "process": bind, capture the token, then drop the manager entirely.
+        let token1 = {
+            let mgr1 = BridgeManager::default();
+            let (_sock, token) = start_bridge_at(None, &mgr1, &app_data, "proj", "restart-agent", "L1").unwrap();
+            // Simulate the process going away without a graceful stop: forget the in-memory handle
+            // (and its listener) but LEAVE the persisted registry on disk.
+            stop_bridge(&mgr1, "restart-agent", None);
+            token
+        };
+        // Second "process": a brand-new manager (empty in-memory map) binds the same agent.
+        let mgr2 = BridgeManager::default();
+        let (sock2, token2) = start_bridge_at(None, &mgr2, &app_data, "proj", "restart-agent", "L2").unwrap();
+        assert_eq!(token1, token2, "token must survive a process restart (reused from the registry)");
+        assert!(UnixStream::connect(&sock2).is_ok(), "rebound socket must be live");
+        stop_bridge(&mgr2, "restart-agent", None);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // sparkle-i95d — boot reconcile: after a restart the host must rebind EVERY persisted agent's
+    // socket up front (not lazily on pane remount). reconcile_bridges_at, given only the on-disk
+    // registry and a fresh manager, brings each socket back live with its stable token.
+    #[test]
+    fn reconcile_rebinds_persisted_sockets_at_boot() {
+        let app_data = short_unique_dir("i95d-recon");
+        // Seed two agents' registry entries via a first "process", then drop that manager.
+        let (tok_a, tok_b) = {
+            let mgr = BridgeManager::default();
+            let (_sa, ta) = start_bridge_at(None, &mgr, &app_data, "proj", "recon-a", "L1").unwrap();
+            let (_sb, tb) = start_bridge_at(None, &mgr, &app_data, "proj", "recon-b", "L1").unwrap();
+            // Tear down the live listeners (sockets removed) but keep the persisted registry.
+            stop_bridge(&mgr, "recon-a", None);
+            stop_bridge(&mgr, "recon-b", None);
+            (ta, tb)
+        };
+        // Sockets are down now.
+        let sock_a = bridge_socket_path(&app_data, "proj", "recon-a");
+        let sock_b = bridge_socket_path(&app_data, "proj", "recon-b");
+        assert!(UnixStream::connect(&sock_a).is_err(), "socket A down before reconcile");
+        assert!(UnixStream::connect(&sock_b).is_err(), "socket B down before reconcile");
+
+        // Boot reconcile with a brand-new manager rebinds both from the registry alone.
+        let mgr2 = BridgeManager::default();
+        let n = reconcile_bridges_at(None, &mgr2, &app_data);
+        assert_eq!(n, 2, "both persisted agents rebound");
+        assert!(UnixStream::connect(&sock_a).is_ok(), "socket A live after reconcile");
+        assert!(UnixStream::connect(&sock_b).is_ok(), "socket B live after reconcile");
+        // Tokens preserved through the reconcile.
+        assert_eq!(persisted_bridge_token(&app_data, "recon-a").as_deref(), Some(tok_a.as_str()));
+        assert_eq!(persisted_bridge_token(&app_data, "recon-b").as_deref(), Some(tok_b.as_str()));
+
+        stop_bridge(&mgr2, "recon-a", None);
+        stop_bridge(&mgr2, "recon-b", None);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // sparkle-i95d — a REAL teardown (stop_orchestration_bridge's owner-matched stop) forgets the
+    // persisted entry so a closed agent is NOT rebound at the next boot; a stale-token no-op stop
+    // must NOT forget it (the reopen reuses the same token). Exercised at the helper level.
+    #[test]
+    fn real_stop_forgets_persisted_entry_reconcile_skips_it() {
+        let app_data = short_unique_dir("i95d-forget");
+        let mgr = BridgeManager::default();
+        let _ = start_bridge_at(None, &mgr, &app_data, "proj", "gone-agent", "L1").unwrap();
+        assert!(persisted_bridge_token(&app_data, "gone-agent").is_some(), "persisted after start");
+
+        // A stale-token stop is a no-op: entry must remain (the close-reopen race).
+        assert!(!stop_bridge(&mgr, "gone-agent", Some("WRONG")), "stale-token stop is a no-op");
+        // (entry still present because the command only forgets on a torn-down stop)
+        assert!(persisted_bridge_token(&app_data, "gone-agent").is_some(), "stale no-op keeps the entry");
+
+        // A real (owner) stop tears down; mirror the command's cleanup and forget the entry.
+        assert!(stop_bridge(&mgr, "gone-agent", Some("L1")), "owner stop tears down");
+        remove_persisted_bridge(&app_data, "gone-agent");
+        assert!(persisted_bridge_token(&app_data, "gone-agent").is_none(), "forgotten after real teardown");
+
+        // Boot reconcile must now rebind nothing.
+        let mgr2 = BridgeManager::default();
+        assert_eq!(reconcile_bridges_at(None, &mgr2, &app_data), 0, "closed agent not rebound at boot");
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // sparkle-i95d — directly cover the torn→forget conditional that stop_orchestration_bridge runs
+    // (the command itself needs a Tauri runtime, so the wiring is exercised via the extracted helper).
+    #[test]
+    fn forget_persisted_if_torn_only_removes_on_real_teardown() {
+        let app_data = short_unique_dir("i95d-torn");
+        let mgr = BridgeManager::default();
+        let _ = start_bridge_at(None, &mgr, &app_data, "proj", "torn-agent", "L1").unwrap();
+        assert!(persisted_bridge_token(&app_data, "torn-agent").is_some(), "persisted after start");
+
+        // torn=false (the stale-token no-op stop path) must KEEP the entry.
+        forget_persisted_if_torn(&app_data, "torn-agent", false);
+        assert!(persisted_bridge_token(&app_data, "torn-agent").is_some(), "no-op stop keeps the entry");
+
+        // torn=true (a real owner-matched teardown) must FORGET it.
+        forget_persisted_if_torn(&app_data, "torn-agent", true);
+        assert!(persisted_bridge_token(&app_data, "torn-agent").is_none(), "real teardown forgets the entry");
+
+        stop_bridge(&mgr, "torn-agent", None);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // sparkle-i95d — the token file must never be world-readable, even briefly: it's created 0600 and
+    // written atomically (temp + rename), so at no point is the plaintext-token registry mode 0644.
+    #[test]
+    fn registry_file_is_0600() {
+        let app_data = short_unique_dir("i95d-perm");
+        let mgr = BridgeManager::default();
+        let _ = start_bridge_at(None, &mgr, &app_data, "proj", "perm-agent", "L1").unwrap();
+        let mode = std::fs::metadata(bridge_registry_path(&app_data)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "registry (plaintext tokens) must be owner-only");
+        stop_bridge(&mgr, "perm-agent", None);
         let _ = std::fs::remove_dir_all(&app_data);
     }
 

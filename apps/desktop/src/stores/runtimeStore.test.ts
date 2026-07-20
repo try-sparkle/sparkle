@@ -204,9 +204,12 @@ describe("runtimeStore — workflowShipped sticky latch (review #13591)", () => 
     const { runtime, projectId, agentId } = await setup("build");
     const store = runtime.useRuntimeStore;
 
-    // Ship: committed work whose tip is in local main → stage advances to "merged".
+    // Ship: committed work whose tip is in ORIGIN main → stage advances to "merged".
+    // Re-aimed for the merged_local split: this latch means "the work is on the REMOTE main", so the
+    // fixture must reach origin. `inLocalMain` alone now settles at merged_local, which deliberately
+    // does NOT trip the latch (see the sticky-latch comment in runtimeStore.applyWorkflowState).
     store.getState().setBranchStatus(agentId, bsStatus(1));
-    agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true }));
+    agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true, inOriginMain: true }));
     await store.getState().refreshWorkflowStage("/root", projectId, agentId);
     expect(store.getState().workflowStage[agentId]).toBe("merged");
     expect(store.getState().workflowShipped[agentId]).toBe(true);
@@ -226,6 +229,133 @@ describe("runtimeStore — workflowShipped sticky latch (review #13591)", () => 
     store.getState().setWorkflowShipped(agentId, true);
     store.getState().close(agentId);
     expect(store.getState().workflowShipped[agentId]).toBeUndefined();
+  });
+});
+
+// The live WorkflowState is stored so the composer CTA can read `hasRemote` (Part 1, Task 1.3).
+// `has_remote` is gated on probe_pr_state in Rust, so EVERY fast/local tick reports false — the
+// store must latch an observed true or the CTA would flap between "Push to Origin Main" and
+// "Close" on alternating polls.
+describe("runtimeStore — workflowState + sticky hasRemote", () => {
+  const wsState = (p: Record<string, unknown>) => ({
+    inLocalMain: false,
+    inOriginMain: false,
+    inParent: false,
+    aheadOfBase: 0,
+    prState: null,
+    prNumber: null,
+    prUrl: null,
+    ...p,
+  });
+  const bsStatus = (ahead: number) => ({
+    ahead,
+    behind: 0,
+    dirty: false,
+    filesChanged: 1,
+    insertions: 1,
+    deletions: 0,
+  });
+
+  it("stores the live workflow state so the CTA can read it", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    store.getState().setBranchStatus(agentId, bsStatus(1));
+    agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true, hasRemote: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(store.getState().workflowState[agentId]?.inLocalMain).toBe(true);
+    expect(store.getState().workflowState[agentId]?.hasRemote).toBe(true);
+  });
+
+  it("hasRemote is sticky: a fast poll's false must not clobber an observed true", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    store.getState().setBranchStatus(agentId, bsStatus(1));
+    // Full (probing) poll: the remote is observed.
+    agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true, hasRemote: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(store.getState().workflowState[agentId]?.hasRemote).toBe(true);
+    // Fast poll: has_remote wasn't probed, so Rust reports false. It must NOT clobber the latch.
+    agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true, hasRemote: false }));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(store.getState().workflowState[agentId]?.hasRemote).toBe(true);
+  });
+
+  it("a never-observed remote stays false (the latch only ever raises)", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    store.getState().setBranchStatus(agentId, bsStatus(1));
+    agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    expect(store.getState().workflowState[agentId]?.hasRemote).toBe(false);
+  });
+
+  // The store-side half of the worker promotion (roborev #38097). deriveLiveStage's consumption of
+  // the flag is covered in workflowStage.test.ts; this pins how the flag is DERIVED — specifically
+  // that it reads the parent's LIVE state, not its sticky stage watermark.
+  it("a worker is promoted to merged only from the parent's LIVE origin signal, not its watermark", async () => {
+    const { runtime, projects, projectId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    const parentId = projects.useProjectStore.getState().projects[0]!.agents[0]!.id;
+    const workerId = projects.useProjectStore
+      .getState()
+      .addAgent(projectId, { kind: "worker", parentId });
+
+    // The parent's watermark says merged (a PREVIOUS cycle reached origin) but its LIVE state has
+    // fallen back — it is NOT on origin right now. Promoting off the watermark here would latch
+    // workflowShipped and close the worker's bead for work that isn't on origin at all.
+    store.getState().setWorkflowStage(parentId, "merged");
+    store.getState().setWorkflowState(parentId, wsState({ inOriginMain: false }) as never);
+
+    store.getState().setBranchStatus(workerId, bsStatus(1));
+    agentWorkflowState.mockResolvedValue(wsState({ inParent: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, workerId);
+    expect(store.getState().workflowStage[workerId]).toBe("merged_local");
+    expect(store.getState().workflowShipped[workerId]).toBeUndefined();
+
+    // Once the parent is LIVE on origin main, the worker earns the full merged (and its ✓ latches).
+    store.getState().setWorkflowState(parentId, wsState({ inOriginMain: true }) as never);
+    await store.getState().refreshWorkflowStage("/root", projectId, workerId);
+    expect(store.getState().workflowStage[workerId]).toBe("merged");
+    expect(store.getState().workflowShipped[workerId]).toBe(true);
+  });
+
+  it("a parent with no live workflow state yet never promotes a worker", async () => {
+    const { runtime, projects, projectId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    const parentId = projects.useProjectStore.getState().projects[0]!.agents[0]!.id;
+    const workerId = projects.useProjectStore
+      .getState()
+      .addAgent(projectId, { kind: "worker", parentId });
+    store.getState().setWorkflowStage(parentId, "merged"); // watermark only — no live state
+    store.getState().setBranchStatus(workerId, bsStatus(1));
+    agentWorkflowState.mockResolvedValue(wsState({ inParent: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, workerId);
+    expect(store.getState().workflowStage[workerId]).toBe("merged_local");
+  });
+
+  it("a GitHub-merged parent PR also promotes the worker (origin has it by definition)", async () => {
+    const { runtime, projects, projectId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    const parentId = projects.useProjectStore.getState().projects[0]!.agents[0]!.id;
+    const workerId = projects.useProjectStore
+      .getState()
+      .addAgent(projectId, { kind: "worker", parentId });
+    store.getState().setWorkflowStage(parentId, "merged");
+    store.getState().setWorkflowState(parentId, wsState({ prState: "merged" }) as never);
+    store.getState().setBranchStatus(workerId, bsStatus(1));
+    agentWorkflowState.mockResolvedValue(wsState({ inParent: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, workerId);
+    expect(store.getState().workflowStage[workerId]).toBe("merged");
+  });
+
+  it("close() drops the workflow state so a reused id can't inherit another repo's remote", async () => {
+    const { runtime, projectId, agentId } = await setup("build");
+    const store = runtime.useRuntimeStore;
+    store.getState().setBranchStatus(agentId, bsStatus(1));
+    agentWorkflowState.mockResolvedValue(wsState({ hasRemote: true }));
+    await store.getState().refreshWorkflowStage("/root", projectId, agentId);
+    store.getState().close(agentId);
+    expect(store.getState().workflowState[agentId]).toBeUndefined();
   });
 });
 
@@ -573,9 +703,10 @@ describe("runtimeStore — programmatic bead writes on stage transitions (review
     const { runtime, projects, projectId, agentId } = await setup("build");
     projects.useProjectStore.getState().setAgentBeadId(projectId, agentId, "bd-2");
     const store = runtime.useRuntimeStore;
-    // First reach Merged → close.
+    // First reach Merged → close. Re-aimed for the merged_local split: a bead closes when the work
+    // is on ORIGIN main (BEAD_LEVEL.closed keys off `merged`), so the fixture must reach origin.
     store.getState().setBranchStatus(agentId, bsStatus(1));
-    agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true }));
+    agentWorkflowState.mockResolvedValue(wsState({ inLocalMain: true, inOriginMain: true }));
     await store.getState().refreshWorkflowStage("/root", projectId, agentId);
     expect(closeBead).toHaveBeenCalledWith("/root", "bd-2");
     claimBead.mockReset();
@@ -701,5 +832,52 @@ describe("runtimeStore — setStatus ref stability (sparkle-f2uz)", () => {
     setStatus("a", "idle");
     expect(useRuntimeStore.getState().status).not.toBe(ref1);
     expect(useRuntimeStore.getState().status["a"]).toBe("idle");
+  });
+});
+
+describe("runtimeStore — one-time roborev consent trigger", () => {
+  // Seed the settings store to a known baseline (roborev on, not yet prompted, modal closed) from
+  // the SAME post-reset module graph maybePromptRoborevConsent reads.
+  async function seed(overrides: Record<string, unknown> = {}) {
+    const { runtime, settings } = await freshModules();
+    settings.useSettingsStore.setState({
+      roborevEnabled: true,
+      roborevConsentPrompted: false,
+      roborevConsentOpen: false,
+      ...overrides,
+    });
+    return { maybePromptRoborevConsent: runtime.maybePromptRoborevConsent, settings };
+  }
+
+  it("opens the modal the first time an agent's stage crosses INTO a committed stage", async () => {
+    const { maybePromptRoborevConsent, settings } = await seed();
+    // From no prior stage straight to committed → this is the first reviewable commit.
+    maybePromptRoborevConsent(null, "building_saved");
+    expect(settings.useSettingsStore.getState().roborevConsentOpen).toBe(true);
+  });
+
+  it("does not open before a commit exists (uncommitted changes are not reviewable)", async () => {
+    const { maybePromptRoborevConsent, settings } = await seed();
+    maybePromptRoborevConsent(null, "building_unsaved");
+    expect(settings.useSettingsStore.getState().roborevConsentOpen).toBe(false);
+  });
+
+  it("does not re-open when a later commit lands on an already-committed agent (no crossing)", async () => {
+    const { maybePromptRoborevConsent, settings } = await seed();
+    // prev already at/above committed → pushing further is not a fresh crossing.
+    maybePromptRoborevConsent("building_saved", "pushed");
+    expect(settings.useSettingsStore.getState().roborevConsentOpen).toBe(false);
+  });
+
+  it("stays shut once consent was already prompted", async () => {
+    const { maybePromptRoborevConsent, settings } = await seed({ roborevConsentPrompted: true });
+    maybePromptRoborevConsent(null, "building_saved");
+    expect(settings.useSettingsStore.getState().roborevConsentOpen).toBe(false);
+  });
+
+  it("stays shut when roborev is turned off", async () => {
+    const { maybePromptRoborevConsent, settings } = await seed({ roborevEnabled: false });
+    maybePromptRoborevConsent(null, "building_saved");
+    expect(settings.useSettingsStore.getState().roborevConsentOpen).toBe(false);
   });
 });

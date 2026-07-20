@@ -10,7 +10,9 @@ import { useResolvedTheme } from "../theme/theme";
 import type { AgentTabStatus } from "../types";
 import { spawnPty, writePty, killPty, resizePty, setPtyPaused, onPtyOutput, onPtyExit, ignorePtyGone } from "../pty";
 import { StatusEngine } from "../engine/statusEngine";
+import { registerStatusEngine, unregisterStatusEngine } from "../engine/engineRegistry";
 import { snapshotScreen } from "../engine/screenSnapshot";
+import { bottomRowIndices } from "../engine/composerOcclusion";
 import { registerScrollback, serializeScrollback } from "../services/terminalScrollback";
 import { useUiStore } from "../stores/uiStore";
 import { useInteractionStore } from "../stores/interactionStore";
@@ -18,6 +20,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { isComposerToggleKey } from "./composerToggle";
 import { isCopySelectionKey } from "./copySelectionKey";
 import { shouldToggleComposerOnClick } from "./terminalClickToggle";
+import { shouldReclaimPlainDrag } from "./terminalSelectionReclaim";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
 import { resolveTerminalOverlay } from "./terminalOverlay";
@@ -94,6 +97,18 @@ export interface TerminalApi {
   // Scroll the viewport to a prompt's marker. "scrolled" on success; "missing" when the marker is
   // unknown or has been trimmed out (a different session, or scrolled out of scrollback).
   scrollToPrompt: (promptId: string) => "scrolled" | "missing";
+  // Cell geometry, for turning the composer overlay's pixel height into a covered ROW count.
+  // cellHeight is 0 until the terminal is genuinely laid out — callers must treat that as
+  // "unknown" and decline to guess (see engine/composerOcclusion.ts).
+  cellMetrics: () => { cellHeight: number; rows: number };
+  // The bottom `count` rows currently ON SCREEN, top-to-bottom, as plain text. Reads the viewport
+  // (not the end of the scrollback) so it reflects what is actually painted under the composer
+  // even when the user has scrolled up.
+  readBottomRows: (count: number) => string[];
+  // Tear down and re-spawn this agent's PTY — the same path as the overlay's "Start again", but
+  // callable by the parent. Used when a send discovers the PTY has exited: the agent is respawned
+  // (resuming its Claude session) and the composer's queued prompt is delivered on the new PTY.
+  restart: () => void;
 }
 
 /**
@@ -356,6 +371,42 @@ export function Terminal({
       }),
     );
     term.open(container);
+
+    // Reclaim plain (no-Option) drags as text selections while the composer is open, even when a
+    // mouse-tracking TUI (Claude Code) owns the mouse. xterm gates all of that on ONE internal
+    // method — SelectionService.shouldForceSelection(event) — which is the shared chokepoint for
+    // both "forward this mousedown to the PTY?" and "start a drag-selection?". On macOS it stock-
+    // returns `altKey && macOptionClickForcesSelection`, so a plain drag can never select over a
+    // TUI without Option. There is no public hook, so we monkey-patch it (verified against
+    // @xterm/xterm 6.0.0; identifiers are un-mangled in the shipped bundle). The patch widens the
+    // decision: force selection when `shouldReclaimPlainDrag` says so (composer open), else defer
+    // to the original Option rule — so Option-drag still works and a closed composer lets drags
+    // fall through to the TUI. Guarded so a future xterm bump that reshapes internals degrades to
+    // Option-only rather than throwing.
+    try {
+      const svc = (
+        term as unknown as {
+          _core?: { _selectionService?: { shouldForceSelection?: (e: MouseEvent) => boolean } };
+        }
+      )._core?._selectionService;
+      if (svc && typeof svc.shouldForceSelection === "function") {
+        const orig = svc.shouldForceSelection.bind(svc);
+        svc.shouldForceSelection = (ev: MouseEvent) =>
+          shouldReclaimPlainDrag(
+            // Composer feature on ⇔ the toggle callback is wired (null when the feature is off).
+            onToggleComposerRef.current != null,
+            useUiStore.getState().composerMinimized,
+          ) || orig(ev);
+      } else {
+        console.warn(
+          "Terminal: xterm SelectionService.shouldForceSelection not found; " +
+            "plain-drag selection over a TUI will require Option (xterm internals changed?)",
+        );
+      }
+    } catch (e) {
+      console.warn("Terminal: failed to patch shouldForceSelection for plain-drag selection", e);
+    }
+
     // Spawn waterfall milestone (perfTrace): xterm core + addons constructed and attached to the DOM.
     // Keyed by agentId — appends to the "spawn" trace started at the click; no-op for a boot-restored
     // pane with no active trace.
@@ -415,6 +466,10 @@ export function Terminal({
       onStatus: onStatusWithCapture,
       getScreen: () => snapshotScreen(term.buffer.active, term.rows),
     });
+    // Publish this engine so the user-input submit paths (Composer / requery → submitPrompt) can
+    // signal noteUserInput on it — the recovery signal for a stuck-red row (Bug B). Unregistered in
+    // the cleanup below.
+    registerStatusEngine(agentId, engine);
 
     // Forward keystrokes typed directly in the terminal to the PTY. onData fires for USER input
     // only (never programmatic agent output), so it's our signal that the user just interacted —
@@ -570,6 +625,28 @@ export function Terminal({
           term.scrollToLine(Math.max(0, marker.line - SCROLL_LEAD_IN_ROWS));
           scheduleScrollRepaint(); // clear any stale cells the jump leaves behind (WebGL)
           return "scrolled";
+        },
+        cellMetrics: () => ({
+          // Same derivation the wheel handler uses: the rendered box divided by the row count.
+          // Reports 0 for an unmounted/collapsed element so callers can tell "not laid out yet"
+          // apart from a real measurement.
+          cellHeight: term.element ? term.element.clientHeight / term.rows : 0,
+          rows: term.rows,
+        }),
+        readBottomRows: (count) => {
+          const buf = term.buffer.active;
+          // Index math lives in the engine so it's unit-tested (see bottomRowIndices) rather than
+          // trusted inline — viewport-relative, so it stays honest while scrolled back.
+          return bottomRowIndices({ viewportY: buf.viewportY, rows: term.rows, count }).map((i) => {
+            const line = buf.getLine(i);
+            return line ? line.translateToString(true) : "";
+          });
+        },
+        restart: () => {
+          // Same lever as the overlay's "Start again": bumping `attempt` is in the mount effect's
+          // deps, so it tears down and re-spawns cleanly (resuming the Claude session).
+          setSpawnFail(null);
+          setAttempt((a) => a + 1);
         },
       };
     }
@@ -752,18 +829,12 @@ export function Terminal({
         return;
       }
       // No selection => a plain click (or a drag that selected nothing). Only a genuine stationary
-      // left-click toggles the composer; a drag must never flip it, and neither may a click a
-      // mouse-tracking TUI is capturing (that click is the app's). Gated on onToggleComposer being
-      // wired (composer feature on); term.hasSelection() is false here since copy returned null.
-      const mouseTracking = term.modes.mouseTrackingMode !== "none";
+      // left-click toggles the composer; a drag must never flip it. This fires even while a
+      // mouse-tracking TUI is active ("click = Sparkle chrome") — see shouldToggleComposerOnClick.
+      // Gated on onToggleComposer being wired (composer feature on); term.hasSelection() is false
+      // here since copy returned null.
       if (
-        shouldToggleComposerOnClick(
-          e.button,
-          downAt,
-          { x: e.clientX, y: e.clientY },
-          term.hasSelection(),
-          mouseTracking,
-        )
+        shouldToggleComposerOnClick(e.button, downAt, { x: e.clientX, y: e.clientY }, term.hasSelection())
       ) {
         onToggleComposerRef.current?.();
       }
@@ -815,6 +886,7 @@ export function Terminal({
       if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
       for (const off of unlistens) void safeUnlisten(off);
       void killPty(agentId).catch(ignorePtyGone);
+      unregisterStatusEngine(agentId, engine);
       engine.dispose();
       markersRef.current.clear(); // term.dispose() drops the markers; clear our handles too
       // Dispose the WebGL renderer BEFORE the terminal. Its render loop runs on

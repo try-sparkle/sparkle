@@ -25,6 +25,7 @@ const FEATURES: Array<{ key: AiFeatureKey; label: string }> = [
   { key: "brainstorm", label: "Enable the AI Think agent (chat with Chief)" },
   { key: "composer", label: "Use AI-enhanced composer" },
   { key: "suggestedActions", label: "Suggested actions" },
+  { key: "autoApprove", label: "Auto-answer Claude Code permission prompts (uncheck to be asked each time)" },
 ];
 
 const row: CSSProperties = { display: "flex", alignItems: "center", gap: 6 };
@@ -90,8 +91,16 @@ export function AiFeaturesMenu() {
   const aiBrainstorm = useSettingsStore((s) => s.aiBrainstorm);
   const aiComposer = useSettingsStore((s) => s.aiComposer);
   const aiSuggestedActions = useSettingsStore((s) => s.aiSuggestedActions);
+  const aiAutoApprove = useSettingsStore((s) => s.aiAutoApprove);
 
-  const flags = { aiAutoRename, cloudDictation, aiBrainstorm, aiComposer, aiSuggestedActions };
+  const flags = {
+    aiAutoRename,
+    cloudDictation,
+    aiBrainstorm,
+    aiComposer,
+    aiSuggestedActions,
+    aiAutoApprove,
+  };
   const mode = aiFeatureMode(flags);
   const valueByKey: Record<AiFeatureKey, boolean> = {
     autoRename: aiAutoRename,
@@ -99,6 +108,7 @@ export function AiFeaturesMenu() {
     brainstorm: aiBrainstorm,
     composer: aiComposer,
     suggestedActions: aiSuggestedActions,
+    autoApprove: aiAutoApprove,
   };
 
   return (

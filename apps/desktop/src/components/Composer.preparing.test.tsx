@@ -6,7 +6,7 @@
 // start typing immediately instead of waiting on the workspace spin-up. Boundary mocks mirror
 // Composer.enterOverflow.test.tsx.
 import { createRef } from "react";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const submitPrompt = vi.fn((..._a: unknown[]) => Promise.resolve());
@@ -64,7 +64,7 @@ describe("Composer — instant composer while the agent is starting (preparing)"
     expect(textarea().value).toBe("draft while starting");
   });
 
-  it("QUEUES a send while preparing (does not touch the PTY) then flushes once ready", () => {
+  it("QUEUES a send while preparing (does not touch the PTY) then flushes once ready", async () => {
     const { onSubmitPrompt, utils } = renderComposer(true);
     fireEvent.change(textarea(), { target: { value: "first prompt" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
@@ -79,7 +79,9 @@ describe("Composer — instant composer while the agent is starting (preparing)"
       <Composer agentId="a1" active preparing={false} onSubmitPrompt={onSubmitPrompt} />,
     );
     expect(submitPrompt).toHaveBeenCalledTimes(1);
-    expect(onSubmitPrompt).toHaveBeenCalledTimes(1);
+    // Prompt history is now recorded only AFTER delivery resolves (so an undelivered prompt can
+    // never show up in the history bar), hence the await rather than a synchronous assertion.
+    await waitFor(() => expect(onSubmitPrompt).toHaveBeenCalledTimes(1));
     expect(onSubmitPrompt.mock.calls[0]?.[0]).toContain("first prompt");
   });
 
@@ -99,7 +101,7 @@ describe("Composer — instant composer while the agent is starting (preparing)"
     expect(submitPrompt).toHaveBeenCalledTimes(1);
   });
 
-  it("merges two pre-ready sends so neither is lost, flushing once when ready", () => {
+  it("merges two pre-ready sends so neither is lost, flushing once when ready", async () => {
     const { onSubmitPrompt, utils } = renderComposer(true);
     fireEvent.change(textarea(), { target: { value: "one" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
@@ -112,6 +114,7 @@ describe("Composer — instant composer while the agent is starting (preparing)"
     );
     // One delivery carrying BOTH messages (merged), not two separate PTY writes.
     expect(submitPrompt).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(onSubmitPrompt).toHaveBeenCalledTimes(1));
     const display = onSubmitPrompt.mock.calls[0]?.[0] as string;
     expect(display).toContain("one");
     expect(display).toContain("two");

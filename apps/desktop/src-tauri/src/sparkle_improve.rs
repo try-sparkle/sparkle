@@ -194,10 +194,8 @@ pub fn sparkle_improve_run(
     prompt: String,
     log_dir: String,
 ) -> Result<(), String> {
-    let worktrees = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("sparkle_improve_run: no app data dir: {e}"))?
+    let worktrees = crate::dev_identity::app_data_dir(&app)
+        .map_err(|e| format!("sparkle_improve_run: {e}"))?
         .join("worktrees");
     let real_cwd = validate_run_inner(&worktrees, &claude_path, &cwd, &log_dir)?;
 

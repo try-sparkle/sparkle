@@ -76,6 +76,15 @@ export async function listBeads(projectPath: string): Promise<Bead[]> {
   return parseBeadArray(raw, "list_beads");
 }
 
+/** Ensure the project has a beads database, creating one (`bd init`) if none resolves yet.
+ *  Idempotent and best-effort — the board calls this once, on the first read that fails with
+ *  "no beads database found", so a brand-new project self-heals into an empty board instead of
+ *  surfacing that raw error ("beads by default"). Returns the Rust status ("exists" |
+ *  "initialized"); rejects only when `bd init` itself failed (e.g. `bd` not installed). */
+export async function ensureBeadsDb(projectPath: string): Promise<string> {
+  return invoke<string>("ensure_beads_db", { projectPath });
+}
+
 /** Run `bd show <id> --json` and return the single bead, or null if not found. */
 export async function beadShow(projectPath: string, id: string): Promise<Bead | null> {
   const raw = await invoke<string>("bead_show", { projectPath, id });

@@ -19,6 +19,20 @@ import {
   sniffPlatform,
   type AnalyticsEvent,
 } from "@sparkle/core";
+// The [tools].analytics consent flag (mirrored into settingsStore, hydrated from config.toml).
+// Off means analytics is used NOWHERE: no init, no session replay, no captures. The store is a
+// pure zustand store (no Tauri runtime), so it's safe to read here.
+import { useSettingsStore } from "./stores/settingsStore";
+
+/** Whether the user consents to analytics right now ([tools].analytics). Defaults on (store default). */
+function analyticsEnabled(): boolean {
+  try {
+    return useSettingsStore.getState().analyticsEnabled;
+  } catch {
+    // Store unavailable (shouldn't happen in the webview) — fall back to the on-by-default state.
+    return true;
+  }
+}
 
 // The live client, assigned once the dynamic import + init completes. Null until then, so every
 // capture/identify call no-ops safely during the pre-init window (and forever if no key/replay).
@@ -56,6 +70,11 @@ const LAST_VERSION_KEY = "sparkle-analytics:last-version";
 
 let ready = false;
 let scheduled = false;
+// initAnalytics wires the consent subscription exactly once — a second call must not register a
+// second (never-unsubscribed) store subscriber. Also tracks the last consent value so the
+// subscription (which fires on EVERY settings-store change) only acts when analyticsEnabled flips.
+let wired = false;
+let lastConsent: boolean | null = null;
 
 function appVersion(): string {
   return typeof __SPARKLE_APP_VERSION__ === "string"
@@ -64,23 +83,58 @@ function appVersion(): string {
 }
 
 /**
- * Schedule PostHog to stand up once, at launch — but OFF the critical path. Returns immediately;
- * the actual dynamic import + posthog.init() runs from an idle callback after first paint, so the
- * heavy analytics bundle and its session-replay recorder never delay the initial render. Safe to
- * call more than once (guarded by `scheduled`). No-ops with no key / outside a browser.
+ * Wire up analytics at launch — but OFF the critical path, and only with the user's consent. The
+ * actual dynamic import + posthog.init() runs from an idle callback after first paint, so the heavy
+ * analytics bundle and its session-replay recorder never delay the initial render. No-ops with no
+ * key / outside a browser.
+ *
+ * Consent-aware: this reads [tools].analytics now AND subscribes to it, so a config hydrate (the
+ * flag may load in as OFF after this runs) or a live toggle in the Tools pane takes effect with no
+ * restart — turning it off opts the live client out of ALL capturing (incl. session replay);
+ * turning it back on opts in (initializing lazily the first time). Safe to call more than once.
  */
 export function initAnalytics(): void {
-  if (scheduled || ready) return;
   if (!KEY || typeof window === "undefined") return;
+  if (wired) return; // idempotent: never register a second subscription
+  wired = true;
+  applyConsent(analyticsEnabled());
+  // React to later changes (config hydrate or the Tools pane toggle). subscribe() fires on every
+  // store change, so applyConsent guards on the consent value actually flipping (lastConsent).
+  useSettingsStore.subscribe((s) => applyConsent(s.analyticsEnabled));
+}
+
+/** Reconcile the live client (or the pending schedule) with the current consent flag. No-ops when
+ *  the consent value hasn't changed since the last call (the subscription fires on unrelated edits). */
+function applyConsent(enabled: boolean): void {
+  if (enabled === lastConsent) return;
+  lastConsent = enabled;
+  if (enabled) {
+    if (ready) posthog?.opt_in_capturing();
+    else scheduleInit();
+  } else if (ready) {
+    // Already running — stop ALL capture (autocapture, session replay, events) at the source.
+    posthog?.opt_out_capturing();
+  }
+}
+
+/** Schedule the deferred import + init from an idle callback (guarded so it runs at most once). */
+function scheduleInit(): void {
+  if (scheduled || ready) return;
   scheduled = true;
   onIdle(() => {
     void loadAndInit();
   });
 }
 
-/** Dynamic-import posthog-js and initialize it. Runs post-paint from initAnalytics's idle callback. */
+/** Dynamic-import posthog-js and initialize it. Runs post-paint from scheduleInit's idle callback. */
 async function loadAndInit(): Promise<void> {
   if (ready || !KEY) return;
+  // Consent may have flipped OFF between scheduling and this idle callback firing — don't init.
+  // Reset `scheduled` so a later opt-in can re-schedule.
+  if (!analyticsEnabled()) {
+    scheduled = false;
+    return;
+  }
 
   let mod: typeof import("posthog-js");
   try {
@@ -119,20 +173,20 @@ async function loadAndInit(): Promise<void> {
   client.capture(ANALYTICS_EVENTS.APP_OPENED);
 }
 
-/** Capture a typed Sparkle event. No-ops until analytics is initialized. */
+/** Capture a typed Sparkle event. No-ops until analytics is initialized, or when consent is off. */
 export function capture(
   event: AnalyticsEvent,
   props?: Record<string, unknown>,
 ): void {
-  if (!ready || !posthog) return;
+  if (!ready || !posthog || !analyticsEnabled()) return;
   posthog.capture(event, props);
 }
 
-/** Associate the anonymous session with a known user (call after login). */
+/** Associate the anonymous session with a known user (call after login). No-ops when consent is off. */
 export function identifyUser(
   distinctId: string,
   props?: Record<string, unknown>,
 ): void {
-  if (!ready || !posthog) return;
+  if (!ready || !posthog || !analyticsEnabled()) return;
   posthog.identify(distinctId, props);
 }

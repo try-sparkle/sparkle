@@ -5,12 +5,26 @@
 
 /** Entry URL for a new project window — carries the initial project, the window's own opaque
  *  label, and (optionally) the agent to deep-link to on mount, so the app can read them
- *  synchronously when it boots. */
-export function projectWindowUrl(projectId: string, label: string, agentId?: string): string {
+ *  synchronously when it boots. `suppressFocus` marks a restored window that should be shown but NOT
+ *  self-focused (session restore reopens several windows at once and focuses exactly one — the
+ *  last-active — so the others must not steal it via main.tsx's show-on-ready self-focus). */
+export function projectWindowUrl(
+  projectId: string,
+  label: string,
+  agentId?: string,
+  suppressFocus = false,
+): string {
   const params: Record<string, string> = { project: projectId, label };
   if (agentId) params.agent = agentId;
+  if (suppressFocus) params.focus = "0";
   const qs = new URLSearchParams(params);
   return `index.html?${qs.toString()}`;
+}
+
+/** Should this window skip the show-on-ready self-focus? True only for a restored, non-active window
+ *  (`?focus=0`). The active restored window and every normally-opened window self-focus as usual. */
+export function parseSuppressSelfFocus(search: string): boolean {
+  return new URLSearchParams(search).get("focus") === "0";
 }
 
 /** Extract the project id a window was opened for, or null. */

@@ -677,6 +677,26 @@ mod tests {
         dir
     }
 
+    /// Pins the JSON keys `accounts_usage` puts on the wire. The TS boundary
+    /// (`accountStore.ts` `mapUsage`) has to read exactly these — it once read
+    /// snake_case (`tokens_5h`) against this camelCase struct, so every tally
+    /// deserialized to `undefined` and the usage bars sat at 0 for every account.
+    /// Note serde's camelCase rule leaves the digit attached: `tokens_5h` → `tokens5h`.
+    #[test]
+    fn account_usage_serializes_camel_case_keys() {
+        let json = serde_json::to_string(&AccountUsage {
+            id: "a1".to_string(),
+            tokens_5h: 111,
+            tokens_7d: 222,
+            exhausted_until: Some(1_700_000_000),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"a1","tokens5h":111,"tokens7d":222,"exhaustedUntil":1700000000}"#
+        );
+    }
+
     fn sample(id: &str, is_default: bool, config_dir: &str) -> Account {
         Account {
             id: id.to_string(),

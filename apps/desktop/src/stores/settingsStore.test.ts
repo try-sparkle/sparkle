@@ -49,6 +49,7 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
     aiBrainstorm: true,
     aiComposer: true,
     aiSuggestedActions: true,
+    aiAutoApprove: true,
     ...over,
   });
 
@@ -64,6 +65,7 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
         aiBrainstorm: false,
         aiComposer: false,
         aiSuggestedActions: false,
+        aiAutoApprove: false,
       }),
     ).toBe("off");
   });
@@ -78,6 +80,7 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
         aiBrainstorm: false,
         aiComposer: false,
         aiSuggestedActions: false,
+        aiAutoApprove: false,
       }),
     ).toBe("some");
   });
@@ -90,6 +93,7 @@ describe("suggestedActions AI flag", () => {
     aiBrainstorm: true,
     aiComposer: true,
     aiSuggestedActions: true,
+    aiAutoApprove: true,
   };
 
   it("maps the menu key to its store field", () => {
@@ -163,6 +167,7 @@ describe("settingsStore — AI feature setters", () => {
     useSettingsStore.getState().setAiFeature("brainstorm", true);
     useSettingsStore.getState().setAiFeature("composer", true);
     useSettingsStore.getState().setAiFeature("suggestedActions", true);
+    useSettingsStore.getState().setAiFeature("autoApprove", true);
     const s = useSettingsStore.getState();
     expect([
       s.aiAutoRename,
@@ -170,7 +175,8 @@ describe("settingsStore — AI feature setters", () => {
       s.aiBrainstorm,
       s.aiComposer,
       s.aiSuggestedActions,
-    ]).toEqual([true, true, true, true, true]);
+      s.aiAutoApprove,
+    ]).toEqual([true, true, true, true, true, true]);
     expect(aiFeatureMode(s)).toBe("all");
   });
 });
@@ -240,7 +246,9 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
           brainstorm: false,
           composer: true,
           suggested_actions: true,
+          auto_approve: true,
         },
+        roborev: { consent_prompted: false },
         freshness: {
           staleness_warn_commits: 25,
           stale_build_block_commits: 25,
@@ -302,7 +310,9 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
           brainstorm: true,
           composer: true,
           suggested_actions: true,
+          auto_approve: true,
         },
+        roborev: { consent_prompted: false },
         freshness: {
           staleness_warn_commits: 25,
           stale_build_block_commits: 25,
@@ -346,7 +356,9 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
           brainstorm: true,
           composer: true,
           suggested_actions: true,
+          auto_approve: true,
         },
+        roborev: { consent_prompted: false },
         freshness: {
           staleness_warn_commits: 25,
           stale_build_block_commits: 25,

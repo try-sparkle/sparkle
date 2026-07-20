@@ -1,0 +1,17 @@
+#!/bin/sh
+# roborev post-rewrite — vendored copy owned by the Sparkle app.
+#
+# git fires post-rewrite after a commit-rewriting operation (`git commit --amend`,
+# `git rebase`) with the rewrite kind ("amend" or "rebase") as $1. roborev remaps
+# its pending/completed reviews from the old commit shas onto the new ones so an
+# amend or rebase doesn't strand or duplicate reviews.
+#
+# Resolve roborev the same way post-commit does: the seed's pinned user-scope path
+# first, then PATH; a missing binary is a silent no-op.
+ROBOREV="$HOME/.local/bin/roborev"
+if [ ! -x "$ROBOREV" ]; then
+    ROBOREV=$(command -v roborev 2>/dev/null)
+    [ -x "$ROBOREV" ] || exit 0
+fi
+# Pass the rewrite kind through; stderr suppressed like the post-commit wrapper.
+"$ROBOREV" post-rewrite "$@" 2>/dev/null

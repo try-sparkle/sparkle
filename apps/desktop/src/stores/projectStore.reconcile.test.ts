@@ -288,6 +288,70 @@ describe("mergePreservingLiveWorkers — preserves a live pinned name (rename re
     expect(b1.autoNameVariants).toBeNull();
   });
 
+  it("keeps a live SELF-NAMED name over a stale non-self-named snapshot (sparkle-pel7)", () => {
+    // A self-name (sparkle-control rename_agent) is authoritative but NOT pinned — same trailing-write
+    // race as a manual rename, so the merge must shield it too. The preserved copy stays selfNamed and
+    // UNpinned (never resurrect namePinned) so the row still shows no pin chip.
+    const renamed = agent({
+      id: "b1",
+      kind: "build",
+      name: "Pin Regression Fix",
+      namePinned: false,
+      selfNamed: true,
+      autoNameVariants: null,
+    });
+    const cur = currentState([project("p1", [renamed])]);
+    const persisted = {
+      projects: [
+        project("p1", [
+          agent({
+            id: "b1",
+            kind: "build",
+            name: "Build 1",
+            namePinned: false,
+            autoNameVariants: { title: "Build 1", description: "" },
+          }),
+        ]),
+      ],
+      selectedProjectId: "p1",
+    };
+
+    const merged = mergePreservingLiveWorkers(persisted, cur);
+    const b1 = merged.projects[0]!.agents.find((a) => a.id === "b1")!;
+    expect(b1.name).toBe("Pin Regression Fix");
+    expect(b1.selfNamed).toBe(true);
+    expect(b1.namePinned).toBe(false);
+    expect(b1.autoNameVariants).toBeNull();
+  });
+
+  it("a live HUMAN pin beats a stale SELF-NAMED snapshot (self-name never reverts a human pin, sparkle-pel7)", () => {
+    // Timeline: agent self-named "Foo" (persisted), then the human pinned "Bar" (in memory, not yet
+    // flushed). A rehydrate carries the older self-named snapshot. The human pin MUST win — a self-name
+    // is not a deliberate human action and must never revert namePinned.
+    const humanPinned = agent({
+      id: "b1",
+      kind: "build",
+      name: "Bar",
+      namePinned: true,
+      selfNamed: false,
+      autoNameVariants: null,
+    });
+    const cur = currentState([project("p1", [humanPinned])]);
+    const persisted = {
+      projects: [
+        project("p1", [
+          agent({ id: "b1", kind: "build", name: "Foo", namePinned: false, selfNamed: true }),
+        ]),
+      ],
+      selectedProjectId: "p1",
+    };
+
+    const merged = mergePreservingLiveWorkers(persisted, cur);
+    const b1 = merged.projects[0]!.agents.find((a) => a.id === "b1")!;
+    expect(b1.name).toBe("Bar");
+    expect(b1.namePinned).toBe(true);
+  });
+
   it("takes the snapshot's name when the snapshot is ALSO pinned (a deliberate cross-window rename wins)", () => {
     // Both pinned but different: the persisted one is another window's already-flushed rename — the
     // more recent deliberate choice — so it wins. We only shield the live name from an UNPINNED revert.
@@ -325,5 +389,54 @@ describe("mergePreservingLiveWorkers — preserves a live pinned name (rename re
 
     const merged = mergePreservingLiveWorkers(persisted, cur);
     expect(merged.projects[0]!.agents[0]!.name).toBe("Fresh Auto Title");
+  });
+});
+
+// A just-created PROJECT is added in memory BEFORE its 400ms debounced write flushes/propagates. A
+// concurrent window's last-writer-wins snapshot that predates it lacks the project, and the merge
+// maps over the INCOMING snapshot's projects — so the brand-new project is dropped entirely
+// ("created a new project but it shows nothing / disappears", the hazel-eco report). The
+// pendingProjectAdds set shields exactly the not-yet-propagated window, without resurrecting a
+// project that was deliberately removed elsewhere. Symmetric to pending local (agent) adds.
+describe("mergePreservingLiveWorkers — pending local PROJECT adds", () => {
+  const NONE = new Set<string>();
+  it("re-attaches a just-created project the persisted snapshot predates", () => {
+    const p1 = project("p1", [agent({ id: "b1", kind: "build" })]);
+    const p2 = project("p2", [agent({ id: "b2", kind: "build" })]); // just created in this window
+    const current = currentState([p1, p2]);
+    // Snapshot from a concurrent writer that never saw p2 (last-writer-wins).
+    const persisted = { projects: [p1], selectedProjectId: "p1" };
+    const merged = mergePreservingLiveWorkers(persisted, current, NONE, NONE, new Set(["p2"]));
+    expect(merged.projects.map((p) => p.id).sort()).toEqual(["p1", "p2"]);
+  });
+
+  it("keeps the window on the just-created project when it was the live selection", () => {
+    const p1 = project("p1", []);
+    const p2 = project("p2", []);
+    const current = { ...currentState([p1, p2]), selectedProjectId: "p2" };
+    const persisted = { projects: [p1], selectedProjectId: "p1" }; // stale: still on p1
+    const merged = mergePreservingLiveWorkers(persisted, current, NONE, NONE, new Set(["p2"]));
+    expect(merged.projects.map((p) => p.id).sort()).toEqual(["p1", "p2"]);
+    // The stale snapshot must not yank the user off the project they just created.
+    expect(merged.selectedProjectId).toBe("p2");
+  });
+
+  it("does NOT resurrect a project missing from the snapshot when it is not a pending add", () => {
+    // p2 removed elsewhere (or already acknowledged) — a stale snapshot lacking it must let it stay gone.
+    const p1 = project("p1", []);
+    const p2 = project("p2", []);
+    const current = currentState([p1, p2]);
+    const persisted = { projects: [p1], selectedProjectId: "p1" };
+    const merged = mergePreservingLiveWorkers(persisted, current, NONE, NONE, NONE);
+    expect(merged.projects.map((p) => p.id)).toEqual(["p1"]);
+  });
+
+  it("never duplicates a pending project already present in the snapshot", () => {
+    const p1 = project("p1", []);
+    const p2 = project("p2", []);
+    const current = currentState([p1, p2]);
+    const persisted = { projects: [p1, p2], selectedProjectId: "p1" }; // snapshot already carries p2
+    const merged = mergePreservingLiveWorkers(persisted, current, NONE, NONE, new Set(["p2"]));
+    expect(merged.projects.map((p) => p.id).sort()).toEqual(["p1", "p2"]);
   });
 });

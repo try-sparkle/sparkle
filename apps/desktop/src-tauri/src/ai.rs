@@ -341,6 +341,25 @@ mod tests {
         assert_eq!(extract_text(&j), Some("hello".to_string()));
     }
 
+    // True once `data` holds a complete HTTP request: headers terminated by `\r\n\r\n`, followed by
+    // at least `Content-Length` body bytes (or no `Content-Length`, meaning a bodyless request).
+    fn request_complete(data: &[u8]) -> bool {
+        let sep = b"\r\n\r\n";
+        let Some(hdr_end) = data.windows(sep.len()).position(|w| w == sep) else {
+            return false; // headers not fully received yet
+        };
+        let body_start = hdr_end + sep.len();
+        let headers = String::from_utf8_lossy(&data[..hdr_end]);
+        let content_len = headers
+            .lines()
+            .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")))
+            .and_then(|(_, v)| v.trim().parse::<usize>().ok());
+        match content_len {
+            Some(len) => data.len().saturating_sub(body_start) >= len,
+            None => true, // no body expected
+        }
+    }
+
     // A minimal one-shot loopback HTTP server: accept a single connection, capture the raw request,
     // and reply with `status` + `body`. Returns the captured request text so tests can assert the
     // method/path/headers we sent. Kept tiny (no deps) — enough to pin the proxy contract end-to-end.
@@ -350,15 +369,36 @@ mod tests {
     // returns the underlying stream to its pool via a setsockopt that PANICS if the peer already
     // closed the socket (ureq response.rs). Keeping the socket open makes that pool-return succeed.
     // (One leaked test socket per call is harmless.)
+    //
+    // A single `read()` is NOT guaranteed to return the whole request: the kernel can deliver the
+    // headers and the POST body in separate TCP segments, so one read often captures only the
+    // headers. Tests that assert on the request BODY then flake under load (this bit CI). We loop
+    // until the full request has arrived — `Content-Length` body bytes past the `\r\n\r\n` header
+    // terminator — bounded by a read timeout so a bodyless request can't hang the thread.
     fn serve_once(status: &'static str, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            let mut data: Vec<u8> = Vec::with_capacity(8192);
             let mut buf = [0u8; 8192];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,                              // peer closed
+                    Ok(n) => {
+                        data.extend_from_slice(&buf[..n]);
+                        if request_complete(&data) {
+                            break;
+                        }
+                    }
+                    Err(_) => break, // timeout / error — proceed with whatever arrived
+                }
+            }
+            let req = String::from_utf8_lossy(&data).to_string();
             let resp = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
@@ -401,6 +441,21 @@ mod tests {
         // The response passes through (text + the injected balance).
         assert_eq!(extract_text(&json), Some("named it".to_string()));
         assert_eq!(json.get("balanceCents").and_then(serde_json::Value::as_i64), Some(4200));
+    }
+
+    #[test]
+    fn request_complete_tracks_headers_then_body() {
+        // Headers not yet terminated → incomplete.
+        assert!(!request_complete(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n"));
+        // Headers done but body still short of Content-Length → incomplete (the split-segment case
+        // that made the body assertion flaky under load).
+        assert!(!request_complete(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhi"));
+        // Full body present → complete.
+        assert!(request_complete(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"));
+        // Header name matched case-insensitively.
+        assert!(request_complete(b"POST / HTTP/1.1\r\ncontent-length: 2\r\n\r\nhi"));
+        // No Content-Length → bodyless request is complete once headers terminate.
+        assert!(request_complete(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
     }
 
     #[test]

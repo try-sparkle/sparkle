@@ -73,19 +73,23 @@ describe("Composer — dictation wiring", () => {
     expect(useDictationStore.getState().insertTarget).toBeNull();
   });
 
-  it("inserts dictated text into the box and restores it from minimized", () => {
+  it("keeps a minimized composer minimized during dictation, retaining the text for reopen", () => {
     renderComposer();
     act(() => useUiStore.getState().setComposerMinimized(true));
 
     act(() => useDictationStore.getState().insert("hello world"));
-    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
-    expect(ta.value).toBe("hello world");
-    // Dictated text must be visible — a minimized composer pops back open.
-    expect(useUiStore.getState().composerMinimized).toBe(false);
+    // A composer the user minimized STAYS minimized during dictation (their explicit choice) — no
+    // reopen on transcript. Reopening on every transcript is what made the click toggle feel
+    // mic-dependent.
+    expect(useUiStore.getState().composerMinimized).toBe(true);
 
-    // A second utterance with the caret at the end appends with a separating space (not a clobber).
-    ta.selectionStart = ta.selectionEnd = ta.value.length;
+    // A second utterance still accumulates while minimized (end-append with a separating space).
     act(() => useDictationStore.getState().insert("again"));
+    expect(useUiStore.getState().composerMinimized).toBe(true);
+
+    // Reopening reveals everything dictated while it was minimized — the text was never lost.
+    act(() => useUiStore.getState().setComposerMinimized(false));
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
     expect(ta.value).toBe("hello world again");
   });
 
@@ -278,19 +282,25 @@ describe("Composer — placeholder reflects audio state", () => {
   });
 
   // Regression (issue 2): armed but not actually capturing (focus-paused) keeps `enabled` true
-  // while `status` is "idle". The composer must NOT claim "I'm listening" then — it falls back to
-  // the wake-word copy, since nothing is actually being captured.
-  it("does NOT claim it's listening when armed but capture is paused (enabled, status idle)", () => {
+  // while `status` is "idle". The composer must NOT claim "I'm listening" then — AND it must not
+  // invite the wake word either, since nothing is being captured. It shows the SAME honest
+  // "Listening paused" state the sidebar caption does (deriveMicPresentation === "focusPaused"), so
+  // the two mic surfaces can never contradict each other in this state (the desync this fixes).
+  it("shows the honest 'Listening paused' state when armed but capture is paused (enabled, status idle)", () => {
     act(() => useDictationStore.setState({ enabled: true, status: "idle" }));
     renderComposer();
     const body = document.body.textContent ?? "";
-    expect(body).toContain("Hey Sparkle");
+    expect(body).toContain("Listening paused");
+    expect(body).toContain("you can type here");
+    // Neither the "I'm listening" claim nor the wake-word invitation the mic can't hear.
     expect(body).not.toContain("I'm listening, so just start talking.");
+    expect(body).not.toContain("Hey Sparkle");
   });
 
-  it("shows the focused typing hint when the mic is ON but capture is paused (armed, focused)", () => {
-    // Mic armed (enabled true) but not actively capturing (status idle). Focusing the box swaps the
-    // wake-word prompt for the typing hint — the mic is on, so a voice-referencing hint is honest.
+  it("keeps the same 'Listening paused' copy whether or not the box is focused (no focus fork)", () => {
+    // The old composer swapped to a focus-only "type your command here" hint here, which the sidebar
+    // never showed — a per-surface fork. The unified focus-paused copy already says "you can type
+    // here", so both surfaces stay on one honest message regardless of textarea focus.
     act(() => useDictationStore.setState({ enabled: true, status: "idle" }));
     renderComposer();
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
@@ -298,7 +308,8 @@ describe("Composer — placeholder reflects audio state", () => {
     fireEvent.focus(ta);
     expect(document.activeElement).toBe(ta);
     const body = document.body.textContent ?? "";
-    expect(body).toContain("or type your command here");
+    expect(body).toContain("Listening paused");
+    expect(body).not.toContain("or type your command here");
   });
 
   it("shows NO focused typing hint when the mic is OFF (no voice promise at all)", () => {

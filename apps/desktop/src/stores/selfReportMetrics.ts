@@ -33,7 +33,13 @@ export type NamingOutcome =
   | "self_named" // the agent pinned its own name (rename_agent) or the user did — no call
   | "deferred_first_turn" // self-reporting agent's first prompt — deferred to let it self-name
   | "paid_haiku_fallback" // actually spent a paid generate_agent_name call
-  | "skipped_thin"; // nothing worth naming (thin/tactical/unchanged) — no call
+  | "skipped_thin" // nothing worth naming (thin/tactical/unchanged) — no call
+  // Name-from-work fallback (sparkle name-from-work): a build/worker doing real work but only ever
+  // handed tactical/no composer prompts, so it never left its "Build N"/"Worker N" default. These
+  // fire OUTSIDE the composer path, on the sidebar poll tick.
+  | "named_from_session_title_backfill" // Tier 1: applied Claude Code's aiTitle to a CLOSED default-named agent (free win)
+  | "work_haiku_backstop" // Tier 2: spent a paid generate_agent_name call using the agent's WORK as basis
+  | "work_backstop_skipped"; // Tier 2 declined: no usable work basis (kept the default)
 
 /** What supplied a needs-you notification body. */
 export type AttentionSource =
@@ -76,6 +82,9 @@ const emptyNamingOutcomes = (): Record<NamingOutcome, number> => ({
   deferred_first_turn: 0,
   paid_haiku_fallback: 0,
   skipped_thin: 0,
+  named_from_session_title_backfill: 0,
+  work_haiku_backstop: 0,
+  work_backstop_skipped: 0,
 });
 
 const emptyAttentionSources = (): Record<AttentionSource, number> => ({
@@ -116,8 +125,11 @@ export function namingCoverage(outcomes: Record<NamingOutcome, number>): {
   paid: number;
   pct: number | null;
 } {
-  const covered = outcomes.ai_title + outcomes.self_named;
-  const paid = outcomes.paid_haiku_fallback;
+  // A session-title backfill is a FREE win (Claude Code's own title), grouped with the other covered
+  // wins; the work-based Haiku backstop is a PAID call, grouped with the composer-path paid fallback.
+  // `work_backstop_skipped` (no usable basis, default kept) is neither, like `skipped_thin`.
+  const covered = outcomes.ai_title + outcomes.self_named + outcomes.named_from_session_title_backfill;
+  const paid = outcomes.paid_haiku_fallback + outcomes.work_haiku_backstop;
   const total = covered + paid;
   return { covered, paid, pct: total === 0 ? null : covered / total };
 }

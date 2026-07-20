@@ -10,7 +10,9 @@ import { ComposerMic } from "./MicButton";
 import { useDictationStore } from "../stores/dictationStore";
 
 beforeEach(() => {
-  useDictationStore.setState({ enabled: true, status: "idle", phase: "passive" });
+  // modelProgress must be reset too: it now drives the "preparing" state, so a case that leaves a
+  // download in flight would otherwise bleed that state into the next test.
+  useDictationStore.setState({ enabled: true, status: "idle", phase: "passive", modelProgress: null });
 });
 afterEach(() => cleanup());
 
@@ -31,6 +33,50 @@ describe("ComposerMic — visibility", () => {
     useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
     render(<ComposerMic />);
     expect(screen.getByRole("button", { name: "Pause listening" })).toBeTruthy();
+  });
+});
+
+describe("ComposerMic — preparing (voice-model download) is visibly its own state", () => {
+  // Bug 3: while the 631 MB model unpacks from its ~482 MB download, the mic used to draw the
+  // "paused" glyph — pixel-identical to a healthy, ready mic. The user had no way to tell a
+  // multi-minute first-run wait from a mic that was simply waiting on the wake word.
+  const downloading = { done: 100_000_000, total: 482_000_000 };
+
+  it("does NOT draw the healthy paused/ready affordance while the model is downloading", () => {
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "passive",
+      modelProgress: downloading,
+    });
+    render(<ComposerMic />);
+    // The paused glyph's control is labelled "Turn off microphone"; preparing gets its own label,
+    // so the two can never render the same button.
+    expect(screen.queryByRole("button", { name: "Turn off microphone" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Setting up voice — turn off microphone" })).toBeTruthy();
+  });
+
+  it("stays clickable so the user can back out of the download", () => {
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "passive",
+      modelProgress: downloading,
+    });
+    render(<ComposerMic />);
+    fireEvent.click(screen.getByRole("button", { name: "Setting up voice — turn off microphone" }));
+    expect(useDictationStore.getState().enabled).toBe(false);
+  });
+
+  it("WARM start (model already on disk) shows the ordinary paused mic — no preparing state", () => {
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "passive",
+      modelProgress: null,
+    });
+    render(<ComposerMic />);
+    expect(screen.getByRole("button", { name: "Turn off microphone" })).toBeTruthy();
   });
 });
 

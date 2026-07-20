@@ -1,7 +1,8 @@
 // "Send to Build" handoff (bead sparkle-hiju.8): hand a beads epic + its PRD off to a Build agent
-// (the orchestrator). Reuses the project's existing build agent if it has one, else creates a fresh
-// one; opens it (mounts the pane / drives the PTY launch); and seeds it with a first prompt that
-// points at the epic + PRD and tells it to execute the epic's children following the beads protocol.
+// (the orchestrator). ONE ORCHESTRATOR PER EPIC (bead sparkle-ctgd): reuses the build agent already
+// bound to THIS epic if there is one, else creates a fresh one; opens it (mounts the pane / drives
+// the PTY launch); and seeds it with a first prompt that points at the epic + PRD and tells it to
+// execute the epic's children following the beads protocol.
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { beadsProtocol } from "./buildAgent";
@@ -62,9 +63,15 @@ export function sendToBuild(args: SendToBuildArgs): string {
   const project = store.projects.find((p) => p.id === args.projectId);
   if (!project) throw new Error(`unknown project ${args.projectId}`);
 
-  // Reuse the project's existing build agent (the orchestrator you talk to) if it has one;
-  // otherwise create a fresh one. Mirrors AgentSidebar's Build button (addAgent kind "build").
-  const existing = project.agents.find((a) => a.kind === "build");
+  // ONE ORCHESTRATOR PER EPIC (bead sparkle-ctgd): reuse a build agent ONLY when it is already
+  // bound to THIS epic, so a new epic never lands on an orchestrator busy with — or finished on —
+  // other work. This is the mirror of planView.ts's `orchestratorNameForEpic`, which reads the link
+  // back with the same `a.kind === "build" && a.epicId === epicId`; the two must agree for the
+  // epic↔orchestrator link to be 1:1.
+  //
+  // An UNBOUND build agent (no epicId) is deliberately not reused: it may be one the user started
+  // by hand and is talking to.
+  const existing = project.agents.find((a) => a.kind === "build" && a.epicId === args.epicId);
   const agentId = existing ? existing.id : store.addAgent(args.projectId, { kind: "build" });
 
   // Bind the epic to the orchestrator right away (spec §8): the sidebar epic pill reads

@@ -21,6 +21,7 @@ vi.mock("../services/dialog", () => ({
 
 import { NewProjectDialog } from "./NewProjectDialog";
 import { useProjectStore } from "../stores/projectStore";
+import { useSettingsStore } from "../stores/settingsStore";
 
 const REPO = {
   fullName: "octocat/hello",
@@ -54,7 +55,11 @@ function renderDialog(over: Partial<ComponentProps<typeof NewProjectDialog>> = {
   );
 }
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  // Restore the tools gate so a case that flipped it off can't leak into the next test.
+  useSettingsStore.setState({ githubEnabled: true });
+});
 beforeEach(() => {
   invoke.mockReset();
   signInHandoff.mockReset();
@@ -83,6 +88,33 @@ describe("NewProjectDialog — tabs", () => {
     fireEvent.click(screen.getByRole("button", { name: "Choose a folder…" }));
     expect(onOpenFromFolder).toHaveBeenCalledOnce();
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("hides the GitHub import tab when [tools].github is off", () => {
+    useSettingsStore.setState({ githubEnabled: false });
+    routeInvoke({});
+    renderDialog();
+    // The tab strip collapses to just the folder flow — no "From GitHub" entry at all.
+    expect(screen.queryByRole("tab", { name: "From GitHub" })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "From folder" })).toBeNull();
+    // The folder flow is still fully usable.
+    expect(screen.getByRole("button", { name: "Choose a folder…" })).toBeTruthy();
+  });
+
+  it("falls back to the folder flow when github is disabled while on the GitHub tab", async () => {
+    routeInvoke({ github_status: () => ({ connected: false, login: null }) });
+    const { rerender } = renderDialog();
+    // Select the GitHub tab (tab state = "github").
+    fireEvent.click(screen.getByRole("tab", { name: "From GitHub" }));
+    expect(await screen.findByRole("button", { name: /Sign in with GitHub/ })).toBeTruthy();
+
+    // Now disable github live: effectiveTab must fall back to "folder" even though tab is "github".
+    useSettingsStore.setState({ githubEnabled: false });
+    rerender(<NewProjectDialog onClose={noop} onOpenFromFolder={noop} onCloned={noop} />);
+
+    expect(screen.queryByRole("tab", { name: "From GitHub" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Sign in with GitHub/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Choose a folder…" })).toBeTruthy();
   });
 });
 

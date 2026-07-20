@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { FiX, FiCheck, FiChevronDown } from "react-icons/fi";
+import { FiX, FiCheck, FiChevronDown, FiArrowUpRight } from "react-icons/fi";
 import { C, FONT_WEIGHT } from "../../theme/colors";
 import type { SuggestionButton } from "../../services/suggestions/types";
 
@@ -35,10 +35,25 @@ export const SUGGESTION_PILL_ZONE = SUGGESTION_PILL_LABEL_MAX + 18 + 20 + 23 + 8
 // row is ever mounted, so a stable id is safe.
 const POPOVER_ID = "suggestion-more-popover";
 
+/** The leading glyph on a stage-derived CTA (`source === "control"`), and nothing at all on an
+ *  ordinary suggestion. A check reads as "this finishes the job" and fits Close Build Agent, the one
+ *  CTA that ends the agent; an arrow reads as "this hands work back to the agent" and fits the
+ *  prompt CTAs (Land to Main / Push to Origin Main), which ask it to do one more thing. Feather
+ *  icons via react-icons/fi — never emoji. */
+function CtaIcon({ b }: { b: SuggestionButton }) {
+  if (b.source !== "control") return null;
+  const Icon = b.kind === "control" ? FiCheck : FiArrowUpRight;
+  return <Icon size={14} style={{ flexShrink: 0 }} />;
+}
+
 export function SuggestionRow({ buttons, visible, onClick, onDismiss }: Props) {
   // Local popover state: whether the "other candidates" list is open. Hooks must run before the
   // early return below, so they live at the top regardless of visibility.
   const [open, setOpen] = useState(false);
+  // Whether the pointer is over the top label pill. Drives a custom hover tooltip that previews the
+  // FULL prompt (`b.value`), since the pill only shows a short `b.label` and the native `title`
+  // attribute is stripped app-wide by disableNativeTooltips() — so `title=` alone shows nothing.
+  const [hovered, setHovered] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
 
   // Whenever the row hides (composer gains typed/interim content) OR the extra candidates go away,
@@ -46,7 +61,11 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss }: Props) {
   const hasMore = buttons.length > 1;
   useEffect(() => {
     if ((!visible || !hasMore) && open) setOpen(false);
-  }, [visible, hasMore, open]);
+    // Same reasoning for `hovered`: if the row hides while the pointer is over the pill,
+    // onMouseLeave may never fire, so clear it here — otherwise a later-reappearing pill would
+    // flash its tooltip with no pointer actually on it.
+    if (!visible && hovered) setHovered(false);
+  }, [visible, hasMore, open, hovered]);
 
   // While open: Escape closes it, and an outside pointerdown closes it. The caret/popover live
   // inside wrapRef, so clicks on them are ignored here (the caret's own onClick toggles instead).
@@ -71,10 +90,14 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss }: Props) {
   const b = buttons[0];
   if (!visible || !b) return null;
   const extras = buttons.slice(1);
-  // Control buttons (e.g. Close Build Agent) render as a filled green success pill with a
-  // check; suggestion pills are neutral/translucent. White text reads on both green shades.
-  const control = b.kind === "control";
-  const fg = control ? "#ffffff" : C.cream;
+  // Stage-derived CTAs (engine/agentCta: Land to Main / Push to Origin Main / Close Build Agent)
+  // render as a filled green success pill; ordinary suggestions are neutral/translucent. White text
+  // reads on both green shades. Keyed on `source`, NOT `kind`: Land/Push are kind:"prompt" (they
+  // tell the AGENT to act so the repo's contracts run) yet are still THE recommended action, while
+  // Close is a kind:"control" app action. Keying on kind would leave Land/Push looking like an
+  // ordinary suggestion.
+  const isCta = b.source === "control";
+  const fg = isCta ? "#ffffff" : C.cream;
 
   const runButton = (btn: SuggestionButton) => {
     setOpen(false);
@@ -100,6 +123,7 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss }: Props) {
       }}
     >
       <div
+        data-testid="suggestion-pill"
         style={{
           position: "relative",
           pointerEvents: "auto",
@@ -107,14 +131,15 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss }: Props) {
           alignItems: "center",
           height: 32,
           borderRadius: 8,
-          background: control ? C.successInk : "rgba(255,255,255,0.06)",
-          border: control ? "none" : `1px solid ${C.muted}`,
+          background: isCta ? C.successInk : "rgba(255,255,255,0.06)",
+          border: isCta ? "none" : `1px solid ${C.muted}`,
           boxShadow: "0 1px 6px rgba(0,0,0,0.28)",
         }}
       >
         <button
           onClick={() => runButton(b)}
-          title={control ? b.label : b.value}
+          onMouseEnter={() => setHovered(true)}
+          onMouseLeave={() => setHovered(false)}
           style={{
             display: "flex",
             alignItems: "center",
@@ -126,17 +151,60 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss }: Props) {
             height: "100%",
             cursor: "pointer",
             maxWidth: SUGGESTION_PILL_LABEL_MAX,
-            whiteSpace: "nowrap",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
             fontWeight: FONT_WEIGHT.semibold,
             fontFamily: '"IBM Plex Sans", sans-serif',
             fontSize: 13,
           }}
         >
-          {control && <FiCheck size={14} />}
-          {b.label}
+          <CtaIcon b={b} />
+          {/* Ellipsis must live on this span, not the flex <button>: text-overflow only applies to
+              a block box, and the button's `display:flex` turns the label into an anonymous flex
+              item where the ellipsis is silently ignored (you'd get a hard character cut instead of
+              "…"). minWidth:0 lets the span shrink below its content width so overflow can trigger. */}
+          <span
+            style={{
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {b.label}
+          </span>
         </button>
+        {/* Custom hover tooltip previewing the full prompt that will be sent. Opens UPWARD (the
+            composer sits at the window bottom), right-aligned to the pill. Suppressed for control
+            ACTIONS (whose value is an opaque "control:…" action id, not prose) and while the "more
+            candidates" popover is open, so the two never stack on the same anchor. Note this keys on
+            `kind`, not `isCta`: the prompt CTAs DO carry real prose worth previewing ("Land this to
+            main."), so they keep their tooltip. */}
+        {hovered && !open && b.kind !== "control" && b.value && b.value !== b.label && (
+          <div
+            role="tooltip"
+            style={{
+              position: "absolute",
+              bottom: "calc(100% + 6px)",
+              right: 0,
+              maxWidth: 320,
+              padding: "6px 9px",
+              borderRadius: 8,
+              background: C.deepForest,
+              border: `1px solid ${C.muted}`,
+              boxShadow: "0 6px 20px rgba(0,0,0,0.4)",
+              color: C.cream,
+              fontWeight: FONT_WEIGHT.medium,
+              fontFamily: '"IBM Plex Sans", sans-serif',
+              fontSize: 12,
+              lineHeight: 1.4,
+              whiteSpace: "normal",
+              wordBreak: "break-word",
+              pointerEvents: "none",
+              zIndex: 3,
+            }}
+          >
+            {b.value}
+          </div>
+        )}
         {hasMore && (
           <button
             aria-label="More suggested actions"
@@ -147,7 +215,7 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss }: Props) {
             style={{
               background: "transparent",
               border: "none",
-              borderLeft: `1px solid ${control ? "rgba(255,255,255,0.25)" : C.muted}`,
+              borderLeft: `1px solid ${isCta ? "rgba(255,255,255,0.25)" : C.muted}`,
               color: fg,
               paddingLeft: 2,
               paddingRight: 4,
@@ -211,7 +279,6 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss }: Props) {
               <button
                 key={x.id}
                 onClick={() => runButton(x)}
-                title={x.kind === "control" ? x.label : x.value}
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -224,16 +291,23 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss }: Props) {
                   color: C.cream,
                   padding: "6px 8px",
                   cursor: "pointer",
-                  whiteSpace: "nowrap",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
                   fontWeight: FONT_WEIGHT.semibold,
                   fontFamily: '"IBM Plex Sans", sans-serif',
                   fontSize: 13,
                 }}
               >
-                {x.kind === "control" && <FiCheck size={14} />}
-                {x.label}
+                <CtaIcon b={x} />
+                {/* Ellipsis on the span, not the flex button — see the top pill's label for why. */}
+                <span
+                  style={{
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {x.label}
+                </span>
               </button>
             ))}
           </div>

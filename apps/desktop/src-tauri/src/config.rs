@@ -63,6 +63,84 @@ pub struct AiConfig {
     pub brainstorm: bool,
     pub composer: bool,
     pub suggested_actions: bool,
+    /// Master switch for Sparkle Auto-Approve (nudging + auto-answering Claude Code permission
+    /// prompts). Default true. By default every non-destructive category ([approvals] below) ships
+    /// `"always"`, so with this on a fresh install auto-answers skill/edit/tool/web/other prompts
+    /// (bash still asks). Off disables ALL nudging AND all auto-answering regardless of [approvals].
+    pub auto_approve: bool,
+}
+
+/// Per-category Sparkle Auto-Approve rules. Each value is `"always"` (auto-approve that class of
+/// Claude Code permission prompt) or `"never"` (ask, but stop nudging); absent (None) = ask + nudge.
+/// Global `[approvals]` = all-projects rules; a project `.sparkle/config.toml [approvals]` overrides
+/// per category (project value beats global). See the design spec.
+///
+/// DEFAULT (see `impl Default` below): everything EXCEPT `bash` ships `"always"`, so a fresh install
+/// never blocks on a skill / edit / tool-call / web-request / other permission prompt out of the box.
+/// `bash` deliberately stays ask-each-time — auto-approving commands also auto-approves destructive
+/// ones (`rm -rf`, …), so it's the one category a user must opt into explicitly. The master switch
+/// (`ai.auto_approve`, default on) still governs whether ANY of this fires; turning it off, or
+/// setting a category to `"never"`, restores the old ask-each-time behavior.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ApprovalsConfig {
+    pub skill: Option<String>,
+    pub bash: Option<String>,
+    pub edit: Option<String>,
+    pub mcp: Option<String>,
+    pub fetch: Option<String>,
+    pub other: Option<String>,
+}
+
+impl Default for ApprovalsConfig {
+    fn default() -> Self {
+        // Ship auto-approve ON for every non-destructive category so users aren't blocked by
+        // permission prompts out of the box. `bash` stays None (ask each time) because
+        // auto-approving commands would also auto-approve destructive ones.
+        let always = || Some("always".to_string());
+        ApprovalsConfig {
+            skill: always(),
+            bash: None,
+            edit: always(),
+            mcp: always(),
+            fetch: always(),
+            other: always(),
+        }
+    }
+}
+
+/// Opinionated non-AI tools Sparkle uses (surfaced in the ⋯ Settings → "Tools" pane). Machine-wide
+/// (like [ai]): a per-project value is ignored with a warning. Each bool default true = the tool
+/// ships on for every new install; false = that tool is used nowhere in Sparkle. Chief/Deepgram are
+/// NOT here — they stay in [ai] (brainstorm / voice_dictation) so there's no duplication.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ToolsConfig {
+    /// Anonymous usage analytics + masked session replay (PostHog). Off sends nothing.
+    pub analytics: bool,
+    /// The in-repo work graph behind the Plan board (Beads / `bd`). Off hides the board + skips `bd`.
+    pub beads: bool,
+    /// Import a project straight from your GitHub repositories. Off hides the GitHub import path.
+    pub github: bool,
+    /// Opinionated quality guardrails for the code Sparkle's agents write in your project: run the
+    /// project's tests + typecheck before committing, prefer test-first, and never call a red build
+    /// "done". On (default) appends the guardrails workflow to every coding agent's system prompt;
+    /// off omits it. Adaptive — strict where a test setup exists, a nudge where one doesn't.
+    pub guardrails: bool,
+    /// The roborev per-commit AI code-review daemon. On (default) installs + runs reviews on your
+    /// BUILD-agent commits using your existing `claude login`; off tears the daemon down and stops
+    /// reviewing.
+    pub roborev: bool,
+}
+
+/// roborev machine-wide state that isn't a simple on/off tool toggle. Machine-wide (like [tools]):
+/// a per-project value is ignored with a warning.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RoborevConfig {
+    /// roborev first-run consent — whether the one-time "review your commits?" modal has been
+    /// resolved. Default false; set true once the user picks Enable or Not-now.
+    pub consent_prompted: bool,
 }
 
 /// Branch/build freshness rules — guardrails against doing work on (or shipping a DMG from) a
@@ -159,10 +237,16 @@ pub struct SparkleConfig {
     pub workflow: WorkflowConfig,
     pub workers: WorkersConfig,
     pub ai: AiConfig,
+    pub tools: ToolsConfig,
+    /// roborev machine-wide state (the one-time consent flag). Kept in its own section so Rust can
+    /// gate the first-run modal on it.
+    pub roborev: RoborevConfig,
     pub freshness: FreshnessConfig,
     pub worktree_pool: WorktreePoolConfig,
     pub capture: CaptureConfig,
     pub voice: VoiceConfig,
+    /// Per-category Sparkle Auto-Approve rules (repo-scoped overridable, like [workflow]/[freshness]).
+    pub approvals: ApprovalsConfig,
     /// Per-project "Done" stage definition (see the Definable Done & Delivered feature).
     pub done: DoneConfig,
     /// Per-project "Delivered" stage definition + detected production-ship signal.
@@ -195,7 +279,21 @@ impl Default for SparkleConfig {
                 brainstorm: true,
                 composer: true,
                 suggested_actions: true,
+                auto_approve: true,
             },
+            // Ships auto-approve ON for every category except bash (see ApprovalsConfig::default),
+            // so a fresh install isn't blocked by permission prompts. bash stays ask-each-time.
+            approvals: ApprovalsConfig::default(),
+            // Opinionated defaults: every tool ships on for a new install.
+            tools: ToolsConfig {
+                analytics: true,
+                beads: true,
+                github: true,
+                guardrails: true,
+                roborev: true,
+            },
+            // First-run consent is unresolved until the user answers the one-time modal.
+            roborev: RoborevConfig { consent_prompted: false },
             freshness: FreshnessConfig {
                 // Keep these in sync with the bash fallback in scripts/lib/sparkle-config.sh.
                 staleness_warn_commits: 25,
@@ -265,6 +363,31 @@ struct PartialAi {
     brainstorm: Option<bool>,
     composer: Option<bool>,
     suggested_actions: Option<bool>,
+    auto_approve: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialApprovals {
+    skill: Option<String>,
+    bash: Option<String>,
+    edit: Option<String>,
+    mcp: Option<String>,
+    fetch: Option<String>,
+    other: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialTools {
+    analytics: Option<bool>,
+    beads: Option<bool>,
+    github: Option<bool>,
+    guardrails: Option<bool>,
+    roborev: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialRoborev {
+    consent_prompted: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -320,10 +443,13 @@ struct PartialConfig {
     workflow: Option<PartialWorkflow>,
     workers: Option<PartialWorkers>,
     ai: Option<PartialAi>,
+    tools: Option<PartialTools>,
+    roborev: Option<PartialRoborev>,
     freshness: Option<PartialFreshness>,
     worktree_pool: Option<PartialWorktreePool>,
     capture: Option<PartialCapture>,
     voice: Option<PartialVoice>,
+    approvals: Option<PartialApprovals>,
     done: Option<PartialDone>,
     delivered: Option<PartialDelivered>,
 }
@@ -432,6 +558,59 @@ fn apply_ai(into: &mut AiConfig, p: Option<PartialAi>) {
     if let Some(v) = p.suggested_actions {
         into.suggested_actions = v;
     }
+    if let Some(v) = p.auto_approve {
+        into.auto_approve = v;
+    }
+}
+
+/// Overlay a partial `[approvals]` table. Each category present in the layer overrides; an absent
+/// category leaves the lower layer's value (so a project rule beats a global one per category, and
+/// removing a project key falls back to the global rule).
+fn apply_approvals(into: &mut ApprovalsConfig, p: Option<PartialApprovals>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.skill {
+        into.skill = Some(v);
+    }
+    if let Some(v) = p.bash {
+        into.bash = Some(v);
+    }
+    if let Some(v) = p.edit {
+        into.edit = Some(v);
+    }
+    if let Some(v) = p.mcp {
+        into.mcp = Some(v);
+    }
+    if let Some(v) = p.fetch {
+        into.fetch = Some(v);
+    }
+    if let Some(v) = p.other {
+        into.other = Some(v);
+    }
+}
+
+fn apply_tools(into: &mut ToolsConfig, p: Option<PartialTools>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.analytics {
+        into.analytics = v;
+    }
+    if let Some(v) = p.beads {
+        into.beads = v;
+    }
+    if let Some(v) = p.github {
+        into.github = v;
+    }
+    if let Some(v) = p.guardrails {
+        into.guardrails = v;
+    }
+    if let Some(v) = p.roborev {
+        into.roborev = v;
+    }
+}
+
+fn apply_roborev(into: &mut RoborevConfig, p: Option<PartialRoborev>) {
+    if let Some(PartialRoborev { consent_prompted: Some(v) }) = p {
+        into.consent_prompted = v;
+    }
 }
 
 /// Materialize partial criteria into effective ones. A missing `text`/`kind` degrades to an empty
@@ -526,10 +705,13 @@ fn build_effective(
                 apply_workflow(&mut cfg.workflow, p.workflow);
                 apply_workers(&mut cfg.workers, p.workers);
                 apply_ai(&mut cfg.ai, p.ai);
+                apply_tools(&mut cfg.tools, p.tools);
+                apply_roborev(&mut cfg.roborev, p.roborev);
                 apply_freshness(&mut cfg.freshness, p.freshness);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_capture(&mut cfg.capture, p.capture);
                 apply_voice(&mut cfg.voice, p.voice);
+                apply_approvals(&mut cfg.approvals, p.approvals);
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
             }
@@ -557,6 +739,20 @@ fn build_effective(
                             .to_string(),
                     );
                 }
+                if p.tools.is_some() {
+                    warnings.push(
+                        "[tools] in a per-project .sparkle/config.toml is ignored — it is a \
+                         machine-wide setting; set it in the global config.toml"
+                            .to_string(),
+                    );
+                }
+                if p.roborev.is_some() {
+                    warnings.push(
+                        "[roborev] in a per-project .sparkle/config.toml is ignored — it is a \
+                         machine-wide setting; set it in the global config.toml"
+                            .to_string(),
+                    );
+                }
                 if p.capture.is_some() {
                     warnings.push(
                         "[capture] in a per-project .sparkle/config.toml is ignored — the \
@@ -572,12 +768,15 @@ fn build_effective(
                             .to_string(),
                     );
                 }
-                // Per-project layer: [workflow], [freshness], and the [done]/[delivered] stage
-                // definitions are repo-scoped and may override (the stage definitions are
-                // per-project BY DESIGN — they describe how *this* repo ships).
+                // Per-project layer: [workflow], [freshness], [approvals], and the [done]/[delivered]
+                // stage definitions are repo-scoped and may override. [approvals] is honored here so
+                // "this project" auto-approve rules actually take effect (per category, project beats
+                // global). [ai].auto_approve stays global-only (it's the machine-wide master toggle,
+                // ignored per-project like the rest of [ai] above).
                 apply_workflow(&mut cfg.workflow, p.workflow);
                 apply_freshness(&mut cfg.freshness, p.freshness);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
+                apply_approvals(&mut cfg.approvals, p.approvals);
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
             }
@@ -792,6 +991,44 @@ voice_dictation = true   # use the cloud (Deepgram) STT for dictation; off = on-
 brainstorm      = true   # show the Think agent (chat with Chief)
 composer        = true   # use the AI-enhanced composer; off = a plain terminal input
 # suggested_actions = true   # show one-click suggested action buttons in the composer
+# auto_approve  = true   # Sparkle Auto-Approve: MASTER switch for auto-answering Claude Code
+                         # permission prompts (per [approvals] below). On by default. Off disables
+                         # all nudging AND all auto-answering regardless of [approvals].
+
+# --- Sparkle Auto-Approve rules (repo-scoped; overridable in a project file) -------------
+# Per-CATEGORY rules for auto-answering Claude Code permission prompts. Each value is:
+#   "always" = auto-answer the plain "Yes" for that whole class of prompt (Sparkle stays
+#              authoritative — turning [ai].auto_approve off restores the prompts), or
+#   "never"  = keep asking, but stop nudging you to remember an answer for that class.
+# DEFAULTS (so you're never blocked out of the box): every category EXCEPT bash ships "always".
+# bash is the sole exception — it stays ask-each-time because auto-approving commands also
+# auto-approves DESTRUCTIVE ones (rm -rf, …); set bash = "always" only if you accept that.
+# Edit here or via ⋯ Settings → "Auto-approve". Global rules apply to every project; a project's
+# .sparkle/config.toml [approvals] overrides per category (project wins).
+# Categories: skill (skills) · bash (commands) · edit (file edits) · mcp (tool calls) ·
+# fetch (web requests) · other (other prompts).
+# [approvals]
+# bash  = "always"   # opt bash in too (accepts destructive commands)
+# fetch = "never"    # or turn a category back to ask-each-time
+
+# --- Opinionated tools (per-machine; ignored in a project file) -------------------------
+# The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
+# new install; setting one false means that tool is used NOWHERE in Sparkle. (Chief and Deepgram
+# voice are AI features — toggle them under [ai] as brainstorm / voice_dictation.)
+[tools]
+analytics  = true   # anonymous usage + masked session replay (PostHog); off sends nothing
+beads      = true   # the in-repo work graph behind the Plan board; off hides it + skips `bd`
+github     = true   # import a project from your GitHub repositories; off hides that path
+guardrails = true   # opinionated quality workflow (test-first, run tests+typecheck before commit,
+                    # never call a red build "done") appended to every coding agent; off omits it
+roborev    = true   # per-commit AI code review of your BUILD-agent commits (uses your claude login)
+
+# --- roborev first-run consent (per-machine; ignored in a project file) -----------------
+# roborev reviews your BUILD-agent commits locally. The first time it's about to turn on, Sparkle
+# asks once — this flag records that the "review your commits?" prompt has been resolved (Enable or
+# Not-now) so you're never asked again. Toggle the tool itself under [tools] (roborev), not here.
+[roborev]
+consent_prompted = false   # set true once the one-time "review your commits?" prompt is resolved
 
 # --- Menu-bar capture (per-machine; ignored in a project file) --------------------------
 [capture]
@@ -923,6 +1160,34 @@ fn set_dotted(doc: &mut toml_edit::DocumentMut, path: &str, value: toml_edit::Va
     Ok(())
 }
 
+/// Surgically REMOVE a dotted `path` from a TOML document, preserving surrounding comments/format.
+/// A missing key (or a missing intermediate table) is a no-op — removing an unset rule is harmless.
+/// A path that tries to descend through a non-table scalar is an error (matches set_dotted).
+fn unset_dotted(doc: &mut toml_edit::DocumentMut, path: &str) -> Result<(), String> {
+    let parts: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return Err("empty config path".to_string());
+    }
+    let mut item: &mut toml_edit::Item = doc.as_item_mut();
+    for part in &parts[..parts.len() - 1] {
+        match item.get(part) {
+            None => return Ok(()), // intermediate table absent → nothing to remove
+            Some(existing) if !existing.is_table() => {
+                return Err(format!("config path '{path}' traverses '{part}', which is not a table"));
+            }
+            Some(_) => {}
+        }
+        item = &mut item[*part];
+    }
+    let last = parts[parts.len() - 1];
+    if let Some(table) = item.as_table_mut() {
+        table.remove(last);
+    } else if let Some(inline) = item.as_inline_table_mut() {
+        inline.remove(last);
+    }
+    Ok(())
+}
+
 /// Read the current global file (or the default template if absent) as an editable document.
 fn load_document(app_data: &Path) -> toml_edit::DocumentMut {
     let text = read_if_exists(&global_path(app_data)).unwrap_or_else(|| DEFAULT_TEMPLATE.to_string());
@@ -971,6 +1236,58 @@ pub fn set_values(app_data: &Path, entries: &[(String, serde_json::Value)]) -> R
     parse_layer(&text)
         .map_err(|e| format!("rejected: that change would make config.toml invalid: {e}"))?;
     write_atomic(&global_path(app_data), &text)
+}
+
+/// Remove one dotted key from the global config file, preserving comments/formatting. Validates the
+/// rendered result before persisting. Removing an absent key is a harmless no-op.
+pub fn unset_value(app_data: &Path, path: &str) -> Result<(), String> {
+    let mut doc = load_document(app_data);
+    unset_dotted(&mut doc, path)?;
+    let text = doc.to_string();
+    parse_layer(&text)
+        .map_err(|e| format!("rejected: that change would make config.toml invalid: {e}"))?;
+    write_atomic(&global_path(app_data), &text)
+}
+
+/// Read the per-project `.sparkle/config.toml` as an editable document, preserving its comments +
+/// other sections. Refuses to clobber an existing-but-unparseable file (matches
+/// `write_stage_definition`); an absent file starts from an empty document.
+fn load_project_document(project_root: &str) -> Result<toml_edit::DocumentMut, String> {
+    let path = project_path(project_root);
+    match read_if_exists(&path) {
+        Some(text) => text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+            format!("existing .sparkle/config.toml is not valid TOML; fix it before editing it: {e}")
+        }),
+        None => Ok(toml_edit::DocumentMut::new()),
+    }
+}
+
+/// Set one dotted key in the PER-PROJECT `.sparkle/config.toml` (comment-preserving), validating the
+/// rendered result first. Used for "this project" auto-approve rules.
+pub fn set_project_value(project_root: &str, path: &str, value: &serde_json::Value) -> Result<(), String> {
+    let v = json_to_toml_value(value)?;
+    let mut doc = load_project_document(project_root)?;
+    set_dotted(&mut doc, path, v)?;
+    let text = doc.to_string();
+    parse_layer(&text)
+        .map_err(|e| format!("rejected: that change would make .sparkle/config.toml invalid: {e}"))?;
+    write_atomic(&project_path(project_root), &text)
+}
+
+/// Remove one dotted key from the PER-PROJECT `.sparkle/config.toml`. No-op when the file (or key)
+/// is absent — but a present-but-unparseable file is refused rather than clobbered.
+pub fn unset_project_value(project_root: &str, path: &str) -> Result<(), String> {
+    let path_buf = project_path(project_root);
+    // Nothing to remove from a file that doesn't exist yet.
+    if read_if_exists(&path_buf).is_none() {
+        return Ok(());
+    }
+    let mut doc = load_project_document(project_root)?;
+    unset_dotted(&mut doc, path)?;
+    let text = doc.to_string();
+    parse_layer(&text)
+        .map_err(|e| format!("rejected: that change would make .sparkle/config.toml invalid: {e}"))?;
+    write_atomic(&path_buf, &text)
 }
 
 /// Validate then overwrite the whole global file (the raw-editor Save). Rejects invalid TOML
@@ -1163,6 +1480,48 @@ pub fn set_config_values(
     Ok(())
 }
 
+/// Remove one dotted key from the GLOBAL config file (comment-preserving). Used to clear an
+/// all-projects auto-approve rule. Removing an absent key succeeds as a no-op.
+#[tauri::command]
+pub fn unset_config_value(app: AppHandle, path: String) -> Result<(), String> {
+    let ad = app_data(&app)?;
+    unset_value(&ad, &path)?;
+    reload_and_emit(&app, &ad);
+    Ok(())
+}
+
+/// Set one dotted key in a PROJECT's `.sparkle/config.toml` (comment-preserving). Used for a
+/// "this project" auto-approve rule. Emits a fresh GLOBAL `config-changed` so listeners re-pull —
+/// per-project consumers re-read `get_config(project_root)` themselves, and emitting the global
+/// layer (rather than the project-merged one) keeps the global settings mirror uncontaminated by a
+/// project-scoped value.
+#[tauri::command]
+pub fn set_project_config_value(
+    app: AppHandle,
+    project_root: String,
+    path: String,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    set_project_value(&project_root, &path, &value)?;
+    let ad = app_data(&app)?;
+    reload_and_emit(&app, &ad);
+    Ok(())
+}
+
+/// Remove one dotted key from a PROJECT's `.sparkle/config.toml`. Used to clear a "this project"
+/// auto-approve rule (or un-mute a `never`). See `set_project_config_value` for the emit rationale.
+#[tauri::command]
+pub fn unset_project_config_value(
+    app: AppHandle,
+    project_root: String,
+    path: String,
+) -> Result<(), String> {
+    unset_project_value(&project_root, &path)?;
+    let ad = app_data(&app)?;
+    reload_and_emit(&app, &ad);
+    Ok(())
+}
+
 /// Validate + overwrite the whole global file (the raw-editor Save). Invalid TOML is rejected
 /// without touching the file or the live config.
 #[tauri::command]
@@ -1308,6 +1667,93 @@ mod tests {
         assert!(cfg.ai.auto_rename);
         assert!(warns.iter().any(|w| w.contains("[workers]")));
         assert!(warns.iter().any(|w| w.contains("[ai]")));
+    }
+
+    #[test]
+    fn tools_default_all_true() {
+        let (cfg, _, _) = effective(None, None);
+        assert!(cfg.tools.analytics);
+        assert!(cfg.tools.beads);
+        assert!(cfg.tools.github);
+        assert!(cfg.tools.guardrails);
+        assert!(cfg.tools.roborev);
+    }
+
+    #[test]
+    fn global_can_disable_roborev() {
+        // roborev is on by default; a global file can turn the review daemon off.
+        let g = "[tools]\nroborev = false\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(!cfg.tools.roborev);
+        assert!(cfg.tools.guardrails, "untouched tool keeps its default");
+    }
+
+    #[test]
+    fn roborev_consent_defaults_false_and_global_sets_it() {
+        // The one-time consent flag starts unresolved.
+        let (cfg, _, _) = effective(None, None);
+        assert!(!cfg.roborev.consent_prompted);
+
+        // A global [roborev] section resolves it.
+        let g = "[roborev]\nconsent_prompted = true\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(cfg.roborev.consent_prompted);
+    }
+
+    #[test]
+    fn project_roborev_is_ignored_with_warning() {
+        // [roborev] is machine-wide (like [tools]); a per-project value is ignored with a warning.
+        let p = "[roborev]\nconsent_prompted = true\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert!(!cfg.roborev.consent_prompted);
+        assert!(warns.iter().any(|w| w.contains("[roborev]")));
+    }
+
+    #[test]
+    fn global_tools_override_field_by_field() {
+        // A global file can flip a single tool off; untouched tools keep their defaults.
+        let g = "[tools]\nbeads = false\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(!cfg.tools.beads);
+        assert!(cfg.tools.analytics, "untouched tool keeps its default");
+        assert!(cfg.tools.github, "untouched tool keeps its default");
+        assert!(cfg.tools.guardrails, "untouched tool keeps its default");
+    }
+
+    #[test]
+    fn global_can_disable_guardrails() {
+        // Guardrails is on by default; a global file can turn the opinionation off.
+        let g = "[tools]\nguardrails = false\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(!cfg.tools.guardrails);
+        assert!(cfg.tools.analytics, "untouched tool keeps its default");
+    }
+
+    #[test]
+    fn unknown_tools_key_is_tolerated() {
+        // A forward-compatible [tools] key never errors (serde ignores unknown fields).
+        let g = "[tools]\nanalytics = false\nsome_future_tool = true\n";
+        let (cfg, _, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(!cfg.tools.analytics);
+    }
+
+    #[test]
+    fn project_tools_are_ignored_with_warning() {
+        // [tools] is machine-wide (like [ai]); a per-project value is ignored with a warning.
+        let p = "[tools]\nbeads = false\ngithub = false\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert!(cfg.tools.beads);
+        assert!(cfg.tools.github);
+        assert!(warns.iter().any(|w| w.contains("[tools]")));
     }
 
     #[test]
@@ -1478,6 +1924,107 @@ mod tests {
         assert!(!hard);
         assert!(warns.is_empty());
         assert_eq!(cfg, SparkleConfig::default());
+    }
+
+    #[test]
+    fn ai_auto_approve_defaults_on_and_overrides() {
+        let (cfg, _, _) = effective(None, None);
+        assert!(cfg.ai.auto_approve, "auto_approve defaults on");
+
+        let g = "[ai]\nauto_approve = false\n";
+        let (cfg, _, _) = effective(Some(g), None);
+        assert!(!cfg.ai.auto_approve);
+        // Untouched [ai] fields keep their defaults.
+        assert!(cfg.ai.suggested_actions);
+    }
+
+    #[test]
+    fn approvals_default_ships_on_except_bash() {
+        // A fresh install auto-approves every non-destructive category out of the box, so users
+        // aren't blocked by permission prompts. bash stays ask-each-time (destructive).
+        let (cfg, _, _) = effective(None, None);
+        assert_eq!(cfg.approvals, ApprovalsConfig::default());
+        assert_eq!(cfg.approvals.skill.as_deref(), Some("always"));
+        assert_eq!(cfg.approvals.edit.as_deref(), Some("always"));
+        assert_eq!(cfg.approvals.mcp.as_deref(), Some("always"));
+        assert_eq!(cfg.approvals.fetch.as_deref(), Some("always"));
+        assert_eq!(cfg.approvals.other.as_deref(), Some("always"));
+        assert_eq!(cfg.approvals.bash, None, "bash is the one category that must stay ask-each-time");
+    }
+
+    #[test]
+    fn approvals_global_applies_and_project_overrides_per_category() {
+        // Global sets skill=always, bash=never; the project overrides skill and adds edit.
+        let g = "[approvals]\nskill = \"always\"\nbash = \"never\"\n";
+        let p = "[approvals]\nskill = \"never\"\nedit = \"always\"\n";
+        let (cfg, warns, hard) = effective(Some(g), Some(p));
+        assert!(!hard);
+        // Project value beats global for skill; bash falls back to the global rule; edit is the
+        // project's own; a category no layer mentions keeps its shipped default ("always" for mcp).
+        assert_eq!(cfg.approvals.skill.as_deref(), Some("never"));
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("never"));
+        assert_eq!(cfg.approvals.edit.as_deref(), Some("always"));
+        assert_eq!(cfg.approvals.mcp.as_deref(), Some("always"));
+        // [approvals] is repo-scoped BY DESIGN — it must NOT be reported as ignored in a project file
+        // (unlike [ai]/[workers]); this is the per-project-honored assertion from the spec.
+        assert!(
+            !warns.iter().any(|w| w.contains("[approvals]")),
+            "per-project [approvals] must be honored, not ignored"
+        );
+    }
+
+    #[test]
+    fn partial_approvals_section_preserves_defaults_for_omitted_categories() {
+        // Regression: a user who writes ONLY `bash = "always"` must NOT lose the shipped "always"
+        // default on every other category. TOML parses into PartialApprovals (per-field Option) and
+        // apply_approvals overlays field-by-field over ApprovalsConfig::default(), so an omitted
+        // field keeps the default rather than reverting to None ("ask"). Guards against a future
+        // refactor that deserializes straight into ApprovalsConfig (which WOULD zero the omitted
+        // fields to None).
+        let g = "[approvals]\nbash = \"always\"\n";
+        let (cfg, _, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("always"), "the one field written wins");
+        // Every omitted category still carries the shipped default.
+        assert_eq!(cfg.approvals.skill.as_deref(), Some("always"));
+        assert_eq!(cfg.approvals.edit.as_deref(), Some("always"));
+        assert_eq!(cfg.approvals.mcp.as_deref(), Some("always"));
+        assert_eq!(cfg.approvals.fetch.as_deref(), Some("always"));
+        assert_eq!(cfg.approvals.other.as_deref(), Some("always"));
+    }
+
+    #[test]
+    fn approvals_round_trip_through_set_and_unset() {
+        // A round-trip over the comment-preserving writers: set a project rule, then clear it, and
+        // confirm the effective precedence (project overrides global) at each step. Uses a temp dir
+        // as the "app_data"/project root so no real file is touched.
+        let dir = std::env::temp_dir().join(format!("sparkle-approvals-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_string_lossy().to_string();
+
+        // Seed a global rule and a project rule.
+        set_value(&dir, "approvals.bash", &serde_json::json!("always")).unwrap();
+        set_project_value(&root, "approvals.bash", &serde_json::json!("never")).unwrap();
+
+        let g_text = read_if_exists(&global_path(&dir));
+        let p_text = read_if_exists(&project_path(&root));
+        let (cfg, _, _) = build_effective(SparkleConfig::default(), g_text.as_deref(), p_text.as_deref());
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("never"), "project overrides global");
+
+        // Clear the project rule → falls back to the global rule.
+        unset_project_value(&root, "approvals.bash").unwrap();
+        let p_text = read_if_exists(&project_path(&root));
+        let (cfg, _, _) = build_effective(SparkleConfig::default(), g_text.as_deref(), p_text.as_deref());
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("always"), "falls back to global");
+
+        // Clear the global rule → fully unset.
+        unset_value(&dir, "approvals.bash").unwrap();
+        let g_text = read_if_exists(&global_path(&dir));
+        let (cfg, _, _) = build_effective(SparkleConfig::default(), g_text.as_deref(), None);
+        assert_eq!(cfg.approvals.bash, None, "fully cleared");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1812,5 +2359,31 @@ mod tests {
         // Writer path (reload) must not propagate the poison either.
         let dir = tempfile::tempdir().unwrap();
         let _ = reload_global(dir.path());
+    }
+
+    // Drift guard for the vendored roborev git hook bundled at resources/roborev/post-commit.
+    // It is a byte-for-byte copy of the upstream seed-auto-roborev wrapper (which carries its own
+    // exhaustive skip-glob test suite). The subtle pytest/sparkle-fixture skip heuristics are easy
+    // to regress if someone edits the Sparkle copy, so assert the load-bearing guard tokens survive.
+    #[test]
+    fn vendored_roborev_post_commit_keeps_its_skip_guards() {
+        let hook = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/resources/roborev/post-commit"
+        ))
+        .expect("vendored resources/roborev/post-commit must exist (bundled Tauri resource)");
+        for needle in [
+            "pytest-of-",         // pytest tmp_path_factory fixture repos
+            "sparkle-test-",      // Sparkle Rust/TS suite throwaway repos
+            "sparkle-accounts-",
+            "sparkle-bridge-",
+            "\" post-commit",     // the ACTUAL delegation invocation `"$ROBOREV" post-commit` —
+                                  // not the bare word "post-commit", which also appears in comments
+        ] {
+            assert!(
+                hook.contains(needle),
+                "vendored post-commit lost the '{needle}' guard/behavior — did the copy drift from the seed?"
+            );
+        }
     }
 }

@@ -400,7 +400,7 @@ function Card({
       ? `${bead.description.slice(0, DESC_PREVIEW)}…`
       : bead.description;
   const workers = workersForBead(agents, bead.id);
-  // The unified 9-stage progress for this unit of work: prefer the live build progress of any
+  // The unified 10-stage progress for this unit of work: prefer the live build progress of any
   // worker(s) on the bead, else map the bead's own status. Shown as the blue logo-gradient line.
   const workerIds = agents
     .filter((a) => a.kind === "worker" && a.beadId === bead.id)

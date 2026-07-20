@@ -3,7 +3,15 @@
 // restores everything. Live process/status state is NOT here (see runtimeStore).
 import { create } from "zustand";
 import { persist, createJSONStorage, type StateStorage } from "zustand/middleware";
-import type { AgentKind, AgentName, AgentTab, AgentTabStatus, Project } from "../types";
+import type {
+  AgentKind,
+  AgentName,
+  AgentTab,
+  AgentTabStatus,
+  Project,
+  PromptHistoryEntry,
+  PromptSource,
+} from "../types";
 import {
   advanceAlertRecord,
   dismissedRecord,
@@ -15,8 +23,33 @@ import { usageTelemetry } from "../services/usageTelemetry";
 import { perfSpan, perfStart } from "../perfTrace";
 
 // Cap on how many prompts we keep per agent so the persisted localStorage record stays bounded.
-// The oldest entries fall off; the most recent PROMPT_HISTORY_LIMIT are kept.
+// The oldest entries fall off; the most recent PROMPT_HISTORY_LIMIT are kept — PER SOURCE (see
+// capPromptHistory), so a burst of picker answers can never evict real composer prompts.
 export const PROMPT_HISTORY_LIMIT = 100;
+
+/**
+ * Trim prompt history to the most recent {@link PROMPT_HISTORY_LIMIT} entries **of each source**,
+ * preserving chronological order. Capping the union would let a picker-heavy session (the exact use
+ * case this tagging targets) push real composer prompts off the end, shrinking the breadcrumb —
+ * `composerPrompts` reads this already-capped list. Independent caps keep each class bounded (so the
+ * persisted record stays small — at most 2×limit) while guaranteeing composer history is only ever
+ * evicted by more composer prompts, exactly as before picker entries were recorded. A missing
+ * `source` counts as composer. Pure; exported for unit testing.
+ */
+export function capPromptHistory(entries: PromptHistoryEntry[]): PromptHistoryEntry[] {
+  if (entries.length <= PROMPT_HISTORY_LIMIT) return entries; // fast path: can't exceed either cap
+  const keep = new Set<number>();
+  for (const wantPicker of [true, false]) {
+    let kept = 0;
+    for (let i = entries.length - 1; i >= 0 && kept < PROMPT_HISTORY_LIMIT; i--) {
+      if ((entries[i]!.source === "picker") === wantPicker) {
+        keep.add(i);
+        kept++;
+      }
+    }
+  }
+  return entries.filter((_, i) => keep.has(i));
+}
 
 // Options for creating an agent. `kind` defaults to "build" (the orchestrator you talk to);
 // `parentId` is set only for workers spawned under a build agent.
@@ -53,6 +86,11 @@ export interface ProjectState {
   addProject: (name: string, rootPath: string) => string;
   removeProject: (id: string) => void;
   selectProject: (id: string) => void;
+  /** Set the cold-start restore hint (the project a relaunch reopens) without bumping
+   *  lastOpenedAt. ONLY the main window claims this as it navigates — it's the window a restart
+   *  restores. Accepts null (main window showing no project) so restart falls back to the first
+   *  project. Secondary windows never call this; each owns its own current project. */
+  setSelectedProject: (id: string | null) => void;
   /** Bump lastOpenedAt only (for Recent ordering) without claiming the shared
    *  selectedProjectId — multi-window: each window owns its own current project. */
   touchProjectOpened: (id: string) => void;
@@ -80,6 +118,11 @@ export interface ProjectState {
    *  the caller passes `pinnedIndex` (the agent's current displayed slot), also anchor the row
    *  there — the unified pin (manual-agent-reorder-pin). */
   renameAgent: (projectId: string, agentId: string, name: string, pinnedIndex?: number) => void;
+  /** Self-name: the AGENT names ITSELF via the sparkle-control `rename_agent` op. Sets the name and
+   *  marks it authoritative (`selfNamed` — freezes auto-naming, skips paid Haiku, survives rehydrate)
+   *  WITHOUT pinning the row: no pin chip, no `pinnedIndex` anchor, so the human can still reorder and
+   *  there is nothing to "unpin". A human pin (`namePinned`) still wins — a self-name is a no-op over it. */
+  selfNameAgent: (projectId: string, agentId: string, name: string) => void;
   /** Auto-rename from the naming model. No-op if the user has pinned the name. Records the
    *  basis prompt so we can later detect when the work has shifted enough to re-name. Pass
    *  `autoName` (title + description) to enable the truncated title + hover description; `name` is
@@ -142,7 +185,7 @@ export interface ProjectState {
   /** Record a submitted prompt: updates `lastPrompt` (pinned header) AND appends to
    *  `promptHistory` (capped). Returns the new entry's id so the caller can register the matching
    *  terminal scroll marker under the same key. */
-  appendPrompt: (projectId: string, agentId: string, text: string) => string;
+  appendPrompt: (projectId: string, agentId: string, text: string, source?: PromptSource) => string;
 }
 
 function mapProject(
@@ -244,6 +287,67 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
       agents: (p.agents ?? []).map((a) =>
         (a.kind as string) === "brainstorm" ? { ...a, kind: "think" } : a,
       ),
+    }));
+  }
+  if (version < 9) {
+    // Heal the sparkle-pel7 residue. Before that fix, the `rename_agent` control op routed through
+    // renameAgent(), which froze the row (namePinned:true) every time an agent named ITSELF. Pel7
+    // rerouted self-naming to selfNameAgent() (name authoritative, row NOT pinned) — but nothing
+    // cleared the pins already written to localStorage, so those rows kept showing a pin chip
+    // ("rows get pinned without the user pinning them"). The frozen self-name has an exact
+    // fingerprint that no legitimate pin shares:
+    //   • namePinned:true                    — it's showing the pin chip
+    //   • pinnedIndex == null                — a real manual/drag pin (renameAgent w/ index, or
+    //                                           pinAgentAt) always records a row anchor; this never did
+    //   • kind is "build" | "worker"         — a Think→epic rename (renameAgent, index-less) is kind
+    //                                           "think"; a Run-as-cmd tab is "shell" — both deliberate
+    //   • !selfNamed                          — the old path never set selfNamed
+    // Convert exactly that shape to the state the fixed path would have produced: keep the chosen
+    // name, drop the pin (namePinned:false → rejoins the attention sort, no chip) and mark it
+    // selfNamed so the name stays authoritative and is never clobbered by auto-naming. Anything with
+    // a pinnedIndex, a think/shell kind, or already-selfNamed is a real pin and left untouched.
+    //
+    // KNOWN, ACCEPTED AMBIGUITY (roborev): before bbea8ac4 (2026-06-27, the "rename anchors at the
+    // displayed row" change) the sidebar's MANUAL rename also called renameAgent() WITHOUT an index,
+    // so a pre-bbea8ac4 user rename of a build/worker agent has the IDENTICAL fingerprint and no field
+    // distinguishes it from the pel7 residue. Such a record is also healed to selfNamed. Trade-off,
+    // deliberately taken:
+    //   • Removing the erroneous pin is the whole point, and it fixes the COMMON case (agents that
+    //     named themselves — the reported bug).
+    //   • selfNamed is the LEAST-lossy heal available: like namePinned it freezes the name against
+    //     auto-naming, so the name the user sees is preserved. The ONLY divergence from the old
+    //     namePinned state is resetAutoName (AgentPane slot-reuse): a namePinned row was kept forever,
+    //     whereas a selfNamed row is cleared to the kind default when its worktree is wiped and the
+    //     slot is reused with no resumable session. For the common (self-name) case that clear is
+    //     CORRECT — the name belonged to the prior occupant. For the rare mislabeled manual rename it
+    //     means the name reverts to "Build 1" on that specific reuse event — accepted as strictly
+    //     better than leaving every self-named row wearing a stuck, un-earned pin chip.
+    // See projectStore.migrate.test.ts ("ambiguous pre-unified-pin manual rename") for the pinned-down
+    // behavior of this case.
+    state.projects = state.projects.map((p) => ({
+      ...p,
+      agents: (p.agents ?? []).map((a) => {
+        const isStaleSelfNamePin =
+          a.namePinned === true &&
+          (a as AgentTab).pinnedIndex == null &&
+          !a.selfNamed &&
+          (a.kind === "build" || a.kind === "worker");
+        return isStaleSelfNamePin ? { ...a, namePinned: false, selfNamed: true } : a;
+      }),
+    }));
+  }
+  if (version < 10) {
+    // Picker-tagging (Task 2.3): promptHistory entries gain a `source`. Every entry that predates
+    // this change was a real composer/seed prompt (picker answers were never recorded before), so
+    // backfill "composer". Readers already treat a missing `source` as "composer", so this is for
+    // explicitness/consistency rather than correctness — but it means a re-serialized record carries
+    // the field, and any future logic keyed on `source` sees a fully-populated history.
+    state.projects = state.projects.map((p) => ({
+      ...p,
+      agents: (p.agents ?? []).map((a) => ({
+        ...a,
+        promptHistory: (a.promptHistory ?? []).map((e) => ({ ...e, source: e.source ?? "composer" })),
+      })),
     }));
   }
   // Version-collision safety net. PR #62 shipped shellCommand as v4 on its own branch while main
@@ -370,6 +474,21 @@ export function acknowledgePendingAdds(ids: Iterable<string>): void {
   for (const id of ids) pendingLocalAdds.delete(id);
 }
 
+/** Ids of PROJECTS added locally in THIS window but not yet confirmed present in a persisted
+ *  snapshot — the project-level analog of pendingLocalAdds (which shields brand-new AGENTS). The
+ *  cross-window merge maps over the INCOMING snapshot's projects, so a just-created project that a
+ *  concurrent window's last-writer-wins blob predates would be dropped entirely ("created a new
+ *  project but it shows nothing / disappears" — the hazel-eco report). While an id lives here the
+ *  merge re-attaches its project. Cleared the instant a snapshot carrying it arrives (propagated) and
+ *  on local removeProject — so a deliberately-removed project is never resurrected. One set per window. */
+const pendingLocalProjectAdds = new Set<string>();
+
+/** Drop project ids from the pending-add set once a persisted snapshot carries them (propagated) or
+ *  they were removed locally. Exported for tests. */
+export function acknowledgePendingProjectAdds(ids: Iterable<string>): void {
+  for (const id of ids) pendingLocalProjectAdds.delete(id);
+}
+
 /** Ids of agents REMOVED locally in THIS window but whose removal may not have propagated to the
  *  shared persisted blob yet. The exact mirror of pendingLocalAdds: while an id lives here the merge
  *  FILTERS it out of any incoming snapshot, so a concurrent writer's stale snapshot that still
@@ -435,6 +554,7 @@ export function mergePreservingLiveWorkers(
   currentState: ProjectState,
   pendingAdds: ReadonlySet<string> = EMPTY_PENDING_ADDS,
   pendingRemovals: ReadonlySet<string> = EMPTY_PENDING_ADDS,
+  pendingProjectAdds: ReadonlySet<string> = EMPTY_PENDING_ADDS,
 ): ProjectState {
   const persisted = (persistedState ?? undefined) as Partial<ProjectState> | undefined;
   const merged = { ...currentState, ...(persisted ?? {}) } as ProjectState;
@@ -455,25 +575,39 @@ export function mergePreservingLiveWorkers(
     pp = ppAgents === pp.agents ? pp : { ...pp, agents: ppAgents };
     if (!cur) return pp;
     const present = new Set(pp.agents.map((a) => a.id));
-    // Pinned-identity preservation: a manual rename (renameAgent / the sparkle-control rename_agent op)
-    // sets namePinned=true + the chosen name in memory, but the projects blob is persisted on a trailing
+    // Authoritative-identity preservation: a manual rename (renameAgent) sets namePinned=true, and a
+    // self-name (the sparkle-control rename_agent op → selfNameAgent) sets selfNamed=true — both make
+    // the chosen name authoritative in memory, but the projects blob is persisted on a trailing
     // debounce (see the 400ms write below). A rehydrate that fires before the write flushes carries the
-    // SAME agent still UNPINNED with its old auto-name; taking it verbatim reverted the name AND cleared
-    // namePinned, which re-opened the agent to auto-naming so the auto-title silently won ("rename_agent
-    // returns ok but the row keeps its old name"). For an agent present in BOTH, when the LIVE copy is
-    // pinned and the incoming snapshot is NOT, keep the live name/namePinned/autoNameVariants. A snapshot
-    // that is itself pinned is a deliberate (already-flushed or cross-window) rename and wins, so we only
-    // shield the unpinned-revert case — symmetric to how the live selectedAgentId is preserved below.
+    // SAME agent still un-renamed with its old auto-name; taking it verbatim reverted the name AND
+    // cleared the authoritative flag, which re-opened the agent to auto-naming so the auto-title
+    // silently won ("rename_agent returns ok but the row keeps its old name"). For an agent present in
+    // BOTH, when the LIVE copy is authoritatively named and the incoming snapshot is NOT, keep the live
+    // name + flags + autoNameVariants. A snapshot that is itself authoritatively named is a deliberate
+    // (already-flushed or cross-window) rename and wins, so we only shield the revert case — symmetric
+    // to how the live selectedAgentId is preserved below.
+    // Precedence, strict: human pin (namePinned) > self-name (selfNamed) > auto-name. We shield the
+    // live copy only when the incoming snapshot is a STRICTLY-lower-precedence revert — never when the
+    // snapshot is an equal-or-higher deliberate/flushed rename (which wins, as before):
+    //   • a live human pin beats any snapshot that is not ITSELF a human pin (incl. a self-named one —
+    //     a self-name must never revert the human's deliberate pin);
+    //   • a live self-name beats only an auto-named snapshot (a namePinned OR selfNamed snapshot is a
+    //     flushed/cross-window rename and wins).
     const curById = new Map(cur.agents.map((a) => [a.id, a] as const));
     let pinnedIdentityReconciled = false;
     const reconciledAgents = pp.agents.map((a) => {
       const live = curById.get(a.id);
-      if (live?.namePinned && !a.namePinned) {
+      const preserveLive =
+        !!live &&
+        ((live.namePinned && !a.namePinned) ||
+          (live.selfNamed && !a.namePinned && !a.selfNamed));
+      if (preserveLive) {
         pinnedIdentityReconciled = true;
         return {
           ...a,
           name: live.name,
-          namePinned: true,
+          namePinned: live.namePinned,
+          selfNamed: live.selfNamed,
           autoNameVariants: live.autoNameVariants,
         };
       }
@@ -528,6 +662,26 @@ export function mergePreservingLiveWorkers(
       return pp;
     return { ...pp, agents: mergedAgents, selectedAgentId, freshBuildAgentId };
   });
+  // Project-level shield (symmetric to pendingLocalAdds for agents): the map above iterates the
+  // INCOMING snapshot's projects, so a project created locally in THIS window but absent from a
+  // concurrent writer's stale blob is dropped. Re-attach any just-added project the snapshot doesn't
+  // yet carry, and keep the user on it when it was the live selection — a stale snapshot must not
+  // yank the window off the project the user just created. Cleared once the snapshot propagates the
+  // project (see the merge caller's acknowledgePendingProjectAdds), so a genuinely-removed project is
+  // never resurrected.
+  if (pendingProjectAdds.size > 0) {
+    const mergedIds = new Set(merged.projects.map((p) => p.id));
+    const projectSurvivors = currentProjects.filter(
+      (p) => pendingProjectAdds.has(p.id) && !mergedIds.has(p.id),
+    );
+    if (projectSurvivors.length > 0) {
+      merged.projects = [...merged.projects, ...projectSurvivors];
+      const liveSel = currentState.selectedProjectId;
+      if (liveSel != null && projectSurvivors.some((p) => p.id === liveSel)) {
+        merged.selectedProjectId = liveSel;
+      }
+    }
+  }
   return merged;
 }
 
@@ -552,16 +706,24 @@ export const useProjectStore = create<ProjectState>()(
           freshBuildAgentId: null,
         };
         set((s) => ({ projects: [...s.projects, project], selectedProjectId: id }));
+        // Shield this brand-new project from a concurrent window's stale rehydrate until the add
+        // propagates to the shared blob (mirrors pendingLocalAdds for agents). Cleared on
+        // acknowledge (a snapshot carries it) or removeProject.
+        pendingLocalProjectAdds.add(id);
         return id;
       },
 
-      removeProject: (id) =>
+      removeProject: (id) => {
+        // Deliberate removal — stop shielding it so a stale cross-window snapshot can't resurrect
+        // the project via the survivor clause above.
+        pendingLocalProjectAdds.delete(id);
         set((s) => {
           const projects = s.projects.filter((p) => p.id !== id);
           const selectedProjectId =
             s.selectedProjectId === id ? (projects[0]?.id ?? null) : s.selectedProjectId;
           return { projects, selectedProjectId };
-        }),
+        });
+      },
 
       selectProject: (id) =>
         set((s) => ({
@@ -571,6 +733,8 @@ export const useProjectStore = create<ProjectState>()(
             lastOpenedAt: new Date().toISOString(),
           })),
         })),
+
+      setSelectedProject: (id) => set({ selectedProjectId: id }),
 
       touchProjectOpened: (id) =>
         set((s) => ({
@@ -742,15 +906,33 @@ export const useProjectStore = create<ProjectState>()(
           ),
         })),
 
+      selfNameAgent: (projectId, agentId, name) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) =>
+              // A human pin (namePinned) is the user's deliberate choice and always wins — a self-name
+              // over it is a no-op. Otherwise adopt the agent's chosen name: mark it authoritative via
+              // `selfNamed` (freezes the auto-namer, skips paid Haiku, survives rehydrate) but do NOT
+              // set namePinned/pinnedIndex, so the row shows no pin chip and stays reorderable. Clear
+              // autoNameVariants so the chosen label shows verbatim (the sidebar prefers variants over
+              // `name`, so a stale variant would otherwise keep winning) — mirrors renameAgent.
+              a.namePinned || !name.trim()
+                ? a
+                : { ...a, name: name.trim(), selfNamed: true, autoNameVariants: null },
+            ),
+          ),
+        })),
+
       autoRenameAgent: (projectId, agentId, name, basis, autoName) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) =>
-              // Respect a pinned name (manual) AND a Claude Code session title (authoritative).
-              // The aiTitle check makes the STORE the single arbiter of precedence, closing the
-              // race where an in-flight Haiku call (started before a title existed) resolves AFTER
-              // the title poll applied one — without it, the stale guess would clobber the title.
-              a.namePinned || a.aiTitle || !name.trim()
+              // Respect a pinned name (manual), a self-chosen name (sparkle-control rename_agent), AND
+              // a Claude Code session title (authoritative). The aiTitle check makes the STORE the
+              // single arbiter of precedence, closing the race where an in-flight Haiku call (started
+              // before a title existed) resolves AFTER the title poll applied one — without it, the
+              // stale guess would clobber the title.
+              a.namePinned || a.selfNamed || a.aiTitle || !name.trim()
                 ? a
                 : { ...a, name: name.trim(), autoNameBasis: basis, autoNameVariants: autoName ?? null },
             ),
@@ -768,7 +950,7 @@ export const useProjectStore = create<ProjectState>()(
           const agent = s.projects
             .find((p) => p.id === projectId)
             ?.agents.find((a) => a.id === agentId);
-          if (!agent || agent.namePinned || agent.aiTitle === t) return s;
+          if (!agent || agent.namePinned || agent.selfNamed || agent.aiTitle === t) return s;
           return {
             projects: mapProject(s.projects, projectId, (p) =>
               mapAgent(p, agentId, (a) => ({
@@ -785,14 +967,20 @@ export const useProjectStore = create<ProjectState>()(
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) =>
-              // A manual rename is the user's choice — never auto-reset it on a fresh start. Also
-              // bail (return the SAME reference) when there's no auto-name to clear — the common
-              // first-launch case — so subscribers don't re-render for a no-op.
+              // A manual rename is the user's choice — never auto-reset it on a fresh start. A
+              // self-name, by contrast, is agent-generated identity for the PRIOR occupant, so a
+              // reused slot must clear it like any other auto-name. Also bail (return the SAME
+              // reference) when there's no auto-name to clear — the common first-launch case — so
+              // subscribers don't re-render for a no-op.
               a.namePinned ||
-              (a.autoNameBasis === null && a.autoNameVariants === null && a.aiTitle === undefined)
+              (!a.selfNamed &&
+                a.autoNameBasis === null &&
+                a.autoNameVariants === null &&
+                a.aiTitle === undefined)
                 ? a
                 : {
                     ...a,
+                    selfNamed: false,
                     // Recompute the kind default against the OTHER agents so a lone "Build" slot
                     // reverts to "Build 1" (not "Build 2" — defaultAgentName counts inclusively).
                     // The number is positional-best-effort and not guaranteed unique with multiple
@@ -932,18 +1120,23 @@ export const useProjectStore = create<ProjectState>()(
           }),
         })),
 
-      appendPrompt: (projectId, agentId, text) => {
+      appendPrompt: (projectId, agentId, text, source = "composer") => {
         const id = uuid();
+        // A picker answer is recorded ONLY to advance promptCount for the naming ladder; it must not
+        // become the pinned banner's "last prompt" (that surface, like the breadcrumb, is for real
+        // user messages). So only a composer send moves `lastPrompt`; a picker send leaves it.
+        const isPicker = source === "picker";
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) => ({
               ...a,
-              lastPrompt: text,
-              // Append newest-last, then keep only the most recent entries so the persisted
-              // record can't grow without bound. The dropdown reverses this for display.
-              promptHistory: [...(a.promptHistory ?? []), { id, text, at: Date.now() }].slice(
-                -PROMPT_HISTORY_LIMIT,
-              ),
+              lastPrompt: isPicker ? a.lastPrompt : text,
+              // Append newest-last, then cap PER SOURCE so the persisted record stays bounded without
+              // letting picker volume evict real composer prompts (capPromptHistory). Dropdown reverses.
+              promptHistory: capPromptHistory([
+                ...(a.promptHistory ?? []),
+                { id, text, at: Date.now(), source },
+              ]),
             })),
           ),
         }));
@@ -964,8 +1157,11 @@ export const useProjectStore = create<ProjectState>()(
       // (the pinned-header dropdown) as an empty array. v6 backfills shellCommand: null for the
       // Run-as-cmd "shell" agent kind (folded in from PR #62). v7 remaps the legacy
       // "brainstorm" agent kind to "think" (the Think rename). v8 backfills pinnedIndex: null
-      // (manual reorder anchor) without touching namePinned.
-      version: 8,
+      // (manual reorder anchor) without touching namePinned. v9 heals the sparkle-pel7 residue:
+      // build/worker rows frozen (namePinned:true, pinnedIndex null) by the OLD self-name path get
+      // unpinned + marked selfNamed so the erroneous pin chip clears while the name is preserved.
+      // v10 backfills promptHistory[].source: "composer" (picker-tagging, Task 2.3).
+      version: 10,
       migrate: (persisted, version) =>
         perfSpan("persist.migrate", () => migratePersisted(persisted, version), { version }) as ProjectState,
       // sparkle-3tqv: a protective merge so no rehydrate (startup or cross-window) can evict a
@@ -977,8 +1173,17 @@ export const useProjectStore = create<ProjectState>()(
         const persistedProjects =
           (persisted as Partial<ProjectState> | undefined)?.projects ?? [];
         acknowledgePendingAdds(persistedProjects.flatMap((p) => p.agents.map((a) => a.id)));
+        // Same for projects: any pending project-add the snapshot now carries has propagated — stop
+        // shielding it so a later genuine removal isn't overridden by the survivor clause.
+        acknowledgePendingProjectAdds(persistedProjects.map((p) => p.id));
         return perfSpan("persist.merge", () =>
-          mergePreservingLiveWorkers(persisted, current, pendingLocalAdds, pendingLocalRemovals),
+          mergePreservingLiveWorkers(
+            persisted,
+            current,
+            pendingLocalAdds,
+            pendingLocalRemovals,
+            pendingLocalProjectAdds,
+          ),
         );
       },
     },

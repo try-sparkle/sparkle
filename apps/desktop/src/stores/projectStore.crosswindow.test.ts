@@ -6,6 +6,24 @@ beforeEach(() => {
   localStorage.clear();
 });
 
+describe("setSelectedProject", () => {
+  it("sets the restore hint (accepting null) without bumping lastOpenedAt", () => {
+    const id = useProjectStore.getState().addProject("P", "/tmp/p");
+    const old = "2000-01-01T00:00:00.000Z";
+    useProjectStore.setState((s) => ({
+      selectedProjectId: null,
+      projects: s.projects.map((p) => (p.id === id ? { ...p, lastOpenedAt: old } : p)),
+    }));
+    useProjectStore.getState().setSelectedProject(id);
+    expect(useProjectStore.getState().selectedProjectId).toBe(id);
+    // Restore-hint write must NOT touch lastOpenedAt (Recent ordering is owned by touchProjectOpened).
+    expect(useProjectStore.getState().projects[0]?.lastOpenedAt).toBe(old);
+    // Null clears the hint (main window closed to no project → restart falls back to first project).
+    useProjectStore.getState().setSelectedProject(null);
+    expect(useProjectStore.getState().selectedProjectId).toBeNull();
+  });
+});
+
 describe("touchProjectOpened", () => {
   it("updates lastOpenedAt without changing selectedProjectId", () => {
     const id = useProjectStore.getState().addProject("P", "/tmp/p");

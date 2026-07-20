@@ -10,9 +10,10 @@ import { C, ON_BRAND_FILL, DANGER } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { useAuthStore } from "../stores/authStore";
 import { formatBalance } from "../services/creditPricing";
-import { openPaywall, PAYWALL_URL } from "../services/sparkleApi";
+import { lastSignInUrl, openPaywall, openSignIn, PAYWALL_URL } from "../services/sparkleApi";
 import {
   PACKS,
+  checkoutGuidance,
   fetchAutoTopup,
   fetchHistory,
   historyLabel,
@@ -21,10 +22,12 @@ import {
   startCardSetup,
   startTopup,
   type AutoTopup,
+  type CheckoutGuidance,
   type LedgerEntry,
   type PackId,
 } from "../services/creditsMenuApi";
 import { PromoRedeem } from "./PromoRedeem";
+import { SupportModal } from "./SupportModal";
 
 /** Same recovery as AuthGate's fallback: when the system browser can't launch, show the URL
  *  selectable so the user can open it manually — never a dead button. */
@@ -56,11 +59,14 @@ export function CreditsPanel() {
   }, [refresh]);
 
   // Pack whose checkout launch is in flight (all buttons disabled meanwhile), and the outcome
-  // of the last attempt: quiet in-browser hint, launch-failure URL, or a server refusal.
+  // of the last attempt: quiet in-browser hint, launch-failure URL, or a diagnosed checkout failure.
   const [busyPack, setBusyPack] = useState<PackId | null>(null);
   const [launched, setLaunched] = useState(false);
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
-  const [buyError, setBuyError] = useState<string | null>(null);
+  const [buyGuidance, setBuyGuidance] = useState<CheckoutGuidance | null>(null);
+  // Support flow opened from a config-error's "Contact support" affordance. SupportModal is a
+  // self-contained overlay (ModalShell), so it renders fine on top of the settings dialog.
+  const [supportOpen, setSupportOpen] = useState(false);
 
   // fetchMe() resolves null on ANY auth/network failure, so `me === null` alone is NOT "signed
   // out": while the initial load is in flight show nothing pushy, and when a token is present a
@@ -89,19 +95,31 @@ export function CreditsPanel() {
     setBusyPack(pack);
     setLaunched(false);
     setFailedUrl(null);
-    setBuyError(null);
+    setBuyGuidance(null);
     try {
       const ok = await startTopup(pack);
       if (ok) setLaunched(true);
       else setFailedUrl(lastCheckoutUrl());
     } catch (e) {
-      // The server refused the checkout (or the request died) — recoverable, keep it inline,
-      // but log the real cause (bad_pack vs auth vs network) so field reports are diagnosable.
+      // Diagnose the failure instead of a blanket "try again": the Rust command hands us a
+      // structured error so we can distinguish an our-side config problem (the prod Stripe 403)
+      // from offline vs. a lost session, and guide the user accordingly. Log the raw cause too so
+      // field reports stay diagnosable.
       console.error("topup checkout failed:", e);
-      setBuyError("Couldn't start checkout — try again.");
+      setBuyGuidance(checkoutGuidance(e));
     } finally {
+      // Always recover the button state — a failed checkout must never leave a stuck spinner.
       setBusyPack(null);
     }
+  };
+
+  // The session's expired (checkout reported not_signed_in): open the real sign-in → desktop
+  // hand-off (state/PKCE-bound), surfacing the copy/paste URL if the browser can't launch — same
+  // recovery the rest of the pane uses. NOT `refresh()`, which only re-reads a token we don't have.
+  const signInAgain = async () => {
+    setFailedUrl(null);
+    const ok = await openSignIn();
+    if (!ok) setFailedUrl(lastSignInUrl());
   };
 
   return (
@@ -132,14 +150,36 @@ export function CreditsPanel() {
               Complete the purchase in your browser — your balance updates when you return.
             </p>
           )}
-          {buyError && (
-            <p style={{ color: DANGER, fontSize: 12, margin: 0 }} role="alert">
-              {buyError}
-            </p>
+          {buyGuidance && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, maxWidth: 420 }}>
+              <p style={{ color: DANGER, fontSize: 12, margin: 0 }} role="alert">
+                {buyGuidance.message}
+              </p>
+              {buyGuidance.showSupport && (
+                <button
+                  type="button"
+                  style={{ ...smallBtn, alignSelf: "flex-start" }}
+                  onClick={() => setSupportOpen(true)}
+                >
+                  Contact support
+                </button>
+              )}
+              {buyGuidance.needsSignIn && (
+                <button
+                  type="button"
+                  style={{ ...smallBtn, alignSelf: "flex-start" }}
+                  onClick={() => void signInAgain()}
+                >
+                  Sign in
+                </button>
+              )}
+            </div>
           )}
           {failedUrl && <LaunchFallback url={failedUrl} />}
         </div>
       </div>
+
+      {supportOpen && <SupportModal onClose={() => setSupportOpen(false)} />}
 
       <div>
         <div style={subLabel}>Auto-refill</div>

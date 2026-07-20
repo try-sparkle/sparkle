@@ -45,6 +45,57 @@ describe("deriveMicState — the shared mic tri-state", () => {
   });
 });
 
+// PREPARING — the first-run bug. useDictation optimistically sets status "listening" BEFORE
+// invoke("start_dictation"), which on a cold start blocks for MINUTES downloading the voice model.
+// For that whole wait the old derivation returned "paused", byte-identical to a healthy ready mic,
+// while the composer invited the user to say the wake word at a model that didn't exist yet.
+// modelProgress (non-null only while the backend is fetching the model) is the signal that tells
+// the two apart — and it is precisely the signal a WARM start never emits, which is what keeps the
+// already-downloaded case untouched.
+describe("deriveMicState — the preparing (voice-model download) state", () => {
+  const progress = { done: 100_000_000, total: 482_000_000 };
+
+  it("armed + a model download in flight → PREPARING (not the healthy-looking 'paused')", () => {
+    expect(deriveMicState(true, "listening", "passive", progress)).toBe<MicState>("preparing");
+  });
+
+  it("preparing outranks ACTIVE: the model isn't there, so nothing can be dictated yet", () => {
+    // Reachable: the user picks "Listening" from the mic pill mid-download, setting phase active
+    // under the optimistic "listening" status. Claiming active here is the same lie in a new hat.
+    expect(deriveMicState(true, "listening", "active", progress)).toBe<MicState>("preparing");
+  });
+
+  it("holds while the total is unknown (no content-length → total null)", () => {
+    expect(deriveMicState(true, "listening", "passive", { done: 1, total: null })).toBe<MicState>(
+      "preparing",
+    );
+  });
+
+  it("mic OFF still wins over a download in flight (the user disarmed; nothing is preparing)", () => {
+    expect(deriveMicState(false, "listening", "passive", progress)).toBe<MicState>("off");
+  });
+
+  // THE regression guard for the founder/warm-start path: model already on disk → the backend emits
+  // no model-progress at all → every state must be exactly what it was before this state existed.
+  it("WARM start (no progress events) is byte-for-byte the old behavior", () => {
+    for (const status of STATUSES)
+      for (const phase of PHASES) {
+        // Passing null explicitly and omitting the argument must agree, so existing call sites that
+        // never pass it can't drift from the ones that do.
+        expect(deriveMicState(true, status, phase, null)).toBe(deriveMicState(true, status, phase));
+        expect(deriveMicState(true, status, phase, null)).not.toBe<MicState>("preparing");
+      }
+    expect(deriveMicState(true, "listening", "active", null)).toBe<MicState>("active");
+    expect(deriveMicState(true, "listening", "passive", null)).toBe<MicState>("paused");
+  });
+
+  it("download finishing (progress cleared) hands straight back to the normal states", () => {
+    // dictation://level and ://partial null out modelProgress the moment capture really starts.
+    expect(deriveMicState(true, "listening", "passive", null)).toBe<MicState>("paused");
+    expect(deriveMicState(true, "listening", "active", null)).toBe<MicState>("active");
+  });
+});
+
 describe("shouldBlockMicArm — the out-of-credits arm decision", () => {
   it("blocks arming when there is no signed-in user (anonymous trial has no credits)", () => {
     expect(shouldBlockMicArm(null)).toBe(true);

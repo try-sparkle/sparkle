@@ -16,7 +16,7 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
 import { PinnedPrompt } from "./PinnedPrompt";
 import { SparkleConsentBanner } from "./SparkleConsentBanner";
-import { Terminal } from "./Terminal";
+import { Terminal, type TerminalApi } from "./Terminal";
 import { Composer } from "./Composer";
 import { Onboarding } from "./Onboarding";
 import { paneVisibilityStyle } from "./paneVisibility";
@@ -56,6 +56,7 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
   const setStatus = useRuntimeStore((s) => s.setStatus);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const termFocusRef = useRef<(() => void) | null>(null);
+  const terminalApiRef = useRef<TerminalApi | null>(null);
   const composerMinimized = useUiStore((s) => s.composerMinimized);
 
   const prepare = async () => {
@@ -175,14 +176,25 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
               onReady={() => setPtyReady(true)}
               onRequestFocus={() => composerInputRef.current?.focus()}
               focusRef={termFocusRef}
+              apiRef={terminalApiRef}
             />
           </div>
           <Composer
             agentId={agentId}
             active={visible}
-            disabled={!ptyReady}
+            // `preparing` (not `disabled`): a send before the PTY is up must QUEUE and flush on
+            // ready, which is also what makes the dead-PTY restart below deliver its re-queued
+            // prompt — the flush effect keys on this transition. `disabled` would hard-block the
+            // send instead, stranding anything queued by a restart.
+            preparing={!ptyReady}
             inputRef={composerInputRef}
             onSubmitPrompt={(t) => setLastPrompt(t)}
+            // Same self-heal as AgentPane: a send that finds the PTY gone respawns the agent and
+            // the queued prompt lands on the new PTY.
+            onRestartAgent={() => {
+              setPtyReady(false);
+              terminalApiRef.current?.restart();
+            }}
           />
         </div>
       )}

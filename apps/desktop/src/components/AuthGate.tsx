@@ -13,7 +13,12 @@ import { useAuthStore } from "../stores/authStore";
 import { useTrialStore, TRIAL_LIMIT } from "../stores/trialStore";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { TrialChrome } from "./TrialChrome";
-import { deriveAuthView, parseAuthCode, parseAuthState } from "../services/entitlement";
+import {
+  deriveAuthView,
+  isNoPendingSignIn,
+  parseAuthCode,
+  parseAuthState,
+} from "../services/entitlement";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { exchangeCode } from "../services/sparkleApi";
 import {
@@ -84,12 +89,18 @@ export function AuthGate({ children }: { children: ReactNode }) {
     useAuthStore();
   const trialStarted = useTrialStore((s) => s.started);
   const trialLoading = useTrialStore((s) => s.loading);
+  const trialError = useTrialStore((s) => s.error);
   const promptsUsed = useTrialStore((s) => s.promptsUsed);
   const refreshTrial = useTrialStore((s) => s.refresh);
   const startTrial = useTrialStore((s) => s.start);
   // De-dupe URLs across the two delivery paths (the live "deep-link" event and the
   // cold-launch pending-drain), so one link is never processed twice.
   const processedUrls = useRef<Set<string>>(new Set());
+  // Set when an auth callback arrived with no in-flight sign-in to bind it to (the user quit
+  // mid-sign-in; the relaunching deep link can't complete against a fresh process — Rust returns
+  // NO_PENDING_SIGNIN). Rather than swallow it, we surface a "sign-in didn't finish — try again"
+  // banner on the Welcome screen; the existing Sign in button re-initiates a fresh flow.
+  const [signInInterrupted, setSignInInterrupted] = useState(false);
 
   // Initial load + listen for the deep-link hand-off and window focus.
   useEffect(() => {
@@ -105,8 +116,14 @@ export function AuthGate({ children }: { children: ReactNode }) {
           // Pass the echoed `state` so Rust can bind this callback to the sign-in this instance
           // started; a planted code (mismatched/absent state) is rejected before the exchange.
           await exchangeCode(code, parseAuthState(url));
-        } catch {
-          // expired/used code, or state mismatch — refresh leaves us unauthenticated
+          // A fresh success clears any prior "sign-in didn't finish" banner.
+          setSignInInterrupted(false);
+        } catch (e) {
+          // Distinguish the RECOVERABLE quit-mid-sign-in case (no in-flight sign-in to bind this
+          // callback to) from a genuine state mismatch / expired code. The former is not the user's
+          // fault and is trivially fixable by starting sign-in again — surface a clear banner rather
+          // than dead-ending silently. Other failures just leave us unauthenticated (refresh below).
+          if (isNoPendingSignIn(e)) setSignInInterrupted(true);
         }
       }
       await refresh();
@@ -146,8 +163,12 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // All three "convert" entry points delegate to the shared primitives in trialUnlock.ts — the SAME
   // ones the in-bar TopBar TrialIndicator uses — so the checkout / sign-in behavior (incl. the
   // fallback URLs) lives in ONE place and the two surfaces can't drift.
-  //   • Welcome sign-in.
-  const handleSignIn = () => void signInHandoff(setFailedUrl);
+  //   • Welcome sign-in. Clears the "sign-in didn't finish" banner up front — the user is starting a
+  //     brand-new flow, which mints a fresh pending sign-in in Rust.
+  const handleSignIn = () => {
+    setSignInInterrupted(false);
+    void signInHandoff(setFailedUrl);
+  };
   //   • "Pay $99": signed-in → one-click Stripe (falling back to the web paywall); signed-out → the
   //     web paywall directly, since there's no bearer to create a checkout session.
   const handlePay = () =>
@@ -221,12 +242,20 @@ export function AuthGate({ children }: { children: ReactNode }) {
     );
   }
 
-  // welcome (token-less, trial not yet started)
+  // welcome (token-less, trial not yet started). A recoverable failure gets a banner so the user
+  // knows what happened and that the same Sign in / Try again buttons will fix it — interrupted
+  // sign-in takes precedence over a trial-read failure (it's the more actionable of the two).
+  const welcomeBanner = signInInterrupted
+    ? "Your sign-in didn't finish. Please sign in again."
+    : trialError
+      ? "We couldn't load your free-trial status. Sign in or start a new trial to continue."
+      : undefined;
   return (
     <WelcomeScreen
       onSignIn={() => void handleSignIn()}
       onTryFree={() => void startTrial()}
       signInFailedUrl={failedUrl}
+      banner={welcomeBanner}
     />
   );
 }

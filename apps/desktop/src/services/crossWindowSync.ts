@@ -122,10 +122,12 @@ function projectSignature(): string {
   );
 }
 
-// The dictation mute is a single global boolean; mic level/status/phase are intentionally excluded
-// (not persisted, and they change constantly) so only an actual mute toggle broadcasts.
+// The two persisted, user-facing mic settings — `enabled` (on/off) and `phase` (paused vs. active)
+// — form the signature, so a change to either fans out to the other windows. Mic level/status and
+// other high-churn runtime fields are intentionally excluded (not persisted, change constantly).
 function dictationSignature(): string {
-  return String(useDictationStore.getState().enabled);
+  const s = useDictationStore.getState();
+  return `${s.enabled}|${s.phase}`;
 }
 
 /** Wire cross-window consistency for all shared persisted stores. Returns an unsubscribe fn;

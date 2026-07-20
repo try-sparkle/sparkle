@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::Command;
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 /// The open-source Sparkle client the self-improvement agent files PRs against.
 const SPARKLE_REPO_URL: &str = "https://github.com/drodio/sparkle.git";
@@ -54,7 +54,7 @@ fn apply_noninteractive(cmd: &mut Command) {
 }
 
 fn is_git_repo(path: &Path) -> bool {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(crate::preflight::git_program());
     cmd.arg("-C").arg(path).args(["rev-parse", "--git-dir"]);
     apply_noninteractive(&mut cmd);
     cmd.output().map(|o| o.status.success()).unwrap_or(false)
@@ -81,7 +81,7 @@ pub fn ensure_sparkle_repo_at(app_data: &Path) -> Result<String, String> {
             .map_err(|e| format!("failed to create sparkle-self dir: {e}"))?;
     }
 
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(crate::preflight::git_program());
     cmd.args(["clone", SPARKLE_REPO_URL])
         .arg(&repo);
     apply_noninteractive(&mut cmd);
@@ -107,14 +107,8 @@ pub fn ensure_sparkle_repo_at(app_data: &Path) -> Result<String, String> {
 /// duration; offloading it keeps the window responsive (the frontend shows its "Preparing…" phase).
 #[tauri::command]
 pub async fn ensure_sparkle_repo(app: AppHandle) -> Result<SparkleWorkspace, String> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("no app data dir: {e}"))?;
-    let log_dir = app
-        .path()
-        .app_log_dir()
-        .map_err(|e| format!("no app log dir: {e}"))?;
+    let app_data = crate::dev_identity::app_data_dir(&app)?;
+    let log_dir = crate::dev_identity::app_log_dir(&app)?;
     // Create the log dir so --add-dir never points at a missing path on a fresh install.
     let _ = std::fs::create_dir_all(&log_dir);
 
@@ -187,7 +181,7 @@ pub fn reap_secondary_sparkle_worktrees_at(app_data: &Path) -> Result<u32, Strin
         // branch as it goes so the (rare) loss isn't fully silent. Best-effort.
         let branch = format!("sparkle/agent-{name}");
         tracing::info!(%branch, "reaping orphaned per-window Sparkle branch");
-        let mut cmd = Command::new("git");
+        let mut cmd = Command::new(crate::preflight::git_program());
         cmd.arg("-C").arg(&repo_str).args(["branch", "-D", &branch]);
         apply_noninteractive(&mut cmd);
         let _ = cmd.output();
@@ -207,10 +201,7 @@ pub fn reap_secondary_sparkle_worktrees_at(app_data: &Path) -> Result<u32, Strin
 /// each); offloading keeps the window responsive.
 #[tauri::command]
 pub async fn reap_secondary_sparkle_worktrees(app: AppHandle) -> Result<u32, String> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("no app data dir: {e}"))?;
+    let app_data = crate::dev_identity::app_data_dir(&app)?;
     tauri::async_runtime::spawn_blocking(move || reap_secondary_sparkle_worktrees_at(&app_data))
         .await
         .map_err(|e| format!("reap task failed to run: {e}"))?

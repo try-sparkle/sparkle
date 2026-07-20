@@ -89,6 +89,17 @@ describe("subscribeToCrossWindowSync", () => {
     expect(emit).toHaveBeenCalledWith("sparkle://dictation-changed");
   });
 
+  it("broadcasts a phase change (paused↔active) across windows", () => {
+    // The user's active/paused selection must fan out to other windows just like the mute toggle,
+    // so focusing another project shows the shared status. Seed passive BEFORE wiring so `last` is
+    // seeded from passive and the change to active is genuinely a change.
+    useDictationStore.setState({ phase: "passive" });
+    unsub = subscribeToCrossWindowSync();
+    emit.mockClear();
+    useDictationStore.getState().setPhase("active");
+    expect(emit).toHaveBeenCalledWith("sparkle://dictation-changed");
+  });
+
   it("does NOT broadcast on a non-persisted dictation change (mic level)", () => {
     unsub = subscribeToCrossWindowSync();
     emit.mockClear();

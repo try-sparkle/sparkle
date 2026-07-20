@@ -1,6 +1,6 @@
 // Trial chrome shown while the user is in the anonymous "100 free prompts" trial. Two pieces:
 //   • TrialIndicator — the small "Free trial · N prompts left" counter + Unlock button. It now
-//     lives INLINE inside the TopBar row (rendered by TopBar, left of the Recent/Open/New/⋯
+//     lives INLINE inside the TopBar row (rendered by TopBar, left of the Recent/Open/⋯
 //     cluster) as plain bar text — NOT a floating pill. The old version was a position:fixed pill
 //     pinned top-right, which sat on top of and covered the TopBar's action buttons; rendering it
 //     in normal bar flow is the fix, so it can never overlap them.

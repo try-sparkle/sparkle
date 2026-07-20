@@ -1,6 +1,8 @@
-// The "New Project" dialog opened from the TopBar "New" button. Two tabs:
-//   [ From folder ] (default) — runs today's exact native-picker flow (lifted in as onOpenFromFolder
-//     so behavior is byte-identical to the old New button).
+// The unified "Open a Project" dialog opened from the TopBar (and formerly the separate "New"
+// button — the two were merged, since "open from GitHub" and "new from GitHub" are the same clone).
+// The component name is kept for now to limit churn. Two tabs:
+//   [ From folder ] (default) — the native folder picker (also creates a fresh folder), lifted in as
+//     onOpenFromFolder so behavior is byte-identical to the old standalone Open button.
 //   [ From GitHub ]           — sign in / browse repos / clone → open, driven by useGithubImport.
 // On a successful clone this calls onCloned(name, path); TopBar wires that into the same
 // resolveAndRoute path the Open flow uses, so the cloned project is created AND selected.
@@ -14,6 +16,7 @@ import { ModalShell } from "./ModalShell";
 import { signInHandoff } from "../services/trialUnlock";
 import { pickProjectFolder } from "../services/dialog";
 import { useGithubImport, repoName, type GithubRepo } from "../hooks/useGithubImport";
+import { useSettingsStore } from "../stores/settingsStore";
 
 const XCODE_CLT_CMD = "xcode-select --install";
 
@@ -91,30 +94,36 @@ export function NewProjectDialog({
   onSignInGithub?: () => void;
 }) {
   const [tab, setTab] = useState<"folder" | "github">("folder");
+  // GitHub import tool gate ([tools].github). Off → the "From GitHub" path is hidden entirely and
+  // only the folder flow remains (the tab strip collapses to nothing, so we drop it).
+  const githubEnabled = useSettingsStore((s) => s.githubEnabled);
+  const effectiveTab = githubEnabled ? tab : "folder";
 
   return (
     <ModalShell width={560} onCancel={onClose}>
       <style>{SPIN_KEYFRAMES}</style>
       <div style={{ fontSize: 18, fontWeight: FONT_WEIGHT.semibold, marginBottom: 14 }}>
-        New Project
+        Open a Project
       </div>
 
-      <div
-        style={{
-          display: "flex",
-          borderBottom: `1px solid ${C.forest}`,
-          marginBottom: 18,
-        }}
-      >
-        <button role="tab" aria-selected={tab === "folder"} style={tabBtn(tab === "folder")} onClick={() => setTab("folder")}>
-          From folder
-        </button>
-        <button role="tab" aria-selected={tab === "github"} style={tabBtn(tab === "github")} onClick={() => setTab("github")}>
-          From GitHub
-        </button>
-      </div>
+      {githubEnabled && (
+        <div
+          style={{
+            display: "flex",
+            borderBottom: `1px solid ${C.forest}`,
+            marginBottom: 18,
+          }}
+        >
+          <button role="tab" aria-selected={effectiveTab === "folder"} style={tabBtn(effectiveTab === "folder")} onClick={() => setTab("folder")}>
+            From folder
+          </button>
+          <button role="tab" aria-selected={effectiveTab === "github"} style={tabBtn(effectiveTab === "github")} onClick={() => setTab("github")}>
+            From GitHub
+          </button>
+        </div>
+      )}
 
-      {tab === "folder" ? (
+      {effectiveTab === "folder" ? (
         <FolderTab
           onChoose={() => {
             onClose();

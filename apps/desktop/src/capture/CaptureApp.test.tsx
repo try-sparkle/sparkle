@@ -25,6 +25,7 @@ vi.mock("../useDictation", () => ({ useAmbientVoice: () => {} }));
 
 import { CaptureApp } from "./CaptureApp";
 import { useProjectStore } from "../stores/projectStore";
+import { useAuthStore } from "../stores/authStore";
 import { LAST_FOCUSED_PROJECT_KEY } from "./lastFocusedProject";
 import type { Project } from "../types";
 
@@ -46,6 +47,29 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("CaptureApp", () => {
+  // The capture window renders its own React root with NO AuthGate, so unless it loads auth itself,
+  // `me` stays null → hasAiCredits false → the mic falsely reports "out of credits" and gets
+  // force-disabled (LogoWaveform), making its status disagree with the signed-in main window. It
+  // must refresh auth on mount AND every time the takeover opens (a top-up done while it was closed
+  // must be reflected before the user can touch the mic).
+  it("refreshes auth on mount and on each shot so the credit balance isn't stale", () => {
+    const original = useAuthStore.getState().refresh;
+    const refresh = vi.fn(() => Promise.resolve());
+    useAuthStore.setState({ refresh });
+    try {
+      render(<CaptureApp />);
+      expect(refresh).toHaveBeenCalledTimes(1); // mount
+
+      fireShot();
+      expect(refresh).toHaveBeenCalledTimes(2); // takeover opened
+
+      fireShot({ path: "/tmp/shot2.png", dataUrl: "data:image/png;base64,BBBB" });
+      expect(refresh).toHaveBeenCalledTimes(3); // re-capture
+    } finally {
+      useAuthStore.setState({ refresh: original });
+    }
+  });
+
   it("renders nothing until a shot arrives, then scrim + the three send buttons", async () => {
     render(<CaptureApp />);
     expect(screen.queryByTestId("capture-scrim")).toBeNull();

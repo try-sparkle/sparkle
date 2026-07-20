@@ -205,7 +205,7 @@ fn validate_dest(dest: &str) -> Result<PathBuf, String> {
 /// Is the system `git` runnable? (`git --version` succeeds.) A fresh Mac without Xcode Command Line
 /// Tools has no `git`; the frontend maps `git_missing` to the "Install Xcode CLT" prompt.
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(crate::preflight::git_program())
         .arg("--version")
         .output()
         .map(|o| o.status.success())
@@ -292,7 +292,7 @@ fn run_clone(clone_url: &str, dest: &str, token: &str) -> Result<String, String>
     let token_b64 = STANDARD.encode(format!("x-access-token:{token}").as_bytes());
     let header = format!("Authorization: Basic {token_b64}");
 
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(crate::preflight::git_program());
     cmd.args(["clone", "--progress"]).arg(clone_url).arg(dest);
     apply_noninteractive(&mut cmd);
     // Feed the auth header via git's env-based config rather than `-c ...=<header>` on the command

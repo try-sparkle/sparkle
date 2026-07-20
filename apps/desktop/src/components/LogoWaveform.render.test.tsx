@@ -5,9 +5,15 @@
 // can't reach: the caption must switch on ACTUAL capture (`status === "listening"`), not on
 // the armed `enabled` flag, so an armed-but-focus-paused mic never claims to be hearing you.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// The permission notice's "Open System Settings" button deep-links through the Tauri opener; mock
+// it so the click is observable without a real IPC (same shape as the Composer voice tests).
+const openUrl = vi.fn((_url: string) => Promise.resolve());
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: (u: string) => openUrl(u) }));
 
 import { LogoWaveform } from "./LogoWaveform";
+import { BACKEND_MIC_DENIED } from "../voice/backendVoiceErrors";
 import { useDictationStore } from "../stores/dictationStore";
 import { useAuthStore } from "../stores/authStore";
 import { useUiStore } from "../stores/uiStore";
@@ -33,6 +39,127 @@ beforeEach(() => {
   useAuthStore.setState({ me: { clerkUserId: "u1", entitled: true, balanceCents: 500, tokenVersion: 1 } });
 });
 afterEach(() => cleanup());
+
+describe("LogoWaveform — the error caption reports the REAL failure", () => {
+  // This caption was the app's ONLY consumer of dictationStore.error, and it used the value as a
+  // mere boolean: every failure — no mic hardware, an exotic sample format, an offline model
+  // download, a full disk — rendered the same hardcoded "check System Settings → Privacy →
+  // Microphone". The payload plumbed here from the dictation://error listener was discarded, so a
+  // first-run user with no internet could never discover the true cause.
+  it("an offline download failure does NOT blame microphone privacy", () => {
+    useDictationStore.setState({ error: "Dns Failed: resolve error", status: "error" });
+    render(<LogoWaveform />);
+    expect(document.body.textContent).toMatch(/couldn't download the voice model/i);
+    expect(document.body.textContent).not.toMatch(/Privacy/);
+  });
+
+  it("a real permission failure still gets the Privacy remedy", () => {
+    useDictationStore.setState({ error: "microphone permission denied", status: "error" });
+    render(<LogoWaveform />);
+    expect(document.body.textContent).toMatch(/can't use the microphone/i);
+    expect(document.body.textContent).toMatch(/Privacy & Security → Microphone/);
+  });
+
+  it("no input device gets its own remedy, not the permission one", () => {
+    useDictationStore.setState({ error: "no input device available", status: "error" });
+    render(<LogoWaveform />);
+    expect(document.body.textContent).toMatch(/no microphone found/i);
+  });
+
+  it("an unrecognized error shows its raw text rather than a guessed cause", () => {
+    useDictationStore.setState({ error: "app_data_dir() failed: no home", status: "error" });
+    render(<LogoWaveform />);
+    expect(document.body.textContent).toContain("app_data_dir() failed: no home");
+  });
+
+  it("the error outranks the download caption (a failed download isn't still downloading)", () => {
+    useDictationStore.setState({
+      error: "No space left on device (os error 28)",
+      status: "error",
+      modelProgress: { done: 1, total: 482_000_000 },
+    });
+    render(<LogoWaveform />);
+    expect(document.body.textContent).toMatch(/disk space/i);
+    expect(document.body.textContent).not.toMatch(/setting up voice/i);
+  });
+});
+
+// This surface renders the same notice as the composer, so it needs the same way out — a remedy
+// that exists in only one of the two places is a remedy the user may never be looking at
+// (roborev 37737). The backend counterpart is src-tauri/src/mic_permission.rs.
+describe("LogoWaveform — a denied microphone gets the same one-click remedy as the composer", () => {
+  const DENIED = BACKEND_MIC_DENIED;
+
+  // The console.warn spy is installed/removed HERE rather than inside the one test that needs it.
+  // Restoring at the end of a test body only runs if every assertion before it passed, so a single
+  // failure would leave console.warn mocked for the rest of the file — swallowing warnings in
+  // unrelated tests and turning one red test into a confusing several (roborev 37848). afterEach
+  // runs regardless.
+  let warn: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    openUrl.mockClear();
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => warn.mockRestore());
+
+  it("opens the Microphone privacy pane directly", () => {
+    useDictationStore.setState({ error: DENIED, status: "error" });
+    render(<LogoWaveform />);
+    fireEvent.click(screen.getByRole("button", { name: "Open System Settings" }));
+    expect(openUrl).toHaveBeenCalledWith(
+      "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+    );
+  });
+
+  it("offers System Settings ONLY for permission — never for a failure it cannot fix", () => {
+    for (const raw of [
+      "Dns Failed: resolve error",
+      "No space left on device (os error 28)",
+      "no input device available",
+      "Permission denied (os error 13)", // a MODEL-DIR write failure, not the mic
+    ]) {
+      cleanup();
+      useDictationStore.setState({ error: raw, status: "error" });
+      render(<LogoWaveform />);
+      expect(screen.queryByRole("button", { name: "Open System Settings" })).toBeNull();
+    }
+  });
+
+  it("keeps the notice readable when the pane itself fails to open", async () => {
+    // The `.catch` on openUrl claims the notice survives a rejected open — the detail line spells
+    // out the path, so it stays the user's way through even when the shortcut breaks. Asserted
+    // rather than left to the comment (roborev 37737).
+    //
+    // The console.warn assertion is what gives this teeth: rendering-survives alone passes even
+    // with the `.catch` deleted (verified — vitest does not fail this test on an unhandled
+    // rejection), so it would pin nothing. Observing the warn proves the catch actually ran.
+    openUrl.mockImplementationOnce(() => Promise.reject(new Error("no handler for URL scheme")));
+    useDictationStore.setState({ error: DENIED, status: "error" });
+    render(<LogoWaveform />);
+    fireEvent.click(screen.getByRole("button", { name: "Open System Settings" }));
+    await Promise.resolve();
+    expect(warn).toHaveBeenCalledWith(
+      "voice: open microphone settings failed",
+      expect.any(Error),
+    );
+    expect(document.body.textContent).toMatch(/Privacy & Security → Microphone/);
+    expect(screen.getByRole("button", { name: "Open System Settings" })).toBeTruthy();
+  });
+});
+
+describe("LogoWaveform — the first-run model download caption", () => {
+  it("shows setting-up with progress while the model comes down", () => {
+    useDictationStore.setState({ modelProgress: { done: 241_000_000, total: 482_000_000 } });
+    render(<LogoWaveform />);
+    expect(document.body.textContent).toContain("Setting up voice (50%)");
+  });
+
+  it("WARM start (no download in flight) shows no setting-up caption at all", () => {
+    useDictationStore.setState({ modelProgress: null, status: "listening" });
+    render(<LogoWaveform />);
+    expect(document.body.textContent).not.toMatch(/setting up voice/i);
+  });
+});
 
 describe("LogoWaveform — honest listening", () => {
   // The waveform strip button shares the "Activate Sparkle voice" aria-label, and the live

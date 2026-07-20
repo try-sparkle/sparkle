@@ -46,13 +46,18 @@ export interface Identity {
   organization: string | null;
 }
 
-/** Raw shape the Rust side returns (snake_case) — mapped to {@link Usage} at the boundary.
- *  `exhausted_until` is epoch SECONDS (Rust's unit); `mapUsage` converts it to ms. */
+/** Raw shape the Rust side returns — mapped to {@link Usage} at the boundary. `AccountUsage` in
+ *  accounts.rs is `#[serde(rename_all = "camelCase")]`, so the keys arrive camelCase with the digit
+ *  attached (`tokens_5h` → `tokens5h`); the Rust test `account_usage_serializes_camel_case_keys`
+ *  pins that contract. This interface once declared snake_case, which typechecks fine (the invoke
+ *  result is cast, never validated) but made every tally read `undefined` → the AccountsScreen bars
+ *  showed 0 for every account. Only the unit differs from {@link Usage}: `exhaustedUntil` is epoch
+ *  SECONDS here (Rust's unit) and `mapUsage` converts it to ms. */
 interface RawUsage {
   id: string;
-  tokens_5h: number;
-  tokens_7d: number;
-  exhausted_until: number | null;
+  tokens5h: number;
+  tokens7d: number;
+  exhaustedUntil: number | null;
 }
 
 /** Seconds ⇄ milliseconds at the Rust boundary. accounts.rs stores/filters `exhausted_until` in
@@ -64,10 +69,10 @@ const MS_PER_SEC = 1000;
 function mapUsage(raw: RawUsage): Usage {
   return {
     id: raw.id,
-    tokens5h: raw.tokens_5h,
-    tokens7d: raw.tokens_7d,
+    tokens5h: raw.tokens5h,
+    tokens7d: raw.tokens7d,
     // Rust seconds → JS ms so callers can compare against Date.now() / feed new Date(...).
-    exhaustedUntil: raw.exhausted_until != null ? raw.exhausted_until * MS_PER_SEC : null,
+    exhaustedUntil: raw.exhaustedUntil != null ? raw.exhaustedUntil * MS_PER_SEC : null,
   };
 }
 

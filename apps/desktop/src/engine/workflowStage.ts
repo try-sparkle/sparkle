@@ -1,10 +1,10 @@
-// The unified Think→Plan→Build lifecycle: the NINE stages a unit of work passes through, from a
+// The unified Think→Plan→Build lifecycle: the TEN stages a unit of work passes through, from a
 // first thought to shipped-to-production, plus the pure logic that decides which stage a unit is in
 // and how a build agent rolls up its workers. Kept free of React so it's unit-tested in isolation —
 // the progress-line UI lives in components/WorkflowLine.tsx.
 //
 // Stages 1-3 (Thought/Spec'd/Planned) live in the Think + Plan tabs and are driven by what exists
-// (a think doc, a spec/PRD, a bead). Stages 4-9 live in the Build tab and are derived from git/PR
+// (a think doc, a spec/PRD, a bead). Stages 4-10 live in the Build tab and are derived from git/PR
 // state (the proven model) plus a release "shipped" signal. A unit that's only planned (no code yet)
 // sits at Planned; opening a Build agent starts there and the bar fills as work advances.
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
@@ -19,8 +19,9 @@ export type WorkflowStageId =
   | "building_saved" //   5 — committed to the branch (Build tab)
   | "pushed" //           6 — pushed to the remote branch (Build tab)
   | "pull_request" //     7 — a PR is open / requesting merge (Build tab)
-  | "merged" //           8 — merged with main (Build tab)
-  | "shipped"; //         9 — shipped to production / in a published release (Build tab)
+  | "merged_local" //     8 — landed on LOCAL main, not yet on origin (Build tab)
+  | "merged" //           9 — merged with origin main (Build tab)
+  | "shipped"; //        10 — shipped to production / in a published release (Build tab)
 
 export interface WorkflowStageMeta {
   id: WorkflowStageId;
@@ -41,7 +42,8 @@ export const WORKFLOW_STAGES: readonly WorkflowStageMeta[] = [
   { id: "building_saved", label: "Building Locally (Committed & Saved)", short: "Saved", color: C.accent, detail: "Saved: committed to this task's branch — closing keeps the branch." },
   { id: "pushed", label: "Pushed to Remote Branch", short: "Pushed", color: C.accent, detail: "Pushed: the branch is backed up on the remote." },
   { id: "pull_request", label: "Requesting to be merged (Pull Request Issued)", short: "In PR", color: C.violet, detail: "Pull Request: requesting to be merged into main, under review." },
-  { id: "merged", label: "Merged with Main", short: "Merged", color: C.teal, detail: "Merged: this work has landed on main." },
+  { id: "merged_local", label: "Merged with Local Main", short: "Local Main", color: C.teal, detail: "Merged locally: landed on your local main — not yet pushed to the remote." },
+  { id: "merged", label: "Merged with Main", short: "Merged", color: C.teal, detail: "Merged: this work has landed on the remote main." },
   { id: "shipped", label: "Shipped to Production", short: "Shipped", color: C.success, detail: "Shipped: included in a published release / deployed to production." },
 ] as const;
 
@@ -91,7 +93,12 @@ export interface LiveStageInputs {
   bs?: BranchStatus | null; // ahead/behind/dirty (drives Unsaved/Saved)
   ws?: WorkflowState | null; // reachability + PR probe (drives PR/Merged)
   prev?: WorkflowStageId | null; // the stage already recorded — derivation never regresses below it
-  parentReachedMain?: boolean; // worker: has the parent orchestrator's own work reached main?
+  parentReachedMain?: boolean; // worker: has the parent orchestrator's own work reached main (local or origin)?
+  // worker: is the parent's work on ORIGIN main specifically? A worker's own tip is only ever in its
+  // PARENT's branch, so it can never observe origin main itself — it inherits the fact from the
+  // parent. Without this a worker would cap at merged_local forever, so its bead would never close
+  // (beadLifecycle closes at >= merged) and the sidebar ✓ would never show.
+  parentOnOriginMain?: boolean;
   // ── Planning floors (Think/Plan tabs) — a unit sits at the highest of these until code work
   //    raises it. A planned-but-unstarted bead floors at Planned even with no git work.
   hasThinkDoc?: boolean; // a Think agent/conversation exists  → floor Thought
@@ -117,7 +124,7 @@ function planningFloor(input: LiveStageInputs): number {
 // post-merge `ahead→0` dip, except when a NEW work cycle starts (prior work landed, but fresh
 // un-landed commits exist) — then the bar tracks the new cycle rather than staying pinned green.
 export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
-  const { kind, bs, ws, prev, parentReachedMain } = input;
+  const { kind, bs, ws, prev, parentReachedMain, parentOnOriginMain } = input;
   // Git floor only when a worktree/branch exists (bs present). With no worktree yet there is no
   // build signal, so the planning floor (Thought/Spec'd/Planned) decides where the unit sits.
   let idx = bs ? stageIndex(gitDerivedStage(bs)) : -1;
@@ -148,13 +155,16 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
     if (ws.prState === "merged") bump("merged");
     else if (ws.prState === "open") bump("pull_request");
 
-    // Build agent: reaching local OR origin main is "Merged with Main" (local-first), once real
-    // work exists (else a no-op branch's tip trivially sits in main and would read as landed).
-    // `ws.landed` is the SQUASH/REBASE case — the tip isn't an ancestor (so inLocalMain/inOriginMain
-    // are false) but its tree already matches main. The committedSeen gate is what keeps a no-op
-    // branch (also tree-identical, hence landed) from falsely reading as merged.
-    if (committedSeen && kind !== "worker" && (ws.inLocalMain || ws.inOriginMain || ws.landed))
-      bump("merged");
+    // Build agent: landing on LOCAL main is `merged_local`; only reaching ORIGIN main (or a
+    // GitHub-merged PR, which implies origin has it) is the full `merged`. Splitting these is what
+    // lets the CTA say "Push to Origin Main" instead of falsely offering Close on unpushed work.
+    // `ws.landed` is the SQUASH/REBASE case — the tip isn't an ancestor but its tree already
+    // matches. It can't distinguish local from origin, so it settles at the cautious `merged_local`.
+    // The committedSeen gate is what keeps a no-op branch (also tree-identical) from reading landed.
+    if (committedSeen && kind !== "worker") {
+      if (ws.inLocalMain || ws.landed) bump("merged_local");
+      if (ws.inOriginMain) bump("merged");
+    }
   }
 
   // A worker is "Merged with Main" ONLY once BOTH are true: (a) this worker's OWN branch is actually
@@ -166,15 +176,24 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
   // was the "Close this worker? Your code has been pushed to main" false pop-up. The committedSeen
   // gate (bs.ahead, ws.aheadOfBase, or the prior watermark) additionally keeps a no-op worker from
   // skipping the build stages to read as landed.
+  // A worker integrates into its PARENT branch, which is a LOCAL merge, so on its own that's only
+  // merged_local. But once the PARENT's work is on ORIGIN main, this worker's work is on origin main
+  // too (it's contained in the parent), so it earns the full `merged` — which is what lets its bead
+  // close and its sidebar ✓ light. A worker can never observe origin main directly: its tip is in
+  // the parent's branch, not the default branch, so it inherits the fact from the parent's stage.
   const ownWorkInParent = (ws?.inParent ?? false) || (ws?.landed ?? false);
-  if (kind === "worker" && committedSeen && ownWorkInParent && parentReachedMain) bump("merged");
+  if (kind === "worker" && committedSeen && ownWorkInParent && parentReachedMain) {
+    bump(parentOnOriginMain ? "merged" : "merged_local");
+  }
 
   // Shipped is the authoritative top — only meaningful once real work landed.
   if (input.shipped && committedSeen) bump("shipped");
 
   // New-cycle detection: prior work already landed (prev ≥ Merged) but live signals fell back AND
   // there are fresh un-landed commits — track the new cycle instead of staying pinned at Merged.
-  const landedBefore = prevIdx >= stageIndex("merged");
+  // Work that landed only LOCALLY counts as "landed before" too — otherwise an agent that landed on
+  // local main and then started a fresh cycle would stay pinned at merged_local.
+  const landedBefore = prevIdx >= stageIndex("merged_local");
   const freshWork = (bs?.ahead ?? 0) > 0 || (ws?.aheadOfBase ?? 0) > 0;
   const newCycle = landedBefore && idx < prevIdx && freshWork;
   idx = newCycle
@@ -211,6 +230,7 @@ function emptyCounts(): StageCounts {
     building_saved: 0,
     pushed: 0,
     pull_request: 0,
+    merged_local: 0,
     merged: 0,
     shipped: 0,
   };
@@ -235,13 +255,13 @@ export function rollupStages(stages: WorkflowStageId[]): WorkflowRollup | null {
 // ── Progress-line palette ────────────────────────────────────────────────────────────────────
 // The line reproduces the sparkle.ai wordmark's gradient: the teal of the "S" on the left warming
 // to the deep blue of the "i" (its dotted eye) on the right. It fills left→right as work advances
-// through the nine stages, so a glance reads "how far toward shipped" from BOTH the fill length and
+// through the ten stages, so a glance reads "how far toward shipped" from BOTH the fill length and
 // its color deepening from teal to blue. These are the literal stops of the logo's linearGradient.
 export const LINE_FROM = "#34e0f0"; // the "S" — teal/cyan, left end of the logo gradient
 export const LINE_TO = "#2f6bff"; //   the "i"/eye — deepest blue, right end of the logo gradient
 
-// Fraction of the bar filled at a given stage. Stage 1 (Thought) shows a short stub (1/9) so a
-// brand-new idea reads as "started", and Shipped fills the whole bar (9/9).
+// Fraction of the bar filled at a given stage. Stage 1 (Thought) shows a short stub (1/10) so a
+// brand-new idea reads as "started", and Shipped fills the whole bar (10/10).
 export function stageFraction(stage: WorkflowStageId): number {
   return (stageIndex(stage) + 1) / WORKFLOW_STAGES.length;
 }

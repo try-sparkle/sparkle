@@ -22,6 +22,16 @@ pub struct ClaudeStatus {
     version: Option<String>,
 }
 
+/// roborev install status, mirroring [`ClaudeStatus`]: the resolved absolute path plus, when it
+/// resolves, `roborev --version`. Drives the roborev onboarding/consent surface.
+#[derive(Serialize)]
+pub struct RoborevStatus {
+    installed: bool,
+    /// Absolute path to the roborev binary.
+    path: Option<String>,
+    version: Option<String>,
+}
+
 #[cfg(unix)]
 fn login_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
@@ -123,9 +133,11 @@ pub fn resolve_node_path() -> Option<String> {
 // ---------------------------------------------------------------------------
 // git detection
 //
-// git is used as a bare `Command::new("git")` all over worktree.rs / sparkle_agent.rs, so a
-// brand-new Mac with no git makes every worktree op fail. We detect it up front so onboarding can
-// offer to install it.
+// git backs every worktree op (worktree.rs / sparkle_agent.rs / delivery.rs / github.rs), so a
+// brand-new Mac with no git makes them all fail. Those call sites spawn git via `git_program()`
+// (below), which resolves the ABSOLUTE path — a Finder/Dock-launched GUI app doesn't inherit the
+// login-shell PATH, so a bare `Command::new("git")` could miss a user-scope git. We also detect git
+// up front here so onboarding can offer to install it when it's genuinely absent.
 //
 // SUBTLETY (macOS): `/usr/bin/git` is a Command-Line-Tools *shim*. The file EXISTS even when the
 // CLT are NOT installed — and *running* it then pops Apple's "install developer tools" dialog. So
@@ -205,6 +217,44 @@ pub fn resolve_git_path() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// roborev detection
+//
+// roborev is the per-commit AI code-review daemon we ship to end-users. Like `claude`, it's a
+// user-scope binary (installed to ~/.local/bin, brew, or npm-global prefixes) that a Finder/Dock-
+// launched GUI app won't see on its bare PATH — so we resolve it the same way: a login-shell
+// `command -v roborev`, then the canonical absolute install locations. Cached for the session with
+// the same "only cache a positive hit" policy (a fresh install is picked up on the next probe).
+// ---------------------------------------------------------------------------
+
+/// Canonical absolute `roborev` locations, user-first: our own non-sudo install (`~/.local/bin`,
+/// where `install_roborev` lands it), then homebrew prefixes. Pure form takes the home dir
+/// explicitly so it can be unit-tested without mutating the process-global `HOME`.
+pub fn known_roborev_paths_for(home: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = home {
+        paths.push(home.join(".local/bin/roborev")); // our installer / native install
+    }
+    paths.push(PathBuf::from("/opt/homebrew/bin/roborev")); // homebrew (Apple silicon)
+    paths.push(PathBuf::from("/usr/local/bin/roborev")); // homebrew (Intel) / npm
+    paths
+}
+
+/// Resolve the absolute `roborev` path WITHOUT a version probe (login-shell PATH probe, then the
+/// canonical absolute install locations). Unix form.
+#[cfg(unix)]
+fn resolve_roborev_uncached() -> Option<String> {
+    run_in_login_shell("command -v roborev").or_else(|| {
+        first_executable(&known_roborev_paths_for(std::env::var_os("HOME").map(PathBuf::from)))
+    })
+}
+
+/// Windows form: `where roborev` (GUI apps inherit PATH), then canonical install paths.
+#[cfg(not(unix))]
+fn resolve_roborev_uncached() -> Option<String> {
+    resolve_on_path("roborev").or_else(|| first_executable(&known_roborev_paths_for(home_dir())))
+}
+
+// ---------------------------------------------------------------------------
 // Session-lifetime path caches
 //
 // Both `claude` and `node` are resolved by shelling out to a LOGIN shell (`command -v …`), which is
@@ -231,6 +281,11 @@ fn node_path_cache() -> &'static Mutex<Option<String>> {
 }
 
 fn git_path_cache() -> &'static Mutex<Option<String>> {
+    static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn roborev_path_cache() -> &'static Mutex<Option<String>> {
     static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
 }
@@ -300,7 +355,38 @@ pub fn resolve_git_path_cached() -> Option<String> {
     resolved
 }
 
-/// Clear the cached claude/node/git paths so the next resolve re-probes (e.g. the user
+/// The `git` program to spawn for any internal git invocation: the cached resolved ABSOLUTE path,
+/// or the bare name `"git"` as a last resort. A Finder/Dock-launched GUI app does NOT inherit the
+/// login-shell PATH, so a bare `Command::new("git")` can fail to locate a user-scope git (Homebrew,
+/// Xcode CLT) with "failed to run git" — which surfaces to the user as "Couldn't start this agent"
+/// on an otherwise-healthy machine (a fresh external-user install is the common case). Routing every
+/// git spawn through this keeps behavior identical where git is already on PATH (`resolve_git_path`
+/// prefers exactly that) while healing the GUI-PATH gap. When git is genuinely absent, the bare-name
+/// fallback errors the same way it does today and the ReadinessGate/prereq check surfaces the cause.
+pub fn git_program() -> String {
+    resolve_git_path_cached().unwrap_or_else(|| "git".to_string())
+}
+
+/// Resolved absolute `roborev` path, cached for the app session (resolution per
+/// [`resolve_roborev_uncached`]). Only a positive hit is cached — see the cache note above — so a
+/// just-installed roborev is picked up on the next probe. Concurrent callers may both resolve on a
+/// cold cache (idempotent); a poisoned lock falls back to an uncached resolve.
+pub fn cached_roborev_path() -> Option<String> {
+    if let Ok(guard) = roborev_path_cache().lock() {
+        if let Some(path) = guard.as_ref() {
+            return Some(path.clone());
+        }
+    }
+    let resolved = resolve_roborev_uncached();
+    if let Some(path) = resolved.as_ref() {
+        if let Ok(mut guard) = roborev_path_cache().lock() {
+            *guard = Some(path.clone());
+        }
+    }
+    resolved
+}
+
+/// Clear the cached claude/node/git/roborev paths so the next resolve re-probes (e.g. the user
 /// moved/reinstalled a toolchain, or just finished an in-app install, while the app was running).
 /// Note that a "not installed" result is never cached in the first place, so a fresh install is
 /// already picked up without calling this.
@@ -312,6 +398,9 @@ pub fn invalidate_preflight_caches() {
         *g = None;
     }
     if let Ok(mut g) = git_path_cache().lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = roborev_path_cache().lock() {
         *g = None;
     }
 }
@@ -478,6 +567,47 @@ pub async fn git_preflight() -> PrereqStatus {
         .unwrap_or(PrereqStatus { installed: false, path: None })
 }
 
+/// Detect whether `roborev` (the per-commit AI code-review daemon) is installed, resolving its
+/// absolute path off the main thread (cached for the session), together with `roborev --version`.
+/// Mirrors [`claude_preflight`] but DOES populate the version — roborev is a native binary (no
+/// node cold-boot), so probing its version is cheap. Returns None for version when the probe fails.
+#[cfg(unix)]
+#[tauri::command]
+pub async fn roborev_preflight() -> RoborevStatus {
+    tauri::async_runtime::spawn_blocking(|| {
+        let path = cached_roborev_path();
+        let version = path
+            .as_deref()
+            // Pass the path as a positional `$1` (never interpolated) so a quoted/space-y path can't
+            // break out of the command — same invariant claude_version relies on.
+            .and_then(|p| run_in_login_shell_with_arg("\"$1\" --version", p));
+        RoborevStatus { installed: path.is_some(), path, version }
+    })
+    .await
+    .unwrap_or(RoborevStatus { installed: false, path: None, version: None })
+}
+
+/// Windows form: the version probe runs `roborev --version` directly (native binary, no shim shell).
+#[cfg(not(unix))]
+#[tauri::command]
+pub async fn roborev_preflight() -> RoborevStatus {
+    tauri::async_runtime::spawn_blocking(|| {
+        let path = cached_roborev_path();
+        let version = path.as_deref().and_then(|p| {
+            Command::new(p)
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        RoborevStatus { installed: path.is_some(), path, version }
+    })
+    .await
+    .unwrap_or(RoborevStatus { installed: false, path: None, version: None })
+}
+
 /// Combined first-run probe for the three runtime prerequisites (claude / node / git) in ONE IPC
 /// round-trip, resolved off the main thread. Drives the setup checklist's initial detection pass.
 #[derive(Serialize)]
@@ -531,6 +661,36 @@ mod tests {
     }
 
     #[test]
+    fn git_program_returns_a_runnable_git() {
+        // Regression guard for the GUI-PATH fix: every internal git spawn goes through
+        // `git_program()`, so whatever it returns MUST actually run git. Resolution prefers an
+        // absolute path (login-shell/known locations) and falls back to the bare name; either way
+        // `<git_program> --version` must succeed. If this breaks, build-agent spawn dies with
+        // "Couldn't start this agent" on a fresh machine — the exact bug this closes.
+        let prog = git_program();
+        assert!(!prog.is_empty(), "git_program() must never be empty");
+        let out = std::process::Command::new(&prog)
+            .arg("--version")
+            .output()
+            .unwrap_or_else(|e| panic!("git_program() ({prog}) is not runnable: {e}"));
+        assert!(out.status.success(), "`{prog} --version` failed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.starts_with("git version"),
+            "unexpected `{prog} --version` output: {stdout}"
+        );
+    }
+
+    #[test]
+    fn git_program_matches_resolver_when_it_resolves() {
+        // When resolution succeeds, git_program() must return exactly that absolute path (not the
+        // bare fallback) — otherwise the GUI-PATH gap isn't actually closed.
+        if let Some(resolved) = resolve_git_path_cached() {
+            assert_eq!(git_program(), resolved);
+        }
+    }
+
+    #[test]
     fn known_paths_includes_native_installer_location() {
         // Regression guard: the native installer's ~/.local/bin/claude must be a
         // candidate even though its PATH entry lives in the interactive-only
@@ -548,6 +708,25 @@ mod tests {
         assert_eq!(strs[0], "/Users/x/.local/bin/node");
         assert!(strs.contains(&"/opt/homebrew/bin/node".to_string()));
         assert!(strs.contains(&"/usr/local/bin/node".to_string()));
+    }
+
+    #[test]
+    fn known_roborev_paths_prioritizes_user_then_brew_then_usr_local() {
+        let home = Some(std::path::PathBuf::from("/Users/x"));
+        let paths = super::known_roborev_paths_for(home);
+        let strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        // Our installer's ~/.local/bin/roborev must be the first candidate.
+        assert_eq!(strs[0], "/Users/x/.local/bin/roborev");
+        assert!(strs.contains(&"/opt/homebrew/bin/roborev".to_string()));
+        assert!(strs.contains(&"/usr/local/bin/roborev".to_string()));
+    }
+
+    #[test]
+    fn known_roborev_paths_handles_no_home() {
+        let paths = super::known_roborev_paths_for(None);
+        // No home → no ~/.local entry, but the system locations are still present.
+        assert!(paths.iter().any(|p| p.ends_with("opt/homebrew/bin/roborev")));
+        assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".local")));
     }
 
     #[test]

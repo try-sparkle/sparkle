@@ -1,5 +1,18 @@
 // Helpers for the pinned-header prompt-history dropdown (PinnedPrompt). Kept pure and
 // DOM-free so they're unit-testable under the node test env (the desktop suite has no jsdom).
+import type { PromptHistoryEntry } from "../types";
+
+/**
+ * The history entries fit to SHOW the user (breadcrumb, dropdown, tray) — real composer/seed
+ * prompts only. Picker answers are recorded in the raw store so they advance the naming ladder's
+ * promptCount, but they must never reach a display surface: a terse answer like "Unlisted — direct
+ * link only" would evict the actual request from the last-4 breadcrumb, and its row's Jump has no
+ * xterm marker (picker sends don't create one) so it would always report "scrolled out". A missing
+ * `source` is a pre-v10 entry, always composer, so it passes.
+ */
+export function composerPrompts(history: PromptHistoryEntry[]): PromptHistoryEntry[] {
+  return history.filter((e) => e.source !== "picker");
+}
 
 /**
  * A compact "time ago" label for a prompt-history entry, e.g. "just now", "3m", "2h", "5d".

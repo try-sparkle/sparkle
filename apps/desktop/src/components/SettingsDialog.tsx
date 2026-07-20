@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type CSSProperties, type ComponentType } from "react";
-import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic } from "react-icons/fi";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ComponentType } from "react";
+import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle } from "react-icons/fi";
 import { C, ROW_ACTIVE_BUBBLE } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { openSignIn, signOut } from "../services/sparkleApi";
+import { authIdentity } from "../services/entitlement";
 import { useAuthStore } from "../stores/authStore";
 import { useUiStore, type CategoryId } from "../stores/uiStore";
 import { AiFeaturesMenu } from "./AiFeaturesMenu";
@@ -16,6 +17,8 @@ import { MobileDevicesPane } from "./MobileDevicesPane";
 import { KeyboardShortcutsMenu } from "./KeyboardShortcutsMenu";
 import { CreditsPanel } from "./CreditsPanel";
 import { VoiceControlsMenu } from "./VoiceControlsMenu";
+import { ToolsPane } from "./ToolsPane";
+import { ApprovalsMenu } from "./ApprovalsMenu";
 
 // The ⋯ settings dialog. A focused, centered dialog with a left rail of categories driving a
 // single right pane (the "macOS System Settings" pattern), replacing the old 80vw×80vh stack
@@ -33,19 +36,24 @@ interface Category {
   Icon: ComponentType<{ size?: number }>;
   /** One-line description shown under the pane heading. */
   blurb: string;
+  /** Extra search terms the rail search matches on, beyond the visible label — so e.g. "voice"
+   *  or "review" or "github" surfaces the Tools category via the tools it contains. */
+  keywords?: string;
 }
 
 const CATEGORIES: Category[] = [
-  { id: "ai", label: "AI features", Icon: FiZap, blurb: "Each feature degrades to a non-AI baseline when off." },
-  { id: "credits", label: "Credits", Icon: FiCreditCard, blurb: "Your AI credit balance, top-ups, and usage." },
-  { id: "notifications", label: "Notifications", Icon: FiBell, blurb: "Which agent transitions raise a desktop banner." },
-  { id: "appearance", label: "Appearance", Icon: FiEye, blurb: "Theme, text size, and how agents are ordered." },
-  { id: "shortcuts", label: "Shortcuts", Icon: FiCommand, blurb: "Rebind keyboard shortcuts. Tap a modifier or press a combo." },
-  { id: "workers", label: "Workers", Icon: FiCpu, blurb: "How many agents an orchestrator runs in parallel." },
-  { id: "accounts", label: "Accounts", Icon: FiUsers, blurb: "Your Sparkle and Claude accounts." },
-  { id: "mobile", label: "Mobile", Icon: FiSmartphone, blurb: "Pair your phone with this Mac and manage paired devices." },
-  { id: "voice", label: "Voice controls", Icon: FiMic, blurb: "Wake word, stop word, and what happens when you submit." },
-  { id: "advanced", label: "Advanced", Icon: FiSliders, blurb: "Edit the configuration file directly." },
+  { id: "ai", label: "AI features", Icon: FiZap, blurb: "Each feature degrades to a non-AI baseline when off.", keywords: "chief brainstorm think composer dictation deepgram voice auto-rename suggested actions" },
+  { id: "tools", label: "Tools", Icon: FiTool, blurb: "The opinionated stack that powers Sparkle — toggle what you use.", keywords: "chief deepgram voice dictation beads plan board github import usage analytics posthog privacy claude code roborev review superpowers skills" },
+  { id: "credits", label: "Credits", Icon: FiCreditCard, blurb: "Your AI credit balance, top-ups, and usage.", keywords: "balance top-up billing payment" },
+  { id: "notifications", label: "Notifications", Icon: FiBell, blurb: "Which agent transitions raise a desktop banner.", keywords: "banner alerts desktop" },
+  { id: "appearance", label: "Appearance", Icon: FiEye, blurb: "Theme, text size, and how agents are ordered.", keywords: "theme dark light text size zoom agent order" },
+  { id: "shortcuts", label: "Shortcuts", Icon: FiCommand, blurb: "Rebind keyboard shortcuts. Tap a modifier or press a combo.", keywords: "keyboard keybindings hotkeys" },
+  { id: "workers", label: "Workers", Icon: FiCpu, blurb: "How many agents an orchestrator runs in parallel.", keywords: "concurrency parallel agents" },
+  { id: "accounts", label: "Accounts", Icon: FiUsers, blurb: "Your Sparkle and Claude accounts.", keywords: "sign in sign out claude sparkle login" },
+  { id: "mobile", label: "Mobile", Icon: FiSmartphone, blurb: "Pair your phone with this Mac and manage paired devices.", keywords: "phone pair devices" },
+  { id: "voice", label: "Voice controls", Icon: FiMic, blurb: "Wake word, stop word, and what happens when you submit.", keywords: "wake word stop word dictation microphone" },
+  { id: "approvals", label: "Auto-approve", Icon: FiCheckCircle, blurb: "Remember answers to Claude Code permission prompts and auto-answer matching ones.", keywords: "auto-approve approvals permission prompts skills commands bash edits mcp tools fetch remember yes nudge" },
+  { id: "advanced", label: "Advanced", Icon: FiSliders, blurb: "Edit the configuration file directly.", keywords: "config toml file raw editor" },
 ];
 
 export interface SettingsDialogProps {
@@ -66,6 +74,22 @@ export function SettingsDialog({ onClose, onManageAccounts, initialCategory }: S
   }, [initialCategory]);
   // `active` is always one of CATEGORIES' ids, so find() can't miss.
   const current = CATEGORIES.find((c) => c.id === active) as Category;
+
+  // Rail search: filter the categories by label OR their keyword set, so "voice" surfaces both
+  // "Voice controls" and "Tools" (Deepgram). The query is ALSO passed into the active pane so it
+  // filters that pane's rows too (currently the Tools pane). Trimmed + lowercased once.
+  const [query, setQuery] = useState("");
+  const q = query.trim().toLowerCase();
+  const filtered = useMemo(
+    () =>
+      q
+        ? CATEGORIES.filter(
+            (c) =>
+              c.label.toLowerCase().includes(q) || (c.keywords ?? "").toLowerCase().includes(q),
+          )
+        : CATEGORIES,
+    [q],
+  );
 
   // Move keyboard focus into the dialog on open so screen-reader / keyboard users land inside
   // it (the trigger button keeps focus otherwise) and Escape/Tab anchor here.
@@ -88,32 +112,47 @@ export function SettingsDialog({ onClose, onManageAccounts, initialCategory }: S
         <div style={bodyRow}>
           {/* Category rail */}
           <nav aria-label="Settings categories" style={rail}>
-            {CATEGORIES.map(({ id, label, Icon }) => {
-              const selected = id === active;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  aria-current={selected ? "page" : undefined}
-                  onClick={() => setActive(id)}
-                  style={{
-                    ...railItem,
-                    background: selected ? ROW_ACTIVE_BUBBLE : "transparent",
-                    color: selected ? C.cream : C.muted,
-                  }}
-                >
-                  <Icon size={16} />
-                  <span>{label}</span>
-                </button>
-              );
-            })}
+            <div style={searchWrap}>
+              <FiSearch size={14} style={searchIcon} aria-hidden />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search settings…"
+                aria-label="Search settings"
+                spellCheck={false}
+                style={searchInput}
+              />
+            </div>
+            {filtered.length === 0 ? (
+              <div style={railEmpty}>No settings match “{query.trim()}”.</div>
+            ) : (
+              filtered.map(({ id, label, Icon }) => {
+                const selected = id === active;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    aria-current={selected ? "page" : undefined}
+                    onClick={() => setActive(id)}
+                    style={{
+                      ...railItem,
+                      background: selected ? ROW_ACTIVE_BUBBLE : "transparent",
+                      color: selected ? C.cream : C.muted,
+                    }}
+                  >
+                    <Icon size={16} />
+                    <span>{label}</span>
+                  </button>
+                );
+              })
+            )}
           </nav>
 
           {/* Active pane */}
           <section style={pane} aria-label={current.label}>
             <h2 style={paneHeading}>{current.label}</h2>
             <p style={paneBlurb}>{current.blurb}</p>
-            <PaneBody id={active} onManageAccounts={onManageAccounts} />
+            <PaneBody id={active} query={q} onManageAccounts={onManageAccounts} />
           </section>
         </div>
       </div>
@@ -124,14 +163,18 @@ export function SettingsDialog({ onClose, onManageAccounts, initialCategory }: S
 /** Renders the controls for the selected category. Only the active pane mounts. */
 function PaneBody({
   id,
+  query,
   onManageAccounts,
 }: {
   id: CategoryId;
+  query: string;
   onManageAccounts: () => void;
 }) {
   switch (id) {
     case "ai":
       return <AiFeaturesMenu />;
+    case "tools":
+      return <ToolsPane query={query} />;
     case "credits":
       return <CreditsPanel />;
     case "notifications":
@@ -148,6 +191,8 @@ function PaneBody({
       return <MobileDevicesPane />;
     case "voice":
       return <VoiceControlsMenu />;
+    case "approvals":
+      return <ApprovalsMenu />;
     case "advanced":
       return <AdvancedConfigMenu />;
   }
@@ -162,10 +207,12 @@ function AccountsPane({ onManageAccounts }: { onManageAccounts: () => void }) {
   const loading = useAuthStore((s) => s.loading);
   const [signingOut, setSigningOut] = useState(false);
 
-  // Who to show: email is the identity users recognize; name and the raw Clerk id are
-  // fallbacks. `me` can be null with a token present (e.g. offline) — still signed in,
-  // just without a resolvable identity.
-  const identity = me?.email ?? me?.name ?? me?.clerkUserId ?? null;
+  // Who to show — the SAME shared source as the TopBar avatar/label (authIdentity), so the two can
+  // never disagree on precedence or blank-handling. It resolves name → email and returns null when
+  // neither is present, so a token-present user with no resolvable identity (offline, or a degraded
+  // /me whose Clerk profile lookup soft-failed) renders a clean "Signed in" rather than the opaque
+  // `user_…` clerkUserId.
+  const identity = authIdentity(me);
 
   const handleSignOut = async () => {
     setSigningOut(true);
@@ -341,6 +388,41 @@ const rail: CSSProperties = {
   flexDirection: "column",
   gap: 3,
   overflowY: "auto",
+};
+
+const searchWrap: CSSProperties = {
+  position: "relative",
+  marginBottom: 6,
+  flex: "none",
+};
+
+const searchIcon: CSSProperties = {
+  position: "absolute",
+  left: 9,
+  top: "50%",
+  transform: "translateY(-50%)",
+  color: C.muted,
+  pointerEvents: "none",
+};
+
+const searchInput: CSSProperties = {
+  width: "100%",
+  boxSizing: "border-box",
+  background: C.deepForest,
+  color: C.cream,
+  border: `1px solid ${C.deepForest}`,
+  borderRadius: 8,
+  padding: "7px 10px 7px 28px",
+  fontSize: 13,
+  fontFamily: '"IBM Plex Sans", sans-serif',
+  outline: "none",
+};
+
+const railEmpty: CSSProperties = {
+  fontSize: 12,
+  color: C.muted,
+  padding: "8px 11px",
+  lineHeight: 1.4,
 };
 
 const railItem: CSSProperties = {

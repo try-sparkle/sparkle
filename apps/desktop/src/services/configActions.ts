@@ -6,8 +6,25 @@
 // These live outside settingsStore so the store stays free of the Tauri runtime (it must stay
 // testable under jsdom). Failures are non-fatal: the optimistic update already happened and the
 // next hydrate reconciles with the file.
-import { setConfigValue, setConfigValues } from "./config";
-import { useSettingsStore, type AiFeatureKey } from "../stores/settingsStore";
+import {
+  setConfigValue,
+  setConfigValues,
+  unsetConfigValue,
+  setProjectConfigValue,
+  unsetProjectConfigValue,
+} from "./config";
+import { useSettingsStore, type AiFeatureKey, type ToolKey } from "../stores/settingsStore";
+import { useProjectStore } from "../stores/projectStore";
+import {
+  installRoborev,
+  deactivateRoborev,
+  installRepoHooks,
+  removeRepoHooks,
+  roborevAuthSelftest,
+  type RoborevAuthVerdict,
+} from "./roborev";
+import { useApprovalsStore } from "../stores/approvalsStore";
+import type { ApprovalCategory, ApprovalRule } from "./suggestions/approvalCategories";
 import {
   DEFAULT_WAKE_WORD,
   DEFAULT_STOP_WORD,
@@ -21,7 +38,83 @@ const AI_CONFIG_PATH: Record<AiFeatureKey, string> = {
   brainstorm: "ai.brainstorm",
   composer: "ai.composer",
   suggestedActions: "ai.suggested_actions",
+  autoApprove: "ai.auto_approve",
 };
+
+/** Scope an approval rule is written to: the machine-wide global file or the current project's file. */
+export type ApprovalScope = "global" | "project";
+
+/** The dotted config path for a category's rule (same key in both the global + project files). */
+function approvalPath(category: ApprovalCategory): string {
+  return `approvals.${category}`;
+}
+
+/**
+ * Set a category rule ("always"/"never") at the given scope: optimistic store update, then persist
+ * to the correct config.toml (global vs the project's `.sparkle/config.toml`). A project write needs
+ * `projectRoot`; without one it falls back to the global scope so the rule is never silently dropped.
+ */
+export async function setApprovalRule(
+  category: ApprovalCategory,
+  rule: ApprovalRule,
+  scope: ApprovalScope,
+  projectRoot: string | null,
+): Promise<void> {
+  if (scope === "project" && projectRoot) {
+    useApprovalsStore.getState().setProjectApproval(projectRoot, category, rule);
+    try {
+      await setProjectConfigValue(projectRoot, approvalPath(category), rule);
+    } catch (e) {
+      console.warn("config write failed (approval project)", e);
+    }
+    return;
+  }
+  useSettingsStore.getState().setGlobalApproval(category, rule);
+  try {
+    await setConfigValue(approvalPath(category), rule);
+  } catch (e) {
+    console.warn("config write failed (approval global)", e);
+  }
+}
+
+/**
+ * Clear a category rule at the given scope: optimistic store update, then remove the key from the
+ * matching config.toml. A project clear optimistically falls back to the current global rule (the
+ * effective value once the project override is gone) so the UI never flashes an unset state that
+ * the config round-trip then corrects.
+ */
+export async function clearApprovalRule(
+  category: ApprovalCategory,
+  scope: ApprovalScope,
+  projectRoot: string | null,
+): Promise<void> {
+  if (scope === "project" && projectRoot) {
+    const globalRule = useSettingsStore.getState().approvals[category] ?? null;
+    useApprovalsStore.getState().setProjectApproval(projectRoot, category, globalRule);
+    try {
+      await unsetProjectConfigValue(projectRoot, approvalPath(category));
+    } catch (e) {
+      console.warn("config write failed (approval clear project)", e);
+    }
+    return;
+  }
+  useSettingsStore.getState().setGlobalApproval(category, null);
+  try {
+    await unsetConfigValue(approvalPath(category));
+  } catch (e) {
+    console.warn("config write failed (approval clear global)", e);
+  }
+}
+
+/** Remove a category rule from BOTH scopes so the effective state is truly unset (the pane's
+ *  "Remove"). Clears global + (if a project is in context) the project override. */
+export async function removeApprovalRuleEverywhere(
+  category: ApprovalCategory,
+  projectRoot: string | null,
+): Promise<void> {
+  await clearApprovalRule(category, "global", projectRoot);
+  if (projectRoot) await clearApprovalRule(category, "project", projectRoot);
+}
 
 /** Toggle one AI feature: optimistic store update, then persist to config.toml. */
 export async function setAiFeature(key: AiFeatureKey, on: boolean): Promise<void> {
@@ -30,6 +123,125 @@ export async function setAiFeature(key: AiFeatureKey, on: boolean): Promise<void
     await setConfigValue(AI_CONFIG_PATH[key], on);
   } catch (e) {
     console.warn("config write failed (ai feature)", e);
+  }
+}
+
+/** Tool key → its dotted config path under [tools]. */
+const TOOLS_CONFIG_PATH: Record<ToolKey, string> = {
+  analytics: "tools.analytics",
+  beads: "tools.beads",
+  github: "tools.github",
+  guardrails: "tools.guardrails",
+  roborev: "tools.roborev",
+};
+
+/** Toggle one [tools] flag: optimistic store update, then persist to config.toml. */
+export async function setToolEnabled(key: ToolKey, on: boolean): Promise<void> {
+  useSettingsStore.getState().setToolEnabled(key, on);
+  try {
+    await setConfigValue(TOOLS_CONFIG_PATH[key], on);
+  } catch (e) {
+    console.warn("config write failed (tool)", e);
+  }
+}
+
+/** Toggle roborev (the per-commit AI code-review daemon). Beyond the config write, this has real
+ *  side effects: turning it ON installs the daemon and wires roborev's git hooks into EVERY known
+ *  project; turning it OFF deactivates the daemon and removes those hooks. The optimistic store
+ *  update + config write go first (via setToolEnabled) so the UI flips instantly; the daemon/hook
+ *  work is best-effort (each roborev.ts wrapper swallows + logs its own error) and never rejects. */
+/** Turn an auth-probe verdict into an actionable sentence for the Roborev row, or null when there's
+ *  nothing wrong. `undefined` (the probe couldn't run) is deliberately NOT silent: an unverified
+ *  daemon is exactly the state that fails invisibly. */
+export function authWarningFor(verdict: RoborevAuthVerdict | undefined): string | null {
+  switch (verdict?.kind) {
+    case "Passed":
+      return null;
+    case "ClaudeMissing":
+      return "Roborev can't find the claude command, so your commits won't be reviewed. Install Claude Code, then turn Roborev on again.";
+    case "NotAuthenticated":
+      return "Roborev found claude but couldn't sign in, so your commits won't be reviewed. Run `claude login` in a terminal, then turn Roborev on again.";
+    default:
+      // Unknown verdict, or the probe didn't run at all. We can't claim it works and we can't claim
+      // it's broken — say so, and leave it on rather than blocking on our own uncertainty.
+      return "Sparkle couldn't confirm Roborev is able to review your commits. It's on — but if reviews never appear, run `claude login` in a terminal.";
+  }
+}
+
+/**
+ * Turn roborev on or off.
+ *
+ * Turning it ON probes the daemon's real environment before we let the toggle claim it's working.
+ * The failure this guards against is silent: an unauthenticated daemon runs happily, reviews nothing,
+ * and looks identical to a healthy one. On a CONFIDENT negative (no claude / can't sign in) we hand
+ * the toggle back off and say why, so the UI never shows "on" for something that cannot work. An
+ * inconclusive probe leaves it on with a warning — our own uncertainty shouldn't block a setup that
+ * may well be fine.
+ */
+export async function setRoborevEnabled(on: boolean): Promise<void> {
+  // Optimistic store set + persist tools.roborev to config.toml (same path as any other tool).
+  await setToolEnabled("roborev", on);
+  // Side effects: daemon + a sweep of every project's git hooks. Fire the hook sweep in parallel;
+  // each call is independently best-effort.
+  const projects = useProjectStore.getState().projects;
+  const settings = useSettingsStore.getState();
+
+  if (!on) {
+    settings.setRoborevAuthWarning(null);
+    await deactivateRoborev();
+    await Promise.all(projects.map((p) => removeRepoHooks(p.rootPath)));
+    return;
+  }
+
+  await installRoborev();
+  const verdict = await roborevAuthSelftest();
+  settings.setRoborevAuthWarning(authWarningFor(verdict));
+  if (verdict?.kind === "ClaudeMissing" || verdict?.kind === "NotAuthenticated") {
+    // Confidently broken: revert to off and tear the daemon back down, so we don't leave a daemon
+    // running that can only ever no-op. The warning above tells the user how to fix it.
+    await setToolEnabled("roborev", false);
+    await deactivateRoborev();
+    return;
+  }
+  await Promise.all(projects.map((p) => installRepoHooks(p.rootPath)));
+}
+
+/**
+ * Re-probe roborev's auth and publish the result to the Roborev row. Call this at startup.
+ *
+ * Why it's needed on top of the toggle gate: `tools.roborev` DEFAULTS TO ON and is persisted, while
+ * the warning is deliberately UI-only. So the two commonest states — a fresh install (already on,
+ * never toggled) and every subsequent app launch — would otherwise never be probed at all, and an
+ * unauthenticated daemon would go right back to looking healthy. That's the exact failure this
+ * feature exists to prevent, so the check can't only live on the OFF→ON edge.
+ *
+ * Unlike the toggle path this only WARNS — it never flips the toggle off. A transient probe failure
+ * at launch shouldn't silently disable a feature the user chose; being loud is enough here.
+ */
+export async function refreshRoborevAuth(): Promise<void> {
+  if (!useSettingsStore.getState().roborevEnabled) {
+    useSettingsStore.getState().setRoborevAuthWarning(null);
+    return;
+  }
+  const verdict = await roborevAuthSelftest();
+  // Re-read rather than reusing the pre-await snapshot: the probe can take ~90s, and the user may
+  // have turned roborev OFF while we waited — publishing then would warn about a disabled feature.
+  // Scope, precisely: this guards the off case only. An off→on→resolve sequence inside the same
+  // window still lets this stale verdict overwrite the toggle's fresher one. Left alone on purpose
+  // — both probes measure the same auth state, so they agree in all but a transient blip, and an
+  // epoch counter would be real machinery for a self-correcting cosmetic race.
+  if (!useSettingsStore.getState().roborevEnabled) return;
+  useSettingsStore.getState().setRoborevAuthWarning(authWarningFor(verdict));
+}
+
+/** Record that the one-time roborev consent modal has been shown (so it never appears again),
+ *  whichever choice the user made. Optimistic store set, then persist roborev.consent_prompted. */
+export async function markRoborevConsentPrompted(): Promise<void> {
+  useSettingsStore.getState().setRoborevConsentPrompted(true);
+  try {
+    await setConfigValue("roborev.consent_prompted", true);
+  } catch (e) {
+    console.warn("config write failed (roborev consent)", e);
   }
 }
 

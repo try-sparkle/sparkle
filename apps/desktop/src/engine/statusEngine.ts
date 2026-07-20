@@ -26,7 +26,7 @@
 import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
 import { screenAwaitsInput } from "./screenClassifier";
-import { StreamFailureDetector, isApiErrorLine, isSelfPromptLine } from "./streamFailure";
+import { StreamFailureDetector, isApiErrorLine } from "./streamFailure";
 
 // Strip ANSI/control sequences before classifying (xterm still renders the raw bytes).
 // Built from a string with \u escapes so the source stays paste-safe (no literal ESC).
@@ -67,6 +67,13 @@ const IDLE_MS = 2500;
 const BLOCKED_MS = 25000;
 // Spinner ticks ~1/s; if we don't see it for this long the turn has ended.
 const SPINNER_GRACE_MS = 2000;
+// How many ingested lines the "the user just submitted a message" echo-suppression window lasts
+// (Fix 2). Bounded so it can't permanently mask a LATER genuine wedge: after this many lines with
+// no further user input (and no progress event, which also clears it), detection re-arms fully.
+const USER_INPUT_ECHO_WINDOW_LINES = 200;
+// Below this noted-text length, echo suppression uses exact line equality only — a 1-2 char user
+// message must not broadly suppress detection via a bare substring match (roborev).
+const ECHO_SUBSTRING_MIN_CHARS = 8;
 // Cap the unterminated-line buffer. The spinner redraws without a trailing newline, so
 // `partial` would otherwise grow for the whole turn (memory + O(n^2) prompt scans). Prompt
 // and spinner markers are short, so a bounded tail keeps detection intact.
@@ -97,6 +104,14 @@ export class StatusEngine {
   // only by real forward progress (a classified tool/file event) or a real interactive prompt.
   private sawStreamFailure = false;
   private readonly failure = new StreamFailureDetector();
+  // Fix 2 (Bug B): the normalized text of the message the user MOST RECENTLY submitted to this
+  // agent, set by noteUserInput(). The TUI echoes the user's own input back into pty:output, so an
+  // echo of "hey Sparkler" or "Are you there? Give me an update." would otherwise trip the
+  // self-prompt/churn detector and paint a healthy, resuming agent RED. While this is set, any
+  // ingested line that IS that echo is skipped for failure detection. Bounded by a line countdown
+  // (and cleared on real progress) so it can never mask a later genuine wedge.
+  private notedUserText = "";
+  private notedUserLinesLeft = 0;
 
   constructor(private readonly opts: StatusEngineOpts) {
     this.opts.onStatus(this.status);
@@ -114,6 +129,45 @@ export class StatusEngine {
     if (this.blockedTimer) clearTimeout(this.blockedTimer);
     this.idleTimer = null;
     this.blockedTimer = null;
+  }
+
+  /**
+   * The user just submitted a message to this agent (Fix B / Bug B). Their presence is the
+   * STRONGEST recovery signal: a NEW turn is starting and any prior stall/error latched from earlier
+   * output is, by definition, stale — the user is here and driving. So:
+   *   1. Clear the sticky/one-shot failure+error+risk flags and reset the churn detector, so a
+   *      resuming spinner is no longer OVERRIDDEN by a dead `sawStreamFailure` and can go green. We
+   *      do NOT force a color here — the next ingest/spinner tick classifies — we only lift the
+   *      override so the real signal wins. (A genuine wedge with NO user input still goes red; the
+   *      spinner alone never clears a stall — see sparkle-pqxh.)
+   *   2. Record the submitted text (normalized) so its ECHO in the ingested output is not mistaken
+   *      for a self-prompt/churn ping (Fix 2). Bounded to a line window so a LATER genuine wedge is
+   *      still caught.
+   */
+  noteUserInput(text: string): void {
+    this.sawStreamFailure = false;
+    this.sawRecentError = false;
+    this.sawRecentRisk = false;
+    this.failure.reset();
+    // stripAnsi also strips the bracketed-paste ESC[200~/ESC[201~ wrappers submitPrompt adds (they
+    // are CSI sequences), so this normalizes both raw text and paste-wrapped payloads the same way.
+    const norm = stripAnsi(text).trim().toLowerCase();
+    this.notedUserText = norm;
+    this.notedUserLinesLeft = norm ? USER_INPUT_ECHO_WINDOW_LINES : 0;
+  }
+
+  // True when `lowerLine` (an already-lowercased, trimmed ingested line) is an echo of the message
+  // the user just submitted — so it must not be read as a self-prompt/churn wedge (Fix 2). Matches
+  // when the line equals the noted text, is a fragment OF it (a multi-line message echoes line by
+  // line), or contains it (an echo decorated with a prompt marker). The two SUBSTRING directions are
+  // gated on a minimum noted-text length: a tiny submission ("ok", "go") must fall back to
+  // exact-equality only, or `lowerLine.includes("go")` would suppress detection on any line that
+  // merely contains that token for the whole window (roborev). Only meaningful while the window is open.
+  private isUserEchoLine(lowerLine: string): boolean {
+    if (this.notedUserLinesLeft <= 0 || !this.notedUserText || !lowerLine) return false;
+    if (this.notedUserText === lowerLine) return true;
+    if (this.notedUserText.length < ECHO_SUBSTRING_MIN_CHARS) return false;
+    return this.notedUserText.includes(lowerLine) || lowerLine.includes(this.notedUserText);
   }
 
   // The turn has gone quiet (spinner stopped, or the legacy timer fired). Decide red vs
@@ -165,9 +219,12 @@ export class StatusEngine {
       if (ev) {
         // A classified tool/file event is genuine forward progress — the agent is doing real work
         // again, not churning on a dead API call. Clear any sticky mid-stream failure (sparkle-pqxh)
-        // and reset the churn counter so post-recovery output starts fresh.
+        // and reset the churn counter so post-recovery output starts fresh. Real progress also ends
+        // the user-input echo window (Fix 2): from here a repeated self-ping is a fresh wedge again.
         this.sawStreamFailure = false;
         this.failure.reset();
+        this.notedUserText = "";
+        this.notedUserLinesLeft = 0;
       }
       if (ev?.event_type === "approval_needed") this.sawRecentRisk = true;
       // Mid-stream failure/stall while the process is alive (sparkle-pqxh). Only observed when this
@@ -175,21 +232,30 @@ export class StatusEngine {
       // `if (ev)` above just reset the detector, so re-observing it (a tool arg/path that happens to
       // contain "api error") must not re-trip the failure (roborev 16153). The detector keys off the
       // visible \r-frame, so a banner fused onto a spinner redraw is still caught. Sticky once
-      // tripped; only the recovery paths (a real tool event above, a real prompt below) clear it.
-      else if (!ev && this.failure.observe(line)) {
+      // tripped; only the recovery paths (a real tool event above, a real prompt below, or
+      // noteUserInput) clear it. Fix 2: an echo of the user's own just-submitted message is NOT a
+      // wedge — skip it entirely so it neither trips a self-prompt nor accrues churn.
+      else if (!ev && !this.isUserEchoLine(line.toLowerCase()) && this.failure.observe(line)) {
         this.sawStreamFailure = true;
       }
       if (screenAwaitsInput(line)) prompt = true;
+      // Spend one tick of the user-input echo window per non-empty line, so it can't mask a later
+      // genuine wedge (Fix 2). Decremented AFTER this line's echo check so the final in-window line
+      // is still covered (no boundary off-by-one). When it runs out, drop the noted text so
+      // detection re-arms fully. A classified tool event above already cleared it (real progress).
+      if (this.notedUserLinesLeft > 0 && --this.notedUserLinesLeft === 0) this.notedUserText = "";
     }
     // Claude prints its input prompt without a trailing newline — check the partial too.
     if (screenAwaitsInput(this.partial)) prompt = true;
 
-    // A banner / self-prompt can also sit in the still-unterminated partial: the spinner redraws
+    // An API-error banner can also sit in the still-unterminated partial: the spinner redraws
     // without a newline, so a fused banner may not have flushed as a completed line yet. Mirror the
     // partial prompt-check above so detection isn't one missing '\n' away from silently not firing
-    // (roborev 16152). Only the phrase signals (which key off the visible \r-frame), NOT the churn
-    // counter — that needs discrete completed lines. Set-only (never clears), keeping it sticky.
-    if (!this.sawStreamFailure && (isApiErrorLine(this.partial) || isSelfPromptLine(this.partial))) {
+    // (roborev 16152). Only the API-error signal (which keys off the visible \r-frame and trips on a
+    // single occurrence), NOT self-prompt — a self-prompt is a wedge only once it REPEATS (Bug A),
+    // and repetition needs discrete completed lines the detector counts, so a lone self-ping in the
+    // partial must NOT trip. Set-only (never clears), keeping it sticky.
+    if (!this.sawStreamFailure && isApiErrorLine(this.partial)) {
       this.sawStreamFailure = true;
     }
 
