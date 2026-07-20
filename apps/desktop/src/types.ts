@@ -117,6 +117,13 @@ export interface AgentTab {
   // The alert-episode record backing "Dismiss Alert" (AgentAlertRecord above). Undefined until the
   // agent first enters a red status; advanced by projectStore.advanceAlerts on red transitions.
   alert?: AgentAlertRecord;
+  // Epoch ms at which this agent row was created in THIS window (sparkle-pckz). Used solely by
+  // mergePreservingLiveWorkers to tell a stale writer's ignorance apart from a deliberate removal:
+  // an agent created AFTER an incoming snapshot was written (ProjectState.persistedAt) cannot have
+  // been removed by that snapshot's writer, so its absence there must not evict the live row.
+  // Optional — legacy persisted records read as undefined and keep the pre-existing behaviour
+  // exactly (no migration step, no retroactive shielding).
+  createdAt?: number;
 }
 
 export interface Project {

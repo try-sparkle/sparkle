@@ -82,6 +82,11 @@ function uuid(): string {
 export interface ProjectState {
   projects: Project[];
   selectedProjectId: string | null;
+  /** Epoch ms stamped onto the blob at every persist (see the persist `partialize` below), so a
+   *  rehydrate can tell HOW OLD the incoming snapshot is (sparkle-pckz). Never set in memory by
+   *  any action — it exists only on the persisted record and is read by mergePreservingLiveWorkers
+   *  to date the writer. Undefined on a legacy blob written before this field existed. */
+  persistedAt?: number;
 
   addProject: (name: string, rootPath: string) => string;
   removeProject: (id: string) => void;
@@ -562,6 +567,10 @@ export function mergePreservingLiveWorkers(
 ): ProjectState {
   const persisted = (persistedState ?? undefined) as Partial<ProjectState> | undefined;
   const merged = { ...currentState, ...(persisted ?? {}) } as ProjectState;
+  // When the incoming blob was written (sparkle-pckz). Dates the writer so survivor clause (3) can
+  // tell "didn't know about this agent yet" from "deliberately removed it". Undefined on a legacy
+  // blob, which disables that clause rather than guessing.
+  const snapshotAt = typeof persisted?.persistedAt === "number" ? persisted.persistedAt : null;
   const currentProjects = currentState.projects ?? [];
   const incoming = persisted?.projects ?? currentProjects;
   merged.projects = incoming.map((pp) => {
@@ -620,6 +629,11 @@ export function mergePreservingLiveWorkers(
     const baseAgents = pinnedIdentityReconciled ? reconciledAgents : pp.agents;
     const survivors = cur.agents.filter((a) => {
       if (present.has(a.id)) return false; // already in the snapshot — nothing to re-attach
+      // A deliberate local removal outranks EVERY survivor clause below. The tombstone filter above
+      // only strips the id from the INCOMING snapshot; without this the re-attach clauses would pull
+      // the same row back out of live state and undo the ×. Recency (clause 3) must never resurrect
+      // something the user explicitly closed.
+      if (pendingRemovals.has(a.id)) return false;
       // (1) A live worker with a cut worktree whose parent still exists (sparkle-3tqv): a snapshot
       //     that predates the spawn must not evict it — its worktree + manifest are live on disk.
       if (a.kind === "worker" && !!a.worktreePath && pp.agents.some((x) => x.id === a.parentId)) {
@@ -631,6 +645,18 @@ export function mergePreservingLiveWorkers(
       //     window — pendingAdds is cleared the moment a snapshot carrying the id arrives — so a
       //     genuinely-removed agent (never pending, or already acknowledged) is NOT resurrected.
       if (pendingAdds.has(a.id)) return true;
+      // (3) An agent created AFTER this snapshot was written (sparkle-pckz). Clause (2) only covers
+      //     the not-yet-acknowledged window: the merge caller clears pendingAdds for every id the
+      //     incoming snapshot carries, so the FIRST snapshot carrying an agent strips its shield and
+      //     any LATER stale write that omits it evicts it — "the agent shows up, then vanishes a beat
+      //     later". Recency disambiguates what absence alone cannot: a writer whose blob predates the
+      //     agent's creation never knew the agent existed, so its omission is ignorance, not deletion.
+      //     A NEWER snapshot that omits the agent IS a genuine cross-window removal and still evicts
+      //     (that is what makes this safe to apply after acknowledgement, unlike simply never
+      //     acknowledging). Both timestamps must be present — a legacy agent (no createdAt) or a
+      //     legacy blob (no persistedAt) can't be dated, so those fall through to the old behaviour
+      //     rather than being shielded unconditionally, which would resurrect real removals.
+      if (snapshotAt != null && a.createdAt != null && a.createdAt > snapshotAt) return true;
       return false;
     });
     const mergedAgents = survivors.length > 0 ? [...baseAgents, ...survivors] : baseAgents;
@@ -782,6 +808,8 @@ export const useProjectStore = create<ProjectState>()(
           projects: mapProject(s.projects, projectId, (p) => {
             const agent: AgentTab = {
               id,
+              // Dates the row so a snapshot written before this moment can't evict it (sparkle-pckz).
+              createdAt: Date.now(),
               name: opts?.name ?? defaultAgentName(p, kind),
               kind,
               parentId,
@@ -1108,6 +1136,9 @@ export const useProjectStore = create<ProjectState>()(
             if (pendingLocalRemovals.has(worker.id)) return p;
             const agent: AgentTab = {
               id: worker.id,
+              // Adoption time, not spawn time — this is when the ROW appeared in this window, which
+              // is what the stale-snapshot comparison is about (sparkle-pckz).
+              createdAt: Date.now(),
               name: defaultAgentName(p, "worker"),
               kind: "worker",
               parentId: worker.parentId,
@@ -1160,6 +1191,24 @@ export const useProjectStore = create<ProjectState>()(
       // Debounced localStorage (sparkle-pngb) so a burst of prompt appends / tab switches coalesces
       // into ONE main-thread JSON.stringify + setItem instead of one per mutation.
       storage: createJSONStorage(() => debouncedProjectsStorage),
+      // Date every blob as it is written (sparkle-pckz). This is the ONLY writer of persistedAt —
+      // it is a property of the write, not in-memory state, so it is stamped here rather than by any
+      // action. mergePreservingLiveWorkers reads it to date an incoming snapshot and decide whether a
+      // missing agent was unknown to that writer (keep) or removed by it (evict). Everything else is
+      // persisted verbatim — this store has no field filtering, so partialize must pass state through.
+      //
+      // Timing vs the debounce above: partialize runs at SERIALIZE time, and debouncedProjectsStorage
+      // receives the finished string and writes that exact string at flush — so the stamp can never
+      // disagree with the payload it describes. It does mean the stamp is up to `delayMs` EARLIER than
+      // the actual localStorage write, which is the safe direction: an older-looking snapshot shields
+      // MORE agents in clause (3), never fewer, so the debounce can only make the merge err toward
+      // keeping a live row. Stamping at flush time instead would be wrong — it would post-date the
+      // writer's knowledge and could evict an agent created during the debounce window.
+      //
+      // sparkle-en2e: because this changes on every write, no two blobs are ever byte-identical.
+      // A skip-identical-writes optimization (unmerged 933cda14) must exclude persistedAt from its
+      // comparison rather than dropping the stamp — the shield depends on every blob being dated.
+      partialize: (state) => ({ ...state, persistedAt: Date.now() }),
       // Bumped when the persisted shape gains fields. v1 backfills the main-first-defaults
       // fields so legacy records rehydrate with `null` (matching fresh records) rather than
       // `undefined` — an undefined baseBranch would otherwise send "" to the git commands.
