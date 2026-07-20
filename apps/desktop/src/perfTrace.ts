@@ -62,8 +62,14 @@ export function perfCancel(key: string): void {
 }
 
 // ── One-shot spans around a specific operation ────────────────────────────────────────────────
-/** Only spans at/above this many ms are logged, so sub-ms work doesn't flood the file. */
-const SPAN_MIN_MS = 1;
+/** Only spans at/above this many ms are logged. One frame at 60Hz (~16.7ms) is the bar: a span
+ *  below it did NOT drop a frame, so it isn't a stall anyone can perceive and isn't worth a line.
+ *  The old 1ms floor logged nearly every span — in a steady session the rehydrate + persist spans
+ *  alone were tens of thousands of INFO lines a day (the bulk of the perf log on disk), burying the
+ *  handful of genuinely slow spans (the 50–750ms rehydrates) the instrument exists to surface. A
+ *  span is now logged only when the single operation ate a whole frame's budget; cumulative
+ *  sub-frame cost still shows up in the jank monitor's stalls. */
+const SPAN_MIN_MS = 16;
 
 /** Time a synchronous operation and log if it took ≥ SPAN_MIN_MS. Returns fn()'s value; rethrows. */
 export function perfSpan<T>(name: string, fn: () => T, meta?: Record<string, unknown>): T {
@@ -76,7 +82,7 @@ export function perfSpan<T>(name: string, fn: () => T, meta?: Record<string, unk
   }
 }
 
-/** Time an async operation end-to-end (await included) and log if it took ≥ SPAN_MIN_MS. */
+/** Time an async operation end-to-end (await included) and log only if it took ≥ SPAN_MIN_MS. */
 export async function perfSpanAsync<T>(
   name: string,
   fn: () => Promise<T>,

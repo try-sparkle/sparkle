@@ -19,6 +19,7 @@ import {
   checkForUpdatesNow,
   applyUpdateAndRestart,
   useUpdaterStore,
+  isMainWindowSearch,
   DEFAULT_UPDATE_INTERVAL_MS,
   MIN_CHECK_GAP_MS,
 } from "./updaterService";
@@ -129,6 +130,23 @@ describe("checkForUpdates (returns an outcome for the manual check)", () => {
     check.mockResolvedValue(makeUpdate());
     await expect(checkForUpdates()).resolves.toBe("update-available");
     expect(check).not.toHaveBeenCalled();
+  });
+});
+
+describe("isMainWindowSearch (only the main window polls)", () => {
+  it("initial window (no ?label=) owns the poll", () => {
+    expect(isMainWindowSearch("")).toBe(true);
+    expect(isMainWindowSearch("?project=p1")).toBe(true);
+  });
+
+  it("secondary project window (?label=) does NOT poll", () => {
+    expect(isMainWindowSearch("?label=win-1")).toBe(false);
+    expect(isMainWindowSearch("?project=p1&label=win-2&agent=a1")).toBe(false);
+  });
+
+  it("blank/whitespace label is not a real label → still the main window", () => {
+    expect(isMainWindowSearch("?label=")).toBe(true);
+    expect(isMainWindowSearch("?label=%20")).toBe(true);
   });
 });
 

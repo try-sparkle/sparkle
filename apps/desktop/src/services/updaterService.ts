@@ -19,6 +19,7 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { create } from "zustand";
 import { useSettingsStore } from "../stores/settingsStore";
+import { parseWindowLabelFromSearch } from "./projectWindows.url";
 
 /** Default poll cadence: every 60 minutes, plus once at launch and whenever the app regains focus. */
 export const DEFAULT_UPDATE_INTERVAL_MS = 60 * 60 * 1000;
@@ -79,6 +80,22 @@ let pendingUpdate: Update | null = null;
 
 function inTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+/**
+ * Does this window own the update poll? Only the initial ("main") window does.
+ *
+ * Every project window loads this same bundle in its OWN JS context, so module state (`started`,
+ * `timer`, `lastCheckAt`, the store) is per-window and can't coordinate: without this guard, N open
+ * windows each run their own poller. That means N× the release-feed traffic per interval, and —
+ * with auto-apply on — N concurrent downloadAndInstall() calls racing to stage the same bundle.
+ *
+ * `?label=` is the same signal windowContext derives `isMain` from: secondary windows carry one,
+ * the initial window doesn't. Kept as a pure search-string predicate so it unit-tests in node
+ * (startUpdater itself is unreachable in tests behind the packaged/dev guard).
+ */
+export function isMainWindowSearch(search: string): boolean {
+  return parseWindowLabelFromSearch(search) === null;
 }
 
 /** Outcome of a single update check — lets the user-initiated "Check for updates" show feedback. */
@@ -172,11 +189,14 @@ let onFocus: (() => void) | null = null;
  * seconds of the user returning, not up to a full interval later. The focus check is guarded by
  * MIN_CHECK_GAP_MS so rapid alt-tabbing doesn't spam the feed. No-ops in dev / the browser preview
  * / when not packaged — the updater plugin and signed manifest only exist in a real build, so
- * running check() there only generates noise. Returns a cleanup that stops the interval and removes
- * the focus listener.
+ * running check() there only generates noise — and in secondary project windows, which would
+ * otherwise each poll independently (see isMainWindowSearch). Returns a cleanup that stops the
+ * interval and removes the focus listener.
  */
 export function startUpdater(intervalMs: number = DEFAULT_UPDATE_INTERVAL_MS): () => void {
-  if (started || !inTauri() || import.meta.env.DEV) return () => {};
+  // inTauri() short-circuits first, so window.location is safe to read here.
+  if (started || !inTauri() || import.meta.env.DEV || !isMainWindowSearch(window.location.search))
+    return () => {};
   started = true;
   void checkForUpdates();
   timer = setInterval(() => void checkForUpdates(), intervalMs);

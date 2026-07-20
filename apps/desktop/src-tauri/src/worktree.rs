@@ -717,6 +717,20 @@ pub fn create_worktree_at(
         // so the NEXT agent's cut and this branch's later refresh see a fresh tip. Held under the
         // per-repo lock so a background warm can't collide on index.lock.
         let base = effective_base(root, base_branch, false);
+        // `effective_base` guarantees a RESOLVABLE ref in every normal repo, but documents one
+        // terminal case where it hands back the logical name verbatim: an unborn HEAD / empty repo
+        // where nothing — not origin/<base>, a local branch, the detected default, nor even HEAD —
+        // resolves to a commit. Feeding that name straight to `git worktree add -b … <base>` dead-ends
+        // with a cryptic `fatal: invalid reference: main` (seen in the wild) that reads like a Sparkle
+        // bug and gives the user nothing to act on. Pre-check the cut point and, when it has no commit,
+        // return the actionable message `effective_base`'s own contract defers to the caller for.
+        if git(root, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")]).is_err() {
+            return Err(format!(
+                "Can't open an agent here: the base branch '{base}' has no commits yet, so there's \
+                 nothing to branch a workspace from. Make an initial commit in this repository, then \
+                 try again."
+            ));
+        }
         {
             let gl = repo_git_lock(root);
             let _lock = gl.lock().unwrap_or_else(|e| e.into_inner());
@@ -3230,6 +3244,31 @@ mod tests {
             git(&info.path, &["rev-parse", "HEAD"]).unwrap(),
             main_sha,
             "new branch descends from the detected default branch's tip"
+        );
+    }
+
+    // Degenerate but real: opening an agent in a freshly `git init`'d repo with NO commits (unborn
+    // HEAD). `effective_base` finds nothing resolvable and hands back the logical name verbatim, so
+    // the raw `git worktree add` used to dead-end with a cryptic `fatal: invalid reference: <name>`.
+    // Creation must instead fail with a clear, actionable message (and never leave a half-made tree).
+    #[test]
+    fn create_worktree_errors_clearly_in_an_unborn_repo() {
+        let root = unique_root("wt-unborn");
+        let r = root.to_str().unwrap().to_string();
+        git(&r, &["init", "-q"]).unwrap();
+        let app_data = unique_root("wt-unborn-appdata");
+
+        let err = match create_worktree_at(&r, "p1", "a1", "main", &app_data) {
+            Ok(_) => panic!("creation must fail when the repo has no commit to branch from"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("no commits yet"),
+            "error must explain the unborn-repo cause, got: {err}"
+        );
+        assert!(
+            !err.contains("invalid reference"),
+            "the cryptic raw-git error must not leak to the user, got: {err}"
         );
     }
 
