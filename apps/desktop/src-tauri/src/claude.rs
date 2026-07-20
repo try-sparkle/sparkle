@@ -199,9 +199,19 @@ fn scan_last_ai_title(file: &mut File, start: u64) -> Option<String> {
 }
 
 /// The freshest `ai-title` Claude Code wrote into a transcript. Claude Code appends
-/// `{"type":"ai-title","aiTitle":"…","sessionId":"…"}` lines as it summarizes the session from the
-/// FULL conversation (prompts, responses, attached images) — so the LAST one is its best current
-/// title for the work. Best-effort: any read/parse failure (or no title yet) yields None.
+/// `{"type":"ai-title","aiTitle":"…","sessionId":"…"}` lines throughout the session.
+///
+/// IMPORTANT — it does NOT re-summarize as the conversation grows. It derives the title on the
+/// first turn and then re-emits that SAME value verbatim on every subsequent line: measured across
+/// 58/58 real transcripts, every one had exactly ONE distinct title, and a 702-line session emitted
+/// it 39 times byte-identical from line 17 to line 691. So "latest" here means "the one title this
+/// session has", NOT "its current view of the work" — callers must treat it as a FIRST-TURN name
+/// that goes stale, not an authoritative running summary. (Naming used to assume the latter and
+/// let it permanently freeze an agent's name; see agentNaming.namingOutcome rung 1.)
+///
+/// Taking the last occurrence is still the right read — it costs nothing and stays correct if
+/// Claude Code ever does start refreshing the title. Best-effort: any read/parse failure (or no
+/// title yet) yields None.
 ///
 /// Reads only the final [`TAIL_SCAN_BYTES`] of a large transcript (the fast path), falling back to
 /// a full scan only when the window holds no title (a session whose title predates the window).

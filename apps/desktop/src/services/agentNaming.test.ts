@@ -212,16 +212,21 @@ describe("namingOutcome — labels the branch (Phase 2c observation, sparkle-rl8
     ).toBe("paid_haiku_fallback"); // worker spawn-time one-shot
   });
 
-  it("labels paid_haiku_fallback for exactly the ladder invariant: no aiTitle, not deferred, shouldRename", () => {
+  it("labels paid_haiku_fallback for exactly the ladder invariant: title yielded, not deferred, shouldRename", () => {
     // NOT a tautology: shouldHaikuName is DEFINED as namingOutcome(...) === "paid_haiku_fallback", so we
     // instead reconstruct the invariant from its independent parts — the two upstream guards (aiTitle /
     // first-turn defer) composed with the public shouldRename heuristic. This catches a divergence in how
     // namingOutcome composes the guards or delegates step 3.
+    //
+    // The aiTitle guard is no longer "any title blocks forever": a title only holds while it still
+    // describes the work, judged by the SAME shouldRename heuristic with the title as the basis (see
+    // namingOutcome rung 1 — Claude Code never refreshes the title, so a permanent block froze names).
+    // "Login Redirect Fix" overlaps the substantive prompt and still blocks; "Title" does not and yields.
     const kinds: NamingDecisionOpts["kind"][] = ["build", "worker", "think", "shell"];
     const prompts = ["fix the login redirect bug", "yes", "push to production", "ok"];
     for (const kind of kinds) {
       for (const namePinned of [false, true]) {
-        for (const aiTitle of [null, "Title"]) {
+        for (const aiTitle of [null, "Title", "Login Redirect Fix"]) {
           for (const autoNameBasis of [null, "add dark mode toggle"]) {
             for (const promptCount of [0, 1, 2, 3]) {
               for (const bypassFirstTurnDefer of [false, true]) {
@@ -237,8 +242,14 @@ describe("namingOutcome — labels the branch (Phase 2c observation, sparkle-rl8
                   };
                   const deferred =
                     !bypassFirstTurnDefer && isSelfNamingAgent({ kind }) && promptCount < 2;
+                  // Rung 1 only guards while the title is the live name (no autoNameBasis has
+                  // superseded it), and it yields exactly when the title stops describing the work.
+                  const titleYields =
+                    !aiTitle ||
+                    Boolean(autoNameBasis) ||
+                    shouldRename({ namePinned, autoNameBasis: aiTitle, prompt });
                   const expectedPaid =
-                    !aiTitle && !deferred && shouldRename({ namePinned, autoNameBasis, prompt });
+                    titleYields && !deferred && shouldRename({ namePinned, autoNameBasis, prompt });
                   expect(namingOutcome(opts) === "paid_haiku_fallback").toBe(expectedPaid);
                   // And shouldHaikuName stays wired to the same verdict.
                   expect(shouldHaikuName(opts)).toBe(expectedPaid);
@@ -317,6 +328,60 @@ describe("maybeAutoName — paid call gating for self-reporting agents", () => {
     seed(agentTab({ kind: "worker", aiTitle: "Login Redirect Fix", promptHistory: history(3) }));
     await maybeAutoName("p1", "a1", "fix the login redirect bug");
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  // Claude Code writes its ai-title ONCE, on the first turn, and repeats that same value verbatim
+  // for the rest of the session (verified across 58/58 real transcripts). So a stale title must not
+  // latch the name forever — when the work moves on, the paid fallback has to be reachable again.
+  it("aiTitle that no longer describes the work → DOES call generate_agent_name", async () => {
+    seed(
+      agentTab({
+        kind: "worker",
+        aiTitle: "Make YouTube videos full width of page",
+        promptHistory: history(3),
+      }),
+    );
+    await maybeAutoName("p1", "a1", "add a live archive count to the dock pill");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(useSelfReportMetrics.getState().namingOutcomes.paid_haiku_fallback).toBe(1);
+  });
+
+  // The other half of the seenAiTitle contract: the rename is allowed past the title it was DECIDED
+  // against, but a title that changes mid-flight means the decision was made on stale state and the
+  // fresh title must win. Without this the seenAiTitle check would be a pure widening of the guard.
+  it("a title that lands mid-flight beats the in-flight rename", async () => {
+    seed(
+      agentTab({
+        kind: "worker",
+        aiTitle: "Make YouTube videos full width of page",
+        promptHistory: history(3),
+      }),
+    );
+    // The naming call resolves only AFTER the title poll applied a different title.
+    invoke.mockImplementation(async () => {
+      useProjectStore.getState().applyAiTitle("p1", "a1", "A Newer Session Title");
+      return { title: "Dock Archive Count", description: "" };
+    });
+    await maybeAutoName("p1", "a1", "add a live archive count to the dock pill");
+    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === "a1")!;
+    expect(agent.name).toBe("A Newer Session Title"); // the fresh title, not the stale guess
+  });
+
+  it("a diverged-work rename actually lands over the stale aiTitle", async () => {
+    invoke.mockResolvedValue({ title: "Dock Archive Count", description: "" });
+    seed(
+      agentTab({
+        kind: "worker",
+        aiTitle: "Make YouTube videos full width of page",
+        promptHistory: history(3),
+      }),
+    );
+    await maybeAutoName("p1", "a1", "add a live archive count to the dock pill");
+    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === "a1")!;
+    expect(agent.name).toBe("Dock Archive Count");
+    // The title itself is retained so the 30s poll's dedupe keeps re-applying it as a no-op
+    // rather than clobbering the fresh name back to the stale title.
+    expect(agent.aiTitle).toBe("Make YouTube videos full width of page");
   });
 
   it("self-reporting worker that self-named (namePinned) → does NOT call generate_agent_name", async () => {

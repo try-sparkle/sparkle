@@ -90,9 +90,14 @@ export interface RenameOpts {
 /** The step-3 prompt heuristic (pin / thin / tactical / similarity), returning the LABEL for why it
  *  would (not) spend a naming call — the SINGLE source of truth both {@link shouldRename} and
  *  {@link namingOutcome} derive from, so the boolean decision and its observed label can never drift.
- *  `"rename"` means a paid call is warranted; `"self_named"` / `"skipped_thin"` are the two reasons to
- *  skip (an already-pinned name vs nothing worth naming). Pure. */
-function renameDecision(opts: RenameOpts): "self_named" | "skipped_thin" | "rename" {
+ *  `"rename"` means a paid call is warranted; the other three are reasons to skip: an already-pinned
+ *  name, nothing worth naming, or work that hasn't moved. `"unchanged_work"` is split out from
+ *  `"skipped_thin"` because the aiTitle rung needs to tell "this prompt says nothing" (keep the
+ *  title, no call) from "this prompt still matches the basis" (a genuine title win) — both collapse
+ *  back to `"skipped_thin"` at step 3, preserving the existing outcome labels. Pure. */
+type RenameVerdict = "self_named" | "skipped_thin" | "unchanged_work" | "rename";
+
+function renameDecision(opts: RenameOpts): RenameVerdict {
   const words = contentWords(opts.prompt);
   // An already-pinned name (self-report or user) wins — never re-name over it.
   if (opts.namePinned) return "self_named";
@@ -106,7 +111,7 @@ function renameDecision(opts: RenameOpts): "self_named" | "skipped_thin" | "rena
   // Otherwise only re-name when the work has clearly shifted.
   return similarity(words, contentWords(opts.autoNameBasis)) < RENAME_SIMILARITY_THRESHOLD
     ? "rename"
-    : "skipped_thin";
+    : "unchanged_work";
 }
 
 /** Exported for unit testing: should this prompt trigger a (re)naming call? Derives from the single
@@ -133,8 +138,11 @@ export function isSelfNamingAgent(agent: { kind: AgentKind }): boolean {
  * Decide whether to spend a paid Haiku `generate_agent_name` call for this submit. The ladder,
  * highest-precedence first:
  *
- *  1. `aiTitle` present → NO call. Claude Code's own session title is derived from the WHOLE
- *     conversation and is authoritative; the prompt-only Haiku name must never fight it.
+ *  1. `aiTitle` present AND still matching the prompt → NO call. Claude Code's own session title is
+ *     free and beats a thin first prompt, so it owns the name by default. But it is written ONCE on
+ *     the first turn and never refreshed (see namingOutcome), so it only holds while the work still
+ *     overlaps it; a clearly-shifted prompt falls through to the rungs below. Skipped entirely once
+ *     `autoNameBasis` is set, i.e. once a later name already superseded the title.
  *  2. Self-reporting agent (build/worker) on its FIRST prompt (promptCount < 2) → NO call. Give the
  *     agent its first prompt→response turn to name itself (rename_agent → namePinned) or emit an
  *     aiTitle. Eliminating this eager first-prompt call is the whole point of Phase 2a: we stop
@@ -171,14 +179,39 @@ export interface NamingDecisionOpts {
  * `shouldHaikuName` returns true, so the two never disagree (see the unit tests).
  *
  * The non-fallback branches partition the "no paid call" space:
- *  - `ai_title`          — Claude Code's own session title wins outright (ladder step 1).
+ *  - `ai_title`          — Claude Code's own session title holds, because the prompt still overlaps
+ *                          it (ladder step 1). It does NOT win outright: the title is first-turn-only
+ *                          and yields once the work has clearly shifted.
  *  - `deferred_first_turn` — a self-reporting build/worker's first prompt (ladder step 2).
  *  - `self_named`        — the agent pinned its own name (rename_agent) or the user did.
  *  - `skipped_thin`      — nothing worth a call: too-thin, tactical/ack-only, or work hasn't shifted.
  */
 export function namingOutcome(opts: NamingDecisionOpts): NamingOutcome {
-  // (1) Claude Code's whole-conversation title wins outright.
-  if (opts.aiTitle) return "ai_title";
+  // (1) Claude Code's session title wins — but only while it still describes the work.
+  //
+  //     It used to win OUTRIGHT, on the documented belief that Claude Code keeps re-summarizing the
+  //     full conversation so the newest `ai-title` always tracks the current work. It does not: it
+  //     writes the title once on the first turn and then re-emits that SAME value verbatim for the
+  //     rest of the session (58/58 real transcripts; one 702-line session emitted it 39 times,
+  //     byte-identical from line 17 to line 691). Combined with the unconditional short-circuit,
+  //     the first-turn title latched the name permanently — an agent that started on "Make YouTube
+  //     videos full width of page" still wore that name hours later while doing unrelated work,
+  //     and every skip was tallied as `ai_title`, i.e. reported as naming working correctly.
+  //
+  //     So the title now defends its own name the same way a Haiku name does: it holds while the
+  //     prompt still overlaps it, and yields once the work has clearly moved on. `autoNameBasis`
+  //     non-null means a later name already superseded the title — step 3 owns that case, and
+  //     reading the (stale) title here would fight it.
+  if (opts.aiTitle && !opts.autoNameBasis) {
+    const step1 = renameDecision({
+      namePinned: opts.namePinned,
+      autoNameBasis: opts.aiTitle, // the title IS the current name — judge divergence against it
+      prompt: opts.prompt,
+    });
+    // Still the right name (or nothing worth naming) → free win, no call. Only a clear work shift
+    // falls through to the rungs below.
+    if (step1 !== "rename") return step1 === "unchanged_work" ? "ai_title" : step1;
+  }
   // (2) A self-reporting agent hasn't had a chance to self-name on its first prompt — defer,
   //     unless this is the worker's one-shot spawn-time naming (see bypassFirstTurnDefer).
   if (!opts.bypassFirstTurnDefer && isSelfNamingAgent(opts) && opts.promptCount < 2) {
@@ -191,7 +224,10 @@ export function namingOutcome(opts: NamingDecisionOpts): NamingOutcome {
     autoNameBasis: opts.autoNameBasis,
     prompt: opts.prompt,
   });
-  return step3 === "rename" ? "paid_haiku_fallback" : step3;
+  if (step3 === "rename") return "paid_haiku_fallback";
+  // "unchanged_work" is an internal split used by rung 1; at step 3 it collapses back into
+  // "skipped_thin" so the outcome labels (and their telemetry) are unchanged.
+  return step3 === "unchanged_work" ? "skipped_thin" : step3;
 }
 
 export function shouldHaikuName(opts: NamingDecisionOpts): boolean {
@@ -255,8 +291,12 @@ export async function maybeAutoName(
     // description on hover.
     const canonical = name?.title?.trim();
     if (canonical) {
-      // Re-check pinned state at apply time — the user may have renamed mid-flight.
-      useProjectStore.getState().autoRenameAgent(projectId, agentId, canonical, prompt, name);
+      // Re-check pinned state at apply time — the user may have renamed mid-flight. Pass the
+      // aiTitle this decision was made against so the store can distinguish "we deliberately
+      // renamed past a stale title" from "a title landed while we were in flight" (the latter wins).
+      useProjectStore
+        .getState()
+        .autoRenameAgent(projectId, agentId, canonical, prompt, name, agent.aiTitle ?? null);
     }
   } catch (e) {
     // No API key, offline, or model hiccup — keep the existing name silently.

@@ -133,6 +133,10 @@ export interface ProjectState {
     name: string,
     basis: string,
     autoName?: AgentName | null,
+    /** The `aiTitle` the caller's naming decision was made against. The store applies the rename
+     *  only if the agent's title still matches it — see the implementation for why this replaces a
+     *  blanket "never overwrite an aiTitle" guard. */
+    seenAiTitle?: string | null,
   ) => void;
   /** Apply Claude Code's session title (`ai-title`) as the authoritative auto-name. No-op if the
    *  user has pinned the name, the title is empty, or it's already applied. Supersedes any
@@ -923,16 +927,24 @@ export const useProjectStore = create<ProjectState>()(
           ),
         })),
 
-      autoRenameAgent: (projectId, agentId, name, basis, autoName) =>
+      autoRenameAgent: (projectId, agentId, name, basis, autoName, seenAiTitle) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) =>
-              // Respect a pinned name (manual), a self-chosen name (sparkle-control rename_agent), AND
-              // a Claude Code session title (authoritative). The aiTitle check makes the STORE the
-              // single arbiter of precedence, closing the race where an in-flight Haiku call (started
-              // before a title existed) resolves AFTER the title poll applied one — without it, the
-              // stale guess would clobber the title.
-              a.namePinned || a.selfNamed || a.aiTitle || !name.trim()
+              // Respect a pinned name (manual) and a self-chosen name (sparkle-control rename_agent).
+              //
+              // The aiTitle rule is narrower than "a title always wins". It exists to close ONE race:
+              // a Haiku call that started before any title existed, resolving AFTER the title poll
+              // applied one — there the stale guess must not clobber the fresh title. But an agent
+              // whose work has moved on from a first-turn title has legitimately earned a re-name
+              // (agentNaming rung 1), and a blanket guard silently swallowed it.
+              //
+              // Both cases are told apart by whether the title CHANGED under the caller: compare the
+              // title the decision was made against with the one on the agent now. Equal (including
+              // both absent) → the caller knew the current state, apply. Different → a title landed
+              // or changed mid-flight, so this name is stale, bail. Callers that pass nothing keep
+              // the old strict behavior: any existing title blocks them.
+              a.namePinned || a.selfNamed || !name.trim() || (a.aiTitle ?? null) !== (seenAiTitle ?? null)
                 ? a
                 : { ...a, name: name.trim(), autoNameBasis: basis, autoNameVariants: autoName ?? null },
             ),
