@@ -7,11 +7,34 @@
 // delivered across separate WKWebViews); we also write storage so dev/tests fan out via `storage`.
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AGENT_STATUS } from "@sparkle/ui";
-import { isWindowOpen, defaultStore, WINDOW_REGISTRY_KEY, type KV } from "./windowRegistry";
+import {
+  isWindowOpen,
+  openWindowLabels,
+  removeKey,
+  allKeys,
+  defaultStore,
+  WINDOW_REGISTRY_KEY,
+  type KV,
+} from "./windowRegistry";
 import { safeUnlisten } from "./safeUnlisten";
 import type { AgentTabStatus } from "../types";
 
+/** LEGACY single-blob key. Every window used to read-modify-write this ONE map, which is not atomic
+ *  across separate WKWebViews — so a publish could drop another window's entry or resurrect one it
+ *  had just deleted, and nothing ever corrected it (sparkle-csq2). Kept only so resetWindowStatus
+ *  can clear a blob left by an older build. */
 export const WINDOW_STATUS_KEY = "sparkle-window-status";
+
+/** Per-window key prefix: each window owns `sparkle-window-status:<label>` and writes ONLY that key.
+ *  There is no shared map to read-modify-write, so the lost-update race is gone BY CONSTRUCTION —
+ *  a heartbeat would only have masked it. Readers enumerate the open windows (windowRegistry) and
+ *  read each one's key. */
+export const WINDOW_STATUS_KEY_PREFIX = "sparkle-window-status:";
+
+/** This window's own status key. */
+export function windowStatusKey(label: string): string {
+  return `${WINDOW_STATUS_KEY_PREFIX}${label}`;
+}
 export const STATUS_CHANGED_EVENT = "sparkle://status-changed";
 
 const inTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -65,19 +88,28 @@ function sinceOf(since: unknown): number {
   return typeof since === "number" && Number.isFinite(since) ? since : 0;
 }
 
-function readMap(store: KV): WindowStatusMap {
+/** Read ONE window's entry. Returns null when absent, empty (the removeItem-less shim writes ""),
+ *  or malformed. */
+function readEntry(store: KV, label: string): WindowStatusEntry | null {
   try {
-    const raw = store.getItem(WINDOW_STATUS_KEY);
-    if (!raw) return {};
+    const raw = store.getItem(windowStatusKey(label));
+    if (!raw) return null;
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? (parsed as WindowStatusMap) : {};
+    return parsed && typeof parsed === "object" ? (parsed as WindowStatusEntry) : null;
   } catch {
-    return {};
+    return null;
   }
 }
 
-function writeMap(store: KV, map: WindowStatusMap): void {
-  store.setItem(WINDOW_STATUS_KEY, JSON.stringify(map));
+/** Read every OPEN window's entry as the map shape the readers below expect. The open-window set
+ *  comes from the windowRegistry, so a crashed window's leftover key is never surfaced. */
+function readMap(store: KV): WindowStatusMap {
+  const out: WindowStatusMap = {};
+  for (const label of openWindowLabels(store)) {
+    const entry = readEntry(store, label);
+    if (entry) out[label] = entry;
+  }
+  return out;
 }
 
 // The "needs your attention" (RED) statuses are exactly those whose AGENT_STATUS color is the brand
@@ -127,25 +159,23 @@ export function publishWindowRedAgents(
   redAgents: WindowRedAgent[],
   store: KV = defaultStore(),
 ): void {
-  const map = readMap(store);
+  // Touches ONLY this window's key — never another window's data, so there is nothing to lose.
   if (redAgents.length === 0) {
-    if (!(label in map)) return; // nothing to change, skip the write + broadcast
-    delete map[label];
+    if (readEntry(store, label) === null) return; // nothing to change, skip the write + broadcast
+    removeKey(store, windowStatusKey(label));
   } else {
-    map[label] = { projectId, projectName, agents: redAgents };
+    store.setItem(
+      windowStatusKey(label),
+      JSON.stringify({ projectId, projectName, agents: redAgents } satisfies WindowStatusEntry),
+    );
   }
-  writeMap(store, map);
   scheduleEmit();
 }
 
 /** Remove THIS window's entry and broadcast immediately. Called on window unload, so we flush the
  *  emit rather than leaving it on a debounce timer the closing window may never run. */
 export function clearWindowStatus(label: string, store: KV = defaultStore()): void {
-  const map = readMap(store);
-  if (label in map) {
-    delete map[label];
-    writeMap(store, map);
-  }
+  if (readEntry(store, label) !== null) removeKey(store, windowStatusKey(label));
   emitNow();
 }
 
@@ -154,7 +184,16 @@ export function clearWindowStatus(label: string, store: KV = defaultStore()): vo
  *  exist. Cold-start-ONLY: it runs before any other window exists, so — like resetWindowRegistry —
  *  it deliberately does not emit; there is no other window to notify. */
 export function resetWindowStatus(store: KV = defaultStore()): void {
-  store.setItem(WINDOW_STATUS_KEY, "{}");
+  // Sweep by PREFIX, not by the registry: this runs after a hard crash, which may also have left
+  // the registry empty/stale — keying the wipe off registered labels would then orphan exactly the
+  // ghost entries this exists to clear. Fall back to the registry only if the KV can't enumerate.
+  const keys = allKeys(store);
+  if (keys) {
+    for (const k of keys) if (k.startsWith(WINDOW_STATUS_KEY_PREFIX)) removeKey(store, k);
+  } else {
+    for (const label of openWindowLabels(store)) removeKey(store, windowStatusKey(label));
+  }
+  removeKey(store, WINDOW_STATUS_KEY); // drop a legacy shared blob from an older build
 }
 
 // waiting/approval (the user is actively blocking) rank before errored (a crash to triage).
@@ -265,7 +304,13 @@ export function readOtherWindowsRedGroups(
 export function subscribeWindowStatus(onChange: () => void): () => void {
   if (typeof window === "undefined") return () => {};
   const onStorage = (e: StorageEvent) => {
-    if (e.key === WINDOW_STATUS_KEY || e.key === WINDOW_REGISTRY_KEY || e.key === null) onChange();
+    if (
+      e.key === null ||
+      e.key === WINDOW_REGISTRY_KEY ||
+      e.key === WINDOW_STATUS_KEY ||
+      e.key.startsWith(WINDOW_STATUS_KEY_PREFIX)
+    )
+      onChange();
   };
   window.addEventListener("storage", onStorage);
   // Keep the listen() promise; safeUnlisten awaits it on cleanup so a listener that resolves AFTER

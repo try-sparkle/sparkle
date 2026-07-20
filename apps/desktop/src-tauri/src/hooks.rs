@@ -311,11 +311,23 @@ pub fn heal_agent_hooks(app: AppHandle) -> Result<u32, String> {
     )
 }
 
+/// Hard cap on how many bytes ONE poll may pull off disk.
+///
+/// Without it a single poll read the whole remaining log with `read_to_end`, then copied it again
+/// via `from_utf8_lossy`, again into a `Vec<String>`, and a fourth time through serde over the IPC —
+/// ~4x the file size, transiently, ON THE MAIN THREAD. With a 100 MB accumulated log that is a
+/// multi-hundred-MB spike per poll. 1 MiB is far more than a 500 ms tick can legitimately produce,
+/// so in normal operation the cap never engages; it only bounds the pathological case.
+pub const MAX_READ_BYTES: u64 = 1024 * 1024;
+
 /// A batch of newly-appended event-log lines plus the byte offset to resume from.
 #[derive(serde::Serialize)]
 pub struct EventsChunk {
     pub lines: Vec<String>,
     pub offset: u64,
+    /// True when this poll hit `MAX_READ_BYTES` and more data is already waiting at `offset`. The
+    /// watcher uses it to poll again immediately instead of idling a full interval while behind.
+    pub truncated: bool,
 }
 
 /// Incrementally read complete (newline-terminated) lines from the event log starting at byte
@@ -349,29 +361,42 @@ fn log_path_within(base: &Path, log_path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `skip_existing` (optional, defaults false): jump straight to EOF and return an empty batch.
+/// A pane mounting on an agent with a large accumulated log wants only NEW events; doing that
+/// server-side means we stat the file and return, instead of reading and discarding megabytes.
 #[tauri::command]
-pub fn read_events_since(app: AppHandle, log_path: String, offset: u64) -> Result<EventsChunk, String> {
+pub fn read_events_since(
+    app: AppHandle,
+    log_path: String,
+    offset: u64,
+    skip_existing: Option<bool>,
+) -> Result<EventsChunk, String> {
+    let skip = skip_existing.unwrap_or(false);
     // Confine reads to <app_data>/hook-events so a compromised renderer can't turn this into an
     // arbitrary-file read oracle. The legit path is always <app_data>/hook-events/<agentId>.jsonl.
     let base = match crate::dev_identity::app_data_dir(&app).map(|d| d.join("hook-events")) {
         Ok(b) => b,
-        Err(_) => return Ok(EventsChunk { lines: vec![], offset }),
+        Err(_) => return Ok(EventsChunk { lines: vec![], offset, truncated: false }),
     };
     match base.canonicalize() {
         // hook-events dir not created yet → no events are possible; report an empty batch.
-        Err(_) => Ok(EventsChunk { lines: vec![], offset }),
+        Err(_) => Ok(EventsChunk { lines: vec![], offset, truncated: false }),
         Ok(canon_base) if log_path_within(&canon_base, &log_path) => {
-            read_events_since_impl(Path::new(&log_path), offset)
+            read_events_since_impl(Path::new(&log_path), offset, skip)
         }
         Ok(_) => Err("read_events_since: log_path is outside the managed hook-events dir".into()),
     }
 }
 
-pub fn read_events_since_impl(path: &Path, mut offset: u64) -> Result<EventsChunk, String> {
+pub fn read_events_since_impl(
+    path: &Path,
+    mut offset: u64,
+    skip_existing: bool,
+) -> Result<EventsChunk, String> {
     let mut f = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(EventsChunk { lines: vec![], offset });
+            return Ok(EventsChunk { lines: vec![], offset, truncated: false });
         }
         Err(e) => return Err(format!("open log: {e}")),
     };
@@ -379,19 +404,36 @@ pub fn read_events_since_impl(path: &Path, mut offset: u64) -> Result<EventsChun
     if offset > len {
         offset = 0; // file was truncated/rotated — restart from the top
     }
+    // Seek-to-EOF fast path: the caller only wants events from here on, so skip the backlog without
+    // ever reading it. This is what keeps a pane mount O(1) instead of O(size of the whole log).
+    if skip_existing {
+        return Ok(EventsChunk { lines: vec![], offset: len, truncated: false });
+    }
     f.seek(SeekFrom::Start(offset))
         .map_err(|e| format!("seek log: {e}"))?;
-    let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes)
+    // Bounded read (see MAX_READ_BYTES): never pull an unbounded amount onto the main thread.
+    let available = len - offset;
+    let truncated = available > MAX_READ_BYTES;
+    let to_read = if truncated { MAX_READ_BYTES } else { available };
+    let mut bytes = Vec::with_capacity(to_read as usize);
+    Read::by_ref(&mut f)
+        .take(to_read)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("read log: {e}"))?;
     // Consume only through the last newline; the emitter appends whole lines atomically, so the
     // remainder (if any) is a write in progress — leave it for the next poll. Counting bytes (not
     // chars) keeps the offset exact regardless of content.
-    let consumed = bytes
+    let mut consumed = bytes
         .iter()
         .rposition(|&b| b == b'\n')
         .map(|i| i + 1)
         .unwrap_or(0);
+    // A capped read with NO newline in it means a single line longer than the cap (corruption, or
+    // an enormous tool payload). Advancing by 0 here would re-read the same block forever and wedge
+    // the watcher, so consume the whole block and drop the unusable fragment.
+    if consumed == 0 && truncated {
+        consumed = bytes.len();
+    }
     // Lossy decode so a stray non-UTF-8 byte (corruption, external tampering) can't error and
     // wedge the reader re-reading the same tail forever — the offset still advances past it.
     // Our emitter only ever writes UTF-8, so this is belt-and-suspenders.
@@ -404,6 +446,7 @@ pub fn read_events_since_impl(path: &Path, mut offset: u64) -> Result<EventsChun
     Ok(EventsChunk {
         lines,
         offset: offset + consumed as u64,
+        truncated,
     })
 }
 
@@ -643,9 +686,10 @@ mod tests {
     fn missing_log_yields_empty_batch_at_same_offset() {
         let p = temp_log("missing");
         let _ = std::fs::remove_file(&p);
-        let chunk = read_events_since_impl(&p, 0).unwrap();
+        let chunk = read_events_since_impl(&p, 0, false).unwrap();
         assert!(chunk.lines.is_empty());
         assert_eq!(chunk.offset, 0);
+        assert!(!chunk.truncated);
     }
 
     #[test]
@@ -654,15 +698,129 @@ mod tests {
         // Two complete lines plus a partial third (no trailing newline yet).
         std::fs::write(&p, "{\"event\":\"PreToolUse\"}\n{\"event\":\"Stop\"}\n{\"event\":\"Pa")
             .unwrap();
-        let first = read_events_since_impl(&p, 0).unwrap();
+        let first = read_events_since_impl(&p, 0, false).unwrap();
         assert_eq!(first.lines.len(), 2);
         assert_eq!(first.lines[1], "{\"event\":\"Stop\"}");
 
         // Emitter finishes the partial line; resuming from the prior offset yields just it.
         std::fs::write(&p, "{\"event\":\"PreToolUse\"}\n{\"event\":\"Stop\"}\n{\"event\":\"Partial\"}\n")
             .unwrap();
-        let second = read_events_since_impl(&p, first.offset).unwrap();
+        let second = read_events_since_impl(&p, first.offset, false).unwrap();
         assert_eq!(second.lines, vec!["{\"event\":\"Partial\"}".to_string()]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Build a log of `n` identical whole lines; returns (path, line_len).
+    fn write_lines(p: &Path, n: usize) -> usize {
+        let line = "{\"event\":\"Stop\",\"tool\":\"Bash\"}\n";
+        let mut s = String::with_capacity(line.len() * n);
+        for _ in 0..n {
+            s.push_str(line);
+        }
+        std::fs::write(p, &s).unwrap();
+        line.len()
+    }
+
+    #[test]
+    fn caps_a_single_read_at_max_read_bytes_and_flags_truncation() {
+        // The unbounded-read fix: one poll must never pull more than MAX_READ_BYTES off disk,
+        // however far behind the reader is.
+        let p = temp_log("cap");
+        let line_len = write_lines(&p, (MAX_READ_BYTES as usize / 30) * 3); // comfortably over the cap
+        let total = std::fs::metadata(&p).unwrap().len();
+        assert!(total > MAX_READ_BYTES, "fixture must exceed the cap");
+
+        let first = read_events_since_impl(&p, 0, false).unwrap();
+        assert!(first.truncated, "more data remains, so the flag is set");
+        assert!(
+            first.offset <= MAX_READ_BYTES,
+            "consumed {} bytes, over the {MAX_READ_BYTES} cap",
+            first.offset
+        );
+        // Truncation lands on a LINE boundary — every line handed out is whole and parseable.
+        assert_eq!(first.offset as usize % line_len, 0);
+        for l in &first.lines {
+            serde_json::from_str::<Value>(l).expect("no partial line escaped the cap");
+        }
+
+        // Resuming drains the rest, and the final chunk is not flagged truncated.
+        let mut offset = first.offset;
+        let mut guard = 0;
+        loop {
+            let c = read_events_since_impl(&p, offset, false).unwrap();
+            offset = c.offset;
+            guard += 1;
+            assert!(guard < 100, "draining must terminate");
+            if !c.truncated {
+                break;
+            }
+        }
+        assert_eq!(offset, total, "every byte is eventually consumed exactly once");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_single_line_longer_than_the_cap_does_not_wedge_the_reader() {
+        // Pathological: no newline within the capped block. Consuming 0 bytes would re-read the
+        // same block forever. The reader must advance instead of spinning.
+        let p = temp_log("hugeline");
+        let mut data = vec![b'x'; (MAX_READ_BYTES + 4096) as usize];
+        data.push(b'\n');
+        std::fs::write(&p, &data).unwrap();
+
+        let c = read_events_since_impl(&p, 0, false).unwrap();
+        assert!(c.truncated);
+        assert!(c.offset > 0, "offset must advance past an over-long line, not stall at 0");
+        assert_eq!(c.offset, MAX_READ_BYTES);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn skip_existing_seeks_to_eof_without_reading_the_backlog() {
+        // The pane-mount path. Previously the frontend started at offset 0 and read the ENTIRE
+        // accumulated log on every mount, discarding it JS-side. Server-side skip returns EOF.
+        let p = temp_log("skip");
+        write_lines(&p, 50_000); // ~1.5 MB: more than one capped read could drain
+        let total = std::fs::metadata(&p).unwrap().len();
+        assert!(total > MAX_READ_BYTES, "backlog must be big enough that reading it would be the bug");
+
+        let c = read_events_since_impl(&p, 0, true).unwrap();
+        assert!(c.lines.is_empty(), "no backlog is dispatched");
+        assert_eq!(c.offset, total, "and we resume from the true end of file");
+        assert!(!c.truncated, "nothing was truncated — nothing was read");
+
+        // Events appended after the skip ARE delivered, from the skipped offset.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        use std::io::Write;
+        f.write_all(b"{\"event\":\"Fresh\"}\n").unwrap();
+        let next = read_events_since_impl(&p, c.offset, false).unwrap();
+        assert_eq!(next.lines, vec!["{\"event\":\"Fresh\"}".to_string()]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn skip_existing_on_a_missing_log_stays_at_the_caller_offset() {
+        let p = temp_log("skipmissing");
+        let _ = std::fs::remove_file(&p);
+        let c = read_events_since_impl(&p, 0, true).unwrap();
+        assert!(c.lines.is_empty());
+        assert_eq!(c.offset, 0);
+    }
+
+    #[test]
+    fn an_exactly_cap_sized_read_is_not_flagged_truncated() {
+        // Boundary: available == MAX_READ_BYTES means everything fit; the flag must stay false so
+        // the watcher doesn't spin an extra immediate poll for nothing.
+        let p = temp_log("boundary");
+        let mut data = vec![b'x'; (MAX_READ_BYTES - 1) as usize];
+        data.push(b'\n');
+        assert_eq!(data.len() as u64, MAX_READ_BYTES);
+        std::fs::write(&p, &data).unwrap();
+
+        let c = read_events_since_impl(&p, 0, false).unwrap();
+        assert!(!c.truncated, "exactly-at-cap is complete, not truncated");
+        assert_eq!(c.offset, MAX_READ_BYTES);
+        assert_eq!(c.lines.len(), 1);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -695,7 +853,7 @@ mod tests {
         let mut data = b"{\"event\":\"Stop\"}\n".to_vec();
         data.extend_from_slice(b"{\"event\":\"\xFFx\"}\n");
         std::fs::write(&p, &data).unwrap();
-        let chunk = read_events_since_impl(&p, 0).unwrap();
+        let chunk = read_events_since_impl(&p, 0, false).unwrap();
         // Both complete lines are returned (the bad byte is replaced, not fatal) and the offset
         // advances past everything so the next poll won't re-read the corrupt tail.
         assert_eq!(chunk.lines.len(), 2);
@@ -708,7 +866,7 @@ mod tests {
         let p = temp_log("rotated");
         std::fs::write(&p, "{\"event\":\"Stop\"}\n").unwrap();
         // Offset past a now-smaller file (rotated/cleared) → re-read from the top.
-        let chunk = read_events_since_impl(&p, 9999).unwrap();
+        let chunk = read_events_since_impl(&p, 9999, false).unwrap();
         assert_eq!(chunk.lines, vec!["{\"event\":\"Stop\"}".to_string()]);
         let _ = std::fs::remove_file(&p);
     }

@@ -8,7 +8,31 @@ export const WINDOW_REGISTRY_KEY = "sparkle-window-projects";
 export type KV = {
   getItem(k: string): string | null;
   setItem(k: string, v: string): void;
+  /** Optional: real localStorage has it, minimal test/SSR shims may not. Callers that need to
+   *  delete a key should go through `removeKey` below, which falls back to writing "" (read paths
+   *  already treat an empty value as absent). */
+  removeItem?(k: string): void;
+  /** Optional enumeration — real Storage has both; minimal shims may not. Only prefix sweeps need it. */
+  key?(i: number): string | null;
+  readonly length?: number;
 };
+
+/** Every key currently in the store, or null when this KV can't enumerate. */
+export function allKeys(store: KV): string[] | null {
+  if (typeof store.key !== "function" || typeof store.length !== "number") return null;
+  const out: string[] = [];
+  for (let i = 0; i < store.length; i++) {
+    const k = store.key(i);
+    if (k != null) out.push(k);
+  }
+  return out;
+}
+
+/** Delete a key, tolerating a KV shim without removeItem. */
+export function removeKey(store: KV, key: string): void {
+  if (typeof store.removeItem === "function") store.removeItem(key);
+  else store.setItem(key, "");
+}
 
 /** The localStorage-backed KV, with a no-op fallback for non-browser (test/SSR) environments.
  *  Shared by the sibling windowStatus channel so the two key off the same storage. */
@@ -82,6 +106,12 @@ export function resetWindowRegistry(store: KV = defaultStore()): void {
  *  window now shows (after a crash + "Replace") isn't mistaken for this label still being open. */
 export function isWindowOpen(label: string, store: KV = defaultStore()): boolean {
   return label in read(store);
+}
+
+/** Labels of every currently-registered (open) window. The sibling windowStatus channel enumerates
+ *  these to find each window's own status key, instead of everyone sharing one blob (sparkle-csq2). */
+export function openWindowLabels(store: KV = defaultStore()): string[] {
+  return Object.keys(read(store));
 }
 
 export function findWindowForProject(projectId: string, store: KV = defaultStore()): string | null {

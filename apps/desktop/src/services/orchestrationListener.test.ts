@@ -77,7 +77,7 @@ describe("orchestrationListener", () => {
     // Reset the store so projects don't accumulate across tests (liveWorkerCount scans all of them).
     useProjectStore.setState({ projects: [], selectedProjectId: null });
     useRuntimeStore.setState({ openAgentIds: [] });
-    useSettingsStore.setState({ maxConcurrentWorkers: 4 });
+    useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 20 });
     scanWorkerManifestsMock.mockReset();
     scanWorkerManifestsMock.mockResolvedValue([]); // default: nothing on disk to reconcile
     const store = useProjectStore.getState();
@@ -237,6 +237,21 @@ describe("orchestrationListener", () => {
     expect(spinDownWorkerMock).not.toHaveBeenCalled();
     const [, args] = invokeMock.mock.calls.at(-1)!;
     expect((args as { result: { error?: string } }).result.error).toMatch(/not owned/i);
+  });
+
+  it("queues spawns past the RAM-derived cap even when the configured cap is higher (sparkle-01xv)", async () => {
+    // The P0 blowup: the machine only has RAM for 1 agent, but the user configured 4. Spawning to
+    // the configured number is what put 24 agents × ~4 GiB on one Mac and got system daemons
+    // jetsam-killed. The gate must honor whichever cap is lower.
+    useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 1 });
+    fire({ reqId: "m1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "first" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+    invokeMock.mockClear();
+    fire({ reqId: "m2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "second" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // held at the RAM cap, not the configured 4
+    expect(invokeMock).not.toHaveBeenCalled(); // m2's reply deferred until a slot frees
   });
 
   it("queues spawns past the cap, then releases one when a slot frees via spin_down", async () => {

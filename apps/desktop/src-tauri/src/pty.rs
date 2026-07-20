@@ -214,6 +214,45 @@ fn guard_resize_size(id: &str, cols: u16, rows: u16) -> (u16, u16) {
     (c, r)
 }
 
+/// Build the `NODE_OPTIONS` value for an agent's PTY child, merging our per-agent V8 heap cap into
+/// whatever the user already has. Returns None when nothing should be set.
+///
+/// Why this exists (sparkle-01xv / sparkle-asz5): V8's default old-space ceiling is ~4 GiB, so a
+/// runaway agent grows until the KERNEL intervenes. On 2026-07-20 that was 24 `claude` subprocesses
+/// at ~4 GiB each — 99 GiB — and jetsam killed `securityd_system`/`trustd`, forcing a reboot. An
+/// explicit `--max-old-space-size` gives each agent a ceiling we choose instead of one Node picks.
+///
+/// Merge rules, in order:
+///   - `heap_mb == 0` → opt-out: return None and leave the child's inherited env untouched.
+///   - the user already pinned a heap size → their value wins verbatim (a deliberate choice, and
+///     appending a second flag would just be confusing).
+///   - otherwise → append our flag after theirs, so their `--require` shims / source maps / proxy
+///     settings all survive. NODE_OPTIONS is a flag string, not a path list: last flag wins, so
+///     appending is also what makes ours authoritative when nothing conflicts.
+fn node_options_with_cap(existing: Option<&str>, heap_mb: u32) -> Option<String> {
+    if heap_mb == 0 {
+        return None;
+    }
+    let existing = existing.unwrap_or("").trim();
+    if existing.is_empty() {
+        return Some(format!("--max-old-space-size={heap_mb}"));
+    }
+    // Node accepts both `-` and `_` spellings, with `=` or a space before the value.
+    let normalized = existing.replace('_', "-");
+    if normalized.contains("--max-old-space-size") {
+        return Some(existing.to_string());
+    }
+    Some(format!("{existing} --max-old-space-size={heap_mb}"))
+}
+
+/// Apply the per-agent heap cap to a command about to be spawned in a PTY. `inherited` is the
+/// user's own `NODE_OPTIONS` (from our process env, which the child inherits).
+fn apply_heap_cap(cmd: &mut CommandBuilder, inherited: Option<String>, heap_mb: u32) {
+    if let Some(v) = node_options_with_cap(inherited.as_deref(), heap_mb) {
+        cmd.env("NODE_OPTIONS", v);
+    }
+}
+
 /// The `Send` pieces `pty_spawn`'s blocking setup hands back to the async side: the session to
 /// insert into the manager, plus the child's output reader and the child itself (each reaped on
 /// its own thread).
@@ -253,6 +292,8 @@ pub async fn pty_spawn(
     // return the session pieces (+ reader/child) and finish the cheap wiring (map insert, thread
     // spawns) back on the async side.
     let spawn_app = app.clone();
+    // Read the configured per-agent heap cap once, on this side of the thread hop.
+    let heap_mb = crate::config::current_effective().config.workers.agent_heap_mb;
     let (session, reader, child) = tauri::async_runtime::spawn_blocking(
         move || -> Result<SpawnedPty, String> {
             let validated_cwd = validate_spawn(&spawn_app, &command, cwd.as_deref())?;
@@ -269,6 +310,10 @@ pub async fn pty_spawn(
             // TUIs emit their normal palette. (env() overrides on top of the inherited env.)
             cmd.env("TERM", "xterm-256color");
             cmd.env("COLORTERM", "truecolor");
+            // Bound the child's V8 heap so a runaway agent can't run itself up to Node's ~4 GiB
+            // default ceiling (sparkle-01xv). Merges with — never clobbers — a NODE_OPTIONS the
+            // user already set; see node_options_with_cap.
+            apply_heap_cap(&mut cmd, std::env::var("NODE_OPTIONS").ok(), heap_mb);
             // Spawn into the *validated, canonicalized* cwd (not the original string), so a symlink
             // swap between check and use can't redirect the working dir outside the worktrees tree.
             if let Some(dir) = validated_cwd {
@@ -531,9 +576,11 @@ pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_writer, guard_resize_size, guard_spawn_size, validate_spawn_inner, PauseState,
-        PtyManager, PtySession, MIN_PTY_COLS, MIN_PTY_ROWS, SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
+        acquire_writer, apply_heap_cap, guard_resize_size, guard_spawn_size, node_options_with_cap,
+        validate_spawn_inner, PauseState, PtyManager, PtySession, MIN_PTY_COLS, MIN_PTY_ROWS,
+        SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
     };
+    use portable_pty::CommandBuilder;
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -562,6 +609,79 @@ mod tests {
         // And the recovered guard still points at a usable HashMap.
         let len = manager.sessions.lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(len, 0);
+    }
+
+    // ── per-agent V8 heap cap (sparkle-01xv / sparkle-asz5) ───────────────────────────────
+    // On 2026-07-20 the kernel JetsamEvent reports showed 24 `claude` subprocesses each grown to
+    // ~4 GiB — V8's DEFAULT heap ceiling — summing to 99 GiB and killing the machine. Every agent
+    // PTY child now spawns with an explicit `--max-old-space-size`, so a runaway agent hits OUR
+    // ceiling long before it hits Node's.
+
+    #[test]
+    fn node_options_sets_the_cap_when_the_user_has_none() {
+        assert_eq!(node_options_with_cap(None, 3072).as_deref(), Some("--max-old-space-size=3072"));
+        // An empty inherited value is the same as absent (no leading space in the result).
+        assert_eq!(node_options_with_cap(Some(""), 3072).as_deref(), Some("--max-old-space-size=3072"));
+        assert_eq!(
+            node_options_with_cap(Some("   "), 3072).as_deref(),
+            Some("--max-old-space-size=3072")
+        );
+    }
+
+    #[test]
+    fn node_options_appends_to_a_users_existing_value_instead_of_clobbering_it() {
+        // The user's flags MUST survive — NODE_OPTIONS is commonly used for --require shims,
+        // --enable-source-maps, proxy certs, etc. Clobbering it would silently break their setup.
+        let got = node_options_with_cap(Some("--enable-source-maps"), 3072);
+        assert_eq!(got.as_deref(), Some("--enable-source-maps --max-old-space-size=3072"));
+    }
+
+    #[test]
+    fn node_options_lets_an_explicit_user_heap_size_win() {
+        // If the user already pinned a heap size, that's a deliberate choice — leave it alone
+        // rather than appending a second (conflicting) flag.
+        let got = node_options_with_cap(Some("--max-old-space-size=8192"), 3072);
+        assert_eq!(got.as_deref(), Some("--max-old-space-size=8192"));
+        // ...including the `=`-less and mid-string spellings.
+        let got = node_options_with_cap(Some("--enable-source-maps --max-old-space-size 8192"), 3072);
+        assert_eq!(got.as_deref(), Some("--enable-source-maps --max-old-space-size 8192"));
+        let got = node_options_with_cap(Some("--max_old_space_size=8192"), 3072);
+        assert_eq!(got.as_deref(), Some("--max_old_space_size=8192"));
+    }
+
+    #[test]
+    fn node_options_is_left_alone_when_the_cap_is_disabled() {
+        // agent_heap_mb = 0 is the documented escape hatch: no cap, and no NODE_OPTIONS churn.
+        assert_eq!(node_options_with_cap(None, 0), None);
+        assert_eq!(node_options_with_cap(Some("--enable-source-maps"), 0), None);
+    }
+
+    #[test]
+    fn apply_heap_cap_sets_node_options_on_the_spawned_command() {
+        let mut cmd = CommandBuilder::new("/bin/echo");
+        apply_heap_cap(&mut cmd, None, 3072);
+        assert_eq!(
+            cmd.get_env("NODE_OPTIONS").and_then(|v| v.to_str()),
+            Some("--max-old-space-size=3072")
+        );
+    }
+
+    #[test]
+    fn apply_heap_cap_merges_the_inherited_value_onto_the_spawned_command() {
+        let mut cmd = CommandBuilder::new("/bin/echo");
+        apply_heap_cap(&mut cmd, Some("--enable-source-maps".into()), 3072);
+        assert_eq!(
+            cmd.get_env("NODE_OPTIONS").and_then(|v| v.to_str()),
+            Some("--enable-source-maps --max-old-space-size=3072")
+        );
+    }
+
+    #[test]
+    fn apply_heap_cap_touches_nothing_when_disabled() {
+        let mut cmd = CommandBuilder::new("/bin/echo");
+        apply_heap_cap(&mut cmd, Some("--enable-source-maps".into()), 0);
+        // Not set on the builder at all — the child inherits the user's env untouched.
+        assert_eq!(cmd.get_env("NODE_OPTIONS"), None);
     }
 
     // ── thin-column backstop ──────────────────────────────────────────────────────────────

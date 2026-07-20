@@ -38,6 +38,7 @@ mod model_catalog;
 mod naming;
 mod preflight;
 mod pty;
+mod retention;
 mod transcribe;
 mod screenshot;
 mod setup;
@@ -154,6 +155,33 @@ pub fn run() {
                     Err(e) => tracing::error!("history DB init failed: {e}"),
                 },
                 Err(e) => tracing::error!("app_data_dir for history: {e}"),
+            }
+            // Reap the per-agent hook-event logs. Nothing ever deleted these, so the directory grew
+            // to 606 files / 107 MB. Runs on a background thread: it stats every file in the
+            // directory and must not sit in the launch path. Only reaps logs whose agent worktree is
+            // GONE (and then only past an age grace); a live agent's log is size-capped, never
+            // deleted. Worktrees themselves are never touched — only listed, to learn which agent
+            // ids are still live.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || match dev_identity::app_data_dir(&handle) {
+                    Ok(base) => match retention::reap_hook_events(
+                        &base.join("hook-events"),
+                        &base.join("worktrees"),
+                        retention::HookEventsPolicy::default(),
+                        std::time::SystemTime::now(),
+                    ) {
+                        Ok(s) if s.deleted > 0 || s.truncated > 0 => tracing::info!(
+                            deleted = s.deleted,
+                            truncated = s.truncated,
+                            mb_freed = s.bytes_freed / (1024 * 1024),
+                            "hook-events retention pass complete"
+                        ),
+                        Ok(_) => tracing::debug!("hook-events retention: nothing to reap"),
+                        Err(e) => tracing::warn!("hook-events retention failed: {e}"),
+                    },
+                    Err(e) => tracing::warn!("hook-events retention: app_data_dir: {e}"),
+                });
             }
             // Editable TOML config: load the global config.toml and watch it for live reload.
             // Best-effort — a failure here must not stop the app; the engine falls back to

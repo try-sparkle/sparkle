@@ -32,9 +32,18 @@ import {
 import { setWindowProject } from "./windowRegistry";
 import type { AgentTabStatus } from "../types";
 
+// Each window now owns its own `sparkle-window-status:<label>` key (sparkle-csq2) instead of every
+// window read-modify-writing one shared blob. Reassemble the map from the per-window keys so these
+// tests keep asserting the same observable behavior.
 function readMap(): WindowStatusMap {
-  const raw = localStorage.getItem(WINDOW_STATUS_KEY);
-  return raw ? (JSON.parse(raw) as WindowStatusMap) : {};
+  const out: WindowStatusMap = {};
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (!k || !k.startsWith(`${WINDOW_STATUS_KEY}:`)) continue;
+    const raw = localStorage.getItem(k);
+    if (raw) out[k.slice(WINDOW_STATUS_KEY.length + 1)] = JSON.parse(raw);
+  }
+  return out;
 }
 
 beforeEach(() => {

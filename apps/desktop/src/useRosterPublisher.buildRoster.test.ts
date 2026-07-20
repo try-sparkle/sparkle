@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { buildRoster, windowProjects } from "./useRosterPublisher";
 import { setWindowProject, resetWindowRegistry } from "./services/windowRegistry";
+import { hasLoneSurrogate } from "./services/safeText";
 import type { Project } from "./types";
 
 const project: Project = {
@@ -27,6 +28,55 @@ describe("buildRoster", () => {
     expect(r.projects[0]!.agents[0]!.status).toBe("stopped");
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     expect(r.projects[0]!.agents[0]!.status_color).toBe("#8aa0c4");
+  });
+});
+
+// Regression guard for the `publish_window_roster failed unexpected end of hex escape` flood.
+// recentPrompts caps each prompt at 80 chars. A naive UTF-16 `slice(0, 80)` cuts a non-BMP
+// character's surrogate pair in half, leaving a lone leading surrogate that serde_json refuses to
+// parse on the Rust side — so the invoke rejected on EVERY republish (348 times in one day).
+describe("roster payload is always well-formed UTF-16 (hex-escape regression)", () => {
+  /** An agent whose last prompt puts a 🎉 exactly astride the 80-char truncation boundary. */
+  function agentWithPrompt(text: string) {
+    return {
+      id: "a1", name: "Build", kind: "build", parentId: null, runtime: "local",
+      promptHistory: [{ id: "p1", text, at: 1, source: "composer" }],
+    } as any;
+  }
+
+  function rosterFor(text: string) {
+    const p: Project = {
+      id: "p1", name: "Proj", rootPath: "/p", defaultBranch: "main",
+      createdAt: "", agents: [agentWithPrompt(text)], selectedAgentId: null,
+    };
+    return buildRoster([p], { a1: "working" }, {}, {});
+  }
+
+  it("does not emit a lone surrogate when an emoji straddles the 80-char cap", () => {
+    // Code units 79 and 80 are the 🎉 pair — precisely where slice(0, 80) used to cut.
+    const prompt = "x".repeat(79) + "\u{1F389}" + " and more text after the emoji";
+    const r = rosterFor(prompt);
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    const carried = r.projects[0]!.agents[0]!.recent_prompts![0]!.text;
+
+    expect(hasLoneSurrogate(carried)).toBe(false);
+    // The exact wire text that used to reach serde_json: no half-escape of a surrogate.
+    expect(JSON.stringify(carried)).not.toMatch(/\\ud[89ab][0-9a-f]{2}/i);
+    // The whole payload survives a JSON round-trip, which is what the IPC actually does.
+    expect(() => JSON.parse(JSON.stringify(r))).not.toThrow();
+  });
+
+  it("repairs a prompt that arrives already malformed", () => {
+    // Not our truncation's fault — a lone surrogate pasted/scraped into the prompt itself.
+    const r = rosterFor("broken \uD83C tail");
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(hasLoneSurrogate(r.projects[0]!.agents[0]!.recent_prompts![0]!.text)).toBe(false);
+  });
+
+  it("still carries a short emoji prompt intact", () => {
+    const r = rosterFor("ship it \u{1F389}");
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(r.projects[0]!.agents[0]!.recent_prompts![0]!.text).toBe("ship it \u{1F389}");
   });
 });
 

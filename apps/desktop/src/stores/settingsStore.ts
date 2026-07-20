@@ -176,6 +176,22 @@ export function effectiveChiefPat(stored: string, runtime = ""): string {
   return stored.trim() || runtime.trim() || BUILD_ENV_CHIEF_PAT;
 }
 
+/**
+ * The worker-concurrency limit to actually enforce: the MIN of what the user configured and what
+ * this machine's RAM can hold. Both are ceilings — neither may raise the other — so taking the min
+ * is correct in every ordering, including before the first hydrate lands.
+ *
+ * Every concurrency gate must read this rather than `maxConcurrentWorkers` directly. Spawning to
+ * the raw configured number is what let 24 agents × ~4 GiB of V8 heap exhaust a Mac's RAM and get
+ * system daemons jetsam-killed (sparkle-01xv / sparkle-asz5).
+ */
+export function enforcedWorkerCap(s: {
+  maxConcurrentWorkers: number;
+  effectiveMaxConcurrentWorkers: number;
+}): number {
+  return Math.max(1, Math.min(s.maxConcurrentWorkers, s.effectiveMaxConcurrentWorkers));
+}
+
 // --- Sparkle self-improvement consent --------------------------------------------------------
 // How the built-in Sparkle improvement agent may act on the user's anonymous logs. This gates the
 // hourly log evaluation and whether improvement PRs are auto-submitted to the OSS project:
@@ -212,6 +228,16 @@ interface SettingsState {
    *  (floored at 1, otherwise unbounded). Adjustable via the slider in the ⋯ menu; the
    *  orchestration persona reads this same value so the cap it's told about always matches. */
   maxConcurrentWorkers: number;
+  /** The concurrency the app actually ENFORCES: `maxConcurrentWorkers` narrowed by how many
+   *  agent-sized V8 heaps this machine's RAM can hold (computed in Rust, see
+   *  `EffectiveConfig.effective_max_concurrent`). Always ≤ `maxConcurrentWorkers`, always ≥ 1.
+   *
+   *  Why it's separate from `maxConcurrentWorkers`: that one is the user's *request* and stays
+   *  intact so the ⋯-menu slider keeps showing what they chose. This one is what the machine can
+   *  survive. Spawning to the request instead of this is what let 24 agents × ~4 GiB of V8 heap
+   *  exhaust a Mac's RAM and get system daemons jetsam-killed (sparkle-01xv / sparkle-asz5).
+   *  Derived, never persisted — recomputed from config on every hydrate. */
+  effectiveMaxConcurrentWorkers: number;
   /** Use the cloud streaming STT (Deepgram Nova-3) for active dictation when available. Default
    *  on — the gold-standard path. Falls back to the on-device model automatically when off, when
    *  no key is present, or when offline. The always-listening wake word stays on-device either way.
@@ -365,6 +391,10 @@ export const useSettingsStore = create<SettingsState>()(
       chiefProjectByProject: {},
       chiefDocStateByProject: {},
       maxConcurrentWorkers: 20,
+      // Starts permissive and is narrowed by the first hydrate; the enforced cap is always the
+      // MIN of this and maxConcurrentWorkers (see enforcedWorkerCap), so a pre-hydrate spawn is
+      // still bounded by the user's configured value rather than running unlimited.
+      effectiveMaxConcurrentWorkers: 20,
       cloudDictation: true,
       aiAutoRename: true,
       aiBrainstorm: true,
@@ -459,6 +489,16 @@ export const useSettingsStore = create<SettingsState>()(
         set({
           // Concurrency + AI flags (also surfaced in the ⋯ menu controls).
           maxConcurrentWorkers: Math.max(1, Math.floor(config.workers.max_concurrent)),
+          // `?? max_concurrent` covers a backend predating memory-aware concurrency. The extra
+          // Math.min re-asserts the ceiling here so a bad/large backend value can never RAISE the
+          // cap above what the user configured — this store field is what the spawn gate reads.
+          effectiveMaxConcurrentWorkers: Math.max(
+            1,
+            Math.min(
+              Math.floor(config.workers.max_concurrent),
+              Math.floor(eff.effective_max_concurrent ?? config.workers.max_concurrent),
+            ),
+          ),
           aiAutoRename: config.ai.auto_rename,
           cloudDictation: config.ai.voice_dictation,
           aiBrainstorm: config.ai.brainstorm,

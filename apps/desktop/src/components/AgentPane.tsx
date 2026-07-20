@@ -27,7 +27,7 @@ import {
   type McpPaths,
 } from "../services/orchestrationLaunch";
 import { purgeBuildAgent } from "../services/orchestrationListener";
-import { useSettingsStore } from "../stores/settingsStore";
+import { useSettingsStore, enforcedWorkerCap } from "../stores/settingsStore";
 import { setPin, markExhausted, accountLabel, type Account, type Identity } from "../services/accountStore";
 import { chooseAccountForAgent, invalidateAccountState } from "../services/accountSelection";
 import { readWorkerResult } from "../pty";
@@ -641,7 +641,10 @@ function AgentPaneInner({
           }
           const persona = orchestrationPersona({
             ownBranch: wt.branch,
-            maxConcurrentWorkers: useSettingsStore.getState().maxConcurrentWorkers,
+            // The ENFORCED cap, not the raw configured one — the persona is told how many
+            // workers it may spawn, and the spawn gate silently queues anything past this. Telling
+            // it a bigger number just makes it spawn into a queue and wait (sparkle-01xv).
+            maxConcurrentWorkers: enforcedWorkerCap(useSettingsStore.getState()),
             guardrails: useSettingsStore.getState().guardrailsEnabled,
           });
           setSpawn({

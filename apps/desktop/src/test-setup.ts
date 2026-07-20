@@ -15,6 +15,14 @@ class MemoryStorage {
   clear(): void {
     this.store.clear();
   }
+  /** Real Storage supports enumeration; code that sweeps a key PREFIX (windowStatus's cold-start
+   *  wipe) depends on it, so the shim must provide it too or such sweeps silently no-op in tests. */
+  key(i: number): string | null {
+    return Array.from(this.store.keys())[i] ?? null;
+  }
+  get length(): number {
+    return this.store.size;
+  }
 }
 
 if (typeof globalThis.localStorage === "undefined") {

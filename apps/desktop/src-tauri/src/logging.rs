@@ -20,6 +20,12 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+use crate::retention;
+
+/// Basename the daily appender writes (`sparkle.log.YYYY-MM-DD`). Shared with the retention pass so
+/// the prune filter and the writer can never drift apart and start pruning the wrong files.
+pub(crate) const LOG_FILE_PREFIX: &str = "sparkle.log";
+
 /// Resolve the OS log directory for this app (creating it if needed).
 /// `pub(crate)` so the support module can tail the same unified log (support.rs).
 pub(crate) fn resolve_log_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
@@ -36,9 +42,28 @@ pub(crate) fn resolve_log_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf,
 pub fn init<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     let dir = resolve_log_dir(app)?;
 
+    // Prune BEFORE installing the appender, so the file this run is about to open is never a
+    // deletion candidate. `rolling::daily` rotates but never deletes, which had let this directory
+    // reach 523 MB (single days at 116 MB). The policy keeps the newest files unconditionally, so
+    // recent debugging context always survives. Best-effort: a prune failure must not stop logging.
+    match retention::prune_logs(
+        &dir,
+        LOG_FILE_PREFIX,
+        retention::LogPolicy::default(),
+        std::time::SystemTime::now(),
+    ) {
+        Ok(s) if s.deleted > 0 => eprintln!(
+            "log retention: pruned {} old log file(s), freed {} MB",
+            s.deleted,
+            s.bytes_freed / (1024 * 1024)
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("log retention: prune failed (continuing): {e}"),
+    }
+
     // Daily-rolling file. `sparkle.log` becomes `sparkle.log.YYYY-MM-DD` as it rotates,
     // so old sessions are retained without unbounded growth in a single file.
-    let file_appender = tracing_appender::rolling::daily(&dir, "sparkle.log");
+    let file_appender = tracing_appender::rolling::daily(&dir, LOG_FILE_PREFIX);
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sparkle_lib=debug,ui=debug"));

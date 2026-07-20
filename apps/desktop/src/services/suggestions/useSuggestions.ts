@@ -7,6 +7,7 @@ import { useConnectionStore } from "../../stores/connectionStore";
 import { pushSuggestions } from "../relayClient";
 import { deriveCta } from "../../engine/agentCta";
 import { maybeAutoApprove } from "./approvalsRuntime";
+import { detectPendingQuestion } from "./pendingQuestion";
 import { log } from "../../logger";
 import type { AgentTabStatus } from "../../types";
 import type { SuggestionButton } from "./types";
@@ -136,16 +137,23 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // Without this the render-time merge would immediately re-add the very pill they just clicked.
   const [ctaCleared, setCtaCleared] = useState(false);
 
+  // Whether the settled scrollback shows the agent AWAITING AN ANSWER (a prose question or a
+  // terminal widget). A property of the same settled state the buttons were computed from, so it's
+  // captured in the compute effect — where the scrollback is already read and authoritative — and
+  // reset everywhere the buttons reset. Deriving it at render instead would mean calling
+  // getAgentScrollback() on every render and re-scanning a 4000-char tail for no new information.
+  const [questionPending, setQuestionPending] = useState(false);
+
   // Stage-derived primary + computed alternates. deriveCta returns null when there's nothing to
   // nudge (no committed work yet), in which case the ordinary suggestions stand on their own.
   // NOTE this is used only at RENDER (see `shown`), never inside the compute effect — keeping it out
   // of that dep array is what stops a poll from cancelling an in-flight paid compute.
   const applyCta = useCallback(
     (computed: SuggestionButton[]): SuggestionButton[] => {
-      const cta = stage ? deriveCta(stage, { hasRemote }, computed) : null;
+      const cta = stage ? deriveCta(stage, { hasRemote }, computed, { questionPending }) : null;
       return cta ? [cta.primary, ...cta.alternates] : computed;
     },
-    [stage, hasRemote],
+    [stage, hasRemote, questionPending],
   );
 
   useEffect(() => {
@@ -199,6 +207,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         if (autoCat) {
           setAutoApproved(autoCat);
           setButtons([]);
+          setQuestionPending(false); // answered on the user's behalf — nothing is pending
           // Use retire() rather than open-coding it: it already no-ops when nothing non-empty was
           // pushed, AND it resets lastPushedRef. Open-coding left that signature stale, so a later
           // compute in the SAME your-turn yielding the same button ids would hit the sig guard and
@@ -209,6 +218,9 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         }
         setAutoApproved(null);
         setCtaCleared(false); // a fresh state — the CTA is relevant again
+        // Captured from the SAME scrollback the buttons were computed from, so the two can never
+        // disagree about which state they describe.
+        setQuestionPending(detectPendingQuestion(scrollback));
         // Store the RAW computed set; the CTA is merged over it at RENDER time (see `shown` below).
         // Storing the merged list here instead would freeze the CTA at compute time: the workflow
         // stage advances on the ~15-30s poll, long after the scrollback settled, and this effect
@@ -251,6 +263,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
           // they're stale on a terminal that shows something else — drop them locally and retire
           // the phone's copy so a phone can't click an action for a state that no longer exists.
           setButtons([]);
+          setQuestionPending(false); // no answers to lead with — let the stage CTA stand
           retire();
         }
       })
@@ -331,6 +344,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       handledSigs.current.clear();
       lastHash.current = null;
       setCtaCleared(false); // the next your-turn starts with a fresh CTA
+      setQuestionPending(false); // the agent is working again — whatever it asked has been answered
       retire();
     }
   }, [isYourTurn, retire]);
@@ -344,6 +358,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   const clear = useCallback(() => {
     setButtons([]);
     setAutoApproved(null);
+    setQuestionPending(false); // the user just answered it
     // The user just acted on the row; the CTA must go down with the rest of it. Without this the
     // render-time merge would re-add the very pill they clicked (buttons is empty, but deriveCta
     // builds its primary from the stage alone). Reset on the next compute or turn change.

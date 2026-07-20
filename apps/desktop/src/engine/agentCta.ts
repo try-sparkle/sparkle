@@ -45,20 +45,57 @@ const MAX_ALTERNATES = 4;
  * surfaces context-specific offers the agent itself made ("cut a DMG"). The primary is
  * stage-derived and deterministic; the alternates are dynamic. Pure: no store reads, no invokes.
  */
+export interface CtaOpts {
+  /** Whether the agent is blocked awaiting an ANSWER from the user — a prose question or a terminal
+   *  widget (see services/suggestions/pendingQuestion.ts). When true the stage action steps aside. */
+  questionPending?: boolean;
+}
+
 export function deriveCta(
   stage: WorkflowStageId,
   ws: CtaSignals | null | undefined,
   computed: SuggestionButton[],
+  opts: CtaOpts = {},
 ): Cta | null {
-  const primary = primaryFor(stage, ws);
-  if (!primary) return null;
+  const stageAction = primaryFor(stage, ws);
+  if (!stageAction) return null;
 
-  const escape = escapeHatchFor(stage, primary);
+  // The agent asked the user something. The stage describes the BRANCH ("this work has landed");
+  // the question describes the MOMENT ("do you want me to push?") — and it's the moment the user is
+  // looking at. Leading with a stage action here answers a question nobody asked, which is exactly
+  // what the founder hit: "Close Build Agent" over "Want me to commit, then merge main in?", and
+  // "Land to Main" over "Want me to push?" on a branch that had already landed.
+  //
+  // Only when there IS an answer to lead with. With no computed set (learned actions off, offline,
+  // or the model offered nothing) suppressing the stage action would empty the row and leave no way
+  // to close the agent — so we fall through to the normal stage CTA.
+  if (opts.questionPending && computed.length > 0) {
+    const [answer, ...rest] = computed as [SuggestionButton, ...SuggestionButton[]];
+    // Appended AFTER the cap, like the escape hatch below and for the same reason: a full set of
+    // answers must never hide the stage action entirely.
+    const demoted = answer.id === stageAction.id ? [] : [stageAction];
+    // The escape hatch must survive this path too (roborev, Medium). At merged_local the stage
+    // action is PUSH, so demoting it alone leaves no Close anywhere — and if the computed answers
+    // don't happen to include one, the agent becomes impossible to close. That's the exact
+    // invariant escapeHatchFor exists to protect, and the question path was quietly opting out.
+    const taken = new Set([answer.id, ...demoted.map((b) => b.id)]);
+    const escape = escapeHatchFor(stage, stageAction).filter((b) => !taken.has(b.id));
+    return {
+      primary: answer,
+      alternates: [
+        ...rest.filter((b) => b.id !== stageAction.id).slice(0, MAX_ALTERNATES),
+        ...demoted,
+        ...escape,
+      ],
+    };
+  }
+
+  const escape = escapeHatchFor(stage, stageAction);
   const alternates = [
-    ...computed.filter((b) => b.id !== primary.id).slice(0, MAX_ALTERNATES),
+    ...computed.filter((b) => b.id !== stageAction.id).slice(0, MAX_ALTERNATES),
     ...escape,
   ];
-  return { primary, alternates };
+  return { primary: stageAction, alternates };
 }
 
 function primaryFor(

@@ -73,20 +73,29 @@ describe("mergePreservingLiveWorkers (sparkle-3tqv)", () => {
       parentId: "b1",
       worktreePath: "/wt/w1",
     });
-    // In memory the worker exists but its build agent b1 does not (orchestrator closed).
+    // In memory the worker exists but its build agent b1 does not (orchestrator closed). Closing b1
+    // tombstones its workers too (removeAgent), so w1 is dropped by the EXPLICIT delete signal —
+    // not by its mere absence from the snapshot, which no longer implies deletion (sparkle-pckz).
     const current = currentState([project("p1", [worker])]);
-    const persisted = { projects: [project("p1", [])], selectedProjectId: "p1" };
+    const persisted = {
+      projects: [project("p1", [])],
+      selectedProjectId: "p1",
+      removedIds: { b1: 1, w1: 1 },
+    };
     const merged = mergePreservingLiveWorkers(persisted, current);
     expect(merged.projects[0]!.agents).toHaveLength(0);
   });
 
-  it("does NOT preserve a worker that has no cut worktree yet (not materialized)", () => {
+  it("keeps a not-yet-materialized worker that the snapshot has not seen (no tombstone)", () => {
+    // Was "does NOT preserve a worker that has no cut worktree yet": under the old absence=delete
+    // merge an un-materialized worker was evicted, which is exactly how a just-spawned worker could
+    // vanish mid-prepare. With the union it survives until something actually deletes it.
     const build = agent({ id: "b1", kind: "build", branch: "main" });
     const worker = agent({ id: "w1", kind: "worker", parentId: "b1", worktreePath: null });
     const current = currentState([project("p1", [build, worker])]);
     const persisted = { projects: [project("p1", [build])], selectedProjectId: "p1" };
     const merged = mergePreservingLiveWorkers(persisted, current);
-    expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1"]);
+    expect(merged.projects[0]!.agents.map((a) => a.id).sort()).toEqual(["b1", "w1"]);
   });
 
   it("never duplicates a worker already present in the snapshot", () => {
@@ -122,18 +131,23 @@ describe("mergePreservingLiveWorkers — pending local adds", () => {
     // Snapshot from a concurrent writer that never saw b2 (last-writer-wins).
     const persisted = { projects: [project("p1", [build])], selectedProjectId: "p1" };
 
-    const merged = mergePreservingLiveWorkers(persisted, current, new Set(["b2"]));
+    const merged = mergePreservingLiveWorkers(persisted, current);
     expect(merged.projects[0]!.agents.map((a) => a.id).sort()).toEqual(["b1", "b2"]);
   });
 
-  it("does NOT resurrect an agent missing from the snapshot when it is not a pending add", () => {
-    // Same shape, but b2 is NOT pending (e.g. it was already acknowledged, then deleted elsewhere).
+  it("does NOT resurrect an agent the snapshot TOMBSTONED, even though it is live in memory", () => {
+    // b2 was deleted in another window. Deletion now travels as an explicit tombstone rather than as
+    // absence (sparkle-pckz) — absence alone must NOT delete, or acknowledged build agents vanish.
     const build = agent({ id: "b1", kind: "build", branch: "main" });
     const stale = agent({ id: "b2", kind: "build", worktreePath: null });
     const current = currentState([project("p1", [build, stale])]);
-    const persisted = { projects: [project("p1", [build])], selectedProjectId: "p1" };
+    const persisted = {
+      projects: [project("p1", [build])],
+      selectedProjectId: "p1",
+      removedIds: { b2: 1 },
+    };
 
-    const merged = mergePreservingLiveWorkers(persisted, current, new Set());
+    const merged = mergePreservingLiveWorkers(persisted, current);
     expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1"]);
   });
 
@@ -143,7 +157,7 @@ describe("mergePreservingLiveWorkers — pending local adds", () => {
     const current = currentState([project("p1", [build, fresh])]);
     const persisted = { projects: [project("p1", [build, fresh])], selectedProjectId: "p1" };
 
-    const merged = mergePreservingLiveWorkers(persisted, current, new Set(["b2"]));
+    const merged = mergePreservingLiveWorkers(persisted, current);
     expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1", "b2"]);
   });
 });
@@ -164,7 +178,7 @@ describe("mergePreservingLiveWorkers — pending local removals (tombstones)", (
       selectedProjectId: "p1",
     };
 
-    const merged = mergePreservingLiveWorkers(persisted, current, new Set(), new Set(["b2"]));
+    const merged = mergePreservingLiveWorkers(persisted, current, new Set(["b2"]));
     expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1"]);
   });
 
@@ -181,7 +195,7 @@ describe("mergePreservingLiveWorkers — pending local removals (tombstones)", (
       selectedProjectId: "p1",
     };
 
-    const merged = mergePreservingLiveWorkers(persisted, current, new Set(), new Set(["w1"]));
+    const merged = mergePreservingLiveWorkers(persisted, current, new Set(["w1"]));
     expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1"]);
   });
 
@@ -191,7 +205,7 @@ describe("mergePreservingLiveWorkers — pending local removals (tombstones)", (
     const current = currentState([project("p1", [build, other])]);
     const persisted = { projects: [project("p1", [build, other])], selectedProjectId: "p1" };
 
-    const merged = mergePreservingLiveWorkers(persisted, current, new Set(), new Set(["bX"]));
+    const merged = mergePreservingLiveWorkers(persisted, current, new Set(["bX"]));
     expect(merged.projects[0]!.agents.map((a) => a.id)).toEqual(["b1", "b2"]);
   });
 });
@@ -213,7 +227,7 @@ describe("mergePreservingLiveWorkers — preserves live selectedAgentId", () => 
     const persisted = { projects: [project("p1", [build])], selectedProjectId: "p1" };
     expect(persisted.projects[0]!.selectedAgentId).toBe("b1");
 
-    const merged = mergePreservingLiveWorkers(persisted, cur, new Set(["b2"]));
+    const merged = mergePreservingLiveWorkers(persisted, cur);
     expect(merged.projects[0]!.agents.map((a) => a.id).sort()).toEqual(["b1", "b2"]);
     // The new row stays selected — NOT reverted to the stale snapshot's b1.
     expect(merged.projects[0]!.selectedAgentId).toBe("b2");
@@ -399,14 +413,13 @@ describe("mergePreservingLiveWorkers — preserves a live pinned name (rename re
 // pendingProjectAdds set shields exactly the not-yet-propagated window, without resurrecting a
 // project that was deliberately removed elsewhere. Symmetric to pending local (agent) adds.
 describe("mergePreservingLiveWorkers — pending local PROJECT adds", () => {
-  const NONE = new Set<string>();
   it("re-attaches a just-created project the persisted snapshot predates", () => {
     const p1 = project("p1", [agent({ id: "b1", kind: "build" })]);
     const p2 = project("p2", [agent({ id: "b2", kind: "build" })]); // just created in this window
     const current = currentState([p1, p2]);
     // Snapshot from a concurrent writer that never saw p2 (last-writer-wins).
     const persisted = { projects: [p1], selectedProjectId: "p1" };
-    const merged = mergePreservingLiveWorkers(persisted, current, NONE, NONE, new Set(["p2"]));
+    const merged = mergePreservingLiveWorkers(persisted, current);
     expect(merged.projects.map((p) => p.id).sort()).toEqual(["p1", "p2"]);
   });
 
@@ -415,19 +428,20 @@ describe("mergePreservingLiveWorkers — pending local PROJECT adds", () => {
     const p2 = project("p2", []);
     const current = { ...currentState([p1, p2]), selectedProjectId: "p2" };
     const persisted = { projects: [p1], selectedProjectId: "p1" }; // stale: still on p1
-    const merged = mergePreservingLiveWorkers(persisted, current, NONE, NONE, new Set(["p2"]));
+    const merged = mergePreservingLiveWorkers(persisted, current);
     expect(merged.projects.map((p) => p.id).sort()).toEqual(["p1", "p2"]);
     // The stale snapshot must not yank the user off the project they just created.
     expect(merged.selectedProjectId).toBe("p2");
   });
 
-  it("does NOT resurrect a project missing from the snapshot when it is not a pending add", () => {
-    // p2 removed elsewhere (or already acknowledged) — a stale snapshot lacking it must let it stay gone.
+  it("does NOT resurrect a project the snapshot TOMBSTONED, even though it is live in memory", () => {
+    // p2 removed elsewhere. As with agents, the removal must be recorded explicitly — a snapshot
+    // that merely lacks p2 is a writer that hadn't seen it, and must not delete it (sparkle-pckz).
     const p1 = project("p1", []);
     const p2 = project("p2", []);
     const current = currentState([p1, p2]);
-    const persisted = { projects: [p1], selectedProjectId: "p1" };
-    const merged = mergePreservingLiveWorkers(persisted, current, NONE, NONE, NONE);
+    const persisted = { projects: [p1], selectedProjectId: "p1", removedIds: { p2: 1 } };
+    const merged = mergePreservingLiveWorkers(persisted, current);
     expect(merged.projects.map((p) => p.id)).toEqual(["p1"]);
   });
 
@@ -436,7 +450,7 @@ describe("mergePreservingLiveWorkers — pending local PROJECT adds", () => {
     const p2 = project("p2", []);
     const current = currentState([p1, p2]);
     const persisted = { projects: [p1, p2], selectedProjectId: "p1" }; // snapshot already carries p2
-    const merged = mergePreservingLiveWorkers(persisted, current, NONE, NONE, new Set(["p2"]));
+    const merged = mergePreservingLiveWorkers(persisted, current);
     expect(merged.projects.map((p) => p.id).sort()).toEqual(["p1", "p2"]);
   });
 });

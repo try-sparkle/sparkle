@@ -82,11 +82,17 @@ function uuid(): string {
 export interface ProjectState {
   projects: Project[];
   selectedProjectId: string | null;
-  /** Epoch ms stamped onto the blob at every persist (see the persist `partialize` below), so a
-   *  rehydrate can tell HOW OLD the incoming snapshot is (sparkle-pckz). Never set in memory by
-   *  any action — it exists only on the persisted record and is read by mergePreservingLiveWorkers
-   *  to date the writer. Undefined on a legacy blob written before this field existed. */
-  persistedAt?: number;
+
+  /** Shared removal tombstones: id → removedAt (epoch ms), for both AGENT and PROJECT ids (both are
+   *  uuids, so one map can't collide). This is the EXPLICIT delete signal that makes the union merge
+   *  safe (sparkle-pckz / sparkle-8osl). Before it, the merge inferred deletion from ABSENCE in the
+   *  incoming snapshot — but absence has two irreconcilable meanings across windows: "deleted
+   *  elsewhere" and "the writer hadn't seen it yet". Treating absence as deletion is what silently
+   *  evicted live build agents ("my build agents keep disappearing"); treating it as not-yet-seen
+   *  would resurrect closed ones. Recording deletes explicitly separates the two: the merge UNIONS
+   *  by id and drops exactly what is tombstoned. Persisted (so it crosses windows) and bounded to
+   *  MAX_TOMBSTONES, evicting the oldest removals first. */
+  removedIds?: Record<string, number>;
 
   addProject: (name: string, rootPath: string) => string;
   removeProject: (id: string) => void;
@@ -218,6 +224,13 @@ export function nameFromTitle(title: string): AgentName {
 export function migratePersisted(persisted: unknown, version: number): unknown {
   const state = persisted as ProjectState | undefined;
   if (!state || !Array.isArray(state.projects)) return state;
+  if (version < 11) {
+    // Shared removal tombstones (sparkle-pckz). A legacy blob records no deletions; the union merge
+    // then keeps everything it sees, and the first close under the new build seeds the map. Also
+    // repairs a non-object value written by a hand-edited/corrupt blob.
+    state.removedIds =
+      state.removedIds && typeof state.removedIds === "object" ? state.removedIds : {};
+  }
   if (version < 1) {
     state.projects = state.projects.map((p) => ({
       ...p,
@@ -468,38 +481,11 @@ export function flushProjectsPersist(): void {
   flushProjectsPersistImpl();
 }
 
-/** Ids of agents added locally in THIS window but not yet confirmed present in a persisted snapshot.
- *  A concurrent writer's last-writer-wins rehydrate (another window, or a broadcast that predates the
- *  add) can carry a snapshot that lacks a just-clicked agent; while its id lives here the merge
- *  protects it from the whole-array replace. Ids are cleared the instant a snapshot carrying them
- *  arrives (acknowledged = propagated) and on local removal — so this never resurrects a deliberately
- *  removed agent, only shields the brief not-yet-propagated window. Module-scoped: one set per window. */
-const pendingLocalAdds = new Set<string>();
+/** Empty-set sentinel for the optional local-tombstone parameter below. */
 const EMPTY_PENDING_ADDS: ReadonlySet<string> = new Set<string>();
 
-/** Drop ids from the pending-add set once they no longer need protection — because a persisted
- *  snapshot now carries them (propagated) or they were removed locally. Exported for tests. */
-export function acknowledgePendingAdds(ids: Iterable<string>): void {
-  for (const id of ids) pendingLocalAdds.delete(id);
-}
-
-/** Ids of PROJECTS added locally in THIS window but not yet confirmed present in a persisted
- *  snapshot — the project-level analog of pendingLocalAdds (which shields brand-new AGENTS). The
- *  cross-window merge maps over the INCOMING snapshot's projects, so a just-created project that a
- *  concurrent window's last-writer-wins blob predates would be dropped entirely ("created a new
- *  project but it shows nothing / disappears" — the hazel-eco report). While an id lives here the
- *  merge re-attaches its project. Cleared the instant a snapshot carrying it arrives (propagated) and
- *  on local removeProject — so a deliberately-removed project is never resurrected. One set per window. */
-const pendingLocalProjectAdds = new Set<string>();
-
-/** Drop project ids from the pending-add set once a persisted snapshot carries them (propagated) or
- *  they were removed locally. Exported for tests. */
-export function acknowledgePendingProjectAdds(ids: Iterable<string>): void {
-  for (const id of ids) pendingLocalProjectAdds.delete(id);
-}
-
 /** Ids of agents REMOVED locally in THIS window but whose removal may not have propagated to the
- *  shared persisted blob yet. The exact mirror of pendingLocalAdds: while an id lives here the merge
+ *  shared persisted blob yet. While an id lives here the merge
  *  FILTERS it out of any incoming snapshot, so a concurrent writer's stale snapshot that still
  *  carries the just-closed agent can't resurrect its row ("× closes the terminal but the row comes
  *  back", sparkle-close-resurrect). It also gates adoptWorker so the disk reconcile can't re-adopt a
@@ -520,8 +506,8 @@ const pendingLocalRemovals = new Set<string>();
  *  cap is the lesser evil vs. an unbounded set. If it ever bites, gate eviction on confirmed cleanup. */
 const MAX_TOMBSTONES = 500;
 
-/** Register ids as locally removed so the merge/adopt paths suppress them. Unlike pendingLocalAdds,
- *  a removal tombstone is NOT cleared when a fresh snapshot arrives: doing so would reopen the race
+/** Register ids as locally removed so the merge/adopt paths suppress them. A removal tombstone is
+ *  NOT cleared when a fresh snapshot arrives: doing so would reopen the race
  *  where a still-stale window (e.g. the hidden capture webview) re-broadcasts the closed agent AFTER
  *  the self-echo cleared the tombstone, resurrecting the row. A uuid is never legitimately re-added
  *  except by a deliberate local re-create (addAgent clears it), so keeping the tombstone is safe. */
@@ -546,6 +532,20 @@ export function isLocallyRemoved(id: string): boolean {
   return pendingLocalRemovals.has(id);
 }
 
+/** Stamp ids into the PERSISTED tombstone map (sparkle-pckz) so the deletion crosses windows. The
+ *  module-scoped `pendingLocalRemovals` above only protects THIS window; the union merge needs the
+ *  removal to be visible in the shared blob, or another window's live copy would out-live it. */
+function withTombstones(
+  removedIds: Record<string, number> | undefined,
+  ids: string[],
+): Record<string, number> {
+  if (ids.length === 0) return removedIds ?? {};
+  const at = Date.now();
+  const next = { ...(removedIds ?? {}) };
+  for (const id of ids) next[id] = at;
+  return boundTombstones(next);
+}
+
 /** Rehydration merge that NEVER drops a live worker (sparkle-3tqv). Every rehydrate — startup and,
  *  crucially, cross-window (crossWindowSync.ts rehydrates from the shared localStorage blob on
  *  every remote change) — replaces the in-memory `projects` with the persisted snapshot. If another
@@ -561,31 +561,116 @@ export function isLocallyRemoved(id: string): boolean {
 export function mergePreservingLiveWorkers(
   persistedState: unknown,
   currentState: ProjectState,
-  pendingAdds: ReadonlySet<string> = EMPTY_PENDING_ADDS,
   pendingRemovals: ReadonlySet<string> = EMPTY_PENDING_ADDS,
-  pendingProjectAdds: ReadonlySet<string> = EMPTY_PENDING_ADDS,
 ): ProjectState {
   const persisted = (persistedState ?? undefined) as Partial<ProjectState> | undefined;
   const merged = { ...currentState, ...(persisted ?? {}) } as ProjectState;
-  // When the incoming blob was written (sparkle-pckz). Dates the writer so survivor clause (3) can
-  // tell "didn't know about this agent yet" from "deliberately removed it". Undefined on a legacy
-  // blob, which disables that clause rather than guessing.
-  const snapshotAt = typeof persisted?.persistedAt === "number" ? persisted.persistedAt : null;
   const currentProjects = currentState.projects ?? [];
   const incoming = persisted?.projects ?? currentProjects;
-  merged.projects = incoming.map((pp) => {
-    const cur = currentProjects.find((c) => c.id === pp.id);
-    // Removal tombstone (sparkle-close-resurrect): an agent closed locally in THIS window but still
-    // carried by a concurrent writer's stale snapshot must NOT be re-added by the whole-array
-    // replace ("× closes the terminal but the row comes back"). Filter tombstoned ids out of the
-    // incoming snapshot BEFORE anything else — symmetric to pendingLocalAdds, which shields the
-    // opposite direction. The tombstone persists until the id is re-created (registerLocalRemovals),
-    // so a still-stale window re-broadcasting the closed agent stays suppressed.
-    const ppAgents =
-      pendingRemovals.size > 0
-        ? pp.agents.filter((a) => !pendingRemovals.has(a.id))
-        : pp.agents;
-    pp = ppAgents === pp.agents ? pp : { ...pp, agents: ppAgents };
+
+  // UNION the tombstone maps from both sides so neither window loses a delete: a removal recorded
+  // here but not yet propagated, and one propagated to us but not yet seen locally, must BOTH keep
+  // suppressing. On the (impossible-in-practice) same-id collision the later removedAt wins.
+  const tombstones = boundTombstones(mergeTombstones(currentState.removedIds, persisted?.removedIds));
+  merged.removedIds = tombstones;
+  /** Explicitly deleted — the ONLY reason the union drops something. `pendingRemovals` is the
+   *  module-scoped local mirror kept for ids removed before this window wrote its tombstone. */
+  const isRemoved = (id: string): boolean =>
+    Object.prototype.hasOwnProperty.call(tombstones, id) || pendingRemovals.has(id);
+
+  // Project UNION, in snapshot order first so the shared ordering stays stable, then any project
+  // this window has that the snapshot hasn't caught up to. A project missing from the snapshot is
+  // NOT evidence it was deleted (see removedIds) — only a tombstone deletes.
+  const incomingById = new Map(incoming.map((p) => [p.id, p] as const));
+  const projectOrder: string[] = [
+    ...incoming.map((p) => p.id),
+    ...currentProjects.map((p) => p.id).filter((id) => !incomingById.has(id)),
+  ];
+  merged.projects = projectOrder
+    .filter((id) => !isRemoved(id))
+    .map((id) => {
+      const ppMaybe = incomingById.get(id);
+      const cur = currentProjects.find((c) => c.id === id);
+      // Present only in memory (the snapshot's writer hadn't seen this project yet) — keep ours,
+      // minus any agent that has since been tombstoned.
+      if (!ppMaybe) return withoutRemovedAgents(cur as Project, isRemoved);
+      return mergeProject(ppMaybe, cur, isRemoved);
+    });
+
+  // Keep the window on a live selection the incoming snapshot simply hadn't SEEN yet: a stale writer
+  // must not yank the user off the project they just created (it carries its own older selection).
+  // Deliberately narrow — when both sides know the project, the snapshot's selection still wins, as
+  // before. Mirrors the per-agent selectedAgentId rule inside mergeProject.
+  const liveSel = currentState.selectedProjectId;
+  if (
+    liveSel != null &&
+    !incomingById.has(liveSel) &&
+    merged.projects.some((p) => p.id === liveSel)
+  ) {
+    merged.selectedProjectId = liveSel;
+  }
+  return merged;
+}
+
+/** How long a removal is retained no matter how many others pile up. Under the union merge a
+ *  tombstone is the ONLY thing suppressing a stale in-memory copy, so evicting a RECENT one lets a
+ *  just-closed agent reappear in a window that never converged past it. Age is the honest criterion:
+ *  a removal older than this has been seen by every window that is still running. */
+const TOMBSTONE_RETAIN_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+/** Cap the tombstone map so a very long session can't grow it without bound — but only ever evict
+ *  entries past TOMBSTONE_RETAIN_MS, oldest first. The count cap is a backstop against unbounded
+ *  growth, NOT a correctness mechanism; when every entry is recent we keep them all rather than
+ *  resurrect a closed agent (the map is ~50 bytes/entry, so this stays cheap). */
+function boundTombstones(map: Record<string, number>): Record<string, number> {
+  const keys = Object.keys(map);
+  if (keys.length <= MAX_TOMBSTONES) return map;
+  const cutoff = Date.now() - TOMBSTONE_RETAIN_MS;
+  const recent = keys.filter((k) => (map[k] ?? 0) >= cutoff);
+  if (recent.length === keys.length) return map; // nothing is safely evictable yet
+  const evictable = keys
+    .filter((k) => (map[k] ?? 0) < cutoff)
+    .sort((a, b) => (map[b] ?? 0) - (map[a] ?? 0)); // newest of the stale first
+  const room = Math.max(0, MAX_TOMBSTONES - recent.length);
+  const out: Record<string, number> = {};
+  for (const k of recent) out[k] = map[k] as number;
+  for (const k of evictable.slice(0, room)) out[k] = map[k] as number;
+  return out;
+}
+
+/** Union two tombstone maps, keeping the LATER removedAt on any overlap. */
+function mergeTombstones(
+  a: Record<string, number> | undefined,
+  b: Record<string, number> | undefined,
+): Record<string, number> {
+  const out: Record<string, number> = { ...(a ?? {}) };
+  for (const [id, at] of Object.entries(b ?? {})) {
+    const prev = out[id];
+    if (prev === undefined || at > prev) out[id] = at;
+  }
+  return out;
+}
+
+/** Drop tombstoned agents from a project, returning the SAME object when nothing changed. */
+function withoutRemovedAgents(p: Project, isRemoved: (id: string) => boolean): Project {
+  const agents = p.agents.filter((a) => !isRemoved(a.id));
+  return agents.length === p.agents.length ? p : { ...p, agents };
+}
+
+/** Merge one project that exists in BOTH the incoming snapshot and memory: union its agents by id,
+ *  drop tombstoned ones, and preserve the live per-window state (authoritative names, selection,
+ *  fresh-agent boost) that a stale snapshot would otherwise revert. */
+function mergeProject(
+  ppIn: Project,
+  curIn: Project | undefined,
+  isRemoved: (id: string) => boolean,
+): Project {
+  // Removal tombstone (sparkle-close-resurrect): an agent closed in ANY window but still carried by
+  // a concurrent writer's stale snapshot must NOT be re-added ("× closes the terminal but the row
+  // comes back"). Filter tombstoned ids out of the incoming snapshot before anything else.
+  const pp = withoutRemovedAgents(ppIn, isRemoved);
+  const cur = curIn;
+  {
     if (!cur) return pp;
     const present = new Set(pp.agents.map((a) => a.id));
     // Authoritative-identity preservation: a manual rename (renameAgent) sets namePinned=true, and a
@@ -627,44 +712,20 @@ export function mergePreservingLiveWorkers(
       return a;
     });
     const baseAgents = pinnedIdentityReconciled ? reconciledAgents : pp.agents;
-    const survivors = cur.agents.filter((a) => {
-      if (present.has(a.id)) return false; // already in the snapshot — nothing to re-attach
-      // A deliberate local removal outranks EVERY survivor clause below. The tombstone filter above
-      // only strips the id from the INCOMING snapshot; without this the re-attach clauses would pull
-      // the same row back out of live state and undo the ×. Recency (clause 3) must never resurrect
-      // something the user explicitly closed.
-      if (pendingRemovals.has(a.id)) return false;
-      // (1) A live worker with a cut worktree whose parent still exists (sparkle-3tqv): a snapshot
-      //     that predates the spawn must not evict it — its worktree + manifest are live on disk.
-      if (a.kind === "worker" && !!a.worktreePath && pp.agents.some((x) => x.id === a.parentId)) {
-        return true;
-      }
-      // (2) A just-created local agent (any kind) not yet flushed + propagated: a concurrent writer's
-      //     last-writer-wins snapshot predates it, so the whole-array replace would drop the brand-new
-      //     row ("New Build Agent doesn't create a row"). Protect exactly the not-yet-acknowledged
-      //     window — pendingAdds is cleared the moment a snapshot carrying the id arrives — so a
-      //     genuinely-removed agent (never pending, or already acknowledged) is NOT resurrected.
-      if (pendingAdds.has(a.id)) return true;
-      // (3) An agent created AFTER this snapshot was written (sparkle-pckz). Clause (2) only covers
-      //     the not-yet-acknowledged window: the merge caller clears pendingAdds for every id the
-      //     incoming snapshot carries, so the FIRST snapshot carrying an agent strips its shield and
-      //     any LATER stale write that omits it evicts it — "the agent shows up, then vanishes a beat
-      //     later". Recency disambiguates what absence alone cannot: a writer whose blob predates the
-      //     agent's creation never knew the agent existed, so its omission is ignorance, not deletion.
-      //     A NEWER snapshot that omits the agent IS a genuine cross-window removal and still evicts
-      //     (that is what makes this safe to apply after acknowledgement, unlike simply never
-      //     acknowledging). Both timestamps must be present — a legacy agent (no createdAt) or a
-      //     legacy blob (no persistedAt) can't be dated, so those fall through to the old behaviour
-      //     rather than being shielded unconditionally, which would resurrect real removals.
-      if (snapshotAt != null && a.createdAt != null && a.createdAt > snapshotAt) return true;
-      return false;
-    });
+    // AGENT UNION (sparkle-pckz): keep every live agent the snapshot doesn't carry. Absence from a
+    // snapshot only ever means "that writer hadn't seen it yet" — deletion travels as a tombstone
+    // (isRemoved), which was already applied to both sides. This subsumes the two narrow shields
+    // that came before it (a worker with a cut worktree + a still-pending local add): both were
+    // attempts to guess which absences were real deletions, and both left the gap that silently
+    // evicted acknowledged build agents. The old pending-add shields are strictly subsumed: a
+    // just-created agent is just one more absence the union already keeps.
+    const survivors = cur.agents.filter((a) => !present.has(a.id) && !isRemoved(a.id));
     const mergedAgents = survivors.length > 0 ? [...baseAgents, ...survivors] : baseAgents;
     // Nav-bug fix (Unit A): `selectedAgentId` is LIVE per-window navigation state, not something a
     // concurrent writer's snapshot should reset. A cross-window rehydrate that predates a just-added
     // agent carries a stale `pp.selectedAgentId` (the previously-selected row); taking it verbatim
     // reverts the user's selection right after they clicked "New Build Agent" — whose row survives
-    // via the pendingAdds/survivors clause above but is unknown to `pp`, so `pp` still selects the
+    // via the union above but is unknown to `pp`, so `pp` still selects the
     // OLD row. Keep the live `cur.selectedAgentId` whenever it still resolves in the merged agent
     // set; fall back to `pp`'s only when the live selection is a DANGLING non-null id (the selected
     // agent was removed). A live `null` is an intentional deselect (`selectAgent(id, null)` — see the
@@ -691,28 +752,7 @@ export function mergePreservingLiveWorkers(
     )
       return pp;
     return { ...pp, agents: mergedAgents, selectedAgentId, freshBuildAgentId };
-  });
-  // Project-level shield (symmetric to pendingLocalAdds for agents): the map above iterates the
-  // INCOMING snapshot's projects, so a project created locally in THIS window but absent from a
-  // concurrent writer's stale blob is dropped. Re-attach any just-added project the snapshot doesn't
-  // yet carry, and keep the user on it when it was the live selection — a stale snapshot must not
-  // yank the window off the project the user just created. Cleared once the snapshot propagates the
-  // project (see the merge caller's acknowledgePendingProjectAdds), so a genuinely-removed project is
-  // never resurrected.
-  if (pendingProjectAdds.size > 0) {
-    const mergedIds = new Set(merged.projects.map((p) => p.id));
-    const projectSurvivors = currentProjects.filter(
-      (p) => pendingProjectAdds.has(p.id) && !mergedIds.has(p.id),
-    );
-    if (projectSurvivors.length > 0) {
-      merged.projects = [...merged.projects, ...projectSurvivors];
-      const liveSel = currentState.selectedProjectId;
-      if (liveSel != null && projectSurvivors.some((p) => p.id === liveSel)) {
-        merged.selectedProjectId = liveSel;
-      }
-    }
   }
-  return merged;
 }
 
 export const useProjectStore = create<ProjectState>()(
@@ -736,22 +776,20 @@ export const useProjectStore = create<ProjectState>()(
           freshBuildAgentId: null,
         };
         set((s) => ({ projects: [...s.projects, project], selectedProjectId: id }));
-        // Shield this brand-new project from a concurrent window's stale rehydrate until the add
-        // propagates to the shared blob (mirrors pendingLocalAdds for agents). Cleared on
-        // acknowledge (a snapshot carries it) or removeProject.
-        pendingLocalProjectAdds.add(id);
         return id;
       },
 
       removeProject: (id) => {
-        // Deliberate removal — stop shielding it so a stale cross-window snapshot can't resurrect
-        // the project via the survivor clause above.
-        pendingLocalProjectAdds.delete(id);
         set((s) => {
+          const gone = s.projects.find((p) => p.id === id);
           const projects = s.projects.filter((p) => p.id !== id);
           const selectedProjectId =
             s.selectedProjectId === id ? (projects[0]?.id ?? null) : s.selectedProjectId;
-          return { projects, selectedProjectId };
+          // Tombstone the project AND its agents: under the union merge, absence no longer deletes,
+          // so a removal that isn't recorded would be undone by any window still holding the project.
+          const doomed = [id, ...(gone?.agents ?? []).map((a) => a.id)];
+          registerLocalRemovals(doomed);
+          return { projects, selectedProjectId, removedIds: withTombstones(s.removedIds, doomed) };
         });
       },
 
@@ -798,9 +836,6 @@ export const useProjectStore = create<ProjectState>()(
         const id = uuid();
         const kind: AgentKind = opts?.kind ?? "build";
         const parentId = opts?.parentId ?? null;
-        // Shield this brand-new agent from a concurrent writer's last-writer-wins rehydrate until a
-        // persisted snapshot carrying it comes back (see pendingLocalAdds / mergePreservingLiveWorkers).
-        pendingLocalAdds.add(id);
         // A fresh uuid can never collide with a tombstone, but clear defensively so a re-created id
         // is never suppressed by a stale removal record.
         acknowledgeRemovals([id]);
@@ -808,8 +843,6 @@ export const useProjectStore = create<ProjectState>()(
           projects: mapProject(s.projects, projectId, (p) => {
             const agent: AgentTab = {
               id,
-              // Dates the row so a snapshot written before this moment can't evict it (sparkle-pckz).
-              createdAt: Date.now(),
               name: opts?.name ?? defaultAgentName(p, kind),
               kind,
               parentId,
@@ -891,18 +924,21 @@ export const useProjectStore = create<ProjectState>()(
         // Close waterfall: from this removal to the pane's unmount cleanup (ended in AgentPane's
         // unmount, keyed "close:<id>") — captures the cost the user feels when closing an agent.
         perfStart(`close:${agentId}`, "close");
-        set((s) => ({
+        set((s) => {
+          // Closing a build agent also closes its workers (they belong to it). Their worktrees are
+          // cleaned up separately by the caller for each removed id.
+          const doomed = (s.projects.find((p) => p.id === projectId)?.agents ?? [])
+            .filter((a) => a.id === agentId || a.parentId === agentId)
+            .map((a) => a.id);
+          // ...and it must be TOMBSTONED, so a concurrent writer's stale snapshot (or the disk
+          // reconcile) that still carries it can't re-add the row before this removal propagates
+          // (sparkle-close-resurrect — "× closes the terminal but the row comes back").
+          registerLocalRemovals(doomed);
+          return {
+          // The tombstone is also PERSISTED (sparkle-pckz): the union merge never infers deletion
+          // from absence, so this is the only thing that carries the close to other windows.
+          removedIds: withTombstones(s.removedIds, doomed),
           projects: mapProject(s.projects, projectId, (p) => {
-            // Closing a build agent also closes its workers (they belong to it). Their
-            // worktrees are cleaned up separately by the caller for each removed id.
-            const removed = p.agents.filter((a) => a.id === agentId || a.parentId === agentId);
-            // A locally-removed agent must stop being protected as a pending add, or a rehydrate
-            // could resurrect the row the user just closed.
-            acknowledgePendingAdds(removed.map((a) => a.id));
-            // ...and it must be TOMBSTONED, so a concurrent writer's stale snapshot (or the disk
-            // reconcile) that still carries it can't re-add the row before this removal propagates
-            // (sparkle-close-resurrect — "× closes the terminal but the row comes back").
-            registerLocalRemovals(removed.map((a) => a.id));
             const agents = p.agents.filter(
               (a) => a.id !== agentId && a.parentId !== agentId,
             );
@@ -917,7 +953,8 @@ export const useProjectStore = create<ProjectState>()(
               : null;
             return { ...p, agents, selectedAgentId, freshBuildAgentId };
           }),
-        }));
+          };
+        });
       },
 
       renameAgent: (projectId, agentId, name, pinnedIndex) =>
@@ -1136,9 +1173,6 @@ export const useProjectStore = create<ProjectState>()(
             if (pendingLocalRemovals.has(worker.id)) return p;
             const agent: AgentTab = {
               id: worker.id,
-              // Adoption time, not spawn time — this is when the ROW appeared in this window, which
-              // is what the stale-snapshot comparison is about (sparkle-pckz).
-              createdAt: Date.now(),
               name: defaultAgentName(p, "worker"),
               kind: "worker",
               parentId: worker.parentId,
@@ -1191,24 +1225,6 @@ export const useProjectStore = create<ProjectState>()(
       // Debounced localStorage (sparkle-pngb) so a burst of prompt appends / tab switches coalesces
       // into ONE main-thread JSON.stringify + setItem instead of one per mutation.
       storage: createJSONStorage(() => debouncedProjectsStorage),
-      // Date every blob as it is written (sparkle-pckz). This is the ONLY writer of persistedAt —
-      // it is a property of the write, not in-memory state, so it is stamped here rather than by any
-      // action. mergePreservingLiveWorkers reads it to date an incoming snapshot and decide whether a
-      // missing agent was unknown to that writer (keep) or removed by it (evict). Everything else is
-      // persisted verbatim — this store has no field filtering, so partialize must pass state through.
-      //
-      // Timing vs the debounce above: partialize runs at SERIALIZE time, and debouncedProjectsStorage
-      // receives the finished string and writes that exact string at flush — so the stamp can never
-      // disagree with the payload it describes. It does mean the stamp is up to `delayMs` EARLIER than
-      // the actual localStorage write, which is the safe direction: an older-looking snapshot shields
-      // MORE agents in clause (3), never fewer, so the debounce can only make the merge err toward
-      // keeping a live row. Stamping at flush time instead would be wrong — it would post-date the
-      // writer's knowledge and could evict an agent created during the debounce window.
-      //
-      // sparkle-en2e: because this changes on every write, no two blobs are ever byte-identical.
-      // A skip-identical-writes optimization (unmerged 933cda14) must exclude persistedAt from its
-      // comparison rather than dropping the stamp — the shield depends on every blob being dated.
-      partialize: (state) => ({ ...state, persistedAt: Date.now() }),
       // Bumped when the persisted shape gains fields. v1 backfills the main-first-defaults
       // fields so legacy records rehydrate with `null` (matching fresh records) rather than
       // `undefined` — an undefined baseBranch would otherwise send "" to the git commands.
@@ -1222,29 +1238,18 @@ export const useProjectStore = create<ProjectState>()(
       // build/worker rows frozen (namePinned:true, pinnedIndex null) by the OLD self-name path get
       // unpinned + marked selfNamed so the erroneous pin chip clears while the name is preserved.
       // v10 backfills promptHistory[].source: "composer" (picker-tagging, Task 2.3).
-      version: 10,
+      // v11 backfills removedIds: {} — the shared removal tombstones the union merge needs
+      // (sparkle-pckz). An older blob simply has no recorded deletions, which is the safe default:
+      // the union keeps everything, and the first close in the new build starts the map.
+      version: 11,
       migrate: (persisted, version) =>
         perfSpan("persist.migrate", () => migratePersisted(persisted, version), { version }) as ProjectState,
-      // sparkle-3tqv: a protective merge so no rehydrate (startup or cross-window) can evict a
-      // worker whose worktree is live on disk — extended to also shield a just-added agent from a
-      // concurrent writer's stale snapshot (pendingLocalAdds) so "New Build Agent" never loses its row.
+      // sparkle-pckz: a UNION merge, so no rehydrate (startup or cross-window) can evict a record
+      // just because the writing window hadn't seen it yet. Only an explicit tombstone deletes —
+      // `removedIds` from the blob, plus this window's not-yet-persisted local removals.
       merge: (persisted, current) => {
-        // Any pending add the incoming snapshot now carries has propagated — stop protecting it, so a
-        // later genuine removal isn't overridden. Done before the merge (which re-reads the set).
-        const persistedProjects =
-          (persisted as Partial<ProjectState> | undefined)?.projects ?? [];
-        acknowledgePendingAdds(persistedProjects.flatMap((p) => p.agents.map((a) => a.id)));
-        // Same for projects: any pending project-add the snapshot now carries has propagated — stop
-        // shielding it so a later genuine removal isn't overridden by the survivor clause.
-        acknowledgePendingProjectAdds(persistedProjects.map((p) => p.id));
         return perfSpan("persist.merge", () =>
-          mergePreservingLiveWorkers(
-            persisted,
-            current,
-            pendingLocalAdds,
-            pendingLocalRemovals,
-            pendingLocalProjectAdds,
-          ),
+          mergePreservingLiveWorkers(persisted, current, pendingLocalRemovals),
         );
       },
     },

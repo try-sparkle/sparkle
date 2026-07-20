@@ -52,7 +52,14 @@ pub struct WorkflowConfig {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct WorkersConfig {
+    /// The user's requested ceiling on parallel agents. This is a CEILING only — the value the app
+    /// actually enforces is `EffectiveConfig::effective_max_concurrent`, which additionally caps
+    /// concurrency at what installed RAM can hold (see `memory_aware_concurrency`).
     pub max_concurrent: u32,
+    /// Per-agent V8 old-space cap in MiB, applied as `NODE_OPTIONS=--max-old-space-size=<n>` on
+    /// every PTY child (pty.rs). 0 = opt out (agents then use V8's own ~4 GiB default, which is
+    /// exactly the runaway that jetsam-killed a machine — see sparkle-01xv).
+    pub agent_heap_mb: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -272,7 +279,10 @@ impl Default for SparkleConfig {
                 },
             },
             // NOTE: raised from the legacy settingsStore default of 4 (design decision, 2026-06-29).
-            workers: WorkersConfig { max_concurrent: 20 },
+            // NOTE: `max_concurrent` is a ceiling, not a promise — installed RAM narrows it further
+            // (see EffectiveConfig::effective_max_concurrent). 3 GiB per agent sits well under
+            // V8's ~4 GiB default so the cap actually bites, while leaving a real agent room to work.
+            workers: WorkersConfig { max_concurrent: 20, agent_heap_mb: 3072 },
             ai: AiConfig {
                 auto_rename: true,
                 voice_dictation: true,
@@ -328,6 +338,34 @@ impl Default for SparkleConfig {
 pub struct EffectiveConfig {
     pub config: SparkleConfig,
     pub warnings: Vec<String>,
+    /// The concurrency limit the app ENFORCES: `workers.max_concurrent` narrowed by how many
+    /// agent-sized heaps this machine's RAM can actually hold (see `memory_aware_concurrency`).
+    /// Always ≤ `config.workers.max_concurrent`, always ≥ 1. The frontend's concurrency gate reads
+    /// this, not the raw configured value.
+    pub effective_max_concurrent: u32,
+}
+
+impl EffectiveConfig {
+    /// Build an EffectiveConfig, deriving the RAM-aware concurrency and appending the clamp
+    /// warning when installed RAM forces the limit below what the user configured.
+    fn derive(config: SparkleConfig, mut warnings: Vec<String>) -> Self {
+        let (effective_max_concurrent, warn) =
+            memory_aware_concurrency(&config.workers, total_memory_bytes());
+        if let Some(w) = warn {
+            // `for_project` re-derives on top of warnings that already came from the global layer,
+            // so guard against showing the user the same clamp twice.
+            //
+            // This string-equality dedup is exact only because `[workers]` is GLOBAL-ONLY (a
+            // per-project [workers] is rejected with a warning in build_effective), so both
+            // derivations always see identical max_concurrent / agent_heap_mb / RAM inputs. If
+            // per-project [workers] overrides are ever allowed, the two messages will diverge and
+            // this needs a keyed warning instead. (roborev 40088)
+            if !warnings.contains(&w) {
+                warnings.push(w);
+            }
+        }
+        Self { config, warnings, effective_max_concurrent }
+    }
 }
 
 // ============================ partial (parsed-layer) types =========================
@@ -354,6 +392,7 @@ struct PartialWorkflow {
 #[derive(Debug, Default, Deserialize)]
 struct PartialWorkers {
     max_concurrent: Option<u32>,
+    agent_heap_mb: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -494,8 +533,12 @@ fn apply_workflow(into: &mut WorkflowConfig, p: Option<PartialWorkflow>) {
 }
 
 fn apply_workers(into: &mut WorkersConfig, p: Option<PartialWorkers>) {
-    if let Some(PartialWorkers { max_concurrent: Some(v) }) = p {
+    let Some(p) = p else { return };
+    if let Some(v) = p.max_concurrent {
         into.max_concurrent = v;
+    }
+    if let Some(v) = p.agent_heap_mb {
+        into.agent_heap_mb = v;
     }
 }
 
@@ -658,12 +701,118 @@ fn apply_delivered(into: &mut DeliveredConfig, p: Option<PartialDelivered>) {
     }
 }
 
+// ============================ memory-aware concurrency ============================
+// `max_concurrent` is a raw process count: it knows nothing about how much RAM the machine has or
+// how big each agent can get. That combination is what killed a machine on 2026-07-20 (sparkle-01xv
+// / sparkle-asz5) — 24 agents × V8's ~4 GiB default heap = 99 GiB, and the kernel started killing
+// system daemons. Here we turn the two knobs into a number the machine can actually survive:
+// how many agent-sized heaps fit in RAM after leaving the OS and Sparkle itself room to breathe.
+
+/// Smallest per-agent heap worth allowing. Below this an agent OOMs before doing useful work.
+const MIN_AGENT_HEAP_MB: u32 = 512;
+
+/// V8's own default old-space ceiling on a 64-bit machine with plenty of RAM (~4 GiB — the machines
+/// in the incident reported 4.09 GiB). Used as the per-agent budget when the user opts OUT of our
+/// cap, since that is then exactly how big each agent can get.
+const V8_DEFAULT_HEAP_MB: u32 = 4096;
+
+/// RAM held back for the OS, the Tauri app (~0.84 GiB observed), and everything else the user is
+/// running. Deliberately generous: over-reserving costs a little parallelism, under-reserving costs
+/// the user their machine.
+const MEMORY_RESERVE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
+/// How many agents of `agent_heap_mb` fit in `total_ram_bytes` after `reserve_bytes`.
+/// Always at least 1: a machine too small for even one agent must still be able to run one
+/// (degraded, possibly swapping) rather than be told it may run zero and deadlock the orchestrator.
+fn ram_derived_concurrency(total_ram_bytes: u64, reserve_bytes: u64, agent_heap_mb: u32) -> u32 {
+    let per_agent = (agent_heap_mb as u64) * 1024 * 1024;
+    if per_agent == 0 {
+        return 1;
+    }
+    let usable = total_ram_bytes.saturating_sub(reserve_bytes);
+    // u32 saturation is fine: nothing downstream cares about a distinction above 4 billion agents.
+    (usable / per_agent).clamp(1, u32::MAX as u64) as u32
+}
+
+/// The concurrency the app will actually enforce, plus an optional warning when RAM forced it below
+/// what the user configured. `total_ram` is None when we can't measure it.
+///
+/// The configured `max_concurrent` is a CEILING in both directions of reasoning: spare RAM never
+/// raises it (the user asked for at most N), and scarce RAM lowers it (the machine can't hold N).
+fn memory_aware_concurrency(w: &WorkersConfig, total_ram: Option<u64>) -> (u32, Option<String>) {
+    // No measurement means no basis to narrow anything — honor the configured value rather than
+    // inventing a limit that could throttle a big machine to nothing.
+    let Some(total) = total_ram else {
+        return (w.max_concurrent, None);
+    };
+    // Opting OUT of the heap cap must not also opt out of the concurrency clamp (roborev 40088) —
+    // coupling them would restore the exact runaway this exists to prevent. With no cap, agents use
+    // V8's own default, so that becomes the per-agent budget.
+    let budget_mb = if w.agent_heap_mb > 0 { w.agent_heap_mb } else { V8_DEFAULT_HEAP_MB };
+    let by_ram = ram_derived_concurrency(total, MEMORY_RESERVE_BYTES, budget_mb);
+    if by_ram >= w.max_concurrent {
+        return (w.max_concurrent, None);
+    }
+    // The remedy differs by branch, and telling a user to "lower" a value that is already 0 is
+    // impossible advice — 0 maps to the LARGEST budget, so the fix there is to set a positive one
+    // (roborev 40311).
+    let (per_agent, remedy) = if w.agent_heap_mb > 0 {
+        (format!("{budget_mb} MiB per agent"), "Lower agent_heap_mb to allow more.".to_string())
+    } else {
+        (
+            format!("{budget_mb} MiB per agent, V8's default since agent_heap_mb = 0"),
+            format!("Set a positive agent_heap_mb below {budget_mb} to allow more."),
+        )
+    };
+    let warning = format!(
+        "[workers].max_concurrent ({}) is more than this machine's RAM can hold; using {} \
+         (total {} GiB − {} GiB reserved, ÷ {}). {}",
+        w.max_concurrent,
+        by_ram,
+        total / (1024 * 1024 * 1024),
+        MEMORY_RESERVE_BYTES / (1024 * 1024 * 1024),
+        per_agent,
+        remedy,
+    );
+    (by_ram, Some(warning))
+}
+
+/// Installed physical RAM in bytes, or None when we can't determine it (in which case the caller
+/// leaves concurrency alone rather than guessing). macOS: `sysctl hw.memsize`.
+#[cfg(target_os = "macos")]
+fn total_memory_bytes() -> Option<u64> {
+    // Memoized: this is a fixed hardware property, and `for_project` runs on a hot poll.
+    static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
+    *TOTAL.get_or_init(|| {
+        let out = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok().filter(|n| *n > 0)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn total_memory_bytes() -> Option<u64> {
+    // Not implemented off macOS (Sparkle ships mac-only today); None = leave concurrency as configured.
+    None
+}
+
 /// Clamp out-of-range values into something usable; collect a warning for each adjustment.
 /// Never errors — a bad value degrades gracefully rather than breaking the app.
 fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
     if cfg.workers.max_concurrent < 1 {
         warnings.push("[workers].max_concurrent must be >= 1; using 1".to_string());
         cfg.workers.max_concurrent = 1;
+    }
+    // 0 is the deliberate opt-out ("no cap"), so only a positive-but-unusable value is floored.
+    // Below ~512 MiB an agent OOMs before it gets anything done, which reads as a hang, not a cap.
+    if cfg.workers.agent_heap_mb > 0 && cfg.workers.agent_heap_mb < MIN_AGENT_HEAP_MB {
+        warnings.push(format!(
+            "[workers].agent_heap_mb ({}) is too small to run an agent; using {}",
+            cfg.workers.agent_heap_mb, MIN_AGENT_HEAP_MB
+        ));
+        cfg.workers.agent_heap_mb = MIN_AGENT_HEAP_MB;
     }
     // Cap the pool so a fat-fingered size can't spawn a huge burst of parked worktrees (each a real
     // checkout on disk). 16 is far above any sane fan-out; anything higher is almost certainly a typo.
@@ -817,7 +966,7 @@ static GLOBAL: OnceLock<RwLock<EffectiveConfig>> = OnceLock::new();
 
 fn cell() -> &'static RwLock<EffectiveConfig> {
     GLOBAL.get_or_init(|| {
-        RwLock::new(EffectiveConfig { config: SparkleConfig::default(), warnings: Vec::new() })
+        RwLock::new(EffectiveConfig::derive(SparkleConfig::default(), Vec::new()))
     })
 }
 
@@ -837,7 +986,17 @@ pub fn reload_global(app_data: &Path) -> EffectiveConfig {
         // Keep the last-good config; only update the warning list.
         guard.warnings = warnings;
     } else {
-        *guard = EffectiveConfig { config: cfg, warnings };
+        *guard = EffectiveConfig::derive(cfg, warnings);
+        // Log the derived concurrency WITH its inputs, so a user asking "why is Sparkle only
+        // running 3 agents?" can answer it from the daily log alone.
+        tracing::info!(
+            configured_max_concurrent = guard.config.workers.max_concurrent,
+            agent_heap_mb = guard.config.workers.agent_heap_mb,
+            total_ram_bytes = ?total_memory_bytes(),
+            reserve_bytes = MEMORY_RESERVE_BYTES,
+            effective_max_concurrent = guard.effective_max_concurrent,
+            "resolved memory-aware worker concurrency"
+        );
     }
     guard.clone()
 }
@@ -911,7 +1070,7 @@ pub fn for_project(repo_root: &str) -> EffectiveConfig {
     // Carry forward any standing global warnings so the UI sees them in a project context too.
     let mut all = global.warnings;
     all.append(&mut warnings);
-    let effective = EffectiveConfig { config: cfg, warnings: all };
+    let effective = EffectiveConfig::derive(cfg, all);
 
     if let Ok(mut cache) = project_cache().lock() {
         cache.insert(
@@ -980,9 +1139,22 @@ changed_lines  = 1000    # ...or once the agent has changed this many lines (whi
 
 # --- How many agents run at once (per-machine; ignored in a project file) --------------
 [workers]
-# The most agents/worktrees an orchestrator may run in parallel. Higher = more parallel work
-# and more token spend. Floored at 1; there is no hard upper limit.
+# The most agents/worktrees an orchestrator may run in parallel. This is a CEILING, not a
+# promise: Sparkle also caps concurrency at what your RAM can hold — roughly
+#   (installed_RAM - 6 GiB reserved for the OS and Sparkle) / agent_heap_mb
+# — and uses whichever is smaller. So on a 16 GB Mac you get ~3 agents even if this says 20,
+# while lowering this to 4 always gives you 4. The resolved number is logged at startup.
+# Floored at 1; there is no hard upper limit.
 max_concurrent = 20
+# Memory ceiling per agent, in MiB, applied as NODE_OPTIONS=--max-old-space-size. Agents are
+# Node processes, and Node's OWN default ceiling is ~4 GiB — high enough that a handful of
+# runaway agents can exhaust a Mac's RAM and get system daemons killed by the kernel. This caps
+# each agent well below that. Raise it if agents hit out-of-memory errors on huge repos; lower it
+# to run more agents at once. Set 0 to opt out entirely (agents then use Node's ~4 GiB default —
+# not recommended; the RAM-based max_concurrent clamp above stays in force either way, and simply
+# budgets 4 GiB per agent instead). If you set your own NODE_OPTIONS, yours is preserved and merged
+# with this; an explicit --max-old-space-size of your own always wins.
+agent_heap_mb = 3072
 
 # --- AI features (per-machine; each degrades to a non-AI baseline when off) ------------
 [ai]
@@ -1786,6 +1958,120 @@ mod tests {
         let (cfg, warns, _) = effective(Some(g), None);
         assert_eq!(cfg.workers.max_concurrent, 1);
         assert!(warns.iter().any(|w| w.contains("max_concurrent")));
+    }
+
+    // ── per-agent heap cap + memory-aware concurrency (sparkle-01xv / sparkle-asz5) ────────
+    // `max_concurrent` alone is a raw process count blind to installed RAM: 20 agents × V8's
+    // ~4 GiB default heap = 82 GiB, which is how a machine got jetsam-killed. The heap cap bounds
+    // each agent; the RAM-derived concurrency bounds how many of them can exist at once.
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn agent_heap_mb_defaults_below_v8s_own_ceiling() {
+        let (cfg, _, _) = effective(None, None);
+        // Must be meaningfully BELOW V8's ~4 GiB default, or the cap accomplishes nothing.
+        assert_eq!(cfg.workers.agent_heap_mb, 3072);
+        assert!(cfg.workers.agent_heap_mb < 4096);
+    }
+
+    #[test]
+    fn agent_heap_mb_merges_without_disturbing_max_concurrent() {
+        // Setting only the new key leaves its sibling at the default...
+        let (cfg, _, _) = effective(Some("[workers]\nagent_heap_mb = 2048\n"), None);
+        assert_eq!(cfg.workers.agent_heap_mb, 2048);
+        assert_eq!(cfg.workers.max_concurrent, 20);
+        // ...and setting only the old key leaves the new one at the default.
+        let (cfg, _, _) = effective(Some("[workers]\nmax_concurrent = 6\n"), None);
+        assert_eq!(cfg.workers.max_concurrent, 6);
+        assert_eq!(cfg.workers.agent_heap_mb, 3072);
+    }
+
+    #[test]
+    fn validate_floors_agent_heap_mb_at_a_workable_size() {
+        // A sub-512 MiB heap would OOM a real agent before it did anything useful.
+        let (cfg, warns, _) = effective(Some("[workers]\nagent_heap_mb = 64\n"), None);
+        assert_eq!(cfg.workers.agent_heap_mb, 512);
+        assert!(warns.iter().any(|w| w.contains("agent_heap_mb")));
+    }
+
+    #[test]
+    fn agent_heap_mb_zero_is_the_documented_opt_out() {
+        // 0 = "no cap" — deliberately preserved, not floored, so a power user can opt out.
+        let (cfg, warns, _) = effective(Some("[workers]\nagent_heap_mb = 0\n"), None);
+        assert_eq!(cfg.workers.agent_heap_mb, 0);
+        assert!(!warns.iter().any(|w| w.contains("agent_heap_mb")));
+    }
+
+    #[test]
+    fn ram_derived_concurrency_divides_usable_ram_by_the_heap_cap() {
+        // 64 GiB − 6 GiB reserve = 58 GiB usable ÷ 3 GiB per agent = 19.
+        assert_eq!(ram_derived_concurrency(64 * GIB, 6 * GIB, 3072), 19);
+        // 16 GiB − 6 = 10 ÷ 3 = 3. (The machine that died would have allowed 3, not 20.)
+        assert_eq!(ram_derived_concurrency(16 * GIB, 6 * GIB, 3072), 3);
+        assert_eq!(ram_derived_concurrency(128 * GIB, 6 * GIB, 3072), 40);
+    }
+
+    #[test]
+    fn ram_derived_concurrency_floors_at_one() {
+        // A machine with less RAM than the reserve must still be able to run ONE agent —
+        // returning 0 would deadlock the orchestrator instead of degrading.
+        assert_eq!(ram_derived_concurrency(8 * GIB, 6 * GIB, 3072), 1);
+        assert_eq!(ram_derived_concurrency(4 * GIB, 6 * GIB, 3072), 1);
+        assert_eq!(ram_derived_concurrency(0, 6 * GIB, 3072), 1);
+    }
+
+    #[test]
+    fn configured_max_concurrent_is_a_ceiling_never_a_floor() {
+        let mut w = WorkersConfig { max_concurrent: 20, agent_heap_mb: 3072 };
+        // RAM allows fewer than configured → RAM wins, and the clamp is surfaced as a warning.
+        let (n, warn) = memory_aware_concurrency(&w, Some(16 * GIB));
+        assert_eq!(n, 3);
+        let warn = warn.expect("a clamp must be diagnosable as a config warning");
+        assert!(warn.contains("max_concurrent"), "warning names the key: {warn}");
+
+        // RAM allows MORE than configured → the config ceiling holds; nothing to warn about.
+        w.max_concurrent = 4;
+        let (n, warn) = memory_aware_concurrency(&w, Some(128 * GIB));
+        assert_eq!(n, 4, "an explicit max_concurrent must never be raised by spare RAM");
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn memory_aware_concurrency_no_ops_when_it_cannot_measure() {
+        let w = WorkersConfig { max_concurrent: 20, agent_heap_mb: 3072 };
+        // Unknown RAM (unsupported platform / sysctl failure): fall back to the configured value
+        // rather than guessing a number that could throttle a big machine to nothing.
+        assert_eq!(memory_aware_concurrency(&w, None), (20, None));
+    }
+
+    #[test]
+    fn opting_out_of_the_heap_cap_still_bounds_concurrency_by_ram() {
+        // roborev 40088: the two protections must not be coupled. A user who sets agent_heap_mb = 0
+        // to let agents use bigger heaps would otherwise ALSO lose the RAM-derived concurrency
+        // clamp — restoring the exact 20-agents × uncapped-heap runaway this whole change exists to
+        // prevent. With no cap, agents use V8's own default, so that's the budget we divide by.
+        let w = WorkersConfig { max_concurrent: 20, agent_heap_mb: 0 };
+        // 16 GiB − 6 GiB reserve = 10 GiB ÷ V8's ~4 GiB default = 2.
+        let (n, warn) = memory_aware_concurrency(&w, Some(16 * GIB));
+        assert_eq!(n, 2);
+        let warn = warn.expect("the clamp must still be diagnosable when the cap is opted out");
+        // The remedy must be actionable: "lower agent_heap_mb" is impossible at 0, which maps to
+        // the LARGEST per-agent budget. The way out is a positive value (roborev 40311).
+        assert!(warn.contains("Set a positive agent_heap_mb"), "actionable remedy: {warn}");
+        assert!(!warn.contains("Lower agent_heap_mb"), "impossible remedy: {warn}");
+        // And the configured ceiling still wins when RAM is plentiful.
+        let w = WorkersConfig { max_concurrent: 4, agent_heap_mb: 0 };
+        assert_eq!(memory_aware_concurrency(&w, Some(128 * GIB)), (4, None));
+    }
+
+    #[test]
+    fn effective_config_exposes_the_derived_concurrency() {
+        // The frontend concurrency gate reads this field, so it must be populated (and never 0)
+        // on a plain default construction.
+        let eff = EffectiveConfig::derive(SparkleConfig::default(), Vec::new());
+        assert!(eff.effective_max_concurrent >= 1);
+        assert!(eff.effective_max_concurrent <= eff.config.workers.max_concurrent);
     }
 
     #[test]

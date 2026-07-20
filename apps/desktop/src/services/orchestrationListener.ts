@@ -14,7 +14,7 @@ import { spawnWorker, spinDownWorker } from "./workerSpawn";
 import { scanWorkerManifests, type WorkerManifest } from "./worktree";
 import { useProjectStore, isLocallyRemoved } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useSettingsStore } from "../stores/settingsStore";
+import { useSettingsStore, enforcedWorkerCap } from "../stores/settingsStore";
 import { workersNeedingOpen } from "../engine/workerAttention";
 
 const EVENT = "orchestration:request";
@@ -99,9 +99,11 @@ function liveWorkerCount(projectId: string, buildAgentId: string): number {
 /** Slots already taken: live tabs PLUS spawns mid-flight (reserved synchronously). The single
  *  source of truth for the cap so handleSpawn and drainQueue agree.
  *
- *  NB: the cap is PER BUILD AGENT, not global — `maxConcurrentWorkers` is the ceiling each build
+ *  NB: the cap is PER BUILD AGENT, not global — `enforcedWorkerCap` is the ceiling each build
  *  agent may run concurrently (matches the task brief: "count THIS build agent's live workers").
- *  With multiple build agents the machine-wide total can reach N_agents × maxConcurrentWorkers. */
+ *  With multiple build agents the machine-wide total can reach N_agents × that cap, which is why
+ *  the per-agent V8 heap cap (config.rs `[workers].agent_heap_mb`) is the other half of the
+ *  memory bound — this gate alone cannot see other build agents' workers. */
 function usedSlots(projectId: string, buildAgentId: string): number {
   return liveWorkerCount(projectId, buildAgentId) + getInFlight(projectId, buildAgentId);
 }
@@ -154,7 +156,7 @@ async function runSpawn(req: OrchestrationRequest): Promise<void> {
 }
 
 function handleSpawn(req: OrchestrationRequest): void {
-  const cap = useSettingsStore.getState().maxConcurrentWorkers;
+  const cap = enforcedWorkerCap(useSettingsStore.getState());
   if (usedSlots(req.projectId, req.buildAgentId) >= cap) {
     spawnQueue.push(req); // over cap → defer the reply until a slot frees
     return;
@@ -271,7 +273,7 @@ async function handleSpinDown(req: OrchestrationRequest): Promise<void> {
  *  starve a later request belonging to a different agent that has a free slot. */
 async function drainQueue(): Promise<void> {
   for (;;) {
-    const cap = useSettingsStore.getState().maxConcurrentWorkers;
+    const cap = enforcedWorkerCap(useSettingsStore.getState());
     const idx = spawnQueue.findIndex((r) => usedSlots(r.projectId, r.buildAgentId) < cap);
     if (idx === -1) return; // no queued request has a free slot
     const [next] = spawnQueue.splice(idx, 1);

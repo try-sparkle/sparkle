@@ -268,6 +268,84 @@ describe("useSuggestions — stage-driven CTA", () => {
     // assertion above already covers the invariant; a tail that cannot fail is worse than none.
   });
 
+  // ── The agent asked the user something ──────────────────────────────────────────────────────
+  // REGRESSION — founder report 2026-07-20. Both screenshots, end-to-end through the real hook and
+  // the real detector (only compute/scrollback/relay are mocked).
+  describe("when the agent is awaiting an answer", () => {
+    const answer = (id: string, label: string) => ({
+      id,
+      label,
+      value: label,
+      kind: "prompt" as const,
+      source: "learned" as const,
+    });
+
+    // Screenshot 1: landed a previous cycle (stage pinned at `merged` by the watermark — a dirty
+    // tree with ahead === 0 doesn't trip new-cycle detection), agent asks about committing. The
+    // app offered "Close Build Agent" over uncommitted work.
+    it("offers the answer, not Close Build Agent, over a pending question", async () => {
+      getAgentScrollback.mockReturnValue(
+        "Want me to do that — commit, then merge main in? I'd also add the PRD progress entry.",
+      );
+      computeSuggestions.mockResolvedValue({
+        agentId: "a1",
+        buttons: [answer("s:yes", "Yes — commit, then merge"), answer("s:no", "No, just commit")],
+      });
+      seed({ stage: "merged", shipped: true, workflowState: ws({ inOriginMain: true }) });
+      const { result } = renderHook(() => useSuggestions("a1", true));
+      await waitFor(() => {
+        expect(result.current.buttons[0]?.label).toBe("Yes — commit, then merge");
+      });
+      // Demoted, never lost — and last, behind the answers.
+      expect(result.current.buttons.map((b) => b.label).at(-1)).toBe("Close Build Agent");
+    });
+
+    // Screenshot 2: already landed, agent asks "Want me to push?", app offered "Land to Main".
+    it("offers the answer, not Land to Main, on an already-landed branch", async () => {
+      getAgentScrollback.mockReturnValue(
+        "main now contains the fix via a clean --no-ff merge.\n\nWant me to push?",
+      );
+      computeSuggestions.mockResolvedValue({
+        agentId: "a1",
+        buttons: [answer("s:push", "Yes — push to origin")],
+      });
+      seed({ stage: "building_saved", workflowState: ws() });
+      const { result } = renderHook(() => useSuggestions("a1", true));
+      await waitFor(() => {
+        expect(result.current.buttons[0]?.label).toBe("Yes — push to origin");
+      });
+      expect(result.current.buttons.map((b) => b.label)).toContain("Land to Main");
+    });
+
+    // The fallback that keeps the agent closeable when there's no answer to lead with.
+    it("keeps the stage CTA when a question has no computed answers", async () => {
+      getAgentScrollback.mockReturnValue("Want me to push?");
+      computeSuggestions.mockResolvedValue({ agentId: "a1", buttons: [] });
+      seed({ stage: "merged", workflowState: ws({ inOriginMain: true }) });
+      const { result } = renderHook(() => useSuggestions("a1", true));
+      await waitFor(() => {
+        expect(result.current.buttons[0]?.label).toBe("Close Build Agent");
+      });
+    });
+
+    // The detector must not fire on ordinary settled output, or every turn would demote the CTA.
+    it("a settled statement leaves the stage CTA leading", async () => {
+      getAgentScrollback.mockReturnValue("Landed successfully. All 149 tests pass.");
+      computeSuggestions.mockResolvedValue({
+        agentId: "a1",
+        buttons: [answer("s:dmg", "Cut a DMG")],
+      });
+      seed({ stage: "merged", workflowState: ws({ inOriginMain: true }) });
+      const { result } = renderHook(() => useSuggestions("a1", true));
+      await waitFor(() => {
+        expect(result.current.buttons.map((b) => b.label)).toEqual([
+          "Close Build Agent",
+          "Cut a DMG",
+        ]);
+      });
+    });
+  });
+
   it("with no committed work yet, ordinary suggestions stand on their own", async () => {
     computeSuggestions.mockResolvedValue({
       agentId: "a1",

@@ -17,7 +17,8 @@ import { useSettingsStore } from "../stores/settingsStore";
 
 beforeEach(() => {
   vi.clearAllMocks();
-  useSettingsStore.setState({ maxConcurrentWorkers: 20 });
+  // Plenty of RAM by default, so the memory hint stays out of the way in unrelated tests.
+  useSettingsStore.setState({ maxConcurrentWorkers: 20, effectiveMaxConcurrentWorkers: 20 });
 });
 afterEach(() => {
   cleanup();
@@ -27,6 +28,22 @@ afterEach(() => {
 const slider = () => screen.getByLabelText("Max concurrent workers") as HTMLInputElement;
 
 describe("WorkerLimitControl", () => {
+  it("warns when this machine's RAM holds fewer agents than the slider is set to", () => {
+    // The honest case (sparkle-01xv): the user asked for 20, RAM only supports 3. The slider must
+    // keep showing THEIR 20 — but must not let them believe 20 will actually run.
+    useSettingsStore.setState({ maxConcurrentWorkers: 20, effectiveMaxConcurrentWorkers: 3 });
+    render(<WorkerLimitControl />);
+    expect(slider().value).toBe("20");
+    expect(screen.getByText(/memory only fits 3/i)).toBeTruthy();
+  });
+
+  it("shows no memory warning when RAM supports the configured value", () => {
+    useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 8 });
+    render(<WorkerLimitControl />);
+    // Only the memory hint must be absent — the base "may run at once" hint always renders.
+    expect(screen.queryByText(/memory only fits/i)).toBeNull();
+  });
+
   it("reflects the stored value", () => {
     render(<WorkerLimitControl />);
     expect(slider().value).toBe("20");

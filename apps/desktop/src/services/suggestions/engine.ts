@@ -41,6 +41,12 @@ export { deriveContextTags };
 const SYSTEM = [
   "You suggest the next actions a developer would most likely take, given recent terminal output.",
   "Only suggest actions the user plausibly does habitually in this exact situation.",
+  // The single most important rule, and the one the model was missing: an agent that ends its turn
+  // with "Want me to push?" needs ANSWERS offered, not a fresh guess at what to do next. Without
+  // this the model returned generic next-steps ("Check deploy preview") beside a direct question.
+  "IMPORTANT: if the output ends with the agent asking the user a direct question, your suggestions",
+  "MUST be answers to THAT question — the most likely answer first, then the plausible alternatives",
+  "(including declining). Do not suggest unrelated next steps while a question is outstanding.",
   "Reply with ONLY a JSON array of up to THREE objects: {label, value}, ordered MOST-LIKELY FIRST",
   "(index 0 = the single most-likely action). Fewer than three is fine; do not pad with weak guesses.",
   "label: <=40 chars button text. value: a natural-language instruction to send to the",

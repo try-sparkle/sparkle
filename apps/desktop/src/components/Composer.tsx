@@ -1453,11 +1453,27 @@ export function Composer({
       </div>
 
       {!minimized && (
-      <div style={{ flex: 1, minHeight: 0, display: "flex", gap: 8, padding: "0 10px 10px", alignItems: "stretch" }}>
+      <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 6, padding: "0 10px 10px" }}>
+        {/* Attachment tiles span the FULL composer width, above the mic/input/send row rather than
+            inside the input column. Keeping them out of that row is what pins the mic beside the
+            input box: when the tiles lived above the textarea in a shared column, the mic's
+            flex-start alignment latched onto the tile row and the mic drifted up beside a pasted
+            thumbnail instead of the box the user types in. */}
+        <AttachmentRow
+          textBlocks={textBlocks}
+          attachments={attachments}
+          onRemoveTextBlock={removeTextBlock}
+          onRemoveAttachment={removeAttachment}
+          onShowAsText={showBlockAsText}
+        />
+      <div style={{ flex: 1, minHeight: 0, display: "flex", gap: 8, alignItems: "stretch" }}>
         {/* Bare mic to the LEFT of the input box — same behavior as the top waveform ring, shown
             only while the mic is on (paused/active), top-aligned so it stays beside the first line
             when the box grows. Hidden entirely when the mic is off. */}
         <ComposerMic />
+        {/* gap:6 separates the failed-send notice from the textarea. The AttachmentRow that used
+            to be this column's other child now lives ABOVE the whole row (see the comment there) —
+            it is what the mic's flex-start alignment used to latch onto. */}
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 6, position: "relative" }}>
           {/* A send that didn't land says so here. Silence was the bug: the prompt used to go
               into the history bar and nowhere else. */}
@@ -1480,13 +1496,6 @@ export function Composer({
               <span>{deliveryNotice}</span>
             </div>
           )}
-          <AttachmentRow
-            textBlocks={textBlocks}
-            attachments={attachments}
-            onRemoveTextBlock={removeTextBlock}
-            onRemoveAttachment={removeAttachment}
-            onShowAsText={showBlockAsText}
-          />
           {/* The textarea and a mirror layer share one positioning context. The mirror sits
               behind a transparent-background textarea and re-renders the exact same text, but
               transparent — so only the trailing ghost suffix (painted muted) shows through.
@@ -1769,6 +1778,7 @@ export function Composer({
         >
           Send
         </button>
+      </div>
       </div>
       )}
     </div>

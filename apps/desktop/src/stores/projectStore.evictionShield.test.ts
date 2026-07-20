@@ -1,17 +1,30 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { useProjectStore, mergePreservingLiveWorkers, type ProjectState } from "./projectStore";
+import {
+  useProjectStore,
+  mergePreservingLiveWorkers,
+  flushProjectsPersist,
+  type ProjectState,
+} from "./projectStore";
 import type { AgentTab, Project } from "../types";
 
-// sparkle-pckz: the ACKNOWLEDGE-THEN-CLOBBER gap.
+// sparkle-pckz: what makes an agent disappear, and what is allowed to delete one.
 //
-// pendingLocalAdds shields a brand-new agent only until the first snapshot carrying it arrives
-// (projectStore.ts merge → acknowledgePendingAdds). After that the agent's sole protection is the
-// worker-with-worktreePath clause, so a plain build/think agent that has propagated ONCE is fully
-// exposed to any LATER stale write that omits it — "the agent shows up, then vanishes a beat later".
+// HISTORY — this file used to pin a different mechanism. The original fix answered "which absences
+// from a snapshot are real deletions?" with three narrow shield clauses (a worker with a cut
+// worktree, a not-yet-acknowledged local add, and an agent created after the snapshot was written).
+// Each clause was added reactively after a new way of losing an agent showed up in the field, and
+// the third one went inert for any row lacking a `createdAt` — every agent created before that fix.
 //
-// The disambiguator is recency: an agent created AFTER a snapshot was written cannot have been
-// deliberately removed by that snapshot's writer — the writer simply didn't know about it yet.
-// Absence in an OLDER snapshot is not evidence of deletion; absence in a NEWER one is.
+// The union merge replaces the question rather than adding a fourth guess. Absence from a snapshot
+// NEVER means deletion; it only ever means "that writer hadn't seen it yet." Deletion travels as an
+// explicit tombstone in `removedIds`. That is why the shield-mechanism tests are gone: `persistedAt`
+// no longer exists, and `createdAt` is no longer load-bearing for eviction. The BEHAVIOURAL
+// requirements they encoded are all still pinned below — an agent must not vanish, and a close must
+// still propagate — they are just expressed against the mechanism that now enforces them.
+//
+// The failure directions are deliberately asymmetric. A missed tombstone leaves a closed row on
+// screen and the user closes it again. A wrong eviction makes a LIVE agent with work on disk vanish
+// from the roster. The union prefers the first, which is the recoverable one.
 
 function mkAgent(over: Partial<AgentTab> & { id: string }): AgentTab {
   return {
@@ -31,130 +44,150 @@ function mkProject(over: Partial<Project> & { id: string }): Project {
   };
 }
 
-const state = (project: Project, persistedAt?: number): ProjectState =>
-  ({ projects: [project], ...(persistedAt == null ? {} : { persistedAt }) }) as unknown as ProjectState;
+/** A store state carrying one project, plus any removal tombstones. */
+const state = (project: Project, removedIds?: Record<string, number>): ProjectState =>
+  ({ projects: [project], ...(removedIds == null ? {} : { removedIds }) }) as unknown as ProjectState;
 
 const ids = (s: ProjectState) => s.projects[0]!.agents.map((a) => a.id);
 
-// No pendingAdds in ANY of these: every agent here has already been acknowledged, which is
-// precisely the window the old shield left unprotected.
-const NO_PENDING = new Set<string>();
+/** No LOCAL removals pending. Under the union this is the third positional argument — on the old
+ *  shield signature it was the fourth, behind a `pendingAdds` set the union no longer needs. */
+const NO_REMOVALS = new Set<string>();
 
-describe("mergePreservingLiveWorkers — stale-snapshot eviction shield (sparkle-pckz)", () => {
-  it("keeps an acknowledged agent that a snapshot written BEFORE it was created omits", () => {
-    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1", createdAt: 2000 })] }));
-    // Concurrent window's blob: written at t=1000, before a1 existed at t=2000. Its omission of a1
-    // is ignorance, not deletion.
-    const persisted = state(mkProject({ id: "p1", agents: [] }), 1000);
-    const merged = mergePreservingLiveWorkers(persisted, current, NO_PENDING);
+describe("mergePreservingLiveWorkers — absence never deletes (sparkle-pckz)", () => {
+  it("keeps an agent a concurrent snapshot omits", () => {
+    // The core inversion. The other window simply hadn't seen a1 when it wrote; its silence is
+    // ignorance, not an instruction. Under the old shields this survived only if a1 happened to
+    // match a clause — as a plain acknowledged build agent with no createdAt, it did not.
+    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1" })] }));
+    const persisted = state(mkProject({ id: "p1", agents: [] }));
+    const merged = mergePreservingLiveWorkers(persisted, current, NO_REMOVALS);
     expect(ids(merged)).toContain("a1");
   });
 
-  it("still evicts an agent a NEWER snapshot omits (a genuine cross-window removal)", () => {
-    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1", createdAt: 1000 })] }));
-    // Written at t=2000, after a1 existed: this writer knew about a1 and dropped it on purpose.
-    const persisted = state(mkProject({ id: "p1", agents: [] }), 2000);
-    const merged = mergePreservingLiveWorkers(persisted, current, NO_PENDING);
-    expect(ids(merged)).not.toContain("a1");
+  it("keeps a legacy agent with no createdAt (the hole the recency clause could not cover)", () => {
+    // Pinned as a REGRESSION of the old behaviour, deliberately. The recency clause needed a dated
+    // row and fell through to eviction without one, so every agent created before that fix stayed
+    // exposed forever. The union has no such carve-out.
+    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "old1" })] }));
+    const persisted = state(mkProject({ id: "p1", agents: [] }));
+    const merged = mergePreservingLiveWorkers(persisted, current, NO_REMOVALS);
+    expect(ids(merged)).toContain("old1");
   });
 
-  it("shields think agents too, not just build (any kind can be clobbered)", () => {
+  it("keeps think agents too, not just build (any kind can be clobbered)", () => {
     const current = state(
-      mkProject({ id: "p1", agents: [mkAgent({ id: "t1", kind: "think", createdAt: 2000 })] }),
+      mkProject({ id: "p1", agents: [mkAgent({ id: "t1", kind: "think" })] }),
     );
-    const persisted = state(mkProject({ id: "p1", agents: [] }), 1000);
-    const merged = mergePreservingLiveWorkers(persisted, current, NO_PENDING);
+    const persisted = state(mkProject({ id: "p1", agents: [] }));
+    const merged = mergePreservingLiveWorkers(persisted, current, NO_REMOVALS);
     expect(ids(merged)).toContain("t1");
   });
 
-  it("does not resurrect an agent removed locally (tombstone still wins over recency)", () => {
-    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1", createdAt: 2000 })] }));
-    const persisted = state(mkProject({ id: "p1", agents: [] }), 1000);
-    const merged = mergePreservingLiveWorkers(
-      persisted, current, NO_PENDING, new Set(["a1"]),
-    );
-    expect(ids(merged)).not.toContain("a1");
-  });
-
-  it("falls back to the old behaviour for a legacy blob with no persistedAt (no eviction change)", () => {
-    // Undated snapshot: recency is unknowable, so the new clause must not fire either way — the
-    // agent is evicted exactly as it is on today's main. Guards against a legacy blob silently
-    // resurrecting every agent it omits.
-    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1", createdAt: 2000 })] }));
-    const persisted = state(mkProject({ id: "p1", agents: [] }));
-    const merged = mergePreservingLiveWorkers(persisted, current, NO_PENDING);
-    expect(ids(merged)).not.toContain("a1");
-  });
-
-  it("leaves a legacy agent with no createdAt on the old behaviour", () => {
-    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1" })] }));
-    const persisted = state(mkProject({ id: "p1", agents: [] }), 1000);
-    const merged = mergePreservingLiveWorkers(persisted, current, NO_PENDING);
-    expect(ids(merged)).not.toContain("a1");
-  });
-
   it("does not duplicate an agent the snapshot already carries", () => {
-    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1", createdAt: 2000 })] }));
-    const persisted = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1", createdAt: 2000 })] }), 1000);
-    const merged = mergePreservingLiveWorkers(persisted, current, NO_PENDING);
+    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1" })] }));
+    const persisted = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1" })] }));
+    const merged = mergePreservingLiveWorkers(persisted, current, NO_REMOVALS);
     expect(ids(merged)).toEqual(["a1"]);
-  });
-
-  // The clause-2 / clause-3 boundary, pinned from both sides. Clause (2) protects the
-  // not-yet-acknowledged window; clause (3) takes over after acknowledgement. A still-pending agent
-  // must survive even a NEWER snapshot (it hasn't propagated yet, so that writer's omission still
-  // isn't evidence of removal) — otherwise the two clauses would leave a gap at the handover.
-  it("keeps a still-pending agent even when the snapshot is NEWER (clause 2 outranks recency)", () => {
-    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1", createdAt: 1000 })] }));
-    const persisted = state(mkProject({ id: "p1", agents: [] }), 2000);
-    const merged = mergePreservingLiveWorkers(persisted, current, new Set(["a1"]));
-    expect(ids(merged)).toContain("a1");
   });
 });
 
-// The merge clause is only half the mechanism: it is inert unless the two timestamps are actually
-// written. These pin the producers, so a refactor that drops either stamp fails here rather than
-// silently leaving the shield dead in production while every merge test still passes.
-describe("eviction shield — the timestamps are actually produced (sparkle-pckz)", () => {
+describe("mergePreservingLiveWorkers — a tombstone is what deletes (sparkle-pckz)", () => {
+  it("evicts an agent the incoming snapshot tombstoned (the cross-window close)", () => {
+    // The requirement the old "a NEWER snapshot omits it" test was really protecting: closing an
+    // agent in window A must remove it from window B. It now travels as a tombstone the other
+    // window wrote, rather than being inferred from its absence.
+    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1" })] }));
+    const persisted = state(mkProject({ id: "p1", agents: [] }), { a1: 5000 });
+    const merged = mergePreservingLiveWorkers(persisted, current, NO_REMOVALS);
+    expect(ids(merged)).not.toContain("a1");
+  });
+
+  it("does not resurrect an agent removed locally before the tombstone propagated", () => {
+    // The local mirror covers the window between "user clicked ×" and "our blob was written."
+    const current = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1" })] }));
+    const persisted = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1" })] }));
+    const merged = mergePreservingLiveWorkers(persisted, current, new Set(["a1"]));
+    expect(ids(merged)).not.toContain("a1");
+  });
+
+  it("unions tombstones from both sides so neither window loses a delete", () => {
+    // A closed here, B closed there, neither has seen the other. Both must stay closed.
+    const current = state(
+      mkProject({ id: "p1", agents: [mkAgent({ id: "a1" }), mkAgent({ id: "b1" })] }),
+      { a1: 1000 },
+    );
+    const persisted = state(
+      mkProject({ id: "p1", agents: [mkAgent({ id: "a1" }), mkAgent({ id: "b1" })] }),
+      { b1: 2000 },
+    );
+    const merged = mergePreservingLiveWorkers(persisted, current, NO_REMOVALS);
+    expect(ids(merged)).toEqual([]);
+  });
+
+  it("a tombstone outlives a snapshot that still carries the agent", () => {
+    // The resurrection race: the other window's blob predates the close and still lists a1. The
+    // tombstone must win, or the row comes back every time that window writes.
+    const current = state(mkProject({ id: "p1", agents: [] }), { a1: 9000 });
+    const persisted = state(mkProject({ id: "p1", agents: [mkAgent({ id: "a1" })] }));
+    const merged = mergePreservingLiveWorkers(persisted, current, NO_REMOVALS);
+    expect(ids(merged)).not.toContain("a1");
+  });
+});
+
+// The merge is only half the mechanism: under the union a tombstone is the ONLY thing that deletes,
+// so it is inert unless removal actually writes one. These pin the producers — the same role
+// be21ca79 played for the old timestamps — so a refactor that stops tombstoning fails here rather
+// than silently making every close un-propagatable in production.
+describe("removal tombstones are actually produced (sparkle-pckz)", () => {
   beforeEach(() => {
-    useProjectStore.setState({ projects: [], selectedProjectId: null });
+    useProjectStore.setState({ projects: [], selectedProjectId: null, removedIds: {} });
     localStorage.clear();
   });
 
-  it("partialize stamps persistedAt on every write", () => {
-    const partialize = useProjectStore.persist.getOptions().partialize;
-    expect(partialize).toBeTypeOf("function");
-    const before = Date.now();
-    const out = partialize!(useProjectStore.getState()) as { persistedAt?: number };
-    expect(typeof out.persistedAt).toBe("number");
-    expect(out.persistedAt!).toBeGreaterThanOrEqual(before);
-  });
-
-  it("partialize passes the rest of the state through (it must not filter fields)", () => {
+  it("removeAgent tombstones the closed agent", () => {
     const pid = useProjectStore.getState().addProject("P", "/tmp/p");
-    const partialize = useProjectStore.persist.getOptions().partialize;
-    const out = partialize!(useProjectStore.getState()) as ProjectState;
-    expect(out.projects.map((p) => p.id)).toEqual([pid]);
-  });
-
-  it("addAgent dates the new row", () => {
-    const pid = useProjectStore.getState().addProject("P", "/tmp/p");
-    const before = Date.now();
     const id = useProjectStore.getState().addAgent(pid, { kind: "build" });
-    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === id)!;
-    expect(typeof agent.createdAt).toBe("number");
-    expect(agent.createdAt!).toBeGreaterThanOrEqual(before);
+    useProjectStore.getState().removeAgent(pid, id);
+    expect(useProjectStore.getState().removedIds).toHaveProperty(id);
   });
 
-  it("adoptWorker dates the adopted row", () => {
+  it("removeAgent tombstones the closed build agent's workers too", () => {
+    // Workers belong to their orchestrator, so closing it closes them — and each needs its own
+    // tombstone or the union re-adopts the orphans from any window that still lists them.
     const pid = useProjectStore.getState().addProject("P", "/tmp/p");
     const parent = useProjectStore.getState().addAgent(pid, { kind: "build" });
-    const before = Date.now();
     useProjectStore.getState().adoptWorker(pid, {
       id: "w1", parentId: parent, branch: "b", worktreePath: "/tmp/wt",
     });
-    const worker = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === "w1")!;
-    expect(typeof worker.createdAt).toBe("number");
-    expect(worker.createdAt!).toBeGreaterThanOrEqual(before);
+    useProjectStore.getState().removeAgent(pid, parent);
+    expect(useProjectStore.getState().removedIds).toHaveProperty("w1");
+  });
+
+  it("removeProject tombstones the project AND its agents", () => {
+    const pid = useProjectStore.getState().addProject("P", "/tmp/p");
+    const id = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    useProjectStore.getState().removeProject(pid);
+    const removed = useProjectStore.getState().removedIds!;
+    expect(removed).toHaveProperty(pid);
+    expect(removed).toHaveProperty(id);
+  });
+
+  it("tombstones survive the persist round-trip (they must cross windows)", () => {
+    // The whole model rests on this: a tombstone kept only in memory would delete the agent in
+    // this window and let every other window keep resurrecting it.
+    //
+    // The write is trailing-debounced by PROJECTS_PERSIST_DEBOUNCE_MS, so flush explicitly rather
+    // than sleeping. In the app that flush is driven by crossWindowSync, which wires
+    // flushProjectsPersist for exactly this class of structural change; the in-window gap before it
+    // lands is covered by the module-scoped local-removal mirror.
+    const pid = useProjectStore.getState().addProject("P", "/tmp/p");
+    const id = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    useProjectStore.getState().removeAgent(pid, id);
+    flushProjectsPersist();
+
+    const written = localStorage.getItem(useProjectStore.persist.getOptions().name!);
+    expect(written, "the store must have persisted something").toBeTruthy();
+    expect(JSON.parse(written!).state.removedIds).toHaveProperty(id);
   });
 });

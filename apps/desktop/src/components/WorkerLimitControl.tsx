@@ -19,6 +19,10 @@ export const WORKER_LIMIT_SLIDER_MAX = 50;
  */
 export function WorkerLimitControl() {
   const value = useSettingsStore((s) => s.maxConcurrentWorkers);
+  // What installed RAM actually allows (derived in Rust). When it's the smaller number, IT is the
+  // limit in force — the slider keeps showing the user's choice, and the hint below tells the truth.
+  const effective = useSettingsStore((s) => s.effectiveMaxConcurrentWorkers);
+  const ramCapped = effective < value;
   const setLive = useSettingsStore((s) => s.setMaxConcurrentWorkers);
   // Persist the latest store value to config.toml. The control fires commit on several settle
   // events (pointer-up, key-up, blur), and a held arrow key auto-repeats — so debounce them into a
@@ -75,6 +79,20 @@ export function WorkerLimitControl() {
         How many workers an orchestrator may run at once (per build agent). Higher = more parallel
         work, more token spend.
       </div>
+      {ramCapped && (
+        // Say so plainly rather than silently ignoring the setting: this machine's RAM is the
+        // binding constraint, and pretending otherwise is what let 24 agents exhaust memory and
+        // take the system down (sparkle-01xv).
+        // "Lower agent_heap_mb" would be wrong advice in the case that most often triggers this
+        // hint: agent_heap_mb = 0 is the opt-out, it maps to V8's ~4 GiB default (the LARGEST
+        // per-agent budget), and 0 is already the minimum — so there is nothing to lower. The Rust
+        // warning was corrected for exactly this (config.rs, "Set a positive agent_heap_mb…");
+        // the UI says the same thing rather than contradicting it.
+        <div style={{ ...hint, color: C.teal }}>
+          This Mac's memory only fits {effective} at once, so that's the limit in effect. Set a
+          smaller (positive) agent_heap_mb in config.toml to fit more.
+        </div>
+      )}
     </div>
   );
 }

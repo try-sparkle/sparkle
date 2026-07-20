@@ -15,13 +15,16 @@ import { useInteractionStore } from "./stores/interactionStore";
 import { findWindowForProject, onWindowRegistryChange } from "./services/windowRegistry";
 import { useCurrentWindowLabel } from "./windowContext";
 import { composerPrompts } from "./components/promptHistory";
+import { safeTruncate, stripLoneSurrogates } from "./services/safeText";
 import type { AgentTab, Project } from "./types";
 
 const DEFAULT_STATUS: AgentTabStatus = "stopped";
 
-/** The name we show — Claude Code's title if known, else the auto-name, else the fallback. */
+/** The name we show — Claude Code's title if known, else the auto-name, else the fallback.
+ *  Sanitized because titles routinely carry emoji and are truncated by whoever produced them
+ *  (Claude Code, the auto-namer); a half surrogate pair here fails the whole roster invoke. */
 function displayName(a: AgentTab): string {
-  return a.aiTitle || a.autoNameVariants?.title || a.name;
+  return stripLoneSurrogates(a.aiTitle || a.autoNameVariants?.title || a.name);
 }
 
 /** The user's last touch of this agent (composer Send or terminal keystroke), or undefined. Mirrors
@@ -41,12 +44,17 @@ const RECENT_PROMPT_CHARS = 80;
 /** The most recent (~4) user prompts, oldest→newest, whitespace-collapsed and length-capped. Each
  *  keeps its promptHistory id so a tray click can scroll the terminal to that exact turn. Picker
  *  answers are excluded (composerPrompts) — the tray breadcrumb, like the desktop one, is for real
- *  messages, and a picker row's id has no scroll marker to jump to. */
+ *  messages, and a picker row's id has no scroll marker to jump to.
+ *
+ *  The cap goes through `safeTruncate`, NOT a bare `slice`: prompts contain emoji, and a UTF-16
+ *  slice landing between a surrogate pair leaves a lone leading surrogate that serde_json rejects
+ *  when Tauri deserializes the `publish_window_roster` args ("unexpected end of hex escape"). See
+ *  services/safeText.ts — that one-character bug rejected every republish for the affected agent. */
 function recentPrompts(a: AgentTab): { id: string; text: string }[] {
-  return composerPrompts(a.promptHistory ?? []).slice(-RECENT_PROMPTS_MAX).map((e) => {
-    const text = e.text.replace(/\s+/g, " ").trim();
-    return { id: e.id, text: text.length > RECENT_PROMPT_CHARS ? text.slice(0, RECENT_PROMPT_CHARS) : text };
-  });
+  return composerPrompts(a.promptHistory ?? []).slice(-RECENT_PROMPTS_MAX).map((e) => ({
+    id: e.id,
+    text: safeTruncate(e.text.replace(/\s+/g, " ").trim(), RECENT_PROMPT_CHARS),
+  }));
 }
 
 /** Projects open in the given window label. Exported so tests can call the real predicate. */

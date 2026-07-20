@@ -227,6 +227,78 @@ describe("settingsStore — Chief doc state", () => {
   });
 });
 
+// The concurrency the app ENFORCES (sparkle-01xv / sparkle-asz5). `maxConcurrentWorkers` is what
+// the user asked for; `effectiveMaxConcurrentWorkers` is what this machine's RAM can actually hold,
+// computed in Rust. Spawning to the former is how 24 agents × ~4 GiB got a Mac jetsam-killed.
+describe("effectiveMaxConcurrentWorkers — the RAM-aware enforced cap", () => {
+  /** Minimal effective-config payload; only the fields these tests care about vary. */
+  const eff = (max_concurrent: number, effective_max_concurrent?: number): EffectiveConfig =>
+    ({
+      config: {
+        workflow: {
+          require_pr: true,
+          worktree_isolation: true,
+          default_branch: "main",
+          born_fresh_from_base: true,
+          delete_merged_branch: true,
+          drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
+        },
+        workers: { max_concurrent, agent_heap_mb: 3072 },
+        ai: {
+          auto_rename: true,
+          voice_dictation: true,
+          brainstorm: true,
+          composer: true,
+          suggested_actions: true,
+          auto_approve: true,
+        },
+        freshness: {
+          staleness_warn_commits: 25,
+          stale_build_block_commits: 25,
+          require_fresh_branch: true,
+        },
+        capture: { popover_shortcut: "ctrl+shift+r" },
+        done: { description: null, criteria: [] },
+        delivered: {
+          description: null,
+          detected_method: null,
+          confidence: null,
+          confidence_note: null,
+          learned: false,
+          criteria: [],
+        },
+      },
+      warnings: [],
+      effective_max_concurrent,
+    }) as EffectiveConfig;
+
+  it("takes the RAM-derived value when it is below what the user configured", () => {
+    useSettingsStore.getState().hydrateFromConfig(eff(20, 3));
+    const s = useSettingsStore.getState();
+    // The slider still shows the user's choice...
+    expect(s.maxConcurrentWorkers).toBe(20);
+    // ...but the enforced cap is what the machine can hold.
+    expect(s.effectiveMaxConcurrentWorkers).toBe(3);
+  });
+
+  it("never exceeds the configured ceiling even if the backend reports a larger value", () => {
+    // Defense in depth: an explicit max_concurrent is a ceiling, so spare RAM must not raise it.
+    useSettingsStore.getState().hydrateFromConfig(eff(4, 40));
+    expect(useSettingsStore.getState().effectiveMaxConcurrentWorkers).toBe(4);
+  });
+
+  it("falls back to the configured value when the backend omits the field", () => {
+    // An older Rust backend predating memory-aware concurrency sends no effective_max_concurrent.
+    useSettingsStore.getState().hydrateFromConfig(eff(7, undefined));
+    expect(useSettingsStore.getState().effectiveMaxConcurrentWorkers).toBe(7);
+  });
+
+  it("floors at 1 so the orchestrator can always make progress", () => {
+    useSettingsStore.getState().hydrateFromConfig(eff(20, 0));
+    expect(useSettingsStore.getState().effectiveMaxConcurrentWorkers).toBe(1);
+  });
+});
+
 describe("hydrateFromConfig — reflect config.toml into the store", () => {
   it("maps every effective-config field into the store and clamps max workers", () => {
     useSettingsStore.getState().hydrateFromConfig({

@@ -113,6 +113,103 @@ describe("deriveCta", () => {
     expect(cta?.alternates.length).toBeLessThanOrEqual(4);
   });
 
+  // ── The agent asked the user something ──────────────────────────────────────────────────────
+  // REGRESSION — founder report 2026-07-20, two screenshots:
+  //   (1) stage `merged` (landed a previous cycle, now a dirty tree) + "Want me to do that —
+  //       commit, then merge main in?" → pill said "Close Build Agent".
+  //   (2) stage stuck below merged_local (land.sh left the worktree on main) + "Want me to push?"
+  //       → pill said "Land to Main" for work already on main.
+  // The stage describes the BRANCH; a pending question describes the MOMENT. The moment wins.
+  describe("when the agent is awaiting an answer", () => {
+    const q = { questionPending: true };
+
+    it("a computed answer leads instead of the stage action", () => {
+      const cta = deriveCta("merged", ws({ inOriginMain: true }), [suggestion("Yes — push")], q);
+      expect(cta?.primary.label).toBe("Yes — push");
+    });
+
+    it("the stage action is demoted, not lost", () => {
+      const cta = deriveCta("merged", ws({ inOriginMain: true }), [suggestion("Yes — push")], q);
+      expect(cta?.alternates.map((b) => b.label)).toContain("Close Build Agent");
+    });
+
+    it("the demoted stage action sits LAST, behind the answers", () => {
+      const answers = ["Yes — push", "No, hold off", "Show me the diff"].map(suggestion);
+      const cta = deriveCta("merged", ws({ inOriginMain: true }), answers, q);
+      const labels = cta?.alternates.map((b) => b.label) ?? [];
+      expect(labels[labels.length - 1]).toBe("Close Build Agent");
+    });
+
+    it("screenshot 2: an already-landed branch offers the answer, not Land to Main", () => {
+      const cta = deriveCta("building_saved", ws(), [suggestion("Yes — push to origin")], q);
+      expect(cta?.primary.label).toBe("Yes — push to origin");
+      expect(cta?.alternates.map((b) => b.label)).toContain("Land to Main");
+    });
+
+    it("falls back to the stage action when there is no answer to offer", () => {
+      // Learned actions off, offline, or the model returned [] — suppressing the CTA here would
+      // leave the row empty and strand the user with no way to close the agent.
+      expect(deriveCta("merged", ws({ inOriginMain: true }), [], q)?.primary.label).toBe(
+        "Close Build Agent",
+      );
+    });
+
+    it("does not duplicate the stage action when it is already a computed answer", () => {
+      const collide: SuggestionButton = { ...suggestion("Close it"), id: "control:closeAgent" };
+      const cta = deriveCta("merged", ws({ inOriginMain: true }), [collide], q);
+      const ids = [cta?.primary.id, ...(cta?.alternates.map((b) => b.id) ?? [])];
+      expect(ids.filter((id) => id === "control:closeAgent")).toHaveLength(1);
+    });
+
+    // REGRESSION (roborev, Medium): the question path appended only the demoted stage action and
+    // skipped escapeHatchFor. At merged_local the stage action is PUSH, so unless the computed
+    // answers happened to include a close, there was no Close anywhere and the agent could not be
+    // closed at all. Every other question test uses merged/building_saved, neither of which HAS an
+    // escape hatch — so this stage is the only one that can catch it.
+    it("merged_local keeps Close reachable even when an answer leads", () => {
+      const cta = deriveCta(
+        "merged_local",
+        ws({ inLocalMain: true, hasRemote: true }),
+        [suggestion("Yes — push")],
+        q,
+      );
+      expect(cta?.primary.label).toBe("Yes — push");
+      const labels = cta?.alternates.map((b) => b.label) ?? [];
+      expect(labels).toContain("Push to Origin Main"); // the demoted stage action
+      expect(labels).toContain("Close Build Agent"); // the escape hatch
+    });
+
+    it("merged_local's escape hatch survives a full set of answers", () => {
+      const many = ["a", "b", "c", "d", "e", "f"].map(suggestion);
+      const cta = deriveCta("merged_local", ws({ inLocalMain: true, hasRemote: true }), many, q);
+      expect(cta?.alternates.map((b) => b.label)).toContain("Close Build Agent");
+    });
+
+    it("does not duplicate Close when an answer already IS the escape hatch", () => {
+      const collide: SuggestionButton = { ...suggestion("Close it"), id: "control:closeAgent" };
+      const cta = deriveCta("merged_local", ws({ inLocalMain: true, hasRemote: true }), [collide], q);
+      const ids = [cta?.primary.id, ...(cta?.alternates.map((b) => b.id) ?? [])];
+      expect(ids.filter((id) => id === "control:closeAgent")).toHaveLength(1);
+    });
+
+    it("still yields nothing to nudge when the stage has no CTA at all", () => {
+      expect(deriveCta("building_unsaved", ws(), [suggestion("Yes")], q)).toBeNull();
+    });
+
+    it("keeps the caret menu glanceable", () => {
+      const many = ["a", "b", "c", "d", "e", "f", "g"].map(suggestion);
+      const cta = deriveCta("merged", ws({ inOriginMain: true }), many, q);
+      expect(cta?.alternates.length).toBeLessThanOrEqual(5); // 4 answers + the demoted stage action
+    });
+
+    it("no question → the stage action leads, exactly as before", () => {
+      const cta = deriveCta("merged", ws({ inOriginMain: true }), [suggestion("Yes — push")], {
+        questionPending: false,
+      });
+      expect(cta?.primary.label).toBe("Close Build Agent");
+    });
+  });
+
   it("the escape hatch survives the alternates cap", () => {
     // merged_local's Close is appended AFTER the cap, so a full computed set can't hide the only
     // way to close the agent.

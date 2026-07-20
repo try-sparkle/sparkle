@@ -18,7 +18,12 @@ export interface WorkflowConfig {
   drift: DriftConfig;
 }
 export interface WorkersConfig {
+  /** The user's requested ceiling. The number actually enforced is
+   *  `EffectiveConfig.effective_max_concurrent`, which also accounts for installed RAM. */
   max_concurrent: number;
+  /** Per-agent V8 heap cap in MiB (NODE_OPTIONS=--max-old-space-size). 0 = opt out.
+   *  Optional so callers guard: a Rust backend predating this key omits it. */
+  agent_heap_mb?: number;
 }
 export interface AiConfig {
   auto_rename: boolean;
@@ -119,6 +124,10 @@ export interface SparkleConfig {
 export interface EffectiveConfig {
   config: SparkleConfig;
   warnings: string[];
+  /** The concurrency limit to ENFORCE: `workers.max_concurrent` narrowed by how many agent-sized
+   *  heaps this machine's RAM can hold. Always ≤ max_concurrent. Optional so callers guard: a Rust
+   *  backend predating memory-aware concurrency omits it (fall back to `workers.max_concurrent`). */
+  effective_max_concurrent?: number;
 }
 export interface ConfigPaths {
   global: string;
