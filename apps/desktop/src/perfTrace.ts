@@ -92,16 +92,85 @@ export async function perfSpanAsync<T>(
 }
 
 // ── Per-component render counter ────────────────────────────────────────────────────────────────
-const renderCounts = new Map<string, number>();
+/** `count` is cumulative for the key's lifetime; `loggedAt`/`loggedCount` are the clock and count as
+ *  of the last line written, so the next line can state the window's span and how many renders it
+ *  swallowed without holding the renders themselves. */
+type RenderStat = { count: number; loggedAt: number; loggedCount: number };
+
+/** Entries are intentionally never evicted: `count` is documented as lifetime-cumulative, so a
+ *  retired key's entry is what makes a re-mounted pane's count continue rather than silently reset.
+ *  Unbounded in principle, immaterial in practice — an entry is three numbers and a busy day spans
+ *  ~60 keys. There is deliberately no forget/cancel hook (cf. `perfCancel` for `traces`, which
+ *  exists because an abandoned interaction would otherwise log a bogus total; a stale render count
+ *  logs nothing at all). */
+const renderStats = new Map<string, RenderStat>();
+
+/** At most one render line per key per window. Thrash is a RATE, so a burst's worth of individual
+ *  lines carries no signal the coalesced line doesn't — while costing an IPC hop each (see
+ *  logger.ts: every log.debug ships a `frontend_log` invoke) on the very render path this
+ *  instrument exists to measure. Mirrors SPAN_MIN_MS above: every instrument here has a flood guard,
+ *  and this one was the exception — render lines were ~88% of a day's log by volume.
+ *
+ *  1s is the knee of the curve, measured by replaying a day of real render traffic: 250ms/500ms/1s/
+ *  2s/5s windows drop 18%/29%/38%/41%/47% of lines, so widening past 1s trades a lot of temporal
+ *  resolution for a few points. The remaining volume is breadth, not burst — a busy session keeps
+ *  ~60 keys alive, each re-rendering steadily — which is why this caps per-key rate rather than
+ *  trying to hit a whole-file target. Per key, the observed worst case is ~150 renders in one second
+ *  (a Workspace store-write thrash); a 1s window turns that into one line reading since:150. */
+const RENDER_COALESCE_MS = 1_000;
 
 /** Call once per render from a component (e.g. perfRender("AgentPane", agent.id, { visible })). Logs
  *  a running count at debug so a background pane re-rendering on every unrelated store write stands
- *  out — the render-thrash fingerprint. Counting is O(1); the debug line is filterable. */
+ *  out — the render-thrash fingerprint. Counting is O(1); the debug line is filterable.
+ *
+ *  A key's first render always logs (`count: 1` — mount is worth seeing). After that, renders inside
+ *  RENDER_COALESCE_MS of the last line are counted but not logged; the next render past the window
+ *  emits one line carrying `since` (renders coalesced into it, this one included) and `ms` (the span
+ *  since the PREVIOUS line) — i.e. the burst is reported as a rate rather than reconstructed by hand
+ *  from N lines. `count` stays the exact cumulative total, so suppression never costs a render.
+ *
+ *  Read `since`/`ms` as a rate only while a key is rendering steadily — which is the thrash case,
+ *  and there it's the true rate. `ms` is the gap since the last line, NOT the span the coalesced
+ *  renders arrived over, and the two diverge once renders cluster at the front of a window: a pane
+ *  that spins 400× in 200ms and then settles gets flushed by whatever render comes next, so it may
+ *  report `since:400, ms:60000` (≈7/sec) for a burst that really ran at ≈2000/sec. `count` and
+ *  `since` stay exact, so the burst is never hidden — only the derived rate reads low, and it reads
+ *  low precisely when the key has STOPPED thrashing.
+ *
+ *  Pinning the true arrival span would mean closing a batch without a render to close it — i.e. a
+ *  per-key timer on a hot path — or reporting the flush render in the NEXT batch. Both buy accuracy
+ *  only for burst-then-idle, the case that by definition isn't the problem; not worth the state.
+ *  Related: a key that renders hard and then goes permanently silent never flushes its last partial
+ *  window at all. Same reasoning — `count` is cumulative, so the next line, whenever it comes, still
+ *  states the true total. */
 export function perfRender(component: string, key: string, meta?: Record<string, unknown>): void {
   const id = `${component}:${key}`;
-  const count = (renderCounts.get(id) ?? 0) + 1;
-  renderCounts.set(id, count);
-  log.debug("perf", `render ${component}`, { key, count, ...meta });
+  const now = perfNow();
+  const prev = renderStats.get(id);
+  if (!prev) {
+    renderStats.set(id, { count: 1, loggedAt: now, loggedCount: 1 });
+    log.debug("perf", `render ${component}`, { ...meta, key, count: 1 });
+    return;
+  }
+  prev.count += 1;
+  if (now - prev.loggedAt < RENDER_COALESCE_MS) return; // inside the window — counted, not logged
+  // `meta` spreads FIRST so the instrument's own fields always win: `ms` is a plausible thing for a
+  // caller to pass (perfSpan uses it as a meta name), and a caller silently overwriting it would
+  // corrupt the exact rate signal this coalescing exists to preserve.
+  log.debug("perf", `render ${component}`, {
+    ...meta,
+    key,
+    count: prev.count,
+    since: prev.count - prev.loggedCount,
+    ms: Math.round(now - prev.loggedAt),
+  });
+  prev.loggedAt = now;
+  prev.loggedCount = prev.count;
+}
+
+/** Clear render counters/windows so a test starts from a known state (counts are process-lifetime). */
+export function __resetRenderTraceForTest(): void {
+  renderStats.clear();
 }
 
 // ── Global main-thread stall (jank) monitor ─────────────────────────────────────────────────────
