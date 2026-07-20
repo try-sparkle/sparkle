@@ -114,6 +114,53 @@ describe("sparklePersona — consent branching", () => {
   });
 
   it.each(["always", "case_by_case", "never"] as const)(
+    "%s: carries the dedupe gate so work already in flight isn't re-filed",
+    (mode) => {
+      const p = sparklePersona(LOG_DIR, REPO, mode);
+      expect(p).toContain("DEDUPE GATE");
+      // It must name the concrete check, not just gesture at "avoid duplicates".
+      expect(p).toContain("gh pr list --state open");
+      expect(p).toContain("gh pr list --state merged");
+      expect(p).toContain("do NOT open another one");
+    },
+  );
+
+  it.each(["always", "case_by_case"] as const)(
+    "%s: explains the repeating-pass loop the gate exists to break",
+    (mode) => {
+      const p = sparklePersona(LOG_DIR, REPO, mode);
+      expect(p).toContain("You run repeatedly");
+      expect(p).toContain("the bottleneck is review, not discovery");
+    },
+  );
+
+  it("never: the dedupe gate drops its log-mining premise in a chat-only session", () => {
+    const p = sparklePersona(LOG_DIR, REPO, "never");
+    // The check still applies — a requested change may already be in flight...
+    expect(p).toContain("DEDUPE GATE");
+    expect(p).toContain("already be in flight");
+    // ...but nothing may assert this session mines logs on a repeating schedule.
+    expect(p).not.toContain("You run repeatedly");
+    expect(p).not.toContain("the bottleneck is review, not discovery");
+    expect(p).not.toContain("keeps showing up in");
+  });
+
+  it.each(["always", "case_by_case"] as const)(
+    "%s: gates deduping BEFORE the spec step, not after implementation",
+    (mode) => {
+      const p = sparklePersona(LOG_DIR, REPO, mode);
+      expect(p).toContain("Run the DEDUPE GATE below on every candidate");
+      // Ordering is the whole point: dedupe has to precede spec-writing, which precedes the PR.
+      const dedupeStep = p.indexOf("Run the DEDUPE GATE below on every candidate");
+      const specStep = p.indexOf("write a short, well-scoped spec");
+      const prStep = p.indexOf("gh pr create");
+      expect(dedupeStep).toBeGreaterThan(-1);
+      expect(dedupeStep).toBeLessThan(specStep);
+      expect(specStep).toBeLessThan(prStep);
+    },
+  );
+
+  it.each(["always", "case_by_case", "never"] as const)(
     "%s: carries the hard scrub gate before any PR submission",
     (mode) => {
       const p = sparklePersona(LOG_DIR, REPO, mode);
