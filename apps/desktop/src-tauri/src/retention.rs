@@ -106,15 +106,29 @@ fn age(now: SystemTime, mtime: SystemTime) -> Duration {
 // ---------------------------------------------------------------------------
 
 /// The set of agent ids that still have a worktree on disk, read from
-/// `<worktrees_base>/<projectId>/<agentId>`. A missing/unreadable worktrees dir yields an EMPTY
-/// set — and because an empty set makes every log an orphan, callers must not reap on the basis of
-/// a worktrees dir they failed to read. `reap_hook_events` handles that explicitly.
+/// `<worktrees_base>/<projectId>/<agentId>`. `None` means LIVENESS IS UNKNOWN — the caller must
+/// reap nothing, because an absent id is indistinguishable from an orphaned one and would send a
+/// running agent's log to the deleter. `reap_hook_events` handles that explicitly.
+///
+/// Fail-closed applies at EVERY level, not just the top: a per-project read failure used to be
+/// skipped, which silently dropped that project's agents from the set and made their live logs
+/// look orphaned.
 fn live_agent_ids(worktrees_base: &Path) -> Option<std::collections::HashSet<String>> {
     let projects = std::fs::read_dir(worktrees_base).ok()?;
     let mut ids = std::collections::HashSet::new();
     for project in projects.flatten() {
-        let Ok(agents) = std::fs::read_dir(project.path()) else {
+        // A non-directory entry (.DS_Store, a stray file) was never a project and never held
+        // agents, so skipping it loses nothing and must NOT trip the fail-closed path below —
+        // otherwise one piece of junk in the worktrees dir disables retention permanently.
+        if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
+        }
+        let Ok(agents) = std::fs::read_dir(project.path()) else {
+            // A real project directory we cannot enumerate. Its agents are unknown, and an unknown
+            // agent reads as orphaned, so continuing here would queue a RUNNING agent's log for
+            // deletion the first time its project dir is briefly unreadable. Liveness is unknown:
+            // give up for this whole sweep rather than reap on a partial set.
+            return None;
         };
         for agent in agents.flatten() {
             // Directories only: a worktree IS a directory, so a stray regular file named like an
@@ -356,6 +370,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// roborev 40335. The module header promises that a failure to establish liveness reaps
+    /// NOTHING, but only the TOP-LEVEL read honored it: a project directory that could not be
+    /// enumerated was skipped, dropping its agents from the live set. An absent id is
+    /// indistinguishable from an orphaned one, so a still-RUNNING agent's log became eligible for
+    /// deletion the first time its project dir was momentarily unreadable (a transient permission
+    /// or IO error is enough). This is a delete-user-data path, so it must fail closed.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_project_dir_fails_closed_rather_than_orphaning_its_agents() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tmpdir("liveness-failclosed");
+        // A readable project with a live agent, so the happy path is exercised in the same run.
+        std::fs::create_dir_all(base.join("proj-ok").join("agent-alive")).unwrap();
+        // ...and a real project directory whose contents cannot be enumerated.
+        let blocked = base.join("proj-blocked");
+        std::fs::create_dir_all(blocked.join("agent-also-alive")).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let live = live_agent_ids(&base);
+
+        // Restore permissions BEFORE asserting: a failure here must not leave an undeletable
+        // directory behind in the temp dir.
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(
+            live.is_none(),
+            "liveness is UNKNOWN when a project dir can't be read; returning a partial set would \
+             mark agent-also-alive an orphan and delete a running agent's log"
+        );
+    }
+
+    /// The fail-closed path must be reserved for real read failures. A stray file in the worktrees
+    /// base is not a project, and letting it disable the sweep would mean one .DS_Store silently
+    /// turns retention off forever — trading a data-loss bug for a leak.
+    #[test]
+    fn a_stray_file_in_the_worktrees_base_does_not_disable_the_sweep() {
+        let base = tmpdir("liveness-strayfile");
+        std::fs::create_dir_all(base.join("proj-ok").join("agent-alive")).unwrap();
+        std::fs::write(base.join(".DS_Store"), b"junk").unwrap();
+
+        let live = live_agent_ids(&base).expect("a stray file must not make liveness unknown");
+
+        assert!(live.contains("agent-alive"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Write `path` with `size` bytes of whole JSONL lines and stamp its mtime `age_ago` in the past.
