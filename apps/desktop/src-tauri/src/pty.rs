@@ -462,7 +462,16 @@ fn node_options_with_cap(existing: Option<&str>, heap_mb: u32) -> Option<String>
     }
     // Node accepts both `-` and `_` spellings, with `=` or a space before the value.
     let normalized = existing.replace('_', "-");
-    if normalized.contains("--max-old-space-size") {
+    // Match per TOKEN, not by substring. `contains` also fires on unrelated tokens that merely
+    // EMBED the flag name — `--require ./max-old-space-size-helper.js`, or a hypothetical
+    // `--max-old-space-size-foo` — and reads them as "the user already set a heap limit", silently
+    // suppressing the cap. Suppressing it is the one outcome this whole feature exists to prevent
+    // (sparkle-01xv: 24 uncapped agents summing 99 GiB), so the test must be exact.
+    let user_set_heap_flag = normalized.split_whitespace().any(|tok| {
+        // Both spellings Node accepts: `--max-old-space-size=4096` and `--max-old-space-size 4096`.
+        tok == "--max-old-space-size" || tok.starts_with("--max-old-space-size=")
+    });
+    if user_set_heap_flag {
         return Some(existing.to_string());
     }
     Some(format!("{existing} --max-old-space-size={heap_mb}"))
@@ -886,6 +895,33 @@ mod tests {
         assert_eq!(got.as_deref(), Some("--max_old_space_size=8192"));
     }
 
+    /// roborev 40812. The check was `contains("--max-old-space-size")`, which also fires on an
+    /// unrelated token that merely EMBEDS the flag name. Reading that as "the user already set a
+    /// heap limit" suppresses the cap entirely — the one outcome sparkle-01xv exists to prevent
+    /// (24 uncapped agents summing 99 GiB). The match must be per token.
+    #[test]
+    fn node_options_is_not_fooled_by_a_token_that_merely_embeds_the_flag_name() {
+        // A require path that happens to contain the flag name. The cap MUST still be appended.
+        let got = node_options_with_cap(Some("--require ./max-old-space-size-helper.js"), 3072);
+        assert_eq!(
+            got.as_deref(),
+            Some("--require ./max-old-space-size-helper.js --max-old-space-size=3072"),
+            "an embedded occurrence is not the user setting the flag"
+        );
+
+        // A longer flag that merely starts with the same characters.
+        let got = node_options_with_cap(Some("--max-old-space-size-foo=1"), 3072);
+        assert_eq!(
+            got.as_deref(),
+            Some("--max-old-space-size-foo=1 --max-old-space-size=3072"),
+            "a different flag sharing the prefix is not the user setting the flag"
+        );
+
+        // And the real thing is still honoured — the fix must not overshoot into ignoring the user.
+        let got = node_options_with_cap(Some("--require ./x.js --max-old-space-size=8192"), 3072);
+        assert_eq!(got.as_deref(), Some("--require ./x.js --max-old-space-size=8192"));
+    }
+
     #[test]
     fn node_options_is_left_alone_when_the_cap_is_disabled() {
         // agent_heap_mb = 0 is the documented escape hatch: no cap, and no NODE_OPTIONS churn.
@@ -916,9 +952,20 @@ mod tests {
     #[test]
     fn apply_heap_cap_touches_nothing_when_disabled() {
         let mut cmd = CommandBuilder::new("/bin/echo");
+        // Compare against what the builder reported BEFORE the call rather than against `None`.
+        // `CommandBuilder` inherits the process environment, and `get_env` surfaces the inherited
+        // value — so asserting `None` really asserts "NODE_OPTIONS is unset in whoever ran the
+        // tests". That holds on CI and fails for anyone running the suite inside a Sparkle agent,
+        // because Sparkle sets NODE_OPTIONS=--max-old-space-size=… on its agents: this very
+        // feature. The intent here is "touches nothing", and before/after states exactly that,
+        // whatever the ambient env happens to be.
+        let before = cmd.get_env("NODE_OPTIONS").map(|v| v.to_owned());
         apply_heap_cap(&mut cmd, Some("--enable-source-maps".into()), 0);
-        // Not set on the builder at all — the child inherits the user's env untouched.
-        assert_eq!(cmd.get_env("NODE_OPTIONS"), None);
+        assert_eq!(
+            cmd.get_env("NODE_OPTIONS").map(|v| v.to_owned()),
+            before,
+            "a disabled cap must leave NODE_OPTIONS exactly as inherited"
+        );
     }
 
     // ── thin-column backstop ──────────────────────────────────────────────────────────────

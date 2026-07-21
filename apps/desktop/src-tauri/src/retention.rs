@@ -113,15 +113,46 @@ fn age(now: SystemTime, mtime: SystemTime) -> Duration {
 /// Fail-closed applies at EVERY level, not just the top: a per-project read failure used to be
 /// skipped, which silently dropped that project's agents from the set and made their live logs
 /// look orphaned.
+/// What an entry directly inside the worktrees base is, for liveness purposes.
+#[derive(Debug, PartialEq, Eq)]
+enum EntryKind {
+    /// A directory — treat as a project and enumerate its agents.
+    Project,
+    /// Statted fine and is not a directory. Never held agents; skipping it loses nothing.
+    NotAProject,
+    /// Could not be statted, so we cannot tell the two apart. Liveness is unknowable.
+    Unknown,
+}
+
+/// Split out as a pure function purely so the `Unknown` arm is TESTABLE: a real `file_type()`
+/// failure needs a filesystem that errors on stat, which a unit test cannot arrange. Taking the
+/// `Result` as a parameter lets the fail-closed path be exercised directly instead of documented
+/// and hoped for.
+fn classify_worktrees_entry(ft: std::io::Result<std::fs::FileType>) -> EntryKind {
+    match ft {
+        Ok(t) if t.is_dir() => EntryKind::Project,
+        Ok(_) => EntryKind::NotAProject,
+        Err(_) => EntryKind::Unknown,
+    }
+}
+
 fn live_agent_ids(worktrees_base: &Path) -> Option<std::collections::HashSet<String>> {
     let projects = std::fs::read_dir(worktrees_base).ok()?;
     let mut ids = std::collections::HashSet::new();
     for project in projects.flatten() {
-        // A non-directory entry (.DS_Store, a stray file) was never a project and never held
-        // agents, so skipping it loses nothing and must NOT trip the fail-closed path below —
-        // otherwise one piece of junk in the worktrees dir disables retention permanently.
-        if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
+        match classify_worktrees_entry(project.file_type()) {
+            // A non-directory entry (.DS_Store, a stray file) was never a project and never held
+            // agents, so skipping it loses nothing and must NOT trip the fail-closed path —
+            // otherwise one piece of junk in the worktrees dir disables retention permanently.
+            EntryKind::NotAProject => continue,
+            // Could not stat it, so we cannot tell a project from junk. `unwrap_or(false)` used to
+            // resolve that to "junk" and skip it — fail OPEN, in the one function whose entire
+            // contract is fail-closed. Its agents would then be absent from the live set, and an
+            // absent id reads as orphaned, so a transient stat failure could delete a RUNNING
+            // agent's log. Same bug this function's project-read path already guards; it survived
+            // one level down.
+            EntryKind::Unknown => return None,
+            EntryKind::Project => {}
         }
         let Ok(agents) = std::fs::read_dir(project.path()) else {
             // A real project directory we cannot enumerate. Its agents are unknown, and an unknown
@@ -402,6 +433,43 @@ mod tests {
             "liveness is UNKNOWN when a project dir can't be read; returning a partial set would \
              mark agent-also-alive an orphan and delete a running agent's log"
         );
+    }
+
+    /// roborev 40818. The entry classifier used `file_type().map(is_dir).unwrap_or(false)`, so a
+    /// STAT FAILURE resolved to "not a project" and was skipped — fail OPEN, inside the one
+    /// function whose entire contract is fail-closed. Its agents would then be missing from the
+    /// live set, and an absent id reads as orphaned, so a transient stat error could send a
+    /// RUNNING agent's log to the deleter. Exactly the bug fixed one level up at the project-read
+    /// path; it survived one level down.
+    #[test]
+    fn an_unstattable_entry_is_unknown_not_junk() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            classify_worktrees_entry(Err(Error::new(ErrorKind::PermissionDenied, "stat failed"))),
+            EntryKind::Unknown,
+            "a stat failure must not be silently downgraded to 'not a project'"
+        );
+    }
+
+    /// The other two arms, so the fix above cannot overshoot into treating ordinary junk as
+    /// unknown — which would let one .DS_Store disable retention forever.
+    #[test]
+    fn a_statted_entry_is_classified_by_what_it_actually_is() {
+        let dir = tmpdir("classify-arms");
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        std::fs::write(dir.join("junk"), b"x").unwrap();
+
+        let mut saw_project = false;
+        let mut saw_junk = false;
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            match classify_worktrees_entry(e.file_type()) {
+                EntryKind::Project => saw_project = true,
+                EntryKind::NotAProject => saw_junk = true,
+                EntryKind::Unknown => panic!("a readable temp dir must stat cleanly"),
+            }
+        }
+        assert!(saw_project && saw_junk);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The fail-closed path must be reserved for real read failures. A stray file in the worktrees
