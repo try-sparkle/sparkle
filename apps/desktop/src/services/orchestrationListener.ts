@@ -152,13 +152,42 @@ function liveWorkerCount(projectId: string, buildAgentId: string): number {
 /** Slots already taken: live tabs PLUS spawns mid-flight (reserved synchronously). The single
  *  source of truth for the cap so handleSpawn and drainQueue agree.
  *
- *  NB: the cap is PER BUILD AGENT, not global — `enforcedWorkerCap` is the ceiling each build
+  *  NB: this is THIS build agent's own count. The machine-wide bound is `globalUsedSlots`;
  *  agent may run concurrently (matches the task brief: "count THIS build agent's live workers").
  *  With multiple build agents the machine-wide total can reach N_agents × that cap, which is why
  *  the per-agent V8 heap cap (config.rs `[workers].agent_heap_mb`) is the other half of the
  *  memory bound — this gate alone cannot see other build agents' workers. */
 function usedSlots(projectId: string, buildAgentId: string): number {
   return liveWorkerCount(projectId, buildAgentId) + getInFlight(projectId, buildAgentId);
+}
+
+/** Every worker on the MACHINE: all projects, all build agents, plus all in-flight reservations.
+ *
+ *  `effectiveMaxConcurrentWorkers` is derived by dividing the MACHINE's installed RAM
+ *  (`config.rs ram_derived_concurrency`: `(total - reserve) / agent_heap_mb`), so it is a
+ *  machine-wide budget and has to be compared against a machine-wide count. Comparing it per
+ *  build agent is a dimensional error: every agent sits happily under the cap while N agents put
+ *  N x the cap on one machine. On a 32 GiB Mac the derived cap is (32-6)/3 = 8, so three build
+ *  agents legally run 24 workers x 3 GiB = 72 GiB budgeted against 32 GiB of RAM — the coalition
+ *  blowup in sparkle-hfhs, and the same arithmetic behind the original jetsam incident. */
+function globalUsedSlots(): number {
+  const live = useProjectStore
+    .getState()
+    .projects.reduce((n, p) => n + p.agents.filter((a) => a.kind === "worker").length, 0);
+  let flight = 0;
+  for (const n of inFlight.values()) flight += n;
+  return live + flight;
+}
+
+/** True when a spawn must wait: either THIS build agent is at its own ceiling, or the MACHINE is
+ *  at the RAM-derived one. Both are real limits and whichever binds first wins — the per-agent
+ *  gate keeps one agent from monopolising the machine, the global gate keeps N agents from
+ *  collectively overrunning it. Purely additive: this can only ever refuse a spawn the old gate
+ *  would have allowed, never admit one it would have refused. */
+function atCapacity(projectId: string, buildAgentId: string): boolean {
+  const s = useSettingsStore.getState();
+  if (usedSlots(projectId, buildAgentId) >= enforcedWorkerCap(s)) return true;
+  return globalUsedSlots() >= Math.max(1, s.effectiveMaxConcurrentWorkers);
 }
 
 /** Coarse runtime status for list_workers. Authoritative completion is wait_for_workers
@@ -249,9 +278,8 @@ function handleSpawn(req: OrchestrationRequest): void {
     }
     claimedBeads.add(key);
   }
-  const cap = enforcedWorkerCap(useSettingsStore.getState());
-  if (usedSlots(req.projectId, req.buildAgentId) >= cap) {
-    spawnQueue.push(req); // over cap → defer the reply until a slot frees
+  if (atCapacity(req.projectId, req.buildAgentId)) {
+    spawnQueue.push(req); // over cap (this agent's, or the machine's) → defer until a slot frees
     return;
   }
   // runSpawn reserves the slot synchronously at its first line, so firing it (not awaiting) is
@@ -371,9 +399,8 @@ async function handleSpinDown(req: OrchestrationRequest): Promise<void> {
  *  starve a later request belonging to a different agent that has a free slot. */
 async function drainQueue(): Promise<void> {
   for (;;) {
-    const cap = enforcedWorkerCap(useSettingsStore.getState());
-    const idx = spawnQueue.findIndex((r) => usedSlots(r.projectId, r.buildAgentId) < cap);
-    if (idx === -1) return; // no queued request has a free slot
+    const idx = spawnQueue.findIndex((r) => !atCapacity(r.projectId, r.buildAgentId));
+    if (idx === -1) return; // no queued request has a free slot (per-agent or machine-wide)
     const [next] = spawnQueue.splice(idx, 1);
     await runSpawn(next!);
   }

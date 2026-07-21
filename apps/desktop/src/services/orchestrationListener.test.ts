@@ -267,6 +267,82 @@ describe("orchestrationListener", () => {
     expect(invokeMock).not.toHaveBeenCalled(); // m2's reply deferred until a slot frees
   });
 
+  it("counts workers MACHINE-WIDE against the RAM cap, not per build agent (sparkle-hfhs)", async () => {
+    // The dimensional error behind the 33 GiB coalition. `ram_derived_concurrency` (config.rs)
+    // divides the MACHINE's RAM into a machine-wide budget, but this gate applied that budget
+    // PER BUILD AGENT. On a 32 GiB Mac the derived cap is (32-6)/3 ≈ 8, so three build agents
+    // legally run 24 workers × 3 GiB = 72 GiB budgeted on a 32 GiB machine. Each agent is
+    // individually "under the cap" while the machine is three times over it.
+    useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 2 });
+    const store = useProjectStore.getState();
+    const buildB = store.addAgent(projectId, { kind: "build" });
+    store.setAgentWorktree(projectId, buildB, "/wt/buildB", "sparkle/agent-buildB");
+
+    // Build agent A alone fills the machine-wide budget.
+    fire({ reqId: "g1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "a1" } });
+    await flush();
+    fire({ reqId: "g2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "a2" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
+
+    // A DIFFERENT build agent asks for one. It has zero workers of its own, so a per-agent gate
+    // waves it through — and the machine reaches 3× the per-worker heap with RAM budgeted for 2.
+    invokeMock.mockClear();
+    fire({ reqId: "g3", op: "spawn_worker", buildAgentId: buildB, projectId, payload: { task: "b1" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2); // held: the MACHINE is full, not this agent
+    expect(invokeMock).not.toHaveBeenCalled(); // g3's reply deferred until a slot frees
+
+    // ...and it must actually be RELEASED when the OTHER agent frees a slot. The global gate
+    // introduces a cross-agent dependency that did not exist before — B's queued spawn now waits
+    // on A — so the drain path has to notice. Holding forever would be its own bug.
+    const aWorker = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((a) => a.kind === "worker" && a.parentId === buildId)!;
+    fire({
+      reqId: "g4",
+      op: "spin_down",
+      buildAgentId: buildId,
+      projectId,
+      payload: { workerId: aWorker.id },
+    });
+    // Two flushes, matching the same-agent release case below: the drain path (spin_down →
+    // store update → queue scan → spawn) needs an extra microtask turn to settle. One flush
+    // happens to pass today, but this assertion is the regression guard — it should not be
+    // timing-dependent. The exact count still catches over-spawning: a broken gate reads 4.
+    await flush();
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(3); // B's queued spawn released by A's spin_down
+  });
+
+  it("treats maxConcurrentWorkers as PER AGENT and the RAM cap as MACHINE-WIDE", async () => {
+    // Pinning the two settings' dimensions, because the fix above depends on them differing and
+    // roborev reasonably asked which was intended.
+    //
+    //   maxConcurrentWorkers          — the user's ceiling for EACH build agent
+    //   effectiveMaxConcurrentWorkers — RAM-derived, a ceiling for the WHOLE MACHINE
+    //
+    // So two agents may each run up to the configured number as long as the machine's RAM budget
+    // covers the total. Reading the per-agent preference as a machine-wide limit would surprise
+    // anyone who set it to 2 meaning "2 each", and would throttle a big machine for no reason.
+    useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 4 });
+    const store = useProjectStore.getState();
+    const buildC = store.addAgent(projectId, { kind: "build" });
+    store.setAgentWorktree(projectId, buildC, "/wt/buildC", "sparkle/agent-buildC");
+
+    fire({ reqId: "p1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "a" } });
+    await flush();
+    fire({ reqId: "p2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "a2" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // agent A held at ITS per-agent cap of 1
+
+    fire({ reqId: "p3", op: "spawn_worker", buildAgentId: buildC, projectId, payload: { task: "c" } });
+    await flush();
+    // A different agent gets its own slot: 2 machine-wide, still under the RAM budget of 4.
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
+  });
+
   it("queues spawns past the cap, then releases one when a slot frees via spin_down", async () => {
     useSettingsStore.setState({ maxConcurrentWorkers: 1 });
     // First spawn fills the only slot.
