@@ -113,6 +113,76 @@ type RenderStat = { count: number; loggedAt: number; loggedCount: number; window
  *  logs nothing at all). */
 const renderStats = new Map<string, RenderStat>();
 
+// ── Render LOGGING gate (bead sparkle-abv2) ────────────────────────────────────────────────────
+// Counting above is free — a Map bump — so it stays unconditional and `renderCounts()` always
+// answers "which pane is thrashing?". LOGGING is what costs: log.debug → logger.ts forward() →
+// invoke("frontend_log") is a Tauri IPC crossing + JSON serialization + a Rust-side file write, ON
+// THE MAIN THREAD, per logged render.
+//
+// Coalescing (below) and this gate solve DIFFERENT halves and are both needed. Coalescing bounds
+// the rate while logging is on; measured on a real day it drops ~38% of lines at the shipped 1s
+// window, and its own note says the remainder "is breadth, not burst" — so ~145K invokes/day
+// becomes ~90K/day, on the main thread, for every user who is not debugging render thrash. The
+// gate takes that to ZERO by default, which is what the bead actually asked for.
+const PERF_RENDER_LOG_KEY = "sparkle.perf.renderLog";
+
+/** Read the gate. localStorage is AUTHORITATIVE when present — including an explicit "0".
+ *
+ *  Persisting the off-state (rather than removing the key) is deliberate: with `removeItem`, an
+ *  explicit runtime "off" would fall through to the build-time env default and silently turn back
+ *  ON after a webview reload in any build where VITE_PERF_RENDER_LOG=1 — the user's choice would
+ *  not stick, and the persistence test would still pass because the env var is unset in the test
+ *  host. Present-but-falsy therefore means off, and only an ABSENT key consults the env. */
+function readPerfRenderFlag(): boolean {
+  try {
+    const stored = localStorage.getItem(PERF_RENDER_LOG_KEY);
+    if (stored !== null) return stored === "1";
+  } catch {
+    // localStorage can throw (private mode, disabled storage). Fall through to the env default
+    // rather than letting an instrument break the app it is measuring.
+  }
+  return import.meta.env?.VITE_PERF_RENDER_LOG === "1";
+}
+
+let renderLogEnabled = readPerfRenderFlag();
+
+/** Turn per-render logging on/off at runtime and persist the choice. Exposed on `window.sparklePerf`
+ *  so it is reachable from devtools without a rebuild — the whole point of a debug flag is that you
+ *  can flip it while looking at the problem. */
+export function setPerfRenderLogging(on: boolean): void {
+  renderLogEnabled = on;
+  try {
+    localStorage.setItem(PERF_RENDER_LOG_KEY, on ? "1" : "0");
+  } catch {
+    // Non-persistent is still better than not toggling at all; the in-memory flag already flipped.
+  }
+}
+
+export function perfRenderLoggingEnabled(): boolean {
+  return renderLogEnabled;
+}
+
+/** Cumulative render counts per "Component:key", newest state — the signal the log lines carried,
+ *  available with logging OFF because the counting never stopped. */
+export function renderCounts(): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [id, stat] of renderStats) out[id] = stat.count;
+  return out;
+}
+
+/** Expose the gate + counters on `window.sparklePerf` for devtools. A debug flag you cannot reach
+ *  without a rebuild is not a debug flag, and the counters are what make logging-off tolerable:
+ *  `sparklePerf.counts()` answers "which pane is thrashing?" with zero IPC. Called once at startup;
+ *  a no-op outside a browser-ish context (tests import this module headlessly). */
+export function installPerfDevtools(): void {
+  if (typeof window === "undefined") return;
+  (window as unknown as { sparklePerf?: unknown }).sparklePerf = {
+    counts: renderCounts,
+    setRenderLogging: setPerfRenderLogging,
+    renderLoggingEnabled: perfRenderLoggingEnabled,
+  };
+}
+
 /** At most one render line per key per window. Thrash is a RATE, so a burst's worth of individual
  *  lines carries no signal the coalesced line doesn't — while costing an IPC hop each (see
  *  logger.ts: every log.debug ships a `frontend_log` invoke) on the very render path this
@@ -192,10 +262,21 @@ export function perfRender(component: string, key: string, meta?: Record<string,
   const prev = renderStats.get(id);
   if (!prev) {
     renderStats.set(id, { count: 1, loggedAt: now, loggedCount: 1, windowMs: RENDER_COALESCE_MS });
-    log.debug("perf", `render ${component}`, { ...meta, key, count: 1 });
+    // The mount line is still worth seeing, but only when logging is on: a busy session mounts
+    // ~60 keys, so an ungated "first render always logs" is 60 main-thread IPCs nobody asked for.
+    if (renderLogEnabled) log.debug("perf", `render ${component}`, { ...meta, key, count: 1 });
     return;
   }
   prev.count += 1;
+  // COUNT first, gate second: `count` must stay exact whether or not logging is on, because
+  // renderCounts() is the whole reason counting is unconditional. Returning before the increment
+  // would make the gate silently corrupt the data it is meant to preserve.
+  //
+  // The gate sits in FRONT of the adaptive window, so while logging is off neither `loggedAt` nor
+  // `windowMs` advances. That is the behaviour we want on re-enable: `elapsed` is then large, the
+  // next render logs immediately, and the backoff restarts from RENDER_COALESCE_MS rather than
+  // resuming a stale 30s window the user never saw.
+  if (!renderLogEnabled) return;
   const elapsed = now - prev.loggedAt;
   if (elapsed < prev.windowMs) return; // inside the window — counted, not logged
   // `meta` spreads FIRST so the instrument's own fields always win: `ms` is a plausible thing for a
@@ -222,9 +303,11 @@ export function perfRender(component: string, key: string, meta?: Record<string,
       : RENDER_COALESCE_MS;
 }
 
-/** Clear render counters/windows so a test starts from a known state (counts are process-lifetime). */
+/** Clear render counters/windows so a test starts from a known state (counts are process-lifetime).
+ *  Also re-reads the logging gate, so a test that flipped it cannot leak into the next one. */
 export function __resetRenderTraceForTest(): void {
   renderStats.clear();
+  renderLogEnabled = readPerfRenderFlag();
 }
 
 // ── Global main-thread stall (jank) monitor ─────────────────────────────────────────────────────

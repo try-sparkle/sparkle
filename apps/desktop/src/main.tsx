@@ -5,7 +5,7 @@ import { App } from "./App";
 import { TrayApp } from "./tray/TrayApp";
 import { CaptureApp } from "./capture/CaptureApp";
 import { initLogger } from "./logger";
-import { startJankMonitor } from "./perfTrace";
+import { startJankMonitor, installPerfDevtools } from "./perfTrace";
 import { initAnalytics } from "./analytics";
 import { usageTelemetry } from "./services/usageTelemetry";
 import { flushCrashReports } from "./services/crashReporter";
@@ -39,6 +39,11 @@ const isCapture = view === "capture";
 // against the spawn/switch/close/render lines. Only in the real app view — the hidden capture and
 // the tiny tray webviews aren't where the slowness lives and would just add noise.
 if (!isTray && !isCapture) startJankMonitor();
+
+// Render counting is always on (a Map bump); the per-render LOG is gated off by default because
+// each line is a main-thread Tauri IPC (bead sparkle-abv2). This exposes the toggle and the
+// counters so `sparklePerf.counts()` / `sparklePerf.setRenderLogging(true)` work from devtools.
+if (!isTray && !isCapture) installPerfDevtools();
 
 // Analytics (PostHog) — masked session replay + autocapture + lifecycle events.
 // No-ops when no key is configured. Started after the logger so init errors surface.

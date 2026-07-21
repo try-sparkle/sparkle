@@ -3,10 +3,10 @@
 // thousands of lines that you have to count by hand, in a file where every other line is also a
 // render. These tests pin the coalescing that keeps the fingerprint (how many renders, how fast)
 // while bounding what a burst can write.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { log } from "./logger";
-import { __resetRenderTraceForTest, perfRender } from "./perfTrace";
+import { __resetRenderTraceForTest, perfRender, setPerfRenderLogging } from "./perfTrace";
 
 /** Hand-driven clock, so a "burst" is just many calls at the same instant. */
 function clock() {
@@ -30,7 +30,17 @@ describe("perfRender", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    localStorage.clear();
     __resetRenderTraceForTest();
+    // These tests are about COALESCING, which only has anything to bound while logging is on.
+    // Since sparkle-abv2 the per-render log is gated OFF by default (each line is a main-thread
+    // Tauri IPC), so this suite opts in explicitly. perfTrace.renderGate.test.ts covers the gate
+    // itself, including that the default is silent.
+    setPerfRenderLogging(true);
+  });
+
+  afterEach(() => {
+    localStorage.clear();
   });
 
   it("logs the first render of a key immediately", () => {
