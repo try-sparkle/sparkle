@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import { defineConfig, loadEnv } from "vite";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { testPoolOptions } from "../../vitest.pool.mjs";
 
 // In dev, surface the user's Chief PAT to the app as VITE_CHIEF_PAT so the Think agent
 // works on localhost without pasting a token. We look (in order) at: the process env
@@ -125,6 +126,9 @@ export default defineConfig(({ mode, command }) => {
   // middleware doesn't crash. Component tests opt into jsdom per-file via a
   // `// @vitest-environment jsdom` docblock (see Composer.dictation.test.tsx).
   test: {
+    // Bound the worker pool (sparkle-jl3y) — see vitest.pool.mjs. This is the largest suite in
+    // the repo, so it is also the biggest single contributor to the process storm.
+    poolOptions: testPoolOptions(),
     setupFiles: ["./src/test-setup.ts"],
     // Coverage with a blocking ratchet (bead .1): CI fails if statement/line
     // coverage regresses below the floor below. The floor is set a few points UNDER the
