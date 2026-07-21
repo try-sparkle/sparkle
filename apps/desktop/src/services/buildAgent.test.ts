@@ -254,6 +254,19 @@ describe("beadsProtocol", () => {
     expect(p).toContain("spawn_worker");
   });
 
+  it("tells the orchestrator to check list_workers for existing claims before re-fanning out", () => {
+    // NOTE ON WHAT THIS TEST IS WORTH. It pins PROSE, and prose is not a mechanism — the actual
+    // enforcement is the bead claim guard in orchestrationListener (separately tested, and
+    // mutation-tested). This exists only so the clause can't be silently dropped, because the
+    // persona is what a FRESH agent reads after a restart, which is precisely when the duplicate
+    // fan-out happened. A previous attempt at deduplication shipped as persona text with a test
+    // asserting the text existed and no mechanism behind it; that is the mistake this comment
+    // exists to keep visible.
+    expect(p).toMatch(/list_workers/);
+    expect(p).toMatch(/re-entrancy|restart|resume/i);
+    expect(p).toMatch(/skip/i);
+  });
+
   it("leaves status transitions to the app, not manual bd commands", () => {
     // in_progress/closed/delivered are now written programmatically (syncBeadLifecycle); the
     // orchestrator is explicitly told NOT to run them by hand so the board can't drift.
