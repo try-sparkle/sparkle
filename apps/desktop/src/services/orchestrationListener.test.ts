@@ -25,11 +25,20 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock
 
 // --- mock workerSpawn so no real worktree/PTY is touched; spawnWorker registers a real tab so
 //     the listener can read back branch/worktree from the store. ---
-const defaultSpawnImpl = async (args: { projectId: string; parentAgentId: string; task: string }) => {
+const defaultSpawnImpl = async (args: {
+  projectId: string;
+  parentAgentId: string;
+  task: string;
+  beadId?: string;
+}) => {
   const id = useProjectStore.getState().addAgent(args.projectId, {
     kind: "worker",
     parentId: args.parentAgentId,
     task: args.task,
+    // The real spawnWorker persists beadId onto the worker record (workerSpawn.ts). The mock
+    // omitted it, so the store's workers were bead-less here in a way they never are in the app —
+    // which would have hidden the whole bead-claim guard from these tests.
+    beadId: args.beadId,
   });
   const branch = `sparkle/agent-${id}`;
   const worktree = `/wt/${id}`;
@@ -55,7 +64,11 @@ vi.mock("./worktree", async (orig) => ({
   scanWorkerManifests: (...a: unknown[]) => scanWorkerManifestsMock(...(a as [string])),
 }));
 
-import { startOrchestrationListener, type OrchestrationRequest } from "./orchestrationListener";
+import {
+  startOrchestrationListener,
+  purgeBuildAgent,
+  type OrchestrationRequest,
+} from "./orchestrationListener";
 
 const fire = (req: OrchestrationRequest) => firedHandler!({ payload: req });
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -498,5 +511,144 @@ describe("orchestrationListener", () => {
     await flush();
     const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
     expect(proj.agents.some((a) => a.id === "orphan-w")).toBe(false);
+  });
+
+  // ── the bead claim guard ──────────────────────────────────────────────────────────────────────
+  // Observed in production: a restart re-dispatched already-claimed units — five agents
+  // independently solving one P0, two more duplicating other work, ~7 wasted agents in a single
+  // run. `beadId` was threaded end-to-end (MCP → bridge → listener → store → disk manifest) and
+  // never once COMPARED: every occurrence in the spawn path was an assignment. An idempotency guard
+  // already existed for workerId; there was no beadId equivalent, and list_workers stripped beadId
+  // so a resumed orchestrator could not see which bead any live worker owned.
+  const workersOf = (pid: string, parent: string) =>
+    (useProjectStore.getState().projects.find((p) => p.id === pid)?.agents ?? []).filter(
+      (a) => a.kind === "worker" && a.parentId === parent,
+    );
+  const lastResult = () =>
+    (invokeMock.mock.calls.at(-1)![1] as { result: Record<string, unknown> }).result;
+
+  it("a second spawn for the SAME bead does not spawn again — it returns the existing worker", async () => {
+    fire({ reqId: "b1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "fix the P0", beadId: "sparkle-01xv" } });
+    await flush();
+    const first = lastResult() as { workerId: string };
+    expect(workersOf(projectId, buildId)).toHaveLength(1);
+
+    fire({ reqId: "b2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "fix the P0 again", beadId: "sparkle-01xv" } });
+    await flush();
+    // Still ONE worker, and the reply is idempotent — the caller learns the bead is already
+    // claimed and by whom, rather than getting an error it might retry into another duplicate.
+    expect(workersOf(projectId, buildId)).toHaveLength(1);
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+    expect(lastResult().workerId).toBe(first.workerId);
+  });
+
+  it("two spawns for one bead RACING (before the first resolves) still yield one worker", async () => {
+    // The store-only check is not sufficient: runSpawn awaits spawnWorker, so the worker record does
+    // not exist yet when a second request arrives in the same tick. Both would pass a store check
+    // and both would spawn — which is precisely the burst a restart produces.
+    fire({ reqId: "r-a", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "t", beadId: "sparkle-race" } });
+    fire({ reqId: "r-b", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "t", beadId: "sparkle-race" } });
+    await flush();
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+    expect(workersOf(projectId, buildId)).toHaveLength(1);
+  });
+
+  it("a DIFFERENT bead spawns normally — the guard is per work unit, not a global lock", async () => {
+    fire({ reqId: "d1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "a", beadId: "bead-a" } });
+    await flush();
+    fire({ reqId: "d2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "b", beadId: "bead-b" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
+    expect(workersOf(projectId, buildId)).toHaveLength(2);
+  });
+
+  it("spawns with NO beadId are never deduped — anonymous work has no identity to compare", async () => {
+    // Ad-hoc spawns carry no bead. Collapsing them would silently drop legitimate parallel work,
+    // which is a worse failure than the duplication this guard prevents.
+    fire({ reqId: "n1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "one" } });
+    await flush();
+    fire({ reqId: "n2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "two" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
+    expect(workersOf(projectId, buildId)).toHaveLength(2);
+  });
+
+  it("the same bead under a DIFFERENT build agent is allowed — claims are per orchestrator", async () => {
+    const otherBuild = useProjectStore.getState().addAgent(projectId, { kind: "build" });
+    fire({ reqId: "s1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "t", beadId: "shared" } });
+    await flush();
+    fire({ reqId: "s2", op: "spawn_worker", buildAgentId: otherBuild, projectId, payload: { task: "t", beadId: "shared" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
+    expect(workersOf(projectId, buildId)).toHaveLength(1);
+    expect(workersOf(projectId, otherBuild)).toHaveLength(1);
+  });
+
+  it("list_workers reports beadId, so a resumed orchestrator can see its own claims", async () => {
+    // Without this the roster is N anonymous workers: the orchestrator cannot tell which bead any
+    // of them owns, so after a restart it re-dispatches everything it still sees in `bd ready`.
+    fire({ reqId: "lb", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "t", beadId: "sparkle-visible" } });
+    await flush();
+    fire({ reqId: "lb2", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+    await flush();
+    const { workers } = lastResult() as { workers: Array<{ workerId: string; beadId?: string }> };
+    expect(workers).toHaveLength(1);
+    expect(workers[0]!.beadId).toBe("sparkle-visible");
+  });
+
+  it("a queued bead's claim is released when its build agent is purged (roborev 41945)", async () => {
+    // A QUEUED request holds its claim but never reaches runSpawn, where the release lives. Without
+    // an explicit release on the drop path the key leaks in a module-level Set — and since a build
+    // agent id can be reincarnated, its legitimate re-spawn would be refused forever with no worker
+    // and nothing in flight. That is the exact failure the claim exists to prevent.
+    useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 1 });
+    fire({ reqId: "q1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "occupy the slot", beadId: "bead-occupy" } });
+    await flush();
+    // Second bead is over cap → queued, holding its claim.
+    fire({ reqId: "q2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "queued", beadId: "bead-queued" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+
+    purgeBuildAgent(buildId);
+    // Room again, and the purged claim must not linger.
+    useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 20 });
+    useProjectStore.setState({ projects: [], selectedProjectId: null });
+    const p2 = useProjectStore.getState().addProject("Demo2", "/tmp/demo2");
+    const b2 = useProjectStore.getState().addAgent(p2, { kind: "build" });
+    fire({ reqId: "q3", op: "spawn_worker", buildAgentId: b2, projectId: p2, payload: { task: "retry", beadId: "bead-queued" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("an already-claimed bead whose worker is mid-relocation refuses rather than replying malformed", async () => {
+    // A worker record can be concurrently mutated to a null worktreePath by relocation/reconcile
+    // (sparkle-yk3x). Replying with empty branch/worktree trips the MCP client's malformed-reply
+    // guard, which surfaces as an error the orchestrator may RETRY — defeating idempotency. The
+    // claim must still hold; we just can't name the worker yet.
+    fire({ reqId: "m1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "t", beadId: "bead-reloc" } });
+    await flush();
+    const w = workersOf(projectId, buildId)[0]!;
+    useProjectStore.getState().setAgentWorktree(projectId, w.id, "", "");
+    fire({ reqId: "m2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "t", beadId: "bead-reloc" } });
+    await flush();
+    // No second spawn, and the reply is an explanatory error rather than an empty identity.
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+    const res = lastResult() as { error?: string; branch?: string };
+    expect(res.error).toContain("bead-reloc");
+    expect(res.branch).toBeUndefined();
+  });
+
+  it("a freed bead can be re-dispatched after its worker is spun down", async () => {
+    // The guard must not be a permanent tombstone: once the claim is released, the unit is
+    // dispatchable again (a genuine retry after a failure goes through spin_down first).
+    fire({ reqId: "f1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "t", beadId: "bead-free" } });
+    await flush();
+    const w = workersOf(projectId, buildId)[0]!;
+    fire({ reqId: "f2", op: "spin_down", buildAgentId: buildId, projectId, payload: { workerId: w.id } });
+    await flush();
+    fire({ reqId: "f3", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "t", beadId: "bead-free" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
   });
 });
