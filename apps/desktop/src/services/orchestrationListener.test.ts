@@ -611,12 +611,32 @@ describe("orchestrationListener", () => {
     expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
 
     purgeBuildAgent(buildId);
-    // Room again, and the purged claim must not linger.
+    // Retry under the SAME projectId + buildAgentId, because the claim key is
+    // (projectId, buildAgentId, beadId) — retrying under a fresh project/agent would compute a
+    // DIFFERENT key, never collide with the leaked one, and pass whether or not the fix exists.
+    // (That was the original form of this test; roborev 41951 caught that it verified nothing.)
+    // Only the cap is relaxed, so the retry has a slot but the same identity.
     useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 20 });
-    useProjectStore.setState({ projects: [], selectedProjectId: null });
-    const p2 = useProjectStore.getState().addProject("Demo2", "/tmp/demo2");
-    const b2 = useProjectStore.getState().addAgent(p2, { kind: "build" });
-    fire({ reqId: "q3", op: "spawn_worker", buildAgentId: b2, projectId: p2, payload: { task: "retry", beadId: "bead-queued" } });
+    fire({ reqId: "q3", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "retry", beadId: "bead-queued" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("teardown clears claims, so a restarted listener can dispatch a previously-queued bead", async () => {
+    // The second leak path. Previously exercised only incidentally by afterEach(cleanup), so a
+    // regression removing `claimedBeads.clear()` from teardown would not have failed anything.
+    useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 1 });
+    fire({ reqId: "t1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "occupy", beadId: "bead-t-occupy" } });
+    await flush();
+    fire({ reqId: "t2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "queued", beadId: "bead-t-queued" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+
+    cleanup?.(); // teardown — drops the queued request; its claim must not survive
+    cleanup = await startOrchestrationListener();
+    useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 20 });
+    // Same project + build agent + bead as the queued request that was dropped.
+    fire({ reqId: "t3", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "retry", beadId: "bead-t-queued" } });
     await flush();
     expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
   });
