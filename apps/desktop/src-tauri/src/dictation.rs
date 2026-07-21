@@ -402,6 +402,69 @@ enum ReconcileStep {
     },
 }
 
+/// Whether a focus-driven capture TEARDOWN should park the installed cloud session in warm
+/// standby. Deliberately the same predicate as `stop_cloud_stream`'s `keep_warm`: parking on blur
+/// and parking on a stop-word stop are one rule, not two, so they can't drift.
+fn should_standby_on_blur(cloud_active: bool, alive: bool) -> bool {
+    cloud_active && alive
+}
+
+/// Whether a focus-driven capture BUILD should resume a parked cloud session. `alive` is the
+/// load-bearing half: once warm standby expires the worker closes the socket and exits, and
+/// resuming that corpse would flip `cloud_active` back on with nothing behind it — routing the
+/// capture callback at a dead session instead of on-device. An expired session is left for the
+/// frontend's `cloud-ended` cleanup, exactly as today.
+fn should_resume_on_focus(cloud_active: bool, alive: bool) -> bool {
+    !cloud_active && alive
+}
+
+/// Park a live cloud session in warm standby on window blur, mirroring a stop-word stop.
+///
+/// Without this the blur path drops the capture but leaves the socket UNPAUSED: it then idles with
+/// no audio, no `CloseStream` and no warm timer until the relay's upstream idle-close severs it, so
+/// a refocus moments later pays a full TLS+WS handshake — which `start_cloud_stream` runs inline on
+/// the IPC/event-loop thread. Parking instead means a quick refocus resumes on the same connection,
+/// and a long one closes cleanly on OUR timer.
+///
+/// `pause()` is a non-blocking channel send, so this is safe to call under the session lock — the
+/// sparkle-sfxu rule bans blocking work there, not sends. The OS mic is already released by the
+/// capture drop that accompanies this; a paused worker forwards no audio, so the parked socket is
+/// held no longer than today and is explicitly muted for the window it is held.
+fn park_cloud_for_blur(cloud: &Mutex<Option<DeepgramSession>>, cloud_active: &AtomicBool) {
+    let guard = cloud.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(session) = guard.as_ref() else { return }; // on-device dictation — nothing to park
+    if !should_standby_on_blur(cloud_active.load(Ordering::Relaxed), session.is_alive()) {
+        return;
+    }
+    // Order matters: clear the flag BEFORE the pause so the capture callback can never observe
+    // "cloud active" against a socket that is on its way into standby.
+    cloud_active.store(false, Ordering::Relaxed);
+    session.pause();
+}
+
+/// Resume a cloud session parked by `park_cloud_for_blur` when focus returns inside the warm
+/// window — no handshake, the whole point of the standby. A session that expired while we were
+/// away fails the `is_alive` gate and is left alone (see `should_resume_on_focus`).
+fn unpark_cloud_for_focus(cloud: &Mutex<Option<DeepgramSession>>, cloud_active: &AtomicBool) {
+    let guard = cloud.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(session) = guard.as_ref() else { return };
+    if !should_resume_on_focus(cloud_active.load(Ordering::Relaxed), session.is_alive()) {
+        return;
+    }
+    session.resume();
+    // Set the flag only AFTER the resume lands, so the callback never routes at a still-paused
+    // worker (the mirror of the park ordering above).
+    //
+    // `is_alive` above and this store are not atomic together: a worker that exits in between
+    // leaves `cloud_active` true over a dead session, and frames are then dropped (NOT transcribed
+    // on-device) until the worker's `cloud-ended` emit drives the frontend's stop_cloud_stream and
+    // flips the flag back. That is precisely the mid-stream-failure window the capture callback
+    // already documents and accepts — one event round-trip, on a rare disconnect — not a new
+    // hazard. Re-checking `is_alive` here would narrow it without closing it, so we lean on the
+    // existing recovery rather than pretend a second check makes it atomic.
+    cloud_active.store(true, Ordering::Relaxed);
+}
+
 impl DictationState {
     /// Stop any in-flight capture by dropping the cpal stream, so CoreAudio stops invoking the
     /// audio callback. Called on app exit () to quiesce the audio IOThread BEFORE
@@ -445,6 +508,10 @@ impl DictationState {
                     Ok((cap, worker)) => {
                         sess.capture = Some(cap);
                         sess.decode_worker = Some(worker);
+                        // Refocus inside the warm window resumes the parked socket rather than
+                        // re-handshaking. Only once the capture is actually installed: resuming a
+                        // session we then failed to feed would leave it live but silent.
+                        unpark_cloud_for_focus(&sess.cloud, &sess.cloud_active);
                         tracing::info!(target: "dictation", "capture resumed (window focused)");
                     }
                     Err(e) => {
@@ -464,6 +531,8 @@ impl DictationState {
             }
             sess.capture = None; // drop -> stops the cpal stream, releases the OS mic, closes the decode channel
             sess.decode_worker = None; // worker joins near-instantly (aborting) instead of draining the backlog
+            // Park the cloud socket too, so a quick refocus reuses it instead of re-handshaking.
+            park_cloud_for_blur(&sess.cloud, &sess.cloud_active);
             tracing::info!(target: "dictation", "capture paused (window unfocused or muted)");
             }
         }
@@ -546,6 +615,11 @@ impl DictationState {
                 if let Some(w) = sess.decode_worker.as_ref() {
                     w.abort();
                 }
+                // Park the cloud socket in warm standby on the way out. Safe under the lock: pause()
+                // is a non-blocking channel send, not the main-thread-dependent work sparkle-sfxu
+                // bans here. Doing it now (rather than in the caller's off-lock drop) keeps the park
+                // atomic with the decision that produced it.
+                park_cloud_for_blur(&sess.cloud, &sess.cloud_active);
                 ReconcileStep::Teardown {
                     capture: sess.capture.take(),
                     worker: sess.decode_worker.take(),
@@ -571,6 +645,10 @@ impl DictationState {
             if still_current {
                 sess.capture = Some(capture);
                 sess.decode_worker = Some(worker);
+                // Resume a socket parked by the blur that preceded this rebuild — only on the
+                // still_current path, so a capture discarded by a stop/blur race never revives the
+                // cloud session it raced.
+                unpark_cloud_for_focus(&sess.cloud, &sess.cloud_active);
                 tracing::info!(target: "dictation", "capture resumed (window focused)");
                 None
             } else {
@@ -1074,7 +1152,11 @@ pub fn stop_cloud_stream(state: State<DictationState>) {
         // ~WARM_STANDBY so the next utterance reuses it (no handshake). The session stays in the slot;
         // start_cloud_stream resumes it. Any other case (already inactive — e.g. a cloud-ended cleanup
         // after warm expiry — or a worker that already died) takes + finishes the leftover instead.
-        let keep_warm = was_active && cloud.as_ref().map(|s| s.is_alive()).unwrap_or(false);
+        // Shares the predicate with the blur path rather than restating it: parking on a stop-word
+        // stop and parking on a window blur are ONE rule, and an inline copy here is exactly how the
+        // two would drift.
+        let keep_warm =
+            should_standby_on_blur(was_active, cloud.as_ref().map(|s| s.is_alive()).unwrap_or(false));
         if keep_warm {
             // Warm standby: the session (and thus its sender in cloud_tx) is kept for reuse — leave
             // the slot as-is. cloud_active is already false, so the callback routes on-device and
@@ -1128,10 +1210,13 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 #[cfg(test)]
 mod tests {
     use super::{AppHandle, State,
-        capture_should_be_live, choose_engine, frame_speaking, plan_capture, segment_fingerprint,
-        should_emit_blur, should_install_cloud, start_after_load, CapturePlan, DictationState,
-        Engine, ReconcileStep, StartAfterLoad,
+        capture_should_be_live, choose_engine, frame_speaking, park_cloud_for_blur, plan_capture,
+        segment_fingerprint, should_emit_blur, should_install_cloud, should_resume_on_focus,
+        should_standby_on_blur, start_after_load, unpark_cloud_for_focus, CapturePlan,
+        DeepgramSession, DictationState, Engine, ReconcileStep, StartAfterLoad,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn frame_speaking_mirrors_vad_on_device_and_forces_true_on_cloud() {
@@ -1246,6 +1331,86 @@ mod tests {
         let gen = state.1.load(Ordering::SeqCst);
         let _ = state.take_reconcile_step(true, gen);
         assert!(state.0.lock().unwrap().focused, "unraced sample seeds focus so the mic can arm on mount");
+    }
+
+    #[test]
+    fn blur_parks_a_live_cloud_session_and_leaves_everything_else_alone() {
+        // The blur path used to drop the capture and say nothing to the cloud session, so the socket
+        // idled — unpaused, no CloseStream, no warm timer — until the relay's upstream idle-close
+        // severed it. A refocus moments later then paid a full TLS+WS handshake (run inline on the
+        // IPC/event-loop thread) that the 8s warm standby already existed to avoid: 114 sub-8s
+        // reconnects in a single observed session. Park iff there is something live to park.
+        assert!(should_standby_on_blur(true, true), "live + active → park in warm standby");
+        // Not active: the session is already parked (a stop-word stop got there first) or was never
+        // routed to cloud. Re-pausing would restart the warm timer and hold the socket longer.
+        assert!(!should_standby_on_blur(false, true), "already inactive → nothing to park");
+        // Dead worker: the socket is gone; pause() would be a send into a closed channel.
+        assert!(!should_standby_on_blur(true, false), "dead session → nothing to park");
+        assert!(!should_standby_on_blur(false, false), "inactive and dead → nothing to park");
+    }
+
+    #[test]
+    fn refocus_resumes_only_a_session_that_is_still_warm() {
+        // The other half: a refocus inside the warm window resumes on the SAME connection.
+        assert!(should_resume_on_focus(false, true), "parked + still alive → resume, no handshake");
+        // Expired while we were away. This is the load-bearing case: warm standby closed the socket
+        // and the worker exited, so resuming would flip cloud_active back on with nothing behind it
+        // and route the capture callback at a dead session instead of on-device. Leave it for the
+        // frontend's cloud-ended cleanup, which then opens a fresh stream as it does today.
+        assert!(!should_resume_on_focus(false, false), "expired session → do NOT revive");
+        // Already active — a focus gain with no preceding park (e.g. window-to-window). Resuming a
+        // non-paused worker is a no-op, but asserting it keeps park/unpark strictly symmetric.
+        assert!(!should_resume_on_focus(true, true), "never parked → nothing to resume");
+        assert!(!should_resume_on_focus(true, false), "active but dead → not ours to revive");
+    }
+
+    #[test]
+    fn park_and_unpark_are_inverses_on_a_live_session() {
+        // Park then unpark must return the routing flag to where it started, or a blur/refocus pair
+        // would silently strand dictation on-device (or worse, mark cloud active with no socket).
+        for alive in [true, false] {
+            let active_after_park = !should_standby_on_blur(true, alive);
+            assert_eq!(
+                should_resume_on_focus(active_after_park, alive),
+                alive,
+                "a live session must round-trip active→parked→active; a dead one must stay parked"
+            );
+        }
+    }
+
+    #[test]
+    fn park_and_unpark_are_noops_for_an_on_device_session() {
+        // The empty-slot branch: pure on-device dictation has no cloud session, and a blur/refocus
+        // must not touch the routing flag on its way past. Reachable without a mock because the slot
+        // is just an Option — the live-session ordering is covered by the predicates above, since
+        // faking a DeepgramSession would mean a trait abstraction this one call site doesn't earn.
+        let cloud: Mutex<Option<DeepgramSession>> = Mutex::new(None);
+
+        for initial in [false, true] {
+            let flag = AtomicBool::new(initial);
+            park_cloud_for_blur(&cloud, &flag);
+            assert_eq!(flag.load(Ordering::Relaxed), initial, "blur must not touch an empty slot");
+            unpark_cloud_for_focus(&cloud, &flag);
+            assert_eq!(flag.load(Ordering::Relaxed), initial, "refocus must not touch an empty slot");
+        }
+    }
+
+    #[test]
+    fn park_and_unpark_recover_from_a_poisoned_cloud_lock() {
+        // Poison tolerance is load-bearing here (): a panicked frame must never wedge
+        // dictation, so these run on the focus path and must not propagate a poisoned lock.
+        let cloud: Arc<Mutex<Option<DeepgramSession>>> = Arc::new(Mutex::new(None));
+        let poisoner = Arc::clone(&cloud);
+        let _ = std::thread::spawn(move || {
+            let _g = poisoner.lock().unwrap();
+            panic!("poison the cloud slot");
+        })
+        .join();
+        assert!(cloud.is_poisoned(), "precondition: the slot is poisoned");
+
+        let flag = AtomicBool::new(false);
+        park_cloud_for_blur(&cloud, &flag);
+        unpark_cloud_for_focus(&cloud, &flag);
     }
 
     #[test]
