@@ -7,10 +7,26 @@ import { invoke } from "@tauri-apps/api/core";
 export interface BranchStatus {
   ahead: number;
   behind: number;
+  // Uncommitted changes present in the agent's worktree — the RAW reading, deliberately not
+  // filtered by `worktreeOnBranch`. See that field for who must filter it and who must not.
   dirty: boolean;
   filesChanged: number;
   insertions: number;
   deletions: number;
+  // Is the worktree actually on `sparkle/agent-<id>`? Normally true. False when something moved
+  // it off its own branch — the old `land.sh` checked `main` out into agent worktrees
+  // (sparkle-rhgm), and a manual checkout does it too. Optional so a Rust build predating the
+  // field deserializes to undefined (same back-compat shape as WorkflowState's optionals).
+  //
+  // Every other field here is derived from the branch REF and is immune to this. `dirty` is the
+  // sole exception, and the two consumers need OPPOSITE things from it:
+  //   - ATTRIBUTION (stage, bead lifecycle): a parked tree's dirt is some other branch's, so it
+  //     must not count as this agent's work — gate on `worktreeOnBranch !== false`.
+  //   - SAFETY (close prompt): parking CARRIES uncommitted files along, so they are still there
+  //     and still the user's. Never suppress dirty here; treat a parked tree as work-at-risk.
+  // Read `false` as "not this branch's tree", and `undefined` as "unknown" — neither is
+  // evidence the tree is clean.
+  worktreeOnBranch?: boolean;
 }
 
 /** Land-to-green workflow signals for an agent branch (see Rust `agent_workflow_state`). All

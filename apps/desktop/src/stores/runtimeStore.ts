@@ -260,7 +260,13 @@ export async function syncBeadLifecycle(
   // Skip the shell-outs entirely (latched below on the first such failure) so we don't spawn a bd
   // subprocess per deliverable agent per poll for a project that doesn't use beads.
   if (beadsUnavailableProjects.has(projectId)) return;
-  const hasRealWork = !!bs && (bs.ahead > 0 || bs.dirty);
+  // ATTRIBUTION side of sparkle-xk3x: `dirty` is the one BranchStatus field read from the
+  // worktree rather than the branch ref, so when the worktree is parked on another branch its
+  // dirt belongs to THAT branch. Counting it here would mark a landed agent as having real work
+  // and write `in_progress` back onto an already-closed bead. `ahead` is ref-derived and safe.
+  // `undefined` (older Rust build) keeps the previous behaviour rather than silently dropping dirt.
+  const dirtyIsThisBranch = !!bs?.dirty && bs.worktreeOnBranch !== false;
+  const hasRealWork = !!bs && (bs.ahead > 0 || dirtyIsThisBranch);
   // Seed the watermark from the persisted shipped ✓: if this agent's work ever reached main, its bead
   // is at least closed — so a relaunch that sees a re-climbing cycle (stage back at building) never
   // writes in_progress onto it and reopens it. In-memory progress still wins when it's further along.

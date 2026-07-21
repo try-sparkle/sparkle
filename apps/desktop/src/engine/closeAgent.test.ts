@@ -26,6 +26,24 @@ describe("shouldPromptOnClose", () => {
   it("does NOT prompt for a build agent with a KNOWN-clean tree (polled, no work)", () => {
     expect(shouldPromptOnClose("build", "building_unsaved", bs(0, false))).toBe(false);
   });
+  it("prompts when the worktree is PARKED off its branch — the files are still there (sparkle-xk3x)", () => {
+    // Parking (the old land.sh checking `main` into an agent worktree) CARRIES uncommitted files
+    // along. They are still on disk and still the user's, so deleting the worktree destroys them.
+    // This is the same fail-safe posture as the unpolled case below: a tree we cannot attribute is
+    // work we cannot rule out. The sibling gate in runtimeStore goes the OTHER way on purpose —
+    // it must not credit this dirt as the agent's work — and conflating the two loses data here.
+    expect(
+      shouldPromptOnClose("build", "building_unsaved", { ...bs(0, true), worktreeOnBranch: false }),
+    ).toBe(true);
+    // Even with a clean-looking tree: false means "not this branch's tree", never "no work".
+    expect(
+      shouldPromptOnClose("build", "building_unsaved", { ...bs(0, false), worktreeOnBranch: false }),
+    ).toBe(true);
+    // On its own branch, a known-clean tree still closes silently — the gate must not over-prompt.
+    expect(
+      shouldPromptOnClose("build", "building_unsaved", { ...bs(0, false), worktreeOnBranch: true }),
+    ).toBe(false);
+  });
   it("prompts when branch status is unknown (unpolled) — err toward the choice, never silent loss", () => {
     expect(shouldPromptOnClose("build", "building_unsaved", undefined)).toBe(true);
     // …but a merged build agent with unknown status is still safe to close silently.

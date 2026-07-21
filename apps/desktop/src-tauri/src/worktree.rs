@@ -842,22 +842,34 @@ pub async fn create_agent_worktree(
 pub struct BranchStatus {
     ahead: u32,
     behind: u32,
+    /// Uncommitted changes in the agent's worktree. ONLY meaningful when `worktree_on_branch`
+    /// is true — see that field. Every OTHER field on this struct is derived from the branch
+    /// REF and is therefore immune to whatever the worktree happens to be checked out to.
     dirty: bool,
     files_changed: u32,
     insertions: u32,
     deletions: u32,
+    /// Does the worktree actually have `sparkle/agent-<id>` checked out? Normally yes. It goes
+    /// false when something moved the worktree off its own branch — the old `land.sh` checked
+    /// `main` out into agent worktrees (sparkle-rhgm), and a manual checkout does it too.
+    ///
+    /// When false, `dirty` is reported as false, and that false means "NOT KNOWN", not "clean":
+    /// the tree sitting there belongs to some other branch, so its dirt is not this branch's
+    /// dirt and must not be asserted as such. Consumers must not apply the unsaved-edits stage
+    /// floor on a false reading. Same unknown-vs-false shape as `hasRemote` in WorkflowState.
+    worktree_on_branch: bool,
 }
 
 /// Status for an agent branch whose base ref can't be resolved: there's no base to diverge from,
 /// so count the branch's OWN commits as `ahead` (behind 0) and skip the base diff. `dirty` is passed
 /// through from the caller's worktree read. Shared by both the single-agent and batched status paths
 /// so their unresolvable-base guards can't drift apart.
-fn ahead_only_status(root: &str, branch: &str, dirty: bool) -> BranchStatus {
+fn ahead_only_status(root: &str, branch: &str, dirty: bool, worktree_on_branch: bool) -> BranchStatus {
     let ahead = git(root, &["rev-list", "--count", branch])
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    BranchStatus { ahead, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0 }
+    BranchStatus { ahead, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch }
 }
 
 /// Core (AppHandle-free, testable): live ahead/behind + dirty + size of an agent branch vs its
@@ -874,11 +886,33 @@ pub fn agent_branch_status_at(
     let wt = worktree_path(app_data, project_id, agent_id)?;
     let wt_str = wt.to_string_lossy().to_string();
 
+    // Is the worktree actually on the branch we're reporting about? Something may have moved it
+    // (the old land.sh checked `main` out into agent worktrees — sparkle-rhgm; a manual checkout
+    // does it too). If it has, the tree there belongs to a DIFFERENT branch, so its dirt is not
+    // this branch's dirt. A missing tree is not a mismatch — that case is handled below and has
+    // its own long-standing meaning.
+    let worktree_on_branch = if wt.exists() {
+        git(&wt_str, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|h| h.trim() == branch)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     // Dirtiness needs the actual worktree. When it's GONE (a landed/cleaned-up agent whose tab
     // stays open and keeps getting polled), a removed tree has no uncommitted changes — report
     // dirty=false instead of erroring, so the 30s poll doesn't re-fail every tick forever and
     // bury real errors in the log. When the tree EXISTS, still propagate a failed read rather than
     // masking it as a misleading "clean" false-negative on the common UI-status path.
+    //
+    // `dirty` stays the RAW worktree reading even when the worktree is parked — deliberately.
+    // Two consumers need opposite things from it and only the caller knows which:
+    //   - stage/bead attribution must NOT count another branch's dirt as this branch's work
+    //   - close-safety must NOT tear down a tree that may still hold uncommitted files; parking
+    //     CARRIES uncommitted changes along, so they are still there and still the user's
+    // Zeroing it here would silently serve the first at the cost of the second, and the second
+    // loses data (see shouldPromptOnClose, which already errs toward prompting on unknown).
+    // So: report what is there, publish `worktree_on_branch`, and let each consumer decide.
     let dirty = if wt.exists() {
         !git(&wt_str, &["status", "--porcelain"])?.is_empty()
     } else {
@@ -898,7 +932,7 @@ pub fn agent_branch_status_at(
     )
     .is_err()
     {
-        return Ok(BranchStatus { ahead: 0, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0 });
+        return Ok(BranchStatus { ahead: 0, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch });
     }
 
     // The agent branch exists, but its RESOLVED base may not: `effective_base` documents an
@@ -909,7 +943,7 @@ pub fn agent_branch_status_at(
     // branch's own commits as `ahead` (behind 0 — the born-off-nothing model), still reflecting the
     // worktree's dirty state, instead of erroring.
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")]).is_err() {
-        return Ok(ahead_only_status(root, &branch, dirty));
+        return Ok(ahead_only_status(root, &branch, dirty, worktree_on_branch));
     }
 
     // `--left-right --count A...B` emits "<left>\t<right>": left = base-only = behind,
@@ -929,7 +963,7 @@ pub fn agent_branch_status_at(
         deletions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     }
 
-    Ok(BranchStatus { ahead, behind, dirty, files_changed, insertions, deletions })
+    Ok(BranchStatus { ahead, behind, dirty, files_changed, insertions, deletions, worktree_on_branch })
 }
 
 /// Live ahead/behind + dirty + size of an agent branch vs its (no-fetch) effective base.
@@ -1789,6 +1823,17 @@ fn branch_status_with_base(
     // update its stat cache), which would bump the index mtime our fingerprint keys on and defeat the
     // skip on the very next tick. This top-level flag tells git not to take the index lock / write it,
     // so the mtime stays stable and an idle, unchanged agent is actually skipped (sparkle-zlic).
+    // Same worktree-identity check as `agent_branch_status_at` (sparkle-xk3x). This is the path
+    // the sidebar/status BATCH poll uses, so it is the one that actually drives what the user
+    // sees — fixing only the single-agent path would leave the misreport live in the UI.
+    // `rev-parse` doesn't touch the index, so it can't defeat the fingerprint skip above.
+    let worktree_on_branch = if wt.exists() {
+        git(&wt_str, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|h| h.trim() == branch)
+            .unwrap_or(false)
+    } else {
+        false
+    };
     let dirty = if wt.exists() {
         !git(&wt_str, &["--no-optional-locks", "status", "--porcelain"])?.is_empty()
     } else {
@@ -1801,7 +1846,7 @@ fn branch_status_with_base(
     // the batch refactor): return a zeroed status — still reflecting the worktree's dirty state — when
     // the branch ref doesn't exist, so there's nothing to count against a ref that isn't there.
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_err() {
-        return Ok(BranchStatus { ahead: 0, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0 });
+        return Ok(BranchStatus { ahead: 0, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch });
     }
     // The branch exists, but the RESOLVED base may not (`effective_base`'s documented unborn/HEAD-less
     // fallback can return a name git can't resolve). `rev-list <unresolvable-base>...<branch>` then
@@ -1810,7 +1855,7 @@ fn branch_status_with_base(
     // diverge from when the base doesn't exist, so report the branch's own commits as `ahead` (behind 0)
     // instead of erroring — mirrors `agent_branch_status_at`'s base guard.
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("{base_ref}^{{commit}}")]).is_err() {
-        return Ok(ahead_only_status(root, &branch, dirty));
+        return Ok(ahead_only_status(root, &branch, dirty, worktree_on_branch));
     }
     let counts = git(root, &["rev-list", "--left-right", "--count", &format!("{base_ref}...{branch}")])?;
     let mut it = counts.split_whitespace();
@@ -1824,7 +1869,7 @@ fn branch_status_with_base(
         insertions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         deletions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     }
-    Ok(BranchStatus { ahead, behind, dirty, files_changed, insertions, deletions })
+    Ok(BranchStatus { ahead, behind, dirty, files_changed, insertions, deletions, worktree_on_branch })
 }
 
 /// The agent's workflow state given ALREADY-RESOLVED shared inputs (default branch, origin presence)
@@ -4017,6 +4062,77 @@ mod tests {
         std::fs::write(Path::new(&info.path).join("uncommitted.txt"), "u").unwrap();
         let st2 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
         assert!(st2.dirty, "uncommitted file flips dirty");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn agent_branch_status_does_not_attribute_a_parked_worktrees_dirt_to_the_branch() {
+        // sparkle-xk3x. `dirty` is the ONE field read from the worktree rather than from the
+        // branch ref — every other field here comes from `rev-list <base>...refs/heads/<branch>`
+        // and is immune to this. So when a worktree gets moved OFF its own branch (the old
+        // land.sh checked `main` out into it — sparkle-rhgm), `dirty` silently stops describing
+        // the agent's branch and starts describing whatever tree is sitting there now.
+        //
+        // Downstream that is not cosmetic: a dirty reading applies the "unsaved edits" floor in
+        // gitDerivedStage, which is exactly the founder screenshot — stage pinned below
+        // merged_local with ahead == 0, so the CTA offered "Land to Main" for landed work.
+        //
+        // The probe deliberately keeps reporting RAW `dirty` and publishes the identity flag
+        // separately, rather than zeroing `dirty` when parked. Zeroing looks tidier and is
+        // wrong: parking CARRIES uncommitted files along, and shouldPromptOnClose reads `dirty`
+        // to decide whether tearing the worktree down would discard the user's work. Suppressing
+        // it there would trade a cosmetic stage misreport for silent data loss. Attribution is
+        // the CONSUMER's decision — see the two callers in runtimeStore.ts and closeAgent.ts.
+        let root = unique_root("status-parked");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("status-parked-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+
+        // Real agent work, so ahead is non-zero and provably survives the parking.
+        std::fs::write(Path::new(&info.path).join("a.txt"), "a\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+
+        // Baseline: on its own branch, a dirty tree IS the branch's dirt and must be reported.
+        std::fs::write(Path::new(&info.path).join("uncommitted.txt"), "u").unwrap();
+        let before = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        assert!(before.dirty, "on its own branch, dirt belongs to the branch");
+        assert!(before.worktree_on_branch, "worktree is on the agent branch");
+        assert_eq!(before.ahead, 1);
+
+        // Park it, exactly as the old land.sh did: free `main` at the root, then check `main`
+        // out INTO the agent's worktree. The uncommitted file rides along, so the tree is still
+        // dirty — but that dirt now belongs to `main`, not to sparkle/agent-s1.
+        git(&root_str, &["checkout", "--detach"]).unwrap();
+        git(&info.path, &["checkout", "main"]).unwrap();
+        assert_eq!(
+            git(&info.path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "main",
+            "worktree is parked on main (precondition)"
+        );
+        assert!(
+            !git(&info.path, &["status", "--porcelain"]).unwrap().is_empty(),
+            "parked tree really is dirty — so a naive read WOULD report dirty=true"
+        );
+
+        let parked = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        assert!(
+            !parked.worktree_on_branch,
+            "probe must notice the worktree is not on sparkle/agent-s1"
+        );
+        assert!(
+            parked.dirty,
+            "dirty stays RAW so close-safety can still see files at risk — attribution is the \
+             consumer's job, not the probe's"
+        );
+        // The ref-derived fields are unaffected by parking — that is the whole point of only
+        // distrusting `dirty`. If this regresses, the fix over-corrected.
+        assert_eq!(parked.ahead, 1, "ahead comes from the branch ref, not the worktree");
+
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
     }

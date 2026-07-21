@@ -5,9 +5,11 @@
 // time went. Nothing here throws, allocates on a hot path beyond a Map lookup, or changes behavior.
 //
 // Four instruments, each independently grep-able by its message prefix:
-//   • jank      — a requestAnimationFrame stall detector: logs every main-thread freeze (the app
-//                 "hangs") with its duration, so we SEE the 2-5s stalls even without knowing the
-//                 cause. This is the first thing to read: `grep 'perf.*jank'`.
+//   • jank      — a requestAnimationFrame stall detector: catches every main-thread freeze (the app
+//                 "hangs"), so we SEE the 2-5s stalls even without knowing the cause. Freezes long
+//                 enough to feel (>=JANK_SEVERE_MS) warn on their own line; shorter ones are
+//                 counted and reported as a periodic rate, since dropped frames matter in aggregate
+//                 and warning on each buried the tail. First thing to read: `grep 'perf.*jank'`.
 //   • <kind>    — keyed interaction waterfalls (spawn / switch / close): start → milestones → total,
 //                 each milestone carrying ms-since-start and ms-since-previous.
 //   • span      — one-shot timing around a specific sync/async operation (merge, migrate, stringify…).
@@ -189,6 +191,25 @@ let jankRunning = false;
 // main-thread stall lasts this long; anything above it is a wake, not a freeze.
 const SUSPEND_MS = 30_000;
 
+/** A stall at or above this warns on its own line; anything shorter is coalesced into the periodic
+ *  rollup below. Measured against a day of real traffic: stalls run ~10.3k/day with a median of
+ *  221ms — barely past `thresholdMs`, far too short to see — while the freezes that actually cost
+ *  the user sit in the tail (p99 ≈13s). Warning on all of them buried that tail under ~93% noise and
+ *  bloated a log meant to be shareable. 1s keeps every user-perceptible freeze on its own line
+ *  (~750/day, the whole tail) and coalesces the rest; it is the knee, not a round number — 500ms
+ *  keeps 1965/day (much of it still sub-perceptible) and 2s starts dropping real freezes into the
+ *  rollup. Below this a stall is a dropped frame, and dropped frames matter as a RATE, which is
+ *  exactly what the rollup reports. */
+const JANK_SEVERE_MS = 1_000;
+
+/** How long minor stalls accumulate before one rollup line is emitted. Mirrors RENDER_COALESCE_MS's
+ *  reasoning at a coarser scale: this caps the rate at one line per window instead of ~2.5/sec
+ *  observed at peak, and a minute is short enough to still localize a bad patch to the surrounding
+ *  spawn/switch/render lines. The window opens at the FIRST pending stall rather than running free,
+ *  so an isolated stall after a quiet stretch waits out a full window instead of flushing alone —
+ *  otherwise sparse stalls would each get their own line and decay back to the old behaviour. */
+const JANK_ROLLUP_MS = 60_000;
+
 /** How to account for one inter-frame gap. `stall` warns, `resume` records a wake, `ignore` drops it. */
 export type JankVerdict = "stall" | "resume" | "ignore";
 
@@ -230,6 +251,27 @@ export function startJankMonitor(thresholdMs = 150): void {
     });
   }
   log.info("perf", "jank monitor started", { thresholdMs, heapMb: heapMb() });
+  // Sub-severe stalls pending in the current rollup window. `openedAt` is set when the window opens
+  // (first pending stall), not on every flush — see JANK_ROLLUP_MS.
+  let minorCount = 0;
+  let minorTotalMs = 0;
+  let minorMaxMs = 0;
+  let openedAt = 0;
+  /** Emit the pending window, if any, and reset it. `sinceMs` is the span the window actually
+   *  covered, which is why a suspend forces a flush before it lands (see the resume branch). */
+  const flushMinors = (now: number) => {
+    if (minorCount === 0) return;
+    log.info("perf", "jank minor stalls", {
+      count: minorCount,
+      totalMs: Math.round(minorTotalMs),
+      maxMs: Math.round(minorMaxMs),
+      sinceMs: Math.round(now - openedAt),
+      heapMb: heapMb(),
+    });
+    minorCount = 0;
+    minorTotalMs = 0;
+    minorMaxMs = 0;
+  };
   const tick = () => {
     const now = perfNow();
     const gap = now - last;
@@ -237,11 +279,27 @@ export function startJankMonitor(thresholdMs = 150): void {
     const verdict = classifyJankGap(gap, thresholdMs, hiddenSinceLastTick);
     hiddenSinceLastTick = typeof document !== "undefined" && document.hidden;
     if (verdict === "resume") {
+      // Close the open window BEFORE the wake lands. A rollup that straddles a suspend would carry
+      // the whole slept interval in `sinceMs` — an 8-hour sleep makes a perfectly normal window
+      // read as a near-zero stall rate — so the pre-suspend stalls are reported over the span they
+      // actually occurred in, and the post-wake window starts clean.
+      flushMinors(now - gap);
       // Resume from suspend, not a freeze — record it (still useful to correlate) without the warn.
       log.debug("perf", "resume after suspend", { ms: Math.round(gap) });
     } else if (verdict === "stall") {
-      log.warn("perf", "jank stall", { ms: Math.round(gap), heapMb: heapMb() });
+      if (gap >= JANK_SEVERE_MS) {
+        log.warn("perf", "jank stall", { ms: Math.round(gap), heapMb: heapMb() });
+      } else {
+        if (minorCount === 0) openedAt = now;
+        minorCount += 1;
+        minorTotalMs += gap;
+        if (gap > minorMaxMs) minorMaxMs = gap;
+      }
     }
+    // Flush on a tick rather than a timer: rAF already runs every frame while visible, and while the
+    // window is hidden there are no new stalls to report anyway — a pending rollup simply waits for
+    // the return, which is also when a reader would care about it.
+    if (minorCount > 0 && now - openedAt >= JANK_ROLLUP_MS) flushMinors(now);
     requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);

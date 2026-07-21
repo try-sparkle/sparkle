@@ -26,6 +26,13 @@ export function shouldPromptOnClose(
   // rather than a silent teardown that could discard uncommitted changes. The undefined window is
   // sub-second after open (the poll sets it immediately), so this rarely surfaces a needless prompt.
   if (!bs) return true;
+  // SAFETY side of sparkle-xk3x, and the OPPOSITE call from runtimeStore's attribution gate. A
+  // worktree parked on another branch still physically holds whatever was uncommitted when it
+  // was moved — parking carries those files along. So a parked tree is work we cannot rule out,
+  // exactly like the `!bs` case above: prompt rather than tear down. Never suppress `dirty` here
+  // on the grounds that it "belongs to another branch" — the files are real and deleting the
+  // worktree destroys them.
+  if (bs.worktreeOnBranch === false) return true;
   return bs.ahead > 0 || bs.dirty;
 }
 

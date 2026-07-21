@@ -71,7 +71,7 @@ describe("startJankMonitor hidden-window accounting", () => {
     setHidden(false);
     tick(2952); // swallowed
     expect(warn).not.toHaveBeenCalled();
-    tick(400); // a real freeze, window visible throughout
-    expect(warn).toHaveBeenCalledWith("perf", "jank stall", expect.objectContaining({ ms: 400 }));
+    tick(1400); // a real freeze, window visible throughout (severe, so it warns on its own line)
+    expect(warn).toHaveBeenCalledWith("perf", "jank stall", expect.objectContaining({ ms: 1400 }));
   });
 });
