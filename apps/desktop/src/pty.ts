@@ -9,6 +9,9 @@ import { noteUserInputForAgent } from "./engine/engineRegistry";
 export interface PtyOutput {
   id: string;
   chunk: string;
+  /** Authoritative UTF-8 byte length of `chunk`, as counted by Rust. Echo it back via `ptyAck`
+   *  once xterm has parsed the chunk — never recompute it from `chunk.length` (UTF-16 units). */
+  bytes: number;
 }
 export interface PtyExit {
   id: string;
@@ -139,9 +142,28 @@ export function killPty(id: string): Promise<void> {
   return invoke("pty_kill", { id });
 }
 
-/** Subscribe to PTY output. Returns an unlisten fn. */
-export function onPtyOutput(cb: (e: PtyOutput) => void): Promise<UnlistenFn> {
-  return listen<PtyOutput>("pty:output", (ev) => cb(ev.payload));
+/** Return `bytes` of IPC emit credit for a PTY, once xterm has PARSED that chunk. The Rust flusher
+ *  parks past a per-PTY ceiling of un-acked bytes, which is what actually bounds the (otherwise
+ *  unbounded) Tauri IPC queue — see pty.rs `InflightState` and terminalFlow.ts `PtyAckBatcher`.
+ *  Fire-and-forget; the benign "no such pty" teardown race is swallowed like the other PTY ops. */
+export function ptyAck(id: string, bytes: number): Promise<void> {
+  return invoke<void>("pty_ack", { id, bytes }).catch(ignoreExitedPty);
+}
+
+/** Channel prefix for per-agent PTY output. Kept in sync with `output_event()` in pty.rs. */
+export const PTY_OUTPUT_EVENT_PREFIX = "pty:output:";
+
+/**
+ * Subscribe to ONE agent's PTY output. Returns an unlisten fn.
+ *
+ * Targeted by design: output used to be emitted app-wide with every terminal registering a global
+ * listener and filtering by id after delivery, so each chunk was materialized and dispatched to all
+ * N terminals to be discarded by N-1 of them. Rust now emits on a per-agent channel, so only the
+ * owning subscriber is ever invoked. Callers that follow several agents (the phone relay) subscribe
+ * once per agent rather than once globally.
+ */
+export function onPtyOutput(id: string, cb: (e: PtyOutput) => void): Promise<UnlistenFn> {
+  return listen<PtyOutput>(`${PTY_OUTPUT_EVENT_PREFIX}${id}`, (ev) => cb(ev.payload));
 }
 
 /** Subscribe to PTY exit. Returns an unlisten fn. */

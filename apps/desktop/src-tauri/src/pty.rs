@@ -27,6 +27,9 @@ struct PtySession {
     /// master so the kernel PTY buffer fills and the child's own write() blocks — end-to-end
     /// backpressure driven by the frontend's flow controller (see `pty_set_paused`).
     pause: Arc<PauseState>,
+    /// IPC emit credit gate: bounds the bytes emitted-but-not-yet-acked by the frontend, so the
+    /// (unbounded) Tauri IPC queue can't grow without limit. See `InflightState` / `pty_ack`.
+    inflight: Arc<InflightState>,
 }
 
 /// Cooperative pause gate shared between a session's reader thread and `pty_set_paused`. The reader
@@ -56,6 +59,154 @@ impl PauseState {
     }
 }
 
+// ── IPC emit credit gate ──────────────────────────────────────────────────────────────────────
+//
+// `PauseState` above is driven by the FRONTEND's view of its xterm parse backlog — but that view is
+// structurally blind to the thing it was written to bound. `flow.onEnqueue` runs inside the
+// `pty:output` handler, i.e. only AFTER the main thread has already dequeued and deserialized the
+// IPC message. tao's event channel is a `crossbeam::channel::unbounded()`, so when the MAIN THREAD
+// is the bottleneck, messages pile up in that queue while the frontend's `pending` counter stays
+// low — the brake never engages, exactly when it is needed. And it could not help if it did:
+// `pty_set_paused` is itself an `invoke`, so the pause command queues BEHIND the flood it is trying
+// to stop.
+//
+// The fix is producer-side credit. Every emitted chunk CHARGES its byte count here; the frontend
+// releases it with `pty_ack` once xterm has parsed the chunk. Past the high-water mark the flusher
+// and the reader PARK — they never drop or truncate, because `pty:output` is a byte stream where
+// loss or reordering corrupts the terminal (the same reason `PauseState` chose backpressure over
+// truncation). Parking the reader stops read()ing the master, the kernel PTY buffer fills, and the
+// child blocks on its own write(): genuine end-to-end backpressure.
+//
+// This also makes the existing pause machinery meaningful again — with the producer self-limited,
+// the main thread is no longer starved, so a `pty_set_paused`/`pty_ack` invoke is serviced promptly
+// instead of queueing behind megabytes of pending output.
+
+/// Per-PTY ceiling on emitted-but-un-acked bytes.
+///
+/// Sizing: this is the AGGREGATE memory knob — worst case is (agents × this), and each byte is
+/// amplified on the way through IPC because the payload is JSON-escaped (an ANSI 0x1B becomes the
+/// 6-byte ``, and Claude Code's TUI is escape-dense). At 256 KiB, 20 concurrent agents cap
+/// out around 5 MiB of un-acked chunk text — a few tens of MiB after escaping — versus the multi-GiB
+/// footprint the unbounded queue produced. It is deliberately far BELOW the frontend's
+/// `FLOW_HIGH_WATER_BYTES` (2 MiB per terminal, 40 MiB aggregate at 20 agents), because the IPC
+/// queue is the more expensive place to hold bytes and the cheaper place to stop them.
+///
+/// Floor: it is 4 × `PTY_FLUSH_SIZE_THRESHOLD`, so ~4 max-size chunks stay in flight. At the 12 ms
+/// flush interval that is ~21 MB/s of headroom — several times the ~5 MB/s a single PTY can produce
+/// — so ordinary streaming never touches the gate and throughput is unaffected.
+const PTY_INFLIGHT_HIGH_WATER_BYTES: usize = 256 * 1024;
+
+/// How long a producer waits for acks before assuming the consumer is gone. Only a safety valve:
+/// a live terminal acks within a frame, and terminal teardown kills the PTY (which `close()`s this
+/// gate). Without it, a webview that died without killing its PTY would park the flusher forever.
+const PTY_INFLIGHT_STALL: Duration = Duration::from_secs(3);
+
+/// Outcome of parking on the credit gate — distinguished so the caller can log the abnormal cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Credit {
+    /// Under the limit (immediately, or after an ack released capacity).
+    Ready,
+    /// The gate was closed (EOF / kill) — proceed unconditionally so teardown can't wedge.
+    Closed,
+    /// No acks arrived within the stall window; outstanding credit was forgiven so the producer
+    /// makes progress instead of blocking forever.
+    Stalled,
+}
+
+#[derive(Default)]
+struct InflightInner {
+    bytes: usize,
+    closed: bool,
+}
+
+/// Credit gate shared between a session's reader + flusher threads (producers) and `pty_ack`
+/// (consumer). Poison-tolerant like the rest of this module.
+struct InflightState {
+    inner: Mutex<InflightInner>,
+    cvar: Condvar,
+}
+
+impl InflightState {
+    fn new() -> Self {
+        Self { inner: Mutex::new(InflightInner::default()), cvar: Condvar::new() }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, InflightInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Charge bytes about to be emitted. Called immediately before `emit`, so the counter is never
+    /// behind what is actually in the IPC queue.
+    fn charge(&self, bytes: usize) {
+        let mut g = self.lock();
+        g.bytes = g.bytes.saturating_add(bytes);
+    }
+
+    /// Release bytes the frontend has finished parsing (`pty_ack`). Saturating so a duplicate or
+    /// late ack from a tearing-down terminal can't underflow the counter.
+    fn ack(&self, bytes: usize) {
+        let mut g = self.lock();
+        g.bytes = g.bytes.saturating_sub(bytes);
+        drop(g);
+        self.cvar.notify_all();
+    }
+
+    /// Permanently release every parked producer (EOF / `pty_kill`). Idempotent. After this, the
+    /// final drain emits whatever remains without gating, so no trailing output is lost.
+    fn close(&self) {
+        let mut g = self.lock();
+        g.closed = true;
+        drop(g);
+        self.cvar.notify_all();
+    }
+
+    // Observers for the gate's internal counters. Test-only: the production paths act on the
+    // Credit returned by `acquire`, never on a sampled reading of the state, so shipping these
+    // would be dead code in the binary.
+    #[cfg(test)]
+    fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
+    #[cfg(test)]
+    fn inflight_bytes(&self) -> usize {
+        self.lock().bytes
+    }
+
+    /// Park the calling producer while un-acked bytes are at or above `limit`. Returns as soon as
+    /// an ack drops below it, immediately if closed, or — as a liveness backstop — after `stall`
+    /// with the outstanding credit forgiven.
+    fn acquire(&self, limit: usize, stall: Duration) -> Credit {
+        let g = self.lock();
+        if g.closed {
+            return Credit::Closed;
+        }
+        if g.bytes < limit {
+            return Credit::Ready;
+        }
+        let (mut g, res) = self
+            .cvar
+            .wait_timeout_while(g, stall, |s| !s.closed && s.bytes >= limit)
+            .unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            return Credit::Closed;
+        }
+        if res.timed_out() && g.bytes >= limit {
+            // Consumer presumed gone (or acks lost). Forgive the outstanding credit rather than
+            // wedge: the producer then trickles at ~one chunk per stall window. Nothing is dropped.
+            g.bytes = 0;
+            // Wake any CO-PARKED producer. Zeroing `bytes` falsifies their wait predicate, but a
+            // predicate that became false without a notify is never re-checked — the reader and
+            // flusher can both be parked here, and whichever times out first would otherwise leave
+            // the other to burn its own full stall window before noticing the credit it was
+            // waiting for is already free.
+            self.cvar.notify_all();
+            return Credit::Stalled;
+        }
+        Credit::Ready
+    }
+}
+
 #[derive(Default)]
 pub struct PtyManager {
     sessions: Mutex<HashMap<String, PtySession>>,
@@ -74,6 +225,10 @@ impl PtyManager {
 struct PtyOutput {
     id: String,
     chunk: String,
+    /// UTF-8 byte length of `chunk` — the credit the frontend must echo back via `pty_ack` once
+    /// xterm has parsed it. Sent explicitly rather than recomputed frontend-side because JS string
+    /// `.length` counts UTF-16 code units; any drift would slowly leak (or over-release) credit.
+    bytes: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -178,6 +333,74 @@ const PTY_FLUSH_SIZE_THRESHOLD: usize = 64 * 1024;
 struct FlushBuf {
     text: String,
     done: bool,
+}
+
+/// Per-agent `pty:output` channel. Emitting app-wide made every chunk fan out to EVERY terminal's
+/// listener — N producers × N listeners, with N-1 of them filtering the payload straight back out
+/// after Tauri had already materialized it. A per-id event name means only the owning terminal's
+/// listener is ever invoked.
+fn output_event(id: &str) -> String {
+    format!("pty:output:{id}")
+}
+
+/// The flusher thread's body, split out so the flood/ordering contract is unit-testable without a
+/// Tauri `AppHandle`. Drains `shared` into coalesced chunks and hands each to `emit` — but only
+/// after `inflight` grants credit, so the un-acked IPC backlog stays bounded.
+///
+/// Ordering and completeness are the load-bearing properties: a single buffer is drained
+/// front-to-back and the gate only ever DELAYS an emit, never skips or truncates one. On `done` it
+/// drains whatever remains and returns (the gate is closed by then, so the final drain can't park).
+fn run_flusher(
+    shared: &(Mutex<FlushBuf>, Condvar),
+    inflight: &InflightState,
+    id: &str,
+    limit: usize,
+    mut emit: impl FnMut(String, usize),
+) {
+    let (lock, cvar) = shared;
+    loop {
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Block until there's something to flush or the stream ended (no busy-wait while idle).
+        while guard.text.is_empty() && !guard.done {
+            guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+        // We have data (or we're done). If more may still arrive, give the reader a brief
+        // window to pile a burst into the same buffer — but return early if the stream ends or
+        // the buffer hits the size cap, so a flood flushes promptly and bounds per-event size.
+        if !guard.done && guard.text.len() < PTY_FLUSH_SIZE_THRESHOLD {
+            let (g, _timed_out) = cvar
+                .wait_timeout_while(
+                    guard,
+                    Duration::from_millis(PTY_FLUSH_INTERVAL_MS),
+                    |b| !b.done && b.text.len() < PTY_FLUSH_SIZE_THRESHOLD,
+                )
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g;
+        }
+        let chunk = std::mem::take(&mut guard.text);
+        let done = guard.done;
+        // Release the buffer lock BEFORE parking on the credit gate, so the reader can keep
+        // appending (and, more importantly, so it can set `done` / the gate can be closed).
+        drop(guard);
+        if !chunk.is_empty() {
+            if inflight.acquire(limit, PTY_INFLIGHT_STALL) == Credit::Stalled {
+                tracing::warn!(
+                    %id,
+                    inflight_limit = limit,
+                    "pty:output acks stalled — frontend not draining; forgiving credit to keep the stream alive"
+                );
+            }
+            // Charge BEFORE emitting so the counter is never behind the IPC queue. `bytes` is the
+            // authoritative count the frontend echoes back in `pty_ack` — it must not recompute
+            // the length itself (JS string length is UTF-16 units, this is UTF-8 bytes).
+            let bytes = chunk.len();
+            inflight.charge(bytes);
+            emit(chunk, bytes);
+        }
+        if done {
+            break;
+        }
+    }
 }
 
 /// SPAWN backstop: an implausibly small requested size is replaced WHOLESALE with the comfortable
@@ -351,6 +574,7 @@ pub async fn pty_spawn(
                     master: pair.master,
                     killer,
                     pause: Arc::new(PauseState::new()),
+                    inflight: Arc::new(InflightState::new()),
                 },
                 reader,
                 child,
@@ -363,8 +587,11 @@ pub async fn pty_spawn(
     let mut reader = reader;
     let mut child = child;
 
-    // Share the session's pause gate with its reader thread before the session moves into the map.
+    // Share the session's pause + credit gates with its reader/flusher threads before the session
+    // moves into the map.
     let read_pause = session.pause.clone();
+    let inflight = session.inflight.clone();
+    let read_inflight = inflight.clone();
     app.state::<PtyManager>()
         .sessions
         .lock()
@@ -388,37 +615,18 @@ pub async fn pty_spawn(
     let flush_app = app.clone();
     let flush_id = id.clone();
     let flush_shared = shared.clone();
+    let flush_inflight = inflight.clone();
     let flusher = std::thread::spawn(move || {
-        let (lock, cvar) = &*flush_shared;
-        loop {
-            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            // Block until there's something to flush or the stream ended (no busy-wait while idle).
-            while guard.text.is_empty() && !guard.done {
-                guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
-            }
-            // We have data (or we're done). If more may still arrive, give the reader a brief
-            // window to pile a burst into the same buffer — but return early if the stream ends or
-            // the buffer hits the size cap, so a flood flushes promptly and bounds per-event size.
-            if !guard.done && guard.text.len() < PTY_FLUSH_SIZE_THRESHOLD {
-                let (g, _timed_out) = cvar
-                    .wait_timeout_while(
-                        guard,
-                        Duration::from_millis(PTY_FLUSH_INTERVAL_MS),
-                        |b| !b.done && b.text.len() < PTY_FLUSH_SIZE_THRESHOLD,
-                    )
-                    .unwrap_or_else(|e| e.into_inner());
-                guard = g;
-            }
-            let chunk = std::mem::take(&mut guard.text);
-            let done = guard.done;
-            drop(guard);
-            if !chunk.is_empty() {
-                let _ = flush_app.emit("pty:output", PtyOutput { id: flush_id.clone(), chunk });
-            }
-            if done {
-                break;
-            }
-        }
+        let event = output_event(&flush_id);
+        run_flusher(
+            &flush_shared,
+            &flush_inflight,
+            &flush_id,
+            PTY_INFLIGHT_HIGH_WATER_BYTES,
+            |chunk, bytes| {
+                let _ = flush_app.emit(&event, PtyOutput { id: flush_id.clone(), chunk, bytes });
+            },
+        );
     });
 
     let read_app = app.clone();
@@ -443,6 +651,12 @@ pub async fn pty_spawn(
             // blocks on its next write — bounding memory end-to-end (). Returns instantly
             // when not paused, so interactive output is unaffected.
             read_pause.wait_while_paused();
+            // Second gate, same principle but driven by the PRODUCER's own accounting rather than
+            // the frontend's: park while the frontend is behind on acks. Without this the flusher's
+            // credit gate would merely relocate the backlog into `FlushBuf` (an unbounded String on
+            // this side) instead of bounding it. Gating the READ is what makes the backpressure
+            // end-to-end: the kernel PTY buffer fills and the child blocks on its next write().
+            read_inflight.acquire(PTY_INFLIGHT_HIGH_WATER_BYTES, PTY_INFLIGHT_STALL);
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -498,6 +712,12 @@ pub async fn pty_spawn(
             guard.done = true;
             cvar.notify_one();
         }
+        // Release the credit gate BEFORE joining: if the flusher (or this thread) were parked
+        // waiting on acks that will never come — the terminal is unmounting, so nobody is left to
+        // ack — the join below would hang and the session would never be reaped. Closing lets the
+        // final drain emit unconditionally, which is also what guarantees no trailing output is
+        // lost on EOF.
+        read_inflight.close();
         let _ = flusher.join();
         // Reap the session on natural exit (pty_kill also removes it).
         read_app.state::<PtyManager>().remove(&read_id);
@@ -542,6 +762,19 @@ pub fn pty_set_paused(manager: State<PtyManager>, id: String, paused: bool) -> R
     Ok(())
 }
 
+/// Release `bytes` of IPC emit credit for a PTY — the frontend calls this once xterm has PARSED a
+/// `pty:output` chunk, echoing back the `bytes` field the chunk arrived with. This is the consumer
+/// half of the credit gate that bounds the otherwise-unbounded Tauri IPC queue (see
+/// `InflightState`). Fire-and-forget frontend-side; the benign "no such pty" teardown race is
+/// swallowed there like the other PTY ops.
+#[tauri::command]
+pub fn pty_ack(manager: State<PtyManager>, id: String, bytes: usize) -> Result<(), String> {
+    let sessions = manager.sessions.lock().unwrap_or_else(|e| e.into_inner());
+    let session = sessions.get(&id).ok_or(NO_SUCH_PTY)?;
+    session.inflight.ack(bytes);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn pty_resize(
     manager: State<PtyManager>,
@@ -568,6 +801,9 @@ pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
         // If the reader is parked (paused) it won't observe the kill's EOF and would never run its
         // teardown (remove + pty:exit). Resume it first so it wakes, reads EOF, and cleans up.
         session.pause.set(false);
+        // Same hazard, second gate: a reader or flusher parked waiting for acks will get none once
+        // the terminal is gone. Close the credit gate so both proceed, drain, and tear down.
+        session.inflight.close();
         let _ = session.killer.kill();
     }
     Ok(())
@@ -577,15 +813,16 @@ pub fn pty_kill(manager: State<PtyManager>, id: String) -> Result<(), String> {
 mod tests {
     use super::{
         acquire_writer, apply_heap_cap, guard_resize_size, guard_spawn_size, node_options_with_cap,
-        validate_spawn_inner, PauseState, PtyManager, PtySession, MIN_PTY_COLS, MIN_PTY_ROWS,
+        run_flusher, validate_spawn_inner, Credit, FlushBuf, InflightState, PauseState, PtyManager,
+        PtySession, MIN_PTY_COLS, MIN_PTY_ROWS, PTY_INFLIGHT_HIGH_WATER_BYTES,
         SPAWN_FALLBACK_COLS, SPAWN_FALLBACK_ROWS,
     };
     use portable_pty::CommandBuilder;
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -828,6 +1065,7 @@ mod tests {
             master: pair.master,
             killer,
             pause: Arc::new(PauseState::new()),
+            inflight: Arc::new(InflightState::new()),
         };
         let sessions: Mutex<HashMap<String, PtySession>> = Mutex::new(HashMap::new());
         sessions.lock().unwrap().insert("a".to_string(), session);
@@ -975,5 +1213,170 @@ mod tests {
         pause.set(false);
         reader.join().unwrap();
         assert!(woke.load(Ordering::SeqCst), "kill's resume must wake the parked reader");
+    }
+
+    // ── IPC emit credit gate (inflight backpressure) ──────────────────────────────────────────
+    //
+    // The pause gate above can only ever measure the frontend's xterm PARSE backlog, because
+    // `flow.onEnqueue` runs inside the pty:output handler — i.e. AFTER the main thread already
+    // dequeued the IPC message. The IPC queue itself (tao's unbounded crossbeam channel) is
+    // structurally invisible to it, so a main-thread-bound app piles up messages while `pending`
+    // stays low and the brake never engages. `InflightState` closes that hole on the PRODUCER
+    // side: bytes are charged when emitted and released only when the frontend acks them, so the
+    // un-acked IPC queue is bounded by construction.
+
+    /// Charging the gate past the limit must PARK the producer (never drop / truncate), and an
+    /// ack must release it. This is the core credit contract.
+    #[test]
+    fn inflight_gate_parks_the_producer_past_the_limit_and_releases_on_ack() {
+        let gate = Arc::new(InflightState::new());
+        gate.charge(1000);
+        // Below the limit → the producer proceeds immediately.
+        assert_eq!(gate.acquire(2000, Duration::from_secs(5)), Credit::Ready);
+
+        gate.charge(1500); // 2500 un-acked, over a 2000 limit
+        let g2 = gate.clone();
+        let passed = Arc::new(AtomicBool::new(false));
+        let p2 = passed.clone();
+        let h = std::thread::spawn(move || {
+            let c = g2.acquire(2000, Duration::from_secs(10));
+            p2.store(true, Ordering::SeqCst);
+            c
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!passed.load(Ordering::SeqCst), "producer must park while over the credit limit");
+
+        gate.ack(600); // 1900 < 2000 → release
+        assert_eq!(h.join().unwrap(), Credit::Ready);
+        assert_eq!(gate.inflight_bytes(), 1900);
+    }
+
+    /// Acks must clamp at zero — a duplicate/late ack from a tearing-down terminal must not make
+    /// the counter wrap (usize underflow would panic in debug and wedge the gate in release).
+    #[test]
+    fn inflight_ack_clamps_at_zero() {
+        let gate = InflightState::new();
+        gate.charge(100);
+        gate.ack(9999);
+        assert_eq!(gate.inflight_bytes(), 0);
+    }
+
+    /// Teardown liveness: a producer parked on the gate must be released by `close()` — otherwise
+    /// the reader/flusher would never observe EOF and `flusher.join()` would hang forever.
+    #[test]
+    fn inflight_gate_releases_parked_producers_on_close() {
+        let gate = Arc::new(InflightState::new());
+        gate.charge(10_000);
+        let g2 = gate.clone();
+        let h = std::thread::spawn(move || g2.acquire(1000, Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_millis(40));
+        gate.close();
+        assert_eq!(h.join().unwrap(), Credit::Closed);
+        // And every LATER acquire returns instantly, so the final EOF drain can't block.
+        assert_eq!(gate.acquire(1, Duration::from_secs(30)), Credit::Closed);
+    }
+
+    /// Safety valve: if the frontend stops acking entirely (a webview that died without killing
+    /// the PTY, or lost ack invokes), the producer must not wedge forever. After the stall window
+    /// it forgives the outstanding credit and proceeds — throttled to roughly one chunk per
+    /// window rather than blocked, and still dropping nothing.
+    #[test]
+    fn inflight_gate_forgives_credit_after_a_stall_rather_than_wedging() {
+        let gate = InflightState::new();
+        gate.charge(10_000);
+        let t0 = std::time::Instant::now();
+        assert_eq!(gate.acquire(1000, Duration::from_millis(80)), Credit::Stalled);
+        assert!(t0.elapsed() >= Duration::from_millis(70), "must actually wait out the window");
+        assert_eq!(gate.inflight_bytes(), 0, "stalled credit is forgiven so the producer proceeds");
+    }
+
+    /// THE critical correctness property: under a sustained flood the credit gate must throttle
+    /// the flusher without DROPPING or REORDERING a single byte. Drives the real `run_flusher`
+    /// against a fake emitter plus a consumer thread that acks, and asserts the concatenation of
+    /// everything emitted is byte-identical to everything the producer pushed, in order.
+    #[test]
+    fn flusher_preserves_order_and_completeness_under_a_sustained_flood() {
+        let shared = Arc::new((Mutex::new(FlushBuf::default()), Condvar::new()));
+        let gate = Arc::new(InflightState::new());
+        let emitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        // Peak un-acked bytes observed by the emitter — proves the gate actually bounded the queue.
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let limit = 4096usize;
+        let f_shared = shared.clone();
+        let f_gate = gate.clone();
+        let f_emitted = emitted.clone();
+        let f_peak = peak.clone();
+        let flusher = std::thread::spawn(move || {
+            run_flusher(&f_shared, &f_gate, "test", limit, |chunk, bytes| {
+                f_peak.fetch_max(bytes, Ordering::Relaxed);
+                f_emitted.lock().unwrap().push(chunk);
+            });
+        });
+
+        // Consumer ("frontend"): drain credit slowly so the producer is genuinely forced to park.
+        let c_gate = gate.clone();
+        let c_emitted = emitted.clone();
+        let consumer = std::thread::spawn(move || {
+            let mut acked = 0usize;
+            for _ in 0..2000 {
+                let total: usize = {
+                    let e = c_emitted.lock().unwrap();
+                    e.iter().map(|s| s.len()).sum()
+                };
+                if total > acked {
+                    c_gate.ack(total - acked);
+                    acked = total;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+                if c_gate.is_closed() && total == acked {
+                    break;
+                }
+            }
+        });
+
+        // Producer: a deterministic, self-describing stream so any reorder/loss is detectable.
+        let mut expected = String::new();
+        let (lock, cvar) = &*shared;
+        for i in 0..400 {
+            let piece = format!("<{i}:{}>", "x".repeat(200));
+            expected.push_str(&piece);
+            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            g.text.push_str(&piece);
+            cvar.notify_one();
+        }
+        {
+            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            g.done = true;
+            cvar.notify_one();
+        }
+        // EOF must release any parked producer so the final drain completes (see close()).
+        gate.close();
+        flusher.join().unwrap();
+        let _ = consumer.join();
+
+        let got = emitted.lock().unwrap().concat();
+        assert_eq!(got.len(), expected.len(), "no bytes may be dropped under flood");
+        assert_eq!(got, expected, "bytes must arrive complete and in order");
+        assert!(peak.load(Ordering::Relaxed) > 0, "the flusher must have emitted something");
+    }
+
+    /// The per-PTY credit limit is the aggregate memory knob: with N terminals the worst-case
+    /// un-acked IPC backlog is N × this. Pin it so a careless bump can't quietly reintroduce the
+    /// multi-GiB footprint (20 agents × 256 KiB ≈ 5 MiB of chunk text before JSON escaping).
+    #[test]
+    // clippy flags both assertions as having a constant value, which is precisely the intent: this
+    // test exists to FAIL TO COMPILE-TIME-HOLD if someone edits the constants out of their safe
+    // relationship. There is no runtime input to vary — the constants are the subject.
+    #[allow(clippy::assertions_on_constants)]
+    fn inflight_high_water_stays_small_enough_to_aggregate_safely() {
+        assert!(
+            PTY_INFLIGHT_HIGH_WATER_BYTES >= super::PTY_FLUSH_SIZE_THRESHOLD * 2,
+            "must allow at least a couple of max-size chunks in flight or throughput suffers"
+        );
+        assert!(
+            PTY_INFLIGHT_HIGH_WATER_BYTES <= 512 * 1024,
+            "per-PTY credit must stay small — it multiplies by the agent count"
+        );
     }
 }

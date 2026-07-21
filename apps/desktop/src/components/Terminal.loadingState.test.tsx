@@ -16,7 +16,10 @@ import { act, cleanup, render, screen } from "@testing-library/react";
 // Capture the onPtyOutput subscriber so a test can push a chunk through it (hoisted so vi.mock
 // can reference it).
 const { outputCbRef, exitCbRef } = vi.hoisted(() => ({
-  outputCbRef: { cb: null as null | ((e: { id: string; chunk: string }) => void) },
+  outputCbRef: {
+    cb: null as null | ((e: { id: string; chunk: string; bytes: number }) => void),
+    id: null as null | string,
+  },
   exitCbRef: { cb: null as null | ((e: { id: string }) => void) },
 }));
 
@@ -74,10 +77,12 @@ vi.mock("../pty", () => ({
   writePty: vi.fn(() => Promise.resolve()),
   killPty: vi.fn(() => Promise.resolve()),
   resizePty: vi.fn(() => Promise.resolve()),
-  onPtyOutput: vi.fn((cb: (e: { id: string; chunk: string }) => void) => {
+  onPtyOutput: vi.fn((id: string, cb: (e: { id: string; chunk: string; bytes: number }) => void) => {
+    outputCbRef.id = id;
     outputCbRef.cb = cb;
     return Promise.resolve(() => {});
   }),
+  ptyAck: vi.fn(() => Promise.resolve()),
   onPtyExit: vi.fn((cb: (e: { id: string }) => void) => {
     exitCbRef.cb = cb;
     return Promise.resolve(() => {});
@@ -111,6 +116,7 @@ const baseProps = {
 
 beforeEach(() => {
   outputCbRef.cb = null;
+  outputCbRef.id = null;
   exitCbRef.cb = null;
   vi.stubGlobal(
     "ResizeObserver",
@@ -166,7 +172,7 @@ describe("Terminal loading state", () => {
     expect(screen.getByText(/Resuming conversation/)).toBeTruthy();
 
     await act(async () => {
-      outputCbRef.cb?.({ id: "agent-1", chunk: "hello\r\n" });
+      outputCbRef.cb?.({ id: "agent-1", chunk: "hello\r\n", bytes: 7 });
     });
 
     expect(screen.queryByText(/Resuming conversation/)).toBeNull();
@@ -184,14 +190,15 @@ describe("Terminal loading state", () => {
     expect(screen.queryByText(/^Starting…$/)).toBeNull();
   });
 
-  it("ignores output addressed to a different agent (stays in loading state)", async () => {
+  // Output is delivered on a PER-AGENT channel now (pty:output:<id>), so another agent's chunks
+  // never reach this terminal's callback at all — rather than being delivered and filtered out,
+  // which was the O(N²) fanout. Assert the subscription is scoped to THIS agent.
+  it("subscribes only to its own agent's output channel", async () => {
     render(<Terminal {...baseProps} resuming={false} />);
     await flushMount();
 
-    await act(async () => {
-      outputCbRef.cb?.({ id: "some-other-agent", chunk: "noise" });
-    });
-
+    expect(outputCbRef.id).toBe("agent-1");
+    // Nothing arrived for this agent, so it is still waiting on its first byte.
     expect(screen.getByText(/^Starting…$/)).toBeTruthy();
   });
 });

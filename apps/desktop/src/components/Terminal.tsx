@@ -8,7 +8,7 @@ import { copyToClipboard } from "../clipboard";
 import { C, CHAT_USER_BUBBLE, xtermTheme } from "../theme/colors";
 import { useResolvedTheme } from "../theme/theme";
 import type { AgentTabStatus } from "../types";
-import { spawnPty, writePty, killPty, resizePty, setPtyPaused, onPtyOutput, onPtyExit, ignorePtyGone } from "../pty";
+import { spawnPty, writePty, killPty, resizePty, setPtyPaused, ptyAck, onPtyOutput, onPtyExit, ignorePtyGone } from "../pty";
 import { StatusEngine } from "../engine/statusEngine";
 import { registerStatusEngine, unregisterStatusEngine } from "../engine/engineRegistry";
 import { snapshotScreen } from "../engine/screenSnapshot";
@@ -27,7 +27,7 @@ import { resolveTerminalOverlay } from "./terminalOverlay";
 import { makeLineScanState, scanSubmittedLines } from "./terminalSubmit";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { isMeasuredSize, spawnSize } from "./terminalSize";
-import { PtyFlowController } from "./terminalFlow";
+import { PtyAckBatcher, PtyFlowController } from "./terminalFlow";
 import { SelectionPopup } from "./SelectionPopup";
 import { recoverFromWebglContextLoss, forceFullRepaint, settleRepaintPlan } from "./terminalWebgl";
 import { detectRateLimitReset } from "../services/rateLimitWatch";
@@ -738,10 +738,15 @@ export function Terminal({
     const flow = new PtyFlowController((paused) => {
       flowChain = flowChain.then(() => setPtyPaused(agentId, paused)).catch(ignorePtyGone);
     });
+    // The OTHER half of backpressure, and the one that bounds the IPC queue itself: Rust charges
+    // every emitted chunk against a per-PTY credit ceiling and parks its flusher/reader once the
+    // frontend falls behind. Returning that credit here — after xterm has PARSED the chunk, not
+    // merely after we dequeued it — is what makes the producer's accounting reflect real progress.
+    // Batched so a flood doesn't cost one invoke per chunk. See terminalFlow.ts / pty.rs.
+    const acks = new PtyAckBatcher((bytes) => void ptyAck(agentId, bytes).catch(ignorePtyGone));
 
     (async () => {
-      const offOut = await onPtyOutput((e) => {
-        if (e.id !== agentId) return;
+      const offOut = await onPtyOutput(agentId, (e) => {
         // First byte for this agent — drop the loading overlay. setState bails on an unchanged
         // value, so calling this on every subsequent chunk costs nothing.
         // Load-bearing ordering: set gotOutputRef SYNCHRONOUSLY here, before any exit can be
@@ -754,7 +759,12 @@ export function Terminal({
         // parsing (the write callback). string length is a fine byte proxy for the watermarks.
         const chunkLen = e.chunk.length;
         flow.onEnqueue(chunkLen);
-        term.write(e.chunk, () => flow.onParsed(chunkLen));
+        term.write(e.chunk, () => {
+          flow.onParsed(chunkLen);
+          // Ack Rust's OWN byte count (UTF-8), not chunkLen (UTF-16 units) — the two differ on any
+          // non-ASCII output and drifting credit would eventually wedge or unbound the gate.
+          acks.add(e.bytes);
+        });
         engine.ingest(e.chunk);
         watchRateLimit(e.chunk);
         // Remember output that streamed in while we couldn't paint, so the next paintable settle

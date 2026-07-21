@@ -17,7 +17,7 @@ import { cleanup, render } from "@testing-library/react";
 const { clearTextureAtlas, refresh, ptyOutRef } = vi.hoisted(() => ({
   clearTextureAtlas: vi.fn(),
   refresh: vi.fn(),
-  ptyOutRef: { handler: null as null | ((e: { id: string; chunk: string }) => void) },
+  ptyOutRef: { handler: null as null | ((e: { id: string; chunk: string; bytes: number }) => void) },
 }));
 
 vi.mock("@xterm/xterm", () => {
@@ -74,10 +74,11 @@ vi.mock("../pty", () => ({
   resizePty: vi.fn(() => Promise.resolve()),
   setPtyPaused: vi.fn(() => Promise.resolve()),
   // Capture the output handler so the test can push chunks through it.
-  onPtyOutput: vi.fn((cb: (e: { id: string; chunk: string }) => void) => {
+  onPtyOutput: vi.fn((_id: string, cb: (e: { id: string; chunk: string; bytes: number }) => void) => {
     ptyOutRef.handler = cb;
     return Promise.resolve(() => {});
   }),
+  ptyAck: vi.fn(() => Promise.resolve()),
   onPtyExit: vi.fn(() => Promise.resolve(() => {})),
   ignorePtyGone: vi.fn(),
 }));
@@ -156,7 +157,7 @@ describe("Terminal idle sweep (stray glyph self-heal)", () => {
     clearTextureAtlas.mockClear();
     expect(ptyOutRef.handler).toBeTypeOf("function");
 
-    ptyOutRef.handler!({ id: "agent-1", chunk: BIG_BURST });
+    ptyOutRef.handler!({ id: "agent-1", chunk: BIG_BURST, bytes: 0 });
 
     // The 80ms settle does a bare refresh() (cache-respecting) — it must NOT clear the atlas.
     vi.advanceTimersByTime(80);
@@ -175,7 +176,7 @@ describe("Terminal idle sweep (stray glyph self-heal)", () => {
 
     // Stream several substantial chunks under the idle window — the sweep must keep getting pushed out.
     for (let i = 0; i < 5; i += 1) {
-      ptyOutRef.handler!({ id: "agent-1", chunk: BIG_BURST });
+      ptyOutRef.handler!({ id: "agent-1", chunk: BIG_BURST, bytes: 0 });
       vi.advanceTimersByTime(300); // < 500ms idle window: never lets the sweep fire mid-stream
       expect(clearTextureAtlas).not.toHaveBeenCalled();
     }
@@ -192,7 +193,7 @@ describe("Terminal idle sweep (stray glyph self-heal)", () => {
     render(<Terminal {...baseProps} />);
     clearTextureAtlas.mockClear();
 
-    ptyOutRef.handler!({ id: "agent-1", chunk: "y\n" }); // a few bytes — far below IDLE_SWEEP_MIN_BYTES
+    ptyOutRef.handler!({ id: "agent-1", chunk: "y\n", bytes: 0 }); // a few bytes — far below IDLE_SWEEP_MIN_BYTES
     vi.advanceTimersByTime(80);
     expect(refresh).toHaveBeenCalled(); // the settle refresh still runs
     vi.advanceTimersByTime(500);
@@ -200,7 +201,7 @@ describe("Terminal idle sweep (stray glyph self-heal)", () => {
 
     // Cumulative small bursts still eventually heal: once their total crosses the bar, one sweep lands.
     for (let i = 0; i < 20; i += 1) {
-      ptyOutRef.handler!({ id: "agent-1", chunk: "x".repeat(200) }); // 20 × 200 = 4000 > 2048
+      ptyOutRef.handler!({ id: "agent-1", chunk: "x".repeat(200), bytes: 0 }); // 20 × 200 = 4000 > 2048
       vi.advanceTimersByTime(100);
     }
     vi.advanceTimersByTime(500);

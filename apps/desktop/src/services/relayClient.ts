@@ -88,7 +88,36 @@ let connecting = false;
 let lastRoster: RosterPayload | null = null;
 // Agents a phone is currently watching (drill-in) — we stream only these agents' PTY output.
 const watched = new Set<string>();
-let ptyUnlisten: (() => void) | null = null;
+// One PTY subscription PER watched agent, keyed by agent id. Output is emitted on a per-agent
+// channel now (see pty.ts onPtyOutput), so a single global listener is no longer possible — and no
+// longer desirable: this way an un-watched agent's chunks are never dispatched to the relay at all,
+// instead of being delivered and immediately filtered out.
+const ptyUnlistens = new Map<string, () => void>();
+/** Per-agent subscribe generation. Bumped on every `watch` claim so an in-flight subscribe can tell
+ *  whether the slot it is about to fill is still the one it claimed (see the `watch` handler). */
+const ptyWatchGen = new Map<string, number>();
+
+/** What an in-flight `onPtyOutput` subscribe should do once it resolves.
+ *
+ *  Extracted as a pure decision so the watch→unwatch→watch race is testable without a live socket:
+ *  the bug it guards is a millisecond-wide interleaving that no integration test can reliably hit.
+ *
+ *  - `adopt` — still ours; store the unlisten in the slot.
+ *  - `discard` — someone else owns the slot now; unlisten, and DO NOT touch the slot (clearing it
+ *    would strand the listener the newer attempt is about to install).
+ *  - `discard-and-clear` — still our generation but the subscription is dead (socket swapped, or
+ *    the phone unwatched); unlisten and clear our own stale claim. */
+export function subscriptionFate(args: {
+  socketIsCurrent: boolean;
+  myGen: number;
+  currentGen: number | undefined;
+  slotOccupied: boolean;
+}): "adopt" | "discard" | "discard-and-clear" {
+  const stillOurs = args.currentGen === args.myGen;
+  if (!stillOurs) return "discard";
+  if (!args.socketIsCurrent || !args.slotOccupied) return "discard-and-clear";
+  return "adopt";
+}
 // attention_id -> agent_id for attentions we actually raised. A decision may ONLY drive one of
 // these (validated by its attention_id, which is per-attention), so a relay/phone can't inject
 // keystrokes into an arbitrary PTY, and resolving an OLD attention can't drop authorization for
@@ -149,28 +178,53 @@ export async function startRelayHost(): Promise<void> {
 
   // The phone drilled into an agent — start streaming that agent's terminal, and immediately send
   // a snapshot of its existing history so the phone shows where the agent IS, not just new bytes.
+  // Bind subscriptions to THIS socket instance so an unmount→remount can't strand an old listener.
+  const mySocket = socket;
   socket.on("watch", (w: { agent_id?: string }) => {
     if (!w || typeof w.agent_id !== "string") return;
-    watched.add(w.agent_id);
-    const history = getAgentScrollback(w.agent_id);
-    if (history && registered) socket?.emit("agent_output", { agent_id: w.agent_id, chunk: history });
+    const agentId = w.agent_id;
+    watched.add(agentId);
+    const history = getAgentScrollback(agentId);
+    if (history && registered) socket?.emit("agent_output", { agent_id: agentId, chunk: history });
+    // Start forwarding this agent's live PTY output. Guard against a duplicate `watch` for the same
+    // agent stranding a second listener (which would double-emit every chunk to the phone).
+    if (ptyUnlistens.has(agentId)) return;
+    // Claim the slot before the await so a re-entrant watch can't race — and stamp the claim with a
+    // generation, because occupancy ALONE is ambiguous. `onPtyOutput` awaits a real IPC round-trip,
+    // and a watch→unwatch→watch cycle can complete inside that window: the second watch finds the
+    // slot free, installs its own placeholder, and now the first attempt's `has(agentId)` is true
+    // again — but for someone else's claim. It would then store its listener over the newer one,
+    // leaving BOTH live with only the newer tracked, leaking the older and double-emitting every
+    // chunk to the phone. The generation distinguishes "my placeholder" from "a newer placeholder".
+    const gen = (ptyWatchGen.get(agentId) ?? 0) + 1;
+    ptyWatchGen.set(agentId, gen);
+    ptyUnlistens.set(agentId, () => {});
+    void onPtyOutput(agentId, (e) => {
+      if (!registered || !watched.has(agentId)) return;
+      mySocket.emit("agent_output", { agent_id: agentId, chunk: e.chunk });
+    }).then((un) => {
+      // Adopt `un` only if this attempt still owns the slot. safeUnlisten swallows the Tauri
+      // teardown race if the listeners map is already gone.
+      const fate = subscriptionFate({
+        socketIsCurrent: socket === mySocket,
+        myGen: gen,
+        currentGen: ptyWatchGen.get(agentId),
+        slotOccupied: ptyUnlistens.has(agentId),
+      });
+      if (fate === "adopt") {
+        ptyUnlistens.set(agentId, un);
+      } else {
+        if (fate === "discard-and-clear") ptyUnlistens.delete(agentId);
+        void safeUnlisten(un);
+      }
+    });
   });
   socket.on("unwatch", (w: { agent_id?: string }) => {
-    if (w && typeof w.agent_id === "string") watched.delete(w.agent_id);
-  });
-
-  // Forward watched agents' live PTY output to the phone (one global subscription). Bind the
-  // subscription to THIS socket instance so an unmount→remount can't strand the old listener.
-  const mySocket = socket;
-  void onPtyOutput((e) => {
-    if (!registered || !watched.has(e.id)) return;
-    mySocket.emit("agent_output", { agent_id: e.id, chunk: e.chunk });
-  }).then((un) => {
-    // If this run is no longer the active socket (teardown, or a remount installed a new one),
-    // unlisten immediately so we don't leak a listener / double-emit. safeUnlisten swallows the
-    // Tauri teardown race if the listeners map is already gone.
-    if (socket !== mySocket) void safeUnlisten(un);
-    else ptyUnlisten = un;
+    if (!w || typeof w.agent_id !== "string") return;
+    watched.delete(w.agent_id);
+    const un = ptyUnlistens.get(w.agent_id);
+    ptyUnlistens.delete(w.agent_id);
+    void safeUnlisten(un ?? null);
   });
 
   // The phone typed free text into a watched agent — authorize + inject (gate: relayGate).
@@ -268,6 +322,10 @@ export function stopRelayHost(): void {
   liveAttentions.clear();
   suggestionsByAgent.clear();
   watched.clear();
-  void safeUnlisten(ptyUnlisten);
-  ptyUnlisten = null;
+  for (const un of ptyUnlistens.values()) void safeUnlisten(un);
+  ptyUnlistens.clear();
+  // Bump every generation rather than clearing: a subscribe still in flight will resolve AFTER this
+  // teardown, and it must not find its own generation intact and re-populate the map we just
+  // emptied. Clearing would reset the counter to 0 and let exactly that happen.
+  for (const [id, g] of ptyWatchGen) ptyWatchGen.set(id, g + 1);
 }
