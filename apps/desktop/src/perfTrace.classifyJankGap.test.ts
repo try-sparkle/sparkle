@@ -19,6 +19,15 @@ describe("classifyJankGap", () => {
     expect(classifyJankGap(600_000, THRESHOLD, false)).toBe("resume");
   });
 
+  // The 10–30s band is where the everyday machine pauses land (App Nap, display sleep, occlusion).
+  // It used to be warned about as a freeze; a gap this long is a wake, and 3326ms above still has
+  // to stay a stall so lowering the bar doesn't start swallowing genuine multi-second freezes.
+  it("treats the 10-30s band as a resume rather than a multi-second freeze", () => {
+    expect(classifyJankGap(10_000, THRESHOLD, false)).toBe("resume");
+    expect(classifyJankGap(26_245, THRESHOLD, false)).toBe("resume");
+    expect(classifyJankGap(9_999, THRESHOLD, false)).toBe("stall");
+  });
+
   // The regression this function exists for: rAF is paused while the window is hidden, so the gap
   // covering a backgrounded interval is only ever observed by a tick running after the window is
   // visible again. Keying off the latched hidden state (rather than document.hidden sampled at tick

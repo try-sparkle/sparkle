@@ -231,11 +231,25 @@ export function __resetRenderTraceForTest(): void {
 let jankRunning = false;
 
 // A gap this large isn't a dropped-frame stall — the process was suspended (machine asleep, lid
-// closed, or a paused debugger). rAF doesn't fire while suspended, so the first tick on resume sees
-// the entire sleep interval as one "gap". Logging that as jank is a false positive that floods the
-// perf log and buries genuine sub-second stalls, so we classify resumes separately. No running
-// main-thread stall lasts this long; anything above it is a wake, not a freeze.
-const SUSPEND_MS = 30_000;
+// closed, App Nap, display sleep, full window occlusion, or a paused debugger). rAF doesn't fire
+// while suspended, so the first tick on resume sees the entire paused interval as one "gap".
+// Logging that as jank is a false positive that floods the perf log and buries genuine sub-second
+// stalls, so we classify resumes separately. No running main-thread stall lasts this long;
+// anything above it is a wake, not a freeze.
+//
+// 10s, not the original 30s. Only the lid-close case reliably clears 30s — the everyday pauses
+// (App Nap, display sleep, occlusion) land in the 10–30s band and were all logged as freezes,
+// ~166 bogus WARNs on a busy day claiming the app hung for 10+ seconds. They are identifiable in
+// a real session log because a machine-level pause stops EVERY window at once: the 10s+ gaps
+// arrive in tight clusters of 3–8 lines whose durations agree to within a few ms, one per open
+// window. Independent renderers cannot freeze for the same interval to that precision; a genuine
+// main-thread block is a single line from a single window. Measured against real sessions, the
+// observed stall p99 is ~1s and the largest non-clustered gap is well under 10s, so this reclaims
+// the band without shadowing anything real.
+//
+// Misclassifying either way is cheap: a resume is still recorded (at debug) with its duration, so
+// a gap that lands on the wrong side of this line is relabeled, never lost.
+const SUSPEND_MS = 10_000;
 
 /** A stall at or above this warns on its own line; anything shorter is coalesced into the periodic
  *  rollup below. Measured against a day of real traffic: stalls run ~10.3k/day with a median of
