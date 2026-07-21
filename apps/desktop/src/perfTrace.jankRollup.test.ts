@@ -65,9 +65,24 @@ describe("jank minor-stall rollup", () => {
   });
 
   it("still warns immediately for a severe stall", () => {
-    tick(13154); // the observed p99 — the freeze a user actually feels
-    expect(warn).toHaveBeenCalledWith("perf", "jank stall", expect.objectContaining({ ms: 13154 }));
+    // 4000ms: comfortably severe (>= JANK_SEVERE_MS, 1s) and comfortably below SUSPEND_MS (10s).
+    //
+    // This fixture used to be 13154 — "the observed p99". That value stopped being a STALL when
+    // gaps of 10-30s were reclassified as suspend/resume (a sleeping machine, not a freeze), so the
+    // case silently stopped testing what it names. Both changes were right on their own and landed
+    // days apart; the collision only appeared once both were on main. Picking a value in the middle
+    // of the severe band keeps this pinned to "severe stalls bypass the rollup" rather than to
+    // whichever threshold happens to bound it.
+    tick(4000);
+    expect(warn).toHaveBeenCalledWith("perf", "jank stall", expect.objectContaining({ ms: 4000 }));
     expect(rollups()).toHaveLength(0);
+  });
+
+  it("a 10s+ gap is a suspend/resume, NOT a severe stall — the boundary that broke this file", () => {
+    // Pins the interaction directly, so the next change to either threshold fails here loudly
+    // instead of quietly turning the test above into a no-op.
+    tick(13154); // the old fixture: now a resume, not a stall
+    expect(warn).not.toHaveBeenCalledWith("perf", "jank stall", expect.anything());
   });
 
   it("emits one rollup carrying count/total/max once the window elapses", () => {
