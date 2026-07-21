@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { truncateOnBoundary, stripLoneSurrogates, hasLoneSurrogate } from "./safeText";
+import {
+  truncateOnBoundary,
+  stripLoneSurrogates,
+  hasLoneSurrogate,
+  sanitizeJsonStrings,
+} from "./safeText";
 
 // 🎉 U+1F389 is non-BMP: JS stores it as the surrogate PAIR 🎉 (2 code units).
 // Slicing between them leaves a lone LEADING surrogate, which JSON.stringify emits as the
@@ -77,5 +82,34 @@ describe("JSON round-trip: the sanitized payload is well-formed JSON", () => {
   it("truncateOnBoundary output never emits a lone-surrogate escape", () => {
     const safe = truncateOnBoundary("x".repeat(79) + PARTY, 80);
     expect(JSON.stringify(safe)).not.toMatch(/\\ud[89ab][0-9a-f]{2}/i);
+  });
+});
+
+// The boundary backstop: whatever shape a payload has, nothing malformed gets past it.
+describe("sanitizeJsonStrings", () => {
+  it("repairs strings at every depth — object values, arrays, and keys", () => {
+    const dirty = {
+      name: "proj \uD83C",
+      agents: [{ id: "a\uDC00", prompts: ["one \uD83D", "clean"] }],
+      ["key\uD83E"]: "v",
+    };
+    expect(JSON.stringify(sanitizeJsonStrings(dirty))).not.toMatch(/\\ud[89ab][0-9a-f]{2}/i);
+  });
+
+  it("passes non-string scalars through untouched", () => {
+    const v = { n: 1, t: true, z: null, u: undefined, neg: -0.5 };
+    expect(sanitizeJsonStrings(v)).toEqual(v);
+  });
+
+  it("preserves well-formed emoji and array order exactly", () => {
+    const good = { name: `ship ${PARTY}`, xs: ["a", "b", "c"] };
+    expect(sanitizeJsonStrings(good)).toEqual(good);
+  });
+
+  it("makes any payload safe to stringify-and-reparse, which is what the IPC does", () => {
+    const dirty = { deep: { list: [{ s: `bad \uD83C tail` }] } };
+    const clean = sanitizeJsonStrings(dirty);
+    expect(() => JSON.parse(JSON.stringify(clean))).not.toThrow();
+    expect(hasLoneSurrogate(clean.deep.list[0]!.s)).toBe(false);
   });
 });

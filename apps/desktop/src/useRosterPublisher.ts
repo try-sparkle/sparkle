@@ -15,7 +15,7 @@ import { useInteractionStore } from "./stores/interactionStore";
 import { findWindowForProject, onWindowRegistryChange } from "./services/windowRegistry";
 import { useCurrentWindowLabel } from "./windowContext";
 import { composerPrompts } from "./components/promptHistory";
-import { safeTruncate, stripLoneSurrogates } from "./services/safeText";
+import { safeTruncate, sanitizeJsonStrings, stripLoneSurrogates } from "./services/safeText";
 import type { AgentTab, Project } from "./types";
 
 const DEFAULT_STATUS: AgentTabStatus = "stopped";
@@ -62,13 +62,19 @@ export function windowProjects(projects: Project[], label: string): Project[] {
   return projects.filter((p) => findWindowForProject(p.id) === label);
 }
 
+/** Build the roster payload published to BOTH the Rust tray aggregator and the phone relay.
+ *
+ *  The result is swept by `sanitizeJsonStrings` before it leaves: both consumers cross a JSON
+ *  boundary where a single lone surrogate in ANY string rejects the whole payload (see
+ *  services/safeText.ts). `displayName`/`recentPrompts` still sanitize at the source — the sweep is
+ *  the backstop for the fields nobody thought to guard (project name, ids, workflow stage). */
 export function buildRoster(
   projects: Project[],
   status: Record<string, AgentTabStatus>,
   workflowStage: Record<string, string>,
   interaction: Record<string, number>,
 ): RosterPayload {
-  return {
+  return sanitizeJsonStrings<RosterPayload>({
     projects: projects.map((p) => ({
       id: p.id,
       name: p.name,
@@ -89,7 +95,7 @@ export function buildRoster(
         };
       }),
     })),
-  };
+  });
 }
 
 export function useRosterPublisher(): void {

@@ -78,6 +78,62 @@ describe("roster payload is always well-formed UTF-16 (hex-escape regression)", 
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     expect(r.projects[0]!.agents[0]!.recent_prompts![0]!.text).toBe("ship it \u{1F389}");
   });
+
+  /** A project carrying one agent, ready to be corrupted field-by-field. */
+  function projectFixture(): Project {
+    return {
+      id: "p1", name: "Proj", rootPath: "/p", defaultBranch: "main",
+      createdAt: "", agents: [agentWithPrompt("hi")], selectedAgentId: null,
+    };
+  }
+
+  // The invoke is all-or-nothing: serde_json parses the WHOLE args blob, so a lone surrogate in ANY
+  // string field rejects the entire roster — not just the field that carried it. Guarding only the
+  // two fields we happened to truncate (agent name, prompt text) left the same flood reachable via
+  // every other string on the payload, so each one is asserted here.
+  it.each([
+    ["project name", (p: Project) => { p.name = "Proj \uD83C"; }],
+    ["agent name", (p: Project) => { (p.agents[0] as { name: string }).name = "Build \uDC00"; }],
+    ["project id", (p: Project) => { p.id = "p1\uD83D"; }],
+    ["agent id", (p: Project) => { (p.agents[0] as { id: string }).id = "a1\uD83D"; }],
+    ["prompt id", (p: Project) => {
+      (p.agents[0] as { promptHistory: unknown[] }).promptHistory = [
+        { id: "pid\uD83E", text: "hi", at: 1, source: "composer" },
+      ];
+    }],
+  ])("repairs a lone surrogate in the %s", (_label, corrupt) => {
+    const p = projectFixture();
+    corrupt(p);
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    const r = buildRoster([p], { [p.agents[0]!.id]: "working" }, {}, {});
+    const wire = JSON.stringify(r);
+    expect(hasLoneSurrogate(wire)).toBe(false);
+    expect(wire).not.toMatch(/\\ud[89ab][0-9a-f]{2}/i);
+  });
+
+  // workflow_stage is joined in from a separate store keyed by agent id, so it never passed through
+  // the truncation path the original fix guarded.
+  it("repairs a lone surrogate in workflow_stage", () => {
+    const r = buildRoster([projectFixture()], { a1: "working" }, { a1: "review \uD83D" }, {});
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(hasLoneSurrogate(r.projects[0]!.agents[0]!.workflow_stage!)).toBe(false);
+    expect(JSON.stringify(r)).not.toMatch(/\\ud[89ab][0-9a-f]{2}/i);
+  });
+
+  // The sweep must repair, not mangle: well-formed emoji and non-string fields survive untouched.
+  it("leaves a well-formed payload intact", () => {
+    const p = projectFixture();
+    p.name = "Proj \u{1F680}";
+    const r = buildRoster([p], { a1: "working" }, { a1: "review" }, {});
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    const agent = r.projects[0]!.agents[0]!;
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(r.projects[0]!.name).toBe("Proj \u{1F680}");
+    expect(agent.workflow_stage).toBe("review");
+    expect(agent.parent_id).toBeNull();
+    expect(agent.last_activity_at).toBe(1);
+    expect(agent.status_color).toBe("#34c759");
+  });
 });
 
 // Regression guard for the window-scoping fix (roborev 19166):

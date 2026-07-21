@@ -64,3 +64,36 @@ export function stripLoneSurrogates(s: string): string {
 export function safeTruncate(s: string, maxUnits: number): string {
   return stripLoneSurrogates(truncateOnBoundary(s, maxUnits));
 }
+
+/** Recursively repair every string in a JSON-shaped value, returning a payload that `JSON.stringify`
+ *  is guaranteed to render as parseable JSON.
+ *
+ *  WHY A SWEEP AND NOT PER-FIELD GUARDS: the IPC boundary is all-or-nothing. serde_json parses the
+ *  whole args blob, so ONE lone surrogate anywhere rejects the ENTIRE roster — the tray and the
+ *  phone both go stale, and the field that carried it is invisible in the error (the message names
+ *  a column offset, not a key). Sanitizing only the fields we happened to truncate left the same
+ *  flood reachable through project names, ids, and workflow stages, none of which we truncate but
+ *  all of which can carry pasted or scraped text. Guarding the boundary once means a field added
+ *  later is covered by construction rather than by remembering.
+ *
+ *  COST: proportional to the payload (a handful of projects × agents × 4 prompts). Every array and
+ *  object node is rebuilt unconditionally — `map` / `Object.fromEntries` allocate a fresh container
+ *  whether or not a child changed; only an already-well-formed string LEAF is free, via
+ *  `stripLoneSurrogates`' early return. Short-circuiting container rebuilds when nothing changed is
+ *  deliberately not done: at this payload size the copies are noise, and callers run this inside the
+ *  roster's 250ms debounce, never on a render path. */
+export function sanitizeJsonStrings<T>(value: T): T {
+  if (typeof value === "string") return stripLoneSurrogates(value) as unknown as T;
+  if (Array.isArray(value)) return value.map(sanitizeJsonStrings) as unknown as T;
+  // Plain objects only — Date/Map/class instances are not part of our JSON payloads, and rebuilding
+  // one from its own entries would silently drop its prototype.
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+        stripLoneSurrogates(k),
+        sanitizeJsonStrings(v),
+      ]),
+    ) as unknown as T;
+  }
+  return value;
+}
