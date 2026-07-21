@@ -113,8 +113,9 @@ export function PinnedPrompt({
     setScrolledOutId(null);
     const raf = requestAnimationFrame(() => listRef.current?.focus());
     return () => cancelAnimationFrame(raf);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- run only on open transition; `items`
-    // is read fresh at that moment, and we deliberately don't re-fire when history changes mid-open.
+    // Runs only on the open transition; `items` is read fresh at that moment, and we deliberately
+    // don't re-fire when history changes mid-open. (The exhaustive-deps suppression this rationale
+    // was attached to is gone — the rule no longer fires here — but the intent still holds.)
   }, [open]);
 
   // Click a row: a fresh row selects it (collapsed); clicking the already-selected row toggles its

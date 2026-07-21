@@ -91,7 +91,6 @@ export function ModelPill({
       window.removeEventListener("scroll", onMove, true);
       window.removeEventListener("resize", onMove);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   const current = modelShortLabel(value);

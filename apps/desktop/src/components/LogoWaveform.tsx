@@ -234,7 +234,6 @@ export function LogoWaveform() {
     raf.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf.current);
     // paintBar/paintOrb are stable for the component's life; only re-arm on gating change.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, listening]);
 
   const caption = captionFor(phase, enabled, listening, wakeWord, stopWord);

@@ -111,7 +111,10 @@ export function SelectionPopup({
       document.removeEventListener("mousedown", onDocDown, true);
       window.removeEventListener("wheel", onWheel, true);
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- intentionally empty; reads via refs
+    // Intentionally empty: everything this effect touches is read through refs, so there is nothing
+    // to re-subscribe on. (Previously carried an exhaustive-deps suppression; the rule does not fire
+    // here — refs are not dependencies — so the directive was inert and is gone.)
+  }, []);
 
   // Run an action; show a toast then close, or close immediately. The success toast comes from
   // the `done` arg OR from a string the action returns (e.g. the new bead id) — so the action

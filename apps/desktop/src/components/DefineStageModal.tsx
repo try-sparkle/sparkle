@@ -282,7 +282,6 @@ export function DefineStageModal({ stageKey, projectName, projectRoot, onClose }
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectRoot, stageKey, projectName]);
 
   // ── Persist a definition, then show the stage-appropriate confirmation ──
