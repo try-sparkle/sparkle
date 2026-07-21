@@ -32,6 +32,7 @@ import { useTrialStore } from "../stores/trialStore";
 import { deriveAuthView } from "../services/entitlement";
 import { performTrialUnlock } from "../services/trialUnlock";
 import { TrialIndicator } from "./TrialChrome";
+import { OpenPrBadge } from "./OpenPrBadge";
 
 /** Most common status across a project's agents — drives the project's color (spec). */
 function majorityStatus(
@@ -330,6 +331,12 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       {/* Trial counter + Unlock — in-row, to the LEFT of the Recent/Open/⋯ + auth-status
           cluster, so it can never cover them. Only in trial mode; hides once the trial is spent. */}
       {inTrial && <TrialIndicator onUnlock={onTrialUnlock} signInFailedUrl={trialFailedUrl} />}
+
+      {/* "N PRs waiting" — repo-scoped and agent-independent ON PURPOSE. The per-agent "Merge PR"
+          CTA disappears with its agent, so a PR opened by a finished session goes invisible exactly
+          when it's waiting to be merged. Renders nothing at zero, and nothing when the probe
+          couldn't run — those are different facts, and neither is worth a "0". */}
+      <OpenPrBadge rootPath={project?.rootPath ?? null} />
 
       <div style={{ position: "relative" }}>
         <button

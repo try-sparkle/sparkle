@@ -1237,6 +1237,93 @@ fn probe_pr_by_commit(root: &str, tip: &str) -> (Option<String>, Option<u64>, Op
     decode_commit_pulls(&rows)
 }
 
+/// Pure decoder for a `gh pr list --json number` response → the number of open PRs. Kept separate
+/// from the spawn so the "what does this output mean" half is unit-testable without a network or a
+/// `gh` binary. Unparsable output reads as UNKNOWN (`None`), never as zero: the badge must be able
+/// to distinguish "no PRs waiting" from "couldn't find out", because rendering a confident `0` on a
+/// failed probe is exactly the false reassurance this feature exists to prevent.
+fn decode_open_pr_count(stdout: &str) -> Option<u32> {
+    let rows = serde_json::from_str::<Vec<Value>>(stdout).ok()?;
+    u32::try_from(rows.len()).ok()
+}
+
+/// Best-effort count of OPEN pull requests in `root`'s repo authored by the current `gh` identity.
+///
+/// Repo-scoped on purpose, and deliberately NOT keyed on any agent: an agent leaves the sidebar
+/// when its session ends, and a PR-awaiting-merge signal that dies with the agent is precisely the
+/// gap this closes (see PRD/sparkle-pr-awaiting-merge-badge.md). Scoped to `--author @me` so that
+/// on a repo with other contributors this counts only work this identity owns and can merge, rather
+/// than a teammate's review queue.
+///
+/// Best-effort by the same convention as `probe_pr`: gh absent, unauthed, offline, no remote, or a
+/// timeout all yield `None` (unknown) and never an error.
+fn probe_open_pr_count(root: &str) -> Option<u32> {
+    let mut cmd = Command::new("gh");
+    cmd.arg("pr")
+        .args(["list", "--state", "open", "--author", "@me", "--limit", "100", "--json", "number"])
+        .current_dir(root)
+        // Keep gh non-interactive and quiet; never let it block on a prompt or updater.
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    // Network touch → bounded wall-clock, so a hung remote can't stall the poll behind it.
+    let output = output_with_timeout(cmd, NETWORK_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    decode_open_pr_count(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// How many open PRs authored by this identity are waiting in `root`'s repo. `Ok(None)` means
+/// "couldn't find out" (see `probe_open_pr_count`); the badge renders nothing for it.
+#[tauri::command]
+pub async fn project_open_pr_count(root: String) -> Result<Option<u32>, String> {
+    tauri::async_runtime::spawn_blocking(move || probe_open_pr_count(&root))
+        .await
+        .map_err(|e| format!("project_open_pr_count task failed: {e}"))
+}
+
+/// Pure decoder: `gh repo view --json url` → the repo's PR-list URL. Split from the spawn so the
+/// URL-shaping is testable without `gh`. Anything that isn't a plausible https URL yields None
+/// rather than a half-built link — the badge would rather do nothing than open a wrong page.
+fn decode_pr_list_url(stdout: &str) -> Option<String> {
+    let v = serde_json::from_str::<Value>(stdout).ok()?;
+    let url = v.get("url").and_then(Value::as_str)?.trim_end_matches('/');
+    if !url.starts_with("https://") {
+        return None;
+    }
+    Some(format!("{url}/pulls"))
+}
+
+/// The repo's pull-request list URL, for the badge's click-through. Asks `gh` rather than parsing
+/// `git remote get-url`, so SSH remotes, enterprise hosts, and renamed repos all resolve the same
+/// way the rest of the PR machinery already resolves them. Best-effort: `None` on any failure, and
+/// the caller simply doesn't navigate.
+/// Best-effort PR-list URL for `root`'s repo. Mirrors `probe_open_pr_count`'s shape deliberately:
+/// the gh-invocation boilerplate (non-interactive env, bounded wall-clock, failure reads as None)
+/// is identical, and having one path inline it while the other used a helper made the pair harder
+/// to compare than it needed to be.
+fn probe_pr_list_url(root: &str) -> Option<String> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["repo", "view", "--json", "url"])
+        .current_dir(root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    let output = output_with_timeout(cmd, NETWORK_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    decode_pr_list_url(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[tauri::command]
+pub async fn project_pr_list_url(root: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || probe_pr_list_url(&root))
+        .await
+        .map_err(|e| format!("project_pr_list_url task failed: {e}"))
+}
+
 /// Per-repo cooldown between opportunistic `git fetch`es. Reachability into `origin/<default>` is
 /// only as fresh as the last fetch; when a PR is merged in ANOTHER worktree/session this repo's
 /// remote-tracking ref goes stale and the tracker understates "On Main"/"Merged" until something
@@ -3429,6 +3516,57 @@ mod tests {
         // No PR associated with the commit ⇒ all-None.
         let (s, n, u) = decode_commit_pulls(&[]);
         assert!(s.is_none() && n.is_none() && u.is_none());
+    }
+
+    #[test]
+    fn decode_pr_list_url_builds_the_pulls_link() {
+        assert_eq!(
+            decode_pr_list_url(r#"{"url":"https://github.com/owner/repo"}"#).as_deref(),
+            Some("https://github.com/owner/repo/pulls")
+        );
+        // A trailing slash must not produce a double slash in the path.
+        assert_eq!(
+            decode_pr_list_url(r#"{"url":"https://github.com/owner/repo/"}"#).as_deref(),
+            Some("https://github.com/owner/repo/pulls")
+        );
+        // Enterprise / self-hosted hosts work the same way — nothing here assumes github.com.
+        assert_eq!(
+            decode_pr_list_url(r#"{"url":"https://git.example.com/team/app"}"#).as_deref(),
+            Some("https://git.example.com/team/app/pulls")
+        );
+    }
+
+    #[test]
+    fn decode_pr_list_url_refuses_anything_that_is_not_a_plausible_https_url() {
+        // Rather than open a half-built or attacker-influenced link, decline to navigate at all.
+        assert_eq!(decode_pr_list_url(""), None);
+        assert_eq!(decode_pr_list_url("not json"), None);
+        assert_eq!(decode_pr_list_url("{}"), None);
+        assert_eq!(decode_pr_list_url(r#"{"url":""}"#), None);
+        assert_eq!(decode_pr_list_url(r#"{"url":"http://insecure/repo"}"#), None);
+        assert_eq!(decode_pr_list_url(r#"{"url":"javascript:alert(1)"}"#), None);
+        assert_eq!(decode_pr_list_url(r#"{"url":"file:///etc/passwd"}"#), None);
+    }
+
+    #[test]
+    fn decode_open_pr_count_counts_rows() {
+        assert_eq!(decode_open_pr_count("[]"), Some(0));
+        assert_eq!(decode_open_pr_count(r#"[{"number":1}]"#), Some(1));
+        assert_eq!(decode_open_pr_count(r#"[{"number":1},{"number":2},{"number":3}]"#), Some(3));
+    }
+
+    #[test]
+    fn decode_open_pr_count_reads_garbage_as_unknown_not_zero() {
+        // The whole point of the badge is that it must never claim "nothing is waiting" when it
+        // simply failed to look. An empty array is a KNOWN zero; everything else that isn't a
+        // JSON array is UNKNOWN, and the UI renders nothing rather than a reassuring "0".
+        assert_eq!(decode_open_pr_count(""), None);
+        assert_eq!(decode_open_pr_count("not json"), None);
+        assert_eq!(decode_open_pr_count("gh: command not found"), None);
+        // A JSON object (e.g. an error payload) is not a row list either.
+        assert_eq!(decode_open_pr_count(r#"{"message":"Bad credentials"}"#), None);
+        // Known-zero and unknown are genuinely different values, not just different renderings.
+        assert_ne!(decode_open_pr_count("[]"), decode_open_pr_count("Bad credentials"));
     }
 
     #[test]
