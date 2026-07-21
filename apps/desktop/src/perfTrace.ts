@@ -103,7 +103,7 @@ export async function perfSpanAsync<T>(
 /** `count` is cumulative for the key's lifetime; `loggedAt`/`loggedCount` are the clock and count as
  *  of the last line written, so the next line can state the window's span and how many renders it
  *  swallowed without holding the renders themselves. */
-type RenderStat = { count: number; loggedAt: number; loggedCount: number };
+type RenderStat = { count: number; loggedAt: number; loggedCount: number; windowMs: number };
 
 /** Entries are intentionally never evicted: `count` is documented as lifetime-cumulative, so a
  *  retired key's entry is what makes a re-mounted pane's count continue rather than silently reset.
@@ -127,6 +127,35 @@ const renderStats = new Map<string, RenderStat>();
  *  (a Workspace store-write thrash); a 1s window turns that into one line reading since:150. */
 const RENDER_COALESCE_MS = 1_000;
 
+/** Ceiling for the widened window (see RENDER_SUSTAINED_FACTOR). Two lines a minute is still a live
+ *  pulse for a pane that has been thrashing for hours — enough to see it's ongoing and to read the
+ *  rate off `since`/`ms` — without the window growing until a key that finally goes quiet takes an
+ *  unbounded time to say so. */
+const RENDER_COALESCE_MAX_MS = 30_000;
+
+/** A flush landing within this multiple of the current window means the key never actually went
+ *  quiet — it has been rendering continuously since the last line — so the window doubles (capped at
+ *  RENDER_COALESCE_MAX_MS). Any longer gap means the key idled and came back, which is a change in
+ *  behaviour and therefore newsworthy, so the window resets to RENDER_COALESCE_MS.
+ *
+ *  This is the fix for the "breadth, not burst" residual the note above waves off. The flat 1s cap
+ *  bounds how loud one key can be in one second but not how long it can stay loud: the dominant real
+ *  cost isn't a pane spinning 150× in a burst, it's ~60 panes each re-rendering roughly once a
+ *  second for hours, every one of them logging `since:1` forever. In a measured day that steady-state
+ *  tail was ~75% of the whole log — 424k of 565k lines, 70% of them for panes that weren't even
+ *  visible. Those lines are near-duplicates: after the first few windows, "still rendering, still
+ *  ~1/sec" is established, and the 3,000th line restating it at the same resolution adds nothing.
+ *
+ *  Backoff keeps every part of the fingerprint and drops only the redundancy. The mount line, the
+ *  onset of thrash, and the exact cumulative `count` are untouched; `since`/`ms` stay exact over
+ *  whatever window they cover, so the rate is still readable — just sampled more coarsely the longer
+ *  a key has been doing the same thing. A steady 1/sec pane logs at ~1s, 2s, 4s, 8s, 16s, then every
+ *  30s: ~1.2k lines over a 10-hour session instead of ~36k, with the same story.
+ *
+ *  Doubling (rather than a fixed wide window) is what keeps onset sharp: a key that starts thrashing
+ *  is still reported at 1s resolution for the first several seconds, when the information is new. */
+const RENDER_SUSTAINED_FACTOR = 2;
+
 /** Call once per render from a component (e.g. perfRender("AgentPane", agent.id, { visible })). Logs
  *  a running count at debug so a background pane re-rendering on every unrelated store write stands
  *  out — the render-thrash fingerprint. Counting is O(1); the debug line is filterable.
@@ -136,6 +165,12 @@ const RENDER_COALESCE_MS = 1_000;
  *  emits one line carrying `since` (renders coalesced into it, this one included) and `ms` (the span
  *  since the PREVIOUS line) — i.e. the burst is reported as a rate rather than reconstructed by hand
  *  from N lines. `count` stays the exact cumulative total, so suppression never costs a render.
+ *
+ *  The window is not fixed: a key that keeps rendering continuously doubles it up to
+ *  RENDER_COALESCE_MAX_MS, and going quiet past the window resets it (see RENDER_SUSTAINED_FACTOR).
+ *  So a pane's first seconds of thrash are reported at full 1s resolution and an hours-long steady
+ *  hum settles to a line every 30s. Every line stays self-describing — `ms` is always the true span
+ *  it covers and `since` the renders in it — so a widened window changes the sampling, not the math.
  *
  *  Read `since`/`ms` as a rate only while a key is rendering steadily — which is the thrash case,
  *  and there it's the true rate. `ms` is the gap since the last line, NOT the span the coalesced
@@ -156,12 +191,13 @@ export function perfRender(component: string, key: string, meta?: Record<string,
   const now = perfNow();
   const prev = renderStats.get(id);
   if (!prev) {
-    renderStats.set(id, { count: 1, loggedAt: now, loggedCount: 1 });
+    renderStats.set(id, { count: 1, loggedAt: now, loggedCount: 1, windowMs: RENDER_COALESCE_MS });
     log.debug("perf", `render ${component}`, { ...meta, key, count: 1 });
     return;
   }
   prev.count += 1;
-  if (now - prev.loggedAt < RENDER_COALESCE_MS) return; // inside the window — counted, not logged
+  const elapsed = now - prev.loggedAt;
+  if (elapsed < prev.windowMs) return; // inside the window — counted, not logged
   // `meta` spreads FIRST so the instrument's own fields always win: `ms` is a plausible thing for a
   // caller to pass (perfSpan uses it as a meta name), and a caller silently overwriting it would
   // corrupt the exact rate signal this coalescing exists to preserve.
@@ -170,10 +206,20 @@ export function perfRender(component: string, key: string, meta?: Record<string,
     key,
     count: prev.count,
     since: prev.count - prev.loggedCount,
-    ms: Math.round(now - prev.loggedAt),
+    ms: Math.round(elapsed),
   });
   prev.loggedAt = now;
   prev.loggedCount = prev.count;
+  // Widen while the key stays continuously busy; snap back the moment it idles out of the window.
+  // Growth deliberately reuses RENDER_SUSTAINED_FACTOR rather than a literal: the two are one
+  // invariant, not two knobs. A gap qualifies as "sustained" iff it fits within one growth step, so
+  // growing by the same factor guarantees the new window covers the gap that just qualified. Were
+  // growth smaller than the threshold, a key could flush as sustained and then immediately overrun
+  // its own widened window, ping-ponging into a reset instead of settling.
+  prev.windowMs =
+    elapsed < prev.windowMs * RENDER_SUSTAINED_FACTOR
+      ? Math.min(prev.windowMs * RENDER_SUSTAINED_FACTOR, RENDER_COALESCE_MAX_MS)
+      : RENDER_COALESCE_MS;
 }
 
 /** Clear render counters/windows so a test starts from a known state (counts are process-lifetime). */

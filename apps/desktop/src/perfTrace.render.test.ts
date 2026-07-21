@@ -160,16 +160,75 @@ describe("perfRender", () => {
     // i.e. ~7/sec derived, for a burst that really ran at ~2000/sec — but `since` is still 400.
   });
 
-  it("does not coalesce a steady low render rate into silence", () => {
-    // Coalescing is a burst guard, not a sampler: renders spaced past the window each get a line.
+  it("does not coalesce a steady render rate into silence", () => {
+    // Coalescing samples a sustained key, but must never mute one: over a long steady run the lines
+    // keep coming, and the last one still states the true cumulative total.
     const debug = vi.spyOn(log, "debug").mockImplementation(() => {});
     const c = clock();
 
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 400; i++) {
       perfRender("AgentPane", "a");
       c.advance(1_500);
     }
 
-    expect(renderLines(debug)).toHaveLength(4);
+    const lines = renderLines(debug);
+    expect(lines.length).toBeGreaterThan(1);
+    expect(lines.at(-1)).toMatchObject({ count: expect.any(Number) });
+    expect(lines.at(-1)!.count).toBeGreaterThan(300); // still counting every render, not sampling it
+  });
+
+  it("widens the window while a key renders continuously, so a long hum stops restating itself", () => {
+    // The steady-state tail, not the burst, is what actually fills the log: a pane humming at ~1/sec
+    // for hours wrote a near-duplicate `since:1` line every second. Backoff turns that into a
+    // geometric handful of lines while `count` stays exact.
+    const debug = vi.spyOn(log, "debug").mockImplementation(() => {});
+    const c = clock();
+
+    for (let i = 0; i < 3_600; i++) {
+      // one render per second for an hour
+      perfRender("AgentPane", "a");
+      c.advance(1_000);
+    }
+
+    const lines = renderLines(debug);
+    // Flat 1s windows would have written ~3,600 lines. Backoff caps at one per 30s (~120) plus the
+    // handful of doublings on the way up.
+    expect(lines.length).toBeLessThan(150);
+    expect(lines.at(-1)!.count).toBeGreaterThan(3_500); // ...without losing a single render
+  });
+
+  it("caps how wide the window can get, so a thrashing key keeps a live pulse", () => {
+    // Doubling forever would eventually mean a pane could thrash for an hour between lines.
+    const debug = vi.spyOn(log, "debug").mockImplementation(() => {});
+    const c = clock();
+
+    for (let i = 0; i < 2_000; i++) {
+      perfRender("AgentPane", "a");
+      c.advance(1_000);
+    }
+
+    const lines = renderLines(debug);
+    // Once capped, consecutive lines are 30s apart — never more.
+    expect(lines.at(-1)!.ms).toBe(30_000);
+  });
+
+  it("resets the window once a key goes quiet, so renewed thrash is caught at full resolution", () => {
+    // Widening is earned by staying busy and must not be permanent: a key that idles out of its
+    // window has changed behaviour, and the next burst deserves 1s resolution again.
+    const debug = vi.spyOn(log, "debug").mockImplementation(() => {});
+    const c = clock();
+
+    for (let i = 0; i < 200; i++) {
+      // ...thrash long enough to reach the cap
+      perfRender("AgentPane", "a");
+      c.advance(1_000);
+    }
+    c.advance(300_000); // then go idle for five minutes
+    perfRender("AgentPane", "a"); // the return-from-idle render flushes at the widened window...
+    const before = renderLines(debug).length;
+    c.advance(1_000);
+    perfRender("AgentPane", "a"); // ...and this one proves the window is back to 1s
+
+    expect(renderLines(debug)).toHaveLength(before + 1);
   });
 });
