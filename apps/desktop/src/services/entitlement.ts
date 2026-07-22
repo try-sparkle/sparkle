@@ -19,6 +19,31 @@ export interface Me {
 
 export type AuthView = "loading" | "welcome" | "trial" | "unpaid" | "entitled";
 
+/**
+ * How long a locally-cached entitlement is honored WITHOUT a fresh affirmative server confirmation
+ * (offline grace window). A paying customer who is offline or whose backend is unreachable keeps
+ * their workspace instead of being bounced to the paywall; but a token that is silently rotated or
+ * revoked server-side (which, at the JS layer, is indistinguishable from a network failure — both
+ * surface as a null /me) eventually re-gates once this window lapses. 14 days comfortably covers a
+ * long offline stretch (travel, a down backend) while keeping a lost/rotated token from granting
+ * indefinite access.
+ */
+export const ENTITLEMENT_GRACE_MS = 14 * 24 * 60 * 60 * 1000;
+
+/**
+ * Whether a cached `me` may still be trusted to render the workspace optimistically. True only for
+ * an ENTITLED cache stamped within {@link ENTITLEMENT_GRACE_MS} of `now`. A future-dated stamp
+ * (clock skew / a clock rolled backward since caching) is treated as "recent", never as expired, so
+ * a benign clock wobble can't lock a paying user out. `now` is injected so this stays pure/testable.
+ */
+export function isEntitlementCacheValid(
+  me: Me | null,
+  cachedAt: number | null,
+  now: number,
+): boolean {
+  return !!me?.entitled && cachedAt != null && now - cachedAt < ENTITLEMENT_GRACE_MS;
+}
+
 /** Derive which gate screen to show from the current auth + trial state.
  *  Signed-in users (token present) keep the existing unpaid/entitled behavior; the
  *  trial layer only governs token-less users. */

@@ -236,42 +236,82 @@ struct PtyEnd {
     id: String,
 }
 
+/// Binaries `pty_spawn` is permitted to launch, by basename (defense-in-depth allowlist).
+///
+/// Today EVERY real spawn is `/bin/zsh` (the `SHELL` constant in claudeSpawn.ts): the user's
+/// `claude`/`node`/`git` ride as arguments inside `/bin/zsh -l -c 'exec …'`, never as `command`.
+/// The remaining names are the tool binaries the app resolves in preflight.rs (`known_*_paths`)
+/// and could plausibly be spawned directly by a future path. A compromised webview that tries to
+/// launch some OTHER absolute binary — `/usr/bin/osascript`, `/usr/bin/curl`, `/bin/rm`, a
+/// downloaded payload — no longer gets a free arbitrary-exec primitive out of `pty_spawn`.
+const ALLOWED_SPAWN_BASENAMES: &[&str] =
+    &["zsh", "bash", "sh", "node", "git", "claude", "roborev"];
+
 /// Defense-in-depth checks before spawning — NOT the primary security boundary.
 ///
-/// `pty_spawn` exists to launch the user's own `claude` via `/bin/zsh -lc '…'`, so by design
-/// it runs whatever shell script the webview hands it; a binary allowlist can't change that
-/// (`/bin/zsh -c '<anything>'` is the legitimate pattern). The REAL boundary is the WebView's
-/// integrity: a strict CSP with no remote origins and no `unsafe-eval` (see tauri.conf.json),
-/// plus a frontend that never renders agent/file output as executable HTML. These checks only
-/// stop the obvious misuses and catch bugs:
-///  - `command` must be a non-empty ABSOLUTE path (no `$PATH`-relative name resolution).
-///  - `cwd`, if given, must resolve to a directory INSIDE the app's managed worktrees dir —
-///    every real caller passes an agent worktree under `<app_data>/worktrees/…`.
+/// `pty_spawn` exists to launch the user's own `claude` via `/bin/zsh -lc '…'`, so by design it
+/// runs whatever shell script the webview hands it. The REAL boundary is the WebView's integrity:
+/// a strict CSP with no remote origins and no `unsafe-eval` (see tauri.conf.json), plus a frontend
+/// that never renders agent/file output as executable HTML. These checks are a SECOND layer that
+/// stops the obvious misuses and catch bugs:
+///  - `command` must be a non-empty ABSOLUTE path (no `$PATH`-relative name resolution) whose
+///    basename is in `ALLOWED_SPAWN_BASENAMES`, or which lives under the app's managed dir.
+///  - Containment is enforced on EVERY spawn — there is no "cwd is null so skip the check" hole.
+///    A provided `cwd` must resolve INSIDE `<app_data>/worktrees`; a null `cwd` (the pre-worktree
+///    `claude login` flows) is NOT left to inherit the app's arbitrary process cwd — it falls back
+///    to the managed `<app_data>` dir, a trusted, contained location.
 ///
-/// Returns the canonicalized cwd (if any) so the caller spawns into the *validated* path rather
-/// than the original string — closing a check-vs-use symlink-swap window.
-fn validate_spawn(
-    app: &AppHandle,
-    command: &str,
-    cwd: Option<&str>,
-) -> Result<Option<PathBuf>, String> {
-    let worktrees = crate::dev_identity::app_data_dir(app)
-        .map_err(|e| format!("pty_spawn: {e}"))?
-        .join("worktrees");
-    validate_spawn_inner(&worktrees, command, cwd)
+/// Returns the canonicalized cwd the caller must spawn into (never the original string), closing a
+/// check-vs-use symlink-swap window.
+fn validate_spawn(app: &AppHandle, command: &str, cwd: Option<&str>) -> Result<PathBuf, String> {
+    let app_data = crate::dev_identity::app_data_dir(app).map_err(|e| format!("pty_spawn: {e}"))?;
+    // The managed dir is the null-cwd fallback and the "binary under a managed dir" root, so it
+    // must exist and canonicalize. Tauri creates app-data lazily; ensure it before we depend on it.
+    let _ = std::fs::create_dir_all(&app_data);
+    let worktrees = app_data.join("worktrees");
+    validate_spawn_inner(&worktrees, &app_data, command, cwd)
 }
 
 /// Pure, AppHandle-free core of `validate_spawn` (so it can be unit-tested). `worktrees_base` is
-/// `<app_data>/worktrees`.
+/// `<app_data>/worktrees`; `managed_base` is `<app_data>` — used both as the null-cwd fallback and
+/// as the root under which a bundled binary may be spawned. Always returns the validated cwd to
+/// spawn into (there is no longer an "unconstrained / inherited cwd" outcome).
 fn validate_spawn_inner(
     worktrees_base: &Path,
+    managed_base: &Path,
     command: &str,
     cwd: Option<&str>,
-) -> Result<Option<PathBuf>, String> {
-    if command.is_empty() || !Path::new(command).is_absolute() {
+) -> Result<PathBuf, String> {
+    let cmd_path = Path::new(command);
+    if command.is_empty() || !cmd_path.is_absolute() {
         return Err("pty_spawn: command must be a non-empty absolute path".into());
     }
-    let Some(cwd) = cwd else { return Ok(None) };
+    // Binary allowlist: an allowlisted basename, OR a binary that lives under the app's managed
+    // dir. The basename check is lexical (it does not require the binary to exist), so the common
+    // `/bin/zsh` path never touches the filesystem here.
+    let basename_ok = cmd_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|b| ALLOWED_SPAWN_BASENAMES.contains(&b))
+        .unwrap_or(false);
+    if !basename_ok {
+        // Canonicalize both sides so a symlinked binary can't dodge the containment compare; fall
+        // back to a lexical prefix check only when a side can't be resolved.
+        let under_managed = match (cmd_path.canonicalize(), managed_base.canonicalize()) {
+            (Ok(real_cmd), Ok(real_base)) => real_cmd.starts_with(&real_base),
+            _ => cmd_path.starts_with(managed_base),
+        };
+        if !under_managed {
+            return Err("pty_spawn: command is not an allowed binary".into());
+        }
+    }
+    // Null cwd (the pre-worktree login flows): fall back to the managed app-data dir rather than
+    // inheriting the app's process cwd, so EVERY spawn runs in a validated, contained directory.
+    let Some(cwd) = cwd else {
+        return managed_base
+            .canonicalize()
+            .map_err(|e| format!("pty_spawn: managed dir unavailable: {e}"));
+    };
     // Canonicalize BOTH sides fully (resolving macOS /var→/private/var, ~/Library, a symlinked
     // `worktrees`, and any `../` in the supplied cwd) so the containment compare is between two
     // real paths. If the worktrees base can't be resolved (e.g. it doesn't exist yet) we reject
@@ -284,7 +324,7 @@ fn validate_spawn_inner(
     if !real.starts_with(&base) {
         return Err("pty_spawn: cwd is outside the managed worktrees directory".into());
     }
-    Ok(Some(real))
+    Ok(real)
 }
 
 /// Returned (as the `Err` string) when a write/resize/kill targets a PTY that has
@@ -548,9 +588,9 @@ pub async fn pty_spawn(
             apply_heap_cap(&mut cmd, std::env::var("NODE_OPTIONS").ok(), heap_mb);
             // Spawn into the *validated, canonicalized* cwd (not the original string), so a symlink
             // swap between check and use can't redirect the working dir outside the worktrees tree.
-            if let Some(dir) = validated_cwd {
-                cmd.cwd(dir);
-            }
+            // Every spawn now has a validated cwd (a provided one is worktree-contained; a null one
+            // fell back to the managed app-data dir) — no spawn inherits the app's process cwd.
+            cmd.cwd(validated_cwd);
 
             let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
             let killer = child.clone_killer();
@@ -1035,45 +1075,64 @@ mod tests {
         base
     }
 
-    #[test]
-    fn rejects_relative_or_empty_command() {
-        let base = worktrees_base();
-        assert!(validate_spawn_inner(&base, "", None).is_err());
-        assert!(validate_spawn_inner(&base, "bin/zsh", None).is_err());
-        // An absolute path passes the command check even if it doesn't exist (we only require
-        // absoluteness, not existence — the legit command is /bin/zsh).
-        assert!(validate_spawn_inner(&base, "/bin/zsh", None).is_ok());
+    /// `managed_base` is `<app_data>` — the parent of the `<app_data>/worktrees` base returned by
+    /// `worktrees_base()`. It exists (the helper created it), so it canonicalizes.
+    fn managed_of(worktrees: &std::path::Path) -> PathBuf {
+        worktrees.parent().unwrap().to_path_buf()
     }
 
     #[test]
-    fn none_cwd_passes_through() {
+    fn rejects_relative_or_empty_command() {
         let base = worktrees_base();
-        assert_eq!(validate_spawn_inner(&base, "/bin/zsh", None).unwrap(), None);
+        let managed = managed_of(&base);
+        assert!(validate_spawn_inner(&base, &managed, "", None).is_err());
+        assert!(validate_spawn_inner(&base, &managed, "bin/zsh", None).is_err());
+        // An absolute allowlisted binary passes the command check even if it doesn't exist (we only
+        // require absoluteness + an allowlisted basename, not existence — the legit cmd is /bin/zsh).
+        assert!(validate_spawn_inner(&base, &managed, "/bin/zsh", None).is_ok());
+    }
+
+    #[test]
+    fn null_cwd_falls_back_to_the_managed_dir() {
+        // A null cwd (the pre-worktree login flows) no longer skips the containment check: it
+        // resolves to the managed app-data dir so the spawn still runs in a validated location.
+        let base = worktrees_base();
+        let managed = managed_of(&base);
+        let got = validate_spawn_inner(&base, &managed, "/bin/zsh", None).unwrap();
+        assert_eq!(got, managed.canonicalize().unwrap());
     }
 
     #[test]
     fn accepts_cwd_inside_worktrees() {
         let base = worktrees_base();
+        let managed = managed_of(&base);
         let cwd = base.join("proj").join("agent");
-        let got = validate_spawn_inner(&base, "/bin/zsh", Some(cwd.to_str().unwrap())).unwrap();
-        assert_eq!(got, Some(cwd.canonicalize().unwrap()));
+        let got =
+            validate_spawn_inner(&base, &managed, "/bin/zsh", Some(cwd.to_str().unwrap())).unwrap();
+        assert_eq!(got, cwd.canonicalize().unwrap());
     }
 
     #[test]
     fn rejects_cwd_outside_worktrees() {
         let base = worktrees_base();
+        let managed = managed_of(&base);
         let outside = std::env::temp_dir();
         assert!(
-            validate_spawn_inner(&base, "/bin/zsh", Some(outside.to_str().unwrap())).is_err()
+            validate_spawn_inner(&base, &managed, "/bin/zsh", Some(outside.to_str().unwrap()))
+                .is_err()
         );
     }
 
     #[test]
     fn rejects_dotdot_escape_cwd() {
         let base = worktrees_base();
+        let managed = managed_of(&base);
         // <base>/proj/agent/../../.. climbs above the worktrees base.
         let escape = base.join("proj").join("agent").join("..").join("..").join("..");
-        assert!(validate_spawn_inner(&base, "/bin/zsh", Some(escape.to_str().unwrap())).is_err());
+        assert!(
+            validate_spawn_inner(&base, &managed, "/bin/zsh", Some(escape.to_str().unwrap()))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1081,10 +1140,74 @@ mod tests {
         // A string-prefix compare would wrongly admit `<app_data>/worktrees-evil`; component-wise
         // starts_with must reject it. This test pins that behavior.
         let base = worktrees_base();
+        let managed = managed_of(&base);
         let sibling = base.with_file_name("worktrees-evil");
         fs::create_dir_all(&sibling).unwrap();
         assert!(
-            validate_spawn_inner(&base, "/bin/zsh", Some(sibling.to_str().unwrap())).is_err()
+            validate_spawn_inner(&base, &managed, "/bin/zsh", Some(sibling.to_str().unwrap()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_a_disallowed_binary() {
+        // A compromised webview can't turn pty_spawn into an arbitrary-exec primitive by naming
+        // some other absolute binary — even with a perfectly valid, worktree-contained cwd.
+        let base = worktrees_base();
+        let managed = managed_of(&base);
+        let cwd = base.join("proj").join("agent");
+        let cwd_s = cwd.to_str().unwrap();
+        for evil in ["/usr/bin/osascript", "/usr/bin/curl", "/bin/rm", "/usr/bin/python3"] {
+            assert!(
+                validate_spawn_inner(&base, &managed, evil, Some(cwd_s)).is_err(),
+                "{evil} must be rejected by the binary allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_allowlisted_binary_basenames() {
+        // Every basename the app legitimately spawns (or resolves in preflight) passes, wherever it
+        // lives — the check is lexical on the basename, not on the binary existing at that path.
+        let base = worktrees_base();
+        let managed = managed_of(&base);
+        let cwd = base.join("proj").join("agent");
+        let cwd_s = cwd.to_str().unwrap();
+        for ok in [
+            "/bin/zsh",
+            "/bin/bash",
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/git",
+            "/Users/x/.local/bin/claude",
+        ] {
+            assert!(
+                validate_spawn_inner(&base, &managed, ok, Some(cwd_s)).is_ok(),
+                "{ok} should pass the binary allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_a_binary_under_the_managed_dir() {
+        // A binary the app bundles/manages under <app_data> is allowed even if its basename isn't
+        // in the allowlist — it lives inside a trusted root.
+        let base = worktrees_base();
+        let managed = managed_of(&base);
+        let bin_dir = managed.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let helper = bin_dir.join("sparkle-helper");
+        fs::write(&helper, b"#!/bin/sh\n").unwrap();
+        let cwd = base.join("proj").join("agent");
+        assert!(
+            validate_spawn_inner(&base, &managed, helper.to_str().unwrap(), Some(cwd.to_str().unwrap()))
+                .is_ok()
+        );
+        // ...but a same-named binary OUTSIDE the managed dir is still rejected.
+        let outside = std::env::temp_dir().join("sparkle-helper-not-managed");
+        fs::write(&outside, b"#!/bin/sh\n").unwrap();
+        assert!(
+            validate_spawn_inner(&base, &managed, outside.to_str().unwrap(), Some(cwd.to_str().unwrap()))
+                .is_err()
         );
     }
 

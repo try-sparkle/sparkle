@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -111,6 +111,37 @@ struct ChatError {
 /// builds its own headless `claude -p` exec the same way.
 pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The user's LOGIN-shell `PATH`, captured ONCE per session and reused with a NON-login shell.
+///
+/// macOS GUI apps inherit only a minimal PATH, which is why every `claude` spawn used to run
+/// through `zsh -l -c` — but a login shell re-sources the user's dotfiles (nvm/pyenv/rbenv/…)
+/// EVERY time, 100-500ms of startup tax paid on every Think turn and every improvement pass (it
+/// lands squarely on time-to-first-token). Instead we pay ONE login shell to read `$PATH`, cache
+/// it, and hand it to a plain `zsh -c` from then on — the child sees the exact same PATH the login
+/// shell would have produced (so `claude`'s `#!/usr/bin/env node` shebang, and any `git`/`gh`/test
+/// tools an improvement pass shells out to, still resolve) without the per-spawn dotfile cost.
+/// Mirrors preflight.rs's "probe the login shell once, cache the result" policy. On probe failure
+/// (or non-unix) it falls back to the inherited PATH so behavior degrades, never breaks.
+///
+/// Shared with `sparkle_improve.rs`, which builds its own headless `claude -p` exec the same way.
+pub(crate) fn cached_login_shell_path() -> String {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            // Probe with the SAME login shell the old `zsh -l -c` used, so the captured PATH is
+            // byte-for-byte what those spawns saw (no `$SHELL`-vs-zsh drift).
+            Command::new(SHELL)
+                .args(["-l", "-c", "printf %s \"$PATH\""])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+        })
+        .clone()
 }
 
 /// Build the `exec …` script handed to `zsh -l -c`. Mirrors `buildClaudeExec` in
@@ -386,7 +417,11 @@ fn spawn_turn(
     );
 
     let mut cmd = Command::new(SHELL);
-    cmd.args(["-l", "-c", &script]);
+    // NON-login shell (`-c`, not `-l -c`): we supply the login PATH ourselves (resolved once, see
+    // `cached_login_shell_path`) so `claude`'s node shebang still resolves, without paying a
+    // dotfile-sourcing login startup on every turn — that latency lands on time-to-first-token.
+    cmd.args(["-c", &script]);
+    cmd.env("PATH", cached_login_shell_path());
     cmd.current_dir(real_cwd);
     // No stdin: `-p` is one-shot, and a null stdin guarantees nothing can block on input.
     cmd.stdin(Stdio::null());
@@ -978,5 +1013,23 @@ mod tests {
         // ...and when we surfaced claude's own detail.
         let m = build_error_message("", Some(1), None, true, Some("stale session"), true);
         assert_eq!(m, "stale session — retried without --resume");
+    }
+
+    #[test]
+    fn cached_login_shell_path_is_nonempty_and_stable() {
+        // The whole point of caching the login PATH is that it's resolved ONCE and reused, so two
+        // calls must return the identical value — and it must never come back empty (the fallback
+        // to the inherited PATH guarantees a usable value even if the login probe fails).
+        let first = cached_login_shell_path();
+        let second = cached_login_shell_path();
+        assert!(!first.is_empty(), "login PATH must never be empty");
+        assert_eq!(first, second, "cached login PATH must be stable across calls");
+        // A real PATH is a colon-joined list of absolute dirs — at minimum it should mention a
+        // system bin dir on the unix CI/dev boxes this runs on.
+        #[cfg(unix)]
+        assert!(
+            first.split(':').any(|p| p == "/usr/bin" || p == "/bin"),
+            "expected a system bin dir on PATH; got {first}"
+        );
     }
 }

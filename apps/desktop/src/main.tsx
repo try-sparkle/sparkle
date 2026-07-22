@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { App } from "./App";
 import { TrayApp } from "./tray/TrayApp";
 import { CaptureApp } from "./capture/CaptureApp";
+import { ErrorBoundary, AppErrorFallback } from "./components/ErrorBoundary";
 import { initLogger } from "./logger";
 import { startJankMonitor, installPerfDevtools } from "./perfTrace";
 import { initAnalytics } from "./analytics";
@@ -75,8 +76,20 @@ if (!isCapture) {
 // theme in that webview so reused themed components (LogoWaveform) stay legible on the navy
 // card even when the app preference is Light.
 if (isCapture) document.documentElement.dataset.theme = "dark";
+// Wrap the main app root in a top-level ErrorBoundary so an uncaught render exception degrades to a
+// recoverable "Something broke — Reload UI" card (with a Report path into the existing support/crash
+// pipeline) instead of unmounting the whole tree into a blank window. The tray and capture webviews
+// are tiny, single-purpose surfaces — left unwrapped so their minimal render paths stay untouched.
 ReactDOM.createRoot(document.getElementById("root")!).render(
-  isTray ? <TrayApp /> : isCapture ? <CaptureApp /> : <App />,
+  isTray ? (
+    <TrayApp />
+  ) : isCapture ? (
+    <CaptureApp />
+  ) : (
+    <ErrorBoundary scope="app-root" fallback={(p) => <AppErrorFallback {...p} />}>
+      <App />
+    </ErrorBoundary>
+  ),
 );
 
 // Warm the per-agent model catalog from the user's BYOK Anthropic key (Phase 2, sparkle-i6rw).

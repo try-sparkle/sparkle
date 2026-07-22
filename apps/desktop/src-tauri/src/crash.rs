@@ -783,7 +783,9 @@ fn run_flush<R: Runtime>(app: &AppHandle<R>, consent: &str) -> Result<usize, Str
     // upload the crash report without it, so don't even read it. read_recent_logs returns the ~200KB
     // tail ALREADY REDACTED. flush_pending re-applies the same gate as a backstop.
     let recent_logs = if logs_allowed(consent) {
-        crate::support::read_recent_logs(app.clone()).unwrap_or_default()
+        // `read_recent_logs` is now an async Tauri command; run_flush is sync on its own thread, so
+        // call the shared blocking core directly instead of awaiting the command.
+        crate::support::read_recent_logs_sync(app).unwrap_or_default()
     } else {
         String::new()
     };

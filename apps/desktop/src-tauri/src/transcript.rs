@@ -25,8 +25,22 @@ const MAX_TAIL: u64 = 4 * 1024 * 1024;
 
 /// Read the transcript at `path` and return the joined text of its LAST assistant message.
 /// `Err` if the file can't be read; an empty string if it has no assistant text.
+///
+/// `async` + `spawn_blocking`: the bounded tail read + UTF-8 decode + JSONL scan is blocking work
+/// that fires on EVERY agent turn-end (the Stop hook). Running it inline on the Tauri event-loop
+/// thread would stall the whole UI; the blocking pool keeps it off the event loop. The sync core
+/// lives in `read_transcript_last_assistant_sync` so the unit tests can drive it without a runtime.
 #[tauri::command]
-pub fn read_transcript_last_assistant(path: String) -> Result<String, String> {
+pub async fn read_transcript_last_assistant(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || read_transcript_last_assistant_sync(path))
+        .await
+        .map_err(|e| format!("read_transcript_last_assistant task failed: {e}"))?
+}
+
+/// Blocking core of [`read_transcript_last_assistant`]: open the file and tail-read the last
+/// assistant record. Kept synchronous (and free of any Tauri runtime) so the unit tests exercise it
+/// directly. The bounded-read logic lives entirely in `read_last_assistant_from_tail`.
+fn read_transcript_last_assistant_sync(path: String) -> Result<String, String> {
     let mut file = File::open(&path).map_err(|e| format!("read {path}: {e}"))?;
     let len = file
         .metadata()
@@ -187,7 +201,7 @@ mod tests {
     #[test]
     fn missing_file_returns_err() {
         let missing = std::env::temp_dir().join("sparkle_transcript_does_not_exist.jsonl");
-        let r = read_transcript_last_assistant(missing.to_string_lossy().to_string());
+        let r = read_transcript_last_assistant_sync(missing.to_string_lossy().to_string());
         assert!(r.is_err());
     }
 
@@ -199,7 +213,7 @@ mod tests {
         let path = dir.join("session.jsonl");
         std::fs::write(&path, FIXTURE).unwrap();
 
-        let out = read_transcript_last_assistant(path.to_string_lossy().to_string()).unwrap();
+        let out = read_transcript_last_assistant_sync(path.to_string_lossy().to_string()).unwrap();
         assert_eq!(out, "Part one.\n\nPart two.");
 
         std::fs::remove_dir_all(&dir).ok();

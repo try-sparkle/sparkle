@@ -41,7 +41,9 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::claude_chat::{capture_result_status, handle_event, shell_quote};
+use crate::claude_chat::{
+    cached_login_shell_path, capture_result_status, handle_event, shell_quote,
+};
 
 /// Login shell, as `zsh -l -c 'exec …'` — matches `pty.rs` / `claude_chat.rs` / `claudeSpawn.ts`.
 const SHELL: &str = "/bin/zsh";
@@ -205,7 +207,12 @@ pub fn sparkle_improve_run(
     tracing::info!(%claude_path, cwd = %real_cwd.display(), "sparkle_improve_run: starting hourly pass");
 
     let mut cmd = Command::new(SHELL);
-    cmd.args(["-l", "-c", &script]);
+    // NON-login shell: we inject the login PATH ourselves (resolved once, cached — see
+    // `cached_login_shell_path`) instead of re-sourcing the user's dotfiles on every pass. The
+    // pass still shells out to `git`/`gh`/tests, so it gets the SAME full PATH `zsh -l` gave it,
+    // just without the per-run login-startup latency.
+    cmd.args(["-c", &script]);
+    cmd.env("PATH", cached_login_shell_path());
     cmd.current_dir(&real_cwd);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());

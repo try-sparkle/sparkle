@@ -163,13 +163,36 @@ fn tail_file(path: &Path, max: usize) -> Option<String> {
 /// `sparkle.log.YYYY-MM-DD` (rotated files sort chronologically by name). We spend the byte budget
 /// on the newest activity first (current log), then backfill from the previous day if there's room.
 /// The combined text is REDACTED before it is returned to JS.
+///
+/// `async` + `spawn_blocking`: the directory scan, tail reads, and per-call regex redaction are all
+/// blocking work that would otherwise run inline on the Tauri event-loop thread and freeze the UI.
+/// The (cheap) log-dir resolution needs `&app`, so it happens on the caller thread; the blocking
+/// filesystem work moves to the blocking pool. The blocking core is [`read_recent_logs_sync`], which
+/// the crash-flush background thread reuses directly (it already runs off the event loop).
 #[tauri::command]
-pub fn read_recent_logs<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
+pub async fn read_recent_logs<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
     let dir = resolve_log_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || read_recent_logs_from_dir(&dir))
+        .await
+        .map_err(|e| format!("read_recent_logs task failed: {e}"))?
+}
 
+/// Blocking core of [`read_recent_logs`] taking an already-resolved app handle. Used by the crash
+/// flush (`crash.rs::run_flush`), which runs on its own `std::thread` and so can — and must — call
+/// this synchronously rather than awaiting the async command. Resolves the log dir, then delegates
+/// the tailing + redaction to [`read_recent_logs_from_dir`].
+pub(crate) fn read_recent_logs_sync<R: Runtime>(app: &AppHandle<R>) -> Result<String, String> {
+    let dir = resolve_log_dir(app)?;
+    read_recent_logs_from_dir(&dir)
+}
+
+/// Scan `dir`, tail the current + most-recent-rotated log within the byte budget, and return the
+/// combined REDACTED tail. Pure blocking IO over a resolved directory — no Tauri handle — so it can
+/// run on the blocking pool (the async command) or a background thread (crash flush) alike.
+fn read_recent_logs_from_dir(dir: &Path) -> Result<String, String> {
     let mut rotated: Vec<String> = Vec::new();
     let mut has_current = false;
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             if let Some(name) = e.file_name().to_str() {
                 if name == "sparkle.log" {
@@ -259,46 +282,53 @@ pub struct ChatResp {
 
 /// POST the running transcript to the (unauthenticated) docs-aware chat route and return the
 /// assistant reply + any doc links + whether the server suggests opening a ticket.
+///
+/// `async` + `spawn_blocking` so the blocking `ureq` round-trip (up to `HTTP_TIMEOUT` = 30s on a
+/// flaky network) runs on the blocking pool instead of freezing the Tauri event-loop thread.
 #[tauri::command]
-pub fn support_chat_send(messages: Vec<ChatMsg>) -> Result<ChatResp, String> {
-    let url = format!("{}/api/support/chat", web_base_url());
-    let body = json!({ "messages": messages }).to_string();
-    let resp = ureq::post(&url)
-        .timeout(HTTP_TIMEOUT)
-        .set("Content-Type", "application/json")
-        .send_string(&body)
-        .map_err(|e| format!("support chat failed: {e}"))?;
-    let text = resp.into_string().map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+pub async fn support_chat_send(messages: Vec<ChatMsg>) -> Result<ChatResp, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<ChatResp, String> {
+        let url = format!("{}/api/support/chat", web_base_url());
+        let body = json!({ "messages": messages }).to_string();
+        let resp = ureq::post(&url)
+            .timeout(HTTP_TIMEOUT)
+            .set("Content-Type", "application/json")
+            .send_string(&body)
+            .map_err(|e| format!("support chat failed: {e}"))?;
+        let text = resp.into_string().map_err(|e| e.to_string())?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
 
-    let reply = v
-        .get("reply")
-        .and_then(|r| r.as_str())
-        .unwrap_or("")
-        .to_string();
-    let doc_links = v
-        .get("docLinks")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|l| {
-                    let title = l.get("title").and_then(|t| t.as_str())?.to_string();
-                    let href = l.get("href").and_then(|h| h.as_str())?.to_string();
-                    Some(DocLink { title, href })
-                })
-                .collect()
+        let reply = v
+            .get("reply")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        let doc_links = v
+            .get("docLinks")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| {
+                        let title = l.get("title").and_then(|t| t.as_str())?.to_string();
+                        let href = l.get("href").and_then(|h| h.as_str())?.to_string();
+                        Some(DocLink { title, href })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let offer_ticket = v
+            .get("offerTicket")
+            .and_then(|o| o.as_bool())
+            .unwrap_or(false);
+
+        Ok(ChatResp {
+            reply,
+            doc_links,
+            offer_ticket,
         })
-        .unwrap_or_default();
-    let offer_ticket = v
-        .get("offerTicket")
-        .and_then(|o| o.as_bool())
-        .unwrap_or(false);
-
-    Ok(ChatResp {
-        reply,
-        doc_links,
-        offer_ticket,
     })
+    .await
+    .map_err(|e| format!("support_chat_send task failed: {e}"))?
 }
 
 // ── Ticket creation ─────────────────────────────────────────────────────────────────────────────
@@ -334,55 +364,62 @@ pub struct CreatedTicket {
 /// Create a support ticket on the web app. Attaches the desktop bearer as `Authorization` IF one is
 /// stored (so an authenticated user's ticket is tied to their account), but works unauthenticated
 /// too — the server falls back to `body.email`.
+///
+/// `async` + `spawn_blocking` so the blocking `ureq` round-trip (up to `HTTP_TIMEOUT` = 30s on a
+/// flaky network) runs on the blocking pool instead of freezing the Tauri event-loop thread.
 #[tauri::command]
-pub fn desktop_create_ticket(payload: CreateTicketPayload) -> Result<CreatedTicket, String> {
-    let url = format!("{}/api/support/tickets", web_base_url());
-    let body = json!({
-        "email": payload.email,
-        "subject": payload.subject,
-        "message": payload.message,
-        "source": "desktop",
-        "appVersion": payload.app_version,
-        "os": payload.os,
-        "metadata": payload.metadata,
-        "logs": payload.logs,
-        "assistantTranscript": payload.assistant_transcript,
+pub async fn desktop_create_ticket(payload: CreateTicketPayload) -> Result<CreatedTicket, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<CreatedTicket, String> {
+        let url = format!("{}/api/support/tickets", web_base_url());
+        let body = json!({
+            "email": payload.email,
+            "subject": payload.subject,
+            "message": payload.message,
+            "source": "desktop",
+            "appVersion": payload.app_version,
+            "os": payload.os,
+            "metadata": payload.metadata,
+            "logs": payload.logs,
+            "assistantTranscript": payload.assistant_transcript,
+        })
+        .to_string();
+
+        let mut req = ureq::post(&url)
+            .timeout(HTTP_TIMEOUT)
+            .set("Content-Type", "application/json");
+        if let Some(token) = crate::auth::token() {
+            req = req.set("Authorization", &format!("Bearer {token}"));
+        }
+        let resp = req
+            .send_string(&body)
+            .map_err(|e| format!("create ticket failed: {e}"))?;
+        let text = resp.into_string().map_err(|e| e.to_string())?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+
+        let id = v
+            .get("id")
+            .and_then(|i| i.as_str())
+            .ok_or_else(|| "ticket response missing id".to_string())?
+            .to_string();
+        let token = v
+            .get("token")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| "ticket response missing token".to_string())?
+            .to_string();
+        let ticket_url = v
+            .get("url")
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| "ticket response missing url".to_string())?
+            .to_string();
+
+        Ok(CreatedTicket {
+            id,
+            token,
+            url: ticket_url,
+        })
     })
-    .to_string();
-
-    let mut req = ureq::post(&url)
-        .timeout(HTTP_TIMEOUT)
-        .set("Content-Type", "application/json");
-    if let Some(token) = crate::auth::token() {
-        req = req.set("Authorization", &format!("Bearer {token}"));
-    }
-    let resp = req
-        .send_string(&body)
-        .map_err(|e| format!("create ticket failed: {e}"))?;
-    let text = resp.into_string().map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-
-    let id = v
-        .get("id")
-        .and_then(|i| i.as_str())
-        .ok_or_else(|| "ticket response missing id".to_string())?
-        .to_string();
-    let token = v
-        .get("token")
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| "ticket response missing token".to_string())?
-        .to_string();
-    let ticket_url = v
-        .get("url")
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| "ticket response missing url".to_string())?
-        .to_string();
-
-    Ok(CreatedTicket {
-        id,
-        token,
-        url: ticket_url,
-    })
+    .await
+    .map_err(|e| format!("desktop_create_ticket task failed: {e}"))?
 }
 
 // ── Ticket listing (status banner) ────────────────────────────────────────────────────────────
@@ -436,29 +473,38 @@ fn parse_tickets(v: &Value) -> Vec<TicketStatus> {
 /// returns the caller's own tickets. When no bearer is stored (signed-out) there are no tickets
 /// to show, so we short-circuit to an empty Vec and skip the network call. Mirrors
 /// `desktop_create_ticket`: ureq + serde_json (no `json` feature).
+///
+/// `async` + `spawn_blocking` so the blocking `ureq` round-trip runs on the blocking pool instead
+/// of the Tauri event-loop thread. This is the WORST offender: it fires every 60s AND on every
+/// window focus, so inline it could beachball the whole UI for up to `HTTP_TIMEOUT` = 30s whenever
+/// the network is flaky.
 #[tauri::command]
-pub fn desktop_list_tickets() -> Result<Vec<TicketStatus>, String> {
-    let Some(token) = crate::auth::token() else {
-        return Ok(Vec::new());
-    };
-    let url = format!("{}/api/support/tickets", web_base_url());
-    let resp = ureq::get(&url)
-        .timeout(HTTP_TIMEOUT)
-        .set("Authorization", &format!("Bearer {token}"))
-        .call()
-        .map_err(|e| format!("list tickets failed: {e}"))?;
-    let text = resp.into_string().map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+pub async fn desktop_list_tickets() -> Result<Vec<TicketStatus>, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<TicketStatus>, String> {
+        let Some(token) = crate::auth::token() else {
+            return Ok(Vec::new());
+        };
+        let url = format!("{}/api/support/tickets", web_base_url());
+        let resp = ureq::get(&url)
+            .timeout(HTTP_TIMEOUT)
+            .set("Authorization", &format!("Bearer {token}"))
+            .call()
+            .map_err(|e| format!("list tickets failed: {e}"))?;
+        let text = resp.into_string().map_err(|e| e.to_string())?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
 
-    // The GET route returns EVERY ticket (not just the caller's own) when the signed-in user is the
-    // super admin (`isAdmin: true`). This banner is the personal "your open tickets" view, so for an
-    // admin it would surface the whole support queue with inverted attention semantics (an admin's
-    // actionable tickets are `awaiting_support`, not `awaiting_user`). Suppress it for admins — they
-    // use the /admin support console instead (design spec §2).
-    if v.get("isAdmin").and_then(|a| a.as_bool()).unwrap_or(false) {
-        return Ok(Vec::new());
-    }
-    Ok(parse_tickets(&v))
+        // The GET route returns EVERY ticket (not just the caller's own) when the signed-in user is
+        // the super admin (`isAdmin: true`). This banner is the personal "your open tickets" view, so
+        // for an admin it would surface the whole support queue with inverted attention semantics (an
+        // admin's actionable tickets are `awaiting_support`, not `awaiting_user`). Suppress it for
+        // admins — they use the /admin support console instead (design spec §2).
+        if v.get("isAdmin").and_then(|a| a.as_bool()).unwrap_or(false) {
+            return Ok(Vec::new());
+        }
+        Ok(parse_tickets(&v))
+    })
+    .await
+    .map_err(|e| format!("desktop_list_tickets task failed: {e}"))?
 }
 
 #[cfg(test)]

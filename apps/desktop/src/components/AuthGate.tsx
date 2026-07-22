@@ -102,6 +102,15 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // banner on the Welcome screen; the existing Sign in button re-initiates a fresh flow.
   const [signInInterrupted, setSignInInterrupted] = useState(false);
 
+  // Prefetch the code-split Workspace chunk in PARALLEL with the auth check, so its download +
+  // parse overlaps the /me round-trip instead of starting only after an entitled user is gated in.
+  // Same dynamic-import specifier App.tsx uses for the actual <Workspace/> mount, so the bundler
+  // dedupes to the one chunk — this only warms the module cache; App.tsx still owns the mount +
+  // Suspense boundary. Fire-and-forget; a failed prefetch is harmless (the real import retries).
+  useEffect(() => {
+    import("./Workspace").catch(() => {});
+  }, []);
+
   // Initial load + listen for the deep-link hand-off and window focus.
   useEffect(() => {
     const seen = processedUrls.current;

@@ -4,6 +4,8 @@ import {
   avatarLetter,
   deriveAuthControl,
   deriveAuthView,
+  ENTITLEMENT_GRACE_MS,
+  isEntitlementCacheValid,
   isNoPendingSignIn,
   NO_PENDING_SIGNIN,
   parseAuthCode,
@@ -85,6 +87,31 @@ describe("deriveAuthView", () => {
     expect(deriveAuthView({ ...base, loading: false, hasToken: true, me: me({ entitled: true }) })).toBe(
       "entitled",
     );
+  });
+});
+
+describe("isEntitlementCacheValid (offline grace window)", () => {
+  const now = 1_000_000_000_000;
+  it("trusts a fresh entitled cache (rendered optimistically at cold launch)", () => {
+    expect(isEntitlementCacheValid(me({ entitled: true }), now - 1000, now)).toBe(true);
+  });
+  it("trusts an entitled cache right up to the edge of the grace window", () => {
+    // 1ms inside the window is still valid; exactly AT the window (and beyond) is not.
+    expect(isEntitlementCacheValid(me({ entitled: true }), now - (ENTITLEMENT_GRACE_MS - 1), now)).toBe(true);
+    expect(isEntitlementCacheValid(me({ entitled: true }), now - ENTITLEMENT_GRACE_MS, now)).toBe(false);
+  });
+  it("expires an entitled cache older than the grace window (re-gates a rotated/revoked token)", () => {
+    expect(isEntitlementCacheValid(me({ entitled: true }), now - (ENTITLEMENT_GRACE_MS + 1), now)).toBe(false);
+  });
+  it("never trusts a non-entitled cache, however fresh", () => {
+    expect(isEntitlementCacheValid(me({ entitled: false }), now, now)).toBe(false);
+  });
+  it("is false with no cached identity or no stamp", () => {
+    expect(isEntitlementCacheValid(null, now, now)).toBe(false);
+    expect(isEntitlementCacheValid(me({ entitled: true }), null, now)).toBe(false);
+  });
+  it("treats a future-dated stamp (clock skew) as recent, not expired — no false lock-out", () => {
+    expect(isEntitlementCacheValid(me({ entitled: true }), now + 5000, now)).toBe(true);
   });
 });
 

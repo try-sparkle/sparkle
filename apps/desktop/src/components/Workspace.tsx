@@ -29,6 +29,7 @@ import { removeWindowSession } from "../services/windowSession";
 import { clearWindowRoster } from "../services/attention";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { useImprovementScheduler } from "../useImprovementScheduler";
+import { ErrorBoundary, AgentPaneErrorCard } from "./ErrorBoundary";
 import { perfRender } from "../perfTrace";
 
 // Code-split the heavy, not-always-visible surfaces so a cold start doesn't ship them in the
@@ -311,14 +312,22 @@ export function Workspace() {
               blanks a sibling that's already mounted (the live agent panes keep their PTYs). The
               agent panes share one chunk, so a single boundary around the list is enough. */}
           <Suspense fallback={<PaneFallback />}>
-            {live.map(({ project: p, agent }) => (
-              <AgentPane
-                key={agent.id}
-                project={p}
-                agent={agent}
-                visible={!sparkleActive && !boardActive && agent.id === activeAgentId}
-              />
-            ))}
+            {live.map(({ project: p, agent }) => {
+              const visible = !sparkleActive && !boardActive && agent.id === activeAgentId;
+              // Per-pane boundary: one crashing pane degrades to an inline card (respecting its
+              // visibility) instead of unmounting the workspace and its sibling agents.
+              return (
+                <ErrorBoundary
+                  key={agent.id}
+                  scope="agent-pane"
+                  fallback={({ error, reset }) => (
+                    <AgentPaneErrorCard error={error} reset={reset} visible={visible} />
+                  )}
+                >
+                  <AgentPane project={p} agent={agent} visible={visible} />
+                </ErrorBoundary>
+              );
+            })}
           </Suspense>
 
           {sparkleOpen && (

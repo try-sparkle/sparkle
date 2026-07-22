@@ -528,10 +528,16 @@ fn read_oauth_identity_at(
 // ---- Tauri commands (thin wrappers) -------------------------------------------
 
 /// All registered accounts (empty vec on a clean install).
+///
+/// `async` + `spawn_blocking`: reads `accounts.json` off the event loop. The (cheap) app-data-dir
+/// resolution needs `&app`, so it stays on the caller thread; the blocking file read moves to the
+/// blocking pool.
 #[tauri::command]
-pub fn accounts_list(app: AppHandle) -> Result<Vec<Account>, String> {
+pub async fn accounts_list(app: AppHandle) -> Result<Vec<Account>, String> {
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
-    read_accounts_at(&accounts_json_path(&app_data))
+    tauri::async_runtime::spawn_blocking(move || read_accounts_at(&accounts_json_path(&app_data)))
+        .await
+        .map_err(|e| format!("accounts_list task failed: {e}"))?
 }
 
 /// Register a new (non-default) account: create `<app_data>/accounts/<id>/` and
@@ -615,12 +621,19 @@ pub fn accounts_mark_exhausted(
 }
 
 /// Per-account token tallies (5h / 7d) plus any in-effect exhausted-until epoch.
+///
+/// `async` + `spawn_blocking`: reads `accounts.json` AND scans each account's transcript files to
+/// tally tokens — real blocking IO that must stay off the Tauri event-loop thread.
 #[tauri::command]
-pub fn accounts_usage(app: AppHandle) -> Result<Vec<AccountUsage>, String> {
+pub async fn accounts_usage(app: AppHandle) -> Result<Vec<AccountUsage>, String> {
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
-    let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
-    let now = now_secs();
-    Ok(accounts.iter().map(|a| usage_for_account(a, now)).collect())
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<AccountUsage>, String> {
+        let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
+        let now = now_secs();
+        Ok(accounts.iter().map(|a| usage_for_account(a, now)).collect())
+    })
+    .await
+    .map_err(|e| format!("accounts_usage task failed: {e}"))?
 }
 
 /// The REAL authenticated identity (email + org) for every account, read from each
@@ -628,29 +641,36 @@ pub fn accounts_usage(app: AppHandle) -> Result<Vec<AccountUsage>, String> {
 /// account with no identity yet (dir created but never `claude login`ed). This is the
 /// trustworthy account label the badge and Accounts screen surface, so the user can see
 /// which account a session actually runs under — not just the nickname they typed.
+///
+/// `async` + `spawn_blocking`: this opens `accounts.json` PLUS every account's own `.claude.json`,
+/// so it is the heaviest read here — it must never run inline on the Tauri event-loop thread.
 #[tauri::command]
-pub fn accounts_identities(app: AppHandle) -> Result<Vec<AccountIdentity>, String> {
+pub async fn accounts_identities(app: AppHandle) -> Result<Vec<AccountIdentity>, String> {
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
-    let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    Ok(accounts
-        .iter()
-        .map(|a| {
-            // The `<home>/.claude` fallback is only correct for the DEFAULT account (whose
-            // config_dir IS ~/.claude, sometimes stored empty). A NAMED account with an empty
-            // config_dir must NOT fall back to the home identity — that would mislabel the home
-            // user's email as this account's, the exact trust bug this change fixes. So pass home
-            // only for the default; a named account with no usable dir resolves to None ("not
-            // signed in") instead.
-            let home_for = if a.is_default { home.as_deref() } else { None };
-            let identity = read_oauth_identity_at(Some(Path::new(&a.config_dir)), home_for);
-            let (email, organization) = match identity {
-                Some((e, o)) => (Some(e), o),
-                None => (None, None),
-            };
-            AccountIdentity { id: a.id.clone(), email, organization }
-        })
-        .collect())
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<AccountIdentity>, String> {
+        let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Ok(accounts
+            .iter()
+            .map(|a| {
+                // The `<home>/.claude` fallback is only correct for the DEFAULT account (whose
+                // config_dir IS ~/.claude, sometimes stored empty). A NAMED account with an empty
+                // config_dir must NOT fall back to the home identity — that would mislabel the home
+                // user's email as this account's, the exact trust bug this change fixes. So pass home
+                // only for the default; a named account with no usable dir resolves to None ("not
+                // signed in") instead.
+                let home_for = if a.is_default { home.as_deref() } else { None };
+                let identity = read_oauth_identity_at(Some(Path::new(&a.config_dir)), home_for);
+                let (email, organization) = match identity {
+                    Some((e, o)) => (Some(e), o),
+                    None => (None, None),
+                };
+                AccountIdentity { id: a.id.clone(), email, organization }
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("accounts_identities task failed: {e}"))?
 }
 
 /// Whether Claude Code has a completed sign-in for the given config dir — i.e. `claude login` wrote
@@ -659,8 +679,21 @@ pub fn accounts_identities(app: AppHandle) -> Result<Vec<AccountIdentity>, Strin
 /// user actually authenticated. `config_dir` omitted/empty → the default `~/.claude` (the first-run
 /// case, before any named account exists). Never errors — an unreadable/missing file is "not signed
 /// in". Note: this detects the OAuth (`claude login`) flow, which is exactly what the step runs.
+///
+/// `async` + `spawn_blocking`: reads `.claude.json` off the event loop. On a JoinError we default to
+/// `false` ("not signed in"), the same safe fallback the sync core returns for an unreadable file.
+/// The sync core lives in `claude_signed_in_sync` so the unit tests can drive it without a runtime.
 #[tauri::command]
-pub fn claude_signed_in(config_dir: Option<String>) -> bool {
+pub async fn claude_signed_in(config_dir: Option<String>) -> bool {
+    tauri::async_runtime::spawn_blocking(move || claude_signed_in_sync(config_dir))
+        .await
+        .unwrap_or(false)
+}
+
+/// Blocking core of [`claude_signed_in`]: resolve the config dir and check for a recorded
+/// `oauthAccount.emailAddress`. Kept synchronous (no Tauri runtime) so the unit tests exercise it
+/// directly.
+fn claude_signed_in_sync(config_dir: Option<String>) -> bool {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let dir = config_dir.filter(|s| !s.is_empty()).map(PathBuf::from);
     read_oauth_identity_at(dir.as_deref(), home.as_deref()).is_some()
@@ -1084,7 +1117,7 @@ mod tests {
         // `claude login` completed. An explicit non-empty dir bypasses the HOME fallback.
         let base = unique_dir("signed-in-yes");
         write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":"me@example.com"}}"#);
-        assert!(claude_signed_in(Some(base.to_string_lossy().into_owned())));
+        assert!(claude_signed_in_sync(Some(base.to_string_lossy().into_owned())));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1093,10 +1126,10 @@ mod tests {
         let base = unique_dir("signed-in-no");
         // Dir exists but never logged in (no .claude.json) → not signed in.
         std::fs::create_dir_all(&base).unwrap();
-        assert!(!claude_signed_in(Some(base.to_string_lossy().into_owned())));
+        assert!(!claude_signed_in_sync(Some(base.to_string_lossy().into_owned())));
         // oauthAccount present but empty email → not signed in.
         write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":""}}"#);
-        assert!(!claude_signed_in(Some(base.to_string_lossy().into_owned())));
+        assert!(!claude_signed_in_sync(Some(base.to_string_lossy().into_owned())));
         let _ = std::fs::remove_dir_all(&base);
     }
 
