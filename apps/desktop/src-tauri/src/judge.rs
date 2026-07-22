@@ -25,22 +25,29 @@ const JUDGE_MAX_TOKENS: u32 = 8;
 const RESPONSE_TAIL_CHARS: usize = 2000;
 const TASK_HEAD_CHARS: usize = 400;
 
-const SYSTEM_PROMPT: &str = "You classify whether a coding agent's finished message hands the turn \
-back to the user. You are given THE TASK the agent was working on and its FINAL MESSAGE. Reply with \
-EXACTLY ONE word: FOLLOWUP or DONE. Output only that word — no punctuation, no explanation.\n\
-Reply FOLLOWUP when the agent ended its turn waiting on the user — it needs the user to do, decide, \
-answer, or approve something before the work moves forward. This INCLUDES a yes/no offer to take the \
-OBVIOUS NEXT ACTION on the TASK AT HAND and then stopping for the answer: 'Want me to open it?', \
-'Should I land it now?', 'Want me to land it and cut the release?' — the turn is over and the next \
-step is blocked on the user's reply. It also includes approving/confirming a land/merge/push/deploy, \
-answering a question the agent needs in order to continue, choosing between options it laid out, or a \
-manual step only the user can do. The defining trait: the agent stopped and the ball is in the \
-user's court.\n\
-Reply DONE only when nothing is awaited from the user: a plain completion report with no ask, or an \
-offer of genuinely NEW, tangential, or unrequested work BEYOND the task at hand (e.g. 'want me to \
-also tackle that unrelated bug?', 'should I refactor a different module next?'). An offer to do the \
-next obvious step OF THIS TASK is FOLLOWUP, not DONE.\n\
-When genuinely unsure, reply FOLLOWUP.";
+const SYSTEM_PROMPT: &str = "You classify whether a coding agent's finished message leaves the work \
+BLOCKED on the user — stopped, unable to move forward until the user acts. You are given THE TASK the \
+agent was working on and its FINAL MESSAGE. Reply with EXACTLY ONE word: FOLLOWUP or DONE. Output \
+only that word — no punctuation, no explanation.\n\
+Reply FOLLOWUP only when a SPECIFIC next step is parked on the user. Concretely: (a) the agent has \
+PREPARED a concrete next action on THE WORK IT JUST DID and is stopping for a go/no-go before doing \
+it — 'Want me to land it now?', 'Should I open the PR?', 'Want me to land it and cut the release?'; \
+(b) it needs the user to approve/confirm a specific land/merge/push/deploy; (c) it asked a specific \
+question whose answer it NEEDS to continue work already underway, or to choose between concrete \
+options it laid out; or (d) a manual step only the user can do stands between it and finishing. The \
+defining trait: a specific, identifiable next step exists and is blocked solely on the user's reply.\n\
+Reply DONE when nothing blocks the work. This INCLUDES three important cases: (1) a plain completion \
+or status report with no ask; (2) an offer of NEW, additional, tangential, or optional work BEYOND \
+what was asked, EVEN phrased as an offer — 'Want me to kick off new work?', 'Should I also tackle \
+that unrelated bug?', 'Want me to refactor a different module next?'; and (3) a FINISHED task that \
+ends by asking OPEN-ENDEDLY what to do next — 'What would you like to pick up next?', 'Where should I \
+focus?', 'Anything else you'd like?'. A status recap that concludes 'nothing needs your attention — \
+what next?' is DONE: the report is the task, it is complete, and the agent is merely soliciting the \
+next task, not blocked on one.\n\
+Decide by the SHAPE of the ask: a concrete staged action awaiting go/no-go is FOLLOWUP; an \
+open-ended 'what would you like next?' is DONE. When the ask is open-ended, prefer DONE. Only reply \
+FOLLOWUP when a specific next step is genuinely stuck on the user and you cannot tell whether it was \
+requested.";
 
 /// Take the last `max` chars of `s` (on a char boundary), trimmed. The closeout ask lives at the
 /// end of a finished turn, so the tail is the part that matters.

@@ -42,10 +42,73 @@ const PROPOSAL_PHRASES = [
   "if you'd rather",
   "go-ahead",
   "go ahead and tell me",
-  "waiting on you",
-  "waiting for you",
-  "waiting for your",
 ];
+
+// "I'm waiting on you to run the test" is a genuine ask too — but the bare substring ALSO matches
+// the OPPOSITE, benign phrasing that closes an idle status recap: "nothing is waiting on you",
+// "no findings waiting on you" (the real screenshot-1 tail). Matching that as an ask is exactly the
+// false-red the user reported. So the waiting-family counts as a real ask only when it is a genuine,
+// un-negated hand-back. We judge the SENTENCE that contains the CLOSING waiting phrase (the ask, if
+// any, is the last one) rather than the whole message, so a genuine "I'm waiting…" earlier in the
+// turn can't rescue a benign "nothing is waiting on you" that actually closes it, and vice-versa
+// (roborev jobs 44337, 44374).
+//   - WAITING_RE / WAITING_GLOBAL_RE — locate the phrase (the last occurrence is the closeout).
+//   - GENUINE_WAITING_RE — a first-person subject IMMEDIATELY governs "waiting" ("I'm waiting on
+//     you", "we are waiting on you", "I'm still waiting on you"): a real ask. Immediate governance
+//     is the point — "I'm glad nothing is waiting on you" must NOT match, because there "I'm" heads
+//     "glad", not "waiting". Only an optional copula and a few adverbs may sit between subject and
+//     verb.
+//   - NEGATED_WAITING_RE — a negator governs "waiting" within the sentence ("nothing is waiting on
+//     you", "no findings waiting on you", "nothing still waiting on you"): the benign recap close.
+const WAITING_RE = /waiting (?:on|for) (?:you|your)\b/;
+const WAITING_GLOBAL_RE = /waiting (?:on|for) (?:you|your)\b/g;
+const GENUINE_WAITING_RE =
+  /\b(?:i|im|we)\b(?:['’]m|['’]re|['’]ve| am| are)?(?: (?:just|still|currently|now|already|been))* waiting (?:on|for) (?:you|your)\b/;
+const NEGATED_WAITING_RE =
+  /\b(?:no|nothing|none|nobody|not|never|\w+n['’]t)\b[^.?!\n]*?waiting (?:on|for) (?:you|your)\b/;
+
+/**
+ * The sentence (bounded by . ? ! newline, or the string ends) that contains the LAST "waiting on/for
+ * you" phrase, lowercased input. Null when the phrase is absent. Only the closing occurrence matters:
+ * it's the hand-back, and judging just its sentence keeps a genuine earlier "I'm waiting…" from
+ * bleeding onto a benign closeout (and vice-versa).
+ */
+function lastWaitingSentence(whole: string): string | null {
+  let last = -1;
+  for (let m = WAITING_GLOBAL_RE.exec(whole); m; m = WAITING_GLOBAL_RE.exec(whole)) last = m.index;
+  WAITING_GLOBAL_RE.lastIndex = 0;
+  if (last < 0) return null;
+  const start = Math.max(
+    whole.lastIndexOf(".", last),
+    whole.lastIndexOf("?", last),
+    whole.lastIndexOf("!", last),
+    whole.lastIndexOf("\n", last),
+  );
+  const ends = [
+    whole.indexOf(".", last),
+    whole.indexOf("?", last),
+    whole.indexOf("!", last),
+    whole.indexOf("\n", last),
+  ].filter((i) => i >= 0);
+  const end = ends.length ? Math.min(...ends) : whole.length;
+  return whole.slice(start + 1, end);
+}
+
+/**
+ * True when the turn carries a concrete request to act on THIS work (a STRONG signal). `tail` is the
+ * closeout window; `whole` is the full lowercased message. The waiting phrase must close the turn (be
+ * in the tail), but its subject is judged on the sentence that actually contains the closing phrase.
+ */
+function hasStrongProposal(tail: string, whole: string): boolean {
+  if (PROPOSAL_PHRASES.some((p) => tail.includes(p))) return true;
+  if (!WAITING_RE.test(tail)) return false;
+  const sentence = lastWaitingSentence(whole);
+  if (sentence === null) return false;
+  // A first-person subject immediately governing "waiting" is a genuine ask; otherwise a negated
+  // "nothing/no … waiting on you" is the benign recap close.
+  if (GENUINE_WAITING_RE.test(sentence)) return true;
+  return !NEGATED_WAITING_RE.test(sentence);
+}
 
 // High-signal "the next step is GATED on you" phrases — the agent has explicitly parked the work
 // behind your sign-off, confirmation, or approval. Unlike PROPOSAL_PHRASES these are scanned over
@@ -73,25 +136,49 @@ const GATING_PHRASES = [
 ];
 
 /**
+ * Strength of the local fast-path signal that a finished turn is blocked on the user. This is the
+ * FLOOR the judge escalates from — and, when the judge can't run, the verdict we fall back to.
+ *   - "strong": a concrete gate on the user — either a whole-message GATING phrase (your sign-off /
+ *     confirm / approve) or a PROPOSAL/hand-back phrase in the tail ("want me to land it?"). A real
+ *     staged ask; it must stay RED even keyless (sparkle-blpf).
+ *   - "weak": the ONLY signal is a bare trailing '?' with NO proposal/gating phrase. This is the
+ *     shape of an open-ended "what would you like to pick up next?" status-recap close — plausibly an
+ *     ask (worth a judge call), but NOT strong enough to FORCE red on its own. Without a judge it
+ *     falls OPEN to gray, killing the false-red the user saw on idle recap turns.
+ *   - "none": a plain completion report — no ask at all, no judge call.
+ * Pure + exported for testing.
+ */
+export type FollowupSignal = "none" | "weak" | "strong";
+
+export function classifyFollowupSignal(response: string): FollowupSignal {
+  const text = response.trim();
+  if (!text) return "none";
+  const lower = text.toLowerCase();
+  // Whole-message scan first: a high-signal "gated on your sign-off/confirm/approve" phrase can
+  // sit far above the tail in a long, blocked turn, so it must NOT be limited to TAIL_CHARS.
+  if (GATING_PHRASES.some((p) => lower.includes(p))) return "strong";
+  const tail = lower.slice(-TAIL_CHARS);
+  // A concrete action-proposal / hand-back in the tail is a strong ask — checked BEFORE the bare '?'
+  // so "want me to land it?" reads strong, not weak, even though it also ends in a question mark.
+  if (hasStrongProposal(tail, lower)) return "strong";
+  // A closing '?' with no proposal/gating phrase: weak. Worth a judge call, but on its own (keyless)
+  // it must not manufacture a red on an open-ended "what next?" recap.
+  if (tail.includes("?")) return "weak";
+  return "none";
+}
+
+/**
  * LOCAL fast-path: could this finished turn plausibly be blocked on the user — i.e. is it worth a
- * judge call? True when the tail contains a question mark OR a proposal/hand-back phrase. False for
- * a plain completion report (no model call, definitely gray). Pure + exported for testing.
+ * judge call? True when the tail contains a question mark OR a proposal/hand-back phrase (any
+ * non-"none" signal). False for a plain completion report (no model call, definitely gray). Pure +
+ * exported for testing.
  *
  * Bias is intentionally toward TRUE (consult the judge) on anything question-like: a false TRUE
  * only costs one cheap Haiku call that then returns DONE; a false FALSE would silently miss a real
  * ask. The judge is the precise gate; this is just the cheap pre-filter.
  */
 export function mightNeedFollowup(response: string): boolean {
-  const text = response.trim();
-  if (!text) return false;
-  const lower = text.toLowerCase();
-  // Whole-message scan first: a high-signal "gated on your sign-off/confirm/approve" phrase can
-  // sit far above the tail in a long, blocked turn, so it must NOT be limited to TAIL_CHARS.
-  if (GATING_PHRASES.some((p) => lower.includes(p))) return true;
-  // Tail scan: a closing '?' or a proposal/hand-back phrase in the last lines of the turn.
-  const tail = lower.slice(-TAIL_CHARS);
-  if (tail.includes("?")) return true;
-  return PROPOSAL_PHRASES.some((p) => tail.includes(p));
+  return classifyFollowupSignal(response) !== "none";
 }
 
 /**
@@ -144,10 +231,15 @@ export async function judgeNeedsFollowup(args: {
     });
   } catch (e) {
     // The judge could not run (no API key, offline, model hiccup). We can't distinguish done from
-    // blocked, so FAIL CLOSED to the deterministic fast-path verdict: mightNeedFollowup already
-    // matched (we're past its early return), so escalate to `waiting` rather than swallow it to gray.
-    console.debug("followup judge unavailable; failing closed to the fast-path verdict:", e);
-    return true;
+    // blocked, so fall back to the deterministic fast-path — but TIERED, not a blanket red. Only a
+    // STRONG signal (a whole-message gate, or a concrete action-proposal like "want me to land it?")
+    // fails CLOSED to `waiting`: a keyless "Want me to land it now?" must still go red (sparkle-blpf).
+    // A WEAK signal — a bare trailing '?' with no proposal/gating phrase, the shape of an open-ended
+    // "what would you like to pick up next?" recap — falls OPEN to gray rather than manufacturing a
+    // false red on an idle status report the user isn't actually blocking. With a judge key present,
+    // the judge itself grays these (see judge.rs); this floor only governs the keyless path.
+    console.debug("followup judge unavailable; failing closed only on a strong fast-path signal:", e);
+    return classifyFollowupSignal(args.response) === "strong";
   }
   // The judge RAN — trust its verdict. A real DONE pulls the ambiguous turn back to gray.
   return interpretVerdict(raw);

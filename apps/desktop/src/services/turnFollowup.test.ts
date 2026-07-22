@@ -3,7 +3,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
 
-import { mightNeedFollowup, interpretVerdict, judgeNeedsFollowup } from "./turnFollowup";
+import {
+  mightNeedFollowup,
+  classifyFollowupSignal,
+  interpretVerdict,
+  judgeNeedsFollowup,
+} from "./turnFollowup";
 
 describe("mightNeedFollowup (local fast-path)", () => {
   it("skips a plain completion report with no question or proposal", () => {
@@ -93,6 +98,111 @@ describe("mightNeedFollowup (local fast-path)", () => {
   });
 });
 
+describe("classifyFollowupSignal (fast-path strength)", () => {
+  it("classifies a plain completion report as 'none'", () => {
+    expect(
+      classifyFollowupSignal("Done. Built the card, removed the tooltip, suite is 1123 passing."),
+    ).toBe("none");
+  });
+
+  it("classifies a concrete action-proposal ('want me to land it?') as 'strong'", () => {
+    expect(classifyFollowupSignal("All secrets are in. Want me to land it now?")).toBe("strong");
+  });
+
+  it("classifies a whole-message gate ('for your sign-off') as 'strong'", () => {
+    const msg =
+      "It looks ready for your sign-off. " +
+      "It merges every window's roster into one. ".repeat(30) +
+      "Once you approve, I'll write the spec.";
+    expect(classifyFollowupSignal(msg)).toBe("strong");
+  });
+
+  it("classifies an open-ended 'what would you like to pick up next?' recap as 'weak' (real screenshot-1)", () => {
+    // The exact false-red the user reported: a status recap that finished the task and asks,
+    // open-endedly, what to do next. Bare trailing '?' with NO proposal/gating phrase → weak.
+    expect(
+      classifyFollowupSignal(
+        "So: nothing in flight, nothing stuck, and no findings waiting on you. What would you like to pick up next?",
+      ),
+    ).toBe("weak");
+  });
+
+  it("does NOT treat the negated 'nothing waiting on you' recap as a strong ask", () => {
+    // The benign inverse of a real "waiting on you" ask — the substring matches, but it's negated,
+    // so the waiting-family guard must keep it out of 'strong'. Only the bare '?' remains → weak.
+    expect(classifyFollowupSignal("Nothing is waiting on you right now. What's next?")).toBe("weak");
+    expect(classifyFollowupSignal("There are no findings waiting on you. All clear.")).toBe("none");
+  });
+
+  it("still treats a genuine 'I'm waiting on you to run it' ask as 'strong'", () => {
+    expect(
+      classifyFollowupSignal(
+        "Neither diagnostic has fired yet — I'm waiting on you to run the terminal test in the live app.",
+      ),
+    ).toBe("strong");
+  });
+
+  it("lets a genuine first-person ask win over a negator earlier in the SAME sentence (roborev #1)", () => {
+    // "nothing … waiting on you" substring is present AND unbroken by punctuation, but the real
+    // subject is "I'm" — a genuine hand-back. GENUINE must beat NEGATED so this stays red.
+    expect(
+      classifyFollowupSignal("There's nothing else for me to do until you run it — I'm waiting on you."),
+    ).toBe("strong");
+  });
+
+  it("keeps a genuine ask strong when a negator sits in a PRIOR sentence (sentence-boundary guard)", () => {
+    // The '.' after "failed" blocks NEGATED_WAITING_RE from reaching back to "Nothing"; the ask is
+    // its own sentence. Load-bearing behavior of the [^.?!\\n] sentence scope.
+    expect(classifyFollowupSignal("Nothing failed. I'm waiting on you to run it.")).toBe("strong");
+  });
+
+  it("does NOT fire GENUINE when a first-person token heads a DIFFERENT verb (roborev #44374)", () => {
+    // "I'm" governs "glad", not "waiting" — immediate governance must be required so this benign
+    // "nothing is waiting on you" recap is not forced strong. No '?' → none.
+    expect(classifyFollowupSignal("I'm glad nothing is waiting on you.")).toBe("none");
+    // "still" as an adverb after a negator is NOT a genuine subject.
+    expect(classifyFollowupSignal("There's nothing still waiting on you.")).toBe("none");
+  });
+
+  it("recognizes the 'I've been waiting on you' contraction as genuine, even past a negator (roborev #44378)", () => {
+    // 've + been must be in the genuine copula/adverb groups, so this beats the "nothing" negator.
+    expect(
+      classifyFollowupSignal("Nothing else blocked me — I've been waiting on you to run it."),
+    ).toBe("strong");
+  });
+
+  it("judges only the CLOSING waiting phrase, not an earlier genuine one (multi-occurrence, roborev #44374)", () => {
+    // A genuine "I'm waiting on you to review" earlier, but the turn CLOSES on a benign "nothing is
+    // waiting on you". Only the closing sentence is judged → benign → not strong (bare '?' → weak).
+    expect(
+      classifyFollowupSignal(
+        "I'm waiting on you to review the plan. But right now nothing is waiting on you — what next?",
+      ),
+    ).toBe("weak");
+  });
+
+  it("suppresses a benign 'waiting on you' even when the negator falls OUTSIDE the 600-char tail (roborev #2)", () => {
+    // One long sentence whose ONLY negator ("Nothing") sits far above the 600-char tail; the filler
+    // in between is deliberately negator-free, and the phrase "waiting on you" closes the turn. A
+    // tail-only negation scan would miss "Nothing" and wrongly go strong (a false red on a long
+    // recap); scanning NEGATED over the WHOLE message catches it → weak.
+    const filler = "the queue is clear and every branch is green and the roster is calm, ".repeat(12);
+    const msg = "Nothing is pending — " + filler + "and the board is waiting on you? ";
+    expect(msg.length).toBeGreaterThan(700); // "Nothing" is well beyond TAIL_CHARS (600) from the tail
+    expect(classifyFollowupSignal(msg)).toBe("weak"); // bare '?' remains → weak, not strong
+  });
+
+  it("treats a proposal phrase in the tail as 'strong' even though the turn also ends in '?'", () => {
+    // "want me to" must win over the bare '?' so the release-land ask stays strong (keyless red).
+    expect(classifyFollowupSignal("Ready. Want me to land it and cut the release?")).toBe("strong");
+  });
+
+  it("classifies empty / whitespace as 'none'", () => {
+    expect(classifyFollowupSignal("")).toBe("none");
+    expect(classifyFollowupSignal("   \n ")).toBe("none");
+  });
+});
+
 describe("interpretVerdict", () => {
   it("treats FOLLOWUP as needs-followup", () => {
     expect(interpretVerdict("FOLLOWUP")).toBe(true);
@@ -162,6 +272,21 @@ describe("judgeNeedsFollowup (orchestration)", () => {
       response: "Want me to land it now?",
     });
     expect(result).toBe(true);
+  });
+
+  it("FAILS OPEN to gray when the judge can't run on a WEAK (open-ended '?') recap (real screenshot-1)", async () => {
+    // The user's reported false-red: a finished status recap ending "What would you like to pick up
+    // next?" — a bare '?' with no proposal/gating phrase. mightNeedFollowup still flags it (consult
+    // the judge), but with no key the judge throws, and a WEAK signal must fall OPEN to gray rather
+    // than manufacture a red on a turn the user isn't actually being asked to unblock.
+    invokeMock.mockRejectedValueOnce(new Error("no Anthropic API key"));
+    const result = await judgeNeedsFollowup({
+      task: "Give me a brief status update",
+      response:
+        "So: nothing in flight, nothing stuck, and no findings waiting on you. What would you like to pick up next?",
+    });
+    expect(result).toBe(false);
+    expect(invokeMock).toHaveBeenCalled(); // it DID consult the judge; only the fallback grays it
   });
 
   it("still stays gray when the judge can't run on a turn the fast-path did NOT flag", async () => {
