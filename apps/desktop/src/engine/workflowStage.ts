@@ -86,6 +86,18 @@ export function resolveStage(
   return stageAt(Math.max(derived, ovr, 0)).id;
 }
 
+// Does this stage mean "there IS committed work that hasn't landed on (origin) main yet"? True for
+// the committed-but-unlanded band — building_saved (5) through merged_local (8, on LOCAL main only) —
+// and false below it (no commits: thought…building_unsaved) and at/above `merged` (9, on origin main)
+// and `shipped` (10). This is the "needs you to open/merge the PR" signal that escalates a finished
+// (idle/done/stopped) agent's dot to RED via engine/unmergedAttention.ts. "main" here is ORIGIN main:
+// merged_local still counts as unmerged because the workflow lands via a PR to origin, so local-only
+// work still needs you to get it the rest of the way. Pure.
+export function hasUnmergedCommittedWork(stage: WorkflowStageId): boolean {
+  const idx = stageIndex(stage);
+  return idx >= stageIndex("building_saved") && idx < stageIndex("merged");
+}
+
 // Everything we know about a unit of work at poll time, fed into the live stage derivation below.
 export interface LiveStageInputs {
   // "build" | "worker" | etc. Only "worker" uses the parent-branch / parent-reached-main signals.

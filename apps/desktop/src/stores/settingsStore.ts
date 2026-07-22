@@ -45,6 +45,9 @@ export const DEFAULT_NOTIFY_STATUSES: Record<AgentTabStatus, boolean> = {
   done: true,
   working: false,
   blocked: false,
+  // `unmerged` recolors the dot red and floats the row up, but does NOT ping by default (a finished
+  // agent's un-merged branch is a passive "when you get to it" nudge, not a banner-worthy event).
+  unmerged: false,
   stopped: false,
 };
 

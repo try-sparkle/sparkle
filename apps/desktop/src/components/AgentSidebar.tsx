@@ -48,6 +48,7 @@ import { type Bead } from "../services/beads";
 import { orderedTopLevelAgents, firstVisibleAgentId } from "../engine/agentOrdering";
 import { withUnstartedWorkerAttention, withRedWorkerAttention } from "../engine/workerAttention";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
+import { withUnmergedWork } from "../engine/unmergedAttention";
 import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode } from "../engine/workMode";
 import { selectAndOpen } from "../useAttentionNotifications";
@@ -339,17 +340,30 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   useEffect(() => {
     if (project) advanceAlerts(project.id, status);
   }, [project?.id, status, advanceAlerts]);
-  // The status map the ROW COLOR and the SORT ORDER read: the overlaid status with dismissed red
-  // alarms de-escalated to their non-red tier (waiting/approval→idle, errored→stopped). Kept separate
-  // from `status` so the OTHER consumers of red (cross-window publishing, dock notifications, the
-  // alert-button state) still see the true, un-dismissed status.
-  const effectiveStatus = useMemo(
-    () => (project ? withDismissedAlerts(project.agents, status) : status),
-    [project, status],
-  );
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
   const workflowShipped = useRuntimeStore((s) => s.workflowShipped);
+  // The status map the ROW COLOR and the SORT ORDER read, built in two overlay steps:
+  //   (1) withUnmergedWork — a FINISHED agent (idle/done/stopped) that still has committed work not
+  //       yet landed on main is escalated to red `unmerged` ("Needs merge"), so a done-but-unmerged
+  //       row goes red instead of gray until you open/merge its PR.
+  //   (2) withDismissedAlerts — dismissed red alarms de-escalate to their non-red tier
+  //       (waiting/approval→idle, errored→stopped) so a dismissed row drops out of the red zone.
+  // Order matters: unmerged BEFORE dismissal (`unmerged` isn't dismissible, and running it after
+  // dismissal would re-redden a just-calmed row — see withUnmergedWork's header). Kept separate from
+  // `status` so the badge / dock-notification consumers still read the true, un-dismissed status.
+  const effectiveStatus = useMemo(
+    () =>
+      project
+        ? withDismissedAlerts(
+            project.agents,
+            withUnmergedWork(project.agents, status, (id) =>
+              resolveStage(branchStatus[id], workflowStage[id]),
+            ),
+          )
+        : status,
+    [project, status, branchStatus, workflowStage],
+  );
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);

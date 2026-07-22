@@ -38,37 +38,39 @@ export const C = {
 
 /**
  * Agent tab status taxonomy + colors (desktop workspace spec §6). The taxonomy keeps
- * eight states for precise tooltips/legends, but they collapse to exactly THREE colors
+ * nine states for precise tooltips/legends, but they collapse to exactly THREE colors
  * so a glance tells you only what you need to act on:
  *   GREEN  — running                              (working)
- *   RED    — needs your attention                 (waiting, approval, errored)
- *   GRAY   — done / not blocked / not active       (idle, blocked, done, stopped)
- * RED means something is wrong or wants you: the agent is waiting on YOUR input (a question
- * or an approval it drew on screen, OR a finished-turn ask the followup judge flagged as
- * blocked on you — see turnFollowup.ts / statusRouter.ts) OR it crashed/exited with an error.
- * A finished turn that's truly done — or only offering optional/new work — is GRAY (`idle`);
- * a cleanly-exited agent is GRAY too. The distinction between a done turn and a blocked-on-you
- * turn is made by the judge, which escalates the latter from `idle` to `waiting`; the `idle`
- * tier itself stays gray. Never hardcode these — import AGENT_STATUS. `label` is the human
- * phrase shown on hover.
+ *   RED    — needs your action                    (waiting, approval, errored, blocked, unmerged)
+ *   GRAY   — done, nothing left for you            (idle, done, stopped)
+ * RED means the agent needs YOU before its work is truly finished: it's waiting on your input
+ * (a question or an approval it drew on screen, OR a finished-turn ask the followup judge flagged
+ * as blocked on you — see turnFollowup.ts / statusRouter.ts); OR it crashed/exited with an error;
+ * OR it went quiet/stalled (`blocked`); OR it finished but left committed work that hasn't landed
+ * on main yet and needs you to open/merge the PR (`unmerged`, derived from the branch/workflow
+ * state — see engine/unmergedAttention.ts). A finished turn with NOTHING left for you — nothing to
+ * merge, no question — is GRAY (`idle`/`done`); a cleanly-exited, fully-landed agent is GRAY too.
+ * Never hardcode these — import AGENT_STATUS. `label` is the human phrase shown on hover.
  *
- * NOTE: color, badge, and notifications are three SEPARATE concerns. Color is here. The dock
- * badge counts only waiting/approval (attention.ts — "how many need an answer"). Notifications
- * are user-configurable per status (settingsStore.notifyStatuses, default-on for the red +
- * finished tiers incl. errored) — so an errored agent is red AND pings by default, but which
- * statuses ping is the user's choice, independent of this color tier.
+ * NOTE: color, badge, and notifications are three SEPARATE concerns. Color is here (the sidebar
+ * dot + the cross-window red section, which keys off THIS color tier via windowStatus.isRedStatus).
+ * The dock badge + banner notifications key off the NARROWER attention set in engine/attention.ts
+ * (waiting/approval/errored only) — `blocked`/`unmerged` recolor the dot and surface cross-project
+ * but deliberately do NOT add to the badge count or fire a banner (they're "needs you eventually",
+ * not "answer this now"). Notifications stay user-configurable per status (settingsStore).
  */
 const GREEN = C.success; // #34c759 — running, leave it be
-const RED = C.sienna; //   #e0533f — needs your answer
+const RED = C.sienna; //   #e0533f — needs your action
 const GRAY = C.muted; //   #8aa0c4 — not active (legible on navy)
 export const AGENT_STATUS = {
   working: { color: GREEN, label: "Working" }, // actively producing output
-  idle: { color: GRAY, label: "Done — your turn" }, // finished its turn, not blocked on you
+  idle: { color: GRAY, label: "Done — your turn" }, // finished its turn, nothing left for you
   waiting: { color: RED, label: "Needs you" }, // asked a question (on-screen prompt)
   approval: { color: RED, label: "Approve?" }, // caution/dangerous action pending
-  blocked: { color: GRAY, label: "Stalled" }, // quiet, no on-screen question — not blocking you
+  blocked: { color: RED, label: "Blocked" }, // went quiet / stalled — needs you to unstick it
   errored: { color: RED, label: "Errored" }, // process crashed/exited with an error — red so it stands out
-  done: { color: GRAY, label: "Done" }, // finished cleanly, not active
+  unmerged: { color: RED, label: "Needs merge" }, // done, but committed work isn't on main yet — open/merge the PR
+  done: { color: GRAY, label: "Done" }, // finished cleanly AND landed — nothing left for you
   stopped: { color: GRAY, label: "Stopped" }, // not running (persisted tab)
 } as const;
 

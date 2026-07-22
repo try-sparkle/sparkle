@@ -7,6 +7,8 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { withUnstartedWorkerAttention } from "../engine/workerAttention";
 import { withDismissedAlerts } from "../engine/alertDismissal";
+import { withUnmergedWork } from "../engine/unmergedAttention";
+import { resolveStage } from "../engine/workflowStage";
 import { pickProjectFolder, basename } from "../services/dialog";
 import { openProjectInWindow, defaultDeps, type OpenMode } from "../services/projectWindows";
 import { findWindowForProject } from "../services/windowRegistry";
@@ -104,6 +106,10 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const windowLabel = useCurrentWindowLabel();
   const statusMap = useRuntimeStore((s) => s.status);
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
+  // Branch + workflow-stage maps drive the `unmerged` overlay (a finished agent with un-landed
+  // committed work → red dot), so the header dot cluster matches the sidebar rows for it too.
+  const branchStatus = useRuntimeStore((s) => s.branchStatus);
+  const workflowStage = useRuntimeStore((s) => s.workflowStage);
   // A spawned-but-never-started worker has no live status, so it would render GRAY and hide the
   // fact that it's blocking its orchestrator. Overlay RED on it and its parent before computing any
   // dot/summary color, so the block surfaces at the top. Per-project (openAgentIds is global).
@@ -116,7 +122,14 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   // worker-bubbled orchestrator dot can still order/color differently. That divergence is pre-existing
   // (predates dismissals) and out of scope for this overlay.
   const effStatus = (p: Project): Record<string, AgentTabStatus> =>
-    withDismissedAlerts(p.agents, withUnstartedWorkerAttention(p.agents, statusMap, openSet));
+    withDismissedAlerts(
+      p.agents,
+      withUnmergedWork(
+        p.agents,
+        withUnstartedWorkerAttention(p.agents, statusMap, openSet),
+        (id) => resolveStage(branchStatus[id], workflowStage[id]),
+      ),
+    );
   const [recentOpen, setRecentOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   // The unified "Open a Project" dialog (folder / GitHub tabs). The single "Open" button opens this;
@@ -171,7 +184,7 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   const currentEff = useMemo(
     () => (project ? effStatus(project) : {}),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [project, statusMap, openSet],
+    [project, statusMap, openSet, branchStatus, workflowStage],
   );
 
   // "Open agent" from a PR row: the pure branch→agent join (agentLinkForBranch) resolves the live

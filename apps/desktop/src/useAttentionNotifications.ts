@@ -53,12 +53,18 @@ import {
   clearWindowStatus,
   isRedStatus,
 } from "./services/windowStatus";
+import { withDismissedAlerts } from "./engine/alertDismissal";
+import { withUnmergedWork } from "./engine/unmergedAttention";
+import { resolveStage } from "./engine/workflowStage";
 import type { AgentTab, AgentTabStatus } from "./types";
 
-/** The "needs you" red statuses relayed to the phone (mirrors engine/attention's ATTENTION set).
- *  Includes `errored`: a crashed or mid-stream-stalled agent is stuck until you step in (the
- *  "never lose time" intent). Now set-equal to windowStatus.isRedStatus — both cover
- *  waiting|approval|errored — so the badge, the phone relay, and the cross-window red tier agree. */
+/** The "answer now" red statuses relayed to the phone + counted by the badge (mirrors
+ *  engine/attention's ATTENTION set). Includes `errored`: a crashed or mid-stream-stalled agent is
+ *  stuck until you step in (the "never lose time" intent). This is the NARROW subset — it
+ *  intentionally DIVERGES from the broader red-COLOR tier windowStatus.isRedStatus now covers
+ *  (which also includes `blocked` and `unmerged`): those recolor the dot + surface cross-project but
+ *  are "needs you eventually", not "answer this now", so they are NOT relayed to the phone or the
+ *  dock badge. Keep this set = waiting|approval|errored; do not widen it to match isRedStatus. */
 const isRelayRed = (s: AgentTabStatus | undefined): boolean =>
   s === "approval" || s === "waiting" || s === "errored";
 
@@ -190,6 +196,11 @@ export function selectAndOpen(projectId: string, agentId: string): void {
 
 export function useAttentionNotifications(): void {
   const status = useRuntimeStore((s) => s.status);
+  // Branch + workflow-stage maps feed the cross-window publish's `unmerged` overlay (a finished agent
+  // with un-landed committed work broadcasts red). Subscribed (not getState) so the publish re-runs
+  // when an agent's stage advances even if its runtime status hasn't changed.
+  const branchStatus = useRuntimeStore((s) => s.branchStatus);
+  const workflowStage = useRuntimeStore((s) => s.workflowStage);
   const projectId = useCurrentProjectId();
   const label = useCurrentWindowLabel();
   const isMain = useIsMainWindow();
@@ -241,12 +252,22 @@ export function useAttentionNotifications(): void {
     // every run (before the sameProject gate) so a project switch still re-baselines the stamps.
     activitySeen.current = stampActivity(activitySeen.current, agents, now);
 
-    // Publish THIS window's red (needs-attention) agents to the cross-window status channel so other
-    // windows can surface them at the top of their sidebar. Uses the red-color set
-    // (waiting|approval|errored), same tier as the relay. Empty set deletes our entry.
+    // Publish THIS window's red (needs-you) agents to the cross-window status channel so other
+    // windows can surface them at the top of their sidebar. We publish the SAME overlaid status the
+    // in-sidebar row color uses — via the exact overlay chain from AgentSidebar's effectiveStatus:
+    //   (1) withUnmergedWork — a finished agent with un-landed committed work → red `unmerged`, so a
+    //       done-but-unmerged agent shows red in OTHER projects' views too (not just its own).
+    //   (2) withDismissedAlerts — a dismissed red alarm de-escalates out of red, so a row that reads
+    //       calm in its own project is NOT broadcast as red elsewhere (the core cross-project bug).
+    // `blocked` is red purely by its token color, so isRedStatus below picks it up with no overlay.
+    // Order: unmerged before dismissal (see withUnmergedWork's header). Empty set deletes our entry.
+    const publishStatus = withDismissedAlerts(
+      agents,
+      withUnmergedWork(agents, status, (id) => resolveStage(branchStatus[id], workflowStage[id])),
+    );
     const nextRedSince: Record<string, number> = {};
     const redList = agents.flatMap((a) => {
-      const st = status[a.id];
+      const st = publishStatus[a.id];
       if (!isRedStatus(st)) return [];
       // Reuse the existing stamp if this agent was already red; else it just entered red now.
       const since = redSince.current[a.id] ?? now;
@@ -389,7 +410,7 @@ export function useAttentionNotifications(): void {
     }
     prevStatus.current = status;
     prevProject.current = projectId;
-  }, [status, agents, projectId, label, projectName, enabled]);
+  }, [status, agents, projectId, label, projectName, enabled, branchStatus, workflowStage]);
 
   // Report 0 + drop our cross-window status entry on unmount so a closed window stops contributing
   // to the badge total and stops surfacing its (now-gone) red agents in other windows' sidebars.

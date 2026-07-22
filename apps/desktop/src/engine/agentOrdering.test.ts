@@ -36,15 +36,15 @@ describe("sortAgentsByAttention", () => {
       blocked1: "blocked",
     };
     const sorted = ids(sortAgentsByAttention(agents, status));
-    // Tier 0 (red) first — waiting/approval/errored before everything. `errored` is a red,
-    // needs-you status (crashed/stalled), so it floats to the top like the other reds.
-    expect(sorted.slice(0, 3).sort()).toEqual(["approval1", "errored1", "waiting1"]);
+    // Tier 0 (red) first — the full red tier floats to the top: waiting/approval/errored plus
+    // `blocked` (went quiet — needs you to unstick it), which is red now too.
+    expect(sorted.slice(0, 4).sort()).toEqual(["approval1", "blocked1", "errored1", "waiting1"]);
     // Tier 1 next — idle/done.
-    expect(sorted.slice(3, 5).sort()).toEqual(["done1", "idle1"]);
+    expect(sorted.slice(4, 6).sort()).toEqual(["done1", "idle1"]);
     // Tier 2 — working.
-    expect(sorted[5]).toBe("working1");
-    // Tier 3 (bottom) — blocked/stopped (dormant, not asking).
-    expect(sorted.slice(6).sort()).toEqual(["blocked1", "stopped1"]);
+    expect(sorted[6]).toBe("working1");
+    // Tier 3 (bottom) — only stopped is dormant now.
+    expect(sorted.slice(7)).toEqual(["stopped1"]);
   });
 
   it("is stable within a tier — keeps insertion order for equal-rank agents", () => {
@@ -100,17 +100,20 @@ describe("sortAgentsByAttention", () => {
     expect(ids(sortAgentsByAttention(agents, status))).toEqual(["working1", "weird"]);
   });
 
-  it("STATUS_RANK encodes the four tiers as ascending ranks", () => {
+  it("STATUS_RANK encodes the tiers as ascending ranks", () => {
     expect(STATUS_RANK.waiting).toBe(STATUS_RANK.approval);
-    // errored is a red, needs-you status → same top tier as waiting/approval (sparkle-pqxh).
+    // The full red tier shares tier 0 and floats to the top: errored (sparkle-pqxh), plus blocked
+    // ('went quiet') and unmerged ('finished but not on main') which are red now too.
     expect(STATUS_RANK.errored).toBe(STATUS_RANK.waiting);
+    expect(STATUS_RANK.blocked).toBe(STATUS_RANK.waiting);
+    expect(STATUS_RANK.unmerged).toBe(STATUS_RANK.waiting);
     expect(STATUS_RANK.idle).toBe(STATUS_RANK.done);
     expect(STATUS_RANK.waiting).toBeLessThan(STATUS_RANK.idle);
     expect(STATUS_RANK.idle).toBeLessThan(STATUS_RANK.working);
     expect(STATUS_RANK.working).toBeLessThan(STATUS_RANK.stopped);
-    expect(STATUS_RANK.stopped).toBe(STATUS_RANK.blocked);
-    // errored floats up (red), so it is NOT in the dormant bottom tier anymore.
+    // The whole red tier floats up, so none of it sits in the dormant bottom tier with stopped.
     expect(STATUS_RANK.errored).toBeLessThan(STATUS_RANK.stopped);
+    expect(STATUS_RANK.blocked).toBeLessThan(STATUS_RANK.stopped);
   });
 });
 

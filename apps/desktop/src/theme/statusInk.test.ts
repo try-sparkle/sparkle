@@ -13,15 +13,18 @@ describe("statusInk (raw AGENT_STATUS color → themed text ink)", () => {
     expect(statusInk(AGENT_STATUS.working.color)).toBe(C.successInk);
   });
 
-  it("flips the brand gray ('done' and its idle/blocked/stopped peers) to agentIdle", () => {
-    // idle/blocked/done/stopped all share the brand gray, so all four map to agentIdle.
-    for (const st of ["done", "idle", "blocked", "stopped"] as const) {
+  it("flips the brand gray ('done' and its idle/stopped peers) to agentIdle", () => {
+    // idle/done/stopped share the brand gray, so all three map to agentIdle. (blocked/unmerged are
+    // RED now, so they pass through — asserted in the red group below.)
+    for (const st of ["done", "idle", "stopped"] as const) {
       expect(statusInk(AGENT_STATUS[st].color)).toBe(C.agentIdle);
     }
   });
 
   it("passes red/amber statuses through unchanged (already legible in both themes)", () => {
-    for (const st of ["waiting", "approval", "errored"] as const) {
+    // Full red-color tier — waiting/approval/errored plus blocked ('went quiet') and unmerged
+    // ('needs merge'), which are red too.
+    for (const st of ["waiting", "approval", "errored", "blocked", "unmerged"] as const) {
       expect(statusInk(AGENT_STATUS[st].color)).toBe(AGENT_STATUS[st].color);
     }
   });

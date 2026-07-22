@@ -66,10 +66,11 @@ export const CHAT_USER_BUBBLE = "var(--c-chat-bubble)";
 export const ROW_ACTIVE_BUBBLE = "var(--c-chat-bubble-active)";
 
 // Map a raw AGENT_STATUS color to a light-mode-legible THEMED ink, for use as TEXT/glyph color.
-// The brand gray (idle/done/blocked/stopped) and brand green (working) are both too light to read
+// The brand gray (idle/done/stopped) and brand green (working) are both too light to read
 // on the white light-mode sidebar, so they flip to darker themed tokens in light mode (and keep
 // their brand color in dark, via the var()s). Red/amber/violet are already legible in both themes
-// and pass through unchanged. For FILLS (status dots, badges) keep the raw brand color instead.
+// and pass through unchanged (blocked/unmerged are red, so their names read red). For FILLS
+// (status dots, badges) keep the raw brand color instead.
 export function statusInk(color: string): string {
   if (color === AGENT_STATUS.done.color) return C.agentIdle; // brand gray
   if (color === AGENT_STATUS.working.color) return C.successInk; // brand green

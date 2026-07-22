@@ -12,10 +12,10 @@ import type { AgentTabStatus } from "../types";
 
 // Status-colored circle glyph prefixed to the notification title, derived from the SOURCE-OF-TRUTH
 // color tier in AGENT_STATUS (packages/ui/tokens.ts) so it can't drift from the dot/badge colors.
-// RED tier (waiting, approval, errored) → filled red circle; GRAY tier (idle, blocked, done,
-// stopped) → the radio-button ring; GREEN (working) → no glyph. We compare each status's `.color`
-// against a known red status (waiting) and a known gray status (idle) rather than re-listing the
-// tiers here.
+// RED tier (waiting, approval, errored, blocked, unmerged) → filled red circle; GRAY tier (idle,
+// done, stopped) → the radio-button ring; GREEN (working) → no glyph. We compare each status's
+// `.color` against a known red status (waiting) and a known gray status (idle) rather than
+// re-listing the tiers here.
 const RED_CIRCLE = "🔴";
 const GRAY_CIRCLE = "🔘"; // radio-button RING glyph
 function statusGlyph(status: AgentTabStatus): string {
@@ -28,9 +28,12 @@ function statusGlyph(status: AgentTabStatus): string {
 /** Agent id → its current live status. Mirrors runtimeStore.status. */
 export type StatusMap = Record<string, AgentTabStatus>;
 
-// The attention statuses — the agent needs YOU before it can continue. The full red tier:
-// waiting ("Needs you") and approval ("Approve?") are live questions; errored ("Errored / stalled")
-// is a stuck agent that's lost time until you intervene. Mirrors agentOrdering.ts's red intent.
+// The BADGE/NOTIFICATION attention set — the agent needs an answer from you NOW: waiting ("Needs
+// you") and approval ("Approve?") are live questions; errored ("Errored / stalled") is a stuck agent
+// losing time until you intervene. This is deliberately NARROWER than the red-COLOR tier in
+// packages/ui/tokens.ts: `blocked` and `unmerged` are ALSO red (dot + cross-window section + sort
+// order), but they're "needs you eventually" (unstick it / open the PR), not "answer this now", so
+// they don't inflate the dock badge or fire a banner. Keep this set = the "answer now" subset.
 const ATTENTION: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>([
   "waiting",
   "approval",
@@ -109,7 +112,8 @@ export function notificationFor(
     idle: "Finished — your turn",
     done: "Done",
     working: "Started working",
-    blocked: "Stalled",
+    blocked: "Blocked / stalled — needs you",
+    unmerged: "Done — but not merged to main yet",
     stopped: "Stopped",
   };
   const glyph = statusGlyph(status);

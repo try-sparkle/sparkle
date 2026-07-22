@@ -112,12 +112,15 @@ function readMap(store: KV): WindowStatusMap {
   return out;
 }
 
-// The "needs your attention" (RED) statuses are exactly those whose AGENT_STATUS color is the brand
-// red — waiting, approval, errored (packages/ui/tokens.ts). Deliberately NOT the narrower badge set
-// (waiting|approval) used by useAttentionNotifications.isRelayRed: this feature surfaces the full
-// red-color tier, errored included. The subtype is kept in sync with the runtime check below so the
-// predicate narrows SOUNDLY on both branches.
-export type RedStatus = "waiting" | "approval" | "errored";
+// The "needs your action" (RED) statuses are exactly those whose AGENT_STATUS color is the brand
+// red — waiting, approval, errored, blocked, unmerged (packages/ui/tokens.ts). This is the FULL
+// red-COLOR tier and is deliberately BROADER than the narrower badge/relay set (waiting|approval|
+// errored) used by engine/attention.needsAttention + useAttentionNotifications.isRelayRed: this
+// cross-window feature surfaces every red-colored agent (blocked/unmerged included) so nothing that
+// needs you is hidden in another project. The subtype below lists the same five statuses so the
+// type guard narrows SOUNDLY — it must stay in sync with the runtime color check (adding a red token
+// to tokens.ts means adding it here too).
+export type RedStatus = "waiting" | "approval" | "errored" | "blocked" | "unmerged";
 const RED = AGENT_STATUS.errored.color;
 export function isRedStatus(status: AgentTabStatus | undefined): status is RedStatus {
   return status != null && AGENT_STATUS[status]?.color === RED;

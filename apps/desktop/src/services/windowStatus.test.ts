@@ -64,8 +64,8 @@ afterEach(() => {
 
 describe("isRedStatus", () => {
   it("includes the red-color statuses and excludes the rest", () => {
-    const red: AgentTabStatus[] = ["waiting", "approval", "errored"];
-    const notRed: AgentTabStatus[] = ["working", "idle", "done", "blocked", "stopped"];
+    const red: AgentTabStatus[] = ["waiting", "approval", "errored", "blocked", "unmerged"];
+    const notRed: AgentTabStatus[] = ["working", "idle", "done", "stopped"];
     for (const s of red) expect(isRedStatus(s)).toBe(true);
     for (const s of notRed) expect(isRedStatus(s)).toBe(false);
   });

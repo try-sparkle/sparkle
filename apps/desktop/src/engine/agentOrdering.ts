@@ -9,21 +9,24 @@ import type { AgentKind, AgentTabStatus } from "../types";
 // (the sort below is stable). Tune the taxonomy → tier mapping here, nothing else
 // hardcodes it. A status absent from this map sorts to the bottom (see STATUS_RANK_FALLBACK).
 export const STATUS_RANK: Record<AgentTabStatus, number> = {
-  // Tier 0 — red: needs YOU before it can make progress. Most support needed. `errored` belongs
-  // here (not the dormant tier): a crashed / mid-stream-stalled agent is stuck until you step in,
-  // and it's already treated as RED everywhere else — the attention set (engine/attention.ts), the
-  // dock badge + notifications (isRedStatus), and the cross-window red tier. Ranking it at the
-  // bottom made a red agent SINK instead of floating up, contradicting all of those (sparkle-pqxh).
+  // Tier 0 — RED: needs YOU before its work is truly done, so it floats to the top. This is the full
+  // red-COLOR tier (packages/ui/tokens.ts): the live asks (waiting/approval), the stuck states
+  // (errored crash/stall, `blocked` gone-quiet), and `unmerged` (finished but committed work not yet
+  // on main — open/merge the PR). Ranking any of them at the bottom would make a red agent SINK
+  // instead of floating up, contradicting the dot color and the cross-window red section
+  // (sparkle-pqxh). Note this is the color tier, which is BROADER than engine/attention's badge/
+  // notification set (waiting/approval/errored) — blocked/unmerged recolor + reorder but don't ping.
   waiting: 0,
   approval: 0,
   errored: 0,
-  // Tier 1 — finished its turn; it's your move (review / next prompt).
+  blocked: 0,
+  unmerged: 0,
+  // Tier 1 — finished its turn, nothing left for you (nothing to merge, no question).
   idle: 1,
   done: 1,
   // Tier 2 — green: actively building, leave it be.
   working: 2,
-  // Tier 3 — dormant: not asking, not running.
-  blocked: 3,
+  // Tier 3 — dormant: not asking, not running, nothing pending.
   stopped: 3,
 };
 
