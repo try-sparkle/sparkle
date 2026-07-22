@@ -21,7 +21,10 @@ use serde::Serialize;
 use tauri::AppHandle;
 
 /// The open-source Sparkle client the self-improvement agent files PRs against.
-const SPARKLE_REPO_URL: &str = "https://github.com/drodio/sparkle.git";
+/// This is the PUBLIC mirror (try-sparkle/sparkle). The private source-of-truth repo is
+/// not clonable by end users, so its URL must never appear here — this constant ships in
+/// the public mirror, and a private URL would point customers at a repo they cannot access.
+const SPARKLE_REPO_URL: &str = "https://github.com/try-sparkle/sparkle.git";
 
 /// Synthetic project id namespacing the Sparkle agent's worktrees under app-data. MUST match
 /// `SPARKLE_PROJECT_ID` in `src/services/sparkleAgent.ts`.

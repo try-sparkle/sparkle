@@ -3,6 +3,7 @@ name = "sparkle"
 version = "0.35.0"
 edition = "2021"
 description = "Sparkle desktop (macOS)"
+license = "Apache-2.0"
 
 [lib]
 name = "sparkle_lib"
