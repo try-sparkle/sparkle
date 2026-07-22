@@ -25,6 +25,7 @@ import {
 } from "./roborev";
 import { useApprovalsStore } from "../stores/approvalsStore";
 import type { ApprovalCategory, ApprovalRule } from "./suggestions/approvalCategories";
+import { categoriesForPreset, type AutoApprovePreset } from "./autoApprovePreset";
 import {
   DEFAULT_WAKE_WORD,
   DEFAULT_STOP_WORD,
@@ -114,6 +115,40 @@ export async function removeApprovalRuleEverywhere(
 ): Promise<void> {
   await clearApprovalRule(category, "global", projectRoot);
   if (projectRoot) await clearApprovalRule(category, "project", projectRoot);
+}
+
+/**
+ * Apply an Auto-Approve quick preset to the GLOBAL (all-projects) `[approvals]` rules in one pass, so
+ * the ⋯-menu sub-choice under "Auto-answer permission prompts" is a single click:
+ *   - "full"        → every category set to "always" (commands included).
+ *   - "except-bash" → every category EXCEPT bash set to "always"; the bash rule is CLEARED so commands
+ *                     keep prompting. We clear it (ask + nudge), NOT set it to "never" — "never" would
+ *                     mute commands silently, which is the opposite of "except bash".
+ * Optimistic store update first (so the segment highlights instantly), then persist. "full" is a
+ * single atomic setConfigValues (all six keys). "except-bash" is unavoidably TWO writes (there is no
+ * bulk "unset"): the bash unset PLUS the five "always" keys — see the ordering note below. Global
+ * scope only — matches the menu's "all projects" intent; per-category / per-project fine-tuning stays
+ * in the Auto-approve pane. The master `ai.auto_approve` must be ON for any rule to fire — that is the
+ * checkbox this control is nested under (see approvalsRuntime.maybeAutoApprove).
+ */
+export async function setAutoApprovePreset(preset: AutoApprovePreset): Promise<void> {
+  const store = useSettingsStore.getState();
+  const alwaysCats = categoriesForPreset(preset);
+  // Optimistic: set the preset's categories to "always"; for except-bash also clear bash so it asks.
+  for (const cat of alwaysCats) store.setGlobalApproval(cat, "always");
+  if (preset === "except-bash") store.setGlobalApproval("bash", null);
+  try {
+    if (preset === "except-bash") {
+      // Two writes (no bulk "unset"). Do the bash unset FIRST so that if only one lands, we've DROPPED
+      // a command-approval rule rather than ADDED five approvals — the safe direction for a
+      // permissions control. If this rejects we bail before writing the five, and a later
+      // config-changed hydrate reconciles the optimistic store back to the file.
+      await unsetConfigValue(approvalPath("bash"));
+    }
+    await setConfigValues(Object.fromEntries(alwaysCats.map((cat) => [approvalPath(cat), "always"])));
+  } catch (e) {
+    console.warn("config write failed (auto-approve preset)", e);
+  }
 }
 
 /** Toggle one AI feature: optimistic store update, then persist to config.toml. */

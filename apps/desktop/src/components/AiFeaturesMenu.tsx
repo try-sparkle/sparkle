@@ -1,4 +1,5 @@
-import { type CSSProperties } from "react";
+import { Fragment, type CSSProperties } from "react";
+import { FiAlertTriangle } from "react-icons/fi";
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { SettingCheckbox } from "./SettingCheckbox";
 import {
@@ -9,7 +10,8 @@ import {
 } from "../stores/settingsStore";
 // Toggles write to config.toml (the source of truth) via these actions, which also update the
 // store optimistically; the resulting config-changed event re-hydrates the store.
-import { setAiFeature, setAllAiFeatures } from "../services/configActions";
+import { setAiFeature, setAllAiFeatures, setAutoApprovePreset } from "../services/configActions";
+import { autoApprovePresetOf } from "../services/autoApprovePreset";
 
 // "Use AI Features" control for the TopBar ⋯ menu. A segmented All | Some | Off master plus a
 // checkbox per feature. The master is DERIVED from the four feature flags (aiFeatureMode):
@@ -29,6 +31,45 @@ const FEATURES: Array<{ key: AiFeatureKey; label: string }> = [
 ];
 
 const row: CSSProperties = { display: "flex", alignItems: "center", gap: 6 };
+
+// The nested Auto-approve scope sub-control. Indented under the checkbox so it reads as "part of"
+// the yes, with a left rule to make the nesting obvious.
+const scopeBox: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 6,
+  margin: "2px 0 6px 24px",
+  paddingLeft: 10,
+  borderLeft: `2px solid ${C.forest}`,
+};
+
+const scopeRow: CSSProperties = { display: "flex", gap: 6 };
+
+function scopeBtn(active: boolean): CSSProperties {
+  return {
+    flex: 1,
+    background: active ? C.teal : "transparent",
+    color: active ? ON_BRAND_FILL : C.cream,
+    border: `1px solid ${active ? C.teal : C.muted}`,
+    borderRadius: 6,
+    padding: "5px 8px",
+    fontSize: 12,
+    fontFamily: '"IBM Plex Sans", sans-serif',
+    cursor: "pointer",
+    lineHeight: 1.2,
+  };
+}
+
+const scopeHint: CSSProperties = { color: C.muted, fontSize: 11, lineHeight: 1.4 };
+
+const scopeWarn: CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 4,
+  color: C.amber,
+  fontSize: 11,
+  lineHeight: 1.4,
+};
 
 const seg: CSSProperties = {
   flex: 1,
@@ -120,14 +161,60 @@ export function AiFeaturesMenu() {
       />
       <div style={{ marginTop: 6 }}>
         {FEATURES.map(({ key, label }) => (
-          <SettingCheckbox
-            key={key}
-            label={label}
-            checked={valueByKey[key]}
-            onToggle={() => setAiFeature(key, !valueByKey[key])}
-          />
+          <Fragment key={key}>
+            <SettingCheckbox
+              label={label}
+              checked={valueByKey[key]}
+              onToggle={() => setAiFeature(key, !valueByKey[key])}
+            />
+            {/* "Auto-answer" is a yes/no; once yes, the nested scope decides HOW much it auto-answers.
+                Only rendered when the checkbox is on — an off master answers nothing regardless. */}
+            {key === "autoApprove" && aiAutoApprove && <AutoApproveScope />}
+          </Fragment>
         ))}
       </div>
+    </div>
+  );
+}
+
+/** The nested "how much to auto-answer" sub-choice shown under the (checked) Auto-answer toggle. Two
+ *  presets over the [approvals] rules: commands (bash) excluded, or everything. The active one is
+ *  DERIVED from the global approvals map, so it also reflects rules set in the granular Auto-approve
+ *  pane — an unrecognized (custom) combination highlights neither and shows the "asking each time"
+ *  hint. */
+function AutoApproveScope() {
+  const preset = autoApprovePresetOf(useSettingsStore((s) => s.approvals));
+  return (
+    <div style={scopeBox} role="group" aria-label="How much to auto-approve">
+      <div style={scopeRow}>
+        <button
+          type="button"
+          aria-pressed={preset === "except-bash"}
+          style={scopeBtn(preset === "except-bash")}
+          onClick={() => void setAutoApprovePreset("except-bash")}
+        >
+          Everything except commands
+        </button>
+        <button
+          type="button"
+          aria-pressed={preset === "full"}
+          style={scopeBtn(preset === "full")}
+          onClick={() => void setAutoApprovePreset("full")}
+        >
+          Everything, including commands
+        </button>
+      </div>
+      {preset === "full" && (
+        <span style={scopeWarn}>
+          <FiAlertTriangle size={11} /> Commands run without asking — including destructive ones.
+        </span>
+      )}
+      {preset === null && (
+        <span style={scopeHint}>
+          Asking each time. Pick one to auto-approve, or fine-tune per category in the Auto-approve
+          settings.
+        </span>
+      )}
     </div>
   );
 }

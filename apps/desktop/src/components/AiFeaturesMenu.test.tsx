@@ -79,4 +79,45 @@ describe("AiFeaturesMenu", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: /AI-enhanced voice dictation/ }));
     expect(useSettingsStore.getState().cloudDictation).toBe(false);
   });
+
+  describe("auto-approve scope sub-choice", () => {
+    const exceptBtn = () => screen.queryByRole("button", { name: "Everything except commands" });
+    const fullBtn = () => screen.queryByRole("button", { name: "Everything, including commands" });
+
+    it("is shown only while the Auto-answer checkbox is checked", () => {
+      useSettingsStore.setState({ aiAutoApprove: true, approvals: {} });
+      render(<AiFeaturesMenu />);
+      expect(exceptBtn()).not.toBeNull();
+      expect(fullBtn()).not.toBeNull();
+      // Uncheck the master auto-answer toggle → the nested scope disappears.
+      fireEvent.click(
+        screen.getByRole("checkbox", { name: /Auto-answer Claude Code permission prompts/ }),
+      );
+      expect(useSettingsStore.getState().aiAutoApprove).toBe(false);
+      expect(exceptBtn()).toBeNull();
+      expect(fullBtn()).toBeNull();
+    });
+
+    it("'Everything, including commands' sets every category to always and highlights", () => {
+      useSettingsStore.setState({ aiAutoApprove: true, approvals: {} });
+      render(<AiFeaturesMenu />);
+      fireEvent.click(fullBtn()!);
+      const map = useSettingsStore.getState().approvals;
+      expect(map.bash).toBe("always");
+      expect(map.edit).toBe("always");
+      expect(fullBtn()!.getAttribute("aria-pressed")).toBe("true");
+      expect(exceptBtn()!.getAttribute("aria-pressed")).toBe("false");
+    });
+
+    it("'Everything except commands' auto-approves the rest but leaves bash asking", () => {
+      useSettingsStore.setState({ aiAutoApprove: true, approvals: {} });
+      render(<AiFeaturesMenu />);
+      fireEvent.click(exceptBtn()!);
+      const map = useSettingsStore.getState().approvals;
+      expect(map.bash).toBeUndefined();
+      expect(map.edit).toBe("always");
+      expect(exceptBtn()!.getAttribute("aria-pressed")).toBe("true");
+      expect(fullBtn()!.getAttribute("aria-pressed")).toBe("false");
+    });
+  });
 });

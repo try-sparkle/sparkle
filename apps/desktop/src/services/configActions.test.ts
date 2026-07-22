@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("./config", () => ({
   setConfigValue: vi.fn().mockResolvedValue(undefined),
   setConfigValues: vi.fn().mockResolvedValue(undefined),
+  unsetConfigValue: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Mock the roborev daemon/hook shims so setRoborevEnabled's side effects are observable without IPC.
@@ -20,17 +21,19 @@ vi.mock("./roborev", () => ({
   roborevAuthSelftest: vi.fn().mockResolvedValue({ kind: "Passed" }),
 }));
 
-import { setConfigValue, setConfigValues } from "./config";
+import { setConfigValue, setConfigValues, unsetConfigValue } from "./config";
 import { roborevAuthSelftest } from "./roborev";
 import {
   setAiFeature,
   setAllAiFeatures,
+  setAutoApprovePreset,
   setMaxConcurrentWorkers,
   setRoborevEnabled,
   authWarningFor,
   refreshRoborevAuth,
   markRoborevConsentPrompted,
 } from "./configActions";
+import { APPROVAL_CATEGORIES } from "./suggestions/approvalCategories";
 import {
   installRoborev,
   deactivateRoborev,
@@ -74,6 +77,72 @@ describe("configActions", () => {
       "ai.composer": false,
       "ai.suggested_actions": false,
       "ai.auto_approve": false,
+    });
+  });
+
+  describe("setAutoApprovePreset", () => {
+    beforeEach(() => {
+      // Start from a clean approvals map so a preset is applied against no prior rules.
+      useSettingsStore.setState({ approvals: {} });
+    });
+
+    it("'full' sets every category to 'always' in the store and in ONE atomic write", async () => {
+      await setAutoApprovePreset("full");
+      const map = useSettingsStore.getState().approvals;
+      for (const cat of APPROVAL_CATEGORIES) expect(map[cat]).toBe("always");
+      expect(setConfigValues).toHaveBeenCalledTimes(1);
+      expect(setConfigValues).toHaveBeenCalledWith({
+        "approvals.skill": "always",
+        "approvals.bash": "always",
+        "approvals.edit": "always",
+        "approvals.mcp": "always",
+        "approvals.fetch": "always",
+        "approvals.other": "always",
+      });
+      // Full includes commands, so nothing is unset.
+      expect(unsetConfigValue).not.toHaveBeenCalled();
+    });
+
+    it("'except-bash' auto-approves the five non-bash categories and CLEARS the bash rule", async () => {
+      await setAutoApprovePreset("except-bash");
+      const map = useSettingsStore.getState().approvals;
+      // bash stays unset so commands keep prompting; everything else is auto-approved.
+      expect(map.bash).toBeUndefined();
+      for (const cat of APPROVAL_CATEGORIES.filter((c) => c !== "bash")) {
+        expect(map[cat]).toBe("always");
+      }
+      expect(setConfigValues).toHaveBeenCalledWith({
+        "approvals.skill": "always",
+        "approvals.edit": "always",
+        "approvals.mcp": "always",
+        "approvals.fetch": "always",
+        "approvals.other": "always",
+      });
+      // bash must be explicitly removed from the file (not written as a value).
+      expect(unsetConfigValue).toHaveBeenCalledWith("approvals.bash");
+    });
+
+    it("'except-bash' clears a pre-existing bash='always' rule so commands ask again", async () => {
+      useSettingsStore.setState({ approvals: { bash: "always" } });
+      await setAutoApprovePreset("except-bash");
+      expect(useSettingsStore.getState().approvals.bash).toBeUndefined();
+    });
+
+    it("a write failure is swallowed but the optimistic map stays", async () => {
+      (setConfigValues as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("no ipc"));
+      await setAutoApprovePreset("full");
+      expect(useSettingsStore.getState().approvals.bash).toBe("always");
+    });
+
+    it("'except-bash' does the bash unset FIRST — if it fails, the five approvals are NOT written", async () => {
+      // The bash unset is the safety-relevant write (drop a command-approval rule). It runs first, so
+      // a failure there bails before adding the five conveniences — the safe under-approve direction.
+      (unsetConfigValue as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("no ipc"));
+      await setAutoApprovePreset("except-bash");
+      expect(unsetConfigValue).toHaveBeenCalledWith("approvals.bash");
+      expect(setConfigValues).not.toHaveBeenCalled();
+      // Optimistic store still reflects the intended end state; a later hydrate reconciles to the file.
+      expect(useSettingsStore.getState().approvals.bash).toBeUndefined();
     });
   });
 
