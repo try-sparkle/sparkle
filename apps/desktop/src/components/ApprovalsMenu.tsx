@@ -12,12 +12,16 @@ import {
 import {
   setApprovalRule,
   removeApprovalRuleEverywhere,
+  setResumeRule,
 } from "../services/configActions";
 import {
   APPROVAL_CATEGORIES,
   approvalCategoryLabel,
+  DEFAULT_RESUME_RULE,
+  RESUME_RULE_LABEL,
   type ApprovalCategory,
   type ApprovalRule,
+  type ResumeRule,
 } from "../services/suggestions/approvalCategories";
 
 // The ⋯ Settings → "Auto-approve" pane. Lists every category with its current effective rule + the
@@ -60,6 +64,18 @@ function statusText(state: RowState): string {
   return "Asks each time (and offers to remember)";
 }
 
+/** The three session-resume choices, in the order the row lists them. */
+const RESUME_CHOICES: readonly ResumeRule[] = ["ask", "summary", "full"] as const;
+
+/** Human-readable status for the resume row given the effective rule + the scope it came from. */
+function resumeStatusText(effective: ResumeRule, scope: Scope): string {
+  if (effective === "ask") return "Asks you each time you resume a large session";
+  const where = scope === "project" ? "in this project" : "in all projects";
+  return effective === "summary"
+    ? `Auto-resuming from summary ${where}`
+    : `Auto-resuming the full session ${where}`;
+}
+
 export function ApprovalsMenu() {
   const projectId = useCurrentProjectId();
   const projectRoot = useProjectStore(
@@ -69,6 +85,9 @@ export function ApprovalsMenu() {
 
   const globalMap = useSettingsStore((s) => s.approvals);
   const projMap = useApprovalsStore((s) => (projectRoot ? s.byRoot[projectRoot] : undefined));
+  // Session-resume sibling: its own global mirror + per-project effective value.
+  const globalResume = useSettingsStore((s) => s.resumeRule);
+  const projResume = useApprovalsStore((s) => (projectRoot ? s.resumeByRoot[projectRoot] : undefined));
   // VISIBLE gate (flag only): show the pane content regardless of credits, but tell the user when
   // the master toggle is off so a rule they set here won't fire.
   const featureOn = useAiFeatureVisible("autoApprove");
@@ -140,6 +159,78 @@ export function ApprovalsMenu() {
           </div>
         );
       })}
+      {(() => {
+        // Session-resume row. A SIBLING of the categories (its own value domain), so it renders as a
+        // distinct block: two scope groups (all-projects / this-project), each a three-way mode
+        // choice (Ask / Summary / Full). The effective value is the project override if one is set,
+        // else the global. "This project" is disabled with no project in focus, mirroring the rows.
+        const effProjResume: ResumeRule = projResume ?? globalResume;
+        const overriding = projResume !== undefined && projResume !== globalResume;
+        const effective = effProjResume;
+        const scope: Scope = overriding ? "project" : effective !== "ask" ? "global" : null;
+        return (
+          <div key="__resume" style={{ ...row, borderBottom: "none", paddingBottom: 0 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, minWidth: 0, flex: 1 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                <span style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold, fontSize: 13 }}>
+                  Session resume
+                </span>
+                <span style={{ color: C.muted, fontSize: 12 }}>
+                  {resumeStatusText(effective, scope)}
+                </span>
+              </div>
+              <ResumeScopeGroup
+                label="All projects"
+                active={globalResume}
+                onChoose={(rule) => void setResumeRule(rule, "global", projectRoot)}
+              />
+              <ResumeScopeGroup
+                label="This project"
+                active={effProjResume}
+                disabled={!projectRoot}
+                disabledTitle={projectRoot ? undefined : "No project in focus"}
+                onChoose={(rule) => void setResumeRule(rule, "project", projectRoot)}
+              />
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+
+/** One scope's three-way resume choice (Ask / Summary / Full). `active` is the mode currently in
+ *  effect for this scope; the matching button is highlighted. */
+function ResumeScopeGroup({
+  label,
+  active,
+  disabled,
+  disabledTitle,
+  onChoose,
+}: {
+  label: string;
+  active: ResumeRule;
+  disabled?: boolean;
+  disabledTitle?: string;
+  onChoose: (rule: ResumeRule) => void;
+}) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+      <span style={{ color: C.muted, fontSize: 11, minWidth: 78 }}>{label}</span>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {RESUME_CHOICES.map((rule) => (
+          <button
+            key={rule}
+            type="button"
+            style={btn(!disabled && active === rule)}
+            disabled={disabled}
+            title={disabled ? disabledTitle : undefined}
+            onClick={() => onChoose(rule)}
+          >
+            {rule === DEFAULT_RESUME_RULE ? "Ask each time" : RESUME_RULE_LABEL[rule]}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

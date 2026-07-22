@@ -9,6 +9,8 @@ vi.mock("./config", () => ({
   setConfigValue: vi.fn().mockResolvedValue(undefined),
   setConfigValues: vi.fn().mockResolvedValue(undefined),
   unsetConfigValue: vi.fn().mockResolvedValue(undefined),
+  setProjectConfigValue: vi.fn().mockResolvedValue(undefined),
+  unsetProjectConfigValue: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Mock the roborev daemon/hook shims so setRoborevEnabled's side effects are observable without IPC.
@@ -21,7 +23,13 @@ vi.mock("./roborev", () => ({
   roborevAuthSelftest: vi.fn().mockResolvedValue({ kind: "Passed" }),
 }));
 
-import { setConfigValue, setConfigValues, unsetConfigValue } from "./config";
+import {
+  setConfigValue,
+  setConfigValues,
+  unsetConfigValue,
+  setProjectConfigValue,
+  unsetProjectConfigValue,
+} from "./config";
 import { roborevAuthSelftest } from "./roborev";
 import {
   setAiFeature,
@@ -29,11 +37,13 @@ import {
   setAutoApprovePreset,
   setMaxConcurrentWorkers,
   setRoborevEnabled,
+  setResumeRule,
   authWarningFor,
   refreshRoborevAuth,
   markRoborevConsentPrompted,
 } from "./configActions";
 import { APPROVAL_CATEGORIES } from "./suggestions/approvalCategories";
+import { useApprovalsStore } from "../stores/approvalsStore";
 import {
   installRoborev,
   deactivateRoborev,
@@ -343,5 +353,51 @@ describe("configActions", () => {
     await markRoborevConsentPrompted();
     expect(useSettingsStore.getState().roborevConsentPrompted).toBe(true);
     expect(setConfigValue).toHaveBeenCalledWith("roborev.consent_prompted", true);
+  });
+
+  describe("setResumeRule", () => {
+    const ROOT = "/repo";
+    beforeEach(() => {
+      useSettingsStore.setState({ resumeRule: "ask" });
+      useApprovalsStore.setState({ resumeByRoot: {} });
+    });
+
+    it("global summary/full writes approvals.resume; global 'ask' clears it (the default)", async () => {
+      await setResumeRule("summary", "global", null);
+      expect(useSettingsStore.getState().resumeRule).toBe("summary");
+      expect(setConfigValue).toHaveBeenCalledWith("approvals.resume", "summary");
+
+      await setResumeRule("ask", "global", null);
+      expect(useSettingsStore.getState().resumeRule).toBe("ask");
+      expect(unsetConfigValue).toHaveBeenCalledWith("approvals.resume");
+    });
+
+    it("project summary/full writes the project's approvals.resume", async () => {
+      await setResumeRule("full", "project", ROOT);
+      expect(useApprovalsStore.getState().resumeByRoot[ROOT]).toBe("full");
+      expect(setProjectConfigValue).toHaveBeenCalledWith(ROOT, "approvals.resume", "full");
+    });
+
+    it("project 'ask' writes an EXPLICIT ask when the global rule auto-resumes (per-project opt-out)", async () => {
+      useSettingsStore.setState({ resumeRule: "summary" }); // global auto-resumes
+      await setResumeRule("ask", "project", ROOT);
+      // The project must be able to override a global summary/full — so an explicit "ask" is persisted.
+      expect(setProjectConfigValue).toHaveBeenCalledWith(ROOT, "approvals.resume", "ask");
+      expect(unsetProjectConfigValue).not.toHaveBeenCalled();
+      expect(useApprovalsStore.getState().resumeByRoot[ROOT]).toBe("ask");
+    });
+
+    it("project 'ask' clears the key when the global rule is already 'ask' (nothing to override)", async () => {
+      useSettingsStore.setState({ resumeRule: "ask" });
+      await setResumeRule("ask", "project", ROOT);
+      expect(unsetProjectConfigValue).toHaveBeenCalledWith(ROOT, "approvals.resume");
+      expect(setProjectConfigValue).not.toHaveBeenCalled();
+    });
+
+    it("falls back to global scope when a project write has no projectRoot", async () => {
+      await setResumeRule("summary", "project", null);
+      expect(setConfigValue).toHaveBeenCalledWith("approvals.resume", "summary");
+      expect(setProjectConfigValue).not.toHaveBeenCalled();
+    });
   });
 });

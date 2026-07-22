@@ -61,8 +61,11 @@ function truncateLabel(s: string): string {
   return t.length <= PICKER_LABEL_MAX ? t : `${t.slice(0, PICKER_LABEL_MAX - 1)}…`;
 }
 
-/** Detect Claude Code's option picker; returns one button per option ("N · label" → "N\n"). */
-export function detectClaudeCodePicker(scrollback: string): SuggestionButton[] {
+/** Parse Claude Code's option picker out of scrollback into `{ n, label }` options in ascending
+ *  order (1..N), or `[]` when no valid picker is present. Shared by {@link detectClaudeCodePicker}
+ *  (renders every option as a button) and {@link detectResumePrompt} (looks for two specific
+ *  options), so the footer-search + count-down parse lives in exactly one place. */
+function parsePickerOptions(scrollback: string): { n: number; label: string }[] {
   const lines = tail(scrollback, PICKER_WINDOW);
   // The LAST footer wins — an earlier, answered picker higher in the window is stale.
   let footerIdx = -1;
@@ -95,9 +98,38 @@ export function detectClaudeCodePicker(scrollback: string): SuggestionButton[] {
     expected = n - 1;
   }
   if (opts.length < 2 || opts[0]?.n !== 1) return [];
-  return opts
+  return opts;
+}
+
+/** Detect Claude Code's option picker; returns one button per option ("N · label" → "N\n"). */
+export function detectClaudeCodePicker(scrollback: string): SuggestionButton[] {
+  return parsePickerOptions(scrollback)
     .slice(0, PICKER_MAX_BUTTONS)
     .map((o) => btn(`${o.n} · ${truncateLabel(o.label)}`, `${o.n}\n`));
+}
+
+// ── Claude Code's session-resume prompt ──
+// A specialization of the picker above, shown when resuming a large session:
+//   ❯ 1. Resume from summary (recommended)
+//     2. Resume full session as-is
+//     3. Don't ask me again
+// We match it ONLY when BOTH the "summary" and "full session" options are present, and we read the
+// real option numbers off the parsed picker rather than assuming 1/2 — Claude Code may renumber or
+// reorder these. If either option is missing we return null and never guess a digit (fail safe).
+const RESUME_SUMMARY_LABEL = /resume\s+from\s+summary/i;
+const RESUME_FULL_LABEL = /resume\s+(?:the\s+)?full\s+session/i;
+
+/** Detect the session-resume prompt; returns the keystrokes for each mode, or null if it isn't one
+ *  (or is missing either option). `summaryOption`/`fullOption` are ready to `writePty` (e.g. "1\n"). */
+export function detectResumePrompt(
+  scrollback: string,
+): { summaryOption: string; fullOption: string } | null {
+  const opts = parsePickerOptions(scrollback);
+  if (opts.length === 0) return null;
+  const summary = opts.find((o) => RESUME_SUMMARY_LABEL.test(o.label));
+  const full = opts.find((o) => RESUME_FULL_LABEL.test(o.label));
+  if (!summary || !full) return null;
+  return { summaryOption: `${summary.n}\n`, fullOption: `${full.n}\n` };
 }
 
 export function detectTerminalPrompts(scrollback: string): SuggestionButton[] {

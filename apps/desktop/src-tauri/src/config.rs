@@ -97,6 +97,12 @@ pub struct ApprovalsConfig {
     pub mcp: Option<String>,
     pub fetch: Option<String>,
     pub other: Option<String>,
+    /// Sibling of the six categories above but with its OWN value domain (NOT "always"/"never"):
+    /// how to answer the Claude Code session-resume prompt when [ai].auto_approve is on. One of
+    /// `"ask"` (default — surface the prompt, don't auto-answer), `"summary"` (auto-pick "Resume
+    /// from summary"), or `"full"` (auto-pick "Resume full session"). Any unrecognized value is
+    /// treated as "ask". Project [approvals].resume overrides the global value, like the categories.
+    pub resume: Option<String>,
 }
 
 impl Default for ApprovalsConfig {
@@ -115,6 +121,10 @@ impl Default for ApprovalsConfig {
             mcp: always(),
             fetch: always(),
             other: always(),
+            // Session resume defaults to "ask": unlike the permission categories, auto-picking a
+            // resume mode has a real cost (a full resume can burn a big slice of usage limits), so
+            // Sparkle stays hands-off until the user opts into "summary" or "full".
+            resume: Some("ask".to_string()),
         }
     }
 }
@@ -416,6 +426,7 @@ struct PartialApprovals {
     mcp: Option<String>,
     fetch: Option<String>,
     other: Option<String>,
+    resume: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -631,6 +642,9 @@ fn apply_approvals(into: &mut ApprovalsConfig, p: Option<PartialApprovals>) {
     }
     if let Some(v) = p.other {
         into.other = Some(v);
+    }
+    if let Some(v) = p.resume {
+        into.resume = Some(v);
     }
 }
 
@@ -1182,9 +1196,13 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 # .sparkle/config.toml [approvals] overrides per category (project wins).
 # Categories: skill (skills) · bash (commands) · edit (file edits) · mcp (tool calls) ·
 # fetch (web requests) · other (other prompts).
+# The `resume` key is a SIBLING with its own value domain (not "always"/"never"): how to answer
+# Claude Code's session-resume prompt. "ask" (default) surfaces it; "summary" auto-picks "Resume
+# from summary"; "full" auto-picks "Resume full session". Only fires while [ai].auto_approve is on.
 # [approvals]
-# bash  = "never"    # opt bash back out — go back to confirming every command yourself
-# fetch = "never"    # or turn any other category back to ask-each-time
+# bash   = "never"     # opt bash back out — go back to confirming every command yourself
+# fetch  = "never"     # or turn any other category back to ask-each-time
+# resume = "summary"   # auto-resume from summary on every restart (or "full", or "ask")
 
 # --- Opinionated tools (per-machine; ignored in a project file) -------------------------
 # The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
@@ -2294,6 +2312,55 @@ mod tests {
         assert_eq!(cfg.approvals.mcp.as_deref(), Some("always"));
         assert_eq!(cfg.approvals.fetch.as_deref(), Some("always"));
         assert_eq!(cfg.approvals.other.as_deref(), Some("always"));
+        // The sibling `resume` key defaults to "ask" and is untouched by writing only bash.
+        assert_eq!(cfg.approvals.resume.as_deref(), Some("ask"));
+    }
+
+    #[test]
+    fn approvals_resume_defaults_to_ask() {
+        // Unlike the permission categories (which ship "always"), the session-resume sibling ships
+        // "ask" — Sparkle never auto-picks a resume mode until the user opts in.
+        let (cfg, _, _) = effective(None, None);
+        assert_eq!(cfg.approvals.resume.as_deref(), Some("ask"));
+    }
+
+    #[test]
+    fn approvals_resume_global_applies_and_project_overrides() {
+        // Global sets resume=summary; the project flips it to full. Project value beats global,
+        // same as the categories, and [approvals] stays repo-scoped (not reported as ignored).
+        let g = "[approvals]\nresume = \"summary\"\n";
+        let (cfg, _, _) = effective(Some(g), None);
+        assert_eq!(cfg.approvals.resume.as_deref(), Some("summary"), "global resume applies");
+
+        let p = "[approvals]\nresume = \"full\"\n";
+        let (cfg, warns, hard) = effective(Some(g), Some(p));
+        assert!(!hard);
+        assert_eq!(cfg.approvals.resume.as_deref(), Some("full"), "project resume beats global");
+        assert!(
+            !warns.iter().any(|w| w.contains("[approvals]")),
+            "per-project [approvals] (incl. resume) must be honored, not ignored"
+        );
+    }
+
+    #[test]
+    fn approvals_resume_project_ask_overrides_global_auto_resume() {
+        // The per-project opt-out end to end: a project's explicit resume="ask" must beat a global
+        // "summary"/"full", so ONE project can stop auto-resuming even when all-projects auto-resumes.
+        // This is the exact regression the configActions fix guards — assert it at the merge layer.
+        let g = "[approvals]\nresume = \"summary\"\n";
+        let p = "[approvals]\nresume = \"ask\"\n";
+        let (cfg, _, hard) = effective(Some(g), Some(p));
+        assert!(!hard);
+        assert_eq!(cfg.approvals.resume.as_deref(), Some("ask"), "project ask beats global summary");
+    }
+
+    #[test]
+    fn approvals_resume_preserved_when_only_a_category_is_written() {
+        // Writing only `bash = "always"` must NOT wipe the shipped "ask" default on resume — the
+        // same field-by-field overlay guarantee the categories rely on.
+        let g = "[approvals]\nbash = \"always\"\n";
+        let (cfg, _, _) = effective(Some(g), None);
+        assert_eq!(cfg.approvals.resume.as_deref(), Some("ask"));
     }
 
     #[test]

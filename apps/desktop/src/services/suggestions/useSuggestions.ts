@@ -7,7 +7,7 @@ import { useConnectionStore } from "../../stores/connectionStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { pushSuggestions } from "../relayClient";
 import { deriveCta } from "../../engine/agentCta";
-import { maybeAutoApprove } from "./approvalsRuntime";
+import { maybeAutoApprove, maybeAutoResume } from "./approvalsRuntime";
 import { detectPendingQuestion } from "./pendingQuestion";
 import { log } from "../../logger";
 import type { AgentTabStatus } from "../../types";
@@ -300,6 +300,20 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // "Yes" ONCE (signature de-duped) INSTEAD of surfacing buttons. Retire any phone copy and
         // show the inline "Auto-approved" note. The keystroke comes only from the local heuristic
         // tier, never the learned tier — the existing raw-keystroke trust boundary is preserved.
+        // Sparkle Auto-Resume (a sub-option of Auto-approve): the session-resume prompt has no
+        // Yes/No pair so the approval classifier ignores it. If the effective `resume` rule is
+        // "summary"/"full" (and the master toggle is on), the local detector types the matching
+        // digit ONCE and we suppress the buttons — same post-fire cleanup as auto-approve. Checked
+        // first because it shares the handledSigs de-dupe set and never overlaps a permission prompt.
+        const autoResume = maybeAutoResume(agentId, scrollback, handledSigs.current);
+        if (autoResume) {
+          setAutoApproved(null); // not a category note; just suppress the pills for this prompt
+          setButtons([]);
+          setQuestionPending(false); // answered on the user's behalf — nothing is pending
+          retire();
+          log.debug("suggestions", "auto-resumed", { agentId, mode: autoResume });
+          return;
+        }
         const autoCat = maybeAutoApprove(agentId, scrollback, handledSigs.current);
         if (autoCat) {
           setAutoApproved(autoCat);

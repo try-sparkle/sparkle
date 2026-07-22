@@ -18,9 +18,12 @@ import {
 } from "../voice/voiceDefaults";
 import {
   toApprovalMap,
+  asResumeRule,
+  DEFAULT_RESUME_RULE,
   type ApprovalCategory,
   type ApprovalMap,
   type ApprovalRule,
+  type ResumeRule,
 } from "../services/suggestions/approvalCategories";
 
 // --- Status-change notifications -------------------------------------------------------------
@@ -262,6 +265,11 @@ interface SettingsState {
    *  as the effective value when no project is in context and as the "all projects" scope in the
    *  approvals pane. Config-mirrored, NOT persisted. */
   approvals: ApprovalMap;
+  /** GLOBAL (all-projects) session-resume rule, mirrored from config.toml's `[approvals].resume`.
+   *  A SIBLING of `approvals` (own value domain — "ask"/"summary"/"full", not "always"/"never").
+   *  Per-project overrides live in approvalsStore; this is the all-projects layer / the effective
+   *  value when no project is in context. Config-mirrored, NOT persisted. */
+  resumeRule: ResumeRule;
   /** Auto-apply desktop updates: when on (default), a found update downloads + installs silently
    *  and applies on the next restart, with a quiet "ready" affordance. When off, the user gets a
    *  "Restart to apply / Later" prompt instead and nothing is installed until they choose. Read by
@@ -357,6 +365,9 @@ interface SettingsState {
   /** Optimistically set/clear a GLOBAL approval rule (configActions persists to [approvals]).
    *  `rule` null removes the category from the global mirror. */
   setGlobalApproval: (category: ApprovalCategory, rule: ApprovalRule | null) => void;
+  /** Optimistically set the GLOBAL session-resume rule (configActions persists to
+   *  [approvals].resume). Mirrors setGlobalApproval but for the resume sibling. */
+  setGlobalResume: (rule: ResumeRule) => void;
   /** Bulk-set every AI feature (the All / Off segments). */
   setAllAiFeatures: (on: boolean) => void;
   /** Optimistically set the custom wake word (configActions persists it to [voice].wake_word). */
@@ -402,6 +413,7 @@ export const useSettingsStore = create<SettingsState>()(
       aiSuggestedActions: true,
       aiAutoApprove: true,
       approvals: {},
+      resumeRule: DEFAULT_RESUME_RULE,
       autoApplyUpdates: true,
       notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
       sparkleImprovementConsent: DEFAULT_SPARKLE_CONSENT,
@@ -453,6 +465,7 @@ export const useSettingsStore = create<SettingsState>()(
           else delete next[category];
           return { approvals: next };
         }),
+      setGlobalResume: (rule) => set({ resumeRule: asResumeRule(rule) }),
       setWakeWord: (wakeWord) => set({ wakeWord }),
       setStopWord: (stopWord) => set({ stopWord }),
       setPauseOnSubmit: (pauseOnSubmit) => set({ pauseOnSubmit }),
@@ -509,6 +522,9 @@ export const useSettingsStore = create<SettingsState>()(
           // GLOBAL approval rules mirror. App.tsx hydrates from the global layer (no project root),
           // so this stays the all-projects view; per-project overrides come from approvalsStore.
           approvals: toApprovalMap(config.approvals),
+          // GLOBAL session-resume rule (sibling of approvals; own value domain). Coerced so an
+          // absent/unknown value degrades to "ask".
+          resumeRule: asResumeRule(config.approvals?.resume),
           // Workflow rules (display / advanced).
           requirePr: config.workflow.require_pr,
           worktreeIsolation: config.workflow.worktree_isolation,

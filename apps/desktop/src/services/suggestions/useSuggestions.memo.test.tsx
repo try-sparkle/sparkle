@@ -32,6 +32,7 @@ vi.mock("../relayClient", () => ({ pushSuggestions: vi.fn() }));
 const maybeAutoApprove = vi.fn(() => null as string | null);
 vi.mock("./approvalsRuntime", () => ({
   maybeAutoApprove: (...a: unknown[]) => maybeAutoApprove(...(a as [])),
+  maybeAutoResume: () => null,
 }));
 vi.mock("./pendingQuestion", () => ({ detectPendingQuestion: () => false }));
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { detectClaudeCodePicker, detectTerminalPrompts } from "./heuristics";
+import { detectClaudeCodePicker, detectResumePrompt, detectTerminalPrompts } from "./heuristics";
 
 // The exact rendered screen from the reporting bug (IMG_7383): Claude Code's AskUserQuestion
 // picker with a ❯ pointer on option 1, hard-wrapped option bodies, free-text entry underscores,
@@ -161,6 +161,61 @@ describe("detectClaudeCodePicker", () => {
       "\n",
     );
     expect(detectClaudeCodePicker(junk)).toEqual([]);
+  });
+});
+
+describe("detectResumePrompt", () => {
+  const RESUME_FOOTER = "Enter to confirm · Esc to cancel";
+  const RESUME_PROMPT = [
+    "This session is 6h 54m old and 196.3k tokens.",
+    "Resuming the full session will consume a substantial portion of your usage limits.",
+    "❯ 1. Resume from summary (recommended)",
+    "  2. Resume full session as-is",
+    "  3. Don't ask me again",
+    "",
+    RESUME_FOOTER,
+  ].join("\n");
+
+  it("returns the summary + full keystrokes for the real resume prompt", () => {
+    expect(detectResumePrompt(RESUME_PROMPT)).toEqual({ summaryOption: "1\n", fullOption: "2\n" });
+  });
+
+  it("reads the ACTUAL option numbers, not a hardcoded 1/2, when renumbered", () => {
+    // Claude Code could reorder the options — the digits must follow the labels, not their position.
+    const renumbered = [
+      "This session is 2d 3h old and 512.0k tokens.",
+      "❯ 1. Resume full session as-is",
+      "  2. Resume from summary (recommended)",
+      "  3. Don't ask me again",
+      "",
+      RESUME_FOOTER,
+    ].join("\n");
+    expect(detectResumePrompt(renumbered)).toEqual({ summaryOption: "2\n", fullOption: "1\n" });
+  });
+
+  it("returns null when only one of the two resume options is present", () => {
+    const summaryOnly = [
+      "This session is 6h 54m old and 196.3k tokens.",
+      "❯ 1. Resume from summary (recommended)",
+      "  2. Don't ask me again",
+      "",
+      RESUME_FOOTER,
+    ].join("\n");
+    expect(detectResumePrompt(summaryOnly)).toBeNull();
+  });
+
+  it("returns null for an unrelated picker", () => {
+    const other = [
+      "Pick a color:",
+      "❯ 1. Red",
+      "  2. Green",
+      "Enter to select · ↑/↓ to navigate · Esc to cancel",
+    ].join("\n");
+    expect(detectResumePrompt(other)).toBeNull();
+  });
+
+  it("returns null for ordinary output (no picker at all)", () => {
+    expect(detectResumePrompt("Compiling... done\n$ ")).toBeNull();
   });
 });
 

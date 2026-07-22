@@ -43,6 +43,10 @@ export interface ApprovalsConfig {
   mcp: string | null;
   fetch: string | null;
   other: string | null;
+  /** Session-resume rule. NOT an "always"/"never" category — one of "ask" | "summary" | "full"
+   *  (default "ask"). Governs how the Claude Code session-resume prompt is auto-answered while
+   *  [ai].auto_approve is on. Optional so callers guard: a Rust backend predating it omits it. */
+  resume?: string | null;
 }
 /** Opinionated non-AI tools (machine-wide; ignored in a per-project file). Each defaults on for a
  *  new install; false means that tool is used nowhere in Sparkle. Surfaced in the "Tools" pane. */

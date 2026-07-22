@@ -14,8 +14,14 @@ import { useProjectStore } from "../../stores/projectStore";
 import { aiFeatureVisibleNow } from "../aiGate";
 import { writePty } from "../../pty";
 import { classifyApproval } from "./approvalClassifier";
-import { detectClaudeCodePicker } from "./heuristics";
-import { toApprovalMap, type ApprovalCategory, type ApprovalRule } from "./approvalCategories";
+import { detectClaudeCodePicker, detectResumePrompt } from "./heuristics";
+import {
+  toApprovalMap,
+  asResumeRule,
+  type ApprovalCategory,
+  type ApprovalRule,
+  type ResumeRule,
+} from "./approvalCategories";
 import { log } from "../../logger";
 
 /** A stable signature of the picker instance in `scrollback` — its option keystrokes + labels. Used
@@ -59,6 +65,41 @@ export function maybeAutoApprove(
   return classification.category;
 }
 
+/**
+ * Decide whether to auto-answer the session-resume prompt (if any) currently in `scrollback`, and if
+ * so type the chosen mode's keystroke into the PTY exactly once per picker instance. Returns the mode
+ * it answered with ("summary" | "full", so the caller can suppress buttons + show a note), or null to
+ * fall through to the normal buttons.
+ *
+ * This is a SIBLING path to {@link maybeAutoApprove}: the resume prompt has no Yes/No pair, so the
+ * approval classifier deliberately ignores it. It rides the SAME master toggle (ai.auto_approve) —
+ * it's a sub-behavior of "auto-respond to prompts" — but its own `resume` rule decides the answer.
+ *
+ * SECURITY: the keystroke comes ONLY from the local heuristic detector (detectResumePrompt), never
+ * from the AI/learned suggestion tier — preserving the raw-keystroke trust boundary.
+ */
+export function maybeAutoResume(
+  agentId: string,
+  scrollback: string,
+  handled: Set<string>,
+): Exclude<ResumeRule, "ask"> | null {
+  const detected = detectResumePrompt(scrollback);
+  if (!detected) return null; // not the resume prompt (or missing an option) → never auto-type
+  // Gated on the SAME master toggle as auto-approve — this is a sub-option of it, so it must never
+  // fire while the parent is off.
+  if (!aiFeatureVisibleNow("autoApprove")) return null;
+  const root = projectRootForAgent(agentId);
+  const rule = effectiveResumeRule(root);
+  if (rule === "ask") return null; // user hasn't opted into auto-resuming → surface the prompt
+  const sig = pickerSignature(scrollback);
+  // Already answered THIS picker instance: keep buttons suppressed, but never re-send the keystroke.
+  if (handled.has(sig)) return rule;
+  handled.add(sig);
+  void writePty(agentId, rule === "summary" ? detected.summaryOption : detected.fullOption);
+  log.info("approvals", "auto-resumed", { agentId, mode: rule });
+  return rule;
+}
+
 /** The project root path that owns `agentId`, or null if it can't be resolved. */
 export function projectRootForAgent(agentId: string): string | null {
   const project = useProjectStore
@@ -82,6 +123,18 @@ export function effectiveApprovalRule(
   return global[category];
 }
 
+/** Effective session-resume rule for a project (imperative). Project override beats global; when the
+ *  project's value hasn't loaded (or there's no project) the global mirror answers. Always resolves
+ *  to a concrete rule ("ask" is the default), never undefined. */
+export function effectiveResumeRule(root: string | null): ResumeRule {
+  const global = useSettingsStore.getState().resumeRule;
+  if (!root) return global;
+  const proj = useApprovalsStore.getState().resumeByRoot[root];
+  // A loaded project value is already the merged effective view (Rust folds global in). Only fall
+  // through to the global mirror when it hasn't loaded yet.
+  return proj ?? global;
+}
+
 /**
  * Load and keep fresh the effective approval rules for `root` in approvalsStore. Mounted once per
  * project context (the composer). Re-pulls on every `config-changed` (a global OR project write
@@ -94,7 +147,10 @@ export function useSyncProjectApprovals(root: string | null): void {
     const pull = () =>
       getConfig(root)
         .then((eff) => {
-          if (!cancelled) useApprovalsStore.getState().setForRoot(root, toApprovalMap(eff.config.approvals));
+          if (cancelled) return;
+          useApprovalsStore.getState().setForRoot(root, toApprovalMap(eff.config.approvals));
+          // The resume sibling rides the same config pull (it lives in the same [approvals] table).
+          useApprovalsStore.getState().setResumeForRoot(root, asResumeRule(eff.config.approvals?.resume));
         })
         .catch((e) => log.debug("approvals", "getConfig failed", { root, e: String(e) }));
     void pull();

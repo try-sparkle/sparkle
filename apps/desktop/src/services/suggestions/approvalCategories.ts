@@ -59,3 +59,28 @@ export function toApprovalMap(
   }
   return map;
 }
+
+// --- Session resume (a SIBLING of the six categories, with its own value domain) --------------
+// `[approvals].resume` lives in the same TOML section and rides the same per-project override
+// machinery, but it is NOT an ApprovalCategory: its values are "ask" | "summary" | "full", not
+// "always"/"never". Keeping it a separate type is deliberate so it never leaks into the category
+// list, the classifier, or toApprovalMap.
+
+/** How to answer the Claude Code session-resume prompt. "ask" = surface it (default);
+ *  "summary" = auto-pick "Resume from summary"; "full" = auto-pick "Resume full session". */
+export type ResumeRule = "ask" | "summary" | "full";
+
+/** The default when the key is absent or unrecognized: stay hands-off. */
+export const DEFAULT_RESUME_RULE: ResumeRule = "ask";
+
+/** Narrow an arbitrary value (config / older backend) to a valid {@link ResumeRule}, else "ask". */
+export function asResumeRule(v: unknown): ResumeRule {
+  return v === "summary" || v === "full" || v === "ask" ? v : DEFAULT_RESUME_RULE;
+}
+
+/** The one friendly label per resume choice, as it reads in the approvals pane. */
+export const RESUME_RULE_LABEL: Record<ResumeRule, string> = {
+  ask: "Ask me each time",
+  summary: "Resume from summary",
+  full: "Resume full session",
+};

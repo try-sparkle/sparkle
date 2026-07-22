@@ -52,7 +52,7 @@ const CATEGORIES: Category[] = [
   { id: "accounts", label: "Accounts", Icon: FiUsers, blurb: "Your Sparkle and Claude accounts.", keywords: "sign in sign out claude sparkle login" },
   { id: "mobile", label: "Mobile", Icon: FiSmartphone, blurb: "Pair your phone with this Mac and manage paired devices.", keywords: "phone pair devices" },
   { id: "voice", label: "Voice controls", Icon: FiMic, blurb: "Wake word, stop word, and what happens when you submit.", keywords: "wake word stop word dictation microphone" },
-  { id: "approvals", label: "Auto-approve", Icon: FiCheckCircle, blurb: "Remember answers to Claude Code permission prompts and auto-answer matching ones.", keywords: "auto-approve approvals permission prompts skills commands bash edits mcp tools fetch remember yes nudge" },
+  { id: "approvals", label: "Auto-approve", Icon: FiCheckCircle, blurb: "Auto-answer Claude Code permission prompts, and choose how to auto-resume large sessions.", keywords: "auto-approve approvals permission prompts skills commands bash edits mcp tools fetch remember yes nudge resume session summary full continue" },
   { id: "advanced", label: "Advanced", Icon: FiSliders, blurb: "Edit the configuration file directly.", keywords: "config toml file raw editor" },
 ];
 

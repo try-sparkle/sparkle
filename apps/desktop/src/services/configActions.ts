@@ -24,7 +24,12 @@ import {
   type RoborevAuthVerdict,
 } from "./roborev";
 import { useApprovalsStore } from "../stores/approvalsStore";
-import type { ApprovalCategory, ApprovalRule } from "./suggestions/approvalCategories";
+import {
+  DEFAULT_RESUME_RULE,
+  type ApprovalCategory,
+  type ApprovalRule,
+  type ResumeRule,
+} from "./suggestions/approvalCategories";
 import { categoriesForPreset, type AutoApprovePreset } from "./autoApprovePreset";
 import {
   DEFAULT_WAKE_WORD,
@@ -148,6 +153,71 @@ export async function setAutoApprovePreset(preset: AutoApprovePreset): Promise<v
     await setConfigValues(Object.fromEntries(alwaysCats.map((cat) => [approvalPath(cat), "always"])));
   } catch (e) {
     console.warn("config write failed (auto-approve preset)", e);
+  }
+}
+
+/** The dotted config path for the session-resume rule (same key in both the global + project files).
+ *  A SIBLING of the approval categories under the same `[approvals]` table. */
+const RESUME_PATH = "approvals.resume";
+
+/**
+ * Set the session-resume rule at the given scope.
+ *
+ * Unlike the approval categories — which have a distinct `never` value to override a global
+ * `always` — the resume rule's only "off" state is `ask`. So a project must be able to sit on an
+ * EXPLICIT `ask` to opt out of a global `summary`/`full`; simply clearing the key would fold the
+ * project back to the (auto-resuming) global rule and there'd be no way to make one project stop.
+ * Therefore, at PROJECT scope, choosing `ask` writes an explicit `resume = "ask"` whenever the
+ * global rule auto-resumes; only when the global rule is itself `ask` (nothing to override) do we
+ * clear the key to keep config.toml clean. At GLOBAL scope, `ask` is the default so we clear it.
+ * A project write needs `projectRoot`; without one it falls back to the global scope.
+ */
+export async function setResumeRule(
+  rule: ResumeRule,
+  scope: ApprovalScope,
+  projectRoot: string | null,
+): Promise<void> {
+  if (scope === "project" && projectRoot) {
+    if (rule === DEFAULT_RESUME_RULE) {
+      const globalRule = useSettingsStore.getState().resumeRule;
+      // Effective value for this project is "ask" either way; the cache reflects that immediately.
+      useApprovalsStore.getState().setProjectResume(projectRoot, DEFAULT_RESUME_RULE);
+      try {
+        if (globalRule === DEFAULT_RESUME_RULE) {
+          // Nothing to override — drop the project key so we don't litter config with the default.
+          await unsetProjectConfigValue(projectRoot, RESUME_PATH);
+        } else {
+          // Global auto-resumes; persist an explicit project "ask" so THIS project still surfaces
+          // the prompt. This is the per-project opt-out the resume rule otherwise couldn't express.
+          await setProjectConfigValue(projectRoot, RESUME_PATH, DEFAULT_RESUME_RULE);
+        }
+      } catch (e) {
+        console.warn("config write failed (resume ask project)", e);
+      }
+      return;
+    }
+    useApprovalsStore.getState().setProjectResume(projectRoot, rule);
+    try {
+      await setProjectConfigValue(projectRoot, RESUME_PATH, rule);
+    } catch (e) {
+      console.warn("config write failed (resume project)", e);
+    }
+    return;
+  }
+  if (rule === DEFAULT_RESUME_RULE) {
+    useSettingsStore.getState().setGlobalResume(DEFAULT_RESUME_RULE);
+    try {
+      await unsetConfigValue(RESUME_PATH);
+    } catch (e) {
+      console.warn("config write failed (resume clear global)", e);
+    }
+    return;
+  }
+  useSettingsStore.getState().setGlobalResume(rule);
+  try {
+    await setConfigValue(RESUME_PATH, rule);
+  } catch (e) {
+    console.warn("config write failed (resume global)", e);
   }
 }
 
