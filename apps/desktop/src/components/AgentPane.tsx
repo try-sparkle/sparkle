@@ -93,6 +93,25 @@ export function buildShellSpawnArgs(shell: string, cmd: string): string[] {
   return ["-l", "-c", 'eval "$1"; exec "$0" -l', shell, cmd];
 }
 
+/** Settle a pane's "switch:<id>" waterfall against its visibility, returning the effect cleanup.
+ *
+ *  `selectAgent` starts the trace on every selection, but a pane only turns visible when it's the
+ *  selected agent AND no overlay (Tasks board / Sparkle pane) is covering the panes. So a selection
+ *  made *under* an overlay never paints:
+ *   - visible → end the trace after the next paint, recording click→pane-visible latency.
+ *   - not visible → ABANDON it. Leaving it open means the eventual overlay dismissal, seconds or
+ *     minutes later, ends it and reports that idle dwell as switch latency — a garbage outlier in
+ *     the metric, and until then a phantom "in-flight interaction" other perf instruments can see.
+ *     Dropping it keeps the metric honest: it measures the switches that actually painted. */
+export function settleSwitchTrace(key: string, visible: boolean): (() => void) | undefined {
+  if (!visible) {
+    perfCancel(key);
+    return undefined;
+  }
+  const raf = requestAnimationFrame(() => perfEnd(key, "painted"));
+  return () => cancelAnimationFrame(raf);
+}
+
 interface SpawnCmd {
   command: string;
   args: string[];
@@ -792,15 +811,8 @@ function AgentPaneInner({
     });
   }, [scrollIntent, visible, ptyReady, agent.id, consumeScrollIntent]);
 
-  // Switch waterfall end (perfTrace): when this pane becomes the visible one, close its "switch:<id>"
-  // trace after the next paint — capturing click→pane-visible latency (the cost of switching agents).
-  // No-op when no switch was in flight (perfEnd ignores an unstarted key), e.g. a re-render that keeps
-  // the same pane visible.
-  useEffect(() => {
-    if (!visible) return;
-    const raf = requestAnimationFrame(() => perfEnd(`switch:${agent.id}`, "painted"));
-    return () => cancelAnimationFrame(raf);
-  }, [visible, agent.id]);
+  // Switch waterfall end (perfTrace) — see settleSwitchTrace.
+  useEffect(() => settleSwitchTrace(`switch:${agent.id}`, visible), [visible, agent.id]);
 
   return (
     <div
