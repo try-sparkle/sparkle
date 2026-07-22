@@ -203,6 +203,18 @@ describe("orchestrationPersona", () => {
     expect(p).toMatch(/conflict/i);
   });
 
+  it("tells it to land its OWN PR via `gh pr merge --merge`, not to hand off a manual command", () => {
+    // The Composer "Merge PR" CTA prompts the build agent to merge; the persona must permit that
+    // one sanctioned, GitHub-gated path rather than declaring itself blocked from touching main.
+    expect(p).toMatch(/gh pr merge <PR#> --merge/);
+    // It must own the merge end-to-end, not punt it back to the user.
+    expect(p).toMatch(/do not hand the user a raw command|not to explain that you're blocked|RUN the\n?\s*merge/i);
+    // And it must still forbid DIRECT main writes (the 2026-06-23 merge-mess mitigation).
+    expect(p).toMatch(/never .*write to `main` locally|direct-`?main`? writes/i);
+    // The strategy flag is required non-interactively — the exact footgun from the field report.
+    expect(p).toMatch(/no strategy flag fails/i);
+  });
+
   it("tells it to spin_down_worker after merging and to report the consolidated outcome", () => {
     expect(p).toContain("spin_down_worker");
     expect(p).toMatch(/report|consolidated/i);
