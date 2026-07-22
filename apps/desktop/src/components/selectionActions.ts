@@ -4,8 +4,6 @@
 import { writePty } from "../pty";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { appendNote, createTask } from "../services/projectFs";
-import { useHandoffStore } from "../stores/handoffStore";
-import type { CaptureAttachment } from "../capture/types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -24,41 +22,6 @@ export function truncateTitle(text: string, max = 80): string {
   const firstLine = (text.split("\n")[0] ?? "").trim();
   const chars = [...firstLine]; // code-point aware: never split an astral char / surrogate pair
   return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : firstLine;
-}
-
-/** Open (or reuse) the project's singleton think agent and queue an initial prompt.
- *  `attachments` (capture screenshots) ride along on the handoff when provided. */
-export function openThink(
-  projectId: string,
-  text: string,
-  autoSend: boolean,
-  attachments?: CaptureAttachment[],
-): void {
-  const ps = useProjectStore.getState();
-  const project = ps.projects.find((p) => p.id === projectId);
-  if (!project) return;
-  const existing = project.agents.find((a) => a.kind === "think");
-  const id = existing ? existing.id : ps.addAgent(projectId, { kind: "think" });
-  useUiStore.getState().setActiveSpecial(null);
-  ps.selectAgent(projectId, id);
-  useRuntimeStore.getState().open(id);
-  useHandoffStore
-    .getState()
-    .setPending(
-      attachments?.length ? { projectId, text, autoSend, attachments } : { projectId, text, autoSend },
-    );
-}
-
-export function thinkWith(projectId: string, text: string): void {
-  openThink(projectId, text, false);
-}
-
-export function explain(projectId: string, text: string): void {
-  openThink(projectId, `Explain this:\n\n${text}`, true);
-}
-
-export function askWith(projectId: string, question: string, text: string): void {
-  openThink(projectId, `${question}\n\n${text}`, true);
 }
 
 // Neutralize bracketed-paste markers embedded in untrusted selection text so it can't

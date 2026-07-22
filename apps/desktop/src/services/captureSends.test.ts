@@ -17,7 +17,7 @@ import type { Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 
 const payload = (projectId: string): CaptureSendPayload => ({
-  mode: "think",
+  mode: "build",
   projectId,
   text: "narration",
   attachments: [{ path: "/tmp/shot.png", dataUrl: "data:image/png;base64,AA" }],

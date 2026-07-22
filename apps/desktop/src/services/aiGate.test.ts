@@ -75,17 +75,17 @@ describe("aiFeatureNow — credits × per-feature flag", () => {
   it("credits + flag on -> true", () => {
     account({ balanceCents: 500 });
     useSettingsStore.getState().setAllAiFeatures(true);
-    expect(aiFeatureNow("brainstorm")).toBe(true);
+    expect(aiFeatureNow("autoRename")).toBe(true);
   });
   it("credits + flag off -> false (feature toggled off in preferences)", () => {
     account({ balanceCents: 500 });
-    useSettingsStore.getState().setAiFeature("brainstorm", false);
-    expect(aiFeatureNow("brainstorm")).toBe(false);
+    useSettingsStore.getState().setAiFeature("autoRename", false);
+    expect(aiFeatureNow("autoRename")).toBe(false);
   });
   it("out of credits + flag on -> false (even when entitled)", () => {
     account({ balanceCents: 0, entitled: true });
     useSettingsStore.getState().setAllAiFeatures(true);
-    expect(aiFeatureNow("brainstorm")).toBe(false);
+    expect(aiFeatureNow("autoRename")).toBe(false);
     expect(aiFeatureNow("suggestedActions")).toBe(false);
   });
   it("credits unlock the feature even for a non-entitled account", () => {
@@ -120,7 +120,6 @@ describe("aiFeatureNow — credits × per-feature flag", () => {
     // voiceDictation -> cloudDictation: turning that one off must not affect the others.
     useSettingsStore.getState().setCloudDictation(false);
     expect(aiFeatureNow("voiceDictation")).toBe(false);
-    expect(aiFeatureNow("brainstorm")).toBe(true);
     expect(aiFeatureNow("composer")).toBe(true);
     expect(aiFeatureNow("autoRename")).toBe(true);
   });

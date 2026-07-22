@@ -414,7 +414,7 @@ describe("runtimeStore — pushed/shipped wired live (sparkle-v7d0)", () => {
 });
 
 // Seed a connected PAT + a project with one agent of the given kind; returns ids + handles.
-async function setup(kind: "build" | "think") {
+async function setup(kind: "build" | "shell") {
   const { runtime, settings, projects } = await freshModules();
   settings.useSettingsStore.getState().setChiefPat("pat_x");
   const projectId = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
@@ -448,8 +448,8 @@ describe("scheduleChiefSync — debounced per-project sync", () => {
 
 describe("runChiefSync — store glue ()", () => {
 
-  it("skips Think agents (they have no worktree / commits)", async () => {
-    const { runtime, projectId, agentId } = await setup("think");
+  it("skips Shell agents (they have no worktree / commits)", async () => {
+    const { runtime, projectId, agentId } = await setup("shell");
     await runtime.runChiefSync(projectId, agentId);
     expect(syncProjectMarkdown).not.toHaveBeenCalled();
   });
@@ -615,12 +615,12 @@ describe("runChiefSync — store glue ()", () => {
     }
   });
 
-  it("falls back to a workflow agent's worktree when triggered via a Think or Shell agent's id", async () => {
+  it("falls back to a workflow agent's worktree when triggered via a Shell agent's id", async () => {
     const { runtime, settings, projects } = await freshModules();
     settings.useSettingsStore.getState().setChiefPat("pat_x");
     const projectId = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
-    const thinkAgentId = projects.useProjectStore.getState().addAgent(projectId, { kind: "think" });
-    // Shell also has no worktree — fallback must skip it and pick the Build agent.
+    const shellAgentId = projects.useProjectStore.getState().addAgent(projectId, { kind: "shell" });
+    // A second shell also has no worktree — fallback must skip it and pick the Build agent.
     projects.useProjectStore.getState().addAgent(projectId, { kind: "shell" });
     const buildAgentId = projects.useProjectStore.getState().addAgent(projectId, { kind: "build" });
     syncProjectMarkdown.mockResolvedValue({
@@ -630,9 +630,9 @@ describe("runChiefSync — store glue ()", () => {
       deletedAssetIds: [],
     });
 
-    await runtime.runChiefSync(projectId, thinkAgentId);
+    await runtime.runChiefSync(projectId, shellAgentId);
 
-    // Think + shell have no worktree; the Build agent's id must be used for the sync.
+    // Shell agents have no worktree; the Build agent's id must be used for the sync.
     expect(syncProjectMarkdown).toHaveBeenCalledWith(
       expect.objectContaining({ agentId: buildAgentId }),
     );

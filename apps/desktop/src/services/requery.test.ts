@@ -2,14 +2,10 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import type { AgentKind, AgentTab, Project } from "../types";
 import type { AgentTabStatus } from "@sparkle/ui";
 
-// Re-query talks to agents two ways: PTY agents via submitPrompt, Think agents via
-// the bridge. Mock both so the dispatcher's routing/filtering is what's under test.
+// Re-query talks to PTY agents via submitPrompt. Mock it so the dispatcher's
+// routing/filtering is what's under test.
 const submitPrompt = vi.fn();
 vi.mock("../pty", () => ({ submitPrompt: (...a: unknown[]) => submitPrompt(...a) }));
-const sendToThink = vi.fn();
-vi.mock("./thinkBridge", () => ({
-  sendToThink: (...a: unknown[]) => sendToThink(...a),
-}));
 // Silence the failure log so a deliberately-rejecting agent doesn't print to the test output.
 vi.mock("../logger", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -55,7 +51,6 @@ function seed(agents: AgentTab[], open: string[], status: Record<string, AgentTa
 
 beforeEach(() => {
   submitPrompt.mockReset();
-  sendToThink.mockReset();
 });
 
 describe("requeryOpenAgents — PTY (build/worker) agents", () => {
@@ -105,15 +100,6 @@ describe("requeryOpenAgents — PTY (build/worker) agents", () => {
     submitPrompt.mockRejectedValueOnce(new Error("pty dead"));
     await expect(requeryOpenAgents()).resolves.toBeUndefined();
     expect(submitPrompt).toHaveBeenCalledWith("b2", REQUERY_PROMPT);
-  });
-});
-
-describe("requeryOpenAgents — Think agents", () => {
-  it("routes to the think bridge regardless of PTY status", async () => {
-    seed([agent("c1", "think")], ["c1"], {});
-    await requeryOpenAgents();
-    expect(sendToThink).toHaveBeenCalledWith("c1", REQUERY_PROMPT);
-    expect(submitPrompt).not.toHaveBeenCalled();
   });
 });
 

@@ -7,14 +7,14 @@ export interface CaptureAttachment { path: string; dataUrl: string }
  *  serde camelCase). Same fields as CaptureAttachment, kept as a distinct name so the
  *  Rust↔frontend contract is greppable. */
 export interface CaptureShot { path: string; dataUrl: string }
-export type CaptureSendMode = "think" | "plan" | "build";
+export type CaptureSendMode = "plan" | "build";
 export interface CaptureSendPayload {
   mode: CaptureSendMode;
   projectId: string;
   text: string;                       // narration transcript / typed text
   attachments: CaptureAttachment[];   // length 1 in v1
   // Build-only routing (mode === "build"), set by the Build options menu in CaptureApp. Ignored
-  // for think/plan. `forceNewAgent` wins over `targetAgentId`: it makes dispatchBuild ALWAYS spawn
+  // for plan. `forceNewAgent` wins over `targetAgentId`: it makes dispatchBuild ALWAYS spawn
   // a fresh build agent instead of reusing an existing one ("New build agent"). `targetAgentId`
   // routes the capture into that EXACT existing build agent (an entry the user picked from the
   // menu) rather than dispatchBuild's default first-build-agent auto-reuse. Neither set → the

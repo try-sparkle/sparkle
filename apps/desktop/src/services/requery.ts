@@ -1,11 +1,10 @@
 // requery — when connectivity returns, nudge every open agent so it reports where it stands.
-// PTY (build/worker) agents get the prompt typed into their terminal; Think agents get it
-// via the imperative bridge. Driven by connectionMonitor on the offline→online edge. ()
+// PTY (build/worker) agents get the prompt typed into their terminal. Driven by connectionMonitor
+// on the offline→online edge. ()
 import type { AgentTabStatus } from "@sparkle/ui";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { submitPrompt } from "../pty";
-import { sendToThink } from "./thinkBridge";
 import { log } from "../logger";
 
 /** What we send each agent on reconnect. One shared constant so the wording lives in one place. */
@@ -30,7 +29,7 @@ export function shouldRequery(prev: boolean, next: boolean): boolean {
   return prev === false && next === true;
 }
 
-/** Send the status-update prompt to every open agent, routed by kind and gated by PTY status. */
+/** Send the status-update prompt to every open agent, gated by PTY status. */
 export async function requeryOpenAgents(): Promise<void> {
   const { projects } = useProjectStore.getState();
   const { openAgentIds, status } = useRuntimeStore.getState();
@@ -42,13 +41,9 @@ export async function requeryOpenAgents(): Promise<void> {
       // Isolate each agent: a single dead PTY (a "done"/exited process whose write rejects)
       // must not abort the loop and strand every later agent's re-query.
       try {
-        if (agent.kind === "think") {
-          sendToThink(agent.id, REQUERY_PROMPT);
-        } else {
-          const st = status[agent.id];
-          if (st && SAFE_TO_REQUERY.has(st)) {
-            await submitPrompt(agent.id, REQUERY_PROMPT);
-          }
+        const st = status[agent.id];
+        if (st && SAFE_TO_REQUERY.has(st)) {
+          await submitPrompt(agent.id, REQUERY_PROMPT);
         }
       } catch (e) {
         log.error("connectivity", `re-query failed for agent ${agent.id}`, e);

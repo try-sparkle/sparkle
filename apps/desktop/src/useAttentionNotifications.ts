@@ -26,8 +26,6 @@ import { useSettingsStore } from "./stores/settingsStore";
 import { useScrollIntentStore } from "./stores/scrollIntentStore";
 import { useProjectStore } from "./stores/projectStore";
 import { useUiStore } from "./stores/uiStore";
-import { revealModeForKind } from "./engine/workMode";
-import { aiFeatureNow } from "./services/aiGate";
 import {
   useCurrentProjectId,
   useCurrentWindowLabel,
@@ -185,10 +183,10 @@ export function selectAndOpen(projectId: string, agentId: string): void {
     .projects.find((p) => p.id === projectId)
     ?.agents.find((a) => a.id === agentId);
   useUiStore.getState().setActiveSpecial(null);
-  // Gate-aware so this can't fight reconcileWorkMode: a gated-off think agent maps to Build (its
-  // ThinkPanel pane still shows by kind; only the chevron/row stays on Build).
+  // Every agent's pane is a terminal now, surfaced under the Build chevron — switch to it so the
+  // revealed agent is actually shown (rather than sitting behind the Plan board).
   if (agent) {
-    useUiStore.getState().setWorkMode(revealModeForKind(agent.kind, aiFeatureNow("brainstorm")));
+    useUiStore.getState().setWorkMode("build");
   }
   useRuntimeStore.getState().open(agentId);
   useProjectStore.getState().selectAgent(projectId, agentId);

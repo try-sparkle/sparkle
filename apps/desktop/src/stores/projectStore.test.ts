@@ -416,9 +416,10 @@ describe("projectStore migration — shell/shellCommand (v4)", () => {
   });
 });
 
-describe("projectStore migration — brainstorm→think rename (v7)", () => {
-  it("remaps the legacy 'brainstorm' agent kind to 'think'", () => {
-    // A v6 record persisted before the Think rename still carries kind: "brainstorm".
+describe("projectStore migration — legacy Think kinds → build", () => {
+  it("remaps a legacy 'brainstorm' agent kind (v6) straight to 'build'", () => {
+    // A v6 record persisted before the Think rename still carries kind: "brainstorm". Think has since
+    // been removed, so the migration collapses it directly to a build agent.
     const v6 = {
       projects: [
         {
@@ -437,8 +438,33 @@ describe("projectStore migration — brainstorm→think rename (v7)", () => {
     const out = migratePersisted(v6, 6) as {
       projects: Array<{ agents: Array<{ id: string; kind: unknown }> }>;
     };
-    expect(out.projects[0]!.agents[0]!.kind).toBe("think");
-    // Non-brainstorm kinds are left untouched.
+    expect(out.projects[0]!.agents[0]!.kind).toBe("build");
+    // Non-Think kinds are left untouched.
+    expect(out.projects[0]!.agents[1]!.kind).toBe("build");
+  });
+
+  it("remaps a persisted 'think' agent kind (v11) to 'build'", () => {
+    // A record saved while the Think tab still existed carries kind: "think". The v12 migration
+    // turns it into a normal build agent (its worktree is provisioned lazily on next open).
+    const v11 = {
+      projects: [
+        {
+          id: "p",
+          name: "P",
+          rootPath: "/x",
+          defaultBranch: "main",
+          agents: [
+            { id: "a", name: "Think", kind: "think", parentId: null, baseBranch: null },
+            { id: "b", name: "Build 1", kind: "build", parentId: null, baseBranch: "main" },
+          ],
+        },
+      ],
+      selectedProjectId: null,
+    } as unknown;
+    const out = migratePersisted(v11, 11) as {
+      projects: Array<{ agents: Array<{ id: string; kind: unknown }> }>;
+    };
+    expect(out.projects[0]!.agents[0]!.kind).toBe("build");
     expect(out.projects[0]!.agents[1]!.kind).toBe("build");
   });
 });

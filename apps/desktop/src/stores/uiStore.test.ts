@@ -81,11 +81,9 @@ describe("uiStore workMode", () => {
     expect(useUiStore.getState().workMode).toBe("build");
   });
 
-  it("setWorkMode switches between think/plan/build", () => {
+  it("setWorkMode switches between plan/build", () => {
     useUiStore.getState().setWorkMode("plan");
     expect(useUiStore.getState().workMode).toBe("plan");
-    useUiStore.getState().setWorkMode("think");
-    expect(useUiStore.getState().workMode).toBe("think");
     useUiStore.getState().setWorkMode("build");
     expect(useUiStore.getState().workMode).toBe("build");
   });

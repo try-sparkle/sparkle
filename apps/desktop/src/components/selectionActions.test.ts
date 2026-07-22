@@ -17,17 +17,13 @@ import {
   truncateTitle,
   fixInAgent,
   sendToAgent,
-  thinkWith,
-  explain,
   runAsCommand,
 } from "./selectionActions";
-import { useHandoffStore } from "../stores/handoffStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 
 beforeEach(() => {
   writePtyMock.mockClear();
-  useHandoffStore.setState({ pending: null });
   useProjectStore.setState({ projects: [], selectedProjectId: null });
   useRuntimeStore.setState({ status: {}, openAgentIds: [], branchStatus: {} });
 });
@@ -99,40 +95,6 @@ describe("PTY actions", () => {
     const occurrences = payload.split("\x1b[201~").length - 1;
     expect(occurrences).toBe(1);
     expect(payload.endsWith("\x1b[201~")).toBe(true);
-  });
-});
-
-describe("think hand-off", () => {
-  it("thinkWith creates the singleton think agent and queues the text (no auto-send)", () => {
-    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    thinkWith(pid, "selected text");
-    const agents = useProjectStore.getState().projects[0]!.agents;
-    expect(agents.filter((a) => a.kind === "think")).toHaveLength(1);
-    expect(useHandoffStore.getState().pending).toEqual({
-      projectId: pid,
-      text: "selected text",
-      autoSend: false,
-    });
-  });
-
-  it("explain frames the prompt and sets auto-send", () => {
-    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    explain(pid, "stack trace");
-    expect(useHandoffStore.getState().pending).toEqual({
-      projectId: pid,
-      text: "Explain this:\n\nstack trace",
-      autoSend: true,
-    });
-  });
-
-  it("thinkWith reuses an existing think agent instead of making a second", () => {
-    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    thinkWith(pid, "one");
-    thinkWith(pid, "two");
-    const thinks = useProjectStore
-      .getState()
-      .projects[0]!.agents.filter((a) => a.kind === "think");
-    expect(thinks).toHaveLength(1);
   });
 });
 

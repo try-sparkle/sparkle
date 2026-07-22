@@ -1,6 +1,6 @@
 // The capture takeover (spec §3): rendered in the dedicated transparent `capture` window, so the
 // full-viewport scrim IS the window dressing. A shot arrives over `capture://shot`, the user
-// narrates (dictation) or types, picks a project, and routes it to Think / Plan / Build — which
+// narrates (dictation) or types, picks a project, and routes it to Plan / Build — which
 // just broadcasts `capture://send` and hides; the owning project window does the work (Task 4).
 import { useEffect, useRef, useState } from "react";
 import { C, FONT_WEIGHT, THEME_HEX } from "../theme/colors";
@@ -30,7 +30,6 @@ const CREAM = THEME_HEX.dark.cream;
 const MUTED = THEME_HEX.dark.muted;
 
 const MODES: Array<{ mode: CaptureSendMode; label: string }> = [
-  { mode: "think", label: "Think" },
   { mode: "plan", label: "Plan" },
   { mode: "build", label: "Build" },
 ];
@@ -176,8 +175,8 @@ export function CaptureApp() {
       projectId,
       text,
       attachments: captures.map((c) => ({ path: c.path, dataUrl: c.dataUrl })),
-      // Build-only routing (see the Build menu below); omitted for think/plan so their payloads
-      // stay byte-for-byte as before.
+      // Build-only routing (see the Build menu below); omitted for plan so its payload
+      // stays byte-for-byte as before.
       ...(buildOpts?.forceNewAgent ? { forceNewAgent: true } : {}),
       ...(buildOpts?.targetAgentId ? { targetAgentId: buildOpts.targetAgentId } : {}),
     };

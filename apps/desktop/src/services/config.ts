@@ -28,7 +28,6 @@ export interface WorkersConfig {
 export interface AiConfig {
   auto_rename: boolean;
   voice_dictation: boolean;
-  brainstorm: boolean;
   composer: boolean;
   suggested_actions: boolean;
   /** Master switch for Sparkle Auto-Approve (nudging + auto-answering). Default true. */

@@ -61,11 +61,11 @@ export type ThemePref = "auto" | "light" | "dark";
 // feature. Default is "attention" — reordering is the out-of-the-box behavior.
 export type AgentOrdering = "attention" | "manual";
 
-// Sidebar workflow mode — which of the Think / Plan / Build chevrons is active. Lifted out of
-// AgentSidebar's local state into the store so other components (e.g. ThinkPanel's "Make a Plan"
-// button) can switch tabs by calling setWorkMode. Deliberately NOT persisted (see partialize) so
-// it defaults to "build" on every launch, exactly as the old local useState default did.
-export type WorkMode = "think" | "plan" | "build";
+// Sidebar workflow mode — which of the Plan / Build chevrons is active. Lifted out of
+// AgentSidebar's local state into the store so other components can switch tabs by calling
+// setWorkMode. Deliberately NOT persisted (see partialize) so it defaults to "build" on every
+// launch, exactly as the old local useState default did.
+export type WorkMode = "plan" | "build";
 
 interface UiState {
   composerHeight: number;
@@ -102,7 +102,7 @@ interface UiState {
   // Sidebar agent ordering preference (see AgentOrdering). Persisted in `sparkle-ui`.
   agentOrdering: AgentOrdering;
   setAgentOrdering: (v: AgentOrdering) => void;
-  // Active sidebar workflow mode (Think/Plan/Build chevrons). Shared so non-sidebar components can
+  // Active sidebar workflow mode (Plan/Build chevrons). Shared so non-sidebar components can
   // switch tabs. NOT persisted (see partialize) — resets to "build" each launch like the old local state.
   workMode: WorkMode;
   setWorkMode: (m: WorkMode) => void;

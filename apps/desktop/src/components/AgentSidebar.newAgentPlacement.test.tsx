@@ -91,19 +91,4 @@ describe("AgentSidebar — new-agent button placement", () => {
     expect(wrapper.style.position).not.toBe("sticky");
     expect(wrapper.nextElementSibling?.textContent).toMatch(/No Build agents yet/);
   });
-
-  it("applies the same placement rules to + New Think Agent in Think mode", () => {
-    useUiStore.setState({ workMode: "think" });
-    const { rerender } = render(<AgentSidebar project={project} />);
-    const sc = screen.getByTestId("agent-list-scroll");
-    // Fits → below the list.
-    expect(wrapperOf(/New Think Agent/).style.position).not.toBe("sticky");
-    expect(wrapperOf(/New Think Agent/).parentElement).toBe(sc);
-    // Overflows → sticky at the top.
-    setListHeights(rerender, 500, 100);
-    const wrapper = wrapperOf(/New Think Agent/);
-    expect(wrapper.style.position).toBe("sticky");
-    expect(wrapper.parentElement).toBe(sc);
-    expect(sc.firstElementChild).toBe(wrapper);
-  });
 });

@@ -59,7 +59,6 @@ import { Composer, type ComposerApi } from "./Composer";
 import { DragVisionHintPill } from "./DragVisionHintPill";
 import { useDragVisionHint } from "../hooks/useDragVisionHint";
 import { Onboarding } from "./Onboarding";
-import { ThinkPanel } from "./ThinkPanel";
 import { paneVisibilityStyle } from "./paneVisibility";
 import { perfRender, perfMark, perfEnd, perfCancel } from "../perfTrace";
 
@@ -201,11 +200,11 @@ function AgentPaneInner({
   // The terminal pane box, so the drag-vision hint pill can anchor just above it.
   const terminalStageRef = useRef<HTMLDivElement>(null);
   // Drag-vision hint (spec 2026-07-02): when the composer is OFF (no overlay to catch drops), an
-  // image dragged onto the terminal shows a "enable AI Features for vision" pill. Only the visible,
-  // non-think pane listens — the webview drag event is window-global, so gating on `visible`
-  // keeps every background pane from popping its own pill for the same drag. With the composer ON,
-  // Composer.tsx owns the drop (attaches the image), so this listener stands down (!aiComposer).
-  const dragHint = useDragVisionHint(visible && !aiComposer && agent.kind !== "think");
+  // image dragged onto the terminal shows a "enable AI Features for vision" pill. Only the visible
+  // pane listens — the webview drag event is window-global, so gating on `visible` keeps every
+  // background pane from popping its own pill for the same drag. With the composer ON, Composer.tsx
+  // owns the drop (attaches the image), so this listener stands down (!aiComposer).
+  const dragHint = useDragVisionHint(visible && !aiComposer);
 
   // Composer occlusion watch. The composer floats over the terminal's bottom rows by design (it
   // covers Claude's input line so typing lands here), but Claude draws its MENUS in that same
@@ -369,13 +368,11 @@ function AgentPaneInner({
 
   const prepare = async () => {
     // Prepare the project ONCE per root BEFORE the kind-specific early returns: warm the spawn
-    // caches and — critically — ensure the folder is a git repo. Think/Chief and Shell agents run
-    // in-place in the project root with no worktree, so without this an entire project could be
-    // built in a folder that never becomes a git repo and is unrecoverable if the app loses the
-    // project (the hazel-eco case). Idempotent + fire-and-forget (never throws, never blocks).
+    // caches and — critically — ensure the folder is a git repo. Shell agents run in-place in the
+    // project root with no worktree, so without this an entire project could be built in a folder
+    // that never becomes a git repo and is unrecoverable if the app loses the project (the
+    // hazel-eco case). Idempotent + fire-and-forget (never throws, never blocks).
     prewarmProjectCaches(project.rootPath);
-    // Think agents are a Chief chat — no worktree, no PTY, nothing to prepare.
-    if (agent.kind === "think") return;
     // Shell agents (Run-as-cmd) run a raw command in the project root, then drop into an
     // interactive login shell so output stays visible and follow-up commands work. No worktree,
     // no claude — spawn straight away.
@@ -826,13 +823,6 @@ function AgentPaneInner({
         background: C.forest,
       }}
     >
-      {/* Think agents render a Chief chat instead of a Claude terminal. */}
-      {agent.kind === "think" && (
-        <ThinkPanel project={project} agentId={agent.id} visible={visible} />
-      )}
-
-      {agent.kind !== "think" && (
-        <>
       <PinnedPrompt
         prompt={agent.lastPrompt}
         // Composer/seed prompts only — picker answers live in the raw history (for naming's
@@ -1006,8 +996,6 @@ function AgentPaneInner({
             <DragVisionHintPill anchorRef={terminalStageRef} onDismiss={dragHint.dismiss} />
           )}
         </div>
-      )}
-        </>
       )}
     </div>
   );

@@ -49,11 +49,10 @@ const project = (agents: AgentTab[]): Project => ({
 });
 
 beforeEach(() => {
-  useProjectStore.setState({ projects: [project([agent("a-think", "think"), agent("a-build", "build")])] });
+  useProjectStore.setState({ projects: [project([agent("a-worker", "worker"), agent("a-build", "build")])] });
   useRuntimeStore.setState({ openAgentIds: [] });
   // Start from the worst case for visibility: parked on the Plan board, chevron on Build.
   useUiStore.setState({ activeSpecial: "board", workMode: "build" });
-  // Brainstorm gate ON by default (entitled + feature flag) so a think reveal can land on Think.
   useSettingsStore.getState().setAllAiFeatures(true);
   useAuthStore.setState({
     me: { clerkUserId: "u", entitled: true, balanceCents: 20000, tokenVersion: 1 },
@@ -63,31 +62,21 @@ beforeEach(() => {
 });
 
 describe("selectAndOpen — reveals a cross-window-focused agent", () => {
-  it("leaves the special overlay and switches the chevron to a THINK agent's mode", () => {
-    selectAndOpen("p1", "a-think");
+  it("leaves the special overlay and switches the chevron to Build, opening the agent", () => {
+    useUiStore.setState({ activeSpecial: "board", workMode: "plan" });
+    selectAndOpen("p1", "a-worker");
     expect(useUiStore.getState().activeSpecial).toBeNull();
-    expect(useUiStore.getState().workMode).toBe("think");
-    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a-think");
-    expect(useRuntimeStore.getState().openAgentIds).toContain("a-think");
+    expect(useUiStore.getState().workMode).toBe("build");
+    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a-worker");
+    expect(useRuntimeStore.getState().openAgentIds).toContain("a-worker");
   });
 
   it("switches the chevron to Build for a build/worker/shell agent", () => {
-    useUiStore.setState({ activeSpecial: "sparkle", workMode: "think" });
+    useUiStore.setState({ activeSpecial: "sparkle", workMode: "plan" });
     selectAndOpen("p1", "a-build");
     expect(useUiStore.getState().activeSpecial).toBeNull();
     expect(useUiStore.getState().workMode).toBe("build");
     expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a-build");
-  });
-
-  it("reveals a think agent as Build when the brainstorm gate is OFF (can't fight reconcile)", () => {
-    // No Think chevron exists when gated off, so forcing Think would just be reverted by
-    // reconcileWorkMode, re-hiding the agent. Land on Build; the ThinkPanel pane still shows by kind.
-    useAuthStore.setState({ me: null, tokenPresent: false, loading: false }); // un-entitled → gate off
-    useUiStore.setState({ activeSpecial: "board", workMode: "build" });
-    selectAndOpen("p1", "a-think");
-    expect(useUiStore.getState().activeSpecial).toBeNull();
-    expect(useUiStore.getState().workMode).toBe("build");
-    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a-think");
   });
 
   it("still selects + clears the overlay when the agent isn't found (no mode change)", () => {

@@ -33,11 +33,10 @@ describe("AdvancedConfigMenu", () => {
     fireEvent.click(box);
     const after = useSettingsStore.getState();
     expect(after.autoApplyUpdates).toBe(false);
-    // All five AI feature flags are untouched by the updates toggle.
+    // The AI feature flags are untouched by the updates toggle.
     const aiFlags = (s: typeof after) => ({
       aiAutoRename: s.aiAutoRename,
       cloudDictation: s.cloudDictation,
-      aiBrainstorm: s.aiBrainstorm,
       aiComposer: s.aiComposer,
       aiSuggestedActions: s.aiSuggestedActions,
     });

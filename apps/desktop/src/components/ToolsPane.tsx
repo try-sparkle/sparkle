@@ -221,10 +221,9 @@ const SHOWCASE: ShowcaseTool[] = [
 ];
 
 export function ToolsPane({ query = "" }: { query?: string }) {
-  // AI flags: Chief = brainstorm, Deepgram = voiceDictation. The AI master derives from all five.
+  // AI flags: Deepgram = voiceDictation. The AI master derives from all of them.
   const aiAutoRename = useSettingsStore((s) => s.aiAutoRename);
   const cloudDictation = useSettingsStore((s) => s.cloudDictation);
-  const aiBrainstorm = useSettingsStore((s) => s.aiBrainstorm);
   const aiComposer = useSettingsStore((s) => s.aiComposer);
   const aiSuggestedActions = useSettingsStore((s) => s.aiSuggestedActions);
   const aiAutoApprove = useSettingsStore((s) => s.aiAutoApprove);
@@ -240,23 +239,12 @@ export function ToolsPane({ query = "" }: { query?: string }) {
     aiFeatureMode({
       aiAutoRename,
       cloudDictation,
-      aiBrainstorm,
       aiComposer,
       aiSuggestedActions,
       aiAutoApprove,
     }) === "off";
 
   const toggleTools: ToggleTool[] = [
-    {
-      key: "chief",
-      Icon: FiMessageSquare,
-      name: "Chief",
-      desc: "Powers the Think agent — brainstorming grounded in your project's knowledge base.",
-      url: "https://storytell.ai",
-      ai: true,
-      checked: aiBrainstorm,
-      onToggle: () => void setAiFeature("brainstorm", !aiBrainstorm),
-    },
     {
       key: "deepgram",
       Icon: FiMic,

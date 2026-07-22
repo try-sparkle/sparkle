@@ -67,7 +67,6 @@ pub struct WorkersConfig {
 pub struct AiConfig {
     pub auto_rename: bool,
     pub voice_dictation: bool,
-    pub brainstorm: bool,
     pub composer: bool,
     pub suggested_actions: bool,
     /// Master switch for Sparkle Auto-Approve (nudging + auto-answering Claude Code permission
@@ -131,8 +130,8 @@ impl Default for ApprovalsConfig {
 
 /// Opinionated non-AI tools Sparkle uses (surfaced in the ⋯ Settings → "Tools" pane). Machine-wide
 /// (like [ai]): a per-project value is ignored with a warning. Each bool default true = the tool
-/// ships on for every new install; false = that tool is used nowhere in Sparkle. Chief/Deepgram are
-/// NOT here — they stay in [ai] (brainstorm / voice_dictation) so there's no duplication.
+/// ships on for every new install; false = that tool is used nowhere in Sparkle. Deepgram is
+/// NOT here — it stays in [ai] (voice_dictation) so there's no duplication.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ToolsConfig {
@@ -299,7 +298,6 @@ impl Default for SparkleConfig {
             ai: AiConfig {
                 auto_rename: true,
                 voice_dictation: true,
-                brainstorm: true,
                 composer: true,
                 suggested_actions: true,
                 auto_approve: true,
@@ -412,7 +410,6 @@ struct PartialWorkers {
 struct PartialAi {
     auto_rename: Option<bool>,
     voice_dictation: Option<bool>,
-    brainstorm: Option<bool>,
     composer: Option<bool>,
     suggested_actions: Option<bool>,
     auto_approve: Option<bool>,
@@ -605,9 +602,6 @@ fn apply_ai(into: &mut AiConfig, p: Option<PartialAi>) {
     }
     if let Some(v) = p.voice_dictation {
         into.voice_dictation = v;
-    }
-    if let Some(v) = p.brainstorm {
-        into.brainstorm = v;
     }
     if let Some(v) = p.composer {
         into.composer = v;
@@ -1177,7 +1171,6 @@ agent_heap_mb = 3072
 [ai]
 auto_rename     = true   # auto-name worker agents from the work they're doing
 voice_dictation = true   # use the cloud (Deepgram) STT for dictation; off = on-device model
-brainstorm      = true   # show the Think agent (chat with Chief)
 composer        = true   # use the AI-enhanced composer; off = a plain terminal input
 # suggested_actions = true   # show one-click suggested action buttons in the composer
 # auto_approve  = true   # Sparkle Auto-Approve: MASTER switch for auto-answering Claude Code
@@ -1206,8 +1199,8 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 
 # --- Opinionated tools (per-machine; ignored in a project file) -------------------------
 # The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
-# new install; setting one false means that tool is used NOWHERE in Sparkle. (Chief and Deepgram
-# voice are AI features — toggle them under [ai] as brainstorm / voice_dictation.)
+# new install; setting one false means that tool is used NOWHERE in Sparkle. (Deepgram voice is an
+# AI feature — toggle it under [ai] as voice_dictation.)
 [tools]
 analytics  = true   # anonymous usage + masked session replay (PostHog); off sends nothing
 beads      = true   # the in-repo work graph behind the Plan board; off hides it + skips `bd`
@@ -2590,7 +2583,7 @@ mod tests {
         assert!(!cfg.ai.composer);
         assert_eq!(cfg.workers.max_concurrent, 3);
         // Untouched key keeps its value.
-        assert!(cfg.ai.brainstorm);
+        assert!(cfg.ai.voice_dictation);
     }
 
     #[test]

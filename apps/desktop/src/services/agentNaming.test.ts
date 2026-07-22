@@ -105,14 +105,13 @@ describe("shouldRename — tactical command filter", () => {
   });
 });
 
-describe("isSelfNamingAgent (build/worker self-report; think/shell do not)", () => {
+describe("isSelfNamingAgent (build/worker self-report; shell does not)", () => {
   it("treats the Claude-Code kinds (build, worker) as self-reporting", () => {
     expect(isSelfNamingAgent({ kind: "build" })).toBe(true);
     expect(isSelfNamingAgent({ kind: "worker" })).toBe(true);
   });
 
-  it("does NOT treat think (Chief chat) or shell (raw command) as self-reporting", () => {
-    expect(isSelfNamingAgent({ kind: "think" })).toBe(false);
+  it("does NOT treat shell (raw command) as self-reporting", () => {
     expect(isSelfNamingAgent({ kind: "shell" })).toBe(false);
   });
 });
@@ -222,7 +221,7 @@ describe("namingOutcome — labels the branch (Phase 2c observation, sparkle-rl8
     // describes the work, judged by the SAME shouldRename heuristic with the title as the basis (see
     // namingOutcome rung 1 — Claude Code never refreshes the title, so a permanent block froze names).
     // "Login Redirect Fix" overlaps the substantive prompt and still blocks; "Title" does not and yields.
-    const kinds: NamingDecisionOpts["kind"][] = ["build", "worker", "think", "shell"];
+    const kinds: NamingDecisionOpts["kind"][] = ["build", "worker", "shell"];
     const prompts = ["fix the login redirect bug", "yes", "push to production", "ok"];
     for (const kind of kinds) {
       for (const namePinned of [false, true]) {
@@ -482,8 +481,7 @@ describe("isUnpinnedDefaultName — the kind default pattern", () => {
     expect(isUnpinnedDefaultName("worker", "Worker")).toBe(false); // no number
     expect(isUnpinnedDefaultName("build", "Worker 1")).toBe(false); // wrong-kind label
   });
-  it("is never true for non-self-naming kinds (think/shell have no name-from-work default)", () => {
-    expect(isUnpinnedDefaultName("think", "Think")).toBe(false);
+  it("is never true for non-self-naming kinds (shell has no name-from-work default)", () => {
     expect(isUnpinnedDefaultName("shell", "Shell 1")).toBe(false);
   });
 });
@@ -494,8 +492,7 @@ describe("isNameFromWorkCandidate — shared eligibility gate for both tiers", (
     expect(isNameFromWorkCandidate(base)).toBe(true);
     expect(isNameFromWorkCandidate({ ...base, kind: "worker", name: "Worker 2" })).toBe(true);
   });
-  it("THINK / SHELL are never candidates", () => {
-    expect(isNameFromWorkCandidate({ ...base, kind: "think", name: "Think" })).toBe(false);
+  it("SHELL is never a candidate", () => {
     expect(isNameFromWorkCandidate({ ...base, kind: "shell", name: "Shell 1" })).toBe(false);
   });
   it("no worktree → not a candidate (hasn't done real work yet)", () => {
@@ -702,11 +699,7 @@ describe("maybeNameFromWork — Tier 2 paid backstop", () => {
     expect(currentName()).toBe("Build 1");
   });
 
-  it("THINK / SHELL on a default name → NOT eligible", async () => {
-    seed(workAgent({ kind: "think", name: "Think" }));
-    await maybeNameFromWork("p1", "a1");
-    expect(invoke).not.toHaveBeenCalled();
-    __resetNamingGuards();
+  it("SHELL on a default name → NOT eligible", async () => {
     seed(workAgent({ kind: "shell", name: "Shell 1" }));
     await maybeNameFromWork("p1", "a1");
     expect(invoke).not.toHaveBeenCalled();

@@ -5,11 +5,10 @@ import type { AgentTabStatus } from "@sparkle/ui";
 
 export type Runtime = "local" | "cloud";
 
-// What kind of agent this is (spec: Think vs Build). A "think" agent chats with
-// Chief over the project's knowledge (no worktree/PTY). A "build" agent is a master
-// orchestrator you talk to (a Claude terminal) that spawns "worker" sub-agents — each a
-// terminal agent in its own worktree, shown indented under its build parent in the sidebar.
-export type AgentKind = "think" | "build" | "worker" | "shell";
+// What kind of agent this is. A "build" agent is a master orchestrator you talk to (a Claude
+// terminal) that spawns "worker" sub-agents — each a terminal agent in its own worktree, shown
+// indented under its build parent in the sidebar. A "shell" agent runs a raw command (Run-as-cmd).
+export type AgentKind = "build" | "worker" | "shell";
 
 // An auto-generated agent name: a short `title` (3–5 words) for the sidebar plus a one-sentence
 // `description` of the work, produced together in one naming call. The sidebar shows the title
@@ -57,7 +56,7 @@ export interface AgentAlertRecord {
 export interface AgentTab {
   id: string;
   name: string;
-  kind: AgentKind; // think | build | worker | shell (legacy agents migrate to "build")
+  kind: AgentKind; // build | worker | shell (legacy think agents migrate to "build")
   parentId: string | null; // for workers: the build agent that owns them; else null
   runtime: Runtime; // v1: always "local"; cloud is shown-but-disabled
   worktreePath: string | null; // Sparkle-managed isolated dir (hidden from user)

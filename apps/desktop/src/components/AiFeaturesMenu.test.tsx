@@ -14,11 +14,10 @@ afterEach(() => cleanup());
 
 const mode = () => aiFeatureMode(useSettingsStore.getState());
 
-// The four AI-feature checkboxes, addressed by label.
+// The three AI-feature checkboxes, addressed by label.
 const AI_LABELS = [
   "Auto-rename workers based on the work they're doing",
   "Use AI-enhanced voice dictation for much better accuracy",
-  "Enable the AI Think agent (chat with Chief)",
   "Use AI-enhanced composer",
 ];
 const aiBoxes = () => AI_LABELS.map((l) => screen.getByRole("checkbox", { name: l }));
@@ -29,7 +28,7 @@ describe("AiFeaturesMenu", () => {
     expect(mode()).toBe("all");
     // The four AI-feature checkboxes are all checked.
     const boxes = aiBoxes();
-    expect(boxes).toHaveLength(4);
+    expect(boxes).toHaveLength(3);
     expect(boxes.every((b) => b.getAttribute("aria-checked") === "true")).toBe(true);
     expect(screen.getByText("All").getAttribute("aria-pressed")).toBe("true");
   });
@@ -62,14 +61,13 @@ describe("AiFeaturesMenu", () => {
   it("'Some' is status-only — clicking it does not change the flags", () => {
     render(<AiFeaturesMenu />);
     // Put it in a mixed state first so "Some" is showing.
-    fireEvent.click(screen.getByRole("checkbox", { name: /Enable the AI Think agent/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /AI-enhanced composer/ }));
     const before = { ...useSettingsStore.getState() };
     fireEvent.click(screen.getByText("Some"));
     const after = useSettingsStore.getState();
-    expect([after.aiAutoRename, after.cloudDictation, after.aiBrainstorm, after.aiComposer]).toEqual([
+    expect([after.aiAutoRename, after.cloudDictation, after.aiComposer]).toEqual([
       before.aiAutoRename,
       before.cloudDictation,
-      before.aiBrainstorm,
       before.aiComposer,
     ]);
   });

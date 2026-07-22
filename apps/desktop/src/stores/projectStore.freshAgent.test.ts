@@ -44,9 +44,9 @@ describe("projectStore — freshBuildAgentId lifecycle", () => {
     expect(proj().freshBuildAgentId).toBe(second);
   });
 
-  it("opening a THINK agent does NOT steal the build slot", () => {
+  it("opening a SHELL agent does NOT steal the build slot", () => {
     const build = useProjectStore.getState().addAgent("p1", { kind: "build" });
-    useProjectStore.getState().addAgent("p1", { kind: "think" });
+    useProjectStore.getState().addAgent("p1", { kind: "shell" });
     expect(proj().freshBuildAgentId).toBe(build);
   });
 

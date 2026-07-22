@@ -72,18 +72,16 @@ describe("configActions", () => {
     expect([
       s.aiAutoRename,
       s.cloudDictation,
-      s.aiBrainstorm,
       s.aiComposer,
       s.aiSuggestedActions,
       s.aiAutoApprove,
-    ]).toEqual([false, false, false, false, false, false]);
+    ]).toEqual([false, false, false, false, false]);
     // A single batched write — not separate ones (the anti-flicker fix).
     expect(setConfigValues).toHaveBeenCalledTimes(1);
     expect(setConfigValue).not.toHaveBeenCalled();
     expect(setConfigValues).toHaveBeenCalledWith({
       "ai.auto_rename": false,
       "ai.voice_dictation": false,
-      "ai.brainstorm": false,
       "ai.composer": false,
       "ai.suggested_actions": false,
       "ai.auto_approve": false,
@@ -164,20 +162,15 @@ describe("configActions", () => {
 
   it("a write failure is swallowed but the optimistic store update stays", async () => {
     (setConfigValue as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("no ipc"));
-    await setAiFeature("brainstorm", false);
-    expect(useSettingsStore.getState().aiBrainstorm).toBe(false);
+    await setAiFeature("composer", false);
+    expect(useSettingsStore.getState().aiComposer).toBe(false);
   });
 
   it("a bulk write failure is swallowed but all optimistic flags stay", async () => {
     (setConfigValues as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("no ipc"));
     await setAllAiFeatures(false);
     const s = useSettingsStore.getState();
-    expect([s.aiAutoRename, s.cloudDictation, s.aiBrainstorm, s.aiComposer]).toEqual([
-      false,
-      false,
-      false,
-      false,
-    ]);
+    expect([s.aiAutoRename, s.cloudDictation, s.aiComposer]).toEqual([false, false, false]);
   });
 
   describe("setRoborevEnabled", () => {

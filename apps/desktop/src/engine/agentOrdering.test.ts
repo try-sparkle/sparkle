@@ -241,28 +241,19 @@ describe("firstVisibleAgentId", () => {
     pinnedIndex: number | null = null,
   ): Ag => ({ id, kind, parentId, pinnedIndex });
 
-  it("Build mode skips think agents even when one is first in insertion order", () => {
-    // The original bug: agents[0] is a think agent, so removeAgent's raw fallback strands the
-    // Build sidebar on the Think pane. Build mode must land on the first BUILD row instead.
-    const agents = [ag("t1", "think"), ag("b1", "build"), ag("b2", "build")];
+  it("Build mode lands on the first top-level row in insertion order", () => {
+    const agents = [ag("b1", "build"), ag("b2", "build")];
     expect(firstVisibleAgentId(agents, "build", "manual", {})).toBe("b1");
-  });
-
-  it("Think mode lands on the first think agent", () => {
-    const agents = [ag("b1", "build"), ag("t1", "think"), ag("t2", "think")];
-    expect(firstVisibleAgentId(agents, "think", "manual", {})).toBe("t1");
   });
 
   it("Plan mode is treated like Build for selection (plan sidebar paints no rows)", () => {
     // Selection still matters in plan mode (it persists for the switch back to Build), so the
-    // helper deliberately picks the first build-side row rather than null.
-    const agents = [ag("t1", "think"), ag("b1", "build")];
+    // helper deliberately picks the first row rather than null.
+    const agents = [ag("b1", "build"), ag("b2", "build")];
     expect(firstVisibleAgentId(agents, "plan", "manual", {})).toBe("b1");
   });
 
-  it("returns null when the active mode has no rows (→ blank first-load state)", () => {
-    const agents = [ag("t1", "think"), ag("t2", "think")];
-    expect(firstVisibleAgentId(agents, "build", "manual", {})).toBeNull();
+  it("returns null when there are no rows (→ blank first-load state)", () => {
     expect(firstVisibleAgentId([], "build", "manual", {})).toBeNull();
   });
 
@@ -327,17 +318,17 @@ describe("orderedTopLevelAgents — fresh boost end-to-end", () => {
     ]);
   });
 
-  it("never surfaces worker agents as top-level rows — nested or orphaned, both modes", () => {
+  it("never surfaces worker agents as top-level rows — nested or orphaned", () => {
     const agents = [
       ag("b1", "build"),
       ag("w1", "worker", "b1"), // nested under a live orchestrator
       ag("w2", "worker", "gone"), // orphaned (parent gone)
-      ag("t1", "think"),
+      ag("s1", "shell"),
     ];
-    // Build mode: only the build orchestrator, no workers.
-    expect(orderedTopLevelAgents(agents, {}, "build", false).map((x) => x.id)).toEqual(["b1"]);
-    // Think mode: only think agents, and certainly no workers.
-    expect(orderedTopLevelAgents(agents, {}, "think", false).map((x) => x.id)).toEqual(["t1"]);
+    // Only the build orchestrator + the shell agent, no workers.
+    expect(orderedTopLevelAgents(agents, {}, "build", false).map((x) => x.id)).toEqual(["b1", "s1"]);
+    // Plan is treated the same as Build for the row set (Plan renders a board in the main pane).
+    expect(orderedTopLevelAgents(agents, {}, "plan", false).map((x) => x.id)).toEqual(["b1", "s1"]);
     // A lone orphaned worker yields an empty stack, not a stray row.
     expect(orderedTopLevelAgents([ag("w2", "worker", "gone")], {}, "build", false)).toEqual([]);
   });

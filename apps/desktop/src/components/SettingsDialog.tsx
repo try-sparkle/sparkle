@@ -42,7 +42,7 @@ interface Category {
 }
 
 const CATEGORIES: Category[] = [
-  { id: "ai", label: "AI features", Icon: FiZap, blurb: "Each feature degrades to a non-AI baseline when off.", keywords: "chief brainstorm think composer dictation deepgram voice auto-rename suggested actions" },
+  { id: "ai", label: "AI features", Icon: FiZap, blurb: "Each feature degrades to a non-AI baseline when off.", keywords: "composer dictation deepgram voice auto-rename suggested actions" },
   { id: "tools", label: "Tools", Icon: FiTool, blurb: "The opinionated stack that powers Sparkle — toggle what you use.", keywords: "chief deepgram voice dictation beads plan board github import usage analytics posthog privacy claude code roborev review superpowers skills" },
   { id: "credits", label: "Credits", Icon: FiCreditCard, blurb: "Your AI credit balance, top-ups, and usage.", keywords: "balance top-up billing payment" },
   { id: "notifications", label: "Notifications", Icon: FiBell, blurb: "Which agent transitions raise a desktop banner.", keywords: "banner alerts desktop" },

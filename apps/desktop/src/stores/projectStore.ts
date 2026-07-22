@@ -68,9 +68,8 @@ export interface AddAgentOpts {
 }
 
 // Default display name for a freshly created agent, numbered within its kind so you get
-// "Build 1", "Worker 2", etc. Think agents are singular per project by convention.
+// "Build 1", "Worker 2", etc.
 function defaultAgentName(p: Project, kind: AgentKind): string {
-  if (kind === "think") return "Think";
   const label = kind === "worker" ? "Worker" : kind === "shell" ? "Shell" : "Build";
   const n = p.agents.filter((a) => a.kind === kind).length + 1;
   return `${label} ${n}`;
@@ -302,13 +301,14 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
     }));
   }
   if (version < 7) {
-    // "Think" rename: the agent kind formerly persisted as "brainstorm" is now "think". Remap the
-    // old literal so legacy records route to the Think panel instead of falling through to a build
-    // terminal. The old value is matched as a raw string since it's no longer part of AgentKind.
+    // The agent kind formerly persisted as "brainstorm" was renamed to "think", which has since been
+    // removed entirely. Remap the legacy literal straight to "build" (the v12 step below does the same
+    // for "think"), so a legacy chat-only agent becomes a build agent that provisions its worktree on
+    // next open. Matched as a raw string since neither literal is part of AgentKind anymore.
     state.projects = state.projects.map((p) => ({
       ...p,
       agents: (p.agents ?? []).map((a) =>
-        (a.kind as string) === "brainstorm" ? { ...a, kind: "think" } : a,
+        (a.kind as string) === "brainstorm" ? { ...a, kind: "build" } : a,
       ),
     }));
   }
@@ -371,6 +371,18 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
         ...a,
         promptHistory: (a.promptHistory ?? []).map((e) => ({ ...e, source: e.source ?? "composer" })),
       })),
+    }));
+  }
+  if (version < 12) {
+    // The "think" agent kind (Chief chat, no worktree/PTY) was removed with the Think tab. Remap any
+    // persisted think agent to "build" so it becomes a normal build agent — its worktree is
+    // provisioned lazily on next open, and its chat prompt history rides along harmlessly. Matched as
+    // a raw string since "think" is no longer part of AgentKind.
+    state.projects = state.projects.map((p) => ({
+      ...p,
+      agents: (p.agents ?? []).map((a) =>
+        (a.kind as string) === "think" ? { ...a, kind: "build" } : a,
+      ),
     }));
   }
   // Version-collision safety net. PR #62 shipped shellCommand as v4 on its own branch while main
@@ -1256,7 +1268,7 @@ export const useProjectStore = create<ProjectState>()(
       // v11 backfills removedIds: {} — the shared removal tombstones the union merge needs
       // (sparkle-pckz). An older blob simply has no recorded deletions, which is the safe default:
       // the union keeps everything, and the first close in the new build starts the map.
-      version: 11,
+      version: 12,
       migrate: (persisted, version) =>
         perfSpan("persist.migrate", () => migratePersisted(persisted, version), { version }) as ProjectState,
       // sparkle-pckz: a UNION merge, so no rehydrate (startup or cross-window) can evict a record

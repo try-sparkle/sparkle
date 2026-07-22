@@ -41,7 +41,6 @@ import {
 const AI_CONFIG_PATH: Record<AiFeatureKey, string> = {
   autoRename: "ai.auto_rename",
   voiceDictation: "ai.voice_dictation",
-  brainstorm: "ai.brainstorm",
   composer: "ai.composer",
   suggestedActions: "ai.suggested_actions",
   autoApprove: "ai.auto_approve",

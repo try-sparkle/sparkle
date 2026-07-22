@@ -111,11 +111,11 @@ export function orderAgents<T extends { id: string; pinnedIndex: number | null }
 
 /**
  * The single source of truth for the agent stack BOTH the sidebar list and the TopBar dot
- * cluster render: top-level agents (only think or build agents — the orchestrators), filtered
- * by the active work mode (Think → think agents; otherwise everything non-think, i.e. build
- * agents), then attention-ordered the same way. Keeping both consumers on this one helper is
- * what stops the header dots from drifting out of sync with the rows — the bug this was
- * extracted to prevent. Pure and id-preserving.
+ * cluster render: top-level agents (the build orchestrators), then attention-ordered the same way.
+ * Keeping both consumers on this one helper is what stops the header dots from drifting out of sync
+ * with the rows — the bug this was extracted to prevent. Pure and id-preserving. `workMode` is
+ * accepted for signature stability with its callers; the rows are the same for Plan and Build (Plan
+ * renders a board in the main pane, not a different agent list).
  *
  * Workers are NEVER top-level rows (`kind !== "worker"`). The user works with orchestrators; a
  * worker is reached only by opening its parent orchestrator's card, which nests its own workers
@@ -129,15 +129,14 @@ export function orderedTopLevelAgents<
 >(
   agents: readonly T[],
   statusMap: Record<string, AgentTabStatus>,
-  workMode: "think" | "plan" | "build",
+  _workMode: "plan" | "build",
   attentionOrder: boolean,
   freshId?: string | null,
 ): T[] {
   const buildIds = new Set(agents.filter((a) => a.kind === "build").map((a) => a.id));
   const topLevel = agents
     .filter((a) => a.kind !== "worker")
-    .filter((a) => !a.parentId || !buildIds.has(a.parentId))
-    .filter((a) => (workMode === "think" ? a.kind === "think" : a.kind !== "think"));
+    .filter((a) => !a.parentId || !buildIds.has(a.parentId));
   return attentionOrder ? orderAgents(topLevel, statusMap, freshId) : topLevel;
 }
 
@@ -151,16 +150,14 @@ export function orderedTopLevelAgents<
  * back to Build, so we pick the first build-side row rather than clearing it. This is a
  * selection helper, not a 1:1 mirror of which rows the plan sidebar paints.
  *
- * Used to keep selection coherent after a close: `removeAgent`'s own fallback is raw
- * `agents[0]` (insertion order, any kind), which can strand a Build-mode sidebar on a hidden
- * Think agent's pane. Picking the first VISIBLE row (or `null` → blank first-load state) instead
- * keeps the main pane and the sidebar in agreement.
+ * Used to keep selection coherent after a close: picking the first row (or `null` → blank
+ * first-load state) keeps the main pane and the sidebar in agreement.
  */
 export function firstVisibleAgentId<
   T extends { id: string; kind: AgentKind; parentId: string | null; pinnedIndex: number | null },
 >(
   agents: readonly T[],
-  mode: "think" | "plan" | "build",
+  mode: "plan" | "build",
   agentOrdering: "attention" | "manual",
   statusMap: Record<string, AgentTabStatus>,
   freshId?: string | null,

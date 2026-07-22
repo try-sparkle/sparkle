@@ -26,7 +26,6 @@ function seedAllOn() {
   useSettingsStore.setState({
     aiAutoRename: true,
     cloudDictation: true,
-    aiBrainstorm: true,
     aiComposer: true,
     aiSuggestedActions: true,
     aiAutoApprove: true,
@@ -43,7 +42,6 @@ function seedAiOff() {
   useSettingsStore.setState({
     aiAutoRename: false,
     cloudDictation: false,
-    aiBrainstorm: false,
     aiComposer: false,
     aiSuggestedActions: false,
     aiAutoApprove: false,
@@ -56,13 +54,12 @@ function seedAiOff() {
 }
 
 /** A MIXED AI state (aiFeatureMode = "some"): the master isn't Off, so the AI rows stay live and
- *  each reflects its own flag (brainstorm on, voiceDictation off). */
+ *  each reflects its own flag (composer on, voiceDictation off). */
 function seedAiSome() {
   useSettingsStore.setState({
     aiAutoRename: false,
-    cloudDictation: false,
-    aiBrainstorm: true, // Chief on
-    aiComposer: false,
+    cloudDictation: false, // Deepgram off
+    aiComposer: true, // some other AI feature on → mode "some"
     aiSuggestedActions: false,
     aiAutoApprove: false,
     analyticsEnabled: true,
@@ -85,10 +82,9 @@ describe("ToolsPane", () => {
     expect(screen.getByText("Your tools")).toBeTruthy();
     expect(screen.getByText("Built into Sparkle")).toBeTruthy();
 
-    // Exactly the seven toggleable tools carry a switch (Roborev is now a real toggle, not showcase).
-    expect(screen.getAllByRole("switch")).toHaveLength(7);
+    // Exactly the six toggleable tools carry a switch (Roborev is now a real toggle, not showcase).
+    expect(screen.getAllByRole("switch")).toHaveLength(6);
     for (const name of [
-      "Chief",
       "Deepgram voice",
       "Guardrails",
       "Roborev",
@@ -136,10 +132,8 @@ describe("ToolsPane", () => {
     expect(setToolEnabled).toHaveBeenCalledWith("guardrails", false);
   });
 
-  it("toggles Chief through the [ai].brainstorm feature, and Deepgram through voiceDictation", () => {
+  it("toggles Deepgram through the [ai].voice_dictation feature", () => {
     render(<ToolsPane />);
-    fireEvent.click(screen.getByRole("switch", { name: "Chief" }));
-    expect(setAiFeature).toHaveBeenCalledWith("brainstorm", false);
     fireEvent.click(screen.getByRole("switch", { name: "Deepgram voice" }));
     expect(setAiFeature).toHaveBeenCalledWith("voiceDictation", false);
   });
@@ -147,29 +141,23 @@ describe("ToolsPane", () => {
   it("locks the AI tools (disabled + off) and shows a hint when the AI master is Off", () => {
     seedAiOff();
     render(<ToolsPane />);
-    const chief = screen.getByRole("switch", { name: "Chief" }) as HTMLButtonElement;
     const deepgram = screen.getByRole("switch", { name: "Deepgram voice" }) as HTMLButtonElement;
-    expect(chief.disabled).toBe(true);
     expect(deepgram.disabled).toBe(true);
-    expect(chief.getAttribute("aria-checked")).toBe("false");
     expect(deepgram.getAttribute("aria-checked")).toBe("false");
-    // A hint on each AI row.
-    expect(screen.getAllByText("Turn on AI features to use this tool.")).toHaveLength(2);
+    // A hint on the AI row.
+    expect(screen.getAllByText("Turn on AI features to use this tool.")).toHaveLength(1);
     // A clicked locked switch writes nothing.
-    fireEvent.click(chief);
+    fireEvent.click(deepgram);
     expect(setAiFeature).not.toHaveBeenCalled();
   });
 
   it("keeps the AI rows live in 'some' mode, each reflecting its own flag", () => {
     seedAiSome();
     render(<ToolsPane />);
-    const chief = screen.getByRole("switch", { name: "Chief" }) as HTMLButtonElement;
     const deepgram = screen.getByRole("switch", { name: "Deepgram voice" }) as HTMLButtonElement;
-    // Master isn't Off, so neither AI row is locked...
-    expect(chief.disabled).toBe(false);
+    // Master isn't Off, so the AI row is not locked...
     expect(deepgram.disabled).toBe(false);
-    // ...and each mirrors its individual flag (brainstorm on, voiceDictation off).
-    expect(chief.getAttribute("aria-checked")).toBe("true");
+    // ...and it mirrors its individual flag (voiceDictation off).
     expect(deepgram.getAttribute("aria-checked")).toBe("false");
     // No lock hint in this state.
     expect(screen.queryByText("Turn on AI features to use this tool.")).toBeNull();
@@ -186,9 +174,9 @@ describe("ToolsPane", () => {
 
   it("opens the provider URL from Learn more (scoped to the specific tool row)", () => {
     render(<ToolsPane />);
-    // Target Chief's link by its accessible name so the assertion doesn't ride on row order.
-    fireEvent.click(screen.getByRole("button", { name: "Learn more about Chief" }));
-    expect(openUrl).toHaveBeenCalledWith("https://storytell.ai");
+    // Target Deepgram's link by its accessible name so the assertion doesn't ride on row order.
+    fireEvent.click(screen.getByRole("button", { name: "Learn more about Deepgram voice" }));
+    expect(openUrl).toHaveBeenCalledWith("https://deepgram.com");
     // A showcase row's link too (Superpowers → GitHub).
     fireEvent.click(screen.getByRole("button", { name: "Learn more about Superpowers" }));
     expect(openUrl).toHaveBeenCalledWith("https://github.com/obra/superpowers");

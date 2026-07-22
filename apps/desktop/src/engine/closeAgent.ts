@@ -51,8 +51,7 @@ export type CloseSelectionAgent = {
  *  - If the agent that was OPEN (`selectedId`, or one of its workers) was torn down, re-point
  *    selection at the first visible row of the current work `mode` — or `null` (the blank
  *    first-load state with the "+ New Build Agent" CTA) when no rows remain. `removeAgent`'s own
- *    fallback is raw `agents[0]` (insertion order, any kind), which can strand a Build-mode
- *    sidebar on a hidden Think agent's pane; this keeps the pane and sidebar in agreement.
+ *    fallback is raw `agents[0]` (insertion order); this keeps the pane and sidebar in agreement.
  *  - If a row OTHER than the open one was closed, selection stays put (`reselect: false`).
  */
 export function selectionAfterClose<T extends CloseSelectionAgent>(
@@ -60,7 +59,7 @@ export function selectionAfterClose<T extends CloseSelectionAgent>(
   selectedId: string | null,
   agentsBefore: readonly T[],
   agentsAfter: readonly T[],
-  mode: "think" | "plan" | "build",
+  mode: "plan" | "build",
   agentOrdering: "attention" | "manual",
   statusMap: Record<string, AgentTabStatus>,
 ): { reselect: boolean; next: string | null } {

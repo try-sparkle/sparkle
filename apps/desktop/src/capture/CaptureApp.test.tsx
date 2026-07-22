@@ -78,7 +78,6 @@ describe("CaptureApp", () => {
 
     expect(screen.getByTestId("capture-scrim")).toBeTruthy();
     expect(screen.getByAltText("Captured screenshot")).toBeTruthy();
-    expect(screen.getByText("Think ❯")).toBeTruthy();
     expect(screen.getByText("Plan ❯")).toBeTruthy();
     // Build now opens an options menu, so it's badged with a ▾ affordance, not the ❯ send glyph.
     expect(screen.getByText("Build ▾")).toBeTruthy();
@@ -94,14 +93,14 @@ describe("CaptureApp", () => {
     expect((screen.getByLabelText("Project") as HTMLSelectElement).value).toBe("proj-2");
   });
 
-  it("Think sends the full payload (text may be empty) and hides the window", () => {
+  it("Plan sends the full payload (text may be empty) and hides the window", () => {
     render(<CaptureApp />);
     fireShot();
 
-    fireEvent.click(screen.getByText("Think ❯"));
+    fireEvent.click(screen.getByText("Plan ❯"));
 
     expect(emitCaptureSend).toHaveBeenCalledWith({
-      mode: "think",
+      mode: "plan",
       projectId: "proj-1", // no last-focused record → first project
       text: "",
       attachments: [{ path: SHOT.path, dataUrl: SHOT.dataUrl }],
@@ -145,7 +144,7 @@ describe("CaptureApp", () => {
             name: "fallback name",
             autoNameVariants: { title: "Fix login", description: "" },
           },
-          { id: "t1", kind: "think", name: "Ideation", autoNameVariants: null },
+          { id: "w1", kind: "worker", name: "Ideation", autoNameVariants: null },
         ],
       },
     ] as unknown as Project[];
@@ -154,7 +153,7 @@ describe("CaptureApp", () => {
     fireShot();
 
     fireEvent.click(screen.getByText("Build ▾"));
-    // Only build agents are listed (the think agent is not), and autoNameVariants.title wins.
+    // Only build agents are listed (the worker agent is not), and autoNameVariants.title wins.
     expect(screen.queryByText("Ideation")).toBeNull();
     expect(screen.getByText("Build 1")).toBeTruthy();
     expect(screen.getByText("Fix login")).toBeTruthy();

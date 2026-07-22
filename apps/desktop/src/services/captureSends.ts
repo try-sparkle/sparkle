@@ -5,7 +5,7 @@
 // the window whose label === findWindowForProject(projectId) owns the project; an orphan
 // project (no registered window) falls to the main window. routeCaptureSend is the pure
 // decision; the capture://send listener (wired in App.tsx via CaptureSendController) applies it
-// via shouldHandleCaptureSend and dispatches by mode (Think / Build / Plan).
+// via shouldHandleCaptureSend and dispatches by mode (Build / Plan).
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -16,7 +16,6 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useHandoffStore } from "../stores/handoffStore";
 import { useUiStore } from "../stores/uiStore";
 import { useSettingsStore, effectiveChiefPat } from "../stores/settingsStore";
-import { openThink } from "../components/selectionActions";
 import { sendCaptureToPlan, copyCaptureAsset } from "./capturePlan";
 import { synthesizePrd, writePrd } from "./prd";
 import { generateTasks, createBeadFull, beadDepAdd } from "./tasks";
@@ -97,20 +96,13 @@ export interface CaptureSendCtx {
   replace: (id: string | null) => void;
 }
 
-/** Bring this window forward so the routed result (Think draft / Build composer / Plan board) is
+/** Bring this window forward so the routed result (Build composer / Plan board) is
  *  visible even if the window was hidden/minimized while the capture modal had focus. */
 async function focusThisWindow(): Promise<void> {
   const win = getCurrentWindow();
   await win.show().catch(() => {});
   await win.unminimize().catch(() => {});
   await win.setFocus().catch(() => {});
-}
-
-/** Think: ensure/create the project's think agent, queue the narration as a NON-auto-sent draft
- *  with the screenshot attachments, and switch to Think. */
-function dispatchThink(payload: CaptureSendPayload): void {
-  openThink(payload.projectId, payload.text, false, payload.attachments);
-  useUiStore.getState().setWorkMode("think");
 }
 
 /** Build: route the capture into a build agent per the payload's Build-menu selection, set the
@@ -201,9 +193,6 @@ export async function handleCaptureSend(payload: CaptureSendPayload, ctx: Captur
 
   try {
     switch (payload.mode) {
-      case "think":
-        dispatchThink(payload);
-        break;
       case "build":
         dispatchBuild(payload);
         break;

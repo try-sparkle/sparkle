@@ -69,7 +69,7 @@ export interface RecentPromptWire {
 export interface RosterAgentPayload {
   id: string;
   name: string;
-  kind: "build" | "worker" | "think" | "shell";
+  kind: "build" | "worker" | "shell";
   status: string;
   status_color: string;
   status_label: string;

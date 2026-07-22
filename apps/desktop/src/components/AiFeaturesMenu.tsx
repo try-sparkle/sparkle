@@ -24,7 +24,6 @@ import { autoApprovePresetOf } from "../services/autoApprovePreset";
 const FEATURES: Array<{ key: AiFeatureKey; label: string }> = [
   { key: "autoRename", label: "Auto-rename workers based on the work they're doing" },
   { key: "voiceDictation", label: "Use AI-enhanced voice dictation for much better accuracy" },
-  { key: "brainstorm", label: "Enable the AI Think agent (chat with Chief)" },
   { key: "composer", label: "Use AI-enhanced composer" },
   { key: "suggestedActions", label: "Suggested actions" },
   { key: "autoApprove", label: "Auto-answer Claude Code permission prompts (uncheck to be asked each time)" },
@@ -129,7 +128,6 @@ function MasterSegment({ mode, onAll, onOff }: { mode: AiMode; onAll: () => void
 export function AiFeaturesMenu() {
   const aiAutoRename = useSettingsStore((s) => s.aiAutoRename);
   const cloudDictation = useSettingsStore((s) => s.cloudDictation);
-  const aiBrainstorm = useSettingsStore((s) => s.aiBrainstorm);
   const aiComposer = useSettingsStore((s) => s.aiComposer);
   const aiSuggestedActions = useSettingsStore((s) => s.aiSuggestedActions);
   const aiAutoApprove = useSettingsStore((s) => s.aiAutoApprove);
@@ -137,7 +135,6 @@ export function AiFeaturesMenu() {
   const flags = {
     aiAutoRename,
     cloudDictation,
-    aiBrainstorm,
     aiComposer,
     aiSuggestedActions,
     aiAutoApprove,
@@ -146,7 +143,6 @@ export function AiFeaturesMenu() {
   const valueByKey: Record<AiFeatureKey, boolean> = {
     autoRename: aiAutoRename,
     voiceDictation: cloudDictation,
-    brainstorm: aiBrainstorm,
     composer: aiComposer,
     suggestedActions: aiSuggestedActions,
     autoApprove: aiAutoApprove,

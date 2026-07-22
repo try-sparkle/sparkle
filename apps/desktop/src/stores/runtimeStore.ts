@@ -138,8 +138,8 @@ export async function runChiefSync(projectId: string, agentId: string): Promise<
   const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
   if (!project) return;
   // Read markdown from a real worktree — prefer the triggering agent, else any workflow agent.
-  // think + shell agents have no worktree (mirrors the predicate in refreshWorkflowStage).
-  const hasWorktree = (kind: string) => kind !== "think" && kind !== "shell";
+  // shell agents have no worktree (mirrors the predicate in refreshWorkflowStage).
+  const hasWorktree = (kind: string) => kind !== "shell";
   const triggering = project.agents.find((a) => a.id === agentId);
   const syncAgent =
     triggering && hasWorktree(triggering.kind)
@@ -701,7 +701,7 @@ export const useRuntimeStore = create<RuntimeState>()(
           const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
           const agent = project?.agents.find((a) => a.id === agentId);
           // No worktree / no git workflow → nothing to track.
-          if (!project || !agent || agent.kind === "think" || agent.kind === "shell") return;
+          if (!project || !agent || agent.kind === "shell") return;
           // A worker integrates into its orchestrator's branch; everyone else, into project main.
           const parentBranch =
             agent.kind === "worker" && agent.parentId ? `sparkle/agent-${agent.parentId}` : "";
@@ -762,7 +762,7 @@ export const useRuntimeStore = create<RuntimeState>()(
         }
         // ONE debounced Chief sync for the whole project (the same signal a commit would refresh),
         // rather than one per agent as the old per-agent pollBranchStatus fan-out did.
-        const syncAgent = live.find((a) => a.kind !== "think" && a.kind !== "shell");
+        const syncAgent = live.find((a) => a.kind !== "shell");
         if (syncAgent) scheduleChiefSync(projectId, syncAgent.id);
       },
 

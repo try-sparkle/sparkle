@@ -13,7 +13,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
-import { TbPinFilled, TbBulb } from "react-icons/tb";
+import { TbPinFilled } from "react-icons/tb";
 import { FaTasks } from "react-icons/fa";
 import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK, DANGER, statusInk } from "../theme/colors";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
@@ -24,7 +24,6 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useSettingsStore } from "../stores/settingsStore";
-import { useAiFeatureVisible } from "../services/aiGate";
 import { removeAgentWorkspace } from "../services/worktree";
 import { spinDownWorker } from "../services/workerSpawn";
 import { killPty } from "../pty";
@@ -79,13 +78,12 @@ import { BalanceBadge } from "./BalanceBadge";
  * to open the agent, double-click the agent name to rename it, ×
  * to close. "+ Agent" adds one.
  */
-// The three create buttons (Think / Plan / Build) form one continuous Sparkle blue→cyan
-// fade, split into thirds. These are the four fade boundaries: the cyan "S" accent on the far
-// left of Think, the primary brand blue on the far right of Build, and two interpolated stops
-// at 1/3 and 2/3 so each button paints exactly its slice of the SAME overall gradient.
-const FADE_0 = C.accent; // #34e0f0 — logo cyan, far-left edge of Think
-const FADE_1 = "#32b9f5"; // 1/3 stop (Think→Plan seam)
-const FADE_2 = "#3192fa"; // 2/3 stop (Plan→Build seam)
+// The two mode buttons (Plan / Build) form one continuous Sparkle blue→cyan fade. These are the
+// fade boundaries: the cyan "S" accent on the far left of Plan, the primary brand blue on the far
+// right of Build, and an interpolated stop at the Plan→Build seam so each button paints exactly its
+// slice of the SAME overall gradient.
+const FADE_0 = C.accent; // #34e0f0 — logo cyan, far-left edge of Plan
+const FADE_2 = "#3192fa"; // Plan→Build seam
 const FADE_3 = C.teal; // #2f6bff — primary brand blue, far-right edge of Build
 
 // Depth (px) of the chevron point/notch carved into a button's vertical edge.
@@ -118,7 +116,9 @@ function chevronClip(leftNotch: boolean, rightPoint: boolean): string {
 // The strip's rounded outer corners come from the wrapper (overflow:hidden + borderRadius), so the
 // chevrons themselves are square; `leftNotch` chevrons overlap the previous one by CHEVRON px
 // (negative margin) so the point tessellates exactly into the notch. `active` is the currently
-// selected mode: the active chevron keeps its brand color; the other two render grayscale.
+// selected mode: the active chevron keeps its brand color; the inactive one renders grayscale.
+// `justify` places the glyph+label: Plan is left-justified (its flat-left, wrapper-rounded edge
+// reads like the old Think tab), Build stays centered.
 function createBtnStyle(
   from: string,
   to: string,
@@ -126,10 +126,13 @@ function createBtnStyle(
   leftNotch: boolean,
   rightPoint: boolean,
   active: boolean,
+  justify: "center" | "flex-start" = "center",
 ): React.CSSProperties {
   return {
     flex: 1,
-    padding: "9px 10px",
+    // A touch more horizontal room than the old three-up strip so each mode reads a bit wider; the
+    // extra left pad on the left-justified Plan keeps its label off the rounded corner.
+    padding: justify === "flex-start" ? "10px 12px 10px 14px" : "10px 12px",
     border: "none",
     borderRadius: 0,
     marginLeft: leftNotch ? -(CHEVRON - SEAM) : 0,
@@ -140,15 +143,15 @@ function createBtnStyle(
     whiteSpace: "nowrap",
     background: `linear-gradient(90deg, ${from}, ${to})`,
     color: fillText,
-    // The active mode shows its brand color; the inactive two desaturate to grayscale.
+    // The active mode shows its brand color; the inactive one desaturates to grayscale.
     filter: active ? "none" : "grayscale(1)",
     opacity: active ? 1 : 0.9,
     transition: "filter 120ms ease, opacity 120ms ease",
-    // Flex-center the (enlarged, line-height-0) glyph against the label so the
+    // Flex-align the (enlarged, line-height-0) glyph against the label so the
     // icon sits on the label's vertical center rather than its text baseline.
     display: "flex",
     alignItems: "center",
-    justifyContent: "center",
+    justifyContent: justify,
     gap: 7,
   };
 }
@@ -441,7 +444,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         if (!proj) return;
         const { openAgentIds, status, pollProjectStatus } = useRuntimeStore.getState();
         const hasWorkflow = (a: (typeof proj.agents)[number]) =>
-          a.kind !== "think" && a.kind !== "shell"; // those have no git workflow
+          a.kind !== "shell"; // shell agents have no git workflow
         // Targets: every OPEN agent, PLUS the orchestrator parent of each open worker — even when
         // that parent's pane is closed — so a worker's "Merged" (which reads its parent's stage)
         // can still advance. De-duped by id.
@@ -530,15 +533,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const id = setInterval(() => void tick(), 15_000);
     return () => clearInterval(id);
   }, [projectId]);
-  // AI Brainstorming feature gate (Use AI Features menu). Off → hide the ✦ Brainstorm button.
-  // VISIBLE (settings flag only, ignores credits): the Think chevron + Think-mode navigation must
-  // show during the trial / when out of credits so the user can SEE the feature. The buy-to-use
-  // upsell fires later, in ThinkPanel's submit (aiFeatureLockedNow("brainstorm")) — this variable
-  // only governs UI presence and work-mode reconciliation, never an AI action, so `visible` is
-  // correct for every site it gates.
-  const aiBrainstorm = useAiFeatureVisible("brainstorm");
   // Beads tool gate ([tools].beads). Off → the Plan chevron (the read-only Tasks board entry) is
-  // hidden and no `bd` shell-out runs (see beadsStore). Mirrors the Think chevron's aiBrainstorm gate.
+  // hidden and no `bd` shell-out runs (see beadsStore).
   const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
   const [editing, setEditing] = useState<string | null>(null);
   // Which agent the Ship/Save/Discard close prompt is asking about (null = no prompt).
@@ -583,39 +579,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     selectAgent(project.id, id);
     open(id);
   };
-  const onAddThink = () => {
-    if (!project) return;
-    setActiveSpecial(null); // creating an agent leaves the special (Sparkle) view
-    // Think now allows multiple agents per project: always create a fresh one (parallels Build).
-    const id = addAgent(project.id, { kind: "think" });
-    selectAgent(project.id, id);
-    open(id);
-  };
-  // The chevron strip switches the active (colored) mode and filters the sidebar list by kind. Think
-  // and Build are two-stage: the FIRST click (when that mode isn't already the active section) just
-  // switches into the section; clicking the SAME chevron AGAIN while already in that section spawns a
-  // fresh agent of that kind (same as the "+ New Think/Build Agent" buttons). Plan stays a pure mode
-  // switch: it has no agent concept and only opens the read-only Tasks board in the main pane.
-  const onPickThink = () => {
-    // "Already in the Think section" = Think mode AND not parked in a special (Sparkle/board) view.
-    const alreadyHere = mode === "think" && activeSpecial === null;
-    setMode("think");
-    setActiveSpecial(null);
-    if (!project) return;
-    if (alreadyHere) {
-      // Second click on the active chevron: spawn a fresh agent of this kind (≡ the + button).
-      const id = addAgent(project.id, { kind: "think" });
-      selectAgent(project.id, id);
-      open(id);
-      return;
-    }
-    // Switching INTO Think: move selection to the first Think row so the pane matches the chevron
-    // (or clear it → the empty Think state). Without this the pane keeps rendering the previously
-    // selected build agent under a Think chevron.
-    const next = firstVisibleAgentId(project.agents, "think", agentOrdering, status);
-    selectAgent(project.id, next);
-    if (next) open(next);
-  };
+  // The chevron strip switches the active (colored) mode and filters the sidebar list by kind. Build
+  // is two-stage: the FIRST click (when Build isn't already the active section) just switches into
+  // the section; clicking the SAME chevron AGAIN while already in Build spawns a fresh build agent
+  // (same as the "+ New Build Agent" button). Plan stays a pure mode switch: it has no agent concept
+  // and only opens the read-only Tasks board in the main pane.
   const onPickPlan = () => {
     setMode("plan");
     setActiveSpecial("board");
@@ -1009,22 +977,21 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       isAutoScrolling: () => autoTargetRef.current != null,
     };
   }, []);
-  // Keep the chevron coherent with what the main pane shows. The pane renders the SELECTED agent by
-  // its kind (think → ThinkPanel, else terminal), so the active mode must match the selected agent's
-  // kind — otherwise a cross-kind select (Ask-Sparkle from a build terminal, a notification/history
-  // jump, or a selection restored on boot) leaves the chevron pointing at the wrong section while
-  // that agent's pane is showing. reconcileWorkMode also subsumes the old brainstorm-gate fallback
-  // (never sit on a hidden Think chevron). It leaves Plan/Sparkle (activeSpecial) and the empty pane
-  // untouched. The chevron handlers move selection in the other direction, so the two converge.
+  // Keep the chevron coherent with what the main pane shows. The pane renders the SELECTED agent's
+  // terminal, so the active mode must be Build whenever a real agent is selected — otherwise a
+  // cross-mode select (Ask-Sparkle from a build terminal, a notification/history jump, or a
+  // selection restored on boot) leaves the chevron pointing at Plan while that agent's terminal is
+  // showing. It leaves Plan/Sparkle (activeSpecial) and the empty pane untouched. The chevron
+  // handlers move selection in the other direction, so the two converge.
   useEffect(() => {
-    const selKind = project?.agents.find((a) => a.id === project.selectedAgentId)?.kind;
-    const next = reconcileWorkMode(selKind, mode, activeSpecial !== null, aiBrainstorm);
+    const hasSelection = !!project?.agents.find((a) => a.id === project.selectedAgentId);
+    const next = reconcileWorkMode(hasSelection, mode, activeSpecial !== null);
     if (next) setMode(next);
-  }, [project, aiBrainstorm, mode, activeSpecial, setMode]);
+  }, [project, mode, activeSpecial, setMode]);
   // If Beads is turned off while the user is parked on the (now-hidden) Plan board, leave it — the
   // board won't render and the Plan chevron is gone, so a stuck empty state would result otherwise.
-  // Also covers Plan mode without the board special (e.g. ThinkPanel's decompose hand-off sets
-  // workMode "plan" alone), so no code path can strand the user in a Plan mode they can't leave.
+  // Also covers Plan mode without the board special, so no code path can strand the user in a Plan
+  // mode they can't leave.
   useEffect(() => {
     if (beadsEnabled) return;
     if (activeSpecial === "board" || mode === "plan") {
@@ -1084,18 +1051,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     [project, effectiveStatus, mode, agentOrdering],
   );
 
-  // The active mode's "+ New … Agent" button (null in Plan / no project / Think gated off).
+  // The active mode's "+ New Build Agent" button (null in Plan / no project).
   // Rendered in ONE of two slots in the scroll container below, chosen by listOverflows.
   const newAgentButton =
     project && mode === "build" ? (
       <NewBuildAgentButton onClick={spawnBuildAgent} dataHint="newbuild" />
-    ) : project && mode === "think" && aiBrainstorm ? (
-      <NewAgentRow
-        icon={<TbBulb size={16} style={{ flexShrink: 0 }} />}
-        label="+ New Think Agent"
-        hoverColor={FADE_0}
-        onClick={onAddThink}
-      />
     ) : null;
 
   return (
@@ -1158,29 +1118,19 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             background: C.deepForest,
           }}
         >
-          {/* Think / Plan / Build form one chevron strip painting a single blue→cyan fade. It's a
-              MODE SELECTOR: the active chevron keeps its color, the other two go grayscale.
-              Think is AI feature-gated (the "Enable AI Thinking" toggle): off → it disappears
-              and Plan becomes the strip's flat-left start. The gate flag stays aiBrainstorm. */}
-          {aiBrainstorm && (
-            <button
-              data-hint="think"
-              onClick={onPickThink}
-              title="Think mode — your Think agents"
-              // First in the strip: flat left, points right into Plan. Cyan ("S" color) leads; dark ink.
-              style={createBtnStyle(FADE_0, FADE_1, ON_BRAND_FILL_DARK, false, true, mode === "think")}
-            >
-              <TbBulb size={18} style={{ flexShrink: 0 }} />
-              <span>Think</span>
-            </button>
-          )}
+          {/* Plan / Build form one chevron strip painting a single blue→cyan fade. It's a MODE
+              SELECTOR: the active chevron keeps its color, the other goes grayscale. Plan leads with
+              the logo cyan, left-justified, and its flat-left edge is rounded by the wrapper — the
+              look the old Think tab had. Build points-notch tessellates onto it. Plan is Beads-gated
+              ([tools].beads): off → it disappears and Build spans the whole (rounded) strip. */}
           {beadsEnabled && (
             <button
               data-hint="plan"
               onClick={onPickPlan}
               title="Plan mode — this project's read-only Tasks board"
-              // Full chevron when Think is present (notch left + point right); flat-left start when not.
-              style={createBtnStyle(FADE_1, FADE_2, ON_BRAND_FILL_DARK, aiBrainstorm, true, mode === "plan")}
+              // First in the strip: flat, wrapper-rounded left; points right into Build. Cyan leads,
+              // dark ink, left-justified content.
+              style={createBtnStyle(FADE_0, FADE_2, ON_BRAND_FILL_DARK, false, true, mode === "plan", "flex-start")}
             >
               <FaTasks size={14} style={{ flexShrink: 0 }} />
               <span>Plan</span>
@@ -1190,8 +1140,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             data-hint="build"
             onClick={onPickBuild}
             title="Build mode — your Build orchestrator agents"
-            // Last in the strip: notched left when anything precedes it (Think and/or Plan), flat right.
-            style={createBtnStyle(FADE_2, FADE_3, ON_BRAND_FILL, aiBrainstorm || beadsEnabled, false, mode === "build")}
+            // Last in the strip: notched left when Plan precedes it, flat right.
+            style={createBtnStyle(FADE_2, FADE_3, ON_BRAND_FILL, beadsEnabled, false, mode === "build")}
           >
             <span style={{ fontSize: 26, lineHeight: 0, transform: "translateY(-3.5px)" }}>⚒</span>
             <span>Build</span>
@@ -1355,9 +1305,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             }; // end renderRow
 
             // The orchestrator's own chevron: the roll-up of its workers, or its own git stage when
-            // it has none. Think/shell agents have no git workflow → no tracker (null).
+            // it has none. Shell agents have no git workflow → no tracker (null).
             const headStage: WorkflowStageId | null =
-              top.kind === "think" || top.kind === "shell"
+              top.kind === "shell"
                 ? null
                 : rollup
                   ? rollup.stage
@@ -1377,22 +1327,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         {newAgentButton && !listOverflows && (
           <div style={NEW_AGENT_SLOT_STYLE}>{newAgentButton}</div>
         )}
-        {/* Per-mode empty hint: the dashed "+ New …" row above is the call to action. */}
-        {project &&
-          mode === "build" &&
-          topLevelAgents.filter((a) => a.kind !== "think").length === 0 && (
-            <div style={{ color: C.muted, fontSize: 12, padding: "2px 10px 10px", lineHeight: 1.5 }}>
-              No Build agents yet — use <strong>+ New Build Agent</strong> above to start one.
-            </div>
-          )}
-        {project &&
-          mode === "think" &&
-          aiBrainstorm &&
-          topLevelAgents.filter((a) => a.kind === "think").length === 0 && (
-            <div style={{ color: C.muted, fontSize: 12, padding: "2px 10px 10px", lineHeight: 1.5 }}>
-              No Think agents yet — use <strong>+ New Think Agent</strong> above to start one.
-            </div>
-          )}
+        {/* Empty hint: the dashed "+ New Build Agent" row above is the call to action. */}
+        {project && mode === "build" && topLevelAgents.length === 0 && (
+          <div style={{ color: C.muted, fontSize: 12, padding: "2px 10px 10px", lineHeight: 1.5 }}>
+            No Build agents yet — use <strong>+ New Build Agent</strong> above to start one.
+          </div>
+        )}
         {!project && (
           <div style={{ color: C.muted, fontSize: 12, padding: 10, lineHeight: 1.5 }}>
             Create a project to add agents.
@@ -1946,19 +1886,10 @@ const AgentRow = memo(function AgentRow({
   // The behind/ahead pill + its branch-status geometry now live in AgentDetailLines, which renders
   // the Location/Status/Progress block for this row AND for each inline worker (same logic, no dupe).
 
-  const kindGlyph =
-    a.kind === "think" ? (
-      <TbBulb size={16} />
-    ) : a.kind === "worker" ? (
-      "↳"
-    ) : a.kind === "shell" ? (
-      "▶"
-    ) : (
-      "⚒"
-    );
+  const kindGlyph = a.kind === "worker" ? "↳" : a.kind === "shell" ? "▶" : "⚒";
   // Width of the leading glyph slot, kept identical for the glyph and its hover-state × so the
   // name never shifts horizontally when the row expands.
-  const glyphWidth = a.kind === "build" ? 24 : a.kind === "think" ? 20 : 12;
+  const glyphWidth = a.kind === "build" ? 24 : 12;
 
   // Rebase a branch (this row's, or one of its inline workers') onto its base. Parameterized by id +
   // base so the orchestrator's own Status pill and each worker's Status pill share one code path.
@@ -2099,7 +2030,7 @@ const AgentRow = memo(function AgentRow({
             <span
               title={`${a.kind} — ${AGENT_STATUS[st].label}`}
               style={{
-                fontSize: a.kind === "build" ? 28.8 : a.kind === "think" ? 19.5 : 12,
+                fontSize: a.kind === "build" ? 28.8 : 12,
                 color: statusColor,
                 // line-height 0 lets the enlarged ⚒ overflow its line box (staying centered in the
                 // slot) without driving the row's height.

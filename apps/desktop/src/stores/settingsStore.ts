@@ -52,15 +52,14 @@ export const DEFAULT_NOTIFY_STATUSES: Record<AgentTabStatus, boolean> = {
 };
 
 // --- AI features (gated by the "Use AI Features" control in the ⋯ menu) ----------------------
-// Four independent on/off feature flags plus a derived All|Some|Off mode. Each feature degrades
-// to a non-AI baseline when off (on-device dictation, no auto-rename, no Brainstorm button, bare
-// terminal instead of the composer). Default ON so the app is fully featured out of the box.
+// Independent on/off feature flags plus a derived All|Some|Off mode. Each feature degrades to a
+// non-AI baseline when off (on-device dictation, no auto-rename, bare terminal instead of the
+// composer). Default ON so the app is fully featured out of the box.
 
 /** Stable identifiers for the AI features, used by the menu + the generic setter. */
 export type AiFeatureKey =
   | "autoRename"
   | "voiceDictation"
-  | "brainstorm"
   | "composer"
   | "suggestedActions"
   | "autoApprove";
@@ -73,7 +72,6 @@ export interface AiFeatureFlags {
   aiAutoRename: boolean;
   /** The voice-dictation feature is the existing cloud-dictation flag (Deepgram on/off). */
   cloudDictation: boolean;
-  aiBrainstorm: boolean;
   aiComposer: boolean;
   aiSuggestedActions: boolean;
   /** Sparkle Auto-Approve master toggle (nudging + auto-answering permission prompts). */
@@ -85,7 +83,6 @@ export interface AiFeatureFlags {
 export const AI_FEATURE_FIELD: Record<AiFeatureKey, keyof AiFeatureFlags> = {
   autoRename: "aiAutoRename",
   voiceDictation: "cloudDictation",
-  brainstorm: "aiBrainstorm",
   composer: "aiComposer",
   suggestedActions: "aiSuggestedActions",
   autoApprove: "aiAutoApprove",
@@ -124,7 +121,6 @@ export function aiFeatureMode(f: AiFeatureFlags): AiMode {
   const vals = [
     f.aiAutoRename,
     f.cloudDictation,
-    f.aiBrainstorm,
     f.aiComposer,
     f.aiSuggestedActions,
     f.aiAutoApprove,
@@ -156,7 +152,6 @@ export function migrateSettings(persisted: unknown, version: number): unknown {
       ...prev,
       aiAutoRename: false,
       cloudDictation: false,
-      aiBrainstorm: false,
       aiComposer: false,
     };
   }
@@ -252,8 +247,6 @@ interface SettingsState {
   /** Auto-name worker agents from their first prompt (the generate_agent_name call). Off → agents
    *  keep their default names. */
   aiAutoRename: boolean;
-  /** Show the ✦ Brainstorm button. Off → the button is hidden. */
-  aiBrainstorm: boolean;
   /** Use the AI-enhanced composer (ghost text, screenshot drop, dictation insert, Send). Off →
    *  the composer is replaced by the bare terminal input. */
   aiComposer: boolean;
@@ -411,7 +404,6 @@ export const useSettingsStore = create<SettingsState>()(
       effectiveMaxConcurrentWorkers: 20,
       cloudDictation: true,
       aiAutoRename: true,
-      aiBrainstorm: true,
       aiComposer: true,
       aiSuggestedActions: true,
       aiAutoApprove: true,
@@ -456,7 +448,6 @@ export const useSettingsStore = create<SettingsState>()(
         set({
           aiAutoRename: on,
           cloudDictation: on,
-          aiBrainstorm: on,
           aiComposer: on,
           aiSuggestedActions: on,
           aiAutoApprove: on,
@@ -517,7 +508,6 @@ export const useSettingsStore = create<SettingsState>()(
           ),
           aiAutoRename: config.ai.auto_rename,
           cloudDictation: config.ai.voice_dictation,
-          aiBrainstorm: config.ai.brainstorm,
           aiComposer: config.ai.composer,
           aiSuggestedActions: config.ai.suggested_actions,
           // Auto-approve master toggle (`?? true` covers an older backend predating [ai].auto_approve).
@@ -594,7 +584,6 @@ export const useSettingsStore = create<SettingsState>()(
         maxConcurrentWorkers: s.maxConcurrentWorkers,
         cloudDictation: s.cloudDictation,
         aiAutoRename: s.aiAutoRename,
-        aiBrainstorm: s.aiBrainstorm,
         aiComposer: s.aiComposer,
         aiSuggestedActions: s.aiSuggestedActions,
         aiAutoApprove: s.aiAutoApprove,

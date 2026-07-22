@@ -46,7 +46,6 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
   const flags = (over: Partial<AiFeatureFlags>): AiFeatureFlags => ({
     aiAutoRename: true,
     cloudDictation: true,
-    aiBrainstorm: true,
     aiComposer: true,
     aiSuggestedActions: true,
     aiAutoApprove: true,
@@ -62,7 +61,6 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
       aiFeatureMode({
         aiAutoRename: false,
         cloudDictation: false,
-        aiBrainstorm: false,
         aiComposer: false,
         aiSuggestedActions: false,
         aiAutoApprove: false,
@@ -77,7 +75,6 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
       aiFeatureMode({
         aiAutoRename: true,
         cloudDictation: false,
-        aiBrainstorm: false,
         aiComposer: false,
         aiSuggestedActions: false,
         aiAutoApprove: false,
@@ -90,7 +87,6 @@ describe("suggestedActions AI flag", () => {
   const allOn: AiFeatureFlags = {
     aiAutoRename: true,
     cloudDictation: true,
-    aiBrainstorm: true,
     aiComposer: true,
     aiSuggestedActions: true,
     aiAutoApprove: true,
@@ -110,7 +106,6 @@ describe("migrateSettings — v0→v1 AI opt-out + v1→v2 autoApplyUpdates defa
     const out = migrateSettings({ aiEnabled: false, chiefPat: "x" }, 0) as Record<string, unknown>;
     expect(out.aiAutoRename).toBe(false);
     expect(out.cloudDictation).toBe(false);
-    expect(out.aiBrainstorm).toBe(false);
     expect(out.aiComposer).toBe(false);
     expect(out.chiefPat).toBe("x"); // other persisted fields preserved
   });
@@ -145,12 +140,7 @@ describe("settingsStore — AI feature setters", () => {
     useSettingsStore.getState().setAllAiFeatures(false);
     expect(aiFeatureMode(useSettingsStore.getState())).toBe("off");
     const s = useSettingsStore.getState();
-    expect([s.aiAutoRename, s.cloudDictation, s.aiBrainstorm, s.aiComposer]).toEqual([
-      false,
-      false,
-      false,
-      false,
-    ]);
+    expect([s.aiAutoRename, s.cloudDictation, s.aiComposer]).toEqual([false, false, false]);
   });
 
   it("unchecking one feature from 'all' drops the derived mode to 'some'", () => {
@@ -164,7 +154,6 @@ describe("settingsStore — AI feature setters", () => {
     useSettingsStore.getState().setAllAiFeatures(false);
     useSettingsStore.getState().setAiFeature("autoRename", true);
     useSettingsStore.getState().setAiFeature("voiceDictation", true);
-    useSettingsStore.getState().setAiFeature("brainstorm", true);
     useSettingsStore.getState().setAiFeature("composer", true);
     useSettingsStore.getState().setAiFeature("suggestedActions", true);
     useSettingsStore.getState().setAiFeature("autoApprove", true);
@@ -172,11 +161,10 @@ describe("settingsStore — AI feature setters", () => {
     expect([
       s.aiAutoRename,
       s.cloudDictation,
-      s.aiBrainstorm,
       s.aiComposer,
       s.aiSuggestedActions,
       s.aiAutoApprove,
-    ]).toEqual([true, true, true, true, true, true]);
+    ]).toEqual([true, true, true, true, true]);
     expect(aiFeatureMode(s)).toBe("all");
   });
 });
@@ -247,7 +235,6 @@ describe("effectiveMaxConcurrentWorkers — the RAM-aware enforced cap", () => {
         ai: {
           auto_rename: true,
           voice_dictation: true,
-          brainstorm: true,
           composer: true,
           suggested_actions: true,
           auto_approve: true,
@@ -315,7 +302,6 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
         ai: {
           auto_rename: false,
           voice_dictation: false,
-          brainstorm: false,
           composer: true,
           suggested_actions: true,
           auto_approve: true,
@@ -350,12 +336,7 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
     expect(s.driftBehindNudge).toBe(3);
     expect(s.driftAheadNudge).toBe(4);
     expect(s.driftChangedLines).toBe(5);
-    expect([s.aiAutoRename, s.cloudDictation, s.aiBrainstorm, s.aiComposer]).toEqual([
-      false,
-      false,
-      false,
-      true,
-    ]);
+    expect([s.aiAutoRename, s.cloudDictation, s.aiComposer]).toEqual([false, false, true]);
     expect(s.configWarnings).toEqual(["w1", "w2"]);
     // Voice mirror
     expect(s.wakeWord).toBe("Hey Jarvis");
@@ -379,7 +360,6 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
         ai: {
           auto_rename: true,
           voice_dictation: true,
-          brainstorm: true,
           composer: true,
           suggested_actions: true,
           auto_approve: true,
@@ -425,7 +405,6 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
         ai: {
           auto_rename: true,
           voice_dictation: true,
-          brainstorm: true,
           composer: true,
           suggested_actions: true,
           auto_approve: true,

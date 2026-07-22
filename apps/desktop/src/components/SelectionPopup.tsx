@@ -5,10 +5,7 @@
 // overflow:hidden, and positioned with viewport-clamped fixed coords.
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { TbBulb } from "react-icons/tb";
 import {
-  FiHelpCircle,
-  FiMessageCircle,
   FiTool,
   FiCornerUpRight,
   FiPlay,
@@ -20,9 +17,6 @@ import {
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { popupPosition } from "./selectionPopupPosition";
 import {
-  thinkWith,
-  explain,
-  askWith,
   fixInAgent,
   sendToAgent,
   runAsCommand,
@@ -55,8 +49,6 @@ export function SelectionPopup({
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ left: number; top: number }>({ left: x + 8, top: y + 8 });
-  const [mode, setMode] = useState<"menu" | "ask">("menu");
-  const [question, setQuestion] = useState("");
   const [toast, setToast] = useState<string | null>(null);
 
   // Stable ref to onClose so the dismiss effect runs once (avoids listener churn on parent re-renders).
@@ -77,18 +69,12 @@ export function SelectionPopup({
   useLayoutEffect(() => {
     const h = cardRef.current?.offsetHeight ?? 360;
     setPos(popupPosition({ x, y }, { w: WIDTH, h }, { w: window.innerWidth, h: window.innerHeight }));
-  }, [x, y, mode, toast]);
+  }, [x, y, toast]);
 
   // Dismiss on Escape, outside-click, or scroll. Uses onCloseRef so this effect runs once.
-  const modeRef = useRef(mode);
-  useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        // In ask sub-mode, Escape returns to the menu instead of closing the popup entirely.
-        if (modeRef.current === "ask") setMode("menu");
-        else onCloseRef.current();
-      }
+      if (e.key === "Escape") onCloseRef.current();
     };
     const onDocDown = (e: MouseEvent) => {
       if (cardRef.current && !cardRef.current.contains(e.target as Node)) onCloseRef.current();
@@ -141,18 +127,13 @@ export function SelectionPopup({
     })();
   }, []);
 
-  // Some actions require a registered project in the store (Think, Explain, Ask, Run as cmd).
-  // Panes that don't map to a real project (e.g. SparkleAgentPane) pass an unregistered projectId;
-  // hide those actions rather than silently no-op.
+  // Some actions require a registered project in the store (Run as cmd). Panes that don't map to a
+  // real project (e.g. SparkleAgentPane) pass an unregistered projectId; hide those actions rather
+  // than silently no-op.
   const projectExists = useProjectStore((s) => s.projects.some((p) => p.id === projectId));
 
   const aiActions: Action[] = [
-    ...(projectExists ? [
-      { icon: <TbBulb size={15} />, label: "Think", primary: true, run: () => act(() => thinkWith(projectId, text)) },
-      { icon: <FiHelpCircle size={15} />, label: "Explain", run: () => act(() => explain(projectId, text)) },
-      { icon: <FiMessageCircle size={15} />, label: "Ask…", run: () => setMode("ask") },
-    ] : []),
-    { icon: <FiTool size={15} />, label: "Fix it", run: () => act(() => fixInAgent(agentId, text)) },
+    { icon: <FiTool size={15} />, label: "Fix it", primary: true, run: () => act(() => fixInAgent(agentId, text)) },
   ];
   const doActions: Action[] = [
     { icon: <FiCornerUpRight size={15} />, label: "Send to agent", run: () => act(() => sendToAgent(agentId, text)) },
@@ -208,34 +189,6 @@ export function SelectionPopup({
 
       {toast ? (
         <div style={{ padding: "8px 12px", fontSize: 12, color: C.cream }}>{toast}</div>
-      ) : mode === "ask" ? (
-        <div style={{ padding: "4px 10px 8px" }}>
-          <Label>Ask about this</Label>
-          <input
-            autoFocus
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && question.trim()) act(() => askWith(projectId, question.trim(), text));
-            }}
-            placeholder="Ask a question…"
-            style={{
-              width: "100%",
-              boxSizing: "border-box",
-              background: C.forest,
-              color: C.cream,
-              border: `1px solid ${C.teal}`,
-              borderRadius: 6,
-              padding: "7px 9px",
-              fontSize: 12,
-              outline: "none",
-              fontFamily: "inherit",
-            }}
-          />
-          <div style={{ fontSize: 10.5, color: C.muted, marginTop: 6 }}>
-            Opens a think thread with your question + the selected text.
-          </div>
-        </div>
       ) : (
         <>
           <Label>Work with AI</Label>
