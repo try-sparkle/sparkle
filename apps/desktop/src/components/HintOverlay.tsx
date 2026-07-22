@@ -6,6 +6,7 @@ import {
   AGENT_HINT,
   RECENT_HINT,
   RECENT_SWITCH_HINT,
+  RECENT_TRIGGER_HINT,
   assignLabels,
 } from "../keyboardHints/hintTargets";
 
@@ -161,10 +162,32 @@ export function HintOverlay() {
       e.stopPropagation();
       const hit = chiclets.find((c) => c.label === key);
       if (!hit) return; // unassigned key: no-op, stay open
+      const { el } = hit;
+      // Opening the Recent-projects dropdown by keyboard is a "chain straight into picking a
+      // project" moment: keep hint mode ACTIVE instead of closing, so the dropdown's a–z row
+      // badges appear at once and the user can pick without tapping the trigger again. Click to
+      // open the dropdown, then re-collect after a double rAF — that gives React time to mount the
+      // rows, so collectChiclets finds the recent-item rows and switches to its dropdown mode.
+      // A programmatic el.click() dispatches a "click", not a "mousedown", so useHintMode's
+      // mousedown-closes-overlay listener never fires — the overlay correctly stays open. (Every
+      // OTHER control, including the dropdown's own recent-item rows, falls through to close+click.)
+      if (el.dataset.hint === RECENT_TRIGGER_HINT) {
+        el.click();
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => {
+            const next = collectChiclets();
+            // Dropdown opened with rows → show their a–z badges and stay open to chain a pick.
+            // Opened empty (no recent projects) → there's nothing to pick, so close instead of
+            // stranding the user on a "stuck open" chrome overlay still showing the r badge.
+            if (next.some((c) => c.el.dataset.hint === RECENT_HINT)) setChiclets(next);
+            else close();
+          }),
+        );
+        return;
+      }
       close();
       // Fire the control's own click handler. Deferred a tick so React has torn down the overlay
       // first (a synchronous click could re-enter layout while we're mid-update).
-      const { el } = hit;
       setTimeout(() => el.click(), 0);
     };
     window.addEventListener("keydown", onKeyDown, true);

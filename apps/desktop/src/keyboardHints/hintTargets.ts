@@ -21,6 +21,13 @@ export const RECENT_HINT = "recent-item";
 // pick up at "n". Sharing one stream is what keeps a row letter and a switch letter from colliding.
 export const RECENT_SWITCH_HINT = "recent-switch";
 
+// The data-hint value of the chrome TRIGGER that opens the Recent-projects dropdown (the "r" badge
+// in the top bar). Distinct from RECENT_HINT (the dropdown ROWS): selecting this one chains into the
+// dropdown while keeping hint mode active, so the row badges appear without a second trigger tap.
+// Its mnemonic lives in CHROME_HINTS.recent below; exported so HintOverlay compares against the
+// constant instead of a magic "recent" string that could drift if that key is renamed.
+export const RECENT_TRIGGER_HINT = "recent";
+
 // Fixed mnemonic key for each chrome control, keyed by its data-hint attribute value.
 // (The "." for the ⋯ overflow menu is a deliberate pun: three dots → the period key.)
 export const CHROME_HINTS: Record<string, string> = {

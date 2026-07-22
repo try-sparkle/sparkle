@@ -28,6 +28,19 @@ const BASH_PROMPT = [
   FOOTER,
 ].join("\n");
 
+// Same bash prompt, but the real Claude Code amend/explain footer instead of the standard one. The
+// original bug: this footer wasn't recognized, so maybeAutoApprove bailed before the bash rule check.
+const BASH_PROMPT_AMEND_FOOTER = [
+  "Bash command",
+  "  rm -rf build/",
+  "Do you want to proceed?",
+  "❯ 1. Yes",
+  "  2. Yes, and don't ask again for rm commands",
+  "  3. No, and tell Claude what to do differently",
+  "",
+  "Esc to cancel · Tab to amend · ctrl+e to explain",
+].join("\n");
+
 beforeEach(() => {
   writePty.mockClear();
   aiFeatureVisibleNow.mockReturnValue(true);
@@ -50,6 +63,13 @@ describe("maybeAutoApprove", () => {
     const second = maybeAutoApprove("a1", BASH_PROMPT, handled);
     expect(second).toBe("bash");
     expect(writePty).toHaveBeenCalledTimes(1);
+  });
+
+  it("auto-answers a bash prompt whose footer is the amend/explain variant", () => {
+    const result = maybeAutoApprove("a1", BASH_PROMPT_AMEND_FOOTER, new Set());
+    expect(result).toBe("bash");
+    expect(writePty).toHaveBeenCalledTimes(1);
+    expect(writePty).toHaveBeenCalledWith("a1", "1\n");
   });
 
   it("does not auto-answer when the feature is off", () => {

@@ -44,7 +44,32 @@ const ASK_USER_QUESTION_SCREEN = [
   "… +1 completed",
 ].join("\n");
 
+// Claude Code's Bash-command approval prompt renders a DIFFERENT footer than the standard picker —
+// "Esc to cancel · Tab to amend · ctrl+e to explain" (no "Enter to select …" text) — and a plain
+// Yes / Yes-remember / No option block under a "Do you want to proceed?" header. The detector must
+// anchor on the amend/explain footer, which sits below the options like the standard footer does.
+const BASH_APPROVAL_SCREEN = [
+  "Bash command",
+  "  rm -rf build/",
+  "  Remove the build directory",
+  "",
+  "Do you want to proceed?",
+  "❯ 1. Yes",
+  "  2. Yes, and don't ask again for rm commands in this project",
+  "  3. No, and tell Claude what to do differently",
+  "",
+  "Esc to cancel · Tab to amend · ctrl+e to explain",
+].join("\n");
+
 describe("detectClaudeCodePicker", () => {
+  it("parses a Bash-command approval prompt whose footer is the amend/explain variant", () => {
+    const out = detectClaudeCodePicker(BASH_APPROVAL_SCREEN);
+    expect(out.map((b) => b.value)).toEqual(["1\n", "2\n", "3\n"]);
+    expect(out[0]?.label).toBe("1 · Yes");
+    expect(out[2]?.label.startsWith("3 · No")).toBe(true);
+    expect(out.every((b) => b.kind === "terminal" && b.source === "heuristic")).toBe(true);
+  });
+
   it("parses the AskUserQuestion picker from the reporting screenshot", () => {
     const out = detectClaudeCodePicker(ASK_USER_QUESTION_SCREEN);
     expect(out.map((b) => b.value)).toEqual(["1\n", "2\n", "3\n", "4\n", "5\n"]);

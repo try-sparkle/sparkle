@@ -38,9 +38,20 @@ function asksChoice(lastLine: string): boolean {
 // screen keeps rendering content (e.g. the task checklist) BELOW the dialog, so the footer is
 // never the last line. So this detector searches a wider window for the footer, then parses the
 // option block immediately above it.
+//
+// Claude Code's Bash-command approval prompt renders a DIFFERENT footer — "Esc to cancel · Tab to
+// amend · ctrl+e to explain" — that lacks the "Enter to select …" text. We anchor on its unique
+// "Tab to amend … ctrl+e to explain" phrasing, which sits BELOW the option block in the same
+// structural position as the standard footer, so the upward option walk works identically. Both
+// phrases must co-occur on the ONE line (not either alone) so an incidental scrollback line that
+// merely mentions "tab to amend" or "ctrl+e to explain" can't be mistaken for a picker footer.
 const PICKER_WINDOW = 50; // non-empty lines to search for the footer
 const PICKER_SPAN = 30; // non-empty lines above the footer the option block may span
-const PICKER_FOOTER = /enter to (select|confirm|submit)\b.*(navigate|cancel)/i;
+// Exported as the single source of truth: approvalClassifier.ts imports this exact regex for its
+// header-region scan, so the option detector and the category classifier can never desync on which
+// footer marks a prompt (they must agree byte-for-byte — see the classifier's headerRegion).
+export const PICKER_FOOTER =
+  /enter to (select|confirm|submit)\b.*(navigate|cancel)|\btab to amend\b.*ctrl\+e to explain/i;
 const PICKER_OPTION = /^\s*(?:[❯›>]\s*)?(\d{1,2})\.\s+(\S.*)/;
 const PICKER_LABEL_MAX = 40;
 const PICKER_MAX_BUTTONS = 6;

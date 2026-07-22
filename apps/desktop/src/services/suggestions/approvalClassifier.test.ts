@@ -29,6 +29,22 @@ const BASH = [
   FOOTER,
 ].join("\n");
 
+// The real Claude Code Bash-command approval prompt uses a DIFFERENT footer than the standard picker
+// ("Esc to cancel · Tab to amend · ctrl+e to explain"). Without recognizing that footer the whole
+// classify path bails and bash prompts never auto-approve — this is the regression under test.
+const BASH_AMEND_FOOTER = [
+  "Bash command",
+  "  rm -rf build/",
+  "  Remove the build directory",
+  "",
+  "Do you want to proceed?",
+  "❯ 1. Yes",
+  "  2. Yes, and don't ask again for rm commands in this project",
+  "  3. No, and tell Claude what to do differently",
+  "",
+  "Esc to cancel · Tab to amend · ctrl+e to explain",
+].join("\n");
+
 const EDIT = [
   "Edit file",
   "  src/main.ts",
@@ -93,6 +109,10 @@ describe("classifyApproval", () => {
 
   it("classifies a bash/command permission prompt", () => {
     expect(classifyApproval(BASH)).toEqual({ category: "bash", approveOption: "1\n" });
+  });
+
+  it("classifies a bash prompt that uses the amend/explain footer (the regression)", () => {
+    expect(classifyApproval(BASH_AMEND_FOOTER)).toEqual({ category: "bash", approveOption: "1\n" });
   });
 
   it("classifies a file-edit permission prompt", () => {

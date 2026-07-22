@@ -7,7 +7,7 @@
 // but emits nothing except a bare option-number keystroke ("1\n") derived from an option the local
 // heuristic detector already parsed — never anything from the AI/learned tier. See the design spec:
 // docs/superpowers/specs/2026-07-10-sparkle-auto-approve-design.md §1.
-import { detectClaudeCodePicker } from "./heuristics";
+import { PICKER_FOOTER, detectClaudeCodePicker } from "./heuristics";
 import type { SuggestionButton } from "./types";
 import type { ApprovalCategory } from "./approvalCategories";
 
@@ -21,7 +21,9 @@ export interface ApprovalClassification {
 // region the options were parsed from (the header text sits just above the option block).
 const PICKER_WINDOW = 50;
 const PICKER_SPAN = 30;
-const PICKER_FOOTER = /enter to (select|confirm|submit)\b.*(navigate|cancel)/i;
+// PICKER_FOOTER is imported from heuristics.ts (the single source of truth) so header-region
+// classification always reads the SAME footer the option detector parsed the options from — the two
+// can never drift apart. It matches both the standard picker footer and the Bash-approval footer.
 
 // The plain affirmative ("Yes", "Yes.") — the option we auto-select. Deliberately NOT the
 // "Yes, and don't ask again / allow all edits this session" variants (those hand control to Claude

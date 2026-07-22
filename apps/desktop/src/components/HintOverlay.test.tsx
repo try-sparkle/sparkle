@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { useState } from "react";
 import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HintOverlay } from "./HintOverlay";
@@ -100,6 +101,100 @@ describe("HintOverlay", () => {
     fireEvent.keyDown(window, { key: "b" });
     await waitFor(() => expect(onSecond).toHaveBeenCalledTimes(1));
     expect(onFirst).not.toHaveBeenCalled();
+  });
+
+  // A harness whose "recent" trigger opens the dropdown on click, exactly like the real top bar:
+  // the rows only exist once the button has been activated.
+  function RecentDropdownHarness({
+    onFirst = () => {},
+    onSecond = () => {},
+  }: {
+    onFirst?: () => void;
+    onSecond?: () => void;
+  }) {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <button data-hint="recent" onClick={() => setOpen(true)}>Recent</button>
+        {open && (
+          <>
+            <div data-hint="recent-item" onClick={onFirst}>amforge</div>
+            <div data-hint="recent-item" onClick={onSecond}>sparkle-desktop</div>
+          </>
+        )}
+        <HintOverlay />
+      </>
+    );
+  }
+
+  it("opening Recent via the 'r' hint keeps hint mode active and shows the row a–z badges", async () => {
+    render(<RecentDropdownHarness />);
+    controlTap();
+    // Dropdown still closed: only the chrome "r" mnemonic exists, no row badges yet.
+    expect(screen.getByText("r")).toBeTruthy();
+    expect(screen.queryByText("a")).toBeNull();
+
+    fireEvent.keyDown(window, { key: "r" });
+    // The overlay must NOT close: once the dropdown rows mount, a re-collect swaps in the a–z row
+    // badges so the user can chain straight into picking a project.
+    await waitFor(() => expect(screen.getByText("a")).toBeTruthy());
+    expect(screen.getByText("b")).toBeTruthy();
+    // In dropdown mode the chrome "r" badge is suppressed — proof hint mode re-collected, not that
+    // it merely stayed on the pre-open placement.
+    expect(screen.queryByText("r")).toBeNull();
+  });
+
+  it("opening Recent via 'r' when there are NO recent projects closes instead of stranding the overlay", async () => {
+    // The trigger opens, but the dropdown has no rows to badge. Staying open would leave the user on
+    // a "stuck" chrome overlay still showing the r badge with nothing to pick — so it must close.
+    function EmptyRecentHarness() {
+      const [open, setOpen] = useState(false);
+      return (
+        <>
+          <button data-hint="recent" onClick={() => setOpen(true)}>Recent</button>
+          {open && <div data-testid="empty-dropdown" />}
+          <HintOverlay />
+        </>
+      );
+    }
+    render(<EmptyRecentHarness />);
+    controlTap();
+    expect(screen.getByText("r")).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "r" });
+    // After the deferred re-collect finds no recent-item rows, the overlay dismisses.
+    await waitFor(() => expect(screen.queryByText("r")).toBeNull());
+  });
+
+  it("with the Recent dropdown open, an a–z letter selects that project and closes", async () => {
+    const onFirst = vi.fn();
+    const onSecond = vi.fn();
+    render(<RecentDropdownHarness onFirst={onFirst} onSecond={onSecond} />);
+    controlTap();
+    fireEvent.keyDown(window, { key: "r" }); // open the dropdown, staying in hint mode
+    await waitFor(() => expect(screen.getByText("b")).toBeTruthy());
+
+    fireEvent.keyDown(window, { key: "b" }); // a recent-item row: close()+click branch
+    await waitFor(() => expect(onSecond).toHaveBeenCalledTimes(1));
+    expect(onFirst).not.toHaveBeenCalled();
+    // Selecting a project dismisses the overlay (rows are recent-item, not the recent trigger).
+    await waitFor(() => expect(screen.queryByText("b")).toBeNull());
+  });
+
+  it("a non-recent chrome control still closes the overlay and clicks the element", async () => {
+    const onClick = vi.fn();
+    render(
+      <>
+        <button data-hint="open" onClick={onClick}>Open</button>
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    expect(screen.getByText("o")).toBeTruthy();
+    fireEvent.keyDown(window, { key: "o" });
+    await waitFor(() => expect(onClick).toHaveBeenCalledTimes(1));
+    // Overlay dismisses immediately for every control except the Recent trigger.
+    expect(screen.queryByText("o")).toBeNull();
   });
 
   it("skips rows scrolled out of a clipping ancestor instead of badging them off-popover", () => {
