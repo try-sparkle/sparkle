@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { formatPrBadge, OPEN_PR_POLL_MS, OPEN_PR_QUERY_LIMIT } from "./openPrs";
+import {
+  formatPrBadge,
+  OPEN_PR_POLL_MS,
+  OPEN_PR_QUERY_LIMIT,
+  prMergeEligibility,
+} from "./openPrs";
 
 describe("formatPrBadge", () => {
   it("renders a count when PRs are waiting", () => {
@@ -50,5 +55,49 @@ describe("formatPrBadge — query saturation (roborev 43840)", () => {
 
   it("still renders an exact count just below the limit", () => {
     expect(formatPrBadge(OPEN_PR_QUERY_LIMIT - 1)).toBe("99 PRs waiting");
+  });
+});
+
+describe("prMergeEligibility", () => {
+  it("allows a green, mergeable PR", () => {
+    expect(prMergeEligibility({ checks: "passing", mergeable: "mergeable" })).toEqual({
+      canMerge: true,
+      reason: null,
+    });
+  });
+
+  it("allows a PR with NO checks — 'none' is not a failure", () => {
+    expect(prMergeEligibility({ checks: "none", mergeable: "mergeable" }).canMerge).toBe(true);
+  });
+
+  it("allows merging when mergeability is still UNKNOWN — gh is the backstop", () => {
+    // GitHub computes mergeability asynchronously, so a freshly opened PR reads 'unknown'. Blocking
+    // on that would strand a perfectly mergeable PR; gh refuses at merge time if it's actually not.
+    expect(prMergeEligibility({ checks: "passing", mergeable: "unknown" }).canMerge).toBe(true);
+  });
+
+  it("blocks a conflicting PR regardless of checks", () => {
+    const e = prMergeEligibility({ checks: "passing", mergeable: "conflicting" });
+    expect(e.canMerge).toBe(false);
+    expect(e.reason).toMatch(/conflict/i);
+  });
+
+  it("blocks a PR whose checks are failing", () => {
+    const e = prMergeEligibility({ checks: "failing", mergeable: "mergeable" });
+    expect(e.canMerge).toBe(false);
+    expect(e.reason).toMatch(/failing/i);
+  });
+
+  it("blocks while checks are still running — wait for checks, then merge", () => {
+    const e = prMergeEligibility({ checks: "pending", mergeable: "mergeable" });
+    expect(e.canMerge).toBe(false);
+    expect(e.reason).toMatch(/running/i);
+  });
+
+  it("lets a conflict take precedence over a failing-checks reason", () => {
+    // Both are blocking; the conflict message is the more actionable one to lead with.
+    expect(prMergeEligibility({ checks: "failing", mergeable: "conflicting" }).reason).toMatch(
+      /conflict/i,
+    );
   });
 });

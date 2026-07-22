@@ -1324,6 +1324,193 @@ pub async fn project_pr_list_url(root: String) -> Result<Option<String>, String>
         .map_err(|e| format!("project_pr_list_url task failed: {e}"))
 }
 
+/// One open pull request, richer than the bare `probe_open_pr_count` count: enough for the TopBar
+/// PR menu to LIST each PR, join it to a live agent by `head_ref_name` (the `sparkle/agent-<id>`
+/// convention), and gate its Merge action on `checks`/`mergeable`. Serialized camelCase for the JS
+/// side.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrRow {
+    pub number: u64,
+    pub title: String,
+    pub head_ref_name: String,
+    pub url: String,
+    /// Aggregate CI rollup: "passing" | "pending" | "failing" | "none". "none" is a PR with no
+    /// checks at all — distinct from "couldn't tell", which drops the whole probe to `None`.
+    pub checks: String,
+    /// "mergeable" | "conflicting" | "unknown". GitHub computes mergeability asynchronously, so a
+    /// freshly opened PR often reads "unknown"; the UI treats that as "let gh decide", not a block.
+    pub mergeable: String,
+}
+
+/// Aggregate a `gh` `statusCheckRollup` array into one word. A failing check dominates (red beats
+/// everything); else any still-running check makes the whole rollup "pending"; else if there are any
+/// checks they have all succeeded → "passing"; an empty rollup is "none". Pure so the CI-shaping is
+/// unit-tested without a network or a `gh` binary — the same split the badge's decoders use.
+fn classify_checks(rollup: &[Value]) -> &'static str {
+    let mut saw_any = false;
+    let mut saw_pending = false;
+    for c in rollup {
+        saw_any = true;
+        // A check run reports status+conclusion; a legacy commit-status context reports one `state`.
+        if let Some(state) = c.get("state").and_then(Value::as_str) {
+            match state {
+                "SUCCESS" => {}
+                "PENDING" | "EXPECTED" => saw_pending = true,
+                _ => return "failing", // FAILURE | ERROR
+            }
+        } else {
+            // Not COMPLETED yet → still running (QUEUED | IN_PROGRESS | WAITING | REQUESTED | ...).
+            if c.get("status").and_then(Value::as_str) != Some("COMPLETED") {
+                saw_pending = true;
+                continue;
+            }
+            match c.get("conclusion").and_then(Value::as_str).unwrap_or("") {
+                // A neutral/skipped/successful check does not block a merge.
+                "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
+                _ => return "failing", // FAILURE | CANCELLED | TIMED_OUT | ACTION_REQUIRED | STALE
+            }
+        }
+    }
+    if saw_pending {
+        "pending"
+    } else if saw_any {
+        "passing"
+    } else {
+        "none"
+    }
+}
+
+/// GitHub's `mergeable` enum → the lowercase word the UI reads. Anything other than the two known
+/// terminal values (including the very common asynchronously-not-yet-computed `UNKNOWN`) reads as
+/// "unknown", which the UI treats as "attempt the merge and let gh decide" rather than a hard block.
+fn normalize_mergeable(v: Option<&str>) -> &'static str {
+    match v {
+        Some("MERGEABLE") => "mergeable",
+        Some("CONFLICTING") => "conflicting",
+        _ => "unknown",
+    }
+}
+
+/// Pure decoder: `gh pr list --json number,title,headRefName,url,mergeable,statusCheckRollup` → rows.
+/// Unparsable output yields `None` (unknown), never an empty list — the same null-vs-zero discipline
+/// as `decode_open_pr_count`: an empty JSON *array* is a known "no PRs waiting", but garbage means
+/// "couldn't tell", and the menu must not render a confident empty state on a failed probe.
+fn decode_open_prs(stdout: &str) -> Option<Vec<PrRow>> {
+    let rows = serde_json::from_str::<Vec<Value>>(stdout).ok()?;
+    Some(
+        rows.iter()
+            .filter_map(|r| {
+                // A PR without a number is unusable (nothing to merge or link), so drop just that row
+                // rather than failing the whole probe.
+                let number = r.get("number").and_then(Value::as_u64)?;
+                let str_field = |k: &str| {
+                    r.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+                };
+                let checks = r
+                    .get("statusCheckRollup")
+                    .and_then(Value::as_array)
+                    .map(|a| classify_checks(a))
+                    .unwrap_or("none")
+                    .to_string();
+                let mergeable =
+                    normalize_mergeable(r.get("mergeable").and_then(Value::as_str)).to_string();
+                Some(PrRow {
+                    number,
+                    title: str_field("title"),
+                    head_ref_name: str_field("headRefName"),
+                    url: str_field("url"),
+                    checks,
+                    mergeable,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The open PRs authored by this identity in `root`'s repo. Mirrors `probe_open_pr_count`'s
+/// gh-invocation shape (non-interactive env, bounded wall-clock, failure reads as `None`) but asks
+/// for the richer field set the menu needs. Best-effort: gh absent, unauthed, offline, no remote, or
+/// a timeout all yield `None`.
+fn probe_open_prs(root: &str) -> Option<Vec<PrRow>> {
+    let mut cmd = Command::new("gh");
+    cmd.arg("pr")
+        .args([
+            "list",
+            "--state",
+            "open",
+            "--author",
+            "@me",
+            "--limit",
+            "100",
+            "--json",
+            "number,title,headRefName,url,mergeable,statusCheckRollup",
+        ])
+        .current_dir(root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    let output = output_with_timeout(cmd, NETWORK_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    decode_open_prs(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The open PRs waiting in `root`'s repo, for the TopBar PR menu. `Ok(None)` means "couldn't find
+/// out" (see `probe_open_prs`); the menu renders nothing for it, exactly as the count badge does.
+#[tauri::command]
+pub async fn project_open_prs(root: String) -> Result<Option<Vec<PrRow>>, String> {
+    tauri::async_runtime::spawn_blocking(move || probe_open_prs(&root))
+        .await
+        .map_err(|e| format!("project_open_prs task failed: {e}"))
+}
+
+/// Wall-clock ceiling for a user-initiated `gh pr merge`. Longer than `NETWORK_TIMEOUT`: a merge does
+/// more server-side work than a read, and this path is one deliberate click (not a background poll),
+/// so a slightly longer wait is acceptable where a stalled poll would not be.
+const MERGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Merge an open PR by number with a MERGE COMMIT. This is the human gate the workflow is built
+/// around, invoked from the TopBar PR menu — for a PR whose opening agent has already left the
+/// sidebar, it is the only way to merge from the app at all.
+///
+/// Deliberately `--merge`, NOT `--squash`: a squash rewrites the commits so the branch tip stops
+/// being an ancestor of `main`, which breaks Sparkle's landed-by-ancestry proof (see AGENTS.md).
+/// Deliberately NOT `--auto`: on a repo without auto-merge enabled `gh` silently degrades `--auto`
+/// to an immediate merge, so it is not the guard it looks like. The UI only enables this once the
+/// PR's checks are green and it is mergeable; `gh` is the backstop that refuses a merge whose
+/// required checks are still red. The `gh` error text is returned verbatim on failure so the menu
+/// can show exactly why a merge was declined.
+#[tauri::command]
+pub async fn merge_pr(root: String, number: u64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new("gh");
+        cmd.args(["pr", "merge", &number.to_string(), "--merge"])
+            .current_dir(&root)
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1");
+        apply_noninteractive(&mut cmd);
+        let output = output_with_timeout(cmd, MERGE_TIMEOUT)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if stderr.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            stderr
+        };
+        Err(if msg.is_empty() {
+            format!("gh pr merge #{number} failed")
+        } else {
+            msg
+        })
+    })
+    .await
+    .map_err(|e| format!("merge_pr task failed: {e}"))?
+}
+
 /// Per-repo cooldown between opportunistic `git fetch`es. Reachability into `origin/<default>` is
 /// only as fresh as the last fetch; when a PR is merged in ANOTHER worktree/session this repo's
 /// remote-tracking ref goes stale and the tracker understates "On Main"/"Merged" until something
@@ -3567,6 +3754,112 @@ mod tests {
         assert_eq!(decode_open_pr_count(r#"{"message":"Bad credentials"}"#), None);
         // Known-zero and unknown are genuinely different values, not just different renderings.
         assert_ne!(decode_open_pr_count("[]"), decode_open_pr_count("Bad credentials"));
+    }
+
+    #[test]
+    fn classify_checks_lets_failure_dominate_then_pending_then_success() {
+        // Empty rollup → "none" (a PR with no CI at all, not an unknown).
+        assert_eq!(classify_checks(&[]), "none");
+        // All green check runs → passing; a neutral/skipped conclusion doesn't block.
+        assert_eq!(
+            classify_checks(&[
+                json!({ "status": "COMPLETED", "conclusion": "SUCCESS" }),
+                json!({ "status": "COMPLETED", "conclusion": "SKIPPED" }),
+                json!({ "status": "COMPLETED", "conclusion": "NEUTRAL" }),
+            ]),
+            "passing"
+        );
+        // A still-running check makes the whole rollup pending, even beside green ones.
+        assert_eq!(
+            classify_checks(&[
+                json!({ "status": "COMPLETED", "conclusion": "SUCCESS" }),
+                json!({ "status": "IN_PROGRESS", "conclusion": Value::Null }),
+            ]),
+            "pending"
+        );
+        // A single failure dominates both pending and success.
+        assert_eq!(
+            classify_checks(&[
+                json!({ "status": "COMPLETED", "conclusion": "SUCCESS" }),
+                json!({ "status": "IN_PROGRESS", "conclusion": Value::Null }),
+                json!({ "status": "COMPLETED", "conclusion": "FAILURE" }),
+            ]),
+            "failing"
+        );
+        // Legacy commit-status contexts (a single `state`) classify the same way.
+        assert_eq!(classify_checks(&[json!({ "state": "SUCCESS" })]), "passing");
+        assert_eq!(classify_checks(&[json!({ "state": "PENDING" })]), "pending");
+        assert_eq!(classify_checks(&[json!({ "state": "FAILURE" })]), "failing");
+        assert_eq!(classify_checks(&[json!({ "state": "ERROR" })]), "failing");
+    }
+
+    #[test]
+    fn normalize_mergeable_maps_only_the_two_terminal_values() {
+        assert_eq!(normalize_mergeable(Some("MERGEABLE")), "mergeable");
+        assert_eq!(normalize_mergeable(Some("CONFLICTING")), "conflicting");
+        // UNKNOWN (async-not-yet-computed), an unexpected value, and a missing field all read as
+        // "unknown" — the UI treats that as "let gh decide", never as a block.
+        assert_eq!(normalize_mergeable(Some("UNKNOWN")), "unknown");
+        assert_eq!(normalize_mergeable(Some("SOMETHING_NEW")), "unknown");
+        assert_eq!(normalize_mergeable(None), "unknown");
+    }
+
+    #[test]
+    fn decode_open_prs_shapes_rows_and_defaults_missing_fields() {
+        let rows = decode_open_prs(
+            r#"[
+                {
+                    "number": 42,
+                    "title": "fix: a thing",
+                    "headRefName": "sparkle/agent-abc",
+                    "url": "https://github.com/o/r/pull/42",
+                    "mergeable": "MERGEABLE",
+                    "statusCheckRollup": [{ "status": "COMPLETED", "conclusion": "SUCCESS" }]
+                },
+                { "number": 7 }
+            ]"#,
+        )
+        .expect("valid array decodes");
+        assert_eq!(
+            rows[0],
+            PrRow {
+                number: 42,
+                title: "fix: a thing".into(),
+                head_ref_name: "sparkle/agent-abc".into(),
+                url: "https://github.com/o/r/pull/42".into(),
+                checks: "passing".into(),
+                mergeable: "mergeable".into(),
+            }
+        );
+        // A sparse row keeps its number and defaults the rest — a missing rollup is "none", a missing
+        // mergeable is "unknown".
+        assert_eq!(
+            rows[1],
+            PrRow {
+                number: 7,
+                title: String::new(),
+                head_ref_name: String::new(),
+                url: String::new(),
+                checks: "none".into(),
+                mergeable: "unknown".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn decode_open_prs_reads_garbage_as_unknown_and_drops_only_numberless_rows() {
+        // Garbage (not a JSON array) is UNKNOWN — the whole probe drops to None, never an empty list,
+        // matching decode_open_pr_count's null-vs-zero discipline.
+        assert_eq!(decode_open_prs(""), None);
+        assert_eq!(decode_open_prs("not json"), None);
+        assert_eq!(decode_open_prs(r#"{"message":"Bad credentials"}"#), None);
+        // A known-empty array is Some(empty), not None.
+        assert_eq!(decode_open_prs("[]"), Some(vec![]));
+        // A row without a number is unusable (nothing to merge/link) and is dropped, but a valid
+        // sibling still comes through — one bad row must not blank the menu.
+        let rows = decode_open_prs(r#"[{"title":"no number"},{"number":9}]"#).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].number, 9);
     }
 
     #[test]

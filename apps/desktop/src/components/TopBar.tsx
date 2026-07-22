@@ -1,11 +1,10 @@
-import { useState, useEffect, useMemo, memo, type CSSProperties } from "react";
+import { useState, useEffect, useMemo, type CSSProperties } from "react";
 import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, statusInk } from "../theme/colors";
 import type { AgentTabStatus, Project } from "../types";
 import { SettingsDialog } from "./SettingsDialog";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
-import { orderedTopLevelAgents } from "../engine/agentOrdering";
 import { withUnstartedWorkerAttention } from "../engine/workerAttention";
 import { withDismissedAlerts } from "../engine/alertDismissal";
 import { pickProjectFolder, basename } from "../services/dialog";
@@ -32,7 +31,7 @@ import { useTrialStore } from "../stores/trialStore";
 import { deriveAuthView } from "../services/entitlement";
 import { performTrialUnlock } from "../services/trialUnlock";
 import { TrialIndicator } from "./TrialChrome";
-import { OpenPrBadge } from "./OpenPrBadge";
+import { OpenPrMenu, agentLinkForBranch, type PrAgentLink } from "./OpenPrMenu";
 
 /** Most common status across a project's agents — drives the project's color (spec). */
 function majorityStatus(
@@ -55,59 +54,6 @@ function majorityStatus(
   }
   return best;
 }
-
-/** One mark in the TopBar cluster: a top-level agent ("dot") or one of its workers ("half"). */
-export type AgentDot = { id: string; status: AgentTabStatus; shape: "dot" | "half" };
-
-/**
- * The TopBar dot cluster must TRACK the sidebar rows, not the raw `project.agents` array.
- * So both consume the SAME `orderedTopLevelAgents` (top-level agents, mode-filtered, attention-
- * ordered); here we then splice each build agent's workers in right after it — workers as
- * half-discs ("D"), so a sub-agent reads as nested under the full dot it follows. (Plan mode
- * lists no agents in the sidebar, so we fall back to the Build set to keep the header
- * status glanceable.)
- */
-export function agentDots(
-  project: Project,
-  statusMap: Record<string, AgentTabStatus>,
-  workMode: "think" | "plan" | "build",
-  attentionOrder: boolean,
-): AgentDot[] {
-  const ordered = orderedTopLevelAgents(
-    project.agents,
-    statusMap,
-    workMode,
-    attentionOrder,
-    project.freshBuildAgentId,
-  );
-  const dots: AgentDot[] = [];
-  for (const top of ordered) {
-    dots.push({ id: top.id, status: statusMap[top.id] ?? "stopped", shape: "dot" });
-    if (top.kind === "build") {
-      for (const w of project.agents.filter((a) => a.parentId === top.id)) {
-        dots.push({ id: w.id, status: statusMap[w.id] ?? "stopped", shape: "half" });
-      }
-    }
-  }
-  return dots;
-}
-
-/**
- * The per-agent status-dot cluster in the TopBar. Extracted + `React.memo`'d (sparkle-alrm.3) so
- * that when unrelated TopBar state changes (Recent/settings menus opening, a pending open dialog),
- * the dot list doesn't re-render at all; and because each `StatusDot` is itself memoized, a single
- * agent's status flip only re-paints that one dot rather than the whole cluster. `dots` is memoized
- * by the caller so this bails out whenever the derived cluster is unchanged.
- */
-const AgentDotCluster = memo(function AgentDotCluster({ dots }: { dots: AgentDot[] }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-      {dots.map((d) => (
-        <StatusDot key={d.id} status={d.status} size={7} shape={d.shape} />
-      ))}
-    </div>
-  );
-});
 
 const btn: CSSProperties = {
   background: "transparent",
@@ -171,8 +117,6 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
   // (predates dismissals) and out of scope for this overlay.
   const effStatus = (p: Project): Record<string, AgentTabStatus> =>
     withDismissedAlerts(p.agents, withUnstartedWorkerAttention(p.agents, statusMap, openSet));
-  const workMode = useUiStore((s) => s.workMode);
-  const agentOrdering = useUiStore((s) => s.agentOrdering);
   const [recentOpen, setRecentOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   // The unified "Open a Project" dialog (folder / GitHub tabs). The single "Open" button opens this;
@@ -229,14 +173,28 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [project, statusMap, openSet],
   );
-  // The header dot cluster, derived once per (project, status, mode, ordering) change. Memoized so
-  // opening the Recent/settings menus (which re-render TopBar without touching status) doesn't
-  // recompute or re-render the dots (sparkle-alrm.3).
-  const dots = useMemo(
-    () =>
-      project ? agentDots(project, currentEff, workMode, agentOrdering === "attention") : [],
-    [project, currentEff, workMode, agentOrdering],
-  );
+
+  // "Open agent" from a PR row: the pure branch→agent join (agentLinkForBranch) resolves the live
+  // agent that opened a PR, falling back to null — the common case, since PRs outlive their agents,
+  // and the menu then shows only the GitHub link.
+  const resolveAgentForPr = (branch: string): PrAgentLink | null =>
+    agentLinkForBranch(branch, projects, currentProjectId);
+
+  const openAgentForPr = (link: PrAgentLink) => {
+    if (link.isCurrentProject) {
+      // Same window: mount its pane + select it, the same landing a jump-to-agent deep link performs.
+      useRuntimeStore.getState().open(link.agentId);
+      useProjectStore.getState().selectAgent(link.projectId, link.agentId);
+    } else {
+      // Another project: focus (or open) that project's window, deep-linked to the agent.
+      void openProjectInWindow(
+        link.projectId,
+        "new",
+        defaultDeps(replaceCurrent, touchProjectOpened, windowLabel),
+        link.agentId,
+      );
+    }
+  };
   // Recent first (most recently opened), so the "Recent Projects" label is honest.
   const recent = [...projects].sort((a, b) =>
     (b.lastOpenedAt ?? b.createdAt).localeCompare(a.lastOpenedAt ?? a.createdAt),
@@ -318,8 +276,16 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
               {project.name}
             </span>
           </button>
-          <AgentDotCluster dots={dots} />
-          {/* The Tasks board now opens from the "Plan" button in the agent strip (AgentSidebar). */}
+          {/* Where the per-agent dot cluster used to sit: the open-PR menu. Repo-scoped and
+              agent-independent ON PURPOSE — the per-agent "Merge PR" CTA disappears with its agent,
+              so a PR opened by a finished session goes invisible exactly when it's waiting to be
+              merged. Renders nothing at zero, and nothing when the probe couldn't run (those are
+              different facts, and neither is worth a "0"). Click to merge or jump to the agent. */}
+          <OpenPrMenu
+            rootPath={project.rootPath ?? null}
+            resolveAgent={resolveAgentForPr}
+            onOpenAgent={openAgentForPr}
+          />
         </>
       ) : (
         <span style={{ color: C.muted, fontSize: 14 }}>No project open</span>
@@ -331,12 +297,6 @@ export function TopBar({ onOpenSettings }: { onOpenSettings: (p: Project) => voi
       {/* Trial counter + Unlock — in-row, to the LEFT of the Recent/Open/⋯ + auth-status
           cluster, so it can never cover them. Only in trial mode; hides once the trial is spent. */}
       {inTrial && <TrialIndicator onUnlock={onTrialUnlock} signInFailedUrl={trialFailedUrl} />}
-
-      {/* "N PRs waiting" — repo-scoped and agent-independent ON PURPOSE. The per-agent "Merge PR"
-          CTA disappears with its agent, so a PR opened by a finished session goes invisible exactly
-          when it's waiting to be merged. Renders nothing at zero, and nothing when the probe
-          couldn't run — those are different facts, and neither is worth a "0". */}
-      <OpenPrBadge rootPath={project?.rootPath ?? null} />
 
       <div style={{ position: "relative" }}>
         <button

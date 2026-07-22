@@ -343,6 +343,8 @@ pub fn run() {
             worktree::project_agents_status,
             worktree::project_open_pr_count,
             worktree::project_pr_list_url,
+            worktree::project_open_prs,
+            worktree::merge_pr,
             worktree::land_agent_branch,
             worktree::push_agent_branch,
             worktree::delete_agent_branch,

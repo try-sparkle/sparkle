@@ -11,18 +11,67 @@
 // See PRD/sparkle-pr-awaiting-merge-badge.md.
 import { invoke } from "@tauri-apps/api/core";
 
-/** Open-PR count for `root`'s repo, or null when it could not be determined (no `gh`, unauthed,
- *  offline, no remote, timeout). Null is NOT zero — see `formatPrBadge`. */
-export async function fetchOpenPrCount(root: string): Promise<number | null> {
+/** One open PR as surfaced to the TopBar PR menu. Mirrors the Rust `PrRow` (camelCase). `checks` is
+ *  the aggregate CI rollup and `mergeable` is GitHub's async-computed conflict state; together they
+ *  drive `prMergeEligibility`. `headRefName` is what joins a PR back to the agent that opened it
+ *  (`sparkle/agent-<id>`). */
+export interface PrRow {
+  number: number;
+  title: string;
+  headRefName: string;
+  url: string;
+  checks: "passing" | "pending" | "failing" | "none";
+  mergeable: "mergeable" | "conflicting" | "unknown";
+}
+
+/** The open PRs waiting in `root`'s repo, or null when it could not be determined (no `gh`, unauthed,
+ *  offline, no remote, timeout). Null is NOT an empty list — the menu renders nothing for both, but
+ *  a confident "no PRs" on a failed probe is exactly the false reassurance to avoid. */
+export async function fetchOpenPrs(root: string): Promise<PrRow[] | null> {
   if (!root) return null;
   try {
-    const n = await invoke<number | null>("project_open_pr_count", { root });
-    return typeof n === "number" ? n : null;
+    const rows = await invoke<PrRow[] | null>("project_open_prs", { root });
+    return Array.isArray(rows) ? rows : null;
   } catch {
-    // Best-effort by design: a probe failure must never surface as an error toast. The badge simply
+    // Best-effort by design: a probe failure must never surface as an error toast. The menu simply
     // doesn't render, which is honest — we don't know.
     return null;
   }
+}
+
+/** Ask GitHub to merge PR `number` with a MERGE COMMIT (the Rust `merge_pr` command). Rejects with
+ *  gh's own error text when the merge is declined (red required checks, a conflict, lost auth), which
+ *  the menu surfaces so the user sees exactly why. */
+export async function mergePr(root: string, number: number): Promise<void> {
+  await invoke("merge_pr", { root, number });
+}
+
+export interface MergeEligibility {
+  /** Whether the menu should ENABLE the merge action. */
+  canMerge: boolean;
+  /** When blocked, a short human reason for the tooltip; null when mergeable. */
+  reason: string | null;
+}
+
+/**
+ * Whether a PR is safe to merge from the menu, and if not, why. Pure so the gate is tested without
+ * Tauri. This encodes AGENTS.md's rule — never merge over red checks or a conflict, and wait for
+ * checks before merging — as a UI gate: a human clicking Merge IS the deliberate gate the workflow
+ * wants, but only once it is actually safe.
+ *
+ * - `conflicting` → blocked: a merge would fail or force a bad resolution.
+ * - `failing` checks → blocked: never merge red.
+ * - `pending` checks → blocked: "wait for checks, then merge" — gh would refuse a required-check
+ *   merge anyway, so blocking here is honest rather than a click that errors.
+ * - `passing`/`none` with a non-conflicting (incl. async-`unknown`) mergeability → allowed; gh is
+ *   the backstop for anything the probe hasn't caught up to yet.
+ */
+export function prMergeEligibility(pr: Pick<PrRow, "checks" | "mergeable">): MergeEligibility {
+  if (pr.mergeable === "conflicting")
+    return { canMerge: false, reason: "Has conflicts with the base branch" };
+  if (pr.checks === "failing") return { canMerge: false, reason: "Checks are failing" };
+  if (pr.checks === "pending") return { canMerge: false, reason: "Checks are still running" };
+  return { canMerge: true, reason: null };
 }
 
 /**
