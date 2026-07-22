@@ -89,6 +89,24 @@ export function retryBackoffMs(failures: number): number {
 // Two consecutive identical hashes = the terminal has finished painting (settled).
 export const SETTLE_TICK_MS = 1200;
 
+// How many distinct settled states to remember per agent (see `memo` below). Small on purpose: the
+// point is to cover an agent that flips out of and back into the SAME your-turn state, which needs
+// only the last handful. Insertion-ordered, so evicting the oldest key is the LRU-ish behavior we
+// want without carrying a real LRU.
+export const MEMO_LIMIT = 8;
+
+/** Remember a computed set under its scrollback hash, evicting the oldest once past MEMO_LIMIT.
+ *  Pure (mutates the map it's handed) so the eviction rule is testable without rendering. */
+export function rememberComputed<T>(memo: Map<string, T>, hash: string, value: T): void {
+  memo.delete(hash); // re-insert so a re-hit refreshes recency
+  memo.set(hash, value);
+  while (memo.size > MEMO_LIMIT) {
+    const oldest = memo.keys().next().value;
+    if (oldest === undefined) break;
+    memo.delete(oldest);
+  }
+}
+
 /**
  * Owns the per-agent suggestion set. Recomputes once when the agent enters a your-turn status with
  * an empty composer and a changed scrollback; caches by scrollback hash so identical state never
@@ -104,6 +122,15 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // re-send the keystroke. Per-agent (this hook instance owns one agent). See maybeAutoApprove.
   const handledSigs = useRef<Set<string>>(new Set());
   const lastHash = useRef<string | null>(null);
+  // Results of past computes for THIS agent, keyed by scrollback hash. `lastHash` is nulled every
+  // time the agent leaves your-turn (so a genuinely-repeated prompt recomputes), which means an
+  // agent that flips out of and back into the SAME settled screen re-ran the whole compute — and
+  // when learned actions are on, that is a metered Haiku call bought for a state we already have
+  // the answer to. Surviving the reset lets that round-trip be served locally. Deliberately NOT
+  // persisted and not shared across agents: it's a within-session echo cache, nothing more.
+  const memo = useRef<Map<string, { buttons: SuggestionButton[]; questionPending: boolean }>>(
+    new Map(),
+  );
   // Guards against a duplicate concurrent (paid) compute while one is in flight. `retryTick` lets a
   // discarded compute re-trigger the effect so a state we returned to still gets suggestions.
   const computing = useRef(false);
@@ -209,6 +236,39 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
     // committed for a failing hash, so shouldRecompute alone can't stop it).
     if (nextHash !== lastFailHash.current) failures.current = 0;
     else if (!withinRetryBudget(failures.current)) return;
+    // Already computed this exact settled state earlier in the session (the agent left your-turn and
+    // came back to the same screen). Serve it locally instead of re-buying the compute. The
+    // auto-approve check still runs — it's the local heuristic tier, it's what `handledSigs` being
+    // cleared on the turn flip is FOR (a genuinely repeated prompt must be answered again), and
+    // skipping it here would leave a repeat permission prompt showing buttons instead of being
+    // auto-answered. Accepted staleness: the learned tier also reads the user's action history, so a
+    // memo hit can serve suggestions ranked from slightly older history. Same screen, same answers —
+    // worth far more than the metered call it saves.
+    const hit = memo.current.get(nextHash);
+    if (hit) {
+      const autoCat = maybeAutoApprove(agentId, scrollback, handledSigs.current);
+      lastHash.current = nextHash;
+      // Unlike the success path below, this branch deliberately does NOT clear `lastFailHash`.
+      // It can't be stale here: only a SUCCEEDED compute is ever memoized, so a hash present in the
+      // memo is by construction not the hash we're currently failing on — and the budget reset above
+      // has already run for it. Clearing it would read as though the two paths guard the same thing.
+      setDismissed(new Set());
+      if (autoCat) {
+        setAutoApproved(autoCat);
+        setButtons([]);
+        setQuestionPending(false);
+        retire();
+        log.debug("suggestions", "auto-approved", { agentId, category: autoCat });
+        return;
+      }
+      rememberComputed(memo.current, nextHash, hit); // refresh recency
+      setAutoApproved(null);
+      setCtaCleared(false);
+      setQuestionPending(hit.questionPending);
+      setButtons(hit.buttons);
+      log.debug("suggestions", "memo hit", { agentId, buttons: hit.buttons.length });
+      return;
+    }
     computing.current = true;
     let alive = true;
     // Whether the finally block should bump retryTick. The bump must happen AFTER the in-flight
@@ -257,7 +317,12 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         setCtaCleared(false); // a fresh state — the CTA is relevant again
         // Captured from the SAME scrollback the buttons were computed from, so the two can never
         // disagree about which state they describe.
-        setQuestionPending(detectPendingQuestion(scrollback));
+        const pending = detectPendingQuestion(scrollback);
+        setQuestionPending(pending);
+        // Remember this settled state so a later return to the SAME screen is served locally rather
+        // than re-bought. Only the ordinary (non-auto-approved) path caches: the auto-approve branch
+        // above returns early and deliberately re-runs its local classifier each time.
+        rememberComputed(memo.current, nextHash, { buttons: set.buttons, questionPending: pending });
         // Store the RAW computed set; the CTA is merged over it at RENDER time (see `shown` below).
         // Storing the merged list here instead would freeze the CTA at compute time: the workflow
         // stage advances on the ~15-30s poll, long after the scrollback settled, and this effect
