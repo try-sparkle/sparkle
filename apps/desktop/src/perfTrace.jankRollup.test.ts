@@ -148,6 +148,27 @@ describe("jank minor-stall rollup", () => {
     expect(rollup!.sinceMs).toBeLessThan(6_000);
   });
 
+  // The same invariant as the suspend case above, for the other interval rAF doesn't run across:
+  // a hidden/occluded window. Observed in a real session log — a lone 238ms stall reported with
+  // sinceMs ≈ 5.9 HOURS, because the pending window opened just before the window was backgrounded
+  // and was flushed by the first tick after it came back. The gap is correctly classified "ignore"
+  // (it isn't a freeze), but the pending rollup was still measured across it.
+  it("closes the open window before a hidden gap rather than spanning it", () => {
+    tick(200);
+    quiet(5_000);
+    // Window goes hidden, rAF pauses for ~6 hours, then the first tick back observes the whole gap.
+    Object.defineProperty(document, "hidden", { value: true, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "hidden", { value: false, configurable: true });
+    tick(6 * 60 * 60 * 1000);
+    const [rollup] = rollups();
+    expect(rollup).toMatchObject({ count: 1, totalMs: 200 });
+    // A backgrounded window is not a stall, so it must not be warned...
+    expect(warn).not.toHaveBeenCalled();
+    // ...and must not be folded into the window the pre-hide stall actually occurred in.
+    expect(rollup!.sinceMs).toBeLessThan(6_000);
+  });
+
   it("starts a fresh window after a flush", () => {
     tick(200);
     quiet(60_000); // flushes window 1

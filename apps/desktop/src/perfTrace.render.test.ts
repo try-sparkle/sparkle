@@ -207,6 +207,71 @@ describe("perfRender", () => {
     expect(lines.at(-1)!.count).toBeGreaterThan(3_500); // ...without losing a single render
   });
 
+  it("widens for a key rendering slower than the base window, not just faster than it", () => {
+    // The hole the old window-relative idle test left. It asked whether the span since the last LINE
+    // fit inside twice the CURRENT window, so a key whose render period sat past 2x the 1s base
+    // flushed on every single render (period >= window, so always past it) and scored that flush as
+    // "idled and came back" (period >= 2x window) — resetting the backoff every time. The window
+    // could never grow, and every render wrote its own `since:1` line forever. A real day's log is
+    // ~83% exactly this: `since:1` lines at ms 2.3s-5.6s, the band no amount of widening could reach.
+    //
+    // 2.3s is a period observed in real traffic. The 1.0s and 1.5s periods the other tests use both
+    // happen to fall UNDER the 2x floor, which is why the suite passed while the log filled up.
+    const debug = vi.spyOn(log, "debug").mockImplementation(() => {});
+    const c = clock();
+
+    for (let i = 0; i < 400; i++) {
+      perfRender("AgentPane", "a");
+      c.advance(2_300);
+    }
+
+    const lines = renderLines(debug);
+    // Was 400 — one line per render. Backing off to the 30s cap over ~920s of traffic is a few dozen.
+    expect(lines.length).toBeLessThan(60);
+    // ...without the coarser sampling costing renders: the last line's `count` is the true running
+    // total as of that line. It trails 400 only by the handful still sitting in the open window,
+    // which by design waits for a render to flush it (see the burst-then-idle test above).
+    expect(lines.at(-1)!.count).toBeGreaterThan(380);
+  });
+
+  it("treats a key rendering steadily as busy however coarse the window has become", () => {
+    // Continuity must be a property of the render stream, not of the current sampling rate: once the
+    // window has widened, a steady key still has to read as busy or it would ping-pong back to 1s.
+    const debug = vi.spyOn(log, "debug").mockImplementation(() => {});
+    const c = clock();
+
+    for (let i = 0; i < 300; i++) {
+      perfRender("AgentPane", "a");
+      c.advance(5_000); // slower than the base window, far slower than 2x it
+    }
+
+    // At the cap, consecutive lines sit a full 30s apart rather than one per 5s render.
+    expect(renderLines(debug).at(-1)!.ms).toBe(30_000);
+  });
+
+  it("resets once a key stops rendering for longer than the idle threshold", () => {
+    // The reset branch, pinned just past RENDER_IDLE_MS rather than at the 300s the older reset test
+    // uses. Both reach the same branch, but a five-minute idle would keep passing if the threshold
+    // were raised to any value under it; this one fails the moment the threshold moves, which is the
+    // point of pinning a boundary. It is also the half of the render-gap semantics the widening
+    // tests don't reach: they only ever exercise `renderGap < RENDER_IDLE_MS`.
+    const debug = vi.spyOn(log, "debug").mockImplementation(() => {});
+    const c = clock();
+
+    for (let i = 0; i < 200; i++) {
+      // ...widen all the way to the 30s cap
+      perfRender("AgentPane", "a");
+      c.advance(1_000);
+    }
+    c.advance(40_000); // silent for longer than the idle threshold, but nowhere near five minutes
+    perfRender("AgentPane", "a"); // return-from-idle render: flushes, and resets the window
+    const before = renderLines(debug).length;
+    c.advance(1_000);
+    perfRender("AgentPane", "a"); // logs only if the window really is back to the 1s base
+
+    expect(renderLines(debug)).toHaveLength(before + 1);
+  });
+
   it("caps how wide the window can get, so a thrashing key keeps a live pulse", () => {
     // Doubling forever would eventually mean a pane could thrash for an hour between lines.
     const debug = vi.spyOn(log, "debug").mockImplementation(() => {});

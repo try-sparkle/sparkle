@@ -103,7 +103,15 @@ export async function perfSpanAsync<T>(
 /** `count` is cumulative for the key's lifetime; `loggedAt`/`loggedCount` are the clock and count as
  *  of the last line written, so the next line can state the window's span and how many renders it
  *  swallowed without holding the renders themselves. */
-type RenderStat = { count: number; loggedAt: number; loggedCount: number; windowMs: number };
+type RenderStat = {
+  count: number;
+  loggedAt: number;
+  loggedCount: number;
+  windowMs: number;
+  /** Clock as of the previous render, so the backoff can ask "did this key go quiet?" against the
+   *  gap between RENDERS rather than the gap between LINES — see RENDER_IDLE_MS. */
+  lastRenderAt: number;
+};
 
 /** Entries are intentionally never evicted: `count` is documented as lifetime-cumulative, so a
  *  retired key's entry is what makes a re-mounted pane's count continue rather than silently reset.
@@ -203,10 +211,34 @@ const RENDER_COALESCE_MS = 1_000;
  *  unbounded time to say so. */
 const RENDER_COALESCE_MAX_MS = 30_000;
 
-/** A flush landing within this multiple of the current window means the key never actually went
- *  quiet — it has been rendering continuously since the last line — so the window doubles (capped at
- *  RENDER_COALESCE_MAX_MS). Any longer gap means the key idled and came back, which is a change in
- *  behaviour and therefore newsworthy, so the window resets to RENDER_COALESCE_MS.
+/** How long a key must produce NO renders at all before the backoff treats it as having gone quiet.
+ *  A flush whose preceding render gap is under this means the key has been rendering continuously,
+ *  so the window doubles (capped at RENDER_COALESCE_MAX_MS); a longer gap means it idled and came
+ *  back, which is a change in behaviour and therefore newsworthy, so the window resets to
+ *  RENDER_COALESCE_MS.
+ *
+ *  This is measured against the gap since the previous RENDER, not the gap since the previous LINE,
+ *  and that distinction is the whole point. The original test asked `elapsed < windowMs * FACTOR`,
+ *  where `elapsed` is the span since the last line — which makes "quiet" mean something different at
+ *  every window size, and unsatisfiable below a floor. A key rendering once every 2.3s always flushes
+ *  on its very next render (2300 >= the 1000ms base window) with `elapsed` 2300, and 2300 is NOT
+ *  under 1000*2 — so it scored as "idled and came back", reset to the base window, and did it again
+ *  on the next render, forever. Every render past ~2x the base period logged its own `since:1` line
+ *  and the backoff could never engage on the panes that needed it most. A real day's log shows the
+ *  failure plainly: ~260k `render AgentPane` lines, 83% of the entire file, every one of them reading
+ *  `since:1` at `ms` between 2.3s and 5.6s — the exact band the ratio test cannot widen out of.
+ *
+ *  An absolute threshold has no such floor: continuity is a property of the key's render stream, not
+ *  of how coarsely we happen to be sampling it, so the same 2.3s hum now doubles its way to the cap
+ *  like any other sustained key. RENDER_COALESCE_MAX_MS is the natural value — a key that hasn't
+ *  rendered once in the time spanned by the widest window we would ever use has, by any reading,
+ *  stopped.
+ *
+ *  The comparison is exclusive, so a key rendering at EXACTLY this period counts as idle and logs
+ *  every render. Deliberate: that is one line per 30s, which is a live pulse rather than a flood, and
+ *  a key rendering once every 30 seconds is a fair description of idle anyway. The floor this
+ *  replaces was pathological because it scaled — it silently swallowed a whole band of ordinary
+ *  periods — whereas this is a single exact period with a bounded, unremarkable cost.
  *
  *  This is the fix for the "breadth, not burst" residual the note above waves off. The flat 1s cap
  *  bounds how loud one key can be in one second but not how long it can stay loud: the dominant real
@@ -224,6 +256,12 @@ const RENDER_COALESCE_MAX_MS = 30_000;
  *
  *  Doubling (rather than a fixed wide window) is what keeps onset sharp: a key that starts thrashing
  *  is still reported at 1s resolution for the first several seconds, when the information is new. */
+const RENDER_IDLE_MS = RENDER_COALESCE_MAX_MS;
+
+/** How fast the window widens per sustained flush. Kept separate from RENDER_IDLE_MS now that the
+ *  two are genuinely independent knobs: growth sets the sampling curve, the idle threshold sets what
+ *  counts as "still rendering". (They used to be one number, which is what produced the floor
+ *  described above.) */
 const RENDER_SUSTAINED_FACTOR = 2;
 
 /** Call once per render from a component (e.g. perfRender("AgentPane", agent.id, { visible })). Logs
@@ -261,7 +299,13 @@ export function perfRender(component: string, key: string, meta?: Record<string,
   const now = perfNow();
   const prev = renderStats.get(id);
   if (!prev) {
-    renderStats.set(id, { count: 1, loggedAt: now, loggedCount: 1, windowMs: RENDER_COALESCE_MS });
+    renderStats.set(id, {
+      count: 1,
+      loggedAt: now,
+      loggedCount: 1,
+      windowMs: RENDER_COALESCE_MS,
+      lastRenderAt: now,
+    });
     // The mount line is still worth seeing, but only when logging is on: a busy session mounts
     // ~60 keys, so an ungated "first render always logs" is 60 main-thread IPCs nobody asked for.
     if (renderLogEnabled) log.debug("perf", `render ${component}`, { ...meta, key, count: 1 });
@@ -277,6 +321,12 @@ export function perfRender(component: string, key: string, meta?: Record<string,
   // next render logs immediately, and the backoff restarts from RENDER_COALESCE_MS rather than
   // resuming a stale 30s window the user never saw.
   if (!renderLogEnabled) return;
+  // Gap since the PREVIOUS render, captured before `lastRenderAt` advances — the continuity signal
+  // the backoff decides on below. Advanced only past the gate, so a stretch with logging OFF leaves
+  // it stale on purpose: re-enabling then reads a large gap and restarts the backoff from the base
+  // window, matching what `loggedAt`/`windowMs` already do (see the note above the gate).
+  const renderGap = now - prev.lastRenderAt;
+  prev.lastRenderAt = now;
   const elapsed = now - prev.loggedAt;
   if (elapsed < prev.windowMs) return; // inside the window — counted, not logged
   // `meta` spreads FIRST so the instrument's own fields always win: `ms` is a plausible thing for a
@@ -291,14 +341,11 @@ export function perfRender(component: string, key: string, meta?: Record<string,
   });
   prev.loggedAt = now;
   prev.loggedCount = prev.count;
-  // Widen while the key stays continuously busy; snap back the moment it idles out of the window.
-  // Growth deliberately reuses RENDER_SUSTAINED_FACTOR rather than a literal: the two are one
-  // invariant, not two knobs. A gap qualifies as "sustained" iff it fits within one growth step, so
-  // growing by the same factor guarantees the new window covers the gap that just qualified. Were
-  // growth smaller than the threshold, a key could flush as sustained and then immediately overrun
-  // its own widened window, ping-ponging into a reset instead of settling.
+  // Widen while the key keeps rendering at all; snap back only once it has genuinely stopped. The
+  // test is on `renderGap` rather than `elapsed` so that "still rendering" means the same thing at
+  // every window size — see RENDER_IDLE_MS for the floor the old window-relative form imposed.
   prev.windowMs =
-    elapsed < prev.windowMs * RENDER_SUSTAINED_FACTOR
+    renderGap < RENDER_IDLE_MS
       ? Math.min(prev.windowMs * RENDER_SUSTAINED_FACTOR, RENDER_COALESCE_MAX_MS)
       : RENDER_COALESCE_MS;
 }
@@ -421,12 +468,23 @@ export function startJankMonitor(thresholdMs = 150): void {
     last = now;
     const verdict = classifyJankGap(gap, thresholdMs, hiddenSinceLastTick);
     hiddenSinceLastTick = typeof document !== "undefined" && document.hidden;
+    // Close the open window BEFORE any gap rAF did not run across. A rollup that straddles one
+    // would carry the whole paused interval in `sinceMs` — an 8-hour sleep makes a perfectly normal
+    // window read as a near-zero stall rate — so the stalls before it are reported over the span
+    // they actually occurred in, and the next window starts clean.
+    //
+    // BOTH non-stall verdicts qualify, which is the fix for a real observed case: a lone 238ms
+    // stall was reported with sinceMs ≈ 5.9 HOURS. Its window opened just before the window was
+    // backgrounded and was flushed by the first tick after it returned. That gap is classified
+    // "ignore" (a hidden window is not a freeze, correctly) rather than "resume", so it used to
+    // skip this flush — but rAF is paused just the same, and the pending window spanned the whole
+    // hidden interval. Guarding on the verdict rather than on suspend-vs-hidden covers both.
+    //
+    // The `gap >= thresholdMs` guard is what keeps this off the hot path: an "ignore" verdict is
+    // overwhelmingly just a healthy sub-threshold frame, and flushing on those would emit a line
+    // per frame and destroy the coalescing entirely.
+    if (verdict !== "stall" && gap >= thresholdMs) flushMinors(now - gap);
     if (verdict === "resume") {
-      // Close the open window BEFORE the wake lands. A rollup that straddles a suspend would carry
-      // the whole slept interval in `sinceMs` — an 8-hour sleep makes a perfectly normal window
-      // read as a near-zero stall rate — so the pre-suspend stalls are reported over the span they
-      // actually occurred in, and the post-wake window starts clean.
-      flushMinors(now - gap);
       // Resume from suspend, not a freeze — record it (still useful to correlate) without the warn.
       log.debug("perf", "resume after suspend", { ms: Math.round(gap) });
     } else if (verdict === "stall") {
