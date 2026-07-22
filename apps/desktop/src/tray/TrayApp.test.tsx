@@ -4,13 +4,18 @@
 // so TrayApp renders the empty state. Canvas is unavailable in jsdom — paintTrayIcon must not throw.
 // Plus the capture flow (plan Task 2 Step 4): hide popover → crosshair → show capture window.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 
 const hide = vi.fn(() => Promise.resolve());
 const show = vi.fn(() => Promise.resolve());
+// Holds the handler TrayApp registers, so a test can drive focus/blur the way Tauri would.
+const focus = vi.hoisted(() => ({ fire: undefined as ((focused: boolean) => void) | undefined }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
-    onFocusChanged: () => Promise.resolve(() => {}),
+    onFocusChanged: (cb: (e: { payload: boolean }) => void) => {
+      focus.fire = (focused: boolean) => cb({ payload: focused });
+      return Promise.resolve(() => {});
+    },
     hide: () => hide(),
     show: () => show(),
   }),
@@ -41,6 +46,32 @@ describe("TrayApp", () => {
   it("renders the empty state with no Tauri backend", async () => {
     render(<TrayApp />);
     await waitFor(() => expect(screen.getByText("No projects running.")).toBeTruthy());
+  });
+});
+
+describe("TrayApp elapsed clock", () => {
+  // The popover hides itself on blur, so an unfocused tray window is one nobody can see. Ticking a
+  // 1s re-render of the whole dashboard there is pure waste — the menu-bar extra is closed almost
+  // all the time, so this is hours of unobserved work per session, not a rounding error.
+  it("stops the 1s clock while the popover is hidden and restarts it when shown again", async () => {
+    const setSpy = vi.spyOn(globalThis, "setInterval");
+    const clearSpy = vi.spyOn(globalThis, "clearInterval");
+    try {
+      render(<TrayApp />);
+      await waitFor(() => expect(focus.fire).toBeTruthy());
+      const clocks = () => setSpy.mock.calls.filter(([, ms]) => ms === 1000).length;
+      expect(clocks()).toBe(1);
+
+      await act(async () => focus.fire!(false));
+      expect(clearSpy).toHaveBeenCalled();
+      expect(clocks()).toBe(1); // stayed stopped — no clock re-armed while hidden
+
+      await act(async () => focus.fire!(true));
+      expect(clocks()).toBe(2); // resumed on re-show
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
   });
 });
 

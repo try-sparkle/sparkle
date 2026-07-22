@@ -31,6 +31,9 @@ function paintTrayIcon(roster: TrayRoster): void {
 export function TrayApp() {
   const [roster, setRoster] = useState<TrayRoster>(EMPTY);
   const [now, setNow] = useState(() => Date.now());
+  // Starts true: the popover is created in response to a click, so it is on screen before the first
+  // focus event arrives. Defaulting to false would leave the clock frozen until the first blur.
+  const [shown, setShown] = useState(true);
   const [captureBusy, setCaptureBusy] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
   // Synchronous re-entrancy guard: `captureBusy` state is read from the render closure, so two
@@ -46,15 +49,27 @@ export function TrayApp() {
     return () => { alive = false; void safeUnlisten(un); };
   }, []);
 
-  // Shared 1s clock so every elapsed timer ticks together.
+  // Shared 1s clock so every elapsed timer ticks together — but only while the popover is on
+  // screen. A menu-bar extra spends nearly all of its life closed, and the clock's only job is to
+  // advance elapsed timers nobody can read while it's hidden: left ungated it re-renders the whole
+  // dashboard once a second, for hours, entirely unobserved. Same reasoning as the visibility gate
+  // on useRowClock and the beadsStore poll.
+  //
+  // The gate is FOCUS, not `document.visibilityState`: this window hides itself the instant it
+  // loses focus (the effect below), so unfocused and unseen are the same state here, and focus is a
+  // signal Tauri reports for certain — a hidden native window does not reliably fire
+  // `visibilitychange` in the webview.
   useEffect(() => {
+    if (!shown) return;
+    setNow(Date.now()); // catch the (frozen-while-hidden) clock up the instant we're shown again
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
-  }, []);
+  }, [shown]);
 
   // Menu-bar-extra behavior: hide the popover when it loses focus.
   useEffect(() => {
     const p = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      setShown(focused);
       if (!focused) void getCurrentWindow().hide();
     });
     return () => { void safeUnlisten(p); };
