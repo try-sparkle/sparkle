@@ -46,6 +46,7 @@ import {
   classifyOccludedRows,
   resolveAutoYield,
   shouldShowHiddenChip,
+  sameOcclusion,
   measuredComposerHeight,
   type Occlusion,
   type YieldState,
@@ -227,7 +228,10 @@ function AgentPaneInner({
         bottomInset: TERMINAL_STAGE_PADDING,
       });
       const next = classifyOccludedRows(api.readBottomRows(covered));
-      setOcclusion(next);
+      // Keep the previous object when the verdict is unchanged. classifyOccludedRows allocates a new
+      // one every tick, so storing it unconditionally re-rendered the whole pane at the poll rate
+      // (~4×/sec) for as long as an agent was on screen, idle terminal included.
+      setOcclusion((prev) => (sameOcclusion(prev, next) ? prev : next));
       const move = resolveAutoYield({
         occlusion: next,
         minimized: ui.composerMinimized,

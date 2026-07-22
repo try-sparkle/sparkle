@@ -139,6 +139,19 @@ export function classifyOccludedRows(lines: readonly string[]): Occlusion {
   return { kind: "content", hiddenLines };
 }
 
+/**
+ * Do two classifications describe the same screen?
+ *
+ * The poll re-classifies on a fixed interval and `classifyOccludedRows` always returns a FRESH
+ * object, so storing its result unconditionally re-renders the pane at the poll rate forever —
+ * even on a completely idle terminal where the answer never changes. Callers gate the state write
+ * on this so an unchanged verdict costs nothing. Safe as a plain field compare: `Occlusion` is two
+ * primitives, and every consumer reads it by value.
+ */
+export function sameOcclusion(a: Occlusion, b: Occlusion): boolean {
+  return a.kind === b.kind && a.hiddenLines === b.hiddenLines;
+}
+
 /** Should the composer move itself out of the way? Only for something the user must answer. */
 export function shouldAutoYield(o: Occlusion): boolean {
   return o.kind === "prompt";

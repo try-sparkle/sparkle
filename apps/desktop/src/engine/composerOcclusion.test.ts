@@ -7,6 +7,7 @@ import {
   resolveAutoYield,
   bottomRowIndices,
   measuredComposerHeight,
+  sameOcclusion,
 } from "./composerOcclusion";
 
 // The real shapes Claude Code draws in the live bottom region, mirrored from the fixtures already
@@ -290,5 +291,47 @@ describe("measuredComposerHeight (oscillation latch)", () => {
     // Yields once on the first tick, then holds — no flapping while the prompt is unanswered.
     expect(seen).toEqual([true, true, true, true, true, true, true, true]);
     expect(state).toBe("yielded");
+  });
+});
+
+describe("sameOcclusion", () => {
+  it("treats two classifications of the same screen as equal despite fresh object identity", () => {
+    const a = classifyOccludedRows(INPUT_BOX);
+    const b = classifyOccludedRows(INPUT_BOX);
+    expect(a).not.toBe(b); // the allocation that drove the render loop
+    expect(sameOcclusion(a, b)).toBe(true);
+  });
+
+  it("separates verdicts that differ in kind or in hidden-line count", () => {
+    expect(sameOcclusion(classifyOccludedRows(INPUT_BOX), classifyOccludedRows([]))).toBe(false);
+    // A menu appearing over what was an idle input box: the transition the poll exists to catch.
+    expect(
+      sameOcclusion(classifyOccludedRows(INPUT_BOX), classifyOccludedRows(PERMISSION_BOX)),
+    ).toBe(false);
+    // Same kind, different count — the chip's number changed, so the render must happen.
+    expect(
+      sameOcclusion(classifyOccludedRows(RESUME_MENU), classifyOccludedRows(RESUME_MENU.slice(1))),
+    ).toBe(false);
+    expect(sameOcclusion({ kind: "content", hiddenLines: 2 }, { kind: "content", hiddenLines: 3 })).toBe(
+      false,
+    );
+  });
+
+  it("holds the first object across a steady poll, so an idle screen stops re-rendering the pane", () => {
+    // What the poll actually does: re-classify an unchanging screen every OCCLUSION_POLL_MS and
+    // keep `prev` whenever the verdict matches. Identity must survive all 20 ticks — each change
+    // of identity is one full AgentPane render.
+    let stored = classifyOccludedRows(INPUT_BOX);
+    const first = stored;
+    let writes = 0;
+    for (let i = 0; i < 20; i++) {
+      const next = classifyOccludedRows(INPUT_BOX);
+      if (!sameOcclusion(stored, next)) {
+        stored = next;
+        writes++;
+      }
+    }
+    expect(writes).toBe(0);
+    expect(stored).toBe(first);
   });
 });
