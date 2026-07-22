@@ -255,6 +255,45 @@ fn resolve_roborev_uncached() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// gh detection
+//
+// The GitHub CLI backs every PR probe (worktree.rs: PR state for the workflow CTA, the open-PR
+// count badge, the PR-list URL, and `gh pr create`). Those probes swallow a failed spawn as "no PR
+// found" by design — so when a Finder/Dock-launched app (bare GUI PATH) can't see a homebrew gh,
+// they don't error, they silently report no PR forever: the composer keeps offering "Open Pull
+// Request" over a PR that's already open. Resolve gh like the other user-scope binaries: login-shell
+// `command -v gh`, then the canonical absolute install locations.
+// ---------------------------------------------------------------------------
+
+/// Canonical absolute `gh` locations, user-first: `~/.local/bin` (manual tarball installs), then
+/// homebrew prefixes. Pure form takes the home dir explicitly so it can be unit-tested without
+/// mutating the process-global `HOME`.
+pub fn known_gh_paths_for(home: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = home {
+        paths.push(home.join(".local/bin/gh"));
+    }
+    paths.push(PathBuf::from("/opt/homebrew/bin/gh")); // homebrew (Apple silicon)
+    paths.push(PathBuf::from("/usr/local/bin/gh")); // homebrew (Intel) / manual install
+    paths
+}
+
+/// Resolve the absolute `gh` path (login-shell PATH probe, then the canonical absolute install
+/// locations). Unix form.
+#[cfg(unix)]
+fn resolve_gh_uncached() -> Option<String> {
+    run_in_login_shell("command -v gh").or_else(|| {
+        first_executable(&known_gh_paths_for(std::env::var_os("HOME").map(PathBuf::from)))
+    })
+}
+
+/// Windows form: `where gh` (GUI apps inherit PATH), then canonical install paths.
+#[cfg(not(unix))]
+fn resolve_gh_uncached() -> Option<String> {
+    resolve_on_path("gh").or_else(|| first_executable(&known_gh_paths_for(home_dir())))
+}
+
+// ---------------------------------------------------------------------------
 // Session-lifetime path caches
 //
 // Both `claude` and `node` are resolved by shelling out to a LOGIN shell (`command -v …`), which is
@@ -286,6 +325,11 @@ fn git_path_cache() -> &'static Mutex<Option<String>> {
 }
 
 fn roborev_path_cache() -> &'static Mutex<Option<String>> {
+    static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn gh_path_cache() -> &'static Mutex<Option<String>> {
     static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
 }
@@ -386,7 +430,36 @@ pub fn cached_roborev_path() -> Option<String> {
     resolved
 }
 
-/// Clear the cached claude/node/git/roborev paths so the next resolve re-probes (e.g. the user
+/// Resolved absolute `gh` path, cached for the app session (resolution per
+/// [`resolve_gh_uncached`]). Only a positive hit is cached — see the cache note above — so a
+/// just-installed gh is picked up on the next probe. Concurrent callers may both resolve on a
+/// cold cache (idempotent); a poisoned lock falls back to an uncached resolve.
+pub fn cached_gh_path() -> Option<String> {
+    if let Ok(guard) = gh_path_cache().lock() {
+        if let Some(path) = guard.as_ref() {
+            return Some(path.clone());
+        }
+    }
+    let resolved = resolve_gh_uncached();
+    if let Some(path) = resolved.as_ref() {
+        if let Ok(mut guard) = gh_path_cache().lock() {
+            *guard = Some(path.clone());
+        }
+    }
+    resolved
+}
+
+/// The `gh` program to spawn for any internal GitHub CLI invocation: the cached resolved ABSOLUTE
+/// path, or the bare name `"gh"` as a last resort. Mirrors [`git_program`] and exists for the same
+/// reason — a Finder/Dock-launched GUI app doesn't inherit the login-shell PATH, so a bare
+/// `Command::new("gh")` misses a homebrew gh. Unlike git, a failed gh spawn is SWALLOWED by every
+/// caller (the PR probes read it as "no PR"), which turned this PATH gap into a silent wrong answer
+/// rather than an error: the workflow CTA stuck on "Open Pull Request" over an already-open PR.
+pub fn gh_program() -> String {
+    cached_gh_path().unwrap_or_else(|| "gh".to_string())
+}
+
+/// Clear the cached claude/node/git/roborev/gh paths so the next resolve re-probes (e.g. the user
 /// moved/reinstalled a toolchain, or just finished an in-app install, while the app was running).
 /// Note that a "not installed" result is never cached in the first place, so a fresh install is
 /// already picked up without calling this.
@@ -401,6 +474,9 @@ pub fn invalidate_preflight_caches() {
         *g = None;
     }
     if let Ok(mut g) = roborev_path_cache().lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = gh_path_cache().lock() {
         *g = None;
     }
 }
@@ -727,6 +803,33 @@ mod tests {
         // No home → no ~/.local entry, but the system locations are still present.
         assert!(paths.iter().any(|p| p.ends_with("opt/homebrew/bin/roborev")));
         assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".local")));
+    }
+
+    #[test]
+    fn known_gh_paths_prioritizes_user_then_brew_then_usr_local() {
+        let home = Some(std::path::PathBuf::from("/Users/x"));
+        let paths = super::known_gh_paths_for(home);
+        let strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        assert_eq!(strs[0], "/Users/x/.local/bin/gh");
+        assert!(strs.contains(&"/opt/homebrew/bin/gh".to_string()));
+        assert!(strs.contains(&"/usr/local/bin/gh".to_string()));
+    }
+
+    #[test]
+    fn known_gh_paths_handles_no_home() {
+        let paths = super::known_gh_paths_for(None);
+        // No home → no ~/.local entry, but the system locations are still present.
+        assert!(paths.iter().any(|p| p.ends_with("opt/homebrew/bin/gh")));
+        assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".local")));
+    }
+
+    #[test]
+    fn gh_program_never_returns_empty() {
+        // Whatever the machine looks like, gh_program must yield something spawnable-shaped:
+        // either an absolute resolved path or the bare "gh" fallback — never an empty string.
+        let prog = super::gh_program();
+        assert!(!prog.is_empty());
+        assert!(prog == "gh" || std::path::Path::new(&prog).is_absolute());
     }
 
     #[test]

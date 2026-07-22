@@ -1134,7 +1134,7 @@ fn probe_pr(root: &str, branch: &str) -> (Option<String>, Option<u64>, Option<St
     if branch.trim().is_empty() {
         return none;
     }
-    let mut cmd = Command::new("gh");
+    let mut cmd = Command::new(crate::preflight::gh_program());
     cmd.arg("pr")
         .args(["list", "--head", branch, "--state", "all", "--limit", "1", "--json", "number,state,url"])
         .current_dir(root)
@@ -1212,7 +1212,7 @@ fn probe_pr_by_commit(root: &str, tip: &str) -> (Option<String>, Option<u64>, Op
     if tip.trim().is_empty() {
         return none;
     }
-    let mut cmd = Command::new("gh");
+    let mut cmd = Command::new(crate::preflight::gh_program());
     // gh substitutes {owner}/{repo} from the repo at `current_dir`. The endpoint returns the PRs
     // whose head branch contains `tip`, regardless of that branch's name.
     cmd.arg("api")
@@ -1258,7 +1258,7 @@ fn decode_open_pr_count(stdout: &str) -> Option<u32> {
 /// Best-effort by the same convention as `probe_pr`: gh absent, unauthed, offline, no remote, or a
 /// timeout all yield `None` (unknown) and never an error.
 fn probe_open_pr_count(root: &str) -> Option<u32> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = Command::new(crate::preflight::gh_program());
     cmd.arg("pr")
         .args(["list", "--state", "open", "--author", "@me", "--limit", "100", "--json", "number"])
         .current_dir(root)
@@ -1304,7 +1304,7 @@ fn decode_pr_list_url(stdout: &str) -> Option<String> {
 /// is identical, and having one path inline it while the other used a helper made the pair harder
 /// to compare than it needed to be.
 fn probe_pr_list_url(root: &str) -> Option<String> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = Command::new(crate::preflight::gh_program());
     cmd.args(["repo", "view", "--json", "url"])
         .current_dir(root)
         .env("GH_PROMPT_DISABLED", "1")
@@ -2770,7 +2770,7 @@ pub async fn open_agent_pr(
             return Err("no-branch".to_string());
         }
         let args = pr_create_args(&branch, &target_branch, &title)?;
-        let mut cmd = Command::new("gh");
+        let mut cmd = Command::new(crate::preflight::gh_program());
         cmd.args(&args)
             .current_dir(&root)
             .env("GH_PROMPT_DISABLED", "1")
