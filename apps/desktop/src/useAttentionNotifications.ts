@@ -274,7 +274,12 @@ export function useAttentionNotifications(): void {
     });
     // Prune to only currently-red ids so a later return-to-red gets a fresh Date.now() above.
     redSince.current = nextRedSince;
-    publishWindowRedAgents(label, projectId ?? "", projectName, redList);
+    // A project switch (Open/Replace) must reach other windows NOW, not on the 250ms debounce: until
+    // they re-read, their snapshot still carries THIS window's previous project's red agents, and the
+    // reader-side staleness guard can only drop them on a re-read. Read before prevProject.current is
+    // updated at the end of this effect, so it still holds the PREVIOUS project here.
+    const projectChanged = prevProject.current !== projectId;
+    publishWindowRedAgents(label, projectId ?? "", projectName, redList, undefined, projectChanged);
 
     const sameProject = prevProject.current === projectId;
     if (sameProject) {

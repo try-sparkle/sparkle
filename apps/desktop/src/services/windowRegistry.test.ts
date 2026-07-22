@@ -4,6 +4,7 @@ import {
   setWindowProject,
   clearWindowProject,
   findWindowForProject,
+  getWindowProject,
   onWindowRegistryChange,
   resetWindowRegistry,
 } from "./windowRegistry";
@@ -24,6 +25,21 @@ describe("windowRegistry", () => {
     expect(findWindowForProject("p1", s)).toBe("main");
     expect(findWindowForProject("p2", s)).toBe("project-p2");
     expect(findWindowForProject("nope", s)).toBeNull();
+  });
+
+  it("getWindowProject reads back the project a label currently shows", () => {
+    const s = fakeStore();
+    setWindowProject("main", "p1", s);
+    expect(getWindowProject("main", s)).toBe("p1");
+    // Unregistered label (closed window) → null, so callers can tell "shows nothing" from "shows X".
+    expect(getWindowProject("project-p2", s)).toBeNull();
+  });
+
+  it("getWindowProject follows a Replace (label re-pointed to a new project)", () => {
+    const s = fakeStore();
+    setWindowProject("main", "p1", s);
+    setWindowProject("main", "p2", s);
+    expect(getWindowProject("main", s)).toBe("p2");
   });
 
   it("clearing a label removes its mapping", () => {

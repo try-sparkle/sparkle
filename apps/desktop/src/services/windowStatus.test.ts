@@ -113,6 +113,29 @@ describe("publishWindowRedAgents", () => {
     await new Promise((r) => setTimeout(r, 300));
     expect(emit).toHaveBeenCalledWith(STATUS_CHANGED_EVENT);
   });
+
+  it("emits SYNCHRONOUSLY when `immediate` is set (the project-switch path)", () => {
+    publishWindowRedAgents(
+      "win-B",
+      "projB",
+      "Proj B",
+      [{ id: "a1", name: "One", status: "waiting" }],
+      undefined,
+      true,
+    );
+    // No await: a Replace must reach other windows before the 250ms debounce would have fired.
+    expect(emit).toHaveBeenCalledWith(STATUS_CHANGED_EVENT);
+  });
+
+  it("emits immediately when a project switch CLEARS the entry (new project has no red agents)", () => {
+    publishWindowRedAgents("win-B", "projB", "Proj B", [
+      { id: "a1", name: "One", status: "waiting" },
+    ]);
+    emit.mockClear();
+    publishWindowRedAgents("win-B", "projC", "Proj C", [], undefined, true);
+    expect(readMap()["win-B"]).toBeUndefined();
+    expect(emit).toHaveBeenCalledWith(STATUS_CHANGED_EVENT);
+  });
 });
 
 describe("clearWindowStatus", () => {
@@ -170,6 +193,30 @@ describe("readOtherWindowsRedAgents", () => {
       { id: "b1", name: "Ghost", status: "waiting" },
     ]);
     expect(readOtherWindowsRedAgents("main")).toEqual([]);
+  });
+
+  it("excludes a stale entry when the owning window has REPLACED its project (blob lags registry)", () => {
+    // win-B is open and published red agents for projB, then Replaced onto projC — the registry
+    // flips immediately, but win-B's status blob still carries projB's agents until it republishes.
+    // Surfacing it put a card for a project win-B no longer shows into another window's sidebar.
+    publishWindowRedAgents("win-B", "projB", "Proj B", [
+      { id: "b1", name: "Stale", status: "waiting" },
+    ]);
+    setWindowProject("win-B", "projC");
+    expect(readOtherWindowsRedAgents("main")).toEqual([]);
+  });
+
+  it("re-admits the entry once the Replaced window republishes for its new project", () => {
+    publishWindowRedAgents("win-B", "projB", "Proj B", [
+      { id: "b1", name: "Stale", status: "waiting" },
+    ]);
+    setWindowProject("win-B", "projC");
+    expect(readOtherWindowsRedAgents("main")).toEqual([]);
+    // The owner catches up: its blob now agrees with the registry, so the guard lets it through.
+    publishWindowRedAgents("win-B", "projC", "Proj C", [
+      { id: "c1", name: "Fresh", status: "waiting" },
+    ]);
+    expect(readOtherWindowsRedAgents("main").map((a) => a.agentId)).toEqual(["c1"]);
   });
 
   it("flattens open other-window entries and sorts by attention rank, project, name", () => {
@@ -258,6 +305,14 @@ describe("readOtherWindowsRedGroups", () => {
     ]);
     const groups = readOtherWindowsRedGroups("main");
     expect(groups.map((g) => g.windowLabel)).toEqual(["win-D", "win-C", "win-B"]);
+  });
+
+  it("inherits the Replace staleness guard (no group for a window whose blob lags the registry)", () => {
+    publishWindowRedAgents("win-B", "projB", "Proj B", [
+      { id: "b1", name: "Stale", status: "waiting", since: 100 },
+    ]);
+    setWindowProject("win-B", "projC");
+    expect(readOtherWindowsRedGroups("main")).toEqual([]);
   });
 
   it("tolerates items missing `since` (treated as 0) when picking the representative", () => {

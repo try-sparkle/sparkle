@@ -9,6 +9,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AGENT_STATUS } from "@sparkle/ui";
 import {
   isWindowOpen,
+  getWindowProject,
   openWindowLabels,
   removeKey,
   allKeys,
@@ -154,13 +155,19 @@ function emitNow(): void {
 }
 
 /** Write/overwrite THIS window's entry with its red agents (deleting it when there are none), then
- *  broadcast (debounced). Other windows re-read and recompute their cross-window section. */
+ *  broadcast (debounced). Other windows re-read and recompute their cross-window section.
+ *
+ *  `immediate` flushes the broadcast instead of debouncing it (~250ms). Pass it when THIS window
+ *  changed PROJECT: until other windows re-read, their last snapshot still shows this window's
+ *  previous project's red agents, and the reader's staleness guard only runs when they re-read.
+ *  Ordinary status ticks stay debounced — they're frequent and a quarter-second late is harmless. */
 export function publishWindowRedAgents(
   label: string,
   projectId: string,
   projectName: string,
   redAgents: WindowRedAgent[],
   store: KV = defaultStore(),
+  immediate = false,
 ): void {
   // Touches ONLY this window's key — never another window's data, so there is nothing to lose.
   if (redAgents.length === 0) {
@@ -172,7 +179,8 @@ export function publishWindowRedAgents(
       JSON.stringify({ projectId, projectName, agents: redAgents } satisfies WindowStatusEntry),
     );
   }
-  scheduleEmit();
+  if (immediate) emitNow();
+  else scheduleEmit();
 }
 
 /** Remove THIS window's entry and broadcast immediately. Called on window unload, so we flush the
@@ -231,6 +239,14 @@ export function readOtherWindowsRedAgents(
     // a window's own unload clears its registry entry, and a crash + "Replace" that re-points the
     // same project to a DIFFERENT live window must not keep this dead label's stale red agents.
     if (!isWindowOpen(windowLabel, store)) continue;
+    // PROJECT STALENESS: `entry.projectId` is SELF-REPORTED by the owning window and lags a
+    // "Replace" — that window swaps its project in place under the SAME label, so the registry
+    // flips to the new project immediately while this blob still carries the OLD project's red
+    // agents until the owner republishes. Trusting that gap surfaced a card for a project the
+    // window no longer shows into a freshly-opened window's sidebar (a card "leaking in" from an
+    // unrelated project). The registry is the authority on what a window shows NOW, so only trust
+    // an entry that still agrees with it; the owner's republish re-admits it a moment later.
+    if (entry.projectId !== getWindowProject(windowLabel, store)) continue;
     for (const a of entry.agents ?? []) {
       if (!a || !a.id) continue; // skip a malformed agent item from a partial blob
       out.push({

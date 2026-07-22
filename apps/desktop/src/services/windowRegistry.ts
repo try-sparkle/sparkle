@@ -121,3 +121,12 @@ export function findWindowForProject(projectId: string, store: KV = defaultStore
   }
   return null;
 }
+
+/** The project this window is showing RIGHT NOW, or null when the label isn't registered (closed).
+ *  The forward counterpart to findWindowForProject: that answers "which window shows project X?",
+ *  this answers "what does window L show?". The registry is updated the moment a window opens or
+ *  Replaces a project, so it is the authority any SELF-REPORTED per-window blob must be validated
+ *  against before it's trusted — see windowStatus.readOtherWindowsRedAgents. */
+export function getWindowProject(label: string, store: KV = defaultStore()): string | null {
+  return read(store)[label] ?? null;
+}
