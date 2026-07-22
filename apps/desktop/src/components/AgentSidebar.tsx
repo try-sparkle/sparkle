@@ -1056,7 +1056,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         else childrenByParent.set(a.parentId, [a]);
       }
     }
-    const topLevelAgents = project.agents.filter((a) => !a.parentId || !buildIds.has(a.parentId));
+    // Mirror orderedTopLevelAgents' rule: workers are never top-level rows (they nest under their
+    // orchestrator's card), so orphaned/in-flight workers can't flash into the sidebar list.
+    const topLevelAgents = project.agents.filter(
+      (a) => a.kind !== "worker" && (!a.parentId || !buildIds.has(a.parentId)),
+    );
     return { topLevelAgents, childrenByParent };
   }, [project]);
 
@@ -1245,8 +1249,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         {(() => {
           if (!project) return null;
           if (mode === "plan") return null; // Plan: sidebar list stays clear (board shows in main pane)
-          // Top-level agents (build agents + workers orphaned by a missing parent), mode-filtered
-          // and attention-ordered. Shared with the TopBar dot cluster via orderedTopLevelAgents so
+          // Top-level agents (the orchestrators — build agents in Build mode, think agents in Think;
+          // workers are never top-level rows), mode-filtered and attention-ordered. Shared with the
+          // TopBar dot cluster via orderedTopLevelAgents so
           // the header dots can't drift out of sync with these rows. Only the top-level stack
           // reorders; nested workers stay under their parent in insertion order. Selection is
           // tracked by id (project.selectedAgentId), so re-sorting never changes which agent is open.
@@ -1314,8 +1319,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           // The ✓ on the head row reflects the whole build: itself OR any worker that has shipped.
           const rowShipped =
             shippedOf(a.id) || (a.id === top.id && workers.some((w) => shippedOf(w.id)));
-          // Indent by tree position, not by parentId: the group head (top) sits at depth 0 — so
-          // an orphaned worker surfaced as its own head isn't mis-indented — and real children at 1.
+          // Indent by tree position, not by parentId: the group head (top) sits at depth 0 and its
+          // nested workers at 1. (Workers are never top-level heads — orderedTopLevelAgents filters
+          // them out — so a head is always a build/think orchestrator.)
           const depth = a.id === top.id ? 0 : 1;
           return (
             <AgentRow

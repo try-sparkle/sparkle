@@ -38,11 +38,15 @@ import type { BranchStatus } from "../services/branchStatus";
 const TITLE = "Agent Name";
 const DESCRIPTION = "Refines the agent sidebar hover card";
 
+// The default fixture is a top-level BUILD agent (orchestrator) — the canonical renderable row.
+// Workers are never top-level rows (orderedTopLevelAgents filters kind === "worker"), so a lone
+// `kind: "worker"` fixture would be filtered out and render nothing; tests that specifically need
+// a nested worker set kind + parentId explicitly (see "counts workers … for an orchestrator").
 function mkAgent(over: Partial<AgentTab> = {}): AgentTab {
   return {
     id: "a1",
     name: TITLE,
-    kind: "worker",
+    kind: "build",
     parentId: null,
     runtime: "local",
     worktreePath: "/tmp/demo/.worktrees/a1",

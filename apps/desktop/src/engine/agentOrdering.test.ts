@@ -266,16 +266,17 @@ describe("firstVisibleAgentId", () => {
     expect(firstVisibleAgentId([], "build", "manual", {})).toBeNull();
   });
 
-  it("excludes a build agent's nested workers but keeps orphaned workers visible", () => {
+  it("excludes ALL workers — nested and orphaned — from the top-level selection", () => {
     const agents = [
       ag("b1", "build"),
       ag("w1", "worker", "b1"), // nested under present build → hidden
-      ag("w2", "worker", "gone"), // orphaned (parent absent) → surfaces at top level
+      ag("w2", "worker", "gone"), // orphaned (parent absent) → still hidden, never a top-level row
     ];
     // Manual order keeps insertion order, so the build agent is first.
     expect(firstVisibleAgentId(agents, "build", "manual", {})).toBe("b1");
-    // With only the orphan present, it's the first visible Build-mode row.
-    expect(firstVisibleAgentId([ag("w2", "worker", "gone")], "build", "manual", {})).toBe("w2");
+    // A worker never surfaces as a row, even orphaned or alone — the user works with orchestrators
+    // and reaches a worker only via its parent's card, so there is nothing to select here.
+    expect(firstVisibleAgentId([ag("w2", "worker", "gone")], "build", "manual", {})).toBeNull();
   });
 
   it("respects attention ordering — a waiting build agent floats above a working one", () => {
@@ -324,5 +325,20 @@ describe("orderedTopLevelAgents — fresh boost end-to-end", () => {
       "b1",
       "b2",
     ]);
+  });
+
+  it("never surfaces worker agents as top-level rows — nested or orphaned, both modes", () => {
+    const agents = [
+      ag("b1", "build"),
+      ag("w1", "worker", "b1"), // nested under a live orchestrator
+      ag("w2", "worker", "gone"), // orphaned (parent gone)
+      ag("t1", "think"),
+    ];
+    // Build mode: only the build orchestrator, no workers.
+    expect(orderedTopLevelAgents(agents, {}, "build", false).map((x) => x.id)).toEqual(["b1"]);
+    // Think mode: only think agents, and certainly no workers.
+    expect(orderedTopLevelAgents(agents, {}, "think", false).map((x) => x.id)).toEqual(["t1"]);
+    // A lone orphaned worker yields an empty stack, not a stray row.
+    expect(orderedTopLevelAgents([ag("w2", "worker", "gone")], {}, "build", false)).toEqual([]);
   });
 });

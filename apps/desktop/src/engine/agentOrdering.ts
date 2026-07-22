@@ -111,12 +111,18 @@ export function orderAgents<T extends { id: string; pinnedIndex: number | null }
 
 /**
  * The single source of truth for the agent stack BOTH the sidebar list and the TopBar dot
- * cluster render: top-level agents (a build agent, or a worker orphaned by a missing parent),
- * filtered by the active work mode (Think → think agents; otherwise everything non-think, i.e.
- * build agents + orphaned workers), then attention-ordered the same way. Keeping both consumers
- * on this one helper is what stops the header dots from drifting out of sync with the rows —
- * the bug this was extracted to prevent. Pure and id-preserving (workers are NOT spliced here;
- * each consumer nests its own per-parent workers afterward).
+ * cluster render: top-level agents (only think or build agents — the orchestrators), filtered
+ * by the active work mode (Think → think agents; otherwise everything non-think, i.e. build
+ * agents), then attention-ordered the same way. Keeping both consumers on this one helper is
+ * what stops the header dots from drifting out of sync with the rows — the bug this was
+ * extracted to prevent. Pure and id-preserving.
+ *
+ * Workers are NEVER top-level rows (`kind !== "worker"`). The user works with orchestrators; a
+ * worker is reached only by opening its parent orchestrator's card, which nests its own workers
+ * afterward. This unconditionally excludes workers — even one orphaned by a missing parent —
+ * because a worker flashing into the sidebar (during spawn/spin-down windows or after its parent
+ * closes) is exactly the distraction we're removing. A worker's red attention still bubbles up to
+ * its orchestrator elsewhere; it just never claims a row of its own here.
  */
 export function orderedTopLevelAgents<
   T extends { id: string; kind: AgentKind; parentId: string | null; pinnedIndex: number | null },
@@ -129,6 +135,7 @@ export function orderedTopLevelAgents<
 ): T[] {
   const buildIds = new Set(agents.filter((a) => a.kind === "build").map((a) => a.id));
   const topLevel = agents
+    .filter((a) => a.kind !== "worker")
     .filter((a) => !a.parentId || !buildIds.has(a.parentId))
     .filter((a) => (workMode === "think" ? a.kind === "think" : a.kind !== "think"));
   return attentionOrder ? orderAgents(topLevel, statusMap, freshId) : topLevel;

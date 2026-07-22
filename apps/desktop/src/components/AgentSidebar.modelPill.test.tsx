@@ -28,11 +28,16 @@ import type { Project, AgentTab } from "../types";
 
 const TITLE = "Agent Name";
 
+// The default fixture is a top-level BUILD agent — a claude-terminal orchestrator, the canonical
+// row the model pill renders on. (Workers are the OTHER claude-terminal kind but are never top-level
+// rows, so a lone `kind: "worker"` fixture would be filtered out by orderedTopLevelAgents and render
+// nothing.) The pill's kind gating — claude-terminal (build) shows it, a shell tab doesn't — is what
+// these tests pin.
 function mkAgent(over: Partial<AgentTab> = {}): AgentTab {
   return {
     id: "a1",
     name: TITLE,
-    kind: "worker",
+    kind: "build",
     parentId: null,
     runtime: "local",
     worktreePath: "/tmp/demo/.worktrees/a1",
@@ -113,7 +118,7 @@ describe("AgentRow — ModelPill wiring", () => {
   });
 
   it("the pill renders only for claude-terminal kinds — a shell row's card has none", () => {
-    const worker = mkAgent();
+    const claudeAgent = mkAgent(); // build = claude-terminal → gets a pill
     const shell = mkAgent({
       id: "s1",
       name: "Shell Row",
@@ -122,7 +127,7 @@ describe("AgentRow — ModelPill wiring", () => {
       worktreePath: "/tmp/demo/.worktrees/s1",
       shellCommand: "npm run dev",
     });
-    const project = mkProject([worker, shell]);
+    const project = mkProject([claudeAgent, shell]);
     seedProject(project);
     render(<AgentSidebar project={project} />);
     fireEvent.click(screen.getByText("Shell Row"));
@@ -131,6 +136,6 @@ describe("AgentRow — ModelPill wiring", () => {
     // (Once hovered, the name renders twice — hidden in-flow row + overlay — hence getAllByText.)
     fireEvent.mouseOut(screen.getAllByText("Shell Row")[0]!);
     fireEvent.click(screen.getByText(TITLE));
-    expect(screen.getByTestId("model-pill")).toBeTruthy(); // the worker card has one
+    expect(screen.getByTestId("model-pill")).toBeTruthy(); // the claude-terminal card has one
   });
 });
