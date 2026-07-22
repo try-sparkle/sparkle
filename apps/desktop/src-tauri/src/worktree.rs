@@ -2060,6 +2060,32 @@ fn status_cache() -> &'static Mutex<HashMap<String, StatusFingerprint>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// How long a worktree's last gh PR probe stays authoritative before the batch re-probes it EVEN IF
+/// the git fingerprint is unchanged (sparkle-prpb). The fingerprint (tip/base/default/index) only
+/// tracks GIT movement, but a PR opening, merging, or closing is a server-side fact that moves no
+/// git ref — so without this an out-of-band PR open (e.g. the agent ran `gh pr create`) would leave
+/// the CTA stuck on "Open Pull Request" until the branch happened to commit again. 90s bounds that
+/// staleness while keeping gh calls to ~one per idle agent per TTL (vs. every 15s tick), preserving
+/// the point of the fingerprint skip (sparkle-zlic).
+const PR_REPROBE_TTL: Duration = Duration::from_secs(90);
+
+/// Per-worktree-path clock of the last time the batch actually RAN the gh PR probe for that agent
+/// (sparkle-prpb). Separate from `status_cache` because it advances on a different axis (wall-clock,
+/// not git state). Session-scoped; evicted alongside the fingerprint in `remove_worktree_at`.
+fn pr_probe_cache() -> &'static Mutex<HashMap<String, Instant>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pure throttle decision (testable without a clock): re-probe PR state if we never have for this
+/// worktree, or PR_REPROBE_TTL has elapsed since the last probe. Mirrors `fetch_due`.
+fn pr_reprobe_due(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        Some(t) => now.duration_since(t) >= PR_REPROBE_TTL,
+        None => true,
+    }
+}
+
 /// mtime (ms since epoch) of a linked worktree's private git index, or 0 when it can't be read. The
 /// index lives under the shared repo at `<git-common-dir>/worktrees/<name>/index`; our worktree leaf
 /// name IS the agent id (a UUID, never deduped by git), so we stat it without spawning a subprocess.
@@ -2226,6 +2252,9 @@ pub fn project_agents_status_at(
     if has_origin {
         maybe_refresh_origin(root, &default_branch);
     }
+    // One clock read for the whole batch, so every agent's PR-reprobe TTL is measured from the same
+    // instant (sparkle-prpb).
+    let now = Instant::now();
     // git-common-dir for locating each worktree's private index (fingerprint input). Best-effort.
     let git_common_dir: Option<PathBuf> = git(root, &["rev-parse", "--git-common-dir"]).ok().map(|d| {
         let p = PathBuf::from(&d);
@@ -2290,10 +2319,24 @@ pub fn project_agents_status_at(
         };
         let wt_key = wt.to_string_lossy().to_string();
 
-        // Skip an idle agent whose fingerprint matches the cache — reuse the prior result.
+        // Skip an idle agent whose fingerprint matches the cache — reuse the prior result. EXCEPTION
+        // (sparkle-prpb): PR state (open/merged/closed) is a SERVER-SIDE fact that moves no git ref,
+        // so a fingerprint match does NOT prove the CTA is fresh — the gh probe is pr_state's only
+        // source and it lives past this skip. On a probe-enabled poll against a remote we therefore
+        // still recompute once PR_REPROBE_TTL has elapsed since this worktree's last probe, so an
+        // out-of-band PR open flips "Open Pull Request" → "Merge PR #N" within the TTL instead of
+        // never. `has_origin` confines this to polls that would actually run gh; the local-only /
+        // no-probe path is byte-for-byte unchanged.
         if !a.force {
-            if let Ok(cache) = status_cache().lock() {
-                if cache.get(&wt_key).map(|prev| *prev == fp).unwrap_or(false) {
+            let fp_match = status_cache()
+                .lock()
+                .ok()
+                .map(|c| c.get(&wt_key).map(|prev| *prev == fp).unwrap_or(false))
+                .unwrap_or(false);
+            if fp_match {
+                let last_pr_probe =
+                    pr_probe_cache().lock().ok().and_then(|m| m.get(&wt_key).copied());
+                if !(has_origin && pr_reprobe_due(last_pr_probe, now)) {
                     out.push(skipped(&a.agent_id));
                     continue;
                 }
@@ -2314,7 +2357,15 @@ pub fn project_agents_status_at(
             workflow_state_shared(root, &a.agent_id, &a.parent_branch, &default_branch, has_origin, &tip);
 
         if let Ok(mut cache) = status_cache().lock() {
-            cache.insert(wt_key, fp);
+            cache.insert(wt_key.clone(), fp);
+        }
+        // Stamp the PR-probe clock whenever this recompute actually ran the gh probe (has_origin), so
+        // the next TTL window starts now. Both a git-moved recompute and a PR-refresh recompute run
+        // the probe, so both reset it (sparkle-prpb).
+        if has_origin {
+            if let Ok(mut cache) = pr_probe_cache().lock() {
+                cache.insert(wt_key, now);
+            }
         }
         out.push(AgentStatusResult {
             agent_id: a.agent_id.clone(),
@@ -2802,6 +2853,11 @@ pub fn remove_worktree_at(
     // entry lingers for the app's lifetime for a removed agent — and if a future agent ever reused
     // the same path, a stale fingerprint could wrongly skip its first real recompute.
     if let Ok(mut cache) = status_cache().lock() {
+        cache.remove(&wt_str);
+    }
+    // Evict the PR-probe clock alongside the fingerprint so a reused worktree path re-probes
+    // immediately on its first tick (sparkle-prpb).
+    if let Ok(mut cache) = pr_probe_cache().lock() {
         cache.remove(&wt_str);
     }
     match git(root, &["worktree", "remove", "--force", &wt_str]) {
@@ -3432,6 +3488,95 @@ mod tests {
         assert_eq!(after[0].branch.as_ref().unwrap().ahead, 2);
     }
 
+    // sparkle-prpb: an idle agent whose git fingerprint never moves must still get its PR state
+    // re-probed once PR_REPROBE_TTL elapses — otherwise an out-of-band PR open leaves the CTA stuck
+    // on "Open Pull Request". Exercises the batch's skip-vs-recompute wiring end to end: fresh probe
+    // skips, a back-dated probe clock forces a recompute, the recompute re-stamps the clock, the
+    // no-remote path never reprobes, and removal evicts the clock. (The gh probe finds nothing for a
+    // local-path origin — this asserts the RECOMPUTE decision, not pr_state.)
+    #[test]
+    fn batch_reprobes_pr_state_after_ttl_even_when_git_unchanged() {
+        let r = init_repo("batch-reprobe");
+        // A local bare repo standing in as `origin` so `has_origin` is true on a probe poll.
+        let origin = unique_root("batch-reprobe-origin");
+        let origin_str = origin.to_str().unwrap().to_string();
+        git(&origin_str, &["init", "-q", "--bare"]).unwrap();
+        git(&r, &["remote", "add", "origin", &origin_str]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+
+        let app_data = unique_root("batch-reprobe-appdata");
+        let info = create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let wt = info.path;
+        std::fs::write(format!("{wt}/w.txt"), "work").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "work"]).unwrap();
+
+        let input = |force: bool| AgentStatusInput {
+            agent_id: "a1".into(),
+            base_branch: "main".into(),
+            parent_branch: String::new(),
+            kind: "build".into(),
+            force,
+        };
+        let wt_key =
+            worktree_path(&app_data, "p1", "a1").unwrap().to_string_lossy().to_string();
+        // Make the next poll see this worktree's last probe as "older than the TTL". If the monotonic
+        // clock is itself younger than the TTL (a container booted <~91s ago), no Instant can
+        // represent that instant — so drop the entry instead, which pr_reprobe_due reads as
+        // never-probed (also due). Either path yields "reprobe is due", and neither can panic.
+        let back_date_probe_clock = |key: &str| {
+            let mut cache = pr_probe_cache().lock().unwrap();
+            match Instant::now().checked_sub(PR_REPROBE_TTL + Duration::from_secs(1)) {
+                Some(stale) => {
+                    cache.insert(key.to_string(), stale);
+                }
+                None => {
+                    cache.remove(key);
+                }
+            }
+        };
+
+        // First probe poll computes and stamps the PR-probe clock.
+        let first = project_agents_status_at(&r, "p1", &[input(false)], true, &app_data);
+        assert!(first[0].changed, "first tick computes");
+
+        // Immediately again: fingerprint matches AND the probe clock is fresh → skipped.
+        let second = project_agents_status_at(&r, "p1", &[input(false)], true, &app_data);
+        assert!(!second[0].changed, "unchanged idle agent within the TTL is skipped");
+
+        // Back-date the probe clock past the TTL (git still untouched) → the next probe poll must
+        // recompute to refresh PR state, even though the fingerprint is identical.
+        back_date_probe_clock(&wt_key);
+        let before_third = Instant::now();
+        let third = project_agents_status_at(&r, "p1", &[input(false)], true, &app_data);
+        assert!(third[0].changed, "past the PR-reprobe TTL an idle agent recomputes to refresh PR state");
+        // Direct proof (not just the `changed` proxy) that the reprobe actually ran and re-stamped the
+        // probe clock: the stored instant is now fresh — at or after the moment just before this poll.
+        let stamped = *pr_probe_cache()
+            .lock()
+            .unwrap()
+            .get(&wt_key)
+            .expect("a reprobe recompute must re-stamp the PR-probe clock");
+        assert!(stamped >= before_third, "the recompute re-stamped the PR-probe clock to a fresh instant");
+
+        // The recompute re-stamped the clock → the very next poll skips again.
+        let fourth = project_agents_status_at(&r, "p1", &[input(false)], true, &app_data);
+        assert!(!fourth[0].changed, "recompute re-stamps the clock, so the following tick skips");
+
+        // A poll with NO remote gate (probe_pr_state=false ⇒ has_origin=false) must NEVER reprobe on
+        // the TTL, even with a stale clock — the local-only path is unchanged.
+        back_date_probe_clock(&wt_key);
+        let local_only = project_agents_status_at(&r, "p1", &[input(false)], false, &app_data);
+        assert!(!local_only[0].changed, "a no-remote poll never reprobes on the TTL");
+
+        // Removing the worktree evicts the probe clock so a reused path re-probes on its first tick.
+        remove_worktree_at(&r, "p1", "a1", &app_data).unwrap();
+        assert!(
+            !pr_probe_cache().lock().unwrap().contains_key(&wt_key),
+            "remove_worktree_at evicts the PR-probe clock",
+        );
+    }
+
     // Resilience: a recorded base branch that no longer exists (the repo was renamed
     // `main` → `master`, or the base was deleted) must NOT be handed to git as a phantom ref.
     // `effective_base` falls back to the repo's actual default; a base that DOES exist is
@@ -3894,6 +4039,21 @@ mod tests {
         assert!(fetch_due(Some(long_ago), now), "past the cooldown ⇒ due");
         let recent = now.checked_sub(FETCH_COOLDOWN / 2).unwrap();
         assert!(!fetch_due(Some(recent), now), "within the cooldown ⇒ not due");
+    }
+
+    // sparkle-prpb: an idle agent whose git fingerprint never moves must still get its PR state
+    // re-probed once the TTL elapses, so an out-of-band PR open (agent ran `gh pr create`) flips the
+    // CTA instead of leaving it stuck on "Open Pull Request". This is the pure decision the batch's
+    // skip consults.
+    #[test]
+    fn pr_reprobe_due_respects_ttl() {
+        let now = Instant::now();
+        assert!(pr_reprobe_due(None, now), "never probed ⇒ due (first sighting always computes)");
+        assert!(!pr_reprobe_due(Some(now), now), "just probed ⇒ not due");
+        let long_ago = now.checked_sub(PR_REPROBE_TTL + Duration::from_secs(1)).unwrap();
+        assert!(pr_reprobe_due(Some(long_ago), now), "past the TTL ⇒ re-probe");
+        let recent = now.checked_sub(PR_REPROBE_TTL / 2).unwrap();
+        assert!(!pr_reprobe_due(Some(recent), now), "within the TTL ⇒ reuse cached PR state");
     }
 
     #[test]
