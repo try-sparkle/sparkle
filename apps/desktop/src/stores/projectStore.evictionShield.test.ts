@@ -75,9 +75,9 @@ describe("mergePreservingLiveWorkers — absence never deletes (sparkle-pckz)", 
     expect(ids(merged)).toContain("old1");
   });
 
-  it("keeps think agents too, not just build (any kind can be clobbered)", () => {
+  it("keeps shell agents too, not just build (any kind can be clobbered)", () => {
     const current = state(
-      mkProject({ id: "p1", agents: [mkAgent({ id: "t1", kind: "think" })] }),
+      mkProject({ id: "p1", agents: [mkAgent({ id: "t1", kind: "shell" })] }),
     );
     const persisted = state(mkProject({ id: "p1", agents: [] }));
     const merged = mergePreservingLiveWorkers(persisted, current, NO_REMOVALS);
