@@ -51,12 +51,23 @@ const ws = (over: Partial<WorkflowState> = {}): WorkflowState => ({
 /** Seed one agent in the your-turn "idle" state, with a live stage (+ raw workflow signals). Tests
  *  that care about a working agent drive the idle→working TRANSITION instead of seeding it, so the
  *  assertion can't pass before the CTA had a chance to appear. */
-function seed(opts: { stage?: WorkflowStageId; shipped?: boolean; workflowState?: WorkflowState }) {
+function seed(opts: {
+  stage?: WorkflowStageId;
+  shipped?: boolean;
+  workflowState?: WorkflowState;
+  /** Git evidence (ahead/dirty). The CTA resolves its stage from this AND `stage`, so it must be
+   *  reset on every seed — zustand's setState MERGES, and a leftover `ahead > 0` from a previous
+   *  test would silently raise a later test's stage to building_saved. */
+  branchStatus?: { ahead: number; behind?: number; dirty?: boolean };
+}) {
   useRuntimeStore.setState({
     status: { a1: "idle" },
     workflowStage: opts.stage ? { a1: opts.stage } : {},
     workflowShipped: opts.shipped ? { a1: true } : {},
     workflowState: opts.workflowState ? { a1: opts.workflowState } : {},
+    branchStatus: opts.branchStatus
+      ? { a1: { behind: 0, dirty: false, ...opts.branchStatus } as never }
+      : {},
   });
 }
 
@@ -115,6 +126,48 @@ describe("useSuggestions — the delivery policy actually governs", () => {
     const { result } = renderHook(() => useSuggestions("a1", true));
     await waitFor(() => {
       expect(result.current.buttons[0]?.label).toBe("Land to Main");
+    });
+  });
+});
+
+// The CTA used to read the bare `workflowStage` override while AgentSidebar read
+// `resolveStage(branchStatus, workflowStage)` — two surfaces, two stages for one agent. Before the
+// first stage poll writes an override, git already proves `building_saved` on a branch with
+// commits, so the sidebar showed a stage while the CTA had none at all.
+describe("useSuggestions — the CTA resolves its stage like the sidebar does", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ requirePr: true });
+  });
+
+  it("offers a CTA from git evidence alone, before any stage override is recorded", async () => {
+    // No `stage` → no override. Git proves committed work, which is all the sidebar needed.
+    seed({ workflowState: ws({ hasRemote: true }), branchStatus: { ahead: 2 } });
+    const { result } = renderHook(() => useSuggestions("a1", true));
+    await waitFor(() => {
+      expect(result.current.buttons[0]?.label).toBe("Open Pull Request");
+    });
+  });
+
+  it("still offers nothing when git proves no committed work either", async () => {
+    seed({ workflowState: ws({ hasRemote: true }), branchStatus: { ahead: 0, dirty: true } });
+    const { result } = renderHook(() => useSuggestions("a1", true));
+    // Nothing committed → deriveCta returns null → the row stays on ordinary suggestions (none).
+    await waitFor(() => {
+      expect(result.current.buttons).toHaveLength(0);
+    });
+  });
+
+  it("never regresses below a recorded override that is further along than git", async () => {
+    // A landed agent whose branch reads ahead>0 again must keep the override's stage, not drop back
+    // to building_saved — resolveStage takes the MAX of the two.
+    seed({
+      stage: "merged",
+      workflowState: ws({ hasRemote: true, inOriginMain: true }),
+      branchStatus: { ahead: 2 },
+    });
+    const { result } = renderHook(() => useSuggestions("a1", true));
+    await waitFor(() => {
+      expect(result.current.buttons[0]?.label).toBe("Close Build Agent");
     });
   });
 });

@@ -20,17 +20,25 @@ vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => scrollback }
 vi.mock("../aiGate", () => ({ useAiFeature: () => true }));
 vi.mock("../relayClient", () => ({ pushSuggestions: vi.fn() }));
 vi.mock("../../stores/runtimeStore", () => ({
-  // No workflowStage entry for a1 → deriveCta is skipped entirely, so these settle/retry tests see
-  // the raw computed set with no CTA merged over it. The CTA's own wiring is covered by
-  // useSuggestions.cta.test.tsx.
+  // No workflowStage entry AND no branchStatus for a1 → the resolved stage is building_unsaved, for
+  // which deriveCta returns null, so these settle/retry tests see the raw computed set with no CTA
+  // merged over it. The CTA's own wiring is covered by useSuggestions.cta.test.tsx.
   useRuntimeStore: (
     sel: (s: {
       status: Record<string, string>;
       workflowShipped: Record<string, boolean>;
       workflowStage: Record<string, string>;
       workflowState: Record<string, unknown>;
+      branchStatus: Record<string, unknown>;
     }) => unknown,
-  ) => sel({ status: { a1: "idle" }, workflowShipped: {}, workflowStage: {}, workflowState: {} }),
+  ) =>
+    sel({
+      status: { a1: "idle" },
+      workflowShipped: {},
+      workflowStage: {},
+      workflowState: {},
+      branchStatus: {},
+    }),
 }));
 
 import { useSuggestions, SETTLE_TICK_MS, MAX_COMPUTE_ATTEMPTS } from "./useSuggestions";

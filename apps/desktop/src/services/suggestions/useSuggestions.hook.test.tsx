@@ -24,17 +24,26 @@ vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => "Done. Commi
 vi.mock("../aiGate", () => ({ useAiFeature: () => true }));
 vi.mock("../relayClient", () => ({ pushSuggestions: vi.fn() }));
 vi.mock("../../stores/runtimeStore", () => ({
-  // status[agentId] === "idle" → a your-turn state, so the hook computes. No workflowStage entry for
-  // a1 → deriveCta is skipped, so these concurrency tests see the raw computed set with no CTA
-  // merged over it. The CTA's own wiring is covered by useSuggestions.cta.test.tsx.
+  // status[agentId] === "idle" → a your-turn state, so the hook computes. No workflowStage entry AND
+  // no branchStatus for a1 → the resolved stage is building_unsaved, for which deriveCta returns
+  // null, so these concurrency tests see the raw computed set with no CTA merged over it. The CTA's
+  // own wiring is covered by useSuggestions.cta.test.tsx.
   useRuntimeStore: (
     sel: (s: {
       status: Record<string, string>;
       workflowShipped: Record<string, boolean>;
       workflowStage: Record<string, string>;
       workflowState: Record<string, unknown>;
+      branchStatus: Record<string, unknown>;
     }) => unknown,
-  ) => sel({ status: { a1: "idle" }, workflowShipped: {}, workflowStage: {}, workflowState: {} }),
+  ) =>
+    sel({
+      status: { a1: "idle" },
+      workflowShipped: {},
+      workflowStage: {},
+      workflowState: {},
+      branchStatus: {},
+    }),
 }));
 
 import { useSuggestions } from "./useSuggestions";

@@ -110,7 +110,7 @@ describe("withRedWorkerAttention", () => {
   ];
 
   it("bubbles a started worker's RED status to its orchestrator (parent floats up + turns red)", () => {
-    const status: Record<string, AgentTabStatus> = { build1: "working", w1: "errored" };
+    const status: Record<string, AgentTabStatus> = { build1: "idle", w1: "errored" };
     const eff = withRedWorkerAttention(agents, status);
     expect(eff.build1).toBe("errored");
     expect(eff.w1).toBe("errored"); // worker's own status is untouched
@@ -119,7 +119,7 @@ describe("withRedWorkerAttention", () => {
   it.each(["waiting", "approval", "errored"] as const)(
     "bubbles the %s red status specifically",
     (redStatus) => {
-      const status: Record<string, AgentTabStatus> = { build1: "working", w1: redStatus };
+      const status: Record<string, AgentTabStatus> = { build1: "idle", w1: redStatus };
       expect(withRedWorkerAttention(agents, status).build1).toBe(redStatus);
     },
   );
@@ -135,8 +135,48 @@ describe("withRedWorkerAttention", () => {
   });
 
   it("does not mutate the input status map", () => {
-    const status: Record<string, AgentTabStatus> = { build1: "working", w1: "errored" };
+    const status: Record<string, AgentTabStatus> = { build1: "idle", w1: "errored" };
     withRedWorkerAttention(agents, status);
-    expect(status).toEqual({ build1: "working", w1: "errored" });
+    expect(status).toEqual({ build1: "idle", w1: "errored" });
+  });
+
+  // IN-MOTION SUPPRESSION. These pin the 2026-07-22 fix: a moving orchestrator is not "needs you".
+  // Note the first case REVERSES what this suite asserted before — a `working` parent used to be
+  // painted red by its worker. That was the reported bug, not a behavior to preserve.
+  it("does NOT bubble to a parent that is working itself", () => {
+    const status: Record<string, AgentTabStatus> = { build1: "working", w1: "errored" };
+    expect(withRedWorkerAttention(agents, status)).toBe(status); // same ref → untouched
+  });
+
+  it("does NOT bubble while another worker is still building (fleet is progressing)", () => {
+    const status: Record<string, AgentTabStatus> = { build1: "idle", w1: "errored", w2: "working" };
+    expect(withRedWorkerAttention(agents, status)).toBe(status);
+  });
+
+  // Motion must not latch: the whole point is that a genuinely stuck fleet still surfaces.
+  it("bubbles once the fleet settles and nothing is moving any more", () => {
+    const moving: Record<string, AgentTabStatus> = { build1: "idle", w1: "errored", w2: "working" };
+    expect(withRedWorkerAttention(agents, moving).build1).toBe("idle");
+    const settled: Record<string, AgentTabStatus> = { build1: "idle", w1: "errored", w2: "idle" };
+    expect(withRedWorkerAttention(agents, settled).build1).toBe("errored");
+  });
+
+  // Suppression is scoped to the parent that is moving — an unrelated orchestrator still bubbles.
+  it("suppresses only the moving parent, not another orchestrator's fleet", () => {
+    const twoFleets = [
+      agent({ id: "build1", kind: "build", parentId: null }),
+      agent({ id: "build2", kind: "build", parentId: null }),
+      agent({ id: "w1" }),
+      agent({ id: "w2", parentId: "build2" }),
+    ];
+    const status: Record<string, AgentTabStatus> = {
+      build1: "working",
+      w1: "errored",
+      build2: "idle",
+      w2: "errored",
+    };
+    const eff = withRedWorkerAttention(twoFleets, status);
+    expect(eff.build1).toBe("working"); // moving → suppressed
+    expect(eff.build2).toBe("errored"); // settled → bubbled
   });
 });

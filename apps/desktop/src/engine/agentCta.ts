@@ -66,6 +66,17 @@ export interface CtaOpts {
   /** Whether the agent is blocked awaiting an ANSWER from the user — a prose question or a terminal
    *  widget (see services/suggestions/pendingQuestion.ts). When true the stage action steps aside. */
   questionPending?: boolean;
+  /** Whether the agent is still MOVING despite its turn being closed — a worker it spawned is
+   *  mid-build (see engine/inMotion.ts). When true the stage action steps aside, exactly as it does
+   *  for a pending question, and for the same reason: the stage describes the BRANCH, but the
+   *  moment says the work isn't finished.
+   *
+   *  This is what the 2026-07-22 report hit. An orchestrator that had landed an earlier cycle sat at
+   *  stage `merged`/`shipped`, so the primary resolved to "Close Build Agent" — offered as the
+   *  filled pill while a worker it had just spawned was actively building. Closing an agent is
+   *  terminal and destructive-adjacent (it tears down the worktree), so it is the LAST thing that
+   *  should be led with over work in flight. */
+  inMotion?: boolean;
   /** How work reaches the integration branch. Defaults to `pr_first`, mirroring `[workflow]
    *  require_pr`'s own default so the engine's default and the config's default agree. Callers
    *  resolve the effective value from config (global, overridable per repo). */
@@ -91,24 +102,16 @@ export function deriveCta(
   // or the model offered nothing) suppressing the stage action would empty the row and leave no way
   // to close the agent — so we fall through to the normal stage CTA.
   if (opts.questionPending && computed.length > 0) {
-    const [answer, ...rest] = computed as [SuggestionButton, ...SuggestionButton[]];
-    // Appended AFTER the cap, like the escape hatch below and for the same reason: a full set of
-    // answers must never hide the stage action entirely.
-    const demoted = answer.id === stageAction.id ? [] : [stageAction];
-    // The escape hatch must survive this path too (roborev, Medium). At merged_local the stage
-    // action is PUSH, so demoting it alone leaves no Close anywhere — and if the computed answers
-    // don't happen to include one, the agent becomes impossible to close. That's the exact
-    // invariant escapeHatchFor exists to protect, and the question path was quietly opting out.
-    const taken = new Set([answer.id, ...demoted.map((b) => b.id)]);
-    const escape = escapeHatchFor(stage, stageAction).filter((b) => !taken.has(b.id));
-    return {
-      primary: answer,
-      alternates: [
-        ...rest.filter((b) => b.id !== stageAction.id).slice(0, MAX_ALTERNATES),
-        ...demoted,
-        ...escape,
-      ],
-    };
+    return withStageActionDemoted(stage, stageAction, computed);
+  }
+
+  // Still moving (a worker mid-build). Same demotion as the question path — never LEAD with a stage
+  // action, least of all Close, over work in flight. With no computed set to lead with instead we
+  // return null rather than inventing a primary: the caller then falls through to ordinary
+  // suggestions, which is the same no-CTA state every pre-`building_saved` stage already produces.
+  // The sidebar row's × remains the always-available way to close an agent, so nothing is stranded.
+  if (opts.inMotion) {
+    return computed.length > 0 ? withStageActionDemoted(stage, stageAction, computed) : null;
   }
 
   const escape = escapeHatchFor(stage, stageAction);
@@ -117,6 +120,37 @@ export function deriveCta(
     ...escape,
   ];
   return { primary: stageAction, alternates };
+}
+
+/**
+ * Lead with the first COMPUTED button instead of the stage action, pushing the stage action into
+ * the alternates. Shared by the two "the moment beats the branch" paths — a pending question and an
+ * agent still in motion — so they can't drift apart.
+ *
+ * `computed` must be non-empty (both callers check). The stage action is appended AFTER the cap,
+ * like the escape hatch, for the same reason: a full set of answers must never hide it entirely.
+ */
+function withStageActionDemoted(
+  stage: WorkflowStageId,
+  stageAction: SuggestionButton,
+  computed: SuggestionButton[],
+): Cta {
+  const [answer, ...rest] = computed as [SuggestionButton, ...SuggestionButton[]];
+  const demoted = answer.id === stageAction.id ? [] : [stageAction];
+  // The escape hatch must survive this path (roborev, Medium). At merged_local the stage action is
+  // PUSH, so demoting it alone leaves no Close anywhere — and if the computed answers don't happen
+  // to include one, the agent becomes impossible to close. That's the exact invariant escapeHatchFor
+  // exists to protect, and the question path was quietly opting out.
+  const taken = new Set([answer.id, ...demoted.map((b) => b.id)]);
+  const escape = escapeHatchFor(stage, stageAction).filter((b) => !taken.has(b.id));
+  return {
+    primary: answer,
+    alternates: [
+      ...rest.filter((b) => b.id !== stageAction.id).slice(0, MAX_ALTERNATES),
+      ...demoted,
+      ...escape,
+    ],
+  };
 }
 
 function primaryFor(

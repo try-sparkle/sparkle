@@ -272,7 +272,6 @@ describe("deriveCta", () => {
       const cta = deriveCta("merged_local", ws({ inLocalMain: true, hasRemote: true }), many, q);
       expect(cta?.alternates.map((b) => b.label)).toContain("Close Build Agent");
     });
-
     it("does not duplicate Close when an answer already IS the escape hatch", () => {
       const collide: SuggestionButton = { ...suggestion("Close it"), id: "control:closeAgent" };
       const cta = deriveCta("merged_local", ws({ inLocalMain: true, hasRemote: true }), [collide], q);
@@ -295,6 +294,69 @@ describe("deriveCta", () => {
         questionPending: false,
       });
       expect(cta?.primary.label).toBe("Close Build Agent");
+    });
+  });
+
+  // REGRESSION — founder report 2026-07-22, screenshot: an orchestrator that had landed an earlier
+  // cycle sat at stage `merged`, so the pill read "Close Build Agent" — while a worker it had just
+  // spawned was actively building and a backgrounded wait_for_workers was pending. The stage
+  // describes the BRANCH; motion describes the MOMENT, and closing is terminal (it tears down the
+  // worktree), so it must never be the thing led with over work in flight. See engine/inMotion.ts.
+  describe("when the agent is still in motion", () => {
+    const moving = { inMotion: true };
+    const landed = () => ws({ inOriginMain: true });
+
+    it("does not lead with Close Build Agent", () => {
+      const cta = deriveCta("merged", landed(), [], moving);
+      expect(cta?.primary.label).not.toBe("Close Build Agent");
+    });
+
+    it("offers no CTA at all when there is nothing else to lead with", () => {
+      // Deliberately null rather than an invented primary: the caller falls through to ordinary
+      // suggestions, the same no-CTA state every pre-building_saved stage already produces. The
+      // sidebar row's × is still the always-available way to close.
+      expect(deriveCta("merged", landed(), [], moving)).toBeNull();
+    });
+
+    it("leads with a computed suggestion when one exists, demoting the stage action", () => {
+      const cta = deriveCta("merged", landed(), [suggestion("Show me the diff")], moving);
+      expect(cta?.primary.label).toBe("Show me the diff");
+      expect(cta?.alternates.map((b) => b.label)).toContain("Close Build Agent");
+    });
+
+    it("suppresses Open Pull Request mid-flight too, not just Close", () => {
+      const cta = deriveCta("building_saved", ws({ hasRemote: true }), [], moving);
+      expect(cta).toBeNull();
+    });
+
+    it("merged_local keeps Close reachable when an answer leads", () => {
+      const cta = deriveCta(
+        "merged_local",
+        ws({ inLocalMain: true, hasRemote: true }),
+        [suggestion("Show me the diff")],
+        moving,
+      );
+      const labels = cta?.alternates.map((b) => b.label) ?? [];
+      expect(labels).toContain("Push to Origin Main"); // the demoted stage action
+      expect(labels).toContain("Close Build Agent"); // the escape hatch
+    });
+
+    // Motion must not latch — the ordinary CTA has to come straight back when the fleet settles.
+    it("restores the normal stage action once motion stops", () => {
+      expect(deriveCta("merged", landed(), [], { inMotion: false })?.primary.label).toBe(
+        "Close Build Agent",
+      );
+      expect(deriveCta("merged", landed(), [])?.primary.label).toBe("Close Build Agent");
+    });
+
+    // A live question is the more specific signal, and it already demotes the stage action, so the
+    // two paths agree on the outcome that matters: the stage action never leads.
+    it("a pending question still leads when both are true", () => {
+      const cta = deriveCta("merged", landed(), [suggestion("Yes — push")], {
+        questionPending: true,
+        inMotion: true,
+      });
+      expect(cta?.primary.label).toBe("Yes — push");
     });
   });
 

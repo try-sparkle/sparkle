@@ -1,12 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { computeSuggestions, SuggestionOfflineError } from "./engine";
 import { getAgentScrollback } from "../terminalScrollback";
 import { useAiFeature } from "../aiGate";
 import { useRuntimeStore } from "../../stores/runtimeStore";
+import { useProjectStore } from "../../stores/projectStore";
 import { useConnectionStore } from "../../stores/connectionStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { pushSuggestions } from "../relayClient";
 import { deriveCta } from "../../engine/agentCta";
+import { isInMotion } from "../../engine/inMotion";
+import { resolveStage } from "../../engine/workflowStage";
 import { maybeAutoApprove, maybeAutoResume } from "./approvalsRuntime";
 import { detectPendingQuestion } from "./pendingQuestion";
 import { log } from "../../logger";
@@ -171,7 +174,20 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // that landed an earlier cycle offer "Close Build Agent" over fresh un-landed work. The watermark
   // still exists for the bead lifecycle and the "landed at least once" marker, whose ever-landed
   // semantics are correct — it's just wrong for "what should you do right now".
-  const stage = useRuntimeStore((s) => s.workflowStage[agentId]);
+  //
+  // Resolved the SAME way the sidebar resolves it — `resolveStage(branchStatus, workflowStage)`,
+  // the furthest-along of what git proves and the recorded override. Reading the bare override here
+  // was a real divergence: two surfaces, two different stages for one agent. Before the first stage
+  // poll writes an override, git already proves `building_saved` on a branch with commits, so the
+  // sidebar showed a stage while the CTA had none at all (`undefined` → no CTA). resolveStage never
+  // returns below what git proves and never undefined, so the CTA now tracks the same truth; stages
+  // below `building_saved` still yield no CTA, because deriveCta returns null for them.
+  const branchStatusForAgent = useRuntimeStore((s) => s.branchStatus[agentId]);
+  const stageOverride = useRuntimeStore((s) => s.workflowStage[agentId]);
+  const stage = useMemo(
+    () => resolveStage(branchStatusForAgent, stageOverride),
+    [branchStatusForAgent, stageOverride],
+  );
   // Select the one PRIMITIVE deriveCta reads (CtaSignals), not the WorkflowState object.
   // `setWorkflowState` builds a fresh object every applied poll, so subscribing to the object would
   // hand this hook a new reference each tick. That identity churn used to reach the compute effect's
@@ -182,6 +198,21 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // They joined CtaSignals when the PR became the gate under the `pr_first` delivery policy.
   const prState = useRuntimeStore((s) => s.workflowState[agentId]?.prState);
   const prNumber = useRuntimeStore((s) => s.workflowState[agentId]?.prNumber);
+  // Is this agent still MOVING even though its own turn is closed — a worker it spawned is
+  // mid-build? An orchestrator that landed an earlier cycle sits at stage `merged`/`shipped`, and
+  // without this the pill read "Close Build Agent" over a fleet that was actively building (founder
+  // report 2026-07-22). Subscribing to the whole status map is safe HERE specifically because
+  // `applyCta` is used only at RENDER and is deliberately kept out of the compute effect's dep
+  // array — the identity-churn hazard documented on `hasRemote` above is about aborting an
+  // in-flight paid compute, which this can't reach.
+  const statusMap = useRuntimeStore((s) => s.status);
+  const agents = useProjectStore(
+    (s) => s.projects.find((p) => p.id === s.selectedProjectId)?.agents,
+  );
+  const inMotion = useMemo(
+    () => isInMotion(agentId, agents ?? [], statusMap),
+    [agentId, agents, statusMap],
+  );
   // The delivery policy, from the editable config mirror (`[workflow] require_pr`, default true).
   // This is the line that makes the setting LOAD-BEARING: require_pr has shipped defaulted-true and
   // fully plumbed since the config file landed, while the CTA hardcoded the opposite policy — so the
@@ -212,12 +243,13 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       const cta = stage
         ? deriveCta(stage, signals, computed, {
             questionPending,
+            inMotion,
             policy: requirePr ? "pr_first" : "direct",
           })
         : null;
       return cta ? [cta.primary, ...cta.alternates] : computed;
     },
-    [stage, hasRemote, prState, prNumber, questionPending, requirePr],
+    [stage, hasRemote, prState, prNumber, questionPending, inMotion, requirePr],
   );
 
   useEffect(() => {

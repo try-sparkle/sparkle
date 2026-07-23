@@ -13,6 +13,7 @@
 //      and its orchestrator red so it surfaces at the top instead of hiding in gray.
 import type { AgentTab } from "../types";
 import { needsAttention, type StatusMap } from "./attention";
+import { isInMotion } from "./inMotion";
 
 /** A worker whose worktree was cut but which never went live — not in `openIds`, no PTY `status` —
  *  WHILE its orchestrator is live (`openIds.has(parentId)`). A running worker has a status entry; a
@@ -88,19 +89,41 @@ export function withUnstartedWorkerAttention(
  *  AgentSidebar); this function is purely the parent-bubble half so the block is visible from the
  *  collapsed top-level stack too. An orchestrator already red for its own reason is left as-is (we
  *  never downgrade one red to another). Returns a NEW map only when something changed; otherwise the
- *  SAME reference, so a no-op can't churn renders. Compose AFTER withUnstartedWorkerAttention. */
+ *  SAME reference, so a no-op can't churn renders. Compose AFTER withUnstartedWorkerAttention.
+ *
+ *  IN-MOTION SUPPRESSION (the 2026-07-22 report: "why is this red when it's in motion?"). A parent
+ *  that is still MOVING — working itself, or with another worker mid-build (see engine/inMotion.ts)
+ *  — does NOT get the bubble. The fleet is progressing and the orchestrator handles its own workers;
+ *  painting the top-level row red there is noise, and it fires precisely when the user can see the
+ *  agent is busy, which is what made the signal read as a bug. Nothing is lost: the red worker still
+ *  carries its own red and still floats up as its own row. The moment the fleet SETTLES the parent
+ *  stops being in motion and the bubble returns — so a genuinely stuck fleet still surfaces, which
+ *  is the case this overlay was built for. */
 export function withRedWorkerAttention(
   agents: readonly AgentTab[],
   statusMap: StatusMap,
 ): StatusMap {
   let out: StatusMap | null = null;
   const ensure = (): StatusMap => (out ??= { ...statusMap });
+  // Computed against the INPUT map, once per parent: the bubbles this loop writes are reds, which
+  // never make a parent in-motion, so a later worker can't observe a different answer than an
+  // earlier one. Memoized because a large fleet asks the same question for every worker.
+  const motion = new Map<string, boolean>();
+  const parentInMotion = (parentId: string): boolean => {
+    let m = motion.get(parentId);
+    if (m === undefined) {
+      m = isInMotion(parentId, agents, statusMap);
+      motion.set(parentId, m);
+    }
+    return m;
+  };
   for (const a of agents) {
     if (a.kind !== "worker" || a.parentId === null) continue;
     // Read from the working copy so a bubble from an earlier worker in this loop isn't clobbered.
     const src = out ?? statusMap;
     const ws = src[a.id];
     if (ws === undefined || !needsAttention(ws)) continue; // only RED workers bubble
+    if (parentInMotion(a.parentId)) continue; // still moving — it'll handle its own fleet
     if (!needsAttention(src[a.parentId])) {
       ensure()[a.parentId] = ws;
     }

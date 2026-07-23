@@ -46,8 +46,16 @@ vi.mock("../../stores/runtimeStore", () => ({
       workflowShipped: Record<string, boolean>;
       workflowStage: Record<string, string>;
       workflowState: Record<string, unknown>;
+      branchStatus: Record<string, unknown>;
     }) => unknown,
-  ) => sel({ status: { a1: status }, workflowShipped: {}, workflowStage: {}, workflowState: {} }),
+  ) =>
+    sel({
+      status: { a1: status },
+      workflowShipped: {},
+      workflowStage: {},
+      workflowState: {},
+      branchStatus: {},
+    }),
 }));
 
 import { useSuggestions, rememberComputed, MEMO_LIMIT } from "./useSuggestions";
