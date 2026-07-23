@@ -114,6 +114,9 @@ export interface CouponRedeemResult {
   grantedCents?: number;
   balanceCents?: number;
   promotionCode?: string | null;
+  /** True when the coupon also cleared the $99 paywall (an `entitles` credit_grant), so the caller
+   *  can say "you're unlocked" rather than just "credits added". */
+  entitled?: boolean;
 }
 
 /** Redeem an admin-issued coupon (the `/admin coupons` system) via /billing/coupon. Resolves with

@@ -52,6 +52,8 @@ export function PromoRedeem({ refresh }: { refresh: () => Promise<void> }) {
   const REFRESH_HINT = "Redeemed — it may take a moment to appear; try refreshing.";
   // Confirmation shown after a credit_grant when the component stays mounted (Credits pane).
   const CREDITS_ADDED = "Credits added.";
+  // An `entitles` coupon cleared the $99 paywall too, not just the balance.
+  const UNLOCKED = "Unlocked — Sparkle is yours, and credits were added.";
 
   const submit = async () => {
     const trimmed = code.trim();
@@ -73,8 +75,9 @@ export function PromoRedeem({ refresh }: { refresh: () => Promise<void> }) {
       }
       await refresh(); // credits granted → balance/entitlement re-derives (gate may unmount this)
       // On the paywall the gate unmounts on this refresh; in the Credits pane it stays mounted, so
-      // confirm the grant instead of leaving the user with only a silently updated balance.
-      setNotice(CREDITS_ADDED);
+      // confirm the grant instead of leaving the user with only a silently updated balance. An
+      // `entitles` coupon did more than top up the balance — say so.
+      setNotice(res.entitled ? UNLOCKED : CREDITS_ADDED);
     } catch (e) {
       const msg = String(e);
       if (redeemed) {
