@@ -13,7 +13,11 @@ import { AgentSidebar, NewBuildAgentButton } from "./AgentSidebar";
 import { TopBar } from "./TopBar";
 import { OfflineBanner } from "./OfflineBanner";
 import { ClosePrompt } from "./ClosePrompt";
-import { sparkleAgentIdFor, sparkleOpenSetWhitelist } from "../services/sparkleAgent";
+import {
+  shouldWarmSparkleAtLaunch,
+  sparkleAgentIdFor,
+  sparkleOpenSetWhitelist,
+} from "../services/sparkleAgent";
 import {
   useCurrentProjectId,
   useIsMainWindow,
@@ -110,6 +114,20 @@ export function Workspace() {
     // window has its own copy now, keyed by its own id — so this is correct in every window, not
     // just the main one.
     if (useUiStore.getState().activeSpecial === "sparkle") open(sparkleAgentId);
+    // Otherwise, WARM the pane at launch when consent allows it (shouldWarmSparkleAtLaunch):
+    // `open()` alone mounts the pane with visible=false, which spawns/resumes its claude session
+    // behind the current view. Deliberately NOT paired with an activeSpecial change — warming must
+    // never steal the user's view at startup; it only means that when they do open the row, the
+    // agent is already up instead of cold-starting on the click.
+    else if (
+      shouldWarmSparkleAtLaunch({
+        consent: useSettingsStore.getState().sparkleImprovementConsent,
+        optIn: useSettingsStore.getState().improvementLaunchWarm,
+        isMainWindow,
+      })
+    ) {
+      open(sparkleAgentId);
+    }
     // Run once on mount; the persisted open set is reconciled against the hydrated projects.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

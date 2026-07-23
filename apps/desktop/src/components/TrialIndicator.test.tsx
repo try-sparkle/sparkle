@@ -12,11 +12,25 @@ import { TrialIndicator } from "./TrialChrome";
 import { useTrialStore } from "../stores/trialStore";
 
 beforeEach(() => {
-  useTrialStore.setState({ started: true, promptsUsed: 0, loading: false });
+  useTrialStore.setState({
+    started: true,
+    promptsUsed: 0,
+    remaining: null,
+    cap: null,
+    blocked: false,
+    loading: false,
+  });
 });
 afterEach(() => {
   cleanup();
-  useTrialStore.setState({ started: false, promptsUsed: 0, loading: true });
+  useTrialStore.setState({
+    started: false,
+    promptsUsed: 0,
+    remaining: null,
+    cap: null,
+    blocked: false,
+    loading: true,
+  });
 });
 
 describe("TrialIndicator (in-bar trial counter)", () => {
@@ -64,9 +78,25 @@ describe("TrialIndicator (in-bar trial counter)", () => {
     expect(screen.queryByText("https://checkout.stripe.com/c/pay/very-long-session-url")).toBeNull();
   });
 
-  it("renders nothing once the trial is exhausted (the full-screen upsell takes over)", () => {
-    useTrialStore.setState({ promptsUsed: 100 });
+  it("prefers the SERVER's remaining count over the local estimate", () => {
+    // The mirror can drift while offline; once the server has answered, its number is the one shown.
+    useTrialStore.setState({ promptsUsed: 3, remaining: 12, cap: 100 });
+    render(<TrialIndicator onUnlock={vi.fn()} signInFailedUrl={null} />);
+    expect(screen.getByText(/12 prompts left/)).toBeTruthy();
+  });
+
+  it("renders nothing once the SERVER says the trial is exhausted (the upsell takes over)", () => {
+    useTrialStore.setState({ promptsUsed: 100, remaining: 0, cap: 100, blocked: true });
     const { container } = render(<TrialIndicator onUnlock={vi.fn()} signInFailedUrl={null} />);
     expect(container.firstChild).toBeNull();
+  });
+
+  it("still renders at 0 cached prompts when the server has NOT blocked (offline drift)", () => {
+    // Fail-open: an offline session can count its cache down to zero. That is not an expired trial,
+    // so the counter must stay up and the upsell must NOT take over.
+    useTrialStore.setState({ promptsUsed: 100, remaining: 0, cap: 100, blocked: false });
+    render(<TrialIndicator onUnlock={vi.fn()} signInFailedUrl={null} />);
+    expect(screen.getByTestId("trial-indicator")).toBeTruthy();
+    expect(screen.getByText(/0 prompts left/)).toBeTruthy();
   });
 });

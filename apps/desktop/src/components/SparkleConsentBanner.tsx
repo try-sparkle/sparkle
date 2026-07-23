@@ -45,6 +45,7 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
           "Once per hour, we use a small amount of your Claude Code subscription to evaluate your logs.",
           "If we see failures or performance issues, we automatically craft a PR to submit to the Sparkle OSS project to improve it",
           'On "Always" mode, these PRs will be submitted automatically. No action required from you.',
+          "On 'Always', the improvement agent also starts with the app, so it's already working when you open it — on 'Case by case' that's opt-in.",
           "If Sparkle crashes, we securely upload a scrubbed crash report so we can find and fix the crash fast — the error message and backtrace only, anonymized, never any PII, secrets, or code.",
           "On 'Always', that crash report also carries your recent logs (last ~hour), scrubbed the same way, which gives us the context around the crash.",
           "We scrub the PR for anything sensitive: No PII, secrets, code snippets, etc will be sent",
@@ -78,6 +79,8 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
 export function SparkleConsentBanner() {
   const mode = useSettingsStore((s) => s.sparkleImprovementConsent);
   const setMode = useSettingsStore((s) => s.setSparkleImprovementConsent);
+  const launchWarm = useSettingsStore((s) => s.improvementLaunchWarm);
+  const setLaunchWarm = useSettingsStore((s) => s.setImprovementLaunchWarm);
   const copy = consentCopy(mode);
   // The "how it works" detail is collapsed by default — the pinned bar shows only the question +
   // control. It expands as an OVERLAY (so the terminal below never resizes) on two independent
@@ -179,6 +182,33 @@ export function SparkleConsentBanner() {
           })}
         </div>
       </div>
+
+      {/* Launch-warm opt-in. "Case by case" means ASK ME, so the agent must not greet the user
+          already running at startup unless they turned that on — hence a checkbox here rather than
+          a silent default. The other two modes need no control: "Always" is standing authority (it
+          warms, and the bullets say so) and "Never" runs nothing at all. See
+          sparkleAgent.shouldWarmSparkleAtLaunch, which is the one place these rules are resolved. */}
+      {mode === "case_by_case" && (
+        <label
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            marginTop: 6,
+            color: C.muted,
+            fontSize: 12,
+            cursor: "pointer",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={launchWarm === true}
+            onChange={(e) => setLaunchWarm(e.target.checked)}
+            style={{ cursor: "pointer" }}
+          />
+          Start the improvement agent when Sparkle opens (instead of when you click this row)
+        </label>
+      )}
 
       {open && (
         <div

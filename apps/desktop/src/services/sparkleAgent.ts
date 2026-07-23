@@ -56,6 +56,34 @@ export function sparkleOpenSetWhitelist(opts: {
   return [...new Set([ownId, ...openIds.filter(isSparkleAgentId)])];
 }
 
+/** Everything the launch-warm decision weighs. Plain data so the gate is unit-testable. */
+export interface LaunchWarmGate {
+  consent: SparkleImprovementConsent;
+  /** settingsStore.improvementLaunchWarm — null = the user has not been asked/answered yet. */
+  optIn: boolean | null;
+  /** Warming spawns a real `claude` in the canonical worktree, so only the MAIN window may do it:
+   *  a secondary window would cold-start its own copy nobody asked for, and the canonical worktree
+   *  admits one claude at a time. */
+  isMainWindow: boolean;
+}
+
+/** Should this window mount (hidden) and spawn the Improve Sparkle pane at app launch, so the agent
+ *  is already working when the user opens its row rather than cold-starting on the click?
+ *
+ *  Consent decides whether we may do this WITHOUT asking:
+ *   - "always"       → yes. The user granted standing authority to spend a little of their
+ *                      subscription on improving Sparkle; making them click first adds nothing.
+ *   - "case_by_case" → only on an explicit opt-in (`optIn === true`). This mode means "ask me", so
+ *                      the first pass must be something the user turned on, not something that
+ *                      greeted them. `null` (never answered) is an opt-OUT.
+ *   - "never"        → never. No evaluation of any kind runs in this mode. */
+export function shouldWarmSparkleAtLaunch(gate: LaunchWarmGate): boolean {
+  if (!gate.isMainWindow) return false;
+  if (gate.consent === "never") return false;
+  if (gate.consent === "always") return true;
+  return gate.optIn === true;
+}
+
 export interface SparkleWorkspace {
   /** App-owned clone of the OSS Sparkle repo — the agent's worktree is cut from this. */
   repoPath: string;

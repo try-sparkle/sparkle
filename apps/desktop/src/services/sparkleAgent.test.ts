@@ -9,8 +9,42 @@ import {
   sparkleChatOnlyMissionPrompt,
   sparkleAgentIdFor,
   sparkleOpenSetWhitelist,
+  shouldWarmSparkleAtLaunch,
   SPARKLE_AGENT_ID,
 } from "./sparkleAgent";
+
+// Warming spawns a real claude at app launch, so the gate is the consent contract in code: the
+// user who said "Always" gets it unasked; the user who said "Case by case" must have ticked the
+// box; "Never" gets nothing. Secondary windows never warm regardless.
+describe("shouldWarmSparkleAtLaunch — who may start the agent at app launch", () => {
+  const gate = (over: Partial<Parameters<typeof shouldWarmSparkleAtLaunch>[0]> = {}) =>
+    shouldWarmSparkleAtLaunch({
+      consent: "case_by_case",
+      optIn: null,
+      isMainWindow: true,
+      ...over,
+    });
+
+  it('"always" warms without an opt-in — the user already granted standing authority', () => {
+    expect(gate({ consent: "always", optIn: null })).toBe(true);
+    expect(gate({ consent: "always", optIn: false })).toBe(true);
+  });
+
+  it('"case_by_case" warms ONLY on an explicit opt-in; unanswered means opt-out', () => {
+    expect(gate({ optIn: null })).toBe(false);
+    expect(gate({ optIn: false })).toBe(false);
+    expect(gate({ optIn: true })).toBe(true);
+  });
+
+  it('"never" never warms, even if the opt-in flag was set under a previous mode', () => {
+    expect(gate({ consent: "never", optIn: true })).toBe(false);
+  });
+
+  it("a secondary window never warms — one canonical worktree admits one claude", () => {
+    expect(gate({ consent: "always", isMainWindow: false })).toBe(false);
+    expect(gate({ optIn: true, isMainWindow: false })).toBe(false);
+  });
+});
 
 describe("sparkleOpenSetWhitelist — cross-window open-set reconcile", () => {
   const MAIN = SPARKLE_AGENT_ID;

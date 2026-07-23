@@ -4,12 +4,13 @@
 //     cluster) as plain bar text — NOT a floating pill. The old version was a position:fixed pill
 //     pinned top-right, which sat on top of and covered the TopBar's action buttons; rendering it
 //     in normal bar flow is the fix, so it can never overlap them.
-//   • TrialChrome — once the 100 prompts are spent, a full-bleed upsell that reuses the Welcome
-//     screen with an exhausted banner. The Workspace stays mounted underneath (workers keep
-//     running) until the user converts.
+//   • TrialChrome — once the SERVER says the prompts are spent, a full-bleed upsell that reuses the
+//     Welcome screen with an exhausted banner. The Workspace stays mounted underneath (workers
+//     already running keep running) until the user converts, but the overlay covers every surface,
+//     which is what hard-blocks NEW prompts and new agents.
 import { useEffect, useState, type CSSProperties } from "react";
 import { C, ON_BRAND_FILL, DANGER } from "../theme/colors";
-import { useTrialStore, trialPromptsLeft, TRIAL_LIMIT } from "../stores/trialStore";
+import { useTrialStore, trialPromptsLeft, trialExhausted, TRIAL_LIMIT } from "../stores/trialStore";
 import { copyToClipboard } from "../clipboard";
 import { WelcomeScreen } from "./WelcomeScreen";
 
@@ -60,7 +61,8 @@ const copyLinkBtn: CSSProperties = {
 
 /**
  * The small in-bar trial indicator (counter + Unlock). Rendered by TopBar in trial mode only.
- * Returns null once the trial is exhausted — the full-screen TrialChrome upsell takes over then.
+ * Returns null once the server says the trial is exhausted — the full-screen TrialChrome upsell
+ * takes over then.
  * `onUnlock` MUST route through the shared paywall handler (see performTrialUnlock), never bare
  * sign-in, so a signed-in user converts via one-click Stripe.
  */
@@ -71,13 +73,17 @@ export function TrialIndicator({
   onUnlock: () => void;
   signInFailedUrl: string | null;
 }) {
+  // The server's remaining count when we have it; the local estimate only until the first sync.
   const promptsUsed = useTrialStore((s) => s.promptsUsed);
-  const left = trialPromptsLeft({ promptsUsed });
+  const remaining = useTrialStore((s) => s.remaining);
+  const cap = useTrialStore((s) => s.cap);
+  const blocked = useTrialStore((s) => s.blocked);
+  const left = trialPromptsLeft({ promptsUsed, remaining, cap });
   const [copied, setCopied] = useState(false);
   // Reset the "Copied" affordance whenever the fallback URL changes, so a later hand-off failure
   // (a different link) doesn't falsely read as already-copied.
   useEffect(() => setCopied(false), [signInFailedUrl]);
-  if (promptsUsed >= TRIAL_LIMIT) return null;
+  if (blocked) return null;
   return (
     <div style={indicator} data-testid="trial-indicator">
       <span style={counterText}>
@@ -107,8 +113,8 @@ export function TrialIndicator({
 }
 
 /**
- * Full-screen upsell shown once the 100 free prompts are spent. Rendered by AuthGate in the trial
- * branch; a no-op (null) until the trial is exhausted, so the Workspace shows through until then.
+ * Full-screen upsell shown once the SERVER reports the free prompts are spent. Rendered by AuthGate
+ * in the trial branch; a no-op (null) until then, so the Workspace shows through.
  */
 export function TrialChrome({
   onUnlock,
@@ -117,14 +123,17 @@ export function TrialChrome({
   onUnlock: () => void;
   signInFailedUrl: string | null;
 }) {
-  const promptsUsed = useTrialStore((s) => s.promptsUsed);
-  if (promptsUsed < TRIAL_LIMIT) return null;
+  // Driven by the SERVER's verdict, not a local count: only an affirmative 402 / 0-remaining answer
+  // raises this wall, so an offline blip can never falsely tell a user their trial expired.
+  const blocked = useTrialStore(trialExhausted);
+  const cap = useTrialStore((s) => s.cap);
+  if (!blocked) return null;
   // Omit onTryFree so WelcomeScreen hides the free box — the only action here is to convert.
   return (
     <WelcomeScreen
       onSignIn={onUnlock}
       signInFailedUrl={signInFailedUrl}
-      banner="You've used all 100 free prompts."
+      banner={`You've used all ${cap ?? TRIAL_LIMIT} free prompts.`}
     />
   );
 }

@@ -967,7 +967,9 @@ export function Composer({
     // Pass the typed text as the naming basis, separate from the marker-decorated `display`.
     // Attachments-only sends carry an empty basis, so auto-naming is skipped.
     onSubmitPrompt(display, naming);
-    // Consume a trial prompt only now that it's actually delivered (no-op for entitled users).
+    // Debit a trial prompt against the SERVER only now that it's actually delivered (no-op for
+    // entitled users). Fire-and-forget: awaiting the round-trip here would put a network wait in
+    // front of the user's Enter key.
     void recordTrialSend();
     // "Pause listening on submit" (default): if actively dictating, drop back to passive wake-word
     // listening now that the prompt is sent. No-op under "Keep listening" or when not dictating.
@@ -981,10 +983,10 @@ export function Composer({
     const atts = attachments;
     const blocks = textBlocks;
     if (isComposerEmpty()) return;
-    // Free-trial cap (checked BEFORE delivery, consumed AFTER): block once the 100 are spent.
-    // Entitled users always pass. When blocked, AuthGate's TrialChrome overlay is already
-    // visible (it shows whenever promptsUsed ≥ limit), so this is defense-in-depth, not a
-    // silent dead-end.
+    // Free-trial cap (checked BEFORE delivery, debited AFTER): refuse once the SERVER has said the
+    // trial is spent (an affirmative 402 / 0-remaining answer — never a network blip). Entitled
+    // users always pass. When blocked, AuthGate's TrialChrome overlay is already visible (it shows
+    // on the same `blocked` flag), so this is defense-in-depth, not a silent dead-end.
     if (!trialSendAllowed()) return;
     setValue("");
     setAttachments([]);

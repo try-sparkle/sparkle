@@ -283,6 +283,13 @@ interface SettingsState {
    *  scheduler seeds it on its first tick, so the first pass lands ~1h after consent is active
    *  rather than the moment the app opens. Persisted (a restart must not reset the hour). */
   improvementLastRunAt: number | null;
+  /** Opt-in for warming the Improve Sparkle pane at app launch (main window only), so the agent is
+   *  already up when the user opens its row instead of cold-starting on click. Only consulted in
+   *  "case_by_case" consent — "always" is standing authority and warms without asking, "never"
+   *  never warms. null = not yet decided (treated as opt-out until the user ticks the box).
+   *  Persisted. See sparkleAgent.shouldWarmSparkleAtLaunch — that gate, not this flag, is the
+   *  single place the three modes are resolved. */
+  improvementLaunchWarm: boolean | null;
 
   // --- Editable config-file mirror (reflections of config.toml; the file is the source of truth) ---
   // Hydrated from the TOML config via `hydrateFromConfig` at startup and on every config-changed
@@ -385,6 +392,8 @@ interface SettingsState {
   setSparkleImprovementConsent: (mode: SparkleImprovementConsent) => void;
   /** Record when an hourly improvement pass was last attempted (see improvementLastRunAt). */
   setImprovementLastRunAt: (at: number) => void;
+  /** Set the launch-warm opt-in (the "Start automatically when Sparkle opens" control). */
+  setImprovementLaunchWarm: (on: boolean) => void;
   /** Reflect the effective config (from config.toml) into the mirrored store fields. Called at
    *  startup and whenever the file changes. The file is the source of truth — this is the read side. */
   hydrateFromConfig: (eff: EffectiveConfig) => void;
@@ -413,6 +422,7 @@ export const useSettingsStore = create<SettingsState>()(
       notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
       sparkleImprovementConsent: DEFAULT_SPARKLE_CONSENT,
       improvementLastRunAt: null,
+      improvementLaunchWarm: null,
 
       // Config-file mirror defaults (match SparkleConfig::default() in config.rs; overwritten by hydrate).
       requirePr: true,
@@ -469,6 +479,7 @@ export const useSettingsStore = create<SettingsState>()(
       setRoborevAuthWarning: (warning) => set({ roborevAuthWarning: warning }),
       setSparkleImprovementConsent: (mode) => set({ sparkleImprovementConsent: mode }),
       setImprovementLastRunAt: (at) => set({ improvementLastRunAt: at }),
+      setImprovementLaunchWarm: (on) => set({ improvementLaunchWarm: on }),
 
       setChiefProject: (sparkleProjectId, chiefProjectId) =>
         set((s) => ({
@@ -591,6 +602,7 @@ export const useSettingsStore = create<SettingsState>()(
         notifyStatuses: s.notifyStatuses,
         sparkleImprovementConsent: s.sparkleImprovementConsent,
         improvementLastRunAt: s.improvementLastRunAt,
+        improvementLaunchWarm: s.improvementLaunchWarm,
       }),
     },
   ),

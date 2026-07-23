@@ -102,7 +102,14 @@ afterEach(() => {
     refresh: vi.fn(),
     paywallDismissed: false,
   });
-  useTrialStore.setState({ started: false, promptsUsed: 0, loading: true });
+  useTrialStore.setState({
+    started: false,
+    promptsUsed: 0,
+    remaining: null,
+    cap: null,
+    blocked: false,
+    loading: true,
+  });
 });
 
 describe("TopBar — in-bar trial indicator", () => {

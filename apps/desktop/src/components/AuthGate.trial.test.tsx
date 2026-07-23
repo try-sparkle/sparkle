@@ -36,7 +36,11 @@ beforeEach(() => {
     loading: false,
     refresh: vi.fn(),
     start: vi.fn(),
-    increment: vi.fn(),
+    remaining: null,
+    cap: null,
+    blocked: false,
+    syncRemote: vi.fn(),
+    consume: vi.fn(),
   });
 });
 afterEach(() => cleanup());
@@ -64,7 +68,9 @@ describe("AuthGate — trial flow", () => {
     expect(screen.queryByText(/prompts left/)).toBeNull();
   });
   it("at the limit: keeps the Workspace mounted, shows the upsell, drops 'Try it now'", () => {
-    useTrialStore.setState({ started: true, promptsUsed: 100 });
+    // `blocked` is the SERVER's affirmative verdict (a 402 / 0-remaining answer) — the count alone
+    // no longer raises this wall, so an offline device that drifted to 0 is never falsely walled.
+    useTrialStore.setState({ started: true, promptsUsed: 100, remaining: 0, cap: 100, blocked: true });
     render(
       <AuthGate>
         <div>WORKSPACE</div>
@@ -78,5 +84,68 @@ describe("AuthGate — trial flow", () => {
     // Token-less → the upsell's convert button routes to the sign-in hand-off (same as main).
     fireEvent.click(screen.getByRole("button", { name: /Log in \/ Sign up/ }));
     expect(openSignIn).toHaveBeenCalled();
+  });
+
+  it("offline drift to 0 does NOT raise the upsell — only the server's verdict does", () => {
+    // Fail-open regression guard: an unreachable server debits the local cache, so `remaining` can
+    // legitimately reach 0 with `blocked` false. That must keep the user working, not wall them.
+    useTrialStore.setState({ started: true, promptsUsed: 100, remaining: 0, cap: 100, blocked: false });
+    render(
+      <AuthGate>
+        <div>WORKSPACE</div>
+      </AuthGate>,
+    );
+    expect(screen.getByText("WORKSPACE")).toBeTruthy();
+    expect(screen.queryByText(/used all/)).toBeNull();
+  });
+
+  it("a REINSTALL (trial.json gone) whose server counter is spent gets no 'Try it now'", async () => {
+    // The revenue invariant, at the UI: `started` is false because the local file was deleted, but
+    // the server-authoritative sync says this DEVICE is done. Offering the free box would hand them
+    // a button that dead-ends on the first prompt, so it's dropped and the banner says why.
+    const syncRemote = vi.fn(async () => {
+      useTrialStore.setState({ blocked: true, remaining: 0, cap: 100, promptsUsed: 100 });
+    });
+    useTrialStore.setState({ started: false, syncRemote });
+    render(
+      <AuthGate>
+        <div>WORKSPACE</div>
+      </AuthGate>,
+    );
+    await screen.findByText(/already used its free trial/);
+    expect(screen.queryByRole("button", { name: /Try it now/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Log in \/ Sign up/ })).toBeTruthy();
+  });
+
+  it("runs the authoritative sync for a NON-entitled user", async () => {
+    const syncRemote = vi.fn().mockResolvedValue(undefined);
+    useTrialStore.setState({ syncRemote });
+    render(
+      <AuthGate>
+        <div>WORKSPACE</div>
+      </AuthGate>,
+    );
+    await vi.waitFor(() => expect(syncRemote).toHaveBeenCalled());
+  });
+
+  it("an ENTITLED user never touches the trial endpoints", async () => {
+    // Requirement: paid users skip the trial gate entirely — no sync, no device-token mint.
+    const syncRemote = vi.fn().mockResolvedValue(undefined);
+    useTrialStore.setState({ syncRemote });
+    useAuthStore.setState({
+      me: { clerkUserId: "u1", entitled: true, balanceCents: 500, tokenVersion: 1 },
+      tokenPresent: true,
+      loading: false,
+      refresh: vi.fn(),
+    });
+    render(
+      <AuthGate>
+        <div>WORKSPACE</div>
+      </AuthGate>,
+    );
+    expect(screen.getByText("WORKSPACE")).toBeTruthy();
+    // Give the effect a tick to (not) fire.
+    await Promise.resolve();
+    expect(syncRemote).not.toHaveBeenCalled();
   });
 });

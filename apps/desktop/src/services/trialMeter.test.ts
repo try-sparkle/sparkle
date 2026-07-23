@@ -1,11 +1,15 @@
 // @vitest-environment jsdom
+//
+// The trial gate is SERVER-authoritative: `blocked` is set only by an affirmative server verdict
+// (a 402, or a debit that left 0 remaining), never by a local count and never by a network failure.
+// These tests pin that contract at the meter seam the composer and the raw terminal both call.
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const increment = vi.fn();
-let trialUsed = 0;
+const consume = vi.fn();
+let blocked = false;
 let entitled = false;
 vi.mock("../stores/trialStore", () => ({
-  useTrialStore: { getState: () => ({ promptsUsed: trialUsed, increment }) },
+  useTrialStore: { getState: () => ({ blocked, consume }) },
   TRIAL_LIMIT: 100,
 }));
 vi.mock("../stores/authStore", () => ({
@@ -15,45 +19,43 @@ vi.mock("../stores/authStore", () => ({
 import { trialSendAllowed, recordTrialSend } from "./trialMeter";
 
 afterEach(() => {
-  trialUsed = 0;
+  blocked = false;
   entitled = false;
   vi.clearAllMocks();
 });
 
 describe("trialSendAllowed (pre-send gate, consumes nothing)", () => {
-  it("entitled users always pass, even over the limit", () => {
+  it("entitled users always pass — even when the server blocked this device", () => {
     entitled = true;
-    trialUsed = 999;
+    blocked = true;
     expect(trialSendAllowed()).toBe(true);
   });
-  it("trial under the limit passes", () => {
-    trialUsed = 99;
+  it("an un-blocked trial user passes", () => {
     expect(trialSendAllowed()).toBe(true);
   });
-  it("trial at the limit is blocked", () => {
-    trialUsed = 100;
+  it("an AFFIRMATIVE server block refuses the send", () => {
+    blocked = true;
     expect(trialSendAllowed()).toBe(false);
   });
-  it("never increments (the gate is a pure read)", () => {
-    trialUsed = 5;
+  it("never consumes (the gate is a pure read)", () => {
     trialSendAllowed();
-    expect(increment).not.toHaveBeenCalled();
+    expect(consume).not.toHaveBeenCalled();
   });
 });
 
-describe("recordTrialSend (post-delivery consume)", () => {
-  it("entitled users are never metered", async () => {
+describe("recordTrialSend (post-delivery server debit)", () => {
+  it("entitled users are never metered — the trial endpoints are never touched", async () => {
     entitled = true;
     await recordTrialSend();
-    expect(increment).not.toHaveBeenCalled();
+    expect(consume).not.toHaveBeenCalled();
   });
-  it("trial users consume one prompt", async () => {
-    increment.mockResolvedValue(undefined);
+  it("trial users debit one prompt against the server", async () => {
+    consume.mockResolvedValue(undefined);
     await recordTrialSend();
-    expect(increment).toHaveBeenCalledOnce();
+    expect(consume).toHaveBeenCalledOnce();
   });
-  it("fails open — a counter write error never rejects into the caller", async () => {
-    increment.mockRejectedValue(new Error("backend down"));
+  it("fails open — a metering error never rejects into the caller", async () => {
+    consume.mockRejectedValue(new Error("orchestration down"));
     await expect(recordTrialSend()).resolves.toBeUndefined();
   });
 });

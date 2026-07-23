@@ -48,7 +48,34 @@ describe("subscribeToCrossWindowSync", () => {
   it("broadcasts on a structural change (addProject)", () => {
     unsub = subscribeToCrossWindowSync();
     useProjectStore.getState().addProject("P", "/tmp/p");
-    expect(emit).toHaveBeenCalledWith("sparkle://projects-changed");
+    expect(emit).toHaveBeenCalledWith("sparkle://projects-changed", expect.any(String));
+  });
+
+  it("skips a rehydrate whose payload signature matches ours (self-echo)", () => {
+    // Tauri `emit` echoes back to the emitter. The echo carries the signature we just broadcast,
+    // which equals our current `last`, so it must be dropped without a rehydrate — otherwise every
+    // local structural change pays a redundant self-echo rehydrate (half the fan-out cost).
+    const rehydrate = vi
+      .spyOn(useProjectStore.persist, "rehydrate")
+      .mockResolvedValue(undefined as unknown as void);
+    unsub = subscribeToCrossWindowSync();
+    useProjectStore.getState().addProject("P", "/tmp/p"); // local change → emit(event, sig); last=sig
+    const sig = emit.mock.calls.find((c) => c[0] === "sparkle://projects-changed")?.[1];
+    expect(typeof sig).toBe("string");
+    rehydrate.mockClear();
+    captured.get("sparkle://projects-changed")?.({ payload: sig }); // the echo, same signature
+    expect(rehydrate).not.toHaveBeenCalled();
+    rehydrate.mockRestore();
+  });
+
+  it("rehydrates when the payload signature differs from ours", () => {
+    const rehydrate = vi
+      .spyOn(useProjectStore.persist, "rehydrate")
+      .mockResolvedValue(undefined as unknown as void);
+    unsub = subscribeToCrossWindowSync();
+    captured.get("sparkle://projects-changed")?.({ payload: "a-different-signature" });
+    expect(rehydrate).toHaveBeenCalled();
+    rehydrate.mockRestore();
   });
 
   it("does NOT broadcast on a non-structural change (appendPrompt)", () => {
@@ -88,7 +115,8 @@ describe("subscribeToCrossWindowSync", () => {
     // Leading edge only: the other 49 folded into the pending trailing run.
     expect(rehydrate).toHaveBeenCalledTimes(1);
 
-    await vi.advanceTimersByTimeAsync(100);
+    // The trailing run fires after the (widened, 300ms) coalesce window.
+    await vi.advanceTimersByTimeAsync(350);
     expect(rehydrate).toHaveBeenCalledTimes(2);
 
     // Burst over — no further runs from the events already collapsed.
@@ -109,7 +137,8 @@ describe("subscribeToCrossWindowSync", () => {
 
     fire?.({ payload: undefined });
     expect(rehydrate).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(200);
+    // Past the 300ms coalesce window, the cooldown has lapsed with nothing pending.
+    await vi.advanceTimersByTimeAsync(350);
 
     fire?.({ payload: undefined });
     expect(rehydrate).toHaveBeenCalledTimes(2);
@@ -197,7 +226,7 @@ describe("subscribeToCrossWindowSync", () => {
     unsub = subscribeToCrossWindowSync();
     emit.mockClear();
     useDictationStore.getState().setEnabled(false);
-    expect(emit).toHaveBeenCalledWith("sparkle://dictation-changed");
+    expect(emit).toHaveBeenCalledWith("sparkle://dictation-changed", expect.any(String));
   });
 
   it("broadcasts a phase change (paused↔active) across windows", () => {
@@ -208,7 +237,7 @@ describe("subscribeToCrossWindowSync", () => {
     unsub = subscribeToCrossWindowSync();
     emit.mockClear();
     useDictationStore.getState().setPhase("active");
-    expect(emit).toHaveBeenCalledWith("sparkle://dictation-changed");
+    expect(emit).toHaveBeenCalledWith("sparkle://dictation-changed", expect.any(String));
   });
 
   it("does NOT broadcast on a non-persisted dictation change (mic level)", () => {
@@ -236,12 +265,12 @@ describe("subscribeToCrossWindowSync", () => {
     // A change that lands while hydration is still in flight must NOT fan out — it's the persisted
     // value being restored, not a user toggle.
     useDictationStore.getState().setEnabled(false);
-    expect(emit).not.toHaveBeenCalledWith("sparkle://dictation-changed");
+    expect(emit).not.toHaveBeenCalledWith("sparkle://dictation-changed", expect.any(String));
 
     // Once hydration settles, `last` is reseeded from the hydrated value and real toggles resume.
     finishHydration?.();
     useDictationStore.getState().setEnabled(true);
-    expect(emit).toHaveBeenCalledWith("sparkle://dictation-changed");
+    expect(emit).toHaveBeenCalledWith("sparkle://dictation-changed", expect.any(String));
 
     hasHydrated.mockRestore();
     onFinish.mockRestore();

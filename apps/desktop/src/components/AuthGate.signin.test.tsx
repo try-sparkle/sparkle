@@ -46,7 +46,11 @@ beforeEach(() => {
     error: false,
     refresh: vi.fn(),
     start: vi.fn(),
-    increment: vi.fn(),
+    remaining: null,
+    cap: null,
+    blocked: false,
+    syncRemote: vi.fn(),
+    consume: vi.fn(),
   });
   vi.clearAllMocks();
 });

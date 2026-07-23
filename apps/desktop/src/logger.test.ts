@@ -1,5 +1,9 @@
-import { describe, expect, it } from "vitest";
-import { isBenignTauriRejection, shouldForwardConsole } from "./logger";
+import { describe, expect, it, vi } from "vitest";
+
+const invoke = vi.fn((..._a: unknown[]) => Promise.resolve());
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
+
+import { isBenignTauriRejection, shouldForwardConsole, log, setDebugForwarding } from "./logger";
 
 // The console patch forwards captured console.* lines to the persistent log. Tauri's own
 // JS runtime emits "[TAURI] Couldn't find callback id N" on every in-flight IPC callback
@@ -60,5 +64,51 @@ describe("isBenignTauriRejection", () => {
     ).toBe(false);
     expect(isBenignTauriRejection("Unhandled rejection: Error: something genuinely broke")).toBe(false);
     expect(isBenignTauriRejection("")).toBe(false);
+  });
+});
+
+// Debug lines are a hot path (suggestions/approvals across dozens of agents). Forwarding each to the
+// persistent log paid a synchronous `frontend_log` IPC → disk write on the JS main thread — the
+// jank/log-volume this gate exists to remove. info/warn/error must always forward.
+describe("debug forwarding gate", () => {
+  it("does NOT forward debug lines when disabled, while info still forwards", () => {
+    setDebugForwarding(false);
+    invoke.mockClear();
+    log.debug("suggestions", "compute", { chars: 5000, learnedOn: true });
+    expect(invoke).not.toHaveBeenCalled();
+    log.info("suggestions", "computed", { buttons: 3 });
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards debug lines once enabled (e.g. for a support capture)", () => {
+    setDebugForwarding(true);
+    invoke.mockClear();
+    log.debug("suggestions", "compute", { chars: 5000 });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    setDebugForwarding(false);
+  });
+
+  it("gates the patched console.debug the same way (the other hot path)", async () => {
+    // initLogger patches global console.* and installs window listeners — shim window for node env.
+    const realWin = (globalThis as unknown as { window?: unknown }).window;
+    (globalThis as unknown as { window: unknown }).window = {
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+    const { initLogger } = await import("./logger");
+    initLogger();
+
+    setDebugForwarding(false);
+    invoke.mockClear();
+    console.debug("hot path debug line", { a: 1 });
+    expect(invoke).not.toHaveBeenCalled();
+
+    setDebugForwarding(true);
+    invoke.mockClear();
+    console.debug("hot path debug line", { a: 1 });
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    setDebugForwarding(false);
+    (globalThis as unknown as { window?: unknown }).window = realWin;
   });
 });

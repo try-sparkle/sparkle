@@ -10,7 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { C, ON_BRAND_FILL, DANGER } from "../theme/colors";
 import { useAuthStore } from "../stores/authStore";
-import { useTrialStore, TRIAL_LIMIT } from "../stores/trialStore";
+import { useTrialStore, trialPromptsLeft } from "../stores/trialStore";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { TrialChrome } from "./TrialChrome";
 import {
@@ -91,7 +91,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const trialLoading = useTrialStore((s) => s.loading);
   const trialError = useTrialStore((s) => s.error);
   const promptsUsed = useTrialStore((s) => s.promptsUsed);
+  const trialRemainingCount = useTrialStore((s) => s.remaining);
+  const trialCap = useTrialStore((s) => s.cap);
+  const trialBlocked = useTrialStore((s) => s.blocked);
   const refreshTrial = useTrialStore((s) => s.refresh);
+  const syncTrialRemote = useTrialStore((s) => s.syncRemote);
   const startTrial = useTrialStore((s) => s.start);
   // De-dupe URLs across the two delivery paths (the live "deep-link" event and the
   // cold-launch pending-drain), so one link is never processed twice.
@@ -164,6 +168,21 @@ export function AuthGate({ children }: { children: ReactNode }) {
     };
   }, [refresh, refreshTrial]);
 
+  // SERVER-authoritative trial reconcile. `refreshTrial` above is a local, instant read of the
+  // cached mirror so the gate never waits on HTTP; THIS pulls the authoritative counter and clamps
+  // the mirror to it — which is what makes a reinstall (or a deleted trial.json) land straight on
+  // the upgrade wall instead of a fresh 100 prompts, since the counter is keyed by the keychain
+  // device token, not by anything on disk.
+  //
+  // Gated on `!entitled` and on auth having RESOLVED, so a paid user never calls the trial
+  // endpoints at all (and never mints a trial device token). Fire-and-forget: Rust fails open, so
+  // an unreachable server just leaves the cached meter in place.
+  const entitled = me?.entitled === true;
+  useEffect(() => {
+    if (loading || entitled) return;
+    void syncTrialRemote();
+  }, [loading, entitled, syncTrialRemote]);
+
   // When the system-browser hand-off can't launch (no default browser, opener-scope denial, …), the
   // shared primitives resolve false and report the copy/paste URL through this setter (rendered as a
   // LaunchFallback below) rather than leaving the user on a dead button.
@@ -185,8 +204,12 @@ export function AuthGate({ children }: { children: ReactNode }) {
   //   • Trial "Unlock" (exhausted upsell + in-bar): signed-in → checkout, signed-out → sign-in.
   const handleTrialUnlock = () => void performTrialUnlock(tokenPresent, setFailedUrl);
 
-  // Trial prompts still available to fall back to (device-local meter, independent of payment).
-  const trialRemaining = Math.max(0, TRIAL_LIMIT - promptsUsed);
+  // Trial prompts still available to fall back to (the server's count once it has answered).
+  const trialRemaining = trialPromptsLeft({
+    promptsUsed,
+    remaining: trialRemainingCount,
+    cap: trialCap,
+  });
   // Escape hatch: a signed-in-but-unpaid user who started the trial and still has prompts can
   // dismiss the unlock screen and return to the trial workspace. The dismissed flag is LATCHED
   // (not the live count) so exhausting the last prompt hands off to TrialChrome's own exhausted
@@ -254,15 +277,22 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // welcome (token-less, trial not yet started). A recoverable failure gets a banner so the user
   // knows what happened and that the same Sign in / Try again buttons will fix it — interrupted
   // sign-in takes precedence over a trial-read failure (it's the more actionable of the two).
+  //
+  // `trialBlocked` here is the reinstall case: this DEVICE already spent its trial (the server said
+  // so), but the local `started` flag was lost with trial.json. Offering "Try it now" would hand
+  // them a button that dead-ends on the first prompt, so we hide the free box and say why — the
+  // only honest action left is to convert. Omitting onTryFree makes WelcomeScreen drop that box.
   const welcomeBanner = signInInterrupted
     ? "Your sign-in didn't finish. Please sign in again."
-    : trialError
-      ? "We couldn't load your free-trial status. Sign in or start a new trial to continue."
-      : undefined;
+    : trialBlocked
+      ? "This device has already used its free trial. Sign in to unlock Sparkle."
+      : trialError
+        ? "We couldn't load your free-trial status. Sign in or start a new trial to continue."
+        : undefined;
   return (
     <WelcomeScreen
       onSignIn={() => void handleSignIn()}
-      onTryFree={() => void startTrial()}
+      onTryFree={trialBlocked ? undefined : () => void startTrial()}
       signInFailedUrl={failedUrl}
       banner={welcomeBanner}
     />

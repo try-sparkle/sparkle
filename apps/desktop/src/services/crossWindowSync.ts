@@ -11,13 +11,16 @@ import { safeUnlisten } from "./safeUnlisten";
 const inTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 /** Minimum gap between two rehydrates of the same store. A structural change fans out one event per
- *  mutation, so a burst (spawning agents, a branch of rapid status flips) can deliver events far
- *  faster than a rehydrate is worth doing: each one re-reads and re-parses the whole persisted blob
- *  and writes the store, re-rendering every subscriber. Rehydrate always reads the CURRENT blob, so
- *  collapsing N events in a window into one run is equivalent to running only the last — the
- *  intermediate runs would each be overwritten by the next. 50ms caps the cost at ~20 rehydrates/s
- *  while staying well under the ~100ms that reads as instant for cross-window liveness. */
-const REHYDRATE_COALESCE_MS = 50;
+ *  mutation, so a burst (spawning agents, a branch of rapid status flips, auto-name churn across
+ *  dozens of agents) can deliver events far faster than a rehydrate is worth doing: each one
+ *  re-reads and re-parses the whole persisted blob and writes the store, re-rendering every
+ *  subscriber. Rehydrate always reads the CURRENT blob, so collapsing N events in a window into one
+ *  run is equivalent to running only the last — the intermediate runs would each be overwritten by
+ *  the next. At scale (40+ agents) 50ms was too tight: name-churn bursts arrived ~every 60-110ms and
+ *  each paid a full rehydrate, producing recurring ~1s main-thread jank (perfTrace `rehydrate` spans
+ *  hitting 900ms+). 300ms collapses a whole burst into a single trailing run; cross-window liveness
+ *  of ~300ms is imperceptible (the receiving window is not the one being interacted with). */
+const REHYDRATE_COALESCE_MS = 300;
 
 /** A persisted store wired for cross-window liveness. `rehydrate()` is provided by zustand's
  *  `persist` middleware; `signature()` is a coarse hash of just the fields other windows care
@@ -101,7 +104,13 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>, isTorndown: () => boole
     });
   };
 
-  const rehydrate = () => {
+  const rehydrate = (incomingSig?: string) => {
+    // A remote change whose signature already matches ours is a no-op — skip the whole
+    // read/parse/write. Tauri `emit` echoes to the emitter AND fans out to every window, so
+    // without this the window that made a change pays a redundant self-echo rehydrate, and two
+    // windows that already converged rehydrate each other pointlessly. `undefined` (the browser
+    // `storage` event, which carries no payload) always falls through and rehydrates.
+    if (incomingSig !== undefined && incomingSig === last) return;
     if (running || cooldown !== null) {
       pending = true;
       return;
@@ -125,7 +134,7 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>, isTorndown: () => boole
   unsubs.push(() => window.removeEventListener("storage", onStorage));
 
   if (inTauri()) {
-    void listen(spec.event, () => rehydrate()).then((u) => {
+    void listen<string>(spec.event, (e) => rehydrate(e.payload)).then((u) => {
       if (isTorndown()) void safeUnlisten(u);
       else unsubs.push(u);
     });
@@ -146,7 +155,9 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>, isTorndown: () => boole
     // Structural change is about to fan out to other windows — make sure the debounced projects
     // write has hit real localStorage first, so the receivers rehydrate the fresh blob.
     spec.flush?.();
-    if (inTauri()) void emit(spec.event);
+    // Carry the new signature as the payload so a receiver already at this signature (self-echo,
+    // or a converged window) can skip the rehydrate entirely — see rehydrate(incomingSig).
+    if (inTauri()) void emit(spec.event, now);
   });
   unsubs.push(unsubStore);
 }

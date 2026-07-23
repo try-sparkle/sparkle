@@ -234,7 +234,15 @@ describe("production singleton — Tauri guard (real getInstallId)", () => {
     vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
     const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const { fetchTrial } = await import("./trialApi");
-    vi.mocked(fetchTrial).mockResolvedValue({ installId: id, started: false, promptsUsed: 0 });
+    vi.mocked(fetchTrial).mockResolvedValue({
+      installId: id,
+      started: false,
+      promptsUsed: 0,
+      remaining: null,
+      cap: null,
+      blocked: false,
+      serverConfirmed: false,
+    });
     const { usageTelemetry } = await import("./usageTelemetry");
     await usageTelemetry.trackAgentSpawned("worker");
     expect(fetchTrial).toHaveBeenCalled();

@@ -27,6 +27,23 @@ const realConsole = {
 // Reentrancy guard: if invoke() ever logs to console on failure, we must not re-forward.
 let forwarding = false;
 
+// Whether DEBUG-level lines are forwarded to the persistent log file. Default: ON in dev, OFF in
+// production builds. On hot paths (suggestions compute, auto-approve decisions, per-event
+// console.debug across dozens of agents) debug fired thousands of times/day, and EACH forward pays
+// a render() (JSON.stringify) plus a synchronous `frontend_log` IPC → disk write on the JS main
+// thread — measured at 87–121 MB/day and contributing to main-thread jank at scale. info/warn/error
+// always forward. A support capture can flip this on at runtime via setDebugForwarding(true); the
+// devtools console still shows every debug line regardless (that costs nothing on disk).
+let debugForwardEnabled = Boolean(import.meta.env.DEV);
+
+/** Enable/disable forwarding DEBUG lines to the persistent log (e.g. turn on for a support capture).
+ *  NOTE: this flag is per-webview (module state), so a support-capture toggle must be applied in
+ *  each window whose debug traffic should be captured (main + capture + worker webviews), or driven
+ *  from a cross-window setting. info/warn/error forwarding is unaffected. */
+export function setDebugForwarding(on: boolean): void {
+  debugForwardEnabled = on;
+}
+
 // Known-benign, high-frequency messages emitted by third-party runtimes (not our code) that
 // would otherwise flood the persistent log and bury real signal. These are still printed to the
 // live console (devtools) via the real console methods; we just don't forward them to the log
@@ -101,6 +118,12 @@ export const log = {
 };
 
 function emit(level: Level, scope: string, message: string, data?: unknown) {
+  // Skip the whole render+forward for debug lines when debug forwarding is off — this is the hot
+  // path (log.debug on suggestions/approvals/etc.). Still print to the live devtools console cheaply.
+  if (level === "debug" && !debugForwardEnabled) {
+    realConsole.debug(`[${scope}]`, message, data);
+    return;
+  }
   const line = data === undefined ? message : `${message} ${render([data])}`;
   realConsole[level === "debug" ? "debug" : level === "info" ? "info" : level]?.(`[${scope}]`, line);
   forward(level, scope, line);
@@ -115,6 +138,9 @@ export function initLogger() {
   const patch = (name: "log" | "info" | "warn" | "error" | "debug", level: Level) => {
     console[name] = (...args: unknown[]) => {
       realConsole[name](...args);
+      // console.debug is a hot path; when debug forwarding is off, skip render() + forward entirely
+      // (the line was already printed to devtools above).
+      if (level === "debug" && !debugForwardEnabled) return;
       const line = render(args);
       // Drop known-benign Tauri-internal noise from the log file (still printed above).
       if (shouldForwardConsole(line)) forward(level, "console", line);

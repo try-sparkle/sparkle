@@ -50,6 +50,9 @@ vi.mock("../services/sparkleAgent", () => ({
   SPARKLE_AGENT_ID: "sparkle",
   sparkleAgentIdFor: (label: string) => (label === "main" ? "sparkle" : `sparkle-${label}`),
   sparkleOpenSetWhitelist: (o: { ownId: string }) => [o.ownId],
+  // This suite is about the orchestration listener, not launch-warm: never warm, so boot doesn't
+  // mount the Sparkle pane here. The gate itself is covered in services/sparkleAgent.test.ts.
+  shouldWarmSparkleAtLaunch: () => false,
 }));
 
 // --- child components: stub out so their own Tauri/API calls don't interfere ---

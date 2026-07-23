@@ -439,9 +439,10 @@ pub fn run() {
             accounts::claude_signed_in,
             trial::trial_status,
             trial::trial_start,
-            trial::trial_increment,
-            trial_remote::trial_remote_status,
-            trial_remote::trial_remote_consume,
+            // The hot path. `trial_increment` (a device-local bump) is deliberately GONE: the
+            // counter is server-side now, so there is no JS-callable way to move it locally.
+            trial_remote::trial_sync,
+            trial_remote::trial_consume,
             config::get_config,
             config::config_file_paths,
             config::set_config_value,

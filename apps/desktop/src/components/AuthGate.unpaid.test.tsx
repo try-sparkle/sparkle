@@ -50,7 +50,11 @@ function signedInUnpaid(promptsUsed: number) {
     loading: false,
     refresh: vi.fn(),
     start: vi.fn(),
-    increment: vi.fn(),
+    remaining: null,
+    cap: null,
+    blocked: false,
+    syncRemote: vi.fn(),
+    consume: vi.fn(),
   });
 }
 
@@ -72,7 +76,14 @@ afterEach(() => {
     refresh: vi.fn(),
     paywallDismissed: false,
   });
-  useTrialStore.setState({ started: false, promptsUsed: 0, loading: true });
+  useTrialStore.setState({
+    started: false,
+    promptsUsed: 0,
+    remaining: null,
+    cap: null,
+    blocked: false,
+    loading: true,
+  });
 });
 
 describe("AuthGate — unlock screen (one-click Stripe)", () => {
@@ -155,7 +166,7 @@ describe("AuthGate — stay-on-trial escape hatch", () => {
     // Dismiss the $99 wall back to the trial workspace, then spend the last prompt so AuthGate hands
     // off to its exhausted full-screen upsell (whose Unlock is wired to handleTrialUnlock).
     fireEvent.click(screen.getByRole("button", { name: /stay on the free trial/ }));
-    act(() => useTrialStore.setState({ promptsUsed: 100 }));
+    act(() => useTrialStore.setState({ promptsUsed: 100, remaining: 0, blocked: true }));
     fireEvent.click(await screen.findByRole("button", { name: /log in \/ sign up/i }));
     await waitFor(() => expect(mockCheckout).toHaveBeenCalledTimes(1));
     expect(mockOpenSignIn).not.toHaveBeenCalled();
