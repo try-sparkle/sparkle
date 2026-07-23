@@ -4476,7 +4476,7 @@ dependencies = [
 
 [[package]]
 name = "sparkle"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "base64 0.22.1",
  "block2",
