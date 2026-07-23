@@ -5,6 +5,11 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...
 
 import { isBenignTauriRejection, shouldForwardConsole, log, setDebugForwarding } from "./logger";
 
+// Exactly the methods initLogger() patches (logger.ts `patch(...)` calls). Kept here so the
+// console-patch test can hand the globals back untouched.
+const CONSOLE_METHODS = ["log", "info", "warn", "error", "debug"] as const;
+type ConsoleMethod = (typeof CONSOLE_METHODS)[number];
+
 // The console patch forwards captured console.* lines to the persistent log. Tauri's own
 // JS runtime emits "[TAURI] Couldn't find callback id N" on every in-flight IPC callback
 // when the webview reloads mid-async — thousands per reload — which is benign noise that
@@ -91,24 +96,48 @@ describe("debug forwarding gate", () => {
   it("gates the patched console.debug the same way (the other hot path)", async () => {
     // initLogger patches global console.* and installs window listeners — shim window for node env.
     const realWin = (globalThis as unknown as { window?: unknown }).window;
-    (globalThis as unknown as { window: unknown }).window = {
-      addEventListener: () => {},
-      removeEventListener: () => {},
+    // Snapshot the REAL console methods: initLogger patches them globally and process-wide, and a
+    // patched console.debug forwards to the mocked invoke. Leaving them patched would make every
+    // later test that happens to console.* silently trip this mock — order-dependent by construction.
+    const realConsole = {} as Record<ConsoleMethod, typeof console.log>;
+    for (const k of CONSOLE_METHODS) realConsole[k] = console[k];
+    // (initLogger's own `installed` guard stays flipped for the process, so restoring here is
+    // final — a second initLogger() in this file would no-op rather than re-patch.)
+    const restore = () => {
+      for (const k of CONSOLE_METHODS) console[k] = realConsole[k];
+      (globalThis as unknown as { window?: unknown }).window = realWin;
+      setDebugForwarding(false);
     };
-    const { initLogger } = await import("./logger");
-    initLogger();
 
-    setDebugForwarding(false);
-    invoke.mockClear();
-    console.debug("hot path debug line", { a: 1 });
-    expect(invoke).not.toHaveBeenCalled();
+    try {
+      (globalThis as unknown as { window: unknown }).window = {
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      };
+      const { initLogger } = await import("./logger");
+      initLogger();
 
+      setDebugForwarding(false);
+      invoke.mockClear();
+      console.debug("hot path debug line", { a: 1 });
+      expect(invoke).not.toHaveBeenCalled();
+
+      setDebugForwarding(true);
+      invoke.mockClear();
+      console.debug("hot path debug line", { a: 1 });
+      expect(invoke).toHaveBeenCalledTimes(1);
+    } finally {
+      // finally, not a trailing statement: an assertion failure above must not leak the patch either.
+      restore();
+    }
+
+    // The global console is genuinely handed back — with forwarding ON (the state that would expose a
+    // still-patched method), a console.debug must reach nothing.
     setDebugForwarding(true);
     invoke.mockClear();
-    console.debug("hot path debug line", { a: 1 });
-    expect(invoke).toHaveBeenCalledTimes(1);
-
+    console.debug("after restore", { a: 1 });
+    expect(invoke).not.toHaveBeenCalled();
     setDebugForwarding(false);
-    (globalThis as unknown as { window?: unknown }).window = realWin;
+    for (const k of CONSOLE_METHODS) expect(console[k]).toBe(realConsole[k]);
   });
 });
