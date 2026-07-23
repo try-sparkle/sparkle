@@ -53,8 +53,9 @@ import {
 } from "./services/windowStatus";
 import { withDismissedAlerts } from "./engine/alertDismissal";
 import { withUnmergedWork } from "./engine/unmergedAttention";
+import { withRedWorkerAttention, withUnstartedWorkerAttention } from "./engine/workerAttention";
 import { resolveStage } from "./engine/workflowStage";
-import type { AgentTab, AgentTabStatus } from "./types";
+import type { AgentKind, AgentTab, AgentTabStatus } from "./types";
 
 /** The "answer now" red statuses relayed to the phone + counted by the badge (mirrors
  *  engine/attention's ATTENTION set). Includes `errored`: a crashed or mid-stream-stalled agent is
@@ -70,6 +71,61 @@ const isRelayRed = (s: AgentTabStatus | undefined): boolean =>
  *  fallback. Mirrors useRosterPublisher.displayName. */
 const displayName = (a: AgentTab): string =>
   a.aiTitle || a.autoNameVariants?.title || a.name;
+
+/** Which of THIS window's agents may claim a row in every OTHER window's cross-window attention
+ *  block: the red ones, minus every worker.
+ *
+ *  The cross-window block is a SECOND agent list, independent of the one `orderedTopLevelAgents`
+ *  feeds — so the "workers are never top-level rows" rule has to be restated here or a red worker
+ *  leaks straight back into the sidebar of every other window, project pill and all (which is
+ *  exactly what kept happening after that fix). The user works with orchestrators; a worker is
+ *  reachable only inside its parent's card, and that card lives in the OWNING window, so a worker
+ *  row here isn't even clickable-to-anything-useful.
+ *
+ *  The red isn't dropped on the floor: the caller runs the worker-attention overlays first, so a red
+ *  worker has already bubbled its status onto its orchestrator and THAT is the row we publish. An
+ *  orphaned worker (parent gone) has nobody to bubble to and simply goes quiet — the same trade
+ *  orderedTopLevelAgents made, and a teardown-window edge case either way. */
+export function crossWindowRedAgents<
+  A extends { id: string; kind: AgentKind; parentId: string | null },
+>(agents: readonly A[], publishStatus: StatusMap): A[] {
+  return agents.filter((a) => a.kind !== "worker" && isRedStatus(publishStatus[a.id]));
+}
+
+/** The overlaid status this window BROADCASTS — the same chain AgentSidebar's `effectiveStatus`
+ *  applies to color its own rows, kept here as one exported function so the two can be compared (and
+ *  tested) instead of drifting as two hand-copied call stacks. Order is the contract:
+ *
+ *   1. `withUnstartedWorkerAttention` — a worker whose worktree was cut but which never went live has
+ *      NO status entry, so nothing downstream would call it red. Invents the red and bubbles it.
+ *   2. `withRedWorkerAttention` — a worker that started and then went red paints its orchestrator.
+ *      After (1) so a strand's synthetic red bubbles too.
+ *      Steps 1–2 are load-bearing, not cosmetic: `crossWindowRedAgents` drops workers from the
+ *      published list, so without these bubbles a build whose worker is stuck would broadcast nothing
+ *      at all. The orchestrator carries it instead — the only row another window could act on anyway,
+ *      since the worker's card lives in the OWNING window.
+ *   3. `withUnmergedWork` — a finished agent with un-landed committed work goes red `unmerged`, so a
+ *      done-but-unmerged agent shows red in other projects' views too.
+ *   4. `withDismissedAlerts` — a dismissed red alarm de-escalates, so a row that reads calm in its own
+ *      project is not broadcast as red elsewhere (the original cross-project bug). Strictly after (3):
+ *      dismissal last, or it would re-redden a just-calmed row (see withUnmergedWork's header).
+ *
+ *  `blocked` is red purely by its token color, so `isRedStatus` picks it up with no overlay. */
+export function publishedStatusFor(
+  agents: readonly AgentTab[],
+  status: StatusMap,
+  openIds: ReadonlySet<string>,
+  stageOf: (id: string) => ReturnType<typeof resolveStage>,
+): StatusMap {
+  return withDismissedAlerts(
+    agents,
+    withUnmergedWork(
+      agents,
+      withRedWorkerAttention(agents, withUnstartedWorkerAttention(agents, status, openIds)),
+      stageOf,
+    ),
+  );
+}
 
 /** Cap the raw terminal `detail` we relay to the phone. The trigger sits at the BOTTOM of the
  *  screen/scrollback, so keep the tail (a runaway scrollback would otherwise bloat the payload).
@@ -199,6 +255,10 @@ export function useAttentionNotifications(): void {
   // when an agent's stage advances even if its runtime status hasn't changed.
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
+  // Which agents are live, for the publish chain's unstarted-worker overlay. The store keeps this
+  // array's reference stable on a no-op open() (see mergeOpenAgentIds), so subscribing here does not
+  // churn the effect on every tick.
+  const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
   const projectId = useCurrentProjectId();
   const label = useCurrentWindowLabel();
   const isMain = useIsMainWindow();
@@ -251,26 +311,21 @@ export function useAttentionNotifications(): void {
     activitySeen.current = stampActivity(activitySeen.current, agents, now);
 
     // Publish THIS window's red (needs-you) agents to the cross-window status channel so other
-    // windows can surface them at the top of their sidebar. We publish the SAME overlaid status the
-    // in-sidebar row color uses — via the exact overlay chain from AgentSidebar's effectiveStatus:
-    //   (1) withUnmergedWork — a finished agent with un-landed committed work → red `unmerged`, so a
-    //       done-but-unmerged agent shows red in OTHER projects' views too (not just its own).
-    //   (2) withDismissedAlerts — a dismissed red alarm de-escalates out of red, so a row that reads
-    //       calm in its own project is NOT broadcast as red elsewhere (the core cross-project bug).
-    // `blocked` is red purely by its token color, so isRedStatus below picks it up with no overlay.
-    // Order: unmerged before dismissal (see withUnmergedWork's header). Empty set deletes our entry.
-    const publishStatus = withDismissedAlerts(
-      agents,
-      withUnmergedWork(agents, status, (id) => resolveStage(branchStatus[id], workflowStage[id])),
+    // windows can surface them at the top of their sidebar. The overlaid status we broadcast is the
+    // same one the in-sidebar row color uses — see publishedStatusFor for the chain and why its
+    // order is a contract. An empty set deletes our entry.
+    const publishStatus = publishedStatusFor(agents, status, new Set(openAgentIds), (id) =>
+      resolveStage(branchStatus[id], workflowStage[id]),
     );
     const nextRedSince: Record<string, number> = {};
-    const redList = agents.flatMap((a) => {
-      const st = publishStatus[a.id];
-      if (!isRedStatus(st)) return [];
+    // Workers never claim a cross-window row (see crossWindowRedAgents) — their red rides up to the
+    // orchestrator in (1) above.
+    const redList = crossWindowRedAgents(agents, publishStatus).map((a) => {
+      const st = publishStatus[a.id]!;
       // Reuse the existing stamp if this agent was already red; else it just entered red now.
       const since = redSince.current[a.id] ?? now;
       nextRedSince[a.id] = since;
-      return [{ id: a.id, name: displayName(a), status: st, since }];
+      return { id: a.id, name: displayName(a), status: st, since };
     });
     // Prune to only currently-red ids so a later return-to-red gets a fresh Date.now() above.
     redSince.current = nextRedSince;
@@ -413,7 +468,17 @@ export function useAttentionNotifications(): void {
     }
     prevStatus.current = status;
     prevProject.current = projectId;
-  }, [status, agents, projectId, label, projectName, enabled, branchStatus, workflowStage]);
+  }, [
+    status,
+    agents,
+    projectId,
+    label,
+    projectName,
+    enabled,
+    branchStatus,
+    workflowStage,
+    openAgentIds,
+  ]);
 
   // Report 0 + drop our cross-window status entry on unmount so a closed window stops contributing
   // to the badge total and stops surfacing its (now-gone) red agents in other windows' sidebars.
