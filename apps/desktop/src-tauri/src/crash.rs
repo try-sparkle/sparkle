@@ -63,6 +63,73 @@ fn orchestration_base_url() -> String {
         .unwrap_or_else(|| DEFAULT_ORCHESTRATION_URL.to_string())
 }
 
+// ── Build provenance ────────────────────────────────────────────────────────────────────────────
+//
+// Every crash report carries WHICH BUILD produced it, so a crash from the founder's own `cargo
+// tauri dev` / locally-built DMG is distinguishable from a crash in a shipped build. Both values
+// come from `option_env!`, which is resolved at COMPILE time and needs no build script and no extra
+// crate dependency — that is exactly why they're env vars rather than, say, a `vergen`-style build
+// dependency.
+//
+// CI (the official release pipeline) is expected to set BOTH at build time:
+//   SPARKLE_OFFICIAL_BUILD=1                 → this is an official build   → channel "release"
+//   SPARKLE_GIT_SHA=<the commit being built> → provenance for that build
+// Neither is required: an unset/empty value DEGRADES (to channel "local" and an absent sha) rather
+// than failing the build, so a plain `cargo build` keeps working untouched.
+
+/// Longest git sha we'll send (a full sha-1 is 40 hex chars). Anything longer is truncated.
+const MAX_GIT_SHA_LEN: usize = 40;
+
+/// Which kind of build produced this crash: `"dev"` | `"local"` | `"release"`.
+///
+/// - `"dev"`     — a debug build (`cargo tauri dev`, `cargo test`, any `debug_assertions` build).
+/// - `"release"` — a release build produced by official CI (`SPARKLE_OFFICIAL_BUILD` set non-empty).
+/// - `"local"`   — a release build someone made on their own machine (the env var wasn't set).
+fn build_channel() -> &'static str {
+    if cfg!(debug_assertions) {
+        "dev"
+    } else if option_env!("SPARKLE_OFFICIAL_BUILD").is_some_and(|v| !v.trim().is_empty()) {
+        "release"
+    } else {
+        "local"
+    }
+}
+
+/// The commit this binary was built from, or None when CI didn't stamp one in.
+/// Whether a candidate sha is plausibly a git object id. `build.rs` falls back to the literal
+/// `"unknown"` when git is unavailable (a tarball build), and `bridge.rs` legitimately displays that
+/// — but it is NOT a sha, and the server rejects a non-hex value. Filtering here keeps a
+/// non-sha sentinel off the wire entirely rather than relying on the server to cope with it.
+fn is_hex_sha(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn git_sha() -> Option<&'static str> {
+    normalize_git_sha(option_env!("SPARKLE_GIT_SHA")?).filter(|s| is_hex_sha(s))
+}
+
+/// Normalize a raw `SPARKLE_GIT_SHA` value: trim it, treat empty/whitespace-only as absent, and bound
+/// it to `MAX_GIT_SHA_LEN` bytes. Split out from `git_sha` (whose env read is compile-time only) so
+/// the rule is unit-testable against arbitrary inputs.
+///
+/// A real sha is 40 ASCII hex chars, so truncation is a guard against a mis-set env var rather than
+/// an expected path. It cuts at the largest char boundary at or below the cap: that both keeps the
+/// ≤`MAX_GIT_SHA_LEN` guarantee real for a non-ASCII value and makes the slice panic-free.
+fn normalize_git_sha(raw: &str) -> Option<&str> {
+    let sha = raw.trim();
+    if sha.is_empty() {
+        return None;
+    }
+    if sha.len() <= MAX_GIT_SHA_LEN {
+        return Some(sha);
+    }
+    let end = (0..=MAX_GIT_SHA_LEN)
+        .rev()
+        .find(|&i| sha.is_char_boundary(i))
+        .unwrap_or(0);
+    Some(&sha[..end])
+}
+
 // ── Crash record schema ─────────────────────────────────────────────────────────────────────────
 
 /// The structured crash record persisted to `crashes/crash-<crash_id>.json`. Field names are the
@@ -561,10 +628,16 @@ extern "C" fn handle_fatal_signal(sig: libc::c_int) {
 //
 // TWO TIERS, and the difference between them is real — keep it that way:
 //
-//   "never"        → nothing is uploaded. Reports stay on the user's disk.
+//   "never"        → nothing is uploaded. Reports stay on the user's disk. No keychain read, no
+//                    Authorization header — a "never" user emits nothing at all.
 //   "case_by_case" → the crash REPORT ONLY: redacted message + backtrace, install_id, app_version,
-//                    os, arch, timestamps. NO recent-logs tail.
-//   "always"       → the crash report PLUS the redacted ~200KB recent-logs tail.
+//                    os, arch, timestamps, plus the BUILD PROVENANCE (`build_channel` =
+//                    dev/local/release and `git_sha`, both compile-time constants of the binary —
+//                    they describe the build, not the user). And, WHEN THE USER IS SIGNED IN, the
+//                    request carries an `Authorization: Bearer <desktop token>` header, so the
+//                    report is attributable to that Sparkle account; signed-out/trial users send no
+//                    header and stay anonymous (install_id only). NO recent-logs tail.
+//   "always"       → all of the above PLUS the redacted ~200KB recent-logs tail.
 //
 // Why "case_by_case" uploads at all: it is the DEFAULT (settingsStore.ts `DEFAULT_SPARKLE_CONSENT`),
 // and an always-only upload gate meant the crash pipeline received nothing from anyone who never
@@ -592,12 +665,30 @@ fn logs_allowed(consent: &str) -> bool {
     consent == "always"
 }
 
+/// Resolve the desktop bearer token for a flush — but ONLY when the consent value permits uploading
+/// at all. A non-consenting value never even calls `read`, so a "never" user performs no keychain
+/// read (and therefore never triggers a macOS keychain prompt) for a flush that would upload nothing.
+///
+/// `read` is injected so the invariant is unit-testable without a keychain: production passes
+/// `crate::auth::token`, which reads the item in-process via the `keyring` crate.
+fn resolve_upload_token<F: FnOnce() -> Option<String>>(consent: &str, read: F) -> Option<String> {
+    if upload_allowed(consent) {
+        read()
+    } else {
+        None
+    }
+}
+
 /// Build the `/telemetry/crash` upload body for a record. Applies `redact_secrets` to the (possibly
 /// secret-bearing) message + backtrace; `recent_logs` is already redacted by the caller. `install_id`
-/// is the anonymous 32-hex key from trial.rs.
+/// is the anonymous 32-hex key from trial.rs. `build_channel` / `git_sha` describe the BINARY (see
+/// the build-provenance section): they let a crash from a dev/local build be told apart from one in
+/// an officially shipped release. `git_sha` is null when CI didn't stamp one in.
 fn build_upload_body(rec: &CrashRecord, install_id: &str, recent_logs: &str) -> String {
     json!({
         "install_id": install_id,
+        "build_channel": build_channel(),
+        "git_sha": git_sha(),
         "crash_id": rec.crash_id,
         "kind": rec.kind,
         "signal": rec.signal,
@@ -637,7 +728,8 @@ fn list_pending_crashes(dir: &Path) -> Vec<std::path::PathBuf> {
 
 /// Core flush logic, factored out of the Tauri command so it unit-tests without a Tauri runtime.
 ///
-/// `post` returns true on a 2xx. When the consent value is not a consenting mode (`upload_allowed`
+/// `post` is called with `(body, bearer_token)` and returns true on a 2xx. When the consent value is
+/// not a consenting mode (`upload_allowed`
 /// is false — "never", or any unrecognized value, which fails closed) NOTHING is uploaded and
 /// NOTHING is deleted (`post` is never called) — the reports are left on disk. On a 2xx the local
 /// file is deleted so it isn't re-uploaded. Returns the number of reports successfully uploaded.
@@ -647,11 +739,16 @@ fn list_pending_crashes(dir: &Path) -> Vec<std::path::PathBuf> {
 /// re-apply `logs_allowed` here rather than trusting the argument: this is the function the tests
 /// pin the privacy line against, so the "case_by_case sends no logs" invariant is enforced at the
 /// same place the body is built, and a future caller can't quietly leak a tail past it.
-fn flush_pending<P: Fn(&str) -> bool>(
+///
+/// `token` is the signed-in user's desktop bearer token (None when signed out / on a trial), already
+/// resolved once by the caller inside its own consent gate (`resolve_upload_token`). It is threaded
+/// to `post` only past the gate below, so a non-consenting flush can never attach one.
+fn flush_pending<P: Fn(&str, Option<&str>) -> bool>(
     crashes_dir: &Path,
     install_id: &str,
     recent_logs: &str,
     consent: &str,
+    token: Option<&str>,
     post: P,
     max_uploads: usize,
 ) -> usize {
@@ -683,6 +780,11 @@ fn flush_pending<P: Fn(&str) -> bool>(
     // The privacy line between the two consenting tiers: the recent-logs tail is "always"-only.
     let recent_logs = if logs_allowed(consent) { recent_logs } else { "" };
 
+    // Same belt-and-suspenders for the signed-in identity: the bearer token rides along ONLY on a
+    // consenting flush. We already returned above for a non-consenting value, so this is a backstop
+    // that keeps the invariant stated right where the request is built.
+    let token = if upload_allowed(consent) { token } else { None };
+
     let total = pending.len();
     let mut uploaded = 0usize;
     for path in pending.into_iter().take(max_uploads) {
@@ -703,7 +805,7 @@ fn flush_pending<P: Fn(&str) -> bool>(
             }
         };
         let body = build_upload_body(&rec, install_id, recent_logs);
-        if post(&body) {
+        if post(&body, token) {
             match std::fs::remove_file(&path) {
                 Ok(()) => {
                     uploaded += 1;
@@ -730,15 +832,31 @@ fn flush_pending<P: Fn(&str) -> bool>(
     uploaded
 }
 
+/// The `Authorization` header value for a bearer token, or None when there is nothing usable to send
+/// (signed out, or an empty/whitespace-only token). Pure, so the exact header the POST would carry is
+/// assertable in a unit test without standing up an HTTP server.
+fn authorization_header(bearer: Option<&str>) -> Option<String> {
+    bearer
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("Bearer {t}"))
+}
+
 /// POST one crash body to the orchestration ingest. Returns true on a 2xx. ureq maps 4xx/5xx to
 /// `Err(Error::Status(..))`, so `Ok(_)` already means a 2xx. Matches support.rs: ureq without the
 /// `json` feature → serde_json + send_string.
-fn post_crash(url: &str, body: &str) -> bool {
-    match ureq::post(url)
+///
+/// `bearer` attaches `Authorization: Bearer <desktop token>` so the server can attribute the crash
+/// to a Sparkle account. It is OPTIONAL and absent is the normal case (signed-out / trial): with no
+/// token we send exactly the request we always did, and the report stays anonymous (install_id only).
+fn post_crash(url: &str, body: &str, bearer: Option<&str>) -> bool {
+    let mut req = ureq::post(url)
         .timeout(HTTP_TIMEOUT)
-        .set("Content-Type", "application/json")
-        .send_string(body)
-    {
+        .set("Content-Type", "application/json");
+    if let Some(v) = authorization_header(bearer) {
+        req = req.set("Authorization", &v);
+    }
+    match req.send_string(body) {
         Ok(_) => true,
         Err(e) => {
             tracing::warn!(target: "crash", "POST {url} failed: {e}");
@@ -765,9 +883,9 @@ pub fn flush_crash_reports<R: Runtime>(app: AppHandle<R>, consent: String) {
 }
 
 /// The blocking flush body, factored out of the command so it runs off the main thread. Scans the
-/// crashes dir, resolves the anonymous install id, attaches a redacted recent-log window (only when
-/// uploading), and delegates the consent gate + POST loop to `flush_pending`. Returns how many
-/// reports were uploaded.
+/// crashes dir, resolves the anonymous install id (plus, on a consenting flush only, the signed-in
+/// desktop token), attaches a redacted recent-log window (only when uploading), and delegates the
+/// consent gate + POST loop to `flush_pending`. Returns how many reports were uploaded.
 fn run_flush<R: Runtime>(app: &AppHandle<R>, consent: &str) -> Result<usize, String> {
     let log_dir = crate::dev_identity::app_log_dir(app)?;
     let crashes_dir = log_dir.join("crashes");
@@ -790,13 +908,20 @@ fn run_flush<R: Runtime>(app: &AppHandle<R>, consent: &str) -> Result<usize, Str
         String::new()
     };
 
+    // Signed-in identity, resolved ONCE per flush (not per report) and STRICTLY inside the consent
+    // gate: `resolve_upload_token` doesn't call `auth::token` at all unless `upload_allowed`, so a
+    // "never" user performs no keychain read and sends no Authorization header. `auth::token` reads
+    // the keychain in-process via the `keyring` crate — never shell out to the `security` CLI.
+    let token = resolve_upload_token(consent, crate::auth::token);
+
     let url = format!("{}/telemetry/crash", orchestration_base_url());
     Ok(flush_pending(
         &crashes_dir,
         &install_id,
         &recent_logs,
         consent,
-        |body| post_crash(&url, body),
+        token.as_deref(),
+        |body, bearer| post_crash(&url, body, bearer),
         MAX_UPLOADS_PER_FLUSH,
     ))
 }
@@ -829,6 +954,38 @@ mod tests {
         }
     }
 
+    /// A recording fake for `flush_pending`'s `post`: captures the body AND the bearer token of every
+    /// attempted upload, so tests can assert on the Authorization header, not just the payload.
+    #[derive(Default)]
+    struct Posted {
+        calls: std::cell::RefCell<Vec<(String, Option<String>)>>,
+    }
+
+    impl Posted {
+        fn recorder(&self, ack: bool) -> impl Fn(&str, Option<&str>) -> bool + '_ {
+            move |body, bearer| {
+                self.calls
+                    .borrow_mut()
+                    .push((body.to_string(), bearer.map(|t| t.to_string())));
+                ack
+            }
+        }
+        fn len(&self) -> usize {
+            self.calls.borrow().len()
+        }
+        fn body(&self, i: usize) -> String {
+            self.calls.borrow()[i].0.clone()
+        }
+        fn json(&self, i: usize) -> serde_json::Value {
+            serde_json::from_str(&self.body(i)).unwrap()
+        }
+        /// The `Authorization` value `post_crash` would actually send for call `i` (None = no header),
+        /// derived through the SAME production helper the real POST uses.
+        fn auth_header(&self, i: usize) -> Option<String> {
+            authorization_header(self.calls.borrow()[i].1.as_deref())
+        }
+    }
+
     #[test]
     fn upload_body_redacts_message_and_backtrace() {
         // Secret-SHAPED values assembled at runtime so no literal secret appears in source (keeps the
@@ -857,6 +1014,228 @@ mod tests {
         assert_eq!(v["arch"], "aarch64");
         assert_eq!(v["occurred_at"], 1_700_000_000_000u64);
         assert_eq!(v["recent_logs"], "recent log line");
+    }
+
+    // ── Build provenance ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn upload_body_carries_a_legal_build_channel() {
+        let rec = sample_record("bc", "boom", None);
+        let v: serde_json::Value =
+            serde_json::from_str(&build_upload_body(&rec, "iid", "")).unwrap();
+
+        let channel = v["build_channel"]
+            .as_str()
+            .expect("build_channel must be a string on every crash upload");
+        assert!(
+            matches!(channel, "dev" | "local" | "release"),
+            "build_channel must be one of dev/local/release, got {channel:?}"
+        );
+        assert_eq!(channel, build_channel(), "body must carry the derived channel verbatim");
+    }
+
+    /// `cargo test` is a debug build, so this pins the `debug_assertions` branch: the founder's own
+    /// `cargo tauri dev` crashes report as "dev", never as a shipped release. The release/local split
+    /// is pinned by `build_channel_release_local_split_follows_official_build_env` below.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn build_channel_is_dev_in_a_debug_build() {
+        assert_eq!(build_channel(), "dev");
+    }
+
+    #[test]
+    fn build_channel_release_local_split_follows_official_build_env() {
+        // The release/local split is a COMPILE-time decision (option_env!), so we can't flip it at
+        // runtime — but we can pin the rule it implements against the value this binary was built
+        // with, which is exactly what CI would be setting.
+        let official = option_env!("SPARKLE_OFFICIAL_BUILD").is_some_and(|v| !v.trim().is_empty());
+        let expected = if cfg!(debug_assertions) {
+            "dev"
+        } else if official {
+            "release"
+        } else {
+            "local"
+        };
+        assert_eq!(build_channel(), expected);
+    }
+
+    #[test]
+    fn git_sha_field_is_always_present_and_null_when_unstamped() {
+        let rec = sample_record("sha", "boom", None);
+        let body = build_upload_body(&rec, "iid", "");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        // The key is ALWAYS emitted (the server reads it as optional); its value is null when CI
+        // didn't stamp a sha in — which is the case for an ordinary `cargo test` build.
+        assert!(
+            v.as_object().unwrap().contains_key("git_sha"),
+            "git_sha must be part of the wire contract: {body}"
+        );
+        match git_sha() {
+            None => assert!(v["git_sha"].is_null(), "unstamped build must send git_sha: null"),
+            Some(sha) => {
+                assert_eq!(v["git_sha"], sha);
+                assert!(sha.len() <= MAX_GIT_SHA_LEN, "git_sha must be truncated to 40 chars");
+            }
+        }
+        // SPARKLE_GIT_SHA is not set for a plain test build, so we expect the unstamped shape here.
+        assert!(
+            option_env!("SPARKLE_GIT_SHA").is_some() || v["git_sha"].is_null(),
+            "git_sha must be null when SPARKLE_GIT_SHA is unset"
+        );
+    }
+
+    #[test]
+    fn a_non_hex_sha_never_reaches_the_wire() {
+        // build.rs emits the literal "unknown" when git is unavailable (a tarball build), and
+        // bridge.rs legitimately shows that string — but it is not a sha, and the server rejects a
+        // non-hex value. If it ever reached the wire it would cost us the WHOLE crash report.
+        assert!(!is_hex_sha("unknown"));
+        assert!(!is_hex_sha(""));
+        assert!(!is_hex_sha("not-a-sha"));
+        assert!(!is_hex_sha("deadbeefZ"));
+        // Real shas, short and full, in either case.
+        assert!(is_hex_sha("d4bd221d"));
+        assert!(is_hex_sha("0123456789abcdef0123456789abcdef01234567"));
+        assert!(is_hex_sha("ABCDEF0123"));
+    }
+
+    #[test]
+    fn normalize_git_sha_trims_drops_empty_and_bounds_length() {
+        let full = "0123456789abcdef0123456789abcdef01234567"; // exactly 40 hex chars
+        assert_eq!(full.len(), MAX_GIT_SHA_LEN);
+        assert_eq!(normalize_git_sha(full), Some(full));
+        assert_eq!(normalize_git_sha("  abc123  "), Some("abc123"));
+
+        // Nothing usable → absent, so the wire field is null rather than an empty string.
+        assert_eq!(normalize_git_sha(""), None);
+        assert_eq!(normalize_git_sha("   \n\t "), None);
+
+        // Over-long values are bounded (a mis-set env var, not an expected path).
+        let long = format!("{full}deadbeef");
+        assert_eq!(normalize_git_sha(&long), Some(full));
+
+        // A non-ASCII value must still be bounded to <= MAX_GIT_SHA_LEN *bytes* and must not panic on
+        // a char boundary: 3-byte chars mean the cut lands at byte 39, not 40.
+        let multibyte = "é".repeat(40); // 2 bytes each = 80 bytes
+        let out = normalize_git_sha(&multibyte).unwrap();
+        assert!(out.len() <= MAX_GIT_SHA_LEN, "non-ASCII sha not bounded: {} bytes", out.len());
+        let wide = "☃".repeat(20); // 3 bytes each = 60 bytes; 40 is NOT a char boundary
+        let out = normalize_git_sha(&wide).unwrap();
+        assert_eq!(out.len(), 39, "must cut at the largest char boundary at or below the cap");
+    }
+
+    // ── Authorization header ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn authorization_header_is_bearer_or_absent() {
+        assert_eq!(authorization_header(Some("tok-123")), Some("Bearer tok-123".to_string()));
+        assert_eq!(authorization_header(Some("  tok-123  ")), Some("Bearer tok-123".to_string()));
+        // Nothing usable → NO header at all (rather than a malformed empty bearer).
+        assert_eq!(authorization_header(None), None);
+        assert_eq!(authorization_header(Some("")), None);
+        assert_eq!(authorization_header(Some("   ")), None);
+    }
+
+    #[test]
+    fn flush_sends_no_authorization_header_when_signed_out() {
+        // The NORMAL case (signed out / trial): upload exactly as before, anonymous via install_id.
+        let dir = tmp_dir();
+        write_crash_record(&dir, &sample_record("anon", "boom", None)).unwrap();
+
+        let posted = Posted::default();
+        let uploaded = flush_pending(
+            &dir,
+            "iid",
+            "logs",
+            "always",
+            None,
+            posted.recorder(true),
+            MAX_UPLOADS_PER_FLUSH,
+        );
+
+        assert_eq!(uploaded, 1);
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted.auth_header(0), None, "signed-out flush must send no Authorization header");
+        assert_eq!(posted.json(0)["install_id"], "iid");
+    }
+
+    #[test]
+    fn flush_sends_bearer_authorization_header_when_signed_in() {
+        let dir = tmp_dir();
+        write_crash_record(&dir, &sample_record("s1", "boom", None)).unwrap();
+        write_crash_record(&dir, &sample_record("s2", "boom", None)).unwrap();
+
+        let posted = Posted::default();
+        let uploaded = flush_pending(
+            &dir,
+            "iid",
+            "logs",
+            "case_by_case",
+            Some("desktop-token-abc"),
+            posted.recorder(true),
+            MAX_UPLOADS_PER_FLUSH,
+        );
+
+        assert_eq!(uploaded, 2);
+        assert_eq!(posted.len(), 2);
+        // The same token rides on EVERY report of the flush (resolved once, not per report).
+        for i in 0..2 {
+            assert_eq!(
+                posted.auth_header(i),
+                Some("Bearer desktop-token-abc".to_string()),
+                "signed-in flush must attach the bearer header on report {i}"
+            );
+        }
+        // The token is a HEADER only — it must never end up in the JSON body.
+        assert!(
+            !posted.body(0).contains("desktop-token-abc"),
+            "the desktop token must not be written into the upload body: {}",
+            posted.body(0)
+        );
+    }
+
+    #[test]
+    fn never_consent_reads_no_token_and_posts_nothing() {
+        // The strongest form of the privacy line: a non-consenting user must not even trigger a
+        // keychain read, let alone an upload. `resolve_upload_token` is the gate that guarantees it.
+        for consent in ["never", "", "Always", "sometimes"] {
+            let read = std::cell::Cell::new(0);
+            let token = resolve_upload_token(consent, || {
+                read.set(read.get() + 1);
+                Some("should-never-be-read".to_string())
+            });
+            assert_eq!(read.get(), 0, "keychain was read despite consent={consent:?}");
+            assert!(token.is_none(), "token resolved despite consent={consent:?}");
+        }
+        // …and a consenting mode DOES read it, exactly once.
+        for consent in ["always", "case_by_case"] {
+            let read = std::cell::Cell::new(0);
+            let token = resolve_upload_token(consent, || {
+                read.set(read.get() + 1);
+                Some("tok".to_string())
+            });
+            assert_eq!(read.get(), 1, "consenting flush must read the token once");
+            assert_eq!(token.as_deref(), Some("tok"));
+        }
+
+        // End to end through flush_pending: a "never" flush attempts no POST even if a token were
+        // somehow handed to it.
+        let dir = tmp_dir();
+        write_crash_record(&dir, &sample_record("nv", "boom", None)).unwrap();
+        let posted = Posted::default();
+        let uploaded = flush_pending(
+            &dir,
+            "iid",
+            "logs",
+            "never",
+            Some("leaked-token"),
+            posted.recorder(true),
+            MAX_UPLOADS_PER_FLUSH,
+        );
+        assert_eq!(uploaded, 0);
+        assert_eq!(posted.len(), 0, "a never-consent flush must perform no upload at all");
+        assert!(dir.join("crash-nv.json").exists(), "the report stays on disk");
     }
 
     #[test]
@@ -892,7 +1271,8 @@ mod tests {
                 "iid",
                 "logs",
                 consent,
-                |_body| {
+                Some("desktop-token"),
+                |_body, _bearer| {
                     posted.set(true); // must NEVER fire for a non-consenting value
                     true
                 },
@@ -929,30 +1309,27 @@ mod tests {
         let dir = tmp_dir();
         write_crash_record(&dir, &sample_record("cbc", "boom-cbc", Some("bt-cbc"))).unwrap();
 
-        let bodies = std::cell::RefCell::new(Vec::<String>::new());
+        let posted = Posted::default();
         let uploaded = flush_pending(
             &dir,
             "iid",
             "SECRET-LOG-TAIL-should-not-be-sent",
             "case_by_case",
-            |body| {
-                bodies.borrow_mut().push(body.to_string());
-                true
-            },
+            None,
+            posted.recorder(true),
             MAX_UPLOADS_PER_FLUSH,
         );
 
         assert_eq!(uploaded, 1, "case_by_case must upload the crash report");
-        let bodies = bodies.borrow();
-        assert_eq!(bodies.len(), 1);
-        let v: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(posted.len(), 1);
+        let v = posted.json(0);
         // No log tail — the field is present (the server contract wants it) but empty, and the tail
         // text appears nowhere in the body.
         assert_eq!(v["recent_logs"], "", "case_by_case must not send the recent-logs tail");
         assert!(
-            !bodies[0].contains("SECRET-LOG-TAIL"),
+            !posted.body(0).contains("SECRET-LOG-TAIL"),
             "log tail leaked into a case_by_case upload: {}",
-            bodies[0]
+            posted.body(0)
         );
         // The report itself IS sent: the crash fields the server needs are all there.
         assert_eq!(v["crash_id"], "cbc");
@@ -972,21 +1349,19 @@ mod tests {
         let dir = tmp_dir();
         write_crash_record(&dir, &sample_record("alw", "boom-alw", None)).unwrap();
 
-        let bodies = std::cell::RefCell::new(Vec::<String>::new());
+        let posted = Posted::default();
         let uploaded = flush_pending(
             &dir,
             "iid",
             "recent log tail here",
             "always",
-            |body| {
-                bodies.borrow_mut().push(body.to_string());
-                true
-            },
+            None,
+            posted.recorder(true),
             MAX_UPLOADS_PER_FLUSH,
         );
 
         assert_eq!(uploaded, 1);
-        let v: serde_json::Value = serde_json::from_str(&bodies.borrow()[0]).unwrap();
+        let v = posted.json(0);
         assert_eq!(v["crash_id"], "alw");
         assert_eq!(
             v["recent_logs"], "recent log tail here",
@@ -1005,7 +1380,7 @@ mod tests {
                 write_crash_record(&dir, &sample_record(&format!("x{i}"), "boom", None)).unwrap();
             }
             // Never acknowledge, so nothing is deleted by an upload — only prune can bound the dir.
-            flush_pending(&dir, "iid", "logs", consent, |_b| false, MAX_UPLOADS_PER_FLUSH);
+            flush_pending(&dir, "iid", "logs", consent, None, |_b, _t| false, MAX_UPLOADS_PER_FLUSH);
             assert!(
                 list_pending_crashes(&dir).len() <= MAX_RETAINED_CRASH_FILES,
                 "crashes dir unbounded at consent={consent:?}"
@@ -1025,7 +1400,8 @@ mod tests {
             "iid",
             "logs",
             "always",
-            |_body| {
+            None,
+            |_body, _bearer| {
                 count.set(count.get() + 1);
                 true
             },
@@ -1042,7 +1418,8 @@ mod tests {
     fn flush_leaves_file_when_upload_fails() {
         let dir = tmp_dir();
         write_crash_record(&dir, &sample_record("fail", "boom", None)).unwrap();
-        let uploaded = flush_pending(&dir, "iid", "logs", "always", |_b| false, MAX_UPLOADS_PER_FLUSH);
+        let uploaded =
+            flush_pending(&dir, "iid", "logs", "always", None, |_b, _t| false, MAX_UPLOADS_PER_FLUSH);
         assert_eq!(uploaded, 0);
         // A failed POST must leave the file for the next launch.
         assert!(dir.join("crash-fail.json").exists());
@@ -1054,7 +1431,7 @@ mod tests {
         for i in 0..5 {
             write_crash_record(&dir, &sample_record(&format!("c{i}"), "boom", None)).unwrap();
         }
-        let uploaded = flush_pending(&dir, "iid", "logs", "always", |_b| true, 2);
+        let uploaded = flush_pending(&dir, "iid", "logs", "always", None, |_b, _t| true, 2);
         // Capped at 2 even though 5 are pending.
         assert_eq!(uploaded, 2);
         // 3 remain on disk for a future flush.

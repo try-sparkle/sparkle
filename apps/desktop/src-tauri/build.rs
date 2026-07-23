@@ -88,19 +88,34 @@ fn main() {
     // MCP/bridge and does NOT hot-reload, so a fix on main isn't live until an app restart — this
     // SHA is the signal that lets a developer/orchestrator notice the running build is stale.
     // Best-effort: an unavailable git (e.g. a tarball build) yields "unknown" rather than failing.
-    let sha = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
+    //
+    // An EXTERNALLY provided SPARKLE_GIT_SHA wins. This is load-bearing: a build script's
+    // `rustc-env` overrides the ambient process environment, so without this precedence check CI's
+    // `SPARKLE_GIT_SHA: ${{ github.sha }}` would be silently discarded in favor of the short sha
+    // below, and the CI stamp would be a no-op.
+    let sha = std::env::var("SPARKLE_GIT_SHA")
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_else(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
     println!("cargo:rustc-env=SPARKLE_GIT_SHA={sha}");
     // Rebuild when HEAD moves so the embedded SHA stays honest across commits/checkouts.
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs/heads");
+    // Provenance vars are read at COMPILE time via option_env!/rustc-env. Track them so a cached
+    // build artifact from a non-official build can't be reused and silently ship the wrong channel.
+    println!("cargo:rerun-if-env-changed=SPARKLE_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=SPARKLE_OFFICIAL_BUILD");
 
     tauri_build::build()
 }

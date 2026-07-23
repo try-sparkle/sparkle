@@ -37,7 +37,12 @@ vi.mock("../services/sparkleApi", async (importOriginal) => {
 // cares that deep-open lands on the right category, so keep the pane body inert here.
 vi.mock("./CreditsPanel", () => ({ CreditsPanel: () => null }));
 
+// The Accounts pane's Install ID row calls the Rust trial meter over IPC. Mock it so no IPC
+// fires under jsdom; each test drives the resolved/rejected value it needs.
+vi.mock("../services/trialApi", () => ({ fetchTrial: vi.fn() }));
+
 import { openSignIn, signOut } from "../services/sparkleApi";
+import { fetchTrial } from "../services/trialApi";
 import { useAuthStore } from "../stores/authStore";
 import { SettingsDialog } from "./SettingsDialog";
 
@@ -285,5 +290,94 @@ describe("SettingsDialog — Sparkle account", () => {
     expect(screen.getByText("Checking sign-in status…")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
+  });
+});
+
+// The Install ID row in the Accounts pane. It is the identifier on every crash report and usage
+// event, so "does it render, and does Copy put the exact value on the clipboard" is the contract.
+describe("SettingsDialog — Install ID", () => {
+  const INSTALL_ID = "6dacbaa360a5f6f294118408c598f1c8";
+  const openAccountsPane = () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Accounts" }));
+  };
+  /** A full TrialMeter (main widened fetchTrial's return type); only installId matters here. */
+  const meter = (installId: string) => ({
+    installId,
+    started: true,
+    promptsUsed: 0,
+    remaining: null,
+    cap: null,
+    blocked: false,
+    serverConfirmed: false,
+  });
+  /** Pretend we're inside the real Tauri webview — the row's guard keys on this exact global. */
+  const inTauri = () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+  };
+
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    vi.mocked(fetchTrial).mockReset();
+  });
+
+  it("renders the install id and copies the EXACT value to the clipboard", async () => {
+    inTauri();
+    vi.mocked(fetchTrial).mockResolvedValue(meter(INSTALL_ID));
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+
+    openAccountsPane();
+    await waitFor(() => expect(screen.getByTestId("install-id").textContent).toBe(INSTALL_ID));
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy install ID" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(INSTALL_ID));
+    // The button confirms rather than silently succeeding.
+    await waitFor(() => expect(screen.getByRole("button", { name: "Copied" })).toBeTruthy());
+  });
+
+  it("says UNAVAILABLE (not 'preview') when the trial command throws inside the real app", async () => {
+    // Inside the app the browser-preview wording would be factually wrong, and it would mislead
+    // exactly the user who has been asked to read their install ID out to support.
+    inTauri();
+    vi.mocked(fetchTrial).mockRejectedValue(new Error("no IPC"));
+    openAccountsPane();
+    await waitFor(() => expect(screen.getByText(/Install ID unavailable/)).toBeTruthy());
+    expect(screen.queryByText(/in this preview/)).toBeNull();
+    expect(screen.queryByTestId("install-id")).toBeNull();
+  });
+
+  it("degrades when the command resolves an EMPTY id rather than rendering a blank box", async () => {
+    inTauri();
+    vi.mocked(fetchTrial).mockResolvedValue(meter(""));
+    openAccountsPane();
+    await waitFor(() => expect(screen.getByText(/Install ID unavailable/)).toBeTruthy());
+    expect(screen.queryByTestId("install-id")).toBeNull();
+  });
+
+  it("survives a clipboard rejection without throwing or falsely confirming", async () => {
+    inTauri();
+    vi.mocked(fetchTrial).mockResolvedValue(meter(INSTALL_ID));
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    Object.assign(navigator, {
+      clipboard: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
+    });
+
+    openAccountsPane();
+    await waitFor(() => expect(screen.getByTestId("install-id")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Copy install ID" }));
+
+    await waitFor(() => expect(err).toHaveBeenCalled());
+    // It must NOT claim success — the id is still on screen and selectable for a manual copy.
+    expect(screen.getByRole("button", { name: "Copy install ID" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Copied" })).toBeNull();
+    err.mockRestore();
+  });
+
+  it("does not touch IPC at all outside the Tauri webview (plain-browser dev preview)", async () => {
+    // No __TAURI_INTERNALS__ on window.
+    openAccountsPane();
+    await waitFor(() => expect(screen.getByText(/Not available in this preview/)).toBeTruthy());
+    expect(fetchTrial).not.toHaveBeenCalled();
   });
 });

@@ -123,6 +123,38 @@ objc2-av-foundation = { version = "0.3", default-features = false, features = [
     "AVMediaFormat",
 ] }
 
+# AppKit, for the project-folder picker (see folder_picker.rs). We present NSOpenPanel OURSELVES
+# rather than going through tauri-plugin-dialog, because that path took the app down in production:
+# `+[NSOpenPanel openPanel]` returned nil, objc2-app-kit's generated binding UNWRAPPED it and
+# panicked ("unexpected NULL returned from +[NSOpenPanel openPanel]"), and the plugin's blocking
+# wrapper then panicked a second time on the RecvError from the channel whose sender had just died.
+# Calling the selector directly lets us nil-CHECK instead of unwrapping, which is the whole fix.
+#
+# This adds NO new package: objc2-app-kit 0.3.2 is already in Cargo.lock via wry, and cargo unifies
+# the semver-compatible range to that same build. We are only turning on features.
+#
+# default-features = false with an explicit list, exactly like objc2-av-foundation above: the crate
+# defaults to the whole of AppKit. objc2 requires a feature per class in the inheritance chain, so
+# NSOpenPanel drags in its superclasses (NSSavePanel → NSPanel → NSWindow → NSResponder); NSApplication
+# is here for the NSModalResponse constants the run-modal result is compared against.
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSOpenPanel",
+    "NSPanel",
+    "NSResponder",
+    "NSSavePanel",
+    "NSWindow",
+] }
+
+# Foundation, for the NSURL the panel hands back and the NSString we set the title from. Same
+# reasoning as above — already in the tree via wry, feature-pruned to what we touch.
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSURL",
+] }
+
 # Windows: native Credential Manager backend for `keyring`. Notifications are handled without an
 # extra crate in attention.rs (see the #[cfg(not(target_os = "macos"))] path).
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -139,12 +171,18 @@ hound = "3.5"
 tempfile = "3"
 
 # Release tuning for a perf-sensitive native app. LTO + single codegen unit trade build time
-# for faster runtime on the git/audio/transcribe hot paths; strip removes symbols to shrink the
-# shipped binary. Deliberately NOT panic="abort": the app runs work on spawned threads (pty
-# readers, audio, transcribe, bridge) and relies on unwind isolation so one thread's panic
-# doesn't abort the whole process.
+# for faster runtime on the git/audio/transcribe hot paths. Deliberately NOT panic="abort": the app
+# runs work on spawned threads (pty readers, audio, transcribe, bridge) and relies on unwind
+# isolation so one thread's panic doesn't abort the whole process.
+#
+# `strip = "debuginfo"`, NOT `strip = true`. DO NOT "optimize" this back. `true` strips the SYMBOL
+# TABLE as well, which made every frame of every shipped crash backtrace resolve to
+# `__mh_execute_header` — we were capturing, redacting, byte-capping and emailing backtraces that
+# carried exactly zero information, and the first two production crashes we ever received were
+# undiagnosable from their backtraces for precisely this reason. "debuginfo" still drops DWARF (so
+# the binary stays close to its stripped size) while keeping the symbol names `backtrace` needs.
 [profile.release]
 lto = true
 codegen-units = 1
-strip = true
+strip = "debuginfo"
 opt-level = 3

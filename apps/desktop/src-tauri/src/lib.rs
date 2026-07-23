@@ -26,6 +26,7 @@ mod connectivity;
 mod delivery;
 mod dev_identity;
 mod dictation;
+mod folder_picker;
 mod github;
 mod history;
 mod hooks;
@@ -289,6 +290,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             notify_frontend_shown,
+            folder_picker::pick_folder,
             pty::pty_spawn,
             pty::pty_write,
             pty::pty_resize,

@@ -4,7 +4,7 @@ import { useSettingsStore, type SparkleImprovementConsent } from "../stores/sett
 
 /**
  * Consent banner for the Sparkle self-improvement agent. Sits at the top of the Sparkle pane
- * (below the pinned prompt) and lets the user choose how their anonymous logs may be used to
+ * (below the pinned prompt) and lets the user choose how their logs may be used to
  * improve the open-source Sparkle client: Always (auto-submit), Case by case (review + approve
  * each PR — the default), or Never (don't evaluate logs at all). The choice is persisted in
  * settingsStore and gates the hourly log evaluation + PR submission, AND the crash-report upload
@@ -46,7 +46,8 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
           "If we see failures or performance issues, we automatically craft a PR to submit to the Sparkle OSS project to improve it",
           'On "Always" mode, these PRs will be submitted automatically. No action required from you.',
           "On 'Always', the improvement agent also starts with the app, so it's already working when you open it — on 'Case by case' that's opt-in.",
-          "If Sparkle crashes, we securely upload a scrubbed crash report so we can find and fix the crash fast — the error message and backtrace only, anonymized, never any PII, secrets, or code.",
+          "If Sparkle crashes, we securely upload a scrubbed crash report so we can find and fix the crash fast — the error message and backtrace only, never any PII, secrets, or code.",
+          "That report says which install and which build it came from, and — only if you are signed in — which Sparkle account, so we can tell whose crash it is and follow up. Signed out, it stays anonymous.",
           "On 'Always', that crash report also carries your recent logs (last ~hour), scrubbed the same way, which gives us the context around the crash.",
           "We scrub the PR for anything sensitive: No PII, secrets, code snippets, etc will be sent",
         ],
@@ -56,7 +57,7 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
         lead: "Sparkle will not evaluate your logs.",
         bullets: [
           "Your logs stay on your device — the improvement agent won't read them or craft any PRs.",
-          "Crash reports are still captured locally to your device, but nothing is uploaded — on 'Never' we send no crash reports and no logs.",
+          "Crash reports are still captured locally to your device, but nothing is uploaded — on 'Never' we send no crash reports, no logs, and no account or build information.",
           "You can switch this back on at any time.",
         ],
       };
@@ -68,7 +69,8 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
           "Once per hour, we use a small amount of your Claude Code subscription to evaluate your logs.",
           "If we see failures or performance issues, we automatically craft a proposed PR to submit upon your approval to the Sparkle OSS project to improve it",
           "You review and approve every PR before it is submitted",
-          "If Sparkle crashes, we securely upload a scrubbed crash report so we can find and fix the crash fast — the error message and backtrace only, anonymized, never any PII, secrets, or code.",
+          "If Sparkle crashes, we securely upload a scrubbed crash report so we can find and fix the crash fast — the error message and backtrace only, never any PII, secrets, or code.",
+          "That report says which install and which build it came from, and — only if you are signed in — which Sparkle account, so we can tell whose crash it is and follow up. Signed out, it stays anonymous.",
           "Your recent logs are NOT sent on this setting — the crash report travels on its own. Uploading the last ~hour of logs alongside it is 'Always' only.",
           "We scrub the PR for anything sensitive: No PII, secrets, code snippets, etc will be sent",
         ],
@@ -120,7 +122,7 @@ export function SparkleConsentBanner() {
       >
         <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
           <span style={{ fontStyle: "italic", fontWeight: FONT_WEIGHT.semibold, fontSize: 13.5 }}>
-            Can we use your anonymous logs &amp; crash reports to automatically improve Sparkle?
+            Can we use your logs &amp; crash reports to automatically improve Sparkle?
           </span>
           {/* Disclosure toggle: a real button so the detail is reachable by click/tap (not just
               hover/focus) — important for touch users and for informed consent. */}

@@ -4,6 +4,7 @@ import { C, ROW_ACTIVE_BUBBLE } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { openSignIn, signOut } from "../services/sparkleApi";
 import { authIdentity } from "../services/entitlement";
+import { fetchTrial } from "../services/trialApi";
 import { useAuthStore } from "../stores/authStore";
 import { useUiStore, type CategoryId } from "../stores/uiStore";
 import { AiFeaturesMenu } from "./AiFeaturesMenu";
@@ -49,7 +50,7 @@ const CATEGORIES: Category[] = [
   { id: "appearance", label: "Appearance", Icon: FiEye, blurb: "Theme, text size, and how agents are ordered.", keywords: "theme dark light text size zoom agent order" },
   { id: "shortcuts", label: "Shortcuts", Icon: FiCommand, blurb: "Rebind keyboard shortcuts. Tap a modifier or press a combo.", keywords: "keyboard keybindings hotkeys" },
   { id: "workers", label: "Workers", Icon: FiCpu, blurb: "How many agents an orchestrator runs in parallel.", keywords: "concurrency parallel agents" },
-  { id: "accounts", label: "Accounts", Icon: FiUsers, blurb: "Your Sparkle and Claude accounts.", keywords: "sign in sign out claude sparkle login" },
+  { id: "accounts", label: "Accounts", Icon: FiUsers, blurb: "Your Sparkle and Claude accounts.", keywords: "sign in sign out claude sparkle login install id crash report support" },
   { id: "mobile", label: "Mobile", Icon: FiSmartphone, blurb: "Pair your phone with this Mac and manage paired devices.", keywords: "phone pair devices" },
   { id: "voice", label: "Voice controls", Icon: FiMic, blurb: "Wake word, stop word, and what happens when you submit.", keywords: "wake word stop word dictation microphone" },
   { id: "approvals", label: "Auto-approve", Icon: FiCheckCircle, blurb: "Auto-answer Claude Code permission prompts, and choose how to auto-resume large sessions.", keywords: "auto-approve approvals permission prompts skills commands bash edits mcp tools fetch remember yes nudge resume session summary full continue" },
@@ -276,6 +277,96 @@ function AccountsPane({ onManageAccounts }: { onManageAccounts: () => void }) {
           Manage accounts…
         </button>
       </div>
+      <InstallIdRow />
+    </div>
+  );
+}
+
+/** This install's anonymous id (trial.rs mints one 32-hex value per install and persists it to
+ *  trial.json). It is the identifier on every crash report and usage event we receive, and until
+ *  now it was rendered NOWHERE — which made an emailed crash report unattributable even to
+ *  yourself, and made "send me your install id" impossible to ask of a user.
+ *
+ *  Degrades quietly: outside the real Tauri webview (a plain-browser dev preview) there is no
+ *  install id at all, and a throwing/empty command is treated the same way — render the
+ *  unavailable line rather than an empty monospace box or a raw error. */
+function InstallIdRow() {
+  const [installId, setInstallId] = useState<string | null>(null);
+  // "preview" (no Tauri) and "failed" (IPC threw / empty id) are DIFFERENT: inside the real app
+  // "Not available in this preview" is factually wrong, and it would mislead exactly the user
+  // who has been asked to read their install ID out to support.
+  const [state, setState] = useState<"loading" | "ready" | "preview" | "failed">("loading");
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    // Same guard usageTelemetry.ts uses: only resolve inside the real Tauri webview.
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+      setState("preview");
+      return;
+    }
+    void fetchTrial()
+      .then((t) => {
+        if (!alive) return;
+        if (t.installId) {
+          setInstallId(t.installId);
+          setState("ready");
+        } else {
+          setState("failed");
+        }
+      })
+      .catch(() => {
+        if (alive) setState("failed");
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // Reset the confirmation after a moment so the button doesn't read "Copied" forever.
+  useEffect(() => {
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(false), 1500);
+    return () => clearTimeout(t);
+  }, [copied]);
+
+  const handleCopy = async () => {
+    if (!installId) return;
+    try {
+      await navigator.clipboard.writeText(installId);
+      setCopied(true);
+    } catch (e) {
+      // A denied/absent clipboard must not throw out of the void'd click handler. The id stays
+      // selectable on screen, so manual copy remains the recovery.
+      console.error("Copy install ID failed:", e);
+    }
+  };
+
+  return (
+    <div>
+      <div style={subLabel}>Install ID</div>
+      <div style={{ ...accountLine, marginBottom: 10 }}>
+        Identifies this install in crash and usage reports. It carries no personal information —
+        safe to share with support.
+      </div>
+      {state === "ready" && installId ? (
+        <div style={accountStack}>
+          <code data-testid="install-id" style={installIdValue}>
+            {installId}
+          </code>
+          <button type="button" style={fullButton} onClick={() => void handleCopy()}>
+            {copied ? "Copied" : "Copy install ID"}
+          </button>
+        </div>
+      ) : (
+        <div style={accountLine}>
+          {state === "loading"
+            ? "Reading install ID…"
+            : state === "preview"
+              ? "Not available in this preview."
+              : "Install ID unavailable. Restarting Sparkle usually fixes this."}
+        </div>
+      )}
     </div>
   );
 }
@@ -495,6 +586,14 @@ const accountLine: CSSProperties = {
   lineHeight: 1.5,
 };
 
+const installIdValue: CSSProperties = {
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  fontSize: 12,
+  color: C.cream,
+  letterSpacing: 0.5,
+  userSelect: "text",
+  wordBreak: "break-all",
+};
 const fullButton: CSSProperties = {
   background: "transparent",
   color: C.cream,

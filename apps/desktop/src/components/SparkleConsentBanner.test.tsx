@@ -64,10 +64,45 @@ describe("consentCopy — crash-report promises match the Rust upload gate", () 
     expect(all).toContain("On 'Always'");
   });
 
+  // Attribution was added to the crash payload (an optional Authorization: Bearer resolved from the
+  // keychain, plus the build channel and git sha). That widened what a consenting upload reveals, so
+  // BOTH consenting tiers must say so — and "never" must still promise none of it leaves the machine.
+  it("both consenting tiers disclose the account + build attribution, and its signed-out fallback", () => {
+    for (const mode of ["case_by_case", "always"] as const) {
+      const all = consentCopy(mode).bullets.join(" ");
+      expect(all, mode).toContain("which install and which build it came from");
+      expect(all, mode).toContain("only if you are signed in");
+      expect(all, mode).toContain("Signed out, it stays anonymous");
+    }
+  });
+
+  it("no consenting tier still calls the crash report flatly anonymized", () => {
+    // It is anonymous only when signed OUT; an unqualified "anonymized" is now a false promise.
+    for (const mode of ["case_by_case", "always"] as const) {
+      const bullets = crashBullets(mode);
+      expect(bullets.some((b) => /backtrace only, anonymized/.test(b)), mode).toBe(false);
+    }
+  });
+
+  it("never promises no account or build information either", () => {
+    const all = consentCopy("never").bullets.join(" ");
+    expect(all).toContain("no account or build information");
+    expect(all).not.toContain("only if you are signed in");
+  });
+
+  it("the HEADLINE makes no unqualified anonymity promise either", () => {
+    // The per-tier bullets are test-pinned, but the overarching question is what most users
+    // actually read — and it used to say "anonymous logs & crash reports", contradicting the
+    // bullets the moment a signed-in user's report carries their account.
+    render(<SparkleConsentBanner />);
+    const headline = screen.getByText(/Can we use your .*logs .* crash reports/);
+    expect(headline.textContent).not.toMatch(/anonymous/i);
+  });
+
   it("never says nothing is uploaded", () => {
     const bullets = crashBullets("never");
     expect(bullets.some((b) => b.includes("nothing is uploaded"))).toBe(true);
-    expect(bullets.some((b) => b.includes("no crash reports and no logs"))).toBe(true);
+    expect(bullets.some((b) => b.includes("no crash reports, no logs, and no account or build information"))).toBe(true);
     // No mode may promise an upload on "never" (upload_allowed("never") === false).
     expect(bullets.some((b) => b.includes("we securely upload"))).toBe(false);
   });
