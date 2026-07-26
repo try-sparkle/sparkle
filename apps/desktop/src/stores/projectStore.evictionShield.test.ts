@@ -147,7 +147,7 @@ describe("removal tombstones are actually produced (sparkle-pckz)", () => {
 
   it("removeAgent tombstones the closed agent", () => {
     const pid = useProjectStore.getState().addProject("P", "/tmp/p");
-    const id = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const id = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
     useProjectStore.getState().removeAgent(pid, id);
     expect(useProjectStore.getState().removedIds).toHaveProperty(id);
   });
@@ -156,7 +156,7 @@ describe("removal tombstones are actually produced (sparkle-pckz)", () => {
     // Workers belong to their orchestrator, so closing it closes them — and each needs its own
     // tombstone or the union re-adopts the orphans from any window that still lists them.
     const pid = useProjectStore.getState().addProject("P", "/tmp/p");
-    const parent = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const parent = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
     useProjectStore.getState().adoptWorker(pid, {
       id: "w1", parentId: parent, branch: "b", worktreePath: "/tmp/wt",
     });
@@ -166,7 +166,7 @@ describe("removal tombstones are actually produced (sparkle-pckz)", () => {
 
   it("removeProject tombstones the project AND its agents", () => {
     const pid = useProjectStore.getState().addProject("P", "/tmp/p");
-    const id = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const id = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
     useProjectStore.getState().removeProject(pid);
     const removed = useProjectStore.getState().removedIds!;
     expect(removed).toHaveProperty(pid);
@@ -182,7 +182,7 @@ describe("removal tombstones are actually produced (sparkle-pckz)", () => {
     // flushProjectsPersist for exactly this class of structural change; the in-window gap before it
     // lands is covered by the module-scoped local-removal mirror.
     const pid = useProjectStore.getState().addProject("P", "/tmp/p");
-    const id = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const id = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
     useProjectStore.getState().removeAgent(pid, id);
     flushProjectsPersist();
 

@@ -12,8 +12,8 @@ import type { AgentTabStatus } from "../types";
 
 // Status-colored circle glyph prefixed to the notification title, derived from the SOURCE-OF-TRUTH
 // color tier in AGENT_STATUS (packages/ui/tokens.ts) so it can't drift from the dot/badge colors.
-// RED tier (waiting, approval, errored, blocked, unmerged) → filled red circle; GRAY tier (idle,
-// done, stopped) → the radio-button ring; GREEN (working) → no glyph. We compare each status's
+// RED tier (waiting, approval, errored, blocked) → filled red circle; GRAY tier (idle, done,
+// stopped, unmerged) → the radio-button ring; GREEN (working) → no glyph. We compare each status's
 // `.color` against a known red status (waiting) and a known gray status (idle) rather than
 // re-listing the tiers here.
 const RED_CIRCLE = "🔴";
@@ -31,9 +31,10 @@ export type StatusMap = Record<string, AgentTabStatus>;
 // The BADGE/NOTIFICATION attention set — the agent needs an answer from you NOW: waiting ("Needs
 // you") and approval ("Approve?") are live questions; errored ("Errored / stalled") is a stuck agent
 // losing time until you intervene. This is deliberately NARROWER than the red-COLOR tier in
-// packages/ui/tokens.ts: `blocked` and `unmerged` are ALSO red (dot + cross-window section + sort
-// order), but they're "needs you eventually" (unstick it / open the PR), not "answer this now", so
-// they don't inflate the dock badge or fire a banner. Keep this set = the "answer now" subset.
+// packages/ui/tokens.ts: `blocked` is ALSO red (dot + cross-project banding + sort order), but it's
+// "needs you eventually" (unstick it), not "answer this now", so it doesn't inflate the dock badge
+// or fire a banner. `unmerged` isn't even red — see tokens.ts. Keep this set = the "answer now"
+// subset, and reach for windowStatus.isRedStatus when the question is "is this row red".
 const ATTENTION: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>([
   "waiting",
   "approval",

@@ -54,6 +54,10 @@ fn apply_noninteractive(cmd: &mut Command) {
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.env("GIT_ASKPASS", "true");
     cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    // Mirrored too: this module's fixtures commit into throwaway repos under the temp dir, so they
+    // must not fire the developer's hooks either. See worktree.rs for why.
+    #[cfg(test)]
+    crate::worktree::apply_test_hook_isolation(cmd);
 }
 
 fn is_git_repo(path: &Path) -> bool {
@@ -210,10 +214,301 @@ pub async fn reap_secondary_sparkle_worktrees(app: AppHandle) -> Result<u32, Str
         .map_err(|e| format!("reap task failed to run: {e}"))?
 }
 
+/// Can this machine actually SUBMIT the improvement agent's work upstream?
+///
+/// The agent's whole loop ends in `gh pr create` against the public mirror — but only the repo's
+/// maintainers have push access to it. For everyone else the push 403s at the very last step,
+/// after a full pass has already been spent, and the failure surfaces as a quiet gray "blocked"
+/// row with no explanation. Worse, the consent banner has already promised that PRs get
+/// submitted, which for a read-only user is simply false.
+///
+/// So we ask BEFORE spending the pass, and let the persona degrade to propose-only rather than
+/// march into a wall. The verdicts are deliberately distinct: they mean different things to the
+/// user (install a tool / log in / you're read-only / we couldn't tell).
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubmitVerdict {
+    /// The authenticated account has push access — the normal `gh pr create` path is available.
+    CanSubmit,
+    /// Authenticated, but read-only on the upstream repo. The common case for a public user.
+    NoPush,
+    /// `gh` is installed but has no usable credentials.
+    NotAuthenticated,
+    /// No `gh` binary on this machine.
+    GhMissing,
+    /// We could not determine it (offline, API error, unexpected output). Treated as "assume the
+    /// normal path" everywhere downstream: a transient network blip must never silently downgrade
+    /// a maintainer's agent to propose-only.
+    Unknown,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitCapability {
+    pub verdict: SubmitVerdict,
+    /// `owner/repo` the verdict is about, so the UI can name it without re-deriving it.
+    pub repo: String,
+}
+
+/// `owner/repo` for a GitHub clone URL. Pure so the slug the probe asks about is testable without
+/// touching the network. Handles the `https://…/owner/repo(.git)` form this app ships with; any
+/// other shape yields None rather than a guess (a wrong slug would probe the wrong repo).
+pub fn repo_slug_from_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    if parts.next().is_some() {
+        return None; // deeper path — not a bare repo URL
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// What one `gh api repos/<slug>` probe told us. Most outcomes are decided on the spot; the
+/// absent-permissions case genuinely isn't, and needs a second question (see below).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Decided(SubmitVerdict),
+    /// The call succeeded but carried no `.permissions` block. In practice this is an ANONYMOUS
+    /// read of a public repo: GitHub returns a `permissions` object for any authenticated request,
+    /// so a signed-in token normally lands in the `true`/`false` branches above. We still refuse to
+    /// call it "signed out" from this evidence alone — telling a signed-in user to sign in is
+    /// exactly the dishonest failure this probe exists to end, and the cost of being sure is one
+    /// extra call on a branch that is already rare. The signed-in resolution is therefore
+    /// defensive rather than an observed case.
+    PermissionsAbsent,
+}
+
+/// Classify one `gh api repos/<slug> --jq .permissions.push` invocation. Pure: the whole point is
+/// that every branch is unit-testable, since the interesting cases (read-only user, logged out)
+/// are exactly the ones a maintainer's machine can never reproduce locally.
+pub fn classify_push_probe(ok: bool, stdout: &str, stderr: &str) -> ProbeOutcome {
+    let out = stdout.trim();
+    if ok {
+        return ProbeOutcome::Decided(match out {
+            "true" => SubmitVerdict::CanSubmit,
+            "false" => SubmitVerdict::NoPush,
+            "" | "null" => return ProbeOutcome::PermissionsAbsent,
+            _ => SubmitVerdict::Unknown,
+        });
+    }
+    ProbeOutcome::Decided(classify_probe_failure(stderr))
+}
+
+/// Resolve `PermissionsAbsent` from what a follow-up `gh api user` established:
+/// `Some(true)` signed in, `Some(false)` definitely not, `None` we still couldn't tell.
+///
+/// `None` must NOT collapse to "signed out". The first probe had just succeeded, so a failure here
+/// is far more likely a flaky second round-trip than a real credential problem — and answering it
+/// with "you're signed out" would recreate the very mislabel this branch exists to prevent. An
+/// honest `Unknown` keeps the normal submitting path instead.
+pub fn resolve_permissions_absent(authenticated: Option<bool>) -> SubmitVerdict {
+    match authenticated {
+        Some(true) => SubmitVerdict::NoPush,
+        Some(false) => SubmitVerdict::NotAuthenticated,
+        None => SubmitVerdict::Unknown,
+    }
+}
+
+/// Does this stderr say "no usable credentials"? gh's wording varies by version; match on the
+/// stable fragments. Shared by both probes so they can't drift apart.
+fn is_auth_error(stderr: &str) -> bool {
+    is_auth_error_lower(&stderr.to_ascii_lowercase())
+}
+
+/// The actual test, on already-lowercased input, so a caller that needs `err` for other checks
+/// lowercases once rather than once per question.
+fn is_auth_error_lower(err: &str) -> bool {
+    err.contains("gh auth login")
+        || err.contains("authentication")
+        || err.contains("not logged in")
+        || err.contains("requires authentication")
+        || err.contains("bad credentials")
+        || err.contains("http 401")
+}
+
+fn classify_probe_failure(stderr: &str) -> SubmitVerdict {
+    let err = stderr.to_ascii_lowercase();
+    if is_auth_error_lower(&err) {
+        return SubmitVerdict::NotAuthenticated;
+    }
+    // A 404 on a repo we know exists is GitHub's way of hiding a repo the token can't see.
+    if err.contains("http 404") || err.contains("could not resolve to a repository") {
+        return SubmitVerdict::NoPush;
+    }
+    // Anything else (offline, DNS, rate limit, timeout) stays Unknown — see the variant's note.
+    SubmitVerdict::Unknown
+}
+
+/// Probe whether the improvement agent's work can be submitted upstream from this machine.
+///
+/// Deliberately NOT cached: it is one `gh api` call against a per-pass or per-pane-open action, and
+/// a stale verdict is worse than a cheap re-ask — a user who runs `gh auth login` and reopens the
+/// pane must not stay stuck on "you're signed out" for the rest of the session.
+///
+/// `async` + `spawn_blocking`: it makes a network round-trip, which must never run on the main
+/// thread.
+#[tauri::command]
+pub async fn sparkle_submit_capability() -> Result<SubmitCapability, String> {
+    let repo = repo_slug_from_url(SPARKLE_REPO_URL)
+        .ok_or_else(|| format!("unrecognized Sparkle repo URL: {SPARKLE_REPO_URL}"))?;
+    let probe_repo = repo.clone();
+    let verdict = tauri::async_runtime::spawn_blocking(move || {
+        if crate::preflight::cached_gh_path().is_none() {
+            return SubmitVerdict::GhMissing;
+        }
+        let mut cmd = Command::new(crate::preflight::gh_program());
+        cmd.args([
+            "api",
+            &format!("repos/{probe_repo}"),
+            "--jq",
+            ".permissions.push",
+        ]);
+        apply_noninteractive(&mut cmd);
+        let outcome = match cmd.output() {
+            Ok(out) => classify_push_probe(
+                out.status.success(),
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            ),
+            // Spawn failed even though a path was cached (deleted mid-session, permissions):
+            // that's "no usable gh", not "no push".
+            Err(_) => ProbeOutcome::Decided(SubmitVerdict::GhMissing),
+        };
+        match outcome {
+            ProbeOutcome::Decided(v) => v,
+            // Only the genuinely ambiguous case pays for a second round-trip.
+            ProbeOutcome::PermissionsAbsent => {
+                let mut auth = Command::new(crate::preflight::gh_program());
+                auth.args(["api", "user", "--jq", ".login"]);
+                apply_noninteractive(&mut auth);
+                // Three-way on purpose: only a call that RAN and answered counts as evidence.
+                let authenticated = match auth.output() {
+                    Ok(o) if o.status.success() => {
+                        let login = String::from_utf8_lossy(&o.stdout);
+                        // A successful call with no login is not an answer we understand.
+                        if login.trim().is_empty() { None } else { Some(true) }
+                    }
+                    // Non-zero: trust it only when gh actually said "no credentials". Anything
+                    // else (offline, rate limit) is a failed question, not a negative answer.
+                    Ok(o) if is_auth_error(&String::from_utf8_lossy(&o.stderr)) => Some(false),
+                    _ => None,
+                };
+                resolve_permissions_absent(authenticated)
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("submit-capability probe failed to run: {e}"))?;
+    Ok(SubmitCapability { verdict, repo })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn repo_slug_parses_the_shipped_url_and_rejects_odd_shapes() {
+        assert_eq!(repo_slug_from_url(SPARKLE_REPO_URL).unwrap(), "try-sparkle/sparkle");
+        assert_eq!(
+            repo_slug_from_url("https://github.com/owner/repo").unwrap(),
+            "owner/repo"
+        );
+        // A wrong slug would probe the WRONG repo and could report CanSubmit for a repo the user
+        // happens to own — so anything unexpected must be None, never a best guess.
+        assert!(repo_slug_from_url("https://example.com/owner/repo.git").is_none());
+        assert!(repo_slug_from_url("git@github.com:owner/repo.git").is_none());
+        assert!(repo_slug_from_url("https://github.com/owner").is_none());
+        assert!(repo_slug_from_url("https://github.com/owner/repo/tree/main").is_none());
+    }
+
+    fn decided(ok: bool, stdout: &str, stderr: &str) -> SubmitVerdict {
+        match classify_push_probe(ok, stdout, stderr) {
+            ProbeOutcome::Decided(v) => v,
+            ProbeOutcome::PermissionsAbsent => panic!("expected a decided verdict"),
+        }
+    }
+
+    #[test]
+    fn push_true_is_the_only_thing_that_unlocks_submission() {
+        assert_eq!(decided(true, "true\n", ""), SubmitVerdict::CanSubmit);
+        assert_eq!(decided(true, "false\n", ""), SubmitVerdict::NoPush);
+    }
+
+    #[test]
+    fn an_absent_permissions_block_is_ambiguous_and_is_never_guessed() {
+        // It means EITHER an anonymous read of a public repo OR a token that can see the repo
+        // without collaborator rights. Those need opposite advice, so the classifier refuses to
+        // decide and the caller asks a second question.
+        assert_eq!(classify_push_probe(true, "\n", ""), ProbeOutcome::PermissionsAbsent);
+        assert_eq!(classify_push_probe(true, "null\n", ""), ProbeOutcome::PermissionsAbsent);
+    }
+
+    #[test]
+    fn the_ambiguous_case_resolves_on_whether_the_cli_is_actually_signed_in() {
+        // Signed in but no permissions block => read-only. Telling THIS user to `gh auth login`
+        // would be the dishonest failure this whole probe exists to end.
+        assert_eq!(resolve_permissions_absent(Some(true)), SubmitVerdict::NoPush);
+        assert_eq!(
+            resolve_permissions_absent(Some(false)),
+            SubmitVerdict::NotAuthenticated
+        );
+    }
+
+    #[test]
+    fn a_follow_up_probe_that_could_not_answer_never_becomes_signed_out() {
+        // The FIRST probe had just succeeded, so a failed second round-trip is far more likely
+        // flaky than a real credential problem. Unknown keeps the normal submitting path.
+        assert_eq!(resolve_permissions_absent(None), SubmitVerdict::Unknown);
+    }
+
+    #[test]
+    fn auth_error_detection_is_shared_by_both_probes() {
+        assert!(is_auth_error("error: Requires authentication (HTTP 401)"));
+        assert!(is_auth_error("run: gh auth login"));
+        // A network failure is not a credential failure — this is the distinction the whole
+        // three-way resolution rests on.
+        assert!(!is_auth_error("dial tcp: lookup api.github.com: no such host"));
+        assert!(!is_auth_error("gh: Not Found (HTTP 404)"));
+    }
+
+    #[test]
+    fn auth_failures_are_reported_as_auth_not_as_read_only() {
+        for stderr in [
+            "gh: To use GitHub CLI in a GitHub Actions workflow, run: gh auth login",
+            "error: Requires authentication (HTTP 401)",
+            "Bad credentials",
+        ] {
+            assert_eq!(
+                decided(false, "", stderr),
+                SubmitVerdict::NotAuthenticated,
+                "stderr: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_404_on_a_repo_we_know_exists_means_the_token_cannot_see_it() {
+        assert_eq!(
+            decided(false, "", "gh: Not Found (HTTP 404)"),
+            SubmitVerdict::NoPush
+        );
+    }
+
+    #[test]
+    fn transient_failures_stay_unknown_so_offline_never_downgrades_a_maintainer() {
+        for stderr in [
+            "dial tcp: lookup api.github.com: no such host",
+            "error connecting to api.github.com",
+            "context deadline exceeded",
+        ] {
+            assert_eq!(decided(false, "", stderr), SubmitVerdict::Unknown, "stderr: {stderr}");
+        }
+        // Unparseable success output is equally "we couldn't tell".
+        assert_eq!(decided(true, "maybe", ""), SubmitVerdict::Unknown);
+    }
 
     fn unique_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("sparkle-self-test-{tag}-{}", std::process::id()));
@@ -229,12 +524,20 @@ mod tests {
         let app_data = unique_dir("reuse");
         let repo = app_data.join("sparkle-self").join("repo");
         std::fs::create_dir_all(&repo).unwrap();
+        // Routed through apply_noninteractive so the fixture's commits can't fire the developer's
+        // git hooks (a global core.hooksPath would otherwise queue a review per fixture commit
+        // against a directory this test deletes on the way out).
         let run = |args: &[&str]| {
-            assert!(Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+            let mut cmd = Command::new("git");
+            cmd.arg("-C").arg(&repo).args(args);
+            apply_noninteractive(&mut cmd);
+            assert!(cmd.status().unwrap().success());
         };
         run(&["init"]);
-        run(&["config", "user.email", "t@t.local"]);
-        run(&["config", "user.name", "t"]);
+        // Identity is required to commit; git does not validate the shape, so keep these
+        // free of anything resembling a real address (same convention as worktree.rs).
+        run(&["config", "user.email", "sparkle-test"]);
+        run(&["config", "user.name", "sparkle-test"]);
         run(&["commit", "--allow-empty", "-m", "seed"]);
 
         let got = ensure_sparkle_repo_at(&app_data).expect("reuse existing clone");
@@ -249,15 +552,16 @@ mod tests {
         let app_data = unique_dir("reap");
         let repo = app_data.join("sparkle-self").join("repo");
         std::fs::create_dir_all(&repo).unwrap();
+        // Same hook isolation as above — this fixture commits AND cuts worktrees.
         let run = |cwd: &Path, args: &[&str]| {
-            assert!(
-                Command::new("git").arg("-C").arg(cwd).args(args).status().unwrap().success(),
-                "git {args:?} failed"
-            );
+            let mut cmd = Command::new("git");
+            cmd.arg("-C").arg(cwd).args(args);
+            apply_noninteractive(&mut cmd);
+            assert!(cmd.status().unwrap().success(), "git {args:?} failed");
         };
         run(&repo, &["init"]);
-        run(&repo, &["config", "user.email", "t@t.local"]);
-        run(&repo, &["config", "user.name", "t"]);
+        run(&repo, &["config", "user.email", "sparkle-test"]);
+        run(&repo, &["config", "user.name", "sparkle-test"]);
         run(&repo, &["commit", "--allow-empty", "-m", "seed"]);
 
         // Worktrees live under <app_data>/worktrees/sparkle-self/<agent_id> (worktree_path layout).

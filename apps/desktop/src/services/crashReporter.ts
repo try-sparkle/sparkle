@@ -17,6 +17,10 @@ import { useSettingsStore } from "../stores/settingsStore";
  * Flush pending crash reports at launch. Reads `sparkleImprovementConsent` from settingsStore and
  * passes it to the Rust `flush_crash_reports` command (which enforces the "always"-only upload gate).
  * Swallows every error — crash reporting must never disrupt app startup.
+ *
+ * Safe to call from EVERY window: main.tsx runs per webview, so a multi-window session invokes this
+ * N times, and the Rust side keeps only one flush in flight per process (`try_begin_flush`) so the
+ * same report isn't uploaded once per open window.
  */
 export async function flushCrashReports(): Promise<void> {
   try {

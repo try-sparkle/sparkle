@@ -1,13 +1,13 @@
 // @vitest-environment jsdom
 //
-// CurrentProjectProvider's `?agent=` deep-link mount effect: a window opened by a history-search
+// AppBoot's `?agent=` deep-link mount effect: a window opened by a history-search
 // "jump to agent" into a fresh window must land directly on that agent (open + select), and must
 // silently ignore a closed/unknown agent id (the search row reports "closed" instead). We assert
 // on the resulting store state rather than spying, so the test pins behavior, not call shape.
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { CurrentProjectProvider, useCurrentProjectId } from "./windowContext";
+import { AppBoot, useCurrentProjectId } from "./windowContext";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useDictationStore } from "./stores/dictationStore";
@@ -57,19 +57,20 @@ afterEach(() => {
 // main window is the only window, so it resets a stale "active" (left over from a previous session)
 // back to "passive" — relaunching never resumes mid-dictation. A non-main window must NOT reset, or
 // opening a second window mid-session would clobber the live shared status.
-describe("CurrentProjectProvider — cold-start mic phase reset", () => {
+describe("AppBoot — cold-start mic phase reset", () => {
   it("main window resets a stale active phase to passive on cold start", () => {
     useDictationStore.setState({ phase: "active" });
     setSearch(""); // no ?label= → the main window
-    render(<CurrentProjectProvider>ok</CurrentProjectProvider>);
+    render(<AppBoot>ok</AppBoot>);
     expect(useDictationStore.getState().phase).toBe("passive");
   });
 
-  it("a non-main window does NOT reset the shared mic phase", () => {
+  it("resets the mic phase regardless of URL params — one window, always \"main\"", () => {
+    // CM-U7 part 2: there are no secondary windows; the boot hygiene always runs.
     useDictationStore.setState({ phase: "active" });
-    setSearch("?label=win-1"); // a secondary window
-    render(<CurrentProjectProvider>ok</CurrentProjectProvider>);
-    expect(useDictationStore.getState().phase).toBe("active");
+    setSearch("?label=win-1"); // a stale multi-window era URL must not change behavior
+    render(<AppBoot>ok</AppBoot>);
+    expect(useDictationStore.getState().phase).toBe("passive");
   });
 
   it("main window defers the reset until hydration finishes when not yet hydrated", () => {
@@ -88,7 +89,7 @@ describe("CurrentProjectProvider — cold-start mic phase reset", () => {
       });
 
     setSearch(""); // the main window
-    render(<CurrentProjectProvider>ok</CurrentProjectProvider>);
+    render(<AppBoot>ok</AppBoot>);
     // Hydration still in flight → reset deferred, phase untouched so far.
     expect(useDictationStore.getState().phase).toBe("active");
 
@@ -101,11 +102,11 @@ describe("CurrentProjectProvider — cold-start mic phase reset", () => {
   });
 });
 
-describe("CurrentProjectProvider — ?agent= deep-link", () => {
+describe("AppBoot — ?agent= deep-link", () => {
   it("selects + opens an existing agent named by ?agent= on mount", () => {
     seedProject([mkAgent("a1"), mkAgent("a2")]);
     setSearch("?project=p1&label=win-1&agent=a2");
-    render(<CurrentProjectProvider>ok</CurrentProjectProvider>);
+    render(<AppBoot>ok</AppBoot>);
     expect(selectedAgentId()).toBe("a2");
     expect(useRuntimeStore.getState().isOpen("a2")).toBe(true);
   });
@@ -113,7 +114,7 @@ describe("CurrentProjectProvider — ?agent= deep-link", () => {
   it("silently ignores a closed/unknown agent id (no select, no open)", () => {
     seedProject([mkAgent("a1")]);
     setSearch("?project=p1&label=win-1&agent=gone");
-    render(<CurrentProjectProvider>ok</CurrentProjectProvider>);
+    render(<AppBoot>ok</AppBoot>);
     expect(selectedAgentId()).toBeNull();
     expect(useRuntimeStore.getState().isOpen("gone")).toBe(false);
     expect(useRuntimeStore.getState().openAgentIds).toEqual([]);
@@ -122,7 +123,7 @@ describe("CurrentProjectProvider — ?agent= deep-link", () => {
   it("does nothing when no ?agent= param is present", () => {
     seedProject([mkAgent("a1")]);
     setSearch("?project=p1&label=win-1");
-    render(<CurrentProjectProvider>ok</CurrentProjectProvider>);
+    render(<AppBoot>ok</AppBoot>);
     expect(selectedAgentId()).toBeNull();
     expect(useRuntimeStore.getState().openAgentIds).toEqual([]);
   });
@@ -134,14 +135,14 @@ describe("CurrentProjectProvider — ?agent= deep-link", () => {
 // find the id absent, and strand at null forever ("amforge" title + "No project open"). The window
 // must adopt its deep-linked project the moment it actually appears, while still ignoring an id that
 // is genuinely gone.
-describe("CurrentProjectProvider — late-hydration project recovery", () => {
+describe("AppBoot — late-hydration project recovery", () => {
   it("adopts its ?project= id once the store hydrates it after mount", () => {
     // Store is empty at mount (persist snapshot not applied yet); p1 arrives afterward.
     setSearch("?project=p1&label=win-1");
     const { getByTestId } = render(
-      <CurrentProjectProvider>
+      <AppBoot>
         <ProjectIdProbe />
-      </CurrentProjectProvider>,
+      </AppBoot>,
     );
     // One-shot `initial` resolves to null because p1 isn't in the unhydrated store.
     expect(getByTestId("pid").textContent).toBe("none");
@@ -152,19 +153,24 @@ describe("CurrentProjectProvider — late-hydration project recovery", () => {
     expect(getByTestId("pid").textContent).toBe("p1");
   });
 
-  it("stays projectless when its ?project= id never appears (stale/deleted)", () => {
+  // Single-window shell (CM-U7): a stale `?project=` no longer strands the app at "no project" —
+  // there is one window and every project is a tab, so an unresolvable deep link simply falls back
+  // to the persisted selection / the first tab. Only a store with NO projects shows nothing.
+  it("falls back to the first tab when its ?project= id never appears (stale/deleted)", () => {
     setSearch("?project=ghost&label=win-1");
     const { getByTestId } = render(
-      <CurrentProjectProvider>
+      <AppBoot>
         <ProjectIdProbe />
-      </CurrentProjectProvider>,
+      </AppBoot>,
     );
-    expect(getByTestId("pid").textContent).toBe("none");
-    // A DIFFERENT project (p1) hydrates — the phantom `ghost` id must not resolve to it.
+    expect(getByTestId("pid").textContent).toBe("none"); // nothing hydrated yet
+    // A DIFFERENT project (p1) hydrates — the phantom `ghost` id must not resolve to it, but the
+    // shell still lands on a real tab rather than showing an empty window.
     act(() => {
       seedProject([]);
     });
-    expect(getByTestId("pid").textContent).toBe("none");
+    expect(getByTestId("pid").textContent).toBe("p1");
+    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
   });
 
   it("still lands the ?agent= deep-link after the project hydrates late", () => {
@@ -172,9 +178,9 @@ describe("CurrentProjectProvider — late-hydration project recovery", () => {
     // late store hydration — the recovery path adopts the project AND lands the agent, not just one.
     setSearch("?project=p1&label=win-1&agent=a2");
     const { getByTestId } = render(
-      <CurrentProjectProvider>
+      <AppBoot>
         <ProjectIdProbe />
-      </CurrentProjectProvider>,
+      </AppBoot>,
     );
     expect(getByTestId("pid").textContent).toBe("none");
     expect(useRuntimeStore.getState().isOpen("a2")).toBe(false);
@@ -191,7 +197,7 @@ describe("CurrentProjectProvider — late-hydration project recovery", () => {
 // selectedProjectId. So the main window must keep selectedProjectId synced with the project it
 // actually shows, or a relaunch reverts to the first ("zero-zero") project. Secondary windows carry
 // `?project=` and must NOT claim the shared hint.
-describe("CurrentProjectProvider — main-window restore hint", () => {
+describe("AppBoot — main-window restore hint", () => {
   function seedTwo(): void {
     const mk = (id: string): Project => ({
       id, name: id, rootPath: `/tmp/${id}`, defaultBranch: null,
@@ -205,9 +211,9 @@ describe("CurrentProjectProvider — main-window restore hint", () => {
     seedTwo();
     setSearch(""); // no ?label= → this IS the main window
     const { getByTestId } = render(
-      <CurrentProjectProvider>
+      <AppBoot>
         <ProjectIdProbe />
-      </CurrentProjectProvider>,
+      </AppBoot>,
     );
     expect(getByTestId("pid").textContent).toBe("p1");
     expect(useProjectStore.getState().selectedProjectId).toBe("p1");
@@ -219,25 +225,40 @@ describe("CurrentProjectProvider — main-window restore hint", () => {
     useProjectStore.setState({ selectedProjectId: "p2" } as never);
     setSearch("");
     const { getByTestId } = render(
-      <CurrentProjectProvider>
+      <AppBoot>
         <ProjectIdProbe />
-      </CurrentProjectProvider>,
+      </AppBoot>,
     );
     expect(getByTestId("pid").textContent).toBe("p2");
     expect(useProjectStore.getState().selectedProjectId).toBe("p2");
   });
 
-  it("a secondary window does NOT overwrite the shared restore hint", () => {
+  // Single-window shell (CM-U7): selectedProjectId is no longer a restore HINT that only the main
+  // window may claim — it is the live selection every surface reads, and a `?project=` deep link
+  // adopts it for the whole app rather than for one window's private state.
+  it("a ?project= deep link adopts the shared selection (no per-window fork)", () => {
     seedTwo();
     useProjectStore.setState({ selectedProjectId: "p1" } as never);
-    setSearch("?project=p2&label=win-1"); // secondary window showing p2
+    setSearch("?project=p2&label=win-1");
     const { getByTestId } = render(
-      <CurrentProjectProvider>
+      <AppBoot>
         <ProjectIdProbe />
-      </CurrentProjectProvider>,
+      </AppBoot>,
     );
     expect(getByTestId("pid").textContent).toBe("p2");
-    // The hint stays pinned to the main window's project, untouched by the secondary window.
-    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
+    expect(useProjectStore.getState().selectedProjectId).toBe("p2");
+  });
+
+  it("the probe follows a later selectProject (tab switch), not just the boot value", () => {
+    seedTwo();
+    setSearch("");
+    const { getByTestId } = render(
+      <AppBoot>
+        <ProjectIdProbe />
+      </AppBoot>,
+    );
+    expect(getByTestId("pid").textContent).toBe("p1");
+    act(() => useProjectStore.getState().selectProject("p2"));
+    expect(getByTestId("pid").textContent).toBe("p2");
   });
 });

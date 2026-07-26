@@ -731,6 +731,11 @@ fn install_roborev_blocking(_app: &AppHandle) -> Result<String, String> {
 pub enum RoborevAuthVerdict {
     /// claude-code answered the smoke-test prompt — reviews will work.
     Passed,
+    /// The roborev binary itself isn't installed, so there's nothing to probe. Distinct from an
+    /// Unknown/failed probe: this is a deterministic, expected state (the daemon never installed, or
+    /// its install failed), not an anomaly — so the UI can say so plainly instead of "couldn't
+    /// confirm", and callers needn't log it as a warning.
+    NotInstalled,
     /// `claude` isn't on the daemon's PATH.
     ClaudeMissing,
     /// `claude` ran but couldn't produce output (almost always: not logged in).
@@ -797,8 +802,11 @@ pub async fn roborev_auth_selftest(app: AppHandle) -> Result<RoborevAuthVerdict,
 
 #[cfg(all(unix, target_os = "macos"))]
 fn roborev_auth_selftest_blocking(app: &AppHandle) -> Result<RoborevAuthVerdict, String> {
-    let roborev_path =
-        preflight::cached_roborev_path().ok_or_else(|| "roborev isn't installed".to_string())?;
+    let Some(roborev_path) = preflight::cached_roborev_path() else {
+        // Not an error: the binary simply isn't present. Report it as a first-class verdict so the
+        // frontend doesn't have to string-match an error message — and doesn't log it as a warning.
+        return Ok(RoborevAuthVerdict::NotInstalled);
+    };
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "no HOME directory".to_string())?;

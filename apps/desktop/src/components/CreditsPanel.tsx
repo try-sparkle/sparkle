@@ -27,6 +27,7 @@ import {
   type PackId,
 } from "../services/creditsMenuApi";
 import { PromoRedeem } from "./PromoRedeem";
+import { ZeroCreditBanner } from "./ZeroCreditBanner";
 import { SupportModal } from "./SupportModal";
 
 /** Same recovery as AuthGate's fallback: when the system browser can't launch, show the URL
@@ -124,6 +125,9 @@ export function CreditsPanel() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {/* Same warning as the workspace bar, in its compact variant — a bare "$0.00" balance below
+          doesn't say what stopped working. Shared component, so the copy can't drift. */}
+      <ZeroCreditBanner inline />
       <div>
         <div style={subLabel}>Balance</div>
         <div style={balanceText}>{formatBalance(me.balanceCents)}</div>
@@ -494,10 +498,33 @@ function HistoryBlock() {
         // U+2212 minus (not a hyphen) so debits read as amounts, matching the design copy.
         const amount = `${credit ? "+" : "−"}$${(Math.abs(e.deltaCents) / 100).toFixed(2)}`;
         const label = historyLabel(e);
+        // Trim, and treat blank as absent: `meta.project` is typed `string | null`, so only the
+        // CURRENT writers guarantee non-blank — a whitespace name would otherwise render an empty
+        // cell that reads as a real but nameless project (roborev 48164).
+        const project = e.project?.trim() || null;
         return (
           <div key={e.id} style={historyRow}>
             <span style={{ color: C.muted, width: 76, flex: "none" }}>
               {new Date(e.createdAt).toLocaleDateString()}
+            </span>
+            {/* Which project the spend was for. Fixed-width so the amounts stay aligned; a row with
+                no recorded project (everything before attribution shipped, plus account-level
+                top-ups/promos) shows an em-dash rather than a guess.
+
+                The dash carries meaning, so it gets a real accessible NAME (role="img" + aria-label)
+                rather than leaving it to `title`, which screen readers don't reliably announce and
+                keyboard users never see. And NO `title` alongside it: aria-label wins the name, but
+                accname then falls back to `title` for the DESCRIPTION, so the same sentence gets
+                announced twice. The CELL keeps a `title` either way — a long name to read in full, or
+                the explanation for mouse users who hover the dash — because an ancestor's title does
+                not participate in the inner role="img" element's name/description computation.
+                (roborev 48157/51700/51712/52980) */}
+            <span style={historyProjectCell} title={project ?? "No project recorded"}>
+              {project ?? (
+                <span role="img" aria-label="No project recorded">
+                  —
+                </span>
+              )}
             </span>
             {/* Clip to one line — a long AI `purpose` ("AI: …") must not wrap the row; full text on
                 hover. Keeps the date | label | amount three-column layout unchanged. */}
@@ -651,6 +678,18 @@ const historyRow: CSSProperties = {
   gap: 10,
   fontSize: 12,
   fontFamily: '"IBM Plex Sans", sans-serif',
+};
+
+// The project column. Fixed width (like the date) so the label column keeps taking the slack and
+// the amounts stay right-aligned in a ragged list; clipped to one line — a long project name
+// ellipsizes with the full text on hover.
+const historyProjectCell: CSSProperties = {
+  color: C.muted,
+  width: 96,
+  flex: "none",
+  whiteSpace: "nowrap",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
 };
 
 // The middle (reason/description) column: takes the slack and clips to a single line so a long AI

@@ -32,7 +32,7 @@
 // usable gate too, since they have no "user tried to use it" moment.
 import { useAuthStore } from "../stores/authStore";
 import { useSettingsStore, AI_FEATURE_FIELD, type AiFeatureKey } from "../stores/settingsStore";
-import type { Me } from "./entitlement";
+import { hasCreditsAbove, type Me } from "./entitlement";
 import { OutOfCreditsError } from "./credits";
 
 /** Paid-entitlement check (the one-time $99). Still used by the paywall (deriveAuthView) and the
@@ -42,22 +42,44 @@ export function aiEnhancementsEnabled(me: Me | null): boolean {
   return me?.entitled === true;
 }
 
-/** Are AI enhancement features unlocked? True ⇔ the user is signed in and has a positive credit
- *  balance. This — not entitlement — is what gates every AI extra, so features go dark exactly when
- *  the user runs out of credits (and are off during the anonymous trial, where there is no `me`). */
-export function hasAiCredits(me: Me | null): boolean {
-  return me != null && me.balanceCents > 0;
+/** Are AI enhancement features unlocked? True ⇔ the user is signed in and has a credit balance the
+ *  server will actually serve. This — not entitlement — is what gates every AI extra, so features go
+ *  dark exactly when the user runs out of credits (and are off during the anonymous trial, where
+ *  there is no `me`).
+ *
+ *  `floorCents` is the balance the server last refused a call at (see authStore.creditFloorCents).
+ *  A bare `balance > 0` was the wrong line: the server reserves a per-request HOLD before it runs
+ *  the call, so it refuses at any balance under that hold. A leftover balance of a few cents
+ *  therefore passed this gate and 402'd on EVERY call — and because nothing recorded the refusal,
+ *  the gate kept re-opening, so every AI surface (per agent, per settled state, forever) re-bought
+ *  the same doomed round-trip. Comparing against the refused level closes the gate at a balance the
+ *  server has actually rejected; a top-up lifts the balance back above it, and `refresh()` drops the
+ *  floor outright so a coarse inference can't outlive its evidence. Defaulted from the store so all
+ *  existing call sites keep working; pass it explicitly to test the rule as a pure function.
+ *
+ *  The RULE itself lives in ./entitlement, a store-free module, and this is the store-bound binding
+ *  of it: aiGate imports useAuthStore for its hooks, so anything the stores need — authStore's
+ *  $0-banner seam, services/zeroCreditBanner — would close an authStore → aiGate → authStore cycle
+ *  by importing from here. Consumers that already depend on the store keep using this one. */
+export function hasAiCredits(
+  me: Me | null,
+  floorCents: number = useAuthStore.getState().creditFloorCents,
+): boolean {
+  return hasCreditsAbove(me, floorCents);
 }
 
 export function useHasAiCredits(): boolean {
-  return useAuthStore((s) => hasAiCredits(s.me));
+  // Subscribes to the floor as well as `me` — otherwise the first refusal would not re-render the
+  // surfaces this gate drives, and they would keep firing until some unrelated auth change landed.
+  return useAuthStore((s) => hasAiCredits(s.me, s.creditFloorCents));
 }
 
 /** Hard client-side credit gate: throw {@link OutOfCreditsError} when the signed-in user has no
  *  positive credit balance, so every AI call routed through this guard fails FAST locally (no server
  *  round-trip) the moment credits hit zero. Reuses the same error the server's 402 maps to, so
  *  callers surface the existing "Out of AI credits" upsell path either way. Carries the live balance
- *  (0 for a null `me`) for the "you have $X" UI. */
+ *  (0 for a null `me`) on {@link OutOfCreditsError.balanceCents}, which nothing renders today — see
+ *  its doc before you do. */
 export function assertAiCredits(): void {
   const me = useAuthStore.getState().me;
   if (!hasAiCredits(me)) throw new OutOfCreditsError(me?.balanceCents ?? 0);

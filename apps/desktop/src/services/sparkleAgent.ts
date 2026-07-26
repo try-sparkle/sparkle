@@ -99,6 +99,75 @@ export function ensureSparkleRepo(): Promise<SparkleWorkspace> {
   return invoke<SparkleWorkspace>("ensure_sparkle_repo");
 }
 
+/** Whether this machine can actually submit the agent's work upstream. Mirrors `SubmitVerdict` in
+ *  src-tauri/src/sparkle_agent.rs — see that enum for what each verdict means and why "unknown"
+ *  must behave like "assume we can". */
+export type SubmitVerdict =
+  | "canSubmit"
+  | "noPush"
+  | "notAuthenticated"
+  | "ghMissing"
+  | "unknown";
+
+export interface SubmitCapability {
+  verdict: SubmitVerdict;
+  /** `owner/repo` the verdict is about. */
+  repo: string;
+}
+
+/** Probe whether the agent's work can be submitted upstream from this machine (one `gh api` call).
+ *  Deliberately re-asked per pass / per pane-open rather than cached for the session: a user who
+ *  runs `gh auth login` and reopens the pane must not stay stuck on a stale "you're signed out". */
+export function checkSubmitCapability(): Promise<SubmitCapability> {
+  return invoke<SubmitCapability>("sparkle_submit_capability");
+}
+
+/** True when the agent must NOT attempt to push or open a PR. "unknown" is deliberately excluded:
+ *  a transient network failure must never downgrade a maintainer's agent to propose-only. */
+export function isSubmitBlocked(verdict: SubmitVerdict): boolean {
+  return verdict === "noPush" || verdict === "notAuthenticated" || verdict === "ghMissing";
+}
+
+/** One line of user-facing explanation per blocked verdict, plus the way out. Pure + exported so
+ *  the UI and the persona say the SAME thing — a user told "you're read-only" by the pane and
+ *  "run gh auth login" by the agent would rightly not trust either. */
+export function submitBlockedReason(verdict: SubmitVerdict, repo: string): string | null {
+  switch (verdict) {
+    case "noPush":
+      return `This machine's GitHub account doesn't have write access to ${repo}, so improvements can't be submitted as pull requests from here. They'll be prepared and saved locally instead.`;
+    case "notAuthenticated":
+      return `GitHub CLI isn't signed in, so improvements can't be submitted as pull requests. Run \`gh auth login\` to enable submission; until then they'll be prepared and saved locally.`;
+    case "ghMissing":
+      return `GitHub CLI (\`gh\`) isn't installed, so improvements can't be submitted as pull requests. Install it to enable submission; until then they'll be prepared and saved locally.`;
+    default:
+      return null;
+  }
+}
+
+/** The persona section that turns the agent propose-only. Empty when submission is available. */
+function submitBlockedSection(verdict: SubmitVerdict): string[] {
+  if (!isSubmitBlocked(verdict)) return [];
+  return [
+    "SUBMISSION IS NOT AVAILABLE ON THIS MACHINE — THIS OVERRIDES ANY INSTRUCTION ABOVE",
+    "- This machine cannot open pull requests against the upstream repo (no write access, or no",
+    "  usable GitHub CLI credentials). This was checked before your session started; it is a fact",
+    "  about the environment, not something you can retry your way past.",
+    "- Do NOT run `gh pr create`, `gh pr edit`, `git push`, `gh auth login`, `gh auth setup-git`,",
+    "  or `gh repo fork`. They will fail, and repeatedly retrying them wastes the whole pass.",
+    "- Work PROPOSE-ONLY instead: do the full job — investigate, spec, implement, and then",
+    "  COMMIT to a local branch — and stop there. Your final message is the deliverable: state the",
+    "  branch name, what changed and why, and the exact PR title + body you would have submitted",
+    "  (still scrubbed: the PII rules below apply in full — the user may submit this text",
+    "  themselves).",
+    "- The DEDUPE GATE below still applies, but `gh pr list` needs the same credentials you don't",
+    "  have. If it fails, say so in your summary and dedupe against the local git history instead",
+    "  (`git log --oneline origin/main -100`) rather than skipping the check silently.",
+    "- Do not treat this as an error state or a reason to do nothing. A committed branch plus a",
+    "  clear write-up is a complete, successful pass.",
+    "",
+  ];
+}
+
 /** The agent's persona, merged into Claude's system prompt via `--append-system-prompt`. This
  *  is what makes a plain `claude` session a *Sparkle-improvement* agent. The privacy contract
  *  (no PII / no user content in specs or PRs) lives here by design — it is the default.
@@ -116,6 +185,7 @@ export function sparklePersona(
   logDir: string,
   repoPath: string,
   consent: SparkleImprovementConsent,
+  submit: SubmitVerdict = "unknown",
 ): string {
   const whatYouWorkOn = [
     "WHAT YOU WORK ON",
@@ -213,6 +283,14 @@ export function sparklePersona(
     "  push a fix to its branch, or comment on what it is missing) or drop the candidate and move to",
     "  the next one on your list.",
     "- If a MERGED PR already fixed it, the candidate is stale. Drop it and move on.",
+    "- If those `gh` commands FAIL (most often `gh` is installed but not authenticated), the gate is",
+    "  NOT waived — it just runs on git, which needs no gh auth:",
+    "    git fetch origin && git ls-remote --heads origin",
+    "    git log origin/main --oneline -200",
+    "  Branch names and merged commit subjects are a weaker signal than PR titles, so lean harder on",
+    "  the files a fix would touch: `git diff --stat origin/main...origin/<branch>` on any branch",
+    "  whose name is even loosely adjacent to your candidate. Overlapping files are the duplicate",
+    "  signal; identical wording is not required.",
     ...(consent !== "never"
       ? [
           "- A fix landing is what makes a log signature go quiet. If the same problem keeps showing",
@@ -241,6 +319,9 @@ export function sparklePersona(
     "",
     ...whatYouDo,
     "",
+    // AFTER the mode instructions on purpose: when submission is impossible this block must
+    // override whatever the consent mode just said about `gh pr create`.
+    ...submitBlockedSection(submit),
     ...dedupeGate,
     "",
     ...scrubGate,

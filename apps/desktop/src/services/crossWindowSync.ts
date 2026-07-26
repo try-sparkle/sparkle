@@ -54,6 +54,23 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>, isTorndown: () => boole
   let applyingRemote = false;
   let last = spec.signature();
 
+  /** The persisted blob this window has already synced with — either applied via rehydrate or just
+   *  published itself. Rehydrating a byte-identical blob is a guaranteed no-op by construction:
+   *  rehydrate reads THAT string, parses it, migrates it and writes the result to the store, so
+   *  re-running it against the same bytes reproduces the state already there — at the cost of a
+   *  full parse + merge + a state write that re-renders every subscriber. projectStore already
+   *  elides the mirror-image waste on the write side (sparkle-noop-persist); this is the read side.
+   *  Null until the first sync, so the initial rehydrate always runs. */
+  let syncedBlob: string | null = null;
+
+  const readBlob = (): string | null => {
+    try {
+      return localStorage.getItem(spec.persistKey);
+    } catch {
+      return null;
+    }
+  };
+
   // zustand's persist rehydrates asynchronously after store creation, so the persisted value can
   // land *after* we wire and fire the subscriber. That initial hydration is not a user mutation —
   // counting it as one would broadcast a spurious change to every other window at launch. Gate the
@@ -76,6 +93,17 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>, isTorndown: () => boole
   let pending = false;
 
   const runRehydrate = () => {
+    // Nothing new on disk since we last synced → skip the whole rehydrate. The `getItem` this costs
+    // is the same read rehydrate would have done anyway, so a miss is free and a hit saves the
+    // parse/migrate/merge/re-render behind it. Deliberately does NOT arm the cooldown: no work was
+    // done, so there is nothing to throttle, and a later event still gets an immediate check.
+    const blob = readBlob();
+    if (blob !== null && blob === syncedBlob) return;
+    // Record the blob we are ABOUT to apply, not one re-read afterwards: if another window writes
+    // between this read and rehydrate's own, rehydrate applies the newer bytes while we remember the
+    // older ones. That errs toward one redundant rehydrate later, never toward skipping a real
+    // change.
+    syncedBlob = blob;
     running = true;
     // `applyingRemote` guards the store subscriber so the state-write that `persist.rehydrate()`
     // performs does not get mistaken for a local mutation and re-broadcast — that would loop
@@ -155,8 +183,19 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>, isTorndown: () => boole
     // Structural change is about to fan out to other windows — make sure the debounced projects
     // write has hit real localStorage first, so the receivers rehydrate the fresh blob.
     spec.flush?.();
+    // Two independent short-circuits for the same redundant work, kept together because they cover
+    // different entry points.
+    //
+    // Tauri's `emit` echoes to the emitter, so this window is about to receive its own event and
+    // rehydrate the blob it just published — the one guaranteed-redundant rehydrate in every
+    // broadcast. Remember what we published so that echo is recognised as already-synced. Read it
+    // back rather than assuming: with no `flush` the write may still be sitting in a debounce, and
+    // remembering the older bytes just means the echo rehydrates as before. This is the layer that
+    // covers the browser `storage` event, which carries no payload and so has no signature to test.
+    syncedBlob = readBlob();
     // Carry the new signature as the payload so a receiver already at this signature (self-echo,
-    // or a converged window) can skip the rehydrate entirely — see rehydrate(incomingSig).
+    // or a converged window) can skip the rehydrate entirely — see rehydrate(incomingSig). This
+    // fires earlier and cheaper than the blob check: it never touches localStorage at all.
     if (inTauri()) void emit(spec.event, now);
   });
   unsubs.push(unsubStore);
@@ -166,15 +205,22 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>, isTorndown: () => boole
 // excludes high-churn fields like lastPrompt so we don't broadcast on every keystroke. The full
 // JSON.stringify is O(projects × agents); negligible at realistic project/agent counts.
 function projectSignature(): string {
-  return JSON.stringify(
-    useProjectStore.getState().projects.map((p) => [
+  const s = useProjectStore.getState();
+  return JSON.stringify([
+    // WHICH TAB IS SELECTED is part of the shared structural state now (CM-U7): another webview
+    // (the tray, the capture window) writes `selectedProjectId` to say "show this project", and
+    // without it in the signature that write never fans out — the app window stayed on its old tab
+    // and the click read as dead (roborev 46249-H1). It is a low-churn field (a tab click, not a
+    // keystroke), so carrying it costs nothing.
+    s.selectedProjectId,
+    s.projects.map((p) => [
       p.id,
       p.name,
       p.rootPath,
       p.defaultBranch,
       p.agents.map((a) => [a.id, a.name, a.kind, a.parentId]),
     ]),
-  );
+  ]);
 }
 
 // The two persisted, user-facing mic settings — `enabled` (on/off) and `phase` (paused vs. active)

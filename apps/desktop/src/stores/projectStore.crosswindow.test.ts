@@ -48,7 +48,7 @@ describe("removal tombstone blocks re-adoption", () => {
   it("adoptWorker refuses a just-removed worker id", () => {
     const store = useProjectStore.getState();
     const pid = store.addProject("P", "/tmp/p");
-    const buildId = store.addAgent(pid, { kind: "build" });
+    const buildId = store.addAgent(pid, { kind: "build" })!;
     // Give the build agent a branch so a worker can hang off it, then adopt a worker on disk.
     useProjectStore.getState().setAgentWorktree(pid, buildId, "/wt/b", "sparkle/agent-b");
     const wid = "worker-1";
@@ -79,7 +79,7 @@ describe("removal tombstone blocks re-adoption", () => {
     // leaves a manifest on disk can't be reconciled back into a row (sparkle-close-resurrect).
     const store = useProjectStore.getState();
     const pid = store.addProject("P", "/tmp/p");
-    const buildId = store.addAgent(pid, { kind: "build" });
+    const buildId = store.addAgent(pid, { kind: "build" })!;
     useProjectStore.getState().setAgentWorktree(pid, buildId, "/wt/b", "sparkle/agent-b");
     const w1 = "child-1";
     const w2 = "child-2";

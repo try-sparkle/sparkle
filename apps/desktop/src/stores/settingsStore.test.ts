@@ -447,3 +447,153 @@ describe("voice setters", () => {
     expect(s.pauseOnSubmit).toBe(false);
   });
 });
+
+describe("1Password env backup — config hydration", () => {
+  // A minimal effective config with no [tools] and no [onepassword] section: exactly what an
+  // older Rust backend (predating this feature) sends.
+  const bare = (): EffectiveConfig => ({
+    config: {
+      workflow: {
+        require_pr: true,
+        worktree_isolation: true,
+        default_branch: "main",
+        born_fresh_from_base: true,
+        delete_merged_branch: true,
+        drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
+      },
+      workers: { max_concurrent: 5 },
+      ai: {
+        auto_rename: true,
+        voice_dictation: true,
+        composer: true,
+        suggested_actions: true,
+        auto_approve: true,
+      },
+      roborev: { consent_prompted: false },
+      freshness: {
+        staleness_warn_commits: 25,
+        stale_build_block_commits: 25,
+        require_fresh_branch: true,
+      },
+      capture: { popover_shortcut: "ctrl+shift+r" },
+      done: { description: null, criteria: [] },
+      delivered: {
+        description: null,
+        detected_method: null,
+        confidence: null,
+        confidence_note: null,
+        learned: false,
+        criteria: [],
+      },
+    },
+    warnings: [],
+  });
+
+  it("defaults to off/unset — the one tool that must not ship on", () => {
+    // Every other tool hydrates `?? true`. This one can't: without an account, the `op` CLI, and
+    // a chosen vault it can do nothing, so an absent section must never read as enabled.
+    useSettingsStore.getState().hydrateFromConfig(bare());
+    const s = useSettingsStore.getState();
+    expect(s.onepasswordEnabled).toBe(false);
+    expect(s.onepasswordVaultId).toBeNull();
+    expect(s.onepasswordSeedWorktrees).toBe(false);
+    // Sanity: the absent [tools] block still reads the OTHER tools as on, so this test is
+    // really pinning the asymmetry rather than a blanket "everything defaults off".
+    expect(s.roborevEnabled).toBe(true);
+  });
+
+  it("hydrates the flag, vault and seeding from config", () => {
+    const eff = bare();
+    eff.config.tools = {
+      analytics: true,
+      beads: true,
+      github: true,
+      guardrails: true,
+      roborev: true,
+      onepassword: true,
+    };
+    eff.config.onepassword = { vault_id: "vault-abc", seed_worktrees: true };
+    useSettingsStore.getState().hydrateFromConfig(eff);
+    const s = useSettingsStore.getState();
+    expect(s.onepasswordEnabled).toBe(true);
+    expect(s.onepasswordVaultId).toBe("vault-abc");
+    expect(s.onepasswordSeedWorktrees).toBe(true);
+  });
+
+  it("treats a null vault_id as no vault picked", () => {
+    const eff = bare();
+    eff.config.onepassword = { vault_id: null, seed_worktrees: false };
+    useSettingsStore.getState().hydrateFromConfig(eff);
+    expect(useSettingsStore.getState().onepasswordVaultId).toBeNull();
+  });
+
+  it.each(["", "   ", "\t\n"])(
+    "normalizes a blank vault_id (%j) on the way in, like the setter and Rust do",
+    (blank) => {
+      // Hydration is the third write path into this field and used to be the only one that passed
+      // `""` through verbatim — which every "is a vault picked?" check downstream reads as YES.
+      useSettingsStore.setState({ onepasswordVaultId: "stale" });
+      const eff = bare();
+      eff.config.onepassword = { vault_id: blank, seed_worktrees: false };
+      useSettingsStore.getState().hydrateFromConfig(eff);
+      expect(useSettingsStore.getState().onepasswordVaultId).toBeNull();
+    },
+  );
+
+  it("trims a padded vault_id rather than storing the padding", () => {
+    const eff = bare();
+    eff.config.onepassword = { vault_id: "  vault-abc  ", seed_worktrees: false };
+    useSettingsStore.getState().hydrateFromConfig(eff);
+    expect(useSettingsStore.getState().onepasswordVaultId).toBe("vault-abc");
+  });
+
+  it("reads onepassword as OFF when a [tools] block predates the flag (backend skew)", () => {
+    // The likeliest real skew payload: an older backend that has [tools] but no onepassword key.
+    // A stray `?? true` copy-paste would flip the tool on for everyone running that build.
+    const eff = bare();
+    // Build the CURRENT shape, then delete the key an older backend wouldn't have sent. A literal
+    // cast would keep compiling if ToolsConfig gained another required field, quietly ceasing to
+    // model "older backend" while the rest of the suite caught the change.
+    const tools: NonNullable<typeof eff.config.tools> = {
+      analytics: true,
+      beads: true,
+      github: true,
+      guardrails: true,
+      roborev: true,
+      onepassword: true,
+    };
+    delete (tools as Partial<typeof tools>).onepassword;
+    eff.config.tools = tools;
+    useSettingsStore.getState().hydrateFromConfig(eff);
+    expect(useSettingsStore.getState().onepasswordEnabled).toBe(false);
+    expect(useSettingsStore.getState().roborevEnabled).toBe(true);
+  });
+});
+
+describe("1Password setters", () => {
+  it("setOnePasswordVaultId trims, and empties to null", () => {
+    useSettingsStore.getState().setOnePasswordVaultId("  vault-xyz  ");
+    expect(useSettingsStore.getState().onepasswordVaultId).toBe("vault-xyz");
+
+    // A blank id must clear the vault rather than being stored verbatim — an empty string would
+    // read as "configured" everywhere downstream and make every op call fail opaquely.
+    useSettingsStore.getState().setOnePasswordVaultId("   ");
+    expect(useSettingsStore.getState().onepasswordVaultId).toBeNull();
+
+    useSettingsStore.getState().setOnePasswordVaultId("v2");
+    useSettingsStore.getState().setOnePasswordVaultId(null);
+    expect(useSettingsStore.getState().onepasswordVaultId).toBeNull();
+  });
+
+  it("setToolEnabled drives the onepassword flag through TOOL_FIELD", () => {
+    useSettingsStore.getState().setToolEnabled("onepassword", true);
+    expect(useSettingsStore.getState().onepasswordEnabled).toBe(true);
+    useSettingsStore.getState().setToolEnabled("onepassword", false);
+    expect(useSettingsStore.getState().onepasswordEnabled).toBe(false);
+  });
+
+  it("setOnePasswordSeedWorktrees updates the store", () => {
+    useSettingsStore.getState().setOnePasswordSeedWorktrees(true);
+    expect(useSettingsStore.getState().onepasswordSeedWorktrees).toBe(true);
+  });
+});

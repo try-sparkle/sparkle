@@ -102,11 +102,14 @@ describe("sortAgentsByAttention", () => {
 
   it("STATUS_RANK encodes the tiers as ascending ranks", () => {
     expect(STATUS_RANK.waiting).toBe(STATUS_RANK.approval);
-    // The full red tier shares tier 0 and floats to the top: errored (sparkle-pqxh), plus blocked
-    // ('went quiet') and unmerged ('finished but not on main') which are red now too.
+    // The full red tier shares tier 0 and floats to the top: errored (sparkle-pqxh) plus blocked
+    // ('went quiet').
     expect(STATUS_RANK.errored).toBe(STATUS_RANK.waiting);
     expect(STATUS_RANK.blocked).toBe(STATUS_RANK.waiting);
-    expect(STATUS_RANK.unmerged).toBe(STATUS_RANK.waiting);
+    // `unmerged` is its OWN band — not red, not calm. Strictly between the two, so unlanded work
+    // stays visible without impersonating an alarm (see packages/ui/tokens.ts, 2026-07-26).
+    expect(STATUS_RANK.unmerged).toBeGreaterThan(STATUS_RANK.waiting);
+    expect(STATUS_RANK.unmerged).toBeLessThan(STATUS_RANK.idle);
     expect(STATUS_RANK.idle).toBe(STATUS_RANK.done);
     expect(STATUS_RANK.waiting).toBeLessThan(STATUS_RANK.idle);
     expect(STATUS_RANK.idle).toBeLessThan(STATUS_RANK.working);

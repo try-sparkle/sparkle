@@ -58,6 +58,7 @@ export function runAsCommand(projectId: string, text: string): void {
     name: truncateTitle(text, 40),
     shellCommand: text,
   });
+  if (!id) return; // project vanished (closed/removed) — nothing to select or open
   useUiStore.getState().setActiveSpecial(null);
   ps.selectAgent(projectId, id);
   useRuntimeStore.getState().open(id);

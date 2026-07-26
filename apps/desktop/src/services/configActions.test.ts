@@ -2,7 +2,7 @@
 //
 // Tests for the config write-back actions: each optimistically updates the store AND persists to
 // config.toml via the (mocked) config service. The bulk path must use a SINGLE atomic write.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock the Tauri-backed config service so no IPC is attempted under jsdom.
 vi.mock("./config", () => ({
@@ -41,6 +41,8 @@ import {
   authWarningFor,
   refreshRoborevAuth,
   markRoborevConsentPrompted,
+  setOnePasswordVault,
+  setOnePasswordSeedWorktrees,
 } from "./configActions";
 import { APPROVAL_CATEGORIES } from "./suggestions/approvalCategories";
 import { useApprovalsStore } from "../stores/approvalsStore";
@@ -217,7 +219,7 @@ describe("configActions", () => {
 
     // The whole point of the self-test: a daemon that can't authenticate must never leave the
     // toggle reading "on", because it would run happily and review nothing.
-    it.each([["ClaudeMissing"], ["NotAuthenticated"]])(
+    it.each([["ClaudeMissing"], ["NotAuthenticated"], ["NotInstalled"]])(
       "turning ON with a %s verdict reverts to OFF, tears the daemon down, and explains why",
       async (kind) => {
         vi.mocked(roborevAuthSelftest).mockResolvedValueOnce({
@@ -325,6 +327,7 @@ describe("configActions", () => {
       // Including `undefined` (probe didn't run) and Unknown: an unverified daemon is precisely the
       // invisible-failure case, so it must still say something.
       const verdicts = [
+        { kind: "NotInstalled" as const },
         { kind: "ClaudeMissing" as const },
         { kind: "NotAuthenticated" as const },
         { kind: "Unknown" as const, detail: "weird output" },
@@ -336,6 +339,7 @@ describe("configActions", () => {
     });
 
     it("tells the user the specific fix for each confident failure", () => {
+      expect(authWarningFor({ kind: "NotInstalled" })).toContain("isn't installed");
       expect(authWarningFor({ kind: "ClaudeMissing" })).toContain("Install Claude Code");
       expect(authWarningFor({ kind: "NotAuthenticated" })).toContain("claude login");
     });
@@ -346,6 +350,68 @@ describe("configActions", () => {
     await markRoborevConsentPrompted();
     expect(useSettingsStore.getState().roborevConsentPrompted).toBe(true);
     expect(setConfigValue).toHaveBeenCalledWith("roborev.consent_prompted", true);
+  });
+
+  // The one non-obvious invariant of the 1Password write path: a blank vault UNSETS the key rather
+  // than writing `vault_id = ""`. Rust reads a blank vault as "not chosen", so a stale empty string
+  // would misrepresent the file as configured — and nothing else pins that.
+  describe("1Password write-back", () => {
+    beforeEach(() => {
+      useSettingsStore.setState({ onepasswordVaultId: null, onepasswordSeedWorktrees: false });
+    });
+    afterEach(() => {
+      // `vi.clearAllMocks()` does NOT drain a queued `mockRejectedValueOnce`, and these fields are
+      // module-global: leave either behind and an unrelated describe later in the file fails with
+      // "disk full" or reads a stale vault.
+      vi.mocked(setConfigValue).mockReset().mockResolvedValue(undefined);
+      useSettingsStore.setState({ onepasswordVaultId: null, onepasswordSeedWorktrees: false });
+    });
+
+    it("persists a trimmed vault id and updates the store optimistically", async () => {
+      await setOnePasswordVault("  v1  ");
+      expect(setConfigValue).toHaveBeenCalledWith("onepassword.vault_id", "v1");
+      expect(unsetConfigValue).not.toHaveBeenCalled();
+      expect(useSettingsStore.getState().onepasswordVaultId).toBe("v1");
+    });
+
+    it("UNSETS the key for a null vault rather than writing an empty string", async () => {
+      await setOnePasswordVault(null);
+      expect(unsetConfigValue).toHaveBeenCalledWith("onepassword.vault_id");
+      expect(setConfigValue).not.toHaveBeenCalled();
+      expect(useSettingsStore.getState().onepasswordVaultId).toBeNull();
+    });
+
+    it("treats a whitespace-only vault the same as null", async () => {
+      await setOnePasswordVault("   ");
+      expect(unsetConfigValue).toHaveBeenCalledWith("onepassword.vault_id");
+      expect(setConfigValue).not.toHaveBeenCalled();
+      expect(useSettingsStore.getState().onepasswordVaultId).toBeNull();
+    });
+
+    it("writes both directions of the worktree-seeding consent", async () => {
+      await setOnePasswordSeedWorktrees(true);
+      expect(setConfigValue).toHaveBeenCalledWith("onepassword.seed_worktrees", true);
+      expect(useSettingsStore.getState().onepasswordSeedWorktrees).toBe(true);
+
+      await setOnePasswordSeedWorktrees(false);
+      expect(setConfigValue).toHaveBeenCalledWith("onepassword.seed_worktrees", false);
+      expect(useSettingsStore.getState().onepasswordSeedWorktrees).toBe(false);
+    });
+
+    it("keeps the optimistic store update when the config write fails", async () => {
+      // The pane must not appear to forget the vault the user just picked because the file write
+      // lost a race; the next hydrate is what corrects a genuinely failed write.
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        vi.mocked(setConfigValue).mockRejectedValueOnce(new Error("disk full"));
+        await setOnePasswordVault("v9");
+        expect(useSettingsStore.getState().onepasswordVaultId).toBe("v9");
+        expect(warn).toHaveBeenCalled();
+      } finally {
+        // A failed assertion above must not leave the spy installed for the rest of the file.
+        warn.mockRestore();
+      }
+    });
   });
 
   describe("setResumeRule", () => {

@@ -15,7 +15,9 @@ vi.mock("./engine", () => ({
   computeSuggestions: (...a: unknown[]) => computeSuggestions(...a),
   SuggestionOfflineError,
 }));
-let scrollback = "";
+// `null` models an UNMOUNTED terminal pane (no provider registered), which the real
+// getAgentScrollback returns and which the hook must treat differently from a painted buffer.
+let scrollback: string | null = "";
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => scrollback }));
 vi.mock("../aiGate", () => ({ useAiFeature: () => true }));
 vi.mock("../relayClient", () => ({ pushSuggestions: vi.fn() }));
@@ -61,27 +63,28 @@ const settle = async () => {
 
 describe("useSuggestions settle-watcher", () => {
   it("recomputes when the scrollback settles on new content after the initial compute", async () => {
-    // Initial compute sees the mid-paint (empty) scrollback and finds nothing.
-    computeSuggestions
-      .mockResolvedValueOnce({ agentId: "a1", buttons: [] })
-      .mockResolvedValueOnce({ agentId: "a1", buttons: [BTN] });
+    computeSuggestions.mockResolvedValue({ agentId: "a1", buttons: [BTN] });
 
     const { result } = renderHook(() => useSuggestions("a1", true));
     await act(async () => {});
-    expect(computeSuggestions).toHaveBeenCalledTimes(1);
-    expect(computeSuggestions.mock.calls[0]?.[0]).toMatchObject({ scrollback: "" });
+    // The status flip beat the terminal paint, so the scrollback is still empty. That buys NO
+    // compute — an empty buffer can only produce an empty result (see the empty-guard test below).
+    expect(computeSuggestions).not.toHaveBeenCalled();
 
-    // The terminal finishes painting AFTER the status flip already triggered the compute.
+    // The terminal finishes painting AFTER the status flip; the watcher picks it up.
     scrollback = "All changes committed. Say the word to rebase and open a PR.";
     await settle();
 
-    expect(computeSuggestions).toHaveBeenCalledTimes(2);
-    expect(computeSuggestions.mock.calls[1]?.[0]).toMatchObject({ scrollback });
+    expect(computeSuggestions).toHaveBeenCalledTimes(1);
+    expect(computeSuggestions.mock.calls[0]?.[0]).toMatchObject({ scrollback });
     expect(result.current.buttons).toEqual([BTN]);
   });
 
   it("does not recompute on a still-changing (unsettled) scrollback tail", async () => {
     computeSuggestions.mockResolvedValue({ agentId: "a1", buttons: [] });
+    // Seed real content so the initial compute actually fires — this test is about the watcher
+    // refusing an UNSETTLED tail, not about the empty-scrollback guard.
+    scrollback = "first settled state";
     renderHook(() => useSuggestions("a1", true));
     await act(async () => {});
     expect(computeSuggestions).toHaveBeenCalledTimes(1);
@@ -138,6 +141,42 @@ describe("useSuggestions settle-watcher", () => {
     rerender({ empty: true });
     for (let i = 0; i < 4; i++) await settle();
     expect(computeSuggestions).toHaveBeenCalledTimes(MAX_COMPUTE_ATTEMPTS);
+  });
+
+  it("does not refund an exhausted hash's budget when another state passes through", async () => {
+    // The budget is per FAILING STATE, but the terminal doesn't sit still between retries: other
+    // states are computed, served from the memo, or deferred offline in among them. None of those
+    // may hand the exhausted state a fresh budget — that turns the cap into no cap at all, and a
+    // persistently-rejecting backend keeps buying metered calls for as long as the agent idles.
+    const A = "state A, settled, persistently failing";
+    const B = "state B, settled, computes fine";
+    const C = "state C, settled, computes fine";
+    computeSuggestions.mockImplementation(({ scrollback: sb }: { scrollback: string }) =>
+      sb === A ? Promise.reject(new Error("boom")) : Promise.resolve({ agentId: "a1", buttons: [BTN] }),
+    );
+
+    scrollback = B;
+    renderHook(() => useSuggestions("a1", true));
+    await act(async () => {});
+    scrollback = C;
+    await settle();
+    expect(computeSuggestions).toHaveBeenCalledTimes(2);
+
+    // A fails until its budget is gone.
+    scrollback = A;
+    for (let i = 0; i < 6; i++) await settle();
+    expect(computeSuggestions).toHaveBeenCalledTimes(2 + MAX_COMPUTE_ATTEMPTS);
+
+    // Back to B — served from the memo, so it costs nothing and, crucially, records no failure of
+    // its own. This is the pass-through that used to zero the counter while it still pointed at A.
+    scrollback = B;
+    await settle();
+    expect(computeSuggestions).toHaveBeenCalledTimes(2 + MAX_COMPUTE_ATTEMPTS);
+
+    // Return to A. Its budget was spent and nothing has succeeded for it since, so it stays refused.
+    scrollback = A;
+    for (let i = 0; i < 6; i++) await settle();
+    expect(computeSuggestions).toHaveBeenCalledTimes(2 + MAX_COMPUTE_ATTEMPTS);
   });
 
   it("recovers from a transient failure: fail once, succeed on retry, fresh budget later", async () => {
@@ -198,6 +237,46 @@ describe("useSuggestions settle-watcher", () => {
     scrollback = "agent replied with new output";
     await settle();
     expect(computeSuggestions).toHaveBeenCalledTimes(2);
+  });
+
+  // Both no-content shapes must behave identically: `null` is an UNMOUNTED pane, `""` a mounted
+  // terminal with an empty buffer. Coercing either to "" used to buy a paid Haiku call per
+  // your-turn that could only return nothing.
+  it.each([
+    ["an unmounted terminal (null provider)", null],
+    ["a mounted terminal with an empty buffer", ""],
+  ])("spends no compute on %s, and does not clobber live buttons", async (_label, empty) => {
+    computeSuggestions.mockResolvedValue({ agentId: "a1", buttons: [BTN] });
+    scrollback = "settled state with real output";
+    let renders = 0;
+    const { result, rerender } = renderHook(({ composerEmpty }) => {
+      renders++;
+      return useSuggestions("a1", composerEmpty);
+    }, { initialProps: { composerEmpty: true } });
+    await act(async () => {});
+    expect(computeSuggestions).toHaveBeenCalledTimes(1);
+    expect(result.current.buttons).toEqual([BTN]);
+
+    // The content goes away. Drive the effect via a composer type-then-clear cycle so it
+    // re-evaluates against the no-content buffer.
+    scrollback = empty;
+    rerender({ composerEmpty: false });
+    rerender({ composerEmpty: true });
+    const rendersBefore = renders;
+    for (let i = 0; i < 5; i++) await settle();
+
+    expect(computeSuggestions).toHaveBeenCalledTimes(1);
+    expect(result.current.buttons).toEqual([BTN]);
+    // The effect never commits lastHash for a state it skipped, so a watcher that settled on the
+    // no-content hash would find it != lastHash forever and bump retryTick EVERY tick. It must bail
+    // on the same condition the effect does, leaving these ten ticks completely quiet.
+    expect(renders).toBe(rendersBefore);
+
+    // The skipped hash was never committed, so real output still computes.
+    scrollback = "the terminal painted again";
+    await settle();
+    expect(computeSuggestions).toHaveBeenCalledTimes(2);
+    expect(computeSuggestions.mock.calls[1]?.[0]).toMatchObject({ scrollback });
   });
 
   it("stops watching (no further computes) once the composer goes non-empty", async () => {

@@ -2,7 +2,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 
-const openProjectInWindow = vi.fn((..._a: unknown[]) => Promise.resolve("created"));
+const requestProjectTabFromOtherWindow = vi.fn((..._a: unknown[]) => {});
 const pickProjectFolder = vi.fn((..._a: unknown[]) => Promise.resolve("/tmp/picked"));
 const resolveOpenTarget = vi.fn((..._a: unknown[]) => ({ kind: "existing", id: "p1" }));
 const quitApp = vi.fn();
@@ -20,9 +20,10 @@ vi.mock("../stores/projectStore", () => {
   useProjectStore.getState = () => storeState;
   return { useProjectStore };
 });
-vi.mock("../services/projectWindows", () => ({
-  openProjectInWindow: (...a: unknown[]) => openProjectInWindow(...a),
-  defaultDeps: () => ({}),
+// Single-window shell (CM-U7): the tray no longer opens WINDOWS — it claims the app's project
+// TAB and asks the app window to come forward.
+vi.mock("../services/openProjectTab", () => ({
+  requestProjectTabFromOtherWindow: (...a: unknown[]) => requestProjectTabFromOtherWindow(...a),
 }));
 vi.mock("../services/dialog", () => ({
   pickProjectFolder: (...a: unknown[]) => pickProjectFolder(...a),
@@ -47,23 +48,23 @@ describe("TrayHeader", () => {
     expect(screen.getByText("Recent ▾")).toBeTruthy();
   });
 
-  it("opens a project window via the picker, then signals onAction", async () => {
+  it("selects the picked project's tab, then signals onAction", async () => {
     const onAction = vi.fn();
     const { TrayHeader } = await import("./TrayChrome");
     render(<TrayHeader onAction={onAction} onCapture={() => {}} />);
     fireEvent.click(screen.getByText("Open"));
-    await waitFor(() => expect(openProjectInWindow).toHaveBeenCalledWith("p1", "new", expect.anything()));
+    await waitFor(() => expect(requestProjectTabFromOtherWindow).toHaveBeenCalledWith("p1"));
     expect(pickProjectFolder).toHaveBeenCalled();
     expect(onAction).toHaveBeenCalled();
   });
 
-  it("expands Recent and opens the chosen project in a window", async () => {
+  it("expands Recent and selects the chosen project's tab", async () => {
     const onAction = vi.fn();
     const { TrayHeader } = await import("./TrayChrome");
     render(<TrayHeader onAction={onAction} onCapture={() => {}} />);
     fireEvent.click(screen.getByText("Recent ▾"));
     fireEvent.click(screen.getByText("Alpha"));
-    await waitFor(() => expect(openProjectInWindow).toHaveBeenCalledWith("p1", "new", expect.anything()));
+    await waitFor(() => expect(requestProjectTabFromOtherWindow).toHaveBeenCalledWith("p1"));
     expect(onAction).toHaveBeenCalled();
   });
 });

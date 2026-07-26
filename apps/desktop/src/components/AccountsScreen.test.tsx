@@ -96,7 +96,7 @@ describe("AccountsScreen", () => {
     const deps = makeDeps(
       [acct("a", { nickname: "DROdio Gmail", isDefault: true })],
       [],
-      [{ id: "a", email: "drodio@storytell.ai", organization: "drodio@storytell.ai's Organization" }],
+      [{ id: "a", email: "drodio@storytell.ai", organization: "drodio@storytell.ai's Organization", accountUuid: null }],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     // The trustworthy identity (email + org) is surfaced...
@@ -110,7 +110,7 @@ describe("AccountsScreen", () => {
     const deps = makeDeps(
       [acct("a", { nickname: "DROdio Chief" })],
       [],
-      [{ id: "a", email: null, organization: null }],
+      [{ id: "a", email: null, organization: null, accountUuid: null }],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     expect(await screen.findByText("DROdio Chief")).toBeTruthy();
@@ -125,5 +125,156 @@ describe("AccountsScreen", () => {
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     expect(await screen.findByText(/Exhausted until/)).toBeTruthy();
+  });
+});
+
+describe("duplicate-login warning", () => {
+  // Reproduces the live-machine state that motivated this: "DROdio Storytell" and "DROdio Gmail"
+  // were two config dirs holding ONE login (accountUuid 5fb3d67c-…), presented as two accounts
+  // with independent headroom bars.
+  const UUID = "5fb3d67c-f4ed-417b-9bf2-f9156450eb73";
+
+  it("warns when two registered accounts are the same Claude login", async () => {
+    const deps = makeDeps(
+      [
+        acct("s", { nickname: "DROdio Storytell", isDefault: true }),
+        acct("g", { nickname: "DROdio Gmail" }),
+      ],
+      [],
+      [
+        { id: "s", email: "drodio@gmail.com", organization: null, accountUuid: UUID },
+        { id: "g", email: "drodio@gmail.com", organization: null, accountUuid: UUID },
+      ],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    const alert = await screen.findByText(/are the same Claude login/i);
+    expect(alert).toBeTruthy();
+    expect(alert.textContent).toContain("drodio@gmail.com");
+    // Names both offenders so the user knows which to re-log-in.
+    const banner = alert.closest("[role='alert']");
+    expect(banner?.textContent).toContain("DROdio Storytell");
+    expect(banner?.textContent).toContain("DROdio Gmail");
+  });
+
+  it("shows no warning when the accounts are genuinely different logins", async () => {
+    const deps = makeDeps(
+      [acct("s", { nickname: "Storytell" }), acct("g", { nickname: "Gmail" })],
+      [],
+      [
+        { id: "s", email: "drodio@storytell.ai", organization: null, accountUuid: "uuid-a" },
+        { id: "g", email: "drodio@gmail.com", organization: null, accountUuid: "uuid-b" },
+      ],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    expect(await screen.findByText("drodio@storytell.ai")).toBeTruthy();
+    expect(screen.queryByText(/are the same Claude login/i)).toBeNull();
+  });
+
+  it("does not warn about accounts that simply aren't signed in yet", async () => {
+    const deps = makeDeps(
+      [acct("s", { nickname: "One" }), acct("g", { nickname: "Two" })],
+      [],
+      [
+        { id: "s", email: null, organization: null, accountUuid: null },
+        { id: "g", email: null, organization: null, accountUuid: null },
+      ],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    expect(await screen.findByText("One")).toBeTruthy();
+    expect(screen.queryByText(/are the same Claude login/i)).toBeNull();
+  });
+});
+
+describe("log in / switch login on an EXISTING account", () => {
+  // Before this, onLogin fired only at account-CREATION time, so an account that was never signed
+  // into — or two that turned out to hold the same login — had no route to a fix but delete and
+  // recreate. Re-logging one of a duplicate pair into a different Claude account IS the remedy.
+  it("offers 'Log in' for an account with no identity", async () => {
+    const onLogin = vi.fn();
+    const deps = makeDeps([acct("a", { nickname: "Third" })], [], [
+      { id: "a", email: null, organization: null, accountUuid: null },
+    ]);
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    const btn = await screen.findByRole("button", { name: "Log in" });
+    fireEvent.click(btn);
+    expect(onLogin).toHaveBeenCalledWith(expect.objectContaining({ id: "a" }));
+  });
+
+  it("offers 'Switch login' for an account that IS signed in", async () => {
+    const onLogin = vi.fn();
+    const deps = makeDeps([acct("a", { nickname: "Gmail" })], [], [
+      { id: "a", email: "drodio@gmail.com", organization: null, accountUuid: "u1" },
+    ]);
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    const btn = await screen.findByRole("button", { name: "Switch login" });
+    fireEvent.click(btn);
+    expect(onLogin).toHaveBeenCalledWith(expect.objectContaining({ id: "a" }));
+  });
+
+  it("is offered for the default account too — behind a confirm", async () => {
+    // The default (~/.claude) is the one most likely to be signed into the wrong account, and it
+    // can't be removed — so without a login button it would be permanently stuck. But its config
+    // dir is the user's REAL ~/.claude, so it takes a confirm step; see the guard suite below.
+    const onLogin = vi.fn();
+    const deps = makeDeps([acct("a", { nickname: "Default", isDefault: true })], [], [
+      { id: "a", email: "drodio@gmail.com", organization: null, accountUuid: "u1" },
+    ]);
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Switch login" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change system-wide login" }));
+    expect(onLogin).toHaveBeenCalledOnce();
+  });
+});
+
+describe("the DEFAULT account's login is guarded", () => {
+  // Its configDir is the user's real ~/.claude (registered by reference, never copied — which is
+  // why the Rust side also refuses to delete it). Re-logging it in replaces the login used by
+  // `claude` everywhere on the machine, not just inside Sparkle. That must not be one click.
+  it("requires a confirm step before re-logging in the default account", async () => {
+    const onLogin = vi.fn();
+    const deps = makeDeps([acct("a", { nickname: "Default", isDefault: true })], [], [
+      { id: "a", email: "drodio@gmail.com", organization: null, accountUuid: "u1" },
+    ]);
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Switch login" }));
+    expect(onLogin).not.toHaveBeenCalled(); // first click only arms the confirm
+
+    const confirm = screen.getByRole("button", { name: "Change system-wide login" });
+    fireEvent.click(confirm);
+    expect(onLogin).toHaveBeenCalledOnce();
+  });
+
+  it("the confirm can be cancelled without logging in", async () => {
+    const onLogin = vi.fn();
+    const deps = makeDeps([acct("a", { nickname: "Default", isDefault: true })], [], [
+      { id: "a", email: "drodio@gmail.com", organization: null, accountUuid: "u1" },
+    ]);
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Switch login" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onLogin).not.toHaveBeenCalled();
+    expect(await screen.findByRole("button", { name: "Switch login" })).toBeTruthy();
+  });
+
+  it("a NON-default account still logs in with one click", async () => {
+    const onLogin = vi.fn();
+    const deps = makeDeps([acct("a", { nickname: "Second" })], [], [
+      { id: "a", email: "drodio@gmail.com", organization: null, accountUuid: "u1" },
+    ]);
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Switch login" }));
+    expect(onLogin).toHaveBeenCalledOnce();
+  });
+
+  it("treats an identity with a uuid but no email as signed in", async () => {
+    // All three affordances (label, tooltip, 'Not signed in' badge) must agree — keying on email
+    // alone would claim a signed-in account isn't, while tinting it as a duplicate.
+    const deps = makeDeps([acct("a", { nickname: "Nick" })], [], [
+      { id: "a", email: null, organization: null, accountUuid: "u1" },
+    ]);
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    expect(await screen.findByRole("button", { name: "Switch login" })).toBeTruthy();
+    expect(screen.queryByText("Not signed in")).toBeNull();
   });
 });

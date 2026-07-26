@@ -14,18 +14,21 @@ import {
 import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled } from "react-icons/tb";
-import { FaTasks } from "react-icons/fa";
-import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, ON_BRAND_FILL_DARK, DANGER, statusInk } from "../theme/colors";
+import { FiCloud } from "react-icons/fi";
+import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
+import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
 import { WEB_BASE_URL } from "../services/sparkleApi";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { APP_WINDOW_LABEL } from "../windowContext";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { removeAgentWorkspace } from "../services/worktree";
 import { spinDownWorker } from "../services/workerSpawn";
+import { terminateIfCloud } from "../services/cloudAgents/terminate";
 import { killPty } from "../pty";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
@@ -39,7 +42,6 @@ import {
 } from "../services/agentNaming";
 import { sparkleAgentIdFor } from "../services/sparkleAgent";
 import { handleImproveSparkleClick } from "../services/sparkleReveal";
-import { parseWindowLabelFromSearch } from "../services/projectWindows.url";
 import { consentPillLabel, sparkleBarState, type SparkleBarState } from "./sparkleRowStatus";
 import { useBeadsStore } from "../stores/beadsStore";
 import { beadLabel, epicForBuild, epicPillFor } from "../services/planView";
@@ -50,24 +52,19 @@ import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal"
 import { withUnmergedWork } from "../engine/unmergedAttention";
 import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode } from "../engine/workMode";
-import { selectAndOpen } from "../useAttentionNotifications";
+import { isCalmBand } from "../services/conciergeFeed";
+import { PlanBuildToggle, FADE_3 } from "./PlanBuildToggle";
 import { StatusDot } from "./StatusDot";
-import { StatusBar } from "./StatusBar";
 import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
 import { ModelPill } from "./ModelPill";
 import { applyModelToRunningAgent } from "../services/agentModel";
 import { WorkflowLine } from "./WorkflowLine";
 import { HistorySearch } from "./HistorySearch";
-import { OtherWindowAgentRow } from "./OtherWindowAgentRow";
-import { useOtherWindowsRedGroups } from "../useOtherWindowsRedAgents";
-import type { OtherWindowAgent } from "../services/windowStatus";
-import { emitFocusAgent } from "../services/attention";
-import { findWindowForProject } from "../services/windowRegistry";
-import { openProjectInWindow, defaultDeps } from "../services/projectWindows";
 import { resolveStage, rollupStages, stageFraction, stageIndex, LINE_FROM, LINE_TO } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
-import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
+import { useNewAgent } from "../hooks/useNewAgent";
+import { NewAgentRuntimeToggle } from "./NewAgentRuntimeToggle";
 import { NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
 import { CloseAgentPrompt } from "./CloseAgentPrompt";
 import { BalanceBadge } from "./BalanceBadge";
@@ -78,84 +75,6 @@ import { BalanceBadge } from "./BalanceBadge";
  * to open the agent, double-click the agent name to rename it, ×
  * to close. "+ Agent" adds one.
  */
-// The two mode buttons (Plan / Build) form one continuous Sparkle blue→cyan fade. These are the
-// fade boundaries: the cyan "S" accent on the far left of Plan, the primary brand blue on the far
-// right of Build, and an interpolated stop at the Plan→Build seam so each button paints exactly its
-// slice of the SAME overall gradient.
-const FADE_0 = C.accent; // #34e0f0 — logo cyan, far-left edge of Plan
-const FADE_2 = "#3192fa"; // Plan→Build seam
-const FADE_3 = C.teal; // #2f6bff — primary brand blue, far-right edge of Build
-
-// Depth (px) of the chevron point/notch carved into a button's vertical edge.
-const CHEVRON = 11;
-
-// Width (px) of the hairline left between adjacent chevrons. We underlap the tessellation by this
-// much (overlap = CHEVRON - SEAM) so a thin diagonal sliver of the wrapper's background shows
-// through at each Think→Plan / Plan→Build seam.
-const SEAM = 1;
-
-// Build the clip-path for a button in the chevron strip. The OUTER edges of the strip
-// (Think's left, Build's right) stay flat ("vertical button surfaces"); interior seams are
-// arrow-shaped: a button that isn't last grows a rightward point, a button that isn't first
-// gets a matching inward notch on its left so the previous button's point nests into it.
-function chevronClip(leftNotch: boolean, rightPoint: boolean): string {
-  const d = `${CHEVRON}px`;
-  const pts: string[] = ["0 0"];
-  if (rightPoint) {
-    pts.push(`calc(100% - ${d}) 0`, "100% 50%", `calc(100% - ${d}) 100%`);
-  } else {
-    pts.push("100% 0", "100% 100%");
-  }
-  pts.push("0 100%");
-  if (leftNotch) pts.push(`${d} 50%`);
-  return `polygon(${pts.join(", ")})`;
-}
-
-// Shared style for a chevron in the mode strip: a solid gradient slice with NO border/stroke,
-// clipped to its chevron shape. `fillText` is the per-chevron ink chosen for contrast on that fill.
-// The strip's rounded outer corners come from the wrapper (overflow:hidden + borderRadius), so the
-// chevrons themselves are square; `leftNotch` chevrons overlap the previous one by CHEVRON px
-// (negative margin) so the point tessellates exactly into the notch. `active` is the currently
-// selected mode: the active chevron keeps its brand color; the inactive one renders grayscale.
-// `justify` places the glyph+label: Plan is left-justified (its flat-left, wrapper-rounded edge
-// reads like the old Think tab), Build stays centered.
-function createBtnStyle(
-  from: string,
-  to: string,
-  fillText: string,
-  leftNotch: boolean,
-  rightPoint: boolean,
-  active: boolean,
-  justify: "center" | "flex-start" = "center",
-): React.CSSProperties {
-  return {
-    flex: 1,
-    // A touch more horizontal room than the old three-up strip so each mode reads a bit wider; the
-    // extra left pad on the left-justified Plan keeps its label off the rounded corner.
-    padding: justify === "flex-start" ? "10px 12px 10px 14px" : "10px 12px",
-    border: "none",
-    borderRadius: 0,
-    marginLeft: leftNotch ? -(CHEVRON - SEAM) : 0,
-    clipPath: chevronClip(leftNotch, rightPoint),
-    cursor: "pointer",
-    fontFamily: '"IBM Plex Sans", sans-serif',
-    fontSize: 13,
-    whiteSpace: "nowrap",
-    background: `linear-gradient(90deg, ${from}, ${to})`,
-    color: fillText,
-    // The active mode shows its brand color; the inactive one desaturates to grayscale.
-    filter: active ? "none" : "grayscale(1)",
-    opacity: active ? 1 : 0.9,
-    transition: "filter 120ms ease, opacity 120ms ease",
-    // Flex-align the (enlarged, line-height-0) glyph against the label so the
-    // icon sits on the label's vertical center rather than its text baseline.
-    display: "flex",
-    alignItems: "center",
-    justifyContent: justify,
-    gap: 7,
-  };
-}
-
 // A dashed-outline "+ New <kind> Agent" row — the per-mode affordance for creating an agent,
 // shown in the sidebar list for the active Build/Think mode: below the last row when the list
 // fits, or pinned (sticky) at the top when the list is tall enough to scroll.
@@ -188,6 +107,9 @@ const DASHED_ROW_STYLE: React.CSSProperties = {
 const NEW_AGENT_SLOT_STYLE: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
+  // Separates the Local/Cloud runtime toggle from the button when the toggle renders (cloud
+  // enabled). With the toggle absent there is a single child, so this has no effect.
+  gap: 6,
 };
 
 // Coordinates the gentle auto-scroll of the agent list when a near-the-bottom row's hover card
@@ -309,8 +231,6 @@ export function NewBuildAgentButton({
 
 export function AgentSidebar({ project }: { project: Project | null }) {
   const selectAgent = useProjectStore((s) => s.selectAgent);
-  const touchProjectOpened = useProjectStore((s) => s.touchProjectOpened);
-  const addAgent = useProjectStore((s) => s.addAgent);
   const removeAgent = useProjectStore((s) => s.removeAgent);
   const open = useRuntimeStore((s) => s.open);
   const close = useRuntimeStore((s) => s.close);
@@ -323,8 +243,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const status = useMemo(() => {
     if (!project) return liveStatus;
     // Two attention overlays, composed: (1) an unstarted worker gets a synthetic red + bubbles to
-    // its orchestrator; (2) a started-then-red worker (waiting/approval/errored) bubbles its own red
-    // to its orchestrator so the orchestrator floats up and shows red. Order matters — run (2) after
+    // its orchestrator; (2) a started-then-red worker — ANY red-tier status, `blocked` included (see
+    // services/windowStatus.isRedStatus) — bubbles its own red to its orchestrator so the
+    // orchestrator floats up and shows red. Order matters — run (2) after
     // (1) so a strand's synthetic red also bubbles.
     const s1 = withUnstartedWorkerAttention(project.agents, liveStatus, new Set(openAgentIds));
     return withRedWorkerAttention(project.agents, s1);
@@ -348,10 +269,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const workflowShipped = useRuntimeStore((s) => s.workflowShipped);
   // The status map the ROW COLOR and the SORT ORDER read, built in two overlay steps:
   //   (1) withUnmergedWork — a FINISHED agent (idle/done/stopped) that still has committed work not
-  //       yet landed on main is escalated to red `unmerged` ("Needs merge"), so a done-but-unmerged
-  //       row goes red instead of gray until you open/merge its PR.
+  //       yet landed on main is escalated to `unmerged` ("Needs merge"). That is a GRAY status, not
+  //       an alarm; what it buys the row is its own ordering band (above the calm tier) and the
+  //       hover label, until you open/merge its PR.
   //   (2) withDismissedAlerts — dismissed red alarms de-escalate to their non-red tier
-  //       (waiting/approval→idle, errored→stopped) so a dismissed row drops out of the red zone.
+  //       (waiting/approval/blocked→idle, errored→stopped) so a dismissed row leaves the red zone.
   // Order matters: unmerged BEFORE dismissal (`unmerged` isn't dismissible, and running it after
   // dismissal would re-redden a just-calmed row — see withUnmergedWork's header). Kept separate from
   // `status` so the badge / dock-notification consumers still read the true, un-dismissed status.
@@ -367,44 +289,20 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         : status,
     [project, status, branchStatus, workflowStage],
   );
+  // CONCIERGE BANDING NOTE (roborev 46341-M3): `effectiveStatus` above IS the published map.
+  // `status` already carries both worker overlays (withUnstartedWorkerAttention +
+  // withRedWorkerAttention, see its memo), and effectiveStatus adds withUnmergedWork +
+  // withDismissedAlerts — the exact composition publishedStatusFor performs. Re-running
+  // publishedStatusFor here was a value-identical second computation of the whole map per render,
+  // so the calm band reads effectiveStatus directly.
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
-  // This window's opaque label — derived from the same URL primitive the windowContext provider
-  // uses (label param absent → "main"), read directly so this leaf doesn't require the provider
-  // (keeps the component render-testable). Fixed for a window's life, so it's stable across
-  // renders. Improve Sparkle is per-window: this window's own copy is keyed by
-  // sparkleAgentIdFor(windowLabel) (see onSelectSparkle / services/sparkleReveal).
-  const windowLabel =
-    parseWindowLabelFromSearch(typeof window !== "undefined" ? window.location.search : "") ?? "main";
-  const sparkleAgentId = sparkleAgentIdFor(windowLabel);
-
-  // Red agents in OTHER open windows — surfaced as a block at the top of the sidebar, COLLAPSED to
-  // one row per window (representative = most recently red; "+N" badge = the rest in that window).
-  const otherWindowRedGroups = useOtherWindowsRedGroups();
-  // Clicking such a row raises the owning window and selects the agent. Same three-way router as
-  // HistorySearch.onResultClick: same project → focus in place; another OPEN window → emitFocusAgent
-  // (the live path, since these only come from open windows); no window → open one (covers the rare
-  // race where that window closed between render and click).
-  const onOtherWindowAgentClick = (a: OtherWindowAgent) => {
-    if (project && a.projectId === project.id) {
-      // Same project shown here too: focus in place via the shared reveal (leaves any Sparkle/board
-      // overlay AND switches the chevron to the agent's kind, so it's surfaced even from Plan mode —
-      // where the reconcile effect alone wouldn't switch). Same path a cross-WINDOW jump takes.
-      selectAndOpen(a.projectId, a.agentId);
-      return;
-    }
-    if (findWindowForProject(a.projectId) != null) {
-      emitFocusAgent({ projectId: a.projectId, agentId: a.agentId });
-    } else {
-      void openProjectInWindow(
-        a.projectId,
-        "new",
-        defaultDeps(() => {}, touchProjectOpened, "main"),
-        a.agentId,
-      );
-    }
-  };
+  // The Improve-Sparkle agent is keyed by window label (sparkleAgentIdFor — see onSelectSparkle /
+  // services/sparkleReveal). There is exactly one app window now, and its label is the constant
+  // APP_WINDOW_LABEL; the id is spelled through it rather than the literal so the persistence key
+  // that existing users already have on disk can't drift.
+  const sparkleAgentId = sparkleAgentIdFor(APP_WINDOW_LABEL);
 
   // Which chevron is selected. Drives both the strip's coloring (active = brand, others grayscale)
   // and which agents the sidebar list shows. Defaults to Build; not persisted across launches.
@@ -591,7 +489,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // Spawn a build agent AND auto-create a bead for it, so every piece of build work is tracked
   // from the start (it floors at "Planned" until code work begins). Shared with the Workspace
   // empty-state start button via the useSpawnBuildAgent hook so both create agents identically.
-  const spawnBuildAgent = useSpawnBuildAgent(project);
+  // Runtime-aware: with the Local/Cloud toggle on "Cloud" this opens the cloud create dialog
+  // instead of spawning a local PTY. Identical behavior in both "+ New Build Agent" call sites.
+  const spawnBuildAgent = useNewAgent(project);
   const onPickBuild = () => {
     const alreadyHere = mode === "build" && activeSpecial === null;
     setMode("build");
@@ -702,6 +602,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const teardownAgent = async (id: string) => {
     if (!project) return;
     const agent = project.agents.find((a) => a.id === id);
+    // Closing is the user's "stop it" for a CLOUD agent — its "process" is a metered sandbox that
+    // deliberately outlives the pane (unmount only detaches), so without this the sandbox bills on
+    // until idle-pause and re-attach re-materializes the tab (roborev 46881). Ahead of the worker
+    // early-return and over the WHOLE subtree, so no cloud row is ever dropped with its sandbox left
+    // running (roborev 46918). Not awaited: the helper never rejects and the rows go immediately.
+    for (const a of [agent, ...project.agents.filter((c) => c.parentId === id)]) void terminateIfCloud(a);
     // A worker owns its OWN PTY and an on-disk manifest/worktree (.sparkle/worker.json). spinDownWorker
     // drops the row + closes the runtime SYNCHRONOUSLY up front, then kills the PTY and removes the
     // worktree/manifest in the background — the terminal process dies AND no lingering manifest is
@@ -792,13 +698,17 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     const id = closePromptId;
     setClosePromptId(null);
     if (!id || !project) return;
+    const row = project.agents.find((a) => a.id === id);
     const children = project.agents.filter((a) => a.parentId === id);
     const ids = [id, ...children.map((a) => a.id)];
-    const beadIds = [
-      project.agents.find((a) => a.id === id)?.beadId,
-      ...children.map((a) => a.beadId),
-    ].filter((b): b is string => !!b);
+    const beadIds = [row?.beadId, ...children.map((a) => a.beadId)].filter(
+      (b): b is string => !!b,
+    );
     for (const cid of ids) close(cid);
+    // Discard is the most explicit "destroy this" there is — every cloud sandbox under it goes too
+    // (roborev 46881, 46918). The background loop below still runs killPty/removeAgentWorkspace for
+    // cloud ids — harmless no-ops (no local PTY or worktree to reap).
+    for (const a of [row, ...children]) void terminateIfCloud(a);
     await discardAgentGit({ root: project.rootPath, projectId: project.id, ids, beadIds });
     removeAgent(project.id, id);
     reselectAfterClose(id);
@@ -1055,7 +965,14 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // Rendered in ONE of two slots in the scroll container below, chosen by listOverflows.
   const newAgentButton =
     project && mode === "build" ? (
-      <NewBuildAgentButton onClick={spawnBuildAgent} dataHint="newbuild" />
+      // A fragment, not a wrapper element: both placement slots are already flex columns, and the
+      // button must stay THEIR direct child (the sticky/below-the-list placement is asserted on the
+      // button's parent). The toggle renders null unless cloud is enabled, so a local-only sidebar
+      // is byte-for-byte the same tree as before.
+      <>
+        <NewAgentRuntimeToggle />
+        <NewBuildAgentButton onClick={spawnBuildAgent} dataHint="newbuild" />
+      </>
     ) : null;
 
   return (
@@ -1107,46 +1024,15 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       </div>
       <LogoWaveform />
 
+      {/* Column-2 header (PRD §3): the Plan / Build segmented toggle. Build keeps its two-stage
+          behavior here — a second click on the active chevron spawns a fresh build agent. */}
       {project && (
-        <div
-          style={{
-            display: "flex",
-            margin: "0 10px 8px",
-            borderRadius: 8,
-            overflow: "hidden",
-            // Seam between chevrons = the sidebar background (light gray, theme-aware), not white.
-            background: C.deepForest,
-          }}
-        >
-          {/* Plan / Build form one chevron strip painting a single blue→cyan fade. It's a MODE
-              SELECTOR: the active chevron keeps its color, the other goes grayscale. Plan leads with
-              the logo cyan, left-justified, and its flat-left edge is rounded by the wrapper — the
-              look the old Think tab had. Build points-notch tessellates onto it. Plan is Beads-gated
-              ([tools].beads): off → it disappears and Build spans the whole (rounded) strip. */}
-          {beadsEnabled && (
-            <button
-              data-hint="plan"
-              onClick={onPickPlan}
-              title="Plan mode — this project's read-only Tasks board"
-              // First in the strip: flat, wrapper-rounded left; points right into Build. Cyan leads,
-              // dark ink, left-justified content.
-              style={createBtnStyle(FADE_0, FADE_2, ON_BRAND_FILL_DARK, false, true, mode === "plan", "flex-start")}
-            >
-              <FaTasks size={14} style={{ flexShrink: 0 }} />
-              <span>Plan</span>
-            </button>
-          )}
-          <button
-            data-hint="build"
-            onClick={onPickBuild}
-            title="Build mode — your Build orchestrator agents"
-            // Last in the strip: notched left when Plan precedes it, flat right.
-            style={createBtnStyle(FADE_2, FADE_3, ON_BRAND_FILL, beadsEnabled, false, mode === "build")}
-          >
-            <span style={{ fontSize: 26, lineHeight: 0, transform: "translateY(-3.5px)" }}>⚒</span>
-            <span>Build</span>
-          </button>
-        </div>
+        <PlanBuildToggle
+          mode={mode}
+          beadsEnabled={beadsEnabled}
+          onPickPlan={onPickPlan}
+          onPickBuild={onPickBuild}
+        />
       )}
 
       {/* Full-text search across all projects' prompts & responses. Lives directly under the
@@ -1177,23 +1063,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             }}
           >
             {newAgentButton}
-          </div>
-        )}
-        {/* Cross-window attention block: red agents from OTHER open windows, each tagged with a
-            project pill. Sits ABOVE this window's own agents (and below the "+ New … Agent" button
-            when the overflowing list pins it to the top — with a short list the button renders
-            below the last row instead); hidden when there are none. Click raises the owning window
-            and selects the agent. */}
-        {otherWindowRedGroups.length > 0 && (
-          <div style={{ paddingTop: 2, paddingBottom: 6, marginBottom: 4, borderBottom: `1px solid ${CHAT_USER_BUBBLE}` }}>
-            {otherWindowRedGroups.map((group) => (
-              <OtherWindowAgentRow
-                key={group.windowLabel}
-                agent={group.agent}
-                extraCount={group.count - 1}
-                onClick={() => onOtherWindowAgentClick(group.agent)}
-              />
-            ))}
           </div>
         )}
         {(() => {
@@ -1281,6 +1150,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               depth={depth}
               isActive={isActive}
               st={st}
+              calm={isCalmBand(effectiveStatus[a.id])}
               statusColor={color}
               alertControl={alertControl}
               onDismissAlert={() => dismissAlert(project.id, a.id, trueSt)}
@@ -1352,8 +1222,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           Renders nothing when there are none. Sits between Improve Sparkle and the footer. */}
       <SupportTicketRow />
 
-      {/* Bottom-left: version + "Show logs". Pinned under the agent list. */}
-      <StatusBar />
+      {/* (The old bottom-left StatusBar — version popover / changelog / support — is gone: that
+          chrome now lives in the top-right kebab menu, see Concierge/KebabMenu.tsx.) */}
 
       {/* Ship / Save / Discard, shown when closing a Build agent with unmerged work at risk. */}
       {closingAgent && (
@@ -1599,6 +1469,11 @@ type AgentRowProps = {
   depth: number;
   isActive: boolean;
   st: AgentTabStatus;
+  /** This row recedes (PRD §3 / prototype `.arow.p2`): P2 in the CONCIERGE's banding, which is
+   *  what the tab badges, the feed and the terminal all read. Computed by the parent from
+   *  `publishedStatusFor` — deriving it here from `st` made the sidebar disagree with every other
+   *  surface for an orchestrator whose worker is red (roborev 46254-M4). */
+  calm: boolean;
   statusColor: string;
   /** The alert toggle to show on this row's expanded card: "dismiss" (truly red, not dismissed),
    *  "reenable" (red-underneath but dismissed), or null (not red). Computed from the TRUE status. */
@@ -1678,6 +1553,7 @@ function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
     prev.depth === next.depth &&
     prev.isActive === next.isActive &&
     prev.st === next.st &&
+    prev.calm === next.calm &&
     prev.statusColor === next.statusColor &&
     prev.alertControl === next.alertControl &&
     prev.bs === next.bs &&
@@ -1697,6 +1573,7 @@ const AgentRow = memo(function AgentRow({
   depth,
   isActive,
   st,
+  calm: calmBand,
   statusColor,
   alertControl,
   onDismissAlert,
@@ -1962,6 +1839,23 @@ const AgentRow = memo(function AgentRow({
     </span>
   ) : null;
 
+  // Cloud glyph (Service B): a small cloud next to the name marks an agent whose PTY runs in a
+  // Sparkle sandbox rather than on this Mac — so "why is this still running with my laptop shut"
+  // and "why does this one spend credits" are answerable at a glance. Deliberately the ONLY visual
+  // difference from a local row (spec §Creation UX: "no other visual difference"). Rendered from
+  // the tab's own `runtime`, so it survives a relaunch and a re-attach without any live state.
+  const cloudChip =
+    a.runtime === "cloud" ? (
+      <span
+        data-testid="cloud-glyph"
+        title="Runs in the cloud — keeps going with your laptop closed; bills credits per running minute."
+        aria-label="Cloud agent"
+        style={{ display: "inline-flex", flex: "0 0 auto", lineHeight: 1, color: C.muted }}
+      >
+        <FiCloud size={11} />
+      </span>
+    ) : null;
+
   // The source-epic pill (spec §8): a small 4px-radius chip on orchestrator rows showing the epic
   // title (ellipsized ~18ch). Clicking it (stopPropagation so it doesn't select the agent) jumps to
   // the Plan board and opens that epic's DetailOverlay via the one-shot boardFocusBeadId handoff.
@@ -2133,6 +2027,7 @@ const AgentRow = memo(function AgentRow({
                   />
                 )}
                 {epicPill}
+                {cloudChip}
                 {pinChip}
               </div>
               {/* The model pill anchors the card's top-right corner, above the progress bar's
@@ -2165,6 +2060,7 @@ const AgentRow = memo(function AgentRow({
                   }}
                 />
                 {epicPill}
+                {cloudChip}
                 {pinChip}
               </div>
             </div>
@@ -2305,6 +2201,22 @@ const AgentRow = memo(function AgentRow({
   // the terminal window (mergeIntoTerminal below drives that).
   const mergeIntoTerminal = isActive;
   const cardBg = isActive ? C.forest : CHAT_USER_BUBBLE;
+  // Calm rows recede (PRD §3 / prototype `.arow.p2`): a P2 agent — nothing for you to answer — goes
+  // grayscale and dims, so ONLY the P0/P1 rows carry color and the eye lands on what needs you. The
+  // selected row is exempt: it's docked into the terminal you're reading, and graying it would gray
+  // that join. The BAND comes from the parent (see the `calm` prop): computing it here from `st`
+  // read a different status map than the concierge feed, so an orchestrator with a red worker was
+  // listed as P0 by the concierge and grayscaled by its own row at the same time.
+  const calm = !isActive && calmBand;
+  // One definition, spread where it's needed — this used to be three copy-pasted blocks, two of
+  // them mis-indented. NOT applied to the hover card: that card is the thing the user deliberately
+  // opened, it floats over live terminal text, and its whole legibility story is the thick border
+  // separating it from what's behind it (roborev 46254-L1).
+  const calmStyle = {
+    filter: calm ? "grayscale(1) opacity(0.72)" : undefined,
+    // Transitioned so a row fading out of the red zone settles rather than snaps.
+    transition: "filter .3s ease",
+  } as const;
   // Show the slide-out only while hovering AND not renaming. Suppressing it during a rename means
   // the in-flow row is the SOLE owner of the rename <input> — the field never swaps mount points on
   // a hover change, so a trailing unmount-blur can't silently commit a half-typed name.
@@ -2360,6 +2272,7 @@ const AgentRow = memo(function AgentRow({
           // drag grabs the card instead of highlighting the name underneath the cursor. Gated on
           // !editing (like dragProps) so the rename <input> keeps normal text selection.
           userSelect: orderedIndex != null && !editing ? "none" : undefined,
+          ...calmStyle,
           // Active = the terminal's own color (merges into it); the hover state's CHAT_USER_BUBBLE
           // lives on the unified card, not here. Cleared while the card is open (showOverlay) so the
           // row reads as empty behind the stand-in card.
@@ -2846,8 +2759,12 @@ function openTicketThread(token: string) {
 
 /** Pinned status banner for the signed-in user's OPEN support tickets, shown between the "Improve
  *  Sparkle" row and the footer StatusBar. Renders nothing when there are no open tickets. Polls
- *  every 60s, refetches on window focus, and refreshes when a ticket is created (via
- *  TICKET_CREATED_EVENT). One open ticket → click opens its thread; many → click toggles an
+ *  every 60s while the window is visible — a hidden window skips the tick and catches up on
+ *  `visibilitychange`, so a backgrounded app doesn't fetch once a minute for hours nobody sees.
+ *  Also refetches on window focus and when a ticket is created (via TICKET_CREATED_EVENT). An
+ *  unchanged poll result is dropped rather than re-set, so the memo'd row doesn't re-render every
+ *  minute for identical tickets (see supportTicketPoll). One open ticket → click opens its thread;
+ *  many → click toggles an
  *  expanded per-ticket list directly beneath the banner. `memo`'d (no props) so unrelated sidebar
  *  re-renders don't churn it. */
 const SupportTicketRow = memo(function SupportTicketRow() {
@@ -2856,25 +2773,43 @@ const SupportTicketRow = memo(function SupportTicketRow() {
 
   useEffect(() => {
     let alive = true;
+    // Last signature we applied. Kept in a ref-like closure rather than state so comparing it
+    // never itself triggers the render it exists to avoid.
+    let lastSig = ticketsSignature([]);
     const refetch = () => {
       listMyTickets()
         .then((t) => {
-          if (alive) setTickets(t);
+          if (!alive) return;
+          const sig = ticketsSignature(t);
+          if (sig === lastSig) return; // same tickets as last poll — don't churn the memo'd row
+          lastSig = sig;
+          setTickets(t);
         })
         .catch(() => {
           // Signed-out / offline / transient — leave the last-known list; the banner just hides
           // when there are no open tickets. Not worth surfacing an error in the sidebar chrome.
         });
     };
+    // A hidden window gets no scheduled polls; onVisible catches it up on the way back. The
+    // event-driven paths (focus, ticket-created) always fetch — they only fire when someone is
+    // actually here, and a just-created ticket should appear without waiting for the next tick.
+    const onTick = () => {
+      if (shouldPollTickets()) refetch();
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refetch();
+    };
     refetch();
-    const timer = window.setInterval(refetch, 60_000);
+    const timer = window.setInterval(onTick, 60_000);
     window.addEventListener("focus", refetch);
     window.addEventListener(TICKET_CREATED_EVENT, refetch);
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       alive = false;
       window.clearInterval(timer);
       window.removeEventListener("focus", refetch);
       window.removeEventListener(TICKET_CREATED_EVENT, refetch);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, []);
 

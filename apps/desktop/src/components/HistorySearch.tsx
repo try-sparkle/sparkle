@@ -1,9 +1,9 @@
 // HistorySearch — the full-text search box under the Brainstorm/Build buttons in AgentSidebar.
 // Presentational: it binds the input to the historyStore (which owns the debounce + the Tauri
 // `history_search` call) and renders the ranked results. Clicking a result jumps to the AGENT that
-// produced it: selecting it in place when it lives in this window's project, asking the window that
-// owns its project to focus it when that window is open, or opening that project in a new window
-// otherwise. If the agent has since been closed (deleted), the row reports "That agent has been
+// produced it: selecting it in place when it lives in the selected project, or switching to that
+// project's TAB and selecting it there (single-window shell, CM-U7 — there is no other window to
+// raise). If the agent has since been closed (deleted), the row reports "That agent has been
 // closed" instead of navigating.
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { C, DANGER, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
@@ -11,17 +11,15 @@ import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useScrollIntentStore } from "../stores/scrollIntentStore";
-import { emitFocusAgent } from "../services/attention";
-import { findWindowForProject } from "../services/windowRegistry";
 import { correlatePromptId } from "./promptCorrelate";
 import type { PromptHistoryEntry } from "../types";
 import type { HistoryHit, RetentionTier } from "../services/history";
 import { purchaseRetention } from "../services/credits";
-import {
-  openProjectInWindow,
-  defaultDeps,
-  type OpenMode,
-} from "../services/projectWindows";
+import { openProjectTab } from "../services/openProjectTab";
+
+/** Retained shape of the injectable router (tests pass their own). "new" is the only mode the
+ *  single-window shell ever asks for — it means "make that project the active tab". */
+export type OpenMode = "replace" | "new";
 
 /** Shown on a row whose source agent no longer exists. Closing an agent deletes its worktree from
  *  disk (see AgentSidebar.onClose), so there's nothing left to reopen — say so honestly. */
@@ -30,9 +28,8 @@ const AGENT_CLOSED_MESSAGE = "This agent was closed — its workspace no longer 
 const NOTICE_TIMEOUT_MS = 4000;
 
 interface HistorySearchProps {
-  /** Route a hit's project into a window, deep-linking to its agent. Injected in tests; defaults
-   *  to the real Tauri wiring. Only ever called with mode `"new"` (a DIFFERENT project than this
-   *  window's, with no window currently showing it). */
+  /** Route a hit's project into view, deep-linking to its agent. Injected in tests; defaults to
+   *  selecting that project's TAB. Only ever called for a DIFFERENT project than the current one. */
   openInWindow?: (projectId: string, mode: OpenMode, agentId?: string) => void;
   /** This window's current project id. Injected in tests; defaults to the store's selection. */
   currentProjectId?: string | null;
@@ -145,7 +142,6 @@ export function HistorySearch({
   const entitlement = useHistoryStore((s) => s.entitlement);
   const setQuery = useHistoryStore((s) => s.setQuery);
   const storeSelectedProjectId = useProjectStore((s) => s.selectedProjectId);
-  const touchProjectOpened = useProjectStore((s) => s.touchProjectOpened);
 
   // A transient "that agent has been closed" notice, keyed by the row that triggered it so it can
   // render inline on that row. Cleared when it times out or the query changes (see below).
@@ -181,11 +177,13 @@ export function HistorySearch({
       useProjectStore.getState().selectAgent(projectId, agentId);
     });
 
-  // Cross-project, window already open: let that window bring itself forward and select the agent.
-  const focusElsewhere = focusAgentElsewhere ?? ((projectId, agentId) =>
-    emitFocusAgent({ projectId, agentId }));
+  // Cross-project fallbacks. In the single-window shell both collapse to the same act — select
+  // that project's tab and reveal the agent — so `hasWindow` defaults to false and every
+  // cross-project hit takes the router below. (Both stay injectable for tests.)
+  const focusElsewhere =
+    focusAgentElsewhere ?? ((projectId: string, agentId: string) => openProjectTab(projectId, agentId));
 
-  const hasWindow = projectHasWindow ?? ((projectId: string) => findWindowForProject(projectId) != null);
+  const hasWindow = projectHasWindow ?? (() => false);
 
   // The agent's recorded prompts (for hit -> terminal-marker correlation).
   const lookupPromptHistory =
@@ -208,24 +206,10 @@ export function HistorySearch({
     if (promptId) queueScroll(h.agentId, promptId);
   };
 
-  // Real cross-project router. The "new" path of openProjectInWindow never touches
-  // replaceCurrent/currentLabel (only the in-place "replace" path does), so the dummies below are
-  // safe — and this component renders fine outside CurrentProjectProvider (e.g. in AgentSidebar
-  // tests) because it depends on no window context.
+  // Real cross-project router: switch to that project's tab and reveal the agent there.
   const routeToWindow =
     openInWindow ??
-    ((projectId: string, mode: OpenMode, agentId?: string) => {
-      void openProjectInWindow(
-        projectId,
-        mode,
-        defaultDeps(
-          () => {}, // replaceCurrent — unused on the "new" path
-          touchProjectOpened,
-          "main", // currentLabel — unused on the "new" path
-        ),
-        agentId,
-      );
-    });
+    ((projectId: string, _mode: OpenMode, agentId?: string) => openProjectTab(projectId, agentId));
 
   /** Flash the "agent has been closed" notice on a row, auto-dismissing after a beat. */
   const flashClosed = (hitId: string) => {

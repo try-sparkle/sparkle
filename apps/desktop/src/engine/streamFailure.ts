@@ -45,7 +45,25 @@ function frames(line: string): string[] {
   return line.split("\r").map((f) => f.trim());
 }
 
-/** True when any \r-frame of a line is a mid-stream API failure banner. Pure. */
+/** The trimmed banner frames in a raw CHUNK, in order. Splits on \n as well as \r, because unlike
+ *  the single lines the rest of this module takes, a chunk carries both. StatusEngine diffs two of
+ *  these (a `base` prefix vs `base + tail`) to isolate the banners that ARRIVED in a chunk's
+ *  unterminated tail, then applies its own per-frame guards — so this stays a pure extractor and the
+ *  policy (which arrivals count) lives in the caller. See countApiErrorFrames for the count-only form
+ *  and the StatusEngine partial-banner check for why arrival-diffing (not a whole-buffer count) is
+ *  what survives a verbatim-repeated banner (46899) and a MAX_PARTIAL-saturated buffer (46920). */
+export function apiErrorFramesIn(chunk: string): string[] {
+  return chunk.split(/[\r\n]/).map((f) => f.trim()).filter((f) => API_ERROR_PATTERNS.some((re) => re.test(f)));
+}
+
+/** How many banner frames a raw CHUNK contains. Count-only sugar over {@link apiErrorFramesIn}. */
+export function countApiErrorFrames(chunk: string): number {
+  return apiErrorFramesIn(chunk).length;
+}
+
+/** True when any \r-frame of a line is a mid-stream API failure banner. Pure. Kept as a `some` scan
+ *  rather than `countApiErrorFrames(...) > 0` — it runs on every ingested line and only needs a
+ *  boolean, so it can stop at the first match. */
 export function isApiErrorLine(line: string): boolean {
   return frames(line).some((f) => API_ERROR_PATTERNS.some((re) => re.test(f)));
 }

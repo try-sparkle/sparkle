@@ -9,7 +9,10 @@
 // nil-checks instead, so a picker that won't open is a rejected promise we can report — not a dead
 // process. See folder_picker.rs's module docs for the full crash.
 //
-// `attachmentsApi.ts` still uses the plugin for FILE save/open; only the directory case moved.
+// EVERY directory picker in the app routes here — the project-open flow and the composer's
+// bulk-attachment-download folder prompt. `attachmentsApi.ts` still uses the plugin for the single-
+// file SAVE dialog (NSSavePanel, a different class with no observed nil failure); nothing else
+// should call `open({ directory: true })` again.
 import { invoke } from "@tauri-apps/api/core";
 
 /** True when running inside the Tauri desktop app (vs. a plain browser dev preview). */
@@ -17,9 +20,13 @@ function inTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-/** Prompt the user to choose or create a project folder. Returns its path, or null.
+/** Prompt the user to choose or create a folder. Returns its path, or null.
  * The macOS open-directory dialog has a "New Folder" button, so this covers both
  * "open an existing folder" and "create a new one".
+ *
+ * The name reflects the dominant caller (the project-open flow), not a restriction: this is the
+ * app's ONE directory picker, and the composer's bulk-download prompt uses it too. Pass a `title`
+ * that suits the flow.
  *
  * Returns null for BOTH "the user cancelled" and "the picker could not be opened" — every caller
  * already treats null as "stay where you are", so a failed picker leaves the user exactly where a

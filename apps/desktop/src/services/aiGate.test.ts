@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { aiEnhancementsEnabled, hasAiCredits, aiFeatureNow, assertAiCredits } from "./aiGate";
+import { act, renderHook } from "@testing-library/react";
+import {
+  aiEnhancementsEnabled,
+  hasAiCredits,
+  useHasAiCredits,
+  aiFeatureNow,
+  assertAiCredits,
+} from "./aiGate";
 import { OutOfCreditsError } from "./credits";
 import { useAuthStore } from "../stores/authStore";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -20,7 +27,7 @@ const account = (opts: { balanceCents: number; entitled?: boolean }) =>
   });
 
 afterEach(() => {
-  useAuthStore.setState({ me: null, tokenPresent: false, loading: false });
+  useAuthStore.setState({ me: null, tokenPresent: false, loading: false, creditFloorCents: 0 });
   useSettingsStore.getState().setAllAiFeatures(true);
 });
 
@@ -45,6 +52,63 @@ describe("hasAiCredits — the AI-feature unlock signal", () => {
   });
 });
 
+describe("hasAiCredits — the credit floor (a balance the SERVER already refused)", () => {
+  const me = (balanceCents: number) => ({
+    clerkUserId: "u",
+    entitled: true,
+    balanceCents,
+    tokenVersion: 1,
+  });
+
+  // The regression this exists for: the server reserves an ESTIMATE before running a call, so it
+  // 402s at any balance under that estimate. A leftover cent passed the old `balance > 0` gate, so
+  // every AI surface kept re-issuing a request that could only ever 402 — thousands per day.
+  it("closes at a balance the server refused, even though it is positive", () => {
+    expect(hasAiCredits(me(1), 0)).toBe(true); // no refusal recorded yet
+    expect(hasAiCredits(me(1), 1)).toBe(false); // refused at 1c → 1c is not spendable
+  });
+
+  it("reopens once a top-up lifts the balance above the refused level", () => {
+    expect(hasAiCredits(me(500), 1)).toBe(true);
+  });
+
+  it("still refuses a zero balance when no refusal has been recorded", () => {
+    expect(hasAiCredits(me(0), 0)).toBe(false);
+  });
+
+  it("ignores a negative floor rather than treating it as permission to spend nothing", () => {
+    expect(hasAiCredits(me(0), -100)).toBe(false);
+  });
+
+  it("defaults the floor from the auth store, so existing call sites gate on it", () => {
+    account({ balanceCents: 1 });
+    expect(hasAiCredits(useAuthStore.getState().me)).toBe(true);
+    useAuthStore.getState().noteCreditsRefused(1);
+    expect(hasAiCredits(useAuthStore.getState().me)).toBe(false);
+    expect(aiFeatureNow("suggestedActions")).toBe(false);
+  });
+
+  // The known imprecision: the 402 reports the balance, not the unaffordable hold, so a pricey call
+  // refused at a healthy balance closes the gate for the cheap calls that balance still covers.
+  // Pinned here so the trade-off is visible, and bounded by refresh() clearing the floor
+  // (authStore.test.ts) — not by anything in this function.
+  it("an expensive refusal at a healthy balance DOES close the gate (bounded by refresh, not here)", () => {
+    account({ balanceCents: 300 });
+    useAuthStore.getState().noteCreditsRefused(300);
+    expect(hasAiCredits(useAuthStore.getState().me)).toBe(false);
+  });
+
+  it("useHasAiCredits re-renders when ONLY the floor changes", () => {
+    account({ balanceCents: 1 });
+    const { result } = renderHook(() => useHasAiCredits());
+    expect(result.current).toBe(true);
+    // The balance is untouched — without the hook subscribing to the floor, this would not re-render
+    // and every AI surface would keep firing until some unrelated auth change happened to land.
+    act(() => useAuthStore.getState().noteCreditsRefused(1));
+    expect(result.current).toBe(false);
+  });
+});
+
 describe("assertAiCredits — the hard local gate", () => {
   it("throws OutOfCreditsError carrying the live balance at zero credits", () => {
     account({ balanceCents: 0, entitled: true });
@@ -60,9 +124,21 @@ describe("assertAiCredits — the hard local gate", () => {
     expect(err?.balanceCents).toBe(0);
   });
 
-  it("throws when signed out (no me)", () => {
+  // The thrown figure is asserted, not just the type: the `OutOfCreditsError.balanceCents` doc
+  // names "0 for a null `me`" as one of two reasons not to render that field, and an unpinned
+  // fallback would let a refactor make that doc quietly wrong. The other named hazard (the
+  // fabricated 0) is pinned in anthropic.test.ts; this is its counterpart.
+  it("throws when signed out (no me), reporting 0 — which is NOT a ledger balance", () => {
     useAuthStore.setState({ me: null, tokenPresent: false, loading: false });
-    expect(() => assertAiCredits()).toThrow(OutOfCreditsError);
+    const err = (() => {
+      try {
+        assertAiCredits();
+      } catch (e) {
+        return e as OutOfCreditsError;
+      }
+    })();
+    expect(err).toBeInstanceOf(OutOfCreditsError);
+    expect(err?.balanceCents).toBe(0);
   });
 
   it("does NOT throw when the user has a positive balance", () => {

@@ -1,12 +1,12 @@
 // connectionMonitor — wires the live connectivity signals into connectionStore and fires the
 // re-query on recovery. Two signals: the webview's online/offline events (instant) and a 30s
 // reachability heartbeat (authoritative — catches wifi-up-but-internet-dead). On a genuine
-// offline→online edge it re-queries every open agent. Mounted once, near the app root. ()
+// offline→online edge it re-queries every open agent, once per machine rather than once per
+// window (see claimReconnectRequery). Mounted once, near the app root. ()
 import { useEffect } from "react";
 import { useConnectionStore } from "./stores/connectionStore";
 import { probeConnectivity } from "./connectivity";
-import { requeryOpenAgents, shouldRequery } from "./services/requery";
-import { log } from "./logger";
+import { requeryOnReconnect, shouldRequery } from "./services/requery";
 
 /** How often the heartbeat re-checks reachability. The user-facing spec: "every 30 seconds." */
 export const PROBE_INTERVAL_MS = 30_000;
@@ -68,10 +68,9 @@ export function useConnectionMonitor(): void {
       probe: probeConnectivity,
       applyProbe: (ok) => store.getState().applyProbe(ok, Date.now()),
       isOnline: () => store.getState().isOnline,
-      onRecover: () => {
-        log.info("connectivity", "back online — re-querying open agents");
-        void requeryOpenAgents();
-      },
+      // The edge is per-window; the reconnect it reports is per-machine. requeryOnReconnect takes
+      // the shared claim first, so N open windows don't type N copies of the prompt.
+      onRecover: () => void requeryOnReconnect(Date.now()),
     });
 
     const onOnline = () => {

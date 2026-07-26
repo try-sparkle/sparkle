@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { C } from "../theme/colors";
 import type { Account } from "../services/accountStore";
-import { buildClaudeExec, SHELL } from "../services/claudeSpawn";
+import { buildClaudeLoginExec, SHELL } from "../services/claudeSpawn";
 import { checkClaude } from "../preflight";
 import { Terminal } from "./Terminal";
 
@@ -33,13 +33,16 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
     };
   }, []);
 
-  // Interactive `claude` (no resume, no mission prompt) under the new account's CLAUDE_CONFIG_DIR.
-  // The user runs the normal login flow inside it; closing the modal kills the PTY.
+  // `claude login` directly, under this account's CLAUDE_CONFIG_DIR — the same builder the
+  // first-run SetupChecklist uses. This used to spawn a general interactive `claude` instead, which
+  // dropped the user at a REPL and left them to discover `/login` on their own; for the
+  // re-login case ("this account is signed into the wrong Claude account") that extra step is the
+  // whole task, so the modal now goes straight there.
   const spawn =
     typeof claudePath === "string"
       ? {
           command: SHELL,
-          args: ["-l", "-c", buildClaudeExec(claudePath, false, { configDir: account.configDir })],
+          args: ["-l", "-c", buildClaudeLoginExec(claudePath, { configDir: account.configDir })],
           cwd: account.configDir,
         }
       : null;
@@ -95,7 +98,22 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
         </div>
         <p style={{ fontSize: 12, color: C.muted, marginTop: 0, lineHeight: 1.4 }}>
           Complete the normal Claude login below (it opens your browser). Sparkle never sees your
-          credentials — they’re stored in this account’s own config folder. Close when you’re done.
+          credentials. Close when you’re done.
+        </p>
+        {/* The default account IS the user's real ~/.claude, so "this account's own config folder"
+            would be actively misleading here — the login it writes is the one every `claude`
+            invocation on the machine uses. Say so plainly rather than implying isolation. */}
+        <p
+          style={{
+            fontSize: 12,
+            color: account.isDefault ? C.amber : C.muted,
+            marginTop: 0,
+            lineHeight: 1.4,
+          }}
+        >
+          {account.isDefault
+            ? "This is your system-wide Claude login (~/.claude). Signing in as someone else here changes the account Claude Code uses everywhere, not just in Sparkle."
+            : "Credentials are stored in this account’s own config folder, separate from your other accounts."}
         </p>
         <div style={{ flex: 1, minHeight: 0, border: `1px solid ${C.forest}`, borderRadius: 8, overflow: "hidden", padding: 6 }}>
           {spawn ? (

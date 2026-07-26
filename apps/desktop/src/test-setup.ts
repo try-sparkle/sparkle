@@ -25,7 +25,27 @@ class MemoryStorage {
   }
 }
 
-if (typeof globalThis.localStorage === "undefined") {
+/** Is the ambient global a storage we can actually WRITE to?
+ *
+ *  Node 22+ defines a `localStorage` global of its own, but it only works when the process was
+ *  started with `--localstorage-file`; without that flag the property still resolves to an object
+ *  that carries none of the Storage methods. A `typeof … === "undefined"` guard reads that stub as
+ *  "a real localStorage is already here", skips the shim, and every persisted-store write then
+ *  dies with `storage.setItem is not a function` — which took out every test that touches a
+ *  `persist`-wrapped store on Node 25. Feature-detect the METHODS rather than the binding.
+ *
+ *  Reading the property can itself throw (the global is a getter, and some Node builds raise
+ *  rather than return a stub), so a throw counts as unusable too. */
+function hasUsableStorage(): boolean {
+  try {
+    const existing = (globalThis as { localStorage?: Partial<Storage> }).localStorage;
+    return typeof existing?.setItem === "function" && typeof existing?.getItem === "function";
+  } catch {
+    return false;
+  }
+}
+
+if (!hasUsableStorage()) {
   Object.defineProperty(globalThis, "localStorage", {
     value: new MemoryStorage(),
     // Writable so a test that swaps in its own storage (e.g. runtimeStore.test.ts) still can.

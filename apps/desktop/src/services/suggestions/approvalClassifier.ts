@@ -21,9 +21,10 @@ export interface ApprovalClassification {
 // region the options were parsed from (the header text sits just above the option block).
 const PICKER_WINDOW = 50;
 const PICKER_SPAN = 30;
-// PICKER_FOOTER is imported from heuristics.ts (the single source of truth) so header-region
-// classification always reads the SAME footer the option detector parsed the options from — the two
-// can never drift apart. It matches both the standard picker footer and the Bash-approval footer.
+// PICKER_FOOTER is re-exported by heuristics.ts from its canonical home in engine/screenClassifier
+// (the single retune point for TUI drift), so header-region classification always reads the SAME
+// footer the option detector parsed the options from — the two can never drift apart. It matches
+// both the standard picker footer and the Bash-approval footer (with or without "Tab to amend").
 
 // The plain affirmative ("Yes", "Yes.") — the option we auto-select. Deliberately NOT the
 // "Yes, and don't ask again / allow all edits this session" variants (those hand control to Claude

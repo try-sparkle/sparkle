@@ -10,8 +10,65 @@ import {
   sparkleAgentIdFor,
   sparkleOpenSetWhitelist,
   shouldWarmSparkleAtLaunch,
+  isSubmitBlocked,
+  submitBlockedReason,
   SPARKLE_AGENT_ID,
+  type SubmitVerdict,
 } from "./sparkleAgent";
+
+// A public user is read-only on the upstream repo, so the agent's last step — `gh pr create` —
+// simply cannot work for them. These tests pin the two rules that keeps honest: a blocked machine
+// never gets told to submit, and an INCONCLUSIVE probe never downgrades one that can.
+describe("submit capability — who may open a PR", () => {
+  const BLOCKED: SubmitVerdict[] = ["noPush", "notAuthenticated", "ghMissing"];
+
+  it("blocks only the verdicts that are definitely unable to submit", () => {
+    for (const v of BLOCKED) expect(isSubmitBlocked(v)).toBe(true);
+    expect(isSubmitBlocked("canSubmit")).toBe(false);
+  });
+
+  it('"unknown" is NOT blocked — an offline probe must not mute a maintainer', () => {
+    expect(isSubmitBlocked("unknown")).toBe(false);
+    expect(submitBlockedReason("unknown", "owner/repo")).toBeNull();
+    expect(sparklePersona("/logs", "/repo", "always", "unknown")).not.toContain(
+      "SUBMISSION IS NOT AVAILABLE",
+    );
+  });
+
+  it("every blocked verdict has user-facing copy naming a way forward", () => {
+    expect(submitBlockedReason("noPush", "owner/repo")).toContain("owner/repo");
+    expect(submitBlockedReason("notAuthenticated", "owner/repo")).toContain("gh auth login");
+    expect(submitBlockedReason("ghMissing", "owner/repo")).toContain("isn't installed");
+    // Each one promises the same fallback, so the user knows the work isn't lost.
+    for (const v of BLOCKED) expect(submitBlockedReason(v, "owner/repo")).toContain("locally");
+  });
+
+  it("the persona goes propose-only and forbids the commands that would 403", () => {
+    for (const v of BLOCKED) {
+      const persona = sparklePersona("/logs", "/repo", "always", v);
+      expect(persona).toContain("SUBMISSION IS NOT AVAILABLE ON THIS MACHINE");
+      expect(persona).toContain("Do NOT run `gh pr create`");
+      // The work still has to happen and still has to be committed — blocked is not "do nothing".
+      expect(persona).toContain("COMMIT to a local branch");
+      expect(persona).toContain("a complete, successful pass");
+    }
+  });
+
+  it("the override lands AFTER the consent-mode instructions it has to beat", () => {
+    // "always" mode tells the agent to submit automatically; the override must come later in the
+    // prompt, or the agent reads the two in the wrong order.
+    const persona = sparklePersona("/logs", "/repo", "always", "noPush");
+    expect(persona.indexOf("SUBMISSION IS NOT AVAILABLE")).toBeGreaterThan(
+      persona.indexOf("WHAT YOU DO"),
+    );
+  });
+
+  it("a machine that can submit gets the unmodified persona", () => {
+    expect(sparklePersona("/logs", "/repo", "always", "canSubmit")).not.toContain(
+      "SUBMISSION IS NOT AVAILABLE",
+    );
+  });
+});
 
 // Warming spawns a real claude at app launch, so the gate is the consent contract in code: the
 // user who said "Always" gets it unasked; the user who said "Case by case" must have ticked the
@@ -156,6 +213,23 @@ describe("sparklePersona — consent branching", () => {
       expect(p).toContain("gh pr list --state open");
       expect(p).toContain("gh pr list --state merged");
       expect(p).toContain("do NOT open another one");
+    },
+  );
+
+  it.each(["always", "case_by_case", "never"] as const)(
+    "%s: the dedupe gate survives an unauthenticated gh instead of failing open",
+    (mode) => {
+      const p = sparklePersona(LOG_DIR, REPO, mode);
+      // `gh pr list` needs an authenticated gh; git does not. Without a stated fallback the gate
+      // silently no-ops on such a machine, which is the exact condition under which duplicate
+      // work is most likely (nothing else is telling the agent what is already in flight).
+      expect(p).toContain("the gate is");
+      expect(p).toContain("NOT waived");
+      expect(p).toContain("git ls-remote --heads origin");
+      expect(p).toContain("git log origin/main --oneline");
+      // A branch-name scan alone misses duplicates that describe the same fix differently, so the
+      // fallback has to send the agent at the touched files.
+      expect(p).toContain("git diff --stat origin/main...origin/<branch>");
     },
   );
 

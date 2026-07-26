@@ -41,15 +41,23 @@ vi.mock("./CreditsPanel", () => ({ CreditsPanel: () => null }));
 // fires under jsdom; each test drives the resolved/rejected value it needs.
 vi.mock("../services/trialApi", () => ({ fetchTrial: vi.fn() }));
 
+// The 1Password pane probes the `op` CLI and lists vaults over IPC on mount. It has its own
+// component tests; the shell test only cares that the category routes to it, so keep it inert.
+vi.mock("./OnePasswordPane", () => ({
+  OnePasswordPane: () => <div data-testid="onepassword-pane" />,
+}));
+
 import { openSignIn, signOut } from "../services/sparkleApi";
 import { fetchTrial } from "../services/trialApi";
 import { useAuthStore } from "../stores/authStore";
+import { useSettingsStore } from "../stores/settingsStore";
 import { SettingsDialog } from "./SettingsDialog";
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   useAuthStore.setState({ me: null, tokenPresent: false, loading: true });
+  useSettingsStore.setState({ onepasswordEnabled: false });
 });
 
 const heading = (name: string) => screen.queryByRole("heading", { name });
@@ -136,6 +144,116 @@ describe("SettingsDialog", () => {
   });
 });
 
+// The 1Password category follows its Tools switch. Without this pane the feature is unreachable:
+// the vault picker, the per-file backup table and the worktree-seeding consent all live here, so
+// "the switch is on but the pane never mounts" is the shipping failure these pin.
+describe("SettingsDialog — 1Password category (follows the Tools switch)", () => {
+  const OP_LABEL = "1Password";
+  const enableOp = () => useSettingsStore.setState({ onepasswordEnabled: true });
+
+  it("is absent from the rail, from search, and from deep-linking while the tool is off", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} initialCategory="onepassword" />);
+    expect(screen.queryByRole("button", { name: OP_LABEL })).toBeNull();
+    // A deep link to a category this install doesn't have falls back to the first pane.
+    expect(heading("AI features")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Search settings"), { target: { value: "vault" } });
+    expect(screen.queryByRole("button", { name: OP_LABEL })).toBeNull();
+  });
+
+  it("appears and renders the 1Password pane once the tool is switched on", () => {
+    enableOp();
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: OP_LABEL }));
+    expect(heading(OP_LABEL)).toBeTruthy();
+    expect(screen.getByTestId("onepassword-pane")).toBeTruthy();
+  });
+
+  it("resolves a onepassword DEEP LINK straight to the pane", () => {
+    enableOp();
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} initialCategory="onepassword" />);
+    expect(heading(OP_LABEL)).toBeTruthy();
+    expect(screen.getByTestId("onepassword-pane")).toBeTruthy();
+    expect(heading("AI features")).toBeNull();
+  });
+
+  it("is reachable by searching for what it does ('dotenv', 'secrets') when enabled", () => {
+    enableOp();
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("Search settings"), { target: { value: "dotenv" } });
+    expect(screen.getByRole("button", { name: OP_LABEL })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Workers" })).toBeNull();
+  });
+});
+
+// Cloud Agents (Service B) ships dark: the "Claude auth for cloud agents" category exists ONLY for
+// an account the server advertised `cloudAgentsEnabled` to. These pin both halves — invisible by
+// default (the local-only user's experience is unchanged) and reachable by deep link when on.
+describe("SettingsDialog — cloudauth category (server-gated)", () => {
+  const CLOUD_LABEL = "Claude auth for cloud agents";
+  const enableCloud = () =>
+    useAuthStore.setState({
+      tokenPresent: true,
+      loading: false,
+      me: {
+        clerkUserId: "user_1",
+        entitled: true,
+        balanceCents: 5000,
+        tokenVersion: 1,
+        cloudAgentsEnabled: true,
+      },
+    });
+
+  it("is absent from the rail, from search, and from deep-linking when the server hasn't enabled it", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} initialCategory="cloudauth" />);
+    expect(screen.queryByRole("button", { name: CLOUD_LABEL })).toBeNull();
+    // A deep link to a category this account doesn't have falls back to the first pane rather than
+    // rendering an empty dialog.
+    expect(heading("AI features")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Search settings"), { target: { value: "cloud" } });
+    expect(screen.queryByRole("button", { name: CLOUD_LABEL })).toBeNull();
+  });
+
+  it("appears and renders the Claude-auth pane once the server advertises the capability", () => {
+    enableCloud();
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: CLOUD_LABEL }));
+    expect(heading(CLOUD_LABEL)).toBeTruthy();
+    expect(screen.getByTestId("cloudauth-current")).toBeTruthy();
+  });
+
+  it("resolves a cloudauth DEEP LINK straight to the pane (gating.ts's deepLink target)", () => {
+    enableCloud();
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} initialCategory="cloudauth" />);
+    expect(heading(CLOUD_LABEL)).toBeTruthy();
+    expect(screen.getByTestId("cloudauth-current")).toBeTruthy();
+    expect(heading("AI features")).toBeNull();
+  });
+
+  it("is reachable by searching for 'byok' / 'sandbox' when enabled", () => {
+    enableCloud();
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("Search settings"), { target: { value: "byok" } });
+    expect(screen.getByRole("button", { name: CLOUD_LABEL })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Workers" })).toBeNull();
+  });
+
+  it("stays hidden for a signed-OUT user even if a stale capability sits in the store", () => {
+    useAuthStore.setState({
+      tokenPresent: false,
+      loading: false,
+      me: {
+        clerkUserId: "user_1",
+        entitled: true,
+        balanceCents: 5000,
+        tokenVersion: 1,
+        cloudAgentsEnabled: true,
+      },
+    });
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: CLOUD_LABEL })).toBeNull();
+  });
+});
+
 // The rail search: filters the CATEGORIES by label OR their keyword set. A category with no
 // visible name match still surfaces via a contained tool's keyword (e.g. "github" → Tools).
 describe("SettingsDialog — rail search", () => {
@@ -164,6 +282,117 @@ describe("SettingsDialog — rail search", () => {
     expect(railButton("Voice controls")).toBeTruthy(); // label match
     expect(railButton("Tools")).toBeTruthy(); // Deepgram keyword match
     expect(railButton("Workers")).toBeNull();
+  });
+
+  it("matches a MULTI-WORD query per term, not as one adjacent phrase", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    // "wake" and "microphone" both live in Voice controls' keywords but not next to each other, so
+    // the old raw-substring match found nothing and the user got "No settings match" for a query
+    // that describes exactly one category.
+    fireEvent.change(search(), { target: { value: "wake microphone" } });
+    expect(railButton("Voice controls")).toBeTruthy();
+    expect(railButton("Workers")).toBeNull();
+    // Every term is still REQUIRED — this is a filter, not a fuzzy any-of.
+    fireEvent.change(search(), { target: { value: "wake keyboard" } });
+    expect(railButton("Voice controls")).toBeNull();
+  });
+
+  it("matches a query that mixes a category's LABEL with one of its keywords", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    // The natural way to search: name the thing, then the detail. These span label and keywords,
+    // which a strictly per-entry match would split apart — and did, for a while, on every category
+    // whose pane doesn't filter rows.
+    for (const [q, label] of [
+      ["mobile pair", "Mobile"],
+      ["voice wake", "Voice controls"],
+      ["shortcuts hotkeys", "Shortcuts"],
+    ] as const) {
+      fireEvent.change(search(), { target: { value: q } });
+      expect(railButton(label), `searching "${q}" must still find ${label}`).toBeTruthy();
+    }
+  });
+
+  it("does NOT surface Tools for terms that live in different rows", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    // Tools is the one category whose pane filters its own rows, so the rail has to ask the pane's
+    // question: is there ONE row with all these terms? "deepgram" and "beads" are different rows —
+    // surfacing Tools here would open a pane that immediately renders "No tools match".
+    fireEvent.change(search(), { target: { value: "deepgram beads" } });
+    expect(railButton("Tools")).toBeNull();
+    // …while a query inside a single row still surfaces it.
+    fireEvent.change(search(), { target: { value: "deepgram dictation" } });
+    expect(railButton("Tools")).toBeTruthy();
+  });
+
+  /** Rows currently rendered by the Tools pane, counted from the DOM. */
+  const toolRows = () => screen.queryAllByTestId("tool-row").length;
+
+  it("searching a category's NAME opens its pane with EVERY row, not an empty one", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Tools" }));
+    const unfiltered = toolRows();
+    expect(unfiltered).toBeGreaterThan(0);
+
+    // No Tools row contains the word "tools" — it is the category's LABEL, not row text. The rail
+    // surfaces Tools (right), and the pane must then show its rows rather than filtering them all
+    // away, which is what forwarding the query verbatim did.
+    fireEvent.change(search(), { target: { value: "tools" } });
+    expect(railButton("Tools")).toBeTruthy();
+    expect(screen.queryByText(/No tools match/)).toBeNull();
+    // EVERY row, counted — "some switch exists" would also pass for a partial-clear regression.
+    expect(toolRows()).toBe(unfiltered);
+  });
+
+  it("narrows inside a category when the query names it AND a row", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Tools" }));
+    const unfiltered = toolRows();
+
+    // "tools github" is how people actually search: name the category, then narrow inside it. The
+    // rail has to keep the category (dropping it is worse than an empty pane — the user loses the
+    // route entirely) and the pane has to filter by the part that isn't the label.
+    fireEvent.change(search(), { target: { value: "tools github" } });
+    expect(railButton("Tools"), 'the rail must still offer Tools for "tools github"').toBeTruthy();
+    expect(screen.queryByText(/No tools match/)).toBeNull();
+    expect(toolRows()).toBeGreaterThan(0);
+    expect(toolRows(), "the row filter must still apply to the non-label terms").toBeLessThan(unfiltered);
+  });
+
+  it("keeps narrowing when the query matches NOTHING, instead of swinging back to every row", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Tools" }));
+    const unfiltered = toolRows();
+
+    fireEvent.change(search(), { target: { value: "deepgram" } });
+    const narrowed = toolRows();
+    expect(narrowed).toBeLessThan(unfiltered);
+
+    // One more character and the query matches nothing anywhere. That is still a query about THIS
+    // pane — the user narrowed past the last row — so it must show its empty state, not swing back
+    // to every row. Standing down on "the filter came back empty" did exactly that.
+    fireEvent.change(search(), { target: { value: "deepgramx" } });
+    expect(screen.getByText(/No settings match/)).toBeTruthy();
+    expect(toolRows(), "the pane must not expand when a query stops matching").toBeLessThanOrEqual(narrowed);
+    expect(screen.queryByText(/No tools match/)).toBeTruthy();
+
+    // Same in the label form, where the label terms are stripped before filtering.
+    fireEvent.change(search(), { target: { value: "tools deepgramx" } });
+    expect(toolRows()).toBeLessThanOrEqual(narrowed);
+  });
+
+  it("leaves the pane you're standing in alone when the query is about a different category", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Tools" }));
+    const unfiltered = toolRows();
+
+    // Typing "credits" while on Tools narrows the rail to Credits — correct — but the Tools pane is
+    // still mounted. The query was never about its rows, so filtering them to nothing and rendering
+    // "No tools match" would be a dead end in the pane the user is actually looking at.
+    fireEvent.change(search(), { target: { value: "credits" } });
+    expect(railButton("Credits")).toBeTruthy();
+    expect(railButton("Tools")).toBeNull();
+    expect(screen.queryByText(/No tools match/)).toBeNull();
+    expect(toolRows()).toBe(unfiltered);
   });
 
   it("shows an empty state when nothing matches", () => {

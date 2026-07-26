@@ -5,6 +5,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { loadAccountState } from "./accountSelection";
 import { createWorkerWorktree } from "../pty";
+import { abandonWorktreeSeed, seedWorktreeEnv } from "./envSeed";
+import { useProjectStore } from "../stores/projectStore";
 
 export interface WorktreeInfo {
   path: string;
@@ -100,6 +102,28 @@ export function createAgentWorktree(
   return invoke<WorktreeInfo>("create_agent_worktree", { root, projectId, agentId, baseBranch });
 }
 
+/** What `parkWorktreeOnBase` did, or the machine token for why it declined. */
+export interface ParkOutcome {
+  parked: boolean;
+  /** `parked` | `already-fresh` | `no-worktree` | `dirty` | `unpushed` | `no-base` | `checkout-failed`. */
+  reason: string;
+}
+
+/** Park an app-owned, UNATTENDED agent worktree back on a fresh `origin/<baseBranch>` before its
+ *  next headless run. `createAgentWorktree` is idempotent by leaving an existing worktree alone, so
+ *  a recurring pass would otherwise inherit the previous run's topic branch and drift further
+ *  behind main every hour. Conservative by construction: declines (never destroys) when the tree is
+ *  dirty or carries commits that aren't on any origin ref yet. Not for interactive agents — their
+ *  in-progress branch must survive. */
+export function parkWorktreeOnBase(
+  root: string,
+  projectId: string,
+  agentId: string,
+  baseBranch: string,
+): Promise<ParkOutcome> {
+  return invoke<ParkOutcome>("park_worktree_on_base", { root, projectId, agentId, baseBranch });
+}
+
 /** Remove an agent's worktree (leaves the branch so it can resume later). */
 export function removeAgentWorktree(
   root: string,
@@ -171,8 +195,44 @@ export function prepareAgentWorkspace(
 ): Promise<WorktreeInfo> {
   return withRepoLock(root, async () => {
     await ensureProjectRepo(root);
-    return createAgentWorktree(root, projectId, agentId, baseBranch);
+    const info = await createAgentWorktree(root, projectId, agentId, baseBranch);
+    seedEnvInto(projectId, agentId, info.path);
+    return info;
   });
+}
+
+/** Which worktree path each (project, agent/worker) pair was seeded into. Teardown is addressed by
+ *  id, not by path, so this is how `removeAgentWorkspace` finds the seed aimed at the directory it
+ *  is about to delete. */
+const seededPaths = new Map<string, string>();
+const seedKey = (projectId: string, agentId: string) => `${projectId}\u0000${agentId}`;
+
+/** Kick off the 1Password env-file restore for a newly cut worktree, if the user has turned it on.
+ *
+ *  Deliberately NOT awaited: the worktree is ready and the caller should proceed. Seeding is a
+ *  best-effort convenience that must never delay — or fail — opening an agent. See envSeed.ts.
+ *
+ *  The project NAME (not the id) is what the vault item titles are keyed on, so it is read from the
+ *  store here rather than derived from the root path, which can differ from the project's name. */
+function seedEnvInto(projectId: string, agentId: string, worktreePath: string): void {
+  // The try/catch enforces "seeding never fails a spawn" HERE rather than trusting every callee to
+  // keep being throw-free. The store read and the seeder are both non-throwing today; this is what
+  // makes that a property of this seam instead of a fact you have to re-verify downstream.
+  try {
+    const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
+    if (!project) {
+      // An evicted record, a worker re-derived from its on-disk manifest, or a store still
+      // rehydrating: without the name there is no title prefix to match, so seeding is impossible
+      // rather than merely empty. Say so — silence here looks identical to "the feature is off".
+      // The project ID only: a worktree path is exactly what these logs keep out.
+      console.warn(`env seed: no project record for ${projectId}; skipping seed`);
+      return;
+    }
+    seededPaths.set(seedKey(projectId, agentId), worktreePath);
+    seedWorktreeEnv(project.name, worktreePath);
+  } catch (e) {
+    console.warn("env seed: could not start the seed for this worktree", e);
+  }
 }
 
 /**
@@ -190,7 +250,14 @@ export function prepareWorkerWorkspace(args: {
   workerId: string;
   parentBranch: string;
 }): Promise<WorktreeInfo> {
-  return withRepoLock(args.root, () => createWorkerWorktree(args));
+  return withRepoLock(args.root, async () => {
+    const info = await createWorkerWorktree(args);
+    // Workers need this MORE than agents do: a fan-out cuts many worktrees at once, and every one
+    // of them would otherwise start without the project's secrets. (envSeed queues them so the
+    // fan-out doesn't turn into N concurrent `op` invocations.)
+    seedEnvInto(args.projectId, args.workerId, info.path);
+    return info;
+  });
 }
 
 /**
@@ -199,11 +266,21 @@ export function prepareWorkerWorkspace(args: {
  * the same project root (git init/commit/worktree add) would otherwise race on
  * `.git/index.lock`. Always route agent-close cleanup through this, never the raw
  * removeAgentWorktree bridge, so removal queues behind any in-flight prepare/remove.
+ *
+ * Also settles any env seed aimed at this worktree FIRST. Seeding is fire-and-forget and so
+ * escapes this lock; without that step a `git worktree remove` can run while `op` is still
+ * writing into the directory, which re-creates the tree git just deleted (see envSeed.ts).
  */
 export function removeAgentWorkspace(
   root: string,
   projectId: string,
   agentId: string,
 ): Promise<void> {
-  return withRepoLock(root, () => removeAgentWorktree(root, projectId, agentId));
+  const key = seedKey(projectId, agentId);
+  const seedPath = seededPaths.get(key);
+  seededPaths.delete(key);
+  return withRepoLock(root, async () => {
+    if (seedPath) await abandonWorktreeSeed(seedPath);
+    return removeAgentWorktree(root, projectId, agentId);
+  });
 }

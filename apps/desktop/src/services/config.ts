@@ -55,11 +55,24 @@ export interface ToolsConfig {
   github: boolean;
   guardrails: boolean;
   roborev: boolean;
+  /** Back your `.env*` files up to a 1Password vault. The one tool here that defaults OFF — it
+   *  needs a 1Password account, the `op` CLI, and a chosen vault before it can do anything. */
+  onepassword: boolean;
 }
 /** roborev machine-wide state (the one-time consent flag), its own section so Rust can gate the
  *  first-run modal on it. Machine-wide (like [tools]); ignored in a per-project file. */
 export interface RoborevConfig {
   consent_prompted: boolean;
+}
+/** 1Password env-backup state (chosen vault + worktree seeding). Machine-wide; ignored in a
+ *  per-project file — and here that's a security boundary, not just tidiness: a project-level
+ *  value would let one repo redirect where another repo's secrets are written. */
+export interface OnePasswordConfig {
+  /** The vault chosen in the one-time picker; null/absent until then. Rust normalizes a blank
+   *  string to absent, so a falsy value here always means "no vault picked yet". */
+  vault_id?: string | null;
+  /** Restore backed-up env files into each newly created agent worktree. */
+  seed_worktrees: boolean;
 }
 /** Branch/build freshness guardrails (read by the build script + session-start staleness hook). */
 export interface FreshnessConfig {
@@ -110,6 +123,10 @@ export interface SparkleConfig {
   // Optional for the same back-compat reason as `tools?` above: a payload from a Rust backend
   // predating [roborev] omits it. Callers read `config.roborev?.consent_prompted ?? false`.
   roborev?: RoborevConfig;
+  /** Optional for the same back-compat reason as `tools?`/`roborev?` above: a payload from a Rust
+   *  backend predating [onepassword] omits it. Callers must guard and fall back to the off/unset
+   *  defaults — never read an absent section as "enabled". */
+  onepassword?: OnePasswordConfig;
   freshness: FreshnessConfig;
   capture: CaptureConfig;
   // Optional so callers must guard: an older Rust backend (predating [voice]) omits it at runtime.

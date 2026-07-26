@@ -129,7 +129,8 @@ describe("DefineStageModal — Delivered", () => {
     ).toBeTruthy();
     expect(screen.queryByText("Yes")).toBeNull();
     expect(screen.getByLabelText(/Describe what “Delivered” means/i)).toBeTruthy();
-    expect(detectDelivery).toHaveBeenCalledWith("/tmp/demo");
+    // The project NAME rides along as metering-only credit attribution for the enrich turn.
+    expect(detectDelivery).toHaveBeenCalledWith("/tmp/demo", { projectName: "Demo" });
   });
 
   it("low-confidence detection flags the best guess and offers Yes/No → No reveals chat", async () => {

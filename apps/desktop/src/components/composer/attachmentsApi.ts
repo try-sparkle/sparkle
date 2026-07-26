@@ -2,7 +2,8 @@
 // dialog plugin. Keeps Tauri specifics out of the React components and the pure model.
 
 import { invoke } from "@tauri-apps/api/core";
-import { save, open } from "@tauri-apps/plugin-dialog";
+import { save } from "@tauri-apps/plugin-dialog";
+import { pickProjectFolder } from "../../services/dialog";
 import { isImagePath, basename, type Attachment } from "./attachments";
 import { log } from "../../logger";
 
@@ -47,11 +48,17 @@ export async function downloadAttachment(att: Attachment): Promise<boolean> {
 }
 
 /** Bulk download: pick a destination folder → copy all selected files into it.
- *  Resolves false if the user cancels the folder picker. */
+ *  Resolves false if the user cancels the folder picker.
+ *
+ *  Goes through OUR `pickProjectFolder` (services/dialog.ts), NOT the dialog plugin's
+ *  `open({ directory: true })`. That plugin call is the exact path that killed the app in
+ *  production — a nil `+[NSOpenPanel openPanel]` unwrapped inside objc2-app-kit, then a second
+ *  panic on the resulting RecvError. The project-open flow moved off it; this call site was the
+ *  one directory picker left behind. `pickProjectFolder` nil-checks and returns null instead. */
 export async function downloadAttachments(atts: Attachment[]): Promise<boolean> {
   if (atts.length === 0) return false;
-  const dir = await open({ directory: true, multiple: false, title: "Choose a download folder" });
-  if (!dir || typeof dir !== "string") return false;
+  const dir = await pickProjectFolder("Choose a download folder");
+  if (!dir) return false;
   await invoke("copy_files_to_dir", { srcs: atts.map((a) => a.path), destDir: dir });
   log.info("composer", "bulk-downloaded attachments", { count: atts.length, dir });
   return true;

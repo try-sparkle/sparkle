@@ -193,3 +193,38 @@ describe("uiStore zoom", () => {
     expect(isClean(useUiStore.getState().zoom)).toBe(true);
   });
 });
+
+// The concierge pin (CM-U7): ONE project at a time, and pinning the pinned one clears it. The pin
+// is persisted and load-bearing — it scopes the concierge's surfaced P0/P1 — so its semantics need
+// pinning down (roborev 46246-L1).
+describe("uiStore pinnedProjectId", () => {
+  beforeEach(() => useUiStore.setState({ pinnedProjectId: null }));
+  afterEach(() => useUiStore.setState({ pinnedProjectId: null }));
+
+  it("defaults to no pin (following all projects)", () => {
+    expect(useUiStore.getState().pinnedProjectId).toBeNull();
+  });
+
+  it("toggling an unpinned project pins it", () => {
+    useUiStore.getState().togglePinnedProject("p1");
+    expect(useUiStore.getState().pinnedProjectId).toBe("p1");
+  });
+
+  it("toggling a DIFFERENT project replaces the pin (one at a time, never two)", () => {
+    useUiStore.getState().togglePinnedProject("p1");
+    useUiStore.getState().togglePinnedProject("p2");
+    expect(useUiStore.getState().pinnedProjectId).toBe("p2");
+  });
+
+  it("toggling the pinned project clears the pin", () => {
+    useUiStore.getState().togglePinnedProject("p1");
+    useUiStore.getState().togglePinnedProject("p1");
+    expect(useUiStore.getState().pinnedProjectId).toBeNull();
+  });
+
+  it("setPinnedProject(null) clears it outright (the removal-cleanup path)", () => {
+    useUiStore.getState().setPinnedProject("p1");
+    useUiStore.getState().setPinnedProject(null);
+    expect(useUiStore.getState().pinnedProjectId).toBeNull();
+  });
+});

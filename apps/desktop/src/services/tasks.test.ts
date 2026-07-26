@@ -288,7 +288,10 @@ describe("generateTasks (multi-epic EpicPlan)", () => {
       EPIC_PLAN_SYSTEM,
       args.prdContent,
       undefined,
-      "Planning tasks from your prompt",
+      // The metering object now carries the project too; it resolves to undefined here because the
+      // test's projectPath isn't a project open in the store — exactly the "no project recorded"
+      // case the history must render honestly.
+      { purpose: "Planning tasks from your prompt", project: undefined },
     );
 
     // Two epic beads, each with the SAME PRD back-link; children parented to their own epic.
@@ -419,7 +422,7 @@ describe("decomposeEpic", () => {
       TASK_PLAN_SYSTEM,
       prdMarkdown,
       undefined,
-      expect.stringContaining("epic into tasks"),
+      expect.objectContaining({ purpose: expect.stringContaining("epic into tasks") }),
     );
     // NO epic bead is created — children only, parented to the existing epic id.
     expect(createBeadFull).toHaveBeenCalledTimes(2);
@@ -484,7 +487,7 @@ describe("decomposeEpic", () => {
       TASK_PLAN_SYSTEM,
       planningCopy,
       undefined,
-      expect.stringContaining("epic into tasks"),
+      expect.objectContaining({ purpose: expect.stringContaining("epic into tasks") }),
     );
     // …but the write-back patches the FRESH copy.
     const [, , content] = writePrd.mock.calls[0]!;

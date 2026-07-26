@@ -8,6 +8,7 @@ import {
   setNickname,
   removeAccount,
   accountLabel,
+  duplicateAccountGroups,
   type Account,
   type Usage,
   type Identity,
@@ -143,6 +144,14 @@ function exhaustedLabel(usage: Usage | undefined, now: number): string | null {
   return `Exhausted until ${d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
 }
 
+/** Whether this account has a real Claude login. Derived from accountUuid OR email: the Rust
+ *  `AccountIdentity` allows those independently, and `duplicateAccountGroups` matches on uuid alone,
+ *  so keying the login button on email alone could render "Log in" for an account that IS signed in
+ *  (and even tint it as a duplicate at the same time). One definition, shared by every affordance. */
+function isSignedIn(identity: Identity | undefined): boolean {
+  return !!(identity?.accountUuid || identity?.email);
+}
+
 export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
   const io: AccountsDeps = { ...DEPS, ...deps };
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -160,6 +169,9 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
   // (Enter) or a cancelled-edit save (Escape).
   const editingIdRef = useRef<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  // Two-step confirm for re-logging in the DEFAULT account, whose config dir is the user's real
+  // ~/.claude — see the button below.
+  const [confirmLogin, setConfirmLogin] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
@@ -189,6 +201,10 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
 
   const usageFor = (id: string) => usage.find((u) => u.id === id);
   const identityFor = (id: string) => identities.find((i) => i.id === id);
+  // Registrations that resolve to the SAME Anthropic account (identical accountUuid) — see the
+  // banner below and `duplicateAccountGroups`.
+  const duplicates = duplicateAccountGroups(accounts, identities);
+  const duplicateIds = new Set(duplicates.flatMap((g) => g.accounts.map((a) => a.id)));
   const now = Date.now();
   // Each window's bar fills RELATIVE to the busiest account, so the emptiest account reads shortest
   // (= most headroom). Floor at 1 so an all-zero set divides cleanly to empty bars, not NaN.
@@ -305,6 +321,25 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
         </div>
       )}
 
+      {/* Two registrations of the SAME Claude login look like two accounts here but share one
+          quota, so failover between them is a no-op that re-hits the same limit immediately. The
+          nickname can't reveal this (it's user-typed), so we surface the real accountUuid clash. */}
+      {duplicates.map((g) => (
+        <div
+          key={g.accountUuid}
+          role="alert"
+          style={{ ...card, borderColor: C.amber, color: C.amber, fontSize: 12, lineHeight: 1.5 }}
+        >
+          <strong>
+            {g.accounts.length} accounts are the same Claude login
+            {g.email ? ` (${g.email})` : ""}.
+          </strong>{" "}
+          {g.accounts.map((a) => a.nickname).join(" and ")} share one usage quota, so switching
+          between them gains you nothing — they hit the limit together. Log one of them into a
+          different Claude account, or remove it.
+        </div>
+      ))}
+
       {accounts.length === 0 && !adding && (
         <div style={{ ...card, color: C.muted, fontSize: 13 }}>No accounts yet. Add one to get started.</div>
       )}
@@ -347,12 +382,71 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
                   {identity?.organization && (
                     <span style={{ fontSize: 11, color: C.muted, display: "block" }}>{identity.organization}</span>
                   )}
-                  {!identity?.email && (
+                  {!isSignedIn(identity) && (
                     <span style={{ fontSize: 11, color: C.amber, display: "block" }}>Not signed in</span>
                   )}
                 </span>
               )}
               {a.isDefault && <span style={tag}>default</span>}
+              {/* Log in / re-point this config dir at a different Claude account. Without this an
+                  account could only ever be logged in at the moment it was CREATED, so an account
+                  that was never signed into — or two that turned out to hold the SAME login — had no
+                  route to a fix but delete-and-recreate. Highlighted for a duplicate, since
+                  re-logging one of the pair into a different account is exactly the remedy. */}
+              {!isEditing &&
+                // The DEFAULT account's config dir is the user's real `~/.claude` (registered by
+                // reference, never copied — which is also why the Rust side refuses to delete it).
+                // Re-logging it in therefore replaces the login used by `claude` EVERYWHERE on this
+                // machine, not just inside Sparkle. That is not a one-click action, so it takes the
+                // same confirm step as Remove.
+                (a.isDefault && confirmLogin !== a.id ? (
+                  <button
+                    type="button"
+                    style={
+                      duplicateIds.has(a.id)
+                        ? { ...smallBtn, borderColor: C.amber, color: C.amber }
+                        : smallBtn
+                    }
+                    onClick={() => setConfirmLogin(a.id)}
+                    title="This is your system-wide Claude login (~/.claude) — changing it affects every use of Claude Code, not just Sparkle."
+                  >
+                    {isSignedIn(identity) ? "Switch login" : "Log in"}
+                  </button>
+                ) : a.isDefault ? (
+                  <>
+                    <button
+                      type="button"
+                      style={{ ...smallBtn, borderColor: C.amber, color: C.amber }}
+                      onClick={() => {
+                        setConfirmLogin(null);
+                        onLogin(a);
+                      }}
+                      title="Replaces your system-wide Claude Code login"
+                    >
+                      Change system-wide login
+                    </button>
+                    <button type="button" style={smallBtn} onClick={() => setConfirmLogin(null)}>
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    style={
+                      duplicateIds.has(a.id)
+                        ? { ...smallBtn, borderColor: C.amber, color: C.amber }
+                        : smallBtn
+                    }
+                    onClick={() => onLogin(a)}
+                    title={
+                      isSignedIn(identity)
+                        ? `Currently ${identity?.email ?? "signed in"}. Logging in again lets you point this account at a different Claude login.`
+                        : "Log this account into Claude"
+                    }
+                  >
+                    {isSignedIn(identity) ? "Switch login" : "Log in"}
+                  </button>
+                ))}
               {!isEditing && (
                 <button
                   type="button"

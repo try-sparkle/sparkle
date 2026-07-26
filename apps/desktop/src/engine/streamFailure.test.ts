@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   isApiErrorLine,
   isSelfPromptLine,
+  apiErrorFramesIn,
+  countApiErrorFrames,
   StreamFailureDetector,
   STALL_REPEAT_THRESHOLD,
   SELF_PROMPT_REPEAT_THRESHOLD,
@@ -42,6 +44,61 @@ describe("isApiErrorLine", () => {
     // a heading/narration like "API Error handling: …" has a word after "API Error", not ":".
     expect(isApiErrorLine("API Error handling: returns 500.")).toBe(false);
     expect(isApiErrorLine("API Error responses now return 529.")).toBe(false);
+  });
+});
+
+describe("countApiErrorFrames", () => {
+  // The StatusEngine partial-banner check subtracts one count from another to learn how many banners
+  // ARRIVED in a chunk, so the arithmetic properties matter. Unlike isApiErrorLine (a per-line `some`),
+  // this splits on BOTH \r and \n so one chunk carrying several frames is counted correctly.
+  it("counts zero when there is no banner", () => {
+    expect(countApiErrorFrames("✻ Cogitating… (12s · esc to interrupt)")).toBe(0);
+    expect(countApiErrorFrames("")).toBe(0);
+    expect(countApiErrorFrames("API Er")).toBe(0); // a bare prefix frame is not a banner
+  });
+
+  it("counts one banner whichever framing delimiter carries it", () => {
+    expect(countApiErrorFrames("API Error: 500 Internal server error")).toBe(1);
+    expect(countApiErrorFrames("✻ Cogitating…\rAPI Error: Rate limited")).toBe(1); // \r-fused
+    expect(countApiErrorFrames("some line\nAPI Error: overloaded")).toBe(1); // \n-separated
+  });
+
+  it("counts every banner frame in a multi-frame chunk", () => {
+    expect(countApiErrorFrames("API Error: 500\rAPI Error: 500")).toBe(2); // verbatim retry loop
+    expect(countApiErrorFrames("API Error: 500\n✻ working\nAPI Error: 529")).toBe(2);
+  });
+
+  it("treats a \\r\\n empty frame as no banner (no double-count, no phantom)", () => {
+    expect(countApiErrorFrames("API Error: 500\r\nnext line")).toBe(1);
+    expect(countApiErrorFrames("\r\n")).toBe(0);
+  });
+
+  it("ignores narration ABOUT errors, same as isApiErrorLine", () => {
+    expect(countApiErrorFrames("I'll add handling for the API Error case\nAPI Error handling: 500")).toBe(0);
+  });
+
+  it("trims leading whitespace before matching the line-initial anchor", () => {
+    // The StatusEngine partial can hand it a frame with leading spaces; the impl trims, so pin it.
+    expect(countApiErrorFrames("   API Error: 500 Internal server error")).toBe(1);
+  });
+
+  it("counts a banner straddling a base/tail concat boundary once (the delta contract)", () => {
+    // StatusEngine computes count(base + tail) - count(base); a banner split across the join must
+    // read as one arrival, not zero (missed) or two (double).
+    const base = "API Er";
+    const tail = "ror: 500 Internal server error";
+    expect(countApiErrorFrames(base)).toBe(0); // the prefix alone is not yet a banner
+    expect(countApiErrorFrames(base + tail)).toBe(1); // the joined frame is
+  });
+});
+
+describe("apiErrorFramesIn", () => {
+  it("returns the trimmed banner frames in order (StatusEngine diffs these for arrivals)", () => {
+    expect(apiErrorFramesIn("✻ working\rAPI Error: 500\nAPI Error: 529")).toEqual([
+      "API Error: 500",
+      "API Error: 529",
+    ]);
+    expect(apiErrorFramesIn("no banners here")).toEqual([]);
   });
 });
 

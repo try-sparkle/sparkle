@@ -215,10 +215,13 @@ export function interpretVerdict(raw: string): boolean {
  * @param task     What the agent was asked to do (its naming basis / name) — lets the judge tell a
  *                 closeout ask (land/verify THIS work → red) from an offer of new work (gray).
  * @param response The finished turn's last assistant message (already read for history capture).
+ * @param project  Metering-only: the project this agent belongs to, so the judge's credit debit is
+ *                 attributable in the Credits history. Omitted → the row carries no project.
  */
 export async function judgeNeedsFollowup(args: {
   task: string;
   response: string;
+  project?: string;
 }): Promise<boolean> {
   if (!mightNeedFollowup(args.response)) return false;
   // Scope the try to ONLY the judge call, so the catch strictly means "the judge could not run"
@@ -228,6 +231,7 @@ export async function judgeNeedsFollowup(args: {
     raw = await invoke<string>("judge_turn_followup", {
       task: args.task,
       response: args.response,
+      project: args.project,
     });
   } catch (e) {
     // The judge could not run (no API key, offline, model hiccup). We can't distinguish done from

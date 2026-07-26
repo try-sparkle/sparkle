@@ -10,7 +10,7 @@
 // returns Err, and the caller (useAttentionNotifications) falls back to the existing generic body —
 // so the feature is a no-op until the user is signed in with credit rather than a blank banner.
 
-use crate::ai::{call_anthropic_proxy, extract_text, CLASSIFY_READ_TIMEOUT};
+use crate::ai::{call_anthropic_proxy, extract_text, Metering, CLASSIFY_READ_TIMEOUT};
 
 /// Cheapest current Claude model — a one-line summary needs nothing more. (claude-api skill:
 /// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.) It is also the
@@ -66,7 +66,12 @@ fn clean_summary(s: &str) -> String {
 /// cleaned one-line body. Returns Err on any failure (no key, empty input/result, network, HTTP
 /// error, parse) so the caller degrades to the generic notification body.
 #[tauri::command]
-pub async fn summarize_attention(screen: String) -> Result<String, String> {
+pub async fn summarize_attention(
+    screen: String,
+    // Display name of the project whose agent is asking, so the debit is attributable in the
+    // Credits history. Metering-only; a caller that doesn't know passes nothing (→ None).
+    project: Option<String>,
+) -> Result<String, String> {
     let screen = tail(&screen, SCREEN_TAIL_CHARS);
     // Nothing to summarize — an empty screen isn't an ask. (The caller pre-filters, but a
     // direct/empty call must not bill a request.)
@@ -81,13 +86,18 @@ pub async fn summarize_attention(screen: String) -> Result<String, String> {
     // token → signed out; degrade (generic banner) rather than call the proxy.
     tauri::async_runtime::spawn_blocking(move || {
         let token = crate::auth::bearer_token().ok_or_else(|| "not signed in".to_string())?;
-        call_summarize(&base, &token, &screen)
+        call_summarize(&base, &token, &screen, project.as_deref())
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-fn call_summarize(base: &str, token: &str, screen: &str) -> Result<String, String> {
+fn call_summarize(
+    base: &str,
+    token: &str,
+    screen: &str,
+    project: Option<&str>,
+) -> Result<String, String> {
     let json = call_anthropic_proxy(
         base,
         token,
@@ -96,7 +106,8 @@ fn call_summarize(base: &str, token: &str, screen: &str) -> Result<String, Strin
         screen,
         SUMMARY_MAX_TOKENS,
         CLASSIFY_READ_TIMEOUT,
-        Some("Summarizing what an agent needs"), // metering description shown in the credit history
+        // Metering description + project attribution shown in the credit history.
+        Metering::new("Summarizing what an agent needs", project),
     )?;
     let text = extract_text(&json).ok_or_else(|| "summarize returned no text".to_string())?;
     let cleaned = clean_summary(&text);

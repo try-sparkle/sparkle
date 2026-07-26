@@ -3,11 +3,11 @@
 // The writer half of the sparkle-last-focused-project contract (the reader half is covered in
 // CaptureApp.test.tsx): the tracker records this window's project on mount when the window is
 // already focused, on every subsequent DOM `focus`, and never without a project. Rendered
-// inside the real CurrentProjectProvider (jsdom URL has no ?label= → main window; the initial
+// inside the real AppBoot (jsdom URL has no ?label= → main window; the initial
 // project resolves from the seeded store).
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CurrentProjectProvider } from "../windowContext";
+import { AppBoot } from "../windowContext";
 import { LastFocusedProjectTracker } from "./LastFocusedProjectTracker";
 import { LAST_FOCUSED_PROJECT_KEY, readLastFocusedProject } from "./lastFocusedProject";
 import { useProjectStore } from "../stores/projectStore";
@@ -17,9 +17,9 @@ const projects = [{ id: "proj-1", name: "Alpha", agents: [] }] as unknown as Pro
 
 const mount = () =>
   render(
-    <CurrentProjectProvider>
+    <AppBoot>
       <LastFocusedProjectTracker />
-    </CurrentProjectProvider>,
+    </AppBoot>,
   );
 
 beforeEach(() => {

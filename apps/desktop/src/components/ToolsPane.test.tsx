@@ -19,9 +19,12 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(() => Promise.resol
 import { setAiFeature, setToolEnabled, setRoborevEnabled } from "../services/configActions";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useSettingsStore } from "../stores/settingsStore";
-import { ToolsPane } from "./ToolsPane";
+import { ToolsPane, TOOLS_CATEGORY_KEYWORDS, TOOL_META } from "./ToolsPane";
 
-/** Seed the store to a known baseline: every AI flag + every tool ON (aiFeatureMode = "all"). */
+/** Seed the store to a known baseline: every AI flag + every tool ON (aiFeatureMode = "all") —
+ *  EXCEPT 1Password, which is pinned to its shipped default (off, no vault) rather than left to
+ *  whatever a previous test wrote. Without those two lines the tests that read the default depend
+ *  on file ordering, and `--shuffle` silently inverts their assertions. */
 function seedAllOn() {
   useSettingsStore.setState({
     aiAutoRename: true,
@@ -34,6 +37,8 @@ function seedAllOn() {
     githubEnabled: true,
     guardrailsEnabled: true,
     roborevEnabled: true,
+    onepasswordEnabled: false,
+    onepasswordVaultId: null,
   });
 }
 
@@ -82,12 +87,14 @@ describe("ToolsPane", () => {
     expect(screen.getByText("Your tools")).toBeTruthy();
     expect(screen.getByText("Built into Sparkle")).toBeTruthy();
 
-    // Exactly the six toggleable tools carry a switch (Roborev is now a real toggle, not showcase).
-    expect(screen.getAllByRole("switch")).toHaveLength(6);
+    // Exactly the seven toggleable tools carry a switch (Roborev is now a real toggle, not
+    // showcase; 1Password env backup is the newest and the only one that ships off).
+    expect(screen.getAllByRole("switch")).toHaveLength(7);
     for (const name of [
       "Deepgram voice",
       "Guardrails",
       "Roborev",
+      "1Password env backup",
       "Beads",
       "GitHub import",
       "Usage analytics",
@@ -207,5 +214,203 @@ describe("ToolsPane", () => {
     expect(screen.getByRole("switch", { name: "GitHub import" })).toBeTruthy();
     expect(screen.queryByRole("switch", { name: "Beads" })).toBeNull();
     expect(screen.queryByText("Built into Sparkle")).toBeNull();
+  });
+});
+
+describe("ToolsPane — 1Password env backup row", () => {
+  it("is the one tool that reads OFF from the shared all-on baseline", () => {
+    // seedAllOn() (the beforeEach) turns every OTHER tool on but leaves this one at its default.
+    // That default is deliberate: without the `op` CLI and a chosen vault the tool cannot do
+    // anything, so an on switch would claim a capability the install doesn't have.
+    render(<ToolsPane />);
+    const sw = screen.getByRole("switch", { name: "1Password env backup" });
+    expect(sw.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("routes its toggle through setToolEnabled with the onepassword key", () => {
+    render(<ToolsPane />);
+    fireEvent.click(screen.getByRole("switch", { name: "1Password env backup" }));
+    expect(setToolEnabled).toHaveBeenCalledWith("onepassword", true);
+  });
+
+  it("warns that nothing is being backed up while no vault is chosen", () => {
+    // The dangerous state: the switch is ON, so it LOOKS like backups are happening, but without a
+    // vault nothing is. The row has to say so.
+    useSettingsStore.setState({ onepasswordEnabled: true, onepasswordVaultId: null });
+    render(<ToolsPane />);
+    expect(screen.getByText("Open Settings → 1Password to choose a vault and start backing up your .env files.")).toBeTruthy();
+  });
+
+  it("drops the warning once a vault is chosen", () => {
+    useSettingsStore.setState({ onepasswordEnabled: true, onepasswordVaultId: "vault-abc" });
+    render(<ToolsPane />);
+    expect(screen.queryByText("Open Settings → 1Password to choose a vault and start backing up your .env files.")).toBeNull();
+  });
+
+  it.each(["dotenv", "secrets", "vault", "onepassword", "1password", "env"])(
+    "is findable by searching %j",
+    (q) => {
+      render(<ToolsPane query={q} />);
+      expect(screen.getByRole("switch", { name: "1Password env backup" })).toBeTruthy();
+    },
+  );
+
+  it("stays quiet about the vault while the tool is off", () => {
+    // Off is a coherent state, not a misconfiguration — don't nag about a vault nobody needs yet.
+    useSettingsStore.setState({ onepasswordEnabled: false, onepasswordVaultId: null });
+    render(<ToolsPane />);
+    expect(screen.queryByText("Open Settings → 1Password to choose a vault and start backing up your .env files.")).toBeNull();
+  });
+
+});
+
+// Every term the ⋯ rail advertises for the Tools category has to be answerable by a row in this
+// pane. A keyword no row matches surfaces the category and then renders "No tools match" — a dead
+// end worse than not matching at all, and the class of bug this pins is wider than any one row.
+describe("ToolsPane — the rail's keywords all land on a row", () => {
+  it.each([...new Set(TOOLS_CATEGORY_KEYWORDS.split(/\s+/).filter(Boolean))])(
+    "matches at least one row for %j",
+    (token) => {
+      render(<ToolsPane query={token} />);
+      // Assert a row SURVIVED, not merely that a particular empty-state string is absent — the
+      // absence form would pass vacuously forever if that copy were ever reworded.
+      expect(countVisibleRows()).toBeGreaterThan(0);
+    },
+  );
+});
+
+/** How many rows the pane is currently showing, toggle AND showcase.
+ *
+ *  Counted from the DOM (`data-testid="tool-row"`), NOT by looking up TOOL_META names. Deriving the
+ *  count from the table cannot see a row that isn't in the table — which is precisely the drift the
+ *  converse test below exists to catch, and showcase rows have no `switch` to fall back on. It also
+ *  replaces the hardcoded `["Claude Code", "Superpowers"]` this file used to repeat in three
+ *  places, where a renamed showcase row went silently uncounted instead of failing something. */
+function countVisibleRows(): number {
+  return screen.queryAllByTestId("tool-row").length;
+}
+
+// The CONVERSE direction, and the one that was previously true only by coincidence. Rows match on
+// name + desc + keywords, but the rail's advertised string is derived from a table — so a row whose
+// NAME carries a term the rail doesn't advertise is unreachable: the query matches no category, the
+// rail renders "No settings match", and this pane is never reached to do the matching. That is a
+// worse dead end than the one above, because the user never even sees the category.
+describe("ToolsPane — every word a row is searchable by is advertised by the rail", () => {
+  // The CONVERSE direction, and the one that was wrong in production. Rows match on
+  // name + desc + keywords; the rail matched keywords only (then keywords + names). Anything living
+  // just in a `desc` was a live dead end — it matched the row but no CATEGORY, so the rail rendered
+  // "No settings match" and this pane was never reached.
+  //
+  // The derivation tests below deliberately do NOT scrape rendered text: the pane's own row chrome
+  // (hints, badges, the Learn-more link) is not part of the searchable surface, and a textContent
+  // scrape both picks that up and welds adjacent elements together ("voice"+"AI" → "voiceai"). The
+  // two DOM tests that follow them read text on purpose, via queryAllByText — which matches direct
+  // text nodes, so nothing is welded — because set equality between the table and the rendered rows
+  // is not a fact any derivation from the table can establish.
+
+  /** Words worth searching for: drop punctuation and single characters. */
+  const searchableTokens = (text: string) =>
+    text
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((t) => t.length >= 2);
+
+  it("advertises every word of every row's name and description", () => {
+    // Guards the specific regression: someone dropping `t.desc` from the derivation restores the
+    // dead ends. Reads TOOL_META through the exported string, which is what the rail consumes.
+    const advertised = new Set(searchableTokens(TOOLS_CATEGORY_KEYWORDS));
+    const missing: string[] = [];
+    for (const meta of Object.values(TOOL_META)) {
+      for (const token of new Set(searchableTokens(`${meta.name} ${meta.desc}`))) {
+        if (!advertised.has(token)) missing.push(`${meta.name} → "${token}"`);
+      }
+    }
+    expect(missing).toEqual([]);
+  });
+
+  // The assertion above compares TOOL_META against the string DERIVED from it, so on its own it
+  // only catches someone dropping `desc`/`name` out of the derivation. It says nothing about what
+  // the rows actually RENDER — and an inlined `desc:` on a row literal is the same live dead end
+  // (the row matches a word, no category does, the rail says "No settings match"). The rows spread
+  // `...TOOL_META.x` so that divergence is unrepresentable; this pins it from the DOM side, which
+  // is the half the derivation test can't see.
+  it("renders every row's name and desc from TOOL_META — nothing inlined past the rail", () => {
+    render(<ToolsPane />);
+    for (const meta of Object.values(TOOL_META)) {
+      // queryAllByText, not queryByText: the latter THROWS on multiple matches, which would report
+      // a duplicated string as an unrelated crash instead of this assertion's message. Exactly one
+      // is also the stronger fact — two rows rendering the same name is its own bug.
+      expect(screen.queryAllByText(meta.name), `expected exactly one row named "${meta.name}"`).toHaveLength(1);
+      expect(
+        screen.queryAllByText(meta.desc),
+        `the row "${meta.name}" does not render TOOL_META's desc — an inlined desc is a word the rail never advertises`,
+      ).toHaveLength(1);
+    }
+  });
+
+  it("renders NO row that isn't in TOOL_META — the direction that catches a brand-new row", () => {
+    // The test above only proves TOOL_META ⊆ rendered. The realistic drift isn't editing an existing
+    // row (that now fails) — it's ADDING one with inline strings: `{ key: "chief", name: "Chief",
+    // desc: "Brainstorming co-pilot", … }` compiles, renders, matches "brainstorming", is advertised
+    // by no category, and reproduces the "No settings match" dead end with every other test green.
+    // `name: string` accepts any literal, so the type can't refuse it; counting can.
+    render(<ToolsPane />);
+    const tableNames = new Set<string>(Object.values(TOOL_META).map((m) => m.name));
+
+    // Scrape each RENDERED row's name and demand it be in the table. This covers showcase rows too
+    // — they have no switch, so an aria-label sweep misses them entirely, and a count derived from
+    // TOOL_META could never notice an extra one.
+    for (const row of screen.getAllByTestId("tool-row")) {
+      const name = row.querySelector("span")?.textContent ?? "";
+      expect(
+        tableNames.has(name),
+        `the row "${name}" is not in TOOL_META, so the rail never advertises it`,
+      ).toBe(true);
+    }
+    // …and the counts agree in both directions: every table entry renders (asserted above) and the
+    // pane shows nothing beyond them.
+    expect(countVisibleRows(), "the pane renders a row that is not in TOOL_META").toBe(
+      Object.keys(TOOL_META).length,
+    );
+  });
+
+  it("surfaces a row for the desc-only words that used to dead-end", () => {
+    // Named explicitly so the fix can't silently rot back. Each of these appears ONLY in a row's
+    // description — none is in any keyword string — so each one exercises the desc half.
+    for (const token of [
+      "repositories",
+      "masked",
+      "anonymous",
+      "typechecks",
+      "worktrees",
+      "on-device",
+    ]) {
+      expect(
+        TOOLS_CATEGORY_KEYWORDS.toLowerCase().includes(token),
+        `the rail must advertise "${token}" or searching it dead-ends before the pane`,
+      ).toBe(true);
+      render(<ToolsPane query={token} />);
+      const rows = countVisibleRows();
+      cleanup();
+      expect(rows, `searching "${token}" found no row`).toBeGreaterThan(0);
+    }
+  });
+
+  it("surfaces a row when searching any single word of any row name", () => {
+    // aria-label is the row's real rendered name, so this catches a row whose name diverges from
+    // the TOOL_META entry it is supposed to render.
+    render(<ToolsPane />);
+    const labels = screen.getAllByRole("switch").map((el) => el.getAttribute("aria-label") ?? "");
+    cleanup();
+    expect(labels.length).toBeGreaterThan(0);
+
+    for (const label of [...labels, "Claude Code", "Superpowers"]) {
+      for (const token of label.split(/\s+/).filter(Boolean)) {
+        render(<ToolsPane query={token} />);
+        const rows = countVisibleRows();
+        cleanup();
+        expect(rows, `searching "${token}" (from row "${label}") found no row`).toBeGreaterThan(0);
+      }
+    }
   });
 });

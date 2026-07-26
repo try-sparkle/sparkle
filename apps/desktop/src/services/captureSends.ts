@@ -20,68 +20,35 @@ import { sendCaptureToPlan, copyCaptureAsset } from "./capturePlan";
 import { synthesizePrd, writePrd } from "./prd";
 import { generateTasks, createBeadFull, beadDepAdd } from "./tasks";
 import { structuredJson } from "./anthropic";
+import {
+  routeToOwningWindow,
+  shouldHandleInThisWindow,
+  type WindowRouteDeps,
+  type WindowDispatchDeps,
+} from "./windowOwnership";
 import { startChat, pollForResponse } from "./chief";
 import { log } from "../logger";
 
-export interface CaptureRouteDeps {
-  /** This window's opaque label ("main" for the initial window). */
-  myLabel: string;
-  isMain: boolean;
-  /** Registry lookup: which window (label) currently shows this project, or null. */
-  findWindowForProject: (projectId: string) => string | null;
-}
+// The single-owner election itself now lives in windowOwnership.ts — it is not capture-specific
+// (orchestration:request needs the identical at-most-one/at-least-one guarantee). These stay as the
+// capture-shaped names/signatures so call sites and tests read in terms of a payload.
+export type CaptureRouteDeps = WindowRouteDeps;
+export type CaptureDispatchDeps = WindowDispatchDeps;
 
-/** Should THIS window handle the payload? Pure — at most one window across the app answers
- *  true for a given payload: the registered owner, or main when no window owns the project.
- *  Caveat: a registry entry can be stale after a hard crash (unload cleanup skipped), leaving
- *  a dead label as owner and zero live handlers — shouldHandleCaptureSend closes that hole. */
+/** Should THIS window handle the payload? See routeToOwningWindow. */
 export function routeCaptureSend(payload: CaptureSendPayload, deps: CaptureRouteDeps): boolean {
-  const owner = deps.findWindowForProject(payload.projectId);
-  if (owner === null) return deps.isMain;
-  return owner === deps.myLabel;
+  return routeToOwningWindow(payload.projectId, deps);
 }
 
-export interface CaptureDispatchDeps extends CaptureRouteDeps {
-  /** Does a window with this label actually exist right now? (WebviewWindow.getByLabel-backed.) */
-  isWindowAlive: (label: string) => Promise<boolean>;
-  /** Drop a stale registry entry (crash skipped the owner's cleanup). */
-  evictWindow: (label: string) => void;
-}
-
-/** The dispatch-layer decision: routeCaptureSend, plus main's stale-owner self-heal. When the
- *  registry names an owner but that window no longer exists (hard crash — the registry's own
- *  docs acknowledge stale entries outlive windows), main evicts the dead label and adopts the
- *  payload as orphaned, so a capture is never silently dropped by every window. Mirrors
- *  openProjectInWindow's stale-entry eviction. Non-main windows never fall back, preserving
- *  the at-most-one-handler guarantee.
- *
- *  Re-resolves after each eviction (roborev 25170/25171): a crash + "Replace" can leave two
- *  labels mapped to one project (`{win-dead, win-alive}`); if the dead label resolves first,
- *  main evicts it and looks again rather than adopting — the LIVE replacement window is the real
- *  owner and handles it, so main only adopts when NO live owner remains. A liveness probe that
- *  rejects (IPC hiccup / window mid-teardown) is treated as ALIVE: the resolved owner already
- *  answered true via routeCaptureSend in its own window, so assuming-dead here would risk a
- *  double dispatch — staying out is the at-most-one-handler-preserving default. */
+/** routeCaptureSend plus main's stale-owner self-heal. See shouldHandleInThisWindow.
+ *  Stays `async` rather than returning the inner promise directly: callers absorb failures with
+ *  `.catch(...)`, and a SYNCHRONOUS throw out of the registry read would bypass that if this
+ *  forwarded the call bare. Every failure mode stays a rejection. */
 export async function shouldHandleCaptureSend(
   payload: CaptureSendPayload,
   deps: CaptureDispatchDeps,
 ): Promise<boolean> {
-  if (routeCaptureSend(payload, deps)) return true;
-  if (!deps.isMain) return false;
-  let owner = deps.findWindowForProject(payload.projectId);
-  while (owner !== null) {
-    if (owner === deps.myLabel) return true; // a re-resolution surfaced us as the owner
-    let alive: boolean;
-    try {
-      alive = await deps.isWindowAlive(owner);
-    } catch {
-      alive = true; // inconclusive probe → assume alive, main stays out
-    }
-    if (alive) return false; // a live owner exists — it handles the payload, not main
-    deps.evictWindow(owner);
-    owner = deps.findWindowForProject(payload.projectId);
-  }
-  return true; // no owner remains — main adopts the orphan
+  return shouldHandleInThisWindow(payload.projectId, deps);
 }
 
 // ── Dispatch (thin IO over the pure routing above) ──────────────────────────────────────────
@@ -124,6 +91,7 @@ export function dispatchBuild(payload: CaptureSendPayload): void {
       : undefined;
   const existing = payload.forceNewAgent ? undefined : picked ?? project.agents.find((a) => a.kind === "build");
   const agentId = existing ? existing.id : store.addAgent(payload.projectId, { kind: "build" });
+  if (!agentId) return; // project vanished between the lookup and the create — drop the send
   useUiStore.getState().setActiveSpecial(null);
   store.selectAgent(payload.projectId, agentId);
   useRuntimeStore.getState().open(agentId);

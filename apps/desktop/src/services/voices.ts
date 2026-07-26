@@ -1,3 +1,4 @@
+import type { Metering } from "./anthropic";
 // Expert voices (Phase 3 of the Think revamp): generate a small slate of project-grounded personas
 // and register them as Chief skills, so the Think sidebar can surface them and the user can
 // @mention them. Pure composition (DI) so the generation logic is unit-testable; the UI passes the
@@ -18,7 +19,7 @@ export interface VoiceDef {
 }
 
 export interface GenerateVoicesDeps {
-  structuredJson: <T>(system: string, user: string, maxTokens?: number, purpose?: string) => Promise<T>;
+  structuredJson: <T>(system: string, user: string, maxTokens?: number, metering?: Metering) => Promise<T>;
   /** Register (idempotently) a persona skill in Chief; resolves to the skill name. */
   ensureVoice: (name: string, instructions: string) => Promise<string>;
 }
@@ -30,6 +31,13 @@ export interface GenerateVoicesArgs {
   conversation: string;
   /** Max voices to keep (default 5). */
   max?: number;
+  /** Metering-only: the project this Think session belongs to, so the debit is attributable in the
+   *  Credits history. Omitted → the row carries no project rather than a guess.
+   *
+   *  CURRENTLY UNWIRED: `generateVoices` has no production call site yet (only voices.test.ts), so
+   *  in practice this debit records no project. The field is here so whoever wires the Think caller
+   *  threads attribution at the same time rather than discovering the gap later (roborev 48157). */
+  projectName?: string;
 }
 
 export const VOICES_SYSTEM = [
@@ -56,7 +64,7 @@ export async function generateVoices(
     VOICES_SYSTEM,
     `Project library summary:\n${args.corpusSummary}\n\nConversation so far:\n${args.conversation}`,
     undefined,
-    "Generating expert voices",
+    { purpose: "Generating expert voices", project: args.projectName },
   );
   const voices = (plan?.voices ?? [])
     // Drop malformed entries — a voice with no name or no instructions can't be @mentioned or run.

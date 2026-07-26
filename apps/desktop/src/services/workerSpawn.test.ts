@@ -40,7 +40,7 @@ describe("spawnWorker", () => {
   it("creates a worker tab under the parent, cuts a worktree from the parent branch, and persists it", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    const buildId = store.addAgent(projectId, { kind: "build" });
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
     // Give the parent a known branch (as the worktree step would have).
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
 
@@ -96,7 +96,7 @@ describe("spawnWorker", () => {
 
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    const buildId = store.addAgent(projectId, { kind: "build" });
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
 
     // Key the mock on the command name (not call order): maybeAutoName fires unawaited (void), so
@@ -112,7 +112,10 @@ describe("spawnWorker", () => {
 
     // The naming backend was called with the worker's task as the basis.
     await vi.waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("generate_agent_name", { prompt: "Build the login flow" }),
+      expect(invokeMock).toHaveBeenCalledWith("generate_agent_name", {
+        prompt: "Build the login flow",
+        project: "Demo", // metering-only attribution for the Credits history
+      }),
     );
     await vi.waitFor(() => {
       const worker = useProjectStore.getState().projects.find((p) => p.id === projectId)!
@@ -128,7 +131,7 @@ describe("spawnWorker", () => {
 
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    const buildId = store.addAgent(projectId, { kind: "build" });
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
 
     invokeMock.mockImplementation((cmd: string) => {
@@ -148,7 +151,7 @@ describe("spawnWorker", () => {
   it("throws if the parent has no branch yet", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    const buildId = store.addAgent(projectId, { kind: "build" });
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
     await expect(spawnWorker({ projectId, parentAgentId: buildId, task: "x" }))
       .rejects.toThrow(/branch/);
   });
@@ -156,7 +159,7 @@ describe("spawnWorker", () => {
   it("rolls back the worker tab if worktree creation fails (no orphan)", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    const buildId = store.addAgent(projectId, { kind: "build" });
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
     const before = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents.length;
 
@@ -174,7 +177,7 @@ describe("spawnWorker", () => {
   it("rolls back the just-cut worktree AND the tab if the manifest write fails (fail-closed, a670)", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    const buildId = store.addAgent(projectId, { kind: "build" });
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
     const before = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents.length;
 
@@ -202,7 +205,7 @@ describe("spawnWorker", () => {
   it("does NOT try to remove a worktree when the cut itself failed (nothing to roll back)", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    const buildId = store.addAgent(projectId, { kind: "build" });
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
 
     invokeMock.mockImplementation((cmd: string) => {
@@ -232,9 +235,9 @@ describe("spinDownWorker", () => {
   it("kills pty, removes worktree, closes runtime entry, removes tab, keeps branch", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    const buildId = store.addAgent(projectId, { kind: "build" });
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
-    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId });
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId })!;
     store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
 
     // Spy on the runtime store's close to assert the 4th teardown step fires.
@@ -262,9 +265,9 @@ describe("spinDownWorker", () => {
   it("is a no-op when passed a build agent id (worker-only contract)", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    const buildId = store.addAgent(projectId, { kind: "build" });
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
-    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId });
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId })!;
 
     // Passing the build id must NOT tear anything down: removeAgent cascades to the build's
     // workers, which would orphan their PTYs/worktrees (this fn only tears down the passed id).
@@ -280,9 +283,9 @@ describe("spinDownWorker", () => {
   it("drops the row BEFORE the slow worktree removal resolves (optimistic teardown)", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    const buildId = store.addAgent(projectId, { kind: "build" });
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
-    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId });
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId })!;
     store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
 
     // Hold the worktree removal open — this is the slow git op the row must NOT wait on.
@@ -311,9 +314,9 @@ describe("spinDownWorker", () => {
   it("still removes the tab when killPty / removeAgentWorkspace reject", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    const buildId = store.addAgent(projectId, { kind: "build" });
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
-    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId });
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId })!;
     store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
 
     killPtyMock.mockRejectedValue(new Error("pty gone"));

@@ -10,7 +10,7 @@
 // returns Err, and the caller treats any failure as "not a followup" (gray), so the feature is a
 // no-op until the user is signed in with credit rather than a hard error or a false red.
 
-use crate::ai::{call_anthropic_proxy, extract_text, CLASSIFY_READ_TIMEOUT};
+use crate::ai::{call_anthropic_proxy, extract_text, Metering, CLASSIFY_READ_TIMEOUT};
 
 /// Cheapest current Claude model — a one-word classification needs nothing more. (claude-api skill:
 /// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.) It is also the
@@ -78,7 +78,13 @@ fn build_user_message(task: &str, response: &str) -> String {
 /// "DONE"); the frontend interprets it leniently (turnFollowup.ts). Returns Err on any failure (no
 /// key, empty response, network, HTTP error, empty result) so the caller degrades to gray.
 #[tauri::command]
-pub async fn judge_turn_followup(task: String, response: String) -> Result<String, String> {
+pub async fn judge_turn_followup(
+    task: String,
+    response: String,
+    // Display name of the project whose agent produced this turn, so the debit is attributable in
+    // the Credits history. Metering-only; a caller that doesn't know passes nothing (→ None).
+    project: Option<String>,
+) -> Result<String, String> {
     let response = response.trim().to_string();
     // Nothing to judge — an empty turn isn't an ask. (The frontend already pre-filters, but a
     // direct/empty call must not bill a request.)
@@ -93,13 +99,19 @@ pub async fn judge_turn_followup(task: String, response: String) -> Result<Strin
     // token → signed out; degrade (gray verdict) rather than call the proxy.
     tauri::async_runtime::spawn_blocking(move || {
         let token = crate::auth::bearer_token().ok_or_else(|| "not signed in".to_string())?;
-        call_judge(&base, &token, &task, &response)
+        call_judge(&base, &token, &task, &response, project.as_deref())
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-fn call_judge(base: &str, token: &str, task: &str, response: &str) -> Result<String, String> {
+fn call_judge(
+    base: &str,
+    token: &str,
+    task: &str,
+    response: &str,
+    project: Option<&str>,
+) -> Result<String, String> {
     let user = build_user_message(task, response);
     let json = call_anthropic_proxy(
         base,
@@ -109,7 +121,8 @@ fn call_judge(base: &str, token: &str, task: &str, response: &str) -> Result<Str
         &user,
         JUDGE_MAX_TOKENS,
         CLASSIFY_READ_TIMEOUT,
-        Some("Checking whether an agent needs you"), // metering description shown in the credit history
+        // Metering description + project attribution shown in the credit history.
+        Metering::new("Checking whether an agent needs you", project),
     )?;
     extract_text(&json).ok_or_else(|| "judge returned no text".to_string())
 }

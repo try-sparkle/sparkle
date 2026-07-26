@@ -1,6 +1,6 @@
 // The fixed top/bottom chrome of the menu-bar popover, around the scrollable agent dashboard:
-//   - TrayHeader: the Sparkle logo + the $ balance pill, then a Recent / Open action row
-//     that opens project windows (the same actions as the in-app TopBar, driven from the tray).
+//   - TrayHeader: the Sparkle logo + the $ balance pill, then a Recent / Open action row that
+//     selects the app's project TAB (single-window shell, CM-U7) and raises the app window.
 //   - TrayFooter: a pinned "Quit Sparkle" button — the in-app way to fully exit (closing the
 //     main window only hides it behind the tray).
 //
@@ -10,33 +10,28 @@ import { useState } from "react";
 import { C } from "@sparkle/ui";
 import { BalanceBadge } from "../components/BalanceBadge";
 import { useProjectStore } from "../stores/projectStore";
-import { openProjectInWindow, defaultDeps } from "../services/projectWindows";
+import { requestProjectTabFromOtherWindow } from "../services/openProjectTab";
 import { pickProjectFolder, basename } from "../services/dialog";
 import { resolveOpenTarget } from "../services/openTarget";
 import { quitApp } from "../services/attention";
 
-// Tray opens are always "new window or focus existing" — the tray has no project of its own to
-// replace, so replaceCurrent is a no-op (the "new" path never calls it). Label "tray" is this
-// popover window; createWindow mints its own opaque label for the project window.
-function trayDeps() {
-  return defaultDeps(() => {}, useProjectStore.getState().touchProjectOpened, "tray");
-}
-
-async function openExisting(projectId: string, afterOpen: () => void) {
-  // finally: always close the popover after an open attempt (matches the click → "something
-  // happens" expectation); swallow + log a failed open rather than leaving an unhandled rejection
-  // and a stuck-open popover.
+// The tray is its own webview: it shares the persisted stores with the app window but cannot raise
+// it, so "open this project" claims the selection here and asks the app window to come forward
+// (see services/openProjectTab.requestProjectTabFromOtherWindow).
+function openExisting(projectId: string, afterOpen: () => void) {
   try {
-    await openProjectInWindow(projectId, "new", trayDeps());
+    requestProjectTabFromOtherWindow(projectId);
   } catch (e) {
     console.debug("tray: open recent project failed", e);
   } finally {
+    // Always close the popover after an open attempt (matches the click → "something happens"
+    // expectation), even if the request threw.
     afterOpen();
   }
 }
 
 // Open pops the folder picker; resolveOpenTarget decides whether the chosen folder is an
-// already-known project (reuse) or a new one (create on commit) — same logic as TopBar.startOpen.
+// already-known project (reuse) or a new one (created on commit).
 async function pickAndOpen(title: string, afterOpen: () => void) {
   const picked = await pickProjectFolder(title);
   if (!picked) return; // user cancelled the picker — take no action, leave the popover as-is
@@ -44,7 +39,7 @@ async function pickAndOpen(title: string, afterOpen: () => void) {
     const { projects, addProject } = useProjectStore.getState();
     const target = resolveOpenTarget(picked, projects, basename);
     const id = target.kind === "existing" ? target.id : addProject(target.name, target.path);
-    await openProjectInWindow(id, "new", trayDeps());
+    requestProjectTabFromOtherWindow(id);
   } catch (e) {
     console.debug("tray: open/new project failed", e);
   } finally {
@@ -170,7 +165,7 @@ export function TrayHeader({
                 key={p.id}
                 title={p.rootPath}
                 style={{ all: "unset", cursor: "pointer", color: C.cream, fontSize: 13, padding: "6px 8px", borderRadius: 6, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                onClick={() => void openExisting(p.id, close)}
+                onClick={() => openExisting(p.id, close)}
               >
                 {p.name}
               </button>

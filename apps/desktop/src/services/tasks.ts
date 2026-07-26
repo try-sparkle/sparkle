@@ -9,6 +9,8 @@
 // those are enrichments, not the work graph, so a failure there must not undo the tasks.
 
 import { invoke } from "@tauri-apps/api/core";
+import type { Metering } from "./anthropic";
+import { projectNameForPath } from "./creditProject";
 
 export interface PlannedTask {
   title: string;
@@ -129,7 +131,7 @@ export function updateFrontmatter(
 }
 
 export interface GenerateDeps {
-  structuredJson: <T>(system: string, user: string, maxTokens?: number, purpose?: string) => Promise<T>;
+  structuredJson: <T>(system: string, user: string, maxTokens?: number, metering?: Metering) => Promise<T>;
   createBeadFull: (
     projectPath: string,
     title: string,
@@ -277,7 +279,11 @@ export async function generateTasks(
   args: GenerateArgs,
 ): Promise<GenerateResult> {
   const plan = toEpicPlan(
-    await deps.structuredJson<EpicPlan>(EPIC_PLAN_SYSTEM, args.prdContent, undefined, "Planning tasks from your prompt"),
+    await deps.structuredJson<EpicPlan>(EPIC_PLAN_SYSTEM, args.prdContent, undefined, {
+      purpose: "Planning tasks from your prompt",
+      // Resolved from the path the caller already passes, so no call site has to thread a name.
+      project: projectNameForPath(args.projectPath),
+    }),
   );
   validateEpicPlan(plan);
 
@@ -404,7 +410,10 @@ export async function decomposeEpic(
     TASK_PLAN_SYSTEM,
     planInput,
     undefined,
-    `Breaking down the "${epic.title}" epic into tasks`,
+    {
+      purpose: `Breaking down the "${epic.title}" epic into tasks`,
+      project: projectNameForPath(projectPath),
+    },
   );
   if (!plan || typeof plan !== "object") {
     throw new Error("Task plan was empty or malformed (need an epic and at least one task).");

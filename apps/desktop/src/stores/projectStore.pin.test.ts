@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { useProjectStore } from "./projectStore";
+import { useUiStore } from "./uiStore";
 import type { AgentTab, Project } from "../types";
 
 function mkAgent(): AgentTab {
@@ -105,5 +106,27 @@ describe("projectStore selfNameAgent", () => {
     useProjectStore.getState().selfNameAgent("p1", "a1", "   ");
     expect(agent().name).toBe("A1");
     expect(agent().selfNamed).toBeFalsy();
+  });
+});
+
+// The CONCIERGE pin (uiStore.pinnedProjectId) is a different pin from the agent ones above, but it
+// is projectStore.removeProject that has to keep it honest: the pin scopes the concierge's vitals,
+// and no tab renders for a project that's gone (roborev 46248-M4 / 46291-L).
+describe("removeProject and the concierge project pin", () => {
+  beforeEach(() => {
+    seed();
+    useUiStore.getState().setPinnedProject(null);
+  });
+
+  it("clears a pin naming the removed project", () => {
+    useUiStore.getState().setPinnedProject("p1");
+    useProjectStore.getState().removeProject("p1");
+    expect(useUiStore.getState().pinnedProjectId).toBeNull();
+  });
+
+  it("leaves an unrelated pin alone", () => {
+    useUiStore.getState().setPinnedProject("p2");
+    useProjectStore.getState().removeProject("p1");
+    expect(useUiStore.getState().pinnedProjectId).toBe("p2");
   });
 });

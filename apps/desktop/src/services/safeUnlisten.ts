@@ -36,7 +36,13 @@ export async function safeUnlisten(
   if (target == null) return;
   try {
     const fn = typeof target === "function" ? target : await target;
-    fn?.();
+    // AWAIT is load-bearing. `UnlistenFn` is typed `() => void`, but Tauri's real unlisten is an
+    // ASYNC function (`async () => _unlisten(event, eventId)`), and the torn-down-map lookup that
+    // throws happens inside it. An un-awaited call therefore hands back a REJECTED PROMISE rather
+    // than throwing synchronously, so the catch below never sees it and the race resurfaces as the
+    // app-level unhandled rejection this helper exists to prevent. Awaiting a genuinely-void return
+    // is a no-op, so this is safe for a synchronous unlisten too.
+    await fn?.();
   } catch (e) {
     if (isTeardownRace(e)) {
       console.debug("safeUnlisten: swallowed Tauri listener teardown race", e);

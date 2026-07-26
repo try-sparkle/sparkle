@@ -865,6 +865,47 @@ fn post_crash(url: &str, body: &str, bearer: Option<&str>) -> bool {
     }
 }
 
+/// Set while a flush is running, so only ONE flush per process is ever in flight. See
+/// `try_begin_flush` for why this exists.
+static FLUSH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// RAII release for `FLUSH_IN_FLIGHT` — clears the flag however the flush ends, including an unwind.
+struct FlushGuard;
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        FLUSH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Claim the process-wide right to flush, or decline. `Some(guard)` means this caller owns the flush
+/// until the guard drops; `None` means another flush is already running and this one must not start.
+///
+/// `flush_crash_reports` is invoked once per WINDOW (main.tsx runs in every webview), so a
+/// multi-window session fired N concurrent flushes over the SAME crashes dir. They all listed the same
+/// files, all POSTed them — one crash uploaded once per open window, each carrying the ~200KB
+/// recent-logs tail on "always" — and then raced on the delete, so the N-1 losers logged
+/// "uploaded ... but could not delete file: No such file or directory". The upload is idempotent
+/// server-side (it dedupes on crash_id), so the duplicates were waste and warn-noise rather than data
+/// loss, but the fix is to not send them.
+///
+/// Skipping (rather than queueing behind the winner) is deliberate: the in-flight flush is scanning
+/// the same directory, so it already covers everything this caller would have uploaded. Serializing
+/// instead would leave a blocked thread per window for up to ~600s against an unreachable host and
+/// then re-scan a dir the winner just emptied. Nothing is lost either way — anything still on disk is
+/// retried on the next launch.
+fn try_begin_flush() -> Option<FlushGuard> {
+    FLUSH_IN_FLIGHT
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .ok()
+        .map(|_| FlushGuard)
+}
+
 /// Tauri command: flush pending crash reports. Called fire-and-forget at launch with the CURRENT
 /// consent value; the consent gate is ENFORCED in Rust (`run_flush` → `flush_pending`).
 ///
@@ -873,12 +914,21 @@ fn post_crash(url: &str, body: &str, bearer: Option<&str>) -> bool {
 /// command body executes on the main thread, so doing the blocking I/O inline would jank or freeze
 /// the UI at startup even though the frontend calls this "fire-and-forget". The command therefore
 /// spawns the thread and returns immediately; the result is logged, not returned.
+///
+/// Every window calls this at launch, so the thread first claims `try_begin_flush` and exits if
+/// another window's flush already owns it.
 #[tauri::command]
 pub fn flush_crash_reports<R: Runtime>(app: AppHandle<R>, consent: String) {
-    std::thread::spawn(move || match run_flush(&app, &consent) {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(target: "crash", uploaded = n, "flushed crash reports"),
-        Err(e) => tracing::warn!(target: "crash", "crash flush failed: {e}"),
+    std::thread::spawn(move || {
+        let Some(_guard) = try_begin_flush() else {
+            tracing::debug!(target: "crash", "crash flush already in flight; skipping this one");
+            return;
+        };
+        match run_flush(&app, &consent) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(target: "crash", uploaded = n, "flushed crash reports"),
+            Err(e) => tracing::warn!(target: "crash", "crash flush failed: {e}"),
+        }
     });
 }
 
@@ -938,6 +988,50 @@ mod tests {
         p.push(format!("sparkle-crash-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// The panic hook's `Backtrace::force_capture()` is only worth uploading if the shipped binary
+    /// still has a symbol table to resolve against. `strip = true` (an alias for `"symbols"`) drops
+    /// it, and every frame degrades to the nearest exported symbol — reports arrive as a column of
+    /// `__mh_execute_header`, which is not just useless but misleading about which subsystem failed.
+    /// Nothing else in the build fails when that happens, so pin it here: this test is the only
+    /// thing standing between a working crash pipeline and a silently dark one.
+    #[test]
+    fn release_profile_keeps_symbols_for_backtraces() {
+        let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("read src-tauri/Cargo.toml");
+        let profile = manifest
+            .split("[profile.release]")
+            .nth(1)
+            .expect("[profile.release] section missing from Cargo.toml");
+        // Stop at the next section header so we only read this profile's keys.
+        let profile = profile.split("\n[").next().unwrap_or(profile);
+        let raw = profile
+            .lines()
+            .map(str::trim)
+            .find_map(|l| {
+                // Match the key exactly — `strip` followed by `=`, so a hypothetical `stripe = ...`
+                // can't be mistaken for it.
+                let rest = l.strip_prefix("strip")?.trim_start();
+                Some(rest.strip_prefix('=')?.trim())
+            })
+            // Absent means Cargo's default, which keeps symbols.
+            .unwrap_or("false");
+        // Normalize before comparing. TOML accepts either quote style and allows a trailing
+        // comment, so `'symbols'` and `"symbols" # smaller binary` must not slip past a guard whose
+        // entire job is to catch exactly that.
+        let strip = raw
+            .split('#')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .trim_matches(['"', '\'']);
+        assert!(
+            !matches!(strip, "true" | "symbols"),
+            "release profile sets strip = {raw}, which discards the symbol table and blinds the \
+             crash reporter. Use strip = \"debuginfo\" — it still drops DWARF (the part that \
+             actually costs binary size) while keeping function names resolvable."
+        );
     }
 
     fn sample_record(crash_id: &str, message: &str, backtrace: Option<&str>) -> CrashRecord {
@@ -1437,6 +1531,24 @@ mod tests {
         // 3 remain on disk for a future flush.
         let remaining = list_pending_crashes(&dir).len();
         assert_eq!(remaining, 3);
+    }
+
+    #[test]
+    fn only_one_flush_runs_at_a_time() {
+        // Every window calls flush_crash_reports at launch; without this guard they all uploaded the
+        // same reports and then raced on the delete. The second claim must be REFUSED while the first
+        // guard is alive, and the right must be reclaimable once it drops (so a later launch still
+        // flushes).
+        let first = try_begin_flush().expect("first caller owns the flush");
+        assert!(
+            try_begin_flush().is_none(),
+            "a second window must not start a concurrent flush"
+        );
+        drop(first);
+        assert!(
+            try_begin_flush().is_some(),
+            "the flush right must be reclaimable after the guard drops"
+        );
     }
 
     #[test]

@@ -298,7 +298,7 @@ describe("runtimeStore — workflowState + sticky hasRemote", () => {
     const parentId = projects.useProjectStore.getState().projects[0]!.agents[0]!.id;
     const workerId = projects.useProjectStore
       .getState()
-      .addAgent(projectId, { kind: "worker", parentId });
+      .addAgent(projectId, { kind: "worker", parentId })!;
 
     // The parent's watermark says merged (a PREVIOUS cycle reached origin) but its LIVE state has
     // fallen back — it is NOT on origin right now. Promoting off the watermark here would latch
@@ -325,7 +325,7 @@ describe("runtimeStore — workflowState + sticky hasRemote", () => {
     const parentId = projects.useProjectStore.getState().projects[0]!.agents[0]!.id;
     const workerId = projects.useProjectStore
       .getState()
-      .addAgent(projectId, { kind: "worker", parentId });
+      .addAgent(projectId, { kind: "worker", parentId })!;
     store.getState().setWorkflowStage(parentId, "merged"); // watermark only — no live state
     store.getState().setBranchStatus(workerId, bsStatus(1));
     agentWorkflowState.mockResolvedValue(wsState({ inParent: true }));
@@ -339,7 +339,7 @@ describe("runtimeStore — workflowState + sticky hasRemote", () => {
     const parentId = projects.useProjectStore.getState().projects[0]!.agents[0]!.id;
     const workerId = projects.useProjectStore
       .getState()
-      .addAgent(projectId, { kind: "worker", parentId });
+      .addAgent(projectId, { kind: "worker", parentId })!;
     store.getState().setWorkflowStage(parentId, "merged");
     store.getState().setWorkflowState(parentId, wsState({ prState: "merged" }) as never);
     store.getState().setBranchStatus(workerId, bsStatus(1));
@@ -418,7 +418,7 @@ async function setup(kind: "build" | "shell") {
   const { runtime, settings, projects } = await freshModules();
   settings.useSettingsStore.getState().setChiefPat("pat_x");
   const projectId = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
-  const agentId = projects.useProjectStore.getState().addAgent(projectId, { kind });
+  const agentId = projects.useProjectStore.getState().addAgent(projectId, { kind })!;
   return { runtime, settings, projects, projectId, agentId };
 }
 
@@ -619,10 +619,10 @@ describe("runChiefSync — store glue ()", () => {
     const { runtime, settings, projects } = await freshModules();
     settings.useSettingsStore.getState().setChiefPat("pat_x");
     const projectId = projects.useProjectStore.getState().addProject("Sparkle-Desktop", "/root");
-    const shellAgentId = projects.useProjectStore.getState().addAgent(projectId, { kind: "shell" });
+    const shellAgentId = projects.useProjectStore.getState().addAgent(projectId, { kind: "shell" })!;
     // A second shell also has no worktree — fallback must skip it and pick the Build agent.
     projects.useProjectStore.getState().addAgent(projectId, { kind: "shell" });
-    const buildAgentId = projects.useProjectStore.getState().addAgent(projectId, { kind: "build" });
+    const buildAgentId = projects.useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
     syncProjectMarkdown.mockResolvedValue({
       chiefProjectId: "project_x",
       docState: {},

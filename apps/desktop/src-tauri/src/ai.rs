@@ -71,6 +71,10 @@ pub async fn anthropic_chat(
     // 'Fix OAuth loop'"). Forwarded in the proxy body so the server persists it into the credit
     // ledger (`meta.description`); it is NEVER sent to the vendor. Back-compat: a missing key → None.
     purpose: Option<String>,
+    // Optional, metering-only display name of the PROJECT this call belongs to, so the Credits
+    // history can answer "which project did this cost me?". Persisted to `meta.project`; likewise
+    // never sent to the vendor. Back-compat: a missing key → None.
+    project: Option<String>,
 ) -> Result<String, String> {
     let user = user.trim().to_string();
     if user.is_empty() {
@@ -94,7 +98,7 @@ pub async fn anthropic_chat(
             &user,
             max_tokens,
             CHAT_READ_TIMEOUT,
-            purpose.as_deref(),
+            Metering { purpose: purpose.as_deref(), project: project.as_deref() },
         )?;
         extract_text(&json).ok_or_else(|| "anthropic chat returned no text".to_string())
     })
@@ -107,17 +111,58 @@ pub async fn anthropic_chat(
 /// bloat the ledger `meta.description` from the desktop side.
 const MAX_PURPOSE_CHARS: usize = 200;
 
+/// Cap on the metering `project` name (wire contract: <= 120 chars — a name, not a sentence).
+/// Same defence-in-depth reasoning as MAX_PURPOSE_CHARS.
+const MAX_PROJECT_CHARS: usize = 120;
+
+/// The METERING-ONLY annotations attached to a proxied AI call. Neither field is ever forwarded to
+/// the vendor: the server records them in the credit ledger row's `meta` so the Credits history can
+/// say WHAT the spend was for (`purpose` → `meta.description`) and WHICH PROJECT it belonged to
+/// (`project` → `meta.project`).
+///
+/// A struct rather than two adjacent `Option<&str>` parameters: at a call site
+/// `Metering { purpose: Some("Naming an agent"), project: None }` cannot be silently transposed the
+/// way two positional options can, and `Metering::default()` reads better than `None, None`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Metering<'a> {
+    /// Short human description of WHY this call was made, e.g. "Renamed agent to 'Fix OAuth loop'".
+    pub purpose: Option<&'a str>,
+    /// Display name of the project the spend belongs to. None for genuinely account-level calls
+    /// (and for any caller that doesn't know) — the history renders that absence honestly.
+    pub project: Option<&'a str>,
+}
+
+impl<'a> Metering<'a> {
+    /// A purpose, attributed to a project when the caller knows one. Every real caller has a
+    /// purpose; only the project is genuinely optional, which is why this is the single constructor.
+    pub fn new(purpose: &'a str, project: Option<&'a str>) -> Self {
+        Self { purpose: Some(purpose), project }
+    }
+}
+
+/// Insert a trimmed, length-capped metering string under `key`, or omit the key entirely when the
+/// value is absent/blank. Shared by both metering fields so they can't drift in their handling.
+fn put_metering(body: &mut serde_json::Value, key: &str, value: Option<&str>, max_chars: usize) {
+    if let Some(v) = value {
+        let v = v.trim();
+        if !v.is_empty() {
+            let clipped: String = v.chars().take(max_chars).collect();
+            body[key] = serde_json::Value::String(clipped);
+        }
+    }
+}
+
 /// Build the JSON body POSTed to the orchestration `/ai/anthropic` route. Pure so the shape is
 /// pinned by unit tests without a network call. Matches the server's `anthropicBody` zod schema:
-/// `{ model, max_tokens, messages:[{role,content}], system?, purpose? }`. `system` is omitted when
-/// empty; `purpose` (an optional metering-only description persisted into the credit ledger, NEVER
-/// sent to the vendor) is omitted when None/blank and truncated to `MAX_PURPOSE_CHARS`.
+/// `{ model, max_tokens, messages:[{role,content}], system?, purpose?, project? }`. `system` is
+/// omitted when empty; both `Metering` fields (metering-only, persisted into the credit ledger,
+/// NEVER sent to the vendor) are omitted when None/blank and truncated to their wire caps.
 pub(crate) fn build_proxy_body(
     model: &str,
     system: &str,
     user: &str,
     max_tokens: u32,
-    purpose: Option<&str>,
+    metering: Metering<'_>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -127,20 +172,15 @@ pub(crate) fn build_proxy_body(
     if !system.trim().is_empty() {
         body["system"] = serde_json::Value::String(system.to_string());
     }
-    if let Some(p) = purpose {
-        let p = p.trim();
-        if !p.is_empty() {
-            let clipped: String = p.chars().take(MAX_PURPOSE_CHARS).collect();
-            body["purpose"] = serde_json::Value::String(clipped);
-        }
-    }
+    put_metering(&mut body, "purpose", metering.purpose, MAX_PURPOSE_CHARS);
+    put_metering(&mut body, "project", metering.project, MAX_PROJECT_CHARS);
     body
 }
 
 /// Map a proxy HTTP error status (+ its response body) to a typed error string the JS layer can
-/// branch on. `402` carries the current balance so the UI can show "you have $X"; `403`/`503` are
-/// stable sentinels; anything else is a generic message. Pure so it's unit-testable. Never echoes
-/// the raw server body (it can contain request fragments).
+/// branch on. `402` carries the current balance so the UI can show "you have $X"; `403`/`404`/`503`
+/// are stable sentinels; anything else is a generic message. Pure so it's unit-testable. Never
+/// echoes the raw server body (it can contain request fragments).
 pub(crate) fn classify_proxy_error(code: u16, body: &str) -> String {
     match code {
         402 => {
@@ -151,8 +191,31 @@ pub(crate) fn classify_proxy_error(code: u16, body: &str) -> String {
             format!("insufficient_credits:{bal}")
         }
         403 => "not_entitled".to_string(),
-        503 => "ai_unconfigured".to_string(),
+        // The route never 404s on its own: gates answer 400/402/403/503 and vendor failures are
+        // re-emitted as 502. So a 404 means `/ai/anthropic` isn't registered at all — the client is
+        // pointed at a server that doesn't serve it. That's the backend being unavailable, not a
+        // per-request failure, so it maps onto the same sentinel as 503: no amount of retrying the
+        // same call will make the route appear.
+        404 | 503 => "ai_unconfigured".to_string(),
         _ => format!("ai request failed (HTTP {code})"),
+    }
+}
+
+/// Map a ureq TRANSPORT failure (the request never reached the proxy at all — no HTTP status was
+/// ever received) to a typed error string. `Dns`/`ConnectionFailed`/`Io` all mean the same thing
+/// operationally: this machine currently has no working network path to the orchestration host.
+/// That is a LOCAL condition, not a fault in the request, so the JS layer treats it as a
+/// connectivity signal rather than spending a retry budget on paid calls that cannot succeed.
+///
+/// Everything else (`InvalidUrl`, `UnknownScheme`, proxy-config errors, …) stays generic: those are
+/// misconfiguration, not connectivity, and must not masquerade as "you're offline".
+/// Pure so it's unit-testable without a network.
+pub(crate) fn classify_transport_kind(kind: ureq::ErrorKind) -> String {
+    match kind {
+        ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Io => {
+            "ai_unreachable".to_string()
+        }
+        _ => "ai request failed".to_string(),
     }
 }
 
@@ -170,11 +233,11 @@ pub(crate) fn call_anthropic_proxy(
     user: &str,
     max_tokens: u32,
     read_timeout: Duration,
-    // Optional metering-only description; forwarded in the body (persisted to the ledger), never to
-    // the vendor. Classify callers (naming/judge/attention) pass None; the chat sink threads it.
-    purpose: Option<&str>,
+    // Metering-only annotations (purpose + project); forwarded in the body (persisted to the
+    // ledger), never to the vendor. `Metering::default()` when the caller has neither.
+    metering: Metering<'_>,
 ) -> Result<serde_json::Value, String> {
-    let body = build_proxy_body(model, system, user, max_tokens, purpose);
+    let body = build_proxy_body(model, system, user, max_tokens, metering);
     let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {e}"))?;
     let url = format!("{}/ai/anthropic", base_url.trim_end_matches('/'));
 
@@ -197,8 +260,8 @@ pub(crate) fn call_anthropic_proxy(
             return Err(classify_proxy_error(code, &detail));
         }
         Err(e) => {
-            tracing::debug!(error = %e, "ai proxy request failed");
-            return Err("ai request failed".into());
+            tracing::debug!(error = %e, kind = ?e.kind(), "ai proxy request failed");
+            return Err(classify_transport_kind(e.kind()));
         }
     };
     serde_json::from_str(&raw).map_err(|e| format!("bad JSON: {e}"))
@@ -270,17 +333,18 @@ mod tests {
 
     #[test]
     fn build_proxy_body_shapes_the_request_and_omits_empty_system() {
-        let b = build_proxy_body("claude-haiku-4-5", "you are terse", "hi", 256, None);
+        let b = build_proxy_body("claude-haiku-4-5", "you are terse", "hi", 256, Metering::default());
         assert_eq!(b["model"], "claude-haiku-4-5");
         assert_eq!(b["max_tokens"], 256);
         assert_eq!(b["system"], "you are terse");
         assert_eq!(b["messages"][0]["role"], "user");
         assert_eq!(b["messages"][0]["content"], "hi");
-        // No purpose passed → the key is omitted entirely.
+        // No metering passed → both keys are omitted entirely.
         assert!(b.get("purpose").is_none());
+        assert!(b.get("project").is_none());
 
         // An empty/whitespace system is omitted entirely (not sent as "").
-        let b2 = build_proxy_body("claude-haiku-4-5", "   ", "hi", 8, None);
+        let b2 = build_proxy_body("claude-haiku-4-5", "   ", "hi", 8, Metering::default());
         assert!(b2.get("system").is_none());
     }
 
@@ -292,21 +356,46 @@ mod tests {
             "sys",
             "hi",
             256,
-            Some("Renamed agent to 'Fix OAuth loop'"),
+            Metering::new("Renamed agent to 'Fix OAuth loop'", None),
         );
         assert_eq!(b["purpose"], "Renamed agent to 'Fix OAuth loop'");
 
         // A blank/whitespace purpose is omitted (same treatment as an empty system).
-        let blank = build_proxy_body("m", "sys", "hi", 8, Some("   "));
+        let blank = build_proxy_body("m", "sys", "hi", 8, Metering::new("   ", None));
         assert!(blank.get("purpose").is_none());
 
         // An over-long purpose is clipped to MAX_PURPOSE_CHARS (defence in depth vs the server cap).
         let long = "x".repeat(500);
-        let clipped = build_proxy_body("m", "sys", "hi", 8, Some(&long));
+        let clipped = build_proxy_body("m", "sys", "hi", 8, Metering::new(&long, None));
         assert_eq!(
             clipped["purpose"].as_str().map(|s| s.chars().count()),
             Some(MAX_PURPOSE_CHARS)
         );
+    }
+
+    #[test]
+    fn build_proxy_body_forwards_and_bounds_project() {
+        // A project rides alongside the purpose under its own key (metering-only, meta.project).
+        let b = build_proxy_body("m", "sys", "hi", 8, Metering::new("Naming an agent", Some("sparkle")));
+        assert_eq!(b["project"], "sparkle");
+        assert_eq!(b["purpose"], "Naming an agent");
+
+        // A blank/whitespace project is omitted — the history must show "no project recorded",
+        // never an empty string masquerading as one.
+        let blank = build_proxy_body("m", "sys", "hi", 8, Metering::new("p", Some("   ")));
+        assert!(blank.get("project").is_none());
+
+        // An over-long project is clipped to the wire cap (defence in depth vs the server's 120).
+        let long = "x".repeat(500);
+        let clipped = build_proxy_body("m", "sys", "hi", 8, Metering::new("p", Some(&long)));
+        assert_eq!(
+            clipped["project"].as_str().map(|s| s.chars().count()),
+            Some(MAX_PROJECT_CHARS)
+        );
+
+        // A purpose with no project keeps the pre-attribution shape exactly.
+        let none = build_proxy_body("m", "sys", "hi", 8, Metering::new("p", None));
+        assert!(none.get("project").is_none());
     }
 
     #[test]
@@ -327,7 +416,44 @@ mod tests {
         assert_eq!(classify_proxy_error(402, "nope"), "insufficient_credits:0");
         assert_eq!(classify_proxy_error(403, "{}"), "not_entitled");
         assert_eq!(classify_proxy_error(503, "{}"), "ai_unconfigured");
+        // A 404 means the route isn't registered on the server we're pointed at — the backend is
+        // unavailable, so it shares the 503 sentinel instead of the generic retryable message.
+        assert_eq!(
+            classify_proxy_error(
+                404,
+                r#"{"message":"Route POST:/ai/anthropic not found","statusCode":404}"#
+            ),
+            "ai_unconfigured"
+        );
         assert_eq!(classify_proxy_error(500, "boom"), "ai request failed (HTTP 500)");
+        // 502 (the route's own vendor-failure status) stays generic + retryable: unlike a 404 it can
+        // be a transient vendor blip, so it must keep drawing on the caller's retry budget.
+        assert_eq!(
+            classify_proxy_error(502, r#"{"error":"vendor_error"}"#),
+            "ai request failed (HTTP 502)"
+        );
+    }
+
+    #[test]
+    fn classify_transport_kind_flags_only_the_no_network_path_kinds() {
+        // The three kinds observed in the field when the machine loses its route: a DNS resolve
+        // failure, a TLS/connect timeout, and a mid-request socket error. All mean "unreachable".
+        assert_eq!(classify_transport_kind(ureq::ErrorKind::Dns), "ai_unreachable");
+        assert_eq!(
+            classify_transport_kind(ureq::ErrorKind::ConnectionFailed),
+            "ai_unreachable"
+        );
+        assert_eq!(classify_transport_kind(ureq::ErrorKind::Io), "ai_unreachable");
+        // Misconfiguration is NOT connectivity — it must not be reported as being offline, or a bad
+        // base URL would silently show the offline banner and defer forever instead of surfacing.
+        assert_eq!(
+            classify_transport_kind(ureq::ErrorKind::InvalidUrl),
+            "ai request failed"
+        );
+        assert_eq!(
+            classify_transport_kind(ureq::ErrorKind::UnknownScheme),
+            "ai request failed"
+        );
     }
 
     #[test]
@@ -425,7 +551,7 @@ mod tests {
             "hello",
             256,
             Duration::from_secs(5),
-            Some("Renamed agent to 'Fix OAuth loop'"),
+            Metering::new("Renamed agent to 'Fix OAuth loop'", Some("sparkle-desktop")),
         )
         .expect("proxy call should succeed");
         let req = handle.join().expect("server thread");
@@ -437,6 +563,11 @@ mod tests {
         assert!(
             req.contains("Renamed agent to 'Fix OAuth loop'"),
             "purpose missing from request body: {req:?}"
+        );
+        // …as does the project it belonged to (server persists it into meta.project).
+        assert!(
+            req.contains("sparkle-desktop"),
+            "project missing from request body: {req:?}"
         );
         // The response passes through (text + the injected balance).
         assert_eq!(extract_text(&json), Some("named it".to_string()));
@@ -464,7 +595,7 @@ mod tests {
             "402 Payment Required",
             r#"{"error":"insufficient_credits","balanceCents":15}"#,
         );
-        let err = call_anthropic_proxy(&base, "tok", "claude-haiku-4-5", "", "hi", 8, Duration::from_secs(5), None)
+        let err = call_anthropic_proxy(&base, "tok", "claude-haiku-4-5", "", "hi", 8, Duration::from_secs(5), Metering::default())
             .expect_err("402 must be an Err");
         let _ = handle.join();
         assert_eq!(err, "insufficient_credits:15");

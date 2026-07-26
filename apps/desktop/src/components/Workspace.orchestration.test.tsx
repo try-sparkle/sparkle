@@ -37,8 +37,13 @@ vi.mock("../services/orchestrationListener", () => ({
 vi.mock("../services/crossWindowSync", () => ({
   subscribeToCrossWindowSync: () => () => {},
 }));
+// Mirrors EVERY export: Vitest throws on access to a missing one, so a partial factory breaks the
+// moment Workspace reaches for another symbol from this module.
 vi.mock("../services/windowClose", () => ({
-  killProjectAgents: vi.fn(() => Promise.resolve()),
+  stopOpenProjectAgents: vi.fn(() => Promise.resolve()),
+  killAllOpenAgents: vi.fn(() => Promise.resolve()),
+  projectsWithOpenAgents: vi.fn(() => []),
+  closeScopeProjectNames: vi.fn(() => []),
   planWindowClose: vi.fn(() => ({ killAgents: false, clearRegistry: false, hide: true })),
 }));
 vi.mock("../services/windowRegistry", () => ({

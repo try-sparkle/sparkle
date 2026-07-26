@@ -19,6 +19,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { reportNamingOutcome } from "./selfReportObservability";
 import type { NamingOutcome } from "../stores/selfReportMetrics";
 import type { AgentKind, AgentName, PromptHistoryEntry } from "../types";
+import { projectName } from "./creditProject";
 
 // Common filler words ignored when comparing two prompts — so "please fix the test" and
 // "fix the test now" read as the same work.
@@ -286,7 +287,11 @@ export async function maybeAutoName(
   // Tally the paid fallback only once we actually commit to invoking (past the in-flight guard).
   reportNamingOutcome("paid_haiku_fallback", agent.kind);
   try {
-    const name = await invoke<AgentName>("generate_agent_name", { prompt });
+    const name = await invoke<AgentName>("generate_agent_name", {
+      prompt,
+      // Metering-only: attributes this paid naming call to its project in the Credits history.
+      project: projectName(projectId),
+    });
     // The title is the canonical `name`; the sidebar truncates it to fit and reveals the title +
     // description on hover.
     const canonical = name?.title?.trim();
@@ -479,7 +484,10 @@ export async function maybeNameFromWork(projectId: string, agentId: string): Pro
   }
   inFlight.add(agentId);
   try {
-    const name = await invoke<AgentName>("generate_agent_name", { prompt: basis });
+    const name = await invoke<AgentName>("generate_agent_name", {
+      prompt: basis,
+      project: projectName(projectId),
+    });
     const canonical = name?.title?.trim();
     if (canonical) {
       // TERMINAL: we produced a name, so never spend a second call for this agent.

@@ -1,5 +1,14 @@
 // Pure auth/entitlement helpers for the desktop gate (design spec §8). No IO — the React
 // AuthGate feeds these the current loading/token/me state and renders the derived view.
+//
+// The credit predicate is split across this module and services/aiGate, because aiGate imports
+// useAuthStore for its hooks and an authStore → aiGate import would close a cycle. This module
+// imports no store, so it is safe from anywhere:
+//   • `hasCreditsAbove(me, floorCents)` — the pure rule, here.
+//   • `aiGate.hasAiCredits(me, floorCents = store)` — the store-bound binding EVERY feature gate
+//     uses; it respects the credit floor (a balance the server has refused).
+//   • `hasPositiveBalance(me)` — the zero-floor form, here, for the one consumer that must ask about
+//     the balance itself rather than the gate: the "$0" banner.
 
 import type { AutoTopup } from "./creditsMenuApi";
 
@@ -15,6 +24,12 @@ export interface Me {
   /** Auto-top-up settings (credits-menu spec §3). Optional so an older orchestration server that
    *  doesn't send it yet reads as "settings unavailable" rather than breaking /me parsing. */
   autoTopup?: AutoTopup;
+  /** Cloud Agents (Service B) capability for this account — the server advertises it only when the
+   *  feature is switched on for the caller (spec §Feature flag: "ships dark"). Absent (an older
+   *  server, or the flag off) reads as FALSE everywhere, which hides every cloud surface. Never
+   *  infer it from anything else: this is the single source for "may this account run agents in the
+   *  cloud". */
+  cloudAgentsEnabled?: boolean;
 }
 
 export type AuthView = "loading" | "welcome" | "trial" | "unpaid" | "entitled";
@@ -168,4 +183,30 @@ export function parseAuthState(url: string): string {
   }
   if (parsed.protocol !== "sparkle:" || parsed.host !== "auth") return "";
   return parsed.searchParams.get("state") ?? "";
+}
+
+/** The single definition of "has credits", as a PURE function of a balance and a floor: signed in,
+ *  and holding strictly more than the floor. Store-free so both the store-bound gate and the stores
+ *  themselves can route through one rule — see the header note on the import cycle.
+ *
+ *  `floorCents` is the balance the server last refused a call at. services/aiGate's `hasAiCredits`
+ *  binds it to `authStore.creditFloorCents` for every feature gate; pass 0 for the literal
+ *  "is the balance itself gone?" question. */
+export function hasCreditsAbove(me: Me | null, floorCents: number): boolean {
+  return me != null && me.balanceCents > Math.max(0, floorCents);
+}
+
+/** Does the user hold a positive balance — no inferred floor, just `balanceCents > 0`?
+ *
+ *  NAMED for the rule rather than the feature, and deliberately NOT `hasAiCredits`: that name belongs
+ *  to services/aiGate's floor-aware gate, and two same-named exports in sibling modules would let an
+ *  auto-import (or a "fixed" import path) silently swap one gate for the other with no compile error.
+ *
+ *  The "$0 balance" banner is the one consumer that must ask THIS question instead of the gate's. Its
+ *  copy states "Your Sparkle credit balance is $0", and the floor can be in force at a genuinely
+ *  positive balance — showing that sentence to someone holding 3¢ would be a false statement about
+ *  their money on the surface that exists to be honest about it. The floor case is also self-healing
+ *  within one `refresh()` (see authStore); a false claim is not. See services/zeroCreditBanner. */
+export function hasPositiveBalance(me: Me | null): boolean {
+  return hasCreditsAbove(me, 0);
 }

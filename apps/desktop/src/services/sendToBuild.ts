@@ -73,6 +73,9 @@ export function sendToBuild(args: SendToBuildArgs): string {
   // by hand and is talking to.
   const existing = project.agents.find((a) => a.kind === "build" && a.epicId === args.epicId);
   const agentId = existing ? existing.id : store.addAgent(args.projectId, { kind: "build" });
+  // addAgent returns null only for an unknown project, which the guard above already rejected —
+  // keep the check anyway so a future reorder can't turn it into a silent phantom-id path.
+  if (!agentId) throw new Error(`unknown project ${args.projectId}`);
 
   // Bind the epic to the orchestrator right away (spec §8): the sidebar epic pill reads
   // AgentTab.epicId, so it shows immediately — before any worker binds to a bead.

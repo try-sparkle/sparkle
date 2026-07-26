@@ -1,6 +1,23 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
+
+// The env seeder shells out to the 1Password `op` CLI over IPC. Mocked here so the wiring — which
+// call sites seed, with what, and that none of them WAIT on it — is testable without a vault.
+vi.mock("./envSeed", () => ({
+  seedWorktreeEnv: vi.fn(),
+  abandonWorktreeSeed: vi.fn(() => Promise.resolve()),
+}));
+
+// Seeding needs the project's NAME (the vault item titles are keyed on it), which worktree.ts
+// reads from the store by id.
+vi.mock("../stores/projectStore", () => ({
+  useProjectStore: {
+    getState: () => ({ projects: [{ id: "p", name: "Sparkle", rootPath: "/root" }] }),
+  },
+}));
+
+import { seedWorktreeEnv, abandonWorktreeSeed } from "./envSeed";
 import {
   createAgentWorktree,
   assertWorkspaceIntegrity,
@@ -113,5 +130,101 @@ describe("worktree service", () => {
     await a;
     await b;
     expect(cuts).toBe(2);
+  });
+});
+
+// The 1Password env seed is wired into both worktree-cutting seams. The properties worth pinning
+// are the ones a refactor could quietly break: a spawn must never WAIT on the seed, never FAIL on
+// it, and teardown must settle it before deleting the directory it writes into.
+describe("worktree service — env seeding", () => {
+  const seedMock = vi.mocked(seedWorktreeEnv);
+  const abandonMock = vi.mocked(abandonWorktreeSeed);
+
+  beforeEach(() => {
+    invoke.mockReset();
+    seedMock.mockReset();
+    abandonMock.mockReset();
+    abandonMock.mockResolvedValue(undefined);
+  });
+
+  it("seeds an agent worktree with the project's NAME and the path that was just cut", async () => {
+    // The NAME, not the id: vault item titles are `<projectName>/<relPath>`, so an id here would
+    // match nothing and silently seed an empty worktree.
+    invoke.mockResolvedValue({ path: "/wt/p/a", branch: "sparkle/agent-a" });
+    await prepareAgentWorkspace("/root-seed-agent", "p", "a", "main");
+    expect(seedMock).toHaveBeenCalledWith("Sparkle", "/wt/p/a");
+  });
+
+  it("seeds a worker worktree too — a fan-out is where empty worktrees hurt most", async () => {
+    invoke.mockResolvedValue({ path: "/wt/p/w1", branch: "sparkle/agent-w1" });
+    await prepareWorkerWorkspace({
+      root: "/root-seed-worker", projectId: "p", workerId: "w1", parentBranch: "main",
+    });
+    expect(seedMock).toHaveBeenCalledWith("Sparkle", "/wt/p/w1");
+  });
+
+  it("does NOT wait on the seed — a spawn resolves while the restore is still running", async () => {
+    // The seeder returns void today, so returning a never-settling THENABLE is what makes this test
+    // meaningful: `await`ing a void is a no-op and would pass regardless, but the refactor that
+    // would actually break the property — making the seam async and awaiting the seeder — hangs on
+    // a thenable that never calls back. So this fails (times out) exactly when it should.
+    const neverSettles = { then: () => {} } as unknown as void;
+    seedMock.mockReturnValue(neverSettles);
+    invoke.mockResolvedValue({ path: "/wt/p/a", branch: "b" });
+    const info = await prepareAgentWorkspace("/root-seed-nonblocking", "p", "a", "main");
+    expect(info.path).toBe("/wt/p/a");
+    expect(seedMock).toHaveBeenCalled();
+  });
+
+  it("does not fail the spawn when seeding throws outright", async () => {
+    seedMock.mockImplementation(() => {
+      throw new Error("store exploded");
+    });
+    invoke.mockResolvedValue({ path: "/wt/p/a", branch: "b" });
+    await expect(
+      prepareAgentWorkspace("/root-seed-throws", "p", "a", "main"),
+    ).resolves.toMatchObject({ path: "/wt/p/a" });
+  });
+
+  it("skips seeding — and says so — when the project isn't in the store", async () => {
+    // Silence here is indistinguishable from "the feature is off", and the vault titles cannot be
+    // built without the name, so this branch has to be audible.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invoke.mockResolvedValue({ path: "/wt/ghost/a", branch: "b" });
+    await prepareAgentWorkspace("/root-seed-ghost", "ghost", "a", "main");
+    expect(seedMock).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("settles the in-flight seed BEFORE removing the worktree it writes into", async () => {
+    // Seeding escapes the per-root git lock by design; without this, `git worktree remove` can run
+    // while `op` is mid-write and the backend re-creates the tree git just deleted.
+    invoke.mockResolvedValue({ path: "/wt/p/a", branch: "b" });
+    const root = "/root-seed-teardown";
+    await prepareAgentWorkspace(root, "p", "a", "main");
+
+    const order: string[] = [];
+    abandonMock.mockImplementation(() => {
+      order.push("abandon");
+      return Promise.resolve();
+    });
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "remove_agent_worktree") order.push("remove");
+      return Promise.resolve(undefined);
+    });
+
+    await removeAgentWorkspace(root, "p", "a");
+    expect(abandonMock).toHaveBeenCalledWith("/wt/p/a");
+    expect(order).toEqual(["abandon", "remove"]);
+  });
+
+  it("removes a worktree it never seeded without waiting on anything", async () => {
+    invoke.mockResolvedValue(undefined);
+    await removeAgentWorkspace("/root-seed-none", "p", "never-seeded");
+    expect(abandonMock).not.toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledWith("remove_agent_worktree", {
+      root: "/root-seed-none", projectId: "p", agentId: "never-seeded",
+    });
   });
 });

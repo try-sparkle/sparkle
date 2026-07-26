@@ -11,6 +11,7 @@ import type {
   Project,
   PromptHistoryEntry,
   PromptSource,
+  Runtime,
 } from "../types";
 import {
   advanceAlertRecord,
@@ -22,6 +23,7 @@ import { isDefaultModel } from "../services/models";
 import { clearPin } from "../services/accountStore";
 import { usageTelemetry } from "../services/usageTelemetry";
 import { perfSpan, perfStart } from "../perfTrace";
+import { useUiStore } from "./uiStore";
 
 // Cap on how many prompts we keep per agent so the persisted localStorage record stays bounded.
 // The oldest entries fall off; the most recent PROMPT_HISTORY_LIMIT are kept — PER SOURCE (see
@@ -65,6 +67,13 @@ export interface AddAgentOpts {
   /** Claude model id for this agent (services/models.ts); undefined/"default" → inherit the
    *  user's Claude Code default. */
   model?: string;
+  /** Pre-issued tab id. For a CLOUD agent the server-issued session id IS the tab id (spec
+   *  §Identity: server session id = AgentTab id), so the caller passes it here instead of letting
+   *  the store mint a uuid. Local agents omit it and get a fresh uuid. */
+  id?: string;
+  /** Execution runtime. Defaults to "local" (today's behavior). "cloud" tabs are created after a
+   *  successful POST /sessions/start and rely on W4's CloudTransport to attach. */
+  runtime?: Runtime;
 }
 
 // Default display name for a freshly created agent, numbered within its kind so you get
@@ -110,8 +119,13 @@ export interface ProjectState {
   relocateProject: (id: string, newName: string, newRootPath: string) => void;
   /** Persist the project's logical integration branch (auto-detected on first agent, editable). */
   setDefaultBranch: (projectId: string, branch: string) => void;
+  /** Cache the ORCHESTRATION-side project id this local project maps to (cloud agents). Resolved
+   *  once by services/cloudAgents/projectLink.ts, then reused for every start/list call. */
+  setCloudProjectId: (projectId: string, cloudProjectId: string) => void;
 
-  addAgent: (projectId: string, opts?: AddAgentOpts) => string;
+  /** Create an agent tab in `projectId`. Returns its id, or NULL when no such project exists in
+   *  this window's store (nothing is created — see the guard in the implementation). */
+  addAgent: (projectId: string, opts?: AddAgentOpts) => string | null;
   /** Attach a bead id to an existing agent (e.g. after async bead creation on build-agent spawn). */
   setAgentBeadId: (projectId: string, agentId: string, beadId: string) => void;
   /** Set the agent's Claude model (a models.ts id, or "default"/undefined to inherit the user's
@@ -620,6 +634,16 @@ export function mergePreservingLiveWorkers(
       return mergeProject(ppMaybe, cur, isRemoved);
     });
 
+  // …and the array itself: when every project came back as its live reference (a no-op rehydrate),
+  // reuse the live array so the whole merge is a true no-op for `useProjectStore(s => s.projects)`,
+  // which is what Workspace subscribes to — otherwise a fresh array re-renders it on every rehydrate.
+  if (
+    merged.projects.length === currentProjects.length &&
+    merged.projects.every((p, i) => p === currentProjects[i])
+  ) {
+    merged.projects = currentProjects;
+  }
+
   // Keep the window on a live selection the incoming snapshot simply hadn't SEEN yet: a stale writer
   // must not yank the user off the project they just created (it carries its own older selection).
   // Deliberately narrow — when both sides know the project, the snapshot's selection still wins, as
@@ -678,6 +702,65 @@ function mergeTombstones(
 function withoutRemovedAgents(p: Project, isRemoved: (id: string) => boolean): Project {
   const agents = p.agents.filter((a) => !isRemoved(a.id));
   return agents.length === p.agents.length ? p : { ...p, agents };
+}
+
+/** True for an object with no richer prototype than plain `{}` (or a null prototype). Anything else —
+ *  Date, Map, Set, a class instance — is NOT value-comparable by an own-key walk, so `sameValue`
+ *  fails closed on it (see below). */
+function isPlainObject(o: object): boolean {
+  const proto = Object.getPrototypeOf(o);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Deep VALUE equality for the JSON-ish shapes the projects blob carries (agents, projects, their
+ *  nested arrays/records). Used only to decide whether a rehydrated value is INDISTINGUISHABLE from
+ *  the live one, so we can keep the live object reference — see the canonicalization in `mergeProject`.
+ *  Exported for direct unit testing.
+ *
+ *  Two rules the persisted blob forces:
+ *   • Walk the UNION of both key sets, so an own key holding `undefined` (addAgent/setAgentModel store
+ *     `model: undefined`; the name reconcile spreads `selfNamed`) compares EQUAL to the absent key
+ *     `JSON.stringify` leaves behind. Comparing key COUNTS would report the most ordinary agent there
+ *     is as "changed" forever, and one non-reused agent cascades to its project and then the whole
+ *     `projects` array — silently returning it to the pre-fix behaviour.
+ *   • Fail CLOSED on any non-plain object (Date/Map/Set/class): an own-key walk sees them as key-less
+ *     and would call two DIFFERENT instances equal, which would canonicalize across a real change and
+ *     render stale — the one failure mode this must never have. Latent today (the blob is JSON-only),
+ *     but it now errs toward "no reuse" rather than "reuse". */
+export function sameValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  const aArr = Array.isArray(a);
+  if (aArr !== Array.isArray(b)) return false;
+  if (aArr) {
+    const av = a as unknown[];
+    const bv = b as unknown[];
+    return av.length === bv.length && av.every((v, i) => sameValue(v, bv[i]));
+  }
+  if (!isPlainObject(a) || !isPlainObject(b)) return false;
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const keys = new Set([...Object.keys(ao), ...Object.keys(bo)]);
+  for (const k of keys) {
+    if (!sameValue(ao[k], bo[k])) return false;
+  }
+  return true;
+}
+
+/** The project fields the merge resolves against the LIVE copy (compared directly, field-by-field, at
+ *  the `mergeProject` return). Everything else is snapshot-owned metadata compared by value. */
+const PROJECT_LIVE_RESOLVED_KEYS = new Set(["agents", "selectedAgentId", "freshBuildAgentId"]);
+
+/** Deep-equal for a project's snapshot-owned metadata (name, rootPath, defaultBranch, …) — everything
+ *  EXCEPT the live-resolved fields. Walks the UNION of both key sets, so an absent key and an explicit
+ *  `undefined` compare equal — the merge normalizes `freshBuildAgentId` to null while a live project
+ *  may omit the key, semantically identical but enough to defeat a strict whole-object compare, which
+ *  is why those fields are excluded here and compared separately. */
+function sameProjectMeta(a: Project, b: Project): boolean {
+  const av = a as unknown as Record<string, unknown>;
+  const bv = b as unknown as Record<string, unknown>;
+  const keys = [...Object.keys(av), ...Object.keys(bv)].filter((k) => !PROJECT_LIVE_RESOLVED_KEYS.has(k));
+  return keys.every((k) => sameValue(av[k], bv[k]));
 }
 
 /** Merge one project that exists in BOTH the incoming snapshot and memory: union its agents by id,
@@ -768,13 +851,37 @@ function mergeProject(
     const freshBuildAgentId = liveFreshValid
       ? (cur.freshBuildAgentId ?? null)
       : (pp.freshBuildAgentId ?? null);
+    // Reference canonicalization (supersedes #473). A rehydrate hands us structurally-fresh objects
+    // for EVERY agent (JSON.parse mints new ones; migratePersisted's normalization rebuilds them
+    // again), so taking them verbatim changes `agent` identity for every agent at once. That defeats
+    // AgentPane's React.memo — arePanePropsEqual requires `a.agent === b.agent` — and re-renders every
+    // open pane, hidden ones included, on every rehydrate (the render-thrash + jank fingerprint: one
+    // Workspace render propagating 1:1 to every pane). Reusing the live reference is safe precisely
+    // because it is gated on deep VALUE equality: the agent is indistinguishable from the live one, so
+    // no render can observe the swap. An agent that genuinely changed still takes the incoming value,
+    // so none of the merge semantics above are weakened.
+    const canonicalAgents = mergedAgents.map((a) => {
+      const live = curById.get(a.id);
+      return live && sameValue(a, live) ? live : a;
+    });
+    // When every agent AND every live-resolved scalar survived unchanged, hand back the LIVE project
+    // object so `projects` consumers (Workspace) don't churn either. Compared against `cur` (LIVE),
+    // NOT `pp` (the incoming/fresh snapshot) — returning `pp` on a no-op would still hand out fresh
+    // identities, which is exactly the bug. The three live-resolved fields are compared directly
+    // rather than via a whole-object compare, because this merge normalizes `freshBuildAgentId` to
+    // null while a live project may omit the key — semantically identical, but enough to defeat a
+    // strict key-set comparison.
+    const agentsUnchanged =
+      canonicalAgents.length === cur.agents.length &&
+      canonicalAgents.every((a, i) => a === cur.agents[i]);
     if (
-      mergedAgents === pp.agents &&
-      selectedAgentId === pp.selectedAgentId &&
-      freshBuildAgentId === (pp.freshBuildAgentId ?? null)
+      agentsUnchanged &&
+      selectedAgentId === cur.selectedAgentId &&
+      freshBuildAgentId === (cur.freshBuildAgentId ?? null) &&
+      sameProjectMeta(pp, cur)
     )
-      return pp;
-    return { ...pp, agents: mergedAgents, selectedAgentId, freshBuildAgentId };
+      return cur;
+    return { ...pp, agents: canonicalAgents, selectedAgentId, freshBuildAgentId };
   }
 }
 
@@ -814,6 +921,13 @@ export const useProjectStore = create<ProjectState>()(
           registerLocalRemovals(doomed);
           return { projects, selectedProjectId, removedIds: withTombstones(s.removedIds, doomed) };
         });
+        // Drop the concierge pin if it named THIS project. The pin is persisted and load-bearing
+        // (it scopes the concierge's surfaced P0/P1), and no tab renders for a project that's
+        // gone — so a dangling pin would silently zero the vitals with no affordance to clear it.
+        // One-way edge: uiStore imports nothing from here, so there's no cycle.
+        if (useUiStore.getState().pinnedProjectId === id) {
+          useUiStore.getState().setPinnedProject(null);
+        }
       },
 
       selectProject: (id) =>
@@ -855,8 +969,37 @@ export const useProjectStore = create<ProjectState>()(
           })),
         })),
 
+      setCloudProjectId: (projectId, cloudProjectId) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) => ({ ...p, cloudProjectId })),
+        })),
+
       addAgent: (projectId, opts) => {
-        const id = uuid();
+        // No such project in THIS window's store → create nothing and say so. `mapProject` silently
+        // no-ops on an unknown id, so without this guard the setter would return a plausible id for
+        // a tab that was never inserted: createCloudAgent would selectAgent + open() a phantom id
+        // (blank pane, no row) and the re-attach loop would count phantom creates. A caller can
+        // legitimately race a project removal (multi-window close, a cloud re-attach resolving after
+        // the project is gone), so this is a normal state, not an assertion.
+        const project = get().projects.find((p) => p.id === projectId);
+        if (!project) return null;
+        // Cloud agents pass the server session id (spec §Identity); local agents mint a uuid.
+        const id = opts?.id ?? uuid();
+        // A pre-issued id (a cloud session id) can collide with a tab that already exists in THIS
+        // project — e.g. a create racing the startup re-attach that already materialized the tab.
+        // Never insert a second row: no-op and return the existing id. Selection is deliberately NOT
+        // touched here — a re-add must not yank the user's active tab (the store's background-reconcile
+        // invariant; see ensureAgentPresent / adoptWorker / the rehydrate-merge note). Callers that
+        // want focus (createCloudAgent) call selectAgent explicitly after this returns.
+        //
+        // The scan is project-scoped on purpose: a cloud session id is created for, and listed under,
+        // exactly ONE project (POST /sessions/start targets the current project; GET /sessions is
+        // project-scoped), so the same id is only ever added to its own project in v1 — a
+        // cross-project collision can't arise, and a global scan would only add a dangling-selection
+        // hazard for a case that doesn't occur. Minted uuids can't collide, so this guards only the
+        // caller-supplied-id path.
+        const preId = opts?.id;
+        if (preId && project.agents.some((a) => a.id === preId)) return preId;
         const kind: AgentKind = opts?.kind ?? "build";
         const parentId = opts?.parentId ?? null;
         // A fresh uuid can never collide with a tombstone, but clear defensively so a re-created id
@@ -869,7 +1012,7 @@ export const useProjectStore = create<ProjectState>()(
               name: opts?.name ?? defaultAgentName(p, kind),
               kind,
               parentId,
-              runtime: "local",
+              runtime: opts?.runtime ?? "local",
               worktreePath: null,
               branch: null,
               baseBranch: p.defaultBranch,

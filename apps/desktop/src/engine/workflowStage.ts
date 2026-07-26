@@ -90,7 +90,8 @@ export function resolveStage(
 // the committed-but-unlanded band — building_saved (5) through merged_local (8, on LOCAL main only) —
 // and false below it (no commits: thought…building_unsaved) and at/above `merged` (9, on origin main)
 // and `shipped` (10). This is the "needs you to open/merge the PR" signal that escalates a finished
-// (idle/done/stopped) agent's dot to RED via engine/unmergedAttention.ts. "main" here is ORIGIN main:
+// (idle/done/stopped) agent to the `unmerged` status via engine/unmergedAttention.ts — gray, but
+// ranked above the calm tier (it stopped being RED on 2026-07-26). "main" here is ORIGIN main:
 // merged_local still counts as unmerged because the workflow lands via a PR to origin, so local-only
 // work still needs you to get it the rest of the way. Pure.
 export function hasUnmergedCommittedWork(stage: WorkflowStageId): boolean {

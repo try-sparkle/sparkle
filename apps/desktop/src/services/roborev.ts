@@ -31,6 +31,7 @@ export async function deactivateRoborev(): Promise<void> {
  *  raw probe output in `detail`. */
 export type RoborevAuthVerdict =
   | { kind: "Passed" }
+  | { kind: "NotInstalled" }
   | { kind: "ClaudeMissing" }
   | { kind: "NotAuthenticated" }
   | { kind: "Unknown"; detail: string };

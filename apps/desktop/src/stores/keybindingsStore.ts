@@ -21,7 +21,7 @@ export const SHORTCUT_DEFAULTS: Record<ShortcutId, KeyBinding> = {
 // so a tap binding there would silently never fire — the capture UI rejects taps for it.
 export const SHORTCUT_LABELS: Record<ShortcutId, { title: string; blurb: string; allowsTap: boolean }> = {
   toggleHints: { title: "Show shortcut hints", blurb: "Pops the gold chiclet overlay over clickable controls.", allowsTap: true },
-  toggleComposer: { title: "Composer ⇄ Terminal", blurb: "Move focus between the prompt box and the terminal.", allowsTap: false },
+  toggleComposer: { title: "Composer ⇄ Terminal", blurb: "Improve-Sparkle pane only: move focus between its prompt box and terminal. (Builder agents have no terminal composer — the Sparkle box is the composer.)", allowsTap: false },
 };
 
 interface KeybindingsState {

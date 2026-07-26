@@ -26,7 +26,7 @@
 import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
 import { screenAwaitsInput } from "./screenClassifier";
-import { StreamFailureDetector, isApiErrorLine } from "./streamFailure";
+import { StreamFailureDetector, apiErrorFramesIn, countApiErrorFrames, isApiErrorLine } from "./streamFailure";
 
 // Strip ANSI/control sequences before classifying (xterm still renders the raw bytes).
 // Built from a string with \u escapes so the source stays paste-safe (no literal ESC).
@@ -62,6 +62,49 @@ const ERROR_PATTERNS: RegExp[] = [
 // Claude Code's live "working" status line, re-drawn ~once a second while it is busy.
 // "esc to interrupt" is the stable marker across spinner glyph / wording changes.
 const WORKING_PATTERNS: RegExp[] = [/esc to interrupt/i];
+
+// The spinner also carries a live token counter — "↑ 1.2k tokens", "↓ 2.1k tokens" — that only
+// climbs while the model is ACTIVELY GENERATING. Parse the number (k → ×1000, m → ×1000000) so a
+// strictly-higher count between frames can serve as positive proof of forward progress (see the
+// token-advance recovery in ingest). Returns null when the frame carries no token figure (some
+// spinners omit it), in which case the token signal simply doesn't apply and the other recovery
+// paths still hold. Feed it ONE spinner frame — never a whole chunk: the pattern is unanchored, so
+// prose that merely mentions "30k tokens" would otherwise read as the counter and could clear a
+// sticky failure (roborev on da7c80c). `latestSpinnerTokens` below is the live path; it does the
+// frame-splitting for you.
+// Retune point: like WORKING_PATTERNS, this tracks a Claude Code TUI detail that may drift.
+const SPINNER_TOKENS = /(?:↑|↓)?\s*(\d+(?:\.\d+)?)\s*([km])?\s*tokens/i;
+// `| undefined` is deliberate: under noUncheckedIndexedAccess an unknown suffix reads as undefined,
+// and the `?? 1` below turns that into "no scaling" rather than a silent NaN that would compare false
+// in every advance check and quietly disable the recovery (roborev 46783).
+const TOKEN_SUFFIX_SCALE: Record<string, number | undefined> = { k: 1_000, m: 1_000_000 };
+export function parseSpinnerTokens(spinnerFrame: string): number | null {
+  const m = SPINNER_TOKENS.exec(spinnerFrame);
+  if (!m?.[1]) return null;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n)) return null;
+  const scaled = n * (TOKEN_SUFFIX_SCALE[m[2]?.toLowerCase() ?? ""] ?? 1);
+  return Number.isFinite(scaled) ? Math.round(scaled) : null;
+}
+
+// The token figure from the NEWEST spinner frame in a cleaned chunk that actually carries one. The
+// spinner redraws in place with carriage returns, so one chunk can hold several frames AND ordinary
+// prose: walking BACK over the frames means (a) the count we read is the most recent one, not a stale
+// earlier redraw, and (b) prose is never mistaken for a spinner frame, so "compacted 30k tokens" in
+// the same chunk can't be read as the counter (roborev on da7c80c). Walking PAST figure-less frames
+// matters because Claude drops the counter from some redraws: stopping at the newest marker frame
+// alone would read null and skip both the comparison AND the baseline update for that chunk, silently
+// delaying recovery (roborev 46783).
+export function latestSpinnerTokens(chunk: string): number | null {
+  const frames = chunk.split(/[\r\n]/);
+  for (let i = frames.length - 1; i >= 0; i--) {
+    const frame = frames[i] ?? "";
+    if (!WORKING_PATTERNS.some((re) => re.test(frame))) continue;
+    const tokens = parseSpinnerTokens(frame);
+    if (tokens !== null) return tokens;
+  }
+  return null;
+}
 
 const IDLE_MS = 2500;
 const BLOCKED_MS = 25000;
@@ -103,6 +146,25 @@ export class StatusEngine {
   // spinner: the bug is precisely that the spinner keeps ticking while the agent is wedged. Cleared
   // only by real forward progress (a classified tool/file event) or a real interactive prompt.
   private sawStreamFailure = false;
+  // WHICH shape of failure latched `sawStreamFailure`, because only one of them is safe to clear on
+  // token progress (roborev on da7c80c):
+  //   "api"   — a transient API/server banner. The request failed; nothing was generated under it, so
+  //             a climbing token counter is genuine proof the agent recovered and is generating again.
+  //   "churn" — a self-prompt loop or a repeating-line churn wedge. A wedged agent GENERATES its own
+  //             pings, so its token counter climbs too; token progress here proves nothing and must
+  //             NEVER clear the red. Only real progress (a classified tool event), a real prompt, or
+  //             user input clears a churn wedge — the original sparkle-pqxh contract.
+  // "churn" outranks "api": once churn is seen, a later banner must not downgrade it to clearable.
+  private failureKind: "api" | "churn" | null = null;
+  // The token count from the most recent spinner frame that carried one, so a strictly-higher count
+  // on a later frame proves the model is still GENERATING (forward progress) and clears a sticky
+  // mid-stream failure — the healthy-but-transiently-blipped case (see the recovery in ingest). Null
+  // until the first spinner frame with a token figure; a lone frame only sets the baseline (a frozen
+  // count must never read as progress), so recovery needs a genuine frame-to-frame increase.
+  // RESET AT EVERY TURN BOUNDARY (settle, noteUserInput — NOT a mid-turn prompt): Claude's counter is PER-TURN and
+  // restarts low, so a stale high-water mark from a long previous turn would make the whole recovery
+  // a silent no-op until the new turn out-grew it (roborev on da7c80c).
+  private lastSpinnerTokens: number | null = null;
   private readonly failure = new StreamFailureDetector();
   // Fix 2 (Bug B): the normalized text of the message the user MOST RECENTLY submitted to this
   // agent, set by noteUserInput(). The TUI echoes the user's own input back into pty:output, so an
@@ -131,6 +193,30 @@ export class StatusEngine {
     this.blockedTimer = null;
   }
 
+  // The ONE way into the sticky mid-stream failure, so the flag and the kind that governs its
+  // recovery can never drift apart. "churn" outranks "api" (see failureKind).
+  private tripStreamFailure(kind: "api" | "churn"): void {
+    this.sawStreamFailure = true;
+    if (kind === "churn" || this.failureKind === null) this.failureKind = kind;
+  }
+
+  // The ONE way out of it: every recovery path (a classified tool event, a real prompt, user input, a
+  // token advance) must drop the flag, the kind AND the churn counters together — a leftover kind or
+  // a half-counted repeat re-arms red on the next line.
+  private clearStreamFailure(): void {
+    this.sawStreamFailure = false;
+    this.failureKind = null;
+    this.failure.reset();
+  }
+
+  // A turn boundary (the turn settling, or the user submitting the next message — an approval prompt
+  // is asked MID-turn and is deliberately NOT one): forget the spinner token baseline. Claude's
+  // counter is per-turn and restarts low, so carrying a previous turn's high-water mark into the next
+  // turn would silently disable the token-advance recovery (roborev on da7c80c).
+  private resetSpinnerTokens(): void {
+    this.lastSpinnerTokens = null;
+  }
+
   /**
    * The user just submitted a message to this agent (Fix B / Bug B). Their presence is the
    * STRONGEST recovery signal: a NEW turn is starting and any prior stall/error latched from earlier
@@ -145,10 +231,11 @@ export class StatusEngine {
    *      still caught.
    */
   noteUserInput(text: string): void {
-    this.sawStreamFailure = false;
+    this.clearStreamFailure();
     this.sawRecentError = false;
     this.sawRecentRisk = false;
-    this.failure.reset();
+    // A new turn starts here, and its token counter restarts from zero.
+    this.resetSpinnerTokens();
     // stripAnsi also strips the bracketed-paste ESC[200~/ESC[201~ wrappers submitPrompt adds (they
     // are CSI sequences), so this normalizes both raw text and paste-wrapped payloads the same way.
     const norm = stripAnsi(text).trim().toLowerCase();
@@ -178,6 +265,9 @@ export class StatusEngine {
   private settle(): void {
     this.idleTimer = null;
     this.sawRecentError = false;
+    // The turn is over; the next one's spinner counter starts from zero, so drop the baseline rather
+    // than carry this turn's high-water mark into it (roborev on da7c80c).
+    this.resetSpinnerTokens();
     const screen = this.opts.getScreen?.() ?? "";
     const awaiting = screenAwaitsInput(screen);
     // Consume the risk flag on every settle, not just the red branch: a non-blocking
@@ -202,6 +292,10 @@ export class StatusEngine {
   /** Feed a raw PTY chunk. Splits into lines, classifies, updates status. */
   ingest(chunk: string): void {
     const clean = stripAnsi(chunk);
+    // The frame that was still being drawn before this chunk landed (everything after the partial's
+    // last \r). Joined with the incoming text below, it is how the partial-banner check counts what
+    // ARRIVED in this chunk without ever re-scanning the whole buffer — see that check for why.
+    const carry = this.partial.slice(this.partial.lastIndexOf("\r") + 1);
     this.partial += clean;
     const lines = this.partial.split(/\r?\n/);
     this.partial = lines.pop() ?? "";
@@ -211,6 +305,11 @@ export class StatusEngine {
     if (this.partial.length > MAX_PARTIAL) this.partial = this.partial.slice(-MAX_PARTIAL);
 
     let prompt = false;
+    // Whether THIS chunk freshly observed a failure line (an API banner, a self-prompt/churn repeat).
+    // The token-advance recovery below is suppressed when true, so a churn/self-prompt chunk that
+    // happens to also carry an advancing spinner can never clear the very failure it just tripped —
+    // the repeated bad lines keep re-arming red, which is the intended sticky behavior.
+    let trippedThisChunk = false;
     for (const raw of lines) {
       const line = raw.trim();
       if (!line) continue;
@@ -221,8 +320,7 @@ export class StatusEngine {
         // again, not churning on a dead API call. Clear any sticky mid-stream failure (sparkle-pqxh)
         // and reset the churn counter so post-recovery output starts fresh. Real progress also ends
         // the user-input echo window (Fix 2): from here a repeated self-ping is a fresh wedge again.
-        this.sawStreamFailure = false;
-        this.failure.reset();
+        this.clearStreamFailure();
         this.notedUserText = "";
         this.notedUserLinesLeft = 0;
       }
@@ -236,7 +334,14 @@ export class StatusEngine {
       // noteUserInput) clear it. Fix 2: an echo of the user's own just-submitted message is NOT a
       // wedge — skip it entirely so it neither trips a self-prompt nor accrues churn.
       else if (!ev && !this.isUserEchoLine(line.toLowerCase()) && this.failure.observe(line)) {
-        this.sawStreamFailure = true;
+        // A banner is an "api" failure (clearable by token progress); ANY other trip is a
+        // self-prompt/churn wedge, which generates its own tokens and so is NEVER token-clearable.
+        // A banner that REPEATS stays "api" on purpose: a long turn can survive several transient
+        // blips while genuinely generating, and escalating repeats to "churn" would pin exactly that
+        // healthy agent red — the false-red this whole line of work exists to kill. A retry loop with
+        // no generation is still caught, by the frozen-counter rule.
+        this.tripStreamFailure(isApiErrorLine(line) ? "api" : "churn");
+        trippedThisChunk = true;
       }
       if (screenAwaitsInput(line)) prompt = true;
       // Spend one tick of the user-input echo window per non-empty line, so it can't mask a later
@@ -248,15 +353,33 @@ export class StatusEngine {
     // Claude prints its input prompt without a trailing newline — check the partial too.
     if (screenAwaitsInput(this.partial)) prompt = true;
 
-    // An API-error banner can also sit in the still-unterminated partial: the spinner redraws
-    // without a newline, so a fused banner may not have flushed as a completed line yet. Mirror the
-    // partial prompt-check above so detection isn't one missing '\n' away from silently not firing
-    // (roborev 16152). Only the API-error signal (which keys off the visible \r-frame and trips on a
-    // single occurrence), NOT self-prompt — a self-prompt is a wedge only once it REPEATS (Bug A),
-    // and repetition needs discrete completed lines the detector counts, so a lone self-ping in the
-    // partial must NOT trip. Set-only (never clears), keeping it sticky.
-    if (!this.sawStreamFailure && isApiErrorLine(this.partial)) {
-      this.sawStreamFailure = true;
+    // An API-error banner can also sit in the still-unterminated partial: the spinner redraws without
+    // a newline, so a fused banner may not have flushed as a completed line yet. This catches it so
+    // detection isn't one missing '\n' away from silently not firing (roborev 16152). The banner-count
+    // history that forced the current shape: keying on banner TEXT missed a verbatim-repeated banner
+    // (a retry loop re-emits the same string — fail-OPEN, 46783/46899); a whole-partial COUNT stalled
+    // once the MAX_PARTIAL trim started evicting one banner per arrival (fail-OPEN again, 46920). So
+    // we diff banner frames to isolate ARRIVALS. Full rationale on `apiErrorFramesIn`.
+    //
+    // Scope: the UNTERMINATED TAIL ONLY, with the SAME user-echo guard the loop applies. Completed
+    // lines are the loop's job; scanning them here re-counted a pasted "API Error: …" report the loop
+    // deliberately skips (Fix 2), false-redding a healthy agent (47232/47233). Scoping to the tail
+    // fixed the '\n'-terminated shape but not the common one — a TUI input-box redraw echoes with NO
+    // trailing '\n', landing the echo entirely in the tail — so the guard must apply here too
+    // (47981/47996). `base` is the already-flushed prefix (empty when this chunk had a '\n'; else
+    // `carry`), so `arrived` is exactly the banner frames the tail ADDED; we then drop any that are an
+    // echo of the user's own just-submitted message. The tool-event exemption (16153) needs no guard
+    // here: a frame that later completes as a classified line hits the `if (ev)` clear above, and no
+    // real tool-event line begins with "api error:" anyway.
+    const nl = clean.lastIndexOf("\n");
+    const base = nl >= 0 ? "" : carry; // a '\n' flushed carry + everything before it through the loop
+    const tail = nl >= 0 ? clean.slice(nl + 1) : clean;
+    const arrived = apiErrorFramesIn(base + tail)
+      .slice(countApiErrorFrames(base))
+      .filter((f) => !this.isUserEchoLine(f.toLowerCase()));
+    if (arrived.length > 0) {
+      this.tripStreamFailure("api");
+      trippedThisChunk = true;
     }
 
     // The spinner status line is re-drawn in place (often no trailing newline), so test
@@ -264,15 +387,53 @@ export class StatusEngine {
     const hasSpinner = WORKING_PATTERNS.some((re) => re.test(clean));
     if (hasSpinner) this.sawSpinner = true;
 
+    // Token-advance recovery (sparkle-pqxh follow-up): after an API BANNER the request that failed
+    // generated nothing, so a strictly-higher spinner token count is positive proof the agent is
+    // generating again — the same thing a classified tool event proves. This rescues the false-red
+    // where a HEALTHY agent hit a transient API blip early in a long turn and kept streaming tokens
+    // with no tool event yet ("Incubating… ↓ 2.1k tokens"): without it the sticky flag pinned the row
+    // red for the rest of the turn. Guards, each one load-bearing:
+    //   (a) `failureKind === "api"` — a self-prompt/churn wedge GENERATES its own pings, so its
+    //       counter climbs too; letting tokens clear it would make the pqxh wedge flap red↔green
+    //       (roborev on da7c80c). Churn only clears on real progress / a prompt / user input.
+    //   (b) only a genuine frame-to-frame INCREASE clears — a repeated/frozen count (the rate-limit
+    //       retry loop, and the tests' static spinner) does not, preserving "sticky until progress".
+    //   (c) `!trippedThisChunk` so a chunk that itself observed a failure line can't self-clear.
+    //   (d) the figure is read from the NEWEST SPINNER FRAME only, so prose in the same chunk that
+    //       mentions "30k tokens" is neither mistaken for the counter nor able to poison the baseline.
+    // The baseline is tracked regardless of failure state (and reset at every turn boundary) so the
+    // first frame after a blip already has something real to compare against.
+    if (hasSpinner && !trippedThisChunk) {
+      const tokens = latestSpinnerTokens(clean);
+      if (tokens !== null) {
+        if (
+          this.sawStreamFailure &&
+          this.failureKind === "api" &&
+          this.lastSpinnerTokens !== null &&
+          tokens > this.lastSpinnerTokens
+        ) {
+          this.clearStreamFailure();
+          // Token progress is real progress, so — like a classified tool event — it also closes the
+          // user-input echo window: from here a repeated self-ping is a fresh wedge again.
+          this.notedUserText = "";
+          this.notedUserLinesLeft = 0;
+        }
+        this.lastSpinnerTokens = tokens;
+      }
+    }
+
     // 1. An input prompt always wins: the agent is asking for you.
     if (prompt) {
       this.clearTimers();
       this.set(this.sawRecentRisk ? "approval" : "waiting");
       this.sawRecentRisk = false;
-      // A calm prompt means the agent recovered and is awaiting you — not a crash or a stall.
+      // A calm prompt means the agent recovered and is awaiting you — not a crash or a stall. The
+      // token baseline deliberately SURVIVES here: an approval question is asked MID-turn and the
+      // counter keeps climbing from where it was once you answer, so dropping it would throw away a
+      // still-valid high-water mark. The true boundaries — the turn settling, and the user submitting
+      // the next message — reset it (roborev 46783).
       this.sawRecentError = false;
-      this.sawStreamFailure = false;
-      this.failure.reset();
+      this.clearStreamFailure();
       return;
     }
 

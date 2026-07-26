@@ -18,6 +18,8 @@ import {
   clearPin,
   clearAllPins,
   signedInAccountIds,
+  duplicateAccountGroups,
+  duplicateAccountIds,
   PINS_STORAGE_KEY,
   type Account,
   type Usage,
@@ -177,26 +179,26 @@ describe("getIdentities", () => {
   it("invokes accounts_identities and returns identity rows verbatim", async () => {
     invoke.mockResolvedValue([
       { id: "a", email: "drodio@storytell.ai", organization: "drodio@storytell.ai's Organization" },
-      { id: "b", email: null, organization: null },
+      { id: "b", email: null, organization: null, accountUuid: null },
     ]);
     const out = await getIdentities();
     expect(invoke).toHaveBeenCalledWith("accounts_identities");
     expect(out).toEqual([
       { id: "a", email: "drodio@storytell.ai", organization: "drodio@storytell.ai's Organization" },
-      { id: "b", email: null, organization: null },
+      { id: "b", email: null, organization: null, accountUuid: null },
     ]);
   });
 });
 
 describe("accountLabel — real email is authoritative, nickname is the fallback", () => {
   it("prefers the real authenticated email over the nickname", () => {
-    expect(accountLabel(acct("a", { nickname: "DROdio Gmail" }), { id: "a", email: "drodio@storytell.ai", organization: null })).toBe(
+    expect(accountLabel(acct("a", { nickname: "DROdio Gmail" }), { id: "a", email: "drodio@storytell.ai", organization: null, accountUuid: null })).toBe(
       "drodio@storytell.ai",
     );
   });
 
   it("falls back to the nickname when the account has no identity (not signed in)", () => {
-    expect(accountLabel(acct("a", { nickname: "DROdio Chief" }), { id: "a", email: null, organization: null })).toBe("DROdio Chief");
+    expect(accountLabel(acct("a", { nickname: "DROdio Chief" }), { id: "a", email: null, organization: null, accountUuid: null })).toBe("DROdio Chief");
     expect(accountLabel(acct("a", { nickname: "DROdio Chief" }), undefined)).toBe("DROdio Chief");
   });
 });
@@ -317,8 +319,8 @@ describe("signedInAccountIds", () => {
   it("keeps only accounts with a real authenticated email", () => {
     expect(
       signedInAccountIds([
-        { id: "a", email: "drodio@storytell.ai", organization: null },
-        { id: "b", email: null, organization: null },
+        { id: "a", email: "drodio@storytell.ai", organization: null, accountUuid: null },
+        { id: "b", email: null, organization: null, accountUuid: null },
       ]),
     ).toEqual(["a"]);
   });
@@ -376,5 +378,73 @@ describe("pickAccount — signed-in filter (sparkle-gms0)", () => {
       pinnedAccountId: "pinned",
     });
     expect(chosen?.id).toBe("pinned");
+  });
+});
+
+describe("duplicateAccountGroups — two registrations, one real login", () => {
+  // The bug this exists for, verbatim from a live machine: "DROdio Storytell" (~/.claude) and
+  // "DROdio Gmail" (a separate config dir) both held a login to accountUuid 5fb3d67c-…. The UI
+  // showed two independent headroom bars, and failover between them switched to the SAME quota
+  // and re-hit the same limit immediately.
+  const UUID = "5fb3d67c-f4ed-417b-9bf2-f9156450eb73";
+  const storytell = acct("s", { nickname: "DROdio Storytell", isDefault: true });
+  const gmail = acct("g", { nickname: "DROdio Gmail" });
+  const sameLogin = [
+    { id: "s", email: "drodio@gmail.com", organization: "drodio@gmail.com's Organization", accountUuid: UUID },
+    { id: "g", email: "drodio@gmail.com", organization: "drodio@gmail.com's Organization", accountUuid: UUID },
+  ];
+
+  it("groups accounts that share an accountUuid, regardless of nickname", () => {
+    const groups = duplicateAccountGroups([storytell, gmail], sameLogin);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.accountUuid).toBe(UUID);
+    expect(groups[0]!.email).toBe("drodio@gmail.com");
+    expect(groups[0]!.accounts.map((a) => a.id)).toEqual(["s", "g"]);
+  });
+
+  it("reports genuinely distinct logins as NOT duplicates", () => {
+    const distinct = [
+      { id: "s", email: "drodio@storytell.ai", organization: null, accountUuid: "uuid-storytell" },
+      { id: "g", email: "drodio@gmail.com", organization: null, accountUuid: "uuid-gmail" },
+    ];
+    expect(duplicateAccountGroups([storytell, gmail], distinct)).toEqual([]);
+  });
+
+  it("does not treat two never-signed-in accounts as duplicates of each other", () => {
+    // Both have accountUuid null. Grouping on null would report "not set up yet" as "same login".
+    const none = [
+      { id: "s", email: null, organization: null, accountUuid: null },
+      { id: "g", email: null, organization: null, accountUuid: null },
+    ];
+    expect(duplicateAccountGroups([storytell, gmail], none)).toEqual([]);
+  });
+
+  it("keys on accountUuid, not email — a shared email with distinct uuids is not a duplicate", () => {
+    // Defensive: email is a display label. Only the uuid identifies the account.
+    const sameEmail = [
+      { id: "s", email: "drodio@gmail.com", organization: null, accountUuid: "uuid-a" },
+      { id: "g", email: "drodio@gmail.com", organization: null, accountUuid: "uuid-b" },
+    ];
+    expect(duplicateAccountGroups([storytell, gmail], sameEmail)).toEqual([]);
+  });
+
+  it("ignores identities for accounts that are not registered", () => {
+    const groups = duplicateAccountGroups([storytell], sameLogin);
+    expect(groups).toEqual([]); // only one registered account carries the uuid
+  });
+
+  it("duplicateAccountIds flattens the groups", () => {
+    expect(duplicateAccountIds([storytell, gmail], sameLogin)).toEqual(new Set(["s", "g"]));
+    expect(duplicateAccountIds([storytell, gmail], [])).toEqual(new Set());
+  });
+
+  it("handles three registrations of the same login", () => {
+    const third = acct("t", { nickname: "DROdio Third" });
+    const groups = duplicateAccountGroups(
+      [storytell, gmail, third],
+      [...sameLogin, { id: "t", email: "drodio@gmail.com", organization: null, accountUuid: UUID }],
+    );
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.accounts.map((a) => a.id)).toEqual(["s", "g", "t"]);
   });
 });

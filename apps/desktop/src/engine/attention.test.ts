@@ -23,7 +23,7 @@ describe("needsAttention", () => {
   });
 
   it("is false for every non-badge status and for undefined", () => {
-    // needsAttention is the NARROW badge/notification set. blocked and unmerged are red-COLORED
+    // needsAttention is the NARROW badge/notification set. `blocked` is red-COLORED
     // (dot + cross-window + sort) but deliberately NOT in this set — they don't ping/count.
     for (const s of ["working", "idle", "blocked", "unmerged", "done", "stopped"] as const) {
       expect(needsAttention(s)).toBe(false);
@@ -134,14 +134,15 @@ describe("notificationFor", () => {
   });
 
   it("uses 🔴 for every red status", () => {
-    // Full red-color tier, including blocked ('went quiet') and unmerged ('needs merge').
-    for (const s of ["waiting", "approval", "errored", "blocked", "unmerged"] as const) {
+    // Full red-color tier, including blocked ('went quiet').
+    for (const s of ["waiting", "approval", "errored", "blocked"] as const) {
       expect(notificationFor(s, "A", "P").title).toBe("🔴 A");
     }
   });
 
   it("uses 🔘 for every gray status", () => {
-    for (const s of ["idle", "done", "stopped"] as const) {
+    // `unmerged` is gray-tier: a landing state, not an alarm (packages/ui/tokens.ts).
+    for (const s of ["idle", "done", "stopped", "unmerged"] as const) {
       expect(notificationFor(s, "A", "P").title).toBe("🔘 A");
     }
   });

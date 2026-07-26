@@ -11,7 +11,16 @@ vi.mock("../logger", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { requeryOpenAgents, shouldRequery, REQUERY_PROMPT } from "./requery";
+import {
+  requeryOpenAgents,
+  shouldRequery,
+  claimReconnectRequery,
+  requeryOnReconnect,
+  REQUERY_PROMPT,
+  REQUERY_CLAIM_KEY,
+  REQUERY_CLAIM_WINDOW_MS,
+} from "./requery";
+import type { KV } from "./windowRegistry";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 
@@ -100,6 +109,80 @@ describe("requeryOpenAgents — PTY (build/worker) agents", () => {
     submitPrompt.mockRejectedValueOnce(new Error("pty dead"));
     await expect(requeryOpenAgents()).resolves.toBeUndefined();
     expect(submitPrompt).toHaveBeenCalledWith("b2", REQUERY_PROMPT);
+  });
+});
+
+/** Stands in for the localStorage every webview window shares. */
+function sharedStore(): KV {
+  const map = new Map<string, string>();
+  return {
+    getItem: (k) => map.get(k) ?? null,
+    setItem: (k, v) => void map.set(k, v),
+  };
+}
+
+describe("claimReconnectRequery — one re-query per reconnect, machine-wide", () => {
+  it("lets the first caller through", () => {
+    expect(claimReconnectRequery(1_000, sharedStore())).toBe(true);
+  });
+
+  it("suppresses the other windows recovering from the same reconnect", () => {
+    const shared = sharedStore(); // four windows, one machine, one link coming back
+    const claims = [0, 60, 90, 800].map((offset) => claimReconnectRequery(1_000 + offset, shared));
+    expect(claims).toEqual([true, false, false, false]);
+  });
+
+  it("suppresses a flapping link re-crossing the edge inside the window", () => {
+    const shared = sharedStore();
+    claimReconnectRequery(1_000, shared);
+    expect(claimReconnectRequery(1_000 + REQUERY_CLAIM_WINDOW_MS - 1, shared)).toBe(false);
+  });
+
+  it("re-queries again once the window has elapsed (a genuinely separate outage)", () => {
+    const shared = sharedStore();
+    claimReconnectRequery(1_000, shared);
+    expect(claimReconnectRequery(1_000 + REQUERY_CLAIM_WINDOW_MS, shared)).toBe(true);
+  });
+
+  it("reclaims a stamp from the future so a backwards clock can't wedge re-query off", () => {
+    const shared = sharedStore();
+    shared.setItem(REQUERY_CLAIM_KEY, String(1_000 + REQUERY_CLAIM_WINDOW_MS - 1));
+    expect(claimReconnectRequery(1_000, shared)).toBe(false); // inside the window: still one event
+    shared.setItem(REQUERY_CLAIM_KEY, String(5_000_000)); // way ahead — stale, not a live claim
+    expect(claimReconnectRequery(1_000, shared)).toBe(true);
+  });
+
+  it("reclaims past a garbled value rather than treating it as a live claim", () => {
+    const shared = sharedStore();
+    shared.setItem(REQUERY_CLAIM_KEY, "not-a-timestamp");
+    expect(claimReconnectRequery(1_000, shared)).toBe(true);
+  });
+
+  it("falls back to re-querying when the shared storage throws", () => {
+    const broken: KV = {
+      getItem: () => {
+        throw new Error("storage unavailable");
+      },
+      setItem: () => {},
+    };
+    expect(claimReconnectRequery(1_000, broken)).toBe(true);
+  });
+});
+
+describe("requeryOnReconnect — the claim actually gates the prompting", () => {
+  it("prompts the open agents when it wins the claim", async () => {
+    seed([agent("b1", "build")], ["b1"], { b1: "idle" });
+    await requeryOnReconnect(1_000, sharedStore());
+    expect(submitPrompt).toHaveBeenCalledWith("b1", REQUERY_PROMPT);
+  });
+
+  it("sends nothing at all when another window already claimed the reconnect", async () => {
+    seed([agent("b1", "build")], ["b1"], { b1: "idle" });
+    const shared = sharedStore();
+    await requeryOnReconnect(1_000, shared); // the window that won
+    submitPrompt.mockClear();
+    await requeryOnReconnect(1_060, shared); // a sibling window, same reconnect
+    expect(submitPrompt).not.toHaveBeenCalled();
   });
 });
 

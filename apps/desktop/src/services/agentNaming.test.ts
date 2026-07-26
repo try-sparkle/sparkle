@@ -398,13 +398,19 @@ describe("maybeAutoName — paid call gating for self-reporting agents", () => {
   it("self-reporting worker on a LATER prompt with neither signal → falls back to Haiku", async () => {
     seed(agentTab({ kind: "worker", promptHistory: history(2) }));
     await maybeAutoName("p1", "a1", "fix the login redirect bug");
-    expect(invoke).toHaveBeenCalledWith("generate_agent_name", { prompt: "fix the login redirect bug" });
+    expect(invoke).toHaveBeenCalledWith("generate_agent_name", {
+      prompt: "fix the login redirect bug",
+      project: "Proj", // metering-only attribution for the Credits history
+    });
   });
 
   it("non-self-reporting shell agent → Haiku on the first prompt, as before", async () => {
     seed(agentTab({ kind: "shell", promptHistory: history(1) }));
     await maybeAutoName("p1", "a1", "fix the login redirect bug");
-    expect(invoke).toHaveBeenCalledWith("generate_agent_name", { prompt: "fix the login redirect bug" });
+    expect(invoke).toHaveBeenCalledWith("generate_agent_name", {
+      prompt: "fix the login redirect bug",
+      project: "Proj", // metering-only attribution for the Credits history
+    });
   });
 });
 
@@ -441,7 +447,7 @@ describe("appendPrompt→maybeAutoName ordering invariant (sparkle-y2tv)", () =>
     await maybeAutoName("p1", "a1", prompt2);
     // append-first ⇒ promptCount === 2 ⇒ past the first-turn defer ⇒ the paid last-resort fallback fires ONCE.
     expect(invoke).toHaveBeenCalledTimes(1);
-    expect(invoke).toHaveBeenCalledWith("generate_agent_name", { prompt: prompt2 });
+    expect(invoke).toHaveBeenCalledWith("generate_agent_name", { prompt: prompt2, project: "Proj" });
     expect(useSelfReportMetrics.getState().namingOutcomes.paid_haiku_fallback).toBe(1);
   });
 
@@ -558,6 +564,7 @@ describe("maybeNameFromWork — Tier 2 paid backstop", () => {
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invoke).toHaveBeenCalledWith("generate_agent_name", {
       prompt: "refactor the billing webhook handler",
+      project: "Proj",
     });
     expect(currentName()).toBe("Billing Webhook Refactor");
     expect(useSelfReportMetrics.getState().namingOutcomes.work_haiku_backstop).toBe(1);

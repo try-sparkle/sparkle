@@ -13,7 +13,7 @@ import {
   setProjectConfigValue,
   unsetProjectConfigValue,
 } from "./config";
-import { useSettingsStore, type AiFeatureKey, type ToolKey } from "../stores/settingsStore";
+import { useSettingsStore, normalizeVaultId, type AiFeatureKey, type ToolKey } from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
 import {
   installRoborev,
@@ -237,7 +237,34 @@ const TOOLS_CONFIG_PATH: Record<ToolKey, string> = {
   github: "tools.github",
   guardrails: "tools.guardrails",
   roborev: "tools.roborev",
+  onepassword: "tools.onepassword",
 };
+
+/** Set (or clear) the 1Password vault backups are written to. A null id UNSETS the key rather
+ *  than writing an empty string: Rust treats a blank vault_id as "not chosen", so leaving a stale
+ *  `vault_id = ""` behind would misrepresent the file as configured. */
+export async function setOnePasswordVault(vaultId: string | null): Promise<void> {
+  // Normalize ONCE, through the store's exported rule, then branch on the result — set vs unset is
+  // the only decision left here.
+  const normalized = normalizeVaultId(vaultId);
+  useSettingsStore.getState().setOnePasswordVaultId(normalized);
+  try {
+    if (normalized) await setConfigValue("onepassword.vault_id", normalized);
+    else await unsetConfigValue("onepassword.vault_id");
+  } catch (e) {
+    console.warn("config write failed (onepassword vault)", e);
+  }
+}
+
+/** Toggle restoring backed-up env files into each newly created agent worktree. */
+export async function setOnePasswordSeedWorktrees(on: boolean): Promise<void> {
+  useSettingsStore.getState().setOnePasswordSeedWorktrees(on);
+  try {
+    await setConfigValue("onepassword.seed_worktrees", on);
+  } catch (e) {
+    console.warn("config write failed (onepassword seed_worktrees)", e);
+  }
+}
 
 /** Toggle one [tools] flag: optimistic store update, then persist to config.toml. */
 export async function setToolEnabled(key: ToolKey, on: boolean): Promise<void> {
@@ -261,6 +288,8 @@ export function authWarningFor(verdict: RoborevAuthVerdict | undefined): string 
   switch (verdict?.kind) {
     case "Passed":
       return null;
+    case "NotInstalled":
+      return "Roborev isn't installed, so your commits won't be reviewed. Turn Roborev off and on again to reinstall it.";
     case "ClaudeMissing":
       return "Roborev can't find the claude command, so your commits won't be reviewed. Install Claude Code, then turn Roborev on again.";
     case "NotAuthenticated":
@@ -300,9 +329,15 @@ export async function setRoborevEnabled(on: boolean): Promise<void> {
   await installRoborev();
   const verdict = await roborevAuthSelftest();
   settings.setRoborevAuthWarning(authWarningFor(verdict));
-  if (verdict?.kind === "ClaudeMissing" || verdict?.kind === "NotAuthenticated") {
+  if (
+    verdict?.kind === "ClaudeMissing" ||
+    verdict?.kind === "NotAuthenticated" ||
+    verdict?.kind === "NotInstalled"
+  ) {
     // Confidently broken: revert to off and tear the daemon back down, so we don't leave a daemon
-    // running that can only ever no-op. The warning above tells the user how to fix it.
+    // running that can only ever no-op. NotInstalled lands here too — installRoborev() ran just
+    // above and the binary is still absent, so the install failed and reviews can never happen.
+    // The warning above tells the user how to fix it.
     await setToolEnabled("roborev", false);
     await deactivateRoborev();
     return;

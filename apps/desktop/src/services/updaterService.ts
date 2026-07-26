@@ -19,7 +19,7 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { create } from "zustand";
 import { useSettingsStore } from "../stores/settingsStore";
-import { parseWindowLabelFromSearch } from "./projectWindows.url";
+import { isAppWindowSearch } from "./windowIdentity";
 
 /** Default poll cadence: every 60 minutes, plus once at launch and whenever the app regains focus. */
 export const DEFAULT_UPDATE_INTERVAL_MS = 60 * 60 * 1000;
@@ -90,12 +90,14 @@ function inTauri(): boolean {
  * windows each run their own poller. That means N× the release-feed traffic per interval, and —
  * with auto-apply on — N concurrent downloadAndInstall() calls racing to stage the same bundle.
  *
- * `?label=` is the same signal windowContext derives `isMain` from: secondary windows carry one,
- * the initial window doesn't. Kept as a pure search-string predicate so it unit-tests in node
- * (startUpdater itself is unreachable in tests behind the packaged/dev guard).
+ * "Main" now means the APP window rather than "the window without a `?label=`" — nothing has
+ * minted a label since CM-U7 part 2, which quietly made this predicate `true` in the tray and
+ * capture webviews too (roborev 46485-M). The auxiliary webviews carry `?view=`. Kept as a pure
+ * search-string predicate so it unit-tests in node (startUpdater itself is unreachable in tests
+ * behind the packaged/dev guard).
  */
 export function isMainWindowSearch(search: string): boolean {
-  return parseWindowLabelFromSearch(search) === null;
+  return isAppWindowSearch(search);
 }
 
 /** Outcome of a single update check — lets the user-initiated "Check for updates" show feedback. */

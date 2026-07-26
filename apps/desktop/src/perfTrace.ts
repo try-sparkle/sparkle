@@ -45,7 +45,13 @@ export function perfMark(key: string, milestone: string, meta?: Record<string, u
   const msSinceStart = Math.round(now - tr.t0);
   const msSincePrev = Math.round(now - tr.last);
   tr.last = now;
-  log.info("perf", `${tr.kind} ${milestone}`, { key, msSinceStart, msSincePrev, heapMb: heapMb() });
+  log.info("perf", `${tr.kind} ${milestone}`, {
+    key,
+    msSinceStart,
+    msSincePrev,
+    heapMb: heapMb(),
+    ...meta,
+  });
 }
 
 /** Close a keyed trace with a final total. No-op for an unstarted key. */
@@ -63,6 +69,75 @@ export function perfCancel(key: string): void {
   traces.delete(key);
 }
 
+// ── Suspend & background attribution (shared by the span and jank instruments) ─────────────────
+// Both instruments measure WALL CLOCK, so both can bill the app for time it was not running. The
+// jank monitor learned this the hard way (see classifyJankGap and SUSPEND_MS below); the span
+// instrument never did, and paid for it: `span rehydrate …` is the single loudest line in a real
+// session log, and its samples run to twenty-plus SECONDS for a body that is a JSON parse and a
+// merge. No such operation blocks the main thread that long — the webview was asleep or throttled
+// across the await. Those samples are not just noise, they poison the instrument: sizing work off
+// this span's timings has to be explicitly disclaimed today.
+//
+// The fix mirrors the jank monitor exactly. A span that cannot be main-thread work is RELABELLED,
+// never dropped: it moves from INFO to DEBUG with a verdict in the message, so the INFO stream is
+// the spans a human should act on and the raw sample survives for anyone who wants it.
+
+/** A span at or above this is a resume, not work — reuses the jank monitor's threshold and its
+ *  reasoning (see SUSPEND_MS). Named separately only so the forward reference reads clearly. */
+const SPAN_SUSPEND_MS = 10_000;
+
+/** The visibility state a span started in, compared against the live state when it ends. */
+export interface VisibilityMark {
+  /** `hiddenEpoch` at span start. */
+  epoch: number;
+  /** Whether the window was already hidden at span start. */
+  hidden: boolean;
+}
+
+// Incremented every time this window goes hidden. Sampling `document.hidden` when a span ENDS is
+// not enough on its own: a window hidden and re-shown mid-span reads "visible" at both ends while
+// having spent the whole interval throttled. That is the same trap classifyJankGap documents, and
+// a monotonic counter is what survives it.
+let hiddenEpoch = 0;
+let visibilityBound = false;
+
+function bindVisibility(): void {
+  if (visibilityBound || typeof document === "undefined") return;
+  visibilityBound = true;
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) hiddenEpoch += 1;
+  });
+}
+
+/** Snapshot the visibility state for a span about to start. Binds the listener on first use, so a
+ *  window that never times an async span (tray, capture) pays nothing. */
+export function markVisibility(): VisibilityMark {
+  bindVisibility();
+  return { epoch: hiddenEpoch, hidden: typeof document !== "undefined" && document.hidden };
+}
+
+/** True when the interval since `mark` overlapped ANY hidden period: hidden at the start, hidden
+ *  right now, or hidden and re-shown in between (the epoch moved). */
+export function overlappedHidden(mark: VisibilityMark): boolean {
+  if (mark.hidden) return true;
+  if (typeof document !== "undefined" && document.hidden) return true;
+  return hiddenEpoch !== mark.epoch;
+}
+
+/** How to account for one completed span. `report` is real main-thread cost (INFO); `suspend` and
+ *  `background` are wall-clock the app did not spend working (DEBUG). */
+export type SpanVerdict = "report" | "suspend" | "background";
+
+/** Classify a completed span. Pure, so the attribution is testable without a clock or a DOM.
+ *
+ *  `suspend` outranks `background`: a span long enough to clear SPAN_SUSPEND_MS is a wake whether
+ *  or not the window also went hidden, and that is the more specific claim about the duration. */
+export function classifySpan(ms: number, hiddenOverlap: boolean): SpanVerdict {
+  if (ms >= SPAN_SUSPEND_MS) return "suspend";
+  if (hiddenOverlap) return "background";
+  return "report";
+}
+
 // ── One-shot spans around a specific operation ────────────────────────────────────────────────
 /** Only spans at/above this many ms are logged. One frame at 60Hz (~16.7ms) is the bar: a span
  *  below it did NOT drop a frame, so it isn't a stall anyone can perceive and isn't worth a line.
@@ -73,6 +148,23 @@ export function perfCancel(key: string): void {
  *  sub-frame cost still shows up in the jank monitor's stalls. */
 const SPAN_MIN_MS = 16;
 
+/** Emit one completed span at the level its verdict earns. Below one frame nothing is emitted at
+ *  all — that gate is unchanged and still runs first, so this adds no lines. */
+function emitSpan(
+  name: string,
+  ms: number,
+  hiddenOverlap: boolean,
+  meta?: Record<string, unknown>,
+): void {
+  if (ms < SPAN_MIN_MS) return;
+  const verdict = classifySpan(ms, hiddenOverlap);
+  if (verdict === "report") {
+    log.info("perf", `span ${name}`, { ms, ...meta });
+    return;
+  }
+  log.debug("perf", `span ${name} (${verdict})`, { ms, ...meta });
+}
+
 /** Time a synchronous operation and log if it took ≥ SPAN_MIN_MS. Returns fn()'s value; rethrows. */
 export function perfSpan<T>(name: string, fn: () => T, meta?: Record<string, unknown>): T {
   const t0 = perfNow();
@@ -80,22 +172,29 @@ export function perfSpan<T>(name: string, fn: () => T, meta?: Record<string, unk
     return fn();
   } finally {
     const ms = round2(perfNow() - t0);
-    if (ms >= SPAN_MIN_MS) log.info("perf", `span ${name}`, { ms, ...meta });
+    // No hidden-window discount for a SYNCHRONOUS body: it never yields, so it cannot be
+    // background-throttled part-way through. A slow sync span in a hidden window is genuine
+    // main-thread work and keeps its INFO line. Only the suspend reclassification applies here
+    // (the machine can still sleep mid-call), which is what `false` selects.
+    emitSpan(name, ms, false, meta);
   }
 }
 
-/** Time an async operation end-to-end (await included) and log only if it took ≥ SPAN_MIN_MS. */
+/** Time an async operation end-to-end (await included) and log only if it took ≥ SPAN_MIN_MS.
+ *  Elapsed time here spans arbitrary event-loop turns, so it is attributed (see classifySpan)
+ *  before being reported as main-thread cost. */
 export async function perfSpanAsync<T>(
   name: string,
   fn: () => Promise<T>,
   meta?: Record<string, unknown>,
 ): Promise<T> {
   const t0 = perfNow();
+  const vis = markVisibility();
   try {
     return await fn();
   } finally {
     const ms = round2(perfNow() - t0);
-    if (ms >= SPAN_MIN_MS) log.info("perf", `span ${name}`, { ms, ...meta });
+    emitSpan(name, ms, overlappedHidden(vis), meta);
   }
 }
 
@@ -379,6 +478,10 @@ let jankRunning = false;
 //
 // Misclassifying either way is cheap: a resume is still recorded (at debug) with its duration, so
 // a gap that lands on the wrong side of this line is relabeled, never lost.
+//
+// The span instrument applies the same threshold for the same reason — see SPAN_SUSPEND_MS. Keep
+// the two in step: they are one claim ("nothing this app does on the main thread lasts 10s")
+// measured by two instruments, not two independently tunable knobs.
 const SUSPEND_MS = 10_000;
 
 /** A stall at or above this warns on its own line; anything shorter is coalesced into the periodic
@@ -427,8 +530,15 @@ export function classifyJankGap(
  *  backgrounded time, not a freeze), and gaps above `SUSPEND_MS` are logged as a resume rather than
  *  a stall (the machine was asleep). This is the single most useful instrument for "the app is
  *  slow": it catches EVERY stall, whatever the cause, so we can then correlate the timestamp against
- *  the spawn/switch/close/span/render lines. Idempotent; safe to call from multiple mounts. */
-export function startJankMonitor(thresholdMs = 150): void {
+ *  the spawn/switch/close/span/render lines. Idempotent; safe to call from multiple mounts.
+ *
+ *  `windowLabel` stamps every line with the webview it came from. Each project window runs its own
+ *  monitor against its own rAF clock, so without it one wide freeze produces N near-identical warns
+ *  a few hundred microseconds apart, differing only by a jitter in `ms` — indistinguishable from a
+ *  single window double-logging, and hiding how wide the freeze actually was. The label is the
+ *  window's opaque Tauri label, decoupled from the project it shows, so it identifies the webview
+ *  without naming user content. */
+export function startJankMonitor(thresholdMs = 150, windowLabel = "main"): void {
   if (jankRunning || typeof requestAnimationFrame !== "function") return;
   jankRunning = true;
   let last = perfNow();
@@ -440,7 +550,7 @@ export function startJankMonitor(thresholdMs = 150): void {
       if (document.hidden) hiddenSinceLastTick = true;
     });
   }
-  log.info("perf", "jank monitor started", { thresholdMs, heapMb: heapMb() });
+  log.info("perf", "jank monitor started", { thresholdMs, heapMb: heapMb(), win: windowLabel });
   // Sub-severe stalls pending in the current rollup window. `openedAt` is set when the window opens
   // (first pending stall), not on every flush — see JANK_ROLLUP_MS.
   let minorCount = 0;
@@ -457,6 +567,7 @@ export function startJankMonitor(thresholdMs = 150): void {
       maxMs: Math.round(minorMaxMs),
       sinceMs: Math.round(now - openedAt),
       heapMb: heapMb(),
+      win: windowLabel,
     });
     minorCount = 0;
     minorTotalMs = 0;
@@ -486,10 +597,10 @@ export function startJankMonitor(thresholdMs = 150): void {
     if (verdict !== "stall" && gap >= thresholdMs) flushMinors(now - gap);
     if (verdict === "resume") {
       // Resume from suspend, not a freeze — record it (still useful to correlate) without the warn.
-      log.debug("perf", "resume after suspend", { ms: Math.round(gap) });
+      log.debug("perf", "resume after suspend", { ms: Math.round(gap), win: windowLabel });
     } else if (verdict === "stall") {
       if (gap >= JANK_SEVERE_MS) {
-        log.warn("perf", "jank stall", { ms: Math.round(gap), heapMb: heapMb() });
+        log.warn("perf", "jank stall", { ms: Math.round(gap), heapMb: heapMb(), win: windowLabel });
       } else {
         if (minorCount === 0) openedAt = now;
         minorCount += 1;
@@ -513,7 +624,7 @@ export function startJankMonitor(thresholdMs = 150): void {
       const obs = new PO((list) => {
         for (const e of list.getEntries()) {
           if (e.duration >= thresholdMs) {
-            log.warn("perf", "longtask", { ms: Math.round(e.duration), name: e.name });
+            log.warn("perf", "longtask", { ms: Math.round(e.duration), name: e.name, win: windowLabel });
           }
         }
       });

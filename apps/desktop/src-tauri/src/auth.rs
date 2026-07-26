@@ -156,6 +156,13 @@ pub struct Me {
     /// Optional (and omitted when absent) to tolerate older orchestration servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auto_topup: Option<Value>,
+    /// Cloud Agents (Service B) capability — a GLOBAL server feature flag (`CLOUD_AGENTS_ENABLED`),
+    /// NOT a per-account allowlist; every caller sees the same value. Passed through verbatim for the same reason as
+    /// `auto_topup`: without the field serde drops the key and the desktop always reads undefined,
+    /// which the gating layer treats as "off". Absent/false ⇒ the desktop hides every cloud
+    /// surface, so the feature genuinely ships dark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cloud_agents_enabled: Option<bool>,
 }
 
 /// True if a (non-empty) desktop bearer token is stored.
@@ -717,6 +724,29 @@ mod auth_binding_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn me_passes_through_the_cloud_agents_capability_and_omits_it_when_absent() {
+        // The desktop hides every cloud-agent surface unless the server advertises the capability,
+        // so this field must SURVIVE the Rust hop. Without an explicit member serde drops unknown
+        // keys and JS reads undefined ⇒ the feature would look permanently dark even once OPS
+        // flips it on.
+        let on: Me = serde_json::from_str(
+            r#"{"clerkUserId":"u1","entitled":true,"balanceCents":500,"tokenVersion":1,"cloudAgentsEnabled":true}"#,
+        )
+        .unwrap();
+        let round: Value = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert_eq!(round["cloudAgentsEnabled"], true);
+
+        // An older server that predates the field must still deserialize, and the key must be
+        // OMITTED (not null) so the JS side reads a plain `undefined` ⇒ gated off.
+        let off: Me = serde_json::from_str(
+            r#"{"clerkUserId":"u1","entitled":true,"balanceCents":500,"tokenVersion":1}"#,
+        )
+        .unwrap();
+        let round: Value = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(round.get("cloudAgentsEnabled").is_none());
+    }
 
     #[test]
     fn checkout_body_includes_pack_when_present() {

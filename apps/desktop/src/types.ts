@@ -41,15 +41,20 @@ export interface PromptHistoryEntry {
 }
 
 // Per-agent alert-episode record backing the "Dismiss Alert" affordance (engine/alertDismissal.ts,
-// spec: docs/superpowers/specs/2026-07-09-dismiss-alert-design.md). A row is RED purely because its
-// status is waiting|approval|errored; dismissing acknowledges that red WITHOUT resolving it. A plain
+// spec: docs/superpowers/specs/2026-07-09-dismiss-alert-design.md). A row is RED because its status
+// is waiting|approval|errored|blocked; dismissing acknowledges that red WITHOUT resolving it. A plain
 // boolean can't distinguish "the alert I dismissed" from "a fresh problem", so we track episodes:
 // `seq` counts red episodes entered, `lastRed` is the last red signature (seeds restart), and
 // `dismissedSeq` is the episode the user acknowledged. Suppressed iff red now AND dismissedSeq===seq;
 // any new episode bumps seq past dismissedSeq → re-alert. Optional so legacy records need no migration.
+//
+// `blocked` joined the union on 2026-07-26 (see engine/alertDismissal.RedStatus). Widening it is
+// backward-compatible in both directions: a persisted record from an older build simply never carries
+// the new value, and a record carrying it read by an older build lands in the `lastRed !== status`
+// branch, which starts a fresh episode rather than crashing.
 export interface AgentAlertRecord {
   seq: number;
-  lastRed: "waiting" | "approval" | "errored" | null;
+  lastRed: "waiting" | "approval" | "errored" | "blocked" | null;
   dismissedSeq: number | null;
 }
 
@@ -142,6 +147,13 @@ export interface Project {
   // until any new one is opened — harmless and self-correcting. Optional so pre-existing persisted
   // projects (missing the field) read as "no fresh agent".
   freshBuildAgentId?: string | null;
+  /** The ORCHESTRATION-side project row this local project maps to (Service B / cloud agents).
+   *  A cloud session is started and listed against a server `sparkle_projects.id` (a uuid the
+   *  server owns), which is NOT this record's locally-minted `id` — so the first cloud action
+   *  resolves/creates that row and caches its id here (see services/cloudAgents/projectLink.ts).
+   *  Absent for every project that has never run a cloud agent, i.e. all of them until the
+   *  feature is switched on for the account. */
+  cloudProjectId?: string | null;
 }
 
 export type { AgentTabStatus };

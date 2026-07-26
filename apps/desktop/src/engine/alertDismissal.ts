@@ -1,7 +1,8 @@
 // Dismiss / re-enable the RED alarm on an agent row (spec:
 // docs/superpowers/specs/2026-07-09-dismiss-alert-design.md).
 //
-// A row is RED purely because its status is waiting | approval | errored (isRedStatus). "Dismiss
+// A row is RED when services/windowStatus.isRedStatus says so (the color tier in
+// packages/ui/tokens.ts); every red status is currently dismissible — see DISMISSIBLE below. "Dismiss
 // Alert" acknowledges that red WITHOUT resolving it: the row recolors to its non-alerting tone and
 // drops out of the red zone, while its true status is untouched. Two requirements shape the design:
 //   - Re-alert on new events: a *new/different* red episode must re-raise red even after a dismiss.
@@ -13,22 +14,63 @@
 //
 // Everything here is PURE (no store, no React) so it unit-tests in isolation and composes with the
 // other status-map transforms (withUnstartedWorkerAttention / withRedWorkerAttention) in the sidebar.
-// The red predicate is `needsAttention` (engine/attention.ts) — the same waiting|approval|errored
-// tier used by the badge/notifications — reused here instead of services/windowStatus.isRedStatus so
-// this module stays free of that file's top-level Tauri import (keeps it pure + unit-testable).
+// The red predicate is the module-local `DISMISSIBLE` set below, NOT engine/attention.needsAttention.
+// It used to delegate to that, which is what silently made `blocked` undismissable while the type said
+// otherwise. It still doesn't reach for services/windowStatus.isRedStatus — not because that answers a
+// different question (today it answers the same one) but to keep this module free of that file's
+// top-level Tauri import, so it stays pure and unit-testable.
 import type { AgentTabStatus, AgentAlertRecord } from "../types";
-import { needsAttention } from "./attention";
 
 // The persisted record shape lives in ../types (next to AgentTab); re-exported here so callers can
 // import the type alongside these helpers from the one engine module that operates on it.
 export type { AgentAlertRecord };
 
-/** The RED "needs-you" statuses. Mirrors agentOrdering.ts / attention.ts's red tier. */
-export type RedStatus = "waiting" | "approval" | "errored";
+/** The DISMISSIBLE red statuses.
+ *
+ *  This set currently COINCIDES with the red-COLOR tier (services/windowStatus.isRedStatus) and is
+ *  deliberately NOT the narrower needs-you-now set (engine/attention.needsAttention). An earlier
+ *  version of this docstring asserted the exact opposite, which is the belief that made the whole
+ *  feature inert for `blocked`; if you are here to check whether `blocked` is dismissible, it is.
+ *  Coinciding is not the same as being the same question, though — this one is "can the user
+ *  acknowledge this red?", and it is answered from the union below, not by importing a predicate.
+ *
+ *  `blocked` IS here as of 2026-07-26. It was left out on the argument that it is "close to
+ *  unreachable — statusEngine only sets it from the screen-scraper fallback, which statusRouter
+ *  suppresses once hooks are live". That was wrong, and roborev caught it: services/improvementPass
+ *  sets `blocked` PROGRAMMATICALLY on every failed or network-errored hourly pass, nowhere near the
+ *  PTY/hook path, and it persists on the pinned Sparkle row until the next pass an hour later. A
+ *  permanent red you cannot acknowledge is precisely the `unmerged` complaint that drove this whole
+ *  taxonomy fix, so it gets the same remedy rather than an excuse. */
+export type RedStatus = "waiting" | "approval" | "errored" | "blocked";
 
-/** Type-guard form of `needsAttention`, narrowing to the red union for signature/color math. */
+/** The dismissible set, spelled out over {@link RedStatus} rather than delegated to
+ *  `attention.needsAttention`.
+ *
+ *  It used to be `return needsAttention(status)`, and when `blocked` was added to the union above
+ *  that delegation silently made the whole feature inert for it: `needsAttention` is the narrower
+ *  badge set, so every gate here — the Dismiss control, the episode recorder, the suppression check,
+ *  the de-escalation overlay — went on rejecting `blocked` while the type claimed otherwise. Nothing
+ *  failed; the feature just didn't exist (roborev on 15664dbeb). Deriving the predicate FROM the
+ *  union is what stops the two drifting apart again.
+ *
+ *  Still Tauri-free (the reason this module doesn't import services/windowStatus.isRedStatus), and
+ *  still deliberately NOT the same question as either of the other two red predicates — see the trap
+ *  note in packages/ui/tokens.ts. This one is "can the user acknowledge this red?". */
+//  KNOWN LIMIT, newly relevant for `blocked`: episodes key on the red KIND, not on which agent
+//  caused it (see the note on advanceAlerts in AgentSidebar). A worker's red bubbles to its
+//  orchestrator, so dismissing a bubbled `blocked` suppresses every LATER `blocked` bubble from any
+//  other worker under that orchestrator until the parent's red kind changes — in a six-worker fleet,
+//  one acknowledgement can hide five unrelated stalls from the top-level row. That limit predates
+//  this and is accepted for waiting/errored; it is recorded here because `blocked` is the status most
+//  likely to recur across different workers, so it is the one where it will actually bite.
+const DISMISSIBLE: ReadonlySet<AgentTabStatus> = new Set<RedStatus>([
+  "waiting",
+  "approval",
+  "errored",
+  "blocked",
+]);
 function isRedStatus(status: AgentTabStatus | undefined): status is RedStatus {
-  return needsAttention(status);
+  return status !== undefined && DISMISSIBLE.has(status);
 }
 
 /** A never-seen agent's implicit record: no episodes, not dismissed. */
@@ -87,8 +129,11 @@ export function reenabledRecord(record: AgentAlertRecord | undefined): AgentAler
 
 /**
  * The non-red status a suppressed red agent is treated as, for BOTH color and sort tier: waiting /
- * approval de-escalate to `idle` (Tier 1 "your move", muted gray); errored de-escalates to `stopped`
- * (Tier 3 dormant). This is "same tier as its real status, minus the alarm".
+ * approval / blocked de-escalate to `idle` (Tier 1 "your move", muted gray); errored de-escalates to
+ * `stopped` (Tier 3 dormant). This is "same tier as its real status, minus the alarm".
+ *
+ * `blocked` → `idle` rather than `stopped`: a stalled agent still has a live process and is still
+ * your move, it just stopped shouting about it. `stopped` would claim it isn't running.
  */
 export function deEscalatedStatus(status: RedStatus): AgentTabStatus {
   return status === "errored" ? "stopped" : "idle";

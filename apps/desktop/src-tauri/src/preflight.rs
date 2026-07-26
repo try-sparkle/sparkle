@@ -37,8 +37,10 @@ fn login_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
+/// `pub(crate)` so sibling modules that must resolve a user-scope binary the same way (see
+/// `onepassword::resolve_op_uncached`) reuse this rather than re-deriving the login-shell dance.
 #[cfg(unix)]
-fn run_in_login_shell(script: &str) -> Option<String> {
+pub(crate) fn run_in_login_shell(script: &str) -> Option<String> {
     Command::new(login_shell())
         .args(["-lc", script])
         .output()
@@ -54,7 +56,7 @@ fn run_in_login_shell(script: &str) -> Option<String> {
 /// path that contains a quote/space/`;`/`$(…)` must NOT be able to break out of the command — a
 /// quoted positional `"$1"` is substituted verbatim and never re-tokenized.
 #[cfg(unix)]
-fn run_in_login_shell_with_arg(script: &str, arg: &str) -> Option<String> {
+pub(crate) fn run_in_login_shell_with_arg(script: &str, arg: &str) -> Option<String> {
     Command::new(login_shell())
         // The token after the script becomes $0; `arg` becomes $1.
         .args(["-lc", script, "sparkle-preflight", arg])
@@ -69,7 +71,7 @@ fn run_in_login_shell_with_arg(script: &str, arg: &str) -> Option<String> {
 /// user's PATH, so there's no login-shell dance — `where` returns the same matches a terminal
 /// would. Returns the first hit as an absolute path.
 #[cfg(not(unix))]
-fn resolve_on_path(bin: &str) -> Option<String> {
+pub(crate) fn resolve_on_path(bin: &str) -> Option<String> {
     Command::new("where")
         .arg(bin)
         .output()
@@ -85,7 +87,7 @@ fn resolve_on_path(bin: &str) -> Option<String> {
 
 /// Windows home directory (`%USERPROFILE%`, falling back to `HOME` for MSYS/Git-Bash setups).
 #[cfg(not(unix))]
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
@@ -511,7 +513,7 @@ fn is_executable(p: &Path) -> bool {
 }
 
 /// First candidate that exists and is executable, as an absolute path string.
-fn first_executable(candidates: &[PathBuf]) -> Option<String> {
+pub(crate) fn first_executable(candidates: &[PathBuf]) -> Option<String> {
     candidates
         .iter()
         .find(|p| is_executable(p))

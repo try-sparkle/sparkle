@@ -45,6 +45,29 @@ const BASH_AMEND_FOOTER = [
   "Esc to cancel · Tab to amend · ctrl+e to explain",
 ].join("\n");
 
+// Claude Code DROPS "Tab to amend" from the approval footer whenever the highlighted option is not
+// the amendable "Yes" — i.e. when the cursor sits on option 2/3 — leaving just
+// "Esc to cancel · ctrl+e to explain". A footer regex anchored on "tab to amend" silently missed
+// these frames, so the agent sat stuck on the prompt with no auto-approve. This fixture (cursor on
+// option 2, no "Tab to amend", trailing Ink content BELOW the footer as the real render shows) is
+// the regression the "esc to cancel … ctrl+e to explain" anchor fixes.
+const BASH_NO_AMEND_FOOTER = [
+  "This command requires approval",
+  "",
+  "Do you want to proceed?",
+  "  1. Yes",
+  '❯ 2. Yes, and don\'t ask again for: echo "---- retry exit: $? ----"',
+  "  3. No",
+  "",
+  "Esc to cancel · ctrl+e to explain",
+  "",
+  "5 tasks (0 done, 1 in progress, 4 open)",
+].join("\n");
+
+// The highlighted-option glyph also drifts (❯ → › → ">"); the classifier must still parse the
+// options and pick the plain Yes regardless. Same no-amend footer, "›" cursor.
+const BASH_NO_AMEND_ALT_CURSOR = BASH_NO_AMEND_FOOTER.replace("❯", "›");
+
 const EDIT = [
   "Edit file",
   "  src/main.ts",
@@ -113,6 +136,16 @@ describe("classifyApproval", () => {
 
   it("classifies a bash prompt that uses the amend/explain footer (the regression)", () => {
     expect(classifyApproval(BASH_AMEND_FOOTER)).toEqual({ category: "bash", approveOption: "1\n" });
+  });
+
+  it("classifies a bash prompt whose footer DROPS 'Tab to amend' (cursor on option 2)", () => {
+    // The primary regression from the founder report: option 2/3 highlighted → no "Tab to amend" →
+    // previously classified null and the agent hung. Must now auto-approve to the plain Yes (opt 1).
+    expect(classifyApproval(BASH_NO_AMEND_FOOTER)).toEqual({ category: "bash", approveOption: "1\n" });
+  });
+
+  it("classifies the no-amend footer regardless of the cursor glyph (❯ → ›)", () => {
+    expect(classifyApproval(BASH_NO_AMEND_ALT_CURSOR)).toEqual({ category: "bash", approveOption: "1\n" });
   });
 
   it("classifies a file-edit permission prompt", () => {

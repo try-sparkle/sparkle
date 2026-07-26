@@ -18,6 +18,7 @@ import { useUiStore } from "../stores/uiStore";
 import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 import { isOverDndTarget, NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
 import { safeUnlisten } from "../services/safeUnlisten";
+import { describePaths } from "../services/logSafePaths";
 import { log } from "../logger";
 import type { Project } from "../types";
 
@@ -45,9 +46,11 @@ export function useNewBuildAgentDrop(project: Project | null): void {
           if (paths.length === 0) return;
           const id = spawnRef.current();
           if (!id) return; // no project open — no button rendered either; nothing to do
+          // Kinds, never paths — the log ships with support tickets and crash reports
+          // (see services/logSafePaths).
           log.info("composer", `dropped ${paths.length} file(s) on + New Build Agent`, {
             agentId: id,
-            paths,
+            ...describePaths(paths),
           });
           // The new composer hasn't mounted yet — queue the paths for it to drain on mount.
           usePendingAttachmentsStore.getState().add(id, paths);

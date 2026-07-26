@@ -20,7 +20,7 @@ describe("projectStore default/base branch", () => {
   it("a new agent records baseBranch from the project's defaultBranch", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
     useProjectStore.getState().setDefaultBranch(pid, "main");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
     expect(agent.baseBranch).toBe("main");
   });
@@ -69,7 +69,7 @@ describe("projectStore auto-naming", () => {
 
   it("a fresh default-named agent is unpinned; auto-rename applies and records the basis", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     let agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
     expect(agent.namePinned).toBe(false);
 
@@ -82,7 +82,7 @@ describe("projectStore auto-naming", () => {
 
   it("a manual rename pins the name and blocks subsequent auto-renames", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     useProjectStore.getState().renameAgent(pid, aid, "My Agent");
     useProjectStore.getState().autoRenameAgent(pid, aid, "Auto Name", "some prompt");
     const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
@@ -92,7 +92,7 @@ describe("projectStore auto-naming", () => {
 
   it("a manual rename clears the auto-name variants (pinned = name only)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     // Auto-name first so the title/description are populated, then rename by hand.
     useProjectStore.getState().autoRenameAgent(pid, aid, "Fix Login", "fix the login bug", {
       title: "Fix Login Redirect",
@@ -110,7 +110,7 @@ describe("projectStore auto-naming", () => {
 
   it("unpinning re-enables auto-rename", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     useProjectStore.getState().renameAgent(pid, aid, "My Agent");
     useProjectStore.getState().unpinAgent(pid, aid);
     useProjectStore.getState().autoRenameAgent(pid, aid, "Auto Name", "some prompt");
@@ -126,7 +126,7 @@ describe("projectStore applyAiTitle (Claude Code session title)", () => {
 
   it("applies Claude Code's title as the name and records aiTitle (title with empty description)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid); // "Build 1" default
+    const aid = useProjectStore.getState().addAgent(pid)!; // "Build 1" default
     useProjectStore.getState().applyAiTitle(pid, aid, "  Debug Merged Agent On New Pop Open  ");
     const a = agentOf(pid, aid);
     expect(a.name).toBe("Debug Merged Agent On New Pop Open"); // trimmed
@@ -140,7 +140,7 @@ describe("projectStore applyAiTitle (Claude Code session title)", () => {
 
   it("overrides a prior Haiku auto-name (the title is authoritative)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     useProjectStore.getState().autoRenameAgent(pid, aid, "Some Guess", "a thin prompt");
     useProjectStore.getState().applyAiTitle(pid, aid, "Fix False Merged Status");
     expect(agentOf(pid, aid).name).toBe("Fix False Merged Status");
@@ -148,7 +148,7 @@ describe("projectStore applyAiTitle (Claude Code session title)", () => {
 
   it("never overrides a manually-pinned name", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     useProjectStore.getState().renameAgent(pid, aid, "My Agent");
     useProjectStore.getState().applyAiTitle(pid, aid, "Claude's Title");
     expect(agentOf(pid, aid).name).toBe("My Agent");
@@ -156,7 +156,7 @@ describe("projectStore applyAiTitle (Claude Code session title)", () => {
 
   it("an empty/whitespace title is a no-op (no name yet, keep the default)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     const before = agentOf(pid, aid).name;
     useProjectStore.getState().applyAiTitle(pid, aid, "   ");
     expect(agentOf(pid, aid).name).toBe(before);
@@ -168,7 +168,7 @@ describe("projectStore applyAiTitle (Claude Code session title)", () => {
     // ai-title while it was in flight; when the Haiku call resolves it must NOT overwrite the
     // authoritative title with its stale guess. The store is the arbiter.
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     useProjectStore.getState().applyAiTitle(pid, aid, "Authoritative Title");
     useProjectStore.getState().autoRenameAgent(pid, aid, "Late Haiku Guess", "a thin prompt");
     expect(agentOf(pid, aid).name).toBe("Authoritative Title");
@@ -176,7 +176,7 @@ describe("projectStore applyAiTitle (Claude Code session title)", () => {
 
   it("re-applying the same title is a no-op but a changed title updates the name", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     useProjectStore.getState().applyAiTitle(pid, aid, "First Title");
     const ref1 = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
     useProjectStore.getState().applyAiTitle(pid, aid, "First Title"); // unchanged
@@ -193,7 +193,7 @@ describe("projectStore prompt history", () => {
 
   const seed = () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     return { pid, aid };
   };
   const agentOf = (aid: string) =>
@@ -473,8 +473,8 @@ describe("setAgentBeadId", () => {
   beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
   it("attaches a bead id to an existing agent without disturbing others", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const a1 = useProjectStore.getState().addAgent(pid, { kind: "build" });
-    const a2 = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const a1 = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
+    const a2 = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
     useProjectStore.getState().setAgentBeadId(pid, a1, "bd-42");
     const agents = useProjectStore.getState().projects[0]!.agents;
     expect(agents.find((a) => a.id === a1)!.beadId).toBe("bd-42");
@@ -487,14 +487,14 @@ describe("setAgentModel (per-agent Claude model, sparkle-i6rw)", () => {
 
   it("a new agent has no model (inherit Claude Code's default)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!.model)
       .toBeUndefined();
   });
 
   it("addAgent carries an explicit model onto the new tab", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid, { model: "claude-haiku-4-5" });
+    const aid = useProjectStore.getState().addAgent(pid, { model: "claude-haiku-4-5" })!;
     expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!.model)
       .toBe("claude-haiku-4-5");
   });
@@ -502,7 +502,7 @@ describe("setAgentModel (per-agent Claude model, sparkle-i6rw)", () => {
   it("normalizes the 'default' sentinel to undefined at the store boundary (one canonical form)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
     // addAgent with the sentinel persists undefined, same as omitting it.
-    const aid = useProjectStore.getState().addAgent(pid, { model: "default" });
+    const aid = useProjectStore.getState().addAgent(pid, { model: "default" })!;
     expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!.model)
       .toBeUndefined();
     // Picking a real model then re-picking Default also lands back on undefined.
@@ -514,8 +514,8 @@ describe("setAgentModel (per-agent Claude model, sparkle-i6rw)", () => {
 
   it("setAgentModel updates only the target agent and can clear back to undefined", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const a1 = useProjectStore.getState().addAgent(pid);
-    const a2 = useProjectStore.getState().addAgent(pid);
+    const a1 = useProjectStore.getState().addAgent(pid)!;
+    const a2 = useProjectStore.getState().addAgent(pid)!;
     useProjectStore.getState().setAgentModel(pid, a1, "claude-opus-4-8");
     let agents = useProjectStore.getState().projects[0]!.agents;
     expect(agents.find((a) => a.id === a1)!.model).toBe("claude-opus-4-8");
@@ -530,8 +530,8 @@ describe("setAgentEpicId", () => {
   beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
   it("binds an epic id to an existing agent without disturbing others", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const a1 = useProjectStore.getState().addAgent(pid, { kind: "build" });
-    const a2 = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const a1 = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
+    const a2 = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
     useProjectStore.getState().setAgentEpicId(pid, a1, "epic-7");
     const agents = useProjectStore.getState().projects[0]!.agents;
     expect(agents.find((a) => a.id === a1)!.epicId).toBe("epic-7");
@@ -546,7 +546,7 @@ describe("setAgentEpicId", () => {
   // SAME epic on an idempotent re-hit of "Build It", and adoptWorker/reconcile paths may re-set it).
   it("re-binding overwrites the previous epic (last write wins — this setter holds no policy)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const a1 = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const a1 = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
     useProjectStore.getState().setAgentEpicId(pid, a1, "epic-7");
     useProjectStore.getState().setAgentEpicId(pid, a1, "epic-8");
     const agents = useProjectStore.getState().projects[0]!.agents;
@@ -559,7 +559,7 @@ describe("adoptWorker (sparkle-3xus disk reconcile)", () => {
 
   it("inserts an evicted worker under its parent without stealing the selected tab", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const buildId = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const buildId = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
     // The user is looking at the build agent; adoption must not yank selection to the new worker.
     useProjectStore.getState().selectAgent(pid, buildId);
 
@@ -586,8 +586,8 @@ describe("adoptWorker (sparkle-3xus disk reconcile)", () => {
 
   it("is idempotent — never clobbers an existing in-memory record", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const buildId = useProjectStore.getState().addAgent(pid, { kind: "build" });
-    const wid = useProjectStore.getState().addAgent(pid, { kind: "worker", parentId: buildId, task: "live task" });
+    const buildId = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
+    const wid = useProjectStore.getState().addAgent(pid, { kind: "worker", parentId: buildId, task: "live task" })!;
     useProjectStore.getState().renameAgent(pid, wid, "My Worker");
 
     // Re-adopting the SAME id must be a no-op (keep the live name/task, not the disk snapshot).
@@ -608,7 +608,7 @@ describe("adoptWorker (sparkle-3xus disk reconcile)", () => {
 
   it("REFUSES to re-adopt a worker whose row is mid-teardown (× just closed it)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const buildId = useProjectStore.getState().addAgent(pid, { kind: "build" });
+    const buildId = useProjectStore.getState().addAgent(pid, { kind: "build" })!;
 
     // The user just closed this worker; it's tombstoned as locally-removed. A disk reconcile firing
     // before the id is re-created must NOT bring the row back.

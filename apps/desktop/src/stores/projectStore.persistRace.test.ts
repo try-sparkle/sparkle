@@ -221,8 +221,8 @@ describe("store wiring — removals are recorded as persisted tombstones (sparkl
   it("removeAgent tombstones the agent AND its workers", () => {
     const st = () => useProjectStore.getState();
     const pid = st().addProject("P", "/tmp/p");
-    const build = st().addAgent(pid, { kind: "build" });
-    const worker = st().addAgent(pid, { kind: "worker", parentId: build });
+    const build = st().addAgent(pid, { kind: "build" })!;
+    const worker = st().addAgent(pid, { kind: "worker", parentId: build })!;
 
     st().removeAgent(pid, build);
 
@@ -235,7 +235,7 @@ describe("store wiring — removals are recorded as persisted tombstones (sparkl
   it("removeProject tombstones the project AND its agents", () => {
     const st = () => useProjectStore.getState();
     const pid = st().addProject("P", "/tmp/p");
-    const build = st().addAgent(pid, { kind: "build" });
+    const build = st().addAgent(pid, { kind: "build" })!;
 
     st().removeProject(pid);
 
@@ -247,7 +247,7 @@ describe("store wiring — removals are recorded as persisted tombstones (sparkl
     // End-to-end: close an agent, then rehydrate from a window that still carries it.
     const st = () => useProjectStore.getState();
     const pid = st().addProject("P", "/tmp/p");
-    const build = st().addAgent(pid, { kind: "build" });
+    const build = st().addAgent(pid, { kind: "build" })!;
     const snapshotWithIt = JSON.parse(
       JSON.stringify({ projects: st().projects, selectedProjectId: pid }),
     );

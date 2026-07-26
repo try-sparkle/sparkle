@@ -213,7 +213,7 @@ export function DefineStageModal({ stageKey, projectName, projectRoot, onClose }
         // Delivered → detect how the project ships, then phrase the intro by confidence tier.
         let p: DeliveryProposal | undefined;
         try {
-          p = await detectDelivery(projectRoot);
+          p = await detectDelivery(projectRoot, { projectName });
         } catch {
           p = undefined; // detection failed → fall through to the generic line
         }
@@ -337,7 +337,7 @@ export function DefineStageModal({ stageKey, projectName, projectRoot, onClose }
     const def: StageDefinition = { ...parsed, learned: false };
     let p = proposal;
     try {
-      p = await detectDelivery(projectRoot);
+      p = await detectDelivery(projectRoot, { projectName });
       setProposal(p);
     } catch {
       // keep whatever we already had; a detector failure must not block saving.
@@ -360,7 +360,7 @@ export function DefineStageModal({ stageKey, projectName, projectRoot, onClose }
         systemPrompt(stageKey),
         trimmed,
         undefined,
-        `Defining the "${stageKey}" stage`,
+        { purpose: `Defining the "${stageKey}" stage`, project: projectName },
       );
       const normalized = normalizeParsed(parsed);
       const finalDef =

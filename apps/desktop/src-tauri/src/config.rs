@@ -150,6 +150,29 @@ pub struct ToolsConfig {
     /// BUILD-agent commits using your existing `claude login`; off tears the daemon down and stops
     /// reviewing.
     pub roborev: bool,
+    /// Back your `.env*` files up to a 1Password vault, and restore them into fresh agent
+    /// worktrees. The ONE tool here that defaults OFF: every other flag toggles behavior Sparkle
+    /// can deliver on its own, but this one needs an external account, the `op` CLI, and a chosen
+    /// vault. Shipping it on would advertise a capability a new install cannot actually perform,
+    /// so the user opts in from the Tools pane once those prerequisites are met.
+    pub onepassword: bool,
+}
+
+/// 1Password env-backup state that isn't a simple on/off toggle. Machine-wide (like [tools]): a
+/// per-project value is ignored with a warning, because the vault is a property of the user's
+/// 1Password account, not of any one repo.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OnePasswordConfig {
+    /// The vault chosen in the one-time picker. `None` until then — the backup UI stays in its
+    /// "pick a vault" state rather than guessing, since writing secrets into the wrong vault (say,
+    /// one shared with a team) is not something to do by default.
+    pub vault_id: Option<String>,
+    /// Restore backed-up env files into each newly created agent worktree. This is the payoff of
+    /// the whole feature — `.env*` is gitignored, so a worktree never carries one and every worker
+    /// agent starts without its project's secrets. Off by default: it writes files into a fresh
+    /// worktree, which the user should ask for rather than discover.
+    pub seed_worktrees: bool,
 }
 
 /// roborev machine-wide state that isn't a simple on/off tool toggle. Machine-wide (like [tools]):
@@ -260,6 +283,9 @@ pub struct SparkleConfig {
     /// roborev machine-wide state (the one-time consent flag). Kept in its own section so Rust can
     /// gate the first-run modal on it.
     pub roborev: RoborevConfig,
+    /// 1Password env-backup state (chosen vault + worktree seeding). Its own section for the same
+    /// reason as [roborev]: it is machine-wide state, not a per-repo preference.
+    pub onepassword: OnePasswordConfig,
     pub freshness: FreshnessConfig,
     pub worktree_pool: WorktreePoolConfig,
     pub capture: CaptureConfig,
@@ -305,16 +331,20 @@ impl Default for SparkleConfig {
             // Ships auto-approve ON for every category except bash (see ApprovalsConfig::default),
             // so a fresh install isn't blocked by permission prompts. bash stays ask-each-time.
             approvals: ApprovalsConfig::default(),
-            // Opinionated defaults: every tool ships on for a new install.
+            // Opinionated defaults: every tool ships on for a new install — except onepassword,
+            // which needs an external account + CLI before it can do anything (see the field doc).
             tools: ToolsConfig {
                 analytics: true,
                 beads: true,
                 github: true,
                 guardrails: true,
                 roborev: true,
+                onepassword: false,
             },
             // First-run consent is unresolved until the user answers the one-time modal.
             roborev: RoborevConfig { consent_prompted: false },
+            // No vault until the user picks one, and no worktree seeding until they ask for it.
+            onepassword: OnePasswordConfig { vault_id: None, seed_worktrees: false },
             freshness: FreshnessConfig {
                 // Keep these in sync with the bash fallback in scripts/lib/sparkle-config.sh.
                 staleness_warn_commits: 25,
@@ -433,11 +463,18 @@ struct PartialTools {
     github: Option<bool>,
     guardrails: Option<bool>,
     roborev: Option<bool>,
+    onepassword: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct PartialRoborev {
     consent_prompted: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialOnePassword {
+    vault_id: Option<String>,
+    seed_worktrees: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -495,6 +532,7 @@ struct PartialConfig {
     ai: Option<PartialAi>,
     tools: Option<PartialTools>,
     roborev: Option<PartialRoborev>,
+    onepassword: Option<PartialOnePassword>,
     freshness: Option<PartialFreshness>,
     worktree_pool: Option<PartialWorktreePool>,
     capture: Option<PartialCapture>,
@@ -659,11 +697,28 @@ fn apply_tools(into: &mut ToolsConfig, p: Option<PartialTools>) {
     if let Some(v) = p.roborev {
         into.roborev = v;
     }
+    if let Some(v) = p.onepassword {
+        into.onepassword = v;
+    }
 }
 
 fn apply_roborev(into: &mut RoborevConfig, p: Option<PartialRoborev>) {
     if let Some(PartialRoborev { consent_prompted: Some(v) }) = p {
         into.consent_prompted = v;
+    }
+}
+
+fn apply_onepassword(into: &mut OnePasswordConfig, p: Option<PartialOnePassword>) {
+    let Some(p) = p else { return };
+    // An empty/whitespace vault_id is treated as "not chosen" rather than stored verbatim: a blank
+    // string would otherwise read as a configured vault everywhere downstream and make every `op`
+    // call fail with an opaque error instead of showing the picker.
+    if let Some(v) = p.vault_id {
+        let v = v.trim();
+        into.vault_id = if v.is_empty() { None } else { Some(v.to_string()) };
+    }
+    if let Some(v) = p.seed_worktrees {
+        into.seed_worktrees = v;
     }
 }
 
@@ -867,6 +922,7 @@ fn build_effective(
                 apply_ai(&mut cfg.ai, p.ai);
                 apply_tools(&mut cfg.tools, p.tools);
                 apply_roborev(&mut cfg.roborev, p.roborev);
+                apply_onepassword(&mut cfg.onepassword, p.onepassword);
                 apply_freshness(&mut cfg.freshness, p.freshness);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_capture(&mut cfg.capture, p.capture);
@@ -910,6 +966,14 @@ fn build_effective(
                     warnings.push(
                         "[roborev] in a per-project .sparkle/config.toml is ignored — it is a \
                          machine-wide setting; set it in the global config.toml"
+                            .to_string(),
+                    );
+                }
+                if p.onepassword.is_some() {
+                    warnings.push(
+                        "[onepassword] in a per-project .sparkle/config.toml is ignored — the \
+                         vault belongs to your 1Password account, not to one repo; set it in the \
+                         global config.toml"
                             .to_string(),
                     );
                 }
@@ -1208,6 +1272,21 @@ github     = true   # import a project from your GitHub repositories; off hides 
 guardrails = true   # opinionated quality workflow (test-first, run tests+typecheck before commit,
                     # never call a red build "done") appended to every coding agent; off omits it
 roborev    = true   # per-commit AI code review of your BUILD-agent commits (uses your claude login)
+onepassword = false # back your .env* files up to a 1Password vault. The one tool that ships OFF:
+                    # it needs a 1Password account, the `op` CLI, and a chosen vault, so you opt in
+                    # from ⋯ Settings → "Tools" once those exist.
+
+# --- 1Password env backup (per-machine; ignored in a project file) ----------------------
+# Where Sparkle backs your .env* files up to, and whether it restores them into fresh agent
+# worktrees. .env/.env.* are gitignored, so a git worktree NEVER carries one — seed_worktrees is
+# what stops every new worker agent from starting without its project's secrets.
+# Requires the 1Password CLI (`brew install --cask 1password-cli`) plus 1Password → Settings →
+# Developer → "Integrate with 1Password CLI", which is what lets `op` authenticate via Touch ID
+# through the desktop app. Sparkle never sees or stores a 1Password credential.
+# Toggle the tool itself under [tools] (onepassword), not here.
+[onepassword]
+# vault_id = ""        # the vault chosen in ⋯ Settings; unset means "no vault picked yet"
+seed_worktrees = false # restore backed-up env files into each newly created agent worktree
 
 # --- roborev first-run consent (per-machine; ignored in a project file) -----------------
 # roborev reviews your BUILD-agent commits locally. The first time it's about to turn on, Sparkle
@@ -1897,6 +1976,59 @@ mod tests {
         let (cfg, warns, _) = effective(None, Some(p));
         assert!(!cfg.roborev.consent_prompted);
         assert!(warns.iter().any(|w| w.contains("[roborev]")));
+    }
+
+    #[test]
+    fn onepassword_is_the_one_tool_that_ships_off() {
+        // Every other [tools] flag defaults on; this one can't (it needs an external account + CLI),
+        // so a fresh install must not advertise it as active.
+        let (cfg, _, _) = effective(None, None);
+        assert!(!cfg.tools.onepassword);
+        assert!(cfg.tools.roborev, "the other tools still ship on");
+
+        // Opting in is a plain global [tools] flip.
+        let g = "[tools]\nonepassword = true\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(cfg.tools.onepassword);
+    }
+
+    #[test]
+    fn onepassword_vault_and_seeding_default_unset_and_global_sets_them() {
+        // No vault picked and no worktree seeding until the user asks for both.
+        let (cfg, _, _) = effective(None, None);
+        assert_eq!(cfg.onepassword.vault_id, None);
+        assert!(!cfg.onepassword.seed_worktrees);
+
+        let g = "[onepassword]\nvault_id = \"abc123\"\nseed_worktrees = true\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.onepassword.vault_id.as_deref(), Some("abc123"));
+        assert!(cfg.onepassword.seed_worktrees);
+    }
+
+    #[test]
+    fn blank_vault_id_reads_as_unset_not_as_a_configured_vault() {
+        // A whitespace-only vault_id must degrade to "pick a vault", not be stored verbatim — a
+        // blank string would read as configured everywhere downstream and turn every `op` call
+        // into an opaque failure instead of showing the picker.
+        let g = "[onepassword]\nvault_id = \"   \"\n";
+        let (cfg, _, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert_eq!(cfg.onepassword.vault_id, None);
+    }
+
+    #[test]
+    fn project_onepassword_is_ignored_with_warning() {
+        // The vault belongs to the user's 1Password account, not to a repo, so a project file
+        // must not be able to redirect where another repo's secrets get written.
+        let p = "[onepassword]\nvault_id = \"attacker-vault\"\nseed_worktrees = true\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert_eq!(cfg.onepassword.vault_id, None);
+        assert!(!cfg.onepassword.seed_worktrees);
+        assert!(warns.iter().any(|w| w.contains("[onepassword]")));
     }
 
     #[test]
@@ -2730,9 +2862,19 @@ mod tests {
     }
 
     // Drift guard for the vendored roborev git hook bundled at resources/roborev/post-commit.
-    // It is a byte-for-byte copy of the upstream seed-auto-roborev wrapper (which carries its own
-    // exhaustive skip-glob test suite). The subtle pytest/sparkle-fixture skip heuristics are easy
-    // to regress if someone edits the Sparkle copy, so assert the load-bearing guard tokens survive.
+    //
+    // It WAS a byte-for-byte copy of the upstream seed-auto-roborev wrapper. As of 2026-07-26 it
+    // deliberately DIVERGES, and that divergence is the point of half the needles below: Sparkle
+    // added (a) owner-repo resolution via `--git-common-dir`, because the upstream basename-only
+    // test cannot see a fixture from inside a linked worktree, and (b) a self-heal that strips the
+    // stub `roborev install-hook --force` splices in above this wrapper. Without those, Sparkle's
+    // own suites flooded the review queue with ~11.5k dead-repo jobs.
+    //
+    // So this test now guards TWO things: that the upstream skip heuristics survive an edit to the
+    // Sparkle copy, AND that a future seed re-sync cannot silently drop the Sparkle-only fixes by
+    // overwriting this file with the upstream version. Behaviour for all of it is covered end-to-end
+    // in scripts/tests/roborev-hook-guard.test.sh, which drives the hook as a real git hook; these
+    // are cheap token assertions that fail fast at the Rust layer.
     #[test]
     fn vendored_roborev_post_commit_keeps_its_skip_guards() {
         let hook = std::fs::read_to_string(concat!(
@@ -2747,6 +2889,11 @@ mod tests {
             "sparkle-bridge-",
             "\" post-commit",     // the ACTUAL delegation invocation `"$ROBOREV" post-commit` —
                                   // not the bare word "post-commit", which also appears in comments
+            // ── Sparkle-only, and the reason a seed re-sync must fail this test ──────────────
+            "sparkle-self-test-", // the nested <tmp>/sparkle-self-test-*/sparkle-self/repo layout
+            "--git-common-dir",   // owner-repo resolution (linked-worktree blind spot)
+            "*/sparkle-test-*",   // path-COMPONENT matching, not basename-only
+            "heal-failed",        // the self-heal's visible-failure sentinel
         ] {
             assert!(
                 hook.contains(needle),

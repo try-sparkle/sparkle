@@ -14,7 +14,7 @@ import { disableNativeTooltips } from "./disableNativeTooltips";
 import { resolveThemeFromStorage } from "./theme/theme";
 import { useHistoryStore } from "./stores/historyStore";
 import { refreshModelCatalog } from "./services/models";
-import { parseSuppressSelfFocus } from "./services/projectWindows.url";
+import { parseSuppressSelfFocus } from "./services/windowIdentity";
 import "@xterm/xterm/css/xterm.css";
 import "./index.css";
 
@@ -38,8 +38,16 @@ const isCapture = view === "capture";
 // Main-thread stall detector (perfTrace): logs every frame gap > threshold as a "jank stall" so a
 // reproduction of the slowness surfaces exactly when the app froze and for how long, to correlate
 // against the spawn/switch/close/render lines. Only in the real app view — the hidden capture and
-// the tiny tray webviews aren't where the slowness lives and would just add noise.
-if (!isTray && !isCapture) startJankMonitor();
+// the tiny tray webviews aren't where the slowness lives and would just add noise. Every project
+// window runs its own monitor, so pass the window's label to keep their stalls tellable apart.
+//
+// The label comes from Tauri rather than the URL: the `?win=` parser this used to read lived in
+// projectWindows.url.ts, which was removed when window identity consolidated into windowIdentity.ts.
+// getCurrentWindow().label is the same opaque, non-user-facing value with no parsing, but it exists
+// only inside a real webview — hence the guard, which mirrors the one on the self-show path below
+// and keeps the plain-browser dev/preview working.
+const jankWindowLabel = "__TAURI_INTERNALS__" in window ? getCurrentWindow().label : "main";
+if (!isTray && !isCapture) startJankMonitor(undefined, jankWindowLabel);
 
 // Render counting is always on (a Map bump); the per-render LOG is gated off by default because
 // each line is a main-thread Tauri IPC (bead sparkle-abv2). This exposes the toggle and the

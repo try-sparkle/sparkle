@@ -87,6 +87,42 @@ fn apply_noninteractive(cmd: &mut Command) {
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.env("GIT_ASKPASS", "true");
     cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    #[cfg(test)]
+    apply_test_hook_isolation(cmd);
+}
+
+/// TEST-ONLY: keep the suite's throwaway fixture repos from firing the developer's git hooks.
+///
+/// The suite builds real git repos under the system temp dir, commits into them (and into linked
+/// worktrees cut from them), then deletes the directory. A developer with a GLOBAL
+/// `core.hooksPath` — which is how the roborev review loop installs itself, and how Sparkle's own
+/// `AGENTS.md` workflow expects it to be installed — has those hooks fire inside every one of
+/// those fixtures. A post-commit hook that enqueues a code review then queues one job per fixture
+/// commit against a directory that is gone by the time a worker picks it up, so each job burns its
+/// full retry budget and dies. One `cargo test --lib` run injects dozens; they accumulate into
+/// thousands of permanently-failed jobs that occupy worker slots and bury the real review signal.
+///
+/// The hook's own skip heuristics are not a substitute. They match on the basename of
+/// `--show-toplevel`, so they can only recognise a fixture whose repo IS the tagged root; a commit
+/// made inside a linked worktree reports that worktree's arbitrary basename and is never matched.
+/// They are also not durable — the hook is rewritten wholesale by its tool's self-update.
+///
+/// So suppress at the only layer that is both complete and ours: `GIT_CONFIG_*` env overrides,
+/// which git applies with the same precedence as `-c` and which therefore beat config at every
+/// level, on every subcommand, regardless of argument order.
+///
+/// `#[cfg(test)]` — the production binary never compiles this, and user repos keep their hooks.
+#[cfg(test)]
+pub(crate) fn apply_test_hook_isolation(cmd: &mut Command) {
+    cmd.env("GIT_CONFIG_COUNT", "1");
+    cmd.env("GIT_CONFIG_KEY_0", "core.hooksPath");
+    // A path that can never BE a directory, rather than merely one we expect to be absent: on unix
+    // `/dev/null` is a character device, so resolving any child of it fails with ENOTDIR and git
+    // finds no hook of any name. Deliberately not a predictable name under the temp dir — that is
+    // shared and world-writable on Linux, so another process could create it and have the suite
+    // execute whatever it put there. Elsewhere this is simply a path that does not exist, which is
+    // the same outcome.
+    cmd.env("GIT_CONFIG_VALUE_0", "/dev/null/sparkle-hooks-disabled");
 }
 
 /// carrying stderr (falling back to stdout) on failure.
@@ -118,10 +154,88 @@ fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
 /// (rev-parse, status of local worktrees, merge-base) are unaffected and stay on the plain `git()`.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Kill an entire process GROUP (Unix), so a timed-out child takes its descendants with it.
+///
+/// `Child::kill` signals only the DIRECT child. Any grandchild it forked inherits the stdout/stderr
+/// pipe write ends, so those pipes stay open after the child dies and the reader threads below block
+/// in `read_to_end` until the GRANDCHILD exits — turning a 300ms deadline into however long the
+/// grandchild runs. That is not hypothetical: `sh -c "sleep 30"` reproduces it (Linux forks the
+/// sleep; macOS often execs it, which is why this only failed in CI), and the real callers spawn
+/// exactly this shape — `git fetch` forks `ssh`, `op` talks to helper processes.
+#[cfg(unix)]
+fn kill_process_group(child: &std::process::Child) {
+    // Negative pid = "the whole group". The child is its own group leader (see `process_group(0)`
+    // at spawn), so this can never reach back into Sparkle's own group.
+    //
+    // Safe to call AFTER the child has been reaped, too: a pid that is still a live process group's
+    // id is not recycled while the group has members, and the only reason we ever call it post-reap
+    // is that a member is still holding a pipe. With no members left the kill just returns ESRCH.
+    let pid = child.id() as i32;
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+}
+
+/// How long the readers get to hand over their buffers AFTER the group has been killed. Killing the
+/// group closes the pipes, so `read_to_end` returns and the send lands almost immediately; this is
+/// a backstop, not a wait we expect to spend.
+const DRAIN_GRACE: Duration = Duration::from_millis(250);
+
+/// Take one reader thread's buffer, waiting no later than `deadline`. `None` means we GAVE UP — the
+/// pipe was still held after the group kill and the grace, so the buffer is gone.
+///
+/// This is the SUCCESS path's ceiling, and it needs one: a child can exit 0 and still leave a
+/// descendant holding the pipe write end (`git fetch` leaving an ssh ControlMaster, `op` talking to
+/// a helper), and `read_to_end` then blocks for as long as THAT process lives. Joining the reader
+/// unconditionally — which is what this function used to do once `try_wait` reported an exit — is an
+/// unbounded wait inside a function whose entire purpose is a ceiling, and it wedges a Tauri
+/// blocking-pool thread for the duration. If the pipe is still held when this call's bound expires
+/// — the grace on the abort paths (the deadline is either already spent, or irrelevant because the
+/// child has just been killed), and `min(remaining deadline, grace)` on the success path, where the
+/// deadline binds only when the command exited within a grace of it — kill the group:
+/// the command itself has already finished, so nothing inside it still needs to run. The buffer is
+/// not lost by doing so — closing the pipe is what lets `read_to_end` return and send it.
+///
+/// RESIDUE, worth knowing: if the holder is NOT in the killed group (a helper daemon that was handed
+/// the fd, a descendant that `setsid`'d itself, or any Windows caller, where there is no group kill),
+/// the reader thread stays blocked in `read_to_end` and leaks itself plus a pipe fd. We return
+/// rather than block — a wedged Tauri blocking-pool thread on a 30s poll is worse. What the CALLER
+/// is told then differs by pipe, and [`finish`] is where that is decided: an abandoned stdout is an
+/// `Err` (a silently empty success is indistinguishable from a command that printed nothing, and
+/// callers parse that as data), while an abandoned stderr degrades to an empty buffer because it is
+/// diagnostic and losing it must not fail a command that succeeded.
+fn take_by(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: Instant,
+    child: &std::process::Child,
+) -> Option<Vec<u8>> {
+    if let Ok(buf) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        return Some(buf);
+    }
+    #[cfg(unix)]
+    kill_process_group(child);
+    #[cfg(not(unix))]
+    let _ = child; // no group kill on Windows — the deadline above is what bounds the wait there
+    match rx.recv_timeout(DRAIN_GRACE) {
+        Ok(buf) => Some(buf),
+        Err(_) => {
+            tracing::warn!("output_with_timeout: gave up on a pipe still held after the group kill");
+            None
+        }
+    }
+}
+
 /// Run `cmd` to completion but ABORT it after `timeout`, killing the child and returning an Err.
 /// std-only (no tokio, per the backend constraint): the child stays owned here so we can kill it,
 /// two reader threads drain stdout/stderr concurrently (so a chatty child can't deadlock on a full
 /// pipe while we wait), and we poll `try_wait` until the deadline (std has no wait-with-timeout).
+///
+/// EVERY exit from here is bounded, which takes two mechanisms, not one: the deadline path kills the
+/// child's whole PROCESS GROUP (see [`kill_process_group`] — killing only the child leaves a
+/// grandchild holding the pipes), and the reader hand-off is bounded by [`take_by`] on the success
+/// path too (a child can exit 0 and leave a descendant holding them). On Windows there is no group
+/// kill, so descendants are not torn down there — but the deadline is still honored, because the
+/// bounded hand-off is what returns, not the reader threads finishing.
 pub(crate) fn output_with_timeout(
     mut cmd: Command,
     timeout: Duration,
@@ -130,25 +244,37 @@ pub(crate) fn output_with_timeout(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // Make the child its own process-group leader so the deadline path can signal the whole group.
+    // Side effect worth knowing: the child no longer receives the parent's terminal signals, which
+    // is what we want for a GUI app's helper subprocesses.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
 
     // Move each pipe into its own reader thread. read_to_end blocks until the write end closes
     // (child exit or kill), so a large output is fully drained rather than deadlocking the child.
+    // The buffers come back over a CHANNEL rather than via join(): a join has no deadline, and
+    // whether the pipes ever close is exactly what we refuse to assume here.
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let out_reader = std::thread::spawn(move || {
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut s) = stdout_pipe {
             let _ = s.read_to_end(&mut buf);
         }
-        buf
+        let _ = out_tx.send(buf);
     });
-    let err_reader = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut s) = stderr_pipe {
             let _ = s.read_to_end(&mut buf);
         }
-        buf
+        let _ = err_tx.send(buf);
     });
 
     let deadline = Instant::now() + timeout;
@@ -157,28 +283,70 @@ pub(crate) fn output_with_timeout(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    // Deadline hit: kill and reap the child, then join the readers (which EOF once
-                    // the child's pipes close) so no threads leak, and report the timeout.
+                    // Deadline hit: kill the whole GROUP (not just the child — a surviving
+                    // grandchild holds the pipes open), reap, and let the readers hand over what
+                    // they have within the grace so no thread is left blocked on a live pipe.
+                    #[cfg(unix)]
+                    kill_process_group(&child);
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = out_reader.join();
-                    let _ = err_reader.join();
+                    let drain = Instant::now() + DRAIN_GRACE;
+                    let _ = take_by(&out_rx, drain, &child);
+                    let _ = take_by(&err_rx, drain, &child);
                     return Err(format!("timed out after {}s", timeout.as_secs()));
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
+                #[cfg(unix)]
+                kill_process_group(&child);
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = out_reader.join();
-                let _ = err_reader.join();
+                let drain = Instant::now() + DRAIN_GRACE;
+                let _ = take_by(&out_rx, drain, &child);
+                let _ = take_by(&err_rx, drain, &child);
                 return Err(format!("wait failed: {e}"));
             }
         }
     };
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
-    Ok(std::process::Output { status, stdout, stderr })
+    // The command exited on its own — but a descendant may still hold the pipes. Everything the
+    // COMMAND wrote is already in the pipe by now, so the only thing left to wait on is a lingering
+    // descendant: bound this by the grace, NOT by whatever remains of the deadline. Waiting out a
+    // 15s fetch deadline (or the 90s brew one) for a command that exited in 200ms is bounded but
+    // absurd, and it's paid on the path that runs every time.
+    // Each pipe gets its OWN grace, computed when its turn comes — a single shared instant would
+    // hand stderr whatever milliseconds stdout left behind, so a scheduling hiccup could expire it
+    // with a near-zero budget.
+    let stdout = take_by(&out_rx, deadline.min(Instant::now() + DRAIN_GRACE), &child);
+    let stderr = take_by(&err_rx, deadline.min(Instant::now() + DRAIN_GRACE), &child);
+
+    finish(status, stdout, stderr)
+}
+
+/// Turn what the two readers managed to hand over into a result. Pure, so the asymmetry it encodes
+/// is testable — which matters, because that asymmetry is easy to flatten back into "both or
+/// nothing" and the shape that would catch it (a descendant abandoning exactly one pipe) is close to
+/// impossible to produce from a real child.
+///
+/// Strict about stdout, lenient about stderr, because they carry different weight. Callers PARSE
+/// stdout — `run_op` would take an empty string as JSON, the ref/count readers would take it as real
+/// data — so abandoning it has to be an error rather than a convincing empty success. stderr is
+/// diagnostic: turning a `merge_pr` that actually merged, or every `git fetch`, into a hard failure
+/// because a lingering helper kept the log pipe open would be a worse lie than the missing text.
+/// The give-up itself is already logged inside [`take_by`].
+fn finish(
+    status: std::process::ExitStatus,
+    stdout: Option<Vec<u8>>,
+    stderr: Option<Vec<u8>>,
+) -> Result<std::process::Output, String> {
+    match stdout {
+        Some(stdout) => Ok(std::process::Output {
+            status,
+            stdout,
+            stderr: stderr.unwrap_or_default(),
+        }),
+        None => Err("output truncated: a descendant held the pipe past the drain grace".to_string()),
+    }
 }
 
 /// Like [`git`], but for the NETWORK-touching invocations (a `fetch`): bounds the wall-clock via
@@ -368,6 +536,30 @@ fn ready_repos() -> &'static Mutex<HashSet<String>> {
     READY.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// `(root, error)` pairs whose roborev hook-install failure has already been reported at WARN this
+/// session. Hook installation is best-effort and retried on EVERY `ensure_project_repo` — i.e. once
+/// per agent open — so a root with a genuinely unresolvable hooks dir emits the identical warning
+/// indefinitely; session telemetry shows a single such root producing this line in the hundreds
+/// within one day, which buries every other warning in the log.
+///
+/// Keying on the error text as well as the root is deliberate: a root whose failure CHANGES has
+/// something new to say and gets its own WARN, while the repeated-identical case (the flooding
+/// shape) is demoted to DEBUG after the first. Nothing is silenced — the detail is still on disk at
+/// DEBUG, which is where a repeat belongs.
+fn warned_hook_failures() -> &'static Mutex<HashSet<(String, String)>> {
+    static WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    WARNED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// True the FIRST time this exact `(root, error)` failure is seen this session, false for repeats.
+/// A poisoned lock returns true — losing the dedupe is strictly better than losing the warning.
+fn should_warn_hook_failure(root: &str, error: &str) -> bool {
+    match warned_hook_failures().lock() {
+        Ok(mut seen) => seen.insert((root.to_string(), error.to_string())),
+        Err(_) => true,
+    }
+}
+
 /// If `<path>/.git` is a gitfile (an orphaned worktree/submodule pointer) whose target gitdir no
 /// longer exists, rename it aside so a fresh `git init` can succeed. A real `.git` *directory*, or a
 /// gitfile whose target still exists (a live worktree/submodule), is left completely untouched — the
@@ -470,7 +662,13 @@ pub async fn ensure_project_repo(app: AppHandle, path: String) -> Result<(), Str
         let cfg = crate::config::for_project(&path).config;
         if cfg.tools.roborev && cfg.roborev.consent_prompted {
             if let Err(e) = install_repo_hooks(&app, &path) {
-                tracing::warn!(%path, error = %e, "roborev hook install failed (non-fatal)");
+                // First occurrence per (root, error) is the one worth surfacing; the retry-driven
+                // repeats that follow it go to DEBUG. See `warned_hook_failures`.
+                if should_warn_hook_failure(&path, &e) {
+                    tracing::warn!(%path, error = %e, "roborev hook install failed (non-fatal)");
+                } else {
+                    tracing::debug!(%path, error = %e, "roborev hook install failed again (non-fatal, repeat)");
+                }
             }
         }
         Ok(())
@@ -523,8 +721,13 @@ fn may_write_hook(exists: bool, contents: Option<&str>, marker: &str) -> bool {
 /// repo's own gitdir is the safer failure: ineffective, not invasive.
 ///
 /// Git may answer with a path relative to `repo_root` (typically a bare `.git`), so a relative
-/// answer is re-anchored. If git can't be run at all we fall back to the literal `.git/hooks` —
-/// correct for the normal-clone majority and no worse than the previous behaviour.
+/// answer is re-anchored.
+///
+/// When git can't answer at all (not on PATH, or the gitlink points at an admin dir that no longer
+/// exists, so `rev-parse` exits non-zero) we do NOT go straight to the literal `.git/hooks`: on a
+/// worktree-rooted project that join is a path under a regular file, so every install re-fails with
+/// a bare ENOTDIR. We read the gitlink ourselves first via [`gitfile_common_dir`], and only use
+/// `<root>/.git` when `.git` really is a directory — correct for the normal-clone majority.
 fn hooks_dir_for(repo_root: &str) -> PathBuf {
     let common = git(repo_root, &["rev-parse", "--git-common-dir"])
         .ok()
@@ -533,8 +736,73 @@ fn hooks_dir_for(repo_root: &str) -> PathBuf {
     match common {
         Some(dir) if dir.is_absolute() => dir.join("hooks"),
         Some(dir) => Path::new(repo_root).join(dir).join("hooks"),
-        None => Path::new(repo_root).join(".git").join("hooks"),
+        None => gitfile_common_dir(repo_root)
+            .unwrap_or_else(|| Path::new(repo_root).join(".git"))
+            .join("hooks"),
     }
+}
+
+/// Resolve `<repo_root>/.git` when it is a gitlink FILE, returning the SHARED (common) gitdir —
+/// the one holding `hooks/`. `None` when `.git` is a directory (a normal clone, where the caller's
+/// own `.git` join is already right) or when the file doesn't carry a parsable `gitdir:` pointer.
+///
+/// This is the no-git-subprocess twin of `rev-parse --git-common-dir`, used only on that command's
+/// failure path. Two gitlink shapes exist and they resolve differently:
+///   * a linked worktree points at `<common>/worktrees/<name>` → the common dir is two levels up
+///   * a submodule points directly at its own gitdir → that IS the common dir
+fn gitfile_common_dir(repo_root: &str) -> Option<PathBuf> {
+    // `read_to_string` on a directory is an Err, which is exactly the "normal clone" signal.
+    let contents = std::fs::read_to_string(Path::new(repo_root).join(".git")).ok()?;
+    let target = contents.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    // A gitlink may hold a path relative to the repo root; re-anchor it the same way git does.
+    let target = match Path::new(target) {
+        p if p.is_absolute() => p.to_path_buf(),
+        p => Path::new(repo_root).join(p),
+    };
+    if target.parent().and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("worktrees")) {
+        target.parent()?.parent().map(PathBuf::from)
+    } else {
+        Some(target)
+    }
+}
+
+/// Repos we have already warned about an inert `core.hooksPath` for. `install_repo_hooks` runs on
+/// every project open (and on the Enable sweep), so without this the same unactionable-once warning
+/// would repeat hundreds of times a session and drown the log.
+fn hooks_path_warned() -> &'static Mutex<HashSet<String>> {
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    WARNED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Would hooks written to `installed_into` be INERT — i.e. is git configured to read hooks from
+/// somewhere else entirely?
+///
+/// `core.hooksPath` (commonly set GLOBALLY, so it applies to repos the user never configured by
+/// hand) redirects git away from the gitdir we install into. When that happens our install still
+/// SUCCEEDS — files are written, no error is raised — but git never executes them, so roborev
+/// silently reviews nothing. That silent-success is worse than the loud ENOTDIR failure it replaced,
+/// hence this check.
+///
+/// A relative `core.hooksPath` is interpreted by git relative to the repo root, so it is re-anchored
+/// before comparing. Paths are compared after canonicalization where possible so that a symlinked or
+/// `..`-laden spelling of the SAME directory is not misreported as a redirect; an unresolvable path
+/// (typically: configured but not yet created) falls back to a literal compare.
+fn hooks_are_inert(repo_root: &str, installed_into: &Path, configured: Option<&str>) -> bool {
+    let configured = match configured.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(c) => c,
+        None => return false, // unset → git reads the gitdir hooks, which is where we installed
+    };
+    let configured = Path::new(configured);
+    let configured = if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        Path::new(repo_root).join(configured)
+    };
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    resolve(&configured) != resolve(installed_into)
 }
 
 /// Copy the vendored roborev git hooks into the repo's hooks dir, mode 0755. Idempotent, and
@@ -582,6 +850,28 @@ pub fn install_repo_hooks(app: &AppHandle, repo_root: &str) -> Result<(), String
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
                 .map_err(|e| format!("chmod roborev {name} hook failed: {e}"))?;
+        }
+    }
+
+    // The install above succeeded, but succeeding is not the same as taking effect: if
+    // `core.hooksPath` points elsewhere, git will never run what we just wrote. Say so ONCE per
+    // repo, rather than letting roborev appear enabled while silently reviewing nothing. This is
+    // deliberately only a warning — writing into a (usually global) shared hooksPath would affect
+    // repos the user never opened here; see `hooks_dir_for`.
+    let configured = git(repo_root, &["config", "--get", "core.hooksPath"]).ok();
+    if hooks_are_inert(repo_root, &hooks_dir, configured.as_deref()) {
+        let first_time = hooks_path_warned()
+            .lock()
+            .map(|mut w| w.insert(repo_root.to_string()))
+            .unwrap_or(true);
+        if first_time {
+            tracing::warn!(
+                repo = %repo_root,
+                installed_into = %hooks_dir.display(),
+                "roborev hooks installed but core.hooksPath redirects git elsewhere — they will \
+                 not run; point core.hooksPath at the repo's own hooks dir, or unset it, to \
+                 re-enable per-commit review"
+            );
         }
     }
     Ok(())
@@ -835,6 +1125,144 @@ pub async fn create_agent_worktree(
     })
     .await
     .map_err(|e| format!("create_agent_worktree task failed: {e}"))?
+}
+
+/// What [`park_worktree_on_base_at`] did (or, when `parked` is false, why it declined). `reason`
+/// is a stable machine token, never prose, so the caller can log it without leaking a path.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ParkOutcome {
+    /// True only when the worktree now sits on the freshly-fetched base.
+    pub parked: bool,
+    /// `already-fresh` | `no-worktree` | `dirty` | `unpushed` | `no-base` | `checkout-failed`.
+    pub reason: String,
+}
+
+impl ParkOutcome {
+    fn declined(reason: &str) -> Self {
+        Self { parked: false, reason: reason.into() }
+    }
+}
+
+/// Core (AppHandle-free, testable): park an UNATTENDED, app-owned agent worktree back on a fresh
+/// `origin/<base>` so the next headless run starts from an up-to-date base instead of inheriting
+/// whatever branch the previous run left checked out.
+///
+/// `create_worktree_at` is idempotent by *returning the existing worktree untouched* — correct for
+/// an interactive agent (its in-progress branch must survive), but it means a recurring headless
+/// pass accumulates staleness forever: each run reuses the last run's topic branch, drifting
+/// further behind `origin/main` every hour. That is precisely the trap AGENTS.md calls out ("Start
+/// work on a FRESH branch (never a stale base)"), and it eventually blocks the desktop build, whose
+/// staleness gate refuses a branch too far behind.
+///
+/// This is deliberately CONSERVATIVE — it declines rather than destroys. Parking happens only when
+/// there is provably nothing to lose:
+///   * the worktree exists and is a real worktree (`no-worktree` otherwise),
+///   * the tree is clean — no uncommitted or unmerged files (`dirty`),
+///   * every commit reachable from HEAD *and* from the agent's own branch already exists on some
+///     `origin/*` ref (`unpushed`) — this is the valve that protects a run which committed but
+///     could not push (e.g. an unauthenticated `gh`), and a case-by-case draft awaiting review.
+/// Only then does it fetch and `checkout -B` the agent branch onto the fresh base. A failed fetch
+/// is non-fatal: it falls through to the last-known `origin/<base>`, so an offline machine still
+/// gets parked (just not freshened) rather than erroring.
+pub fn park_worktree_on_base_at(
+    root: &str,
+    project_id: &str,
+    agent_id: &str,
+    base_branch: &str,
+    app_data: &Path,
+) -> Result<ParkOutcome, String> {
+    let wt = worktree_path(app_data, project_id, agent_id)?;
+    let wt_str = wt.to_string_lossy().to_string();
+    if !wt.exists() || git(&wt_str, &["rev-parse", "--is-inside-work-tree"]).is_err() {
+        // Nothing to park — the caller creates it fresh from the base anyway.
+        return Ok(ParkOutcome::declined("no-worktree"));
+    }
+
+    // Never disturb work in progress. `--porcelain` covers untracked, staged, modified AND the
+    // unmerged entries a halted rebase/merge leaves behind, so a mid-operation tree lands here too.
+    if !git(&wt_str, &["status", "--porcelain"])?.is_empty() {
+        return Ok(ParkOutcome::declined("dirty"));
+    }
+
+    // Containment check: refuse if ANY commit reachable from HEAD or from the agent's own branch is
+    // missing from every origin ref. `--not --remotes=origin` is the whole safety story — a run that
+    // committed and failed to push is indistinguishable from a run that pushed, except right here.
+    let branch = format!("sparkle/agent-{agent_id}");
+    let branch_ref = format!("refs/heads/{branch}");
+    let mut tips: Vec<&str> = vec!["HEAD"];
+    if git(root, &["rev-parse", "--verify", "--quiet", &branch_ref]).is_ok() {
+        tips.push(branch_ref.as_str());
+    }
+    let mut rev_list: Vec<&str> = vec!["rev-list", "--count"];
+    rev_list.extend_from_slice(&tips);
+    rev_list.extend_from_slice(&["--not", "--remotes=origin"]);
+    // A failure here (no origin, unborn HEAD) must read as "can't prove it's safe" → decline.
+    let unpushed: u32 = match git(&wt_str, &rev_list).ok().and_then(|s| s.trim().parse().ok()) {
+        Some(n) => n,
+        None => return Ok(ParkOutcome::declined("unpushed")),
+    };
+    if unpushed > 0 {
+        return Ok(ParkOutcome::declined("unpushed"));
+    }
+
+    // Freshen the base. Best-effort and time-bounded (git_networked): offline must degrade to
+    // "park on the last-known base", never to an error that blocks the run.
+    let logical = if base_branch.trim().is_empty() || validate_ref(base_branch.trim()).is_err() {
+        resolve_default_branch(root)
+    } else {
+        base_branch.trim().to_string()
+    };
+    let _ = git_networked(root, &["fetch", "--quiet", "--no-tags", "origin", &logical]);
+    let base = effective_base(root, &logical, false);
+    let base_rev = format!("{base}^{{commit}}");
+    let base_sha = match git(root, &["rev-parse", "--verify", "--quiet", &base_rev]) {
+        Ok(sha) => sha.trim().to_string(),
+        Err(_) => return Ok(ParkOutcome::declined("no-base")),
+    };
+
+    // Already sitting on the fresh base with the right branch checked out → nothing to do. Checking
+    // the branch too (not just the SHA) keeps the outcome honest when a topic branch happens to
+    // point at the base commit.
+    let head_sha = git(&wt_str, &["rev-parse", "HEAD"]).unwrap_or_default().trim().to_string();
+    let head_branch =
+        git(&wt_str, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default().trim().to_string();
+    if head_sha == base_sha && head_branch == branch {
+        return Ok(ParkOutcome::declined("already-fresh"));
+    }
+
+    // `checkout -B` creates-or-resets the agent's own branch at the base and checks it out in one
+    // step. Under the per-repo lock so a background pool warm can't collide on index.lock.
+    {
+        let gl = repo_git_lock(root);
+        let _lock = gl.lock().unwrap_or_else(|e| e.into_inner());
+        if git(&wt_str, &["checkout", "-B", &branch, &base_sha]).is_err() {
+            return Ok(ParkOutcome::declined("checkout-failed"));
+        }
+    }
+    Ok(ParkOutcome { parked: true, reason: "parked".into() })
+}
+
+/// Park an app-owned, unattended agent worktree back on a fresh integration base before its next
+/// headless run. Declines (never destroys) when the tree is dirty or holds unpushed commits.
+#[tauri::command]
+pub async fn park_worktree_on_base(
+    app: AppHandle,
+    root: String,
+    project_id: String,
+    agent_id: String,
+    base_branch: String,
+) -> Result<ParkOutcome, String> {
+    let app_data = app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = park_worktree_on_base_at(&root, &project_id, &agent_id, &base_branch, &app_data);
+        // Log the machine token only — never the path, branch, or any user content.
+        if let Ok(o) = &out {
+            tracing::info!(%agent_id, parked = o.parked, reason = %o.reason, "park_worktree_on_base");
+        }
+        out
+    })
+    .await
+    .map_err(|e| format!("park_worktree_on_base task failed: {e}"))?
 }
 
 #[derive(Serialize, Clone)]
@@ -1433,7 +1861,7 @@ fn decode_open_prs(stdout: &str) -> Option<Vec<PrRow>> {
 /// for the richer field set the menu needs. Best-effort: gh absent, unauthed, offline, no remote, or
 /// a timeout all yield `None`.
 fn probe_open_prs(root: &str) -> Option<Vec<PrRow>> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = Command::new(crate::preflight::gh_program());
     cmd.arg("pr")
         .args([
             "list",
@@ -1485,7 +1913,7 @@ const MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 #[tauri::command]
 pub async fn merge_pr(root: String, number: u64) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let mut cmd = Command::new("gh");
+        let mut cmd = Command::new(crate::preflight::gh_program());
         cmd.args(["pr", "merge", &number.to_string(), "--merge"])
             .current_dir(&root)
             .env("GH_PROMPT_DISABLED", "1")
@@ -2860,22 +3288,96 @@ pub fn remove_worktree_at(
     if let Ok(mut cache) = pr_probe_cache().lock() {
         cache.remove(&wt_str);
     }
+    // Serialize with the repo's other index/ref-mutating worktree ops — the case this lock's own
+    // doc comment lists as "remove", but which this path never actually took.
+    //
+    // Closing ONE agent fans teardown out to EVERY open window, so N windows issue N concurrent
+    // `git worktree remove --force` against the same path. The frontend's `withRepoLock` cannot
+    // help: `repoLocks` is a module-level Map in the webview bundle, so each window has its own
+    // independent chain and they serialize only against themselves. The backend is the only place
+    // that can order these. Unserialized they race — the winner unlinks the checkout's `.git`, and
+    // a loser past its own existence check dies on `validation failed, cannot remove working tree`
+    // for a removal that in fact succeeded. `git` never re-acquires this lock, so it cannot nest.
+    // The guard is held across the whole removal — including the half-deleted-checkout recovery
+    // below — so the recovery's own prune/delete is serialized against a concurrent add too.
+    let gl = repo_git_lock(root);
+    let _g = gl.lock().unwrap_or_else(|e| e.into_inner());
     match git(root, &["worktree", "remove", "--force", &wt_str]) {
-        Ok(_) => Ok(()),
+        // Success is NOT proof the dir is gone. For a path git no longer recognizes as a
+        // worktree it exits 0 having deleted nothing, so a "clean" teardown can still leak the
+        // orphaned dir. Only an absent dir ends the removal; anything left goes through cleanup.
+        Ok(_) if !wt.exists() => Ok(()),
+        Ok(_) => discard_half_deleted_worktree(root, &wt),
         Err(e) => {
             // Ignore "not a working tree" / "is not a working tree" so removal is
             // idempotent; surface anything else.
             let lower = e.to_lowercase();
-            if lower.contains("not a working tree")
+            let half_deleted = lower.contains("not a working tree")
                 || lower.contains("is not a working tree")
                 || lower.contains("no such file or directory")
-            {
-                Ok(())
+                // A checkout whose own `.git` link file is broken, phrased as
+                // `validation failed, cannot remove working tree: '<path>/.git' <reason>`.
+                || (lower.contains("validation failed") && broken_git_link_reason(&lower));
+            if half_deleted {
+                discard_half_deleted_worktree(root, &wt)
             } else {
                 Err(e)
             }
         }
     }
+}
+
+/// Does a lowercased `validation failed` message blame the checkout's own `.git` link file?
+///
+/// Git's worktree validation rejects a broken link with one of three reasons, and it reaches for
+/// a different one depending on HOW the link broke: the file is gone, it survives as something
+/// that isn't a gitfile (truncated, or replaced by a real dir), or it still parses but points at
+/// an admin record that no longer names it back. All three describe the same half-deleted
+/// checkout and leak the same way, so all three route to the same cleanup.
+///
+/// Matching only the first reason is what let the other two escape: they carry no `does not
+/// exist`, so they fell through to `Err` and teardown never converged.
+fn broken_git_link_reason(lower: &str) -> bool {
+    lower.contains("does not exist")
+        || lower.contains("is not a .git file")
+        || lower.contains("does not point back to")
+}
+
+/// Finish tearing down a worktree that `git worktree remove` won't handle because its checkout
+/// is already broken — the dir's `.git` link file is missing, or git no longer recognizes the
+/// path as a worktree at all.
+///
+/// Both shapes leave the SAME leak, and neither converges on retry: git either errors out
+/// ("validation failed") or reports success while deleting nothing, so the admin record in
+/// `.git/worktrees/` keeps the agent's branch claimed and the orphaned dir keeps its disk for
+/// the life of the repo. Prune the record and delete the remains ourselves.
+///
+/// Idempotent: a worktree that is genuinely gone leaves nothing to prune or delete, which is
+/// what makes repeat teardowns of an already-removed agent a no-op rather than an error.
+fn discard_half_deleted_worktree(root: &str, wt: &Path) -> Result<(), String> {
+    // Delete BEFORE pruning. `prune` drops only those records whose checkout is already missing,
+    // so pruning first leaves the record standing for any break that keeps a `.git` entry on disk
+    // — a corrupt link file reads as present enough for prune to keep it. Deleting the dir first
+    // makes the checkout unambiguously missing, which is the one state prune acts on, so a single
+    // pass clears both halves for every break instead of just the ones that erased `.git`.
+    if wt.exists() {
+        std::fs::remove_dir_all(wt)
+            .map_err(|io| format!("couldn't remove half-deleted worktree: {io}"))?;
+    }
+    // `prune` is repo-wide by design. Deleting `.git/worktrees/<id>` by hand would scope it to
+    // this agent, but that means hand-editing git's admin store — a worse trade than the blast
+    // radius, which is small: prune only drops records whose checkout is ALREADY missing, and a
+    // record dropped from a worktree that later comes back is rebuilt by `git worktree repair`.
+    //
+    // A prune failure is not escalated: the disk is already reclaimed, and the surviving record
+    // is repairable (the next teardown or any `git worktree prune` clears it), so failing here
+    // would turn a recovered teardown back into the error the caller retries forever. But since
+    // the reorder above makes prune the last step that can silently leave the record standing,
+    // log it — a branch that stays claimed is otherwise indistinguishable from a clean teardown.
+    if let Err(e) = git(root, &["worktree", "prune"]) {
+        tracing::warn!(error = %e, "worktree prune failed after discarding a half-deleted checkout; a stale admin record may still claim the branch");
+    }
+    Ok(())
 }
 
 /// Remove an agent's worktree (force, to discard any uncommitted changes). The
@@ -3258,6 +3760,159 @@ mod tests {
         dir
     }
 
+    /// A command that finishes ON TIME but leaves a descendant holding the pipes must still return.
+    ///
+    /// This is the path with no deadline on it at all before: `try_wait` reports the exit, the loop
+    /// breaks, and joining the reader threads waits for a `read_to_end` that only ends when the
+    /// GRANDCHILD does. Real shape, not a contrivance — `git fetch` leaves an ssh ControlMaster and
+    /// `op` talks to a helper, both of which outlive the command that started them.
+    #[cfg(unix)]
+    #[test]
+    fn a_cleanly_exited_child_cannot_hang_the_call_by_leaving_a_grandchild_on_the_pipes() {
+        // The timeout is deliberately LONG (10s) and the assertion tight (2s): the command exits
+        // immediately, so everything it wrote is already in the pipe and the only thing left to wait
+        // on is the lingering descendant — that wait must be the GRACE, not whatever remains of the
+        // deadline. With a 300ms timeout and a 5s window, bounding by the full deadline would have
+        // passed just as well, which is the whole distinction being pinned.
+        let root = unique_root("pgroup-success");
+        let pidfile = root.join("grandchild.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "echo done; sh -c 'echo $$ > {}; sleep 30' & exit 0",
+            pidfile.display()
+        ));
+        let started = Instant::now();
+        let out = output_with_timeout(cmd, Duration::from_secs(10))
+            .expect("the command SUCCEEDED — a lingering descendant must not turn that into an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the post-exit drain must be bounded by the grace, not by the remaining deadline; took {:?}",
+            started.elapsed()
+        );
+        // The output survives the bounding: killing the group is what closes the pipe, which is what
+        // lets the reader hand its buffer over. Cutting the wait must not cost us the bytes.
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+
+        // And the grandchild is actually GONE — the elapsed-time assertion alone would also pass if
+        // we had simply stopped waiting and left it running.
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the grandchild should have written its pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        let mut alive = true;
+        for _ in 0..40 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive, "the group kill must have taken the grandchild (pid {pid}) with it");
+    }
+
+    /// `take_by`'s give-up branch: a pipe holder that survives the group kill (a helper daemon
+    /// handed the fd, a `setsid`'d descendant, any Windows caller) must not block the call — and
+    /// must not be reported as an empty-but-successful read either, which callers parse as data.
+    /// A child spawned the way `output_with_timeout` spawns one: its OWN group leader, which is the
+    /// documented precondition of `kill_process_group`. It sleeps rather than exiting immediately,
+    /// so the group kill has something to land on — with `exit 0` the kill hits a reaped group and
+    /// returns ESRCH whether or not the child ever led one, and deleting `process_group(0)` would
+    /// leave these tests green while reinstating the state the precondition rules out.
+    #[cfg(unix)]
+    fn group_leader_child() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 5");
+        cmd.process_group(0);
+        cmd.spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn take_by_gives_up_rather_than_waiting_forever_on_a_buffer_that_never_arrives() {
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>(); // held open, nothing ever sent
+        let mut child = group_leader_child();
+        let started = Instant::now();
+        let taken = take_by(&rx, Instant::now(), &child);
+        // The give-up path kills the GROUP on its way out, so the still-sleeping child is gone —
+        // which is what makes spawning it as a group leader load-bearing rather than decorative.
+        let status = child.wait().expect("reap");
+        assert!(
+            !status.success(),
+            "the group kill must have taken the sleeping child; it exited cleanly instead"
+        );
+        assert!(taken.is_none(), "a buffer that never arrives must read as GIVEN UP, not as empty");
+        assert!(
+            started.elapsed() < DRAIN_GRACE * 4,
+            "the give-up must happen within the grace; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn take_by_returns_a_buffer_that_arrives_in_time() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        tx.send(b"hello".to_vec()).unwrap();
+        let mut child = group_leader_child();
+        let taken = take_by(&rx, Instant::now() + Duration::from_secs(1), &child);
+        // Nothing killed this one — the buffer arrived, so take_by returned before the kill path.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(taken, Some(b"hello".to_vec()));
+    }
+
+    /// The deadline path, at the level the behavior actually lives (the `op` test in `onepassword`
+    /// covers it end-to-end, but that one's teeth are a shell string that a later cleanup could
+    /// innocently simplify back to `sleep 30` — which does NOT fork on macOS, silently deleting the
+    /// coverage). Named for the invariant so that edit is obvious.
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_child_does_not_leave_a_grandchild_holding_the_pipes() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sh -c 'sleep 30' & wait");
+        let started = Instant::now();
+        let err = output_with_timeout(cmd, Duration::from_millis(300)).unwrap_err();
+        assert!(err.contains("timed out"), "got {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not bound the call; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The stdout-strict / stderr-lenient decision, in all four combinations. This is the entire
+    /// point of the asymmetry and it is a pure function, so there is no excuse for leaving it to an
+    /// integration shape that a real child can barely produce.
+    #[test]
+    fn finish_is_strict_about_stdout_and_lenient_about_stderr() {
+        // No child: `finish` is pure, which is the reason it was extracted. Spawning `sh` here made
+        // this the only ungated test in the module and would have failed it on Windows — the one
+        // platform where take_by's give-up branch is the NORMAL outcome and this asymmetry matters
+        // most, since there is no group kill there to release the pipe.
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        let ok = std::process::ExitStatus::from_raw(0);
+
+        // Both arrived: the ordinary case.
+        let out = finish(ok, Some(b"data".to_vec()), Some(b"warn".to_vec())).unwrap();
+        assert_eq!(out.stdout, b"data");
+        assert_eq!(out.stderr, b"warn");
+
+        // stderr abandoned: still a SUCCESS. Failing here would report a merged PR as an error.
+        let out = finish(ok, Some(b"data".to_vec()), None).unwrap();
+        assert_eq!(out.stdout, b"data");
+        assert!(out.stderr.is_empty());
+
+        // stdout abandoned: an ERROR, even though the command exited 0 — an empty stdout would be
+        // parsed as real data by every caller that reads it.
+        assert!(finish(ok, None, Some(b"warn".to_vec())).unwrap_err().contains("truncated"));
+        assert!(finish(ok, None, None).unwrap_err().contains("truncated"));
+    }
+
     /// `remove_repo_hooks` deletes ONLY hooks whose contents carry our vendored marker, and never
     /// clobbers a user's own same-named hook. (The `install_repo_hooks` copy path needs an AppHandle
     /// resource resolver, so it's exercised via the app; the safety-critical marker guard is pure.)
@@ -3283,6 +3938,62 @@ mod tests {
         // Idempotent: a second sweep (nothing of ours left) is a clean no-op.
         remove_repo_hooks(&root_str).unwrap();
         assert!(theirs.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fixture commit must NOT run the repo's git hooks. On a machine where the review loop is
+    /// installed via a global `core.hooksPath` (the layout `AGENTS.md` assumes), every commit this
+    /// suite makes in a throwaway repo otherwise enqueues a review against a directory the test is
+    /// about to delete — a job that can only fail, dozens per run.
+    ///
+    /// A REPO-LOCAL `core.hooksPath` stands in for that global one: the isolation is a
+    /// `GIT_CONFIG_*` env override, which outranks config at every level, so beating the local
+    /// setting is the stronger proof. Both commit shapes are covered — the second is made inside a
+    /// LINKED WORKTREE, which is where the flood actually came from, since a hook that filters on
+    /// the basename of `--show-toplevel` sees the worktree's arbitrary name and can't recognise it.
+    #[cfg(unix)]
+    #[test]
+    fn a_fixture_commit_does_not_run_the_repos_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_root("hook-isolation");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        // A hook that leaves a marker file behind if git ever runs it.
+        let hooks = root.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let marker = root.join("HOOK_RAN");
+        let hook = hooks.join("post-commit");
+        std::fs::write(&hook, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "sparkle-test"],
+            vec!["config", "user.name", "sparkle-test"],
+            vec!["config", "core.hooksPath", &hooks.to_string_lossy()],
+            vec!["commit", "-q", "--allow-empty", "-m", "seed"],
+        ] {
+            git(&repo_str, &args).unwrap();
+        }
+
+        let wt = root.join("wt");
+        let wt_str = wt.to_string_lossy().to_string();
+        git(&repo_str, &["worktree", "add", "-q", &wt_str, "-b", "side"]).unwrap();
+        git(&wt_str, &["commit", "-q", "--allow-empty", "-m", "work"]).unwrap();
+
+        assert!(
+            !marker.exists(),
+            "a fixture commit ran the repo's post-commit hook — test git invocations must not"
+        );
+
+        // Sanity: the hook is genuinely runnable, so the assertion above is about suppression and
+        // not about a hook that could never have fired in the first place.
+        assert!(Command::new("/bin/sh").arg(&hook).status().unwrap().success());
+        assert!(marker.exists(), "the hook does create its marker when actually run");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3332,6 +4043,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The FALLBACK path: when `rev-parse --git-common-dir` can't answer (git missing, or the
+    /// gitlink points at an admin dir that's been deleted) the old code went straight to
+    /// `<root>/.git/hooks`. On a worktree-rooted project that is a path under a regular file, so
+    /// every install re-failed with a bare ENOTDIR and roborev review silently never installed.
+    /// `gitfile_common_dir` must read the gitlink itself and land on the shared hooks dir.
+    #[test]
+    fn gitfile_common_dir_resolves_both_gitlink_shapes_without_git() {
+        let root = unique_root("gitfile-common-dir");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A normal clone (.git is a DIRECTORY) has no gitlink to resolve — the caller's own join wins.
+        let clone = root.join("clone");
+        std::fs::create_dir_all(clone.join(".git")).unwrap();
+        assert_eq!(gitfile_common_dir(&clone.to_string_lossy()), None);
+
+        // Linked worktree: gitdir is <common>/worktrees/<name>, so the common dir is two levels up.
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let common = root.join("parent").join(".git");
+        std::fs::write(wt.join(".git"), format!("gitdir: {}/worktrees/wt\n", common.display()))
+            .unwrap();
+        assert_eq!(gitfile_common_dir(&wt.to_string_lossy()), Some(common.clone()));
+
+        // Submodule: the gitlink points straight at its own gitdir, which IS the common dir.
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sub_gitdir = root.join("parent").join(".git").join("modules").join("sub");
+        std::fs::write(sub.join(".git"), format!("gitdir: {}\n", sub_gitdir.display())).unwrap();
+        assert_eq!(gitfile_common_dir(&sub.to_string_lossy()), Some(sub_gitdir));
+
+        // A relative pointer is re-anchored on the repo root, the way git resolves it.
+        let rel = root.join("rel");
+        std::fs::create_dir_all(&rel).unwrap();
+        std::fs::write(rel.join(".git"), "gitdir: ../parent/.git/worktrees/rel\n").unwrap();
+        assert_eq!(
+            gitfile_common_dir(&rel.to_string_lossy()),
+            Some(rel.join("../parent/.git")),
+        );
+
+        // A gitlink with no parsable pointer must not invent a directory.
+        let junk = root.join("junk");
+        std::fs::create_dir_all(&junk).unwrap();
+        std::fs::write(junk.join(".git"), "not a gitlink\n").unwrap();
+        assert_eq!(gitfile_common_dir(&junk.to_string_lossy()), None);
+
+        // End to end: the worktree case now resolves to a CREATABLE hooks dir. `rev-parse` fails
+        // here (the admin dir was never created), so this exercises the fallback, not the git path.
+        let resolved = hooks_dir_for(&wt.to_string_lossy());
+        assert_eq!(resolved, common.join("hooks"));
+        std::fs::create_dir_all(&resolved).expect("fallback hooks dir must be creatable");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The INSTALL-side safety rule (the fix for the clobber regression): we may write our hook only
     /// when there's nothing there, or when the existing file is already ours — never over a user's
     /// own same-named hook. Pure, so it's pinned without the bundle resource resolver.
@@ -3363,6 +4128,48 @@ mod tests {
         );
         // Empty-but-present foreign file is still foreign.
         assert!(!may_write_hook(true, Some(""), marker));
+    }
+
+    /// `core.hooksPath` is frequently set GLOBALLY, which silently redirects git away from the
+    /// gitdir we install into: the install succeeds, the hooks never run, and roborev appears
+    /// enabled while reviewing nothing. `hooks_are_inert` is what turns that silent no-op into a
+    /// warning, so it must not cry wolf on the ordinary unset case, nor on a differently-spelled
+    /// path that names the very directory we installed into.
+    #[test]
+    fn hooks_are_inert_only_when_git_reads_from_somewhere_else() {
+        let tmp = std::env::temp_dir().join(format!("sparkle-hookspath-{}", std::process::id()));
+        let installed = tmp.join(".git").join("hooks");
+        std::fs::create_dir_all(&installed).expect("create installed hooks dir");
+        let root = tmp.to_string_lossy().to_string();
+
+        // Unset / blank → git reads the gitdir hooks, which is exactly where we installed.
+        assert!(!hooks_are_inert(&root, &installed, None), "unset core.hooksPath → effective");
+        assert!(!hooks_are_inert(&root, &installed, Some("")), "blank → effective");
+        assert!(!hooks_are_inert(&root, &installed, Some("   ")), "whitespace-only → effective");
+
+        // Set to somewhere else entirely (the global-config case seen in the wild) → inert.
+        assert!(
+            hooks_are_inert(&root, &installed, Some("/somewhere/else/git-hooks")),
+            "an absolute core.hooksPath elsewhere → hooks we install never run"
+        );
+
+        // A RELATIVE core.hooksPath is resolved by git against the repo root, not the cwd.
+        assert!(
+            !hooks_are_inert(&root, &installed, Some(".git/hooks")),
+            "relative path naming our own hooks dir → effective, must not warn"
+        );
+        assert!(
+            hooks_are_inert(&root, &installed, Some("other-hooks")),
+            "relative path naming a different dir → inert"
+        );
+
+        // Same directory, noisier spelling — canonicalization must see through it.
+        assert!(
+            !hooks_are_inert(&root, &installed, Some(".git/./hooks")),
+            "a `.`-laden spelling of our own hooks dir → effective, must not warn"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Spawn `sh -c <script>` in a PTY with the given cwd, read stdout to EOF, return it.
@@ -3440,6 +4247,124 @@ mod tests {
         clear_dangling_gitfile(&r);
         assert!(Path::new(&r).join(".git").is_file(), "live gitfile must remain in place");
         assert!(!Path::new(&r).join(".git.orphaned").exists(), "nothing should be moved aside");
+    }
+
+    // ── park_worktree_on_base_at ────────────────────────────────────────────────────────────────
+    //
+    // A repo with a REAL `origin` (a bare clone we can push to), plus an agent worktree cut from
+    // main. Returns (root, worktree path, app_data) — enough to drive every park branch.
+    fn init_repo_with_origin(tag: &str) -> (String, String, PathBuf) {
+        let r = init_repo(tag);
+        let bare = unique_root(&format!("{tag}-origin"));
+        let bare_str = bare.to_string_lossy().to_string();
+        git(&bare_str, &["init", "-q", "--bare"]).unwrap();
+        git(&r, &["remote", "add", "origin", &bare_str]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+        let app_data = unique_root(&format!("{tag}-appdata"));
+        let info = create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        (r, info.path, app_data)
+    }
+
+    /// Advance `origin/main` by one commit made directly in the source repo's main checkout.
+    fn advance_origin_main(root: &str, name: &str) {
+        std::fs::write(format!("{root}/{name}.txt"), "upstream").unwrap();
+        git(root, &["add", "."]).unwrap();
+        git(root, &["commit", "-q", "-m", name]).unwrap();
+        git(root, &["push", "-q", "origin", "main"]).unwrap();
+    }
+
+    // THE BUG: `create_worktree_at` is idempotent by leaving an existing worktree ALONE, so a
+    // recurring headless pass reuses the previous pass's topic branch and falls further behind
+    // origin/main every run (observed at 56 commits). Parking must pull a clean, fully-pushed
+    // worktree back onto the fresh base — and land it on the agent's own branch, not the stale one.
+    #[test]
+    fn park_returns_a_stale_pushed_worktree_to_the_fresh_base() {
+        let (r, wt, app_data) = init_repo_with_origin("park-stale");
+
+        // A previous pass left the worktree on its own topic branch, whose work already landed.
+        git(&wt, &["checkout", "-q", "-b", "sparkle/last-pass-topic"]).unwrap();
+        // Upstream moved on twice since. The worktree is now demonstrably behind.
+        advance_origin_main(&r, "up1");
+        advance_origin_main(&r, "up2");
+        let behind: u32 = git(&wt, &["rev-list", "--count", "HEAD..origin/main"])
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(behind, 2, "precondition: the reused worktree is stale");
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert!(out.parked, "a clean, fully-pushed worktree must be parked: {out:?}");
+
+        assert_eq!(
+            git(&wt, &["rev-list", "--count", "HEAD..origin/main"]).unwrap().trim(),
+            "0",
+            "the worktree must now sit ON the fresh base"
+        );
+        assert_eq!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "sparkle/agent-a1",
+            "parking lands on the agent's OWN branch, not the previous pass's topic branch"
+        );
+    }
+
+    // The safety valve that matters most: a pass that COMMITTED but could not push (unauthenticated
+    // `gh`/no network) — or a case-by-case draft awaiting review — has work that exists nowhere but
+    // this worktree. Parking would erase it, so it must decline instead.
+    #[test]
+    fn park_declines_when_the_worktree_holds_unpushed_commits() {
+        let (r, wt, app_data) = init_repo_with_origin("park-unpushed");
+        std::fs::write(format!("{wt}/pass-work.txt"), "committed but never pushed").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "work from a pass that could not push"]).unwrap();
+        let tip = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+        advance_origin_main(&r, "up1");
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert_eq!(out, ParkOutcome::declined("unpushed"));
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip, "the commit must survive");
+        assert!(Path::new(&wt).join("pass-work.txt").exists(), "its files must survive");
+    }
+
+    // Uncommitted work is even more fragile than a commit — `checkout -B` would carry or clobber it.
+    #[test]
+    fn park_declines_on_a_dirty_worktree() {
+        let (r, wt, app_data) = init_repo_with_origin("park-dirty");
+        std::fs::write(format!("{wt}/scratch.txt"), "uncommitted").unwrap();
+        advance_origin_main(&r, "up1");
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert_eq!(out, ParkOutcome::declined("dirty"));
+        assert!(Path::new(&wt).join("scratch.txt").exists(), "uncommitted work must survive");
+    }
+
+    // Already on the fresh base → a reported no-op, so the caller doesn't log a false "stale base".
+    #[test]
+    fn park_is_a_reported_no_op_when_already_fresh() {
+        let (r, _wt, app_data) = init_repo_with_origin("park-fresh");
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert_eq!(out, ParkOutcome::declined("already-fresh"));
+    }
+
+    // No worktree yet (first ever run, or one that was reaped): nothing to park, and NOT an error —
+    // the caller creates it from the base immediately after.
+    #[test]
+    fn park_declines_when_there_is_no_worktree() {
+        let r = init_repo("park-none");
+        let app_data = unique_root("park-none-appdata");
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert_eq!(out, ParkOutcome::declined("no-worktree"));
+    }
+
+    // With no `origin` at all, "is this commit pushed?" is unanswerable — the conservative reading
+    // is "can't prove it's safe", so decline rather than reset against a local-only base.
+    #[test]
+    fn park_declines_when_containment_cannot_be_proven() {
+        let r = init_repo("park-no-origin");
+        let app_data = unique_root("park-no-origin-appdata");
+        create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert_eq!(out, ParkOutcome::declined("unpushed"));
     }
 
     // sparkle-zlic: the batched status command computes every agent in one pass and, crucially,
@@ -4008,6 +4933,22 @@ mod tests {
     }
 
     #[test]
+    fn every_gh_invocation_goes_through_gh_program() {
+        // A Finder/Dock-launched app doesn't inherit the login-shell PATH, so spawning gh by its
+        // bare name can't find a homebrew/`~/.local/bin` install — and because every gh caller here
+        // SWALLOWS a spawn failure, the miss reads as "no PRs" instead of an error.
+        // `preflight::gh_program()` resolves the absolute path and is the only correct spawn form.
+        // This is a structural guard, not a behavioral one: the gap has been introduced twice, once
+        // per batch of new gh callers, and neither time did a test fail.
+        let needle = format!("Command::new(\"{}\")", "gh"); // built at runtime so this test can't match itself
+        let src = include_str!("worktree.rs");
+        assert!(
+            !src.contains(&needle),
+            "spawn gh via crate::preflight::gh_program(), not the bare name"
+        );
+    }
+
+    #[test]
     fn decode_commit_pulls_disambiguates_multiple_prs() {
         // Several PRs contain the tip and the order isn't relevance-sorted: a merged PR wins over
         // anything else, so a trailing closed/open row can't shadow the ship.
@@ -4407,6 +5348,160 @@ mod tests {
         remove_worktree_at(&root_str, "p", "a", &app_data).unwrap();
         assert!(!Path::new(&info.path).exists(), "external worktree dir removed");
         remove_worktree_at(&root_str, "p", "a", &app_data).unwrap(); // twice = no-op
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Closing one agent fans teardown out to every open window, so the same worktree takes several
+    /// concurrent removal calls; all must converge on success with the dir gone.
+    ///
+    /// NOTE: this is a contract guard, NOT a reproduction. It passes with the serialization removed
+    /// — a fixture worktree is deleted in microseconds, while the production race window is the
+    /// 2-10s it takes to delete a real one. It fails only if a change makes concurrent removes
+    /// error outright, so it is not evidence that the lock is what fixes the observed failure.
+    #[test]
+    fn concurrent_removes_of_the_same_worktree_all_succeed() {
+        let root = unique_root("rm-race");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("rm-race-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        let info = create_worktree_at(&root_str, "p", "a", "HEAD", &app_data).unwrap();
+        assert!(Path::new(&info.path).exists());
+
+        // Six racers, released together: the observed fan-out width for a close with six windows.
+        let barrier = std::sync::Barrier::new(6);
+        let errs: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..6)
+                .map(|_| {
+                    let (r, ad, b) = (root_str.clone(), app_data.clone(), &barrier);
+                    s.spawn(move || {
+                        b.wait();
+                        remove_worktree_at(&r, "p", "a", &ad)
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().unwrap().err()).collect()
+        });
+
+        assert!(errs.is_empty(), "concurrent removals reported failures: {errs:?}");
+        assert!(!Path::new(&info.path).exists(), "external worktree dir removed");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// A half-deleted worktree — dir still on disk, its `.git` link file gone — is the shape
+    /// `git worktree remove` cannot finish: it either fails ("validation failed, cannot remove
+    /// working tree") or reports success while deleting nothing. Teardown has to prune the
+    /// admin record and delete the remains itself, or the agent's branch stays claimed and the
+    /// orphaned dir leaks for the life of the repo.
+    #[test]
+    fn remove_worktree_recovers_from_a_missing_dot_git_link() {
+        let root = unique_root("rm-broken");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("rm-broken-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        let info = create_worktree_at(&root_str, "p", "a", "HEAD", &app_data).unwrap();
+
+        // Break the checkout the way a half-finished teardown does: drop the `.git` link file,
+        // leaving both the dir and the parent repo's admin record behind.
+        std::fs::remove_file(Path::new(&info.path).join(".git")).unwrap();
+
+        remove_worktree_at(&root_str, "p", "a", &app_data).unwrap();
+        assert!(!Path::new(&info.path).exists(), "half-deleted worktree dir removed");
+        assert!(
+            !git(&root_str, &["worktree", "list", "--porcelain"])
+                .unwrap()
+                .contains(&info.path),
+            "stale admin record pruned"
+        );
+        remove_worktree_at(&root_str, "p", "a", &app_data).unwrap(); // still idempotent
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The same broken link, phrased differently: when the `.git` file survives as something
+    /// that isn't a gitfile, git blames it with `is not a .git file, error code N` instead of
+    /// `does not exist`. Same half-deleted checkout, same leak — but a guard keyed to the first
+    /// wording alone lets this one through, so teardown errors out and never converges.
+    #[test]
+    fn remove_worktree_recovers_from_a_corrupt_dot_git_link() {
+        let root = unique_root("rm-corrupt");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("rm-corrupt-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        let info = create_worktree_at(&root_str, "p", "a", "HEAD", &app_data).unwrap();
+
+        // Truncated/overwritten link file: present, but no longer a `gitdir:` pointer.
+        std::fs::write(Path::new(&info.path).join(".git"), b"not a gitfile\n").unwrap();
+
+        remove_worktree_at(&root_str, "p", "a", &app_data).unwrap();
+        assert!(!Path::new(&info.path).exists(), "corrupt-link worktree dir removed");
+        assert!(
+            !git(&root_str, &["worktree", "list", "--porcelain"])
+                .unwrap()
+                .contains(&info.path),
+            "stale admin record pruned"
+        );
+        remove_worktree_at(&root_str, "p", "a", &app_data).unwrap(); // still idempotent
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The third phrasing, and the subtlest break: the `.git` file is a perfectly well-formed
+    /// gitfile, but the admin record it names belongs to a DIFFERENT worktree, so the link no
+    /// longer round-trips. Git rejects it with `does not point back to`. Nothing about the file
+    /// looks wrong on disk, which is exactly why the guard has to match on git's reason rather
+    /// than on any property we could check ourselves.
+    #[test]
+    fn remove_worktree_recovers_from_a_dot_git_link_that_points_elsewhere() {
+        let root = unique_root("rm-crosslink");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("rm-crosslink-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        let a = create_worktree_at(&root_str, "p", "a", "HEAD", &app_data).unwrap();
+        let b = create_worktree_at(&root_str, "p", "b", "HEAD", &app_data).unwrap();
+
+        // Point a's link at b's admin record. b's record still names b, so validating a fails.
+        let b_link = std::fs::read_to_string(Path::new(&b.path).join(".git")).unwrap();
+        std::fs::write(Path::new(&a.path).join(".git"), b_link).unwrap();
+
+        remove_worktree_at(&root_str, "p", "a", &app_data).unwrap();
+        assert!(!Path::new(&a.path).exists(), "cross-linked worktree dir removed");
+        assert!(
+            !git(&root_str, &["worktree", "list", "--porcelain"])
+                .unwrap()
+                .contains(&a.path),
+            "stale admin record pruned"
+        );
+        // The bystander must survive: cleanup is repo-wide but only drops missing checkouts.
+        assert!(Path::new(&b.path).exists(), "unrelated worktree left intact");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The quieter half of the same leak: for a path git does NOT recognize as a worktree,
+    /// `git worktree remove` exits 0 having deleted nothing. Teardown that trusts the exit code
+    /// reports success and leaves the dir on disk forever.
+    #[test]
+    fn remove_worktree_deletes_an_orphan_git_reports_success_for() {
+        let root = unique_root("rm-orphan");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("rm-orphan-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+
+        // An orphan git never knew about: the dir exists at the agent's worktree path with no
+        // admin record backing it. This is what a crash mid-`worktree add` leaves behind.
+        let wt = worktree_path(&app_data, "p", "a").unwrap();
+        std::fs::create_dir_all(wt.join("nested")).unwrap();
+        std::fs::write(wt.join("nested/leftover.txt"), b"x").unwrap();
+
+        remove_worktree_at(&root_str, "p", "a", &app_data).unwrap();
+        assert!(!wt.exists(), "orphaned dir removed despite git reporting success");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
@@ -5645,6 +6740,29 @@ mod tests {
         // fetch:false with no remote-tracking ref also falls back to local.
         assert_eq!(effective_base(&root_str, "main", false), "main");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The flooding shape: hook install is retried once per agent open, so an unresolvable root
+    /// repeats the SAME failure forever. Only the first occurrence may warn; repeats are demoted.
+    /// A root whose error text changes is a different fact and warns again.
+    #[test]
+    fn hook_failure_warns_once_per_root_and_error() {
+        let root = unique_root("hookwarn").to_string_lossy().to_string();
+        let other = unique_root("hookwarn2").to_string_lossy().to_string();
+        let enotdir = "cannot create hooks dir: Not a directory (os error 20)";
+
+        // First sighting warns; the identical retries that follow do not.
+        assert!(should_warn_hook_failure(&root, enotdir));
+        assert!(!should_warn_hook_failure(&root, enotdir));
+        assert!(!should_warn_hook_failure(&root, enotdir));
+
+        // A DIFFERENT failure on the same root is new information — it gets its own warning.
+        assert!(should_warn_hook_failure(&root, "bundled resource missing"));
+        assert!(!should_warn_hook_failure(&root, "bundled resource missing"));
+
+        // Dedupe is per-root: another project hitting the same error still warns once.
+        assert!(should_warn_hook_failure(&other, enotdir));
+        assert!(!should_warn_hook_failure(&other, enotdir));
     }
 
     #[test]

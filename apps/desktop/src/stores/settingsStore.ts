@@ -45,8 +45,9 @@ export const DEFAULT_NOTIFY_STATUSES: Record<AgentTabStatus, boolean> = {
   done: true,
   working: false,
   blocked: false,
-  // `unmerged` recolors the dot red and floats the row up, but does NOT ping by default (a finished
-  // agent's un-merged branch is a passive "when you get to it" nudge, not a banner-worthy event).
+  // `unmerged` floats the row above the calm tier but is GRAY, not red (see packages/ui/tokens.ts),
+  // and does NOT ping by default — a finished agent's un-merged branch is a passive "when you get to
+  // it" nudge, not a banner-worthy event.
   unmerged: false,
   stopped: false,
 };
@@ -94,18 +95,24 @@ export const AI_FEATURE_FIELD: Record<AiFeatureKey, keyof AiFeatureFlags> = {
 // workflow-mirror fields these are hydrated from config.toml and NOT persisted to localStorage.
 
 /** Stable identifiers for the config-backed [tools] flags. */
-export type ToolKey = "analytics" | "beads" | "github" | "guardrails" | "roborev";
+export type ToolKey = "analytics" | "beads" | "github" | "guardrails" | "roborev" | "onepassword";
 
 /** Map a tool key to its settings-store field name (the single source of that relationship). */
 export const TOOL_FIELD: Record<
   ToolKey,
-  "analyticsEnabled" | "beadsEnabled" | "githubEnabled" | "guardrailsEnabled" | "roborevEnabled"
+  | "analyticsEnabled"
+  | "beadsEnabled"
+  | "githubEnabled"
+  | "guardrailsEnabled"
+  | "roborevEnabled"
+  | "onepasswordEnabled"
 > = {
   analytics: "analyticsEnabled",
   beads: "beadsEnabled",
   github: "githubEnabled",
   guardrails: "guardrailsEnabled",
   roborev: "roborevEnabled",
+  onepassword: "onepasswordEnabled",
 };
 
 // --- Chief sync state (replacing the legacy markdown-sync watermark) -----------------------
@@ -114,6 +121,16 @@ export const TOOL_FIELD: Record<
 export interface ChiefDocState {
   hash: string;
   assetId: string;
+}
+
+/** The ONE rule for a 1Password vault id: trimmed, and blank-or-absent means "no vault picked".
+ *
+ *  Every write path into `onepasswordVaultId` goes through this — the store setter, the config
+ *  hydrator, and the configActions writer — because the bug this replaced was three
+ *  near-identical copies where one of them (hydration) quietly didn't trim. A truthy-but-blank id
+ *  reads as "configured" to every downstream check and makes each `op` call fail opaquely. */
+export function normalizeVaultId(vaultId: string | null | undefined): string | null {
+  return vaultId?.trim() || null;
 }
 
 /** Derive the master segment from the four flags: all on → "all", all off → "off", else "some". */
@@ -335,6 +352,18 @@ interface SettingsState {
    *  the daemon reviews each BUILD-agent commit; off → dormant. Mirrors [tools].roborev. Config-
    *  backed, NOT persisted — re-read from the file each launch. */
   roborevEnabled: boolean;
+  /** 1Password `.env*` backup. Mirrors [tools].onepassword. Config-backed, NOT persisted.
+   *  Unlike every other tool this defaults OFF — see the hydration note below. */
+  onepasswordEnabled: boolean;
+  /** The 1Password vault backups are written to. Null until the user picks one in Settings;
+   *  the backup UI stays in its "pick a vault" state rather than guessing, because writing
+   *  secrets into the wrong vault (say, one shared with a team) is not a safe default.
+   *  Mirrors [onepassword].vault_id. Config-backed, NOT persisted. */
+  onepasswordVaultId: string | null;
+  /** Restore backed-up env files into each newly created agent worktree. This is the payoff of
+   *  the feature — `.env*` is gitignored, so a worktree never carries one and every worker agent
+   *  otherwise starts without its project's secrets. Mirrors [onepassword].seed_worktrees. */
+  onepasswordSeedWorktrees: boolean;
   /** Whether the one-time roborev consent modal has already been shown. Set true the first time it
    *  appears (whichever choice the user made) so it never appears again. Mirrors
    *  [roborev].consent_prompted. Config-backed, NOT persisted. */
@@ -381,6 +410,12 @@ interface SettingsState {
   setPauseOnSubmit: (on: boolean) => void;
   /** Optimistically toggle one [tools] flag; configActions persists it to config.toml. */
   setToolEnabled: (key: ToolKey, on: boolean) => void;
+  /** Optimistically set the chosen 1Password vault (configActions persists
+   *  [onepassword].vault_id). Null clears it, returning the UI to its "pick a vault" state. */
+  setOnePasswordVaultId: (vaultId: string | null) => void;
+  /** Optimistically set worktree seeding (configActions persists
+   *  [onepassword].seed_worktrees). */
+  setOnePasswordSeedWorktrees: (on: boolean) => void;
   /** Mark the one-time roborev consent modal as shown (configActions persists
    *  [roborev].consent_prompted). */
   setRoborevConsentPrompted: (prompted: boolean) => void;
@@ -441,6 +476,9 @@ export const useSettingsStore = create<SettingsState>()(
       githubEnabled: true,
       guardrailsEnabled: true,
       roborevEnabled: true,
+      onepasswordEnabled: false,
+      onepasswordVaultId: null,
+      onepasswordSeedWorktrees: false,
       roborevConsentPrompted: false,
       roborevConsentOpen: false,
       roborevAuthWarning: null,
@@ -474,6 +512,11 @@ export const useSettingsStore = create<SettingsState>()(
       setStopWord: (stopWord) => set({ stopWord }),
       setPauseOnSubmit: (pauseOnSubmit) => set({ pauseOnSubmit }),
       setToolEnabled: (key, on) => set({ [TOOL_FIELD[key]]: on } as Partial<SettingsState>),
+      // Trim + empty→null so a blank id can never read as a configured vault (Rust normalizes the
+      // same way); otherwise every `op` call would fail opaquely instead of showing the picker.
+      setOnePasswordVaultId: (vaultId) =>
+        set({ onepasswordVaultId: normalizeVaultId(vaultId) }),
+      setOnePasswordSeedWorktrees: (on) => set({ onepasswordSeedWorktrees: on }),
       setRoborevConsentPrompted: (prompted) => set({ roborevConsentPrompted: prompted }),
       setRoborevConsentOpen: (open) => set({ roborevConsentOpen: open }),
       setRoborevAuthWarning: (warning) => set({ roborevAuthWarning: warning }),
@@ -551,6 +594,18 @@ export const useSettingsStore = create<SettingsState>()(
           githubEnabled: config.tools?.github ?? true,
           guardrailsEnabled: config.tools?.guardrails ?? true,
           roborevEnabled: config.tools?.roborev ?? true,
+          // NOTE THE ASYMMETRY: every tool above falls back to `?? true`, this one to `?? false`.
+          // 1Password backup needs an external account, the `op` CLI, and a chosen vault before it
+          // can do anything, so an absent [tools] block must read as OFF — defaulting it on would
+          // advertise a capability a fresh install cannot perform. Matches Rust's
+          // SparkleConfig::default(). Same reasoning for the two [onepassword] fields: no vault
+          // until the user picks one, no worktree seeding until they ask for it.
+          onepasswordEnabled: config.tools?.onepassword ?? false,
+          // Same rule as every other write path — see normalizeVaultId. Hydration was the one that
+          // used to skip it, so a ""/"   " payload landed verbatim and read as "a vault is
+          // configured" everywhere downstream.
+          onepasswordVaultId: normalizeVaultId(config.onepassword?.vault_id),
+          onepasswordSeedWorktrees: config.onepassword?.seed_worktrees ?? false,
           // `?? false`: an absent [roborev] block (older backend) means we've never prompted, so a
           // first reviewable commit still surfaces the one-time consent modal.
           roborevConsentPrompted: config.roborev?.consent_prompted ?? false,

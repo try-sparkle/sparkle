@@ -41,23 +41,31 @@ export const C = {
  * nine states for precise tooltips/legends, but they collapse to exactly THREE colors
  * so a glance tells you only what you need to act on:
  *   GREEN  — running                              (working)
- *   RED    — needs your action                    (waiting, approval, errored, blocked, unmerged)
- *   GRAY   — done, nothing left for you            (idle, done, stopped)
- * RED means the agent needs YOU before its work is truly finished: it's waiting on your input
- * (a question or an approval it drew on screen, OR a finished-turn ask the followup judge flagged
- * as blocked on you — see turnFollowup.ts / statusRouter.ts); OR it crashed/exited with an error;
- * OR it went quiet/stalled (`blocked`); OR it finished but left committed work that hasn't landed
- * on main yet and needs you to open/merge the PR (`unmerged`, derived from the branch/workflow
- * state — see engine/unmergedAttention.ts). A finished turn with NOTHING left for you — nothing to
- * merge, no question — is GRAY (`idle`/`done`); a cleanly-exited, fully-landed agent is GRAY too.
+ *   RED    — needs your action                    (waiting, approval, errored, blocked)
+ *   GRAY   — nothing is stopping you              (idle, done, stopped, unmerged)
+ * RED means the agent needs YOU before it can make progress: it's waiting on your input (a question
+ * or an approval it drew on screen, OR a finished-turn ask the followup judge flagged as blocked on
+ * you — see turnFollowup.ts / statusRouter.ts); OR it crashed/exited with an error; OR it went
+ * quiet/stalled (`blocked`). A finished turn is GRAY (`idle`/`done`), as is a cleanly-exited agent.
+ *
+ * `unmerged` — finished, with committed work not yet on main — is GRAY BY DESIGN, not an oversight;
+ * it is a landing state rather than an alarm, and it is the one gray status that still outranks the
+ * calm tier in engine/agentOrdering (its own band) and in conciergeFeed (P1). See its token below
+ * for why it stopped being red on 2026-07-26.
  * Never hardcode these — import AGENT_STATUS. `label` is the human phrase shown on hover.
  *
  * NOTE: color, badge, and notifications are three SEPARATE concerns. Color is here (the sidebar
- * dot + the cross-window red section, which keys off THIS color tier via windowStatus.isRedStatus).
+ * dot + the cross-project red banding, which keys off THIS color tier via windowStatus.isRedStatus).
  * The dock badge + banner notifications key off the NARROWER attention set in engine/attention.ts
- * (waiting/approval/errored only) — `blocked`/`unmerged` recolor the dot and surface cross-project
- * but deliberately do NOT add to the badge count or fire a banner (they're "needs you eventually",
- * not "answer this now"). Notifications stay user-configurable per status (settingsStore).
+ * (waiting/approval/errored only) — `blocked` recolors the dot and surfaces cross-project but
+ * deliberately does NOT add to the badge count or fire a banner (it's "needs you eventually", not
+ * "answer this now"). Notifications stay user-configurable per status (settingsStore).
+ *
+ * THE TWO SETS ARE DIFFERENT ON PURPOSE, AND THAT IS A TRAP. Code that means "is this row red?"
+ * must call windowStatus.isRedStatus; code that means "is this agent asking me something right
+ * now?" must call attention.needsAttention. Reaching for the wrong one is a bug that has actually
+ * shipped twice — engine/workerAttention.ts used needsAttention behind a comment reading "only RED
+ * workers bubble", so a `blocked` worker never surfaced on its orchestrator's row at all.
  */
 const GREEN = C.success; // #34c759 — running, leave it be
 const RED = C.sienna; //   #e0533f — needs your action
@@ -69,7 +77,15 @@ export const AGENT_STATUS = {
   approval: { color: RED, label: "Approve?" }, // caution/dangerous action pending
   blocked: { color: RED, label: "Blocked" }, // went quiet / stalled — needs you to unstick it
   errored: { color: RED, label: "Errored" }, // process crashed/exited with an error — red so it stands out
-  unmerged: { color: RED, label: "Needs merge" }, // done, but committed work isn't on main yet — open/merge the PR
+  // Done, but committed work isn't on main yet — open/merge the PR. GRAY, deliberately: this is a
+  // LANDING state, not an alarm. It was red until 2026-07-26, and on a real fleet that made red
+  // meaningless — 27 of 51 agents sat in the committed-but-unlanded band, so the wall of red said
+  // "most of your agents have a branch", not "these agents need you". Worse, it was undismissable:
+  // the dismissal tier only ever covered waiting|approval|errored, so there was no way to calm it.
+  // The row still carries the fact — this label on hover, and the workflow line + ✓ that show
+  // exactly how far the work got — and agentOrdering still floats it above the calm tier. What it
+  // no longer does is impersonate "answer me now". See engine/redTaxonomySeparation.test.ts.
+  unmerged: { color: GRAY, label: "Needs merge" },
   done: { color: GRAY, label: "Done" }, // finished cleanly AND landed — nothing left for you
   stopped: { color: GRAY, label: "Stopped" }, // not running (persisted tab)
 } as const;

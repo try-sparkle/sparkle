@@ -20,13 +20,21 @@ vi.mock("@tauri-apps/api/window", () => ({
 // Spy the attention.ts boundary. summarizeAttention is the credit-metered call we want to skip;
 // notifyAttention is the banner whose `body` we assert. The other exports the hook imports are
 // no-op stubs (they only invoke Tauri, absent under jsdom).
-const summarizeAttention = vi.fn<(screen: string) => Promise<string | null>>();
+// Typed with the FULL signature (including the metering-only `project`) on purpose: a mock narrowed
+// to `(screen: string)` swallows the second argument, so dropping the project at the call site would
+// leave every assertion here green. (roborev 48164)
+const summarizeAttention = vi.fn<(screen: string, project?: string) => Promise<string | null>>();
 const notifyAttention = vi.fn();
-vi.mock("./services/attention", () => ({
+// importOriginal + spread, NOT a hand-listed factory: Vitest throws on access to an export the
+// factory forgot, so a partial list breaks this suite the next time the hook reaches for another
+// symbol from this module (it did — `onSelectProject`).
+vi.mock("./services/attention", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./services/attention")>()),
   reportAttentionCount: vi.fn(),
   notifyAttention: (...a: unknown[]) => notifyAttention(...a),
-  summarizeAttention: (s: string) => summarizeAttention(s),
+  summarizeAttention: (s: string, project?: string) => summarizeAttention(s, project),
   onFocusAgent: () => Promise.resolve(() => {}),
+  onSelectProject: () => Promise.resolve(() => {}),
 }));
 
 // The phone relay fires alongside the banner but is a separate device — stub it so the test stays
@@ -37,7 +45,7 @@ vi.mock("./services/relayClient", () => ({
 }));
 
 import { useAttentionNotifications } from "./useAttentionNotifications";
-import { CurrentProjectProvider } from "./windowContext";
+import { AppBoot } from "./windowContext";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useSettingsStore } from "./stores/settingsStore";
@@ -79,9 +87,9 @@ function mountWith(a: AgentTab) {
   useProjectStore.setState({ projects: [project([a])], selectedProjectId: "p1" });
   useRuntimeStore.setState({ status: { [AGENT_ID]: "working" }, attentionScreen: {} });
   return render(
-    <CurrentProjectProvider>
+    <AppBoot>
       <Harness />
-    </CurrentProjectProvider>,
+    </AppBoot>,
   );
 }
 
@@ -140,6 +148,9 @@ describe("Phase-2b — fresh self-report skips the paid Haiku scrape", () => {
       await Promise.resolve();
     });
     expect(summarizeAttention).toHaveBeenCalledTimes(1);
+    // The paid summarizer must carry the OWNING project so its debit is attributable in the Credits
+    // history — asserted here because nothing else observes the threading at this call site.
+    expect(summarizeAttention).toHaveBeenCalledWith("● Bash(rm -rf build)\nProceed?", "Sparkle");
     expect(notifyAttention.mock.calls[0]![0]).toMatchObject({ body: "Approve deleting build/?" });
   });
 

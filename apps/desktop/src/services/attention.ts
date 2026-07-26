@@ -38,11 +38,18 @@ export function notifyAttention(n: AttentionNotice): void {
 /** Ask the backend (Haiku 4.5) for a short, notification-friendly summary of WHAT an agent is
  *  asking, derived from the tail of its terminal `screen`. Used as the banner body for the
  *  waiting/approval "ask" cases. Returns null outside Tauri and on any failure (no key, network,
- *  empty) — never throws — so the caller falls back to the generic body. */
-export async function summarizeAttention(screen: string): Promise<string | null> {
+ *  empty) — never throws — so the caller falls back to the generic body.
+ *
+ *  `project` is metering-only: it attributes this call's credit debit to a project in the Credits
+ *  history. Omit it when the owning project can't be resolved — the row then carries no project
+ *  rather than a wrong one. */
+export async function summarizeAttention(
+  screen: string,
+  project?: string,
+): Promise<string | null> {
   if (!hasTauri) return null;
   try {
-    const summary = await invoke<string>("summarize_attention", { screen });
+    const summary = await invoke<string>("summarize_attention", { screen, project });
     return typeof summary === "string" ? summary : null;
   } catch (e) {
     console.debug("summarize_attention failed", e);
@@ -72,6 +79,33 @@ export function emitFocusAgent(p: FocusAgentPayload): void {
   if (!hasTauri) return;
   void emit("attention://focus-agent", p).catch((e) =>
     console.debug("emit focus-agent failed", e),
+  );
+}
+
+export interface SelectProjectPayload {
+  projectId: string;
+}
+
+/**
+ * "Show me this project" from another webview — the menu-bar tray's Open, the capture window.
+ *
+ * SEPARATE from focus-agent on purpose (roborev 46249-H1/M2). Raising the app window used to be a
+ * side effect of emitFocusAgent, which needs an agent to aim at: a project with no agents emitted
+ * nothing at all (the tray's Open on a freshly added folder was a dead click), and a project WITH
+ * agents got an invented target — mounting/resuming a PTY at real token cost and yanking the user
+ * out of Plan/Sparkle for a click that only asked to see a project. This event carries no agent,
+ * so it can do neither. Reserve focus-agent for genuine agent reveals.
+ */
+export function onSelectProject(cb: (p: SelectProjectPayload) => void): Promise<UnlistenFn> {
+  if (!hasTauri) return Promise.resolve(() => {});
+  return listen<SelectProjectPayload>("attention://select-project", (e) => cb(e.payload));
+}
+
+/** Broadcast "select this project's tab and raise the app window". No-op outside Tauri. */
+export function emitSelectProject(p: SelectProjectPayload): void {
+  if (!hasTauri) return;
+  void emit("attention://select-project", p).catch((e) =>
+    console.debug("emit select-project failed", e),
   );
 }
 

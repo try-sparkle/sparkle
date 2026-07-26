@@ -37,6 +37,7 @@ mod mic_permission;
 mod model;
 mod model_catalog;
 mod naming;
+mod onepassword;
 mod preflight;
 mod pty;
 mod retention;
@@ -53,6 +54,7 @@ mod trial;
 mod trial_remote;
 mod worktree;
 mod notes;
+mod concierge;
 
 use pty::PtyManager;
 use tauri::{Emitter, Manager};
@@ -86,6 +88,7 @@ pub fn run() {
         .manage(PtyManager::default())
         .manage(claude_chat::ClaudeChatManager::default())
         .manage(sparkle_improve::SparkleImproveManager::default())
+        .manage(concierge::ConciergeManager::default())
         .manage(dictation::DictationState::default())
         .manage(bridge::BridgeManager::default())
         .manage(bridge::ControlBridgeManager::default())
@@ -305,6 +308,16 @@ pub fn run() {
             preflight::git_preflight,
             preflight::prereqs_preflight,
             preflight::roborev_preflight,
+            // 1Password .env backup/restore — implements src/services/onepassword.ts.
+            onepassword::op_preflight,
+            onepassword::op_refresh,
+            onepassword::op_install,
+            onepassword::op_vaults,
+            onepassword::env_scan,
+            onepassword::op_list_backups,
+            onepassword::op_backup,
+            onepassword::op_restore,
+            onepassword::op_seed_worktree,
             setup::install_node,
             setup::install_claude_code,
             setup::install_git,
@@ -315,6 +328,8 @@ pub fn run() {
             claude_chat::claude_chat_cancel,
             sparkle_improve::sparkle_improve_run,
             sparkle_improve::sparkle_improve_cancel,
+            concierge::concierge_turn,
+            concierge::concierge_cancel,
             claude::claude_has_session,
             claude::claude_latest_session_id,
             claude::agent_session_title,
@@ -330,6 +345,7 @@ pub fn run() {
             worktree::prewarm_spawn,
             worktree::warm_worktree_pool,
             worktree::create_agent_worktree,
+            worktree::park_worktree_on_base,
             worktree::create_worker_worktree,
             worktree::remove_agent_worktree,
             worktree::move_project,
@@ -360,6 +376,7 @@ pub fn run() {
             worktree::scan_worker_manifests,
             sparkle_agent::ensure_sparkle_repo,
             sparkle_agent::reap_secondary_sparkle_worktrees,
+            sparkle_agent::sparkle_submit_capability,
             github::github_status,
             github::github_list_repos,
             github::github_clone_repo,
@@ -437,7 +454,10 @@ pub fn run() {
             accounts::accounts_import_default,
             accounts::accounts_mark_exhausted,
             accounts::accounts_usage,
+            accounts::accounts_spend,
             accounts::accounts_identities,
+            accounts::accounts_limit_events,
+            accounts::accounts_ceilings,
             accounts::claude_signed_in,
             trial::trial_status,
             trial::trial_start,

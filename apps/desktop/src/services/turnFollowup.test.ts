@@ -251,6 +251,24 @@ describe("judgeNeedsFollowup (orchestration)", () => {
     expect(invokeMock).toHaveBeenCalledWith("judge_turn_followup", {
       task: "Ship the release",
       response: "All secrets are in. Want me to land it now?",
+      project: undefined,
+    });
+  });
+
+  it("threads the metering project through to the judge invoke", async () => {
+    // Asserted EXPLICITLY: Vitest's equality ignores `undefined` properties, so the assertion above
+    // passes whether or not `project` is threaded at all. Without this case, a regression that
+    // stopped passing the project would leave the whole suite green. (roborev 48157)
+    invokeMock.mockResolvedValueOnce("DONE");
+    await judgeNeedsFollowup({
+      task: "Ship the release",
+      response: "All secrets are in. Want me to land it now?", // ambiguous → the judge actually runs
+      project: "acme-lawsuit",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("judge_turn_followup", {
+      task: "Ship the release",
+      response: "All secrets are in. Want me to land it now?",
+      project: "acme-lawsuit",
     });
   });
 

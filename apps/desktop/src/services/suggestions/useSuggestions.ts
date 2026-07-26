@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { computeSuggestions, SuggestionOfflineError } from "./engine";
+import { AiUnavailableError } from "../anthropic";
 import { getAgentScrollback } from "../terminalScrollback";
+import { AiUnreachableError } from "../anthropic";
 import { useAiFeature } from "../aiGate";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useProjectStore } from "../../stores/projectStore";
@@ -55,6 +57,25 @@ export const MAX_COMPUTE_ATTEMPTS = 3;
  *  `failures` counts attempts already failed, so budget remains while it's below the cap. */
 export function withinRetryBudget(failures: number): boolean {
   return failures < MAX_COMPUTE_ATTEMPTS;
+}
+
+/** The failure count paired with the state it was spent on. Kept as ONE value rather than a count
+ *  and a hash that can drift apart: the count is meaningless without the hash it belongs to. */
+export interface FailState {
+  hash: string | null;
+  count: number;
+}
+
+export const NO_FAILURES: FailState = { hash: null, count: 0 };
+
+/** Attempts already failed for `hash` — 0 for any OTHER state (which starts with a full budget).
+ *  Reading the count *relative to* a hash is what keeps the budget attached to the state that spent
+ *  it. Zeroing the counter whenever a different hash passed through looked equivalent, but computes
+ *  for other states interleave freely with the retries of a failing one — the terminal repaints, or
+ *  an offline-deferred compute runs — and each one refunded the exhausted budget, so a persistently
+ *  failing state kept buying metered calls indefinitely. Pure, for testing. */
+export function failuresFor(state: FailState, hash: string): number {
+  return state.hash === hash ? state.count : 0;
 }
 
 /**
@@ -142,8 +163,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // it when the state moves on before the backoff fires, and so we never stack overlapping timers.
   const retryTimer = useRef<number | null>(null);
   // Consecutive-failure counter (+ the hash it's failing on) to bound retries per failing state.
-  const failures = useRef(0);
-  const lastFailHash = useRef<string | null>(null);
+  const fail = useRef<FailState>(NO_FAILURES);
   // Whether we last pushed a NON-empty set to the phone — so retiring only emits a clearing push
   // when there's actually something to clear (no chatty empty pushes on every status flip).
   const pushedNonEmpty = useRef(false);
@@ -258,16 +278,24 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
     // learned actions are on, is a redundant paid Haiku call). The in-flight one will either apply
     // its result or, if superseded, bump retryTick to re-evaluate.
     if (computing.current) return;
-    const scrollback = getAgentScrollback(agentId) ?? "";
+    // No content, no compute — the same rule the settle watcher below already applies. A null
+    // provider means the terminal is UNMOUNTED (not empty), and an empty buffer gives the model an
+    // empty "Recent terminal output:" block, so either way the paid Haiku call can only return
+    // nothing while clobbering whatever buttons are already up. Coercing null to "" here instead
+    // spent one call per your-turn on agents whose terminal hadn't registered its provider yet.
+    // lastHash is deliberately NOT committed: once real output arrives its hash differs from
+    // whatever we skipped, and the watcher bumps retryTick to compute it.
+    const scrollback = getAgentScrollback(agentId);
+    if (!scrollback) return;
     const nextHash = hashScrollback(scrollback);
     if (!shouldRecompute({ lastHash: lastHash.current, nextHash, composerEmpty })) return;
     // A genuinely different state gets a fresh retry budget; retries of the SAME failing state draw
     // down the budget set in .catch below — and once that budget is exhausted, ANY re-trigger for
     // the same hash (composer typed-then-cleared, learnedOn toggled) must bail here too, or each
     // such cycle would buy a fresh paid call the budget already refused (lastHash was never
-    // committed for a failing hash, so shouldRecompute alone can't stop it).
-    if (nextHash !== lastFailHash.current) failures.current = 0;
-    else if (!withinRetryBudget(failures.current)) return;
+    // committed for a failing hash, so shouldRecompute alone can't stop it). Note this only READS
+    // the budget — a different hash must not RESET it, or passing through one refunds the other.
+    if (!withinRetryBudget(failuresFor(fail.current, nextHash))) return;
     // Already computed this exact settled state earlier in the session (the agent left your-turn and
     // came back to the same screen). Serve it locally instead of re-buying the compute. The
     // auto-approve check still runs — it's the local heuristic tier, it's what `handledSigs` being
@@ -280,10 +308,10 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
     if (hit) {
       const autoCat = maybeAutoApprove(agentId, scrollback, handledSigs.current);
       lastHash.current = nextHash;
-      // Unlike the success path below, this branch deliberately does NOT clear `lastFailHash`.
-      // It can't be stale here: only a SUCCEEDED compute is ever memoized, so a hash present in the
-      // memo is by construction not the hash we're currently failing on — and the budget reset above
-      // has already run for it. Clearing it would read as though the two paths guard the same thing.
+      // Unlike the success path below, this branch deliberately does NOT clear `fail`. It can't be
+      // stale here: only a SUCCEEDED compute is ever memoized, so a hash present in the memo is by
+      // construction not the hash we're currently failing on. Clearing it would read as though the
+      // two paths guard the same thing — and would throw away a budget this path never spent.
       setDismissed(new Set());
       if (autoCat) {
         setAutoApproved(autoCat);
@@ -323,8 +351,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
           retryAfter = true;
           return;
         }
-        failures.current = 0;
-        lastFailHash.current = null;
+        fail.current = NO_FAILURES;
         lastHash.current = nextHash;
         setDismissed(new Set());
         // Sparkle Auto-Approve: if this settled state is a classifiable permission prompt whose
@@ -387,31 +414,49 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // Leave lastHash unadvanced (so it recomputes) but DON'T spend the retry budget, DON'T warn,
         // and DON'T bump retryTick (which would spin every render while offline). The isOnline effect
         // dep re-runs this compute when connectivity returns.
-        if (err instanceof SuggestionOfflineError) {
+        // Same disposition for a compute that DISCOVERED we're offline mid-flight: the pre-compute
+        // `online` gate can only read the store, and the reachability heartbeat is up to 30s stale,
+        // so a route that dropped inside that window let the call through to a guaranteed transport
+        // failure. Retrying it spends the budget on paid calls that cannot succeed. chatOnce has
+        // already marked the store offline, so `isOnline` (an effect dep) re-runs this compute the
+        // moment connectivity returns — the same recovery path as the gate above, not a dead end.
+        if (err instanceof SuggestionOfflineError || err instanceof AiUnreachableError) {
           log.debug("suggestions", "compute deferred (offline)", { agentId });
           return;
         }
         // The compute rejected — leave lastHash unadvanced and re-trigger so this state can retry,
         // but only up to MAX_COMPUTE_ATTEMPTS for the SAME failing state, so a persistent rejection
         // can't spin into an unbounded loop of paid computes. A genuine state change resets this.
-        failures.current += 1;
-        lastFailHash.current = nextHash;
+        // An unavailable backend is the one rejection with NO transient hope: the retries are
+        // guaranteed to hit the same wall, so spend the whole budget at once rather than paying for
+        // two more round-trips per state. Note this canNOT take the deferred (offline) path above:
+        // offline is detected locally and costs nothing, whereas learning the backend is down COSTS
+        // a request — so deferring without drawing down the budget would let every re-render buy
+        // another doomed call, which is worse than the bounded retries this replaces.
+        const unavailable = err instanceof AiUnavailableError;
         const message = err instanceof Error ? err.message : String(err);
-        // A permanent rejection (see isTerminalComputeError) can't be retried into a success, so
-        // burn the whole budget at once: the retry branch below then falls through to the terminal
-        // path, and the effect's own budget guard refuses any later re-trigger for this same hash.
-        const terminal = isTerminalComputeError(message);
-        if (terminal) failures.current = MAX_COMPUTE_ATTEMPTS;
-        log.warn("suggestions", "compute failed", {
+        // A permanent rejection can't be retried into a success, so burn the whole budget at once:
+        // the retry branch below then falls through to the terminal path, and the effect's own
+        // budget guard refuses any later re-trigger for this same hash. Two disjoint shapes are
+        // terminal — an unavailable backend (AiUnavailableError, tracked above via `unavailable`,
+        // whose message carries no HTTP code) and a 4xx surfaced as `... (HTTP 4xx)` — so OR them.
+        const terminal = unavailable || isTerminalComputeError(message);
+        const spent = terminal ? MAX_COMPUTE_ATTEMPTS : failuresFor(fail.current, nextHash) + 1;
+        // Count and hash move together, so a compute for another state can never be charged this
+        // budget — nor refund it.
+        fail.current = { hash: nextHash, count: spent };
+        // An unavailable backend logs at debug, not warn: it's an environmental condition the user
+        // can't act on, and warning on every occurrence is the retry-storm noise this cut aims at.
+        log[unavailable ? "debug" : "warn"]("suggestions", "compute failed", {
           agentId,
-          failures: failures.current,
+          failures: spent,
           terminal,
           error: message,
         });
         if (!alive) return;
-        if (withinRetryBudget(failures.current)) {
+        if (withinRetryBudget(spent)) {
           retryAfter = true;
-          retryDelay = retryBackoffMs(failures.current);
+          retryDelay = retryBackoffMs(spent);
         } else {
           // Budget exhausted: this settled state is known-uncomputable. Keeping the PREVIOUS
           // state's buttons through the transient retries was fine, but past the last retry
@@ -468,16 +513,19 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       // effect dep re-runs the compute on reconnect. Read the store live so the running interval
       // (its deps don't include isOnline) sees the current connectivity without restarting.
       if (!useConnectionStore.getState().isOnline) return;
-      // A null provider means the terminal is UNMOUNTED, not that the terminal is empty — don't
-      // spend a compute on no content (or clobber good buttons with the empty result). Ticks
-      // resume once the provider registers, which still covers the mount race.
+      // No content, no compute — the same guard the effect above applies, and it must stay the
+      // SAME guard. A null provider means the terminal is UNMOUNTED, not that it is empty, but an
+      // empty buffer is equally uncomputable. Bailing on both also keeps this tick from spinning:
+      // the effect never commits lastHash for a state it skipped, so were we to settle on the
+      // empty hash we'd find `h !== lastHash.current` forever and bump retryTick every tick.
+      // Ticks resume once real output arrives, which still covers the mount race.
       const scrollback = getAgentScrollback(agentId);
-      if (scrollback == null) return;
+      if (!scrollback) return;
       const h = hashScrollback(scrollback);
       const settled = h === prevTickHash;
       prevTickHash = h;
       if (!settled || h === lastHash.current) return;
-      if (h === lastFailHash.current && !withinRetryBudget(failures.current)) return;
+      if (!withinRetryBudget(failuresFor(fail.current, h))) return;
       setRetryTick((t) => t + 1);
     }, SETTLE_TICK_MS);
     return () => window.clearInterval(id);

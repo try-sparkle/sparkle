@@ -23,6 +23,26 @@ const invokeMock = vi.fn();
 invokeMock.mockReturnValue(Promise.resolve()); // respond() calls .then() — must return a thenable
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
 
+// --- mock the window identity used by spin_down's single-owner election. Default is "main" with
+//     an EMPTY registry, i.e. no window owns any project → main adopts, so every pre-existing test
+//     below services its spin_down exactly as before the election was added. The ownership tests
+//     override `thisWindowLabel` / `registry` to put this window on the losing side. ---
+let thisWindowLabel = "main";
+let registry: Record<string, string> = {};
+const liveWindows = new Set<string>();
+vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: thisWindowLabel }) }));
+vi.mock("@tauri-apps/api/webviewWindow", () => ({
+  WebviewWindow: { getByLabel: async (l: string) => (liveWindows.has(l) ? {} : null) },
+}));
+vi.mock("./windowRegistry", async (orig) => ({
+  ...(await orig<typeof import("./windowRegistry")>()),
+  findWindowForProject: (pid: string) =>
+    Object.entries(registry).find(([, v]) => v === pid)?.[0] ?? null,
+  clearWindowProject: (l: string) => {
+    delete registry[l];
+  },
+}));
+
 // --- mock workerSpawn so no real worktree/PTY is touched; spawnWorker registers a real tab so
 //     the listener can read back branch/worktree from the store. ---
 const defaultSpawnImpl = async (args: {
@@ -39,7 +59,7 @@ const defaultSpawnImpl = async (args: {
     // omitted it, so the store's workers were bead-less here in a way they never are in the app —
     // which would have hidden the whole bead-claim guard from these tests.
     beadId: args.beadId,
-  });
+  })!;
   const branch = `sparkle/agent-${id}`;
   const worktree = `/wt/${id}`;
   useProjectStore.getState().setAgentWorktree(args.projectId, id, worktree, branch);
@@ -67,6 +87,9 @@ vi.mock("./worktree", async (orig) => ({
 import {
   startOrchestrationListener,
   purgeBuildAgent,
+  reapOrphanedWorkers,
+  __setReaperNow,
+  REAP_GRACE_MS,
   type OrchestrationRequest,
 } from "./orchestrationListener";
 
@@ -93,9 +116,13 @@ describe("orchestrationListener", () => {
     useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 20 });
     scanWorkerManifestsMock.mockReset();
     scanWorkerManifestsMock.mockResolvedValue([]); // default: nothing on disk to reconcile
+    // Default election state: this is main and nothing is registered → main adopts every request.
+    thisWindowLabel = "main";
+    registry = {};
+    liveWindows.clear();
     const store = useProjectStore.getState();
     projectId = store.addProject("Demo", "/tmp/demo");
-    buildId = store.addAgent(projectId, { kind: "build" });
+    buildId = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build");
     cleanup = await startOrchestrationListener();
   });
@@ -127,7 +154,7 @@ describe("orchestrationListener", () => {
         kind: "worker",
         parentId: args.parentAgentId,
         task: args.task,
-      });
+      })!;
       const branch = `sparkle/agent-${id}`;
       const worktree = `/wt/${id}`;
       useProjectStore.getState().setAgentWorktree(args.projectId, id, worktree, branch);
@@ -162,7 +189,7 @@ describe("orchestrationListener", () => {
     // orchestrator must be live for the heal to apply (a worker is live iff its orchestrator is).
     useRuntimeStore.getState().open(buildId);
     const ps = useProjectStore.getState();
-    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId });
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
     ps.setAgentWorktree(projectId, workerId, "/wt/heal", "sparkle/agent-heal");
     await flush();
     expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
@@ -171,7 +198,7 @@ describe("orchestrationListener", () => {
   it("self-heals after an EVICTION: re-opens a worker removed from openAgentIds", async () => {
     useRuntimeStore.getState().open(buildId);
     const ps = useProjectStore.getState();
-    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId });
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
     ps.setAgentWorktree(projectId, workerId, "/wt/evict", "sparkle/agent-evict");
     await flush();
     expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
@@ -183,6 +210,65 @@ describe("orchestrationListener", () => {
     expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
   });
 
+  it("gives UP on a strand the heal can't win: bounded re-opens, then one warning", async () => {
+    // The re-open/evict ping-pong. An evictor that keeps pace with the heal (a cross-window
+    // rehydrate racing this window's open) makes every open() come straight back out of the shared
+    // set, and each open() wakes the subscription that schedules the next heal — an exit-free loop
+    // that writes persisted, cross-window state every round. The heal must bound its own attempts.
+    useRuntimeStore.getState().open(buildId);
+    const ps = useProjectStore.getState();
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    ps.setAgentWorktree(projectId, workerId, "/wt/pingpong", "sparkle/agent-pingpong");
+    await flush();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let reopens = 0;
+      // Far more rounds than the cap, so a heal that never gave up would keep re-opening forever.
+      for (let i = 0; i < 200; i++) {
+        useRuntimeStore.setState({ openAgentIds: [buildId] }); // the racer evicts it again
+        await flush();
+        if (useRuntimeStore.getState().openAgentIds.includes(workerId)) reopens++;
+      }
+      expect(reopens).toBeGreaterThan(0); // it does try
+      expect(reopens).toBeLessThan(200); // …but not forever
+      // And the give-up is reported once, not once per pass — otherwise the WARN is the new spin.
+      const giveUps = warn.mock.calls.filter(
+        (c) => typeof c[0] === "string" && c[0].includes("still stranded after"),
+      );
+      expect(giveUps).toHaveLength(1);
+      expect(giveUps[0]).toContain(workerId);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("a worker that comes up live gets a FRESH attempt budget if it strands again later", async () => {
+    // The bound is per unresolved strand, not per lifetime. Once the worker actually goes live (it
+    // has a PTY status), the earlier attempts must be forgotten — otherwise a long session would
+    // eventually stop healing a worker whose every previous strand the heal resolved.
+    useRuntimeStore.getState().open(buildId);
+    const ps = useProjectStore.getState();
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    ps.setAgentWorktree(projectId, workerId, "/wt/fresh", "sparkle/agent-fresh");
+    await flush();
+    const evictThenHeal = async (): Promise<boolean> => {
+      useRuntimeStore.setState({ openAgentIds: [buildId] });
+      await flush();
+      return useRuntimeStore.getState().openAgentIds.includes(workerId);
+    };
+    for (let i = 0; i < 20; i++) expect(await evictThenHeal()).toBe(true);
+    // Its PTY finally reports in — the strand is resolved, so the budget resets on the next heal
+    // pass. A status write alone doesn't schedule one (the runtimeStore subscription is gated to the
+    // openAgentIds slice), so nudge projectStore the way the running app does constantly.
+    useRuntimeStore.setState({ status: { [workerId]: "working" } });
+    useProjectStore.getState().selectAgent(projectId, buildId);
+    await flush();
+    // …and when a later restart clears the status and the same race strands it again, the heal is
+    // willing to work for it a second time. (40 rounds total — well past a lifetime cap.)
+    useRuntimeStore.setState({ status: {} });
+    for (let i = 0; i < 20; i++) expect(await evictThenHeal()).toBe(true);
+  });
+
   it("does NOT re-open a worker mid-teardown (spin_down close()→removeAgent() leaves no ghost id)", async () => {
     // The heal is deferred to a microtask so it sees the END of a synchronous mutation batch. A
     // teardown closes the worker then removes it from `agents` in the same tick; by the time the
@@ -191,7 +277,7 @@ describe("orchestrationListener", () => {
     const rt = useRuntimeStore.getState();
     rt.open(buildId);
     const ps = useProjectStore.getState();
-    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId });
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
     ps.setAgentWorktree(projectId, workerId, "/wt/td", "sparkle/agent-td");
     await flush();
     expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
@@ -206,7 +292,7 @@ describe("orchestrationListener", () => {
     // buildId is NOT opened: the worker is materialized but its orchestrator isn't live, so the
     // self-heal must leave it alone instead of fighting a deliberate teardown.
     const ps = useProjectStore.getState();
-    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId });
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
     ps.setAgentWorktree(projectId, workerId, "/wt/closed", "sparkle/agent-closed");
     await flush();
     expect(useRuntimeStore.getState().openAgentIds).not.toContain(workerId);
@@ -215,7 +301,7 @@ describe("orchestrationListener", () => {
   it("does NOT auto-open a worker whose worktree was never cut (mid-spawn / queued)", async () => {
     useRuntimeStore.getState().open(buildId);
     const ps = useProjectStore.getState();
-    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId }); // no worktree
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!; // no worktree
     ps.selectAgent(projectId, buildId); // force a store change to run the heal
     await flush();
     expect(useRuntimeStore.getState().openAgentIds).not.toContain(workerId);
@@ -234,7 +320,7 @@ describe("orchestrationListener", () => {
   });
 
   it("spin_down → tears down the worker and replies spunDown:true", async () => {
-    const workerId = useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: buildId });
+    const workerId = useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: buildId })!;
     fire({ reqId: "d1", op: "spin_down", buildAgentId: buildId, projectId, payload: { workerId } });
     await flush();
     expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId });
@@ -243,13 +329,69 @@ describe("orchestrationListener", () => {
   });
 
   it("spin_down of a worker owned by a DIFFERENT build agent is rejected (no cross-agent reach)", async () => {
-    const otherBuild = useProjectStore.getState().addAgent(projectId, { kind: "build" });
-    const foreign = useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: otherBuild });
+    const otherBuild = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+    const foreign = useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: otherBuild })!;
     fire({ reqId: "x1", op: "spin_down", buildAgentId: buildId, projectId, payload: { workerId: foreign } });
     await flush();
     expect(spinDownWorkerMock).not.toHaveBeenCalled();
     const [, args] = invokeMock.mock.calls.at(-1)!;
     expect((args as { result: { error?: string } }).result.error).toMatch(/not owned/i);
+  });
+
+  // ── spin_down single-owner election ────────────────────────────────────────────────────────────
+  // orchestration:request is broadcast to EVERY window, so before the election each open window ran
+  // the whole destructive teardown for one request: N killPty, N `git worktree remove` racing over
+  // one checkout, N responses to one reqId. These pin down that exactly one window acts, and that
+  // the one that acts is never zero.
+  describe("spin_down is serviced by exactly one window", () => {
+    const spinDown = (workerId: string) =>
+      fire({ reqId: "o1", op: "spin_down", buildAgentId: buildId, projectId, payload: { workerId } });
+
+    it("a non-owning window does NOT tear down, and stays silent rather than answering the reqId", async () => {
+      thisWindowLabel = "win-b";
+      registry = { "win-a": projectId, "win-b": "other-project" };
+      liveWindows.add("win-a");
+      const workerId = useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: buildId })!;
+      invokeMock.mockClear();
+      spinDown(workerId);
+      await flush();
+      expect(spinDownWorkerMock).not.toHaveBeenCalled();
+      // A second reply to one reqId is at best ignored and at worst races the owner's verdict.
+      expect(invokeMock).not.toHaveBeenCalled();
+    });
+
+    it("the window the registry names as owner DOES tear down", async () => {
+      thisWindowLabel = "win-a";
+      registry = { "win-a": projectId, "win-b": "other-project" };
+      const workerId = useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: buildId })!;
+      spinDown(workerId);
+      await flush();
+      expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId });
+    });
+
+    it("main is NOT the owner while a live owner exists (main must not double up)", async () => {
+      thisWindowLabel = "main";
+      registry = { "win-a": projectId, main: "other-project" };
+      liveWindows.add("win-a"); // owner is alive → main stays out
+      const workerId = useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: buildId })!;
+      spinDown(workerId);
+      await flush();
+      expect(spinDownWorkerMock).not.toHaveBeenCalled();
+    });
+
+    it("main adopts the request when the registry names an owner that no longer exists", async () => {
+      // The at-LEAST-one half. A hard crash skips a window's unload cleanup, so its registry entry
+      // outlives it; without the self-heal every window would decline and the build agent would
+      // block on the bridge's timeout waiting for a reply that never comes.
+      thisWindowLabel = "main";
+      registry = { "win-dead": projectId, main: "other-project" };
+      // liveWindows stays empty → win-dead probes dead, main evicts it and adopts.
+      const workerId = useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: buildId })!;
+      spinDown(workerId);
+      await flush();
+      expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId });
+      expect(registry["win-dead"]).toBeUndefined(); // stale entry evicted, not just skipped
+    });
   });
 
   it("queues spawns past the RAM-derived cap even when the configured cap is higher (sparkle-01xv)", async () => {
@@ -275,7 +417,7 @@ describe("orchestrationListener", () => {
     // individually "under the cap" while the machine is three times over it.
     useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 2 });
     const store = useProjectStore.getState();
-    const buildB = store.addAgent(projectId, { kind: "build" });
+    const buildB = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildB, "/wt/buildB", "sparkle/agent-buildB");
 
     // Build agent A alone fills the machine-wide budget.
@@ -328,7 +470,7 @@ describe("orchestrationListener", () => {
     // anyone who set it to 2 meaning "2 each", and would throttle a big machine for no reason.
     useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 4 });
     const store = useProjectStore.getState();
-    const buildC = store.addAgent(projectId, { kind: "build" });
+    const buildC = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildC, "/wt/buildC", "sparkle/agent-buildC");
 
     fire({ reqId: "p1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "a" } });
@@ -379,7 +521,7 @@ describe("orchestrationListener", () => {
         kind: "worker",
         parentId: args.parentAgentId,
         task: args.task,
-      });
+      })!;
       useProjectStore.getState().setAgentWorktree(args.projectId, id, `/wt/${id}`, `sparkle/agent-${id}`);
       return { workerId: id, branch: `sparkle/agent-${id}`, worktree: `/wt/${id}` };
     };
@@ -412,7 +554,7 @@ describe("orchestrationListener", () => {
 
   it("does not starve a second build agent's queued spawn behind a capped head-of-queue", async () => {
     useSettingsStore.setState({ maxConcurrentWorkers: 1 });
-    const buildB = useProjectStore.getState().addAgent(projectId, { kind: "build" });
+    const buildB = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
     useProjectStore.getState().setAgentWorktree(projectId, buildB, "/wt/buildB", "sparkle/agent-buildB");
     // Build A fills its only slot, then queues a SECOND A spawn (A now at cap → head of queue).
     fire({ reqId: "a1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "a-live" } });
@@ -651,7 +793,7 @@ describe("orchestrationListener", () => {
   });
 
   it("the same bead under a DIFFERENT build agent is allowed — claims are per orchestrator", async () => {
-    const otherBuild = useProjectStore.getState().addAgent(projectId, { kind: "build" });
+    const otherBuild = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
     fire({ reqId: "s1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "t", beadId: "shared" } });
     await flush();
     fire({ reqId: "s2", op: "spawn_worker", buildAgentId: otherBuild, projectId, payload: { task: "t", beadId: "shared" } });
@@ -746,5 +888,300 @@ describe("orchestrationListener", () => {
     fire({ reqId: "f3", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "t", beadId: "bead-free" } });
     await flush();
     expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
+  });
+
+  // ── reaper: reclaim orphaned workers (machine-wide cap leak) ───────────────────────────────────
+  describe("reapOrphanedWorkers", () => {
+    const T0 = 1_000_000;
+    const GRACE_MS = REAP_GRACE_MS; // the real constant, not a copied literal
+    let clock = T0; // the reaper reads this via the injected clock, so grace timing is deterministic
+
+    // Inject a worker whose parent build agent is NOT in the store — the leak a crashed/force-quit
+    // build agent leaves behind (its workers were never spun down, so their records occupy the
+    // machine-wide cap forever). addAgent accepts an arbitrary parentId, exactly as the real spawn
+    // path records it, so this reproduces the on-disk/in-memory orphan faithfully.
+    const addOrphanWorker = (pid: string, ghostParent: string): string => {
+      const id = useProjectStore.getState().addAgent(pid, {
+        kind: "worker",
+        parentId: ghostParent,
+        task: "stranded work",
+      })!;
+      useProjectStore.getState().setAgentWorktree(pid, id, `/wt/${id}`, `sparkle/agent-${id}`);
+      return id;
+    };
+    // Re-point an existing worker's parent (to simulate a parent vanishing / returning across a
+    // cross-window sync), without going through a store action that would cascade.
+    const setParent = (workerId: string, parent: string) =>
+      useProjectStore.setState((s) => ({
+        projects: s.projects.map((p) =>
+          p.id === projectId
+            ? { ...p, agents: p.agents.map((a) => (a.id === workerId ? { ...a, parentId: parent } : a)) }
+            : p,
+        ),
+      }));
+
+    beforeEach(async () => {
+      clock = T0;
+      __setReaperNow(() => clock); // one shared clock domain for every reaper caller
+      await flush(); // settle the fire-and-forget startup reconcile→reap (no orphans yet → no-op)
+      spinDownWorkerMock.mockClear();
+    });
+    afterEach(() => {
+      __setReaperNow(); // restore the production default clock for the rest of the suite
+    });
+
+    it("reaps a parent-gone orphan only after >=2 observations AND the grace elapses", async () => {
+      // A live worker under the real (present) build agent — must never be touched.
+      fire({ reqId: "live", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "real work" } });
+      await flush();
+      const liveWorker = workersOf(projectId, buildId)[0]!;
+      const orphanId = addOrphanWorker(projectId, "ghost-build-agent");
+      spinDownWorkerMock.mockClear();
+
+      // 1st observation: records the clock; a single snapshot is never enough (a transient cross-window
+      // view could show a live worker as orphaned).
+      expect(await reapOrphanedWorkers()).toBe(0);
+      // 2nd observation immediately after: count is now 2, but no time has passed (< grace) → held.
+      expect(await reapOrphanedWorkers()).toBe(0);
+      expect(spinDownWorkerMock).not.toHaveBeenCalled();
+
+      // Observed orphaned throughout, and the grace has now elapsed → reclaimed.
+      clock = T0 + GRACE_MS;
+      expect(await reapOrphanedWorkers()).toBe(1);
+      expect(spinDownWorkerMock).toHaveBeenCalledTimes(1);
+      expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId: orphanId });
+      // The live worker (parent present) was never a candidate.
+      expect(spinDownWorkerMock).not.toHaveBeenCalledWith({ projectId, workerId: liveWorker.id });
+      expect(workersOf(projectId, buildId).some((w) => w.id === liveWorker.id)).toBe(true);
+    });
+
+    it("a single observation never reaps, even far past the grace (monotonic count guard)", async () => {
+      // Guards a wall-clock suspend/resume jump that lands past the grace: one observation is never
+      // enough, no matter how much time the clock claims has elapsed.
+      addOrphanWorker(projectId, "ghost-build-agent");
+      clock = T0 + 100 * GRACE_MS;
+      expect(await reapOrphanedWorkers()).toBe(0);
+      expect(spinDownWorkerMock).not.toHaveBeenCalled();
+    });
+
+    it("a suspend/resume gap breaks continuity — the grace is re-earned, not satisfied by one snapshot", async () => {
+      // count=1 observed, then a >2*interval gap (suspend / clock jump), then one post-resume snapshot.
+      // Without continuity handling that lone snapshot would reap (count→2, elapsed huge). It must not:
+      // the record resets to a single fresh observation, exactly when cross-window rehydrate lag is worst.
+      const orphanId = addOrphanWorker(projectId, "ghost-build-agent");
+      expect(await reapOrphanedWorkers()).toBe(0); // obs #1 at T0
+      clock = T0 + 3 * 60_000; // a 3-minute gap (> 2 * the 60s sweep interval) = lost continuity
+      expect(await reapOrphanedWorkers()).toBe(0); // resets to obs #1 — a single post-resume snapshot
+      expect(spinDownWorkerMock).not.toHaveBeenCalled();
+      // A continuous second observation after the reset, past the grace, does reap.
+      clock = clock + GRACE_MS;
+      expect(await reapOrphanedWorkers()).toBe(1);
+      expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId: orphanId });
+    });
+
+    it("a BACKWARDS clock step also breaks continuity (never strands a future `first`)", async () => {
+      // An NTP correction / manual clock change can move time backwards. Without symmetric handling the
+      // record keeps a `first` in the future, so `now - first` stays < grace forever and the orphan is
+      // never reaped. A backwards step must reset the record, exactly like a forward suspend gap.
+      const orphanId = addOrphanWorker(projectId, "ghost-build-agent");
+      clock = T0;
+      expect(await reapOrphanedWorkers()).toBe(0); // obs #1 at T0
+      clock = T0 - 5_000; // clock jumps BACKWARDS 5s
+      expect(await reapOrphanedWorkers()).toBe(0); // continuity broken → resets to a single obs at T0-5s
+      expect(spinDownWorkerMock).not.toHaveBeenCalled();
+      // From the reset point, a normal continuous run past the grace still reaps (not stranded).
+      clock = T0 - 5_000 + GRACE_MS;
+      expect(await reapOrphanedWorkers()).toBe(1);
+      expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId: orphanId });
+    });
+
+    it("re-runs once when a trigger arrives while a pass is already in flight (single-flight blind spot)", async () => {
+      // Make spinDownWorker await a barrier so the first pass is provably still in flight when a second
+      // trigger arrives. The second call returns 0 (single-flight) but must set the re-run flag, and the
+      // finishing pass must re-run on a microtask — otherwise a just-appeared orphan waits for the sweep.
+      let release!: () => void;
+      const barrier = new Promise<void>((r) => (release = r));
+      const orphanA = addOrphanWorker(projectId, "ghost-a");
+      // Mature orphanA so pass 1 will try to reap it (and block on the barrier mid-teardown).
+      await reapOrphanedWorkers(); // obs #1
+      clock = T0 + GRACE_MS; // obs #2 will be past grace
+      spinDownWorkerMock.mockReset();
+      spinDownWorkerMock.mockImplementationOnce(async (args: { projectId: string; workerId: string }) => {
+        await barrier; // hold the first pass open
+        useProjectStore.getState().removeAgent(args.projectId, args.workerId);
+      });
+      spinDownWorkerMock.mockImplementation(async (args: { projectId: string; workerId: string }) => {
+        useProjectStore.getState().removeAgent(args.projectId, args.workerId);
+      });
+
+      const pass1 = reapOrphanedWorkers(); // enters pass 2, awaits the barrier inside spinDownWorker
+      await flush();
+      // A NEW orphan appears + a concurrent trigger fires while pass 1 is blocked.
+      const orphanB = addOrphanWorker(projectId, "ghost-b");
+      expect(await reapOrphanedWorkers()).toBe(0); // swallowed by single-flight → sets the re-run flag
+      release(); // let pass 1 finish (reaps orphanA)
+      expect(await pass1).toBe(1);
+      expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId: orphanA }); // pass 1 reaped A
+      // The re-run (microtask) now observes orphanB. Give it its first observation; without the re-run
+      // it would never have been looked at until the 60s sweep. Drive it to reap to prove it's tracked.
+      await flush();
+      clock = clock + GRACE_MS;
+      await reapOrphanedWorkers();
+      expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId: orphanB });
+      // restore the default spin mock for later tests
+      spinDownWorkerMock.mockReset();
+      spinDownWorkerMock.mockImplementation(async (args: { projectId: string; workerId: string }) => {
+        useProjectStore.getState().removeAgent(args.projectId, args.workerId);
+      });
+    });
+
+    it("does not reap if the parent reappears within the grace window (transient sync-lag guard)", async () => {
+      const orphanId = addOrphanWorker(projectId, buildId); // parent present at first
+      expect(await reapOrphanedWorkers()).toBe(0); // not even a candidate
+      setParent(orphanId, "ghost"); // parent momentarily vanishes in this window's snapshot
+      expect(await reapOrphanedWorkers()).toBe(0); // 1st orphaned observation → grace starts
+      setParent(orphanId, buildId); // parent propagates back before the grace elapses
+      clock = T0 + GRACE_MS;
+      expect(await reapOrphanedWorkers()).toBe(0); // no longer orphaned → clock cleared, not reaped
+      expect(spinDownWorkerMock).not.toHaveBeenCalled();
+    });
+
+    it("never reaps a PARENTLESS worker (parentId null), even past the grace", async () => {
+      // addAgent defaults parentId to null. Missing data must be treated conservatively (left alone),
+      // exactly as reconcileWorkersFromDisk skips it — not read as "orphaned, destroy it".
+      const id = useProjectStore.getState().addAgent(projectId, { kind: "worker", task: "no parent" })!;
+      useProjectStore.getState().setAgentWorktree(projectId, id, `/wt/${id}`, `sparkle/agent-${id}`);
+
+      await reapOrphanedWorkers();
+      clock = T0 + GRACE_MS;
+      await reapOrphanedWorkers();
+      expect(spinDownWorkerMock).not.toHaveBeenCalled();
+    });
+
+    it("does not reap an idle/'done' worker whose parent build agent is still alive", async () => {
+      fire({ reqId: "d1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "finished work" } });
+      await flush();
+      const doneWorker = workersOf(projectId, buildId)[0]!;
+      // Terminal runtime status, parent still present — the "done but never spun down" duplicate
+      // fleet. The reaper must leave it to its live orchestrator; only a departed parent qualifies.
+      useRuntimeStore.setState({ status: { [doneWorker.id]: "done" } });
+      spinDownWorkerMock.mockClear();
+
+      await reapOrphanedWorkers();
+      clock = T0 + GRACE_MS;
+      await reapOrphanedWorkers();
+      expect(spinDownWorkerMock).not.toHaveBeenCalled();
+    });
+
+    it("skips an orphan whose teardown is already in flight (tombstoned)", async () => {
+      const orphanId = addOrphanWorker(projectId, "ghost-build-agent");
+      registerLocalRemovals([orphanId]); // a spin_down is mid-flight; don't double-reap
+      spinDownWorkerMock.mockClear();
+
+      await reapOrphanedWorkers();
+      clock = T0 + GRACE_MS;
+      await reapOrphanedWorkers();
+      expect(spinDownWorkerMock).not.toHaveBeenCalled();
+      acknowledgeRemovals([orphanId]); // don't leak the tombstone into later tests
+    });
+
+    it("does NOT reap when only this agent's OWN cap binds, even long past the grace", async () => {
+      // Own cap = 1, machine gate slack. A spawn over the OWN cap can't be unblocked by reclaiming
+      // machine-wide orphans, so handleSpawn must not kick a reap. Assert the OBSERVABLE outcome (the
+      // orphan survives well past the grace), not that a timer of a particular delay was scheduled.
+      vi.useFakeTimers();
+      try {
+        __setReaperNow(); // production clock == the (now fake) Date.now, advanced in step with timers
+        vi.setSystemTime(T0);
+        useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 20 });
+        fire({ reqId: "own1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "first" } });
+        await vi.advanceTimersByTimeAsync(0);
+        const orphanId = addOrphanWorker(projectId, "ghost-build-agent");
+        spinDownWorkerMock.mockClear();
+
+        fire({ reqId: "own2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "over own cap" } });
+        await vi.advanceTimersByTimeAsync(GRACE_MS * 3); // no reap was ever triggered by this spawn
+
+        expect(spinDownWorkerMock).not.toHaveBeenCalledWith({ projectId, workerId: orphanId });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("on-cap reap arms a follow-up that reaps the orphan and unblocks the queued spawn", async () => {
+      // Drives the REAL timer-callback path (not a setTimeout-delay assertion): machine cap = 1,
+      // saturated by one orphan. The blocked spawn's on-cap reap is observation #1 and arms a
+      // follow-up; advancing past the grace fires it → observation #2 → reap → drain → the real spawn.
+      vi.useFakeTimers();
+      try {
+        __setReaperNow();
+        vi.setSystemTime(T0);
+        useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 1 });
+        addOrphanWorker(projectId, "ghost-build-agent");
+        spawnWorkerMock.mockClear();
+
+        fire({ reqId: "blocked", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "wants a slot" } });
+        await vi.advanceTimersByTimeAsync(0); // on-cap reap: obs #1, arms the follow-up
+        expect(spawnWorkerMock).not.toHaveBeenCalled(); // still blocked, within grace
+
+        await vi.advanceTimersByTimeAsync(GRACE_MS + 100); // follow-up fires → obs #2 past grace → reap → drain
+        expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+        expect(workersOf(projectId, buildId)).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("teardown cancels a pending grace follow-up so nothing reaps after the listener is gone", async () => {
+      vi.useFakeTimers();
+      try {
+        __setReaperNow();
+        vi.setSystemTime(T0);
+        useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 1 });
+        const orphanId = addOrphanWorker(projectId, "ghost-build-agent");
+        fire({ reqId: "blocked", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "wants a slot" } });
+        await vi.advanceTimersByTimeAsync(0); // arms the follow-up
+        spinDownWorkerMock.mockClear();
+
+        cleanup?.(); // teardown clears graceTimer + bumps the generation
+        cleanup = undefined;
+        await vi.advanceTimersByTimeAsync(GRACE_MS * 2); // the follow-up would have fired in here
+
+        expect(spinDownWorkerMock).not.toHaveBeenCalledWith({ projectId, workerId: orphanId });
+      } finally {
+        vi.useRealTimers();
+        cleanup = await startOrchestrationListener(); // restore for the outer afterEach
+      }
+    });
+
+    it("is single-flight: a concurrent pass returns 0 without a second teardown", async () => {
+      const orphanId = addOrphanWorker(projectId, "ghost-build-agent");
+      await reapOrphanedWorkers(); // 1st observation
+      clock = T0 + GRACE_MS;
+      spinDownWorkerMock.mockClear();
+
+      const p1 = reapOrphanedWorkers(); // matured → reaps, but awaits spinDownWorker (leaves reaping=true)
+      const p2 = reapOrphanedWorkers(); // sees reaping=true → returns 0 immediately, no 2nd teardown
+      const [r1, r2] = await Promise.all([p1, p2]);
+
+      expect(r2).toBe(0);
+      expect(r1).toBe(1);
+      expect(spinDownWorkerMock).toHaveBeenCalledTimes(1);
+      expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId: orphanId });
+      await flush(); // p2 set the re-run flag → drain the queued microtask before teardown, no dangling pass
+    });
+
+    it("a fresh listener after teardown can still reap (state not wedged)", async () => {
+      cleanup?.(); // tear down listener A (bumps the generation, resets reaping + the grace map)
+      cleanup = await startOrchestrationListener(); // listener B
+      await flush();
+      const orphanId = addOrphanWorker(projectId, "ghost-build-agent");
+      spinDownWorkerMock.mockClear();
+
+      expect(await reapOrphanedWorkers()).toBe(0); // 1st observation on the fresh listener
+      clock = T0 + GRACE_MS;
+      expect(await reapOrphanedWorkers()).toBe(1); // grace elapsed → reaped (reaping wasn't left stuck)
+      expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId: orphanId });
+    });
   });
 });

@@ -1,6 +1,5 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { buildRoster, windowProjects } from "./useRosterPublisher";
-import { setWindowProject, resetWindowRegistry } from "./services/windowRegistry";
+import { describe, it, expect } from "vitest";
+import { buildRoster, openProjects } from "./useRosterPublisher";
 import { hasLoneSurrogate } from "./services/safeText";
 import type { Project } from "./types";
 
@@ -136,57 +135,41 @@ describe("roster payload is always well-formed UTF-16 (hex-escape regression)", 
   });
 });
 
-// Regression guard for the window-scoping fix (roborev 19166):
-// publishWindowRoster must only receive THIS window's projects — not projects open in other
-// windows — otherwise cross-window agents are mis-reported as "stopped" (DEFAULT_STATUS) and
-// the last-writer-wins merge in tray.rs corrupts the red/grey/green counts.
-describe("window-scoping: only publish this window's projects to the tray", () => {
-  const projectA: Project = {
-    id: "pA", name: "ProjA", rootPath: "/a", defaultBranch: "main",
-    createdAt: "", agents: [
-      { id: "aA", name: "Agent A", kind: "build", parentId: null,
-        promptHistory: [], runtime: "local" } as any,
-    ],
+// The OPEN-PROJECT predicate. The single-window shell made "open" ambiguous — every project has a
+// tab — and the first cut simply published `projects`, i.e. the whole persisted store: every folder
+// ever added, each agent carrying up to four real prompt snippets, pushed to the phone relay on
+// every status tick (roborev 46258-M1). These pin the restored meaning.
+describe("openProjects — what \"open\" means in the single-window shell", () => {
+  const withAgents = (id: string, agentIds: string[]): Project => ({
+    id, name: id, rootPath: `/${id}`, defaultBranch: "main", createdAt: "",
+    agents: agentIds.map((aid) => ({
+      id: aid, name: aid, kind: "build", parentId: null, promptHistory: [], runtime: "local",
+    })) as unknown as Project["agents"],
     selectedAgentId: null,
-  };
-  const projectB: Project = {
-    id: "pB", name: "ProjB", rootPath: "/b", defaultBranch: "main",
-    createdAt: "", agents: [
-      { id: "aB", name: "Agent B", kind: "build", parentId: null,
-        promptHistory: [], runtime: "local" } as any,
-    ],
-    selectedAgentId: null,
-  };
+  });
+  const live = withAgents("live", ["a1"]);
+  const dormant = withAgents("dormant", ["a2"]);
+  const emptyButVisited = withAgents("visited", []);
+  const none = () => false;
 
-  beforeEach(() => {
-    resetWindowRegistry();
-    setWindowProject("win-A", "pA");
-    setWindowProject("win-B", "pB");
+  it("keeps a project with a live agent", () => {
+    expect(openProjects([live, dormant], ["a1"], none).map((p) => p.id)).toEqual(["live"]);
   });
 
-  it("windowProjects returns only the given window's projects", () => {
-    // windowProjects is the real exported predicate used by the hook — calling it here
-    // means a regression in the production filter (e.g. revert to != null) will fail this test.
-    const allOpen = [projectA, projectB];
-    const mine = windowProjects(allOpen, "win-A");
-    expect(mine.map((p) => p.id)).toEqual(["pA"]);
-
-    // buildRoster on the scoped list: only win-A's agent appears, with correct status.
-    const r = buildRoster(mine, { aA: "working", aB: "waiting" }, {}, {});
-    expect(r.projects).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-    expect(r.projects[0]!.agents[0]!).toMatchObject({ id: "aA", status: "working" });
+  it("keeps a project the user has SELECTED this session, even with nothing running", () => {
+    const visited = (id: string) => id === "visited";
+    expect(openProjects([emptyButVisited, dormant], [], visited).map((p) => p.id)).toEqual([
+      "visited",
+    ]);
   });
 
-  it("without scoping, the other window's agent would get DEFAULT_STATUS (the bug)", () => {
-    // Demonstrates what the bug looked like: win-B builds a roster from all open projects
-    // but only has status for its own agents — win-A's agent falls through to stopped/grey.
-    const allOpen = [projectA, projectB];
-    const r = buildRoster(allOpen, { aB: "waiting" }, {}, {}); // win-B's statuses only
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-    expect(r.projects.find((p) => p.id === "pA")!.agents[0]!.status).toBe("stopped"); // corrupted!
-    // After scoping via windowProjects: win-B's slice excludes pA entirely.
-    const fixed = buildRoster(windowProjects(allOpen, "win-B"), { aB: "waiting" }, {}, {});
-    expect(fixed.projects.map((p) => p.id)).toEqual(["pB"]);
+  it("drops a project that was never opened and has nothing running — prompts stay home", () => {
+    // The regression this exists for: `dormant` is in the store (it is in Recent) and its agent
+    // carries prompt text. Nothing about it may leave the machine.
+    expect(openProjects([dormant], [], none)).toEqual([]);
+  });
+
+  it("is empty when the store is full but the session is fresh", () => {
+    expect(openProjects([live, dormant], [], none)).toEqual([]);
   });
 });

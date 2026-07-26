@@ -162,27 +162,86 @@ fn sanitize_description(raw: &str) -> String {
     s.split_whitespace().take(MAX_DESC_WORDS).collect::<Vec<_>>().join(" ")
 }
 
+/// Byte index of the closing quote of the JSON string that starts at byte 0 of `s` (`s` must begin
+/// with `"`), honoring backslash escapes. `None` when the string is never closed — i.e. the reply
+/// was cut off mid-value, which is exactly the case the caller must NOT treat as a usable value.
+fn json_string_end(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 1; // skip the opening quote
+    while i < b.len() {
+        match b[i] {
+            // Escapes are always ASCII, so stepping two bytes can never land mid-character; and the
+            // only byte we ever act on below is `"`, which no UTF-8 continuation byte can equal.
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Best-effort recovery of ONE string field from a reply `serde_json` rejected as a whole — the
+/// common shape being a value truncated mid-object, so the object never closes and a strict parse
+/// throws away a field that is itself complete and unambiguous.
+///
+/// Finds `"<key>"` used as an OBJECT KEY (the next non-space character is `:`) and re-parses its
+/// quoted value THROUGH `serde_json`, so every escape decodes exactly as the strict path would.
+/// Returns `None` when the key is absent, its value is not a string, or the string never closes.
+///
+/// This deliberately extracts only a quoted field VALUE and never any surrounding braces: #157
+/// fixed names that leaked as `{"title": "…` by stringifying a broken reply wholesale, and that
+/// must stay fixed.
+fn recover_string_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(&needle) {
+        let after = from + rel + needle.len();
+        let rest = text[after..].trim_start();
+        let Some(value) = rest.strip_prefix(':') else {
+            // A match that isn't an object key (e.g. the word inside a description). Keep looking.
+            from = after;
+            continue;
+        };
+        let value = value.trim_start();
+        if !value.starts_with('"') {
+            return None; // present, but not a string value — nothing to recover
+        }
+        let end = json_string_end(value)?;
+        return serde_json::from_str::<String>(&value[..=end]).ok();
+    }
+    None
+}
+
 /// Parse the model's reply into a title + description. The model is asked for a bare JSON object,
 /// but tolerate stray prose or ```json fences by slicing from the first `{` to the last `}`.
+///
+/// When that slice doesn't parse — a reply truncated mid-object has no closing `}` at all, and the
+/// description is written after the title, so the title is typically intact — fall back to reading
+/// the two fields individually rather than discarding an already-paid call and leaving the agent
+/// on its generic name. Only complete, properly-quoted field values are accepted.
+///
 /// Returns None if no usable title is found so the caller can fall back.
 fn parse_name(text: &str) -> Option<AgentName> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    let slice = text.get(start..=end)?;
-    let v: serde_json::Value = serde_json::from_str(slice).ok()?;
-    let title = v
-        .get("title")
-        .and_then(serde_json::Value::as_str)
-        .map(|s| sanitize_name(s, 5))
-        .unwrap_or_default();
+    let object = text
+        .find('{')
+        .zip(text.rfind('}'))
+        .and_then(|(start, end)| text.get(start..=end))
+        .and_then(|slice| serde_json::from_str::<serde_json::Value>(slice).ok());
+    let (raw_title, raw_description) = match &object {
+        Some(v) => (
+            v.get("title").and_then(serde_json::Value::as_str).map(str::to_string),
+            v.get("description").and_then(serde_json::Value::as_str).map(str::to_string),
+        ),
+        None => (
+            recover_string_field(text, "title"),
+            recover_string_field(text, "description"),
+        ),
+    };
+    let title = raw_title.map(|s| sanitize_name(&s, 5)).unwrap_or_default();
     if title.is_empty() {
         return None;
     }
-    let description = v
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .map(sanitize_description)
-        .unwrap_or_default();
+    let description = raw_description.map(|s| sanitize_description(&s)).unwrap_or_default();
     Some(AgentName { title, description })
 }
 
@@ -250,7 +309,12 @@ fn interpret_reply(text: &str) -> Result<AgentName, String> {
 /// Generate a title + description for an agent from a prompt. Returns Err on any failure (no key,
 /// network, HTTP error, empty result) so the caller can silently keep the existing name.
 #[tauri::command]
-pub async fn generate_agent_name(prompt: String) -> Result<AgentName, String> {
+pub async fn generate_agent_name(
+    prompt: String,
+    // Display name of the project this agent belongs to, for credit-history attribution.
+    // Metering-only; a caller that doesn't know passes nothing (→ None).
+    project: Option<String>,
+) -> Result<AgentName, String> {
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() {
         return Err("empty prompt".into());
@@ -263,13 +327,18 @@ pub async fn generate_agent_name(prompt: String) -> Result<AgentName, String> {
     // token → signed out; degrade (leave the name as-is) rather than call the proxy.
     tauri::async_runtime::spawn_blocking(move || {
         let token = crate::auth::bearer_token().ok_or_else(|| "not signed in".to_string())?;
-        call_anthropic(&base, &token, &prompt)
+        call_anthropic(&base, &token, &prompt, project.as_deref())
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-fn call_anthropic(base: &str, token: &str, prompt: &str) -> Result<AgentName, String> {
+fn call_anthropic(
+    base: &str,
+    token: &str,
+    prompt: &str,
+    project: Option<&str>,
+) -> Result<AgentName, String> {
     // A short title + one sentence (plus JSON braces/keys/quotes, and a ```json fence the model
     // often adds) fits comfortably in 256 tokens. The proxy holds the vendor key + meters credits.
     let json = crate::ai::call_anthropic_proxy(
@@ -280,7 +349,8 @@ fn call_anthropic(base: &str, token: &str, prompt: &str) -> Result<AgentName, St
         prompt,
         256,
         crate::ai::CLASSIFY_READ_TIMEOUT,
-        Some("Naming an agent"), // metering description shown in the credit history
+        // Metering description + project attribution shown in the credit history.
+        crate::ai::Metering::new("Naming an agent", project),
     )?;
     let text = crate::ai::extract_text(&json)
         .ok_or_else(|| "naming returned no text".to_string())?;
@@ -495,22 +565,63 @@ mod tests {
     }
 
     #[test]
-    fn interpret_reply_rejects_truncated_json_instead_of_leaking_braces() {
-        // The real bug from the field: too small a max_tokens cut the reply off mid-object, so
-        // there's no closing `}`. parse_name can't parse it, and a naive plain-title fallback
-        // would stringify the raw braces into the name (e.g. `{"title": "URL Path…`). A reply that
-        // is an ATTEMPTED JSON object (contains `{`) but won't parse must error, so the caller
-        // keeps the existing name rather than showing raw JSON.
+    fn interpret_reply_recovers_the_title_from_truncated_json_without_leaking_braces() {
+        // The real bug from the field: the reply is cut off mid-object, so there's no closing `}`
+        // and the whole object won't parse. #157 made that error rather than let a naive
+        // plain-title fallback stringify the raw braces into the name (`{"title": "URL Path…`).
+        // The title, though, is written BEFORE the description and is complete and properly
+        // quoted — so recover it (the call was already paid for) while keeping #157's invariant:
+        // nothing but a quoted field VALUE ever reaches a name.
         let truncated = "```json\n{ \"title\": \"URL Path Clickable Navigation\", \"description\": \"Make";
-        let out = interpret_reply(truncated);
-        assert!(out.is_err(), "truncated JSON must error, not become a name: {out:?}");
-
-        // And on the failure path nothing leaks: if it ever did return Ok, neither field may carry
-        // a stray brace or quote from the raw reply.
-        if let Ok(n) = out {
-            for v in [&n.title, &n.description] {
-                assert!(!v.contains('{') && !v.contains('"'), "leaked raw JSON into a name: {v}");
-            }
+        let n = interpret_reply(truncated).expect("a complete title must survive a truncated reply");
+        assert_eq!(n.title, "URL Path Clickable Navigation");
+        assert_eq!(n.description, "", "an unterminated description is dropped, not half-shown");
+        for v in [&n.title, &n.description] {
+            assert!(!v.contains('{') && !v.contains('"'), "leaked raw JSON into a name: {v}");
         }
+    }
+
+    #[test]
+    fn interpret_reply_still_errors_when_the_title_itself_is_truncated() {
+        // Cut off inside the title: there is no complete value to recover, and half a title is
+        // worse than the name the agent already has. This is the case that must still fail.
+        let out = interpret_reply("{ \"title\": \"URL Path Clic");
+        assert!(out.is_err(), "an unterminated title must not become a name: {out:?}");
+    }
+
+    #[test]
+    fn parse_name_recovers_fields_from_a_reply_the_strict_parse_rejects() {
+        // Unparseable as a whole (trailing comma, no closing brace) but both values are complete.
+        let n = parse_name("{\"title\": \"Fix OAuth Redirect Loop\", \"description\": \"Stops the login page looping\",")
+            .expect("complete field values are recoverable");
+        assert_eq!(n.title, "Fix OAuth Redirect Loop");
+        assert_eq!(n.description, "Stops the login page looping");
+    }
+
+    #[test]
+    fn recovery_decodes_escapes_exactly_as_a_strict_parse_would() {
+        // The recovered span is re-parsed THROUGH serde_json, so `\"` and `\\` decode rather than
+        // being taken literally — and an escaped quote can't be mistaken for the value's end.
+        let n = parse_name(r#"{"title": "Fix The \"Retry\" Button", "description": "Half a sen"#)
+            .expect("escaped quotes must not truncate the title early");
+        assert_eq!(n.title, "Fix The \"Retry\" Button");
+        assert_eq!(n.description, "");
+    }
+
+    #[test]
+    fn recovery_ignores_the_word_title_when_it_is_not_a_key() {
+        // `"title"` appearing inside a value must not be mistaken for the object key; the real key
+        // that follows is the one that wins.
+        let n = parse_name("{\"description\": \"mentions \\\"title\\\" in prose\", \"title\": \"Sidebar Title Truncation\"")
+            .expect("the real key should still be found");
+        assert_eq!(n.title, "Sidebar Title Truncation");
+    }
+
+    #[test]
+    fn recovery_rejects_a_non_string_title() {
+        // A structurally wrong reply stays a failure — recovery widens which REPLIES are usable,
+        // never which VALUES are.
+        assert!(parse_name("{\"title\": 42, \"description\": \"nope\"").is_none());
+        assert!(parse_name("{\"description\": \"no title at all\"").is_none());
     }
 }

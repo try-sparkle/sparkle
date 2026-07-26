@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import {
@@ -10,7 +10,6 @@ import {
   warmWorktreePool,
 } from "../services/worktree";
 import { reconcileDefaultBranch } from "../services/branchStatus";
-import { useAiFeature, useAiFeatureVisible } from "../services/aiGate";
 import { recordTrialSend } from "../services/trialMeter";
 import { checkClaude, claudeSessionInfo } from "../preflight";
 import { buildClaudeExec, buildControlMcpConfig, SHELL } from "../services/claudeSpawn";
@@ -28,10 +27,15 @@ import {
 } from "../services/orchestrationLaunch";
 import { purgeBuildAgent } from "../services/orchestrationListener";
 import { useSettingsStore, enforcedWorkerCap } from "../stores/settingsStore";
-import { setPin, markExhausted, accountLabel, type Account, type Identity } from "../services/accountStore";
-import { chooseAccountForAgent, invalidateAccountState } from "../services/accountSelection";
+import { setPin, accountLabel, type Account, type Identity } from "../services/accountStore";
+import {
+  registerPaneRestart,
+  unregisterPaneRestart,
+  registerPaneAccount,
+  unregisterPaneAccount,
+} from "../services/paneControl";
+import { chooseAccountForAgent } from "../services/accountSelection";
 import { readWorkerResult } from "../pty";
-import { maybeAutoName } from "../services/agentNaming";
 import { judgeNeedsFollowup } from "../services/turnFollowup";
 import { invoke } from "@tauri-apps/api/core";
 import { HookStatusEngine, createHookEventHandler, type HookEvent } from "../engine/hookEvents";
@@ -40,22 +44,14 @@ import { watchHookEvents, type HookWatcher } from "../services/hookWatcher";
 import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useUiStore, COMPOSER_BAR } from "../stores/uiStore";
-import {
-  occludedRowCount,
-  classifyOccludedRows,
-  resolveAutoYield,
-  shouldShowHiddenChip,
-  sameOcclusion,
-  measuredComposerHeight,
-  type Occlusion,
-  type YieldState,
-} from "../engine/composerOcclusion";
 import { useScrollIntentStore, applyScrollIntent } from "../stores/scrollIntentStore";
 import { PinnedPrompt } from "./PinnedPrompt";
 import { composerPrompts } from "./promptHistory";
 import { Terminal, type TerminalApi } from "./Terminal";
-import { Composer, type ComposerApi } from "./Composer";
+import { registerPromptMarker } from "../services/terminalMarkers";
+import { abandonPendingSends, flushPendingSends } from "../services/conciergeDispatch";
+import { setPaneFailed, setPaneReady, unregisterPane } from "../services/paneReadiness";
+import { isTypingInProgress } from "../engine/focusGuard";
 import { DragVisionHintPill } from "./DragVisionHintPill";
 import { useDragVisionHint } from "../hooks/useDragVisionHint";
 import { Onboarding } from "./Onboarding";
@@ -79,14 +75,8 @@ type Phase = "preparing" | "ready" | "no-claude" | "error";
  * string-embedded substitution, so trailing backslashes / unclosed quotes in the selection
  * can't escape into the surrounding script.
  */
-// Padding between the terminal's text box and the bottom of the stage the composer anchors to
-// (the wrapper's `padding: 6` below) — the composer's first 6px cover padding, not text.
+// Inner padding of the terminal stage (the wrapper's `padding: 6` below).
 const TERMINAL_STAGE_PADDING = 6;
-// How often to re-read the rows under the composer. Fast enough that a menu is uncovered before
-// the user reaches for the mouse, cheap enough to be invisible (a handful of already-rendered
-// lines, no PTY traffic).
-const OCCLUSION_POLL_MS = 250;
-const EMPTY_OCCLUSION: Occlusion = { kind: "empty", hiddenLines: 0 };
 
 export function buildShellSpawnArgs(shell: string, cmd: string): string[] {
   return ["-l", "-c", 'eval "$1"; exec "$0" -l', shell, cmd];
@@ -124,10 +114,15 @@ function AgentPaneInner({
   project,
   agent,
   visible,
+  calm = false,
 }: {
   project: Project;
   agent: AgentTab;
   visible: boolean;
+  // PRD §3 "calm": this pane's agent has nothing for you (P2), so its terminal text recedes to one
+  // gray. Only ever true for the VISIBLE pane — a background pane's colors are nobody's business,
+  // and re-theming it would clear its WebGL atlas for a screen no one is looking at.
+  calm?: boolean;
 }) {
   // Re-render counter (perfTrace): with many panes open, a background pane that re-renders on every
   // unrelated store write is the render-thrash fingerprint — `grep 'perf.*render AgentPane'` and watch
@@ -149,7 +144,6 @@ function AgentPaneInner({
   const chosenAccountIdRef = useRef<string | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const setAgentWorktree = useProjectStore((s) => s.setAgentWorktree);
-  const appendPrompt = useProjectStore((s) => s.appendPrompt);
   const setStatus = useRuntimeStore((s) => s.setStatus);
   // Pending "scroll to this prompt" for this agent (set by history-search navigation), consumed
   // once the terminal is the visible, ready pane.
@@ -171,101 +165,31 @@ function AgentPaneInner({
   // prepare() run and passed to start/stop so a stale run's teardown (a sub-second close-reopen, or
   // a superseded prepare()) can only stop the bridge instance IT owns — never a newer run's bridge.
   const bridgeLaunchTokenRef = useRef<string>("");
-  // The composer's textarea — initial focus lands here when a tab opens.
-  const composerInputRef = useRef<HTMLTextAreaElement>(null);
-  // Imperative bridge to push text into the composer (pinned-prompt "Send to Composer").
-  const composerApiRef = useRef<ComposerApi | null>(null);
-  // The terminal's imperative focus(), so we can move focus into it when the composer
-  // minimizes (or on ⌘J) without the user clicking the terminal.
+  // The terminal's imperative focus(), so the pane can put the caret in the terminal without the
+  // user clicking it (this is now the ONLY place a user types into an agent directly — the
+  // concierge box is the app's composer).
   const termFocusRef = useRef<(() => void) | null>(null);
-  const composerMinimized = useUiStore((s) => s.composerMinimized);
-  // Flip the composer's minimized state — the action behind a plain click in the terminal body
-  // (a third trigger alongside ⌘J and the drag handle). Reads live store state so it stays a stable
-  // identity while always toggling from the current value; focus follows via the effect below.
-  const toggleComposerMinimized = useCallback(() => {
-    const s = useUiStore.getState();
-    s.setComposerMinimized(!s.composerMinimized);
-  }, []);
-  // AI feature gates (Use AI Features menu). The composer RENDERS whenever the feature is enabled
-  // (visible gate = settings flag only), NOT gated on AI credits — a trial/no-credits user must still
-  // SEE and type into the composer; the paywall is enforced at send (Composer.send → trialSendAllowed
-  // + AuthGate's TrialChrome overlay), not by hiding the composer. Gating render on credits (the
-  // useAiFeature path) made the composer vanish entirely for no-credits users on Build agents
-  // (regression from 09f60a0c). When the composer feature is OFF, we render the bare terminal instead.
-  // Auto-rename stays the real usable gate (a background feature, no user-initiated moment).
-  const aiComposer = useAiFeatureVisible("composer");
-  const aiAutoRename = useAiFeature("autoRename");
-  // Imperative bridge to the terminal (e.g. arrow hand-off from the composer).
+  // Imperative bridge to the terminal (marker drops, arrow/enter hand-offs, scroll-to-prompt).
   const terminalApiRef = useRef<TerminalApi | null>(null);
   // The terminal pane box, so the drag-vision hint pill can anchor just above it.
   const terminalStageRef = useRef<HTMLDivElement>(null);
-  // Drag-vision hint (spec 2026-07-02): when the composer is OFF (no overlay to catch drops), an
-  // image dragged onto the terminal shows a "enable AI Features for vision" pill. Only the visible
-  // pane listens — the webview drag event is window-global, so gating on `visible` keeps every
-  // background pane from popping its own pill for the same drag. With the composer ON, Composer.tsx
-  // owns the drop (attaches the image), so this listener stands down (!aiComposer).
-  const dragHint = useDragVisionHint(visible && !aiComposer);
+  // Drag-vision hint (spec 2026-07-02): an image dragged onto the terminal shows a pill explaining
+  // that this isn't where images go. Only the visible pane listens — the webview drag event is
+  // window-global, so gating on `visible` keeps every background pane from popping its own pill.
+  // Armed for EVERY user, and entitlement no longer enters into it (roborev 46485): NO surface
+  // accepts a dropped image today — the terminal target went with the pane composer and the
+  // concierge box's pickers are still stubs — so the pill is purely informational, and there is
+  // nothing to sell anyone. Its one action moves the caret to the compose box.
+  const dragHint = useDragVisionHint(visible);
 
-  // Composer occlusion watch. The composer floats over the terminal's bottom rows by design (it
-  // covers Claude's input line so typing lands here), but Claude draws its MENUS in that same
-  // region — so a resume/permission prompt could sit invisible underneath it. Poll what's actually
-  // painted under the overlay: auto-minimize for something the user must answer, and surface a
-  // "N lines hidden" chip for anything else real. All policy lives in engine/composerOcclusion.ts;
-  // this effect is just the sampling loop.
-  const [occlusion, setOcclusion] = useState<Occlusion>(EMPTY_OCCLUSION);
-  const yieldStateRef = useRef<YieldState>("idle");
-  useEffect(() => {
-    // Only the visible pane samples — a background tab's terminal is display:none (cellHeight 0)
-    // and nothing there is worth reacting to anyway.
-    if (!aiComposer || !visible || phase !== "ready" || !ptyReady) {
-      setOcclusion(EMPTY_OCCLUSION);
-      // Drop any latched yield: we stop observing here, so conditions can change unseen (the pane
-      // backgrounds, the PTY dies). Re-arming means the next tick decides from what's actually on
-      // screen instead of acting on a stale "I owe a restore".
-      yieldStateRef.current = "idle";
-      return;
-    }
-    const tick = () => {
-      const api = terminalApiRef.current;
-      if (!api) return;
-      const { cellHeight, rows } = api.cellMetrics();
-      const ui = useUiStore.getState();
-      // NOT simply "what does the composer cover right now" — once we've yielded we keep measuring
-      // against the OPEN height, or revealing the prompt would read as resolving it and we'd
-      // oscillate at the poll rate. See measuredComposerHeight.
-      const height = measuredComposerHeight({
-        minimized: ui.composerMinimized,
-        openHeight: ui.composerHeight,
-        barHeight: COMPOSER_BAR,
-        state: yieldStateRef.current,
-      });
-      const covered = occludedRowCount({
-        composerHeight: height,
-        cellHeight,
-        rows,
-        bottomInset: TERMINAL_STAGE_PADDING,
-      });
-      const next = classifyOccludedRows(api.readBottomRows(covered));
-      // Keep the previous object when the verdict is unchanged. classifyOccludedRows allocates a new
-      // one every tick, so storing it unconditionally re-rendered the whole pane at the poll rate
-      // (~4×/sec) for as long as an agent was on screen, idle terminal included.
-      setOcclusion((prev) => (sameOcclusion(prev, next) ? prev : next));
-      const move = resolveAutoYield({
-        occlusion: next,
-        minimized: ui.composerMinimized,
-        state: yieldStateRef.current,
-      });
-      if (!move) return;
-      yieldStateRef.current = move.state;
-      if (move.minimized !== ui.composerMinimized) ui.setComposerMinimized(move.minimized);
-    };
-    tick();
-    // Poll rather than hook the output stream: a menu can appear from a redraw with no new bytes,
-    // and reading a handful of already-rendered lines is far cheaper than re-classifying on every
-    // PTY chunk during a noisy turn.
-    const timer = window.setInterval(tick, OCCLUSION_POLL_MS);
-    return () => window.clearInterval(timer);
-  }, [aiComposer, visible, phase, ptyReady]);
+  // Publish this agent's "mark a prompt at the current terminal row" capability while its pane is
+  // mounted, so the concierge dispatch path can drop the jump-to-prompt marker the composer used to
+  // drop inline (see services/terminalMarkers + conciergeDispatch). Registered per agent id;
+  // unregistered on unmount so a closed pane can't be marked.
+  useEffect(
+    () => registerPromptMarker(agent.id, (promptId) => terminalApiRef.current?.markPrompt(promptId)),
+    [agent.id],
+  );
 
   // Status routing: Claude Code's hook events are authoritative, but the screen scraper drives
   // until the first hook arrives (and for non-Claude programs that never emit one). The router
@@ -298,7 +222,8 @@ function AgentPaneInner({
       // The "work at hand" the judge weighs a closeout-vs-new-work ask against: the prompt that
       // defined this agent's work, falling back to its name.
       const task = (fresh?.autoNameBasis ?? fresh?.name ?? agent.name ?? "").trim();
-      const needs = await judgeNeedsFollowup({ task, response });
+      // Metering-only: attributes the judge's debit to this agent's project in the Credits history.
+      const needs = await judgeNeedsFollowup({ task, response, project: project.name });
       if (needs && turnSeqRef.current === turn) {
         routerRef.current?.fromJudge("waiting");
       }
@@ -367,6 +292,18 @@ function AgentPaneInner({
   };
 
   const prepare = async () => {
+    // Cloud agents run entirely server-side (in a Sparkle-provisioned E2B sandbox); the session
+    // already exists there. The desktop's job is to ATTACH, not to spawn — so gate the ENTIRE local
+    // spawn policy (project prewarm/git-init, worktree claim, Claude preflight, account selection,
+    // orchestration bridge) on runtime === "local". A cloud agent thus never touches the local
+    // filesystem or spawns a local PTY: Terminal mounts with the cloud transport (getTransport →
+    // CloudTransport) and attaches over the relay. command/args/cwd here are placeholders the cloud
+    // transport ignores. (Creating the server session + re-attach reconciliation is W5's scope.)
+    if (agent.runtime === "cloud") {
+      setSpawn({ command: SHELL, args: [], cwd: project.rootPath, resuming: false });
+      setPhase("ready");
+      return;
+    }
     // Prepare the project ONCE per root BEFORE the kind-specific early returns: warm the spawn
     // caches and — critically — ensure the folder is a git repo. Shell agents run in-place in the
     // project root with no worktree, so without this an entire project could be built in a folder
@@ -521,6 +458,9 @@ function AgentPaneInner({
       setIdentities(state.identities);
       setChosenAccount(chosen);
       chosenAccountIdRef.current = chosen?.id ?? null;
+      // Publish the account this PTY will actually run under, so a global switch can tell which
+      // agents have to move. Not derivable from the pin map — most agents auto-pick and have no pin.
+      if (chosen) registerPaneAccount(agent.id, chosen.id);
       const configDir = chosen?.configDir;
       // Resume the prior conversation if this worktree already has one (the
       // worktree path is the session key). `--continue` errors in a directory
@@ -767,30 +707,97 @@ function AgentPaneInner({
     setAccountMenuOpen(false);
   };
 
-  // Best-effort Phase-1 failover: a usage/rate-limit message in this agent's output flags the chosen
-  // account exhausted so pickAccount steers the next job elsewhere. Fully isolated — any failure is
-  // swallowed and never reaches terminal rendering.
-  const handleRateLimit = (untilEpoch: number) => {
-    const id = chosenAccountIdRef.current;
-    if (!id) return;
-    void markExhausted(id, untilEpoch)
-      .then(() => invalidateAccountState())
-      .catch((e) => console.warn("markExhausted failed (best-effort failover)", e));
-  };
+  // NOTE: exhaustion is no longer inferred from this pane's terminal output. See the comment in
+  // Terminal.tsx's output handler and services/rateLimitWatch — a real limit is read from the
+  // structured `error: "rate_limit"` record in the account's own transcripts, which is authoritative
+  // and self-attributing, instead of guessed from text that any agent can print.
 
-  // Focus follows the minimized state on the visible pane: minimized → terminal (so the user
-  // can answer Claude's menus), restored → composer (so they type in the box). Drives both the
-  // drag-to-minimize path and ⌘J. rAF lets the just-rendered surface mount/show first.
+  // Publish this pane's PTY readiness so the concierge send path can tell "still coming up" (queue
+  // the prompt) from "the process exited" (fail it truthfully) — see services/paneReadiness. A
+  // GIVEN-UP pane (spawn error / Claude missing) publishes `failed` so a prompt sent AFTER the
+  // pane settled there fails truthfully instead of re-queuing into a hold nobody will ever drain
+  // (roborev 46924); a successful Retry re-enters the prepare flow and republishes. On unmount the
+  // entry goes AND any prompt still held for this agent is dropped: the pane is gone for good, so
+  // delivering it into a later reincarnation would be worse than losing it.
+  useEffect(() => {
+    if (phase === "error" || phase === "no-claude") setPaneFailed(agent.id);
+    else setPaneReady(agent.id, ptyReady);
+  }, [agent.id, ptyReady, phase]);
+  useEffect(
+    () => () => {
+      unregisterPane(agent.id);
+      unregisterPaneRestart(agent.id);
+      unregisterPaneAccount(agent.id);
+      // Report (not just drop) anything still held — the concierge promised the user a delivery
+      // and must say what actually happened (roborev 46311).
+      abandonPendingSends(agent.id);
+    },
+    [agent.id],
+  );
+
+  // Publish this pane's re-spawn lever so a global account switch can move this agent when it
+  // reaches a safe boundary. The spawn path resumes the Claude session, so this continues the
+  // conversation; accountSwitch owns choosing a moment where that costs nothing.
+  //
+  // This must RE-PREPARE, not just restart the terminal. `Terminal.restart()` only bumps its own
+  // `attempt`, and its spawn effect re-reads the `args` PROP — which still holds the exec string
+  // built during the last prepare(), with the OLD account's CLAUDE_CONFIG_DIR baked in. Only
+  // prepare() re-reads the pin (chooseAccountForAgent → getPin), rebuilds the exec, and
+  // re-publishes registerPaneAccount. Going through it is what makes a switch real; the terminal
+  // then remounts via its account-derived key above.
+  // `prepare` is re-created every render, so the registry gets a ref that always calls the latest.
+  // Synced in an effect, never during render.
+  const prepareRef = useRef(prepare);
+  useEffect(() => {
+    prepareRef.current = prepare;
+  });
+  useEffect(() => {
+    registerPaneRestart(agent.id, () => void prepareRef.current());
+    return () => unregisterPaneRestart(agent.id);
+  }, [agent.id]);
+
+  // A spawn that ERRORS or finds no Claude will never flip ptyReady, so a held prompt would dangle
+  // with no outcome. Report it the moment the pane gives up (roborev 46311).
+  //
+  // `no-claude` IS a trigger, despite its Retry offering a way back: nothing ages a hold out on its
+  // own (roborev 46897 — MAX_AGE_MS is only consulted inside flushPendingSends, which this pane
+  // never reaches while it is stuck, so no `expired` is ever emitted). The choice is therefore
+  // between telling the user now that the message didn't go, and going silent for the rest of the
+  // session on a pane that may never unmount. Telling them wins: the concierge names the agent and
+  // says to send it again once it's running, which is exactly what a successful Retry allows.
+  useEffect(() => {
+    if (phase === "error" || phase === "no-claude") abandonPendingSends(agent.id);
+  }, [phase, agent.id]);
+
+  // Flush any prompt the user sent while this agent's PTY was still coming up (services/
+  // pendingSends): "create an agent, then tell it what to do" reaches the dispatch path before the
+  // spawn finishes, and the composer used to queue-and-deliver exactly this way. Runs the moment
+  // this pane reports ready — no-op when nothing is held for this agent.
+  useEffect(() => {
+    if (!ptyReady) return;
+    void flushPendingSends(agent.id).catch((e) =>
+      console.warn("flushPendingSends failed", e),
+    );
+  }, [ptyReady, agent.id]);
+
+  // The visible, ready pane takes the caret: with no composer floating over it, the terminal IS
+  // the input surface for anyone who does want to type directly. rAF lets the just-revealed
+  // surface mount/show first.
+  //
+  // …but NEVER out from under a HALF-TYPED message. `ptyReady` flips asynchronously after spawn,
+  // so a user composing in the concierge box while an agent finishes starting would otherwise have
+  // the caret yanked mid-sentence — against the whole premise that the concierge is the one
+  // compose surface. The guard is "unsent text in the focused field", not "any field focused", so
+  // an empty concierge box (the steady state) still yields the caret to the terminal. Re-checked
+  // inside the rAF, not just at effect time, because the frame lands later.
   useEffect(() => {
     if (!visible || !ptyReady) return;
     const raf = requestAnimationFrame(() => {
-      // No composer (feature off) or it's minimized → focus the terminal so the user can type
-      // straight into it; otherwise focus the composer textarea.
-      if (!aiComposer || composerMinimized) termFocusRef.current?.();
-      else composerInputRef.current?.focus();
+      if (isTypingInProgress()) return;
+      termFocusRef.current?.();
     });
     return () => cancelAnimationFrame(raf);
-  }, [composerMinimized, visible, ptyReady, aiComposer]);
+  }, [visible, ptyReady]);
 
   // Consume a pending "scroll to this prompt" intent (set by history-search navigation) once this
   // agent's terminal is the visible, ready pane. Runs when the intent appears or the pane becomes
@@ -825,13 +832,11 @@ function AgentPaneInner({
     >
       <PinnedPrompt
         prompt={agent.lastPrompt}
-        // Composer/seed prompts only — picker answers live in the raw history (for naming's
+        // Dispatched/seed prompts only — picker answers live in the raw history (for naming's
         // promptCount) but are filtered out of every display surface. See composerPrompts.
         history={composerPrompts(agent.promptHistory ?? [])}
-        // "Send to Composer" only makes sense when the composer is mounted (AI feature on).
-        onSendToComposer={
-          aiComposer ? (text) => composerApiRef.current?.insertPrompt(text) : undefined
-        }
+        // No "Send to Composer": there is no composer here any more. The concierge box is the one
+        // place a prompt is written, so re-sending an old prompt happens there.
         // Jump the terminal back to where a prompt was sent. "missing" → the row reports it's
         // scrolled out of this session (marker trimmed or from a prior session).
         onJumpToPrompt={(id) => terminalApiRef.current?.scrollToPrompt(id) ?? "missing"}
@@ -859,11 +864,19 @@ function AgentPaneInner({
             style={{
               position: "absolute",
               inset: 0,
-              padding: 6,
+              padding: TERMINAL_STAGE_PADDING,
               boxSizing: "border-box",
             }}
           >
             <Terminal
+              // Keyed on the account so a SWITCH actually takes effect. The account is baked into
+              // `args` (buildClaudeExec writes `export CLAUDE_CONFIG_DIR=…` into the exec string),
+              // but Terminal's spawn effect is keyed on [agentId, attempt] and does NOT watch
+              // `args` — so rebuilding them alone would re-spawn onto the OLD config dir, and the
+              // switch would silently do nothing while reporting success. Changing the key remounts
+              // the terminal, which spawns fresh with the new dir; the spawn resumes the Claude
+              // session, so the conversation is redrawn rather than lost.
+              key={chosenAccount?.id ?? "default"}
               agentId={agent.id}
               projectId={project.id}
               projectRootPath={project.rootPath}
@@ -871,13 +884,16 @@ function AgentPaneInner({
               args={spawn.args}
               cwd={spawn.cwd}
               resuming={spawn.resuming}
+              calm={calm}
+              // Selects Local vs Cloud transport. For a cloud agent, command/args/cwd above are
+              // placeholders — CloudTransport ignores them and attaches to the server session.
+              runtime={agent.runtime}
               active={visible}
               onStatus={(s) => routerRef.current!.fromScreen(s)}
               onReady={() => {
                 perfEnd(agent.id, "pty ready"); // final milestone of the spawn waterfall
                 setPtyReady(true);
               }}
-              onRateLimit={handleRateLimit}
               onExit={() => {
                 // NOTE (Plan-1 limitation): this block fires only when the PTY process actually
                 // exits — i.e. the user explicitly quits `claude` (e.g. /exit). Because
@@ -913,16 +929,12 @@ function AgentPaneInner({
                     .catch((e) => console.error(`[worker ${agent.id}] bad result.json`, e));
                 }
               }}
-              onRequestFocus={() => composerInputRef.current?.focus()}
-              // Meter free-trial prompts for trial users, who type straight into this raw terminal
-              // (the credit-gated Composer never mounts for them). Terminal's onSubmitLine fires once
-              // per non-empty submitted line (terminalSubmit.ts), so one prompt = one decrement. Only
-              // wired on the NO-composer path (matching the composer's own metering on the AI path);
-              // recordTrialSend also self-gates, no-opping for entitled users.
-              onSubmitLine={aiComposer ? undefined : () => void recordTrialSend()}
-              // A plain click in the terminal toggles the composer (minimize to uncover the lines it
-              // floats over, restore to type). Only wired when the composer exists to be toggled.
-              onToggleComposer={aiComposer ? toggleComposerMinimized : undefined}
+              // Meter free-trial prompts typed straight into the terminal. Terminal's onSubmitLine
+              // fires once per non-empty submitted line (terminalSubmit.ts), so one prompt = one
+              // decrement. Now UNCONDITIONAL: with the composer gone this is the only in-terminal
+              // send path (the concierge dispatch meters its own — see conciergeDispatch).
+              // recordTrialSend self-gates, no-opping for entitled users.
+              onSubmitLine={() => void recordTrialSend()}
               focusRef={termFocusRef}
               apiRef={terminalApiRef}
             />
@@ -933,51 +945,10 @@ function AgentPaneInner({
               I'll send it the moment it's ready.
             </Centered>
           )}
-          {/* AI-enhanced composer (feature-gated). Off → no overlay: the user types straight into
-              the terminal beneath (and photo-drop + Send go away with it).
-              NOTE: auto-rename (maybeAutoName below) is intentionally coupled to the composer — the
-              only "a prompt was submitted" hook is the composer's onSubmitPrompt. With the composer
-              off, the user submits via raw terminal keystrokes (no prompt boundary to summarize), so
-              auto-rename can't run even if its own flag is on. That's an accepted coupling, not a bug. */}
-          {aiComposer && (
-            <Composer
-              agentId={agent.id}
-              active={visible}
-              // Usable immediately: during "preparing" (no spawn yet) or before the PTY reports
-              // ready, the composer accepts typing/voice and QUEUES a send, auto-delivering it the
-              // moment the PTY is live — so the user never waits on the workspace spin-up to compose.
-              preparing={phase !== "ready" || !ptyReady}
-              inputRef={composerInputRef}
-              apiRef={composerApiRef}
-              // Terminal rows this overlay is currently hiding that AREN'T the input line it's
-              // meant to cover — drives the "N lines hidden" reveal chip. 0 = nothing to say.
-              hiddenBelow={shouldShowHiddenChip(occlusion) ? occlusion.hiddenLines : 0}
-              onArrowOverflow={(dir) => terminalApiRef.current?.arrowFromComposer(dir)}
-              onEnterOverflow={() => terminalApiRef.current?.enterFromComposer()}
-              // A send found this agent's PTY already gone. Clearing ptyReady flips the composer
-              // back to `preparing`, so once the respawned PTY reports ready the flush effect
-              // delivers the prompt the composer re-queued — the send survives the restart.
-              onRestartAgent={() => {
-                setPtyReady(false);
-                terminalApiRef.current?.restart();
-              }}
-              onSubmitPrompt={(display, namingBasis) => {
-                // Record the DISPLAY string (typed text + 📄/📷/📎 markers) for the pinned header +
-                // history dropdown, and drop a terminal marker under the same id so "jump to this
-                // prompt" (dropdown + history search) can scroll back here later this session.
-                const promptId = appendPrompt(project.id, agent.id, display);
-                terminalApiRef.current?.markPrompt(promptId);
-                // Fire-and-forget: summarize the work into a short name (first prompt, or when
-                // the work shifts). No-ops if the name is pinned or no API key is configured.
-                // Gated on the auto-rename AI feature. Name from the user's TYPED text only —
-                // never the attachment emoji-count markers — and skip entirely when an
-                // attachments-only send leaves the basis empty (so the naming model never sees
-                // "📷 1 image" and replies with conversational refusal text).
-                const basis = namingBasis.trim();
-                if (aiAutoRename && basis) void maybeAutoName(project.id, agent.id, basis);
-              }}
-            />
-          )}
+          {/* NO COMPOSER HERE (CM-U7, PRD §3: "No composer above it — the only compose box is the
+              concierge"). The prompt side-effects it used to own — appendPrompt, the jump-to-prompt
+              terminal marker, auto-rename and the trial debit — now run in
+              services/conciergeDispatch when the concierge delivers a prompt to this agent. */}
           {/* Account badge: which Claude account this agent runs under, click to pin a different
               one. Only shown once at least one account exists (multi Claude Max support). */}
           {accounts.length > 0 && chosenAccount && (
@@ -1012,12 +983,13 @@ function AgentPaneInner({
  *  Internal store subscriptions (composerMinimized, scrollIntent, AI gates) are unaffected — memo only
  *  gates PARENT-driven re-renders, not the component's own subscriptions. */
 export function arePanePropsEqual(
-  a: { project: Project; agent: AgentTab; visible: boolean },
-  b: { project: Project; agent: AgentTab; visible: boolean },
+  a: { project: Project; agent: AgentTab; visible: boolean; calm?: boolean },
+  b: { project: Project; agent: AgentTab; visible: boolean; calm?: boolean },
 ): boolean {
   return (
     a.agent === b.agent &&
     a.visible === b.visible &&
+    !!a.calm === !!b.calm &&
     a.project.id === b.project.id &&
     a.project.rootPath === b.project.rootPath &&
     a.project.name === b.project.name &&

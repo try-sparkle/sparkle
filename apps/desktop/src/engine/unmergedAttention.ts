@@ -13,7 +13,7 @@
 // nudge is about a FINISHED unit of work, not an in-flight one.
 //
 // COMPOSE ORDER: run this BEFORE alertDismissal.withDismissedAlerts, not after. `unmerged` is
-// deliberately NOT in engine/attention's needsAttention set, so withDismissedAlerts never touches an
+// deliberately NOT in alertDismissal's DISMISSIBLE set, so withDismissedAlerts never touches an
 // `unmerged` row (you can't dismiss it) — but a *dismissed* red row de-escalates to idle/stopped,
 // and if this ran AFTER dismissal it would immediately re-escalate that just-calmed row back to red.
 // Running unmerged first (on the true resting statuses) then dismissal keeps the two concerns clean:

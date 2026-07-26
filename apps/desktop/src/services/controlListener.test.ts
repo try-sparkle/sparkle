@@ -66,8 +66,8 @@ describe("controlListener", () => {
     useUiStore.getState().setThemePref("auto");
     const store = useProjectStore.getState();
     projectId = store.addProject("Demo", "/tmp/demo");
-    callerId = store.addAgent(projectId, { kind: "build" });
-    otherId = store.addAgent(projectId, { kind: "worker", parentId: callerId });
+    callerId = store.addAgent(projectId, { kind: "build" })!;
+    otherId = store.addAgent(projectId, { kind: "worker", parentId: callerId })!;
     cleanup = await startControlListener();
   });
   afterEach(() => {
@@ -89,8 +89,11 @@ describe("controlListener", () => {
     expect(res.agents).toHaveLength(2);
     const caller = res.agents.find((a) => a.id === callerId)!;
     expect(caller).toMatchObject({ name: expect.any(String), kind: "build", status: "working", parentId: null, activity: null });
+    // An agent with NO runtime status entry reads as "stopped" (no process), not "idle" (finished
+    // its turn, waiting on you). This defaulted to "idle" until 2026-07-26, which made every
+    // persisted-but-closed tab report as a live agent idling for attention — see handleGetState.
     const worker = res.agents.find((a) => a.id === otherId)!;
-    expect(worker).toMatchObject({ kind: "worker", parentId: callerId, status: "idle" });
+    expect(worker).toMatchObject({ kind: "worker", parentId: callerId, status: "stopped" });
   });
 
   it("rename_agent defaults the target to the caller and self-names (authoritative, NOT pinned)", async () => {

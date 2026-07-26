@@ -776,6 +776,43 @@ mod tests {
         assert!(root.join("sparkle.log.mid").exists());
     }
 
+    /// The long-session case. A prune that runs only at launch enforces the cap against the state
+    /// the process BOOTED into; `rolling::daily` then opens a new file at every midnight and the
+    /// directory grows past the cap with nothing to reap it. Sparkle sessions span days, so this is
+    /// the common case, not the edge one — measured in the field as a log dir sitting just over the
+    /// 256 MB cap with no restart due.
+    ///
+    /// So: a second pass over a directory that has since grown must bring it back under budget, and
+    /// must do it without touching the file being appended to right now.
+    #[test]
+    fn a_later_pass_reaps_the_days_that_rolled_over_since_the_first_one() {
+        let root = tmpdir("logrollover");
+        let now = SystemTime::now();
+        let policy = LogPolicy { max_age: 365 * DAY, max_total_bytes: 2500, keep_newest: 2 };
+
+        // Boot state: already inside the cap, so the launch pass has nothing to do.
+        write_aged(&root.join("sparkle.log.day1"), 1000, now, 2 * DAY);
+        write_aged(&root.join("sparkle.log.day2"), 1000, now, DAY);
+        let first = prune_logs(&root, "sparkle.log", policy, now).unwrap();
+        assert_eq!(first.deleted, 0, "a dir already under the cap is left alone");
+
+        // Two midnights pass without a restart; the appender has rolled twice and is writing day4.
+        write_aged(&root.join("sparkle.log.day3"), 1000, now, Duration::from_secs(3600));
+        write_aged(&root.join("sparkle.log.day4"), 1000, now, Duration::from_secs(1));
+
+        let second = prune_logs(&root, "sparkle.log", policy, now).unwrap();
+
+        assert_eq!(second.deleted, 2, "4000 bytes must come back under the 2500 cap");
+        assert!(!root.join("sparkle.log.day1").exists(), "oldest goes first");
+        assert!(!root.join("sparkle.log.day2").exists());
+        assert!(root.join("sparkle.log.day3").exists());
+        assert!(
+            root.join("sparkle.log.day4").exists(),
+            "the file the appender holds open is the newest, so keep_newest protects it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn never_touches_files_outside_the_prefix() {
         let root = tmpdir("logprefix");

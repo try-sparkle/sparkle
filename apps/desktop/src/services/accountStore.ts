@@ -9,6 +9,8 @@
 // accountStore.test.ts). The decision logic — `pickAccount` and the pin map — is pure / in-memory
 // so it unit-tests without any IO.
 import { invoke } from "@tauri-apps/api/core";
+import type { LimitEvent } from "./rateLimitWatch";
+import type { Ceiling } from "./headroom";
 
 /** Sparkle metadata for one registered Claude config dir. `configDir` is the absolute path we set
  *  as CLAUDE_CONFIG_DIR when spawning under this account. `isDefault` marks the imported `~/.claude`
@@ -44,6 +46,10 @@ export interface Identity {
   id: string;
   email: string | null;
   organization: string | null;
+  /** Anthropic's own account id. The ONLY reliable way to tell whether two registered accounts are
+   *  really the same login — see {@link duplicateAccountGroups}. `null` on a login predating the
+   *  field, or an account never signed into. */
+  accountUuid: string | null;
 }
 
 /** Raw shape the Rust side returns — mapped to {@link Usage} at the boundary. `AccountUsage` in
@@ -118,12 +124,105 @@ export function getIdentities(): Promise<Identity[]> {
   return invoke<Identity[]>("accounts_identities");
 }
 
+/** Cross-project Claude Code spend, aggregated across every account's transcripts and valued
+ *  per-model at Anthropic list price by the Rust side (`accounts_spend`). `spendTodayUsd` is the
+ *  trailing-24h figure the concierge spend pill renders; the 7d figures back a longer view.
+ *  `fallbackModelRecords` counts trailing-7d records whose model was unrecognized (priced at the
+ *  fallback rate, never dropped) — nonzero means the totals lean on an estimate for some model;
+ *  note its window is 7d, wider than the 24h figure the pill shows.
+ *  These are DOLLARS (not cents) and are an estimate of list-price value, not a billed amount. */
+export interface Spend {
+  spendTodayUsd: number;
+  tokensToday: number;
+  spend7dUsd: number;
+  tokens7d: number;
+  fallbackModelRecords: number;
+}
+
+/** Current cross-project spend summary (see {@link Spend}). */
+export function getSpend(): Promise<Spend> {
+  return invoke<Spend>("accounts_spend");
+}
+
 /** The authoritative label to show for an account: its REAL logged-in email when known, otherwise
  *  the user-typed nickname (an account never `claude login`ed has no identity yet). Use this — not
  *  `account.nickname` — wherever the account is identified to the user, so the label reflects the
  *  identity the session actually runs under. */
 export function accountLabel(account: Account, identity: Identity | undefined): string {
   return identity?.email ?? account.nickname;
+}
+
+/** A set of registered accounts that are all the SAME Anthropic login (identical `accountUuid`).
+ *  Every group returned has ≥2 members — a group of one isn't a duplicate. */
+export interface DuplicateGroup {
+  accountUuid: string;
+  /** The shared login's email, for display. */
+  email: string | null;
+  /** The registered accounts that resolve to it, in input order. */
+  accounts: Account[];
+}
+
+/** Find registered accounts that are really the same Anthropic login.
+ *
+ *  This exists because it happened: two accounts nicknamed "DROdio Storytell" and "DROdio Gmail"
+ *  both resolved to `accountUuid 5fb3d67c-…`. Nothing detected it, so the UI showed two independent
+ *  headroom bars for ONE quota and "failover" between them switched to the same account and re-hit
+ *  the same limit immediately. A nickname is a user-typed label with no bearing on which login a
+ *  config dir holds, so it can never be the identity key.
+ *
+ *  Matching is on `accountUuid` ONLY — deliberately not email. Email is a display label; the uuid is
+ *  the account. Accounts with no uuid (never signed in, or a login predating the field) are excluded
+ *  rather than lumped together, so "not signed in yet" is never reported as a duplicate. */
+export function duplicateAccountGroups(
+  accounts: Account[],
+  identities: Identity[],
+): DuplicateGroup[] {
+  const byId = new Map(identities.map((i) => [i.id, i]));
+  const groups = new Map<string, DuplicateGroup>();
+  for (const a of accounts) {
+    const uuid = byId.get(a.id)?.accountUuid;
+    if (!uuid) continue; // not signed in / no uuid → not comparable
+    const g = groups.get(uuid);
+    if (g) g.accounts.push(a);
+    else
+      groups.set(uuid, {
+        accountUuid: uuid,
+        email: byId.get(a.id)?.email ?? null,
+        accounts: [a],
+      });
+  }
+  return [...groups.values()].filter((g) => g.accounts.length > 1);
+}
+
+/** Ids of accounts that duplicate another account's login (flattened {@link duplicateAccountGroups}). */
+export function duplicateAccountIds(accounts: Account[], identities: Identity[]): Set<string> {
+  return new Set(
+    duplicateAccountGroups(accounts, identities).flatMap((g) => g.accounts.map((a) => a.id)),
+  );
+}
+
+/** Raw {@link LimitEvent} shape from Rust — `atEpoch` is epoch SECONDS (Rust's unit). */
+interface RawLimitEvent {
+  id: string;
+  atEpoch: number;
+  text: string;
+}
+
+/** The newest REAL rate-limit event per account (empty = nothing is rate-limited right now).
+ *
+ *  Read from the structured `error: "rate_limit"` records in each account's own transcripts — the
+ *  authoritative signal, which replaced Phase 1's terminal-text scraping. Seconds are converted to
+ *  ms at this boundary, matching the {@link Usage.exhaustedUntil} convention. */
+export async function listLimitEvents(): Promise<LimitEvent[]> {
+  const raw = await invoke<RawLimitEvent[]>("accounts_limit_events");
+  return raw.map((r) => ({ accountId: r.id, at: r.atEpoch * MS_PER_SEC, text: r.text }));
+}
+
+/** Per-account LEARNED rate-limit ceilings (Rust `accounts_ceilings`): the median 5h consumption
+ *  observed at that account's past limit episodes. `ceiling` is null until enough episodes exist —
+ *  callers must treat that as "unknown", never zero. Backs the proactive switch banner. */
+export function listCeilings(): Promise<Ceiling[]> {
+  return invoke<Ceiling[]>("accounts_ceilings");
 }
 
 /** Flag an account as rate-limited until `untilEpoch` (epoch MS — callers pass a `Date.now()`-based

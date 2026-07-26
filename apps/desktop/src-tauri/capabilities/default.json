@@ -1,8 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core APIs (events for PTY streaming, window) + native folder dialog + open external URLs (any http(s) link, handed to the OS default browser — non-web schemes like file:// stay blocked) + scoped HTTP to the Chief API. Multi-window: the initial 'main' window plus opaque 'win-*' windows created at runtime (see projectWindows.ts). A window whose label matches no capability gets ZERO permissions in Tauri v2 — keep this glob in sync with the createWindow label prefix or invoke/listen silently break in new windows. core:window:default only grants the READ side of the window API, so every mutation the frontend calls needs an explicit core:window:allow-set-* entry below — a missing one type-checks and passes CI, then no-ops at runtime (see windowCapabilities.test.ts).",
-  "windows": ["main", "win-*", "tray", "capture"],
+  "description": "Core APIs (events for PTY streaming, window) + native folder dialog + open external URLs (any http(s) link, handed to the OS default browser \u2014 non-web schemes like file:// stay blocked) + scoped HTTP to the Chief API. Single-window shell (CM-U7): the one 'main' app window plus the tray and capture webviews \u2014 no runtime window creation. core:window:default only grants the READ side of the window API, so every mutation the frontend calls needs an explicit core:window:allow-set-* entry below \u2014 a missing one type-checks and passes CI, then no-ops at runtime (see windowCapabilities.test.ts).",
+  "windows": [
+    "main",
+    "tray",
+    "capture"
+  ],
   "permissions": [
     "core:default",
     "positioner:default",
@@ -24,17 +28,27 @@
     {
       "identifier": "opener:allow-open-url",
       "allow": [
-        { "url": "https://**" },
-        { "url": "http://**" }
+        {
+          "url": "https://**"
+        },
+        {
+          "url": "http://**"
+        }
       ]
     },
     "opener:allow-reveal-item-in-dir",
     {
       "identifier": "http:default",
       "allow": [
-        { "url": "https://api.storytell.ai/*" },
-        { "url": "https://storage.googleapis.com/*" },
-        { "url": "https://*.storage.googleapis.com/*" }
+        {
+          "url": "https://api.storytell.ai/*"
+        },
+        {
+          "url": "https://storage.googleapis.com/*"
+        },
+        {
+          "url": "https://*.storage.googleapis.com/*"
+        }
       ]
     }
   ]

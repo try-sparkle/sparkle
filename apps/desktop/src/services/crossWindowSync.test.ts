@@ -80,7 +80,7 @@ describe("subscribeToCrossWindowSync", () => {
 
   it("does NOT broadcast on a non-structural change (appendPrompt)", () => {
     const id = useProjectStore.getState().addProject("P", "/tmp/p");
-    const agentId = useProjectStore.getState().addAgent(id);
+    const agentId = useProjectStore.getState().addAgent(id)!;
     unsub = subscribeToCrossWindowSync();
     emit.mockClear();
     useProjectStore.getState().appendPrompt(id, agentId, "typing a long prompt...");
@@ -142,6 +142,80 @@ describe("subscribeToCrossWindowSync", () => {
 
     fire?.({ payload: undefined });
     expect(rehydrate).toHaveBeenCalledTimes(2);
+    rehydrate.mockRestore();
+  });
+
+  it("skips a rehydrate when the persisted blob has not changed since the last one", async () => {
+    // Coalescing bounds how OFTEN a rehydrate runs; it can't tell that a run has nothing to do.
+    // Rehydrate reads the blob, parses it, and writes the result to the store — against bytes
+    // already applied that reproduces the state that's there, having re-rendered every subscriber
+    // to get back where it started. Assert the second event does no work at all.
+    vi.useFakeTimers();
+    const blob = JSON.stringify({ state: { projects: [] }, version: 0 });
+    localStorage.setItem("sparkle-projects", blob);
+    const rehydrate = vi
+      .spyOn(useProjectStore.persist, "rehydrate")
+      .mockResolvedValue(undefined as unknown as void);
+    unsub = subscribeToCrossWindowSync();
+    const fire = captured.get("sparkle://projects-changed");
+
+    fire?.({ payload: undefined }); // first sync with this blob — must run
+    // Past the 300ms coalesce window, so the cooldown has lapsed and the next event is judged by
+    // the blob guard alone rather than being deferred as a pending trailing run.
+    await vi.advanceTimersByTimeAsync(350);
+    expect(rehydrate).toHaveBeenCalledTimes(1);
+
+    fire?.({ payload: undefined }); // same bytes on disk — nothing to apply
+    await vi.advanceTimersByTimeAsync(350);
+    expect(rehydrate).toHaveBeenCalledTimes(1);
+    rehydrate.mockRestore();
+  });
+
+  it("still rehydrates once the persisted blob actually changes", async () => {
+    // The other half of the guard: skipping must be driven by the bytes, not by having run once.
+    // A real remote change has to get through immediately.
+    vi.useFakeTimers();
+    localStorage.setItem("sparkle-projects", JSON.stringify({ state: { projects: [] }, version: 0 }));
+    const rehydrate = vi
+      .spyOn(useProjectStore.persist, "rehydrate")
+      .mockResolvedValue(undefined as unknown as void);
+    unsub = subscribeToCrossWindowSync();
+    const fire = captured.get("sparkle://projects-changed");
+
+    fire?.({ payload: undefined });
+    // Past the 300ms coalesce window: this test is about the blob guard letting a real change
+    // through immediately, so the cooldown must not be what defers the second run.
+    await vi.advanceTimersByTimeAsync(350);
+    expect(rehydrate).toHaveBeenCalledTimes(1);
+
+    // Another window wrote a different blob.
+    localStorage.setItem(
+      "sparkle-projects",
+      JSON.stringify({ state: { projects: [{ id: "p1" }] }, version: 0 }),
+    );
+    fire?.({ payload: undefined });
+    await vi.advanceTimersByTimeAsync(350);
+    expect(rehydrate).toHaveBeenCalledTimes(2);
+    rehydrate.mockRestore();
+  });
+
+  it("does not rehydrate this window's echo of its own broadcast", async () => {
+    // Tauri's `emit` delivers to the emitter too, so every broadcast comes back to the window that
+    // sent it. That echo asks this window to re-apply the blob it just flushed — its own state.
+    // One guaranteed-redundant full rehydrate per broadcast, in whichever window the user is
+    // actually working in.
+    const rehydrate = vi
+      .spyOn(useProjectStore.persist, "rehydrate")
+      .mockResolvedValue(undefined as unknown as void);
+    unsub = subscribeToCrossWindowSync();
+    useProjectStore.getState().addProject("P", "/tmp/p"); // structural → flush + emit
+    // The broadcast now carries the new signature as its payload (the receiver-side skip), so this
+    // asserts the event and a signature rather than the bare one-argument emit it used to be.
+    expect(emit).toHaveBeenCalledWith("sparkle://projects-changed", expect.any(String));
+
+    captured.get("sparkle://projects-changed")?.({ payload: undefined }); // the echo
+    await new Promise((r) => setTimeout(r, 0));
+    expect(rehydrate).not.toHaveBeenCalled();
     rehydrate.mockRestore();
   });
 

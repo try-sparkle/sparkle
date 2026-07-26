@@ -33,37 +33,37 @@ describe("projectStore — freshBuildAgentId lifecycle", () => {
   beforeEach(seed);
 
   it("opening a BUILD agent claims the fresh slot", () => {
-    const id = useProjectStore.getState().addAgent("p1", { kind: "build" });
+    const id = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
     expect(proj().freshBuildAgentId).toBe(id);
   });
 
   it("is single-occupancy — a newer build agent takes the slot from the older one", () => {
-    const first = useProjectStore.getState().addAgent("p1", { kind: "build" });
-    const second = useProjectStore.getState().addAgent("p1", { kind: "build" });
+    const first = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
+    const second = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
     expect(first).not.toBe(second);
     expect(proj().freshBuildAgentId).toBe(second);
   });
 
   it("opening a SHELL agent does NOT steal the build slot", () => {
-    const build = useProjectStore.getState().addAgent("p1", { kind: "build" });
+    const build = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
     useProjectStore.getState().addAgent("p1", { kind: "shell" });
     expect(proj().freshBuildAgentId).toBe(build);
   });
 
   it("opening a WORKER does NOT steal the build slot", () => {
-    const build = useProjectStore.getState().addAgent("p1", { kind: "build" });
+    const build = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
     useProjectStore.getState().addAgent("p1", { kind: "worker", parentId: build });
     expect(proj().freshBuildAgentId).toBe(build);
   });
 
   it("closing the fresh agent clears the slot", () => {
-    const build = useProjectStore.getState().addAgent("p1", { kind: "build" });
+    const build = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
     useProjectStore.getState().removeAgent("p1", build);
     expect(proj().freshBuildAgentId).toBeNull();
   });
 
   it("closing a fresh build agent (and its workers) clears the slot", () => {
-    const build = useProjectStore.getState().addAgent("p1", { kind: "build" });
+    const build = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
     useProjectStore.getState().addAgent("p1", { kind: "worker", parentId: build });
     // build is still fresh (worker didn't steal it); closing it removes build + its worker.
     useProjectStore.getState().removeAgent("p1", build);
@@ -71,8 +71,8 @@ describe("projectStore — freshBuildAgentId lifecycle", () => {
   });
 
   it("closing a DIFFERENT agent leaves the fresh slot intact", () => {
-    const older = useProjectStore.getState().addAgent("p1", { kind: "build" });
-    const fresh = useProjectStore.getState().addAgent("p1", { kind: "build" });
+    const older = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
+    const fresh = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
     useProjectStore.getState().removeAgent("p1", older);
     expect(proj().freshBuildAgentId).toBe(fresh);
   });

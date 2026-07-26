@@ -25,37 +25,35 @@ import { useRuntimeStore } from "./stores/runtimeStore";
 import { useSettingsStore } from "./stores/settingsStore";
 import { useScrollIntentStore } from "./stores/scrollIntentStore";
 import { useProjectStore } from "./stores/projectStore";
-import { useUiStore } from "./stores/uiStore";
 import {
   useCurrentProjectId,
   useCurrentWindowLabel,
   useIsMainWindow,
   useReplaceCurrentProject,
 } from "./windowContext";
-import { findWindowForProject } from "./services/windowRegistry";
 import {
   reportAttentionCount,
   notifyAttention,
   summarizeAttention,
   onFocusAgent,
+  onSelectProject,
   type FocusAgentPayload,
+  type SelectProjectPayload,
 } from "./services/attention";
+import { agentExists, selectAndOpen } from "./services/agentReveal";
+import { openProjectTab } from "./services/openProjectTab";
 import { emitAttention, emitResolved } from "./services/relayClient";
 import { reportAttentionSource } from "./services/selfReportObservability";
 import type { AttentionSource } from "./stores/selfReportMetrics";
 import { getAgentScrollback } from "./services/terminalScrollback";
 import { suggestedRepliesFor } from "./services/suggestions/attentionReplies";
 import { safeUnlisten } from "./services/safeUnlisten";
-import {
-  publishWindowRedAgents,
-  clearWindowStatus,
-  isRedStatus,
-} from "./services/windowStatus";
 import { withDismissedAlerts } from "./engine/alertDismissal";
 import { withUnmergedWork } from "./engine/unmergedAttention";
 import { withRedWorkerAttention, withUnstartedWorkerAttention } from "./engine/workerAttention";
 import { resolveStage } from "./engine/workflowStage";
 import type { AgentKind, AgentTab, AgentTabStatus } from "./types";
+import { projectNameForAgent } from "./services/creditProject";
 
 /** The "answer now" red statuses relayed to the phone + counted by the badge (mirrors
  *  engine/attention's ATTENTION set). Includes `errored`: a crashed or mid-stream-stalled agent is
@@ -67,45 +65,21 @@ import type { AgentKind, AgentTab, AgentTabStatus } from "./types";
 const isRelayRed = (s: AgentTabStatus | undefined): boolean =>
   s === "approval" || s === "waiting" || s === "errored";
 
-/** The name other windows should show — Claude Code's title if known, else the auto-name, else the
- *  fallback. Mirrors useRosterPublisher.displayName. */
-const displayName = (a: AgentTab): string =>
-  a.aiTitle || a.autoNameVariants?.title || a.name;
-
-/** Which of THIS window's agents may claim a row in every OTHER window's cross-window attention
- *  block: the red ones, minus every worker.
- *
- *  The cross-window block is a SECOND agent list, independent of the one `orderedTopLevelAgents`
- *  feeds — so the "workers are never top-level rows" rule has to be restated here or a red worker
- *  leaks straight back into the sidebar of every other window, project pill and all (which is
- *  exactly what kept happening after that fix). The user works with orchestrators; a worker is
- *  reachable only inside its parent's card, and that card lives in the OWNING window, so a worker
- *  row here isn't even clickable-to-anything-useful.
- *
- *  The red isn't dropped on the floor: the caller runs the worker-attention overlays first, so a red
- *  worker has already bubbled its status onto its orchestrator and THAT is the row we publish. An
- *  orphaned worker (parent gone) has nobody to bubble to and simply goes quiet — the same trade
- *  orderedTopLevelAgents made, and a teardown-window edge case either way. */
-export function crossWindowRedAgents<
-  A extends { id: string; kind: AgentKind; parentId: string | null },
->(agents: readonly A[], publishStatus: StatusMap): A[] {
-  return agents.filter((a) => a.kind !== "worker" && isRedStatus(publishStatus[a.id]));
-}
-
-/** The overlaid status this window BROADCASTS — the same chain AgentSidebar's `effectiveStatus`
- *  applies to color its own rows, kept here as one exported function so the two can be compared (and
- *  tested) instead of drifting as two hand-copied call stacks. Order is the contract:
+/** The PUBLISHED status map — the same chain AgentSidebar's `effectiveStatus` applies to color its
+ *  own rows, kept here as one exported function so the two can be compared (and tested) instead of
+ *  drifting as two hand-copied call stacks. Read today by the concierge feed (services/
+ *  conciergeFeed) for its P0/P1/P2 banding. Order is the contract:
  *
  *   1. `withUnstartedWorkerAttention` — a worker whose worktree was cut but which never went live has
  *      NO status entry, so nothing downstream would call it red. Invents the red and bubbles it.
  *   2. `withRedWorkerAttention` — a worker that started and then went red paints its orchestrator.
  *      After (1) so a strand's synthetic red bubbles too.
- *      Steps 1–2 are load-bearing, not cosmetic: `crossWindowRedAgents` drops workers from the
- *      published list, so without these bubbles a build whose worker is stuck would broadcast nothing
- *      at all. The orchestrator carries it instead — the only row another window could act on anyway,
- *      since the worker's card lives in the OWNING window.
- *   3. `withUnmergedWork` — a finished agent with un-landed committed work goes red `unmerged`, so a
- *      done-but-unmerged agent shows red in other projects' views too.
+ *      Steps 1–2 are load-bearing, not cosmetic: consumers list orchestrators, not workers, so
+ *      without these bubbles a build whose worker is stuck would surface nothing at all — the
+ *      orchestrator carries it, which is the row the user can act on anyway.
+ *   3. `withUnmergedWork` — a finished agent with un-landed committed work goes `unmerged`. That is
+ *      a GRAY status (packages/ui/tokens.ts), so it never reaches this file's red paths; it is
+ *      composed here only so the published map matches the sidebar's exactly.
  *   4. `withDismissedAlerts` — a dismissed red alarm de-escalates, so a row that reads calm in its own
  *      project is not broadcast as red elsewhere (the original cross-project bug). Strictly after (3):
  *      dismissal last, or it would re-redden a just-calmed row (see withUnmergedWork's header).
@@ -161,7 +135,7 @@ interface ActivityStamp {
 /** Fold this tick's owned agents into the activity-change stamp map. For each agent: first sighting
  *  → `at = 0` (unknown age); value changed vs last seen → `at = now` (just narrated); unchanged →
  *  keep the prior stamp. The returned map is pruned to exactly the current agents (an agent that
- *  left the set and returns gets a fresh first-sighting), mirroring the redSince bookkeeping. Pure. */
+ *  left the set and returns gets a fresh first-sighting). Pure. */
 export function stampActivity(
   prev: Record<string, ActivityStamp>,
   agents: ReadonlyArray<{ id: string; activity?: string }>,
@@ -226,39 +200,19 @@ async function bringToFront(): Promise<void> {
   }
 }
 
-/** Mount the agent (so its pane exists) and make it the selected tab — and crucially REVEAL it.
- *  A cross-window "needs attention" jump lands here in the owning window, but that window may be
- *  showing a special overlay (Sparkle/Plan board) or sitting on a chevron whose mode filter HIDES
- *  this agent (the publish side advertises every red agent regardless of kind/mode, while the
- *  sidebar only paints the current mode's rows). Selecting alone would leave the agent filtered out
- *  of view — the "it's red somewhere but I can't find it" report. So leave any special overlay and
- *  switch the chevron to the agent's kind first, so the agent is actually surfaced and shown. */
-export function selectAndOpen(projectId: string, agentId: string): void {
-  const agent = useProjectStore
-    .getState()
-    .projects.find((p) => p.id === projectId)
-    ?.agents.find((a) => a.id === agentId);
-  useUiStore.getState().setActiveSpecial(null);
-  // Every agent's pane is a terminal now, surfaced under the Build chevron — switch to it so the
-  // revealed agent is actually shown (rather than sitting behind the Plan board).
-  if (agent) {
-    useUiStore.getState().setWorkMode("build");
-  }
-  useRuntimeStore.getState().open(agentId);
-  useProjectStore.getState().selectAgent(projectId, agentId);
-}
+/** The shared reveal, now in services/agentReveal (it had to leave this module so openProjectTab
+ *  could use it without the two importing each other). Re-exported: every existing caller — the
+ *  sidebar, the concierge feed, openProjectTab — keeps its import path. */
+export { selectAndOpen } from "./services/agentReveal";
 
 export function useAttentionNotifications(): void {
   const status = useRuntimeStore((s) => s.status);
-  // Branch + workflow-stage maps feed the cross-window publish's `unmerged` overlay (a finished agent
-  // with un-landed committed work broadcasts red). Subscribed (not getState) so the publish re-runs
-  // when an agent's stage advances even if its runtime status hasn't changed.
-  const branchStatus = useRuntimeStore((s) => s.branchStatus);
-  const workflowStage = useRuntimeStore((s) => s.workflowStage);
-  // Which agents are live, for the publish chain's unstarted-worker overlay. The store keeps this
-  // array's reference stable on a no-op open() (see mergeOpenAgentIds), so subscribing here does not
-  // churn the effect on every tick.
-  const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
+  // NOTE (roborev 46897): branchStatus / workflowStage / openAgentIds are deliberately NOT
+  // subscribed here any more. Their only consumer was the cross-window publish's overlay chain,
+  // deleted with that channel — and `branchStatus` takes a fresh object identity on every poll, so
+  // keeping the subscription re-rendered this hook's host and re-ran the notification effect on
+  // every branch poll to service a dependency nothing read. `publishedStatusFor` still takes them
+  // as PARAMETERS for the concierge feed, which is now their only caller.
   const projectId = useCurrentProjectId();
   const label = useCurrentWindowLabel();
   const isMain = useIsMainWindow();
@@ -288,14 +242,9 @@ export function useAttentionNotifications(): void {
   const prevProject = useRef<string | null>(null);
   // agentId -> the attention_id we sent the phone, so we can resolve it when it clears.
   const attentionIds = useRef<Record<string, string>>({});
-  // agentId -> epoch ms it entered the red tier. Stamped on the FIRST red tick, reused on later
-  // ticks (so the timestamp is "when it went red", not "when we last recomputed"), and pruned to the
-  // currently-red set each run so an agent that leaves red and returns gets a FRESH timestamp. Read
-  // cross-window as the `since` that picks each window's most-recently-red representative row.
-  const redSince = useRef<Record<string, number>>({});
   // agentId -> {value, at}: the last activity narration we observed and WHEN it first appeared this
   // session. Feeds selfReportBody's freshness test (Phase-2b). Pruned to the current owned agents
-  // each run by stampActivity, same lifecycle as redSince.
+  // each run by stampActivity.
   const activitySeen = useRef<Record<string, ActivityStamp>>({});
 
   // Badge + notification side-effects, recomputed whenever status, the owned agent set, or the
@@ -310,32 +259,12 @@ export function useAttentionNotifications(): void {
     // every run (before the sameProject gate) so a project switch still re-baselines the stamps.
     activitySeen.current = stampActivity(activitySeen.current, agents, now);
 
-    // Publish THIS window's red (needs-you) agents to the cross-window status channel so other
-    // windows can surface them at the top of their sidebar. The overlaid status we broadcast is the
-    // same one the in-sidebar row color uses — see publishedStatusFor for the chain and why its
-    // order is a contract. An empty set deletes our entry.
-    const publishStatus = publishedStatusFor(agents, status, new Set(openAgentIds), (id) =>
-      resolveStage(branchStatus[id], workflowStage[id]),
-    );
-    const nextRedSince: Record<string, number> = {};
-    // Workers never claim a cross-window row (see crossWindowRedAgents) — their red rides up to the
-    // orchestrator in (1) above.
-    const redList = crossWindowRedAgents(agents, publishStatus).map((a) => {
-      const st = publishStatus[a.id]!;
-      // Reuse the existing stamp if this agent was already red; else it just entered red now.
-      const since = redSince.current[a.id] ?? now;
-      nextRedSince[a.id] = since;
-      return { id: a.id, name: displayName(a), status: st, since };
-    });
-    // Prune to only currently-red ids so a later return-to-red gets a fresh Date.now() above.
-    redSince.current = nextRedSince;
-    // A project switch (Open/Replace) must reach other windows NOW, not on the 250ms debounce: until
-    // they re-read, their snapshot still carries THIS window's previous project's red agents, and the
-    // reader-side staleness guard can only drop them on a re-read. Read before prevProject.current is
-    // updated at the end of this effect, so it still holds the PREVIOUS project here.
-    const projectChanged = prevProject.current !== projectId;
-    publishWindowRedAgents(label, projectId ?? "", projectName, redList, undefined, projectChanged);
-
+    // The cross-window status BROADCAST is gone (roborev 46485-M). It existed so a second window
+    // could list this window's red agents at the top of its sidebar; CM-U7 part 2 deleted that
+    // reader along with the multi-window shell, and a writer with no reader is a localStorage
+    // write plus a Tauri emit on every status change, feeding nothing. What replaced it: one
+    // window shows every project (the tab bar surfaces other projects' reds), and the tray/phone
+    // read the roster published by useRosterPublisher.
     const sameProject = prevProject.current === projectId;
     if (sameProject) {
       // Read live at fire time (no extra deps / re-baselining): is THIS window the OS-focused
@@ -384,7 +313,10 @@ export function useAttentionNotifications(): void {
             // screen" non-error. Pre-trim here so we only summarize a screen with real content.
             if (screenText?.trim()) {
               awaited = true;
-              const trimmed = (await summarizeAttention(screenText))?.trim();
+              // Metering-only: attributes the summarizer's debit to the agent's OWNING project.
+              const trimmed = (
+                await summarizeAttention(screenText, projectNameForAgent(id))
+              )?.trim();
               if (trimmed) {
                 summary = trimmed;
                 haikuBody = trimmed;
@@ -475,53 +407,128 @@ export function useAttentionNotifications(): void {
     label,
     projectName,
     enabled,
-    branchStatus,
-    workflowStage,
-    openAgentIds,
   ]);
 
-  // Report 0 + drop our cross-window status entry on unmount so a closed window stops contributing
-  // to the badge total and stops surfacing its (now-gone) red agents in other windows' sidebars.
+  // Report 0 on unmount so a closed window stops contributing to the app-global badge total.
   useEffect(
     () => () => {
       reportAttentionCount(label, 0);
-      clearWindowStatus(label);
     },
     [label],
   );
 
-  // Notification-click routing. Registered once; reads live window/project via refs.
+  // Notification-click routing. Registered once; reads the live current project via a ref.
   const ctx = useRef({ projectId, label, isMain, replace });
   ctx.current = { projectId, label, isMain, replace };
   useEffect(() => {
+    // A cross-webview payload can name a project/agent this window's store hasn't rehydrated yet
+    // (crossWindowSync coalesces up to 300ms — the tray adds a project, then immediately asks us
+    // to show it). Dropping would be a dead click (roborev 46328-M2), so on an unknown id we
+    // DEFER the whole response — raise included — and act once the id appears.
+    //
+    // Exactly ONE deferral is ever in flight, and the effect's cleanup cancels it (roborev
+    // 46485-M). Both properties are load-bearing: an untracked deferral fires `replace` /
+    // `selectAndOpen` after this hook unmounts (store writes from a dead tree, and cross-test
+    // bleed, since the stores are module state); and N un-deduped deferrals mean the tab you
+    // land on is whichever project rehydrated last, not the notification you clicked.
+    let cancelPending: (() => void) | null = null;
+    /** Drop whatever deferral is watching the store. Called by BOTH handlers before they act —
+     *  `awaitInStore` cancelling its own predecessor covers deferral-vs-deferral, but the
+     *  focus-agent FAST path reveals inline and never enters awaitInStore, so a pending deferral
+     *  would still fire afterwards and re-point the tab at the older click (roborev 46897). */
+    const cancelDeferral = (): void => cancelPending?.();
+    const awaitInStore = (
+      probe: () => boolean,
+      act: () => void,
+      timeoutMs = 3_000,
+    ): void => {
+      cancelDeferral();
+      if (probe()) {
+        act();
+        return;
+      }
+      const stop = () => {
+        cancelPending = null;
+        unsub();
+        clearTimeout(timer);
+      };
+      const unsub = useProjectStore.subscribe(() => {
+        if (!probe()) return;
+        stop();
+        act();
+      });
+      const timer = setTimeout(stop, timeoutMs);
+      cancelPending = stop;
+    };
     const handle = (p: FocusAgentPayload) => {
-      const { projectId: mine, isMain: main, replace: setProject } = ctx.current;
+      const { projectId: mine, replace: setProject } = ctx.current;
+      // VALIDATE FIRST. The broadcast can be stale (the tray's roster lags a deletion) or rogue,
+      // and everything below is a side effect: `runtimeStore.open` does not check that the agent
+      // exists, so a phantom id would sit in `openAgentIds` forever (roborev 46249-L1). But a
+      // stale AGENT id must still raise the window and land on its project when that project
+      // exists (roborev 46328-M3) — the user clicked a notification; give them the closest thing.
+      //
+      // The RAISE rides along with that validation instead of preceding it (roborev 46485-L):
+      // a window that jumps to the front is a real interruption, so it is owed to a payload that
+      // names something we can show — immediately when the project is already here, one coalesce
+      // later when it is still rehydrating, and never for an id that never arrives.
+      if (!agentExists(p.projectId, p.agentId)) {
+        awaitInStore(
+          () => useProjectStore.getState().projects.some((x) => x.id === p.projectId),
+          () => {
+            void bringToFront();
+            if (agentExists(p.projectId, p.agentId)) {
+              // The agent arrived with the rehydrate — do the full reveal after all.
+              const { projectId: cur, replace: set } = ctx.current;
+              if (p.projectId !== cur) set(p.projectId);
+              selectAndOpen(p.projectId, p.agentId);
+            } else {
+              openProjectTab(p.projectId);
+            }
+          },
+        );
+        return;
+      }
       // If the click carried a specific prompt (tray breadcrumb), queue a scroll to that turn; the
       // target agent's AgentPane consumes it once its terminal is mounted + PTY-ready. Missing/
       // scrolled-out markers (or think agents with no terminal) simply open without scrolling.
       const jumpToPrompt = () => {
         if (p.promptId) useScrollIntentStore.getState().request(p.agentId, p.promptId);
       };
-      if (p.projectId === mine) {
-        void bringToFront();
-        selectAndOpen(p.projectId, p.agentId);
-        jumpToPrompt();
-        return;
-      }
-      // Orphaned project (no window currently shows it) — the main window adopts it. Otherwise
-      // the window that owns it handles this same broadcast via the `=== mine` branch above.
-      if (findWindowForProject(p.projectId) == null && main) {
-        setProject(p.projectId);
-        selectAndOpen(p.projectId, p.agentId);
-        jumpToPrompt();
-        void bringToFront();
-      }
+      // SINGLE-WINDOW SHELL (CM-U7): this window shows every project, one per TAB, so it always
+      // handles the broadcast — there is no owning-window question and no orphan case. A target in
+      // another project simply selects that project's tab first (which is what `replace` now does).
+      // This click resolves NOW, so any older deferral still waiting for its project is stale.
+      cancelDeferral();
+      void bringToFront();
+      if (p.projectId !== mine) setProject(p.projectId);
+      selectAndOpen(p.projectId, p.agentId);
+      jumpToPrompt();
+    };
+    // "Show me this project" from the tray/capture webview: select the tab and raise the window,
+    // and NOTHING else — no agent is mounted, no PTY spawned, no workMode flip. That is the whole
+    // difference from focus-agent, and the reason this is its own event (see services/attention).
+    const handleSelectProject = (p: SelectProjectPayload) => {
+      // Raise + select together, deferring briefly if the project was just added in another
+      // webview and hasn't rehydrated here yet (roborev 46328-M2 / 46485-L).
+      awaitInStore(
+        () => useProjectStore.getState().projects.some((x) => x.id === p.projectId),
+        () => {
+          void bringToFront();
+          openProjectTab(p.projectId);
+        },
+      );
     };
     // Keep the listen() promise; safeUnlisten awaits it on cleanup so a listener that resolves
     // AFTER unmount is still torn down (and the Tauri teardown race is swallowed).
     const unlistenPromise = onFocusAgent(handle);
+    const unlistenSelect = onSelectProject(handleSelectProject);
     return () => {
       void safeUnlisten(unlistenPromise);
+      void safeUnlisten(unlistenSelect);
+      // Drop any deferral still watching the store: without this it fires into an unmounted tree
+      // (and, in tests, into the NEXT case's stores — roborev 46485-M).
+      cancelDeferral();
     };
   }, []);
 }

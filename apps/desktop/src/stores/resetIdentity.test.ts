@@ -12,7 +12,7 @@ describe("projectStore.resetAutoName", () => {
 
   it("clears an auto-name back to the kind default and drops auto-name metadata (unpinned agent)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     const defaultName = useProjectStore
       .getState()
       .projects[0]!.agents.find((a) => a.id === aid)!.name; // "Build 1"
@@ -39,7 +39,7 @@ describe("projectStore.resetAutoName", () => {
 
   it("leaves a never-auto-named agent's record reference untouched (no needless re-render on first launch)", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     const before = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
 
     useProjectStore.getState().resetAutoName(pid, aid);
@@ -50,7 +50,7 @@ describe("projectStore.resetAutoName", () => {
 
   it("is a no-op on a pinned (manually renamed) agent — the user's name is preserved", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     useProjectStore.getState().renameAgent(pid, aid, "My Custom Name");
 
     useProjectStore.getState().resetAutoName(pid, aid);

@@ -30,6 +30,7 @@ import {
 import { aiFeatureNow } from "../services/aiGate";
 import { deriveContextTags } from "../services/suggestions/contextTags";
 import { getAgentScrollback } from "../services/terminalScrollback";
+import { describePaths, pathKind, scrubPaths } from "../services/logSafePaths";
 import { useSuggestionStore } from "../stores/suggestionStore";
 import { closeBuildAgent } from "../services/closeBuildAgent";
 import { parseControlAction, CLOSE_AGENT_ACTION } from "../services/suggestions/controlButtons";
@@ -728,8 +729,16 @@ export function Composer({
       inputRef?.current?.focus();
       void Promise.all(
         paths.map((path) =>
-          loadAttachment(path).catch((e) => {
-            log.error("composer", "load dropped file failed", { path, e });
+          loadAttachment(path).catch((e: unknown) => {
+            // Log the file's KIND and a path-stripped reason, never the path itself — the log
+            // leaves the device with support tickets and crash reports (see logSafePaths). The
+            // rejection needs scrubbing too: `load_attachment` interpolates the path we gave it
+            // into every one of its failure messages.
+            const reason = e instanceof Error ? e.message : String(e);
+            log.error("composer", "load dropped file failed", {
+              kind: pathKind(path),
+              reason: scrubPaths(reason, path),
+            });
             return null;
           }),
         ),
@@ -764,7 +773,7 @@ export function Composer({
           if (isOverDndTarget(p.position, NEW_BUILD_AGENT_DND_TARGET)) return;
           const paths = p.paths ?? [];
           if (paths.length === 0) return;
-          log.info("composer", `dropped ${paths.length} file(s) into chat`, paths);
+          log.info("composer", `dropped ${paths.length} file(s) into chat`, describePaths(paths));
           attachPaths(paths);
         }
       })
@@ -789,7 +798,7 @@ export function Composer({
     if (!active) return;
     const paths = usePendingAttachmentsStore.getState().drain(agentId);
     if (paths.length === 0) return;
-    log.info("composer", `attaching ${paths.length} handed-off file(s)`, paths);
+    log.info("composer", `attaching ${paths.length} handed-off file(s)`, describePaths(paths));
     attachPaths(paths);
   }, [active, agentId, attachPaths]);
 

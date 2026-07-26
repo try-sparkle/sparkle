@@ -4,6 +4,11 @@
 // immutable, and the main window can display any project after a "Replace").
 
 export const WINDOW_REGISTRY_KEY = "sparkle-window-projects";
+// NOTE (roborev 46897): the cross-window LIVENESS half of this module — isWindowOpen,
+// openWindowLabels, allKeys, removeKey, getWindowProject, onWindowRegistryChange — is gone. Every
+// one of them existed to validate the per-window blobs of windowStatus.readOtherWindowsRedAgents,
+// which CM-U7 part 2 deleted along with the multi-window shell. What is left is the project↔window
+// MAPPING that captureSends still routes on.
 
 export type KV = {
   getItem(k: string): string | null;
@@ -17,22 +22,7 @@ export type KV = {
   readonly length?: number;
 };
 
-/** Every key currently in the store, or null when this KV can't enumerate. */
-export function allKeys(store: KV): string[] | null {
-  if (typeof store.key !== "function" || typeof store.length !== "number") return null;
-  const out: string[] = [];
-  for (let i = 0; i < store.length; i++) {
-    const k = store.key(i);
-    if (k != null) out.push(k);
-  }
-  return out;
-}
 
-/** Delete a key, tolerating a KV shim without removeItem. */
-export function removeKey(store: KV, key: string): void {
-  if (typeof store.removeItem === "function") store.removeItem(key);
-  else store.setItem(key, "");
-}
 
 /** The localStorage-backed KV, with a no-op fallback for non-browser (test/SSR) environments.
  *  Shared by the sibling windowStatus channel so the two key off the same storage. */
@@ -69,19 +59,6 @@ function write(store: KV, map: Record<string, string>): void {
   }
 }
 
-/** Subscribe to registry changes from THIS window (local event) and OTHER windows (storage). */
-export function onWindowRegistryChange(cb: () => void): () => void {
-  if (typeof window === "undefined") return () => {};
-  const onStorage = (e: StorageEvent) => {
-    if (e.key === null || e.key === WINDOW_REGISTRY_KEY) cb();
-  };
-  window.addEventListener(LOCAL_CHANGE_EVENT, cb);
-  window.addEventListener("storage", onStorage);
-  return () => {
-    window.removeEventListener(LOCAL_CHANGE_EVENT, cb);
-    window.removeEventListener("storage", onStorage);
-  };
-}
 
 export function setWindowProject(label: string, projectId: string, store: KV = defaultStore()): void {
   const map = read(store);
@@ -101,18 +78,7 @@ export function resetWindowRegistry(store: KV = defaultStore()): void {
   write(store, {}); // via write() so same-window subscribers (onWindowRegistryChange) are notified
 }
 
-/** Is the window with this exact label currently registered (open)? Label-keyed — the symmetric
- *  counterpart to setWindowProject/clearWindowProject — so a stale entry for a project another
- *  window now shows (after a crash + "Replace") isn't mistaken for this label still being open. */
-export function isWindowOpen(label: string, store: KV = defaultStore()): boolean {
-  return label in read(store);
-}
 
-/** Labels of every currently-registered (open) window. The sibling windowStatus channel enumerates
- *  these to find each window's own status key, instead of everyone sharing one blob (sparkle-csq2). */
-export function openWindowLabels(store: KV = defaultStore()): string[] {
-  return Object.keys(read(store));
-}
 
 export function findWindowForProject(projectId: string, store: KV = defaultStore()): string | null {
   const map = read(store);
@@ -122,11 +88,3 @@ export function findWindowForProject(projectId: string, store: KV = defaultStore
   return null;
 }
 
-/** The project this window is showing RIGHT NOW, or null when the label isn't registered (closed).
- *  The forward counterpart to findWindowForProject: that answers "which window shows project X?",
- *  this answers "what does window L show?". The registry is updated the moment a window opens or
- *  Replaces a project, so it is the authority any SELF-REPORTED per-window blob must be validated
- *  against before it's trusted — see windowStatus.readOtherWindowsRedAgents. */
-export function getWindowProject(label: string, store: KV = defaultStore()): string | null {
-  return read(store)[label] ?? null;
-}

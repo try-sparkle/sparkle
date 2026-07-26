@@ -44,6 +44,9 @@ export async function spawnWorker(args: {
     parentBranch: parent.branch,
     beadId: args.beadId,
   });
+  // Null means "no such project" — already rejected above; keep the check so the rollback/worktree
+  // machinery below can never run against a phantom worker id.
+  if (!workerId) throw new Error(`unknown project ${args.projectId}`);
 
   // Fail-closed rollback (sparkle-a670): drop the orphan tab, restore the user's previously-active
   // tab (removeAgent recomputes selection to agents[0], which may not be where the user was), and —

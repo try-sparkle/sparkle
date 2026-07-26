@@ -8,6 +8,7 @@ import { useAuthStore } from "./stores/authStore";
 import { advance, type Advance } from "./voice/wakeMachine";
 import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDictation";
 import { safeUnlisten } from "./services/safeUnlisten";
+import { selectedProjectName } from "./services/creditProject";
 
 /**
  * The cloud-stream command (if any) a wake-machine transition implies. Pure so the
@@ -178,14 +179,14 @@ export async function createDictationController(
     listen<{ balanceCents: number | null; debitedCents: number }>(
       "dictation://cloud-balance",
       (e) => {
-        const { me } = useAuthStore.getState();
+        const { me, setMe } = useAuthStore.getState();
         if (!me) return;
         const { balanceCents, debitedCents } = e.payload;
-        useAuthStore.setState({
-          me: {
-            ...me,
-            balanceCents: nextBalanceCents(me.balanceCents, balanceCents, debitedCents),
-          },
+        // setMe, not setState: this frame carries a real balance change, and setMe is the seam that
+        // re-arms a dismissed $0 banner when the balance crosses back above zero (roborev 48271).
+        setMe({
+          ...me,
+          balanceCents: nextBalanceCents(me.balanceCents, balanceCents, debitedCents),
         });
       },
     ),
@@ -347,7 +348,10 @@ export function useAmbientVoice(): void {
   const openCloud = useRef(() => {
     if (!(aiFeatureNow("composer") && aiFeatureNow("voiceDictation"))) return;
     void openCloudDictationWindow({
-      startCloudStream: () => invoke<boolean>("start_cloud_stream"),
+      // Metering-only: attributes the per-minute dictation debits to the project the user is
+      // dictating into. Resolved at open time; undefined when no project is selected.
+      startCloudStream: () =>
+        invoke<boolean>("start_cloud_stream", { project: selectedProjectName() }),
       stopCloudStream: () => void invoke("stop_cloud_stream").catch(() => {}),
       isStillActive: () =>
         useDictationStore.getState().phase === "active" &&

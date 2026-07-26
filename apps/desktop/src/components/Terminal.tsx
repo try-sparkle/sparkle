@@ -7,8 +7,8 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { copyToClipboard } from "../clipboard";
 import { C, CHAT_USER_BUBBLE, xtermTheme } from "../theme/colors";
 import { useResolvedTheme } from "../theme/theme";
-import type { AgentTabStatus } from "../types";
-import { spawnPty, writePty, killPty, resizePty, setPtyPaused, ptyAck, onPtyOutput, onPtyExit, ignorePtyGone } from "../pty";
+import type { AgentTabStatus, Runtime } from "../types";
+import { getTransport, type AgentTransport } from "../services/agentTransport";
 import { StatusEngine } from "../engine/statusEngine";
 import { registerStatusEngine, unregisterStatusEngine } from "../engine/engineRegistry";
 import { snapshotScreen } from "../engine/screenSnapshot";
@@ -19,7 +19,6 @@ import { useInteractionStore } from "../stores/interactionStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { isComposerToggleKey } from "./composerToggle";
 import { isCopySelectionKey } from "./copySelectionKey";
-import { shouldToggleComposerOnClick } from "./terminalClickToggle";
 import { shouldReclaimPlainDrag } from "./terminalSelectionReclaim";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
@@ -30,7 +29,6 @@ import { isMeasuredSize, spawnSize } from "./terminalSize";
 import { PtyAckBatcher, PtyFlowController } from "./terminalFlow";
 import { SelectionPopup } from "./SelectionPopup";
 import { recoverFromWebglContextLoss, forceFullRepaint, settleRepaintPlan } from "./terminalWebgl";
-import { detectRateLimitReset } from "../services/rateLimitWatch";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { PH_NO_CAPTURE_CLASS } from "@sparkle/core";
 import { perfMark, perfSpan } from "../perfTrace";
@@ -64,15 +62,23 @@ const IDLE_SWEEP_MS = 500;
 // screenful of a default terminal.
 const IDLE_SWEEP_MIN_BYTES = 2048;
 
+// Hand a link clicked in terminal output to the OS default browser. Shared by BOTH link paths —
+// WebLinksAddon (bare URLs in the output) and xterm core's OSC 8 handler (escape-sequence
+// hyperlinks) — because each ships a stock handler that dead-ends in the Tauri webview.
+function openLinkFromTerminal(event: MouseEvent, uri: string): void {
+  event.preventDefault();
+  openUrl(uri).catch((err) => console.error("Failed to open URL from terminal:", uri, err));
+}
+
 // Push the live xterm size to the PTY — but ONLY when it came from a genuinely laid-out
 // container. fit() on a display:none / pre-layout pane collapses to a tiny size (cols≈12), and
 // sending that to the PTY makes the agent CLI hard-wrap its output into a thin column that no
 // later resize can un-wrap. See terminalSize.ts. term.element exists once term.open() has run;
 // its clientWidth is 0 while the pane is hidden.
-function syncPtySize(agentId: string, term: XTerm): void {
+function syncPtySize(transport: AgentTransport | null, term: XTerm): void {
   const laidOut = !!term.element && term.element.clientWidth > 0;
   if (!isMeasuredSize(laidOut, term)) return;
-  void resizePty(agentId, term.cols, term.rows).catch(ignorePtyGone);
+  transport?.resize(term.cols, term.rows);
 }
 
 /**
@@ -128,13 +134,14 @@ export function Terminal({
   onStatus,
   onReady,
   onExit,
-  onRateLimit,
   onRequestFocus,
   onSubmitLine,
-  onToggleComposer,
+  composerOverlay = false,
   focusRef,
   apiRef,
   resuming = false,
+  calm = false,
+  runtime = "local",
 }: {
   agentId: string;
   projectId: string;
@@ -151,25 +158,30 @@ export function Terminal({
   // (or a fresh Claude's banner load) leaves the pane blank for seconds, which — next to a sidebar
   // already showing a named, working agent — reads as broken. Defaults false (fresh).
   resuming?: boolean;
+  // PRD §3 "calm": this agent has nothing for you (P2), so its text recedes to one gray while the
+  // P0/P1 agents keep color. Applied as the terminal's OWN theme, not a filter over the pane — see
+  // theme/colors.xtermTheme for why the filter had to go.
+  calm?: boolean;
+  // Which transport backs this terminal: "local" (a PTY on the Mac, today's behavior) or "cloud"
+  // (a Sparkle-provisioned E2B sandbox, streamed over the relay). Selects LocalTransport vs
+  // CloudTransport via getTransport — so a cloud agent never spawns a local PTY. Defaults to
+  // "local" so every existing call site (and its tests) is unchanged.
+  runtime?: Runtime;
   onStatus: (s: AgentTabStatus) => void;
   onReady?: () => void;
   onExit?: () => void;
-  // Best-effort (Phase 1) multi Claude Max failover: invoked with an epoch-ms reset instant the
-  // first time this PTY's output looks like a usage/rate-limit message, so the parent can flag the
-  // chosen account exhausted. Detection is isolated and wrapped so it can never break rendering.
-  onRateLimit?: (untilEpoch: number) => void;
   // Called when the active tab is shown, to put initial focus in the composer.
   onRequestFocus?: () => void;
   // Called when the user submits a line to the agent by pressing Enter directly in the terminal
   // (a carriage return in USER input) — one call per submitted line. The parent uses this to meter
   // free-trial prompts for trial users who type into the raw terminal (no composer). Best-effort.
   onSubmitLine?: () => void;
-  // Called when the user gives the terminal body a plain click (no drag, no text selection), to
-  // toggle the composer's minimized state — a third trigger alongside ⌘J and the drag handle.
-  // Provided ONLY when the composer feature is on (otherwise there's nothing to toggle), so its
-  // presence also gates the behavior. Flipping the store's composerMinimized drives focus-follow,
-  // so this handler doesn't manage focus itself.
-  onToggleComposer?: () => void;
+  // Does a COMPOSER float over this terminal? True only for the Improve-Sparkle pane, which kept
+  // its Composer when CM-U7 removed the builder panes' (SparkleAgentPane renders one as a sibling
+  // over an absolutely-positioned Terminal). It gates the plain-drag selection reclaim below —
+  // hardcoding it to `false` made that patch a provable no-op AND silently took Option-free
+  // selection away from the one pane that still qualifies (roborev 46485-M).
+  composerOverlay?: boolean;
   // The parent sets this to an imperative focus() so it can move focus into the terminal
   // (e.g. on ⌘J / when the composer minimizes) without the user clicking it.
   focusRef?: RefObject<(() => void) | null>;
@@ -179,6 +191,10 @@ export function Terminal({
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  // The transport backing this terminal (Local or Cloud), created in the mount effect and read by
+  // the visibility/zoom effects (which need it to resize the PTY without re-subscribing). Nulled on
+  // teardown so a late effect callback hits a null guard rather than a stale transport.
+  const transportRef = useRef<AgentTransport | null>(null);
   // promptHistory entry id -> the xterm marker at the line where that prompt was sent. Drives
   // "jump to this prompt" (pinned-prompt dropdown + history search). Session-only.
   const markersRef = useRef<Map<string, IMarker>>(new Map());
@@ -194,16 +210,12 @@ export function Terminal({
   // Latest onRequestFocus, read by the (agentId-keyed) effect without re-subscribing.
   const onRequestFocusRef = useRef(onRequestFocus);
   onRequestFocusRef.current = onRequestFocus;
-  // Latest onRateLimit, read by the (agentId-keyed) output effect without re-subscribing.
-  const onRateLimitRef = useRef(onRateLimit);
-  onRateLimitRef.current = onRateLimit;
   // Latest onSubmitLine, read by the (agentId-keyed) onData handler without re-subscribing.
   const onSubmitLineRef = useRef(onSubmitLine);
   onSubmitLineRef.current = onSubmitLine;
-  // Latest onToggleComposer, read by the (agentId-keyed) container mouse handlers without
-  // re-subscribing. Null when the composer feature is off — the click handler no-ops then.
-  const onToggleComposerRef = useRef(onToggleComposer);
-  onToggleComposerRef.current = onToggleComposer;
+  // Latest composerOverlay, read by the (agentId-keyed) selection patch without re-subscribing.
+  const composerOverlayRef = useRef(composerOverlay);
+  composerOverlayRef.current = composerOverlay;
   const zoom = useUiStore((s) => s.zoom);
   const resolvedTheme = useResolvedTheme();
   // Brief "Copied to clipboard" flash shown after a mouse selection is copied.
@@ -335,6 +347,12 @@ export function Terminal({
     let disposed = false;
     const unlistens: Array<() => void> = [];
 
+    // Select the transport by runtime. Local → a PTY on the Mac (pty.ts, unchanged behavior); cloud
+    // → the relay stream for the already-running server session (never spawns a local PTY). Every
+    // verb below (spawn/write/resize/kill/output/exit) goes through this, not pty.ts directly.
+    const transport = getTransport({ id: agentId, runtime });
+    transportRef.current = transport;
+
     const term = new XTerm({
       // System monospaces (Menlo/SF Mono) carry full box-drawing glyphs as a fallback;
       // the Google-Fonts subset of Source Code Pro drops U+2500-block glyphs.
@@ -355,21 +373,24 @@ export function Terminal({
       macOptionClickForcesSelection: true,
       // Concrete hex (xterm can't read CSS var()); the effect below keeps it in sync when the
       // resolved theme changes. Initial value captured at mount.
-      theme: xtermTheme(resolvedTheme),
+      theme: xtermTheme(resolvedTheme, calm),
+      // OSC 8 hyperlinks (the escape sequence CLIs use to make a WORD clickable, as opposed to a
+      // bare URL in the output) are matched by xterm CORE, not by WebLinksAddon — so the addon
+      // handler below never sees them. Core's stock handler calls window.confirm() and then
+      // window.open(), and both are dead ends in the Tauri webview: confirm is shimmed onto
+      // `plugin:dialog|confirm`, which our capability doesn't grant (`dialog:default` covers only
+      // message/save/open), so it rejects as an unhandled rejection; window.open is blocked for
+      // external URLs. Net effect: clicking an OSC 8 link did nothing at all. Route it through the
+      // opener plugin, same as the addon path. `allowNonHttpProtocols` stays at its default
+      // (false), so only http(s) targets reach the handler.
+      linkHandler: { activate: openLinkFromTerminal },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
-    // Make http(s) URLs in terminal output clickable. The default addon handler uses
+    // Make bare http(s) URLs in terminal output clickable. The default addon handler uses
     // window.open, which the Tauri webview blocks for external URLs; route through the
     // opener plugin instead so links launch in the OS default browser.
-    term.loadAddon(
-      new WebLinksAddon((event, uri) => {
-        event.preventDefault();
-        openUrl(uri).catch((err) =>
-          console.error("Failed to open URL from terminal:", uri, err),
-        );
-      }),
-    );
+    term.loadAddon(new WebLinksAddon(openLinkFromTerminal));
     term.open(container);
 
     // Reclaim plain (no-Option) drags as text selections while the composer is open, even when a
@@ -393,8 +414,9 @@ export function Terminal({
         const orig = svc.shouldForceSelection.bind(svc);
         svc.shouldForceSelection = (ev: MouseEvent) =>
           shouldReclaimPlainDrag(
-            // Composer feature on ⇔ the toggle callback is wired (null when the feature is off).
-            onToggleComposerRef.current != null,
+            // True only where a composer actually overlays the terminal (the Improve-Sparkle
+            // pane). Builder panes lost theirs with CM-U7, so there the policy is simply off.
+            composerOverlayRef.current,
             useUiStore.getState().composerMinimized,
           ) || orig(ev);
       } else {
@@ -485,7 +507,7 @@ export function Terminal({
       useInteractionStore.getState().touch(agentId);
       const submits = scanSubmittedLines(lineScan, d);
       for (let i = 0; i < submits; i += 1) onSubmitLineRef.current?.();
-      void writePty(agentId, d).catch(ignorePtyGone);
+      transport.write(d);
     });
 
     // Copy the current xterm selection to the clipboard and flash the "Copied" confirmation.
@@ -592,14 +614,14 @@ export function Terminal({
           // Encode against the app's cursor-key mode (DECCKM) so the bytes match a real keypress;
           // see arrowKeySequence. `term.modes` reflects whatever the running TUI last requested.
           const seq = arrowKeySequence(dir, term.modes.applicationCursorKeysMode);
-          void writePty(agentId, seq).catch(ignorePtyGone);
+          transport.write(seq);
         },
         enterFromComposer: () => {
           term.focus();
           // \r is the byte a real Enter sends to a PTY (the running TUI translates it per its
           // input mode, exactly as it would a keyboard Enter). This confirms the highlighted menu
           // choice when the user presses Enter in an empty composer.
-          void writePty(agentId, "\r").catch(ignorePtyGone);
+          transport.write("\r");
         },
         markPrompt: (promptId) => {
           // Scrollback lives on the normal buffer only; a full-screen TUI (alternate buffer) has
@@ -651,25 +673,14 @@ export function Terminal({
       };
     }
 
-    // Best-effort multi Claude Max failover (Phase 1): scan output for a usage/rate-limit message
-    // and fire onRateLimit ONCE per spawn. A small rolling buffer catches a message split across
-    // chunks; `rateLimitFired` debounces repeats. Wrapped so a detection error can never disrupt
-    // term.write/engine.ingest — terminal rendering must stay bulletproof.
-    let rateLimitBuf = "";
-    let rateLimitFired = false;
-    const watchRateLimit = (chunk: string) => {
-      if (rateLimitFired || !onRateLimitRef.current) return;
-      try {
-        rateLimitBuf = (rateLimitBuf + chunk).slice(-4096);
-        const until = detectRateLimitReset(rateLimitBuf, Date.now());
-        if (until != null) {
-          rateLimitFired = true;
-          onRateLimitRef.current(until);
-        }
-      } catch {
-        /* detection is best-effort; never let it break the output pipeline */
-      }
-    };
+    // NOTE: this is deliberately NOT where rate-limit failover is detected. Phase 1 scraped a
+    // rolling window of raw PTY text here for `rate limit|usage limit|…`, which cannot distinguish
+    // a real limit from an agent printing those words — on a real machine it benched two healthy
+    // accounts for 4h apiece purely from the agent's own diagnostic output, while never once firing
+    // on the message Claude Code actually emits. Detection now reads the STRUCTURED
+    // `error: "rate_limit"` record out of each account's own transcripts (Rust `accounts_limit_events`
+    // → services/rateLimitWatch), which is unforgeable by terminal text. Do not reintroduce a text
+    // matcher here.
 
     // Whether this terminal's canvas can actually paint right now (it's laid out and visible).
     // A display:none pane has a 0-width element; output written then is cache-poisoned (see
@@ -730,66 +741,67 @@ export function Terminal({
     // the high-water mark, pause the PTY reader (the child then blocks on its own write) until the
     // backlog drains below the low-water mark. Bounds xterm + IPC memory under a runaway-verbose
     // child without dropping bytes or touching normal interactive output. See terminalFlow.ts.
-    // Serialize pause/resume onto a single promise chain: Tauri may service sync commands
-    // concurrently, so firing two independent invokes could let a `false` land before an
-    // earlier `true` and park the reader forever. Chaining guarantees the Rust side sees them
-    // in issue order (roborev nit on ).
-    let flowChain: Promise<void> = Promise.resolve();
+    // Pause/resume the PTY reader across the parse-backlog watermarks. The serialization that keeps
+    // a `false` from overtaking an earlier `true` (roborev nit on ) now lives inside
+    // LocalTransport.setPaused; a cloud transport omits setPaused entirely (the server owns its
+    // sandbox PTY's backpressure), so the optional call is a no-op there.
     const flow = new PtyFlowController((paused) => {
-      flowChain = flowChain.then(() => setPtyPaused(agentId, paused)).catch(ignorePtyGone);
+      transport.setPaused?.(paused);
     });
     // The OTHER half of backpressure, and the one that bounds the IPC queue itself: Rust charges
     // every emitted chunk against a per-PTY credit ceiling and parks its flusher/reader once the
     // frontend falls behind. Returning that credit here — after xterm has PARSED the chunk, not
     // merely after we dequeued it — is what makes the producer's accounting reflect real progress.
-    // Batched so a flood doesn't cost one invoke per chunk. See terminalFlow.ts / pty.rs.
-    const acks = new PtyAckBatcher((bytes) => void ptyAck(agentId, bytes).catch(ignorePtyGone));
+    // Batched so a flood doesn't cost one invoke per chunk. See terminalFlow.ts / pty.rs. Cloud
+    // transports omit ack (no local IPC credit to return), so the optional call is a no-op there.
+    const acks = new PtyAckBatcher((bytes) => transport.ack?.(bytes));
+
+    // Subscribe to output + exit BEFORE spawning (the transport's onOutput/onExit return a sync
+    // unlisten but register their listener under the hood; transport.spawn awaits that registration
+    // for the local PTY, preserving the pre-seam listen-before-spawn ordering). Registered
+    // synchronously here, so cleanup always has both unlistens even if the spawn below is still in
+    // flight when the component unmounts.
+    const offOut = transport.onOutput((e) => {
+      // First byte for this agent — drop the loading overlay. setState bails on an unchanged
+      // value, so calling this on every subsequent chunk costs nothing.
+      // Load-bearing ordering: set gotOutputRef SYNCHRONOUSLY here, before any exit can be
+      // observed, so the exit handler's `!gotOutputRef.current` check correctly distinguishes
+      // "exited after output" (normal end) from "exited with no output" (show the retry state).
+      gotOutputRef.current = true;
+      setFirstOutput(true);
+      setSpawnFail(null); // output means it's alive — clear any prior failed/exited state
+      // Flow control: register the chunk BEFORE writing, then release it when xterm finishes
+      // parsing (the write callback). string length is a fine byte proxy for the watermarks.
+      const chunkLen = e.chunk.length;
+      flow.onEnqueue(chunkLen);
+      term.write(e.chunk, () => {
+        flow.onParsed(chunkLen);
+        // Ack Rust's OWN byte count (UTF-8), not chunkLen (UTF-16 units) — the two differ on any
+        // non-ASCII output and drifting credit would eventually wedge or unbound the gate.
+        acks.add(e.bytes);
+      });
+      engine.ingest(e.chunk);
+      // Remember output that streamed in while we couldn't paint, so the next paintable settle
+      // (or the become-active reveal) repaints it instead of leaving the top half blank.
+      if (!isPaintable()) poisonedRef.current = true;
+      scheduleSettleRepaint();
+      bytesSinceSweep += chunkLen;
+      scheduleIdleSweep();
+    });
+    // The transport filters exit to THIS agent's id (pty:exit is a global channel), so no id check
+    // is needed here anymore.
+    const offExit = transport.onExit(() => {
+      engine.exit();
+      onExit?.();
+      // If the process exited WITHOUT ever emitting output, don't leave a silent blank pane:
+      // show an explicit "Agent exited — Start again" affordance (the spawnFail overlay) instead
+      // of the lingering "Starting…". (If output streamed first, firstOutput already cleared the
+      // overlay and this is a normal end-of-session — nothing to show.)
+      if (!gotOutputRef.current) setSpawnFail("exited");
+    });
+    unlistens.push(offOut, offExit);
 
     (async () => {
-      const offOut = await onPtyOutput(agentId, (e) => {
-        // First byte for this agent — drop the loading overlay. setState bails on an unchanged
-        // value, so calling this on every subsequent chunk costs nothing.
-        // Load-bearing ordering: set gotOutputRef SYNCHRONOUSLY here, before any exit can be
-        // observed, so the exit handler's `!gotOutputRef.current` check correctly distinguishes
-        // "exited after output" (normal end) from "exited with no output" (show the retry state).
-        gotOutputRef.current = true;
-        setFirstOutput(true);
-        setSpawnFail(null); // output means it's alive — clear any prior failed/exited state
-        // Flow control: register the chunk BEFORE writing, then release it when xterm finishes
-        // parsing (the write callback). string length is a fine byte proxy for the watermarks.
-        const chunkLen = e.chunk.length;
-        flow.onEnqueue(chunkLen);
-        term.write(e.chunk, () => {
-          flow.onParsed(chunkLen);
-          // Ack Rust's OWN byte count (UTF-8), not chunkLen (UTF-16 units) — the two differ on any
-          // non-ASCII output and drifting credit would eventually wedge or unbound the gate.
-          acks.add(e.bytes);
-        });
-        engine.ingest(e.chunk);
-        watchRateLimit(e.chunk);
-        // Remember output that streamed in while we couldn't paint, so the next paintable settle
-        // (or the become-active reveal) repaints it instead of leaving the top half blank.
-        if (!isPaintable()) poisonedRef.current = true;
-        scheduleSettleRepaint();
-        bytesSinceSweep += chunkLen;
-        scheduleIdleSweep();
-      });
-      const offExit = await onPtyExit((e) => {
-        if (e.id !== agentId) return;
-        engine.exit();
-        onExit?.();
-        // If the process exited WITHOUT ever emitting output, don't leave a silent blank pane:
-        // show an explicit "Agent exited — Start again" affordance (the spawnFail overlay) instead
-        // of the lingering "Starting…". (If output streamed first, firstOutput already cleared the
-        // overlay and this is a normal end-of-session — nothing to show.)
-        if (!gotOutputRef.current) setSpawnFail("exited");
-      });
-      if (disposed) {
-        void safeUnlisten(offOut);
-        void safeUnlisten(offExit);
-        return;
-      }
-      unlistens.push(offOut, offExit);
       // Re-fit right before spawning to capture the freshest measurement, then guard it: a pane
       // that's still display:none / pre-layout fits to a tiny size (cols≈12), which would make
       // the CLI hard-wrap into a thin column. spawnSize() falls back to safe defaults in that
@@ -802,7 +814,10 @@ export function Terminal({
       }
       const laidOut = !!term.element && term.element.clientWidth > 0;
       const { cols, rows } = spawnSize(laidOut, term);
-      await spawnPty({ id: agentId, command, args, cwd, cols, rows });
+      // A mount→unmount inside this async window must not spawn an orphan PTY the cleanup's
+      // detach (which already ran, on a not-yet-existing PTY) will never reap (roborev 46244).
+      if (disposed) return;
+      await transport.spawn({ command, args, cwd, cols, rows });
       // Layout may have settled — or a ResizeObserver resize may have been dropped because the
       // PTY didn't exist yet — during the async spawn. Now that the PTY exists, sync the true
       // size (no-op while still hidden; the become-active effect covers that).
@@ -812,7 +827,7 @@ export function Terminal({
         } catch {
           /* still not laid out */
         }
-        syncPtySize(agentId, term);
+        syncPtySize(transport, term);
         onReady?.();
       }
     })().catch((e) => {
@@ -825,12 +840,10 @@ export function Terminal({
       if (!disposed) setSpawnFail("failed");
     });
 
-    // Where the current press started, so mouseup can tell a stationary click from a drag.
-    let downAt = { x: 0, y: 0 };
-    // Copy-on-select: when the user finishes a mouse selection, copy it to the clipboard
-    // and flash a confirmation so the (otherwise invisible) copy is obvious. A plain click
-    // leaves an empty selection — nothing is copied and no toast shows; instead it toggles the
-    // composer (minimize to uncover the lines it floats over, restore to type again).
+    // Copy-on-select: when the user finishes a mouse selection, copy it to the clipboard and show
+    // the actions popup, so the (otherwise invisible) copy is obvious. A plain click leaves an
+    // empty selection — nothing is copied, nothing pops, and nothing else happens: the composer
+    // toggle that used to ride on it went with the pane composer (CM-U7 part 2).
     const onMouseUp = (e: MouseEvent) => {
       const sel = copySelectionToClipboard();
       if (sel) {
@@ -838,23 +851,9 @@ export function Terminal({
         setPopup({ x: e.clientX, y: e.clientY, text: sel });
         return;
       }
-      // No selection => a plain click (or a drag that selected nothing). Only a genuine stationary
-      // left-click toggles the composer; a drag must never flip it. This fires even while a
-      // mouse-tracking TUI is active ("click = Sparkle chrome") — see shouldToggleComposerOnClick.
-      // Gated on onToggleComposer being wired (composer feature on); term.hasSelection() is false
-      // here since copy returned null.
-      if (
-        shouldToggleComposerOnClick(e.button, downAt, { x: e.clientX, y: e.clientY }, term.hasSelection())
-      ) {
-        onToggleComposerRef.current?.();
-      }
     };
-    // A new drag (mousedown) dismisses any open popup before the next selection, and records the
-    // press origin for the click/drag discrimination above.
-    const onMouseDown = (e: MouseEvent) => {
-      setPopup(null);
-      downAt = { x: e.clientX, y: e.clientY };
-    };
+    // A new drag (mousedown) dismisses any open popup before the next selection.
+    const onMouseDown = () => setPopup(null);
     container.addEventListener("mouseup", onMouseUp);
     container.addEventListener("mousedown", onMouseDown);
 
@@ -866,7 +865,7 @@ export function Terminal({
         fit.fit();
         // Guard the push: a hide transition fires the observer with a 0×0 box, which fit()
         // collapses to a tiny size — sending that to the PTY re-creates the thin-column bug.
-        syncPtySize(agentId, term);
+        syncPtySize(transport, term);
         // Repaint the viewport. When the container grows (the pane becoming visible after
         // display:none, or the window enlarging), rows newly brought into view can stay blank —
         // xterm only repaints on resize when fit() actually changed the dimensions. applyRepaintPlan
@@ -895,7 +894,11 @@ export function Terminal({
       if (scrollRepaintTimer) window.clearTimeout(scrollRepaintTimer);
       if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
       for (const off of unlistens) void safeUnlisten(off);
-      void killPty(agentId).catch(ignorePtyGone);
+      // DETACH, never kill: unmount happens on tab close, StrictMode double-mount, and "Start
+      // again" — for a cloud agent, kill() would DELETE the server session that is supposed to
+      // outlive this pane (roborev 46244). Local detach == kill (pre-seam behavior).
+      void transport.detach().catch((e) => console.debug("terminal detach failed", agentId, e));
+      transportRef.current = null;
       unregisterStatusEngine(agentId, engine);
       engine.dispose();
       markersRef.current.clear(); // term.dispose() drops the markers; clear our handles too
@@ -967,7 +970,7 @@ export function Terminal({
       safeFit();
       onRequestFocusRef.current?.();
       // Push the true size to the PTY so its wrap column matches xterm (no-op while unmeasured).
-      syncPtySize(agentId, term);
+      syncPtySize(transportRef.current, term);
       // Defer the repaint one frame so the just-resized canvas has valid char dimensions before we
       // clear the WebGL model; otherwise the renderer bails (no valid dims) and wastes the clear.
       // disposedRef guards the deferred frame (#231/#258).
@@ -995,7 +998,7 @@ export function Terminal({
       if (disposedRef.current) return;
       try {
         safeFit();
-        syncPtySize(agentId, term);
+        syncPtySize(transportRef.current, term);
       } catch {
         /* ignore transient fit errors */
       }
@@ -1003,20 +1006,23 @@ export function Terminal({
     return () => cancelAnimationFrame(raf);
   }, [zoom, agentId, safeFit]);
 
-  // Re-theme the live terminal when the resolved theme changes (Light/Dark/Auto toggle or an
-  // OS appearance change while on Auto). xterm needs concrete hex, so it can't follow the CSS
+  // Re-theme the live terminal when the resolved theme (Light/Dark/Auto toggle, or an OS
+  // appearance change while on Auto) or the calm state changes. xterm needs concrete hex, so it can't follow the CSS
   // var() flip the rest of the app rides on — we push a fresh theme object instead.
   useEffect(() => {
     const term = termRef.current;
     if (disposedRef.current || !term) return;
-    term.options.theme = xtermTheme(resolvedTheme);
+    term.options.theme = xtermTheme(resolvedTheme, calm);
     // The WebGL renderer caches colored glyphs in a texture atlas; a bare options.theme set
     // can leave already-painted cells with stale colors until the next reflow. Clear the atlas
     // and force a full repaint so the live toggle is instantaneous like the rest of the app.
     // safeRefresh no-ops if a dispose raced in between the null check and here.
     webglRef.current?.clearTextureAtlas();
     safeRefresh();
-  }, [resolvedTheme, safeRefresh]);
+    // `calm` rides the SAME effect as the theme flip: both are "the palette changed", and both
+    // need the atlas cleared. It flips on a priority change (rare) — unlike the CSS filter it
+    // replaces, which re-composited the whole canvas on every frame of output.
+  }, [resolvedTheme, calm, safeRefresh]);
 
   // What to paint over the blank xterm: a fail/exited affordance, a loading hint, or nothing once
   // output streams. Pure (see terminalOverlay.ts) so the "never a silent blank pane" rule is tested.

@@ -111,3 +111,29 @@ describe("AgentSidebar — attention workers stay reachable via the card", () =>
     expect(open).toHaveBeenCalledWith("w1");
   });
 });
+
+// The row's CALM treatment (PRD §3 `.arow.p2`) has to band the same way the concierge feed does,
+// or the one row that needs you is the one that recedes: the feed applies the worker overlays
+// (publishedStatusFor), so an orchestrator whose worker is red is P0 there — while a calm derived
+// from the row's own effectiveStatus grayscaled it (roborev 46254-M4).
+describe("AgentSidebar — calm banding agrees with the concierge feed", () => {
+  const headRow = () => screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
+
+  it("does NOT gray an orchestrator whose worker is red", () => {
+    const { project } = seed("errored");
+    render(<AgentSidebar project={project} />);
+    expect(headRow().style.filter).toBe("");
+  });
+
+  it("grays a quiet orchestrator whose worker is quiet too", () => {
+    const { project } = seed("working");
+    render(<AgentSidebar project={project} />);
+    expect(headRow().style.filter).toContain("grayscale");
+  });
+
+  it("does NOT gray an orchestrator with an UNSTARTED worker (the feed calls that attention)", () => {
+    const { project } = seed(null); // parent open, worker never mounted
+    render(<AgentSidebar project={project} />);
+    expect(headRow().style.filter).toBe("");
+  });
+});

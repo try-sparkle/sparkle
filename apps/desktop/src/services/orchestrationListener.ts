@@ -9,13 +9,17 @@
 // for wait_for_workers (see bridge.rs + apps/mcp-orchestrator).
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { safeUnlisten } from "./safeUnlisten";
+import { shouldHandleInThisWindow } from "./windowOwnership";
+import { findWindowForProject, clearWindowProject } from "./windowRegistry";
 import { spawnWorker, spinDownWorker } from "./workerSpawn";
 import { scanWorkerManifests, type WorkerManifest } from "./worktree";
 import { useProjectStore, isLocallyRemoved } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore, enforcedWorkerCap } from "../stores/settingsStore";
-import { workersNeedingOpen } from "../engine/workerAttention";
+import { workersNeedingOpen, isNotYetLiveWorker } from "../engine/workerAttention";
 
 const EVENT = "orchestration:request";
 
@@ -185,8 +189,15 @@ function globalUsedSlots(): number {
  *  collectively overrunning it. Purely additive: this can only ever refuse a spawn the old gate
  *  would have allowed, never admit one it would have refused. */
 function atCapacity(projectId: string, buildAgentId: string): boolean {
+  if (usedSlots(projectId, buildAgentId) >= enforcedWorkerCap(useSettingsStore.getState())) return true;
+  return globalGateBinds(); // the machine-wide branch — shared with the reaper so the two can't drift
+}
+
+/** True when the MACHINE-wide gate (not this build agent's own cap) is the binding limit. This is the
+ *  global branch of `atCapacity`, factored out so the on-cap reaper trigger tests the SAME condition
+ *  `atCapacity` does — if the floor/metric ever changes it changes in one place. */
+function globalGateBinds(): boolean {
   const s = useSettingsStore.getState();
-  if (usedSlots(projectId, buildAgentId) >= enforcedWorkerCap(s)) return true;
   return globalUsedSlots() >= Math.max(1, s.effectiveMaxConcurrentWorkers);
 }
 
@@ -280,6 +291,16 @@ function handleSpawn(req: OrchestrationRequest): void {
   }
   if (atCapacity(req.projectId, req.buildAgentId)) {
     spawnQueue.push(req); // over cap (this agent's, or the machine's) → defer until a slot frees
+    // A spawn blocked by LEAKED machine-wide capacity — orphaned workers from a build agent that
+    // departed without spinning them down — would otherwise wait behind dead records forever. Kick a
+    // reap so any reclaimable slot frees and drains this request via the store subscription. Only when
+    // the GLOBAL gate is the binding limit: if this agent is merely at its OWN cap, reclaiming
+    // machine-wide orphans can't unblock it, so a scan+teardown would be wasted work (roborev). The
+    // grace + single-flight inside reapOrphanedWorkers keep a burst of queued spawns cheap. Fire-and-
+    // forget (handleSpawn is sync); it self-throttles, so overlapping triggers are harmless.
+    if (globalGateBinds()) {
+      void reapOrphanedWorkers().catch((e) => console.warn("[orchestration] on-cap reap failed", e));
+    }
     return;
   }
   // runSpawn reserves the slot synchronously at its first line, so firing it (not awaiting) is
@@ -337,6 +358,226 @@ export async function reconcileWorkersFromDisk(projectId?: string): Promise<numb
   return adopted;
 }
 
+// ── reaper: reclaim orphaned workers (the machine-wide cap leak) ───────────────────────────────────
+const REAP_INTERVAL_MS = 60_000;
+// Grace: an orphan must be observed orphaned across at least REAP_MIN_OBSERVATIONS passes of ONE
+// continuous run AND for at least REAP_GRACE_MS before it is torn down. The listener is per-window and
+// `projectStore` syncs across windows through a debounced persist (~400ms) + a 300ms rehydrate
+// coalesce, so a single snapshot can momentarily show a worker whose (live) parent build agent hasn't
+// propagated yet; reaping on one snapshot could kill a LIVE worker's uncommitted work. Both an
+// observation COUNT and an elapsed floor must hold — and "continuous" is enforced: if the gap since a
+// worker's last observation exceeds REAP_CONTINUITY_GAP_MS (a suspend or a wall-clock jump), its record
+// is reset to a single fresh observation, so the grace can't be satisfied by one snapshot taken right
+// after a resume — exactly when rehydrate lag is worst. A genuinely departed orchestrator re-earns the
+// grace within a few seconds of sweeps; a blip or a clock jump does not.
+export const REAP_GRACE_MS = 30_000;
+const REAP_MIN_OBSERVATIONS = 2;
+// A gap between two observations larger than this means the process was suspended or the clock jumped,
+// so prior observations no longer prove continuous orphanhood — the grace is re-earned from scratch.
+const REAP_CONTINUITY_GAP_MS = 2 * REAP_INTERVAL_MS;
+let reapTimer: ReturnType<typeof setInterval> | undefined;
+// One-shot follow-up scheduled while orphans are still maturing, so a spawn blocked purely by leaked
+// capacity is unblocked ~grace later instead of waiting for the next 60s sweep. `graceTimerAt` is its
+// absolute target time, so a later pass that computes a SOONER maturity can re-arm rather than being
+// dropped by coalescing. Both cleared in teardown.
+let graceTimer: ReturnType<typeof setTimeout> | undefined;
+let graceTimerAt: number | undefined;
+// Single-flight within THIS window: overlapping triggers (startup + interval + on-cap + follow-up)
+// collapse to one in-flight pass so we never issue two concurrent spin-downs for the same id.
+let reaping = false;
+// Set when a trigger arrives while a pass is already running: the running pass computed its candidates
+// from an OLDER snapshot, so an orphan (or blocked spawn) that appeared meanwhile would otherwise be
+// missed until the 60s sweep. The finishing pass re-runs once to observe the newer state.
+let reapRerunRequested = false;
+// Bumped by teardown. A pass captures it and stops acting the moment it changes, so an in-flight pass
+// cannot keep tearing down worktrees on behalf of a listener that has already been torn down.
+let reapGen = 0;
+// Injectable so every caller shares ONE clock domain (production = wall clock). Passing a per-call
+// `nowMs` previously let a value seeded in one domain be compared against another and silently never
+// reap; a single module clock removes that whole class of bug.
+let reaperNow: () => number = () => Date.now();
+/** Test-only: override the reaper clock so grace timing is deterministic. Call with no argument to
+ *  restore the production default, so a test can never leave a stale clock installed. */
+export function __setReaperNow(fn?: () => number): void {
+  reaperNow = fn ?? (() => Date.now());
+}
+// workerId → { first: first-observed time, count: observations this continuous run, last: latest
+// observation time }. Cleared for any worker no longer orphaned, so a re-orphaning restarts the grace.
+const orphanSeen = new Map<string, { first: number; count: number; last: number }>();
+
+/** Arm a follow-up reap to fire at absolute time `targetAt` (the earliest orphan's maturity), so a
+ *  still-maturing orphan gets reclaimed as soon as it is eligible rather than up to a full grace late —
+ *  and so a leaked-slot spawn isn't left waiting for the 60s sweep. If a timer is already pending it is
+ *  KEPT unless `targetAt` is sooner, in which case it is re-armed (so the earliest maturity in a burst
+ *  wins, not just the first one seen). Gated on `listenerLive`; cleared in teardown. */
+function scheduleGraceFollowup(targetAt: number): void {
+  if (!listenerLive) return;
+  if (graceTimer !== undefined && graceTimerAt !== undefined && targetAt >= graceTimerAt) return; // pending one is sooner
+  if (graceTimer !== undefined) clearTimeout(graceTimer);
+  graceTimerAt = targetAt;
+  graceTimer = setTimeout(() => {
+    graceTimer = undefined;
+    graceTimerAt = undefined;
+    if (listenerLive) {
+      void reapOrphanedWorkers().catch((e) => console.warn("[orchestration] grace-followup reap failed", e));
+    }
+  }, Math.max(1, targetAt - reaperNow()));
+}
+
+/** Reclaim workers stranded by a build agent that is GONE from the store — the machine-wide cap
+ *  leak. `globalUsedSlots` counts every `kind:"worker"` record until `removeAgent`, but a build
+ *  agent that crashed, was force-quit, or had its bridge die WITHOUT a clean cascading close
+ *  (closeBuildAgent) never spun its workers down, so those records (and their worktrees) occupy cap
+ *  slots forever. On a 32 GiB Mac the RAM-derived `effectiveMaxConcurrentWorkers` is ~8, so a
+ *  handful of leaked workers saturate the machine and EVERY build agent's next spawn is refused —
+ *  recoverable before this only by a manual cap bump or an app restart (and reconcile even
+ *  re-adopts leaked workers across restarts, so the restart didn't reliably help either).
+ *
+ *  `reconcileWorkersFromDisk` already treats a worker whose parent build agent is gone as
+ *  un-adoptable ("orphaned — a separate concern", see the guard in that fn). This IS that concern,
+ *  in the REMOVAL direction — the exact inverse condition, so the two can never fight: reconcile
+ *  only ADOPTS workers whose parent EXISTS; reap only REMOVES workers whose parent is GONE.
+ *
+ *  Safety — a worker is torn down ONLY when all of these hold:
+ *    - it has a non-empty `parentId` that is absent from the SAME project. A PARENTLESS record
+ *      (`parentId` null/empty — `addAgent` defaults it to null) is LEFT ALONE, never reaped: missing
+ *      data is treated conservatively, exactly as reconcile skips rather than destroys it.
+ *    - it has stayed orphaned across >= REAP_MIN_OBSERVATIONS passes AND for >= REAP_GRACE_MS (see
+ *      those constants) — enough to rule out a transient cross-window snapshot where a LIVE parent
+ *      simply hadn't propagated yet.
+ *    - it is not tombstoned (isLocallyRemoved) — a teardown is already mid-flight.
+ *    - a final re-read of the LIVE store right before teardown still shows it orphaned (another
+ *      window may have reclaimed it, or its parent may have returned, in the gap).
+ *  A worker whose parent still exists — however idle, "done", or duplicated — is left ENTIRELY alone;
+ *  reclaiming a live orchestrator's work is never this function's call. `spinDownWorker` KEEPS the
+ *  branch, so an orphan's COMMITTED work survives on its branch; only the worktree + dead record are
+ *  reclaimed (an orphan still mid-run past the grace is genuinely abandoned — its orchestrator is
+ *  gone — so its PTY is killed and only committed work is preserved, same as a clean close).
+ *
+ *  Single-flight and idempotent. Each `spinDownWorker` drops the record synchronously (removeAgent →
+ *  projectStore change → drainQueue), so a spawn blocked purely by leaked capacity proceeds on the
+ *  next drain; while orphans are still maturing a one-shot follow-up (`scheduleGraceFollowup`) drives
+ *  the eventual reclaim without waiting for the 60s sweep. */
+export async function reapOrphanedWorkers(): Promise<number> {
+  // No listener running → nothing to reclaim on its behalf. Checked BEFORE the single-flight flag or
+  // any `orphanSeen` mutation, so a call that lands after teardown (the fire-and-forget startup chain,
+  // a queued microtask / timer / interval whose listener has since stopped) is a clean no-op and can't
+  // wedge `reaping`. This is a liveness gate, not an identity one — if a NEW listener has already
+  // started (HMR / window re-open), this pass runs under it, which is safe: pass 1 re-reads the live
+  // store every time, so its observations are always about the CURRENT state, never stale data. (A
+  // captured-generation compare here would be a no-op tautology — pass 1 is synchronous, so there is
+  // no yield for the generation to change across; pass 2 is where the gen guard actually earns its keep.)
+  if (!listenerLive) return 0;
+  if (reaping) {
+    // A pass is already running and computed its candidates from an OLDER snapshot. Whatever triggered
+    // this call (an orphan or a blocked spawn that materialised since) would be missed until the 60s
+    // sweep — so ask the finishing pass to re-run once against the newer state.
+    reapRerunRequested = true;
+    return 0;
+  }
+  reaping = true;
+  const gen = reapGen; // captured for pass 2, which re-checks it around each await (teardown bumps it)
+  try {
+    const now = reaperNow();
+    // Pass 1 — identify current orphans and advance each one's observation record. Collect (don't act
+    // yet): spinDownWorker mutates the store, and mutating while iterating this snapshot skips neighbours.
+    const candidates: Array<{ projectId: string; workerId: string }> = [];
+    const seenNow = new Set<string>();
+    let maturing = false;
+    let earliestMaturityAt = Infinity; // absolute time the soonest still-maturing orphan becomes reapable
+    for (const project of useProjectStore.getState().projects) {
+      const agentIds = new Set(project.agents.map((a) => a.id));
+      for (const a of project.agents) {
+        if (a.kind !== "worker") continue;
+        if (!a.parentId) continue; // parentless → conservatively LEFT ALONE (never destroy on missing data)
+        if (agentIds.has(a.parentId)) continue; // parent present → not an orphan
+        // Record the observation BEFORE the tombstone bail: if an in-flight teardown later fails and
+        // its tombstone is acknowledged, the orphan should resume its grace clock, not restart it.
+        seenNow.add(a.id);
+        const prev = orphanSeen.get(a.id);
+        // Continuity: only extend the record when the gap since the last observation is within the
+        // window AND non-negative. A gap > window (suspend) OR a BACKWARDS step (`now < prev.last`, e.g.
+        // an NTP correction) both break continuity → start over from a single fresh observation, so the
+        // grace can't be satisfied by one snapshot right after a resume (when rehydrate lag is worst)
+        // and a backwards jump can't strand a future `first` that makes `now - first` perpetually < grace.
+        const gap = prev ? now - prev.last : undefined;
+        orphanSeen.set(
+          a.id,
+          prev && gap !== undefined && gap >= 0 && gap <= REAP_CONTINUITY_GAP_MS
+            ? { first: prev.first, count: prev.count + 1, last: now }
+            : { first: now, count: 1, last: now },
+        );
+        if (isLocallyRemoved(a.id)) continue; // teardown already in flight → not a reap candidate
+        candidates.push({ projectId: project.id, workerId: a.id });
+      }
+    }
+    // Forget anything no longer orphaned so a future re-orphaning restarts its grace from scratch.
+    for (const id of [...orphanSeen.keys()]) if (!seenNow.has(id)) orphanSeen.delete(id);
+
+    // Pass 2 — reap only orphans past BOTH grace conditions, re-checking the LIVE store immediately
+    // before each teardown (another window / its own teardown may have removed it, or its parent may
+    // have returned, in the gap). This shrinks the cross-window double-spin-down race to near-zero;
+    // spinDownWorker is also a no-op on an absent record and swallows an already-gone worktree.
+    let reaped = 0;
+    for (const o of candidates) {
+      if (reapGen !== gen) break; // listener torn down mid-pass → stop acting on its behalf
+      const seen = orphanSeen.get(o.workerId);
+      if (!seen || seen.count < REAP_MIN_OBSERVATIONS || now - seen.first < REAP_GRACE_MS) {
+        maturing = true; // needs another observation and/or more elapsed time before it can be reaped
+        // Track the ABSOLUTE time it could first become reapable, so the follow-up is armed for the
+        // real remaining grace even though arming happens at the END of the pass (after the awaits
+        // below). An orphan past grace but SHORT on observations matures only after another pass, so
+        // floor its target a short step ahead (not 1ms) to avoid busy-arming.
+        const graceAt = (seen?.first ?? now) + REAP_GRACE_MS;
+        const observeAt = seen && seen.count < REAP_MIN_OBSERVATIONS ? now + 250 : 0;
+        earliestMaturityAt = Math.min(earliestMaturityAt, Math.max(graceAt, observeAt));
+        continue;
+      }
+      const proj = useProjectStore.getState().projects.find((p) => p.id === o.projectId);
+      const w = proj?.agents.find((x) => x.id === o.workerId);
+      if (!w || w.kind !== "worker") {
+        orphanSeen.delete(o.workerId);
+        continue; // already gone
+      }
+      if (w.parentId && proj!.agents.some((x) => x.id === w.parentId)) {
+        orphanSeen.delete(o.workerId);
+        continue; // parent returned in the gap — no longer an orphan
+      }
+      if (isLocallyRemoved(o.workerId)) continue; // a teardown started in the gap
+      try {
+        await spinDownWorker(o); // keeps the branch; tolerates an already-gone worktree
+        orphanSeen.delete(o.workerId);
+        reaped++;
+      } catch (e) {
+        console.warn("[orchestration] reapOrphanedWorkers: spinDownWorker failed", o.workerId, e);
+      }
+    }
+    // Drive the eventual reclaim: arm the follow-up for the absolute moment the earliest orphan matures
+    // (+50ms slack so a timer that fires a hair early doesn't miss the boundary and re-arm a grace).
+    // scheduleGraceFollowup reads a fresh clock at arm time, so the awaits above can't push it late.
+    if (maturing && reapGen === gen) scheduleGraceFollowup(earliestMaturityAt + 50);
+    if (reaped > 0) console.info(`[orchestration] reaped ${reaped} orphaned worker(s) (parent gone > grace)`);
+    return reaped;
+  } finally {
+    // Only release the single-flight flag if no teardown started a new generation meanwhile; a
+    // teardown resets `reaping` itself, and a stale pass must not clobber the live listener's state.
+    if (reapGen === gen) {
+      reaping = false;
+      // A trigger arrived mid-pass (from an older snapshot's blind spot). Re-run once on a microtask
+      // against the now-current state so a just-appeared orphan / blocked spawn isn't missed until the
+      // 60s sweep. Cleared first so the re-run only fires for triggers received DURING this pass.
+      if (reapRerunRequested) {
+        reapRerunRequested = false;
+        queueMicrotask(() => {
+          if (listenerLive) {
+            void reapOrphanedWorkers().catch((e) => console.warn("[orchestration] reaper re-run failed", e));
+          }
+        });
+      }
+    }
+  }
+}
+
 async function handleList(req: OrchestrationRequest): Promise<void> {
   try {
     // Self-heal first: re-adopt any of this build agent's workers whose store record was evicted
@@ -365,7 +606,45 @@ async function handleList(req: OrchestrationRequest): Promise<void> {
   }
 }
 
+/** Resolve the single window that services a request for `projectId`. Split out so the IO deps
+ *  (registry / WebviewWindow) are swappable in tests; see the note above `handleSpinDown`. */
+async function ownsRequest(projectId: string): Promise<boolean> {
+  const label = getCurrentWindow().label; // read once — both fields must describe the SAME window
+  return shouldHandleInThisWindow(projectId, {
+    myLabel: label,
+    isMain: label === "main",
+    findWindowForProject: (pid) => findWindowForProject(pid),
+    isWindowAlive: async (l) => (await WebviewWindow.getByLabel(l)) !== null,
+    evictWindow: (l) => clearWindowProject(l),
+  });
+}
+
+/** Tear a worker down — the one op here whose side effects are DESTRUCTIVE and machine-global
+ *  (kill the PTY, `git worktree remove` the checkout, drop the row), so it must run exactly once.
+ *
+ *  `app.emit` broadcasts orchestration:request to every open webview, and none of this module's
+ *  guards can bound that: `spawnQueue` / `inFlight` / `claimedBeads` are MODULE state, so each
+ *  window holds its own copy, and the ownership test below reads the shared persisted projectStore,
+ *  which every window has in full regardless of what it displays. So N open windows each ran the
+ *  whole teardown for one spin_down: N `removeAgent` (N-1 of them starting a `close:<id>` perf trace
+ *  no pane in that window will ever end), N `killPty`, N `git worktree remove` racing each other
+ *  over one checkout, and N `orchestration_respond` for a single reqId. The losing windows' removals
+ *  are what produce the recurring "removeAgentWorkspace failed … validation failed" warnings — the
+ *  checkout is already gone because a sibling window won.
+ *
+ *  Electing one servicer (windowOwnership — the capture://send routing, which guarantees
+ *  at-most-one AND at-least-one handler via main's stale-owner self-heal) removes the fan-out at
+ *  the source. Deliberately scoped to spin_down: `spawn_worker` takes its cap reservation and bead
+ *  claim SYNCHRONOUSLY at accept time, and putting an await in front of that accept is a separate
+ *  change with its own invariant to re-argue. `list_workers` is a read whose duplicate responses
+ *  are merely wasteful. spin_down carries all of the destructive fan-out. */
 async function handleSpinDown(req: OrchestrationRequest): Promise<void> {
+  // Ownership is resolved BEFORE reconcile/teardown so the non-owning windows do no work at all,
+  // and they stay SILENT rather than responding: the owner replies for the request, and a second
+  // reply to one reqId is at best ignored and at worst races the real verdict. A probe that throws
+  // is treated as "not mine" for the same reason the owner-alive probe assumes alive — declining is
+  // the at-most-one-preserving default, and main's self-heal covers a genuinely orphaned request.
+  if (!(await ownsRequest(req.projectId).catch(() => false))) return;
   const workerId = req.payload.workerId ?? "";
   // Consult disk before deciding ownership: an evicted in-memory record would otherwise be
   // (wrongly) reported "not owned by this build agent" even though its manifest — under THIS
@@ -406,18 +685,41 @@ async function drainQueue(): Promise<void> {
   }
 }
 
+/** Heal passes that have re-opened a worker which STILL hasn't come up live, keyed by worker id.
+ *  Pruned every pass down to the workers that are materialized-but-not-live, so it can't grow and a
+ *  worker that goes live (or is torn down) and later strands again starts from a fresh budget.
+ *  Cleared with the rest of the module state on teardown. */
+const healAttempts = new Map<string, number>();
+/** How many consecutive passes may re-assert open() on the SAME still-stranded worker before the
+ *  heal gives up on it. Deliberately well above what a converging heal needs: a re-open that sticks
+ *  clears the entry on the next pass, so a healthy strand costs one attempt. The cap only binds when
+ *  re-opening does NOT stick — see {@link ensureWorkersOpen}. */
+const MAX_HEAL_ATTEMPTS = 25;
+
 /** Self-healing invariant: re-open any worker that was spawned + had its worktree cut but is no
  *  longer live (not in openAgentIds, no PTY status). runSpawn open()s a worker exactly once at spawn;
  *  if a reconcile()/remount race then evicts it from the cross-window-shared openAgentIds before its
  *  pane mounts, that one-shot is silently undone and the worker strands behind "Start this agent",
  *  blocking its orchestrator with no signal. Re-asserting open() converges the system back to "every
- *  materialized worker is live", regardless of which race evicted it. Opening is idempotent and
- *  bounded — once re-opened the worker has a status entry, so it isn't re-opened again (and the
- *  per-build-agent cap already counts these workers, so this can't exceed it). */
+ *  materialized worker is live", regardless of which race evicted it.
+ *
+ *  The heal is NOT self-limiting, contrary to what this comment used to claim ("once re-opened the
+ *  worker has a status entry, so it isn't re-opened again"). Nothing in this module makes the open
+ *  stick: whatever evicted the id can evict it again, and each open() mutates openAgentIds → wakes
+ *  the runtimeStore subscription → schedules another heal. Whenever the evictor keeps pace, that is
+ *  a re-open/evict ping-pong with no exit, every round writing the persisted, cross-window-shared
+ *  open set. Sessions do show the same worker id re-opened ~10 times in a sub-millisecond burst, so
+ *  the loop is real; it has only ever been bounded by the racer happening to settle first.
+ *
+ *  So bound it here: give each stranded worker {@link MAX_HEAL_ATTEMPTS} consecutive attempts, then
+ *  stop re-asserting and warn once. Giving up is safe — a lingering strand is exactly what the RED
+ *  "Approve?" overlay (withUnstartedWorkerAttention) exists to surface — and it is strictly better
+ *  than spinning, which burns the same budget while hiding the problem in DEBUG noise. */
 function ensureWorkersOpen(): void {
   const { projects } = useProjectStore.getState();
   const rt = useRuntimeStore.getState();
   const openIds = new Set(rt.openAgentIds);
+  const stranded: string[] = [];
   for (const project of projects) {
     for (const worker of workersNeedingOpen(project.agents, rt.status, openIds)) {
       // A worker the user just closed can momentarily still look "stranded" — in a stale snapshot's
@@ -427,10 +729,41 @@ function ensureWorkersOpen(): void {
       if (isLocallyRemoved(worker.id)) {
         continue;
       }
-      console.debug("[orchestration] re-opening stranded worker", worker.id);
-      rt.open(worker.id);
-      openIds.add(worker.id); // keep the local view current so a strand isn't opened twice
+      stranded.push(worker.id);
     }
+  }
+  // Forget every id that finally came up live (or was torn down) BEFORE spending any attempts, so
+  // the count measures one unresolved strand. Pruning against `stranded` instead would reset on
+  // every ping-pong round — an open() that lands and is immediately evicted would look like a win.
+  // Skipped entirely when nothing is being counted, which is the steady state: this runs on every
+  // projectStore change, so it must not add a second full-roster scan to the common path.
+  if (healAttempts.size > 0) {
+    const notYetLive = new Set<string>();
+    for (const project of projects) {
+      for (const agent of project.agents) {
+        if (isNotYetLiveWorker(agent, rt.status)) notYetLive.add(agent.id);
+      }
+    }
+    for (const id of healAttempts.keys()) {
+      if (!notYetLive.has(id)) healAttempts.delete(id);
+    }
+  }
+  for (const id of stranded) {
+    const attempts = healAttempts.get(id) ?? 0;
+    if (attempts >= MAX_HEAL_ATTEMPTS) {
+      if (attempts === MAX_HEAL_ATTEMPTS) {
+        // Warn exactly once per strand: bumping past the cap makes every later pass fall through.
+        healAttempts.set(id, attempts + 1);
+        console.warn(
+          `[orchestration] worker still stranded after ${MAX_HEAL_ATTEMPTS} re-open attempts — leaving it to the "Approve?" overlay`,
+          id,
+        );
+      }
+      continue;
+    }
+    healAttempts.set(id, attempts + 1);
+    console.debug("[orchestration] re-opening stranded worker", id);
+    rt.open(id);
   }
 }
 
@@ -479,6 +812,23 @@ function teardown(): void {
   // safeUnlisten swallows the Tauri teardown race (window close / HMR tearing down the listeners
   // map) so cleanup can't surface as an unhandled rejection.
   listenerLive = false; // a heal microtask already queued will see this and bail
+  if (reapTimer) {
+    clearInterval(reapTimer);
+    reapTimer = undefined;
+  }
+  if (graceTimer) {
+    clearTimeout(graceTimer);
+    graceTimer = undefined;
+    graceTimerAt = undefined;
+  }
+  // Bump the generation so any pass still in flight stops acting (its loop checks reapGen and bails),
+  // reset reaper state so a fresh listener (HMR / re-open) starts each orphan's grace anew rather than
+  // reaping on the previous listener's evidence, and clear the single-flight flag so an in-flight pass
+  // at teardown can't wedge the next listener's reaper.
+  reapGen++;
+  orphanSeen.clear();
+  reaping = false;
+  reapRerunRequested = false; // a request captured before teardown must not fire into the next listener
   void safeUnlisten(unlisten);
   unlisten = undefined;
   unsubStore?.();
@@ -494,6 +844,9 @@ function teardown(): void {
   // teardown, so any surviving key is a phantom that would refuse a legitimate spawn once a fresh
   // listener starts. (roborev 41945)
   claimedBeads.clear();
+  // Same reasoning: a surviving attempt count would spend a fresh listener's heal budget on a strand
+  // the previous listener saw, so the first real eviction after a restart could be ignored outright.
+  healAttempts.clear();
   startPromise = undefined; // allow a fresh start after cleanup
 }
 
@@ -517,11 +870,22 @@ async function doStart(): Promise<() => void> {
   });
   scheduleEnsureWorkersOpen(); // heal anything already stranded when the listener (re)starts
   // Re-adopt from disk any workers whose in-memory record was lost before this listener started
-  // (e.g. a crash/restart mid-spawn): the manifest-backed self-heal, fire-and-forget so a slow or
-  // failing scan can't delay listener startup (sparkle-3xus).
-  void reconcileWorkersFromDisk().catch((e) =>
-    console.warn("[orchestration] startup reconcile failed", e),
-  );
+  // (e.g. a crash/restart mid-spawn): the manifest-backed self-heal, then a reap pass so any worker
+  // whose parent build agent did NOT come back is reclaimed instead of leaking a machine-wide cap
+  // slot. Ordered reconcile → reap so a worker adopted this pass (parent present) is never reaped in
+  // the same pass. Fire-and-forget so a slow/failing scan can't delay listener startup (sparkle-3xus).
+  void reconcileWorkersFromDisk()
+    .then(() => {
+      if (listenerLive) return reapOrphanedWorkers(); // don't reap on behalf of a torn-down listener
+    })
+    .catch((e) => console.warn("[orchestration] startup reconcile/reap failed", e));
+  // Low-frequency sweep: reclaim orphaned workers even when no spawn is attempted, so an idle
+  // machine doesn't sit at a leaked cap. Cleared in teardown; guarded on listenerLive so a fire in
+  // the teardown gap is a no-op.
+  reapTimer = setInterval(() => {
+    if (!listenerLive) return;
+    void reapOrphanedWorkers().catch((e) => console.warn("[orchestration] periodic reap failed", e));
+  }, REAP_INTERVAL_MS);
   return teardown;
 }
 

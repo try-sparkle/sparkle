@@ -46,6 +46,43 @@ describe("screenAwaitsInput", () => {
     expect(screenAwaitsInput(screen)).toBe(true);
   });
 
+  it("flags a command-approval prompt via its footer even when the cursor glyph is '>' (not ❯)", () => {
+    // The founder-report bug: a blocked-on-approval agent showed GREEN/gray instead of RED because
+    // the cursor rendered as ">" (not ❯), so the selection-cursor marker missed it. The picker
+    // FOOTER is glyph-independent, so it catches the prompt regardless. Note: footer has NO
+    // "Tab to amend" (Claude drops it when the highlighted option isn't the amendable "Yes").
+    const screen = [
+      "This command requires approval",
+      "",
+      "Do you want to proceed?",
+      "  1. Yes",
+      '> 2. Yes, and don\'t ask again for: echo "---- retry exit: $? ----"',
+      "  3. No",
+      "",
+      "Esc to cancel · ctrl+e to explain",
+    ].join("\n");
+    expect(screenAwaitsInput(screen)).toBe(true);
+  });
+
+  it("flags a command-approval prompt whose footer keeps 'Tab to amend' (cursor on option 1)", () => {
+    const screen = [
+      "Do you want to proceed?",
+      "❯ 1. Yes",
+      "  2. Yes, and don't ask again for: roborev show *",
+      "  3. No",
+      "",
+      "Esc to cancel · Tab to amend · ctrl+e to explain",
+    ].join("\n");
+    expect(screenAwaitsInput(screen)).toBe(true);
+  });
+
+  it("does NOT flag prose that merely mentions 'esc to cancel' OR 'ctrl+e to explain' alone", () => {
+    // The footer anchor requires BOTH phrases on one line, so an incidental prose mention of either
+    // (a changelog note, a help snippet) must not trip a false red.
+    expect(screenAwaitsInput("Tip: press esc to cancel the current operation.")).toBe(false);
+    expect(screenAwaitsInput("The ctrl+e to explain shortcut opens the explainer.")).toBe(false);
+  });
+
   it("flags a shell (y/n) prompt", () => {
     expect(screenAwaitsInput("Overwrite existing file? (y/n)")).toBe(true);
     expect(screenAwaitsInput("Continue? [Y/n]")).toBe(true);

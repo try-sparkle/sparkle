@@ -3,6 +3,8 @@ import {
   shouldRecompute,
   hashScrollback,
   withinRetryBudget,
+  failuresFor,
+  NO_FAILURES,
   retryBackoffMs,
   isTerminalComputeError,
   RETRY_BACKOFF_MS,
@@ -43,6 +45,26 @@ describe("withinRetryBudget (bounds persistent-rejection retries)", () => {
     expect(withinRetryBudget(2)).toBe(true);
     expect(withinRetryBudget(3)).toBe(false);
     expect(withinRetryBudget(4)).toBe(false);
+  });
+});
+
+describe("failuresFor (keeps the budget attached to the state that spent it)", () => {
+  it("reports the count only for the hash it was spent on", () => {
+    const spent = { hash: "h1", count: 2 };
+    expect(failuresFor(spent, "h1")).toBe(2);
+  });
+
+  it("gives every OTHER state a full budget without disturbing the failing one", () => {
+    const spent = { hash: "h1", count: 3 };
+    // The pass-through state starts fresh...
+    expect(failuresFor(spent, "h2")).toBe(0);
+    // ...and asking about it must not have refunded h1, which is the whole point: an exhausted
+    // state stays exhausted no matter how many other states are computed in between.
+    expect(failuresFor(spent, "h1")).toBe(3);
+  });
+
+  it("starts with a full budget before anything has failed", () => {
+    expect(failuresFor(NO_FAILURES, "h1")).toBe(0);
   });
 });
 

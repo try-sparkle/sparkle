@@ -133,20 +133,24 @@ describe("checkForUpdates (returns an outcome for the manual check)", () => {
   });
 });
 
-describe("isMainWindowSearch (only the main window polls)", () => {
-  it("initial window (no ?label=) owns the poll", () => {
+describe("isMainWindowSearch (only the app window polls)", () => {
+  it("the app window (bare index.html, no ?view=) owns the poll", () => {
     expect(isMainWindowSearch("")).toBe(true);
     expect(isMainWindowSearch("?project=p1")).toBe(true);
   });
 
-  it("secondary project window (?label=) does NOT poll", () => {
-    expect(isMainWindowSearch("?label=win-1")).toBe(false);
-    expect(isMainWindowSearch("?project=p1&label=win-2&agent=a1")).toBe(false);
+  it("the tray + capture webviews do NOT poll", () => {
+    // These are the only auxiliary webviews, and `?view=` is the only marker they carry
+    // (src-tauri/src/tray.rs, capture_window.rs). The predicate used to test for an absent
+    // `?label=`, which nothing has minted since CM-U7 part 2 — so both webviews polled too
+    // (roborev 46485-M).
+    expect(isMainWindowSearch("?view=tray")).toBe(false);
+    expect(isMainWindowSearch("?view=capture")).toBe(false);
   });
 
-  it("blank/whitespace label is not a real label → still the main window", () => {
+  it("a leftover ?label= from an older build no longer suppresses the poll", () => {
+    expect(isMainWindowSearch("?label=win-1")).toBe(true);
     expect(isMainWindowSearch("?label=")).toBe(true);
-    expect(isMainWindowSearch("?label=%20")).toBe(true);
   });
 });
 

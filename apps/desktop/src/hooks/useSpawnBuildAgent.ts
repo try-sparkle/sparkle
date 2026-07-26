@@ -29,8 +29,13 @@ export function useSpawnBuildAgent(project: Project | null): () => string | null
   return () => {
     if (!project) return null;
     const proj = project;
-    setActiveSpecial(null); // creating an agent leaves the special (Sparkle/board) view
     const id = addAgent(proj.id, { kind: "build" });
+    // Null = the project is gone from the store (closed in another window between the render and
+    // this click). Nothing was created, so report the same "no agent" the no-project path does
+    // rather than opening a tab id that doesn't exist — and WITHOUT yanking the user out of the
+    // special view for a create that didn't happen (roborev 46278).
+    if (!id) return null;
+    setActiveSpecial(null); // creating an agent leaves the special (Sparkle/board) view
     // Start the spawn-latency waterfall the instant the click adds the agent — AgentPane.prepare()
     // and Terminal add the remaining milestones through to "pty ready" under the same key (perfTrace).
     perfStart(id, "spawn", { kind: "build" });

@@ -1,6 +1,19 @@
 // The drag-vision hint pill (spec: 2026-07-02-terminal-drag-hint, Unit A). Shown when the user
-// drags an image onto the terminal while the AI composer is OFF (see useDragVisionHint) — nudging
-// them to enable AI Features so Claude Code can "see" dropped images.
+// drags an image onto the terminal — which is NOT where images go since CM-U7 removed the pane
+// composer.
+//
+// WHAT THIS PILL MAY PROMISE (roborev 46485-H): only what exists. The terminal drop target is gone
+// and the concierge box's Image/Files pickers are still stubs (ConciergeHost.onAttach is a no-op,
+// PRD §7 "Concierge attach pickers" ⬜), so there is currently NOWHERE to hand an image to an agent.
+// The pill therefore says exactly that. Its one action still earns its place — it puts the caret
+// in the one surface that DOES take input, so the user can type what they wanted to show — but it
+// must not claim the image goes anywhere, and it must not claim it reaches "this agent" (the box
+// aims at Sparkle unless the user pins an agent with the send-target toggle).
+//
+// The paid "Enable AI Features" CTA is gone for the same reason (roborev 46485-M): with no picker
+// anywhere, buying the entitlement still leaves nowhere to hand an agent an image — an upsell into
+// a dead end is worse than the informational pill, because it costs money. When the pickers land,
+// the copy and the CTA come back together.
 //
 // Rendered through a portal (like SelectionPopup.tsx) so the terminal's overflow:hidden can't clip
 // it, and positioned with viewport-clamped fixed coords just ABOVE the terminal pane. Styling
@@ -9,16 +22,13 @@ import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "re
 import { createPortal } from "react-dom";
 import { FiEye, FiExternalLink, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
+import { useUiStore } from "../stores/uiStore";
 import { launch } from "../services/sparkleApi";
-import { aiEnhancementsEnabled } from "../services/aiGate";
-import { useAuthStore } from "../stores/authStore";
-import { useSettingsStore } from "../stores/settingsStore";
 
-/** "Learn more" deep link into the docs (frozen in the shared design contract). */
-export const VISION_LEARN_MORE_URL =
-  "https://sparkle.ai/docs/vision#dragging-images-into-the-terminal";
-/** Pricing page with the vision feature pre-highlighted — the not-entitled upgrade target. */
-export const VISION_PRICING_URL = "https://sparkle.ai/pricing?highlight=composer-vision";
+/** "Learn more" deep link into the docs. Points at the vision page itself, NOT the old
+ *  `#dragging-images-into-the-terminal` anchor — that section describes a behavior this pill
+ *  exists to say no longer happens (roborev 46485-L). */
+export const VISION_LEARN_MORE_URL = "https://sparkle.ai/docs/vision";
 /** Auto-dismiss the pill after this long if the user doesn't act. */
 const AUTO_DISMISS_MS = 8000;
 const WIDTH = 340;
@@ -31,11 +41,6 @@ export function DragVisionHintPill({
   anchorRef?: RefObject<HTMLElement | null>;
   onDismiss: () => void;
 }) {
-  // Entitlement fork signal: the paid $99 unlock (aiGate's `aiEnhancementsEnabled` / the same
-  // entitlement `useAiFeatureLocked` reads). We can't use useAiFeatureLocked("composer") here — it
-  // requires the flag ON, and here the composer flag is OFF — so read the underlying entitlement.
-  const entitled = useAuthStore((s) => aiEnhancementsEnabled(s.me));
-  const setAiFeature = useSettingsStore((s) => s.setAiFeature);
   const cardRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ left: number; top: number }>({ left: 16, top: 16 });
 
@@ -73,17 +78,10 @@ export function DragVisionHintPill({
     setPos({ left, top });
   }, [anchorRef]);
 
-  // Entitlement fork for the "Enable AI Features" button:
-  //  - entitled (paid $99, composer just disabled) → flip the composer flag on and dismiss; the
-  //    Composer mounts and image drops start working immediately.
-  //  - not entitled → hand the pricing page (feature pre-highlighted) to the system browser.
-  // Both paths dismiss the pill (clicking an action closes it, per spec).
-  const onEnable = () => {
-    if (entitled) {
-      setAiFeature("composer", true);
-    } else {
-      void launch(VISION_PRICING_URL);
-    }
+  // Primary action: put the caret in the one surface that takes input, so the user can SAY what
+  // they were trying to show. Deliberately not sold as "your image goes here" — see the header.
+  const onGoToCompose = () => {
+    useUiStore.getState().requestComposeFocus();
     onDismissRef.current();
   };
 
@@ -96,7 +94,7 @@ export function DragVisionHintPill({
     <div
       ref={cardRef}
       role="dialog"
-      aria-label="Enable AI Features for terminal image drag-and-drop"
+      aria-label="Images can't be dropped on the terminal"
       style={{
         position: "fixed",
         left: pos.left,
@@ -142,14 +140,16 @@ export function DragVisionHintPill({
       <div style={{ display: "flex", gap: 8, alignItems: "flex-start", paddingRight: 18 }}>
         <FiEye size={16} style={{ flex: "none", color: C.teal, marginTop: 1 }} aria-hidden />
         <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
-          Enable AI Features to give Claude Code vision by dragging images into the Terminal window.
+          Dropping an image here doesn&apos;t send it — the terminal takes typed input only, and
+          image attachments aren&apos;t wired up anywhere yet. The Sparkle box on the left is where you
+          type; describe what you wanted to show.
         </div>
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10 }}>
         <button
           type="button"
-          onClick={onEnable}
+          onClick={onGoToCompose}
           style={{
             background: C.teal,
             color: ON_BRAND_FILL,
@@ -163,7 +163,7 @@ export function DragVisionHintPill({
             whiteSpace: "nowrap",
           }}
         >
-          Enable AI Features
+          Go to the Sparkle box
         </button>
         <button
           type="button"

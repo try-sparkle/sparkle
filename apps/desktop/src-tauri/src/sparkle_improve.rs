@@ -288,6 +288,12 @@ pub fn sparkle_improve_run(
             let mut result_subtype: Option<String> = None;
             let mut is_error = false;
             let mut error_detail: Option<String> = None;
+            // Plain-text stdout the CLI printed instead of NDJSON. When `claude` fails during
+            // STARTUP — before the stream exists — it commonly writes its reason to stdout and
+            // exits non-zero, leaving stderr empty and no `result` event to lift a detail off.
+            // That combination used to dead-end on the bare "(exit code 1)" fallback, which is
+            // the one failure shape triage can do nothing with.
+            let mut plain_stdout = String::new();
             loop {
                 line.clear();
                 match reader.read_until(b'\n', &mut line) {
@@ -310,6 +316,7 @@ pub fn sparkle_improve_run(
                             );
                         } else {
                             tracing::debug!("sparkle_improve: skipped non-JSON stdout line");
+                            push_plain_stdout(&mut plain_stdout, trimmed);
                         }
                     }
                     Err(_) => break,
@@ -342,6 +349,7 @@ pub fn sparkle_improve_run(
                     result_subtype.as_deref(),
                     is_error,
                     error_detail.as_deref(),
+                    &plain_stdout,
                     &wait_result,
                 );
                 tracing::warn!(%message, "sparkle_improve: pass failed");
@@ -392,6 +400,32 @@ fn describe_exit_status(status: &std::io::Result<std::process::ExitStatus>) -> S
     }
 }
 
+/// Cap on the retained plain-stdout tail. A startup failure states its reason in a line or two;
+/// anything longer is a stream that went wrong in some other way, and an unbounded buffer would
+/// let a chatty child grow it without limit for a string that only ever ends up in one log line.
+const PLAIN_STDOUT_MAX: usize = 2_000;
+/// Keep the FIRST lines rather than the last: a CLI that fails to start prints its reason first
+/// and then any usage/help banner, so the head is the diagnostic and the tail is boilerplate.
+fn push_plain_stdout(buf: &mut String, line: &str) {
+    if buf.len() >= PLAIN_STDOUT_MAX {
+        return;
+    }
+    if !buf.is_empty() {
+        buf.push('\n');
+    }
+    buf.push_str(line);
+    if buf.len() > PLAIN_STDOUT_MAX {
+        // Truncate at a CHAR boundary: these lines come from `from_utf8_lossy`, so a multi-byte
+        // char can straddle the cap, and `String::truncate` PANICS on a non-boundary index — a
+        // panic here would kill the reader thread and strand the pass's child unreaped.
+        let cut = (0..=PLAIN_STDOUT_MAX)
+            .rev()
+            .find(|&i| buf.is_char_boundary(i))
+            .unwrap_or(0);
+        buf.truncate(cut);
+    }
+}
+
 /// Build the `sparkle_improve:error` message for a failed pass. Priority, most-useful first —
 /// the same order `claude_chat::build_error_message` uses for the Think tab, so a failure reads
 /// the same wherever it surfaces:
@@ -399,7 +433,10 @@ fn describe_exit_status(status: &std::io::Result<std::process::ExitStatus>) -> S
 ///  2. `detail` — claude's OWN error text lifted off the failed `result` event by
 ///     `capture_result_status` (a usage limit, an API/auth error, …). This is the fix for the
 ///     recurring empty-stderr exit-1 pass, which used to dead-end on (3) alone;
-///  3. the synthesized exit-status phrase, now naming any non-`"success"` subtype / `is_error`
+///  3. `plain_stdout` — plain-text the CLI printed to stdout instead of NDJSON. A startup failure
+///     (bad flag, unreadable config, auth refusal) exits non-zero with empty stderr and no
+///     `result` event, so (1) and (2) are both blank and this is the ONLY account of the reason;
+///  4. the synthesized exit-status phrase, now naming any non-`"success"` subtype / `is_error`
 ///     flag so a max-turns stop is distinguishable from a crash.
 /// Pure, so the precedence is unit-testable without spawning a real pass.
 fn failure_message(
@@ -407,6 +444,7 @@ fn failure_message(
     result_subtype: Option<&str>,
     is_error: bool,
     detail: Option<&str>,
+    plain_stdout: &str,
     status: &std::io::Result<std::process::ExitStatus>,
 ) -> String {
     let stderr = stderr.trim();
@@ -415,6 +453,12 @@ fn failure_message(
     }
     if let Some(detail) = detail.map(str::trim).filter(|s| !s.is_empty()) {
         return detail.to_string();
+    }
+    // Below the stream's own account (a `result` event is structured and authoritative) but above
+    // the exit code, which says only THAT it failed.
+    let plain_stdout = plain_stdout.trim();
+    if !plain_stdout.is_empty() {
+        return plain_stdout.to_string();
     }
     // Keep the long-standing fallback wording — it's what the existing log history reads like —
     // and append whatever the stream managed to tell us.
@@ -560,6 +604,7 @@ mod tests {
             Some("error_during_execution"),
             true,
             Some("claude's detail"),
+            "",
             &failed_status(),
         );
         assert_eq!(m, "boom: real stderr");
@@ -574,6 +619,7 @@ mod tests {
             Some("error_during_execution"),
             true,
             Some("Claude usage limit reached"),
+            "",
             &failed_status(),
         );
         assert_eq!(m, "Claude usage limit reached");
@@ -584,7 +630,7 @@ mod tests {
     fn failure_message_falls_back_to_exit_status_and_names_the_subtype() {
         // Nothing to quote: keep the existing fallback wording (log continuity) but append the
         // non-success subtype, which distinguishes e.g. a max-turns stop from a crash.
-        let m = failure_message("", Some("error_max_turns"), true, None, &failed_status());
+        let m = failure_message("", Some("error_max_turns"), true, None, "", &failed_status());
         assert!(m.contains("claude exited without a successful result (exit code 1)"), "got: {m}");
         assert!(m.contains("error_max_turns"), "got: {m}");
     }
@@ -592,22 +638,99 @@ mod tests {
     #[test]
     fn failure_message_notes_an_error_result_with_no_subtype() {
         // is_error with no subtype still beats saying nothing about the stream.
-        let m = failure_message("", None, true, None, &failed_status());
+        let m = failure_message("", None, true, None, "", &failed_status());
         assert!(m.contains("stream reported an error result"), "got: {m}");
     }
 
     #[test]
     fn failure_message_is_bare_fallback_when_stream_said_nothing() {
         // Child died before emitting any result event (crash/auth failure) — unchanged behavior.
-        let m = failure_message("", None, false, None, &failed_status());
+        let m = failure_message("", None, false, None, "", &failed_status());
         assert_eq!(m, "claude exited without a successful result (exit code 1)");
     }
 
     #[test]
     fn failure_message_ignores_blank_detail_and_falls_through() {
         // A whitespace-only detail must not win over the synthesized fallback.
-        let m = failure_message("", None, false, Some("   "), &failed_status());
+        let m = failure_message("", None, false, Some("   "), "", &failed_status());
         assert_eq!(m, "claude exited without a successful result (exit code 1)");
+    }
+
+    #[test]
+    fn failure_message_surfaces_plain_stdout_when_the_stream_never_started() {
+        // The observed startup failure: the pass died seconds after launch with exit 1, EMPTY
+        // stderr, and no `result` event — so the CLI's reason existed only as plain text on
+        // stdout, which the reader parsed as non-JSON and dropped. That left the one failure
+        // shape triage can do nothing with. Quote it instead.
+        let m = failure_message(
+            "",
+            None,
+            false,
+            None,
+            "error: unknown option '--append-system-prompt'",
+            &failed_status(),
+        );
+        assert_eq!(m, "error: unknown option '--append-system-prompt'");
+        assert!(!m.contains("without a successful result"), "got: {m}");
+    }
+
+    #[test]
+    fn plain_stdout_ranks_below_stderr_and_the_streams_own_detail() {
+        // Precedence guard: plain stdout is the LAST resort before the exit code, never a
+        // substitute for the child's real diagnostics or a structured `result` detail.
+        let over_stderr =
+            failure_message("real stderr", None, false, None, "noise", &failed_status());
+        assert_eq!(over_stderr, "real stderr");
+        let over_detail = failure_message(
+            "",
+            None,
+            false,
+            Some("claude's detail"),
+            "noise",
+            &failed_status(),
+        );
+        assert_eq!(over_detail, "claude's detail");
+    }
+
+    #[test]
+    fn blank_plain_stdout_still_falls_through_to_the_exit_status() {
+        // Whitespace-only stdout must not shadow the synthesized fallback (cf. blank detail).
+        let m = failure_message("", None, false, None, "  \n ", &failed_status());
+        assert_eq!(m, "claude exited without a successful result (exit code 1)");
+    }
+
+    #[test]
+    fn plain_stdout_accumulates_lines_and_is_bounded() {
+        // Multi-line reasons stay readable in order …
+        let mut buf = String::new();
+        push_plain_stdout(&mut buf, "first");
+        push_plain_stdout(&mut buf, "second");
+        assert_eq!(buf, "first\nsecond");
+
+        // … but a chatty child can't grow the buffer without limit, and the HEAD is kept
+        // (a startup failure states its reason before any banner).
+        let mut big = String::new();
+        for _ in 0..500 {
+            push_plain_stdout(&mut big, &"x".repeat(50));
+        }
+        assert!(big.len() <= PLAIN_STDOUT_MAX, "len {}", big.len());
+        assert!(big.starts_with("xxxx"), "kept the head");
+    }
+
+    #[test]
+    fn plain_stdout_cap_does_not_split_a_multibyte_char() {
+        // Regression guard: `String::truncate` panics on a non-char-boundary index, and stdout
+        // reaches us via `from_utf8_lossy`, so a multi-byte char CAN straddle the cap. A panic
+        // here would kill the reader thread and strand the child unreaped.
+        let mut buf = String::new();
+        // "é" is 2 bytes, so a 3-byte-per-char run lands the cap mid-char for some offsets.
+        for _ in 0..400 {
+            push_plain_stdout(&mut buf, &"é…".repeat(10));
+        }
+        assert!(buf.len() <= PLAIN_STDOUT_MAX, "len {}", buf.len());
+        // The real assertion is simply that we got here without panicking, and that what
+        // survived is still valid UTF-8 we can round-trip.
+        assert_eq!(buf, String::from_utf8(buf.clone().into_bytes()).unwrap());
     }
 
     #[test]
@@ -629,6 +752,7 @@ mod tests {
             subtype.as_deref(),
             is_error,
             detail.as_deref(),
+            "",
             &failed_status(),
         );
         assert_eq!(m, "Claude usage limit reached");

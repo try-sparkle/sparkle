@@ -444,6 +444,112 @@ describe("history block", () => {
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
   });
 
+  it("MOUNTS the $0 warning at the top of the pane for an entitled user at zero", async () => {
+    // Pins the mount point itself: the component's own tests can stay green while a refactor
+    // silently deletes <ZeroCreditBanner inline /> from this pane.
+    useAuthStore.setState({ me: { ...entitledMe, balanceCents: 0 }, tokenPresent: true });
+    render(<CreditsPanel />);
+    expect(
+      await screen.findByText(/AI Enhanced features will no longer work/),
+    ).toBeTruthy();
+  });
+
+  it("does not mount the $0 warning while the user still has credits", () => {
+    // Pins the credited balance explicitly so the describe-level default can't drift to 0 and turn
+    // this into a vacuous pass. (roborev 52646)
+    useAuthStore.setState({ me: { ...entitledMe, balanceCents: 2500 }, tokenPresent: true });
+    render(<CreditsPanel />);
+    expect(screen.queryByText(/AI Enhanced features will no longer work/)).toBeNull();
+  });
+
+  it("shows the project each row was for, and an em-dash when the row didn't record one", async () => {
+    // The founder's ask: the history has to answer "which project did this cost me?". Rows written
+    // before project attribution shipped — and genuinely account-level spend like a top-up — carry
+    // no project, and must say so rather than be attributed to a guess.
+    fetchHistoryMock.mockResolvedValue({
+      entries: [
+        {
+          id: "1",
+          createdAt: "2026-06-30T10:00:00Z",
+          reason: "anthropic_debit",
+          deltaCents: -12,
+          description: "Suggesting next actions",
+          project: "sparkle-desktop",
+        },
+        { id: "2", createdAt: "2026-06-29T10:00:00Z", reason: "credit_topup", deltaCents: 2500 },
+      ],
+    });
+    render(<CreditsPanel />);
+    expect(await screen.findByText("sparkle-desktop")).toBeTruthy();
+    expect(screen.getByText("—")).toBeTruthy();
+  });
+
+  it("explains the em-dash on hover from the CELL, never from the glyph itself", async () => {
+    // Split deliberately: aria-label wins the glyph's NAME, but a `title` on the SAME element is
+    // still accname's description fallback — carrying both made ATs read "No project recorded, No
+    // project recorded". On the ancestor cell it stays a pure mouse affordance.
+    // (roborev 51700/51712/52980)
+    fetchHistoryMock.mockResolvedValue({
+      entries: [{ id: "1", createdAt: "2026-06-30T10:00:00Z", reason: "credit_topup", deltaCents: 2500 }],
+    });
+    render(<CreditsPanel />);
+    const dash = await screen.findByText("—");
+    expect(dash.getAttribute("title")).toBeNull();
+    expect(dash.parentElement?.getAttribute("title")).toBe("No project recorded");
+    // Asserting the computed DESCRIPTION directly would be better, but computeAccessibleDescription
+    // lives in dom-accessibility-api — a transitive testing-library dep whose "exports" map hides its
+    // typings, so importing it fails `tsc --noEmit`. The attribute placement is the whole mechanism
+    // here (accname takes an ancestor's title as neither name nor description), and it is what a
+    // regression would change. (roborev 53024)
+  });
+
+  it("gives the em-dash a real accessible NAME, not just a tooltip", async () => {
+    // `title` is not reliably announced and keyboard users never see it, so a column of bare dashes
+    // was unexplained for them. aria-label names the glyph — and wins over `title`, so the tooltip
+    // doesn't get announced as a duplicate description.
+    fetchHistoryMock.mockResolvedValue({
+      entries: [{ id: "1", createdAt: "2026-06-30T10:00:00Z", reason: "credit_topup", deltaCents: 2500 }],
+    });
+    render(<CreditsPanel />);
+    expect(await screen.findByRole("img", { name: "No project recorded" })).toBeTruthy();
+  });
+
+  it("carries the project name in the cell's title, so a name that ellipsized can be read in full", async () => {
+    // The cell clips to one line, so `title` is how a long name is read in full.
+    fetchHistoryMock.mockResolvedValue({
+      entries: [
+        {
+          id: "1",
+          createdAt: "2026-06-30T10:00:00Z",
+          reason: "anthropic_debit",
+          deltaCents: -12,
+          project: "sparkle-desktop",
+        },
+        { id: "2", createdAt: "2026-06-29T10:00:00Z", reason: "credit_topup", deltaCents: 2500 },
+      ],
+    });
+    render(<CreditsPanel />);
+    expect((await screen.findByText("sparkle-desktop")).getAttribute("title")).toBe("sparkle-desktop");
+  });
+
+  it("treats a blank project name as no project rather than an empty cell", async () => {
+    // `meta.project` is `string | null` — only the CURRENT writers guarantee non-blank, and a
+    // whitespace name would render an empty cell that reads as a real but nameless project.
+    fetchHistoryMock.mockResolvedValue({
+      entries: [
+        {
+          id: "1",
+          createdAt: "2026-06-30T10:00:00Z",
+          reason: "anthropic_debit",
+          deltaCents: -12,
+          project: "   ",
+        },
+      ],
+    });
+    render(<CreditsPanel />);
+    expect(await screen.findByText("—")).toBeTruthy();
+  });
+
   it("shows 'AI: <description>' when a debit row carries a metering purpose, and the static label when it doesn't", async () => {
     fetchHistoryMock.mockResolvedValue({
       entries: [

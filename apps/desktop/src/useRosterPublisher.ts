@@ -1,19 +1,31 @@
 // Publishes the desktop's live agent roster (projects → agents → status) to the phone via the
-// relay, re-pushing whenever projects, statuses, the open-window set, or interaction times change.
-// Mounted once in App.tsx.
+// relay and to the Rust tray aggregator, re-pushing whenever projects, statuses, the open set, or
+// interaction times change. Mounted once in App.tsx.
 //
-// Only projects currently OPEN in a window are published — the phone mirrors what you actually have
-// open on the desktop, not every project that's ever been in Recent. "Open" = a window is showing
-// it (the shared window registry), the same predicate the desktop UI uses.
-import { useEffect, useState } from "react";
+// Only OPEN projects are published — the phone and the menu bar mirror what you actually have open
+// on the desktop, not every project that has ever been in Recent. In the single-window shell
+// (CM-U7) "open" can no longer mean "a window is showing it" (one window shows them all), so it
+// means: the project has at least one agent in the runtime's open set, OR its tab has been selected
+// at least once this session (services/sessionProjects).
+//
+// The distinction is not cosmetic. `useProjectStore.projects` is the FULL persisted list, and each
+// agent carries up to 4 recent prompt snippets: publishing all of it sent real prompt text from
+// projects the user hasn't touched in months to the relay, on every status tick, in a payload that
+// grew without bound (roborev 46258-M1).
+import { useEffect, useSyncExternalStore } from "react";
 import { AGENT_STATUS, type AgentTabStatus } from "@sparkle/ui";
 import { pushRoster, type RosterPayload } from "./services/relayClient";
 import { publishWindowRoster } from "./services/attention";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useInteractionStore } from "./stores/interactionStore";
-import { findWindowForProject, onWindowRegistryChange } from "./services/windowRegistry";
 import { useCurrentWindowLabel } from "./windowContext";
+import {
+  onVisitedProjectsChange,
+  visitedProjectsVersion,
+  wasProjectVisited,
+} from "./services/sessionProjects";
+import { agentDisplayName } from "./engine/agentDisplayName";
 import { composerPrompts } from "./components/promptHistory";
 import { safeTruncate, sanitizeJsonStrings, stripLoneSurrogates } from "./services/safeText";
 import type { AgentTab, Project } from "./types";
@@ -24,7 +36,7 @@ const DEFAULT_STATUS: AgentTabStatus = "stopped";
  *  Sanitized because titles routinely carry emoji and are truncated by whoever produced them
  *  (Claude Code, the auto-namer); a half surrogate pair here fails the whole roster invoke. */
 function displayName(a: AgentTab): string {
-  return stripLoneSurrogates(a.aiTitle || a.autoNameVariants?.title || a.name);
+  return stripLoneSurrogates(agentDisplayName(a));
 }
 
 /** The user's last touch of this agent (composer Send or terminal keystroke), or undefined. Mirrors
@@ -57,9 +69,18 @@ function recentPrompts(a: AgentTab): { id: string; text: string }[] {
   }));
 }
 
-/** Projects open in the given window label. Exported so tests can call the real predicate. */
-export function windowProjects(projects: Project[], label: string): Project[] {
-  return projects.filter((p) => findWindowForProject(p.id) === label);
+/**
+ * The OPEN projects (see the file header): those with a live agent, plus those whose tab the user
+ * has selected this session. Pure — `visited` is passed in — so the predicate is testable without
+ * module state.
+ */
+export function openProjects(
+  projects: Project[],
+  openAgentIds: readonly string[],
+  visited: (projectId: string) => boolean,
+): Project[] {
+  const open = new Set(openAgentIds);
+  return projects.filter((p) => visited(p.id) || p.agents.some((a) => open.has(a.id)));
 }
 
 /** Build the roster payload published to BOTH the Rust tray aggregator and the phone relay.
@@ -102,27 +123,31 @@ export function useRosterPublisher(): void {
   const projects = useProjectStore((s) => s.projects);
   const status = useRuntimeStore((s) => s.status);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
+  const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
   const interaction = useInteractionStore((s) => s.lastAt);
   const label = useCurrentWindowLabel();
 
-  // The window registry isn't reactive (it's localStorage), so bump a tick whenever a window opens
-  // or closes a project, to re-evaluate the open set and re-push.
-  const [registryTick, setRegistryTick] = useState(0);
-  useEffect(() => onWindowRegistryChange(() => setRegistryTick((n) => n + 1)), []);
+  // The visited set is module state, not a store, so subscribe to its version to re-push when the
+  // user opens a tab that has no live agent yet (its project becomes publishable at that moment).
+  const visitedVersion = useSyncExternalStore(onVisitedProjectsChange, visitedProjectsVersion, () => 0);
 
   useEffect(() => {
     // Coalesce rapid changes into one push.
     const t = setTimeout(() => {
-      // Build once over all open projects — used for the phone relay (full picture).
-      // Then filter the already-built projects to this window's slice for the Rust tray
-      // aggregator. Each window only holds live status for agents it's running; publishing
-      // another window's agents would use DEFAULT_STATUS ("stopped") and corrupt the
-      // last-writer-wins merge in tray.rs.
-      const open = projects.filter((p) => findWindowForProject(p.id) != null);
-      const full = buildRoster(open, status, workflowStage, interaction);
+      // SINGLE-WINDOW SHELL (CM-U7): this window hosts every project as a tab, so it is the only
+      // publisher — there is no other window to under-report, and the old per-window registry
+      // slicing (which existed because a window only held live status for the agents IT ran) would
+      // now hide every project except the selected tab. What it must NOT do is publish the whole
+      // store; see openProjects and the file header.
+      const full = buildRoster(
+        openProjects(projects, openAgentIds, wasProjectVisited),
+        status,
+        workflowStage,
+        interaction,
+      );
       pushRoster(full);
-      publishWindowRoster(label, full.projects.filter((p) => findWindowForProject(p.id) === label));
+      publishWindowRoster(label, full.projects);
     }, 250);
     return () => clearTimeout(t);
-  }, [projects, status, workflowStage, interaction, registryTick, label]);
+  }, [projects, status, workflowStage, openAgentIds, interaction, visitedVersion, label]);
 }

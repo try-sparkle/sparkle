@@ -3,6 +3,7 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import { migratePersistedUi } from "./composerPersist";
+import type { Runtime } from "../types";
 
 // Settings-dialog category ids. Defined HERE (not SettingsDialog.tsx) so the store never depends
 // on a component file — SettingsDialog imports and re-exports it for its own consumers.
@@ -15,6 +16,8 @@ export type CategoryId =
   | "shortcuts"
   | "workers"
   | "accounts"
+  | "cloudauth"
+  | "onepassword"
   | "mobile"
   | "voice"
   | "approvals"
@@ -116,6 +119,19 @@ interface UiState {
   // pointing the user at where that affordance normally lives. Transient — NOT persisted.
   buildAgentHover: boolean;
   setBuildAgentHover: (v: boolean) => void;
+  // Which runtime the NEXT agent you create runs on: "local" (a PTY on this Mac, free) or "cloud"
+  // (a Sparkle-provisioned sandbox, billed in credits). Shared so the sidebar's toggle and the
+  // Workspace empty-state button agree. Transient — NOT persisted: cloud is a per-account server
+  // capability that can go away between launches, and a persisted "cloud" would silently re-arm a
+  // billed action for a user who no longer has it. Every launch starts on the free default.
+  newAgentRuntime: Runtime;
+  setNewAgentRuntime: (r: Runtime) => void;
+  // Whether the "new cloud agent" dialog is open. Lives here (not in a component) because the
+  // "+ New Build Agent" affordance exists in two places (sidebar + Workspace empty state) while the
+  // dialog must be rendered exactly ONCE. Transient — NOT persisted; a relaunch never restores a
+  // dialog, least of all one whose action costs credits.
+  cloudCreateOpen: boolean;
+  setCloudCreateOpen: (v: boolean) => void;
   // Per build-agent: whether its worker subtree is collapsed in the sidebar. A build agent's
   // workers start COLLAPSED (a missing entry reads as collapsed) so a busy orchestrator shows a
   // compact "N workers" roll-up by default; the user expands to see each worker's own tracker.
@@ -124,11 +140,43 @@ interface UiState {
   isOrchestratorCollapsed: (id: string) => boolean;
   toggleOrchestratorCollapsed: (id: string) => void;
   // Deep-open request for the ⋯ settings dialog: a component anywhere (e.g. BalanceBadge) asks
-  // for a category; TopBar (which owns the dialog) opens it there and clears the request on
-  // close. Transient — NOT persisted (see partialize), a relaunch must never restore a dialog.
+  // for a category; the shell's kebab menu (which owns the dialog) opens it there and clears the
+  // request on close. Transient — NOT persisted (see partialize), a relaunch must never restore a dialog.
   settingsRequest: CategoryId | null;
   openSettings: (cat: CategoryId) => void;
   clearSettingsRequest: () => void;
+  // Focus request for the concierge compose box: a component anywhere (e.g. the drag-vision pill)
+  // asks the ONE compose surface to take the caret. A monotonically increasing token, not a bool,
+  // so repeat requests re-focus. Transient — NOT persisted.
+  composeFocusSeq: number;
+  requestComposeFocus: () => void;
+  // Concierge pin scope (CM-U7): the project tab whose pin is lit. Pinning scopes the concierge to
+  // that project ("disregard all other project alerts so you can focus"); null = following all
+  // projects. ONE pin at a time — pinning a project replaces any previous pin, pinning the pinned
+  // one clears it. Persisted, so the focus you chose survives a relaunch.
+  pinnedProjectId: string | null;
+  togglePinnedProject: (id: string) => void;
+  setPinnedProject: (id: string | null) => void;
+  // Whether the user has ✕'d the "$0 credit balance" banner (see ZeroCreditBanner). Transient —
+  // NOT persisted (see partialize), so the warning returns on the next launch: the balance is
+  // still zero and the AI extras are still dark, which the user deserves to be reminded of.
+  // `authStore.syncZeroCreditBanner` CLEARS this — a direct call, NOT a store subscription — at every
+  // `me` write that could change the answer (a fetched `me`, `setMe`), whenever credits arrive or a
+  // different user signs in. So the flag tracks "this zero episode is dismissed" rather than latching
+  // forever: spend a refill back down to zero and the banner comes back. A NULL `me` deliberately
+  // does not re-arm (a network blip must not resurrect a dismissal), which is why the no-token and
+  // rehydrate paths skip the call and a real sign-out clears the flag explicitly in `reset()`. The
+  // rule itself lives in services/zeroCreditBanner.
+  zeroCreditBannerDismissed: boolean;
+  // WHOSE dismissal is latched, so a different user signing in gets their own warning while a
+  // transient `fetchMe()` failure (which nulls `me` without changing anyone's balance) does not
+  // resurrect a banner this user already dismissed. Transient alongside the flag itself.
+  zeroCreditBannerDismissedFor: string | null;
+  // `userId` is REQUIRED, not `string | null`: a dismissal latched with no owner can only ever be
+  // cleared by credits arriving — a different user signing in at $0 would inherit the silence, which
+  // is precisely what recording the owner exists to prevent. (roborev 51700/51712)
+  dismissZeroCreditBanner: (userId: string) => void;
+  rearmZeroCreditBanner: () => void;
 }
 
 export const useUiStore = create<UiState>()(
@@ -157,6 +205,10 @@ export const useUiStore = create<UiState>()(
       setBoardFocusBeadId: (id) => set({ boardFocusBeadId: id }),
       buildAgentHover: false,
       setBuildAgentHover: (v) => set({ buildAgentHover: v }),
+      newAgentRuntime: "local",
+      setNewAgentRuntime: (r) => set({ newAgentRuntime: r }),
+      cloudCreateOpen: false,
+      setCloudCreateOpen: (v) => set({ cloudCreateOpen: v }),
       collapsedOrchestrators: {},
       // Absent → collapsed (workers start hidden behind the roll-up).
       isOrchestratorCollapsed: (id) => get().collapsedOrchestrators[id] ?? true,
@@ -168,20 +220,45 @@ export const useUiStore = create<UiState>()(
       settingsRequest: null,
       openSettings: (cat) => set({ settingsRequest: cat }),
       clearSettingsRequest: () => set({ settingsRequest: null }),
+      composeFocusSeq: 0,
+      requestComposeFocus: () => set((s) => ({ composeFocusSeq: s.composeFocusSeq + 1 })),
+      pinnedProjectId: null,
+      togglePinnedProject: (id) =>
+        set((s) => ({ pinnedProjectId: s.pinnedProjectId === id ? null : id })),
+      setPinnedProject: (id) => set({ pinnedProjectId: id }),
+      zeroCreditBannerDismissed: false,
+      zeroCreditBannerDismissedFor: null,
+      dismissZeroCreditBanner: (userId) =>
+        set({ zeroCreditBannerDismissed: true, zeroCreditBannerDismissedFor: userId }),
+      // Idempotent on purpose: authStore calls this on every `me` write, so it must be a no-op
+      // (no state write, no re-render storm, and no `persist` disk write) once the flag is already
+      // clear — otherwise every entitlement poll would churn localStorage.
+      rearmZeroCreditBanner: () =>
+        set((s) =>
+          s.zeroCreditBannerDismissed || s.zeroCreditBannerDismissedFor !== null
+            ? { zeroCreditBannerDismissed: false, zeroCreditBannerDismissedFor: null }
+            : s,
+        ),
     }),
     {
       name: "sparkle-ui",
       storage: createJSONStorage(() => localStorage),
-      // Persist everything EXCEPT workMode, buildAgentHover, boardFocusBeadId, and
-      // settingsRequest, so the active sidebar tab resets to "build" on each launch (matching
-      // the prior local-useState default) and the transient hover flag / one-shot board-focus
-      // handoff / one-shot settings deep-open never persist, while every other UI preference
-      // still sticks. Spreading `rest` keeps all existing persisted keys.
+      // Persist everything EXCEPT workMode, buildAgentHover, boardFocusBeadId,
+      // settingsRequest, newAgentRuntime and zeroCreditBannerDismissed, so the active sidebar tab
+      // resets to "build" on each launch (matching the prior local-useState default) and the
+      // transient hover flag / one-shot board-focus handoff / one-shot settings deep-open / the
+      // dismissed $0 warning never persist, while every other UI preference still sticks.
+      // Spreading `rest` keeps all existing persisted keys.
       partialize: ({
         workMode: _workMode,
         buildAgentHover: _buildAgentHover,
         boardFocusBeadId: _boardFocusBeadId,
         settingsRequest: _settingsRequest,
+        composeFocusSeq: _composeFocusSeq,
+        newAgentRuntime: _newAgentRuntime,
+        cloudCreateOpen: _cloudCreateOpen,
+        zeroCreditBannerDismissed: _zeroCreditBannerDismissed,
+        zeroCreditBannerDismissedFor: _zeroCreditBannerDismissedFor,
         ...rest
       }) => rest,
       // v1: the rest height shrank from 128 to the compact COMPOSER_SNAP. The pure

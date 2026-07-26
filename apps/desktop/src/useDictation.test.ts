@@ -38,6 +38,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 // ---------------------------------------------------------------------------
 import { useDictationStore } from "./stores/dictationStore";
 import { useAuthStore } from "./stores/authStore";
+import { useUiStore } from "./stores/uiStore";
 import { createDictationController, cloudStreamCommandFor } from "./useDictation";
 
 /** A minimal signed-in `me` for the credits-pill tests. */
@@ -233,6 +234,17 @@ describe("createDictationController (hook logic without renderHook)", () => {
     useAuthStore.setState({ me: meWith(19994) });
     emit("dictation://cloud-balance", { balanceCents: null, debitedCents: 5 });
     expect(useAuthStore.getState().me?.balanceCents).toBe(19989);
+  });
+
+  it("dictation://cloud-balance re-arms a dismissed $0 banner when the balance goes positive", () => {
+    // This frame carries the SERVER-authoritative balance, so a top-up can land here rather than
+    // through refresh(). Writing `me` with a bare setState skipped the re-arm rule and latched the
+    // dismissal for the rest of the session, silently swallowing the next $0 episode. (roborev 48271)
+    useAuthStore.setState({ me: meWith(0) });
+    useUiStore.setState({ zeroCreditBannerDismissed: true, zeroCreditBannerDismissedFor: "u1" });
+    emit("dictation://cloud-balance", { balanceCents: 2500, debitedCents: 0 });
+    expect(useAuthStore.getState().me?.balanceCents).toBe(2500);
+    expect(useUiStore.getState().zeroCreditBannerDismissed).toBe(false);
   });
 
   it("dictation://cloud-balance is a no-op when signed out (no me to update)", () => {

@@ -1,7 +1,10 @@
-// Show a "give Claude vision by enabling AI Features" hint pill when the user drags an IMAGE
-// onto the terminal WHILE the AI composer is off (spec: 2026-07-02-terminal-drag-hint). With the
-// composer on, Composer.tsx already handles image drops as attachments — this listener must NOT
-// double-handle, so it only subscribes when `enabled` (i.e. `!aiComposer`) is true.
+// Show a "give Claude vision" hint pill when the user drags an IMAGE onto the terminal
+// (spec: 2026-07-02-terminal-drag-hint).
+//
+// `enabled` used to mean "the AI composer is off", because with it on, Composer.tsx handled image
+// drops itself and this listener must not double-handle. CM-U7 deleted that composer, so the
+// caller now passes simply "this pane is VISIBLE" — the pill is informational (NO surface accepts
+// an image yet), so there is no entitlement to gate it on. See AgentPane and the pill's header.
 //
 // Like useNewBuildAgentDrop this is a webview-level onDragDropEvent listener; Tauri fans events to
 // every listener, so it coexists with the others. It stays passive: it never consumes the drop or
@@ -23,7 +26,7 @@ export function dragPayloadHasImage(payload: { paths?: string[] }): boolean {
  * Subscribe (only while `enabled`) to webview drag/drop and reveal the vision hint the first time
  * an image drag arrives. Returns `{ show, dismiss }`; the caller renders the pill on `show` and
  * clears it via `dismiss` (×, Esc, an action click, or the pill's auto-timeout). Turning `enabled`
- * off (the composer coming on) tears the listener down and hides any showing pill.
+ * off tears the listener down and hides any showing pill.
  */
 export function useDragVisionHint(enabled: boolean): { show: boolean; dismiss: () => void } {
   const [show, setShow] = useState(false);

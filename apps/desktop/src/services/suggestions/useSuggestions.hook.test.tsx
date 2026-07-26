@@ -20,6 +20,25 @@ vi.mock("./engine", () => ({
   computeSuggestions: (...a: unknown[]) => computeSuggestions(...a),
   SuggestionOfflineError,
 }));
+// Same stand-in trick for AiUnavailableError / AiUnreachableError: the hook's `instanceof` checks key
+// off the classes it imports from "../anthropic", so tests must reject with the very same classes.
+// Mocking the module also keeps the real one's @tauri-apps/api/core import out of this suite.
+const { AiUnavailableError, AiUnreachableError } = vi.hoisted(() => {
+  class AiUnavailableError extends Error {
+    constructor() {
+      super("AI backend is unavailable");
+      this.name = "AiUnavailableError";
+    }
+  }
+  class AiUnreachableError extends Error {
+    constructor() {
+      super("Claude request failed: the network is unreachable");
+      this.name = "AiUnreachableError";
+    }
+  }
+  return { AiUnavailableError, AiUnreachableError };
+});
+vi.mock("../anthropic", () => ({ AiUnavailableError, AiUnreachableError }));
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => "Done. Committed abc. Nothing further." }));
 vi.mock("../aiGate", () => ({ useAiFeature: () => true }));
 vi.mock("../relayClient", () => ({ pushSuggestions: vi.fn() }));
@@ -116,6 +135,42 @@ describe("useSuggestions concurrency guard", () => {
       useConnectionStore.setState({ browserOnline: true, isOnline: true });
     });
     await waitFor(() => expect(computeSuggestions).toHaveBeenCalledTimes(2));
+  });
+
+  it("spends no retries when the AI backend reports itself unavailable", async () => {
+    // A generic rejection is worth retrying (see the "retries" test above, which reaches 2 calls).
+    // An unavailable backend is not: the retries would hit the same wall, so the first failure must
+    // exhaust the budget outright — exactly ONE compute for this state, where a generic error buys 3.
+    computeSuggestions.mockRejectedValue(new AiUnavailableError());
+
+    const { unmount } = renderHook(() => useSuggestions("a1", true));
+
+    await waitFor(() => expect(computeSuggestions).toHaveBeenCalledTimes(1));
+    // Wait out the window in which a retry would have fired (first-retry backoff is 700ms), and
+    // confirm nothing further was attempted.
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(computeSuggestions).toHaveBeenCalledTimes(1);
+    // Budget-exhausted, so nothing re-fires — but unmount anyway so this primed hook can't leak
+    // a late compute into the NEXT test's spy.
+    unmount();
+  });
+
+  it("defers a mid-flight transport failure instead of retrying it", async () => {
+    // The store still reads online (the reachability heartbeat is up to 30s stale), so the
+    // pre-compute gate lets this through — and the request then dies at the transport layer.
+    computeSuggestions.mockRejectedValue(new AiUnreachableError());
+
+    const { unmount } = renderHook(() => useSuggestions("a1", true));
+
+    // Exactly one compute. Before this branch existed the failure looked like a generic rejection
+    // and bought the full retry budget — three paid calls, none of which could reach the host.
+    // Wait past the first-retry backoff (700ms): a scheduled retry would have pushed this to 2.
+    await waitFor(() => expect(computeSuggestions).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(computeSuggestions).toHaveBeenCalledTimes(1);
+    // Deferring deliberately leaves lastHash uncommitted so the state recomputes on reconnect —
+    // which means this hook stays primed. Unmount it so it can't fire into the NEXT test's spy.
+    unmount();
   });
 
   it("does not retry a permanent (4xx) rejection — it can only fail the same way", async () => {

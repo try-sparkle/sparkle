@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
+import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { createAgentWorktree, installWorktreeGuard, assertWorkspaceIntegrity } from "../services/worktree";
 import { checkClaude, claudeHasSession } from "../preflight";
 import { buildClaudeExec } from "../services/claudeSpawn";
 import { cancelImprovementPass } from "../services/improvementPass";
 import {
+  checkSubmitCapability,
   ensureSparkleRepo,
   sparklePersona,
   sparkleMissionPrompt,
   sparkleChatOnlyMissionPrompt,
+  submitBlockedReason,
   SPARKLE_PROJECT_ID,
 } from "../services/sparkleAgent";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -53,6 +55,9 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
   const [spawn, setSpawn] = useState<SpawnCmd | null>(null);
   const [ptyReady, setPtyReady] = useState(false);
   const [lastPrompt, setLastPrompt] = useState("");
+  // Why this machine can't open PRs, if it can't (null = it can, or we couldn't tell). Set during
+  // prepare() so the pane says the same thing the agent was told — see submitBlockedReason.
+  const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const setStatus = useRuntimeStore((s) => s.setStatus);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const termFocusRef = useRef<(() => void) | null>(null);
@@ -94,13 +99,23 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
       // spawned command is built here, so a consent change while a session is already running is
       // picked up on the next prepare/resume, not mid-session.
       const consent = useSettingsStore.getState().sparkleImprovementConsent;
+      // Can this machine actually submit? Asked here, once per prepare, so the persona and the
+      // notice below agree — and so a read-only user learns it up front instead of after a full
+      // session ends in a 403. A failed probe is "unknown": the normal submitting path stays.
+      const submit = await checkSubmitCapability().catch(() => null);
+      setSubmitNotice(submit ? submitBlockedReason(submit.verdict, submit.repo) : null);
       setSpawn({
         command: SHELL,
         args: [
           "-l",
           "-c",
           buildClaudeExec(claude.path, resume, {
-            appendSystemPrompt: sparklePersona(ws.logDir, wt.path, consent),
+            appendSystemPrompt: sparklePersona(
+              ws.logDir,
+              wt.path,
+              consent,
+              submit?.verdict ?? "unknown",
+            ),
             // "Never" = chat-only: don't even grant the agent read access to the log dir, and open
             // with an introduction instead of a log-review mission.
             ...(consent === "never" ? {} : { addDirs: [ws.logDir] }),
@@ -150,6 +165,27 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
     >
       <PinnedPrompt prompt={lastPrompt || "Sparkle Improvement Agent — making Sparkle better from your usage"} />
       <SparkleConsentBanner />
+      {/* Submission is the last step of every pass and the one most likely to be unavailable — a
+          public user has read-only access to the upstream repo. Saying so HERE, before the agent
+          starts, is the difference between "it's working differently than promised" and a silent
+          403 at the end. The wording comes from submitBlockedReason, the same source the persona
+          uses, so the pane and the agent can't tell the user different stories. */}
+      {submitNotice && (
+        <div
+          role="status"
+          style={{
+            flex: "0 0 auto",
+            padding: "8px 14px",
+            background: C.deepForest,
+            borderBottom: `1px solid ${CHAT_USER_BUBBLE}`,
+            color: C.muted,
+            fontSize: 12.5,
+            lineHeight: 1.5,
+          }}
+        >
+          {submitNotice}
+        </div>
+      )}
 
       {phase === "preparing" && <Centered>Preparing the Sparkle improvement workspace…</Centered>}
       {phase === "error" && (
@@ -172,6 +208,9 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
               cwd={spawn.cwd}
               resuming={spawn.resuming}
               active={visible}
+              // This pane kept its Composer, so a plain drag over a mouse-tracking TUI is
+              // reclaimed as a text selection while that composer is open (roborev 46485-M).
+              composerOverlay
               onStatus={(s) => setStatus(agentId, s)}
               onReady={() => setPtyReady(true)}
               onRequestFocus={() => composerInputRef.current?.focus()}

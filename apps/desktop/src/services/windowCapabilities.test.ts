@@ -34,9 +34,15 @@ describe("default capability", () => {
     );
   });
 
-  it("covers the main window and the runtime win-* windows", () => {
-    // A window whose label matches no capability gets ZERO permissions in Tauri v2.
-    expect(capabilities.windows).toContain("main");
-    expect(capabilities.windows).toContain("win-*");
+  it("covers exactly the single-window shell's webviews — and no runtime windows", () => {
+    // A window whose label matches no capability gets ZERO permissions in Tauri v2. The
+    // single-window shell (CM-U7 part 2) has no runtime window creation, so the win-* glob is
+    // GONE on purpose — its reappearance would mean multi-window crept back in.
+    //
+    // Membership, not ORDER: reordering the JSON array changes nothing about what is granted, and
+    // pinning order turns a harmless edit into a failing test (roborev 46485-L). The win-* check
+    // is stated separately because it is the part that actually matters.
+    expect(new Set(capabilities.windows)).toEqual(new Set(["main", "tray", "capture"]));
+    expect(capabilities.windows.some((w: string) => w.includes("*"))).toBe(false);
   });
 });

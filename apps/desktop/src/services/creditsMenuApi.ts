@@ -35,6 +35,11 @@ export interface LedgerEntry {
    *  `purpose` threaded through the AI proxy — e.g. "Renamed agent to 'Fix OAuth loop'"). The server
    *  sends `description: string | null`; absent/null falls back to the static reason label. */
   description?: string | null;
+  /** Optional project NAME surfaced from the ledger row's `meta.project` — which project this spend
+   *  was for. null/absent for every row written before project attribution shipped, and for
+   *  genuinely account-level spend (top-ups, promos). The UI renders that absence as a muted dash;
+   *  it must never be back-filled with a guess. */
+  project?: string | null;
 }
 
 // The checkout URL from the most recent startTopup/startCardSetup whose browser launch FAILED —

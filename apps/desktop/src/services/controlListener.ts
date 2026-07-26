@@ -136,8 +136,23 @@ function callerMayAdminister(callerAgentId: string): boolean {
 }
 
 /** get_state → the full agent roster (across every project) + the current theme preference. Status
- *  comes from the live runtimeStore (keyed by agentId globally); an agent with no live status yet
- *  reads as "idle" (finished-its-turn), the same default the sidebar shows. */
+ *  comes from the live runtimeStore (keyed by agentId globally); an agent with no live status reads
+ *  as "stopped" (not running), the same default the sidebar uses.
+ *
+ *  This defaulted to "idle" until 2026-07-26, and the comment claimed that matched the sidebar — it
+ *  did not (AgentSidebar and agentOrdering both default to "stopped"). The two are NOT
+ *  interchangeable: "idle" means the agent finished its turn and is waiting on you, "stopped" means
+ *  it has no process at all. Every persisted-but-closed tab therefore reported as a live agent that
+ *  had just finished, which is exactly the wrong read when you are asking this API "what is my fleet
+ *  doing" — a roster of 51 dormant tabs came back looking like 51 agents idling for your attention.
+ *
+ *  STATUS VOCABULARY, since this crosses the MCP boundary and callers branch on it:
+ *    working                      — actively producing output
+ *    waiting | approval | errored — needs you NOW (the red tier that pings)
+ *    blocked                      — went quiet; red, but nothing is waiting on your answer
+ *    unmerged                     — finished, committed work not yet on main (gray, not an alarm)
+ *    idle | done                  — finished its turn, nothing left for you
+ *    stopped                      — no live process (also the default for an agent with no entry) */
 function handleGetState(): {
   agents: unknown[];
   theme: ThemePref;
@@ -153,7 +168,7 @@ function handleGetState(): {
       id: a.id,
       name: a.name,
       kind: a.kind,
-      status: status[a.id] ?? "idle",
+      status: status[a.id] ?? "stopped",
       parentId: a.parentId,
       activity: a.activity ?? null,
     })),

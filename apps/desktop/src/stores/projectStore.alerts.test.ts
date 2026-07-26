@@ -11,7 +11,7 @@ describe("projectStore — Dismiss Alert", () => {
 
   function setup(): { pid: string; aid: string } {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
-    const aid = useProjectStore.getState().addAgent(pid);
+    const aid = useProjectStore.getState().addAgent(pid)!;
     return { pid, aid };
   }
   const agentOf = (aid: string) =>

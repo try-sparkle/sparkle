@@ -79,11 +79,14 @@ describe("selectAndOpen — reveals a cross-window-focused agent", () => {
     expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a-build");
   });
 
-  it("still selects + clears the overlay when the agent isn't found (no mode change)", () => {
-    useUiStore.setState({ activeSpecial: "board", workMode: "build" });
+  it("BAILS on a gone agent — no overlay drop, no mode change, no phantom selection", () => {
+    // roborev 46353: there is nothing to reveal, so touching anything would leave activeSpecial
+    // and workMode disagreeing (Plan board dropped, plan chevron still selected) and push a
+    // phantom id into the open set.
+    useUiStore.setState({ activeSpecial: "board", workMode: "plan" });
     selectAndOpen("p1", "ghost");
-    expect(useUiStore.getState().activeSpecial).toBeNull();
-    expect(useUiStore.getState().workMode).toBe("build"); // unchanged — kind unknown
-    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("ghost");
+    expect(useUiStore.getState().activeSpecial).toBe("board");
+    expect(useUiStore.getState().workMode).toBe("plan");
+    expect(useProjectStore.getState().projects[0]!.selectedAgentId).not.toBe("ghost");
   });
 });

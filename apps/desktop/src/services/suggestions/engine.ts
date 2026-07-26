@@ -3,6 +3,7 @@ import { SEED_CATALOG } from "./catalog";
 import { deriveContextTags } from "./contextTags";
 import { useSuggestionStore } from "../../stores/suggestionStore";
 import { chatOnce, extractJson } from "../anthropic";
+import { projectNameForAgent } from "../creditProject";
 import { log } from "../../logger";
 import type { SuggestionButton, SuggestionSet } from "./types";
 
@@ -101,7 +102,12 @@ export async function computeSuggestions(opts: ComputeOpts): Promise<SuggestionS
 
   const tags = deriveContextTags(scrollback);
   const history = useSuggestionStore.getState().topByContext(tags, 8);
-  const call = opts.callHaiku ?? ((sys, user) => chatOnce(sys, user, 512, "Suggesting next actions"));
+  // Attributed to the agent's OWNING project so the Credits history can say which project the
+  // suggestion spend belonged to; undefined (→ unattributed) if the agent can't be resolved.
+  const project = projectNameForAgent(agentId);
+  const call =
+    opts.callHaiku ??
+    ((sys, user) => chatOnce(sys, user, 512, { purpose: "Suggesting next actions", project }));
 
   const user = [
     `Recent terminal output:\n${lastLines(scrollback, SCROLLBACK_LINES)}`,

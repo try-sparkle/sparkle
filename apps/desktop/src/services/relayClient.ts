@@ -12,6 +12,7 @@
 // load the `io` runtime lazily inside startRelayHost so it never lands in the initial boot chunk —
 // an unauthenticated first-run user never downloads or parses it.
 import type { Socket } from "socket.io-client";
+import type { RelaySocketLike } from "./agentTransport";
 import { invoke } from "@tauri-apps/api/core";
 import { onPtyOutput, writePty } from "../pty";
 import { getAgentScrollback } from "./terminalScrollback";
@@ -84,6 +85,15 @@ export interface RosterPayload {
 
 let socket: Socket | null = null;
 let registered = false;
+
+/** The live relay socket, or null when the host connection isn't up. Exposed so CloudTransport
+ *  (services/agentTransport.ts) can attach to a cloud agent's server-served stream over the SAME
+ *  socket this host already maintains — cloud sessions ride the existing relay, not a second one.
+ *  Socket.IO's emit/on/off match RelaySocketLike structurally; the cast erases the heavy overloads.
+ *  The type is shared (type-only import, no runtime cycle) so the two sites can't drift. */
+export function getRelaySocket(): RelaySocketLike | null {
+  return socket as unknown as RelaySocketLike | null;
+}
 let connecting = false;
 let lastRoster: RosterPayload | null = null;
 // Agents a phone is currently watching (drill-in) — we stream only these agents' PTY output.

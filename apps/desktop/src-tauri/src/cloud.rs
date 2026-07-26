@@ -113,9 +113,11 @@ enum AudioMsg {
 pub struct DeepgramSession {
     audio_tx: Sender<AudioMsg>,
     worker: Option<JoinHandle<()>>,
-    /// When set, the worker skips its `dictation://cloud-ended` emit on exit. Used by `discard()`
-    /// so a session rejected by the post-handshake race guard doesn't fire an event that would tear
-    /// down the *current* (healthy) session — the event carries no generation identity.
+    /// When set, the worker skips its `dictation://cloud-ended` emit on exit. Set by `finish()` (the
+    /// frontend-initiated stop already tore the UI down, so the event would only trigger a redundant
+    /// round-trip) and by `silence_now()`, where it matters more: a session torn down
+    /// alongside a live successor must not fire an event that would stop the *current* (healthy)
+    /// session — the event carries no generation identity.
     suppress_ended: Arc<AtomicBool>,
     /// True while the worker thread is running. Cleared the instant the worker exits (clean close,
     /// warm-standby expiry, or socket death). Lets the reuse path (`start_cloud_stream`) check, under
@@ -123,6 +125,30 @@ pub struct DeepgramSession {
     /// SAFE: resuming a just-dead session simply drops frames, and the worker's `cloud-ended` emit on
     /// exit drives the frontend back to on-device — the same recovery as any mid-stream death.
     alive: Arc<AtomicBool>,
+    /// True while this session is parked in warm standby (`pause()` sent, no `resume()` since).
+    /// Distinguishes a socket that is DELIBERATELY idling on our warm timer from one that is merely
+    /// installed-but-not-yet-routing, which matters because `stop_cloud_stream` must keep the former
+    /// and close the latter. Owned by the pause/resume callers rather than the worker: on warm
+    /// expiry the worker exits, so `alive` already reports the truth and this flag is moot.
+    parked: Arc<AtomicBool>,
+    /// When set, the worker emits NO transcript (`partial`/`interim`) for the rest of its life. Set
+    /// by `silence_now()` — the teardown of a session whose successor is coming up concurrently.
+    /// The reopen paths call it under the session lock; the post-handshake orphan calls it on a
+    /// session that never entered the slot. Either way the silencing happens on the CALLING thread
+    /// and only the blocking close goes to a worker.
+    ///
+    /// `suppress_ended` is NOT enough there: it gates only the `cloud-ended` emit, while the ~2 s
+    /// post-CloseStream drain keeps forwarding transcripts. `dictation://partial` feeds straight
+    /// into the frontend's `onSegment`, so a trailing final from the OLD socket can inject stale text
+    /// into the new session — or, if it happens to contain the configured stop word, end it. Balance
+    /// emits are deliberately NOT muted: that minute was really debited and the pill must show it.
+    muted: Arc<AtomicBool>,
+    /// The project name this socket was OPENED with, normalized the same way the wire value is
+    /// (trimmed, clipped; blank → None). The relay captures the project once at handshake and stamps it on
+    /// every per-minute debit for the life of the connection, so a warm socket reused after the user
+    /// switched projects would bill the new project's minutes to the old one. `start_cloud_stream`
+    /// compares against this before reusing and reopens on a mismatch (roborev 48164).
+    project: Option<String>,
 }
 
 impl DeepgramSession {
@@ -132,19 +158,42 @@ impl DeepgramSession {
     /// relay refused because the user can't afford the first minute (a non-101 status) — so the
     /// caller can fall back to the on-device path before any audio is captured; no partial/dead
     /// session is ever returned.
-    pub fn start(app: AppHandle, base_url: String, token: String) -> Result<DeepgramSession, String> {
-        let socket = connect(&base_url, &token, SAMPLE_RATE)?;
+    pub fn start(
+        app: AppHandle,
+        base_url: String,
+        token: String,
+        // Project this dictation belongs to, for credit-history attribution. None when unknown.
+        project: Option<String>,
+    ) -> Result<DeepgramSession, String> {
+        let socket = connect(&base_url, &token, SAMPLE_RATE, project.as_deref())?;
         let (tx, rx) = std::sync::mpsc::channel::<AudioMsg>();
         let suppress_ended = Arc::new(AtomicBool::new(false));
         let suppress_cb = suppress_ended.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_cb = alive.clone();
+        let muted = Arc::new(AtomicBool::new(false));
+        let muted_cb = muted.clone();
         let worker = std::thread::Builder::new()
             .name("deepgram-relay".into())
-            .spawn(move || run_session(app, socket, rx, suppress_cb, alive_cb))
+            .spawn(move || run_session(app, socket, rx, suppress_cb, alive_cb, muted_cb))
             .map_err(|e| format!("spawn relay worker: {e}"))?;
         tracing::info!(target: "dictation", "cloud relay stream opened");
-        Ok(DeepgramSession { audio_tx: tx, worker: Some(worker), suppress_ended, alive })
+        Ok(DeepgramSession {
+            audio_tx: tx,
+            worker: Some(worker),
+            suppress_ended,
+            alive,
+            parked: Arc::new(AtomicBool::new(false)),
+            muted,
+            project: normalize_project(project.as_deref()),
+        })
+    }
+
+    /// Whether this socket was opened for `requested` — i.e. whether reusing it would attribute the
+    /// next minutes to the right project. Strict: a session opened WITH a project must not be reused
+    /// for an unattributed request either, since that would silently bill the old project.
+    pub fn is_for_project(&self, requested: Option<&str>) -> bool {
+        self.project.as_deref() == normalize_project(requested).as_deref()
     }
 
     /// A cheap, cloneable handle to just this session's audio channel. The realtime capture
@@ -160,12 +209,21 @@ impl DeepgramSession {
     /// and keep the socket open for `WARM_STANDBY` so the next utterance can reuse it. No-ops if the
     /// worker already exited. Called instead of `finish()` on a normal stop-word stop.
     pub fn pause(&self) {
+        self.parked.store(true, Ordering::Relaxed);
         let _ = self.audio_tx.send(AudioMsg::Pause);
     }
 
     /// Leave warm standby and resume forwarding audio on the same connection (no handshake).
     pub fn resume(&self) {
+        self.parked.store(false, Ordering::Relaxed);
         let _ = self.audio_tx.send(AudioMsg::Resume);
+    }
+
+    /// Whether this session is currently parked in warm standby. Checked (alongside `is_alive`) by
+    /// `stop_cloud_stream` so a stop that arrives AFTER the blur path already parked the socket
+    /// leaves it warm instead of closing it.
+    pub fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::Relaxed)
     }
 
     /// Whether the worker thread is still running (socket usable). Checked before reusing a warm
@@ -193,6 +251,54 @@ impl DeepgramSession {
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
+    }
+
+    /// Go quiet IMMEDIATELY — no transcripts, no `cloud-ended` — and hand back a session that can
+    /// only be closed, never resumed. THE way to tear a session down while a REPLACEMENT is coming
+    /// up concurrently (the reopen paths in `start_cloud_stream`, and the post-handshake orphan).
+    ///
+    /// Consuming, and returning a distinct type, ON PURPOSE. The whole hazard here is ORDERING: the
+    /// silencing must happen on the calling thread, before the bounded-but-blocking close is handed
+    /// to a worker. The predecessor was a single `discard()` that silenced as its first statement —
+    /// which READ as if it silenced synchronously while actually doing it inside the spawned task,
+    /// leaving a window where the outgoing worker could still emit `cloud-ended` (and drain
+    /// transcripts) into whichever session raced ahead. That regressed twice from comments alone
+    /// (roborev 50498/53024).
+    ///
+    /// This does NOT make the hazard unstateable — `spawn_blocking(move || s.silence_now().finish())`
+    /// still compiles. What it removes is the MISLEADING form: the silencing can no longer hide
+    /// inside a teardown method, so a reviewer sees `silence_now()` at the call site or not at all.
+    /// The call-site comments still carry the ordering; keep them.
+    ///
+    /// Not for the ordinary stop path — there the trailing final is the whole point of the
+    /// Finalize/drain, which is why `finish()` does not mute.
+    pub fn silence_now(self) -> SilencedSession {
+        self.muted.store(true, Ordering::Relaxed);
+        self.suppress_ended.store(true, Ordering::Relaxed);
+        SilencedSession(self)
+    }
+}
+
+/// A `DeepgramSession` that has already gone quiet (see `silence_now`). Its only operation is the
+/// blocking close: it cannot be resumed, re-silenced, or handed back to the slot.
+///
+/// It does NOT constrain WHERE that close runs. `finish()` is bounded (~2 s) but blocking, and
+/// `start_cloud_stream` is an `async fn` command, so calling it inline there would stall an async
+/// runtime worker for the whole teardown — the call site must still hand it to `spawn_blocking`.
+///
+/// `#[must_use]`: `Drop for DeepgramSession` signals close but deliberately does NOT join, so letting
+/// one of these go silently degrades a bounded close+join into fire-and-forget — a state the old
+/// consuming `discard(self)` couldn't reach. Note what the lint actually covers, though: a value
+/// produced and thrown away as an expression STATEMENT. It cannot see a binding that later falls out
+/// of scope on an early return, so the `finish()` hand-off still has to be read at the call site.
+#[must_use = "a silenced session must still be closed — hand it to spawn_blocking(|| s.finish())"]
+pub struct SilencedSession(DeepgramSession);
+
+impl SilencedSession {
+    /// Close + join, exactly like `DeepgramSession::finish()`. Bounded (~2 s); meant to run on a
+    /// blocking worker, never on the async runtime.
+    pub fn finish(self) {
+        self.0.finish();
     }
 }
 
@@ -228,7 +334,10 @@ impl CloudAudioSender {
 /// Build the relay WebSocket URL, TCP connect target, and TLS flag from the orchestration base URL.
 /// Pure so the http→ws / https→wss mapping and the default-port logic are unit-testable. Returns
 /// `(ws_url, host:port, tls)`. Accepts `http(s)://` (the base_url form) and `ws(s)://` defensively.
-fn relay_target(base_url: &str, sample_rate: u32) -> Result<(String, String, bool), String> {
+fn relay_target(
+    base_url: &str,
+    sample_rate: u32,
+) -> Result<(String, String, bool), String> {
     let trimmed = base_url.trim();
     let (tls, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
         (true, r)
@@ -258,6 +367,54 @@ fn relay_target(base_url: &str, sample_rate: u32) -> Result<(String, String, boo
     let scheme = if tls { "wss" } else { "ws" };
     let ws_url = format!("{scheme}://{authority}{RELAY_WS_PATH}?sample_rate={sample_rate}");
     Ok((ws_url, host_port, tls))
+}
+
+/// Trim, CLIP, and treat blank as absent — the single normalization used both for the wire value and
+/// for the warm-reuse comparison, so " sparkle " and "sparkle" can never be read as two different
+/// projects (which would pointlessly drop a reusable warm socket, and each reopen costs the user a
+/// fresh first-minute debit). Clipping here too, not only in `project_header_value`: the stored name
+/// must be the name the relay is actually BILLING, or two names differing only past the cap would
+/// force a reopen the ledger can't tell apart.
+fn normalize_project(project: Option<&str>) -> Option<String> {
+    project
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(|n| n.chars().take(MAX_PROJECT_CHARS).collect())
+}
+
+/// Max chars of the project name we put on the wire. Mirrors `ai::MAX_PROJECT_CHARS` and the relay's
+/// own `MAX_PROJECT_CHARS`, and clips by CHARS (Unicode scalars) so all three metering paths agree.
+/// Without a cap here, a pathological name percent-encodes to ~3x its bytes inside a handshake
+/// header — and an oversized header gets the upgrade REFUSED, i.e. a decorative annotation would
+/// break the feature it annotates (roborev 48157).
+const MAX_PROJECT_CHARS: usize = 120;
+
+/// Build the `X-Sparkle-Project` handshake header value for a dictation session: trimmed, clipped,
+/// percent-encoded; None when there is no usable name.
+///
+/// A HEADER, not a `?project=` query param. This endpoint deliberately dropped its `?token=`
+/// fallback (sparkle-5lne) because "a live bearer in the URL is captured by proxies, access logs,
+/// and referrers" — and a user-chosen project name (`creditProject.ts` uses `acme-lawsuit` as the
+/// motivating example) deserves the same hygiene. The client already sets `Authorization`, so a
+/// header costs nothing. Percent-encoded because header values must be visible ASCII, and a
+/// human-typed name is neither. (roborev 48157/48164)
+fn project_header_value(project: Option<&str>) -> Option<String> {
+    normalize_project(project).map(|name| percent_encode_query(&name))
+}
+
+/// Percent-encode a VALUE, keeping only the unreserved set (RFC 3986 §2.3) literal and hex-escaping
+/// every other byte of its UTF-8. Deliberately strict — this is a human-typed project name landing
+/// in a handshake header, so anything outside visible ASCII (or that could confuse a parser) must be
+/// escaped rather than trusted.
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Convert 16 kHz mono f32 samples to PCM16 little-endian bytes (Deepgram `encoding=linear16`).
@@ -365,23 +522,27 @@ pub(crate) fn classify_relay_frame(json: &str) -> RelayFrame {
 }
 
 /// Bound the whole handshake (TCP connect + TLS + WS upgrade). Without this an offline/black-holed
-/// network stalls the start_cloud_stream command thread for the OS SYN timeout (tens of seconds),
-/// undercutting the fast fall-back-to-on-device design.
+/// network stalls the handshake for the OS SYN timeout (tens of seconds). `start_cloud_stream` now
+/// runs this off the main thread (via `spawn_blocking`), so a stall no longer freezes the UI — but
+/// the bound still matters so the fall-back-to-on-device stays fast rather than hanging for tens of
+/// seconds.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Open the WebSocket to the orchestration relay with the Sparkle bearer as the `Authorization`
-/// header. Blocking but bounded by CONNECT_TIMEOUT — callers run it on the Tauri command thread and
-/// treat Err as "fall back to on-device". A non-101 handshake response (the relay's 401/402/403/503
+/// header. Blocking but bounded by CONNECT_TIMEOUT — callers run it on a blocking worker (never the
+/// main/event-loop thread) and treat Err as "fall back to on-device". A non-101 handshake response
+/// (the relay's 401/402/403/503
 /// gates) surfaces as Err too. run_session resets the socket timeouts to its own values after this
 /// returns.
 fn connect(
     base_url: &str,
     token: &str,
     sample_rate: u32,
+    project: Option<&str>,
 ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
     let (ws_url, host_port, tls) = relay_target(base_url, sample_rate)?;
     // into_client_request() fills in the required handshake headers (Host, Upgrade, Sec-*); we
-    // only add Authorization on top.
+    // only add Authorization (and the metering-only project) on top.
     let mut req = ws_url
         .as_str()
         .into_client_request()
@@ -392,6 +553,19 @@ fn connect(
             .parse()
             .map_err(|_| "invalid Sparkle auth header".to_string())?,
     );
+    // Metering-only, and NON-FATAL by construction: an unparseable header value is skipped (losing
+    // the attribution) rather than failing the connection — the annotation must never be able to
+    // break the dictation it annotates.
+    if let Some(value) = project_header_value(project) {
+        match value.parse() {
+            Ok(v) => {
+                req.headers_mut().insert("X-Sparkle-Project", v);
+            }
+            Err(_) => {
+                tracing::warn!(target: "dictation", "dropping unencodable project header; minute will be unattributed")
+            }
+        }
+    }
     // Resolve + TCP-connect with a timeout (fail fast when offline), bound the TLS+WS upgrade reads/
     // writes too, then run the handshake over the prepared stream. Try every resolved address (not
     // just the first) so an unreachable record — e.g. an IPv6 addr on an IPv4-only path — doesn't
@@ -495,6 +669,9 @@ fn run_session(
     audio_rx: Receiver<AudioMsg>,
     suppress_ended: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+    // Set by `silence_now()`: drop transcripts on the floor for the rest of this session, so a
+    // teardown that overlaps a successor session can't inject text into it. See the `muted` field.
+    muted: Arc<AtomicBool>,
 ) {
     set_socket_timeouts(&mut socket, READ_TIMEOUT, WRITE_TIMEOUT);
     let mut closing = false;
@@ -602,8 +779,18 @@ fn run_session(
         // carries.
         match socket.read() {
             Ok(Message::Text(txt)) => match classify_relay_frame(txt.as_str()) {
-                RelayFrame::Partial(t) => emit_partial(&app, "deepgram", t),
-                RelayFrame::Interim(t) => emit_interim(&app, t),
+                // Muted (a discarded session draining alongside its successor) → drop the transcript
+                // rather than emit it into whatever session is live now.
+                RelayFrame::Partial(t) => {
+                    if !muted.load(Ordering::Relaxed) {
+                        emit_partial(&app, "deepgram", t)
+                    }
+                }
+                RelayFrame::Interim(t) => {
+                    if !muted.load(Ordering::Relaxed) {
+                        emit_interim(&app, t)
+                    }
+                }
                 RelayFrame::Control(RelayControl::Ready) => {
                     // Metering is live — flush the frames we buffered during the relay→Deepgram open
                     // (oldest first), then stream directly from here on. A write timeout does NOT lose
@@ -664,7 +851,7 @@ fn run_session(
     // Tell the frontend the cloud stream is gone (clean close OR mid-stream failure / exhaustion) so
     // it clears the interim preview and calls stop_cloud_stream — resuming on-device routing/fallback.
     // `exhausted` asks the frontend to refresh the (now-depleted) balance. Skipped for a discarded
-    // orphan (see discard()), whose event would otherwise stop the current session.
+    // orphan (see silence_now()), whose event would otherwise stop the current session.
     if !suppress_ended.load(Ordering::Relaxed) {
         emit_cloud_ended(&app, exhausted);
     }
@@ -681,6 +868,64 @@ mod tests {
         assert!(!warm_expired(Duration::from_millis(7_999), window), "just under the window stays warm");
         assert!(warm_expired(Duration::from_secs(8), window), "exactly at the window expires");
         assert!(warm_expired(Duration::from_secs(20), window), "well past the window expires");
+    }
+
+    /// A session with no socket and no worker. `pause`/`resume`/`is_parked` only touch the audio
+    /// channel and the flag, so this exercises them without a live relay. The receiver is returned so
+    /// the sends land in a real channel rather than a closed one.
+    fn parkable_session() -> (DeepgramSession, std::sync::mpsc::Receiver<AudioMsg>) {
+        let (tx, rx) = std::sync::mpsc::channel::<AudioMsg>();
+        let session = DeepgramSession {
+            audio_tx: tx,
+            worker: None,
+            suppress_ended: Arc::new(AtomicBool::new(true)),
+            alive: Arc::new(AtomicBool::new(true)),
+            parked: Arc::new(AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(false)),
+            project: None,
+        };
+        (session, rx)
+    }
+
+    #[test]
+    fn silence_now_goes_quiet_on_the_calling_thread_not_in_the_teardown() {
+        // The reopen paths tear a session down WHILE its replacement is opening, so both gates must
+        // close before the blocking close is handed to a worker: `suppress_ended` alone leaves the
+        // ~2 s drain still emitting partials (the frontend feeds those to onSegment — stale text in
+        // the new session, or the stop word ending it outright), and a cloud-ended emitted from the
+        // scheduling gap stops the successor outright. Asserted on the flags the WORKER reads, before
+        // finish() is ever called. (roborev 50498/53024)
+        let (session, _rx) = parkable_session();
+        session.suppress_ended.store(false, Ordering::Relaxed); // the helper starts it suppressed
+        let muted = session.muted.clone();
+        let suppressed = session.suppress_ended.clone();
+        let silenced = session.silence_now();
+        assert!(muted.load(Ordering::Relaxed), "no transcripts may escape a discarded session");
+        assert!(suppressed.load(Ordering::Relaxed), "nor a cloud-ended that would stop its successor");
+        silenced.finish(); // only now does the blocking close run
+    }
+
+    #[test]
+    fn finish_does_not_mute_because_the_trailing_final_is_the_point() {
+        // The ordinary stop path Finalizes precisely so the last words still commit. Muting there
+        // would silently eat the tail of every utterance.
+        let (session, _rx) = parkable_session();
+        let muted = session.muted.clone();
+        session.finish();
+        assert!(!muted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn pause_and_resume_track_whether_the_session_is_parked() {
+        // stop_cloud_stream reads this to tell a socket deliberately idling on our warm timer from
+        // one that is merely installed and not yet routing — see should_keep_warm_on_stop. Without
+        // it, the stop that follows a blur park closed the socket the park had just kept.
+        let (session, _rx) = parkable_session();
+        assert!(!session.is_parked(), "a fresh session is routing, not parked");
+        session.pause();
+        assert!(session.is_parked(), "pause() puts the session into warm standby");
+        session.resume();
+        assert!(!session.is_parked(), "resume() takes it back out");
     }
 
     #[test]
@@ -750,6 +995,75 @@ mod tests {
     fn relay_target_carries_the_requested_sample_rate() {
         let (ws_url, _, _) = relay_target("https://host.test", 48_000).expect("valid");
         assert!(ws_url.ends_with("/ai/deepgram?sample_rate=48000"), "url: {ws_url}");
+    }
+
+    #[test]
+    fn the_project_never_appears_in_the_relay_url() {
+        // It travels as the X-Sparkle-Project HEADER. A query param would land the user's project
+        // name in proxy/access logs — the same reason `?token=` was removed from this endpoint.
+        let (ws_url, _, _) = relay_target("https://host.test", 16_000).expect("valid");
+        assert!(!ws_url.contains("project"), "url: {ws_url}");
+        assert!(ws_url.ends_with("?sample_rate=16000"), "url: {ws_url}");
+    }
+
+    #[test]
+    fn project_header_carries_the_name_for_credit_attribution() {
+        assert_eq!(project_header_value(Some("sparkle")).as_deref(), Some("sparkle"));
+    }
+
+    #[test]
+    fn project_header_is_absent_for_a_missing_or_blank_project() {
+        // Absent and whitespace-only both mean "no project recorded" — the relay must not receive an
+        // empty value that would land as an empty string in the ledger meta.
+        assert_eq!(project_header_value(None), None);
+        assert_eq!(project_header_value(Some("   ")), None);
+    }
+
+    #[test]
+    fn project_header_percent_encodes_so_the_value_stays_visible_ascii() {
+        // A human-typed name may contain spaces, '&', '=', '#', or non-ASCII. Header values must be
+        // visible ASCII, and an un-encoded control char or newline would be rejected (or worse).
+        assert_eq!(
+            project_header_value(Some("my app &x=1 #2 café")).as_deref(),
+            Some("my%20app%20%26x%3D1%20%232%20caf%C3%A9"),
+        );
+    }
+
+    #[test]
+    fn project_header_clips_a_pathological_name_by_chars() {
+        // Uncapped, a long name percent-encodes to ~3x its bytes inside the handshake request — an
+        // oversized header gets the upgrade REFUSED, breaking dictation over a decorative annotation.
+        // Clipping by CHARS (not bytes) matches the Rust proxy path and the relay's own cap.
+        let long = "é".repeat(MAX_PROJECT_CHARS + 50);
+        let encoded = project_header_value(Some(&long)).expect("a long name still yields a value");
+        // Each 'é' is 2 UTF-8 bytes → "%C3%A9" (6 chars) once encoded.
+        assert_eq!(encoded.len(), MAX_PROJECT_CHARS * 6, "encoded: {}", encoded.len());
+    }
+
+    #[test]
+    fn a_session_is_reusable_only_for_the_project_it_was_opened_with() {
+        // The relay stamps the project captured at HANDSHAKE onto every per-minute debit for the life
+        // of the connection, so reusing a warm socket across a project switch bills the wrong project.
+        let (mut session, _rx) = parkable_session();
+        session.project = normalize_project(Some("alpha"));
+        assert!(session.is_for_project(Some("alpha")));
+        assert!(session.is_for_project(Some("  alpha  ")), "normalization must not force a reopen");
+        assert!(!session.is_for_project(Some("beta")), "a different project must reopen");
+        assert!(!session.is_for_project(None), "an unattributed request must not bill alpha");
+
+        // The stored name is the name the relay is BILLING — i.e. clipped exactly like the header —
+        // so two names that differ only past the cap don't force a reopen the ledger can't tell apart.
+        let long = "é".repeat(MAX_PROJECT_CHARS + 50);
+        let longer = "é".repeat(MAX_PROJECT_CHARS + 90);
+        let (mut clipped, _rx3) = parkable_session();
+        clipped.project = normalize_project(Some(&long));
+        assert_eq!(clipped.project.as_deref().map(|p| p.chars().count()), Some(MAX_PROJECT_CHARS));
+        assert!(clipped.is_for_project(Some(&longer)), "same billed name must reuse the socket");
+
+        let (mut unattributed, _rx2) = parkable_session();
+        unattributed.project = None;
+        assert!(unattributed.is_for_project(None));
+        assert!(!unattributed.is_for_project(Some("alpha")));
     }
 
     #[test]

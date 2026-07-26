@@ -5,23 +5,32 @@
 // selection (tracked by agent id, not position) is never disturbed.
 import type { AgentKind, AgentTabStatus } from "../types";
 
+// Where `unmerged` sits: below every red, above everything calm. Declared before STATUS_RANK so the
+// map can name it rather than repeating a bare 0.75 whose meaning lives only in a comment. Private:
+// STATUS_RANK is the public surface, and callers compare ranks rather than naming this one.
+const UNMERGED_RANK = 0.75;
+
 // Lower rank = higher in the stack. Grouped into tiers; ties keep insertion order
 // (the sort below is stable). Tune the taxonomy → tier mapping here, nothing else
 // hardcodes it. A status absent from this map sorts to the bottom (see STATUS_RANK_FALLBACK).
 export const STATUS_RANK: Record<AgentTabStatus, number> = {
-  // Tier 0 — RED: needs YOU before its work is truly done, so it floats to the top. This is the full
-  // red-COLOR tier (packages/ui/tokens.ts): the live asks (waiting/approval), the stuck states
-  // (errored crash/stall, `blocked` gone-quiet), and `unmerged` (finished but committed work not yet
-  // on main — open/merge the PR). Ranking any of them at the bottom would make a red agent SINK
-  // instead of floating up, contradicting the dot color and the cross-window red section
-  // (sparkle-pqxh). Note this is the color tier, which is BROADER than engine/attention's badge/
-  // notification set (waiting/approval/errored) — blocked/unmerged recolor + reorder but don't ping.
+  // Tier 0 — RED: needs YOU before its work is truly done, so it floats to the top. This is exactly
+  // the red-COLOR tier (packages/ui/tokens.ts): the live asks (waiting/approval) and the stuck
+  // states (errored crash/stall, `blocked` gone-quiet). Ranking any of them at the bottom would make
+  // a red agent SINK instead of floating up, contradicting the dot color (sparkle-pqxh). Note this
+  // is the color tier, which is BROADER than engine/attention's badge/notification set
+  // (waiting/approval/errored) — `blocked` recolors + reorders but doesn't ping.
   waiting: 0,
   approval: 0,
   errored: 0,
   blocked: 0,
-  unmerged: 0,
-  // Tier 1 — finished its turn, nothing left for you (nothing to merge, no question).
+  // Tier 0.75 — NOT red, but not nothing either: finished, with committed work that hasn't reached
+  // main. It sits between the alarms and the calm tier so unlanded work stays where you'll see it
+  // without claiming to be an emergency (it stopped being red on 2026-07-26 — see tokens.ts). This
+  // is the ONE rank that is neither a red nor a resting tier, which is the point: "you'll want to
+  // land this eventually" is genuinely a third thing.
+  unmerged: UNMERGED_RANK,
+  // Tier 1 — finished its turn, nothing left for you (no question, nothing to merge).
   idle: 1,
   done: 1,
   // Tier 2 — green: actively building, leave it be.
@@ -35,10 +44,14 @@ export const STATUS_RANK: Record<AgentTabStatus, number> = {
 const STATUS_RANK_FALLBACK = 99;
 
 // The just-opened build agent floats to the TOP of the non-alerting group: below tier 0
-// (red / needs-you, rank 0) but above idle/done/working/dormant. A fractional rank between
+// (red / needs-you, rank 0) but above unmerged/idle/done/working/dormant. A fractional rank between
 // tier 0 and tier 1 does exactly that without a fixed row index, so it tracks the bottom of
 // however many red rows exist at any moment. Only applied while the agent isn't itself red
 // (a red fresh agent already sits in tier 0 and must not be demoted below its red siblings).
+//
+// NOTE it also outranks UNMERGED_RANK (0.75): a fresh build agent that ALSO has unlanded work sorts
+// by its freshness, not its unmerged-ness. That's the intent — you just opened it, so it belongs at
+// the top of what isn't shouting — and it could not arise before `unmerged` left tier 0.
 export const FRESH_BUILD_RANK = 0.5;
 
 function rankOf(
@@ -56,9 +69,9 @@ function rankOf(
 }
 
 /**
- * Return a new array of `agents` ordered by how much support each needs, top-first
- * (waiting/approval → idle/done → working → blocked/errored/stopped). Stable within a
- * tier, so rows only move across tier boundaries. Does NOT mutate the input.
+ * Return a new array of `agents` ordered by how much support each needs, top-first:
+ * red (waiting/approval/errored/blocked) → unmerged → idle/done → working → stopped. Stable within
+ * a tier, so rows only move across tier boundaries. Does NOT mutate the input.
  *
  * Agents missing from `statusMap` are treated as "stopped" (matches the sidebar's own
  * `status[a.id] ?? "stopped"` default), so they land in the bottom tier.

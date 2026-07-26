@@ -4,8 +4,6 @@ import {
   setWindowProject,
   clearWindowProject,
   findWindowForProject,
-  getWindowProject,
-  onWindowRegistryChange,
   resetWindowRegistry,
 } from "./windowRegistry";
 
@@ -25,21 +23,6 @@ describe("windowRegistry", () => {
     expect(findWindowForProject("p1", s)).toBe("main");
     expect(findWindowForProject("p2", s)).toBe("project-p2");
     expect(findWindowForProject("nope", s)).toBeNull();
-  });
-
-  it("getWindowProject reads back the project a label currently shows", () => {
-    const s = fakeStore();
-    setWindowProject("main", "p1", s);
-    expect(getWindowProject("main", s)).toBe("p1");
-    // Unregistered label (closed window) → null, so callers can tell "shows nothing" from "shows X".
-    expect(getWindowProject("project-p2", s)).toBeNull();
-  });
-
-  it("getWindowProject follows a Replace (label re-pointed to a new project)", () => {
-    const s = fakeStore();
-    setWindowProject("main", "p1", s);
-    setWindowProject("main", "p2", s);
-    expect(getWindowProject("main", s)).toBe("p2");
   });
 
   it("clearing a label removes its mapping", () => {
@@ -65,17 +48,8 @@ describe("windowRegistry", () => {
     expect(findWindowForProject("p1", s)).toBe("main");
   });
 
-  // The roster publisher relies on same-window writes broadcasting a local event (the `storage`
-  // event only fires in OTHER windows) so it re-pushes the open set immediately.
-  it("notifies same-window subscribers on every mutation, incl. reset", () => {
-    const cb = vi.fn();
-    const off = onWindowRegistryChange(cb);
-    setWindowProject("main", "p1"); // default store = jsdom localStorage
-    clearWindowProject("main");
-    resetWindowRegistry();
-    expect(cb).toHaveBeenCalledTimes(3);
-    off();
-    setWindowProject("main", "p2");
-    expect(cb).toHaveBeenCalledTimes(3); // no calls after unsubscribe
-  });
+  // getWindowProject / onWindowRegistryChange / the liveness helpers (isWindowOpen,
+  // openWindowLabels, allKeys, removeKey) went with the cross-window status channel they served
+  // — see the note at the top of windowRegistry.ts (roborev 46897). What remains is the
+  // project↔window mapping captureSends routes on, covered above.
 });

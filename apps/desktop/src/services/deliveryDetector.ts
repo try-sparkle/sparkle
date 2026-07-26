@@ -234,7 +234,9 @@ function deliveredCriteria(text: string, signal: AutoSignal | null): StageCriter
  */
 export async function detectDelivery(
   projectRoot: string,
-  opts: { enrich?: boolean } = {},
+  // `projectName` is metering-only: it attributes the enrich turn's credit debit to this project in
+  // the Credits history. Omit it and the row simply carries no project (never a guess).
+  opts: { enrich?: boolean; projectName?: string } = {},
 ): Promise<DeliveryProposal> {
   const evidence = await invoke<DeliveryEvidence>("collect_delivery_evidence", {
     projectRoot,
@@ -245,7 +247,7 @@ export async function detectDelivery(
   if (opts.enrich === false || base.method === "unknown") return base;
 
   try {
-    const enriched = await enrichWithHaiku(evidence, base);
+    const enriched = await enrichWithHaiku(evidence, base, opts.projectName);
     return enriched;
   } catch {
     // Haiku is best-effort polish; never let it block or degrade the deterministic result.
@@ -268,6 +270,7 @@ const ENRICH_SYSTEM = [
 async function enrichWithHaiku(
   evidence: DeliveryEvidence,
   base: DeliveryProposal,
+  projectName?: string,
 ): Promise<DeliveryProposal> {
   const user = JSON.stringify({
     evidence,
@@ -277,7 +280,7 @@ async function enrichWithHaiku(
     ENRICH_SYSTEM,
     user,
     undefined,
-    "Checking delivery criteria",
+    { purpose: "Checking delivery criteria", project: projectName },
   );
   const note = typeof out.note === "string" && out.note.trim() ? out.note.trim() : base.note;
   const criteria = overlayCriteriaText(base.criteria, out.criteria);

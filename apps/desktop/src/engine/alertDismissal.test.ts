@@ -160,3 +160,51 @@ describe("withDismissedAlerts", () => {
     expect(statusMap.w).toBe("waiting");
   });
 });
+
+// ── `blocked` is dismissible (2026-07-26) ───────────────────────────────────────────────────────
+// It was added to the RedStatus UNION in one commit and to nothing else, so the claim "blocked is
+// now dismissible" was inert: every gate in the module routes through a predicate that was still
+// `needsAttention`, which excludes it. Roborev caught that the type widened while the behavior did
+// not. These pin the behavior end-to-end so the union and the gate can't drift apart again.
+//
+// It matters because `blocked` has a producer that is nothing like a stalled PTY:
+// services/improvementPass sets it on every failed hourly pass, and it sits on the pinned Sparkle
+// row until the next one — a permanent red with no way to acknowledge it.
+describe("blocked is a dismissible red", () => {
+  it("offers a Dismiss control (and Re-enable once dismissed)", () => {
+    expect(alertControlKind(EMPTY_ALERT, "blocked")).toBe("dismiss");
+    const dismissed = dismissedRecord(run(["blocked"]));
+    expect(alertControlKind(dismissed, "blocked")).toBe("reenable");
+  });
+
+  it("records an episode, so `lastRed` can actually hold it", () => {
+    expect(run(["blocked"]).lastRed).toBe("blocked");
+    expect(run(["blocked"]).seq).toBe(1);
+  });
+
+  it("suppresses once dismissed, and de-escalates to idle (not stopped — it still has a process)", () => {
+    const rec = dismissedRecord(run(["blocked"]));
+    expect(isAlertSuppressed(rec, "blocked")).toBe(true);
+    expect(deEscalatedStatus("blocked")).toBe("idle");
+    const agents = [{ id: "a", alert: rec }];
+    expect(withDismissedAlerts(agents, { a: "blocked" }).a).toBe("idle");
+  });
+
+  it("re-alerts on a NEW blocked episode after a dismissal", () => {
+    // A failed improvement pass, dismissed; the row recovers; the next pass fails again. That second
+    // failure is a new episode and must raise red again rather than stay acknowledged forever.
+    const dismissed = dismissedRecord(run(["blocked"]));
+    const afterRecovery = run(["idle", "blocked"], dismissed);
+    expect(isAlertSuppressed(afterRecovery, "blocked")).toBe(false);
+  });
+
+  it("a dismissed blocked does not suppress a LATER, different red", () => {
+    // Through the real path: `advanceAlertRecord` is what makes a changed red signature a new
+    // episode, and the sidebar runs it on every status change. Asking `isAlertSuppressed` directly
+    // with a different status would prove nothing — by design it only compares dismissedSeq to seq
+    // (see the isAlertSuppressed block above), for every status, not just this one.
+    const dismissed = dismissedRecord(run(["blocked"]));
+    const nowAsking = run(["waiting"], dismissed);
+    expect(isAlertSuppressed(nowAsking, "waiting")).toBe(false);
+  });
+});

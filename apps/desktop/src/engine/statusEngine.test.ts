@@ -1,6 +1,71 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { StatusEngine } from "./statusEngine";
+import { StatusEngine, parseSpinnerTokens, latestSpinnerTokens } from "./statusEngine";
 import type { AgentTabStatus } from "../types";
+
+describe("parseSpinnerTokens", () => {
+  it("parses k-suffixed and bare token counts from a spinner frame", () => {
+    expect(parseSpinnerTokens("✻ Incubating… (1m 24s · ↓ 2.1k tokens · esc to interrupt)")).toBe(2100);
+    expect(parseSpinnerTokens("✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)")).toBe(1200);
+    expect(parseSpinnerTokens("✻ Working… (3s · ↑ 500 tokens · esc to interrupt)")).toBe(500);
+    expect(parseSpinnerTokens("✻ Working… (9s · ↓ 12.3k tokens · esc to interrupt)")).toBe(12300);
+  });
+
+  it("scales an m-suffixed count so a long turn keeps ordering with k-suffixed frames", () => {
+    // Without the suffix table "1.2m" parsed as 1.2 — i.e. a huge count read as SMALLER than the
+    // preceding "900k" frame, which silently stalls the advance comparison for the rest of the turn.
+    expect(parseSpinnerTokens("✻ Working… (4m 2s · ↓ 1.2m tokens · esc to interrupt)")).toBe(1_200_000);
+    expect(parseSpinnerTokens("✻ Working… (4m 2s · ↓ 1.2M tokens · esc to interrupt)")).toBe(1_200_000);
+    expect(parseSpinnerTokens("✻ Working… (3m · ↓ 900k tokens · esc to interrupt)")).toBe(900_000);
+  });
+
+  it("returns null when the frame carries no token figure", () => {
+    expect(parseSpinnerTokens("✻ Cogitating… (12s · esc to interrupt)")).toBeNull();
+    expect(parseSpinnerTokens("compiling module A")).toBeNull();
+  });
+
+  it("never returns NaN on a malformed or unknown-suffix figure", () => {
+    // A NaN would pass the `!== null` check and then compare false in EVERY advance test, silently
+    // disabling the recovery instead of failing loudly.
+    // Leading punctuation is skipped rather than parsed into NaN — "..5" reads as the 5 it contains.
+    expect(parseSpinnerTokens("✻ Working… (3s · ↑ ..5 tokens · esc to interrupt)")).toBe(5);
+    // A malformed "1.2.3k" resolves to the well-formed figure that actually abuts "tokens" (2.3k),
+    // because that is the only substring the pattern can match end-to-end. Never NaN.
+    expect(parseSpinnerTokens("✻ Working… (3s · ↑ 1.2.3k tokens · esc to interrupt)")).toBe(2300);
+    // An unknown suffix doesn't parse at all — null, i.e. "the token signal doesn't apply", which is
+    // the safe direction (no baseline update, no clear). The `?? 1` scale fallback in
+    // parseSpinnerTokens is the belt-and-braces for a future widening of the suffix class.
+    expect(parseSpinnerTokens("✻ Working… (3s · ↑ 12g tokens · esc to interrupt)")).toBeNull();
+  });
+});
+
+describe("latestSpinnerTokens", () => {
+  it("reads the NEWEST redraw in a multi-frame chunk, not a stale earlier one", () => {
+    const chunk =
+      "✻ Working… (1s · ↑ 100 tokens · esc to interrupt)\r" +
+      "✻ Working… (2s · ↑ 200 tokens · esc to interrupt)\r" +
+      "✻ Working… (3s · ↑ 300 tokens · esc to interrupt)";
+    expect(latestSpinnerTokens(chunk)).toBe(300);
+  });
+
+  it("walks back past figure-less redraws to the newest frame that HAS a count", () => {
+    // Claude drops the counter from some redraws. Reading only the newest marker frame would return
+    // null here and skip both the comparison and the baseline update for the whole chunk.
+    const chunk =
+      "✻ Working… (2s · ↑ 200 tokens · esc to interrupt)\r" +
+      "✻ Working… (3s · esc to interrupt)\r" +
+      "✻ Working… (4s · esc to interrupt)";
+    expect(latestSpinnerTokens(chunk)).toBe(200);
+  });
+
+  it("still prefers the NEWEST frame that carries a count, and ignores prose", () => {
+    const chunk =
+      "compacted 30k tokens\n" +
+      "✻ Working… (2s · ↑ 200 tokens · esc to interrupt)\r" +
+      "✻ Working… (3s · ↑ 300 tokens · esc to interrupt)";
+    expect(latestSpinnerTokens(chunk)).toBe(300);
+    expect(latestSpinnerTokens("compacted 30k tokens\nno spinner here")).toBeNull();
+  });
+});
 
 // Drives the engine and records the latest status, so each test can assert transitions.
 // `getScreen` optionally supplies the rendered-screen snapshot the engine reads on settle
@@ -257,6 +322,280 @@ describe("StatusEngine", () => {
     expect(last()).toBe("errored");
     // The retry succeeds and the agent does real work again (a classified file event + spinner).
     engine.ingest("Reading file src/foo.ts\n" + SPINNER);
+    expect(last()).toBe("working");
+  });
+
+  it("recovers to working when the spinner's token counter ADVANCES after a blip", () => {
+    // The founder-reported false-red: a HEALTHY agent hits a transient API blip early in a long
+    // turn, then keeps GENERATING (the "Incubating… ↓ 2.1k tokens" spinner climbing) with no tool
+    // event yet. An advancing token count is positive proof of forward progress, so the sticky
+    // failure must clear even without a classified tool line.
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Incubating… (30s · ↓ 1.0k tokens · esc to interrupt)"); // baseline 1.0k
+    expect(last()).toBe("working");
+    engine.ingest("\nAPI Error: overloaded\n");
+    expect(last()).toBe("errored");
+    // Generation resumes — the next frame's count is strictly higher than the last we saw.
+    engine.ingest("✻ Incubating… (1m 24s · ↓ 2.1k tokens · esc to interrupt)");
+    expect(last()).toBe("working");
+  });
+
+  it("does NOT recover on a FROZEN token counter (a wedged agent's spinner still ticks)", () => {
+    // The wedge sparkle-pqxh targets: the spinner keeps redrawing (elapsed time even advances) but
+    // the token count is STUCK, because nothing is being generated. A repeated count must stay red.
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Incubating… (30s · ↓ 2.1k tokens · esc to interrupt)"); // baseline 2.1k
+    engine.ingest("\nAPI Error: overloaded\n");
+    expect(last()).toBe("errored");
+    engine.ingest("✻ Incubating… (31s · ↓ 2.1k tokens · esc to interrupt)"); // same count, later clock
+    engine.ingest("✻ Incubating… (32s · ↓ 2.1k tokens · esc to interrupt)"); // still same
+    expect(last()).toBe("errored");
+  });
+
+  it("does NOT let an advancing counter clear a churn wedge tripping in the SAME chunk", () => {
+    // A churn chunk that ALSO carries a higher spinner must not self-clear: the repeated bad lines
+    // re-arm red in the same chunk, and the trippedThisChunk guard suppresses the token recovery.
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Cogitating… (10s · ↑ 1.0k tokens · esc to interrupt)"); // baseline 1.0k
+    expect(last()).toBe("working");
+    // One chunk: >= STALL_REPEAT_THRESHOLD (5) identical short completed lines (trips churn) followed
+    // by a spinner whose token count jumped to 5.0k. The guard must keep it red despite 5.0k > 1.0k.
+    engine.ingest("\n…\n…\n…\n…\n…\n✻ Cogitating… (15s · ↑ 5.0k tokens · esc to interrupt)");
+    expect(last()).toBe("errored");
+  });
+
+  it("does NOT let an advancing counter clear a churn wedge tripped in an EARLIER chunk", () => {
+    // The `trippedThisChunk` guard alone only covers the chunk the churn landed in. A wedged agent
+    // GENERATES its own churn, so its token counter climbs — the next spinner-only chunk would
+    // otherwise clear the very wedge sparkle-pqxh exists to catch, flapping the row red↔green.
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Cogitating… (10s · ↑ 1.0k tokens · esc to interrupt)"); // baseline 1.0k
+    expect(last()).toBe("working");
+    engine.ingest("\n…\n…\n…\n…\n…\n"); // churn trips, no spinner in this chunk
+    expect(last()).toBe("errored");
+    // A LATER chunk carrying only a much higher spinner count must NOT clear a churn wedge.
+    engine.ingest("✻ Cogitating… (15s · ↑ 5.0k tokens · esc to interrupt)");
+    expect(last()).toBe("errored");
+    engine.ingest("✻ Cogitating… (20s · ↑ 9.0k tokens · esc to interrupt)");
+    expect(last()).toBe("errored");
+  });
+
+  it("does NOT let an advancing counter clear a SELF-PROMPT wedge", () => {
+    // The canonical pqxh wedge: the agent pings itself in a loop. It is generating those pings, so
+    // the counter climbs the whole time — token progress must carry no weight here.
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Cogitating… (10s · ↑ 1.0k tokens · esc to interrupt)");
+    engine.ingest("\nAre you there?\nAre you there?\n"); // >= SELF_PROMPT_REPEAT_THRESHOLD
+    expect(last()).toBe("errored");
+    engine.ingest("✻ Cogitating… (20s · ↑ 4.0k tokens · esc to interrupt)");
+    expect(last()).toBe("errored");
+  });
+
+  it("does NOT read a token figure from PROSE that shares a chunk with the spinner", () => {
+    // Guard (d): the figure is taken from the newest spinner FRAME, not the first "N tokens" match in
+    // the chunk. Otherwise a line like "compacted 30k tokens" reads as the counter and force-greens a
+    // still-blipped agent whose real counter is frozen.
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Incubating… (30s · ↓ 2.1k tokens · esc to interrupt)"); // baseline 2.1k
+    engine.ingest("\nAPI Error: overloaded\n");
+    expect(last()).toBe("errored");
+    // Prose mentioning a much larger figure, plus a spinner whose real count has NOT moved.
+    engine.ingest("compacted 30k tokens\n✻ Incubating… (31s · ↓ 2.1k tokens · esc to interrupt)");
+    expect(last()).toBe("errored");
+  });
+
+  it("does NOT carry a PREVIOUS turn's token baseline into the next turn", () => {
+    // Claude's spinner counter is per-turn and restarts low. A stale high-water mark from a short
+    // previous turn (100 tokens) would make the FIRST frozen frame of a wedged new turn (5.0k) read
+    // as an advance and force a false green — so the baseline must be dropped when the turn settles.
+    const { engine, last } = makeEngine(() => IDLE_SCREEN);
+    engine.ingest("✻ Working… (5s · ↑ 100 tokens · esc to interrupt)");
+    expect(last()).toBe("working");
+    vi.advanceTimersByTime(2000); // spinner stops -> settle -> turn over
+    expect(last()).toBe("idle");
+    // New turn: it blips immediately and its counter is FROZEN at 5.0k (a rate-limit retry loop).
+    engine.ingest("\nAPI Error: overloaded\n");
+    expect(last()).toBe("errored");
+    engine.ingest("✻ Working… (8s · ↓ 5.0k tokens · esc to interrupt)"); // first frame of the new turn
+    expect(last()).toBe("errored");
+    engine.ingest("✻ Working… (9s · ↓ 5.0k tokens · esc to interrupt)"); // still frozen
+    expect(last()).toBe("errored");
+  });
+
+  it("does NOT clear when a FRESH banner rides in the partial of the same advancing chunk", () => {
+    // The partial-buffer banner check used to be gated on `!sawStreamFailure`, so a NEW banner
+    // arriving while a failure was already latched didn't re-arm the chunk guard — and the advancing
+    // spinner in that same chunk cleared the red it had just re-observed.
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Incubating… (30s · ↓ 1.0k tokens · esc to interrupt)"); // baseline 1.0k
+    engine.ingest("\nAPI Error: 529 overloaded_error\n");
+    expect(last()).toBe("errored");
+    // One chunk: a DIFFERENT banner still unterminated (no trailing \n) fused onto a higher spinner.
+    engine.ingest("\n✻ Incubating… (40s · ↓ 3.0k tokens · esc to interrupt)\rAPI Error: 500 Internal server error");
+    expect(last()).toBe("errored");
+  });
+
+  it("does NOT let a banner LINGERING in the partial block recovery forever", () => {
+    // The other side of that guard: the spinner redraws with \r, so an unterminated banner can sit in
+    // the partial for the rest of the turn. Re-arming on every chunk that still shows it would pin the
+    // row red for good — the original false-red. Only a banner that ARRIVED in this chunk's tail
+    // re-arms; one already carried in from a prior chunk (`base`) is diffed out.
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Incubating… (30s · ↓ 1.0k tokens · esc to interrupt)");
+    engine.ingest("\nAPI Error: 529 overloaded_error"); // unterminated: stays in the partial
+    expect(last()).toBe("errored");
+    // Same banner still trailing the partial, but the counter is climbing again -> generating.
+    engine.ingest("\r✻ Incubating… (40s · ↓ 2.0k tokens · esc to interrupt)");
+    engine.ingest("\r✻ Incubating… (41s · ↓ 2.4k tokens · esc to interrupt)");
+    expect(last()).toBe("working");
+  });
+
+  it("re-trips when the SAME banner text is re-emitted into the partial after a clear", () => {
+    // The shape that text-identity alone gets wrong (roborev 46899): a rate-limit retry loop repeats
+    // ONE banner verbatim. Occurrence COUNT is what separates "a second banner arrived" from "the
+    // first one is still sitting in the unterminated partial", and getting it wrong here is
+    // fail-OPEN — the row stays green through a live API failure.
+    const BANNER = "API Error: 500 Internal server error";
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Working… (30s · ↓ 1.0k tokens · esc to interrupt)");
+    engine.ingest("\r" + BANNER); // unterminated: lives in the partial
+    expect(last()).toBe("errored");
+    engine.ingest("\r✻ Working… (40s · ↓ 2.0k tokens · esc to interrupt)"); // generating -> clears
+    expect(last()).toBe("working");
+    engine.ingest("\r" + BANNER); // a SECOND, identical banner — must trip again
+    expect(last()).toBe("errored");
+  });
+
+  it("re-trips on a repeated banner even once the partial has saturated past MAX_PARTIAL", () => {
+    // Counting banners in the WHOLE partial fails here: past MAX_PARTIAL (4096) every chunk evicts as
+    // much off the front as it appends, so the chunk that delivers a new identical banner can also
+    // evict the old one — count unchanged, text unchanged, no trip (roborev 46920). Measuring what
+    // ARRIVED in the chunk is immune, because the buffer is never rescanned.
+    const BANNER = "API Error: 500 Internal server error";
+    const { engine, last } = makeEngine();
+    // ~90 redraws with no newline: the unterminated buffer is well past MAX_PARTIAL.
+    for (let i = 0; i < 90; i++) engine.ingest(`\r✻ Working… (${i}s · ↓ 1.0k tokens · esc to interrupt)`);
+    expect(last()).toBe("working");
+    engine.ingest("\r" + BANNER);
+    expect(last()).toBe("errored");
+    engine.ingest("\r✻ Working… (91s · ↓ 2.0k tokens · esc to interrupt)"); // generating -> clears
+    expect(last()).toBe("working");
+    engine.ingest("\r" + BANNER); // identical banner, saturated buffer — must still trip
+    expect(last()).toBe("errored");
+  });
+
+  it("re-reddens when a cleared banner is finally FLUSHED as a completed line", () => {
+    // Pinning deliberate (if slightly noisy) behavior: a banner that was tripped in the partial and
+    // then cleared by a token advance goes through the normal line detector once a '\n' flushes it,
+    // and trips again. Fail-closed and self-correcting — the next advancing frame clears it — but it
+    // is a real flap, so it is pinned here rather than left incidental (roborev 46920).
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Working… (30s · ↓ 1.0k tokens · esc to interrupt)");
+    engine.ingest("\rAPI Error: 500 Internal server error");
+    expect(last()).toBe("errored");
+    engine.ingest("\r✻ Working… (40s · ↓ 2.0k tokens · esc to interrupt)");
+    expect(last()).toBe("working");
+    engine.ingest("\n"); // flushes the buffered banner as a completed line
+    expect(last()).toBe("errored");
+    engine.ingest("✻ Working… (41s · ↓ 2.4k tokens · esc to interrupt)"); // and clears again
+    expect(last()).toBe("working");
+  });
+
+  it("does NOT red on a user-ECHOED 'API Error:' line, terminated (pasting an error report)", () => {
+    // roborev 47232/47233: the partial-banner check must scope to the unterminated tail, NOT scan
+    // completed lines — those are the loop's job, and the loop skips a banner that is an echo of the
+    // user's own just-submitted message (Fix 2). Pasting an "API Error: …" report to debug is the
+    // common case; it must not paint the agent red.
+    const { engine, last } = makeEngine();
+    engine.noteUserInput("API Error: 500 Internal server error");
+    engine.ingest("API Error: 500 Internal server error\n"); // echoed as a completed line
+    expect(last()).toBe("working");
+  });
+
+  it("does NOT red on a user-echoed banner that arrives UNTERMINATED (input-box redraw)", () => {
+    // roborev 47981/47996: the input box echoes the submission as an in-place redraw with NO trailing
+    // '\n', so the echoed banner lands entirely in the unterminated tail — where the tail check runs.
+    // The echo guard must apply HERE too, or this common shape reintroduces the exact false-red.
+    const { engine, last } = makeEngine();
+    engine.noteUserInput("API Error: 500 Internal server error");
+    engine.ingest("API Error: 500 Internal server error"); // no newline — stays in the tail
+    expect(last()).not.toBe("errored");
+  });
+
+  it("does NOT red on a user-echoed banner SPLIT across two chunks (both in the tail)", () => {
+    // The echo can also arrive in fragments across chunk boundaries; the guard's substring match
+    // covers the partial frame, and the completed half still lands in the tail unterminated.
+    const { engine, last } = makeEngine();
+    engine.noteUserInput("API Error: 500 Internal server error");
+    engine.ingest("API Error: 500"); // first fragment (tail)
+    engine.ingest(" Internal server error"); // rest still unterminated (tail)
+    expect(last()).not.toBe("errored");
+  });
+
+  it("stays working on a banner line IMMEDIATELY followed by a classified tool event in one chunk", () => {
+    // roborev 47232: "API Error: …\n<tool event>\n" — the banner trips in the loop, the tool event
+    // clears it (genuine progress). The partial check must not RE-trip off that already-flushed
+    // completed banner line; scoping to the tail (empty here) is what keeps the chunk green.
+    const { engine, last } = makeEngine();
+    engine.ingest("API Error: 500 Internal server error\nReading file src/foo.ts\n");
+    expect(last()).toBe("working");
+  });
+
+  it("STILL reddens on a GENUINE unterminated banner (no echo window open)", () => {
+    // The echo guard must not swallow a real mid-stream banner: with no noteUserInput, an unterminated
+    // "API Error:" in the tail is a live failure and must trip (roborev 16152 preserved).
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Working… (30s · ↓ 1.0k tokens · esc to interrupt)");
+    engine.ingest("\rAPI Error: 500 Internal server error"); // no newline, not an echo
+    expect(last()).toBe("errored");
+  });
+
+  it("a REPEATED api banner stays token-clearable (a long turn can survive several blips)", () => {
+    // Pins the deliberate choice not to escalate repeated banners to "churn": a healthy long turn can
+    // hit several transient blips, and pinning it red is the false-red we set out to kill. A retry
+    // loop with no generation is still caught by the frozen-counter rule (covered above).
+    const { engine, last } = makeEngine();
+    engine.ingest("✻ Incubating… (30s · ↓ 1.0k tokens · esc to interrupt)");
+    engine.ingest("\nAPI Error: overloaded\n");
+    engine.ingest("✻ Incubating… (40s · ↓ 2.0k tokens · esc to interrupt)");
+    expect(last()).toBe("working");
+    engine.ingest("\nAPI Error: overloaded\n"); // a second blip, same turn
+    expect(last()).toBe("errored");
+    engine.ingest("✻ Incubating… (50s · ↓ 3.0k tokens · esc to interrupt)");
+    expect(last()).toBe("working");
+  });
+
+  it("a churn wedge is not a lockout — user input and real tool progress still clear it", () => {
+    // The failureKind gate makes churn immune to TOKEN progress only. The original pqxh recovery
+    // paths must still work, or a false-positive churn trip would pin an agent red for good.
+    const viaUser = makeEngine();
+    viaUser.engine.ingest("✻ Cogitating… (10s · ↑ 1.0k tokens · esc to interrupt)");
+    viaUser.engine.ingest("\n…\n…\n…\n…\n…\n");
+    expect(viaUser.last()).toBe("errored");
+    viaUser.engine.noteUserInput("carry on");
+    viaUser.engine.ingest("✻ Cogitating… (20s · ↑ 4.0k tokens · esc to interrupt)");
+    expect(viaUser.last()).toBe("working");
+
+    const viaTool = makeEngine();
+    viaTool.engine.ingest("✻ Cogitating… (10s · ↑ 1.0k tokens · esc to interrupt)");
+    viaTool.engine.ingest("\n…\n…\n…\n…\n…\n");
+    expect(viaTool.last()).toBe("errored");
+    viaTool.engine.ingest("Reading file src/foo.ts\n"); // a classified file event
+    viaTool.engine.ingest("✻ Cogitating… (20s · ↑ 4.0k tokens · esc to interrupt)");
+    expect(viaTool.last()).toBe("working");
+  });
+
+  it("still recovers on an advancing counter in a LATER turn (baseline reset is not a lockout)", () => {
+    // The flip side of the reset: dropping the baseline must not disable the recovery for the rest of
+    // the session — a genuinely advancing counter in turn 2 clears just like it does in turn 1.
+    const { engine, last } = makeEngine(() => IDLE_SCREEN);
+    engine.ingest("✻ Working… (5s · ↑ 40.0k tokens · esc to interrupt)"); // a long first turn
+    vi.advanceTimersByTime(2000);
+    expect(last()).toBe("idle");
+    engine.ingest("✻ Working… (3s · ↓ 1.0k tokens · esc to interrupt)"); // turn 2 baseline
+    engine.ingest("\nAPI Error: overloaded\n");
+    expect(last()).toBe("errored");
+    engine.ingest("✻ Working… (6s · ↓ 1.4k tokens · esc to interrupt)"); // generating again
     expect(last()).toBe("working");
   });
 

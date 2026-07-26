@@ -127,6 +127,49 @@ pub(crate) fn should_install_cloud(
     same_generation && still_current && capture_present && !already_active
 }
 
+/// What `cloud_reuse` was told about the socket sitting in the slot. NAMED fields, not a bool pair:
+/// a caller that swapped `is_alive()` for `is_for_project()` in a tuple would compile and mis-bill
+/// silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Installed {
+    pub alive: bool,
+    pub project_matches: bool,
+}
+
+/// The decision `cloud_reuse` returns: what `start_cloud_stream` should do with whatever socket is
+/// currently installed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CloudReuse {
+    /// A live socket for THIS project is already routing — do nothing (idempotent: a repeated wake
+    /// transition must not open a second socket).
+    AlreadyRouting,
+    /// A warm (parked) socket for this project — resume it, no handshake.
+    Resume,
+    /// A socket for a DIFFERENT project — take it down and open a fresh one, so the per-minute debits
+    /// carry the right attribution. Reached with `active` true as well, because the focus-regain
+    /// unpark resumes a parked socket without knowing which project we're now dictating into; if this
+    /// only looked at the parked case, that path would keep billing the old project (roborev 50498).
+    Reopen,
+    /// Nothing usable installed — open a fresh socket.
+    Open,
+}
+
+/// Decide the fate of the installed socket. Pure so the BILLING-critical branch is unit-testable
+/// without a relay, a handshake, or an AppHandle. `installed` is `None` when the slot is empty; both
+/// of its fields must be sampled under the same lock that then acts on the decision.
+pub(crate) fn cloud_reuse(active: bool, installed: Option<Installed>) -> CloudReuse {
+    match installed {
+        Some(Installed { alive: true, project_matches: false }) => CloudReuse::Reopen,
+        Some(Installed { alive: true, project_matches: true }) if active => CloudReuse::AlreadyRouting,
+        Some(Installed { alive: true, project_matches: true }) => CloudReuse::Resume,
+        // Dead socket (or empty slot) while the flag still says active: leave it to the existing
+        // mid-stream-death recovery (the worker's cloud-ended → stop_cloud_stream) rather than
+        // opening a second stream underneath it.
+        _ if active => CloudReuse::AlreadyRouting,
+        _ => CloudReuse::Open,
+    }
+}
+
 /// What `start_dictation` should do when its (slow, lock-free) model load finishes and it re-takes
 /// the session lock. Three outcomes, decided purely so the resurrect-race matrix is unit-testable
 /// without an AppHandle, a 482MB model download, or threads:
@@ -406,7 +449,25 @@ enum ReconcileStep {
 /// standby. Deliberately the same predicate as `stop_cloud_stream`'s `keep_warm`: parking on blur
 /// and parking on a stop-word stop are one rule, not two, so they can't drift.
 fn should_standby_on_blur(cloud_active: bool, alive: bool) -> bool {
-    cloud_active && alive
+    should_keep_warm_on_stop(cloud_active, alive, false)
+}
+
+/// Whether `stop_cloud_stream` should LEAVE a session in warm standby instead of closing it.
+///
+/// `was_active` alone is not enough, because the blur path parks the socket BEFORE the frontend's
+/// blur handler invokes `stop_cloud_stream`: `park_cloud_for_blur` clears `cloud_active`, so the
+/// stop that follows a moment later reads `was_active == false` and used to fall through to the
+/// close branch — tearing down the very standby the park had just established. Every window blur
+/// therefore paid a full close plus a full TLS+WS handshake on refocus, which is exactly the
+/// cold-start cost warm standby exists to avoid.
+///
+/// `parked` closes that hole while keeping the close branch for the cases that need it: an
+/// installed-but-not-yet-routing session (alive, never active, never parked) is still taken down,
+/// so a stop during the post-handshake race window can't strand a socket that has no warm timer
+/// running behind it. A worker that already exited (warm expiry, socket death) fails `alive` and is
+/// finished by the caller as before.
+fn should_keep_warm_on_stop(was_active: bool, alive: bool, parked: bool) -> bool {
+    alive && (was_active || parked)
 }
 
 /// Whether a focus-driven capture BUILD should resume a parked cloud session. `alive` is the
@@ -422,9 +483,10 @@ fn should_resume_on_focus(cloud_active: bool, alive: bool) -> bool {
 ///
 /// Without this the blur path drops the capture but leaves the socket UNPAUSED: it then idles with
 /// no audio, no `CloseStream` and no warm timer until the relay's upstream idle-close severs it, so
-/// a refocus moments later pays a full TLS+WS handshake — which `start_cloud_stream` runs inline on
-/// the IPC/event-loop thread. Parking instead means a quick refocus resumes on the same connection,
-/// and a long one closes cleanly on OUR timer.
+/// a refocus moments later pays a full TLS+WS handshake — which, even though `start_cloud_stream`
+/// now runs it off the main thread (via `spawn_blocking`), still adds latency before dictation is
+/// live. Parking instead means a quick refocus resumes on the same connection, and a long one closes
+/// cleanly on OUR timer.
 ///
 /// `pause()` is a non-blocking channel send, so this is safe to call under the session lock — the
 /// sparkle-sfxu rule bans blocking work there, not sends. The OS mic is already released by the
@@ -1029,39 +1091,124 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
 /// stay-on-device path (signed out, handshake failure — which includes the relay refusing an
 /// unentitled / can't-afford-a-minute user — or a stop/restart race discard) so the frontend knows to
 /// stay on the on-device model. Metering is server-side now, so a FALSE simply means "no cloud".
+/// MUST stay `async fn` (see the `spawn_blocking` on the handshake below). A plain sync
+/// `#[tauri::command]` is `ExecutionContext::Blocking`, which runs the body INLINE on the
+/// IPC/event-loop (macOS main) thread — where the ~hundreds-of-ms-to-8s TLS+WS handshake froze the
+/// webview and showed up as multi-second "jank stall"s on a slow/black-holed network. `async fn`
+/// forces `ExecutionContext::Async` (body on the async runtime), and `spawn_blocking` keeps the
+/// blocking handshake off the runtime's small worker pool too. Same shape as `start_dictation`.
 #[tauri::command]
-pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool {
+pub async fn start_cloud_stream(
+    app: AppHandle,
+    state: State<'_, DictationState>,
+    // Display name of the project the user is dictating into, so the per-minute deepgram debits are
+    // attributable in the Credits history. Metering-only; None when the caller doesn't know.
+    project: Option<String>,
+) -> Result<bool, ()> {
     // Capture, under one lock, the state we need to (a) decide whether to open a stream and
     // (b) safely install it after the blocking handshake. The Arcs are captured by IDENTITY so we
     // can later confirm (via ptr_eq) the session generation didn't change.
-    let (cloud_slot, cloud_active, cloud_epoch, cloud_tx) = {
+    let (cloud_slot, cloud_active, cloud_epoch, cloud_tx, stale_socket) = {
         let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
-        if sess.cloud_active.load(Ordering::Relaxed) {
-            return false; // idempotent — a repeated wake transition shouldn't open a second socket
-        }
         // Warm reuse: a socket paused into standby by a recent stop-word stop is still open. If its
-        // worker is alive, resume on it — no TLS+WS handshake, so dictation starts instantly. Done
-        // entirely under the lock (resume() is just a non-blocking channel send). A lost liveness
-        // race is safe: resuming a just-dead worker drops frames and its cloud-ended emit drives the
-        // frontend back to on-device — the same recovery as any mid-stream death.
-        {
-            let cloud = sess.cloud.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(s) = cloud.as_ref() {
-                if s.is_alive() {
-                    s.resume();
-                    sess.cloud_active.store(true, Ordering::Relaxed);
-                    tracing::info!(target: "dictation", "reusing warm deepgram socket");
-                    return true; // caller starts metering, exactly as for a fresh open
+        // worker is alive AND it belongs to the project we're dictating into, resume on it — no
+        // TLS+WS handshake, so dictation starts instantly. Done entirely under the lock (resume() is
+        // just a non-blocking channel send). A lost liveness race is safe: resuming a just-dead
+        // worker drops frames and its cloud-ended emit drives the frontend back to on-device — the
+        // same recovery as any mid-stream death.
+        //
+        // The project check is a BILLING correctness guard, not an optimization: the relay captures
+        // the project once at handshake and stamps it on every per-minute debit for the life of the
+        // connection. Reusing a socket opened for project A while dictating into project B billed
+        // B's minutes to A — attribution the user can't trust, and worse than no attribution because
+        // the history row looks authoritative. On a mismatch we drop the warm socket and reopen,
+        // paying one handshake to keep the ledger honest. (roborev 48164)
+        //
+        // The reopen is not free: every relay connection debits a first minute up front
+        // (firstMinuteCents), so switching project between two utterances inside the warm window
+        // costs ~6¢ extra — as does dictating from a view with NO project selected right after an
+        // attributed session, since the match is strict about None in both directions. That trade is
+        // deliberate: this feature's rule is that a wrong attribution is worse than none, and here a
+        // wrong attribution is also a wrong CHARGE. Loosening it (letting an unattributed request
+        // ride an attributed socket) would bill the old project for minutes spent elsewhere.
+        let stale = {
+            let mut cloud = sess.cloud.lock().unwrap_or_else(|p| p.into_inner());
+            // Take the installed socket OUT of the slot for teardown: stop routing at it, drop the
+            // audio sender pointing at it, and silence it while STILL under the lock. The silencing
+            // can't wait for the spawned teardown task — silencing there only lands once it runs,
+            // and a worker exiting in the gap emits cloud-ended, which drives the frontend to
+            // stop_cloud_stream against the session we are about to install. (roborev 50498/52646)
+            let take_for_teardown = |cloud: &mut Option<DeepgramSession>| {
+                sess.cloud_active.store(false, Ordering::Relaxed);
+                *sess.cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                // silence_now() consumes the session and hands back a SilencedSession, whose only
+                // operation is the blocking close. That keeps the silencing VISIBLE here rather than
+                // hidden inside a teardown method — but it does not forbid getting the order wrong,
+                // so the ordering rule stated in the block above this closure stays comment-enforced,
+                // not type-enforced.
+                cloud.take().map(DeepgramSession::silence_now)
+            };
+            let installed = cloud.as_ref().map(|s| Installed {
+                alive: s.is_alive(),
+                project_matches: s.is_for_project(project.as_deref()),
+            });
+            match cloud_reuse(sess.cloud_active.load(Ordering::Relaxed), installed) {
+                CloudReuse::AlreadyRouting => return Ok(false),
+                CloudReuse::Resume => match cloud.as_ref() {
+                    Some(s) => {
+                        s.resume();
+                        sess.cloud_active.store(true, Ordering::Relaxed);
+                        tracing::info!(target: "dictation", "reusing warm deepgram socket");
+                        return Ok(true); // caller starts metering, exactly as for a fresh open
+                    }
+                    // Unreachable by construction (Resume implies an installed session), but stated
+                    // rather than assumed: flipping cloud_active with an EMPTY slot would tell the
+                    // frontend cloud is live while the callback finds no sender — audio dropped
+                    // instead of transcribed, with no cloud-ended to recover it. (roborev 52647)
+                    None => return Ok(false),
+                },
+                CloudReuse::Reopen => {
+                    tracing::info!(
+                        target: "dictation",
+                        "deepgram socket belongs to another project; reopening so the minutes bill correctly"
+                    );
+                    // `cloud_active` may be TRUE here: the focus-regain unpark resumes a parked socket
+                    // without knowing the project, so this is also where that resume gets corrected
+                    // (roborev 48157/50498).
+                    take_for_teardown(&mut cloud)
                 }
+                // A DEAD socket still in the slot gets the same treatment. run_session clears `alive`
+                // BEFORE it emits cloud-ended, so one sampled dead here can still fire that event a
+                // moment later — the same tear-down-the-successor hazard, just a narrower window.
+                // Leaving it to be overwritten by the install would also drop it without a join.
+                // (Only reachable with cloud_active already false — a dead socket under an `active`
+                // flag returns AlreadyRouting — so the closure's cloud_active clear is a no-op here.
+                // Its cloud_tx clear is NOT: warm standby deliberately leaves the sender installed
+                // alongside the parked session, so a parked-then-died socket arrives here with
+                // cloud_tx still pointing at it, and clearing keeps cloud_tx a faithful mirror of
+                // cloud.) (roborev 53047)
+                CloudReuse::Open if cloud.is_some() => take_for_teardown(&mut cloud),
+                CloudReuse::Open => None,
             }
-        }
+        };
         (
             sess.cloud.clone(),
             sess.cloud_active.clone(),
             sess.cloud_epoch.clone(),
             sess.cloud_tx.clone(),
+            stale,
         )
     };
+    // Close the project-mismatched socket off-thread: teardown is bounded (~2 s) but still blocking.
+    // Already SILENCED (silence_now(), under the lock above) — that is what makes this safe, not
+    // finish() itself: this teardown runs CONCURRENTLY with the successor session's handshake, and
+    // finish() suppresses only the cloud-ended emit — the post-CloseStream drain would keep
+    // forwarding transcripts, so a trailing final from the old project's socket could land in
+    // the new session's composer (or end it, if it carried the stop word). Fire-and-forget — nothing
+    // below depends on it.
+    if let Some(stale) = stale_socket {
+        tauri::async_runtime::spawn_blocking(move || stale.finish());
+    }
     // Cloud dictation now runs through the orchestration relay on the user's Sparkle bearer (the
     // relay holds Sparkle's Deepgram key and meters server-side). setting_enabled is true here (the
     // frontend already gated on the live voice setting); a signed-out user has no bearer → stay
@@ -1069,18 +1216,15 @@ pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool 
     // afford the first minute — a handshake failure we treat as fall-back-to-on-device), so we pass it
     // true here.
     //
-    // CORRECTION (was: "this is a sync Tauri command (its own thread), so the keychain read is fine
-    // inline"): it is NOT on its own thread. A sync `#[tauri::command]` is `ExecutionContext::Blocking`
-    // in tauri-macros, which runs the body INLINE on the IPC/event-loop thread — the same mistake that
-    // made `start_dictation` beachball the app for its whole first-run download. The keychain read is
-    // sub-ms so it's harmless in practice, but the blocking `DeepgramSession::start` handshake below
-    // (~hundreds of ms of TLS+WS) does stall the event loop on every wake transition. Left as-is
-    // deliberately: fixing it means making this `async fn` + `spawn_blocking` like start_dictation,
-    // which changes this command's own race semantics (the ptr_eq/epoch guards below) and belongs in
-    // its own reviewable change, not smuggled into the start_dictation fix.
+    // This command is now `async fn` + `spawn_blocking` (see the handshake below and the fn doc), so
+    // the body runs on the async runtime, not the IPC/event-loop (main) thread. The keychain read and
+    // the two lock blocks are await-free and quick; only the blocking TLS+WS handshake is offloaded.
+    // Making it async means the event loop stays live throughout — a stop/restart can now genuinely
+    // interleave with the in-flight handshake, which is exactly what the ptr_eq/epoch re-validation
+    // below already guards (it re-reads both under the lock after the handshake returns).
     let token = crate::auth::bearer_token();
     if choose_engine(true, token.is_some(), true) != Engine::Cloud {
-        return false; // signed out → stay on the on-device model; don't consume an epoch on this path
+        return Ok(false); // signed out → stay on the on-device model; don't consume an epoch on this path
     }
     let token = token.expect("choose_engine returned Cloud only when a bearer is present");
     let base_url = crate::auth::base_url();
@@ -1088,7 +1232,24 @@ pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool 
     // bumping it outside the lock is sound — the post-handshake re-validation re-reads it under the
     // lock, and any racing stop/start that bumps it meanwhile correctly invalidates this attempt.
     let my_epoch = cloud_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-    match DeepgramSession::start(app, base_url, token) {
+    // Offload the blocking TLS+WS handshake (TCP connect + upgrade, bounded at CONNECT_TIMEOUT per
+    // resolved address) onto a blocking worker so a slow or black-holed network can't stall the UI —
+    // the whole reason this command is async. `app` is consumed by the handshake and unused after it,
+    // so it moves into the closure.
+    let started = match tauri::async_runtime::spawn_blocking(move || {
+        DeepgramSession::start(app, base_url, token, project)
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(join_err) => {
+            // The blocking task panicked (its panic was already logged by the hook). Treat it like a
+            // handshake failure and stay on-device rather than surfacing an error to the mic UI.
+            tracing::info!(target: "dictation", error = %join_err, "cloud handshake task failed; using on-device");
+            return Ok(false);
+        }
+    };
+    match started {
         Ok(session) => {
             // The handshake above is blocking (~hundreds of ms). Re-validate under the lock before
             // installing, so a stop/restart that raced the handshake can't leave an orphaned stream:
@@ -1120,20 +1281,28 @@ pub fn start_cloud_stream(app: AppHandle, state: State<DictationState>) -> bool 
                 }
             };
             match reject {
-                None => true, // installed a live cloud socket → caller may start metering
+                None => Ok(true), // installed a live cloud socket → caller may start metering
                 Some(s) => {
                     tracing::info!(target: "dictation", "discarding cloud stream opened during a stop/again race");
-                    // finish() suppresses the worker's cloud-ended emit, so tearing down this orphan
-                    // can't cross-talk into — and stop — the current healthy session.
-                    s.finish(); // clean close + join (bounded); never leak the worker
-                    false // not installed → caller must not bill
+                    // Silence HERE on this thread, then hand ONLY the blocking close+join off-thread
+                    // (bounded ~2 s; nothing below depends on it). Two separate reasons, both about a
+                    // teardown that overlaps a successor: (1) finish() alone is not enough — it sets
+                    // suppress_ended, which gates only the cloud-ended emit, while the drain keeps
+                    // forwarding transcripts; (2) the silencing must happen HERE rather than inside
+                    // the spawned task, which would leave the orphan live between spawn_blocking
+                    // returning and the worker being scheduled. Either way it speaks into whichever
+                    // session raced ahead. This orphan never routed audio, so muting loses nothing.
+                    // (roborev 51712/52980/53024)
+                    let s = s.silence_now();
+                    tauri::async_runtime::spawn_blocking(move || s.finish());
+                    Ok(false) // not installed → caller must not bill
                 }
             }
         }
         Err(e) => {
             // Offline / bad key / handshake failure → transparently keep using the on-device model.
             tracing::info!(target: "dictation", error = %e, "cloud stream unavailable; using on-device");
-            false
+            Ok(false)
         }
     }
 }
@@ -1154,13 +1323,18 @@ pub fn stop_cloud_stream(state: State<DictationState>) {
         // after warm expiry — or a worker that already died) takes + finishes the leftover instead.
         // Shares the predicate with the blur path rather than restating it: parking on a stop-word
         // stop and parking on a window blur are ONE rule, and an inline copy here is exactly how the
-        // two would drift.
-        let keep_warm =
-            should_standby_on_blur(was_active, cloud.as_ref().map(|s| s.is_alive()).unwrap_or(false));
+        // two would drift. `is_parked` is what makes the blur ordering work — see
+        // `should_keep_warm_on_stop`.
+        let keep_warm = cloud
+            .as_ref()
+            .map(|s| should_keep_warm_on_stop(was_active, s.is_alive(), s.is_parked()))
+            .unwrap_or(false);
         if keep_warm {
             // Warm standby: the session (and thus its sender in cloud_tx) is kept for reuse — leave
             // the slot as-is. cloud_active is already false, so the callback routes on-device and
-            // won't touch the slot until a resume flips it back.
+            // won't touch the slot until a resume flips it back. Re-pausing an already-parked
+            // session is a no-op in the worker (its Pause arm is guarded on `!paused`), so this
+            // never extends the warm timer past the original park.
             cloud.as_ref().unwrap().pause();
             None
         } else {
@@ -1210,10 +1384,10 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 #[cfg(test)]
 mod tests {
     use super::{AppHandle, State,
-        capture_should_be_live, choose_engine, frame_speaking, park_cloud_for_blur, plan_capture,
-        segment_fingerprint, should_emit_blur, should_install_cloud, should_resume_on_focus,
-        should_standby_on_blur, start_after_load, unpark_cloud_for_focus, CapturePlan,
-        DeepgramSession, DictationState, Engine, ReconcileStep, StartAfterLoad,
+        capture_should_be_live, choose_engine, cloud_reuse, frame_speaking, park_cloud_for_blur, plan_capture,
+        segment_fingerprint, should_emit_blur, should_install_cloud, should_keep_warm_on_stop,
+        should_resume_on_focus, should_standby_on_blur, start_after_load, unpark_cloud_for_focus, CapturePlan,
+        CloudReuse, DeepgramSession, DictationState, Engine, Installed, ReconcileStep, StartAfterLoad,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1350,6 +1524,32 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_that_follows_the_blur_park_leaves_the_socket_warm() {
+        // The regression this closes. On blur, TWO things run in order: the Rust reconcile teardown
+        // parks the socket (clearing cloud_active), and THEN the frontend's blur handler invokes
+        // stop_cloud_stream. Judging solely by `was_active` meant that second step read a flag the
+        // first step had just cleared, took the keep-warm branch away, and closed the socket ~100ms
+        // after parking it — so warm standby never survived a blur and every refocus paid a fresh
+        // handshake, which is what the standby was added to prevent.
+        assert!(
+            should_keep_warm_on_stop(false, true, true),
+            "already parked by the blur path → keep the warm socket, don't close it"
+        );
+        // Unchanged: a stop-word stop of a live, actively-routing stream still parks.
+        assert!(should_keep_warm_on_stop(true, true, false), "live + active → park");
+        // Still closed — an installed session that never routed and was never parked has NO warm
+        // timer running behind it, so keeping it would leave a socket idling until the relay's
+        // upstream idle-close. That is the post-handshake race window, and it must still tear down.
+        assert!(
+            !should_keep_warm_on_stop(false, true, false),
+            "alive but neither active nor parked → close it; nothing is holding a warm timer"
+        );
+        // Dead worker (warm expiry / socket death): nothing to keep, the caller finishes the corpse.
+        assert!(!should_keep_warm_on_stop(false, false, true), "dead → close, even if it was parked");
+        assert!(!should_keep_warm_on_stop(true, false, false), "dead → close");
+    }
+
+    #[test]
     fn refocus_resumes_only_a_session_that_is_still_warm() {
         // The other half: a refocus inside the warm window resumes on the SAME connection.
         assert!(should_resume_on_focus(false, true), "parked + still alive → resume, no handshake");
@@ -1459,6 +1659,43 @@ mod tests {
         state.stop_capture();
         state.stop_capture();
         assert!(state.0.lock().unwrap().capture.is_none());
+    }
+
+    /// Every combination is asserted below, so name them once here rather than inline.
+    const LIVE_OURS: Installed = Installed { alive: true, project_matches: true };
+    const LIVE_OTHER: Installed = Installed { alive: true, project_matches: false };
+    const DEAD_OURS: Installed = Installed { alive: false, project_matches: true };
+    const DEAD_OTHER: Installed = Installed { alive: false, project_matches: false };
+
+    #[test]
+    fn cloud_reuse_reopens_for_another_project_even_when_already_routing() {
+        // The billing rule. `active` true + wrong project is the focus-regain case: unpark resumes a
+        // parked socket without knowing which project we're now dictating into, so if this returned
+        // AlreadyRouting the new project's minutes would keep billing the old one (roborev 50498).
+        assert_eq!(cloud_reuse(true, Some(LIVE_OTHER)), CloudReuse::Reopen);
+        assert_eq!(cloud_reuse(false, Some(LIVE_OTHER)), CloudReuse::Reopen);
+    }
+
+    #[test]
+    fn cloud_reuse_is_idempotent_for_the_same_project_and_resumes_a_warm_one() {
+        assert_eq!(cloud_reuse(true, Some(LIVE_OURS)), CloudReuse::AlreadyRouting);
+        assert_eq!(cloud_reuse(false, Some(LIVE_OURS)), CloudReuse::Resume);
+    }
+
+    #[test]
+    fn cloud_reuse_opens_fresh_when_nothing_usable_is_installed() {
+        // All four `installed` shapes are pinned at both `active` values: liveness gates reuse, so a
+        // future arm reordering (say Some(alive:_, project_matches:false) => Reopen) can't silently
+        // change the dead cases. (roborev 52647)
+        assert_eq!(cloud_reuse(false, None), CloudReuse::Open);
+        assert_eq!(cloud_reuse(false, Some(DEAD_OURS)), CloudReuse::Open, "dead → reopen fresh");
+        assert_eq!(cloud_reuse(false, Some(DEAD_OTHER)), CloudReuse::Open);
+        // A dead socket under an `active` flag is the mid-stream-death window the capture callback
+        // already documents: let cloud-ended → stop_cloud_stream recover it rather than opening a
+        // second stream underneath.
+        assert_eq!(cloud_reuse(true, None), CloudReuse::AlreadyRouting);
+        assert_eq!(cloud_reuse(true, Some(DEAD_OURS)), CloudReuse::AlreadyRouting);
+        assert_eq!(cloud_reuse(true, Some(DEAD_OTHER)), CloudReuse::AlreadyRouting);
     }
 
     #[test]

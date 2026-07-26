@@ -6,7 +6,9 @@
 import { useEffect } from "react";
 import {
   IMPROVEMENT_TICK_MS,
+  isHourlySlotDue,
   isPassRunning,
+  passRetryDueAt,
   runImprovementPass,
   shouldRunImprovementPass,
 } from "./services/improvementPass";
@@ -27,18 +29,26 @@ export function useImprovementScheduler(enabled: boolean) {
         settings.setImprovementLastRunAt(Date.now());
         return;
       }
+      const now = Date.now();
       const due = shouldRunImprovementPass({
         consent,
         lastRunAt: settings.improvementLastRunAt,
-        now: Date.now(),
+        now,
         passRunning: isPassRunning(),
         paneStatus: useRuntimeStore.getState().status[SPARKLE_AGENT_ID],
+        // A pass that died because the network was unreachable never ran; it gets ONE early
+        // re-attempt instead of forfeiting the slot (improvementPass.ts owns the latch).
+        retryDueAt: passRetryDueAt(),
       });
       if (!due) return;
+      // Which kind of run this is, read BEFORE the stamp below overwrites the clock: the hourly
+      // slot coming due (re-earns the one retry) or the early re-attempt (spends it).
+      const freshSlot = isHourlySlotDue(settings.improvementLastRunAt, now);
       // Stamp at ATTEMPT time (not completion) so a slow or failing pass still waits a full
-      // hour before the next one — no hot-looping a broken setup.
-      settings.setImprovementLastRunAt(Date.now());
-      void runImprovementPass(consent);
+      // hour before the next one — no hot-looping a broken setup. Same `now` the gate weighed,
+      // so the reading above and the stamp can't straddle a clock tick.
+      settings.setImprovementLastRunAt(now);
+      void runImprovementPass(consent, freshSlot);
     };
     // A short first check (not immediate — let startup I/O settle), then the slow tick.
     const first = setTimeout(tick, 15_000);

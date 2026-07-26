@@ -13,18 +13,19 @@ import { getConfig, onConfigChanged } from "./services/config";
 import { refreshRoborevAuth } from "./services/configActions";
 import { safeUnlisten } from "./services/safeUnlisten";
 import {
-  CurrentProjectProvider,
+  AppBoot,
   useCurrentProjectId,
   useCurrentWindowLabel,
   useIsMainWindow,
   useReplaceCurrentProject,
 } from "./windowContext";
 import { LastFocusedProjectTracker } from "./capture/LastFocusedProjectTracker";
-import { WindowSessionCapture } from "./WindowSessionCapture";
 import { initCaptureSendListener, type CaptureSendCtx } from "./services/captureSends";
 import { useAttentionNotifications } from "./useAttentionNotifications";
 import { useRosterPublisher } from "./useRosterPublisher";
+import { useLimitSync } from "./hooks/useLimitSync";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { AccountSwitchHost } from "./components/AccountSwitchHost";
 import { HintOverlay } from "./components/HintOverlay";
 import { RoborevConsentModal } from "./components/RoborevConsentModal";
 import { startUpdater } from "./services/updaterService";
@@ -61,23 +62,31 @@ function AttentionController() {
   return null;
 }
 
-// Publishes the live agent roster to the paired phone + the tray aggregator. MUST be rendered
-// INSIDE CurrentProjectProvider: useRosterPublisher → useCurrentWindowLabel → useCtx(), which
-// throws "must be used within CurrentProjectProvider" if run in App's body (App renders the
-// provider as a child, so the body is outside it). Mounted as a sibling of AuthGate so it runs
-// regardless of auth/loading state, matching its prior always-on behavior. Paints no UI.
+// Publishes the live agent roster to the paired phone + the tray aggregator. Rendered inside
+// AppBoot so it starts after the boot-time cleanups, and as a sibling of AuthGate so it runs
+// regardless of auth/loading state, matching its prior always-on behavior. (AppBoot is boot
+// EFFECTS only now — CM-U7 part 2 removed the per-window context, so its hooks return constants
+// and no longer throw outside it.) Paints no UI.
 function RosterPublisher() {
   useRosterPublisher();
   return null;
 }
 
+// Keeps account exhaustion flags in step with REAL rate-limit events (structured transcript
+// records, not terminal text — see services/limitSync). App-wide and singular: a limit belongs to
+// an ACCOUNT, so one poller serves every open agent. Paints no UI.
+function LimitSync() {
+  useLimitSync();
+  return null;
+}
+
 // NOTE: LastFocusedProjectTracker lives in capture/LastFocusedProjectTracker.tsx (extracted
-// with its own tests by the T3 worker); it must render inside CurrentProjectProvider.
+// with its own tests by the T3 worker); it must render inside AppBoot.
 
 // Mounts the capture://send listener once per window (spec §4/§5/§6). The capture modal
 // broadcasts one payload to every window; this window's routing (ownership + main's stale-owner
 // self-heal) decides whether to act, then dispatches Think/Build/Plan. MUST render inside
-// CurrentProjectProvider — it needs this window's label/isMain/current project + `replace` (to
+// AppBoot — it needs this window's label/isMain/current project + `replace` (to
 // adopt an orphan project). A ref feeds the listener FRESH context each event without re-mounting
 // (the label/isMain are fixed; projectId changes as the user switches projects). Paints no UI.
 function CaptureSendController() {
@@ -101,8 +110,8 @@ export function App() {
   useConnectionMonitor();
   // App-level always-listening voice controller (mounted once).
   useAmbientVoice();
-  // NOTE: roster publishing moved into <RosterPublisher/> (inside the provider) — it depends on
-  // useCurrentWindowLabel(), which throws if called here in App's body (outside the provider).
+  // NOTE: roster publishing lives in <RosterPublisher/> below, mounted inside AppBoot so it starts
+  // after the boot-time cleanups rather than racing them.
 
   // Phone approvals remote: open the relay host connection (no-op if signed out) so a local
   // agent's "needs you" can reach the paired phone, and a phone decision can drive the PTY.
@@ -220,10 +229,14 @@ export function App() {
   }, []);
 
   return (
-    <CurrentProjectProvider>
+    <AppBoot>
       <RosterPublisher />
+      <LimitSync />
       <LastFocusedProjectTracker />
-      <WindowSessionCapture />
+      {/* Historical: WindowSessionCapture recorded per-window geometry so a cold start could
+          reopen every project WINDOW (bead ). The single-window shell restores the
+          selected TAB + the persisted open agents from the stores instead, and CM-U7 part 2
+          deleted the component. */}
       <CaptureSendController />
       {/* Proactive first-run readiness: walk a fresh user through git/node/claude + sign-in up
           front. Invisible for an already-ready machine (renders children immediately, probes in the
@@ -234,6 +247,7 @@ export function App() {
         <AuthGate>
         <AttentionController />
         <UpdateBanner />
+        <AccountSwitchHost />
         {/* Workspace is code-split (React.lazy); Suspense holds the first frame while its chunk
             loads. fallback={null} keeps the transition invisible — the authed UI paints its own
             skeleton, and this only ever shows for the brief chunk fetch right after sign-in. */}
@@ -248,6 +262,6 @@ export function App() {
         <HintOverlay />
         </AuthGate>
       </ReadinessGate>
-    </CurrentProjectProvider>
+    </AppBoot>
   );
 }

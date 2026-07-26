@@ -1,4 +1,10 @@
 import type { SuggestionButton } from "./types";
+// The picker-footer regex is owned by the engine's screenClassifier (the single retune point for
+// Claude Code TUI drift) and re-exported here for approvalClassifier, so the option detector, the
+// category classifier, and the red-vs-gray status check can never desync on what marks a picker.
+import { PICKER_FOOTER } from "../../engine/screenClassifier";
+
+export { PICKER_FOOTER };
 
 // Only the last N non-empty lines are considered "live" — a prompt scrolled far up is stale.
 const TAIL_LINES = 12;
@@ -39,19 +45,14 @@ function asksChoice(lastLine: string): boolean {
 // never the last line. So this detector searches a wider window for the footer, then parses the
 // option block immediately above it.
 //
-// Claude Code's Bash-command approval prompt renders a DIFFERENT footer — "Esc to cancel · Tab to
-// amend · ctrl+e to explain" — that lacks the "Enter to select …" text. We anchor on its unique
-// "Tab to amend … ctrl+e to explain" phrasing, which sits BELOW the option block in the same
-// structural position as the standard footer, so the upward option walk works identically. Both
-// phrases must co-occur on the ONE line (not either alone) so an incidental scrollback line that
-// merely mentions "tab to amend" or "ctrl+e to explain" can't be mistaken for a picker footer.
+// Claude Code's Bash-command approval prompt renders a DIFFERENT footer — "Esc to cancel · [Tab to
+// amend ·] ctrl+e to explain" — that lacks the "Enter to select …" text (and drops "Tab to amend"
+// whenever the highlighted option isn't the amendable "Yes"). PICKER_FOOTER (imported above from
+// screenClassifier) anchors on the always-present "esc to cancel … ctrl+e to explain" pair, which
+// sits BELOW the option block in the same structural position as the standard footer, so the upward
+// option walk works identically.
 const PICKER_WINDOW = 50; // non-empty lines to search for the footer
 const PICKER_SPAN = 30; // non-empty lines above the footer the option block may span
-// Exported as the single source of truth: approvalClassifier.ts imports this exact regex for its
-// header-region scan, so the option detector and the category classifier can never desync on which
-// footer marks a prompt (they must agree byte-for-byte — see the classifier's headerRegion).
-export const PICKER_FOOTER =
-  /enter to (select|confirm|submit)\b.*(navigate|cancel)|\btab to amend\b.*ctrl\+e to explain/i;
 const PICKER_OPTION = /^\s*(?:[❯›>]\s*)?(\d{1,2})\.\s+(\S.*)/;
 const PICKER_LABEL_MAX = 40;
 const PICKER_MAX_BUTTONS = 6;

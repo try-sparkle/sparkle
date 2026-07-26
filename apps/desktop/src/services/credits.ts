@@ -29,8 +29,16 @@ export class AiDisabledError extends Error {
 }
 
 export class OutOfCreditsError extends Error {
-  /** `balanceCents` is the user's CURRENT ledger balance at reserve-failure time (what the
-   *  server reports after the failed debit), not the shortfall — safe for "you have $X" UI. */
+  /** `balanceCents` is meant to be the user's CURRENT ledger balance at reserve-failure time (what
+   *  the server reports after the failed debit), not the shortfall.
+   *
+   *  DO NOT render it without auditing the construction sites — two of the three can hand you a 0
+   *  that is not a balance. `assertAiCredits` throws `me?.balanceCents ?? 0`, so a signed-out user
+   *  yields 0; and on the sparkle-q5re path `chatOnce` receives `insufficient_credits:0` for an
+   *  unparseable 402 body, so a funded account throws 0 (pinned by the "adopts the fabricated 0"
+   *  test). Nothing reads this field today — the live balance UI takes `me.balanceCents` from the
+   *  store — which is why those have been acceptable. A "you have $X" surface fed from here would
+   *  currently show a funded user $0.00. */
   constructor(public balanceCents: number) {
     super("Out of AI credits");
     this.name = "OutOfCreditsError";

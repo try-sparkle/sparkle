@@ -18,7 +18,7 @@ import {
 import { structuredJson } from "./anthropic";
 import { writePrd } from "./prd";
 import { aiFeatureMode, useSettingsStore } from "../stores/settingsStore";
-import { parseWindowLabelFromSearch } from "./projectWindows.url";
+import { isAppWindowSearch } from "./windowIdentity";
 import { log } from "../logger";
 
 export const DECOMPOSING_LABEL = "decomposing";
@@ -288,8 +288,10 @@ export function runDecomposeWatcherForPoll(
   projectPath: string,
   board: Board,
 ): Promise<void> {
-  const isMain =
-    typeof window !== "undefined" && parseWindowLabelFromSearch(window.location.search) === null;
+  // The APP window only — the tray/capture webviews (which carry `?view=`) must not run the
+  // decompose watcher. This used to test for an absent `?label=`, which nothing mints any more,
+  // so every webview passed (roborev 46485-M).
+  const isMain = typeof window !== "undefined" && isAppWindowSearch(window.location.search);
   const visible = typeof document === "undefined" || document.visibilityState !== "hidden";
   if (!isMain || !visible) return Promise.resolve();
   return maybeRunDecomposeWatcher(
