@@ -8,6 +8,7 @@ import { Markdown } from "../Markdown";
 import { bandColor } from "../../engine/statusBandLabels";
 import { NudgeCard } from "./NudgeCard";
 import { RoutingReceipt } from "./RoutingReceipt";
+import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
 import type {
   ConciergeDigestMessage,
   ConciergeMessage,
@@ -99,7 +100,7 @@ export function ConciergeThread({
   return (
     <div
       ref={scrollRef}
-      data-testid="concierge-thread"
+      data-testid={CONCIERGE_THREAD_TESTID}
       onScroll={(e) => {
         const el = e.currentTarget;
         const atBottom = el.scrollHeight - el.clientHeight - el.scrollTop <= FOLLOW_THRESHOLD_PX;

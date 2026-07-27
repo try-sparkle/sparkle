@@ -287,6 +287,9 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     "activeSpecial",
     "statusFilter",
     "collapsedOrchestrators",
+    // The concierge compose box's dragged height. Persisted on purpose — the user asked for the
+    // size to stick across relaunches.
+    "conciergeComposeH",
     "composerHeight",
     "composerMinimized",
     "composerUserSized",

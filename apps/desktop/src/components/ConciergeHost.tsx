@@ -30,6 +30,7 @@ import {
   receiptText,
   type ConciergeAnnouncement,
   type ConciergeAttachKind,
+  type ConciergeDigestMessage,
   type ConciergeMessage,
   type ConciergeNudge,
   type ConciergeNudgeAction,
@@ -58,6 +59,8 @@ import {
 } from "../services/conciergeDispatch";
 import { routeMessage } from "../services/conciergeRouter";
 import { buildDigest } from "../services/conciergeDigest";
+import { createArrivalOrder, orderByArrival } from "../engine/conciergeStreamOrder";
+import { useUiStore } from "../stores/uiStore";
 import { attachedDisplay, attachedPayload } from "../services/conciergeAttach";
 import { useConciergeAttachments } from "../hooks/useConciergeAttachments";
 import type { Attachment } from "./composer/attachments";
@@ -295,6 +298,11 @@ export function ConciergeHost({
 }) {
   // Latest feed for the event handlers (send/nudge actions), which run after render.
   const feedRef = useRef(feed);
+  // The thread's arrival ledger: which message ids have been seen, and in what order. A REF, not
+  // state — it records history rather than driving a render, and the memo below reads it while
+  // building. Assign-once semantics keep a digest that flickers (a group needs >= 2 agents, so it
+  // collapses at 1 and re-forms at 2) from leaping to the bottom of the thread each time.
+  const arrivalRef = useRef(createArrivalOrder());
   useEffect(() => {
     feedRef.current = feed;
   }, [feed]);
@@ -1121,8 +1129,14 @@ export function ConciergeHost({
         const a = resolveAgent(n.id);
         if (a) openProjectTab(a.projectId, a.id);
       },
-      // The digest's whole purpose: hand off to column two instead of duplicating it.
-      onDigestClick: (d: { leadAgentId: string }) => {
+      // The digest's whole purpose: hand off to column two instead of duplicating it. Two halves:
+      // reveal the lead agent, AND narrow the Build column to the band the line is about — clicking
+      // "17 Need you" should leave you looking at those seventeen, not at all fifty with one of them
+      // selected. `isolateStatusBand` is the SAME state the sidebar's own filter chips render, so
+      // the effect is visible up there and clears with the ordinary "Show all" rather than being an
+      // invisible mode (see uiStore / engine/buildSections).
+      onDigestClick: (d: ConciergeDigestMessage) => {
+        useUiStore.getState().isolateStatusBand(d.band);
         const a = resolveAgent(d.leadAgentId);
         if (a) openProjectTab(a.projectId, a.id);
       },
@@ -1170,13 +1184,18 @@ export function ConciergeHost({
       text: g.text,
       leadAgentId: g.leadAgentId,
     }));
+    // Order the whole stream by WHEN EACH ITEM FIRST APPEARED, not by what kind it is. Concatenated
+    // as [chat, digests, nudges] only to tie-break items that arrive in the SAME tick; anything
+    // already placed keeps its slot (see engine/conciergeStreamOrder for why assign-once matters).
+    const stream = orderByArrival(arrivalRef.current, [...chat, ...digests, ...nudges]);
     return {
       scope: { pinnedProjectName },
       vitals: feed.scopedCounts,
       spend: { amountText: spendText },
-      // Digest lines first, then the individual cards: the collapsed groups are the summary and
-      // belong above the exceptions they summarise.
-      messages: [...chat, ...digests, ...nudges],
+      // In arrival order. This used to be `[...chat, ...digests, ...nudges]`, which pinned every
+      // notice below the entire conversation no matter when it arrived — so the digests read as
+      // stuck to the bottom of the pane rather than as part of the thread.
+      messages: stream,
       typing,
       attachments,
       dropActive,

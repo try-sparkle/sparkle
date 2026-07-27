@@ -30,12 +30,28 @@
 // textarea and are editable and sendable like typed text; the INTERIM preview stays outside the
 // textarea, because Deepgram replaces it word-by-word and a send that captured it would ship a
 // half-heard phrase that is about to be superseded.
-import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { FiCamera, FiFile, FiImage, FiMic, FiPaperclip, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL_DARK } from "../../theme/colors";
 import { CONCIERGE_COMPOSE_DND_TARGET } from "../../services/dndTargets";
 import type { Attachment, ConciergeAttachKind } from "./types";
 import { useUiStore } from "../../stores/uiStore";
+import {
+  COMPOSE_MIN_H,
+  CONCIERGE_THREAD_TESTID,
+  composeDragH,
+  composeDragReleasesManual,
+  composeRenderH,
+} from "../../engine/composeBoxHeight";
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
 
@@ -123,6 +139,122 @@ export function ComposeBox({
     return () => registerInsert(null);
   }, [registerInsert]);
 
+  // ── Height: auto-grow to a ten-line cap, or whatever the user dragged to ────────────────────
+  // The box was a fixed 42px with `resize: none`, so a paragraph scrolled invisibly above the
+  // caret. Policy (cap, floor, drag arithmetic) lives in engine/composeBoxHeight; this half just
+  // measures and listens.
+  const userH = useUiStore((s) => s.conciergeComposeH);
+  const setUserH = useUiStore((s) => s.setConciergeComposeH);
+  const [contentH, setContentH] = useState<number | null>(null);
+  // The space this box's TEXTAREA and the THREAD share — not the window, and not the box's whole
+  // root either. Two distinct traps, both of which clip the Send row off the bottom (roborev
+  // 53572 / 53586):
+  //
+  //   1. The column carries a fixed header (wordmark, spend pill, scope vitals) and a suggestions
+  //      slot that cannot compress, so sizing against `window.innerHeight` over-allocates by all of
+  //      it and the thread collapses to zero.
+  //   2. The ceiling is applied to the TEXTAREA, but the root also holds the attach row, the chips,
+  //      the interim dictation line and the drag handle — ~60px the textarea never sees. Measuring
+  //      the pool in root units and spending it in textarea units silently hands the thread that
+  //      much less than COMPOSE_MIN_THREAD_H promises. So the box's own chrome comes off the pool.
+  //
+  // And because the dragged height is persisted, either mistake survives a relaunch.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [availableH, setAvailableH] = useState(() =>
+    typeof window === "undefined" ? 800 : window.innerHeight,
+  );
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root || typeof ResizeObserver === "undefined") return;
+    let ro: ResizeObserver | null = null;
+    const measure = () => {
+      const ta = textareaRef.current;
+      const thread = root
+        .closest("section")
+        ?.querySelector<HTMLElement>(`[data-testid="${CONCIERGE_THREAD_TESTID}"]`);
+      if (!thread || !ta) {
+        setAvailableH(window.innerHeight);
+        return;
+      }
+      // Everything in the root that is NOT the textarea, so the pool is in the same unit the
+      // ceiling is spent in.
+      const chrome = Math.max(0, root.offsetHeight - ta.offsetHeight);
+      const pool = thread.clientHeight + root.offsetHeight - chrome;
+      setAvailableH(pool > 0 ? pool : window.innerHeight);
+      // The THREAD is the half of the pool that moves when anything else in the column appears:
+      // it is `flex: 1`, so a suggestions row or a search slot mounting shrinks it. Neither the
+      // root (height driven by React state) nor the section (window-sized) resizes when that
+      // happens, so without observing the thread the ceiling would stay stale at its old, larger
+      // value — with no event to correct it.
+      if (ro) ro.observe(thread);
+    };
+    measure();
+    ro = new ResizeObserver(measure);
+    ro.observe(root);
+    measure(); // re-run now that `ro` exists, so the thread gets observed too
+    window.addEventListener("resize", measure);
+    return () => {
+      ro?.disconnect();
+      ro = null;
+      window.removeEventListener("resize", measure);
+    };
+  }, []);
+
+  // Measure BEFORE paint (useLayoutEffect), so the box never renders one frame at the old height
+  // and jumps. Collapsing to `auto` first is what makes scrollHeight report the content's natural
+  // height rather than the height we last set — without it the box can only ever grow.
+  useLayoutEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const prev = ta.style.height;
+    ta.style.height = "auto";
+    const next = ta.scrollHeight;
+    ta.style.height = prev;
+    setContentH((cur) => (cur === next ? cur : next));
+  }, [text, interim]);
+
+  const height = composeRenderH({ contentH, userH: userH ?? null, availableH });
+
+  // Drag the top edge. Pointer capture keeps the gesture alive when the cursor leaves the 6px
+  // handle — without it a fast drag drops on the first frame that outruns the element.
+  const dragFrom = useRef<{ y: number; h: number } | null>(null);
+  const onHandleDown = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      dragFrom.current = { y: e.clientY, h: height };
+      // Optional, not assumed: the Pointer Capture API is absent in jsdom and can throw on an
+      // already-released id. The drag works without it (we just lose the leaves-the-element
+      // guarantee), so a missing implementation must not take the whole gesture down with it.
+      try {
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+      } catch {
+        /* capture is a nicety; the pointer handlers below carry the drag regardless */
+      }
+    },
+    [height],
+  );
+  const onHandleMove = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      const from = dragFrom.current;
+      if (!from) return;
+      const next = composeDragH(from.h, e.clientY - from.y, availableH);
+      // Dragging back down to the resting height hands the box back to auto-grow, so one stray
+      // drag can't freeze it for the session with no obvious undo.
+      setUserH(composeDragReleasesManual(next) ? null : next);
+    },
+    [availableH, setUserH],
+  );
+  const onHandleUp = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    dragFrom.current = null;
+    try {
+      if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+        e.currentTarget.releasePointerCapture?.(e.pointerId);
+      }
+    } catch {
+      /* see onHandleDown — capture is optional */
+    }
+  }, []);
+
   // Clear optimistically (the send almost always lands), but PUT THE DRAFT BACK if the host reports
   // a failure — the removed composer did exactly this, and having to retype a paragraph because an
   // agent's terminal had closed is the worst possible outcome of a failed send. Only restored when
@@ -150,6 +282,7 @@ export function ComposeBox({
 
   return (
     <div
+      ref={rootRef}
       // The hit-test handle for the host's window-global drag listener (services/dndTargets).
       data-dnd-target={CONCIERGE_COMPOSE_DND_TARGET}
       style={{
@@ -247,6 +380,30 @@ export function ComposeBox({
           {interim}
         </div>
       ) : null}
+      {/* Drag the compose box taller. Sits on its TOP edge, so dragging up grows it — past the
+          ten-line auto cap if you want, which is the whole reason to offer a handle. Dragging back
+          down to the resting height releases it to auto-grow again. */}
+      <div
+        data-testid="concierge-compose-handle"
+        role="separator"
+        aria-label="Resize the message box"
+        aria-orientation="horizontal"
+        onPointerDown={onHandleDown}
+        onPointerMove={onHandleMove}
+        onPointerUp={onHandleUp}
+        onPointerCancel={onHandleUp}
+        style={{
+          height: 6,
+          margin: "-4px 0 4px",
+          cursor: "ns-resize",
+          // Invisible until hovered: a permanent rule across the pane would read as a divider, and
+          // the affordance is discoverable from the resize cursor.
+          background: "transparent",
+          borderRadius: 3,
+          touchAction: "none",
+          flex: "none",
+        }}
+      />
       <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
         <button
           type="button"
@@ -290,8 +447,14 @@ export function ComposeBox({
           onKeyDown={onKeyDown}
           style={{
             flex: 1,
+            // `resize: none` stays: the browser's own corner grip resizes only the textarea, which
+            // would desync it from the row's buttons and from the persisted height. The handle
+            // above is the one resize affordance.
             resize: "none",
-            height: 42,
+            height,
+            // Past the auto cap the content scrolls INSIDE the box rather than the box growing on
+            // forever. `auto` (not `scroll`) so a one-line draft shows no dead scrollbar gutter.
+            overflowY: "auto",
             background: C.forest,
             border: `1px solid ${line}`,
             borderRadius: 12,

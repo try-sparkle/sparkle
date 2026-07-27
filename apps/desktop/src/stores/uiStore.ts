@@ -138,6 +138,15 @@ interface UiState {
   // Turning ALL THREE off is allowed and shows an empty column with an explanatory hint. We do NOT
   // silently re-arm the last chip: a user who clicked three times meant it, and a filter that
   // refuses to reach its stated state is worse than an empty list that explains itself.
+  // The height the user DRAGGED the concierge compose box to, or null when they never have (the
+  // box auto-grows with its content instead — see engine/composeBoxHeight).
+  //
+  // Persisted, and separate from `composerHeight` on purpose: that one belongs to the agent-pane
+  // composer, whose drag CLAMPS to its cap. This box's drag may EXCEED its cap — the reason to grab
+  // the handle is to see more than ten lines — so one field serving both would need a flag at the
+  // exact point the two disagree.
+  conciergeComposeH: number | null;
+  setConciergeComposeH: (h: number | null) => void;
   statusFilter: Record<StatusBand, boolean>;
   toggleStatusBand: (b: StatusBand) => void;
   showAllStatusBands: () => void;
@@ -236,6 +245,8 @@ export const useUiStore = create<UiState>()(
       setActiveSpecial: (v) => set({ activeSpecial: v }),
       themePref: "auto",
       setThemePref: (v) => set({ themePref: v }),
+      conciergeComposeH: null,
+      setConciergeComposeH: (h) => set({ conciergeComposeH: h }),
       statusFilter: { needs_you: true, running: true, done: true },
       toggleStatusBand: (b) =>
         set((s) => ({ statusFilter: { ...s.statusFilter, [b]: !s.statusFilter[b] } })),

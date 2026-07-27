@@ -53,3 +53,35 @@ if (!hasUsableStorage()) {
     configurable: true,
   });
 }
+
+/** jsdom implements no `PointerEvent`. Testing-library's `fireEvent.pointerDown/Move/Up` then falls
+ *  back to a plain `Event`, which silently DROPS the coordinate fields — so `clientX`/`clientY`
+ *  arrive `undefined` and any pointer-drag handler computes `NaN` instead of a delta. The handler
+ *  runs, nothing moves, and the test fails looking like a broken component rather than a missing
+ *  browser API.
+ *
+ *  MouseEvent already carries exactly the coordinate surface a drag reads, so aliasing it is enough
+ *  for the drag paths we test; `pointerId`/`pointerType` ride along from the init dict as own
+ *  properties. Only defined when genuinely absent, so a future jsdom that ships the real thing wins. */
+// Guarded on MouseEvent too: this setup file also runs for NODE-environment suites, where there is
+// no DOM at all and `class X extends MouseEvent` throws at module load — which would take down every
+// non-jsdom test in the repo rather than just skipping a polyfill they never use.
+if (
+  typeof (globalThis as { PointerEvent?: unknown }).PointerEvent === "undefined" &&
+  typeof MouseEvent !== "undefined"
+) {
+  class PointerEventPolyfill extends MouseEvent {
+    readonly pointerId: number;
+    readonly pointerType: string;
+    constructor(type: string, init: PointerEventInit = {}) {
+      super(type, init);
+      this.pointerId = init.pointerId ?? 0;
+      this.pointerType = init.pointerType ?? "mouse";
+    }
+  }
+  Object.defineProperty(globalThis, "PointerEvent", {
+    value: PointerEventPolyfill,
+    writable: true,
+    configurable: true,
+  });
+}
