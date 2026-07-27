@@ -42,6 +42,10 @@ export const IMPROVEMENT_TICK_MS = 5 * 60 * 1000;
  *  sparkle_improve.rs (the reclaim backstop for a reloaded webview) must strictly EXCEED it so
  *  the two never race at the boundary. */
 export const PASS_TIMEOUT_MS = 30 * 60 * 1000;
+/** The same wall in the unit a prompt (and a failure message) states it in. Derived, never
+ *  written twice: a budget the mission promises and a watchdog that fires at a different number
+ *  is worse than not stating one at all. */
+export const PASS_BUDGET_MINUTES = PASS_TIMEOUT_MS / 60000;
 /** Minimum cool-off before the ONE re-attempt a connectivity failure earns comes due. A pass
  *  that died because the network was momentarily unreachable did no work at all, so charging it
  *  the full hourly interval throws away an entire slot over a few seconds of bad DNS.
@@ -101,6 +105,29 @@ const LEFTOVER_CLAUSE =
   "it, never fold it into your change, and never describe it in your PR. Set it aside (stash it, " +
   "or leave it on its branch) and cut your fresh branch from origin/main.";
 
+/** The pass runs against a hard wall (PASS_TIMEOUT_MS) that nothing ever told it about. So it
+ *  budgets as if time were unbounded — picking scope it can't finish, and holding the whole
+ *  change for one commit at the end — and the watchdog's SIGKILL arrives with no warning, no
+ *  chance to commit, and no chance to clean up.
+ *
+ *  Everything uncommitted at that moment is lost, and the cost doesn't stop there: the killed
+ *  pass leaves the worktree parked on its branch with its half-finished edits, which is exactly
+ *  the mess LEFTOVER_CLAUSE above has to spend the NEXT pass's attention on. One killed pass
+ *  therefore degrades two.
+ *
+ *  A deadline is only a deadline if you know it before you spend it. State the number, say what
+ *  happens at it, and give the two behaviours that make the wall survivable: commit incrementally
+ *  so progress is durable, and prefer the finished narrow change over the unfinished broad one. */
+const passBudgetClause = () =>
+  `You have about ${PASS_BUDGET_MINUTES} minutes: a watchdog kills this pass at that wall, ` +
+  "abruptly and with no chance to save, commit, or clean up. Plan around it — pick a change " +
+  "you can finish inside it, and make your progress durable as you go by committing each " +
+  "self-contained piece as soon as it verifies, rather than saving one commit for the end. " +
+  "Anything still uncommitted when the wall arrives is lost, and it leaves the worktree dirty " +
+  "for the next pass. If you are running short, finish and land the smaller change you have " +
+  "rather than the larger one you don't — a narrow improvement that ships beats a broad one " +
+  "that gets killed.";
+
 /** The one-shot mission for an hourly pass. Mode-specific ONLY in what happens to a finished
  *  change — the persona (sparklePersona) already carries the hard rules; this restates the
  *  operative ones so a fresh `-p` session can't miss them, and demands the structured trailer. */
@@ -132,6 +159,9 @@ export function hourlyMissionPrompt(
     "small, focused change on a fresh branch in this worktree. If nothing meets that bar, make",
     "no changes at all — a no-op pass is a good outcome.",
     LEFTOVER_CLAUSE,
+    // Before the disposition, not after: the budget is what decides whether the change is small
+    // enough to reach a commit at all, and the disposition is what to do once it has.
+    passBudgetClause(),
     disposition,
     "Never include PII or user-specific content anywhere outward-facing, per your standing",
     "privacy rules.",
@@ -377,7 +407,7 @@ export async function runImprovementPass(
       // (roborev #24516). cancel is silent by design (no error event), so settle here.
       const timer = setTimeout(() => {
         void cancelImprovementPass().catch(() => {});
-        settle({ ok: false, text: `pass timed out after ${PASS_TIMEOUT_MS / 60000} minutes and was killed` });
+        settle({ ok: false, text: `pass timed out after ${PASS_BUDGET_MINUTES} minutes and was killed` });
       }, PASS_TIMEOUT_MS);
       // Each unlistener is captured as ITS OWN listen resolves (not from Promise.all's result):
       // if one listen registers and the other rejects, the fulfilled handle must still reach

@@ -3,6 +3,8 @@ import {
   hourlyMissionPrompt,
   IMPROVEMENT_INTERVAL_MS,
   isTransientPassFailure,
+  PASS_BUDGET_MINUTES,
+  PASS_TIMEOUT_MS,
   parseImproveResult,
   shouldRunImprovementPass,
   type PassGate,
@@ -180,5 +182,29 @@ describe("hourlyMissionPrompt", () => {
       expect(p).toContain("origin/main");
       expect(p.indexOf("leftovers")).toBeLessThan(p.indexOf("scripts/sparkle-scrub.sh"));
     }
+  });
+
+  // The pass runs against a hard watchdog wall. Left unstated, it budgets as if time were
+  // unbounded and the SIGKILL takes everything it hadn't committed — and strands the worktree
+  // for the next pass on top of that.
+  it("both modes state the time budget and how to survive it", () => {
+    for (const mode of ["always", "case_by_case"] as const) {
+      const p = hourlyMissionPrompt(mode);
+      expect(p).toContain(`about ${PASS_BUDGET_MINUTES} minutes`);
+      expect(p).toContain("watchdog kills this pass");
+      expect(p).toContain("committing each self-contained piece"); // durable-as-you-go
+      expect(p).toContain("smaller change"); // land the finished narrow one
+    }
+  });
+
+  // The number the prompt promises and the number the watchdog fires at must be ONE value: a
+  // budget stated as 30 against a wall that fires at 20 is worse than stating none, because the
+  // agent plans against a deadline it doesn't have. The prompt interpolates PASS_BUDGET_MINUTES,
+  // so pinning that constant to the watchdog's own arithmetic is what keeps the two in step.
+  it("states the budget the watchdog actually enforces", () => {
+    expect(PASS_BUDGET_MINUTES).toBe(PASS_TIMEOUT_MS / 60000);
+    expect(hourlyMissionPrompt("always")).toContain(
+      `about ${PASS_TIMEOUT_MS / 60000} minutes`,
+    );
   });
 });
