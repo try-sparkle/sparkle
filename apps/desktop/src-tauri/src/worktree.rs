@@ -292,6 +292,69 @@ fn take_drained(drain: &Drain) -> Vec<u8> {
     std::mem::take(&mut *b)
 }
 
+/// Has the child exited — WITHOUT reaping it?
+///
+/// The distinction is load-bearing, not fastidious. [`std::process::Child::try_wait`] REAPS, which
+/// releases the pid, and with it the process-GROUP id once the group is empty. That is fatal for
+/// the post-exit group kill in [`output_with_timeout_lenient`], because the case that kill exists
+/// for is a descendant still holding the pipes: if it escaped the group (it `setsid`'d, or an fd
+/// was handed to a daemon) the group is EMPTY, the pgid is free for reuse, and
+/// `kill(-pid, SIGKILL)` can land on whatever unrelated process group has since taken it. Every
+/// other [`crate::proc::kill_process_group`] call site signals a child that is still un-reaped;
+/// this keeps the post-exit path honest to the same invariant.
+///
+/// `WNOWAIT` leaves the child waitable — it stays a zombie, and a zombie is still a MEMBER of its
+/// process group — so the kernel keeps the pid reserved and `-pid` provably still names OUR group.
+/// The caller reaps with `Child::wait` afterwards.
+///
+/// `waitid`, not `waitpid`: Darwin defines `WNOWAIT` but its `waitpid` rejects it with `EINVAL` —
+/// the flag is only honored by `waitid` there. `waitid` takes it on both platforms, so one call
+/// covers the dev machine and Linux CI.
+///
+/// Non-unix falls back to `try_wait` (which does reap): there is no group kill on that path, so
+/// nothing depends on the pid staying reserved, and a later `Child::wait` still returns the status
+/// std cached at the reap.
+fn exited_without_reaping(child: &mut std::process::Child) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::id_t;
+        loop {
+            // Zeroed, then read back: with `WNOHANG` and nothing to report, POSIX leaves the
+            // struct's fields untouched, so "did anything happen?" IS "did `si_signo` become
+            // non-zero (SIGCHLD)?". `si_signo` is a plain public field on both macOS and Linux;
+            // `si_pid` is a field on one and an accessor method on the other, which is why the
+            // check reads the signal instead.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `child` is our own direct, un-reaped child, so its pid is ours to wait on.
+            // `WNOWAIT` means this does NOT consume the exit status — `Child::wait` still reaps it
+            // afterwards — and `info` is a live, correctly-sized, zero-initialized `siginfo_t`.
+            let r = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if r != 0 {
+                let e = std::io::Error::last_os_error();
+                // Retried, exactly as std's own `wait`/`try_wait` do: an EINTR here is not a
+                // failure, and reporting it as one would kill the group and fail a command that
+                // was fine.
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e.to_string());
+            }
+            return Ok(info.si_signo != 0);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait().map(|s| s.is_some()).map_err(|e| e.to_string())
+    }
+}
+
 /// Run `cmd` to completion but ABORT it after `timeout`, killing the child and returning an Err.
 /// std-only (no tokio, per the backend constraint): the child stays owned here so we can kill it,
 /// two reader threads drain stdout/stderr concurrently (so a chatty child can't deadlock on a full
@@ -331,10 +394,13 @@ pub(crate) fn output_with_timeout_lenient(
     let drained = |grace| crate::proc::await_threads(&[&out_thread, &err_thread], grace);
 
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
+    // Deliberately NOT `try_wait`: see [`exited_without_reaping`]. The child stays a zombie — and
+    // so its pid, and with it its process-group id, stay reserved — until the post-exit drain below
+    // is finished with them. It is reaped LAST.
+    loop {
+        match exited_without_reaping(&mut child) {
+            Ok(true) => break,
+            Ok(false) => {
                 if Instant::now() >= deadline {
                     // Deadline hit: kill the whole process group, reap, give the readers a bounded
                     // grace to finish, and report the timeout.
@@ -350,7 +416,7 @@ pub(crate) fn output_with_timeout_lenient(
                 return Err(format!("wait failed: {e}"));
             }
         }
-    };
+    }
     // The child is gone, but a surviving grandchild can still hold the write ends — so this join is
     // bounded too. Two steps, and the order matters:
     //
@@ -361,6 +427,11 @@ pub(crate) fn output_with_timeout_lenient(
     //     lets the readers reach EOF and hand over the whole output. Abandoning instead (what this
     //     used to do) cost the bytes AND leaked a reader thread plus a pipe fd for as long as the
     //     holder lived, which for an ssh ControlMaster on a ~30s poll is hours.
+    //
+    // BOTH steps run while the child is still UNREAPED — that is the whole reason the loop above
+    // does not use `try_wait`. Reaping first releases the pid, and an EMPTY group (which is exactly
+    // the shape that reaches step 2: the holder escaped the group) releases the pgid with it, so
+    // the `kill(-pid, …)` below could reach an unrelated group. See `exited_without_reaping`.
     //
     // A bound we still hit after that does NOT mean failure: the holder escaped the group (it
     // `setsid`'d, or this is a non-unix build with no group kill), the bytes MAY be short, and the
@@ -375,6 +446,12 @@ pub(crate) fn output_with_timeout_lenient(
         crate::proc::kill_process_group(&mut child);
         joined = drained(DRAIN_GRACE);
     }
+    // Reaped HERE, and deliberately nowhere earlier — this is the other half of the fix. The wait
+    // loop above left the child a zombie precisely so its pid, and with it the pgid that
+    // `kill(-pid, …)` names, stayed reserved across the group kill directly above. Nothing needs the
+    // pid now, so collect the status and release it. `WNOWAIT` did not consume the exit state, so it
+    // is still here to collect.
+    let status = child.wait().map_err(|e| format!("wait failed: {e}"))?;
     let stdout_capped = out_buf.truncated.load(Ordering::Acquire);
     let stderr_capped = err_buf.truncated.load(Ordering::Acquire);
     let stdout_read_error = out_buf.read_error.load(Ordering::Acquire);
@@ -3896,6 +3973,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// `exited_without_reaping` must report the exit WITHOUT collecting it — the property the
+    /// post-exit group kill depends on, and the one a plain `try_wait` breaks.
+    ///
+    /// Why this matters rather than being pedantic: `try_wait` reaps, which releases the pid and,
+    /// once the group is empty, the process-GROUP id with it. The only case the post-exit
+    /// `kill_process_group` exists for is a holder that escaped the group — i.e. the group IS empty
+    /// and that pgid is prime for reuse — so reaping first can turn `kill(-pid, SIGKILL)` into a
+    /// SIGKILL against an unrelated process group on the user's machine. This shipped in v0.44.0.
+    ///
+    /// The assertion that carries the test is the `wait()` at the end: it can only succeed if the
+    /// child was still un-reaped, because a second reap of the same child fails. Swap
+    /// `exited_without_reaping` back to `try_wait` and that `wait()` errors — the test fails.
+    #[cfg(unix)]
+    #[test]
+    fn exited_without_reaping_reports_exit_but_leaves_the_child_waitable() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 7")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+
+        // Poll until it reports the exit. Bounded so a hang fails loudly instead of hanging CI.
+        let started = Instant::now();
+        loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "child never reported exit"
+            );
+            if exited_without_reaping(&mut child).expect("waitid must not error") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // THE load-bearing assertion, and it has to go through the OS rather than through `Child`.
+        // `Child::wait()` CACHES the status std collected at a reap, so it succeeds either way —
+        // a version of this test that asserted on `wait()` passed even with `try_wait` restored,
+        // which is to say it tested nothing. `kill(pid, 0)` asks the kernel instead: it succeeds
+        // while the pid is still reserved (a zombie is still a process, and still a member of its
+        // process group) and fails with ESRCH once the reap has released it. That reservation is
+        // the entire property the post-exit `kill(-pid, …)` relies on.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(
+            alive,
+            0,
+            "pid must still be RESERVED after the probe (zombie), else the pgid can be recycled \
+             and the post-exit group kill can hit an unrelated group: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // Now reap for real, and confirm the exit state was never consumed by the probe.
+        let status = child.wait().expect("child must still be waitable");
+        assert_eq!(status.code(), Some(7), "the real status still comes back");
+
+        // And after the reap the kernel HAS released it — proving the assertion above was
+        // discriminating rather than vacuously true for any pid.
+        let after = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(after, -1, "pid must be released once actually reaped");
     }
 
     /// The regression this whole process-group/bounded-drain rework exists for: a child that forks a
