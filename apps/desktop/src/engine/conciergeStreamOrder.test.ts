@@ -125,23 +125,23 @@ describe("orderByArrival — the grace window is WALL-CLOCK, not a rebuild count
     ]);
   });
 
-  it("draws the line at the window itself — with the id genuinely absent in between", () => {
-    // Both halves need an intervening call in which `x` is MISSING. Advancing the clock with no
-    // call at all means the id was continuously present and merely un-rebuilt, which must never
-    // re-slot anything (see the render-gap case below); an earlier version of this test skipped
-    // that call and so asserted the defect as the contract (roborev 53594).
+  it("draws the line at the window itself — measured across the ABSENCE", () => {
+    // The clock has to run between the build that DROPS `x` and the one that brings it back; that
+    // span is the absence. Advancing before the dropping call instead times a stretch in which `x`
+    // was on screen the whole while, which is what roborev 53651 caught this test doing — it put
+    // the boundary in the wrong place and so passed either way.
     const justUnder = createArrivalOrder();
     const a = clock();
     orderByArrival(justUnder, [m("x"), m("y")], a.now());
-    a.advance(ARRIVAL_GRACE_MS);
-    orderByArrival(justUnder, [m("y")], a.now()); // x absent, exactly at the boundary
+    orderByArrival(justUnder, [m("y")], a.now()); // x goes absent here
+    a.advance(ARRIVAL_GRACE_MS); // ...and comes back exactly at the boundary
     expect(ids(orderByArrival(justUnder, [m("y"), m("x")], a.now()))).toEqual(["x", "y"]);
 
     const justOver = createArrivalOrder();
     const b = clock();
     orderByArrival(justOver, [m("x"), m("y")], b.now());
-    b.advance(ARRIVAL_GRACE_MS + 1);
-    orderByArrival(justOver, [m("y")], b.now()); // x absent, just past it
+    orderByArrival(justOver, [m("y")], b.now());
+    b.advance(ARRIVAL_GRACE_MS + 1); // ...just past it
     expect(ids(orderByArrival(justOver, [m("y"), m("x")], b.now()))).toEqual(["y", "x"]);
   });
 
@@ -164,13 +164,46 @@ describe("orderByArrival — the grace window is WALL-CLOCK, not a rebuild count
     expect(ids(after)).toEqual(["chat1", "digest", "chat2", "chat3"]);
   });
 
+  it("charges the window to the ABSENCE, not to the quiet stretch before it", () => {
+    // roborev 53651. The window has to measure how long the id was GONE. Measuring from the last
+    // build that contained it charges the preceding silence to the absence — and silence is the
+    // normal state of this memo, which is the whole premise of the render-gap fix above.
+    const o = createArrivalOrder();
+    const c = clock();
+    orderByArrival(o, [m("digest"), m("chat")], c.now());
+
+    // Twelve seconds in which nobody types and no agent crosses `needs_you`. The memo is keyed on
+    // feed/chat identity, so it does not run at all — the digest is on screen the entire time.
+    c.advance(12_000);
+    orderByArrival(o, [m("chat")], c.now()); // the group dips below its >=2-agent threshold...
+    c.advance(200);
+
+    // ...and re-forms 200ms later. That is a textbook flicker, and the digest must not move.
+    expect(ids(orderByArrival(o, [m("chat"), m("digest")], c.now()))).toEqual(["digest", "chat"]);
+  });
+
+  it("stops the clock once a flickering id is back — a survived dip is not a running absence", () => {
+    // The other half of measuring from `absentSince`: it has to be CLEARED on return. Left set, a
+    // dip the id survived keeps ticking underneath it, and the id re-slots later for a gap it is no
+    // longer in — a jump with no event behind it at all.
+    const o = createArrivalOrder();
+    const c = clock();
+    orderByArrival(o, [m("digest"), m("chat")], c.now());
+    orderByArrival(o, [m("chat")], c.now()); // dips...
+    c.advance(200);
+    orderByArrival(o, [m("chat"), m("digest")], c.now()); // ...and is back well inside the window
+
+    // It then sits on screen through an ordinary stretch of conversation.
+    c.advance(ARRIVAL_GRACE_MS * 3);
+    expect(ids(orderByArrival(o, [m("chat"), m("digest")], c.now()))).toEqual(["digest", "chat"]);
+  });
+
   it("a re-raised alert keeps its NEW slot afterwards", () => {
     const o = createArrivalOrder();
     const c = clock();
     orderByArrival(o, [m("alert"), m("chat")], c.now());
-    c.advance(ARRIVAL_GRACE_MS * 5);
-    orderByArrival(o, [m("chat")], c.now());
-    c.advance(1000);
+    orderByArrival(o, [m("chat")], c.now()); // answered; the card goes...
+    c.advance(ARRIVAL_GRACE_MS * 5); // ...and stays gone well past the window
     expect(ids(orderByArrival(o, [m("chat"), m("alert")], c.now())).at(-1)).toBe("alert");
     for (let i = 0; i < 3; i++) {
       c.advance(500);

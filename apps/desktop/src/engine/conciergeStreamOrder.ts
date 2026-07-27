@@ -40,6 +40,16 @@
 // sort key, so it does not reintroduce the "stamped at build time races to the bottom" problem the
 // paragraph above rules out.
 //
+// AND THE CLOCK STARTS WHEN THE ID GOES, NOT WHEN IT WAS LAST HERE. Those differ by exactly the
+// silence in between, and silence is this memo's resting state — it is keyed on feed/chat identity,
+// so ten idle seconds is ordinary rather than exceptional (it is the premise of the render-gap case
+// below). Timing from the last build that CONTAINED an id therefore bills the quiet stretch to the
+// absence: twelve idle seconds, a dip below the digest's >=2-agent threshold, and a re-form 200ms
+// later reads as a twelve-second disappearance, and the line jumps (roborev 53651). Recording when
+// the absence STARTED measures the thing the window is about, and it absorbs the render-gap guard
+// as a side effect — an id nobody re-rendered was never observed missing, so it has no absence to
+// time and cannot go stale, without a separate condition to keep in step.
+//
 // The ledger is small and bounded in practice — projects × bands for digests, fleet size for
 // nudges, session length for chat — so entries are kept rather than swept.
 
@@ -53,21 +63,33 @@ export const ARRIVAL_GRACE_MS = 10_000;
 interface ArrivalEntry {
   /** Position in the thread. Lower sorts higher. */
   slot: number;
-  /** Wall-clock ms when this id was last on screen. Only ever read to decide re-slotting. */
-  lastSeenAt: number;
+  /**
+   * When this id was first missing from a build, or `null` while it is on screen.
+   *
+   * This is the ONLY thing the window is measured against, and the field it replaced — "when the id
+   * was last present" — is why (roborev 53651). Both answer "how long has it been gone?" only if a
+   * build happens the instant it goes, and builds are exactly what this module cannot assume: the
+   * memo runs on input identity, so a quiet stretch produces none at all. Timing from last-present
+   * charges that silence to the absence, so a 200ms flicker after twelve idle seconds reads as a
+   * twelve-second disappearance and the line jumps to the bottom.
+   *
+   * Timing from `absentSince` also subsumes the separate "did it miss a build?" test this used to
+   * need. An id nobody re-rendered was never observed missing, so it has no `absentSince` and
+   * cannot go stale — a render gap re-slots nothing by construction rather than by a second
+   * condition ANDed on (see the header).
+   */
+  absentSince: number | null;
 }
 
-/** The arrival ledger: where each id sits, when it was last present, and when this ledger was last
- *  consulted at all (see `lastCallAt` — it is what separates "absent" from "not re-rendered"). */
+/** The arrival ledger: where each id sits, and — for ids a build has actually been seen without —
+ *  when that absence started. */
 export interface ArrivalOrder {
   entries: Map<string, ArrivalEntry>;
   nextSlot: number;
-  /** Timestamp of the previous call. `-Infinity` before the first, so nothing reads as absent. */
-  lastCallAt: number;
 }
 
 export function createArrivalOrder(): ArrivalOrder {
-  return { entries: new Map(), nextSlot: 0, lastCallAt: Number.NEGATIVE_INFINITY };
+  return { entries: new Map(), nextSlot: 0 };
 }
 
 /** Monotonic by preference. `Date.now()` walks backwards on an NTP correction and jumps forward
@@ -102,30 +124,34 @@ export function orderByArrival<T extends { id: string }>(
   items: readonly T[],
   now: number = defaultNow(),
 ): T[] {
-  // The PREVIOUS call's timestamp, read before we overwrite it. `lastSeenAt < lastCallAt` is the
-  // only honest test for "this id was missing from a build that actually happened".
-  const lastCallAt = order.lastCallAt;
+  const present = new Set<string>();
+  for (const item of items) present.add(item.id);
+
   for (const item of items) {
     const prev = order.entries.get(item.id);
-    // Re-slot only when BOTH hold: the id was genuinely absent from at least one intervening
-    // rebuild, AND it has been gone longer than the window.
-    //
-    // Requiring the first is what stops a quiet stretch from re-slotting the entire thread. The
-    // memo only runs when its inputs change, so a reader who pauses for fifteen seconds produces
-    // no rebuild at all — and a lone elapsed-time test would then find EVERY on-screen id "stale"
-    // on the next keystroke and renumber all of them in the caller's `[chat, digests, nudges]`
-    // concatenation order. That is the original out-of-sequence layout this module exists to
-    // remove, delivered as a visible jump, triggered by nothing more than reading (roborev 53594).
-    const missedABuild = prev != null && prev.lastSeenAt < lastCallAt;
-    const goneTooLong = prev != null && now - prev.lastSeenAt > ARRIVAL_GRACE_MS;
-    if (prev == null || (missedABuild && goneTooLong)) {
-      order.entries.set(item.id, { slot: order.nextSlot, lastSeenAt: now });
+    // Re-slot an id only once its ABSENCE — not the silence preceding it — has outrun the window.
+    // `absentSince` is null for anything that has never been observed missing, which is what makes
+    // a render gap a no-op here: a reader who pauses produces no build, so nothing is observed
+    // missing, so nothing goes stale. Timing from "last present" instead would find EVERY on-screen
+    // id stale on the next keystroke and renumber all of them into the caller's
+    // `[chat, digests, nudges]` concatenation order — the original out-of-sequence layout this
+    // module exists to remove, delivered as a jump, triggered by reading (roborev 53594/53651).
+    const goneTooLong = prev?.absentSince != null && now - prev.absentSince > ARRIVAL_GRACE_MS;
+    if (prev == null || goneTooLong) {
+      order.entries.set(item.id, { slot: order.nextSlot, absentSince: null });
       order.nextSlot += 1;
     } else {
-      prev.lastSeenAt = now;
+      prev.absentSince = null; // back on screen: whatever gap there was did not count against it
     }
   }
-  order.lastCallAt = now;
+
+  // Anything the ledger holds that THIS build did not contain is absent as of now. `??=` starts the
+  // clock on the first build that misses it and leaves it alone thereafter, so the window measures
+  // one continuous absence however many times React re-renders during it.
+  for (const [id, entry] of order.entries) {
+    if (!present.has(id) && entry.absentSince == null) entry.absentSince = now;
+  }
+
   return sortBySlot(order, items);
 }
 
