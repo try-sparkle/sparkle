@@ -412,7 +412,7 @@ function AgentPaneInner({
       // router simply stays on the screen-scraping fallback. Must run before the PTY spawns so the
       // hooks are in settings.local.json when `claude` reads it.
       try {
-        const logPath = await installAgentHooks(wt.path);
+        const logPath = await installAgentHooks(wt.path, project.rootPath);
         const router = routerRef.current!;
         const hookEngine = new HookStatusEngine({
           agentId: agent.id,

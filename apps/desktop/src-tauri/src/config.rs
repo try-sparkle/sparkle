@@ -159,8 +159,14 @@ pub struct ToolsConfig {
     /// BUILD-agent commits using your existing `claude login`; off tears the daemon down and stops
     /// reviewing.
     pub roborev: bool,
+    /// Publish your DAILY TOKEN TOTALS to the public tokenmaxxing leaderboard (Builder Index).
+    /// The ONE tool here that ships OFF: it is the only one that sends anything about you to a
+    /// third party, so it takes a deliberate opt-in plus a one-time consent confirmation
+    /// (see builder_index.rs, which also gates on a stored username + API key). Aggregates only —
+    /// never file paths, prompts, code, or keys.
+    pub builder_index: bool,
     /// Back your `.env*` files up to a 1Password vault, and restore them into fresh agent
-    /// worktrees. The ONE tool here that defaults OFF: every other flag toggles behavior Sparkle
+    /// worktrees. Like `builder_index`, defaults OFF: every other flag toggles behavior Sparkle
     /// can deliver on its own, but this one needs an external account, the `op` CLI, and a chosen
     /// vault. Shipping it on would advertise a capability a new install cannot actually perform,
     /// so the user opts in from the Tools pane once those prerequisites are met.
@@ -182,6 +188,153 @@ pub struct OnePasswordConfig {
     /// agent starts without its project's secrets. Off by default: it writes files into a fresh
     /// worktree, which the user should ask for rather than discover.
     pub seed_worktrees: bool,
+}
+
+// ---------------------------------------------------------------------------------------
+// Claude Code marketplace plugins Sparkle pre-enables for every agent ([plugins]).
+//
+// SCHEMA (verified 2026-07-24 against code.claude.com/docs/en/discover-plugins +
+// /plugins-reference, `claude plugin --help`, and a live `claude plugin install` run — NOT
+// guessed). Claude Code reads two settings keys, both OBJECTS (not arrays):
+//
+//   "extraKnownMarketplaces": { "<marketplace-name>": { "source": { "source": "github",
+//                                                                   "repo": "owner/repo" } } }
+//   "enabledPlugins":         { "<plugin>@<marketplace>": true }
+//
+// AUTO-INSTALL: enabling a plugin in settings alone does NOT fetch it. Verified by hand: a
+// settings.local.json naming `code-simplifier@claude-plugins-official` left `claude plugin list`
+// with no such plugin, and the docs say a settings-enabled plugin from an external source
+// "doesn't load until the team member installs it". So the settings write is only half the job —
+// `hooks::ensure_default_plugins_installed` runs the (headless, idempotent) `claude plugin install`
+// that actually populates the shared `~/.claude/plugins/cache`.
+
+/// Where a marketplace comes from, mirroring the nested `source` object Claude Code expects.
+/// Only the `github` form is modeled — it is what every marketplace we ship uses.
+///
+/// NOT `Serialize`: the wire encoding Claude Code reads is built by hand in
+/// `hooks::merge_plugin_settings` (`{ "source": { "source": "github", "repo": "o/r" } }`), which is
+/// a different, NESTED shape from anything a derive on this struct would emit. A derive here would
+/// be a second, silently-wrong encoding waiting to be picked up by mistake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketplaceSource {
+    /// The marketplace name Claude Code registers it under — the `@<marketplace>` half of a
+    /// plugin id. Must match the `name` field in that repo's `.claude-plugin/marketplace.json`.
+    pub name: &'static str,
+    /// GitHub `owner/repo` hosting `.claude-plugin/marketplace.json`.
+    pub repo: &'static str,
+}
+
+/// One row of the known-plugins table: a `[plugins]` toggle mapped to the marketplace + plugin id
+/// Claude Code needs. Data-driven on purpose — adding episodic-memory, an LSP plugin, etc. is a new
+/// row here plus a bool field on `PluginsConfig`, with no new merge/injection plumbing.
+///
+/// NOT `Serialize`, for the same reason as [`MarketplaceSource`]: nothing sends this struct over a
+/// wire. What crosses to Claude Code is `id()` (an `enabledPlugins` key) and the hand-built
+/// marketplace object in `hooks::merge_plugin_settings`; what crosses to the frontend is
+/// [`PluginsConfig`], which IS serialized as part of `SparkleConfig`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownPlugin {
+    /// The `[plugins]` key (also the dotted config path suffix and the frontend toggle key).
+    pub toggle: &'static str,
+    /// Plugin name as listed in the marketplace's `marketplace.json` — the half before `@`.
+    pub plugin: &'static str,
+    /// Marketplace the plugin is installed from.
+    pub marketplace: &'static str,
+    /// Where that marketplace lives. Populated for EVERY row, including the official one: the
+    /// installer runs an idempotent `claude plugin marketplace add <repo>` from this before
+    /// installing, which is what makes a fresh machine work (see the field note below).
+    pub source: Option<MarketplaceSource>,
+}
+
+impl KnownPlugin {
+    /// The `<plugin>@<marketplace>` id — the `enabledPlugins` key and the `claude plugin install`
+    /// argument. One definition so the settings write and the install shell-out can never diverge.
+    pub fn id(&self) -> String {
+        format!("{}@{}", self.plugin, self.marketplace)
+    }
+
+    /// The source to DECLARE in a worktree's `extraKnownMarketplaces` — `None` for the official
+    /// marketplace, which Claude Code owns and registers itself. Declaring that name ourselves
+    /// would re-point a marketplace Claude Code manages and put a redundant entry in every agent's
+    /// settings file, so registration for it happens the other way: the installer's `marketplace
+    /// add`, which is a machine-level, idempotent no-op once it's registered.
+    pub fn declared_source(&self) -> Option<MarketplaceSource> {
+        self.source.filter(|_| self.marketplace != OFFICIAL_MARKETPLACE)
+    }
+}
+
+/// Anthropic's curated marketplace, and the GitHub repo backing it. Claude Code registers this
+/// marketplace itself — but only once it has been launched INTERACTIVELY at least once. Sparkle
+/// spawns agents on a machine where that may never have happened, so the installer registers it
+/// explicitly rather than assuming; see [`KnownPlugin::declared_source`].
+pub const OFFICIAL_MARKETPLACE: &str = "claude-plugins-official";
+pub const OFFICIAL_MARKETPLACE_REPO: &str = "anthropics/claude-plugins-official";
+
+/// The official marketplace as a source value, for the rows that live in it.
+const OFFICIAL_SOURCE: MarketplaceSource =
+    MarketplaceSource { name: OFFICIAL_MARKETPLACE, repo: OFFICIAL_MARKETPLACE_REPO };
+
+/// The plugins Sparkle knows how to pre-enable. Both current entries live in the official
+/// marketplace (verified against anthropics/claude-plugins-official's marketplace.json on
+/// 2026-07-24) — the official listing for `superpowers` pins the exact same commit obra/superpowers
+/// is at, and official marketplaces auto-update by default, so sourcing it there costs nothing in
+/// freshness.
+///
+/// Every row carries its `source`. It was tempting to leave the official rows at `None` ("Claude
+/// Code pre-registers it"), but that only holds on a machine where Claude Code has already been run
+/// interactively; on a fresh one `claude plugin install x@claude-plugins-official` fails with an
+/// unknown marketplace, and that failure is only warn-logged, so the plugins would silently never
+/// install. With a source present the installer's idempotent `marketplace add` always runs first.
+/// The settings-file declaration is a separate question — see `declared_source`.
+pub const KNOWN_PLUGINS: &[KnownPlugin] = &[
+    KnownPlugin {
+        toggle: "superpowers",
+        plugin: "superpowers",
+        marketplace: OFFICIAL_MARKETPLACE,
+        source: Some(OFFICIAL_SOURCE),
+    },
+    KnownPlugin {
+        toggle: "frontend_design",
+        plugin: "frontend-design",
+        marketplace: OFFICIAL_MARKETPLACE,
+        source: Some(OFFICIAL_SOURCE),
+    },
+];
+
+/// Which marketplace plugins are turned on for every agent Sparkle spawns. Repo-scoped and
+/// per-project overridable (like [workflow]/[freshness]): a frontend-only repo may want
+/// frontend-design on and a backend one may not, and the choice travels with the repo.
+///
+/// Each bool default true = the plugin ships on for every new install. Off means Sparkle writes
+/// nothing about it into an agent's `.claude/settings.local.json` (and never installs it) — it does
+/// NOT disable a plugin the user enabled themselves.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginsConfig {
+    /// obra's superpowers — the most-used agent methodology plugin: plan → TDD → review.
+    pub superpowers: bool,
+    /// Anthropic's official frontend-design plugin (UI quality).
+    pub frontend_design: bool,
+}
+
+impl PluginsConfig {
+    /// Is the `[plugins]` toggle named `toggle` on? Unknown names are off (a forward-compatible
+    /// key from a newer Sparkle must never resolve to "enabled").
+    pub fn is_enabled(&self, toggle: &str) -> bool {
+        match toggle {
+            "superpowers" => self.superpowers,
+            "frontend_design" => self.frontend_design,
+            _ => false,
+        }
+    }
+
+    /// The known plugins currently switched on, in table order.
+    pub fn enabled(&self) -> Vec<&'static KnownPlugin> {
+        KNOWN_PLUGINS
+            .iter()
+            .filter(|p| self.is_enabled(p.toggle))
+            .collect()
+    }
 }
 
 /// roborev machine-wide state that isn't a simple on/off tool toggle. Machine-wide (like [tools]):
@@ -289,6 +442,8 @@ pub struct SparkleConfig {
     pub workers: WorkersConfig,
     pub ai: AiConfig,
     pub tools: ToolsConfig,
+    /// Claude Code marketplace plugins pre-enabled for every agent (repo-scoped overridable).
+    pub plugins: PluginsConfig,
     /// roborev machine-wide state (the one-time consent flag). Kept in its own section so Rust can
     /// gate the first-run modal on it.
     pub roborev: RoborevConfig,
@@ -348,9 +503,16 @@ impl Default for SparkleConfig {
                 beads: true,
                 github: true,
                 guardrails: true,
+                // The lone default-OFF tool: nothing about this machine reaches the public
+                // leaderboard until the user turns this on AND answers the consent modal.
                 roborev: true,
+                builder_index: false,
                 onepassword: false,
             },
+            // Both default-on plugins ship enabled: the July 2026 Builder Index found superpowers in
+            // 11 of the top 15 token maxers' setups and frontend-design in 10 of 15, so on-by-default
+            // is what a new install would otherwise have to discover by hand.
+            plugins: PluginsConfig { superpowers: true, frontend_design: true },
             // First-run consent is unresolved until the user answers the one-time modal.
             roborev: RoborevConfig { consent_prompted: false },
             // No vault until the user picks one, and no worktree seeding until they ask for it.
@@ -473,7 +635,14 @@ struct PartialTools {
     github: Option<bool>,
     guardrails: Option<bool>,
     roborev: Option<bool>,
+    builder_index: Option<bool>,
     onepassword: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialPlugins {
+    superpowers: Option<bool>,
+    frontend_design: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -541,6 +710,7 @@ struct PartialConfig {
     workers: Option<PartialWorkers>,
     ai: Option<PartialAi>,
     tools: Option<PartialTools>,
+    plugins: Option<PartialPlugins>,
     roborev: Option<PartialRoborev>,
     onepassword: Option<PartialOnePassword>,
     freshness: Option<PartialFreshness>,
@@ -711,8 +881,23 @@ fn apply_tools(into: &mut ToolsConfig, p: Option<PartialTools>) {
     if let Some(v) = p.roborev {
         into.roborev = v;
     }
+    if let Some(v) = p.builder_index {
+        into.builder_index = v;
+    }
     if let Some(v) = p.onepassword {
         into.onepassword = v;
+    }
+}
+
+/// Overlay a partial `[plugins]` table. Per-key, like [tools] — so a project can flip
+/// `frontend_design` off without also re-stating `superpowers`.
+fn apply_plugins(into: &mut PluginsConfig, p: Option<PartialPlugins>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.superpowers {
+        into.superpowers = v;
+    }
+    if let Some(v) = p.frontend_design {
+        into.frontend_design = v;
     }
 }
 
@@ -1050,6 +1235,7 @@ fn build_effective(
                 apply_workers(&mut cfg.workers, p.workers);
                 apply_ai(&mut cfg.ai, p.ai);
                 apply_tools(&mut cfg.tools, p.tools);
+                apply_plugins(&mut cfg.plugins, p.plugins);
                 apply_roborev(&mut cfg.roborev, p.roborev);
                 apply_onepassword(&mut cfg.onepassword, p.onepassword);
                 apply_freshness(&mut cfg.freshness, p.freshness);
@@ -1121,12 +1307,16 @@ fn build_effective(
                             .to_string(),
                     );
                 }
-                // Per-project layer: [workflow], [freshness], [approvals], and the [done]/[delivered]
-                // stage definitions are repo-scoped and may override. [approvals] is honored here so
-                // "this project" auto-approve rules actually take effect (per category, project beats
-                // global). [ai].auto_approve stays global-only (it's the machine-wide master toggle,
+                // Per-project layer: [workflow], [freshness], [approvals], [plugins], and the
+                // [done]/[delivered] stage definitions are repo-scoped and may override. [approvals]
+                // is honored here so "this project" auto-approve rules actually take effect (per
+                // category, project beats global). [plugins] is repo-scoped because which agent
+                // plugins a codebase wants is a property of the codebase (a frontend repo wants
+                // frontend-design; a firmware one may not), and it travels with the repo for the
+                // team. [ai].auto_approve stays global-only (it's the machine-wide master toggle,
                 // ignored per-project like the rest of [ai] above).
                 apply_workflow(&mut cfg.workflow, p.workflow);
+                apply_plugins(&mut cfg.plugins, p.plugins);
                 apply_freshness(&mut cfg.freshness, p.freshness);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_approvals(&mut cfg.approvals, p.approvals);
@@ -1316,8 +1506,9 @@ pub const DEFAULT_TEMPLATE: &str = r#"# ========================================
 #   • Global  — this file, in Sparkle's app-data dir. Applies to every project. Holds your
 #               machine-wide preferences ([workers], [ai]) plus default rules.
 #   • Project — a `.sparkle/config.toml` checked into a repo. Overrides ONLY the repo-scoped
-#               rules ([workflow] and [freshness]) for that one project, and travels with the
-#               repo so a team shares them. [workers]/[ai] there are ignored (they're per-machine).
+#               rules ([workflow], [freshness], [approvals], [plugins]) for that one project, and
+#               travels with the repo so a team shares them. [workers]/[ai]/[tools] there are
+#               ignored (they're per-machine).
 #
 # PRECEDENCE: built-in defaults  →  this global file  →  a project's .sparkle/config.toml.
 #
@@ -1426,7 +1617,13 @@ github     = true   # import a project from your GitHub repositories; off hides 
 guardrails = true   # opinionated quality workflow (test-first, run tests+typecheck before commit,
                     # never call a red build "done") appended to every coding agent; off omits it
 roborev    = true   # per-commit AI code review of your BUILD-agent commits (uses your claude login)
-onepassword = false # back your .env* files up to a 1Password vault. The one tool that ships OFF:
+# One of the two default-OFF tools, and the only one that publishes anything about you. On, Sparkle
+# posts your DAILY TOKEN TOTALS (per day, per model — never file paths, prompts, code, or keys) to the
+# public tokenmaxxing leaderboard. Turning it on in ⋯ Settings → "Tools" also asks for your
+# tokenmaxxing username + API key and a one-time consent confirmation; nothing is sent until all
+# three are in place, so flipping this to true by hand alone does NOT start reporting.
+builder_index = false
+onepassword = false # back your .env* files up to a 1Password vault. Also ships OFF:
                     # it needs a 1Password account, the `op` CLI, and a chosen vault, so you opt in
                     # from ⋯ Settings → "Tools" once those exist.
 
@@ -1441,6 +1638,17 @@ onepassword = false # back your .env* files up to a 1Password vault. The one too
 [onepassword]
 # vault_id = ""        # the vault chosen in ⋯ Settings; unset means "no vault picked yet"
 seed_worktrees = false # restore backed-up env files into each newly created agent worktree
+
+# --- Claude Code plugins pre-enabled for every agent (repo-scoped; overridable per project) --
+# Sparkle turns these Claude Code marketplace plugins ON for every agent it spawns: it installs
+# them once (shared, via `claude plugin install`) and writes the marketplace + enabledPlugins
+# entries into each agent worktree's .claude/settings.local.json. Both come from Anthropic's
+# official marketplace, and both default on because the top Claude Code users overwhelmingly run
+# them. Setting one false means Sparkle writes nothing about it and never installs it — it does NOT
+# turn off a plugin you enabled yourself. Toggle these here or in ⋯ Settings → "Tools".
+[plugins]
+superpowers     = true   # the most-used agent methodology plugin: plan → TDD → review
+frontend_design = true   # Anthropic's official UI-quality skill
 
 # --- roborev first-run consent (per-machine; ignored in a project file) -----------------
 # roborev reviews your BUILD-agent commits locally. The first time it's about to turn on, Sparkle
@@ -2238,6 +2446,133 @@ mod tests {
     }
 
     #[test]
+    fn plugins_default_on_and_resolve_to_official_marketplace_ids() {
+        let (cfg, _, _) = effective(None, None);
+        assert!(cfg.plugins.superpowers);
+        assert!(cfg.plugins.frontend_design);
+
+        // Both defaults are live, and each resolves to the exact `<plugin>@<marketplace>` id Claude
+        // Code keys `enabledPlugins` by. These strings were verified against
+        // anthropics/claude-plugins-official's marketplace.json — a typo here silently produces a
+        // settings file that enables a plugin that does not exist.
+        let ids: Vec<String> = cfg.plugins.enabled().iter().map(|p| p.id()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "superpowers@claude-plugins-official".to_string(),
+                "frontend-design@claude-plugins-official".to_string(),
+            ]
+        );
+    }
+
+    /// The `<toggle> = <bool>` assignment for `toggle` in a TOML source, or None if there is no
+    /// such assignment line. Used to check the shipped template ACTUALLY sets a key, rather than
+    /// merely mentioning its name somewhere in prose.
+    fn template_toggle_value(toml_src: &str, toggle: &str) -> Option<bool> {
+        toml_src.lines().find_map(|line| {
+            // Strip a trailing `# comment`, then split on the first `=`.
+            let code = line.split('#').next().unwrap_or("");
+            let (k, v) = code.split_once('=')?;
+            if k.trim() != toggle {
+                return None;
+            }
+            v.trim().parse::<bool>().ok()
+        })
+    }
+
+    #[test]
+    fn every_known_plugin_has_a_live_toggle() {
+        // The table and PluginsConfig are two halves of one mapping. Adding a row without adding
+        // its bool field would leave `is_enabled` falling through to the unknown-name arm, so the
+        // plugin could never turn on — and nothing else would fail. This is that guard.
+        let all_on = PluginsConfig { superpowers: true, frontend_design: true };
+        let defaults = SparkleConfig::default();
+        for p in KNOWN_PLUGINS {
+            assert!(
+                all_on.is_enabled(p.toggle),
+                "KNOWN_PLUGINS row '{}' has no matching PluginsConfig field",
+                p.toggle
+            );
+            // Not a substring check: the template must contain a real `toggle = <bool>` ASSIGNMENT
+            // (a name mentioned only in a comment or a prose paragraph would satisfy `contains` and
+            // leave `reset_config` writing a file with no such key), and its value must match the
+            // built-in default — a template that disagrees silently changes behavior on reset.
+            let templated = template_toggle_value(DEFAULT_TEMPLATE, p.toggle).unwrap_or_else(|| {
+                panic!("DEFAULT_TEMPLATE has no `{} = <bool>` assignment line", p.toggle)
+            });
+            assert_eq!(
+                templated,
+                defaults.plugins.is_enabled(p.toggle),
+                "DEFAULT_TEMPLATE's `{}` disagrees with SparkleConfig::default()",
+                p.toggle
+            );
+            // Every row needs a source: the installer runs `marketplace add <repo>` from it, which
+            // is what makes a machine that never launched Claude Code interactively work at all.
+            let src = p.source.expect("every KNOWN_PLUGINS row needs a marketplace source");
+            assert_eq!(src.name, p.marketplace, "source name must match the plugin id's marketplace half");
+            // ...and only a NON-official marketplace is declared per-worktree.
+            assert_eq!(p.declared_source().is_some(), p.marketplace != OFFICIAL_MARKETPLACE);
+        }
+        // An unknown/forward-compatible toggle never resolves to enabled.
+        assert!(!all_on.is_enabled("episodic_memory"));
+        // And the helper itself only accepts real assignments (guards the guard).
+        assert_eq!(template_toggle_value("superpowers = false # note", "superpowers"), Some(false));
+        assert_eq!(template_toggle_value("# superpowers are great", "superpowers"), None);
+    }
+
+    #[test]
+    fn plugins_config_serializes_exactly_the_known_plugin_toggles() {
+        // The other direction of the table↔struct mapping. `every_known_plugin_has_a_live_toggle`
+        // catches a row with no field; this catches a FIELD with no row — which would ship a
+        // frontend-visible toggle that hydrates and persists but is never read by
+        // `enabled()`, so flipping it would do nothing at all.
+        let json = serde_json::to_value(SparkleConfig::default().plugins).unwrap();
+        let mut serialized: Vec<&str> = json.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut rows: Vec<&str> = KNOWN_PLUGINS.iter().map(|p| p.toggle).collect();
+        serialized.sort_unstable();
+        rows.sort_unstable();
+        assert_eq!(
+            serialized, rows,
+            "PluginsConfig's serialized keys must match KNOWN_PLUGINS exactly (the JSON key is what \
+             the frontend store mirrors, and the toggle is what `enabled()` looks up)"
+        );
+    }
+
+    #[test]
+    fn global_and_project_can_disable_plugins_field_by_field() {
+        // Global turns one off; the other keeps its default.
+        let g = "[plugins]\nfrontend_design = false\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(!cfg.plugins.frontend_design);
+        assert!(cfg.plugins.superpowers, "untouched plugin keeps its default");
+        assert_eq!(
+            cfg.plugins.enabled().iter().map(|p| p.toggle).collect::<Vec<_>>(),
+            vec!["superpowers"]
+        );
+
+        // [plugins] is repo-scoped (like [workflow]), so a project file overrides the global — and
+        // does NOT produce a "machine-wide setting ignored" warning the way [tools] does.
+        let p = "[plugins]\nsuperpowers = false\nfrontend_design = true\n";
+        let (cfg, warns, hard) = effective(Some(g), Some(p));
+        assert!(!hard);
+        assert!(
+            !warns.iter().any(|w| w.contains("[plugins]")),
+            "[plugins] is repo-overridable; it must not be warned about: {warns:?}"
+        );
+        assert!(!cfg.plugins.superpowers, "project beats global");
+        assert!(cfg.plugins.frontend_design, "project re-enables what global turned off");
+    }
+
+    #[test]
+    fn all_plugins_off_yields_no_enabled_plugins() {
+        let g = "[plugins]\nsuperpowers = false\nfrontend_design = false\n";
+        let (cfg, _, _) = effective(Some(g), None);
+        assert!(cfg.plugins.enabled().is_empty());
+    }
+
+    #[test]
     fn global_can_disable_roborev() {
         // roborev is on by default; a global file can turn the review daemon off.
         let g = "[tools]\nroborev = false\n";
@@ -2246,6 +2581,35 @@ mod tests {
         assert!(warns.is_empty());
         assert!(!cfg.tools.roborev);
         assert!(cfg.tools.guardrails, "untouched tool keeps its default");
+    }
+
+    #[test]
+    fn builder_index_is_the_one_tool_that_defaults_off() {
+        // Every other [tools] flag ships ON. This one publishes daily token totals to a public
+        // leaderboard, so a fresh install — and any config file that never mentions it — must be
+        // opted OUT. (The reporter also gates on consent + credentials, but the toggle is the
+        // outermost gate and it has to hold on its own.)
+        let (cfg, _, _) = effective(None, None);
+        assert!(!cfg.tools.builder_index);
+        // A config that sets other tools must not drag it on.
+        let (cfg, _, _) = effective(Some("[tools]\nbeads = false\n"), None);
+        assert!(!cfg.tools.builder_index);
+        // And it is opt-IN-able from the global file.
+        let (cfg, warns, hard) = effective(Some("[tools]\nbuilder_index = true\n"), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(cfg.tools.builder_index);
+        assert!(cfg.tools.roborev, "untouched tool keeps its default");
+    }
+
+    #[test]
+    fn project_cannot_opt_a_machine_into_builder_index() {
+        // [tools] is machine-wide. A cloned repo shipping `builder_index = true` in its
+        // .sparkle/config.toml must NOT be able to start publishing this machine's usage.
+        let p = "[tools]\nbuilder_index = true\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert!(!cfg.tools.builder_index);
+        assert!(warns.iter().any(|w| w.contains("[tools]")));
     }
 
     #[test]

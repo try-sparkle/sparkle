@@ -57,9 +57,16 @@ describe("NudgeCard — rendering", () => {
       name: "Needs you — OG Image Pipeline (drodio-website)",
     });
     expect(card.getAttribute("data-band")).toBe("needs_you");
-    // The left accent bar is the card's strongest signal — literal brand sienna.
-    expect(card.style.borderLeft).toContain(rgb(C.sienna));
-    expect(card.style.borderLeft).not.toContain(rgb(C.amber));
+    // The band reads from the card's border tint and badge — literal brand sienna, never amber
+    // (the gold tier is gone). There is deliberately NO left-edge stripe either (founder
+    // 2026-07-24), so assert the POSITIVE shape: a uniform 1px border on all four edges. A bare
+    // `not.toBe("3px")` passed for a 2px stripe, a 4px stripe, or any re-added asymmetric
+    // borderLeft — this cannot.
+    expect(card.style.border).toContain(rgb(C.sienna));
+    expect(card.style.border).not.toContain(rgb(C.amber));
+    expect(card.style.borderLeftWidth).toBe("1px");
+    expect(card.style.borderLeftColor).toBe(card.style.borderTopColor);
+    expect(card.style.borderLeftStyle).toBe(card.style.borderTopStyle);
     expect(screen.getByText("Needs you")).toBeTruthy();
     expect(screen.getByText("drodio-website")).toBeTruthy();
     expect(screen.getByText("Show me")).toBeTruthy();
@@ -71,7 +78,11 @@ describe("NudgeCard — rendering", () => {
     const card = screen.getByRole("button", {
       name: "Needs you — Live Remote Mirror (sparkle-mobile)",
     });
-    expect(card.style.borderLeft).toContain(rgb(C.sienna));
+    expect(card.getAttribute("data-band")).toBe("needs_you");
+    expect(card.style.border).toContain(rgb(C.sienna));
+    expect(card.style.borderLeftWidth).toBe("1px");
+    expect(card.style.borderLeftColor).toBe(card.style.borderTopColor);
+    expect(screen.getByText("Needs you")).toBeTruthy();
   });
 });
 

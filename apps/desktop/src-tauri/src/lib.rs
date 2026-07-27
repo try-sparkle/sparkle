@@ -5,6 +5,8 @@ mod attention;
 mod attention_summary;
 mod audio;
 mod auth;
+/// Opt-in tokenmaxxing (Builder Index) reporting — default-off, consent-gated (bead sparkle-s3g2.6).
+mod builder_index;
 // The orchestration bridge is built on a Unix-domain socket (std::os::unix::net), so the real
 // implementation is Unix-only. On Windows we compile a stub with the same public surface
 // (BridgeManager + the four tauri commands) that reports the feature as unavailable; porting the
@@ -41,6 +43,7 @@ mod model_catalog;
 mod naming;
 mod onepassword;
 mod preflight;
+mod proc;
 mod pty;
 mod retention;
 mod route_classify;
@@ -50,6 +53,7 @@ mod setup;
 mod socket;
 mod sparkle_agent;
 mod sparkle_improve;
+mod spend;
 mod support;
 mod transcript;
 mod roster;
@@ -281,6 +285,31 @@ pub fn run() {
                     });
                 }
             }
+            // Plugin pre-enable install ensure (bead sparkle-s3g2.1). Writing `enabledPlugins` into
+            // each worktree does NOT fetch the plugin — Claude Code only loads one that is actually
+            // installed — so run the headless, idempotent `claude plugin install` for the default-on
+            // plugins. User scope, so the fetch populates the one shared plugin cache every worktree
+            // reads. Ledger-gated (it no-ops once they're in), best-effort, and OFF the startup path:
+            // spawned onto the async runtime so a slow network never delays boot, and any failure
+            // just leaves the plugin out of the ledger for the next launch to retry.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // The command already does its own spawn_blocking, so this just awaits it.
+                    // `force: None` — startup must keep the per-process retry suppression; only the
+                    // user-initiated toggle bypasses it.
+                    match hooks::ensure_default_plugins_installed(handle, None).await {
+                        Ok(outcomes) => hooks::log_install_outcomes(&outcomes),
+                        Err(e) => tracing::warn!(error = %e, "plugin pre-enable ensure failed (non-fatal)"),
+                    }
+                });
+            }
+            // Opt-in Builder Index reporter (bead sparkle-s3g2.6). Started unconditionally — the
+            // loop itself re-reads `[tools].builder_index` plus the consent/credential gate on
+            // every cycle and posts nothing until all of them pass, so a default install spends
+            // its life asleep. Spawning it here (rather than on the toggle) means turning the
+            // feature on doesn't need an app restart to take effect.
+            builder_index::spawn_reporter(app.handle().clone());
             // Show-on-ready backstop (bead sparkle-alrm.5, #10). The main window is created hidden
             // ("visible": false) so no blank frame flashes before React paints; the frontend calls
             // show() on first paint (see main.tsx) and then invokes `notify_frontend_shown`. This
@@ -342,6 +371,8 @@ pub fn run() {
             preflight::git_preflight,
             preflight::prereqs_preflight,
             preflight::roborev_preflight,
+            preflight::lsp_preflight,
+            preflight::project_lsp_preflight,
             // 1Password .env backup/restore — implements src/services/onepassword.ts.
             onepassword::op_preflight,
             onepassword::op_refresh,
@@ -358,6 +389,7 @@ pub fn run() {
             setup::install_roborev,
             setup::deactivate_roborev,
             setup::roborev_auth_selftest,
+            setup::install_lsp_server,
             claude_chat::claude_chat_send,
             claude_chat::claude_chat_cancel,
             sparkle_improve::sparkle_improve_run,
@@ -387,6 +419,8 @@ pub fn run() {
             worktree::install_worktree_guard,
             hooks::install_agent_hooks,
             hooks::heal_agent_hooks,
+            hooks::ensure_default_plugins_installed,
+            hooks::plugin_install_outcomes,
             hooks::read_events_since,
             worktree::project_default_branch,
             worktree::reconcile_default_branch,
@@ -455,6 +489,11 @@ pub fn run() {
             history::history_search,
             history::history_prune,
             transcript::read_transcript_last_assistant,
+            spend::spend_report,
+            builder_index::builder_index_status,
+            builder_index::builder_index_set_identity,
+            builder_index::builder_index_forget,
+            builder_index::builder_index_report_now,
             auth::desktop_has_token,
             auth::desktop_bearer_token,
             auth::desktop_pair_code,

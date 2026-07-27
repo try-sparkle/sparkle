@@ -13,7 +13,13 @@ import {
   setProjectConfigValue,
   unsetProjectConfigValue,
 } from "./config";
-import { useSettingsStore, normalizeVaultId, type AiFeatureKey, type ToolKey } from "../stores/settingsStore";
+import {
+  useSettingsStore,
+  normalizeVaultId,
+  type AiFeatureKey,
+  type PluginKey,
+  type ToolKey,
+} from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
 import {
   installRoborev,
@@ -23,6 +29,11 @@ import {
   roborevAuthSelftest,
   type RoborevAuthVerdict,
 } from "./roborev";
+import {
+  ensureDefaultPluginsInstalled,
+  pluginInstallOutcomes,
+  type PluginInstallOutcome,
+} from "./worktree";
 import { useApprovalsStore } from "../stores/approvalsStore";
 import {
   DEFAULT_RESUME_RULE,
@@ -238,6 +249,7 @@ const TOOLS_CONFIG_PATH: Record<ToolKey, string> = {
   guardrails: "tools.guardrails",
   roborev: "tools.roborev",
   onepassword: "tools.onepassword",
+  builderIndex: "tools.builder_index",
 };
 
 /** Set (or clear) the 1Password vault backups are written to. A null id UNSETS the key rather
@@ -273,6 +285,168 @@ export async function setToolEnabled(key: ToolKey, on: boolean): Promise<void> {
     await setConfigValue(TOOLS_CONFIG_PATH[key], on);
   } catch (e) {
     console.warn("config write failed (tool)", e);
+  }
+}
+
+/**
+ * Toggle the Builder Index (tokenmaxxing leaderboard) reporter.
+ *
+ * Asymmetric on purpose, and the asymmetry IS the consent design:
+ *   • ON  → does NOT write the config. It opens the consent modal, which is where the user reads
+ *           what gets published, supplies a username + API key, and confirms. Only that
+ *           confirmation flips `[tools].builder_index` on. Writing the flag here would mean a
+ *           stray click had already opted them in to publishing.
+ *   • OFF → writes immediately. Withdrawing consent must never need a dialog.
+ *
+ * Turning it off leaves the stored credentials alone so re-enabling doesn't mean re-typing a key;
+ * "Turn off and forget" in the modal is the path that also clears them.
+ */
+export async function setBuilderIndexEnabled(on: boolean): Promise<void> {
+  if (on) {
+    useSettingsStore.getState().setBuilderIndexModalOpen(true);
+    return;
+  }
+  await setToolEnabled("builderIndex", false);
+}
+
+/** Plugin key → its dotted config path under [plugins]. Note the snake_case leaf: the TOML key is
+ *  `frontend_design`, not the camelCase store key. */
+const PLUGINS_CONFIG_PATH: Record<PluginKey, string> = {
+  superpowers: "plugins.superpowers",
+  frontendDesign: "plugins.frontend_design",
+};
+
+/** Store key → the `[plugins]` TOML key Rust reports back in a `PluginInstallOutcome`.
+ *
+ *  DERIVED, not a third hand-written copy of the plugin set: a new plugin missing from a fourth map
+ *  would yield `undefined`, `find` would miss, and the row would show the false "couldn't confirm"
+ *  hint instead of the truth. */
+const pluginTomlKey = (key: PluginKey): string =>
+  PLUGINS_CONFIG_PATH[key].slice("plugins.".length);
+
+/** The reverse: an outcome's TOML key → the store key whose row it belongs to, or undefined for a
+ *  plugin this build's UI doesn't know about. */
+function pluginKeyForTomlKey(tomlKey: string): PluginKey | undefined {
+  return (Object.keys(PLUGINS_CONFIG_PATH) as PluginKey[]).find(
+    (k) => pluginTomlKey(k) === tomlKey,
+  );
+}
+
+/** The row hint for a plugin that is switched ON but not actually on the machine. `null` when the
+ *  plugin is present (installed just now, or already there).
+ *
+ *  Exported because this is the function that decides whether a toggle tells the truth. Before the
+ *  outcome list existed it could NEVER fire: the command returned Ok even when every install
+ *  failed, so the only path to a hint was a rejection — which the offline / marketplace-outage /
+ *  no-claude cases never produce. The switch read ON with the plugin absent.
+ *
+ *  The remedy sentence comes from Rust so the copy sits next to the condition that produced it
+ *  ("finish setup" vs "check your connection" are different actions). We deliberately do NOT keep a
+ *  local paraphrase of it: a second copy would drift, and the case where it'd be used (a `failed`
+ *  outcome with no message) is one where we genuinely don't know the remedy — which is what
+ *  "couldn't confirm" says.
+ *
+ *  Anything that is not an explicit non-failure verdict falls through to a hint, so a status this
+ *  build doesn't recognize can't render as success. */
+export function pluginInstallHint(outcome: PluginInstallOutcome | undefined): string | null {
+  if (!outcome) {
+    // The pass ran but never mentioned this plugin — most likely it wasn't in the enabled set the
+    // pass read, which means no install was even attempted for it.
+    return "Sparkle couldn't confirm this plugin installed — the install pass didn't report on it. It's on, but agents may not see it yet.";
+  }
+  if (outcome.status === "installed" || outcome.status === "alreadyPresent") return null;
+  return (
+    outcome.message ??
+    "Sparkle couldn't confirm this plugin installed. It's on, but agents may not see it yet."
+  );
+}
+
+/** The hint for the case where the install pass ITSELF couldn't run (no app-data dir, a task panic)
+ *  — distinct from an install that ran and failed, and from an outcome list that omitted the row. */
+export function pluginPassFailedHint(): string {
+  return "Sparkle couldn't run the plugin install. It's on, but agents won't see it until the next launch.";
+}
+
+/** Push a pass's verdicts onto the rows they belong to. Unknown keys (a plugin this build has no row
+ *  for) are ignored rather than dropped loudly — the Rust table can legitimately lead the UI. */
+export function applyPluginInstallOutcomes(outcomes: PluginInstallOutcome[]): void {
+  const store = useSettingsStore.getState();
+  for (const o of outcomes) {
+    const rowKey = pluginKeyForTomlKey(o.key);
+    if (!rowKey) continue;
+    store.setPluginInstallState(rowKey, pluginInstallHint(o));
+  }
+}
+
+/** Hydrate the plugin rows from the LAST install pass — the startup one, usually.
+ *
+ *  Without this the self-diagnosis loop only closed through a user action: the startup and
+ *  agent-prepare passes computed a per-plugin verdict and logged it, so on the machine this whole
+ *  mechanism exists for (install fails, "retries next launch", fails again) the pane showed the
+ *  switch ON with no hint until someone happened to toggle it. Best-effort: a failure here just
+ *  leaves the rows as they were. */
+export async function refreshPluginInstallState(): Promise<void> {
+  try {
+    applyPluginInstallOutcomes(await pluginInstallOutcomes());
+  } catch (e) {
+    console.warn("couldn't read the last plugin install outcomes", e);
+  }
+}
+
+/** Toggle one [plugins] flag: optimistic store update, then persist to config.toml. Written to the
+ *  GLOBAL config (all projects); a repo can still override it in its own .sparkle/config.toml.
+ *
+ *  Turning one ON also kicks the installer, the same way setRoborevEnabled does its daemon/hook
+ *  work: the config write alone only makes future agents' settings.local.json *enable* the plugin,
+ *  and Claude Code doesn't fetch a settings-enabled plugin — so without this the plugin would sit
+ *  enabled-but-absent until the next app launch ran the startup pass. Best-effort and never
+ *  rejects: the command is idempotent, and a failure only defers the install to that launch. */
+export async function setPluginEnabled(key: PluginKey, on: boolean): Promise<void> {
+  useSettingsStore.getState().setPluginEnabled(key, on);
+  try {
+    await setConfigValue(PLUGINS_CONFIG_PATH[key], on);
+  } catch (e) {
+    console.warn("config write failed (plugin)", e);
+    return; // the install pass reads the config, so don't chase a write that didn't land
+  }
+  if (!on) {
+    useSettingsStore.getState().setPluginInstallState(key, null);
+    return;
+  }
+  // Surface the fetch on the row while it runs, and say so if it didn't land. Without this the
+  // switch reads ON with the plugin absent — the same invisible failure the install exists to fix,
+  // just moved one step later. Same reasoning as roborevAuthWarning: "a daemon that can't
+  // authenticate looks exactly like a healthy one".
+  //
+  // The force key is load-bearing. The install pass keeps a per-process "already attempted" set so
+  // an un-installable machine doesn't burn two 90s network calls per plugin on every agent prepare
+  // — but that set also swallowed THIS call, making toggle-off/on (the only remedy the UI names) a
+  // silent no-op that rendered as success. A user asking for it explicitly always gets a real retry.
+  // Scoped to THIS row: a bare "force everything" would re-run the other enabled-but-missing
+  // plugins' installs inside this same awaited call, which is the burn the suppression prevents.
+  const store = useSettingsStore.getState();
+  store.setPluginInstallState(key, "installing");
+  try {
+    const outcomes = await ensureDefaultPluginsInstalled(pluginTomlKey(key));
+    // Apply EVERY outcome, not just the toggled row's. The pass reports on all enabled plugins, so
+    // it can newly discover that another row is broken (or newly fixed) — and that row's state
+    // would otherwise keep whatever stale value it had, with the answer already in hand.
+    for (const o of outcomes.filter((o) => o.status === "failed")) {
+      // Log every failure, with the technical cause when there is one. Gating the log on `detail`
+      // left the no-claude and suppressed cases showing a row hint with no console trace.
+      console.warn("plugin not installed", o.id, o.message ?? "", o.detail ?? "");
+    }
+    applyPluginInstallOutcomes(outcomes);
+    // If the pass said nothing at all about the row the user just clicked, don't leave it on
+    // "installing" — and don't claim success we never saw.
+    if (!outcomes.some((o) => o.key === pluginTomlKey(key))) {
+      store.setPluginInstallState(key, pluginInstallHint(undefined));
+    }
+  } catch (e) {
+    // A rejection means the PASS itself couldn't run (no app-data dir, task panic) — distinct from
+    // "the install failed", which resolves with a failed outcome above.
+    console.warn("plugin install pass failed (will retry next launch)", e);
+    store.setPluginInstallState(key, pluginPassFailedHint());
   }
 }
 

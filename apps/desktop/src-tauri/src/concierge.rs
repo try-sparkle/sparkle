@@ -265,19 +265,10 @@ fn retire_issued_turns() {
 
 /// Kill a turn and everything it spawned, then reap it. The child is placed in its own process
 /// group at spawn (unix), so signal the GROUP — `claude` may have `WebFetch`/search helpers in
-/// flight — with a direct `kill()` as the non-unix / group-signal-failed fallback. (Local copy
-/// of `sparkle_improve.rs`'s `kill_pass_group`; that one is private to its module.)
+/// flight — with a direct `kill()` as the non-unix / group-signal-failed fallback. That is
+/// [`crate::proc::kill_process_group`], which this used to be a local copy of.
 fn kill_turn_group(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let pid = child.id() as i32;
-        // Negative pid = the whole process group (set via process_group(0) at spawn).
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+    crate::proc::kill_process_group(child);
 }
 
 #[derive(Clone, Serialize)]

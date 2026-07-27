@@ -24,6 +24,11 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::preflight;
+use crate::preflight::LspServer;
+// `ProjectLanguage` is referenced only from the `#[cfg(unix)]` install function and the tests, so
+// importing it unconditionally makes a Windows build warn (and fail under `-D warnings`).
+#[cfg(any(unix, test))]
+use crate::preflight::ProjectLanguage;
 
 /// The Node.js version we install: the active maintenance LTS line ("Jod"). Pinned so the download
 /// URL is deterministic and reproducible; bump deliberately.
@@ -37,7 +42,8 @@ pub const ROBOREV_TAG: &str = "v0.1";
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SetupProgress {
-    /// Which prerequisite this line belongs to: "claude" | "node" | "git".
+    /// Which prerequisite this line belongs to: "claude" | "node" | "git" | "roborev", or a
+    /// language-server key ("typescript-language-server" | "pyright") for the LSP installs.
     prereq: String,
     /// A single human-readable status/output line.
     message: String,
@@ -81,6 +87,106 @@ fn run_streaming(app: &AppHandle, prereq: &str, mut cmd: Command) -> Result<(), 
     }
 
     let status = child.wait().map_err(|e| format!("installer wait failed: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "installer exited with {}",
+            status.code().map(|c| c.to_string()).unwrap_or_else(|| "a signal".into())
+        ))
+    }
+}
+
+/// Bound on how long we wait for the line-emitting reader threads after the child is gone. A helper
+/// that escaped the group kill would otherwise hold the pipes open forever; two seconds is orders of
+/// magnitude more than draining a closed pipe needs.
+const READER_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Like [`run_streaming`], but ABORTS the child after `timeout` (killing it) instead of waiting
+/// forever. Kept as a separate function rather than a parameter on `run_streaming` deliberately: the
+/// node/claude/git/roborev installs are shipping code whose streaming behaviour is already proven,
+/// and this only needs to cover the new network-bound `npm install`. Both pipes are drained on their
+/// own threads so a chatty installer can't deadlock while we poll for the deadline (std has no
+/// wait-with-timeout).
+///
+/// The child runs in its OWN process group on unix so expiry kills npm AND the helpers it forked.
+/// Killing only npm leaves those helpers holding the inherited pipe write ends, so the reader
+/// threads never see EOF and the `join` below hangs indefinitely — the 600s npm budget makes that
+/// far more likely here than anywhere else, and the UI would hang on the very toggle this deadline
+/// exists to protect. Same shape as `worktree::output_with_timeout`.
+fn run_streaming_with_timeout(
+    app: &AppHandle,
+    prereq: &str,
+    mut cmd: Command,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    // stdin is closed so a child that decides to prompt gets EOF and exits rather than blocking
+    // until the deadline.
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("failed to start installer: {e}"))?;
+
+    // Set once this call is done with the child. A reader we ABANDON at the grace below is detached,
+    // not stopped — without this it keeps calling `emit` and a timed-out npm's output interleaves
+    // into whatever prereq step runs next, in exactly the failure case a user screenshots.
+    let silenced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for pipe in [
+        child.stdout.take().map(|o| Box::new(o) as Box<dyn std::io::Read + Send>),
+        child.stderr.take().map(|e| Box::new(e) as Box<dyn std::io::Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let app = app.clone();
+        let prereq = prereq.to_string();
+        let silenced = std::sync::Arc::clone(&silenced);
+        readers.push(std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                if silenced.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                if !line.trim().is_empty() {
+                    emit(&app, &prereq, line);
+                }
+            }
+        }));
+    }
+    let finish = |child: &mut std::process::Child, kill: bool| {
+        if kill {
+            crate::proc::kill_process_group(child);
+        }
+        let refs: Vec<&std::thread::JoinHandle<()>> = readers.iter().collect();
+        let done = crate::proc::await_threads(&refs, READER_DRAIN_GRACE);
+        if !done {
+            silenced.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        done
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                finish(&mut child, true);
+                return Err(format!("timed out after {}s", timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => {
+                finish(&mut child, true);
+                return Err(format!("installer wait failed: {e}"));
+            }
+        }
+    };
+    // Unlike `output_with_timeout`, an incomplete drain is NOT an error here: this function's result
+    // is the child's exit status, and the lines were streamed to the UI as they arrived rather than
+    // parsed afterwards. Silencing the abandoned readers is the whole remedy.
+    finish(&mut child, false);
     if status.success() {
         Ok(())
     } else {
@@ -880,9 +986,533 @@ fn deactivate_roborev_blocking(_app: &AppHandle) -> Result<String, String> {
     Ok("roborev is not supported on this platform; nothing to stop".into())
 }
 
+// ── LSP language servers ───────────────────────────────────────────────────────────────────────
+//
+// Claude Code's official LSP plugins (`typescript-lsp`, `pyright-lsp`, …) are README-only: they
+// activate Claude Code's NATIVE LSP client but bundle no binary, so LSP silently stays off unless
+// the language server already exists on the machine. Sparkle closes that gap the same no-sudo way it
+// installs node/claude/roborev.
+//
+// Two of the five are npm-distributed and therefore installable with the pinned Node install's npm:
+//
+//   typescript-language-server + typescript   →  typescript-lsp
+//   pyright                                   →  pyright-lsp
+//
+// The rest (rust-analyzer, gopls, sourcekit-lsp) each need a toolchain we don't manage, so they stay
+// DETECTION-ONLY for now — see the TODO seam at the bottom of this section.
+//
+// Design rules, matching the rest of this module:
+//  - **No sudo.** `npm install --global --prefix ~/.local/share/sparkle/lsp` writes only under the
+//    user's home. We never touch the machine's npm global prefix, which is frequently `/usr/local`
+//    (needs sudo) or the user's own nvm version dir (not ours to mutate).
+//  - **Never clobber the user's own tools.** The `~/.local/bin` symlinks are created only when the
+//    name is free or already points into our prefix; a foreign binary of the same name is left
+//    alone and reported back (see [`link_action`]).
+//  - **Idempotent.** Already resolvable → we report it and return without touching the disk.
+
+/// Pinned `typescript-language-server` release. Bump deliberately, together with the TypeScript pin.
+pub const TYPESCRIPT_LANGUAGE_SERVER_VERSION: &str = "5.3.0";
+
+/// Pinned `typescript` release, which is where `tsserver` — the thing typescript-language-server
+/// actually drives — comes from.
+///
+/// **This pin is load-bearing, not cosmetic.** As of TypeScript 7 the npm package is the native Go
+/// port and ships ONLY `bin/tsc`: `lib/tsserver.js` is gone (verified against the published
+/// tarballs — 5.9.3 and 6.0.3 have it, 7.0.2 does not). So the install line the official plugin's
+/// README suggests, `npm i -g typescript-language-server typescript`, now resolves `typescript` to
+/// a release with no tsserver and yields a language server that starts and does nothing. We pin the
+/// last widely-compatible release that ships tsserver instead. Revisit when
+/// typescript-language-server supports the native port.
+pub const TYPESCRIPT_VERSION: &str = "5.9.3";
+
+/// Pinned `pyright` release (the npm distribution provides both `pyright` and `pyright-langserver`).
+pub const PYRIGHT_VERSION: &str = "1.1.411";
+
+/// Wall-clock ceiling for one `npm install` of a language server. Generous: a cold npm cache on a
+/// slow link genuinely takes a while, but a wedged install must not hang the toggle forever.
+const LSP_NPM_INSTALL_TIMEOUT_SECS: u64 = 600;
+
+/// The exact npm package specs to install for a server, version-pinned, or None for the
+/// detection-only tier. Pure — unit-tested so a pin can't silently go missing.
+pub fn lsp_npm_specs(server: LspServer) -> Option<Vec<String>> {
+    match server {
+        LspServer::TypeScriptLanguageServer => Some(vec![
+            format!("typescript-language-server@{TYPESCRIPT_LANGUAGE_SERVER_VERSION}"),
+            format!("typescript@{TYPESCRIPT_VERSION}"),
+        ]),
+        LspServer::Pyright => Some(vec![format!("pyright@{PYRIGHT_VERSION}")]),
+        _ => None,
+    }
+}
+
+/// The full `npm` argv for installing `specs` into Sparkle's managed prefix without sudo.
+///
+/// `--global` + `--prefix <dir>` is the whole no-sudo trick: it redirects what would be a
+/// system-wide install into a directory we own (`<prefix>/lib/node_modules` + `<prefix>/bin`).
+/// `--no-fund`/`--no-audit` keep the streamed output to install progress. Pure — unit-tested.
+pub fn npm_install_args(prefix: &Path, specs: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "install".to_string(),
+        "--global".to_string(),
+        "--prefix".to_string(),
+        prefix.to_string_lossy().to_string(),
+        "--no-fund".to_string(),
+        "--no-audit".to_string(),
+    ];
+    args.extend(specs.iter().cloned());
+    args
+}
+
+/// What to do about a `~/.local/bin/<name>` entry when linking a managed server onto the PATH.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LinkAction {
+    /// Nothing is there — create the symlink.
+    Create,
+    /// A symlink we own (it resolves into our managed prefix) — replace it, so a version bump or a
+    /// re-run points at the new install.
+    Replace,
+    /// Something we did NOT install occupies the name. Leave it: the user's own
+    /// `typescript-language-server` (nvm, brew, pipx) is the one Claude Code should keep running,
+    /// and silently overwriting a binary outside our prefix is not ours to do.
+    KeepForeign,
+}
+
+/// Decide the action for one link path. A link is "ours" when it resolves into `managed_prefix`;
+/// anything else — a real file, or a symlink pointing elsewhere — is foreign. Unit-tested against
+/// real temp-dir symlinks, since this is the guard that keeps installs non-destructive.
+pub fn link_action(link: &Path, managed_prefix: &Path) -> LinkAction {
+    // symlink_metadata does NOT follow the link, so a DANGLING symlink of ours still reads as
+    // present here (fs::metadata would report it missing and we'd try to create over it).
+    if std::fs::symlink_metadata(link).is_err() {
+        return LinkAction::Create;
+    }
+    // Compare against BOTH the literal and the canonicalized prefix. Canonicalizing only one side
+    // silently breaks whenever the other can't be resolved: a DANGLING link of ours (its target was
+    // cleaned up) canonicalizes to nothing, so it would be compared literally — `/var/…/managed`
+    // against a canonical `/private/var/…/managed` on macOS — and read as foreign, leaving the
+    // broken link in place forever.
+    let canonical_prefix = std::fs::canonicalize(managed_prefix).ok();
+    let under_prefix = |p: &Path| {
+        p.starts_with(managed_prefix)
+            || canonical_prefix.as_ref().map(|c| p.starts_with(c)).unwrap_or(false)
+    };
+    let points_into_prefix = std::fs::read_link(link)
+        .ok()
+        .map(|target| {
+            // Resolve a relative link against the link's own directory before comparing.
+            if target.is_absolute() {
+                target
+            } else {
+                link.parent().map(|d| d.join(&target)).unwrap_or(target)
+            }
+        })
+        .map(|target| {
+            let resolved = std::fs::canonicalize(&target);
+            under_prefix(&target) || resolved.map(|r| under_prefix(&r)).unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if points_into_prefix {
+        LinkAction::Replace
+    } else {
+        LinkAction::KeepForeign
+    }
+}
+
+/// The (link → target) pairs for putting a server's managed binaries on the user's PATH: each name
+/// in `bins` gets `<link_dir>/<name>` → `<managed_bin_dir>/<name>`. Mirrors [`node_bin_symlinks`],
+/// and lands in the same `~/.local/bin` preflight already probes. Pure — unit-tested.
+pub fn lsp_bin_symlinks(
+    managed_bin_dir: &Path,
+    link_dir: &Path,
+    bins: &[&str],
+) -> Vec<(PathBuf, PathBuf)> {
+    bins.iter()
+        .map(|name| (link_dir.join(name), managed_bin_dir.join(name)))
+        .collect()
+}
+
+/// Outcome of an [`install_lsp_server`] call.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspInstallResult {
+    /// Server key, e.g. "typescript-language-server".
+    pub server: String,
+    /// Language key, e.g. "typescript".
+    pub language: String,
+    /// The official Claude Code plugin this unblocks, e.g. "typescript-lsp".
+    pub plugin: String,
+    /// "already-installed" (found on PATH, nothing done), "installed", or "installed-not-linked"
+    /// (ours is on disk but a foreign binary of the same name shadows it — see `install_verdict`).
+    pub status: String,
+    /// Resolved absolute path to the language server.
+    pub path: String,
+    /// Version line read back from the installed binary, when it reports one.
+    pub version: Option<String>,
+    /// Binaries we did NOT link into `~/.local/bin` because a foreign binary already owns the name.
+    /// Not an error — the user's own copy stays authoritative — but surfaced so the UI can say so.
+    pub skipped_links: Vec<String>,
+}
+
+/// Install the language server for `language` (a [`ProjectLanguage`] key such as "typescript" or
+/// "python") without sudo, into Sparkle's managed npm prefix, and link it onto `~/.local/bin`.
+///
+/// Idempotent: when the server already resolves — ours or the user's own — we report it and change
+/// nothing. Deliberately NOT called at startup; it exists so the plugin-toggle wiring
+/// (sparkle-s3g2.4) can provision on demand when a project's language is detected.
+#[tauri::command]
+pub async fn install_lsp_server(app: AppHandle, language: String) -> Result<LspInstallResult, String> {
+    tauri::async_runtime::spawn_blocking(move || install_lsp_server_blocking(&app, &language))
+        .await
+        .map_err(|e| format!("install task panicked: {e}"))?
+}
+
+#[cfg(unix)]
+fn install_lsp_server_blocking(app: &AppHandle, language: &str) -> Result<LspInstallResult, String> {
+    use std::os::unix::fs::symlink;
+
+    let lang = ProjectLanguage::from_key(language)
+        .ok_or_else(|| format!("unknown language {language:?} — no language server is mapped to it"))?;
+    let server = LspServer::for_language(lang);
+    let key = server.key();
+
+    if !server.auto_installable() {
+        // TODO(sparkle-s3g2): installers for the detection-only tier. Each needs a toolchain
+        // Sparkle doesn't manage, so each is its own no-sudo problem:
+        //   - rust-analyzer:  `rustup component add rust-analyzer` when rustup exists, else fetch
+        //                     the pinned GitHub release asset (the roborev pattern in this file).
+        //   - gopls:          `go install golang.org/x/tools/gopls@<pin>` — needs a Go toolchain,
+        //                     which we'd have to provision first (tarball into ~/.local, like node).
+        //   - sourcekit-lsp:  ships inside Xcode/CLT; the install is `xcode-select --install`
+        //                     (already wired as `install_git`), so this is really a detect+guide.
+        return Err(format!(
+            "{key} isn't auto-installed by Sparkle yet — install it with the toolchain that owns it \
+             ({}), then re-check. Detection already works, so it'll be picked up automatically.",
+            match server {
+                LspServer::RustAnalyzer => "rustup component add rust-analyzer",
+                LspServer::Gopls => "go install golang.org/x/tools/gopls@latest",
+                _ => "install Xcode or the Swift toolchain",
+            }
+        ));
+    }
+
+    // Serialize installs: the TypeScript and Python toggles can be flipped back to back, and both
+    // write into the same managed prefix — concurrent `npm install --prefix` runs on one prefix
+    // race on its node_modules tree. The desktop app is single-instance, so a process-wide lock is
+    // enough. Recover a poisoned guard rather than panicking the install.
+    static LSP_INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LSP_INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let result_for = |status: &str, path: String, skipped_links: Vec<String>| LspInstallResult {
+        server: key.to_string(),
+        language: lang.key().to_string(),
+        plugin: server.claude_plugin().to_string(),
+        status: status.to_string(),
+        version: preflight::lsp_server_version(server, &path),
+        path,
+        skipped_links,
+    };
+
+    // Any path through this function can change what's installed, so the session path cache that
+    // `lsp_server_status` reads must not outlive it. Dropped up front too: the idempotency check
+    // below has to see the machine, not a cached answer from before a manual uninstall.
+    preflight::invalidate_lsp_path_cache();
+
+    // (1) Idempotent: already resolvable (ours from a previous run, or the user's own install)?
+    //     Detection WINS — same rule as install_node. Re-running is an "ensure", not an upgrade.
+    if let Some(existing) = preflight::resolve_lsp_server_path(server) {
+        emit(app, key, format!("{key} already installed at {existing}"));
+        return Ok(result_for("already-installed", existing, Vec::new()));
+    }
+
+    // (2) We need Sparkle's managed npm. It's installed alongside the pinned node, so a missing npm
+    //     means node onboarding hasn't run — say that instead of a bare spawn failure.
+    let npm = preflight::resolve_npm_path().ok_or_else(|| {
+        "npm is required to install this language server, and it isn't installed yet — install \
+         Node.js from Setup first"
+            .to_string()
+    })?;
+    let node = preflight::resolve_node_path_cached()
+        .ok_or_else(|| "Node.js is required to install this language server".to_string())?;
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "no HOME directory".to_string())?;
+    let prefix = preflight::lsp_npm_prefix_for(&home);
+    let managed_bin = preflight::lsp_managed_bin_dir_for(&home);
+    let link_dir = home.join(".local/bin");
+    std::fs::create_dir_all(&prefix).map_err(|e| format!("cannot create {prefix:?}: {e}"))?;
+    std::fs::create_dir_all(&link_dir).map_err(|e| format!("cannot create {link_dir:?}: {e}"))?;
+
+    // (3) Install into the managed prefix. npm's shebang is `#!/usr/bin/env node`, and a
+    //     Finder/Dock-launched GUI app's PATH often has no node at all — so prepend the resolved
+    //     node's directory rather than trusting the inherited PATH.
+    let specs = lsp_npm_specs(server).ok_or_else(|| format!("no npm packages defined for {key}"))?;
+    emit(app, key, format!("Installing {} …", specs.join(" ")));
+    let mut cmd = Command::new(&npm);
+    cmd.args(npm_install_args(&prefix, &specs));
+    if let Some(node_dir) = Path::new(&node).parent() {
+        let current = std::env::var("PATH").ok();
+        cmd.env("PATH", preflight::path_with_dir_first(node_dir, current.as_deref()));
+    }
+    run_streaming_with_timeout(
+        app,
+        key,
+        cmd,
+        std::time::Duration::from_secs(LSP_NPM_INSTALL_TIMEOUT_SECS),
+    )
+    .map_err(|e| format!("npm install of {key} failed: {e}"))?;
+
+    // (4) Put the server on the user's PATH — but never over a binary that isn't ours.
+    let mut skipped_links = Vec::new();
+    for (link, target) in lsp_bin_symlinks(&managed_bin, &link_dir, server.linked_binaries()) {
+        if !target.exists() {
+            return Err(format!(
+                "expected {target:?} after the npm install, but it's missing — the install may be \
+                 incomplete"
+            ));
+        }
+        match link_action(&link, &prefix) {
+            LinkAction::KeepForeign => {
+                let name = link.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                emit(
+                    app,
+                    key,
+                    format!("Leaving your existing {} at {} alone.", name, link.display()),
+                );
+                skipped_links.push(name);
+            }
+            LinkAction::Replace | LinkAction::Create => {
+                let _ = std::fs::remove_file(&link); // no-op when nothing is there
+                symlink(&target, &link)
+                    .map_err(|e| format!("symlink {link:?} → {target:?} failed: {e}"))?;
+            }
+        }
+    }
+
+    // (5) Verify the install actually landed — a zero-exit npm that produced no binary must not be
+    //     reported as success (that's how LSP ends up silently off).
+    emit(app, key, "Verifying…");
+    // The npm install changed the machine; drop the cached resolutions before asking about it.
+    preflight::invalidate_lsp_path_cache();
+
+    // When the PRIMARY binary's link was skipped as KeepForeign, our copy is in the managed prefix
+    // — a directory on nobody's PATH — and the binary Claude Code will actually run is whatever
+    // `~/.local/bin` (or the login-shell PATH) resolves. Reporting `installed` at the managed path
+    // would name a file that never runs, so say `installed-not-linked` and point at what does.
+    // The general resolver can't answer that — its candidate list puts the managed prefix FIRST,
+    // so it would just hand the managed copy back — so resolve outside the managed prefix
+    // explicitly. When THAT misses too (the foreign entry is non-executable or dangling), the
+    // install still succeeded, so this is not an error — but it is emphatically not plain
+    // `installed` either: the only copy we can name is the one on nobody's PATH, and what Claude
+    // Code will resolve is the broken foreign entry, i.e. the silently-off-LSP outcome this whole
+    // step exists to catch. It keeps `installed-not-linked` (with the managed path) so the status
+    // still carries the warning.
+    let primary_kept_foreign = skipped_links.iter().any(|n| n == server.primary_binary());
+    let managed = preflight::managed_lsp_server_path(server);
+    let unmanaged_running = if primary_kept_foreign {
+        preflight::resolve_lsp_server_path_outside_managed(server)
+    } else {
+        None
+    };
+    let verdict = match install_verdict(primary_kept_foreign, unmanaged_running, managed) {
+        Some(v) => v,
+        // Nothing in the managed prefix either: fall back to the general resolver, and only then
+        // call the install a failure.
+        None => Verdict::Installed(preflight::resolve_lsp_server_path(server).ok_or_else(|| {
+            format!("npm finished but {} could not be found afterwards", server.primary_binary())
+        })?),
+    };
+    let result = result_for(verdict.status(), verdict.path().to_string(), skipped_links);
+    // The STREAMED LINE is the only channel the user actually sees today — no frontend reads
+    // `status` or `skippedLinks` — so the verdict has to reach the message too. Saying
+    // "pyright installed at <path>" for a not-linked row is the same false claim the status stopped
+    // making — and WHICH lie it is depends on the shape, which is why the two share a status but
+    // not a sentence.
+    emit(
+        app,
+        key,
+        install_progress_line(key, &verdict, result.version.as_deref(), server.primary_binary()),
+    );
+    Ok(result)
+}
+
+/// The `setup:progress` line for a finished install. Pure so the wording — the part a user reads —
+/// is assertable without an npm run. One sentence per verdict, because the two not-linked shapes
+/// carry different paths and imply different actions: sharing a sentence made it false for
+/// whichever shape it wasn't written for.
+#[cfg(unix)]
+fn install_progress_line(key: &str, verdict: &Verdict, version: Option<&str>, bin: &str) -> String {
+    let version = version.map(|v| format!(" ({v})")).unwrap_or_default();
+    let path = verdict.path();
+    match verdict {
+        Verdict::Installed(_) => format!("{key} installed at {path}{version}"),
+        // `path` is the FOREIGN binary and the probed version is ITS version, so this must not say
+        // "installed at {path}" — that names the shadowing binary as ours.
+        Verdict::ShadowedBy(_) => format!(
+            "{key} installed, but {path} is what your PATH resolves for {bin}{version} and it \
+             isn't ours — Claude Code will keep running that one"
+        ),
+        // `path` is OUR copy, in a directory on nobody's PATH — this shape is only reached when
+        // the link into ~/.local/bin was never created (KeepForeign). So "remove the foreign entry
+        // and Claude Code picks ours up" would be FALSE: removing it leaves nothing at that name,
+        // and nothing links ours until the install runs again and takes the Create branch. Name the
+        // action that actually works.
+        Verdict::ShadowedUnresolved(_) => format!(
+            "{key} installed at {path}{version}, but something named {bin} on your PATH shadows it \
+             and we couldn't run that one — remove or fix that entry, then install again so \
+             Sparkle can link ours"
+        ),
+    }
+}
+
+/// The status string for "ours is on disk but it is not what will run". A const because
+/// [`install_verdict`] produces it and the frontend contract quotes it; spelled twice, a rename in
+/// one place silently changes what the UI is told.
+#[cfg(unix)]
+const STATUS_NOT_LINKED: &str = "installed-not-linked";
+
+/// What an install actually achieved. THREE outcomes for two statuses: the two not-linked shapes
+/// mean different things — one names the foreign binary that will run, the other names our own
+/// copy that won't — and a single message for both is necessarily false for one of them.
+#[cfg(unix)]
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    /// Ours is what runs. Path = our copy.
+    Installed(String),
+    /// A foreign binary shadows ours and we resolved it. Path = THAT binary: what Claude Code will
+    /// run, and whose version gets probed.
+    ShadowedBy(String),
+    /// A foreign entry shadows ours and we could NOT resolve it (dangling, non-executable).
+    /// Path = OUR copy, which is on nobody's PATH until the user fixes that entry.
+    ShadowedUnresolved(String),
+}
+
+#[cfg(unix)]
+impl Verdict {
+    fn status(&self) -> &'static str {
+        match self {
+            Verdict::Installed(_) => "installed",
+            Verdict::ShadowedBy(_) | Verdict::ShadowedUnresolved(_) => STATUS_NOT_LINKED,
+        }
+    }
+
+    fn path(&self) -> &str {
+        match self {
+            Verdict::Installed(p) | Verdict::ShadowedBy(p) | Verdict::ShadowedUnresolved(p) => p,
+        }
+    }
+}
+
+/// Which verdict an install earns, given what the machine actually has. Pure, so the one thing that
+/// must never drift — "never call a binary on nobody's PATH plainly `installed`" — is assertable
+/// without an npm run. `None` means neither candidate exists and the caller should fall back to the
+/// general resolver.
+///
+/// `cfg(unix)`: the only caller is the unix-only installer, and on Windows this would be dead code.
+#[cfg(unix)]
+fn install_verdict(
+    primary_kept_foreign: bool,
+    unmanaged_running: Option<String>,
+    managed: Option<String>,
+) -> Option<Verdict> {
+    match (primary_kept_foreign, unmanaged_running, managed) {
+        (true, Some(running), _) => Some(Verdict::ShadowedBy(running)),
+        (true, None, Some(managed)) => Some(Verdict::ShadowedUnresolved(managed)),
+        // Nothing shadows us. `unmanaged_running` is only ever resolved when the primary link was
+        // kept foreign, so the `Some` here is unreachable from the caller; matching it explicitly
+        // means a future caller that resolves it unconditionally gets the RIGHT answer (ours runs)
+        // rather than silently inheriting the shadowed verdict.
+        (false, _, Some(managed)) => Some(Verdict::Installed(managed)),
+        (_, _, None) => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn install_lsp_server_blocking(_app: &AppHandle, _language: &str) -> Result<LspInstallResult, String> {
+    Err("automatic language-server install is only supported on macOS/Unix".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wording a user actually sees, per verdict. The status field is invisible today — no
+    /// frontend reads it — so a correct verdict with a wrong message is still a false claim.
+    #[cfg(unix)]
+    #[test]
+    fn each_verdict_gets_a_message_that_is_true_of_its_own_path() {
+        let managed = "/home/me/.local/share/sparkle/lsp/bin/pyright";
+        let foreign = "/opt/homebrew/bin/pyright";
+        let line = |v: &Verdict| install_progress_line("pyright", v, Some("1.2.3"), "pyright");
+
+        assert_eq!(
+            line(&Verdict::Installed(managed.into())),
+            format!("pyright installed at {managed} (1.2.3)")
+        );
+
+        // `path` is the foreign binary here — never call it ours.
+        let shadowed = line(&Verdict::ShadowedBy(foreign.into()));
+        assert!(shadowed.contains(&format!("{foreign} is what your PATH resolves")), "{shadowed}");
+        assert!(!shadowed.contains(&format!("installed at {foreign}")), "{shadowed}");
+        assert!(shadowed.contains("keep running that one"), "{shadowed}");
+
+        // `path` is OURS here, and nothing will run it — the previous single not-linked sentence
+        // said this path "is what your PATH resolves … and it isn't ours", false three ways over.
+        let unresolved = line(&Verdict::ShadowedUnresolved(managed.into()));
+        assert!(unresolved.contains(&format!("installed at {managed}")), "{unresolved}");
+        assert!(!unresolved.contains("isn't ours"), "our own copy is ours: {unresolved}");
+        assert!(unresolved.contains("shadows it"), "{unresolved}");
+        // The action has to be one that WORKS: this shape means our copy was never linked, so
+        // removing the foreign entry alone leaves the name unclaimed and LSP still off.
+        assert!(unresolved.contains("remove or fix that entry"), "{unresolved}");
+        assert!(
+            unresolved.contains("install again"),
+            "removing the shadow is not enough on its own — say so: {unresolved}"
+        );
+
+        // Both not-linked shapes still report ONE status, so the UI contract is unchanged.
+        assert_eq!(Verdict::ShadowedBy(foreign.into()).status(), STATUS_NOT_LINKED);
+        assert_eq!(Verdict::ShadowedUnresolved(managed.into()).status(), STATUS_NOT_LINKED);
+        assert_eq!(Verdict::Installed(managed.into()).status(), "installed");
+    }
+
+    /// The install's verdict table. The row that matters is the third: a KeepForeign primary whose
+    /// foreign entry we could NOT resolve. Collapsing that into plain `installed` told the user the
+    /// server was ready while pointing at a copy in a directory on nobody's PATH — the silently-off
+    /// LSP the verification step exists to prevent.
+    #[cfg(unix)]
+    #[test]
+    fn install_verdict_never_calls_a_shadowed_managed_copy_plainly_installed() {
+        let managed = || Some("/home/me/.local/share/sparkle/lsp/bin/pyright".to_string());
+        let foreign = || Some("/opt/homebrew/bin/pyright".to_string());
+
+        // Nothing was skipped: our copy is the one that runs.
+        assert_eq!(
+            install_verdict(false, None, managed()),
+            Some(Verdict::Installed(managed().unwrap()))
+        );
+        // A foreign binary shadows ours AND resolves: report the one that actually runs.
+        assert_eq!(
+            install_verdict(true, foreign(), managed()),
+            Some(Verdict::ShadowedBy(foreign().unwrap()))
+        );
+        // A foreign binary shadows ours and does NOT resolve (dangling / non-executable): still a
+        // successful install, still NOT a clean `installed` — and a DIFFERENT shape from the row
+        // above, which is why they are separate variants rather than one status string.
+        assert_eq!(
+            install_verdict(true, None, managed()),
+            Some(Verdict::ShadowedUnresolved(managed().unwrap()))
+        );
+        // Nothing was skipped, so whatever a foreign resolve turned up is irrelevant: ours runs.
+        assert_eq!(
+            install_verdict(false, foreign(), managed()),
+            Some(Verdict::Installed(managed().unwrap())),
+            "a foreign runner without a kept-foreign primary must not downgrade the verdict"
+        );
+        // Neither: the caller falls back to the general resolver.
+        assert_eq!(install_verdict(true, None, None), None);
+        assert_eq!(install_verdict(false, None, None), None);
+    }
 
     // Captured VERBATIM from a real `roborev check-agents --agent claude-code` run inside a launchd
     // LaunchAgent using daemon_path_env() — the exact environment the shipped daemon gets. Pinning
@@ -1135,5 +1765,188 @@ cccc3333  node-v22.12.0-darwin-x64.tar.gz
         // Guard the pinned version stays a well-formed vX.Y.Z the URL builder expects.
         assert!(NODE_VERSION.starts_with('v'));
         assert_eq!(NODE_VERSION.split('.').count(), 3);
+    }
+
+    // ── LSP language-server installs ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn lsp_npm_specs_pin_every_auto_installable_server() {
+        let ts = lsp_npm_specs(LspServer::TypeScriptLanguageServer).unwrap();
+        // typescript-language-server drives `tsserver`, which comes from the `typescript` package —
+        // installing one without the other yields a server that starts and does nothing.
+        assert_eq!(
+            ts,
+            vec![
+                format!("typescript-language-server@{TYPESCRIPT_LANGUAGE_SERVER_VERSION}"),
+                format!("typescript@{TYPESCRIPT_VERSION}"),
+            ]
+        );
+        assert_eq!(lsp_npm_specs(LspServer::Pyright).unwrap(), vec![format!("pyright@{PYRIGHT_VERSION}")]);
+        // Every spec must carry an explicit version — an unpinned `latest` is how an install that
+        // worked yesterday breaks today (see the TYPESCRIPT_VERSION note).
+        for spec in ts.iter().chain(lsp_npm_specs(LspServer::Pyright).unwrap().iter()) {
+            assert!(spec.contains('@'), "unpinned spec: {spec}");
+            let version = spec.rsplit('@').next().unwrap();
+            assert!(!version.is_empty() && version != "latest", "unpinned spec: {spec}");
+        }
+    }
+
+    #[test]
+    fn lsp_npm_specs_none_for_the_detection_only_tier() {
+        for s in [LspServer::RustAnalyzer, LspServer::Gopls, LspServer::SourceKitLsp] {
+            assert!(lsp_npm_specs(s).is_none(), "{s:?} must have no npm install path");
+        }
+    }
+
+    #[test]
+    fn typescript_pin_predates_the_tsserver_removal() {
+        // TypeScript 7 is the native Go port and ships no `lib/tsserver.js`, so pinning to `latest`
+        // would install a language server that can't do anything. Guard the pin stays on a major
+        // that still ships tsserver — if someone bumps this to 7.x, this test is the tripwire.
+        let major: u32 = TYPESCRIPT_VERSION.split('.').next().unwrap().parse().unwrap();
+        assert!(
+            major <= 6,
+            "typescript@{TYPESCRIPT_VERSION} has no tsserver — typescript-language-server needs one"
+        );
+    }
+
+    #[test]
+    fn npm_install_args_are_a_no_sudo_prefixed_global_install() {
+        let args = npm_install_args(
+            Path::new("/Users/x/.local/share/sparkle/lsp"),
+            &["pyright@1.2.3".to_string()],
+        );
+        assert_eq!(args[0], "install");
+        // --global WITHOUT --prefix would write to the machine's npm prefix (often /usr/local →
+        // sudo, or the user's nvm dir → not ours to touch). The pair is what makes this no-sudo.
+        assert!(args.contains(&"--global".to_string()));
+        let prefix_at = args.iter().position(|a| a == "--prefix").expect("--prefix must be passed");
+        assert_eq!(args[prefix_at + 1], "/Users/x/.local/share/sparkle/lsp");
+        assert_eq!(args.last().unwrap(), "pyright@1.2.3");
+    }
+
+    #[test]
+    fn npm_install_args_pass_every_spec() {
+        let specs = lsp_npm_specs(LspServer::TypeScriptLanguageServer).unwrap();
+        let args = npm_install_args(Path::new("/tmp/prefix"), &specs);
+        for spec in &specs {
+            assert!(args.contains(spec), "{spec} missing from argv");
+        }
+    }
+
+    #[test]
+    fn lsp_bin_symlinks_link_managed_bins_into_the_probed_dir() {
+        let managed = PathBuf::from("/Users/x/.local/share/sparkle/lsp/bin");
+        let link_dir = PathBuf::from("/Users/x/.local/bin");
+        let links = lsp_bin_symlinks(
+            &managed,
+            &link_dir,
+            LspServer::Pyright.linked_binaries(),
+        );
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].0, PathBuf::from("/Users/x/.local/bin/pyright-langserver"));
+        assert_eq!(
+            links[0].1,
+            PathBuf::from("/Users/x/.local/share/sparkle/lsp/bin/pyright-langserver")
+        );
+        // Every link must land in the ~/.local/bin dir preflight already probes, or Claude Code
+        // never sees the server we just installed.
+        for (link, target) in &links {
+            assert!(link.starts_with(&link_dir));
+            assert!(target.starts_with(&managed));
+        }
+    }
+
+    #[test]
+    fn lsp_bin_symlinks_empty_for_detection_only_servers() {
+        let links = lsp_bin_symlinks(
+            Path::new("/m/bin"),
+            Path::new("/l/bin"),
+            LspServer::Gopls.linked_binaries(),
+        );
+        assert!(links.is_empty(), "we install nothing for gopls, so there's nothing to link");
+    }
+
+    // link_action is the guard that keeps a re-install non-destructive; exercise it against REAL
+    // symlinks/files in a temp dir rather than mocking the filesystem.
+    #[cfg(unix)]
+    #[test]
+    fn link_action_creates_replaces_ours_and_keeps_foreign() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("sparkle-link-action-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let prefix = root.join("managed");
+        let managed_bin = prefix.join("bin");
+        let link_dir = root.join("localbin");
+        std::fs::create_dir_all(&managed_bin).unwrap();
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let target = managed_bin.join("pyright-langserver");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+
+        // (a) Nothing there yet → create.
+        let link = link_dir.join("pyright-langserver");
+        assert_eq!(link_action(&link, &prefix), LinkAction::Create);
+
+        // (b) A symlink into our managed prefix → ours, replace it (this is the idempotent re-run:
+        //     installing twice must repoint the link, not fail and not duplicate).
+        symlink(&target, &link).unwrap();
+        assert_eq!(link_action(&link, &prefix), LinkAction::Replace);
+
+        // (c) A real binary the user installed themselves → never clobber it.
+        let foreign_link = link_dir.join("typescript-language-server");
+        std::fs::write(&foreign_link, b"#!/bin/sh\necho users own\n").unwrap();
+        assert_eq!(link_action(&foreign_link, &prefix), LinkAction::KeepForeign);
+
+        // (d) A symlink pointing OUTSIDE our prefix (e.g. nvm) is foreign too.
+        let elsewhere = root.join("nvm-tsls");
+        std::fs::write(&elsewhere, b"#!/bin/sh\n").unwrap();
+        let nvm_link = link_dir.join("nvm-linked");
+        symlink(&elsewhere, &nvm_link).unwrap();
+        assert_eq!(link_action(&nvm_link, &prefix), LinkAction::KeepForeign);
+
+        // (e) A DANGLING symlink of ours still reads as ours and gets replaced — otherwise a
+        //     half-cleaned prefix would leave the link permanently broken.
+        std::fs::remove_file(&target).unwrap();
+        assert_eq!(link_action(&link, &prefix), LinkAction::Replace);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_action_is_stable_across_repeated_installs() {
+        // Idempotency in the shape the installer actually uses it: link, then re-decide, then
+        // re-link. The second pass must not error, duplicate, or turn our own link into "foreign".
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("sparkle-link-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let prefix = root.join("managed");
+        let managed_bin = prefix.join("bin");
+        let link_dir = root.join("localbin");
+        std::fs::create_dir_all(&managed_bin).unwrap();
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let target = managed_bin.join("typescript-language-server");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        let link = link_dir.join("typescript-language-server");
+
+        for pass in 0..3 {
+            match link_action(&link, &prefix) {
+                LinkAction::Create | LinkAction::Replace => {
+                    let _ = std::fs::remove_file(&link);
+                    symlink(&target, &link).unwrap();
+                }
+                LinkAction::KeepForeign => panic!("pass {pass}: our own link read as foreign"),
+            }
+            assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_rejects_an_unknown_language_key() {
+        // The command takes a string across the IPC boundary; a typo must be a clean error, not a
+        // silent no-op or a panic.
+        assert!(ProjectLanguage::from_key("kotlin").is_none());
+        assert!(ProjectLanguage::from_key("").is_none());
     }
 }

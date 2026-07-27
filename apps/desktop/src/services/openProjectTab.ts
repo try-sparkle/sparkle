@@ -10,6 +10,8 @@
 // place. The tray runs in its OWN webview — its store writes
 // reach the main window through the cross-window sync, but the main window still has to be raised —
 // so the cross-context path is kept here too, next to the in-window one.
+//
+// (services/projectWindows.ts, which this replaced, has since been deleted.)
 import { useProjectStore } from "../stores/projectStore";
 import { useUiStore } from "../stores/uiStore";
 import { selectAndOpen } from "./agentReveal";

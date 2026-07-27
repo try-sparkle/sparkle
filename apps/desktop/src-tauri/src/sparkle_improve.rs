@@ -95,22 +95,12 @@ fn lock_pass(m: &Mutex<Option<RunningPass>>) -> MutexGuard<'_, Option<RunningPas
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Kill a pass and everything it spawned, then reap it. The child was placed in its own
-/// process group at spawn (unix), so signal the GROUP — `Child::kill` alone would SIGKILL only
-/// `claude` and orphan its `git`/`gh`/test children mid-mutation in the agent worktree. The
-/// direct `kill()` afterwards is the fallback for the (never-expected) case the group signal
-/// failed, and the non-unix path.
+/// Kill a pass and everything it spawned, then reap it. `Child::kill` alone would SIGKILL only
+/// `claude` and orphan its `git`/`gh`/test children mid-mutation in the agent worktree, so the whole
+/// GROUP has to go — see [`crate::proc::kill_process_group`]. The child is placed in its own process
+/// group at spawn (unix), which that helper requires.
 fn kill_pass_group(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let pid = child.id() as i32;
-        // Negative pid = the whole process group (set via process_group(0) at spawn).
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+    crate::proc::kill_process_group(child);
 }
 
 #[derive(Clone, Serialize)]

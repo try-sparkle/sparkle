@@ -369,6 +369,143 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
     expect(s.pauseOnSubmit).toBe(false);
   });
 
+  describe("[plugins] mirror", () => {
+    /** A minimal-but-complete effective config, with `plugins` swapped in per case. */
+    const eff = (plugins?: { superpowers: boolean; frontend_design: boolean }) =>
+      ({
+        config: {
+          workflow: {
+            require_pr: true,
+            worktree_isolation: true,
+            default_branch: "",
+            born_fresh_from_base: true,
+            delete_merged_branch: true,
+            drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
+          },
+          workers: { max_concurrent: 5 },
+          ai: {
+            auto_rename: true,
+            voice_dictation: true,
+            composer: true,
+            suggested_actions: true,
+            auto_approve: true,
+          },
+          ...(plugins ? { plugins } : {}),
+          roborev: { consent_prompted: false },
+          freshness: {
+            staleness_warn_commits: 25,
+            stale_build_block_commits: 25,
+            require_fresh_branch: true,
+          },
+          capture: { popover_shortcut: "ctrl+shift+r" },
+          done: { description: null, criteria: [] },
+          delivered: {
+            description: null,
+            detected_method: null,
+            confidence: null,
+            confidence_note: null,
+            learned: false,
+            criteria: [],
+          },
+        },
+        warnings: [],
+      }) satisfies EffectiveConfig;
+
+    it("mirrors each [plugins] flag independently", () => {
+      useSettingsStore
+        .getState()
+        .hydrateFromConfig(eff({ superpowers: false, frontend_design: true }));
+      const s = useSettingsStore.getState();
+      expect(s.superpowersEnabled).toBe(false);
+      expect(s.frontendDesignEnabled).toBe(true);
+    });
+
+    it("treats an absent [plugins] block as on-by-default (older backend)", () => {
+      // Must match SparkleConfig::default(), which ships both plugins enabled — reading an omitted
+      // section as `false` would silently turn the defaults off for anyone on an older backend.
+      useSettingsStore
+        .getState()
+        .hydrateFromConfig(eff({ superpowers: false, frontend_design: false }));
+      useSettingsStore.getState().hydrateFromConfig(eff());
+      const s = useSettingsStore.getState();
+      expect(s.superpowersEnabled).toBe(true);
+      expect(s.frontendDesignEnabled).toBe(true);
+    });
+  });
+
+  describe("[tools].builder_index hydration", () => {
+    /** A minimal effective config whose [tools] block is whatever the caller passes. */
+    const eff = (tools?: Record<string, boolean>) =>
+      ({
+        config: {
+          workflow: {
+            require_pr: true,
+            worktree_isolation: true,
+            default_branch: "",
+            born_fresh_from_base: true,
+            delete_merged_branch: true,
+            drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
+          },
+          workers: { max_concurrent: 5 },
+          ai: {
+            auto_rename: true,
+            voice_dictation: true,
+            composer: true,
+            suggested_actions: true,
+            auto_approve: true,
+          },
+          ...(tools
+            ? {
+                tools: {
+                  analytics: true,
+                  beads: true,
+                  github: true,
+                  guardrails: true,
+                  roborev: true,
+                  onepassword: false,
+                  ...tools,
+                },
+              }
+            : {}),
+          roborev: { consent_prompted: false },
+          freshness: {
+            staleness_warn_commits: 25,
+            stale_build_block_commits: 25,
+            require_fresh_branch: true,
+          },
+          capture: { popover_shortcut: "ctrl+shift+r" },
+          done: { description: null, criteria: [] },
+          delivered: {
+            description: null,
+            detected_method: null,
+            confidence: null,
+            confidence_note: null,
+            learned: false,
+            criteria: [],
+          },
+        },
+        warnings: [],
+      }) satisfies EffectiveConfig;
+
+    it("mirrors an explicit true", () => {
+      useSettingsStore.getState().hydrateFromConfig(eff({ builder_index: true }));
+      expect(useSettingsStore.getState().builderIndexEnabled).toBe(true);
+    });
+
+    it("reads an ABSENT key as OFF — the opposite of its on-by-default siblings", () => {
+      // Every other [tools] flag hydrates `?? true`. This one must not: an older backend (or a
+      // config file that never mentions it) would otherwise start publishing token totals to a
+      // public leaderboard that the user never opted into.
+      useSettingsStore.getState().hydrateFromConfig(eff({ builder_index: true }));
+      useSettingsStore.getState().hydrateFromConfig(eff({}));
+      expect(useSettingsStore.getState().builderIndexEnabled).toBe(false);
+      // Same for a payload with no [tools] block at all.
+      useSettingsStore.getState().hydrateFromConfig(eff({ builder_index: true }));
+      useSettingsStore.getState().hydrateFromConfig(eff());
+      expect(useSettingsStore.getState().builderIndexEnabled).toBe(false);
+    });
+  });
+
   it("falls back to the default voice words when the config has no [voice] block", () => {
     // Simulate an older backend that predates the [voice] section (voice omitted at runtime).
     const eff = {

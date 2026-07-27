@@ -62,8 +62,10 @@ export function NudgeCard({
         alignSelf: "stretch",
         maxWidth: "100%",
         background: `linear-gradient(180deg, color-mix(in srgb, ${accent} 9%, transparent), color-mix(in srgb, ${accent} 3%, transparent))`,
+        // Priority color reads from the badge, the tint, and the border — but NOT as a left-edge
+        // stripe (founder, 2026-07-24: keeps the orange/red, doesn't want the left-side shading).
+        // Deliberately a uniform 1px border so the card sits symmetrically once the bar is gone.
         border: `1px solid color-mix(in srgb, ${accent} 40%, transparent)`,
-        borderLeft: `3px solid ${accent}`,
         borderRadius: 12,
         padding: "12px 13px",
         boxShadow: `0 0 26px color-mix(in srgb, ${accent} 10%, transparent)`,

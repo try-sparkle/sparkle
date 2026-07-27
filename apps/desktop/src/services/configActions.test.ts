@@ -23,6 +23,17 @@ vi.mock("./roborev", () => ({
   roborevAuthSelftest: vi.fn().mockResolvedValue({ kind: "Passed" }),
 }));
 
+// Mock the worktree service so the plugin-install side effect is observable without IPC (and so
+// importing it doesn't drag the pty module into jsdom).
+vi.mock("./worktree", () => ({
+  // Default to a healthy machine: the toggled plugin comes back present. Each test that cares
+  // about a failure overrides this per-case.
+  ensureDefaultPluginsInstalled: vi.fn().mockResolvedValue([
+    { key: "superpowers", id: "superpowers@m", status: "alreadyPresent", message: null, detail: null },
+    { key: "frontend_design", id: "frontend-design@m", status: "alreadyPresent", message: null, detail: null },
+  ]),
+}));
+
 import {
   setConfigValue,
   setConfigValues,
@@ -31,16 +42,19 @@ import {
   unsetProjectConfigValue,
 } from "./config";
 import { roborevAuthSelftest } from "./roborev";
+import { ensureDefaultPluginsInstalled, type PluginInstallOutcome } from "./worktree";
 import {
   setAiFeature,
   setAllAiFeatures,
   setAutoApprovePreset,
   setMaxConcurrentWorkers,
+  setPluginEnabled,
   setRoborevEnabled,
   setResumeRule,
   authWarningFor,
   refreshRoborevAuth,
   markRoborevConsentPrompted,
+  setBuilderIndexEnabled,
   setOnePasswordVault,
   setOnePasswordSeedWorktrees,
 } from "./configActions";
@@ -59,6 +73,203 @@ beforeEach(() => {
   vi.clearAllMocks();
   useSettingsStore.getState().setAllAiFeatures(true);
   useSettingsStore.getState().setMaxConcurrentWorkers(20);
+});
+
+describe("setPluginEnabled — the [plugins] flags", () => {
+  it("writes the snake_case TOML path, not the camelCase store key", () => {
+    // frontendDesign → plugins.frontend_design. Getting this wrong writes a key nothing reads,
+    // so the toggle would appear to work and change nothing.
+    void setPluginEnabled("frontendDesign", false);
+    expect(setConfigValue).toHaveBeenCalledWith("plugins.frontend_design", false);
+
+    void setPluginEnabled("superpowers", false);
+    expect(setConfigValue).toHaveBeenCalledWith("plugins.superpowers", false);
+  });
+
+  it("updates the store optimistically, before the write resolves", () => {
+    useSettingsStore.setState({ superpowersEnabled: true });
+    const pending = setPluginEnabled("superpowers", false);
+    // Already flipped — the UI must not wait on IPC to reflect the click.
+    expect(useSettingsStore.getState().superpowersEnabled).toBe(false);
+    return pending;
+  });
+
+  it("keeps the optimistic store value when the config write fails", async () => {
+    vi.mocked(setConfigValue).mockRejectedValueOnce(new Error("disk full"));
+    useSettingsStore.setState({ frontendDesignEnabled: true });
+    // Must not throw: a failed persist is warned about, not surfaced as an unhandled rejection.
+    await setPluginEnabled("frontendDesign", false);
+    expect(useSettingsStore.getState().frontendDesignEnabled).toBe(false);
+  });
+
+  it("installs the plugin when toggled ON, so it doesn't wait for the next launch", async () => {
+    // The config write alone only makes future agents ENABLE the plugin, and Claude Code does not
+    // fetch a settings-enabled plugin. Without this the toggle looks like it worked and the plugin
+    // silently never loads until the app is restarted.
+    await setPluginEnabled("superpowers", true);
+    // The force KEY is the load-bearing argument. The pass keeps a per-process "already attempted"
+    // set so an un-installable machine doesn't burn 90s network calls on every agent prepare — but
+    // it also swallowed the user-initiated toggle, making "turn it off and on again" (the only
+    // remedy the UI names) a silent no-op that rendered as success. It names ONE plugin (the TOML
+    // key, not the camelCase store key) so clicking one row can't kick off the other rows' retries.
+    expect(ensureDefaultPluginsInstalled).toHaveBeenCalledWith("superpowers");
+  });
+
+  it("does not install when toggled OFF, or when the config write failed", async () => {
+    await setPluginEnabled("superpowers", false);
+    expect(ensureDefaultPluginsInstalled).not.toHaveBeenCalled();
+
+    // A write that didn't land means the installer would read the OLD config — don't chase it.
+    vi.mocked(setConfigValue).mockRejectedValueOnce(new Error("disk full"));
+    await setPluginEnabled("superpowers", true);
+    expect(ensureDefaultPluginsInstalled).not.toHaveBeenCalled();
+  });
+
+  it("says so on the row when the install FAILED but the pass still resolved", async () => {
+    // THE regression. The pass is best-effort by contract and returns Ok even when every install
+    // failed, so before the per-plugin outcome existed this hint could never fire for the cases it
+    // was written for (offline, marketplace outage, no claude) — the switch read ON with the plugin
+    // absent. A rejection is NOT the signal; the outcome is.
+    vi.mocked(ensureDefaultPluginsInstalled).mockResolvedValueOnce([
+      {
+        key: "superpowers",
+        id: "superpowers@claude-plugins-official",
+        status: "failed",
+        message: "Sparkle couldn't install this plugin. Check your connection.",
+        detail: "`claude plugin install` failed: getaddrinfo ENOTFOUND",
+      },
+    ]);
+    await expect(setPluginEnabled("superpowers", true)).resolves.toBeUndefined();
+    expect(useSettingsStore.getState().superpowersEnabled).toBe(true);
+    expect(useSettingsStore.getState().pluginInstallState.superpowers).toMatch(/couldn't install/);
+  });
+
+  it("never rejects when the whole pass fails, and still says so on the row", async () => {
+    // A rejection means the pass itself couldn't run (no app-data dir, task panic) — distinct from
+    // an install that failed, and still not something to render as a working toggle.
+    vi.mocked(ensureDefaultPluginsInstalled).mockRejectedValueOnce(new Error("offline"));
+    await expect(setPluginEnabled("superpowers", true)).resolves.toBeUndefined();
+    expect(useSettingsStore.getState().superpowersEnabled).toBe(true);
+    expect(useSettingsStore.getState().pluginInstallState.superpowers).toMatch(
+      /couldn't run the plugin install/,
+    );
+  });
+
+  it("clears the row hint when the plugin really did install", async () => {
+    vi.mocked(ensureDefaultPluginsInstalled).mockResolvedValueOnce([
+      {
+        key: "superpowers",
+        id: "superpowers@claude-plugins-official",
+        status: "installed",
+        message: null,
+        detail: null,
+      },
+    ]);
+    await setPluginEnabled("superpowers", true);
+    expect(useSettingsStore.getState().pluginInstallState.superpowers).toBeUndefined();
+  });
+
+  it("won't claim success for a plugin the pass never mentioned", async () => {
+    // An outcome list that omits this plugin means the pass never considered it (a stale config
+    // layer would do it). We can't see it installed, so we must not render the row as fine.
+    vi.mocked(ensureDefaultPluginsInstalled).mockResolvedValueOnce([]);
+    await setPluginEnabled("frontendDesign", true);
+    expect(useSettingsStore.getState().pluginInstallState.frontendDesign).toMatch(
+      /didn't report on it/,
+    );
+  });
+
+  it("clears the row hint when the plugin was already present", async () => {
+    // The common steady state, and the one that must NOT read as a problem.
+    vi.mocked(ensureDefaultPluginsInstalled).mockResolvedValueOnce([
+      {
+        key: "superpowers",
+        id: "superpowers@claude-plugins-official",
+        status: "alreadyPresent",
+        message: null,
+        detail: null,
+      },
+    ]);
+    await setPluginEnabled("superpowers", true);
+    expect(useSettingsStore.getState().pluginInstallState.superpowers).toBeUndefined();
+  });
+
+  it("applies EVERY returned outcome, not just the toggled row's", async () => {
+    // The pass reports on all enabled plugins, so it can newly discover that another row is broken.
+    // Discarding that leaves the other row showing a stale value with the answer already in hand.
+    vi.mocked(ensureDefaultPluginsInstalled).mockResolvedValueOnce([
+      {
+        key: "superpowers",
+        id: "superpowers@claude-plugins-official",
+        status: "installed",
+        message: null,
+        detail: null,
+      },
+      {
+        key: "frontend_design",
+        id: "frontend-design@claude-plugins-official",
+        status: "failed",
+        message: "Sparkle couldn't install this plugin. Check your connection.",
+        detail: null,
+      },
+    ]);
+    await setPluginEnabled("superpowers", true);
+    expect(useSettingsStore.getState().pluginInstallState.superpowers).toBeUndefined();
+    expect(useSettingsStore.getState().pluginInstallState.frontendDesign).toMatch(
+      /couldn't install/,
+    );
+  });
+
+  it("won't render an unrecognized status as success", async () => {
+    // A future Rust status this build doesn't know about must fall through to a hint, not to null.
+    vi.mocked(ensureDefaultPluginsInstalled).mockResolvedValueOnce([
+      {
+        key: "superpowers",
+        id: "superpowers@claude-plugins-official",
+        status: "somethingNew" as unknown as "failed",
+        message: null,
+        detail: null,
+      },
+    ]);
+    await setPluginEnabled("superpowers", true);
+    expect(useSettingsStore.getState().pluginInstallState.superpowers).toMatch(
+      /couldn't confirm/,
+    );
+  });
+
+  it("shows 'installing' while the fetch is outstanding and clears it on success", async () => {
+    let release: (v: PluginInstallOutcome[]) => void = () => {};
+    vi.mocked(ensureDefaultPluginsInstalled).mockReturnValueOnce(
+      new Promise<PluginInstallOutcome[]>((r) => {
+        release = r;
+      }),
+    );
+    const pending = setPluginEnabled("frontendDesign", true);
+    // One turn for the config write to settle — the install starts after it lands.
+    await vi.waitFor(() =>
+      expect(useSettingsStore.getState().pluginInstallState.frontendDesign).toBe("installing"),
+    );
+    // ...and it STAYS "installing" while the fetch is outstanding. A cold marketplace clone can
+    // take seconds to minutes; the row must say so rather than looking idle.
+    expect(useSettingsStore.getState().pluginInstallState.frontendDesign).toBe("installing");
+    release([
+      {
+        key: "frontend_design",
+        id: "frontend-design@claude-plugins-official",
+        status: "installed",
+        message: null,
+        detail: null,
+      },
+    ]);
+    await pending;
+    expect(useSettingsStore.getState().pluginInstallState.frontendDesign).toBeUndefined();
+  });
+
+  it("clears any stale install state when the plugin is toggled back off", async () => {
+    useSettingsStore.getState().setPluginInstallState("superpowers", "some old failure");
+    await setPluginEnabled("superpowers", false);
+    expect(useSettingsStore.getState().pluginInstallState.superpowers).toBeUndefined();
+  });
 });
 
 describe("configActions", () => {
@@ -458,5 +669,28 @@ describe("configActions", () => {
       expect(setConfigValue).toHaveBeenCalledWith("approvals.resume", "summary");
       expect(setProjectConfigValue).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("setBuilderIndexEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ builderIndexEnabled: false, builderIndexModalOpen: false });
+  });
+
+  it("turning it ON opens the consent modal and writes NOTHING", async () => {
+    // The whole point of the opt-in: a click on the switch must not be able to start publishing.
+    // Only the modal's explicit confirmation writes tools.builder_index.
+    await setBuilderIndexEnabled(true);
+    expect(useSettingsStore.getState().builderIndexModalOpen).toBe(true);
+    expect(useSettingsStore.getState().builderIndexEnabled).toBe(false);
+    expect(setConfigValue).not.toHaveBeenCalled();
+  });
+
+  it("turning it OFF writes immediately, with no dialog in the way", async () => {
+    useSettingsStore.setState({ builderIndexEnabled: true });
+    await setBuilderIndexEnabled(false);
+    expect(setConfigValue).toHaveBeenCalledWith("tools.builder_index", false);
+    expect(useSettingsStore.getState().builderIndexEnabled).toBe(false);
+    expect(useSettingsStore.getState().builderIndexModalOpen).toBe(false);
   });
 });

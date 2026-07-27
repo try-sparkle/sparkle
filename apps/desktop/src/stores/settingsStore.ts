@@ -95,7 +95,14 @@ export const AI_FEATURE_FIELD: Record<AiFeatureKey, keyof AiFeatureFlags> = {
 // workflow-mirror fields these are hydrated from config.toml and NOT persisted to localStorage.
 
 /** Stable identifiers for the config-backed [tools] flags. */
-export type ToolKey = "analytics" | "beads" | "github" | "guardrails" | "roborev" | "onepassword";
+export type ToolKey =
+  | "analytics"
+  | "beads"
+  | "github"
+  | "guardrails"
+  | "roborev"
+  | "onepassword"
+  | "builderIndex";
 
 /** Map a tool key to its settings-store field name (the single source of that relationship). */
 export const TOOL_FIELD: Record<
@@ -106,6 +113,7 @@ export const TOOL_FIELD: Record<
   | "guardrailsEnabled"
   | "roborevEnabled"
   | "onepasswordEnabled"
+  | "builderIndexEnabled"
 > = {
   analytics: "analyticsEnabled",
   beads: "beadsEnabled",
@@ -113,6 +121,21 @@ export const TOOL_FIELD: Record<
   guardrails: "guardrailsEnabled",
   roborev: "roborevEnabled",
   onepassword: "onepasswordEnabled",
+  builderIndex: "builderIndexEnabled",
+};
+
+// --- Plugins (the [plugins] flags — Claude Code plugins pre-enabled for every agent) ----------
+// Kept as their OWN key space rather than folded into ToolKey: they persist to a different config
+// section ([plugins], repo-overridable) than [tools] (machine-wide), so a single key type would
+// make the wrong dotted path reachable. Same shape and same hydrate/optimistic-write pattern.
+
+/** Stable identifiers for the config-backed [plugins] flags. */
+export type PluginKey = "superpowers" | "frontendDesign";
+
+/** Map a plugin key to its settings-store field name (the single source of that relationship). */
+export const PLUGIN_FIELD: Record<PluginKey, "superpowersEnabled" | "frontendDesignEnabled"> = {
+  superpowers: "superpowersEnabled",
+  frontendDesign: "frontendDesignEnabled",
 };
 
 // --- Chief sync state (replacing the legacy markdown-sync watermark) -----------------------
@@ -353,6 +376,20 @@ interface SettingsState {
    *  the daemon reviews each BUILD-agent commit; off → dormant. Mirrors [tools].roborev. Config-
    *  backed, NOT persisted — re-read from the file each launch. */
   roborevEnabled: boolean;
+  /** Builder Index (tokenmaxxing leaderboard) reporting. Mirrors [tools].builder_index — the ONE
+   *  tool that defaults OFF, because it's the only one that publishes anything about you. Even
+   *  when on, the Rust reporter posts nothing until consent + a username + an API key are stored
+   *  (see builder_index.rs). Config-backed, NOT persisted. */
+  builderIndexEnabled: boolean;
+  /** Whether the Builder Index consent + settings modal is mounted. UI-only, never persisted:
+   *  the modal is where consent is given, so it must never be restored as "already open". */
+  builderIndexModalOpen: boolean;
+  /** obra's superpowers plugin (plan → TDD → review), pre-enabled in every agent worktree's
+   *  .claude/settings.local.json. Mirrors [plugins].superpowers. Config-backed, NOT persisted. */
+  superpowersEnabled: boolean;
+  /** Anthropic's official frontend-design plugin (UI quality), pre-enabled the same way.
+   *  Mirrors [plugins].frontend_design. Config-backed, NOT persisted. */
+  frontendDesignEnabled: boolean;
   /** 1Password `.env*` backup. Mirrors [tools].onepassword. Config-backed, NOT persisted.
    *  Unlike every other tool this defaults OFF — see the hydration note below. */
   onepasswordEnabled: boolean;
@@ -377,6 +414,12 @@ interface SettingsState {
    *  UI-only (never persisted): it's re-probed each time the toggle is turned on. null = no problem
    *  observed. This is what keeps a daemon that can't authenticate from *looking* like it's working. */
   roborevAuthWarning: string | null;
+  /** What the plugin installer is doing right now, per plugin row — `"installing"` while the fetch
+   *  is outstanding, a sentence when it failed, absent when there's nothing to say. UI-only (never
+   *  persisted); set by configActions when a toggle is switched on. Same job as
+   *  `roborevAuthWarning`: without it, an install that never landed leaves a switch reading ON with
+   *  the plugin absent, which is exactly the invisible failure this whole feature keeps hitting. */
+  pluginInstallState: Partial<Record<PluginKey, "installing" | string>>;
   /** Non-fatal warnings from the last config load (malformed layer, ignored per-project keys). */
   configWarnings: string[];
 
@@ -411,6 +454,10 @@ interface SettingsState {
   setPauseOnSubmit: (on: boolean) => void;
   /** Optimistically toggle one [tools] flag; configActions persists it to config.toml. */
   setToolEnabled: (key: ToolKey, on: boolean) => void;
+  /** Optimistically toggle one [plugins] flag; configActions persists it to config.toml. */
+  setPluginEnabled: (key: PluginKey, on: boolean) => void;
+  /** Set (or clear, with null) what the installer is doing for one plugin row. */
+  setPluginInstallState: (key: PluginKey, state: "installing" | string | null) => void;
   /** Optimistically set the chosen 1Password vault (configActions persists
    *  [onepassword].vault_id). Null clears it, returning the UI to its "pick a vault" state. */
   setOnePasswordVaultId: (vaultId: string | null) => void;
@@ -422,6 +469,8 @@ interface SettingsState {
   setRoborevConsentPrompted: (prompted: boolean) => void;
   /** Open/close the roborev consent modal (UI-only; controls whether the modal is mounted). */
   setRoborevConsentOpen: (open: boolean) => void;
+  /** Open/close the Builder Index consent + settings modal (UI-only). */
+  setBuilderIndexModalOpen: (open: boolean) => void;
   /** Set (or clear, with null) the roborev auth self-test warning shown under the Roborev row. */
   setRoborevAuthWarning: (warning: string | null) => void;
   /** Set the Sparkle self-improvement consent mode (the banner's Always/Case by case/Never control). */
@@ -477,12 +526,18 @@ export const useSettingsStore = create<SettingsState>()(
       githubEnabled: true,
       guardrailsEnabled: true,
       roborevEnabled: true,
+      // Default OFF — nothing is published until the user opts in AND consents.
+      builderIndexEnabled: false,
+      superpowersEnabled: true,
+      frontendDesignEnabled: true,
       onepasswordEnabled: false,
       onepasswordVaultId: null,
       onepasswordSeedWorktrees: false,
       roborevConsentPrompted: false,
       roborevConsentOpen: false,
+      builderIndexModalOpen: false,
       roborevAuthWarning: null,
+      pluginInstallState: {},
       configWarnings: [],
 
       setChiefPat: (pat) => set({ chiefPat: pat.trim() }),
@@ -513,6 +568,14 @@ export const useSettingsStore = create<SettingsState>()(
       setStopWord: (stopWord) => set({ stopWord }),
       setPauseOnSubmit: (pauseOnSubmit) => set({ pauseOnSubmit }),
       setToolEnabled: (key, on) => set({ [TOOL_FIELD[key]]: on } as Partial<SettingsState>),
+      setPluginEnabled: (key, on) => set({ [PLUGIN_FIELD[key]]: on } as Partial<SettingsState>),
+      setPluginInstallState: (key, state) =>
+        set((s) => {
+          const next = { ...s.pluginInstallState };
+          if (state === null) delete next[key];
+          else next[key] = state;
+          return { pluginInstallState: next };
+        }),
       // Trim + empty→null so a blank id can never read as a configured vault (Rust normalizes the
       // same way); otherwise every `op` call would fail opaquely instead of showing the picker.
       setOnePasswordVaultId: (vaultId) =>
@@ -520,6 +583,7 @@ export const useSettingsStore = create<SettingsState>()(
       setOnePasswordSeedWorktrees: (on) => set({ onepasswordSeedWorktrees: on }),
       setRoborevConsentPrompted: (prompted) => set({ roborevConsentPrompted: prompted }),
       setRoborevConsentOpen: (open) => set({ roborevConsentOpen: open }),
+      setBuilderIndexModalOpen: (open) => set({ builderIndexModalOpen: open }),
       setRoborevAuthWarning: (warning) => set({ roborevAuthWarning: warning }),
       setSparkleImprovementConsent: (mode) => set({ sparkleImprovementConsent: mode }),
       setImprovementLastRunAt: (at) => set({ improvementLastRunAt: at }),
@@ -603,6 +667,13 @@ export const useSettingsStore = create<SettingsState>()(
           githubEnabled: config.tools?.github ?? true,
           guardrailsEnabled: config.tools?.guardrails ?? true,
           roborevEnabled: config.tools?.roborev ?? true,
+          // `?? false` here, unlike its on-by-default siblings: an absent [tools] block (older
+          // backend) must read as "not opted in", never as "publishing".
+          builderIndexEnabled: config.tools?.builder_index ?? false,
+          // Plugin flags. Same `?? true` back-compat rule as [tools]: an absent [plugins] block
+          // (older backend) means the on-by-default state, matching SparkleConfig::default().
+          superpowersEnabled: config.plugins?.superpowers ?? true,
+          frontendDesignEnabled: config.plugins?.frontend_design ?? true,
           // NOTE THE ASYMMETRY: every tool above falls back to `?? true`, this one to `?? false`.
           // 1Password backup needs an external account, the `op` CLI, and a chosen vault before it
           // can do anything, so an absent [tools] block must read as OFF — defaulting it on would

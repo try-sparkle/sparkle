@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ComponentType } from "react";
-import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle, FiCloud, FiLock } from "react-icons/fi";
+import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle, FiCloud, FiLock, FiTrendingUp } from "react-icons/fi";
 import { C, ROW_ACTIVE_BUBBLE } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { openSignIn, signOut } from "../services/sparkleApi";
@@ -17,6 +17,7 @@ import { AdvancedConfigMenu } from "./AdvancedConfigMenu";
 import { MobileDevicesPane } from "./MobileDevicesPane";
 import { KeyboardShortcutsMenu } from "./KeyboardShortcutsMenu";
 import { CreditsPanel } from "./CreditsPanel";
+import { SpendPane } from "./SpendPane";
 import { VoiceControlsMenu } from "./VoiceControlsMenu";
 import { ToolsPane, TOOLS_SEARCH_ENTRIES } from "./ToolsPane";
 import { categoryEntries, matchesAny, paneQueryFor } from "../engine/settingsSearch";
@@ -82,6 +83,7 @@ const CATEGORIES: Category[] = [
   { id: "ai", label: "AI features", Icon: FiZap, blurb: "Each feature degrades to a non-AI baseline when off.", keywords: ["composer dictation deepgram voice auto-rename suggested actions"] },
   { id: "tools", ...TOOLS_CATEGORY, Icon: FiTool, blurb: "The opinionated stack that powers Sparkle — toggle what you use." },
   { id: "credits", label: "Credits", Icon: FiCreditCard, blurb: "Your AI credit balance, top-ups, and usage.", keywords: ["balance top-up billing payment"] },
+  { id: "spend", label: "History & Spend", Icon: FiTrendingUp, blurb: "Token usage and estimated cost, read locally from your Claude Code transcripts.", keywords: ["tokens spend cost usage analytics history transcripts money dollars burn rate cache model project session"] },
   { id: "notifications", label: "Notifications", Icon: FiBell, blurb: "Which agent transitions raise a desktop banner.", keywords: ["banner alerts desktop"] },
   { id: "appearance", label: "Appearance", Icon: FiEye, blurb: "Theme, text size, and how agents are ordered.", keywords: ["theme dark light text size zoom agent order"] },
   { id: "shortcuts", label: "Shortcuts", Icon: FiCommand, blurb: "Rebind keyboard shortcuts. Tap a modifier or press a combo.", keywords: ["keyboard keybindings hotkeys"] },
@@ -252,6 +254,8 @@ function PaneBody({
       return <ToolsPane query={query} />;
     case "credits":
       return <CreditsPanel />;
+    case "spend":
+      return <SpendPane />;
     case "notifications":
       return <NotificationsMenu />;
     case "appearance":

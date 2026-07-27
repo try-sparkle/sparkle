@@ -1136,6 +1136,12 @@ export function ConciergeHost({
   // "$X.XX" (or "$—" until the first read). See stores/spendStore.ts.
   const spendText = useSpendPill();
 
+  // NOTE (bead sparkle-y4ft): `messages` below gets a fresh ARRAY IDENTITY on every feed tick —
+  // this memo is keyed on `feed`, which changes whenever any agent's status or a scoped count
+  // moves, and clicking an item ticks the feed. ConciergeThread must therefore never treat a new
+  // `messages` reference as "the thread changed"; it keys auto-follow on message count + last id +
+  // last length for exactly this reason. An identity-keyed consumer scrolls the column out from
+  // under the reader.
   const model: ConciergeViewModel = useMemo(() => {
     // DIGEST, don't enumerate (bead sparkle-4562.4). One item of a priority keeps its card; two or
     // more become a single line. Without this, eight P0s and nineteen P1s meant twenty-seven cards

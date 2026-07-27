@@ -127,9 +127,11 @@ export function getIdentities(): Promise<Identity[]> {
 /** Cross-project Claude Code spend, aggregated across every account's transcripts and valued
  *  per-model at Anthropic list price by the Rust side (`accounts_spend`). `spendTodayUsd` is the
  *  trailing-24h figure the concierge spend pill renders; the 7d figures back a longer view.
- *  `fallbackModelRecords` counts trailing-7d records whose model was unrecognized (priced at the
- *  fallback rate, never dropped) — nonzero means the totals lean on an estimate for some model;
- *  note its window is 7d, wider than the 24h figure the pill shows.
+ *  `fallbackModelRecords` counts trailing-7d records whose model has NO published rate. Their
+ *  tokens ARE counted; their dollars are not — the Rust side refuses to invent a price, matching
+ *  the Spend pane and the published Builder Index row. So nonzero means the dollar figure
+ *  UNDER-states, and by how much is unknown; note its window is 7d, wider than the 24h figure the
+ *  pill shows. Nothing renders it yet (bead sparkle-1m8c).
  *  These are DOLLARS (not cents) and are an estimate of list-price value, not a billed amount. */
 export interface Spend {
   spendTodayUsd: number;

@@ -63,6 +63,16 @@ export interface ToolsConfig {
   /** Back your `.env*` files up to a 1Password vault. The one tool here that defaults OFF — it
    *  needs a 1Password account, the `op` CLI, and a chosen vault before it can do anything. */
   onepassword: boolean;
+  /** Publish daily token totals to the public tokenmaxxing leaderboard. The one flag here that
+   *  defaults FALSE. Optional so callers guard: a Rust backend predating it omits the key, and
+   *  an absent value must read as "off". */
+  builder_index?: boolean;
+}
+/** Claude Code marketplace plugins Sparkle pre-enables for every agent it spawns. Repo-scoped and
+ *  per-project overridable (like [workflow]), so a repo can pick the plugins its codebase wants. */
+export interface PluginsConfig {
+  superpowers: boolean;
+  frontend_design: boolean;
 }
 /** roborev machine-wide state (the one-time consent flag), its own section so Rust can gate the
  *  first-run modal on it. Machine-wide (like [tools]); ignored in a per-project file. */
@@ -125,6 +135,9 @@ export interface SparkleConfig {
   // Optional so callers guard: an older Rust backend (predating [tools]) omits it. The current
   // backend always sends it; hydrateFromConfig defaults each flag to on when absent.
   tools?: ToolsConfig;
+  // Optional for the same back-compat reason as `tools?` above: a payload from a Rust backend
+  // predating [plugins] omits it. hydrateFromConfig defaults each flag to on when absent.
+  plugins?: PluginsConfig;
   // Optional for the same back-compat reason as `tools?` above: a payload from a Rust backend
   // predating [roborev] omits it. Callers read `config.roborev?.consent_prompted ?? false`.
   roborev?: RoborevConfig;

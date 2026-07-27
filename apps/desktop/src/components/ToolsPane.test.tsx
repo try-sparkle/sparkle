@@ -2,21 +2,39 @@
 //
 // The Tools pane of the ⋯ settings dialog. Covers: both groups render (toggle rows have a switch,
 // showcase rows do NOT); toggling a row routes to the right configActions writer (setAiFeature for
-// the AI tools, setToolEnabled for the [tools] flags); the AI rows lock + show a hint when the AI
-// master is Off; Learn-more opens the provider URL. configActions + plugin-opener are mocked so no
-// IPC fires; the settingsStore is the real one, driven per test via setState.
+// the AI tools, setToolEnabled for the [tools] flags, setPluginEnabled for the [plugins] flags);
+// the AI rows lock + show a hint when the AI master is Off; Learn-more opens the provider URL.
+// configActions + plugin-opener are mocked so no IPC fires; the settingsStore is the real one,
+// driven per test via setState.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../services/configActions", () => ({
+// PARTIAL mock, spreading the real module. A vitest mock factory is otherwise EXHAUSTIVE: an
+// export the component imports but the object omits is `undefined` at call time — and when the
+// omitted one is called in a mount effect (`refreshPluginInstallState`) that isn't a failed
+// assertion, it throws on every render and takes the whole file down. Spreading means the next
+// writer the pane starts calling can't do that again. Only the writers are stubbed; nothing here
+// reaches Tauri at import time.
+vi.mock("../services/configActions", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/configActions")>()),
   setAiFeature: vi.fn().mockResolvedValue(undefined),
   setToolEnabled: vi.fn().mockResolvedValue(undefined),
+  setPluginEnabled: vi.fn().mockResolvedValue(undefined),
   setRoborevEnabled: vi.fn().mockResolvedValue(undefined),
+  setBuilderIndexEnabled: vi.fn().mockResolvedValue(undefined),
+  refreshPluginInstallState: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(() => Promise.resolve()) }));
 
-import { setAiFeature, setToolEnabled, setRoborevEnabled } from "../services/configActions";
+import {
+  setAiFeature,
+  setToolEnabled,
+  setPluginEnabled,
+  setRoborevEnabled,
+  setBuilderIndexEnabled,
+  refreshPluginInstallState,
+} from "../services/configActions";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useSettingsStore } from "../stores/settingsStore";
 import { ToolsPane, TOOLS_CATEGORY_KEYWORDS, TOOL_META } from "./ToolsPane";
@@ -37,8 +55,17 @@ function seedAllOn() {
     githubEnabled: true,
     guardrailsEnabled: true,
     roborevEnabled: true,
+    // NOT part of "all on": Builder Index and 1Password are the two tools that ship off, and
+    // seeding either on here would hide a regression that flipped its default.
+    builderIndexEnabled: false,
+    builderIndexModalOpen: false,
     onepasswordEnabled: false,
     onepasswordVaultId: null,
+    superpowersEnabled: true,
+    frontendDesignEnabled: true,
+    // Reset per test: it's a module-level store, so a leftover "installing" from one test would
+    // displace the scope hint in whatever test ran next.
+    pluginInstallState: {},
   });
 }
 
@@ -55,6 +82,8 @@ function seedAiOff() {
     githubEnabled: true,
     guardrailsEnabled: true,
     roborevEnabled: true,
+    superpowersEnabled: true,
+    frontendDesignEnabled: true,
   });
 }
 
@@ -72,6 +101,8 @@ function seedAiSome() {
     githubEnabled: true,
     guardrailsEnabled: true,
     roborevEnabled: true,
+    superpowersEnabled: true,
+    frontendDesignEnabled: true,
   });
 }
 
@@ -87,13 +118,17 @@ describe("ToolsPane", () => {
     expect(screen.getByText("Your tools")).toBeTruthy();
     expect(screen.getByText("Built into Sparkle")).toBeTruthy();
 
-    // Exactly the seven toggleable tools carry a switch (Roborev is now a real toggle, not
-    // showcase; 1Password env backup is the newest and the only one that ships off).
-    expect(screen.getAllByRole("switch")).toHaveLength(7);
+    // Exactly the ten toggleable tools carry a switch. Superpowers is one of them now: it used
+    // to be an info-only showcase row, and is a real [plugins] toggle since the plugin pre-enable
+    // work — a stale showcase copy would claim Sparkle ships something the user can't turn off.
+    expect(screen.getAllByRole("switch")).toHaveLength(10);
     for (const name of [
       "Deepgram voice",
       "Guardrails",
       "Roborev",
+      "Builder Index",
+      "Superpowers",
+      "Frontend design",
       "1Password env backup",
       "Beads",
       "GitHub import",
@@ -103,13 +138,96 @@ describe("ToolsPane", () => {
     }
 
     // Showcase tools are info-only: present by name, badge shown, but NO switch.
-    for (const name of ["Claude Code", "Superpowers"]) {
-      expect(screen.getByText(name)).toBeTruthy();
-      expect(screen.queryByRole("switch", { name })).toBeNull();
-    }
+    expect(screen.getByText("Claude Code")).toBeTruthy();
+    expect(screen.queryByRole("switch", { name: "Claude Code" })).toBeNull();
     expect(screen.getByText("Core")).toBeTruthy();
-    // Only Superpowers remains a "Built-in" showcase row now.
-    expect(screen.getAllByText("Built-in")).toHaveLength(1);
+    // Superpowers no longer double-lists as a "Built-in" showcase row.
+    expect(screen.queryByText("Built-in")).toBeNull();
+  });
+
+  it("hydrates the plugin rows from the last install pass on mount", () => {
+    // The hint on a plugin row comes from `pluginInstallState`, which only exists in the store
+    // once someone reads the last pass's outcomes. Without this mount effect a plugin that failed
+    // to install at launch renders as a healthy ON switch with no hint.
+    render(<ToolsPane />);
+    expect(refreshPluginInstallState).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the failure from the last install pass on the plugin's row", () => {
+    // The OUTCOME the mount effect exists for: what the hydrated state actually renders. A row
+    // whose install failed must say so, rather than showing a healthy ON switch.
+    useSettingsStore.setState({
+      pluginInstallState: { superpowers: "couldn't reach the marketplace" },
+    });
+    render(<ToolsPane />);
+    expect(screen.getByText("couldn't reach the marketplace")).toBeTruthy();
+  });
+
+  it("toggles the [plugins] flags through setPluginEnabled, not setToolEnabled", () => {
+    render(<ToolsPane />);
+    // These persist to [plugins] (repo-overridable), NOT [tools] (machine-wide) — routing them
+    // through setToolEnabled would write the wrong config section entirely.
+    fireEvent.click(screen.getByRole("switch", { name: "Superpowers" }));
+    expect(setPluginEnabled).toHaveBeenCalledWith("superpowers", false);
+
+    fireEvent.click(screen.getByRole("switch", { name: "Frontend design" }));
+    expect(setPluginEnabled).toHaveBeenCalledWith("frontendDesign", false);
+
+    expect(setToolEnabled).not.toHaveBeenCalled();
+  });
+
+  it("reflects each plugin flag independently and never AI-locks them", () => {
+    seedAiOff(); // first — the seed helpers reset every flag, plugins included
+    useSettingsStore.setState({ superpowersEnabled: true, frontendDesignEnabled: false });
+    render(<ToolsPane />);
+    const sp = screen.getByRole("switch", { name: "Superpowers" }) as HTMLButtonElement;
+    const fd = screen.getByRole("switch", { name: "Frontend design" }) as HTMLButtonElement;
+    expect(sp.getAttribute("aria-checked")).toBe("true");
+    expect(fd.getAttribute("aria-checked")).toBe("false");
+    // They are [plugins] flags, not [ai] features, so the AI master must not disable them.
+    expect(sp.disabled).toBe(false);
+    expect(fd.disabled).toBe(false);
+  });
+
+  it("describes each plugin in one line so the pane says what it buys you", () => {
+    render(<ToolsPane />);
+    expect(
+      screen.getByText("The most-used agent methodology plugin: plan → TDD → review."),
+    ).toBeTruthy();
+    expect(screen.getByText("Anthropic's official UI-quality skill.")).toBeTruthy();
+  });
+
+  it("tells the user a plugin toggle only affects agents created from now on", () => {
+    render(<ToolsPane />);
+    // Sparkle writes enabledPlugins insert-if-absent and never retracts, so toggling OFF leaves
+    // every existing worktree exactly as it was. Both rows must say so — otherwise the switch
+    // reads as broken for every agent already on screen.
+    expect(screen.getAllByText("Applies to agents created from now on.")).toHaveLength(2);
+  });
+
+  it("reports the installer's progress and failures on the plugin row", () => {
+    // Turning a plugin on shells out to `claude plugin install`, which can take a while or fail
+    // (offline, no claude, marketplace outage). That half is invisible to the user unless the row
+    // says so — otherwise the switch reads ON while agents never see the plugin.
+    useSettingsStore.setState({
+      pluginInstallState: { superpowers: "installing", frontendDesign: "Sparkle couldn't install" },
+    });
+    render(<ToolsPane />);
+    expect(screen.getByText("Installing…")).toBeTruthy();
+    expect(screen.getByText("Sparkle couldn't install")).toBeTruthy();
+    // The scope note is displaced while there's something more urgent to say, and only then.
+    expect(screen.queryByText("Applies to agents created from now on.")).toBeNull();
+  });
+
+  it("links Frontend design at the repo we actually install from", () => {
+    // The row shipped pointing at anthropics/claude-plugins-public, which 404s. The live
+    // marketplace repo is anthropics/claude-plugins-official (the same one config.rs installs
+    // from); a Rust test pins the two constants together.
+    render(<ToolsPane />);
+    fireEvent.click(screen.getByRole("button", { name: "Learn more about Frontend design" }));
+    expect(openUrl).toHaveBeenCalledWith(
+      "https://github.com/anthropics/claude-plugins-official/tree/main/plugins/frontend-design",
+    );
   });
 
   it("toggles Roborev through setRoborevEnabled (its own daemon+hooks side-effect writer)", () => {
@@ -184,7 +302,7 @@ describe("ToolsPane", () => {
     // Target Deepgram's link by its accessible name so the assertion doesn't ride on row order.
     fireEvent.click(screen.getByRole("button", { name: "Learn more about Deepgram voice" }));
     expect(openUrl).toHaveBeenCalledWith("https://deepgram.com");
-    // A showcase row's link too (Superpowers → GitHub).
+    // A plugin row's link too (Superpowers → GitHub).
     fireEvent.click(screen.getByRole("button", { name: "Learn more about Superpowers" }));
     expect(openUrl).toHaveBeenCalledWith("https://github.com/obra/superpowers");
   });
@@ -205,6 +323,34 @@ describe("ToolsPane", () => {
       useSettingsStore.setState({ roborevAuthWarning: WARNING });
       render(<ToolsPane />);
       expect(screen.getByText(WARNING)).toBeTruthy();
+    });
+  });
+
+  describe("Builder Index row", () => {
+    it("ships OFF and says what it publishes", () => {
+      render(<ToolsPane />);
+      const sw = screen.getByRole("switch", { name: "Builder Index" });
+      expect(sw.getAttribute("aria-checked")).toBe("false");
+      expect(
+        screen.getByText(
+          /Publish your daily token totals to the public tokenmaxxing leaderboard\. Aggregates only, never your code or prompts\./,
+        ),
+      ).toBeTruthy();
+    });
+
+    it("routes its toggle through setBuilderIndexEnabled (which gates on consent), not setToolEnabled", () => {
+      render(<ToolsPane />);
+      fireEvent.click(screen.getByRole("switch", { name: "Builder Index" }));
+      expect(setBuilderIndexEnabled).toHaveBeenCalledWith(true);
+      // Turning it on must NOT write the config directly — the consent modal owns that write.
+      expect(setToolEnabled).not.toHaveBeenCalled();
+    });
+
+    it("offers a way back into its settings once it's on", () => {
+      useSettingsStore.setState({ builderIndexEnabled: true });
+      render(<ToolsPane />);
+      fireEvent.click(screen.getByRole("button", { name: "Manage your Builder Index settings" }));
+      expect(useSettingsStore.getState().builderIndexModalOpen).toBe(true);
     });
   });
 

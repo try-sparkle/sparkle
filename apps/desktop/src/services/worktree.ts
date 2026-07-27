@@ -144,10 +144,63 @@ export function installWorktreeGuard(worktree: string): Promise<void> {
 }
 
 /** Register Claude Code event hooks () in the worktree's settings.local.json so the
- *  app gets structured lifecycle events instead of scraping the TUI. Resolves to the absolute
- *  event-log path the emitter appends to (which a watcher then tails). */
-export function installAgentHooks(worktree: string): Promise<string> {
-  return invoke<string>("install_agent_hooks", { worktree });
+ *  app gets structured lifecycle events instead of scraping the TUI, and pre-enable Sparkle's
+ *  default-on Claude Code plugins in the same file. Resolves to the absolute event-log path the
+ *  emitter appends to (which a watcher then tails).
+ *
+ *  `projectRoot` is the repo the worktree belongs to; it only resolves the repo-scoped [plugins]
+ *  layer, so a repo's `.sparkle/config.toml` can pick its own agent plugins. Omitting it falls
+ *  back to the global config, which is correct — just not repo-aware. */
+export function installAgentHooks(worktree: string, projectRoot?: string): Promise<string> {
+  return invoke<string>("install_agent_hooks", { worktree, projectRoot });
+}
+
+/** What the install pass did for one plugin. `key` is the `[plugins]` TOML key
+ *  (`superpowers`, `frontend_design`), which is how a caller maps an outcome back to its row. */
+export type PluginInstallOutcome = {
+  key: string;
+  /** The `<plugin>@<marketplace>` id. */
+  id: string;
+  /** `unverified` = "we believe it's there but couldn't read Claude Code's plugin folder" — kept
+   *  distinct from `alreadyPresent` so "can't see it" never renders as "it's fine". */
+  status: "installed" | "alreadyPresent" | "unverified" | "failed";
+  /** A user-facing sentence naming the remedy — present only when `status` is `"failed"`.
+   *  Distinct remedies stay distinct: "finish setup" ≠ "check your connection". */
+  message: string | null;
+  /** The underlying technical error (child stderr), for a tooltip or the console — not row copy. */
+  detail: string | null;
+};
+
+/** Install the Claude Code plugins the [plugins] flags turn on (`claude plugin install`, user
+ *  scope, into the one shared plugin cache). Idempotent and gated on what's already on the machine,
+ *  so calling it when everything is present is a filesystem check and nothing more. Runs at startup;
+ *  also called when a plugin toggle is switched ON so the install doesn't wait for the next launch.
+ *
+ *  RESOLVING IS NOT SUCCESS. The pass is best-effort by contract — a plugin that can't install must
+ *  not break agent spawning — so it resolves even when every install failed. Read `status` per
+ *  plugin; a rejection here means the pass itself couldn't run.
+ *
+ *  `forceKey` is the `[plugins]` TOML key the user just switched on. It bypasses the per-process
+ *  retry suppression FOR THAT PLUGIN, without which an install that already failed this session is
+ *  skipped and toggling off and on — the only remedy the UI offers — is a silent no-op that renders
+ *  as success. It names one plugin rather than being a bare flag because clearing every
+ *  enabled-but-missing plugin's suppression would re-run their installs inside the same awaited
+ *  call: on an offline machine, toggling one row would block on two more 90s network shell-outs for
+ *  the other, which is the exact burn the suppression exists to prevent. */
+export function ensureDefaultPluginsInstalled(forceKey?: string): Promise<PluginInstallOutcome[]> {
+  return invoke<PluginInstallOutcome[]>("ensure_default_plugins_installed", { forceKey });
+}
+
+/** What the LAST install pass concluded, per plugin — without running one. Cheap (a cached read in
+ *  Rust: no filesystem work, no shell-out), empty before any pass has run.
+ *
+ *  This is how a startup failure reaches the UI at all. The startup and agent-prepare passes compute
+ *  a per-plugin verdict; before this existed they logged it and dropped it, so on the machine the
+ *  whole mechanism is for — install fails, retries next launch, fails again — the Tools pane showed
+ *  the switch ON with no hint, and the hint only appeared if the user happened to toggle. A cached
+ *  read rather than an event means the pane can't miss an outcome by mounting after it fired. */
+export function pluginInstallOutcomes(): Promise<PluginInstallOutcome[]> {
+  return invoke<PluginInstallOutcome[]>("plugin_install_outcomes");
 }
 
 /** Self-heal stale Claude Code hook script paths across all existing agent worktrees. The emitter

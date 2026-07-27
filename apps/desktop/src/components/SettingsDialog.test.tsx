@@ -8,15 +8,27 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // Controls inside the panes persist to config.toml via these actions; mock so no IPC fires
-// when a pane mounts or a control is touched.
-vi.mock("../services/configActions", () => ({
+// when a pane mounts or a control is touched. PARTIAL (spreads the real module) because this
+// dialog renders whole panes: an exhaustive factory silently makes every export it forgot
+// `undefined`, and the Tools pane calls one of them in a mount effect — so a forgotten name is a
+// crash on render in a file that is not even about that pane.
+vi.mock("../services/configActions", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/configActions")>()),
   setAiFeature: vi.fn().mockResolvedValue(undefined),
   setAllAiFeatures: vi.fn().mockResolvedValue(undefined),
   setMaxConcurrentWorkers: vi.fn().mockResolvedValue(undefined),
-  setAutoApplyUpdates: vi.fn().mockResolvedValue(undefined),
-  setNotifyStatus: vi.fn().mockResolvedValue(undefined),
   setToolEnabled: vi.fn().mockResolvedValue(undefined),
+  // Every OTHER writer the rendered panes can reach, too. The spread protects against a name this
+  // file forgot; these protect against the real writer RUNNING — setPluginEnabled and
+  // setRoborevEnabled kick installers, not just a config write, so a future test that clicks one
+  // of those switches would shell out for real and fail as a swallowed rejection.
+  setPluginEnabled: vi.fn().mockResolvedValue(undefined),
+  setRoborevEnabled: vi.fn().mockResolvedValue(undefined),
+  setBuilderIndexEnabled: vi.fn().mockResolvedValue(undefined),
+  refreshPluginInstallState: vi.fn().mockResolvedValue(undefined),
 }));
+// (The notification and auto-update toggles are settingsStore actions, not configActions exports —
+// store-only, no IPC — so there is nothing to stub for them.)
 
 // The Tools pane's Learn-more links open the system browser via plugin-opener; mock so no IPC
 // fires when that pane mounts or a link is clicked.

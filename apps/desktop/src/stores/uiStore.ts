@@ -16,6 +16,7 @@ export type CategoryId =
   | "ai"
   | "tools"
   | "credits"
+  | "spend"
   | "notifications"
   | "appearance"
   | "shortcuts"

@@ -1,4 +1,4 @@
-import { type CSSProperties, type ComponentType, type ReactNode } from "react";
+import { useEffect, type CSSProperties, type ComponentType, type ReactNode } from "react";
 import {
   FiMessageSquare,
   FiMic,
@@ -9,20 +9,32 @@ import {
   FiShield,
   FiCheckCircle,
   FiBookOpen,
+  FiLayout,
   FiExternalLink,
+  FiTrendingUp,
   FiLock,
 } from "react-icons/fi";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { useSettingsStore, aiFeatureMode } from "../stores/settingsStore";
-import { setAiFeature, setToolEnabled, setRoborevEnabled } from "../services/configActions";
+import {
+  setAiFeature,
+  setToolEnabled,
+  setPluginEnabled,
+  setRoborevEnabled,
+  refreshPluginInstallState,
+  setBuilderIndexEnabled,
+} from "../services/configActions";
+import { BUILDER_INDEX_URL } from "../services/builderIndex";
 import { matchesSearch } from "../engine/settingsSearch";
 
 // The "Tools" pane of the ⋯ settings dialog. Two groups:
 //   • "Your tools"        — real on/off rows (config-backed). Off means the tool is used NOWHERE in
 //                           Sparkle. Chief/Deepgram reuse the [ai] flags (brainstorm/voice_dictation)
-//                           and carry an "AI" badge; the rest are [tools] flags.
+//                           and carry an "AI" badge; Superpowers/Frontend design are [plugins]
+//                           flags (Claude Code plugins pre-enabled for every agent); the rest are
+//                           [tools] flags.
 //   • "Built into Sparkle" — showcase rows (icon + name + description + Learn-more + a badge, NO
 //                           switch): the always-on capabilities that come with Sparkle.
 // AI gating: when the AI master is Off (aiFeatureMode === "off"), the two AI rows are disabled +
@@ -89,10 +101,20 @@ export const TOOL_META = {
     desc: "The agent engine behind every Sparkle agent.",
     keywords: "claude code agent engine cli",
   },
+  builderIndex: {
+    name: "Builder Index",
+    desc: "Publish your daily token totals to the public tokenmaxxing leaderboard. Aggregates only, never your code or prompts.",
+    keywords: "builder index tokenmaxxing leaderboard publish daily tokens totals rank public",
+  },
   superpowers: {
     name: "Superpowers",
-    desc: "The skill library your agents use to plan, debug, and ship.",
-    keywords: "superpowers skills skill library plan debug ship",
+    desc: "The most-used agent methodology plugin: plan → TDD → review.",
+    keywords: "superpowers skills skill library plugin methodology plan tdd debug ship review",
+  },
+  frontendDesign: {
+    name: "Frontend design",
+    desc: "Anthropic's official UI-quality skill.",
+    keywords: "frontend design ui quality plugin skill anthropic official marketplace",
   },
 } as const satisfies Record<string, { name: string; desc: string; keywords: string }>;
 
@@ -220,6 +242,7 @@ function ToolRow({
   badge,
   control,
   hint,
+  onHintClick,
 }: {
   Icon: ComponentType<{ size?: number }>;
   name: string;
@@ -228,6 +251,8 @@ function ToolRow({
   badge?: Badge;
   control: ReactNode;
   hint?: string;
+  /** When set, the hint renders as a button instead of static text (see the Builder Index row). */
+  onHintClick?: () => void;
 }) {
   return (
     // The testid is how a test counts RENDERED rows without deriving the list from TOOL_META.
@@ -258,7 +283,14 @@ function ToolRow({
             <FiExternalLink size={11} />
           </button>
         )}
-        {hint && <div style={hintStyle}>{hint}</div>}
+        {hint &&
+          (onHintClick ? (
+            <button type="button" onClick={onHintClick} style={hintButtonStyle}>
+              {hint}
+            </button>
+          ) : (
+            <div style={hintStyle}>{hint}</div>
+          ))}
       </div>
       <div style={{ flex: "0 0 auto", display: "flex", alignItems: "center", paddingTop: 2 }}>
         {control}
@@ -279,6 +311,8 @@ interface ToggleTool {
   /** Row-specific note under the description (e.g. roborev's auth self-test result). Takes
    *  precedence over the generic AI-master hint. */
   hint?: string;
+  /** Makes the hint a button (e.g. Builder Index's "Manage…" re-entry into its settings dialog). */
+  onHintClick?: () => void;
   /** Extra search terms, matched alongside name + desc. The rail lists a category's keywords, so
    *  without the same terms here a query like "dotenv" surfaces Tools and then renders "No tools
    *  match" — a dead end worse than not matching at all. */
@@ -298,6 +332,35 @@ interface ShowcaseTool {
   badge: Badge;
 }
 
+/** The GitHub repo backing Anthropic's official plugin marketplace. Must stay identical to
+ *  `config::OFFICIAL_MARKETPLACE_REPO` in src-tauri/src/config.rs, which is what the installer
+ *  actually runs `claude plugin marketplace add` against — a Learn-more link pointing at a
+ *  different repo than the one we install from is how the previous `claude-plugins-public` 404
+ *  happened. A Rust test (`hooks::tests::the_frontend_learn_more_url_matches_the_repo_we_install_from`)
+ *  fails if these two drift apart. */
+const OFFICIAL_MARKETPLACE_REPO = "anthropics/claude-plugins-official";
+const FRONTEND_DESIGN_URL = `https://github.com/${OFFICIAL_MARKETPLACE_REPO}/tree/main/plugins/frontend-design`;
+
+/** Both plugin rows carry this. Sparkle writes `enabledPlugins` into an agent worktree's
+ *  settings.local.json at prepare time and never removes an entry (insert-if-absent, so a plugin
+ *  the user enabled or disabled by hand always wins). That means switching a plugin OFF here does
+ *  NOT retract it from worktrees that already have it — without saying so, the toggle looks broken
+ *  for every agent already on screen. */
+const PLUGIN_SCOPE_HINT = "Applies to agents created from now on.";
+
+/** What a plugin row's hint line should say, given the installer's current state for it. The
+ *  install is the half of a toggle-on the user can't see — it shells out to `claude plugin install`
+ *  and can take a while or fail (offline, no `claude`, marketplace outage) — so the row reports it
+ *  rather than leaving a switch that says ON with the plugin absent. Falls back to the scope note
+ *  when there's nothing in flight. */
+function pluginHint(state: string | undefined): string {
+  if (state === "installing") return "Installing…";
+  return state ?? PLUGIN_SCOPE_HINT;
+}
+
+// Superpowers used to live here as a showcase row. It is now a real, config-backed toggle
+// ([plugins].superpowers) below, so listing it in both places would show the same tool twice with
+// only one of them actually doing anything.
 const SHOWCASE: ShowcaseTool[] = [
   {
     // Spread, not field-by-field: a row that copies a name/desc out of TOOL_META can still be
@@ -315,15 +378,17 @@ const SHOWCASE: ShowcaseTool[] = [
     url: "https://claude.com/claude-code",
     badge: { kind: "core", text: "Core" },
   },
-  {
-    ...TOOL_META.superpowers,
-    Icon: FiBookOpen,
-    url: "https://github.com/obra/superpowers",
-    badge: { kind: "builtin", text: "Built-in" },
-  },
 ];
 
 export function ToolsPane({ query = "" }: { query?: string }) {
+  // Hydrate the plugin rows from the LAST install pass — usually the one that ran at startup.
+  // Without this, a plugin that failed to install at launch shows a switch that reads ON with no
+  // hint, and the user only learns about it if they happen to toggle the row. Cheap: a cached read
+  // in Rust, no filesystem work.
+  useEffect(() => {
+    void refreshPluginInstallState();
+  }, []);
+
   // AI flags: Deepgram = voiceDictation. The AI master derives from all of them.
   const aiAutoRename = useSettingsStore((s) => s.aiAutoRename);
   const cloudDictation = useSettingsStore((s) => s.cloudDictation);
@@ -337,8 +402,15 @@ export function ToolsPane({ query = "" }: { query?: string }) {
   const guardrailsEnabled = useSettingsStore((s) => s.guardrailsEnabled);
   const roborevEnabled = useSettingsStore((s) => s.roborevEnabled);
   const roborevAuthWarning = useSettingsStore((s) => s.roborevAuthWarning);
+  const builderIndexEnabled = useSettingsStore((s) => s.builderIndexEnabled);
+  const openBuilderIndexModal = useSettingsStore((s) => s.setBuilderIndexModalOpen);
   const onepasswordEnabled = useSettingsStore((s) => s.onepasswordEnabled);
   const onepasswordVaultId = useSettingsStore((s) => s.onepasswordVaultId);
+  // [plugins] flags — Claude Code marketplace plugins pre-enabled for every agent.
+  const superpowersEnabled = useSettingsStore((s) => s.superpowersEnabled);
+  const frontendDesignEnabled = useSettingsStore((s) => s.frontendDesignEnabled);
+  // What the installer is doing right now, per row — see `pluginHint`.
+  const pluginInstallState = useSettingsStore((s) => s.pluginInstallState);
 
   const aiOff =
     aiFeatureMode({
@@ -377,6 +449,37 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       hint: roborevAuthWarning ?? undefined,
       checked: roborevEnabled,
       onToggle: () => void setRoborevEnabled(!roborevEnabled),
+    },
+    {
+      ...TOOL_META.builderIndex,
+      key: "builderIndex",
+      Icon: FiTrendingUp,
+      url: BUILDER_INDEX_URL,
+      // Once it's on, the row is also the way back into the settings dialog (change username,
+      // report now, turn off and forget) — otherwise the only route would be off-then-on, which
+      // would make withdrawing consent a prerequisite for editing it.
+      hint: builderIndexEnabled ? "Manage your Builder Index settings" : undefined,
+      onHintClick: builderIndexEnabled ? () => openBuilderIndexModal(true) : undefined,
+      checked: builderIndexEnabled,
+      onToggle: () => void setBuilderIndexEnabled(!builderIndexEnabled),
+    },
+    {
+      ...TOOL_META.superpowers,
+      key: "superpowers",
+      Icon: FiBookOpen,
+      url: "https://github.com/obra/superpowers",
+      hint: pluginHint(pluginInstallState.superpowers),
+      checked: superpowersEnabled,
+      onToggle: () => void setPluginEnabled("superpowers", !superpowersEnabled),
+    },
+    {
+      ...TOOL_META.frontendDesign,
+      key: "frontendDesign",
+      Icon: FiLayout,
+      url: FRONTEND_DESIGN_URL,
+      hint: pluginHint(pluginInstallState.frontendDesign),
+      checked: frontendDesignEnabled,
+      onToggle: () => void setPluginEnabled("frontendDesign", !frontendDesignEnabled),
     },
     {
       ...TOOL_META.onepassword,
@@ -443,6 +546,7 @@ export function ToolsPane({ query = "" }: { query?: string }) {
               url={t.url}
               badge={t.ai ? { kind: "ai", text: "AI" } : undefined}
               hint={t.hint ?? (t.ai && aiOff ? AI_HINT : undefined)}
+              onHintClick={t.onHintClick}
               control={
                 <Switch
                   label={t.name}
@@ -523,6 +627,17 @@ const hintStyle: CSSProperties = {
   color: C.amber,
   marginTop: 4,
   lineHeight: 1.4,
+};
+
+const hintButtonStyle: CSSProperties = {
+  ...hintStyle,
+  display: "inline-block",
+  padding: 0,
+  background: "transparent",
+  border: "none",
+  cursor: "pointer",
+  textAlign: "left",
+  fontFamily: '"IBM Plex Sans", sans-serif',
 };
 
 const emptyStyle: CSSProperties = {

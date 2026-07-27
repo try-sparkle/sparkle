@@ -29,6 +29,7 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { AccountSwitchHost } from "./components/AccountSwitchHost";
 import { HintOverlay } from "./components/HintOverlay";
 import { RoborevConsentModal } from "./components/RoborevConsentModal";
+import { BuilderIndexConsentModal } from "./components/BuilderIndexConsentModal";
 import { startUpdater } from "./services/updaterService";
 
 // The Workspace subtree pulls in the heavy authenticated UI — xterm, markdown rendering, modals,
@@ -206,9 +207,13 @@ export function App() {
   // live-reload (hand-edit / in-app write / reset). The file is the source of truth; this is the
   // read side. Handler is idempotent (re-pulls), so the expected double config-changed emit on an
   // in-app write is harmless.
-  // SCOPE: the UI mirror reflects the GLOBAL layer (no project root passed). That's correct — the
-  // mirrored controls are [workers]/[ai], which are global-only by design; per-project [workflow]
-  // overrides are honored by the Rust engine directly (config::for_project), not via this mirror.
+  // SCOPE: the UI mirror reflects the GLOBAL layer (no project root passed), and the ⋯ settings
+  // controls write back to that same global layer. Most mirrored controls ([workers], [ai],
+  // [tools]) are global-only by design, so that's exact. Two are NOT: [plugins] is repo-overridable
+  // (like [workflow]), so a repo whose .sparkle/config.toml disables a plugin will show that plugin
+  // as ON here — the pane is showing the machine-wide default, while the Rust engine honors the
+  // repo's override directly (config::for_project, resolved per worktree in hooks::install_agent_hooks).
+  // Per-project overrides are never surfaced through this mirror.
   useEffect(() => {
     let cancelled = false;
     const hydrate = useSettingsStore.getState().hydrateFromConfig;
@@ -261,6 +266,7 @@ export function App() {
         {/* One-time roborev consent modal — mounted once (not per-agent), self-gated on
             settingsStore.roborevConsentOpen (flipped at the first reviewable commit). */}
         <RoborevConsentModal />
+        <BuilderIndexConsentModal />
         {/* Vimium-style keyboard hints: a clean ⌘ tap overlays gold chiclets on the primary
             controls. Mounted last so its portal sits above the whole UI. */}
         <HintOverlay />

@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -154,75 +155,141 @@ fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
 /// (rev-parse, status of local worktrees, merge-base) are unaffected and stay on the plain `git()`.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Kill an entire process GROUP (Unix), so a timed-out child takes its descendants with it.
+/// How long we'll wait for the drain threads to finish AFTER the child has exited or been killed.
 ///
-/// `Child::kill` signals only the DIRECT child. Any grandchild it forked inherits the stdout/stderr
-/// pipe write ends, so those pipes stay open after the child dies and the reader threads below block
-/// in `read_to_end` until the GRANDCHILD exits — turning a 300ms deadline into however long the
-/// grandchild runs. That is not hypothetical: `sh -c "sleep 30"` reproduces it (Linux forks the
-/// sleep; macOS often execs it, which is why this only failed in CI), and the real callers spawn
-/// exactly this shape — `git fetch` forks `ssh`, `op` talks to helper processes.
-#[cfg(unix)]
-fn kill_process_group(child: &std::process::Child) {
-    // Negative pid = "the whole group". The child is its own group leader (see `process_group(0)`
-    // at spawn), so this can never reach back into Sparkle's own group.
-    //
-    // Safe to call AFTER the child has been reaped, too: a pid that is still a live process group's
-    // id is not recycled while the group has members, and the only reason we ever call it post-reap
-    // is that a member is still holding a pipe. With no members left the kill just returns ESRCH.
-    let pid = child.id() as i32;
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
+/// THE BUG THIS BOUNDS: `Child::kill` only reaches the DIRECT child. A grandchild it forked (a
+/// `git clone` under `claude plugin install`, an `npm` helper) inherits the same stdout/stderr write
+/// ends, so those pipes stay open and a reader blocked in `read` never sees EOF — the deadline
+/// expires, we kill, and then block FOREVER joining a reader. With `output_with_timeout` called
+/// under the plugin-install mutex, that wedges every later pass. The process-group kill below is the
+/// primary fix (it reaches the grandchild); this grace is the backstop for the case where even that
+/// misses — a grandchild that re-parented itself into another group, or the non-unix path. Two
+/// seconds is far more than a drained pipe needs (the readers have been running all along) and far
+/// less than any caller's own deadline.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long the readers get to reach EOF ON THEIR OWN after a child exits normally, before we
+/// conclude something else is holding the write ends and kill the group to release them.
+///
+/// Deliberately short, and paid only when a pipe really is held: everything the command wrote is
+/// already in the pipe by the time it exits, so a healthy capture joins here in microseconds.
+/// Waiting out the full [`DRAIN_GRACE`] first — let alone whatever remains of the caller's deadline
+/// — would spend seconds on the path that runs every single time, for a command that finished in
+/// 200ms.
+const POST_EXIT_SETTLE: Duration = Duration::from_millis(250);
+
+/// Cap on what a drain thread may RETAIN, per stream. A pipe held open by a long-lived grandchild
+/// (an ssh ControlMaster lives for hours) means the thread outlives its caller; without a bound it
+/// would append into a buffer nobody will ever read for the life of the holder — and these captures
+/// run on ~30s polls, so the threads stack up. 4 MiB is far past any output a caller actually
+/// parses.
+///
+/// The real ceiling is this plus one 8 KiB chunk, per stream, so ~2x that for a capture with both
+/// pipes. Overshoot by a chunk, not by the megabyte.
+///
+/// Hitting it is REPORTED, never silent: see [`Drain::truncated`]. Dropping bytes while
+/// `drain_complete` stayed true handed the strict [`output_with_timeout`] a plausible-looking
+/// prefix with `status.success()` — the exact failure that form exists to make impossible.
+///
+/// What survives is the TAIL, not the head: past the cap the front half of the buffer is dropped
+/// and appending continues. For both callers that read this text — a failed `gh pr merge`, a failed
+/// `claude plugin install` — the reason a command failed is the LAST thing it wrote, so keeping the
+/// head would have guaranteed the loss of exactly the bytes the message exists to carry.
+#[cfg(not(test))]
+const DRAIN_BUF_CAP: usize = 4 << 20;
+/// Small enough that a test can reach it without writing 4 MiB. `cap_is_above_the_kept_whole_fixture`
+/// pins the relationship to the "kept whole" fixture, so a bigger fixture fails as a clear
+/// assertion rather than as a mystery `expect()` on the capped path.
+#[cfg(test)]
+const DRAIN_BUF_CAP: usize = 512 << 10;
+
+/// One pipe's drain: the shared buffer and the two ways its contents can be INCOMPLETE.
+struct Drain {
+    buf: Arc<Mutex<Vec<u8>>>,
+    /// Set once the cap forced bytes out of the buffer. The thread keeps reading (so the child
+    /// never blocks on a full pipe) and keeps the tail; this flag is what stops the loss from
+    /// passing as a complete capture.
+    truncated: Arc<AtomicBool>,
+    /// Set when a read failed mid-stream (EIO on a pty-backed pipe, a bad fd after an exotic kill).
+    /// Without it that path returned early and the capture looked JOINED and uncapped — a
+    /// mid-stream prefix reported as the whole output, which is the same lie as the cap by a third
+    /// route, and the one that needs neither a grandchild nor 4 MiB to happen.
+    read_error: Arc<AtomicBool>,
+    /// Set by [`take_drained`] once the caller has its snapshot. From then on the thread reads and
+    /// DISCARDS: keeping the tail only helps someone who will read it, and an abandoned thread
+    /// (an ssh ControlMaster holds the pipe for hours while ~30s polls stack more threads up)
+    /// would otherwise refill a whole cap's worth of bytes nobody will ever look at.
+    abandoned: Arc<AtomicBool>,
 }
 
-/// How long the readers get to hand over their buffers AFTER the group has been killed. Killing the
-/// group closes the pipes, so `read_to_end` returns and the send lands almost immediately; this is
-/// a backstop, not a wait we expect to spend.
-const DRAIN_GRACE: Duration = Duration::from_millis(250);
-
-/// Take one reader thread's buffer, waiting no later than `deadline`. `None` means we GAVE UP — the
-/// pipe was still held after the group kill and the grace, so the buffer is gone.
+/// Drain one pipe into a SHARED buffer on its own thread.
 ///
-/// This is the SUCCESS path's ceiling, and it needs one: a child can exit 0 and still leave a
-/// descendant holding the pipe write end (`git fetch` leaving an ssh ControlMaster, `op` talking to
-/// a helper), and `read_to_end` then blocks for as long as THAT process lives. Joining the reader
-/// unconditionally — which is what this function used to do once `try_wait` reported an exit — is an
-/// unbounded wait inside a function whose entire purpose is a ceiling, and it wedges a Tauri
-/// blocking-pool thread for the duration. If the pipe is still held when this call's bound expires
-/// — the grace on the abort paths (the deadline is either already spent, or irrelevant because the
-/// child has just been killed), and `min(remaining deadline, grace)` on the success path, where the
-/// deadline binds only when the command exited within a grace of it — kill the group:
-/// the command itself has already finished, so nothing inside it still needs to run. The buffer is
-/// not lost by doing so — closing the pipe is what lets `read_to_end` return and send it.
-///
-/// RESIDUE, worth knowing: if the holder is NOT in the killed group (a helper daemon that was handed
-/// the fd, a descendant that `setsid`'d itself, or any Windows caller, where there is no group kill),
-/// the reader thread stays blocked in `read_to_end` and leaks itself plus a pipe fd. We return
-/// rather than block — a wedged Tauri blocking-pool thread on a 30s poll is worse. What the CALLER
-/// is told then differs by pipe, and [`finish`] is where that is decided: an abandoned stdout is an
-/// `Err` (a silently empty success is indistinguishable from a command that printed nothing, and
-/// callers parse that as data), while an abandoned stderr degrades to an empty buffer because it is
-/// diagnostic and losing it must not fail a command that succeeded.
-fn take_by(
-    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
-    deadline: Instant,
-    child: &std::process::Child,
-) -> Option<Vec<u8>> {
-    if let Ok(buf) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        return Some(buf);
-    }
-    #[cfg(unix)]
-    kill_process_group(child);
-    #[cfg(not(unix))]
-    let _ = child; // no group kill on Windows — the deadline above is what bounds the wait there
-    match rx.recv_timeout(DRAIN_GRACE) {
-        Ok(buf) => Some(buf),
-        Err(_) => {
-            tracing::warn!("output_with_timeout: gave up on a pipe still held after the group kill");
-            None
+/// The buffer is shared (rather than returned via `join`) precisely so the caller never has to join
+/// to get the bytes: on a wedged pipe we abandon the thread and still report everything read so far.
+/// Chunked reads (not `read_to_end`) are what make that snapshot non-empty.
+fn spawn_drain<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> (Drain, std::thread::JoinHandle<()>) {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let truncated = Arc::new(AtomicBool::new(false));
+    let read_error = Arc::new(AtomicBool::new(false));
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let sink = Arc::clone(&buf);
+    let overflowed = Arc::clone(&truncated);
+    let errored = Arc::clone(&read_error);
+    let given_up_on = Arc::clone(&abandoned);
+    let handle = std::thread::spawn(move || {
+        let Some(mut s) = pipe else { return };
+        let mut chunk = [0u8; 8192];
+        loop {
+            match s.read(&mut chunk) {
+                Ok(0) => return,
+                // EINTR is not EOF. `read_to_end` — which this loop replaced — retries on it; a
+                // bare `Err(_) => return` would abandon the rest of the stream when a signal
+                // happens to land mid-read, and the caller would parse the truncated bytes as
+                // complete. That failure needs no grandchild at all, so it must be handled here.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    // Release, and the caller loads with Acquire: `await_threads` polls
+                    // `is_finished` instead of joining, so nothing else in this path establishes
+                    // happens-before between this store and the read of the flag.
+                    errored.store(true, Ordering::Release);
+                    return;
+                }
+                Ok(n) => {
+                    let mut b = sink.lock().unwrap_or_else(|e| e.into_inner());
+                    // Checked INSIDE the critical section: `take_drained` sets the flag and empties
+                    // the buffer under this same lock, so a check before acquiring it could pass,
+                    // lose the race, and append a chunk into the buffer nobody will read again.
+                    // Keep draining so the child never blocks on a full pipe — just stop retaining.
+                    if given_up_on.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if b.len() + n > DRAIN_BUF_CAP {
+                        // Keep the TAIL: drop the front half and carry on appending, so the buffer
+                        // stays bounded while the newest output — where a failure reason lives —
+                        // survives.
+                        let drop_to = (DRAIN_BUF_CAP / 2).min(b.len());
+                        b.drain(..drop_to);
+                        overflowed.store(true, Ordering::Release);
+                    }
+                    b.extend_from_slice(&chunk[..n]);
+                }
+            }
         }
-    }
+    });
+    (Drain { buf, truncated, read_error, abandoned }, handle)
+}
+
+/// Take whatever a drain thread has read so far, and tell it to stop retaining: this is the last
+/// read of that buffer, so anything it kept afterwards would be unreachable bytes held for as long
+/// as whatever is holding the pipe open lives.
+fn take_drained(drain: &Drain) -> Vec<u8> {
+    // Flag and buffer are touched under ONE lock acquisition, so "abandoned ⇒ nothing accumulates
+    // afterwards" is an invariant rather than a race the caller usually wins.
+    let mut b = drain.buf.lock().unwrap_or_else(|e| e.into_inner());
+    drain.abandoned.store(true, Ordering::Release);
+    std::mem::take(&mut *b)
 }
 
 /// Run `cmd` to completion but ABORT it after `timeout`, killing the child and returning an Err.
@@ -230,52 +297,38 @@ fn take_by(
 /// two reader threads drain stdout/stderr concurrently (so a chatty child can't deadlock on a full
 /// pipe while we wait), and we poll `try_wait` until the deadline (std has no wait-with-timeout).
 ///
-/// EVERY exit from here is bounded, which takes two mechanisms, not one: the deadline path kills the
-/// child's whole PROCESS GROUP (see [`kill_process_group`] — killing only the child leaves a
-/// grandchild holding the pipes), and the reader hand-off is bounded by [`take_by`] on the success
-/// path too (a child can exit 0 and leave a descendant holding them). On Windows there is no group
-/// kill, so descendants are not torn down there — but the deadline is still honored, because the
-/// bounded hand-off is what returns, not the reader threads finishing.
-pub(crate) fn output_with_timeout(
+/// GRANDCHILDREN are the hard part, and both halves of the fix live here: the child gets its own
+/// process group so expiry can kill the whole tree ([`crate::proc::kill_process_group`]), and the
+/// drain is joined with a bounded grace so a pipe held open by something we still couldn't reach
+/// costs two seconds, not the life of the process. This function returns within
+/// `timeout + DRAIN_GRACE`, always.
+///
+/// The LENIENT form: an incomplete or capped drain is DATA, reported in-band as
+/// [`Captured::drain_complete`], not an error. git legitimately spawns long-lived helpers that
+/// inherit these pipes (`ssh` ControlPersist, `git credential-cache--daemon`), so "we gave up
+/// draining" is a state that really happens, and a mutating caller whose operation already took
+/// effect must not report it as failed. [`output_with_timeout`] is the strict wrapper that turns
+/// the same condition into an `Err` for callers that parse the output as a whole value.
+pub(crate) fn output_with_timeout_lenient(
     mut cmd: Command,
     timeout: Duration,
-) -> Result<std::process::Output, String> {
-    use std::io::Read;
+) -> Result<Captured, String> {
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    // Make the child its own process-group leader so the deadline path can signal the whole group.
-    // Side effect worth knowing: the child no longer receives the parent's terminal signals, which
-    // is what we want for a GUI app's helper subprocesses.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // Own process group, so expiry can signal the child AND its descendants. Safe for these
+        // callers: every one of them is a non-interactive capture with stdin closed, so nothing here
+        // wants the terminal's job-control signals. REQUIRED by `proc::kill_process_group`.
         cmd.process_group(0);
     }
     let mut child = cmd.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
 
-    // Move each pipe into its own reader thread. read_to_end blocks until the write end closes
-    // (child exit or kill), so a large output is fully drained rather than deadlocking the child.
-    // The buffers come back over a CHANNEL rather than via join(): a join has no deadline, and
-    // whether the pipes ever close is exactly what we refuse to assume here.
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let (out_tx, out_rx) = std::sync::mpsc::channel();
-    let (err_tx, err_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut s) = stdout_pipe {
-            let _ = s.read_to_end(&mut buf);
-        }
-        let _ = out_tx.send(buf);
-    });
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut s) = stderr_pipe {
-            let _ = s.read_to_end(&mut buf);
-        }
-        let _ = err_tx.send(buf);
-    });
+    let (out_buf, out_thread) = spawn_drain(child.stdout.take());
+    let (err_buf, err_thread) = spawn_drain(child.stderr.take());
+    let drained = |grace| crate::proc::await_threads(&[&out_thread, &err_thread], grace);
 
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -283,70 +336,148 @@ pub(crate) fn output_with_timeout(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    // Deadline hit: kill the whole GROUP (not just the child — a surviving
-                    // grandchild holds the pipes open), reap, and let the readers hand over what
-                    // they have within the grace so no thread is left blocked on a live pipe.
-                    #[cfg(unix)]
-                    kill_process_group(&child);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let drain = Instant::now() + DRAIN_GRACE;
-                    let _ = take_by(&out_rx, drain, &child);
-                    let _ = take_by(&err_rx, drain, &child);
+                    // Deadline hit: kill the whole process group, reap, give the readers a bounded
+                    // grace to finish, and report the timeout.
+                    crate::proc::kill_process_group(&mut child);
+                    drained(DRAIN_GRACE);
                     return Err(format!("timed out after {}s", timeout.as_secs()));
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
-                #[cfg(unix)]
-                kill_process_group(&child);
-                let _ = child.kill();
-                let _ = child.wait();
-                let drain = Instant::now() + DRAIN_GRACE;
-                let _ = take_by(&out_rx, drain, &child);
-                let _ = take_by(&err_rx, drain, &child);
+                crate::proc::kill_process_group(&mut child);
+                drained(DRAIN_GRACE);
                 return Err(format!("wait failed: {e}"));
             }
         }
     };
-    // The command exited on its own — but a descendant may still hold the pipes. Everything the
-    // COMMAND wrote is already in the pipe by now, so the only thing left to wait on is a lingering
-    // descendant: bound this by the grace, NOT by whatever remains of the deadline. Waiting out a
-    // 15s fetch deadline (or the 90s brew one) for a command that exited in 200ms is bounded but
-    // absurd, and it's paid on the path that runs every time.
-    // Each pipe gets its OWN grace, computed when its turn comes — a single shared instant would
-    // hand stderr whatever milliseconds stdout left behind, so a scheduling hiccup could expire it
-    // with a near-zero budget.
-    let stdout = take_by(&out_rx, deadline.min(Instant::now() + DRAIN_GRACE), &child);
-    let stderr = take_by(&err_rx, deadline.min(Instant::now() + DRAIN_GRACE), &child);
-
-    finish(status, stdout, stderr)
+    // The child is gone, but a surviving grandchild can still hold the write ends — so this join is
+    // bounded too. Two steps, and the order matters:
+    //
+    //  1. A SETTLE window. Everything the command itself wrote is already in the pipe, so a healthy
+    //     capture joins here in microseconds and pays nothing.
+    //  2. Still held ⇒ KILL THE GROUP, then join under the full grace. Nothing inside the command
+    //     needs to run any more — it has already exited — and closing the pipe is precisely what
+    //     lets the readers reach EOF and hand over the whole output. Abandoning instead (what this
+    //     used to do) cost the bytes AND leaked a reader thread plus a pipe fd for as long as the
+    //     holder lived, which for an ssh ControlMaster on a ~30s poll is hours.
+    //
+    // A bound we still hit after that does NOT mean failure: the holder escaped the group (it
+    // `setsid`'d, or this is a non-unix build with no group kill), the bytes MAY be short, and the
+    // caller picks a policy — a parse-sensitive caller treats it as unusable, a mutating caller
+    // keeps trusting `status.success()` (its operation already happened; failing it here would
+    // report a merged PR as unmerged).
+    // Joined-to-EOF is not enough on its own: a stream that overran DRAIN_BUF_CAP reached EOF with
+    // bytes DROPPED, and a stream whose read ERRORED mid-way finished the thread with a prefix in
+    // the buffer. Both are the same lie ("this is the whole output") by different routes.
+    let mut joined = drained(POST_EXIT_SETTLE);
+    if !joined {
+        crate::proc::kill_process_group(&mut child);
+        joined = drained(DRAIN_GRACE);
+    }
+    let stdout_capped = out_buf.truncated.load(Ordering::Acquire);
+    let stderr_capped = err_buf.truncated.load(Ordering::Acquire);
+    let stdout_read_error = out_buf.read_error.load(Ordering::Acquire);
+    let stderr_read_error = err_buf.read_error.load(Ordering::Acquire);
+    Ok(Captured {
+        output: std::process::Output {
+            status,
+            stdout: take_drained(&out_buf),
+            stderr: take_drained(&err_buf),
+        },
+        drain_complete: joined
+            && !stdout_capped
+            && !stderr_capped
+            && !stdout_read_error
+            && !stderr_read_error,
+        pipes_held: !joined,
+        stdout_capped,
+        stderr_capped,
+        stdout_read_error,
+        stderr_read_error,
+    })
 }
 
-/// Turn what the two readers managed to hand over into a result. Pure, so the asymmetry it encodes
-/// is testable — which matters, because that asymmetry is easy to flatten back into "both or
-/// nothing" and the shape that would catch it (a descendant abandoning exactly one pipe) is close to
-/// impossible to produce from a real child.
-///
-/// Strict about stdout, lenient about stderr, because they carry different weight. Callers PARSE
-/// stdout — `run_op` would take an empty string as JSON, the ref/count readers would take it as real
-/// data — so abandoning it has to be an error rather than a convincing empty success. stderr is
-/// diagnostic: turning a `merge_pr` that actually merged, or every `git fetch`, into a hard failure
-/// because a lingering helper kept the log pipe open would be a worse lie than the missing text.
-/// The give-up itself is already logged inside [`take_by`].
-fn finish(
-    status: std::process::ExitStatus,
-    stdout: Option<Vec<u8>>,
-    stderr: Option<Vec<u8>>,
-) -> Result<std::process::Output, String> {
-    match stdout {
-        Some(stdout) => Ok(std::process::Output {
-            status,
-            stdout,
-            stderr: stderr.unwrap_or_default(),
-        }),
-        None => Err("output truncated: a descendant held the pipe past the drain grace".to_string()),
+/// A finished capture plus whether its drain provably reached EOF with nothing dropped.
+/// `!drain_complete` does not mean the child failed — a pipe-holder outlived it, a stream overran
+/// [`DRAIN_BUF_CAP`], or a read errored mid-stream, so `output.stdout`/`stderr` may be short.
+pub(crate) struct Captured {
+    pub(crate) output: std::process::Output,
+    pub(crate) drain_complete: bool,
+    /// A pipe-holder outlived the child AND survived the group kill, so BOTH buffers may be short —
+    /// the drain threads were still running when the grace expired. Its own field because it is the
+    /// only cause that isn't per-stream: the join covers both threads at once.
+    ///
+    /// Rare by construction now that the success path kills the group: what reaches this is a holder
+    /// that escaped it (a `setsid`'d descendant, an fd handed to a daemon) or a non-unix build,
+    /// where there is no group kill and this is the ordinary outcome.
+    pub(crate) pipes_held: bool,
+    /// Per-STREAM, not collapsed bits: both lenient callers build their message from stderr, so a
+    /// stdout overrun (progress spam) or a stdout read error must not make them say the reason may
+    /// be missing when the reason was captured whole.
+    pub(crate) stdout_capped: bool,
+    pub(crate) stderr_capped: bool,
+    pub(crate) stdout_read_error: bool,
+    pub(crate) stderr_read_error: bool,
+}
+
+impl Captured {
+    /// The clause to append to a failure message built from STDERR when that text may be short.
+    /// Empty when stderr is known whole, so call sites can push it unconditionally.
+    ///
+    /// Both lenient call sites build their user-facing error from the captured stderr, which is
+    /// where `gh` and `claude` put the reason — so a lost tail turns "why the merge was declined"
+    /// into a bare `gh pr merge #N failed`, with nothing saying why it's empty.
+    pub(crate) fn truncation_note(&self) -> &'static str {
+        // Ordered by what actually happened to STDERR, then the one cause that hits both streams.
+        // Testing a collapsed "did anything go wrong" bit first was wrong twice: a stdout read
+        // error shadowed the more accurate stderr-capped wording, and gating the held-pipes clause
+        // on `!stdout_capped` silently returned "" for "stdout overran AND a helper held the
+        // pipes", where stderr really can be short.
+        if self.stderr_read_error {
+            " (the output pipe errored mid-read, so this message may be incomplete)"
+        } else if self.stderr_capped {
+            " (output was too large to capture in full — this is the tail, and earlier lines were dropped)"
+        } else if self.pipes_held {
+            " (output may be truncated — a helper process still held the pipes open)"
+        } else {
+            // Only stdout was short: the message the caller is building from stderr is intact.
+            ""
+        }
     }
+}
+
+/// The strict form: an incomplete or capped drain is an `Err`. For callers that PARSE the output as
+/// a whole value — a sha, a version line, a JSON document — where a plausible-looking prefix would
+/// be worse than an error.
+pub(crate) fn output_with_timeout(
+    cmd: Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let captured = output_with_timeout_lenient(cmd, timeout)?;
+    if !captured.drain_complete {
+        let partial = captured.output.stdout.len() + captured.output.stderr.len();
+        if captured.stdout_read_error || captured.stderr_read_error {
+            return Err(format!(
+                "reading the child's output failed mid-stream; {partial} bytes kept, which are a \
+                 fragment, not the whole output"
+            ));
+        }
+        // EITHER stream capping fails the call: this form hands the caller both streams, so
+        // "the one you were going to parse is fine" isn't ours to assume.
+        if captured.stdout_capped || captured.stderr_capped {
+            return Err(format!(
+                "child wrote past the {DRAIN_BUF_CAP}-byte per-stream capture cap; {partial} bytes \
+                 kept, which are the tail, not the whole output"
+            ));
+        }
+        return Err(format!(
+            "child exited but its output pipes stayed open past {}s (a grandchild still holds \
+             them); {partial} bytes read, which may be truncated",
+            DRAIN_GRACE.as_secs()
+        ));
+    }
+    Ok(captured.output)
 }
 
 /// Like [`git`], but for the NETWORK-touching invocations (a `fetch`): bounds the wall-clock via
@@ -1919,20 +2050,27 @@ pub async fn merge_pr(root: String, number: u64) -> Result<(), String> {
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1");
         apply_noninteractive(&mut cmd);
-        let output = output_with_timeout(cmd, MERGE_TIMEOUT)?;
-        if output.status.success() {
+        // Lenient on purpose: this is a MUTATING call. `gh` inherits its pipes to ssh/credential
+        // helpers that can outlive it, and an unfinished drain must not report a PR that actually
+        // merged as failed — the exit status is the truth here, not the output tail.
+        let captured = output_with_timeout_lenient(cmd, MERGE_TIMEOUT)?;
+        if captured.output.status.success() {
             return Ok(());
         }
+        let output = &captured.output;
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let msg = if stderr.is_empty() {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         } else {
             stderr
         };
+        // `gh`'s own words are what the menu shows, so when they may be short, SAY so — an
+        // unexplained empty reason is the least actionable thing this can return.
+        let note = captured.truncation_note();
         Err(if msg.is_empty() {
-            format!("gh pr merge #{number} failed")
+            format!("gh pr merge #{number} failed{note}")
         } else {
-            msg
+            format!("{msg}{note}")
         })
     })
     .await
@@ -3760,25 +3898,71 @@ mod tests {
         dir
     }
 
-    /// A command that finishes ON TIME but leaves a descendant holding the pipes must still return.
+    /// The regression this whole process-group/bounded-drain rework exists for: a child that forks a
+    /// GRANDCHILD which outlives it and keeps the inherited stdout/stderr write ends open. Killing
+    /// only the direct child leaves the reader blocked in `read` with no EOF, so the old code
+    /// returned `timed out` only after the GRANDCHILD's own 30s — with the plugin-install mutex held
+    /// the whole time. `/bin/sh` throughout so nothing depends on the developer's own shell.
+    #[cfg(unix)]
+    #[test]
+    fn a_surviving_grandchild_cannot_hold_the_drain_past_the_deadline() {
+        let root = unique_root("grandchild-kill");
+        let marker = root.join("grandchild-survived");
+        // Single-quoted in the script: a TMPDIR containing a space would otherwise make `: >` fail,
+        // the marker would never appear, and the "grandchild is dead" assertion below would hold
+        // VACUOUSLY. (No `'` can appear in it — `unique_root` builds the name from a literal and a
+        // pid — so simple quoting is sufficient here.)
+        let marker_arg = format!("'{}'", marker.to_string_lossy());
+        // Prove the marker is actually creatable, so a green run means "killed", not "couldn't
+        // write". This is the assertion that keeps the real one honest.
+        std::fs::write(&marker, "").unwrap();
+        std::fs::remove_file(&marker).unwrap();
+
+        let mut cmd = Command::new("/bin/sh");
+        // The backgrounded subshell is the GRANDCHILD: it inherits the pipes and, if it survives the
+        // kill, touches the marker. `exec sleep 30` is the direct child that hangs past the deadline.
+        cmd.arg("-c").arg(format!("(sleep 1; : > {marker_arg}) & exec sleep 30"));
+        let started = Instant::now();
+        let err = output_with_timeout(cmd, Duration::from_millis(300))
+            .expect_err("a hung child must expire, not block");
+        assert!(err.contains("timed out"), "expiry should say so: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must return at the deadline (+ the drain grace), not after the grandchild's own sleep: \
+             took {:?}",
+            started.elapsed()
+        );
+
+        // The timing above is satisfied by the drain grace alone; THIS is what proves the kill
+        // actually reached the process GROUP rather than just the direct child.
+        std::thread::sleep(Duration::from_millis(1500));
+        let survived = marker.exists();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            !survived,
+            "the grandchild outlived the expiry — the kill did not reach the process group"
+        );
+    }
+
+    /// The OTHER guard, on the path the DEADLINE never runs at all: the child EXITS NORMALLY while a
+    /// grandchild keeps the pipes open. This is the live shape for these callers, since git spawns
+    /// `ssh` ControlPersist and `git credential-cache--daemon` helpers that outlive it.
     ///
-    /// This is the path with no deadline on it at all before: `try_wait` reports the exit, the loop
-    /// breaks, and joining the reader threads waits for a `read_to_end` that only ends when the
-    /// GRANDCHILD does. Real shape, not a contrivance — `git fetch` leaves an ssh ControlMaster and
-    /// `op` talks to a helper, both of which outlive the command that started them.
+    /// The timeout is deliberately LONG (10s) and the assertion tight (2s): the command exits
+    /// immediately, so everything it wrote is already in the pipe and the only thing left to wait on
+    /// is the lingering descendant. That wait is `POST_EXIT_SETTLE` + a group kill, NOT the
+    /// remaining deadline — with a 300ms timeout and a 5s window, bounding by the full deadline
+    /// would have passed just as well, which is the whole distinction being pinned.
     #[cfg(unix)]
     #[test]
     fn a_cleanly_exited_child_cannot_hang_the_call_by_leaving_a_grandchild_on_the_pipes() {
-        // The timeout is deliberately LONG (10s) and the assertion tight (2s): the command exits
-        // immediately, so everything it wrote is already in the pipe and the only thing left to wait
-        // on is the lingering descendant — that wait must be the GRACE, not whatever remains of the
-        // deadline. With a 300ms timeout and a 5s window, bounding by the full deadline would have
-        // passed just as well, which is the whole distinction being pinned.
         let root = unique_root("pgroup-success");
         let pidfile = root.join("grandchild.pid");
-        let mut cmd = Command::new("sh");
+        // The direct child is gone in milliseconds, but the backgrounded `sleep` holds the inherited
+        // pipes for 30s.
+        let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(format!(
-            "echo done; sh -c 'echo $$ > {}; sleep 30' & exit 0",
+            "echo started; sh -c 'echo $$ > {}; sleep 30' & exit 0",
             pidfile.display()
         ));
         let started = Instant::now();
@@ -3786,15 +3970,17 @@ mod tests {
             .expect("the command SUCCEEDED — a lingering descendant must not turn that into an error");
         assert!(
             started.elapsed() < Duration::from_secs(2),
-            "the post-exit drain must be bounded by the grace, not by the remaining deadline; took {:?}",
+            "the post-exit drain must be bounded by the settle + kill, not by the remaining \
+             deadline; took {:?}",
             started.elapsed()
         );
         // The output survives the bounding: killing the group is what closes the pipe, which is what
-        // lets the reader hand its buffer over. Cutting the wait must not cost us the bytes.
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+        // lets the reader reach EOF. Cutting the wait must not cost us the bytes.
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "started");
 
         // And the grandchild is actually GONE — the elapsed-time assertion alone would also pass if
-        // we had simply stopped waiting and left it running.
+        // we had simply stopped waiting and left it running (which is what abandoning the drain did,
+        // at the cost of the bytes, a reader thread and a pipe fd for the holder's whole life).
         let pid: i32 = std::fs::read_to_string(&pidfile)
             .expect("the grandchild should have written its pid")
             .trim()
@@ -3808,109 +3994,196 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        let _ = std::fs::remove_dir_all(&root);
         assert!(!alive, "the group kill must have taken the grandchild (pid {pid}) with it");
     }
 
-    /// `take_by`'s give-up branch: a pipe holder that survives the group kill (a helper daemon
-    /// handed the fd, a `setsid`'d descendant, any Windows caller) must not block the call — and
-    /// must not be reported as an empty-but-successful read either, which callers parse as data.
-    /// A child spawned the way `output_with_timeout` spawns one: its OWN group leader, which is the
-    /// documented precondition of `kill_process_group`. It sleeps rather than exiting immediately,
-    /// so the group kill has something to land on — with `exit 0` the kill hits a reaped group and
-    /// returns ESRCH whether or not the child ever led one, and deleting `process_group(0)` would
-    /// leave these tests green while reinstating the state the precondition rules out.
-    #[cfg(unix)]
-    fn group_leader_child() -> std::process::Child {
-        use std::os::unix::process::CommandExt;
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("sleep 5");
-        cmd.process_group(0);
-        cmd.spawn().unwrap()
-    }
-
+    /// The SAME shape through the lenient form. The child exited 0 and its operation already
+    /// happened, so a mutating caller (`gh pr merge`, `claude plugin install`) must not be told
+    /// anything went wrong — and once the group kill releases the pipe there is nothing wrong to
+    /// tell: the capture is COMPLETE and carries no truncation note.
     #[cfg(unix)]
     #[test]
-    fn take_by_gives_up_rather_than_waiting_forever_on_a_buffer_that_never_arrives() {
-        let (_tx, rx) = mpsc::channel::<Vec<u8>>(); // held open, nothing ever sent
-        let mut child = group_leader_child();
+    fn a_grandchild_holding_the_pipes_open_is_released_not_reported_as_truncation() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("echo started; sleep 30 &");
         let started = Instant::now();
-        let taken = take_by(&rx, Instant::now(), &child);
-        // The give-up path kills the GROUP on its way out, so the still-sleeping child is gone —
-        // which is what makes spawning it as a group leader load-bearing rather than decorative.
-        let status = child.wait().expect("reap");
-        assert!(
-            !status.success(),
-            "the group kill must have taken the sleeping child; it exited cleanly instead"
-        );
-        assert!(taken.is_none(), "a buffer that never arrives must read as GIVEN UP, not as empty");
-        assert!(
-            started.elapsed() < DRAIN_GRACE * 4,
-            "the give-up must happen within the grace; took {:?}",
-            started.elapsed()
-        );
+        let captured =
+            output_with_timeout_lenient(cmd, Duration::from_secs(30)).expect("lenient returns Ok");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(captured.output.status.success(), "the child itself exited 0");
+        assert_eq!(String::from_utf8_lossy(&captured.output.stdout).trim(), "started");
+        assert!(captured.drain_complete, "the kill released the pipe, so the capture is whole");
+        assert_eq!(captured.truncation_note(), "", "nothing was lost, so say nothing");
     }
 
+    /// Past [`DRAIN_BUF_CAP`] the drain keeps READING (so the child never blocks on a full pipe)
+    /// but stops retaining — and that loss must be reported. Dropping bytes while `drain_complete`
+    /// stayed true handed the strict form a plausible prefix with a successful status, which is
+    /// precisely what the strict form exists to prevent.
     #[cfg(unix)]
     #[test]
-    fn take_by_returns_a_buffer_that_arrives_in_time() {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        tx.send(b"hello".to_vec()).unwrap();
-        let mut child = group_leader_child();
-        let taken = take_by(&rx, Instant::now() + Duration::from_secs(1), &child);
-        // Nothing killed this one — the buffer arrived, so take_by returned before the kill path.
-        let _ = child.kill();
-        let _ = child.wait();
-        assert_eq!(taken, Some(b"hello".to_vec()));
+    fn output_past_the_capture_cap_is_reported_not_silently_dropped() {
+        let lines = (DRAIN_BUF_CAP / 1001) + 200; // comfortably past the cap
+        let script = format!("i=0; while [ $i -lt {lines} ]; do printf '%01000d\\n' 0; i=$((i+1)); done");
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(&script);
+        let captured =
+            output_with_timeout_lenient(cmd, Duration::from_secs(30)).expect("the child runs");
+        assert!(captured.output.status.success(), "the child is not blocked by the cap");
+        assert!(captured.stdout_capped, "the cap must be recorded, on the stream that hit it");
+        assert!(!captured.stderr_capped, "stderr wrote nothing and is whole");
+        assert!(!captured.drain_complete, "capped output is not a complete capture");
+        assert!(captured.output.stdout.len() <= DRAIN_BUF_CAP + 8192, "retention is bounded");
+        assert_eq!(
+            captured.truncation_note(),
+            "",
+            "a message built from stderr is intact when only stdout overran"
+        );
+
+        // And the strict form refuses it rather than handing back the prefix.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(&script);
+        let err = output_with_timeout(cmd, Duration::from_secs(30))
+            .expect_err("a prefix must not read as the whole output");
+        assert!(err.contains("capture cap"), "the error must name the cap: {err}");
     }
 
-    /// The deadline path, at the level the behavior actually lives (the `op` test in `onepassword`
-    /// covers it end-to-end, but that one's teeth are a shell string that a later cleanup could
-    /// innocently simplify back to `sleep 30` — which does NOT fork on macOS, silently deleting the
-    /// coverage). Named for the invariant so that edit is obvious.
+    /// The half the note exists for: a chatty FAILING command whose reason is on stderr. What
+    /// survives must be the TAIL — the reason is the last thing written — and the note must say so.
     #[cfg(unix)]
     #[test]
-    fn a_timed_out_child_does_not_leave_a_grandchild_holding_the_pipes() {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("sh -c 'sleep 30' & wait");
-        let started = Instant::now();
-        let err = output_with_timeout(cmd, Duration::from_millis(300)).unwrap_err();
-        assert!(err.contains("timed out"), "got {err}");
+    fn a_capped_stderr_keeps_the_tail_and_says_the_message_may_be_short() {
+        let lines = (DRAIN_BUF_CAP / 1001) + 200;
+        let script = format!(
+            "i=0; while [ $i -lt {lines} ]; do printf '%01000d\\n' 0 >&2; i=$((i+1)); done; \
+             echo 'THE ACTUAL REASON' >&2; exit 1"
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(&script);
+        let captured =
+            output_with_timeout_lenient(cmd, Duration::from_secs(30)).expect("the child runs");
+
+        assert!(!captured.output.status.success());
+        assert!(captured.stderr_capped, "stderr hit the cap");
+        assert!(!captured.stdout_capped, "stdout wrote nothing");
+        assert!(!captured.drain_complete);
+        assert!(captured.output.stderr.len() <= DRAIN_BUF_CAP + 8192, "retention is bounded");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the deadline did not bound the call; took {:?}",
-            started.elapsed()
+            String::from_utf8_lossy(&captured.output.stderr).contains("THE ACTUAL REASON"),
+            "the TAIL survives — keeping the head would drop exactly the line that explains the failure"
+        );
+        assert!(
+            captured.truncation_note().contains("too large"),
+            "and the caller's message says the earlier lines are gone: {}",
+            captured.truncation_note()
         );
     }
 
-    /// The stdout-strict / stderr-lenient decision, in all four combinations. This is the entire
-    /// point of the asymmetry and it is a pure function, so there is no excuse for leaving it to an
-    /// integration shape that a real child can barely produce.
+    /// A clean capture must add nothing, or every healthy error message grows a scary clause.
     #[test]
-    fn finish_is_strict_about_stdout_and_lenient_about_stderr() {
-        // No child: `finish` is pure, which is the reason it was extracted. Spawning `sh` here made
-        // this the only ungated test in the module and would have failed it on Windows — the one
-        // platform where take_by's give-up branch is the NORMAL outcome and this asymmetry matters
-        // most, since there is no group kill there to release the pipe.
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt;
-        #[cfg(windows)]
-        use std::os::windows::process::ExitStatusExt;
-        let ok = std::process::ExitStatus::from_raw(0);
+    fn a_clean_capture_has_no_truncation_note() {
+        // A fresh `Captured` per case: `output` isn't Copy, so a struct-update from one binding
+        // can only be used once.
+        let with = |f: fn(&mut Captured)| {
+            let mut c = Captured {
+                output: std::process::Output {
+                    status: Default::default(),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                drain_complete: true,
+                pipes_held: false,
+                stdout_capped: false,
+                stderr_capped: false,
+                stdout_read_error: false,
+                stderr_read_error: false,
+            };
+            f(&mut c);
+            c
+        };
 
-        // Both arrived: the ordinary case.
-        let out = finish(ok, Some(b"data".to_vec()), Some(b"warn".to_vec())).unwrap();
-        assert_eq!(out.stdout, b"data");
-        assert_eq!(out.stderr, b"warn");
+        assert_eq!(with(|_| {}).truncation_note(), "");
 
-        // stderr abandoned: still a SUCCESS. Failing here would report a merged PR as an error.
-        let out = finish(ok, Some(b"data".to_vec()), None).unwrap();
-        assert_eq!(out.stdout, b"data");
-        assert!(out.stderr.is_empty());
+        // A mid-read failure on STDERR gets its own words: no cap size would have prevented it.
+        let errored = with(|c| {
+            c.drain_complete = false;
+            c.stderr_read_error = true;
+        });
+        assert!(errored.truncation_note().contains("errored mid-read"));
 
-        // stdout abandoned: an ERROR, even though the command exited 0 — an empty stdout would be
-        // parsed as real data by every caller that reads it.
-        assert!(finish(ok, None, Some(b"warn".to_vec())).unwrap_err().contains("truncated"));
-        assert!(finish(ok, None, None).unwrap_err().contains("truncated"));
+        // The note describes what happened to STDERR, which is what both callers build their
+        // message from. A stdout-only problem must not put words in that message...
+        let stdout_only = with(|c| {
+            c.drain_complete = false;
+            c.stdout_capped = true;
+            c.stdout_read_error = true;
+        });
+        assert_eq!(stdout_only.truncation_note(), "", "stderr is whole; say nothing about it");
+
+        // ...and a stdout problem must not SHADOW a real stderr one.
+        let both = with(|c| {
+            c.drain_complete = false;
+            c.stdout_read_error = true;
+            c.stderr_capped = true;
+        });
+        assert!(both.truncation_note().contains("too large"), "the accurate stderr wording wins");
+
+        // A held pipe still gets its clause even when stdout also overran — the case that
+        // previously fell through to "" while stderr really could be short.
+        let held_and_capped = with(|c| {
+            c.drain_complete = false;
+            c.pipes_held = true;
+            c.stdout_capped = true;
+        });
+        assert!(held_and_capped.truncation_note().contains("held the pipes open"));
+    }
+
+    /// Once the caller has taken the buffer, an abandoned thread must stop retaining: the bytes are
+    /// unreachable, and these captures run on ~30s polls against pipe-holders that live for hours.
+    #[cfg(unix)]
+    #[test]
+    fn an_abandoned_drain_stops_retaining_after_its_buffer_is_taken() {
+        let (drain, handle) = spawn_drain(Some(std::io::Cursor::new(vec![b'x'; 4096])));
+        // Take it before the thread necessarily finishes; either way `abandoned` is now set.
+        let _first = take_drained(&drain);
+        let _ = handle.join();
+
+        assert!(drain.abandoned.load(Ordering::Acquire), "take_drained gives up on the buffer");
+        assert!(
+            drain.buf.lock().unwrap().is_empty(),
+            "nothing accumulates after the reader has gone"
+        );
+    }
+
+    /// The `#[cfg(test)]` cap and the "kept whole" fixture are coupled: if the fixture ever grows
+    /// past the cap it lands on the capped path and fails as a confusing `expect()`. Pin it here so
+    /// the failure names the real cause.
+    /// A const assertion, so a fixture or cap change fails at COMPILE time with these words rather
+    /// than as a mysterious `expect()` on the capped path. (`assert!` on two consts is a clippy
+    /// `assertions_on_constants` warning for exactly that reason — it belongs in a const block.)
+    const _: () = assert!(
+        DRAIN_BUF_CAP > 200 * 1001 * 2,
+        "output_with_timeout_captures_both_streams_in_full writes 200*1001 bytes and must stay well \
+         under DRAIN_BUF_CAP"
+    );
+
+    /// The chunked shared-buffer drain must still capture a child's full output — including more
+    /// than one pipe-buffer's worth, which is what a naive "snapshot whatever we have" would drop.
+    #[cfg(unix)]
+    #[test]
+    fn output_with_timeout_captures_both_streams_in_full() {
+        let mut cmd = Command::new("/bin/sh");
+        // ~200KB on stdout (well past the 64KB pipe buffer), a marker on stderr, exit 0.
+        cmd.arg("-c")
+            .arg("i=0; while [ $i -lt 200 ]; do printf '%01000d\\n' 0; i=$((i+1)); done; \
+                  echo 'on stderr' >&2");
+        let out = output_with_timeout(cmd, Duration::from_secs(20)).expect("a fast child succeeds");
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), 200 * 1001, "every stdout byte must survive the drain");
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "on stderr");
     }
 
     /// `remove_repo_hooks` deletes ONLY hooks whose contents carry our vendored marker, and never

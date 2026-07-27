@@ -15,6 +15,7 @@
 //! so they unit-test without a Tauri runtime; the `#[tauri::command]`s are thin
 //! wrappers that resolve `app_data_dir` and delegate.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -109,11 +110,12 @@ pub struct AccountUsage {
 
 /// Cross-project Claude Code spend, returned by [`accounts_spend`] and rendered by the concierge
 /// spend pill. `spend_today_usd` is the estimated USD value of every account's token usage in the
-/// trailing 24h (`WINDOW_24H`), priced per-model from [`rate_for_model`]; the 7d figures are the
-/// same over the longer window. `fallback_model_records` counts in-window records whose model was
-/// unrecognized and therefore priced at the fallback rate — a nonzero value means the total leans
-/// on an estimate for at least one model, never that any usage was dropped. These are *estimates*
-/// (list-price valuations of Max-plan usage), not a billed amount.
+/// trailing 24h (`WINDOW_24H`), priced per-model through `spend::estimate_cost_usd` — the Spend
+/// pane's table; the 7d figures are the same over the longer window. `fallback_model_records`
+/// counts in-window records whose model has NO published rate: their TOKENS are counted and their
+/// DOLLARS are omitted, so a nonzero value means the dollar figure is an under-statement, not an
+/// estimate. (No UI surfaces it yet — bead sparkle-1m8c.) These are *estimates* (list-price
+/// valuations of Max-plan usage), not a billed amount.
 #[derive(Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SpendSummary {
@@ -166,7 +168,11 @@ const WINDOW_7D: i64 = 7 * 24 * 60 * 60;
 // ---- path helpers -------------------------------------------------------------
 
 /// `<app_data>/accounts.json` — the metadata file.
-fn accounts_json_path(app_data: &Path) -> PathBuf {
+///
+/// `pub(crate)` so `hooks.rs` can enumerate the registered config dirs: Claude Code plugins are
+/// installed PER config tree, and an agent spawned on a non-default account resolves plugins under
+/// that account's dir, not `~/.claude`.
+pub(crate) fn accounts_json_path(app_data: &Path) -> PathBuf {
     app_data.join("accounts.json")
 }
 
@@ -198,7 +204,9 @@ fn generate_account_id() -> Result<String, String> {
 
 /// Read `accounts.json`, returning an empty vec when the file is absent (a clean
 /// install). A present-but-unparseable file is an error rather than silent loss.
-fn read_accounts_at(path: &Path) -> Result<Vec<Account>, String> {
+///
+/// `pub(crate)` for the same reason as [`accounts_json_path`].
+pub(crate) fn read_accounts_at(path: &Path) -> Result<Vec<Account>, String> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let mut accounts: Vec<Account> =
@@ -403,15 +411,15 @@ fn mark_exhausted_at(accounts_path: &Path, id: &str, until_epoch: i64) -> Result
 // ---- usage tally (pure) -------------------------------------------------------
 
 /// Read the four token counters Claude Code records in a `usage` object as a tuple
-/// `(input, output, cache_write, cache_read)`. Defensive: any missing/non-numeric field is 0.
-fn read_usage_counts(usage: &serde_json::Value) -> (u64, u64, u64, u64) {
+/// `(input, output, cache_write_5m, cache_write_1h, cache_read)`. Defensive: any missing or
+/// non-numeric field is 0.
+fn read_usage_counts(usage: &serde_json::Value) -> (u64, u64, u64, u64, u64) {
     let g = |k: &str| usage.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-    (
-        g("input_tokens"),
-        g("output_tokens"),
-        g("cache_creation_input_tokens"),
-        g("cache_read_input_tokens"),
-    )
+    // The TTL split comes from `spend::cache_write_split`, not a copy of it: 1h writes bill at 2x
+    // input and 5m at 1.25x, so a second implementation here is a second chance to diverge from the
+    // pane — which is what reading only the flat `cache_creation_input_tokens` did.
+    let (cache_5m, cache_1h) = crate::spend::cache_write_split(usage);
+    (g("input_tokens"), g("output_tokens"), cache_5m, cache_1h, g("cache_read_input_tokens"))
 }
 
 /// Sum the four token counters Claude Code records in a `usage` object. Defensive:
@@ -420,66 +428,19 @@ fn read_usage_counts(usage: &serde_json::Value) -> (u64, u64, u64, u64) {
 /// only for the defensiveness unit test, hence `#[cfg(test)]`.
 #[cfg(test)]
 fn sum_usage_tokens(usage: &serde_json::Value) -> u64 {
-    let (i, o, cw, cr) = read_usage_counts(usage);
-    i.saturating_add(o).saturating_add(cw).saturating_add(cr)
+    let (i, o, cw5, cw1h, cr) = read_usage_counts(usage);
+    i.saturating_add(o).saturating_add(cw5).saturating_add(cw1h).saturating_add(cr)
 }
 
 // ---- per-model USD pricing (pure) --------------------------------------------------------------
 //
 // The spend pill needs a dollar figure, so we value each usage record at Anthropic list price by
-// model. Rates mirror apps/orchestration/src/lib/aiPricing.ts (the authoritative server table) for
-// input/output; cache-write / cache-read follow Anthropic's standard cache multipliers (1.25× /
-// 0.10× the model's base input rate). NOTE these value *Max-plan* usage at list price — an estimate
-// of what the same tokens would cost on the metered API, not a billed amount.
-
-/// Per-model USD rate, dollars per MILLION tokens, split across the four token classes.
-#[derive(Clone, Copy, Debug)]
-struct ModelRate {
-    input: f64,
-    output: f64,
-    cache_write: f64,
-    cache_read: f64,
-}
-
-// Dollars per MTok. Keep these in sync with aiPricing.ts's input/output list prices.
-const RATE_HAIKU: ModelRate = ModelRate { input: 1.0, output: 5.0, cache_write: 1.25, cache_read: 0.10 };
-const RATE_SONNET: ModelRate = ModelRate { input: 3.0, output: 15.0, cache_write: 3.75, cache_read: 0.30 };
-const RATE_OPUS: ModelRate = ModelRate { input: 5.0, output: 25.0, cache_write: 6.25, cache_read: 0.50 };
-/// Fallback for an UNRECOGNIZED model: priced at the mid (Sonnet) tier and flagged by
-/// [`rate_for_model`] so an unknown model is surfaced (never silently dropped or zero-priced).
-const RATE_FALLBACK: ModelRate = RATE_SONNET;
-
-/// Normalize a model id to its rate-table key: strip a trailing context-variant bracket (`[1m]`,
-/// the 1M-context ids Sparkle spawns) and a trailing dated suffix (`-YYYYMMDD`). Mirrors
-/// aiPricing.ts `baseModelId`, plus the bracket handling. e.g. `claude-opus-4-8[1m]` and
-/// `claude-haiku-4-5-20251001` both normalize to their base id.
-fn base_model_id(model: &str) -> &str {
-    let mut m = model;
-    if let Some(idx) = m.find('[') {
-        m = &m[..idx];
-    }
-    // Strip a trailing "-" + exactly 8 digits. Transcript input is untrusted: guard the
-    // byte-boundary so a multibyte tail can't panic split_at (roborev 46151).
-    if m.len() > 9 && m.is_char_boundary(m.len() - 9) {
-        let (head, tail) = m.split_at(m.len() - 9);
-        if tail.as_bytes()[0] == b'-' && tail[1..].bytes().all(|b| b.is_ascii_digit()) {
-            return head;
-        }
-    }
-    m
-}
-
-/// Resolve a model id to `(rate, is_fallback)`. Unknown / absent models resolve to
-/// [`RATE_FALLBACK`] with `is_fallback = true`.
-fn rate_for_model(model: Option<&str>) -> (ModelRate, bool) {
-    match model.map(base_model_id) {
-        Some("claude-haiku-4-5") => (RATE_HAIKU, false),
-        // Sonnet family (4-6, 5, …) shares the mid tier.
-        Some("claude-sonnet-4-6") | Some("claude-sonnet-5") => (RATE_SONNET, false),
-        Some("claude-opus-4-8") => (RATE_OPUS, false),
-        _ => (RATE_FALLBACK, true),
-    }
-}
+// model — through `spend::estimate_cost_usd`, NOT a table of our own. This module used to carry
+// one (four models, everything else priced at the Sonnet rate), which is how the same day's
+// transcripts came out 5x low in the pill for `claude-opus-4-*`, ~40% low for `claude-opus-4-5-*`,
+// and with an invented price for models the pane honestly reported as unpriced. NOTE these value
+// *Max-plan* usage at list price — an estimate of what the same tokens would cost on the metered
+// API, not a billed amount.
 
 /// One usage record: a timestamp, the model that produced it (if recorded), and the four token
 /// counters kept SEPARATE (each is priced at its own rate). Replaces the old `(ts, total)` tuple so
@@ -487,10 +448,15 @@ fn rate_for_model(model: Option<&str>) -> (ModelRate, bool) {
 #[derive(Clone, Debug, PartialEq)]
 struct SpendRecord {
     ts: i64,
+    /// `message.id`, when the line carries one — the resume-dedup key. See
+    /// [`dedupe_by_message_id`].
+    message_id: Option<String>,
     model: Option<String>,
     input: u64,
     output: u64,
-    cache_write: u64,
+    /// Cache WRITES, split by TTL because they bill differently (1.25x vs 2x input).
+    cache_write_5m: u64,
+    cache_write_1h: u64,
     cache_read: u64,
 }
 
@@ -500,7 +466,8 @@ impl SpendRecord {
     fn total_tokens(&self) -> u64 {
         self.input
             .saturating_add(self.output)
-            .saturating_add(self.cache_write)
+            .saturating_add(self.cache_write_5m)
+            .saturating_add(self.cache_write_1h)
             .saturating_add(self.cache_read)
     }
 
@@ -521,21 +488,33 @@ impl SpendRecord {
     /// (`MAX_SAFE_INTEGER`) to stop it benching every account. Excluding them yields a figure that
     /// is both tighter and interpretable (~44M/5h for this user), so a near-cap ceiling can be
     /// learned per account instead of switched off.
+    ///
+    /// Both cache-WRITE TTLs count: they differ in price, not in whether they consumed the limit.
     fn limit_tokens(&self) -> u64 {
         self.input
             .saturating_add(self.output)
-            .saturating_add(self.cache_write)
+            .saturating_add(self.cache_write_5m)
+            .saturating_add(self.cache_write_1h)
     }
 
-    /// `(usd, is_fallback)` — the record's list-price USD value and whether its model was unpriced
-    /// (fallback rate).
-    fn cost_usd(&self) -> (f64, bool) {
-        let (r, fallback) = rate_for_model(self.model.as_deref());
-        let usd = self.input as f64 / 1e6 * r.input
-            + self.output as f64 / 1e6 * r.output
-            + self.cache_write as f64 / 1e6 * r.cache_write
-            + self.cache_read as f64 / 1e6 * r.cache_read;
-        (usd, fallback)
+    /// The record's list-price USD value, or `None` when its model has no published rate.
+    ///
+    /// Priced through `spend::estimate_cost_usd` — the SAME table the Spend pane and the published
+    /// Builder Index row use. This module used to carry its own four-model table with a Sonnet
+    /// fallback, which valued `claude-opus-4-*` at a fifth of the pane's figure and gave unknown
+    /// models an invented Sonnet price, so the app showed three different dollar amounts for one
+    /// day's transcripts. `None` (rather than a guess) is why the pill can say the total EXCLUDES
+    /// something instead of quietly understating it.
+    ///
+    fn cost_usd(&self) -> Option<f64> {
+        crate::spend::estimate_cost_usd(
+            self.model.as_deref()?,
+            self.input,
+            self.output,
+            self.cache_write_5m,
+            self.cache_write_1h,
+            self.cache_read,
+        )
     }
 }
 
@@ -549,29 +528,64 @@ fn token_pairs(records: &[SpendRecord]) -> Vec<(i64, u64)> {
     records.iter().map(|r| (r.ts, r.limit_tokens())).collect()
 }
 
+/// Drop the duplicate copies a RESUME makes: `claude --resume` copies prior turns into the new
+/// transcript, so the same `message.id` appears in several files under the same root. Without this
+/// the pill counted a resumed session twice while the Spend pane (which has always deduped) did
+/// not — one more way the two surfaces disagreed about the same day.
+///
+/// Last copy wins, matching `spend::dedupe_window`. Records with no id can't be matched and are
+/// all kept (the same accepted limit the pane has).
+fn dedupe_by_message_id(records: &[SpendRecord], first_ts: i64, now: i64) -> Vec<&SpendRecord> {
+    let mut position: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut chosen: Vec<&SpendRecord> = Vec::new();
+    for r in records {
+        // Window FIRST, then dedupe — the order `spend::dedupe_window` uses, and it decides
+        // contested cases. Deduping first let an out-of-window resume copy win the id and then be
+        // filtered away, silently dropping the in-window turn entirely. The upper bound matters
+        // too: a clock-skewed transcript otherwise counts here and not in the pane.
+        if r.ts < first_ts || r.ts > now {
+            continue;
+        }
+        match r.message_id.as_deref() {
+            None => chosen.push(r),
+            Some(id) => match position.get(id) {
+                Some(&i) => chosen[i] = r,
+                None => {
+                    position.insert(id, chosen.len());
+                    chosen.push(r);
+                }
+            },
+        }
+    }
+    chosen
+}
+
 /// Aggregate spend records into the trailing-24h ("today") and trailing-7d spend/token totals at
-/// `now`. Records older than 7d are ignored (the 7d window is a superset of today). A record priced
-/// at the fallback rate (unknown model) increments `fallback_model_records` when it lands in the 7d
-/// window, so the caller can tell the figure leans on an estimate.
+/// `now`. Records outside the 7d window are ignored (it is a superset of today). A record whose
+/// model has NO published price increments `fallback_model_records`: its tokens are counted and its
+/// dollars are omitted — the totals under-state rather than lean on an invented rate, which is the
+/// pane's stance and the one the published leaderboard row uses.
 fn spend_summary(records: &[SpendRecord], now: i64) -> SpendSummary {
     let mut spend_today = 0.0f64;
     let mut tokens_today = 0u64;
     let mut spend_7d = 0.0f64;
     let mut tokens_7d = 0u64;
     let mut fallback_model_records = 0u64;
-    for r in records {
-        if r.ts < now - WINDOW_7D {
-            continue;
-        }
-        let (usd, fallback) = r.cost_usd();
+    for r in dedupe_by_message_id(records, now - WINDOW_7D, now) {
         let toks = r.total_tokens();
-        spend_7d += usd;
         tokens_7d = tokens_7d.saturating_add(toks);
-        if fallback {
-            fallback_model_records += 1;
+        match r.cost_usd() {
+            Some(usd) => {
+                spend_7d += usd;
+                if r.ts >= now - WINDOW_24H {
+                    spend_today += usd;
+                }
+            }
+            // Tokens still count; the DOLLARS can't, because we have no rate. Surfaced through
+            // `fallback_model_records` rather than valued at a guessed rate.
+            None => fallback_model_records += 1,
         }
         if r.ts >= now - WINDOW_24H {
-            spend_today += usd;
             tokens_today = tokens_today.saturating_add(toks);
         }
     }
@@ -649,13 +663,60 @@ struct CachedFileUsage {
     modified: SystemTime,
     len: u64,
     records: Vec<SpendRecord>,
+    /// The SCAN GENERATION that last used this entry (stored or hit). Drives eviction — see
+    /// [`usage_cache_store`]. A generation, not a timestamp: within one pass every entry is "recent",
+    /// so a plain LRU under a cyclic scan evicts the files this pass visited FIRST and the next pass
+    /// starts at exactly those — the classic 0%-hit-rate case. `mtime` stays the validity key and
+    /// says nothing about usefulness: an old-mtime transcript is append-only and settled, so it hits
+    /// forever, while the newest file is the one about to be appended to and invalidated anyway —
+    /// which is also why the hard-cap tier evicts NEWEST-mtime first. See
+    /// [`crate::spend::evict_two_tier`], the policy both transcript memos share.
+    last_touch: u64,
 }
+
+/// The ceiling enforced at the END of every pass, live pass or not — `spend::evict_two_tier`'s
+/// tier 2. A single pass can transiently exceed it while it runs.
+const USAGE_CACHE_HARD_CAP: usize = 2 * USAGE_CACHE_MAX_FILES;
 
 type UsageCache = std::collections::HashMap<PathBuf, CachedFileUsage>;
 
-/// Safety valve on the memo's footprint. One entry holds only the usage-bearing records of its
-/// transcript (a handful of [`SpendRecord`]s), so this bound is generous; past it the memo is
-/// dropped wholesale and the next scan repopulates it.
+/// Monotonic scan counter, so "used by the pass that is running" is a comparison rather than a
+/// clock read. Mirrors `spend.rs`'s memo generation.
+struct UsagePass(u64);
+
+impl UsagePass {
+    /// Monotonic, and LIVE until this value drops. RAII rather than a mint/retire pair so a panic
+    /// between them cannot leak the generation into the live set — every entry stamped with it
+    /// would then be exempt from tier-1 eviction forever, and this memo has no stale sweep to heal
+    /// it.
+    fn start() -> Self {
+        static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let g = GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        live_usage_passes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(g);
+        Self(g)
+    }
+
+    fn id(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Drop for UsagePass {
+    fn drop(&mut self) {
+        live_usage_passes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Working-set target for the memo. One entry holds only the usage-bearing records of its
+/// transcript (a handful of [`SpendRecord`]s), so this is generous. It is a TARGET, not the bound:
+/// a pass may exceed it while its own entries are exempt from eviction — [`USAGE_CACHE_HARD_CAP`]
+/// is what actually bounds the footprint. See [`crate::spend::evict_two_tier`].
 const USAGE_CACHE_MAX_FILES: usize = 20_000;
 
 /// Process-wide memo of parsed transcripts, shared by every window's `accounts_usage` call.
@@ -669,34 +730,41 @@ fn usage_cache() -> &'static std::sync::Mutex<UsageCache> {
 /// The memoized records for `path`, if the file is byte-for-byte the one we parsed.
 /// Pure (takes the map) so the hit/miss rules unit-test without touching the static.
 fn usage_cache_lookup<'a>(
-    cache: &'a UsageCache,
+    cache: &'a mut UsageCache,
     path: &Path,
     modified: SystemTime,
     len: u64,
+    generation: u64,
 ) -> Option<&'a [SpendRecord]> {
-    let hit = cache.get(path)?;
-    (hit.modified == modified && hit.len == len).then_some(hit.records.as_slice())
+    let hit = cache.get_mut(path)?;
+    if hit.modified != modified || hit.len != len {
+        return None;
+    }
+    // A hit is a USE, and it also marks the entry as belonging to the running pass — which is what
+    // keeps eviction from throwing away the working set mid-scan.
+    hit.last_touch = generation;
+    Some(hit.records.as_slice())
 }
 
-/// Memoize `records` for `path` under the identity it was parsed at, clearing the map first if it
-/// has grown past {@link USAGE_CACHE_MAX_FILES}. Replacing by path (not inserting a new key per
-/// revision) keeps an append-only transcript to ONE entry no matter how often it grows.
+/// Memoize `records` for `path` under the identity it was parsed at. STORE-ONLY by design: eviction
+/// happens once per pass in [`finish_usage_pass`], because mid-walk "this pass hasn't touched it"
+/// means "hasn't REACHED it yet". Replacing by path (not inserting a new key per revision) keeps an
+/// append-only transcript to ONE entry no matter how often it grows.
 fn usage_cache_store(
     cache: &mut UsageCache,
     path: &Path,
     modified: SystemTime,
     len: u64,
     records: Vec<SpendRecord>,
+    generation: u64,
 ) {
-    if cache.len() >= USAGE_CACHE_MAX_FILES && !cache.contains_key(path) {
-        cache.clear();
-    }
     cache.insert(
         path.to_path_buf(),
         CachedFileUsage {
             modified,
             len,
             records,
+            last_touch: generation,
         },
     );
 }
@@ -708,19 +776,23 @@ fn usage_cache_store(
 /// usage-bearing line. Keyed on the `(modified, len)` the caller already stat'ed, a repeat scan
 /// costs one map lookup per file and re-parses only the transcripts actually appended to since.
 ///
+/// `generation` marks every entry this pass touches, so eviction can leave the working set alone —
+/// see [`evict_usage_cache`].
+///
 /// Degrades to the uncached parse whenever the memo can't be trusted or reached: no stat (`meta`
 /// is `None` — the caller's fail-open path) or a poisoned lock.
 fn collect_usage_from_file_memoized(
     path: &Path,
     meta: Option<&std::fs::Metadata>,
     out: &mut Vec<SpendRecord>,
+    generation: u64,
 ) {
     let Some((modified, len)) = meta.and_then(|m| m.modified().ok().map(|t| (t, m.len()))) else {
         collect_usage_from_file(path, out);
         return;
     };
-    if let Ok(cache) = usage_cache().lock() {
-        if let Some(records) = usage_cache_lookup(&cache, path, modified, len) {
+    if let Ok(mut cache) = usage_cache().lock() {
+        if let Some(records) = usage_cache_lookup(&mut cache, path, modified, len, generation) {
             out.extend_from_slice(records);
             return;
         }
@@ -728,7 +800,7 @@ fn collect_usage_from_file_memoized(
     let mut fresh = Vec::new();
     collect_usage_from_file(path, &mut fresh);
     if let Ok(mut cache) = usage_cache().lock() {
-        usage_cache_store(&mut cache, path, modified, len, fresh.clone());
+        usage_cache_store(&mut cache, path, modified, len, fresh.clone(), generation);
     }
     out.append(&mut fresh);
 }
@@ -737,7 +809,8 @@ fn collect_usage_from_file_memoized(
 /// into `out`. Best-effort and DEFENSIVE: a missing file, a non-JSON line, or a line missing
 /// `timestamp`/`usage` is skipped rather than failing the whole scan. The `usage` object and the
 /// `model` are read from `message.*` (where Claude Code records them), falling back to a top-level
-/// `usage` for robustness. `model` is `None` when absent (priced at the fallback rate).
+/// `usage` for robustness. `model` is `None` when absent — no published rate, so its tokens are
+/// counted and its dollars omitted.
 fn collect_usage_from_file(path: &Path, out: &mut Vec<SpendRecord>) {
     let Ok(file) = std::fs::File::open(path) else {
         return;
@@ -764,14 +837,27 @@ fn collect_usage_from_file(path: &Path, out: &mut Vec<SpendRecord>) {
             .and_then(|m| m.get("usage"))
             .or_else(|| v.get("usage"));
         let Some(usage) = usage else { continue };
-        let (input, output, cache_write, cache_read) = read_usage_counts(usage);
+        let (input, output, cache_write_5m, cache_write_1h, cache_read) = read_usage_counts(usage);
         // `message.model` names the model that produced the usage; fall back to a top-level `model`.
         let model = message
             .and_then(|m| m.get("model"))
             .or_else(|| v.get("model"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        let rec = SpendRecord { ts, model, input, output, cache_write, cache_read };
+        let message_id = message
+            .and_then(|m| m.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let rec = SpendRecord {
+            ts,
+            message_id,
+            model,
+            input,
+            output,
+            cache_write_5m,
+            cache_write_1h,
+            cache_read,
+        };
         if rec.total_tokens() > 0 {
             out.push(rec);
         }
@@ -797,15 +883,153 @@ fn collect_usage_from_file(path: &Path, out: &mut Vec<SpendRecord>) {
 /// so skipping it changes no in-window total while avoiding streaming+parsing the whole file on the
 /// main thread. Pass `0` to disable the filter (stat every file in). A file whose mtime can't be
 /// read fails OPEN (is parsed), so we never under-count on a stat error.
+///
+/// Single-root convenience: one root, one pass, eviction at the end. Production callers go through
+/// [`collect_usage_records_across`] with a generation that spans every root of their pass, so this
+/// is `#[cfg(test)]` — a per-root pass boundary is exactly the bug `finish_usage_pass` documents.
+#[cfg(test)]
 fn collect_usage_records(projects_root: &Path, cutoff_epoch: i64, out: &mut Vec<SpendRecord>) {
-    let Ok(entries) = std::fs::read_dir(projects_root) else {
+    let pass = UsagePass::start();
+    let touched = collect_usage_records_across(
+        std::slice::from_ref(&projects_root.to_path_buf()),
+        cutoff_epoch,
+        out,
+        pass.id(),
+    );
+    finish_usage_pass(pass, touched > 0);
+}
+
+/// Walk EVERY root, then parse oldest-mtime first (ties by path) across all of them, with the memo
+/// `generation` handed in.
+///
+/// Both halves matter. The ORDER is `spend::load_records`' order, and it is the reason its "last
+/// copy of an id wins" rule means "attributed to the newer transcript": parsing in `read_dir` order
+/// left that winner inode-dependent, so the pill's totals could differ run-to-run on one tree.
+/// Sorting per ROOT wasn't enough either — that yields "root order, then mtime", so an id contested
+/// ACROSS roots still resolved differently here than in the pane, which sorts the whole set.
+///
+/// One `generation` for the whole pass, across every root: eviction must not treat the roots as
+/// separate scans, or it throws away the working set mid-pass.
+/// Returns how many FILES this walk touched, which is what `touched_any` needs to mean: a machine
+/// with accounts configured but no `projects/` dir under any of them has a non-empty account list
+/// and reads nothing, and evicting on behalf of that pass trims the memo for nobody.
+fn collect_usage_records_across(
+    roots: &[PathBuf],
+    cutoff_epoch: i64,
+    out: &mut Vec<SpendRecord>,
+    generation: u64,
+) -> usize {
+    // Two roots can OVERLAP without being identical — one nested under the other — and the
+    // canonical-key set only catches identical trees. The same transcript would then be parsed
+    // twice and its id-less records counted twice. Deduped on the PATH as the walk goes, not by
+    // adjacency after the sort: each root's walk takes its own `metadata`, so a transcript appended
+    // to between two walks gets two different mtimes, lands non-adjacent, and slips through — and
+    // the file most likely to be appended mid-walk is the active session's.
+    let mut files: Vec<(PathBuf, Option<std::fs::Metadata>, SystemTime)> = Vec::new();
+    // Keyed on the CANONICAL path, like every other overlap guard on this path. Two roots can reach
+    // one file by different spellings — `~/.claude/projects` and an account `projects/` symlinked
+    // to it survive `order_roots` as distinct roots, and `order_roots`' own doc names that shape as
+    // one that occurs — so a raw-path set would let the same transcript through twice. The RAW path
+    // is what goes into `files`, so the memo key and the walk still agree.
+    // Skipped entirely for a single root: `canonical_key` is an `fs::canonicalize` per file, and
+    // with one root a cross-root duplicate cannot exist. `usage_for_account` always passes exactly
+    // one root, on the agent-spawn critical path over the largest tree in the install.
+    let single = roots.len() < 2;
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for root in roots {
+        let mut found = Vec::new();
+        collect_usage_files(root, cutoff_epoch, &mut found);
+        if single {
+            files.append(&mut found);
+            continue;
+        }
+        // Only ACROSS roots. A file reached from a previous root is dropped; duplicates WITHIN one
+        // root are left alone, because a transcript symlinked into a second project under the same
+        // root is long-standing counted behavior with its own tests — changing that is a separate
+        // decision from closing the root-overlap hole.
+        let keys: Vec<PathBuf> =
+            found.iter().map(|(p, _, _)| crate::spend::canonical_key(p)).collect();
+        files.extend(
+            found
+                .into_iter()
+                .zip(keys.iter())
+                .filter(|(_, key)| !seen.contains(*key))
+                .map(|(f, _)| f),
+        );
+        seen.extend(keys);
+    }
+    files.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    for (path, meta, _) in &files {
+        // Memoized on the stat taken during the walk. Sound because these transcripts are
+        // APPEND-ONLY — the writer only ever adds lines — so an unchanged (mtime, len) is an
+        // unchanged file. That invariant lives outside this module; if transcripts ever gain
+        // in-place rewrites, the memo key has to become a digest rather than an identity.
+        collect_usage_from_file_memoized(path, meta.as_ref(), out, generation);
+    }
+    files.len()
+}
+
+/// Trim the memo at the end of a PASS. Call once per command, after every root of that pass has
+/// been walked — never per root or per account.
+///
+/// `accounts_usage` maps over accounts, and each account used to mint its own generation and evict
+/// at the end of its own walk against the PROCESS-WIDE memo: account 1's eviction saw accounts
+/// 2..N's entries as another generation's and trimmed them, account 2 re-parsed what was just
+/// dropped and evicted account 1's, and so on. That caller sits on the agent-spawn critical path.
+///
+/// `touched_any` skips the work for a pass that read nothing (no accounts, or every `config_dir`
+/// resolving to no projects root): evicting on behalf of a pass that opened no files would trim the
+/// memo for nobody's benefit.
+///
+/// The policy is [`crate::spend::evict_two_tier`] — ONE implementation for both transcript memos,
+/// which had already drifted into documenting opposite rationales for the same tier.
+fn finish_usage_pass(pass: UsagePass, touched_any: bool) {
+    if touched_any {
+        if let Ok(mut cache) = usage_cache().lock() {
+            crate::spend::evict_two_tier(
+                &mut cache,
+                USAGE_CACHE_MAX_FILES,
+                USAGE_CACHE_HARD_CAP,
+                |g| {
+                    g != pass.id()
+                        && live_usage_passes()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .contains(&g)
+                },
+                |c| (c.last_touch, c.modified),
+            );
+        }
+    }
+    // `pass` drops here, clearing itself from the live set. Note the `is_live` closure above
+    // excludes THIS pass explicitly: its entries are the ones being trimmed against, and it is
+    // still registered while the closure runs.
+}
+
+/// The usage-scan generations currently RUNNING — tier 1 of the eviction never touches their
+/// entries. Commands OVERLAP (`accounts_usage` and `accounts_spend` are separate `spawn_blocking`
+/// tasks over one process-wide memo), so "not my generation" is not the same as "nobody wants it":
+/// whichever finished first used to trim the other's working set out from under it.
+fn live_usage_passes() -> &'static std::sync::Mutex<HashSet<u64>> {
+    static LIVE: std::sync::OnceLock<std::sync::Mutex<HashSet<u64>>> = std::sync::OnceLock::new();
+    LIVE.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// The walk half of [`collect_usage_records_across`]: every in-window `.jsonl` under `root`, with the stat
+/// that both filtered it and keys the memo, plus its mtime as the sort key.
+fn collect_usage_files(
+    root: &Path,
+    cutoff_epoch: i64,
+    out: &mut Vec<(PathBuf, Option<std::fs::Metadata>, SystemTime)>,
+) {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
         let path = entry.path();
         if ft.is_dir() {
-            collect_usage_records(&path, cutoff_epoch, out);
+            collect_usage_files(&path, cutoff_epoch, out);
         } else if path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
@@ -818,8 +1042,9 @@ fn collect_usage_records(projects_root: &Path, cutoff_epoch: i64, out: &mut Vec<
             // Fail open: if the stat/mtime read errors (e.g. broken symlink), we don't skip.
             // The same stat also keys the parse memo below, so an in-window file costs one stat.
             let meta = std::fs::metadata(&path).ok();
+            let modified = meta.as_ref().and_then(|m| m.modified().ok());
             if cutoff_epoch > 0 {
-                if let Some(modified) = meta.as_ref().and_then(|m| m.modified().ok()) {
+                if let Some(modified) = modified {
                     if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
                         if (dur.as_secs() as i64) < cutoff_epoch {
                             continue;
@@ -827,11 +1052,9 @@ fn collect_usage_records(projects_root: &Path, cutoff_epoch: i64, out: &mut Vec<
                     }
                 }
             }
-            // Memoized on that stat. Sound because these transcripts are APPEND-ONLY — the
-            // writer only ever adds lines — so an unchanged (mtime, len) is an unchanged file.
-            // That invariant lives outside this module; if transcripts ever gain in-place
-            // rewrites, the memo key has to become a digest rather than an identity.
-            collect_usage_from_file_memoized(&path, meta.as_ref(), out);
+            // Unreadable mtime sorts oldest — it already failed OPEN into the window above, and an
+            // arbitrary-but-fixed position keeps the order deterministic.
+            out.push((path, meta, modified.unwrap_or(UNIX_EPOCH)));
         }
     }
 }
@@ -1119,7 +1342,18 @@ fn ceiling_for_account(acct: &Account, now: i64) -> AccountCeiling {
         let episodes = limit_episodes(times);
         if !episodes.is_empty() {
             let mut records = Vec::new();
-            collect_usage_records(&root, since, &mut records);
+            // Its OWN pass, not a bare walk: this runs from `accounts_ceilings`, which is a
+            // separate `spawn_blocking` task from `accounts_usage`/`accounts_spend` over the same
+            // process-wide memo. Registering the pass is what keeps a concurrent scan from evicting
+            // this one's working set mid-walk (see `finish_usage_pass` / `live_usage_passes`).
+            let pass = UsagePass::start();
+            let touched = collect_usage_records_across(
+                std::slice::from_ref(&root),
+                since,
+                &mut records,
+                pass.id(),
+            );
+            finish_usage_pass(pass, touched > 0);
             records.sort_by_key(|r| r.ts);
             for ep in episodes {
                 let c = consumption_before(&records, ep);
@@ -1154,20 +1388,53 @@ fn ceiling_cache() -> &'static std::sync::Mutex<CeilingCache> {
 /// root the SAME way session detection does (`claude.rs::claude_projects_root`,
 /// passing the account's own `config_dir`), then buckets. A stored
 /// `exhausted_until` is surfaced only while still in the future.
-fn usage_for_account(acct: &Account, now: i64) -> AccountUsage {
+/// Usage for EVERY account in one pass: one generation across all of them, eviction once at the
+/// end. Extracted from the command body so the invariant is testable — inlined there, reverting to
+/// a generation per account left every test green while restoring the memo thrash.
+fn usage_for_accounts(accounts: &[Account], now: i64) -> Vec<AccountUsage> {
+    let pass = UsagePass::start();
+    let mut touched = 0usize;
+    let usage: Vec<AccountUsage> = accounts
+        .iter()
+        .map(|a| {
+            let (u, n) = usage_for_account(a, now, pass.id());
+            touched += n;
+            u
+        })
+        .collect();
+    finish_usage_pass(pass, touched > 0);
+    usage
+}
+
+fn usage_for_account(acct: &Account, now: i64, generation: u64) -> (AccountUsage, usize) {
     let mut records = Vec::new();
+    let mut touched = 0usize;
+    // Through the shared resolver, which passes `$HOME`: the DEFAULT account stores an empty
+    // config_dir, and without that fallback it resolves to None and reports zero usage while its
+    // sessions pile up under `$HOME/.claude/projects`.
     if let Some(root) = projects_root_for_account(acct) {
         // Only files touched within the trailing 7d window can hold in-window records; older ones
-        // are skipped by mtime before we open them (see collect_usage_records).
-        collect_usage_records(&root, now - WINDOW_7D, &mut records);
+        // are skipped by mtime before we open them (see `collect_usage_files`).
+        //
+        // The caller's `generation` — every account in one `accounts_usage` call is ONE pass over
+        // the shared memo, and eviction happens after the last of them (`finish_usage_pass`).
+        touched = collect_usage_records_across(
+            std::slice::from_ref(&root),
+            now - WINDOW_7D,
+            &mut records,
+            generation,
+        );
     }
     let (tokens_5h, tokens_7d) = bucket_tokens(&token_pairs(&records), now);
-    AccountUsage {
-        id: acct.id.clone(),
-        tokens_5h,
-        tokens_7d,
-        exhausted_until: acct.exhausted_until.filter(|&e| e > now),
-    }
+    (
+        AccountUsage {
+            id: acct.id.clone(),
+            tokens_5h,
+            tokens_7d,
+            exhausted_until: acct.exhausted_until.filter(|&e| e > now),
+        },
+        touched,
+    )
 }
 
 // ---- real OAuth identity (pure) -----------------------------------------------
@@ -1366,16 +1633,21 @@ pub async fn accounts_usage(app: AppHandle) -> Result<Vec<AccountUsage>, String>
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<AccountUsage>, String> {
         let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
         let now = now_secs();
-        Ok(accounts.iter().map(|a| usage_for_account(a, now)).collect())
+        Ok(usage_for_accounts(&accounts, now))
     })
     .await
     .map_err(|e| format!("accounts_usage task failed: {e}"))?
 }
 
 /// Cross-project Claude Code spend "today" (trailing 24h) plus a 7d figure — the concierge spend
-/// pill's data source. Aggregates every account's transcripts, valued per-model at list price (see
-/// [`spend_summary`] / [`rate_for_model`]). Distinct config dirs are deduped by resolved projects
-/// root so two account records pointing at the same dir can't double-count.
+/// pill's data source. Scans the same roots as the Spend pane (`spend::transcript_roots`) plus any
+/// account whose config dir lives outside app-data, dedupes resumed turns by message id, and values
+/// each record through the pane's price table (see [`spend_summary`] / [`SpendRecord::cost_usd`]).
+///
+/// The windows are the pill's own and deliberately ROLLING (trailing 24h / 7d), where the pane
+/// buckets by UTC civil day — that difference is intentional and visible in the labels ("today" vs
+/// a dated calendar). Everything else — roots, dedupe, prices — is shared, because those three
+/// disagreeing is just three wrong numbers.
 ///
 /// `async` + `spawn_blocking`: scans every account's transcript tree (the same heavy IO as
 /// `accounts_usage`), so it must stay off the Tauri event-loop thread.
@@ -1386,18 +1658,44 @@ pub async fn accounts_spend(app: AppHandle) -> Result<SpendSummary, String> {
         let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
         let now = now_secs();
         let mut records = Vec::new();
-        let mut seen_roots = std::collections::HashSet::new();
+        // `spend::transcript_roots` FIRST, so the pill covers exactly what the Spend pane covers:
+        // `~/.claude` plus every account store under app-data, deduped canonically. Scanning only
+        // the dirs named in accounts.json meant a fresh install — or any machine whose usage lives
+        // in ~/.claude — showed $0.00 in the pill next to a pane full of real spend.
+        //
+        // Scanned in the ORDER that function returns (a Vec, not a set): with last-copy-wins dedupe
+        // the scan order decides which copy of a contested id survives, so iterating a HashSet made
+        // the totals vary between runs of the same tree. Membership is tracked on the CANONICAL key
+        // for the same reason `transcript_roots` dedupes that way — two spellings of one tree would
+        // otherwise scan twice, and the id-less records would double-count.
+        let mut roots = crate::spend::transcript_roots(Some(&app_data));
+        let mut seen_roots: HashSet<PathBuf> =
+            roots.iter().map(|p| crate::spend::canonical_key(p)).collect();
+        // Plus any account whose config dir points somewhere else entirely (an imported account
+        // living outside app-data).
         for a in &accounts {
             if let Some(root) = projects_root_for_account(a) {
                 // Dedupe: two account records with the same config dir would otherwise scan the
                 // same transcripts twice and double the spend total. This also collapses a pre-fix
                 // default (`$HOME/.claude`) and a post-fix one (`""`) — both resolve to
                 // `$HOME/.claude/projects` — so a migrated install can't double-count.
-                if seen_roots.insert(root.clone()) {
-                    collect_usage_records(&root, now - WINDOW_7D, &mut records);
+                //
+                // On the CANONICAL key, not the raw path: that collapses the two spellings above
+                // AND a symlinked store, which a raw-path set lets through. Collected into `roots`
+                // rather than scanned here, so the whole pass is one walk with one memo generation
+                // (below) — a per-root scan is exactly the pass boundary `finish_usage_pass`
+                // documents as the bug.
+                if seen_roots.insert(crate::spend::canonical_key(&root)) {
+                    roots.push(root);
                 }
             }
         }
+        // ONE walk, ONE global sort, ONE memo generation for the whole pass — see
+        // `collect_usage_records_across`.
+        let pass = UsagePass::start();
+        let touched =
+            collect_usage_records_across(&roots, now - WINDOW_7D, &mut records, pass.id());
+        finish_usage_pass(pass, touched > 0);
         Ok(spend_summary(&records, now))
     })
     .await
@@ -1738,7 +2036,16 @@ mod tests {
     /// Memo-test shorthand: a SpendRecord with only (ts, output) set — the shape the old
     /// (ts, tokens) tuple carried.
     fn rec(ts: i64, output: u64) -> SpendRecord {
-        SpendRecord { ts, model: None, input: 0, output, cache_write: 0, cache_read: 0 }
+        SpendRecord {
+            ts,
+            message_id: None,
+            model: None,
+            input: 0,
+            output,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        }
     }
 
     /// A (modified, len) pair distinct from base, for the miss cases.
@@ -1755,29 +2062,31 @@ mod tests {
         // field would fail here, not just totals (roborev 47050).
         let full = SpendRecord {
             ts: 100,
+            message_id: Some("msg_full".into()),
             model: Some("claude-opus-4-8".into()),
             input: 3,
             output: 20,
-            cache_write: 7,
+            cache_write_5m: 7,
+            cache_write_1h: 0,
             cache_read: 11,
         };
-        usage_cache_store(&mut cache, path, at, 42, vec![full.clone()]);
+        usage_cache_store(&mut cache, path, at, 42, vec![full.clone()], 1);
 
         assert_eq!(
-            usage_cache_lookup(&cache, path, at, 42),
+            usage_cache_lookup(&mut cache, path, at, 42, 1),
             Some([full].as_slice()),
             "same mtime + same length is the same bytes — reuse the parse"
         );
         assert!(
-            usage_cache_lookup(&cache, path, shifted(at), 42).is_none(),
+            usage_cache_lookup(&mut cache, path, shifted(at), 42, 1).is_none(),
             "an appended-to transcript has a newer mtime — must re-parse"
         );
         assert!(
-            usage_cache_lookup(&cache, path, at, 43).is_none(),
+            usage_cache_lookup(&mut cache, path, at, 43, 1).is_none(),
             "a different length is different bytes — must re-parse"
         );
         assert!(
-            usage_cache_lookup(&cache, Path::new("/tmp/other.jsonl"), at, 42).is_none(),
+            usage_cache_lookup(&mut cache, Path::new("/tmp/other.jsonl"), at, 42, 1).is_none(),
             "the memo is keyed per file"
         );
     }
@@ -1790,41 +2099,157 @@ mod tests {
         let path = Path::new("/tmp/sparkle-usage-memo/grows.jsonl");
         let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let mut cache = UsageCache::new();
-        usage_cache_store(&mut cache, path, at, 10, vec![rec(1, 5)]);
-        usage_cache_store(&mut cache, path, shifted(at), 20, vec![rec(1, 5), rec(2, 7)]);
+        usage_cache_store(&mut cache, path, at, 10, vec![rec(1, 5)], 1);
+        usage_cache_store(&mut cache, path, shifted(at), 20, vec![rec(1, 5), rec(2, 7)], 1);
 
         assert_eq!(cache.len(), 1, "one entry per path, not per revision");
         assert_eq!(
-            usage_cache_lookup(&cache, path, shifted(at), 20),
+            usage_cache_lookup(&mut cache, path, shifted(at), 20, 1),
             Some([rec(1, 5), rec(2, 7)].as_slice()),
             "the latest parse wins"
         );
         assert!(
-            usage_cache_lookup(&cache, path, at, 10).is_none(),
+            usage_cache_lookup(&mut cache, path, at, 10, 1).is_none(),
             "the superseded revision is gone"
         );
     }
 
     #[test]
-    fn usage_memo_drops_everything_once_past_its_cap() {
-        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    fn usage_memo_evicts_after_the_pass_never_a_live_pass_and_converges() {
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let base = 1_700_000_000;
+        let (target, hard_cap) = (10usize, 20usize);
+        let live = |gens: &[u64]| {
+            let set: HashSet<u64> = gens.iter().copied().collect();
+            move |g: u64| set.contains(&g)
+        };
+        let evict = |c: &mut UsageCache, gens: &[u64]| {
+            crate::spend::evict_two_tier(c, target, hard_cap, live(gens), |v| (v.last_touch, v.modified));
+        };
+
         let mut cache = UsageCache::new();
-        for i in 0..USAGE_CACHE_MAX_FILES {
-            usage_cache_store(&mut cache, &PathBuf::from(format!("/t/{i}.jsonl")), at, 1, vec![]);
+        // Pass 1 fills the memo past the target. Distinct mtimes, oldest first.
+        for i in 0..16u64 {
+            usage_cache_store(&mut cache, &PathBuf::from(format!("/t/{i}.jsonl")), at(base + i), 1, vec![], 1);
         }
-        assert_eq!(cache.len(), USAGE_CACHE_MAX_FILES);
+        assert_eq!(cache.len(), 16, "storing never evicts — that is the pass's own working set");
 
-        usage_cache_store(&mut cache, Path::new("/t/one-too-many.jsonl"), at, 1, vec![]);
-        assert_eq!(cache.len(), 1, "at the cap a NEW file clears the memo first");
-
-        // Re-storing a path already held must NOT trip the clear — that would throw away the whole
-        // memo every scan once the tree is big enough to sit at the cap.
-        let mut full = UsageCache::new();
-        for i in 0..USAGE_CACHE_MAX_FILES {
-            usage_cache_store(&mut full, &PathBuf::from(format!("/t/{i}.jsonl")), at, 1, vec![]);
+        // Pass 2 starts where the scan starts: the OLDEST files. Those hit, marking them as pass 2's.
+        for i in 0..4u64 {
+            assert!(
+                usage_cache_lookup(&mut cache, &PathBuf::from(format!("/t/{i}.jsonl")), at(base + i), 1, 2).is_some(),
+                "a second pass over the same files must HIT, not re-parse"
+            );
         }
-        usage_cache_store(&mut full, Path::new("/t/0.jsonl"), shifted(at), 2, vec![]);
-        assert_eq!(full.len(), USAGE_CACHE_MAX_FILES, "a re-parse of a known file is not growth");
+        // A new session transcript appears mid-pass — storing must not evict anything.
+        usage_cache_store(&mut cache, Path::new("/t/new.jsonl"), at(base + 999), 1, vec![], 2);
+        for i in 4..16u64 {
+            assert!(
+                cache.contains_key(&PathBuf::from(format!("/t/{i}.jsonl"))),
+                "an entry this pass has not REACHED yet must survive a mid-walk store"
+            );
+        }
+
+        // End of pass 2 — but pass 3 is ALSO live (the commands overlap). Nothing belonging to
+        // either may be evicted; that mutual trimming is the bug the live registry closes.
+        usage_cache_store(&mut cache, Path::new("/t/other.jsonl"), at(base + 5), 1, vec![], 3);
+        evict(&mut cache, &[2, 3]);
+        for i in 0..4u64 {
+            assert!(cache.contains_key(&PathBuf::from(format!("/t/{i}.jsonl"))), "pass 2's entries");
+        }
+        assert!(cache.contains_key(Path::new("/t/other.jsonl")), "the CONCURRENT pass's entry");
+        assert_eq!(cache.len(), target, "trimmed to the target out of pass 1's leftovers only");
+
+        // Tier 2: a first pass over a tree larger than the cap has NO evictable entries under tier
+        // 1 (they are all its own), so without a hard cap the memo simply grows.
+        let mut huge = UsageCache::new();
+        for i in 0..(hard_cap + 5) as u64 {
+            usage_cache_store(&mut huge, &PathBuf::from(format!("/h/{i}.jsonl")), at(base + i), 1, vec![], 7);
+        }
+        evict(&mut huge, &[7]);
+        assert_eq!(huge.len(), hard_cap, "the hard cap is enforced against a live pass too");
+        assert!(
+            huge.contains_key(Path::new("/h/0.jsonl")),
+            "the settled, oldest transcript is kept — it stays valid and hits forever"
+        );
+        assert!(
+            !huge.contains_key(&PathBuf::from(format!("/h/{}.jsonl", hard_cap + 4))),
+            "the newest is the one dropped — an append was about to invalidate it anyway"
+        );
+
+        // CONVERGENCE: pass 8 re-walks the same oversized tree. The retained entries hit, the
+        // dropped newest ones are re-parsed and re-stored, and eviction settles on the SAME set.
+        let after_first: Vec<PathBuf> = {
+            let mut k: Vec<PathBuf> = huge.keys().cloned().collect();
+            k.sort();
+            k
+        };
+        for p in &after_first {
+            let i: u64 = p.file_stem().unwrap().to_string_lossy().parse().unwrap();
+            assert!(usage_cache_lookup(&mut huge, p, at(base + i), 1, 8).is_some(), "retained ⇒ hits");
+        }
+        for i in hard_cap as u64..(hard_cap + 5) as u64 {
+            usage_cache_store(&mut huge, &PathBuf::from(format!("/h/{i}.jsonl")), at(base + i), 1, vec![], 8);
+        }
+        evict(&mut huge, &[8]);
+        let after_second: Vec<PathBuf> = {
+            let mut k: Vec<PathBuf> = huge.keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(after_second, after_first, "an oversized tree reaches a STABLE set, not a thrash");
+    }
+
+    /// One generation per COMMAND, spanning every account. Per-account generations made account 1's
+    /// walk-end eviction trim accounts 2..N's entries out of the process-wide memo — on the
+    /// agent-spawn critical path.
+    #[test]
+    fn usage_for_accounts_is_one_pass_over_every_account() {
+        let base = unique_dir("accounts-pass");
+        let mk = |name: &str, tokens: u64| {
+            let cfg = base.join(name);
+            let proj = cfg.join("projects").join("p");
+            std::fs::create_dir_all(&proj).unwrap();
+            std::fs::write(
+                proj.join("s.jsonl"),
+                format!(
+                    "{{\"timestamp\":\"2026-06-25T21:20:25.931Z\",\"type\":\"assistant\",\
+                     \"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\
+                     \"input_tokens\":{tokens},\"output_tokens\":0,\
+                     \"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}}}\n"
+                ),
+            )
+            .unwrap();
+            Account {
+                id: name.into(),
+                nickname: name.into(),
+                config_dir: cfg.to_string_lossy().into_owned(),
+                is_default: false,
+                created_at: 0,
+                exhausted_until: None,
+            }
+        };
+        let accounts = vec![mk("acct-a", 11), mk("acct-b", 22)];
+        let now = parse_iso8601_to_epoch("2026-06-25T21:30:00.000Z").unwrap();
+
+        let usage = usage_for_accounts(&accounts, now);
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0].tokens_7d, 11, "each account still sees only its own transcripts");
+        assert_eq!(usage[1].tokens_7d, 22);
+
+        // The INVARIANT, asserted directly rather than through eviction: both accounts' entries
+        // carry the SAME generation. Checking only that both survived proved nothing at this scale
+        // — eviction is gated on len() > 20_000, so a generation per account passed too.
+        let cache = usage_cache().lock().unwrap();
+        let stamps: HashSet<u64> = cache
+            .iter()
+            .filter(|(p, _)| p.starts_with(&base))
+            .map(|(_, c)| c.last_touch)
+            .collect();
+        assert_eq!(stamps.len(), 1, "one generation across every account in the call");
+        drop(cache);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1846,21 +2271,30 @@ mod tests {
         let meta = std::fs::metadata(&path).unwrap();
 
         let mut first = Vec::new();
-        collect_usage_from_file_memoized(&path, Some(&meta), &mut first);
+        collect_usage_from_file_memoized(&path, Some(&meta), &mut first, 1);
         assert_eq!(
             first,
-            vec![SpendRecord { ts: epoch, model: None, input: 10, output: 5, cache_write: 0, cache_read: 0 }],
+            vec![SpendRecord {
+                ts: epoch,
+                message_id: None,
+                model: None,
+                input: 10,
+                output: 5,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+                cache_read: 0,
+            }],
             "cold scan parses the file"
         );
 
         std::fs::remove_file(&path).unwrap();
         let mut second = Vec::new();
-        collect_usage_from_file_memoized(&path, Some(&meta), &mut second);
+        collect_usage_from_file_memoized(&path, Some(&meta), &mut second, 2);
         assert_eq!(second, first, "warm scan is served from the memo, not the disk");
 
         // No stat to key on (the caller's fail-open path) → parse, which now finds nothing.
         let mut unkeyed = Vec::new();
-        collect_usage_from_file_memoized(&path, None, &mut unkeyed);
+        collect_usage_from_file_memoized(&path, None, &mut unkeyed, 3);
         assert!(unkeyed.is_empty(), "without a stat the memo is bypassed entirely");
 
         let _ = std::fs::remove_dir_all(&base);
@@ -1908,7 +2342,7 @@ mod tests {
 
         let acct = sample("u1", false, config.to_str().unwrap());
         // `now` just after the transcript timestamp so it lands in both windows.
-        let usage = usage_for_account(&acct, recent_epoch + 10);
+        let usage = usage_for_account(&acct, recent_epoch + 10, 1).0;
         // The fixture record is input 10 + output 5 + cache_write 2 + cache_read 3. The near-cap
         // windows report 17, NOT 20 — cache reads don't count toward a rate limit and including
         // them made the tally both a worse predictor and orders of magnitude too large.
@@ -1926,9 +2360,9 @@ mod tests {
             ..sample("e1", false, "/nonexistent")
         };
         // Reset epoch in the future → surfaced.
-        assert_eq!(usage_for_account(&acct, 400).exhausted_until, Some(500));
+        assert_eq!(usage_for_account(&acct, 400, 1).0.exhausted_until, Some(500));
         // Reset epoch in the past → cleared.
-        assert_eq!(usage_for_account(&acct, 600).exhausted_until, None);
+        assert_eq!(usage_for_account(&acct, 600, 1).0.exhausted_until, None);
     }
 
     #[test]
@@ -1966,12 +2400,12 @@ mod tests {
         // Before the reset instant it's still surfaced; once `now` passes it, it clears — the exact
         // behaviour the ms unit broke.
         assert_eq!(
-            usage_for_account(&read[0], reset_secs - 60).exhausted_until,
+            usage_for_account(&read[0], reset_secs - 60, 1).0.exhausted_until,
             Some(reset_secs),
             "still exhausted just before the reset"
         );
         assert_eq!(
-            usage_for_account(&read[0], reset_secs + 60).exhausted_until,
+            usage_for_account(&read[0], reset_secs + 60, 1).0.exhausted_until,
             None,
             "expired exhaustion clears once now_secs passes the (migrated) reset"
         );
@@ -2464,91 +2898,316 @@ mod tests {
 
     // ---- per-model spend pricing --------------------------------------------------------------
 
+    /// The price TABLE being shared isn't enough if the INPUTS aren't: reading only the flat
+    /// `cache_creation_input_tokens` billed every 1h-TTL write at 1.25x here and 2x in the pane.
     #[test]
-    fn base_model_id_strips_date_and_bracket() {
-        // Dated suffix stripped.
-        assert_eq!(base_model_id("claude-haiku-4-5-20251001"), "claude-haiku-4-5");
-        // Context-variant bracket stripped.
-        assert_eq!(base_model_id("claude-opus-4-8[1m]"), "claude-opus-4-8");
-        // Both a bracket AND (hypothetically) a date — bracket handled first.
-        assert_eq!(base_model_id("claude-opus-4-8[1m]"), "claude-opus-4-8");
-        // Already-base ids pass through untouched.
-        assert_eq!(base_model_id("claude-opus-4-8"), "claude-opus-4-8");
-        assert_eq!(base_model_id("claude-sonnet-5"), "claude-sonnet-5");
-        // A trailing "-8digits" that isn't a date-shaped tail is only stripped when it's exactly
-        // dash+8 digits; a short id is left alone.
-        assert_eq!(base_model_id("short"), "short");
-    }
+    fn read_usage_counts_splits_cache_writes_by_ttl_like_the_pane() {
+        let with_breakdown = serde_json::json!({
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "cache_creation_input_tokens": 900,
+            "cache_creation": { "ephemeral_5m_input_tokens": 600, "ephemeral_1h_input_tokens": 300 },
+            "cache_read_input_tokens": 50
+        });
+        assert_eq!(read_usage_counts(&with_breakdown), (1, 2, 600, 300, 50));
 
-    #[test]
-    fn rate_for_model_maps_known_and_flags_unknown() {
-        assert!(!rate_for_model(Some("claude-haiku-4-5-20251001")).1, "haiku is known");
-        assert!(!rate_for_model(Some("claude-sonnet-4-6")).1, "sonnet-4-6 is known");
-        assert!(!rate_for_model(Some("claude-sonnet-5")).1, "sonnet-5 shares the mid tier");
-        assert!(!rate_for_model(Some("claude-opus-4-8[1m]")).1, "opus 1M variant is known");
-        // Unknown model AND absent model both fall back (flagged), never dropped.
-        let (fallback_rate, is_fb) = rate_for_model(Some("claude-fable-5"));
-        assert!(is_fb, "an unpriced model is flagged");
-        assert_eq!(fallback_rate.input, RATE_SONNET.input, "fallback is the mid (sonnet) tier");
-        assert!(rate_for_model(None).1, "a record with no model is flagged too");
-    }
+        // No breakdown (older transcripts): the whole total is the default 5m TTL, never guessed high.
+        let flat = serde_json::json!({
+            "input_tokens": 1, "output_tokens": 2,
+            "cache_creation_input_tokens": 900, "cache_read_input_tokens": 50
+        });
+        assert_eq!(read_usage_counts(&flat), (1, 2, 900, 0, 50));
 
-    #[test]
-    fn cost_usd_prices_each_token_class_at_its_rate() {
-        // Opus: input $5, output $25, cache-write $6.25, cache-read $0.50 per MTok.
-        // 1M of each class → 5 + 25 + 6.25 + 0.50 = $36.75.
+        // And the record built from the breakdown costs what the pane's record costs.
         let rec = SpendRecord {
             ts: 0,
-            model: Some("claude-opus-4-8".to_string()),
+            message_id: None,
+            model: Some("claude-opus-4-8".into()),
+            input: 1,
+            output: 2,
+            cache_write_5m: 600,
+            cache_write_1h: 300,
+            cache_read: 50,
+        };
+        assert_eq!(
+            rec.cost_usd(),
+            crate::spend::estimate_cost_usd("claude-opus-4-8", 1, 2, 600, 300, 50)
+        );
+    }
+
+    /// Set a file's mtime exactly. Sleeping between writes leaves the ordering at the mercy of the
+    /// filesystem's timestamp granularity, which turns an ordering test into a coin flip on some
+    /// hosts.
+    fn set_mtime(path: &Path, epoch_secs: u64) {
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(epoch_secs);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(t)).unwrap();
+    }
+
+    /// The registry's LIFECYCLE through the real guard: live while the `UsagePass` exists,
+    /// evictable once it drops. Deleting the retire step left every test green while making every
+    /// generation permanently live — tier 1 then matches nothing, forever, and this memo has no
+    /// stale sweep to heal it.
+    #[test]
+    fn a_usage_pass_is_exempt_while_live_and_evictable_once_it_ends() {
+        let live = UsagePass::start();
+        let dead = UsagePass::start();
+        let (live_id, dead_id) = (live.id(), dead.id());
+        drop(dead);
+
+        let mut cache = UsageCache::new();
+        usage_cache_store(&mut cache, Path::new("/live.jsonl"), SystemTime::UNIX_EPOCH, 1, vec![], live_id);
+        usage_cache_store(&mut cache, Path::new("/dead.jsonl"), SystemTime::UNIX_EPOCH, 1, vec![], dead_id);
+
+        // The production predicate, not a stub.
+        let is_live =
+            |g: u64| live_usage_passes().lock().unwrap_or_else(|e| e.into_inner()).contains(&g);
+        crate::spend::evict_two_tier(&mut cache, 1, 100, is_live, |c| (c.last_touch, c.modified));
+
+        assert!(cache.contains_key(Path::new("/live.jsonl")), "a running pass's entry is exempt");
+        assert!(!cache.contains_key(Path::new("/dead.jsonl")), "a finished pass's entry is not");
+
+        drop(live);
+        assert!(
+            !live_usage_passes().lock().unwrap().contains(&live_id),
+            "the guard clears itself — no leak, even on an unwind"
+        );
+    }
+
+    /// Two roots reaching ONE tree by different spellings — an account `projects/` symlinked to
+    /// `~/.claude/projects`. A nested-directory test can't catch this: there both roots produce
+    /// identical raw paths, so a raw-path key passes.
+    #[test]
+    fn two_spellings_of_one_tree_scan_it_once() {
+        let base = unique_dir("aliased-roots");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(
+            real.join("s.jsonl"),
+            "{\"timestamp\":\"2026-06-25T21:20:25.931Z\",\"type\":\"assistant\",\
+             \"message\":{\"model\":\"claude-haiku-4-5\",\"usage\":{\"input_tokens\":9,\
+             \"output_tokens\":0,\"cache_creation_input_tokens\":0,\
+             \"cache_read_input_tokens\":0}}}\n",
+        )
+        .unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let mut out = Vec::new();
+        collect_usage_records_across(&[real.clone(), alias.clone()], 0, &mut out, 1);
+        assert_eq!(out.len(), 1, "one file behind two spellings is parsed once");
+        assert_eq!(out[0].input, 9);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Overlapping roots — one nested under the other — are not caught by the canonical-key set,
+    /// which only collapses IDENTICAL trees. Without a path dedupe the shared transcript is parsed
+    /// twice and its id-less records count twice.
+    #[test]
+    fn overlapping_roots_scan_a_shared_transcript_once() {
+        let base = unique_dir("nested-roots");
+        let outer = base.join("outer");
+        let nested = outer.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        // No message id, so nothing downstream can collapse the duplicate for us.
+        let body = "{\"timestamp\":\"2026-06-25T21:20:25.931Z\",\"type\":\"assistant\",\
+                    \"message\":{\"model\":\"claude-haiku-4-5\",\"usage\":{\"input_tokens\":7,\
+                    \"output_tokens\":0,\"cache_creation_input_tokens\":0,\
+                    \"cache_read_input_tokens\":0}}}\n";
+        std::fs::write(nested.join("s.jsonl"), body).unwrap();
+
+        let mut out = Vec::new();
+        collect_usage_records_across(&[outer.clone(), nested.clone()], 0, &mut out, 1);
+        assert_eq!(out.len(), 1, "the shared transcript is parsed once, not once per root");
+        assert_eq!(out[0].input, 7);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sorting per ROOT yields "root order, then mtime", so an id contested ACROSS roots still
+    /// resolved differently here than in the pane, which sorts the whole set. One global sort.
+    #[test]
+    fn collect_usage_records_across_sorts_every_root_together() {
+        let base = unique_dir("scan-order-roots");
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let line = |ts: &str, input: u64| {
+            format!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"assistant\",\"message\":{{\"id\":\"msg_1\",\
+                 \"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":{input},\
+                 \"output_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}}}\n"
+            )
+        };
+        // The NEWER file lives in the FIRST root, so root-order-then-mtime and global-mtime
+        // disagree — the only arrangement that can tell them apart. mtimes are SET, not slept for.
+        std::fs::write(b.join("older.jsonl"), line("2026-06-25T21:20:25.931Z", 111)).unwrap();
+        std::fs::write(a.join("newer.jsonl"), line("2026-06-25T21:20:26.931Z", 222)).unwrap();
+        set_mtime(&b.join("older.jsonl"), 1_700_000_000);
+        set_mtime(&a.join("newer.jsonl"), 1_700_000_060);
+
+        let mut out = Vec::new();
+        collect_usage_records_across(&[a.clone(), b.clone()], 0, &mut out, 1);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].input, 111, "oldest mtime first, whichever root it is in");
+        assert_eq!(out[1].input, 222, "so last-copy-wins still means the newer transcript");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The pane's `dedupe_window` means "the newer transcript wins" only because `load_records`
+    /// hands it records oldest-mtime-first. Parsing in `read_dir` order made the pill's winner
+    /// inode-dependent — different between runs on one tree, and different from the pane's.
+    #[test]
+    fn collect_usage_records_parses_oldest_transcript_first() {
+        let base = unique_dir("scan-order");
+        let proj = base.join("projects").join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let line = |ts: &str, input: u64| {
+            format!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"assistant\",\"message\":{{\"id\":\"msg_1\",\
+                 \"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":{input},\
+                 \"output_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}}}\n"
+            )
+        };
+        // `zzz` is the OLDER file and sorts LAST alphabetically, so read_dir/path order and mtime
+        // order disagree — the only arrangement in which this assertion means anything. mtimes are
+        // SET, not slept for: a filesystem with coarse granularity would otherwise tie them and the
+        // path tiebreak would invert the expectation, failing for a reason unrelated to the code.
+        std::fs::write(proj.join("zzz.jsonl"), line("2026-06-25T21:20:25.931Z", 111)).unwrap();
+        std::fs::write(proj.join("aaa.jsonl"), line("2026-06-25T21:20:26.931Z", 222)).unwrap();
+        set_mtime(&proj.join("zzz.jsonl"), 1_700_000_000);
+        set_mtime(&proj.join("aaa.jsonl"), 1_700_000_060);
+
+        let mut out = Vec::new();
+        collect_usage_records(&proj, 0, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].input, 111, "the older transcript is parsed first");
+        assert_eq!(out[1].input, 222, "so last-copy-wins attributes the turn to the newer one");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The pill and the Spend pane must value the SAME record identically. They used to disagree by
+    /// 5x on `claude-opus-4-*` and ~40% on `claude-opus-4-5-*`, because this module carried its own
+    /// four-model table with a Sonnet fallback for everything else.
+    #[test]
+    fn cost_usd_uses_the_same_price_table_as_the_spend_pane() {
+        let one_of_each = |model: &str| SpendRecord {
+            ts: 0,
+            message_id: None,
+            model: Some(model.to_string()),
             input: 1_000_000,
             output: 1_000_000,
-            cache_write: 1_000_000,
+            cache_write_5m: 1_000_000,
+            cache_write_1h: 0,
             cache_read: 1_000_000,
         };
-        let (usd, fallback) = rec.cost_usd();
-        assert!((usd - 36.75).abs() < 1e-9, "opus per-class sum, got {usd}");
-        assert!(!fallback);
+        for model in [
+            "claude-opus-4-8",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-20250514",
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-5",
+        ] {
+            let rec = one_of_each(model);
+            let pane = crate::spend::estimate_cost_usd(model, 1_000_000, 1_000_000, 1_000_000, 0, 1_000_000);
+            assert_eq!(rec.cost_usd(), pane, "{model} must cost the same in both surfaces");
+            assert!(rec.cost_usd().is_some(), "{model} is priced");
+        }
+        // An unpriced model yields NO dollar figure rather than a guessed one — the pane's stance,
+        // and the only one that lets the pill say the total excludes something.
+        assert_eq!(one_of_each("totally-unknown-model").cost_usd(), None);
+        assert_eq!(SpendRecord { model: None, ..one_of_each("x") }.cost_usd(), None);
+    }
 
-        // An unknown model is priced at the fallback (sonnet) rate and flagged, never $0.
-        let unknown = SpendRecord { model: Some("mystery".into()), ..rec.clone() };
-        let (u_usd, u_fb) = unknown.cost_usd();
-        assert!(u_fb, "unknown model flagged");
-        assert!(u_usd > 0.0, "unknown model still priced, not dropped");
-        // sonnet: 3 + 15 + 3.75 + 0.30 = $22.05 for 1M of each class.
-        assert!((u_usd - 22.05).abs() < 1e-9, "fallback priced at sonnet rate, got {u_usd}");
+    /// The window is applied BEFORE the dedupe, as in `spend::dedupe_window`. Deduping first let an
+    /// out-of-window copy win its id and then be filtered away, dropping the in-window turn
+    /// entirely — a silent undercount that only shows up when a resume straddles the window edge.
+    /// The upper bound matters for the same reason: a clock-skewed transcript must not count here
+    /// while the pane drops it.
+    #[test]
+    fn spend_summary_windows_before_deduping_and_drops_future_records() {
+        let now = 1_000_000_000;
+        let copy = |ts: i64, input: u64| SpendRecord {
+            ts,
+            message_id: Some("msg_1".to_string()),
+            model: Some("claude-haiku-4-5".to_string()),
+            input,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        };
+
+        // The OUT-OF-WINDOW copy comes last, so a dedupe-first pass would let it win the id.
+        let s = spend_summary(&[copy(now - 60, 1_000_000), copy(now - WINDOW_7D - 60, 9)], now);
+        assert_eq!(s.tokens_7d, 1_000_000, "the in-window copy is the one that counts");
+        assert!((s.spend_7d_usd - 1.0).abs() < 1e-9);
+
+        // A clock-skewed record dated in the future is dropped, not counted twice over.
+        let future = spend_summary(&[copy(now + 3_600, 5_000_000)], now);
+        assert_eq!(future.tokens_7d, 0, "a future-dated record is out of the window");
+    }
+
+    /// A resume copies prior turns into the new transcript; both files are under the same root, so
+    /// the pill saw the same turn twice while the pane (which dedupes) saw it once.
+    #[test]
+    fn spend_summary_counts_a_resumed_turn_once() {
+        let now = 1_000_000_000;
+        let turn = |input: u64| SpendRecord {
+            ts: now - 60,
+            message_id: Some("msg_1".to_string()),
+            model: Some("claude-haiku-4-5".to_string()),
+            input,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        };
+        // The original and the copy a resume wrote; the LAST copy wins, as in spend::dedupe_window.
+        let s = spend_summary(&[turn(1_000_000), turn(2_000_000)], now);
+        assert_eq!(s.tokens_today, 2_000_000, "one turn, not two");
+        assert!((s.spend_today_usd - 2.0).abs() < 1e-9, "haiku $1/MTok × 2M, got {}", s.spend_today_usd);
     }
 
     #[test]
     fn spend_summary_buckets_today_and_7d_and_counts_fallback() {
         let now = 1_000_000_000;
-        let haiku = |ts: i64| SpendRecord {
+        let haiku = |ts: i64, id: &str| SpendRecord {
             ts,
+            message_id: Some(id.to_string()),
             model: Some("claude-haiku-4-5".to_string()),
             input: 1_000_000, // haiku input $1/MTok → $1.00 each
             output: 0,
-            cache_write: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
             cache_read: 0,
         };
         let unknown = SpendRecord {
             ts: now - 60,
-            model: Some("who-knows".to_string()),
-            input: 1_000_000, // fallback (sonnet) input $3/MTok → $3.00, flagged
+            message_id: Some("unk".to_string()),
+            model: Some("totally-unknown-model".to_string()),
+            input: 1_000_000, // no published rate: tokens count, dollars can't
             output: 0,
-            cache_write: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
             cache_read: 0,
         };
         let records = vec![
-            haiku(now - 60),               // within 24h → today + 7d ($1)
-            haiku(now - WINDOW_24H - 60),  // outside 24h, inside 7d → 7d only ($1)
-            haiku(now - WINDOW_7D - 60),   // older than 7d → excluded entirely
-            unknown,                       // within 24h, fallback-priced ($3)
+            haiku(now - 60, "a"),               // within 24h → today + 7d ($1)
+            haiku(now - WINDOW_24H - 60, "b"),  // outside 24h, inside 7d → 7d only ($1)
+            haiku(now - WINDOW_7D - 60, "c"),   // older than 7d → excluded entirely
+            unknown,                            // within 24h, UNPRICED (tokens only)
         ];
         let s = spend_summary(&records, now);
-        assert!((s.spend_today_usd - 4.0).abs() < 1e-9, "today = $1 haiku + $3 unknown, got {}", s.spend_today_usd);
-        assert!((s.spend_7d_usd - 5.0).abs() < 1e-9, "7d = $1 + $1 + $3, got {}", s.spend_7d_usd);
+        assert!((s.spend_today_usd - 1.0).abs() < 1e-9, "today = $1 haiku; the unpriced record adds tokens, not dollars, got {}", s.spend_today_usd);
+        assert!((s.spend_7d_usd - 2.0).abs() < 1e-9, "7d = $1 + $1, got {}", s.spend_7d_usd);
         assert_eq!(s.tokens_today, 2_000_000, "today tokens = 1M haiku + 1M unknown");
         assert_eq!(s.tokens_7d, 3_000_000, "7d tokens = 3 × 1M (the >7d record excluded)");
-        assert_eq!(s.fallback_model_records, 1, "exactly one in-window unknown-model record");
+        assert_eq!(s.fallback_model_records, 1, "exactly one in-window unpriced-model record");
     }
 
     #[test]
@@ -2580,12 +3239,16 @@ mod tests {
         assert_eq!(first.ts, epoch);
         assert_eq!(first.model.as_deref(), Some("claude-opus-4-8"));
         // The four counters are kept SEPARATE (not pre-summed).
-        assert_eq!((first.input, first.output, first.cache_write, first.cache_read), (10, 5, 2, 3));
+        assert_eq!(
+            (first.input, first.output, first.cache_write_5m, first.cache_write_1h, first.cache_read),
+            (10, 5, 2, 0, 3)
+        );
         assert_eq!(first.total_tokens(), 20);
 
-        // The model-less line: None model, priced at the flagged fallback rate.
+        // The model-less line: None model, so no dollar figure — its tokens still count, but the
+        // pill reports it as unpriced instead of inventing a rate.
         assert_eq!(out[1].model, None);
-        assert!(out[1].cost_usd().1, "a model-less record uses the flagged fallback rate");
+        assert_eq!(out[1].cost_usd(), None, "a model-less record has no published rate");
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -2602,10 +3265,15 @@ mod tests {
             model: None,
             input: 10,
             output: 5,
-            cache_write: 2,
+            // Split across both TTLs on purpose: they price differently but count the same toward
+            // a limit, so a `limit_tokens` that dropped either half would still pass a fixture
+            // that put all the cache writes in one field.
+            cache_write_5m: 1,
+            cache_write_1h: 1,
             cache_read: 1_000,
+            message_id: None,
         };
-        assert_eq!(r.limit_tokens(), 17, "input + output + cache_write only");
+        assert_eq!(r.limit_tokens(), 17, "input + output + both cache-write TTLs only");
         assert_eq!(r.total_tokens(), 1_017, "spend still counts every token processed");
         // token_pairs (which feeds the 5h/7d near-cap windows) must use the limit unit.
         assert_eq!(token_pairs(&[r]), vec![(0, 17)]);
@@ -2618,8 +3286,10 @@ mod tests {
             model: None,
             input: u64::MAX,
             output: u64::MAX,
-            cache_write: u64::MAX,
+            cache_write_5m: u64::MAX,
+            cache_write_1h: u64::MAX,
             cache_read: 0,
+            message_id: None,
         };
         assert_eq!(r.limit_tokens(), u64::MAX);
     }
@@ -2766,8 +3436,10 @@ mod tests {
             model: None,
             input: n,
             output: 0,
-            cache_write: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
             cache_read: 9_999, // must NOT be counted
+            message_id: None,
         };
         let at = 100_000;
         let records = vec![

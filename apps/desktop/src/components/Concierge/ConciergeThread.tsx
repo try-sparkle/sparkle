@@ -15,6 +15,17 @@ import type {
   ConciergeSparkleMessage,
 } from "./types";
 
+/** How close to the bottom still counts as "following", measured when the READER scrolls.
+ *
+ *  Small on purpose. The old 150px slack existed because the measurement happened after layout and
+ *  had to cover one just-appended message; nothing is unlaid-out at scroll time, so the only slack
+ *  needed is for rounding. At 150px a reader who scrolled up a line to re-read it still counted as
+ *  "following" and got yanked back on the next feed tick — the founder's original complaint, at
+ *  small amplitude. Not smaller than this, though: macOS rubber-band settling and fractional
+ *  clientHeight/scrollHeight under non-integral zoom can leave a genuinely-bottomed container a few
+ *  px off, and each such miss silently costs the reader the follow. Both sides are tested. */
+const FOLLOW_THRESHOLD_PX = 24;
+
 export function ConciergeThread({
   messages,
   typing = false,
@@ -38,15 +49,83 @@ export function ConciergeThread({
   speakingMessageId?: string | null;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // Whether the reader is following the bottom. Starts TRUE (a freshly opened thread should be at
+  // its newest message) and only changes when the READER scrolls — never as a side effect of new
+  // content.
+  const followRef = useRef(true);
+  /** Last observed scrollTop, so an event that moved nothing can be told from the reader actually
+   *  scrolling. -1 is a value no scrollTop can hold, so the first event of a session always counts
+   *  as the reader's. */
+  const lastTopRef = useRef(-1);
+
+  // Auto-follow, but only when the reader is actually at the bottom (bead sparkle-y4ft). This used to
+  // be an unconditional `scrollTop = scrollHeight` keyed on [messages, typing], which produced the
+  // founder-visible bug: "every time I click on an item, it scrolls me to the bottom of the first
+  // column." Two independent causes, so two guards — removing either one leaves the bug reachable.
+  //
+  // Guard 1, the content key. ConciergeHost builds `messages` as [...chat, ...nudges] inside a useMemo
+  // keyed on the concierge feed, so a NEW ARRAY with IDENTICAL CONTENTS arrives on every feed tick —
+  // and clicking an item ticks the feed. Keying on array identity meant a click scrolled the column.
+  // Key on content instead, so an unchanged thread doesn't re-run this at all.
+  //
+  // The key includes TOTAL text length because the brain streams: `onConciergeDelta` upserts the
+  // same `brain-<id>` bubble with more text, so count and last id both stay put while the reply
+  // grows below the fold. Keyed on those alone, the thread stopped following mid-answer.
+  //
+  // Total, not the LAST message's length: ConciergeHost builds `messages` as [...chat, ...nudges],
+  // so the moment any agent is surfaced the growing bubble is no longer last and a per-last-message
+  // length tracks a static nudge instead — which is the state the column normally lives in.
+  const last = messages.length > 0 ? messages[messages.length - 1]! : undefined;
+  const totalLength = messages.reduce((n, m) => n + ("text" in m ? m.text.length : 0), 0);
+  const contentKey = `${messages.length}:${last?.id ?? ""}:${totalLength}`;
+
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, typing]);
+    if (!el) return;
+    // Guard 2, the stick-to-bottom check — READ from the reader's own scrolling, not re-measured
+    // here. Measuring after layout got both ends wrong: on mount `scrollTop` is 0 against a full
+    // `scrollHeight`, so a thread that opens with any content is judged "scrolled up" and never
+    // follows again; and a single tall NudgeCard (badge + text + three buttons) can exceed the
+    // slack, so following silently stops the first time one arrives.
+    if (!followRef.current) return;
+    el.scrollTop = el.scrollHeight;
+    // Record the scroll WE caused, before the browser dispatches its (async) scroll event. Without
+    // this, `lastTopRef` still holds the previous bottom, so a reader gesture that happens to land
+    // on exactly that value reads as "didn't move" and the demotion is skipped — and the previous
+    // bottom is the likeliest such value, since streaming moves the bottom one chunk at a time.
+    lastTopRef.current = el.scrollTop;
+  }, [contentKey, typing]);
 
   return (
     <div
       ref={scrollRef}
       data-testid="concierge-thread"
+      onScroll={(e) => {
+        const el = e.currentTarget;
+        const atBottom = el.scrollHeight - el.clientHeight - el.scrollTop <= FOLLOW_THRESHOLD_PX;
+        // A CLAMP — the browser firing `scroll` because the viewport shrank or content was removed
+        // — leaves scrollTop exactly where it was while the distance from the bottom grows, and it
+        // always comes with a geometry change. Treating that as "the reader scrolled away" would
+        // silently stop the follow for something they never did, the same class of bug as measuring
+        // after layout. Reaching the bottom re-arms, whatever caused it.
+        // ONE test: did this event actually move the scroll position? Every browser re-fit is
+        // already covered without a second term, which is why there isn't one —
+        //   • viewport shrinks (window resize, panel opens): scrollTop is untouched while the
+        //     distance from the bottom grows. `readerMoved` is false, so nothing happens.
+        //   • content removed below the fold: the browser clamps scrollTop to the new maximum,
+        //     which IS the bottom, so `atBottom` re-arms the follow.
+        //   • a scroll event that changed nothing (horizontal scroll on this element, an anchoring
+        //     adjustment that nets zero, a synthetic event): `readerMoved` is false.
+        // Two earlier attempts added a geometry-based "was this a clamp?" term instead. Both were
+        // worse: keyed on any geometry change it swallowed real scroll-aways during streaming
+        // growth, and keyed on a shrinking range it depended on a baseline that a resize with no
+        // scroll event leaves stale. Neither could be given a test that reached it — every shape
+        // they claimed to guard lands on `atBottom` first.
+        const readerMoved = el.scrollTop !== lastTopRef.current;
+        if (atBottom) followRef.current = true;
+        else if (readerMoved) followRef.current = false;
+        lastTopRef.current = el.scrollTop;
+      }}
       // NOT a live region (roborev 53010). Putting one here looked right — `role="log"` is the
       // standard for an append-only transcript — but this transcript is not append-only: the host
       // appends each brain delta into the LAST message's text, so a polite region over the thread

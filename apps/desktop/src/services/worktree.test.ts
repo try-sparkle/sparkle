@@ -21,6 +21,8 @@ import { seedWorktreeEnv, abandonWorktreeSeed } from "./envSeed";
 import {
   createAgentWorktree,
   assertWorkspaceIntegrity,
+  ensureDefaultPluginsInstalled,
+  installAgentHooks,
   prepareAgentWorkspace,
   prepareWorkerWorkspace,
   removeAgentWorkspace,
@@ -29,6 +31,54 @@ import {
 
 describe("worktree service", () => {
   beforeEach(() => invoke.mockReset());
+
+  it("installAgentHooks passes the worktree AND the project root", async () => {
+    // Tauri maps camelCase JS keys → snake_case Rust params, so `projectRoot` must be spelled
+    // exactly that: a mismatched key silently arrives as None on the Rust side, which reads as
+    // "no project" and quietly resolves the GLOBAL [plugins] layer instead of the repo's own —
+    // an agent that gets the wrong plugins with nothing anywhere reporting a problem.
+    invoke.mockResolvedValue("/logs/a.jsonl");
+    await installAgentHooks("/wt/p/a", "/repos/acme");
+    expect(invoke).toHaveBeenCalledWith("install_agent_hooks", {
+      worktree: "/wt/p/a",
+      projectRoot: "/repos/acme",
+    });
+
+    // Omitted is a valid call: the global layer. Asserted on the recorded argument directly —
+    // toHaveBeenCalledWith's recursive equality treats `{worktree}` and `{worktree, projectRoot:
+    // undefined}` as the same object, so it can't tell us which key set actually crossed the bridge.
+    invoke.mockClear();
+    await installAgentHooks("/wt/p/b");
+    const [command, args] = invoke.mock.calls[0] as [string, Record<string, unknown>];
+    expect(command).toBe("install_agent_hooks");
+    expect(Object.keys(args)).toEqual(["worktree", "projectRoot"]);
+    expect(args.projectRoot).toBeUndefined();
+  });
+
+  it("ensureDefaultPluginsInstalled bridges the install command and its force flag", async () => {
+    const outcome = {
+      key: "superpowers",
+      id: "superpowers@claude-plugins-official",
+      status: "installed" as const,
+      message: null,
+      detail: null,
+    };
+    invoke.mockResolvedValue([outcome]);
+    // Default is NOT forced: the background callers (startup, every agent prepare) must keep the
+    // per-process retry suppression, or an un-installable machine burns 90s network calls per agent.
+    await expect(ensureDefaultPluginsInstalled()).resolves.toEqual([outcome]);
+    expect(invoke).toHaveBeenCalledWith("ensure_default_plugins_installed", {
+      forceKey: undefined,
+    });
+
+    // The user-initiated toggle opts in for ONE plugin, so "turn it off and on again" is a real
+    // retry for the row clicked — without re-running every other row's 90s install.
+    invoke.mockClear();
+    await ensureDefaultPluginsInstalled("superpowers");
+    expect(invoke).toHaveBeenCalledWith("ensure_default_plugins_installed", {
+      forceKey: "superpowers",
+    });
+  });
   it("passes projectId + baseBranch into create_agent_worktree", async () => {
     invoke.mockResolvedValue({ path: "/wt/p/a", branch: "sparkle/agent-a" });
     await createAgentWorktree("/root", "p", "a", "main");
