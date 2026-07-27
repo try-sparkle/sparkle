@@ -199,6 +199,45 @@ describe("controlListener", () => {
     expect(res.omittedIds).toEqual([strangerId]);
   });
 
+  // roborev 53476: once "active" started keeping rows on evidence OTHER than a live status entry,
+  // those rows still reported status "stopped" — the documented value for "no process at all" and
+  // the one workerAttention paints RED. A caller polling its fleet could read a live worker as dead
+  // and respawn it. `liveness` is what tells the two apart, so each clause is pinned to its label.
+  it("get_state labels a row with a live status entry as liveness 'local' (status is authoritative)", async () => {
+    useRuntimeStore.getState().setStatus(callerId, "working");
+    useRuntimeStore.getState().setStatus(otherId, "waiting");
+    fire({ reqId: "s9", op: "get_state", callerAgentId: callerId, payload: {} });
+    await flush();
+    const res = lastReply() as { agents: Array<Record<string, unknown>> };
+    expect(res.agents.find((a) => a.id === otherId)).toMatchObject({
+      status: "waiting",
+      liveness: "local",
+    });
+  });
+
+  it("get_state labels an agent open in ANOTHER window as 'other-window', not dead", async () => {
+    useRuntimeStore.getState().setStatus(callerId, "working");
+    useRuntimeStore.setState({ openAgentIds: [otherId] } as never); // open, but no status HERE
+    fire({ reqId: "s10", op: "get_state", callerAgentId: callerId, payload: {} });
+    await flush();
+    const res = lastReply() as { agents: Array<Record<string, unknown>> };
+    const worker = res.agents.find((a) => a.id === otherId)!;
+    // `status` still defaults to "stopped" — that is exactly why the label has to be here.
+    expect(worker).toMatchObject({ status: "stopped", liveness: "other-window" });
+  });
+
+  it("get_state labels a just-spawned worker (no entry, not open) as 'unknown', not dead", async () => {
+    useRuntimeStore.getState().setStatus(callerId, "working");
+    useRuntimeStore.setState({ openAgentIds: [] } as never); // otherId: worker, parentId=callerId
+    fire({ reqId: "s11", op: "get_state", callerAgentId: callerId, payload: {} });
+    await flush();
+    const res = lastReply() as { agents: Array<Record<string, unknown>> };
+    const worker = res.agents.find((a) => a.id === otherId)!;
+    expect(worker).toMatchObject({ status: "stopped", liveness: "unknown" });
+    // The whole point: "stopped" here must NOT be readable as "this worker died".
+    expect(worker.liveness).not.toBe("local");
+  });
+
   it("get_state scope 'self' returns only the caller", async () => {
     useRuntimeStore.getState().setStatus(callerId, "working");
     useRuntimeStore.getState().setStatus(otherId, "working");

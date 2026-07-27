@@ -128,7 +128,25 @@ export const truncateDetail = (raw: string): string => {
 // when each one first appeared (stampActivity). First sighting of an id is stamped `at = 0` —
 // "unknown age" — so an activity restored from a previous session's persisted state is treated as
 // stale (conservative: we keep calling Haiku) until the agent actually re-narrates in this session.
-export const ACTIVITY_FRESH_MS = 10_000;
+//
+// WHY 2 MINUTES AND NOT 10 SECONDS (roborev 53476, 2026-07-27). This window has to match the
+// narration cadence the persona actually asks for, and that cadence changed. The 10s original was
+// tuned when `sparkleControlProtocol()` told agents to narrate at every sub-task, so a narration
+// was almost always seconds old. It now says narrate at PHASE boundaries and skip narration with
+// nothing to batch it against — which is a cost fix, but it aims squarely at the moment this gate
+// depends on: the turn where an agent hands back to the human contains no other tool call, so the
+// narration rides in the LAST tool-using turn and then has to survive however long the agent takes
+// to finish that turn and write its hand-back message. At 10s this gate went near-dead and every
+// `waiting` notification fell through to the credit-metered summarize_attention scrape — trading a
+// token saving for a paid call, which is not a saving at all.
+// The cost of widening is bounded: only `waiting` is eligible (approval is excluded above, where
+// the body MUST describe the action), the text is a phase description, and the ask lies inside that
+// phase — so a 90s-old "Wiring the control listener" is still a fair answer to "what does it want?",
+// and strictly better than the generic fallback it would otherwise get. Two minutes covers "narrated
+// in my last tool-using turn, then finished and asked" while still rejecting a line from an earlier
+// phase. The shift is observable without new telemetry: selfReportMetrics.attentionSources counts
+// self_report vs paid_haiku vs generic_fallback, so a regression here shows up as paid_haiku rising.
+export const ACTIVITY_FRESH_MS = 120_000;
 
 interface ActivityStamp {
   value: string; // the last-observed trimmed activity text

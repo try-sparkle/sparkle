@@ -49,7 +49,10 @@ describe("stampActivity — observes activity changes across effect runs", () =>
 });
 
 describe("selfReportBody — precedence gate for the notification body", () => {
-  const now = 100_000;
+  // Comfortably larger than ACTIVITY_FRESH_MS: the boundary cases below subtract the whole window
+  // from `now`, and a result <= 0 would trip the "first sighting / unknown age" guard instead of the
+  // recency check, silently testing the wrong branch.
+  const now = 10_000_000;
 
   it("uses a FRESH in-session narration for a WAITING body (→ Haiku is skipped)", () => {
     const stamp = { value: "Wiring the relay", at: now - 2_000 }; // 2s old, well inside the window
@@ -81,6 +84,29 @@ describe("selfReportBody — precedence gate for the notification body", () => {
     expect(selfReportBody("Building X", fresh, now, "errored")).toBeNull();
     expect(selfReportBody("Building X", fresh, now, "idle")).toBeNull();
     expect(selfReportBody("Building X", fresh, now, undefined)).toBeNull();
+  });
+
+  // roborev 53476: the window has to match the narration cadence the persona asks for. The persona
+  // now says narrate at PHASE boundaries and fold the narration into the LAST tool-using turn before
+  // handing back — so the line has to survive however long that turn takes to finish and write its
+  // hand-back message. At the original 10s this gate went near-dead and every `waiting` notification
+  // fell through to the credit-metered Haiku scrape, which is not a saving, just a different bill.
+  it("accepts a narration from the agent's last tool-using turn (~45s ago) — the hand-back case", () => {
+    const t = 1_000_000;
+    const stamp = { value: "Wiring the relay", at: t - 45_000 };
+    expect(selfReportBody("Wiring the relay", stamp, t, "waiting")).toBe("Wiring the relay");
+  });
+
+  it("still rejects a narration from an EARLIER phase (5 min ago)", () => {
+    const t = 1_000_000;
+    const stamp = { value: "Old phase", at: t - 300_000 }; // at > 0, so this tests the window itself
+    expect(selfReportBody("Old phase", stamp, t, "waiting")).toBeNull();
+  });
+
+  it("keeps the window wide enough for a phase-boundary cadence (guards against a silent revert)", () => {
+    // The exact value is a judgement call; the FLOOR is not. Anything under a minute cannot span a
+    // tool-using turn plus a hand-back message, which is the case this gate exists to serve.
+    expect(ACTIVITY_FRESH_MS).toBeGreaterThanOrEqual(60_000);
   });
 
   it("accepts a narration exactly at the freshness boundary, rejects one just past it", () => {

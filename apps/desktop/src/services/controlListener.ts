@@ -149,6 +149,32 @@ function resolveScope(raw: unknown): StateScope {
  *  back the context cost the scope was added to remove. `omitted` remains the exact count. */
 const OMITTED_IDS_CAP = 20;
 
+/** How much this window actually KNOWS about a row's status — reported per agent alongside `status`.
+ *
+ *  Necessary because `status` defaults to "stopped" for an agent with no runtime entry, and "stopped"
+ *  is also the documented value for "no process at all". Once scope "active" started keeping rows on
+ *  evidence OTHER than a live status entry (open in another window; the caller; the caller's own
+ *  child), the reply contradicted itself: a scope advertised as "agents with a live process" handing
+ *  back rows labelled dead. An orchestrator polling its fleet would read a live worker as "stopped"
+ *  — the same value workerAttention paints RED — and could reasonably conclude it died and respawn
+ *  it. `liveness` is the field that tells the two apart. Found by roborev 53476.
+ *
+ *    local        — this window has a runtime status entry; `status` is authoritative.
+ *    other-window — no local entry, but the agent is open in SOME window (openAgentIds is persisted
+ *                   and merged app-wide). It IS mounted; `status` merely defaulted. Not dead.
+ *    unknown      — no local entry and not open anywhere. Genuinely stopped, OR a just-spawned
+ *                   worker whose pane has not mounted yet. Do NOT conclude it died. */
+export type AgentLiveness = "local" | "other-window" | "unknown";
+
+function livenessOf(
+  id: string,
+  status: Record<string, unknown>,
+  openIds: ReadonlySet<string>,
+): AgentLiveness {
+  if (status[id] !== undefined) return "local";
+  return openIds.has(id) ? "other-window" : "unknown";
+}
+
 /** Whether a caller may run PRIVILEGED ops (set_theme / set_config). Fails CLOSED: the caller must
  *  resolve to a known, NON-worker (interactive) agent. Workers run unattended and auto-approve every
  *  tool call (dangerouslySkipPermissions), so persona prose alone can't stop one from changing the
@@ -177,7 +203,12 @@ function callerMayAdminister(callerAgentId: string): boolean {
  *    blocked                      — went quiet; red, but nothing is waiting on your answer
  *    unmerged                     — finished, committed work not yet on main (gray, not an alarm)
  *    idle | done                  — finished its turn, nothing left for you
- *    stopped                      — no live process (also the default for an agent with no entry) */
+ *    stopped                      — no live process (also the default for an agent with no entry)
+ *
+ *  That last parenthetical is the trap, so every row also carries `liveness` (see AgentLiveness):
+ *  "stopped" + liveness "local" means the agent really is stopped, while "stopped" + "other-window"
+ *  or "unknown" means this window simply has no entry for it. Branch on `liveness` before you
+ *  conclude an agent is dead. */
 function handleGetState(req: ControlRequest): {
   agents: unknown[];
   scope: StateScope;
@@ -193,16 +224,6 @@ function handleGetState(req: ControlRequest): {
   const status = useRuntimeStore.getState().status;
   const ui = useUiStore.getState();
   const scope = resolveScope(req.payload.scope);
-  const all = projects.flatMap((p) =>
-    p.agents.map((a) => ({
-      id: a.id,
-      name: a.name,
-      kind: a.kind,
-      status: status[a.id] ?? "stopped",
-      parentId: a.parentId,
-      activity: a.activity ?? null,
-    })),
-  );
   // Liveness for scope "active" must NOT come from `status` alone. That map is window-local and
   // never persisted (runtimeStore: "live-only"), while control:request is broadcast to EVERY window
   // and whichever replies first answers — so a window has no status entries for agents mounted in
@@ -213,6 +234,20 @@ function handleGetState(req: ControlRequest): {
   // the app-wide signal. Found by roborev #53406.
   const openIds = new Set(
     mergeOpenAgentIds(useRuntimeStore.getState().openAgentIds, readPersistedOpenAgentIds()),
+  );
+  const all = projects.flatMap((p) =>
+    p.agents.map((a) => ({
+      id: a.id,
+      name: a.name,
+      kind: a.kind,
+      status: status[a.id] ?? "stopped",
+      // Says whether `status` above is authoritative or merely defaulted — see AgentLiveness. A row
+      // kept by scope "active" on evidence other than a live status entry still reads "stopped", so
+      // without this the caller cannot tell a dead agent from one this window just cannot see.
+      liveness: livenessOf(a.id, status, openIds),
+      parentId: a.parentId,
+      activity: a.activity ?? null,
+    })),
   );
   const agents = all.filter((a) => {
     if (scope === "all") return true;

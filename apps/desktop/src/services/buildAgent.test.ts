@@ -38,6 +38,18 @@ describe("sparkleControlProtocol — name yourself early, but never in a turn of
     expect(sparkleControlProtocol()).toMatch(/PHASE boundaries/);
   });
 
+  it("carves out the hand-back case, where skipping narration costs a PAID call instead", () => {
+    // roborev 53476: "skip it if you have nothing to batch with" aims straight at the turn that
+    // hands back to the human — which has no other tool call by construction. But that is exactly
+    // when useAttentionNotifications wants a recent narration to use as the needs-you notification
+    // body; without one it falls through to the credit-metered summarize_attention scrape. So the
+    // saving is illusory there, and the exemption has to survive in the prose or it comes back.
+    const p = sparkleControlProtocol();
+    expect(p).toMatch(/ONE EXCEPTION/);
+    expect(p).toMatch(/hand back to the human/);
+    expect(p).toMatch(/LAST tool-using turn/);
+  });
+
   it("warns that get_state is expensive and offers the narrowing scope", () => {
     const p = sparkleControlProtocol();
     expect(p).toMatch(/get_state\(\{ scope \}\)/);
