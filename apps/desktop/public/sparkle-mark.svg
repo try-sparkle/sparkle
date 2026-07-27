@@ -1,0 +1,28 @@
+<!--
+  The SQUARE sparkle mark — the brand's three-sparkle glyph, for places too narrow to spend
+  ~72px on the full "sparkle.ai" wordmark (public/sparkle-logo.svg). First use: the floating
+  helper island, which is only 268px wide.
+
+  Traced from the canonical square icon at "images/logos/square icons/sparkle-mark-dark.svg":
+  the three sparkle paths and the blue→cyan brand gradient are copied VERBATIM, so this stays
+  in step with the master asset. What is deliberately dropped is everything that only reads at
+  poster size — the graph-paper rules, the dashed construction circles, the sketch→solid
+  masks, and the opaque #0A1A3F plate. At 16-18px those render as grey mush around the glyph;
+  a transparent background also lets the mark sit on the island's navy without a seam.
+
+  The viewBox is the tight square around the three paths (content spans x 160..912, y 228..776,
+  centred at 536,502 → a 752 box), so consumers can set equal width/height and get an optically
+  centred, square-footprint mark. The gradient keeps the master's userSpaceOnUse coordinates,
+  which is why it is unaffected by the crop.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="160 126 752 752" width="752" height="752" role="img" aria-label="Sparkle">
+  <defs>
+    <linearGradient id="sparkleMark" gradientUnits="userSpaceOnUse" x1="120" y1="0" x2="900" y2="0">
+      <stop offset="0" stop-color="#3E7BFF"/>
+      <stop offset="1" stop-color="#34E0F0"/>
+    </linearGradient>
+  </defs>
+  <path d="M300,228 C319.6,348.4 319.6,348.4 440,368 C319.6,387.6 319.6,387.6 300,508 C280.4,387.6 280.4,387.6 160,368 C280.4,348.4 280.4,348.4 300,228 Z" fill="url(#sparkleMark)"/>
+  <path d="M548,344 C578.24,529.76 578.24,529.76 764,560 C578.24,590.24 578.24,590.24 548,776 C517.76,590.24 517.76,590.24 332,560 C517.76,529.76 517.76,529.76 548,344 Z" fill="url(#sparkleMark)"/>
+  <path d="M800,268 C815.68,364.32 815.68,364.32 912,380 C815.68,395.68 815.68,395.68 800,492 C784.32,395.68 784.32,395.68 688,380 C784.32,364.32 784.32,364.32 800,268 Z" fill="url(#sparkleMark)"/>
+</svg>

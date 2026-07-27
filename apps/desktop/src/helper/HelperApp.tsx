@@ -455,6 +455,8 @@ export function HelperApp() {
           vitals={vitals}
           captureBusy={captureBusy}
           captureError={captureError}
+          // Aims the collapse chevrons at the edge the tab will actually dock to.
+          edge={edge}
           onCapture={() => void capture()}
           onCollapse={() => setMode("tab")}
           onChiclet={onChiclet}
