@@ -348,9 +348,10 @@ describe("the stated count equals the rows the click leaves standing", () => {
   //
   // Drawing no such line is not the same as saying nothing, and the difference is a bug this branch
   // briefly shipped: with no line and no row, these two were invisible everywhere in the app. They
-  // are digested as ROWLESS instead — one line whose sentence names what they are and whose count
-  // promises nothing about rows. (They were one card EACH until roborev 53654; see the
-  // "one line, not N cards" case below for why that was the card wall coming back.)
+  // speak as one card EACH — and a card each, not a rowless line, because an orchestrator outside
+  // the fleet leaves them with no row anywhere, so nothing but their own card can reach them. A
+  // line here would have named "2" and delivered one (roborev 53679); the rowless line is reserved
+  // for workers that do get a nested row, which the surfacing suite covers.
   it("draws no row-promising line when the only asks are workers — but still says they exist", () => {
     const p = projectOf("p2", "web", [tab("calm"), worker("w1", "elsewhere"), worker("w2", "elsewhere")]);
     const status: Record<string, AgentTabStatus> = { calm: "idle", w1: "blocked", w2: "blocked" };
@@ -358,10 +359,9 @@ describe("the stated count equals the rows the click leaves standing", () => {
     render(<ConciergeHost feed={feedFrom([p], status)} />);
     expect(screen.queryByText(/2 Need you in web/)).toBeNull();
     expect(promises()).toEqual([]);
-    // Not silence: the rowless asks speak, in a sentence with no row count in it.
-    expect(screen.getByTestId("concierge-rowless-digest").textContent).toBe(
-      "2 workers inside web need you",
-    );
+    // Not silence, and not a promise either: two cards, each with its own "Show me".
+    expect(screen.queryByTestId("concierge-rowless-digest")).toBeNull();
+    expect(screen.queryAllByText(/ — .+ in .+\.$/)).toHaveLength(2);
   });
 
   // The partial version, which is the one that actually happens: a red worker paints its

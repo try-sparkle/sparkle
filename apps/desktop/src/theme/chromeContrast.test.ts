@@ -415,19 +415,14 @@ describe("chrome separation — the shell's edges and fills", () => {
   // the backdrop every one of the row's plane inks is measured on. It is left out as an assertion
   // because an 8% wash of anything is under the chrome floor by construction, and a test that cannot
   // fail is what the header of this file bans.
-  it("the Improve Sparkle row's gold rail reads against both its own fill and the column", () => {
-    for (const mode of MODES) {
-      const hex = THEME_HEX[mode];
-      // The row's own active fill, and the column the rail's outer edge abuts.
-      for (const backdrop of ["forest", "deepForest"] as const) {
-        expect(
-          contrast(hex.goldFill, hex[backdrop]),
-          `${mode}: the selected row's goldFill rail (${hex.goldFill}) on ${backdrop} (${hex[backdrop]})`,
-        ).toBeGreaterThanOrEqual(CONTROL_MIN_CONTRAST);
-      }
-    }
-  });
-
+  //
+  // The rail's own floor is NOT re-asserted here, for that same reason. It is already held by
+  // "`goldFill` clears the non-text control floor on every plane, in both themes" below, which
+  // sweeps `PLANES` — `forest` and `deepForest` among them — over `MODES` at `CONTROL_MIN_CONTRAST`.
+  // A row-scoped copy over those two planes is a strict subset of that sweep: no palette edit can
+  // redden it without reddening the sweep first, so it measured nothing and merely looked like the
+  // rail's guard (roborev 53685). What IS asserted is the half the sweep does not cover — that the
+  // fill step this rail replaces falls BELOW the floor, which is the reason the rail exists at all.
   it("the row's FILL step is below the chrome floor — which is why the rail has to exist", () => {
     // Recorded as a failing measurement, not as a comment, so a future round cannot delete the rail
     // on the theory that "the active fill already says it". It does not, at either end: this is the

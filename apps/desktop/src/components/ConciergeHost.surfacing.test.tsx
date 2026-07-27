@@ -26,7 +26,7 @@
 // The rule that closes both: an agent is REPRESENTED ELSEWHERE when a present ancestor already
 // carries its band. Represented → counted once, at the row. Not represented → it surfaces itself.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 const h = vi.hoisted(() => ({
   openProjectTab: vi.fn(),
@@ -146,6 +146,12 @@ const threadTotal = (): number =>
 
 beforeEach(() => {
   useUiStore.getState().showAllStatusBands();
+  // uiStore is a module singleton, so expansion LEAKS between cases: a test that clicks a rowless
+  // line leaves that head expanded, and the next one asserting "starts collapsed" then reads a
+  // state its own fixture never set. Cleared rather than worked around with distinct ids, because
+  // "absent → collapsed" is the production default these cases are about.
+  useUiStore.setState({ collapsedOrchestrators: {} });
+  h.openProjectTab.mockClear();
 });
 afterEach(() => {
   cleanup();
@@ -184,9 +190,11 @@ describe("no red agent falls through the floor", () => {
   // a status-map key with no agent behind it, so the feed drops it. Previously: two workers red,
   // "2 Need you in web" and an empty column; then, after the topLevel gate, total silence.
   //
-  // TWO of them, so they surface as one ROWLESS LINE rather than two cards (roborev 53654) — the
-  // digest rule applies to this population too. Still surfaced, which is what this case is about;
-  // ConciergeHost.digestFilter.test.tsx owns the shape of what they surface AS.
+  // TWO of them, and they surface as TWO CARDS — not as one rowless line. These have no row
+  // ANYWHERE (no head of their own, and no present parent to nest under), so a card apiece is the
+  // only thing that keeps both reachable: a line can reveal exactly one agent, and its "2" would
+  // have promised an affordance for a second one that did not exist (roborev 53679). The line is
+  // still right for workers that DO get a nested row — see the gap-3 case below.
   it("surfaces workers whose orchestrator is not in the fleet at all", () => {
     const p = projectOf("p1", "web", [
       tab("calm"),
@@ -195,12 +203,147 @@ describe("no red agent falls through the floor", () => {
     ]);
     const feed = feedFrom([p], { calm: "idle", w1: "blocked", w2: "blocked" });
     render(<ConciergeHost feed={feed} />);
+    expect(cardNames()).toEqual(["w1", "w2"]);
+    expect(screen.queryByTestId("concierge-rowless-digest")).toBeNull();
+    // Nothing fell through, and every one of them can be acted on.
+    expect(threadTotal()).toBe(2);
+  });
+
+  // GAP 3 — the high-volume case, and the one the rowless LINE is actually for. The orchestrator IS
+  // present; it is merely in motion, so `withRedWorkerAttention` suppresses the bubble. Each of its
+  // blocked workers used to be a card, which is the card wall the digest exists to prevent.
+  //
+  // Collapsing these is honest in a way collapsing the ancestor-less ones is not — but NOT because
+  // the reveal happens to land well. That was the original claim here and it was wrong: a missing
+  // `collapsedOrchestrators` entry reads as collapsed, so the default is a shut subtree. What makes
+  // them collapsible is having a HEAD the click can name and open; the click then does the opening
+  // itself (`showAllStatusBands` + `expandOrchestrators`), which the case below this one pins.
+  // See ConciergeHost.strandedAgents / revealAgent, and conciergeFeed.parentRowId.
+  it("still collapses workers that DO get a nested row under a present orchestrator", () => {
+    const p = projectOf("p1", "web", [
+      tab("orch"),
+      worker("w1", "orch"),
+      worker("w2", "orch"),
+      worker("w3", "orch"),
+    ]);
+    // `orch` is WORKING, so it bands `running` and does not represent its blocked workers — the
+    // in-motion suppression this gap is made of. Its row is on screen all the same.
+    const feed = feedFrom([p], { orch: "working", w1: "blocked", w2: "blocked", w3: "blocked" });
+    render(<ConciergeHost feed={feed} />);
     expect(cardNames()).toEqual([]);
     expect(screen.getByTestId("concierge-rowless-digest").textContent).toBe(
-      "2 workers inside web need you",
+      "3 workers inside web need you",
     );
-    // Nothing fell through: the line accounts for both of them.
-    expect(threadTotal()).toBe(2);
+    expect(threadTotal()).toBe(3);
+  });
+
+  // THE PREMISE, not the sentence (roborev 53734). "Reveal the lead and the siblings render beside
+  // it" is only true if the head is actually DRAWN and EXPANDED, and neither is the default:
+  // `isOrchestratorCollapsed` reads a missing entry as collapsed, and a prior rows-variant digest
+  // click leaves `running` filtered off — which is exactly the band an in-motion orchestrator sits
+  // in. Asserting the line's text would have passed through both bugs, so assert the state the
+  // reveal depends on instead.
+  it("clicking a rowless line expands the head and un-hides its band, so the group can be seen", () => {
+    const p = projectOf("p1", "web", [tab("orch"), worker("w1", "orch"), worker("w2", "orch")]);
+    const feed = feedFrom([p], { orch: "working", w1: "blocked", w2: "blocked" });
+    // The hostile-but-ordinary starting state: the head's band is filtered out and its subtree has
+    // never been expanded (no entry at all — which uiStore reads as collapsed).
+    useUiStore.getState().isolateStatusBand("needs_you");
+    expect(useUiStore.getState().isOrchestratorCollapsed("orch")).toBe(true);
+    expect(useUiStore.getState().statusFilter.running).toBe(false);
+
+    render(<ConciergeHost feed={feed} />);
+    fireEvent.click(screen.getByTestId("concierge-rowless-digest"));
+
+    // The head is now drawn AND open, which is what makes the line's "2" deliverable.
+    expect(useUiStore.getState().isOrchestratorCollapsed("orch")).toBe(false);
+    expect(useUiStore.getState().statusFilter.running).toBe(true);
+    // And it still reveals — expanding replaces nothing.
+    expect(h.openProjectTab).toHaveBeenCalledWith("p1", "w1");
+  });
+
+  // The OTHER way one line could out-promise one click: same project, same band, DIFFERENT heads.
+  // One line still, because splitting it per head rebuilds the card wall (see the next case) — so
+  // the click's reach is what widens instead: it expands every head the line names.
+  it("keeps workers under different orchestrators on ONE line, and opens every subtree it names", () => {
+    const p = projectOf("p1", "web", [
+      tab("orchA"),
+      tab("orchB"),
+      worker("a1", "orchA"),
+      worker("a2", "orchA"),
+      worker("b1", "orchB"),
+      worker("b2", "orchB"),
+    ]);
+    const feed = feedFrom([p], {
+      orchA: "working",
+      orchB: "working",
+      a1: "blocked",
+      a2: "blocked",
+      b1: "blocked",
+      b2: "blocked",
+    });
+    render(<ConciergeHost feed={feed} />);
+    const lines = screen.queryAllByTestId("concierge-rowless-digest");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.textContent).toBe("4 workers inside web need you");
+
+    fireEvent.click(lines[0]!);
+
+    // BOTH heads, not just the lead's — the count is only deliverable if every subtree opens.
+    expect(useUiStore.getState().isOrchestratorCollapsed("orchA")).toBe(false);
+    expect(useUiStore.getState().isOrchestratorCollapsed("orchB")).toBe(false);
+    expect(cardNames()).toEqual([]);
+    expect(threadTotal()).toBe(4);
+  });
+
+  // THE CARD WALL, in the shape that actually occurs (roborev 53737). Keying rowless buckets by head
+  // made every line honest, and fragmented this fleet — several in-motion orchestrators with ONE
+  // blocked worker each — into a bucket apiece. A bucket of one is a card, so the module built to
+  // prevent the wall rebuilt it. The count is what a line may promise; the fix belongs on the
+  // click's reach, not on the grouping.
+  it("collapses one-blocked-worker-per-orchestrator into a line, not a card each", () => {
+    const p = projectOf("p1", "web", [
+      tab("orchA"),
+      tab("orchB"),
+      tab("orchC"),
+      worker("a1", "orchA"),
+      worker("b1", "orchB"),
+      worker("c1", "orchC"),
+    ]);
+    const feed = feedFrom([p], {
+      orchA: "working",
+      orchB: "working",
+      orchC: "working",
+      a1: "blocked",
+      b1: "blocked",
+      c1: "blocked",
+    });
+    render(<ConciergeHost feed={feed} />);
+    expect(screen.getByTestId("concierge-rowless-digest").textContent).toBe(
+      "3 workers inside web need you",
+    );
+    expect(cardNames()).toEqual([]);
+    expect(threadTotal()).toBe(3);
+  });
+
+  // The SINGLETON path, which the digest line's fix did not cover. One blocked worker keeps a card,
+  // and its card click used a bare `openProjectTab` — hitting the very collapse/filter gates the
+  // line's click had just learned to enforce. The contract belongs with the population, so it lives
+  // in `revealAgent` and every affordance uses it.
+  it("a nested agent's CARD click expands its head and un-hides its band too", () => {
+    const p = projectOf("p1", "web", [tab("orch"), worker("w1", "orch")]);
+    const feed = feedFrom([p], { orch: "working", w1: "blocked" });
+    useUiStore.getState().isolateStatusBand("needs_you");
+    expect(useUiStore.getState().isOrchestratorCollapsed("orch")).toBe(true);
+
+    render(<ConciergeHost feed={feed} />);
+    // A singleton, so it is a card rather than a line — that is the point of this case.
+    expect(cardNames()).toEqual(["w1"]);
+    fireEvent.click(screen.getByText(/ — w1 in web\.$/));
+
+    expect(useUiStore.getState().isOrchestratorCollapsed("orch")).toBe(false);
+    expect(useUiStore.getState().statusFilter.running).toBe(true);
+    expect(h.openProjectTab).toHaveBeenCalledWith("p1", "w1");
   });
 
   // ...and the other direction, which is what keeps the fix from double-speaking: when the bubble
@@ -319,14 +462,16 @@ describe("column one states ONE number", () => {
     render(<ConciergeHost feed={feed} />);
     const lines = screen.queryAllByTestId("concierge-digest");
     expect(lines).toHaveLength(1);
-    // Two ROWS stand behind the line (a and b) — the two workers are on their own line beside it,
-    // not inside this count.
+    // Two ROWS stand behind the line (a and b) — the two workers are cards beside it, not inside
+    // this count.
     expect(lines[0]!.textContent).toBe(`${bandCountLabel("needs_you", 2)} in web`);
-    expect(screen.getByTestId("concierge-rowless-digest").textContent).toBe(
-      "2 workers inside web need you",
-    );
-    expect(cardNames()).toEqual([]);
-    // Four asks, two lines, and the arithmetic still adds up.
+    // Neither worker joins a rowless line here, for two DIFFERENT reasons, which is the point of
+    // pairing them in one fixture: `w1` does get a nested row under the present `orch`, so it is
+    // eligible to collapse — but it is alone in that population, and one is always a card. `w2` is
+    // parentless, so it has no row anywhere and is never eligible at all.
+    expect(screen.queryByTestId("concierge-rowless-digest")).toBeNull();
+    expect(cardNames()).toEqual(["w1", "w2"]);
+    // Four asks, one line plus two cards, and the arithmetic still adds up.
     expect(threadTotal()).toBe(4);
   });
 });

@@ -68,6 +68,27 @@ export interface ConciergeAgent {
    *  the full cross-project truth, and a worker's red still bubbles to its orchestrator); this field
    *  is what lets the surfacing gate count only what is clickable-to. */
   topLevel: boolean;
+  /** The id of the HEAD ROW this agent nests under, or `null` when it has no row anywhere. The third
+   *  state between `topLevel` and "invisible" — and an id rather than a boolean because the digest
+   *  needs to name the subtree, not merely know one exists.
+   *
+   *  It exists because "rowless" was being used to mean two different things, and only one of them
+   *  is really rowless. `AgentSidebar` renders a worker from `childrenByParent` under its head, and
+   *  the head is drawn `top.kind === "build"` only, one level deep — so a worker whose `parentId`
+   *  names a present top-level BUILD agent in this project does have a row. A worker with no
+   *  `parentId`, or one whose orchestrator is not in the fleet, has none.
+   *
+   *  Load-bearing for the digest, because a digest line's click can reveal ONE agent. Collapsing
+   *  agents that share a head is safe — the click expands that head, so the whole group lands on
+   *  screen together. Collapsing agents with no head, or with DIFFERENT heads, is not: the click
+   *  satisfies the lead and strands the rest, which is what roborev 53679/53734 caught. The line
+   *  said "2 workers inside web need you" and could deliver one.
+   *
+   *  Judged against THIS PROJECT's agents, the same population `isTopLevel` is closed over, because
+   *  that is the list the sidebar builds `childrenByParent` from. An orchestrator in another project
+   *  is a real ancestor for `representedElsewhere` (a red bubbles across projects) but it is NOT a
+   *  row this project's column can show. */
+  parentRowId: string | null;
   /** True when this agent gets NO row of its own AND a present ancestor ALREADY carries its band —
    *  so the concierge would be saying the same thing twice if it counted both.
    *
@@ -333,6 +354,12 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
     // sides. Judging it against the flattened fleet instead would call a worker whose orchestrator
     // lives in another project "nested" here, where it has no parent row to nest under.
     const isTopLevel = isTopLevelAgent(p.agents);
+    // The heads this project's column actually draws, for `parentRowId`. Mirrors AgentSidebar's
+    // own nesting exactly: it buckets by `parentId` and renders children only under a row where
+    // `top.kind === "build"`, so a head that is not a present top-level build agent nests nothing.
+    const rowHeadIds = new Set(
+      p.agents.filter((a) => a.kind === "build" && isTopLevel(a)).map((a) => a.id),
+    );
     const agents = p.agents.map((a): ConciergeAgent => {
       const status = derived[a.id] ?? DEFAULT_STATUS;
       const tok = AGENT_STATUS[status] ?? AGENT_STATUS[DEFAULT_STATUS];
@@ -340,6 +367,10 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
       const muted = conciergeTopics(a.id, status).some((t) => !shouldInterrupt(t));
       const since = interaction[a.id];
       const topLevel = isTopLevel(a);
+      // Not a row of its own, but a row nonetheless — see `parentRowId`. One level deep and
+      // in-project, because that is all the sidebar draws.
+      const parentRowId =
+        !topLevel && a.parentId !== null && rowHeadIds.has(a.parentId) ? a.parentId : null;
       // A rowless agent an ancestor already speaks for. See `representedElsewhere` — this is what
       // stops one piece of work being counted twice (the red worker AND the orchestrator that
       // inherited its red), which is what made the vitals line and the thread disagree.
@@ -368,6 +399,7 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
         inScope,
         muted,
         topLevel,
+        parentRowId,
         representedElsewhere,
       };
     });

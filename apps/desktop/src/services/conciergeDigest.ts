@@ -23,6 +23,16 @@
 // hide the urgent behind the count. Keying on it now means widening what the column surfaces is a
 // one-line change here rather than a bug.
 //
+// THE RULE BEHIND THE KEY: a line may only group agents ONE CLICK CAN DELIVER. That is a constraint
+// on the CLICK's reach as much as on the grouping, and the fix belongs on whichever side keeps the
+// column a conversation. A `rows` click narrows the column to a band, so project+band is exactly
+// deliverable. A `rowless` click expands the subtrees its members hide in — so the group records
+// EVERY head it names (`rowHeadIds`) and the click opens all of them, rather than the key being
+// split per head. Splitting the key was tried and reverted: it made each line honest but fragmented
+// the common shape (several in-motion orchestrators, one blocked worker each) into a bucket apiece,
+// and a bucket of one is a card — the card wall, rebuilt by the module meant to prevent it
+// (roborev 53734, then 53737).
+//
 // PURE. No stores, no Tauri — the column renders what this returns, and the whole rule is testable
 // as data in / data out.
 import { STATUS_BANDS, type StatusBand } from "../engine/buildSections";
@@ -60,6 +70,20 @@ export interface ConciergeDigestGroup {
    *  sorted live-question-first then most-recently-touched. Opening the project on the item that
    *  most wants attention beats opening it on an arbitrary one. */
   leadAgentId: string;
+  /** For a `rowless` line, EVERY head row whose subtree holds one of the agents this line stands
+   *  for, de-duplicated and in first-seen order. Empty for a `rows` line, whose agents are heads.
+   *
+   *  A rowless line's members have no row of their own, so the click has to EXPAND the heads they
+   *  nest under: `collapsedOrchestrators` reads a missing entry as collapsed, so on a fresh launch
+   *  the subtrees are shut and revealing the lead would show a terminal pane above zero worker rows.
+   *
+   *  It is a LIST, and that is the whole design (roborev 53734, then 53737). Keying the bucket by
+   *  head instead would also have made the count honest — but it fragments the common fleet shape,
+   *  several in-motion orchestrators with one blocked worker each, into one bucket apiece; a bucket
+   *  of one is a card, so the line the digest exists to draw became N cards. Grouping stays
+   *  `project::band`, and the click's reach is what widens to match: `expandOrchestrators` already
+   *  takes an array, so one line can name several subtrees and still deliver all of them. */
+  rowHeadIds: string[];
   text: string;
 }
 
@@ -107,9 +131,10 @@ function digestText(
  * `agents` must already be in the feed's display order; grouping preserves it, so the lead agent of
  * a group is the one the feed ranked first.
  *
- * `variant` changes what a line SAYS and what its id is, never how the grouping works: both
- * populations go through this one rule, because "two or more become a line" is the whole reason
- * column one is a conversation rather than a card wall.
+ * `variant` changes what a line SAYS, what its id is, and what its click must OPEN — never how the
+ * grouping works: both populations go through the one `project::band` rule, because "two or more
+ * become a line" is the whole reason column one is a conversation rather than a card wall. See
+ * `ConciergeDigestGroup.rowHeadIds` for how a rowless line stays deliverable without splitting.
  */
 export function buildDigest(
   agents: ConciergeAgent[],
@@ -142,6 +167,13 @@ export function buildDigest(
       variant,
       count: bucket.length,
       leadAgentId: first.id,
+      // EVERY head this line stands for, so the click can open all of them. De-duplicated because
+      // several members usually share one orchestrator, and `expandOrchestrators` writes a key per
+      // id. A `rows` group's members are heads themselves, so it names none.
+      rowHeadIds:
+        variant === "rows"
+          ? []
+          : [...new Set(bucket.map((a) => a.parentRowId).filter((id): id is string => id !== null))],
       text: digestText(variant, first.band, bucket.length, first.projectName),
     });
   }

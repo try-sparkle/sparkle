@@ -499,3 +499,68 @@ describe("buildConciergeFeed — topLevel is stamped from the ONE shared predica
     expect(by(feed)["child"]!.topLevel).toBe(true);
   });
 });
+
+// The third state between "has a row" and "invisible", and the one the digest turns on: a worker
+// with no row of its own can still be ON SCREEN, nested under a head the sidebar draws. Collapsing
+// several of THOSE into one line is safe (reveal the lead and the siblings render beside it);
+// collapsing agents with no row anywhere strands all but the lead, which is roborev 53679.
+describe("buildConciergeFeed — parentRowId separates 'no row of its own' from 'no row at all'", () => {
+  const worker = (id: string, parentId: string | null) => agent(id, { kind: "worker", parentId });
+  const by = (feed: ReturnType<typeof buildConciergeFeed>) =>
+    Object.fromEntries(flat(feed).map((a) => [a.id, a]));
+
+  it("a worker under a present top-level build agent has a nested row", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("orch"), worker("w1", "orch")])],
+      status: { orch: "idle", w1: "idle" },
+    });
+    const byId = by(feed);
+    expect(byId["w1"]!.topLevel).toBe(false);
+    expect(byId["w1"]!.parentRowId).toBe("orch");
+    // A head is a row in its own right, never a nested one — the two fields are exclusive.
+    expect(byId["orch"]!.parentRowId).toBeNull();
+  });
+
+  it("a parentless worker has no row anywhere", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("orch"), worker("w2", null)])],
+      status: { orch: "idle", w2: "idle" },
+    });
+    expect(by(feed)["w2"]!.parentRowId).toBeNull();
+  });
+
+  it("a worker whose orchestrator is not in the fleet has no row anywhere", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("calm"), worker("w1", "elsewhere")])],
+      status: { calm: "idle", w1: "idle" },
+    });
+    expect(by(feed)["w1"]!.parentRowId).toBeNull();
+  });
+
+  it("judged against THIS project's agents — an orchestrator in another project draws no row here", () => {
+    // The distinction `representedElsewhere` deliberately does NOT make: a red bubbles across
+    // projects, so a faraway orchestrator can speak FOR this worker. It still cannot show it. The
+    // sidebar builds `childrenByParent` from one project's agents, so there is no row in this
+    // column to nest under, and the worker must keep its own card.
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [worker("w1", "faraway")]), project("p2", [agent("faraway")])],
+      status: { w1: "idle", faraway: "idle" },
+    });
+    expect(by(feed)["w1"]!.parentRowId).toBeNull();
+  });
+
+  it("a worker under a NON-top-level parent has no row — the sidebar only nests under heads", () => {
+    // `mid` is a build agent parented to `orch`, so it is not top-level and the sidebar never draws
+    // it; a worker hanging off it therefore renders nowhere. Nesting is one level deep by design
+    // (`top.kind === "build"` with `childrenByParent.get(top.id)`), not a chain.
+    const feed = buildConciergeFeed({
+      projects: [
+        project("p1", [agent("orch"), agent("mid", { parentId: "orch" }), worker("w1", "mid")]),
+      ],
+      status: { orch: "idle", mid: "idle", w1: "idle" },
+    });
+    const byId = by(feed);
+    expect(byId["mid"]!.topLevel).toBe(false);
+    expect(byId["w1"]!.parentRowId).toBeNull();
+  });
+});

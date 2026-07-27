@@ -338,6 +338,39 @@ function unrepresentedAgents(feed: ConciergeFeed): ConciergeAgent[] {
   return accountedAgents(feed).filter((a) => !a.topLevel);
 }
 
+/** The part of {@link unrepresentedAgents} a LINE may collapse: those that do get a nested row.
+ *
+ *  A digest line's click reveals exactly one agent, so collapsing is only honest when the click can
+ *  nonetheless put the WHOLE group on screen. That is not a free property of the sidebar — it is
+ *  something the click has to DO. The original version of this comment claimed the former ("reveal
+ *  one and the siblings are on screen beside it") and was wrong twice over: `collapsedOrchestrators`
+ *  reads a missing entry as collapsed, so on a fresh launch the subtree is shut, and a leftover band
+ *  filter can drop the head entirely (roborev 53679, then 53734).
+ *
+ *  So the guarantee is attributed where it actually lives: `revealAgent` and the rowless branch of
+ *  `onDigestClick` call `showAllStatusBands()` + `expandOrchestrators(...)` before opening. What
+ *  makes this population collapsible is having a head at all — one the click can name and open. */
+function nestedRowlessAgents(feed: ConciergeFeed): ConciergeAgent[] {
+  return unrepresentedAgents(feed).filter((a) => a.parentRowId !== null);
+}
+
+/** The part that may NOT be collapsed: accounted-for agents with no row ANYWHERE.
+ *
+ *  A worker with no `parentId`, or one whose orchestrator is not in this project's fleet, is not
+ *  drawn by column two at all — not as a head, not as a child. Its nudge card's "Show me" is its
+ *  ONLY affordance in the app, so folding several into one line strands all but the lead: the line
+ *  read "2 workers inside web need you" and the click could satisfy one of them, with no way to
+ *  reach the other until the first resolved (roborev 53679).
+ *
+ *  So these stay one card each, on purpose. That is not the card wall coming back — the wall is the
+ *  HIGH-VOLUME case, a blocked worker under a present-but-in-motion orchestrator, which fires once
+ *  per worker and is exactly what {@link nestedRowlessAgents} still collapses. This population is
+ *  the rare ancestor-less remainder, and a card apiece is the cheapest thing that keeps every one of
+ *  them reachable. */
+function strandedAgents(feed: ConciergeFeed): ConciergeAgent[] {
+  return unrepresentedAgents(feed).filter((a) => a.parentRowId === null);
+}
+
 function actionsFor(a: ConciergeAgent): ConciergeNudgeAction[] {
   const show: ConciergeNudgeAction = { id: "show", label: "Show me" };
   const mute: ConciergeNudgeAction = { id: "mute", label: "Mute", kind: "ghost" };
@@ -749,6 +782,41 @@ export function ConciergeHost({
     (id: string) => allAgents(feedRef.current).find((a) => a.id === id) ?? null,
     [],
   );
+
+  /**
+   * Reveal an agent in column two, ENFORCING the two gates that can otherwise leave a reveal
+   * pointing at nothing. The reveal path for column one's NUDGE AND DIGEST surfaces — not for the
+   * command palette, which still bypasses it; see SCOPE below.
+   *
+   * `openProjectTab` selects and mounts, but two pieces of pre-existing UI state decide whether a
+   * row is actually DRAWN — and for an agent with no row of its own, both default to hiding it:
+   *
+   *   1. `collapsedOrchestrators` reads a missing entry as COLLAPSED, and `expandOnGrowth` skips
+   *      first sighting — so on a fresh launch the head's subtree is shut and the reveal lands on a
+   *      terminal pane above zero worker rows.
+   *   2. The sidebar applies `statusFilter` to heads, so a `running` orchestrator is not drawn at
+   *      all when `running` is off — which a prior rows-variant digest click turns off by design.
+   *
+   * SCOPE: every reveal on COLUMN ONE'S NUDGE/DIGEST PATH — the digest line's click, a singleton's
+   * card click, and that card's "Show me" (roborev 53734 fixed the first; 53737 caught the other
+   * two). It is deliberately not claimed to be the app's only reveal path, because it is not:
+   * `Concierge/paletteJump.ts` still wires `focusAgentElsewhere`/`openInWindow` to a bare
+   * `openProjectTab` and `selectAgentHere` to the runtime/project stores, so a command-palette jump
+   * onto a nested worker lands in exactly the state described above. That gap predates this helper
+   * and is tracked as bead `sparkle-bel2` (raised by roborev 53740) — stated here rather than left
+   * for the docstring to imply it is closed, which would be worse than leaving it undocumented.
+   *
+   * A top-level agent passes through untouched — it owns its row, so there is nothing to expand and
+   * no filter to clear.
+   */
+  const revealAgent = useCallback((a: ConciergeAgent) => {
+    if (a.parentRowId !== null) {
+      const ui = useUiStore.getState();
+      ui.showAllStatusBands();
+      ui.expandOrchestrators([a.parentRowId]);
+    }
+    openProjectTab(a.projectId, a.id);
+  }, []);
 
   /** Is this agent still in the feed? Absence IS "closed / deleted / project unloaded". */
   const agentStillExists = useCallback(
@@ -1477,7 +1545,10 @@ export function ConciergeHost({
       // tab select plus the shared reveal — so a nudge from a background project lands correctly.
       onNudgeClick: (n: ConciergeNudge) => {
         const a = resolveAgent(n.id);
-        if (a) openProjectTab(a.projectId, a.id);
+        // `revealAgent`, not a bare `openProjectTab`: a singleton nested-rowless agent keeps a CARD,
+        // and its card click hits exactly the collapse/filter gates the digest line's click had to
+        // learn about (roborev 53737).
+        if (a) revealAgent(a);
       },
       // The digest's whole purpose: hand off to column two instead of duplicating it.
       //
@@ -1499,16 +1570,38 @@ export function ConciergeHost({
         const feed = feedRef.current;
         const live =
           d.variant === "rowless"
-            ? buildDigest(unrepresentedAgents(feed), "rowless").groups.find((g) => g.id === d.id)
+            ? buildDigest(nestedRowlessAgents(feed), "rowless").groups.find((g) => g.id === d.id)
             : buildDigest(surfacedAgents(feed)).groups.find((g) => g.id === d.id);
         if (!live) return; // resolved out from under the click — open nothing, filter nothing
-        // A ROWLESS line REVEALS, it does not filter. Its agents have no row, so `isolateStatusBand`
-        // has nothing of theirs to leave standing — and worse, it would hide the very row the reveal
-        // needs: the gap-3 case is a blocked worker under an orchestrator that bands `running`, so
-        // isolating `needs_you` removes the orchestrator the worker pops out under. Opening the
-        // project on the lead agent is exactly what that agent's own card's "Show me" did, which is
-        // the honest affordance for a population that owns no rows.
+        // A ROWLESS line REVEALS, it does not NARROW. Its agents have no row of their own, so
+        // `isolateStatusBand` has nothing of theirs to leave standing — and worse, it would hide the
+        // very row the reveal needs: these are blocked workers under an orchestrator that bands
+        // `running`, so isolating `needs_you` removes the head they pop out under.
+        //
+        // But declining to SET a filter is not enough, and that was the bug (roborev 53734). The
+        // line's promise is "click me and see these N", and TWO pieces of pre-existing UI state can
+        // silently break it, both of them the default rather than an edge case:
+        //
+        //   1. COLLAPSE. `uiStore.isOrchestratorCollapsed` reads a missing entry as COLLAPSED, and
+        //      `expandOnGrowth` deliberately skips first sighting — so on a fresh launch the head's
+        //      subtree is shut. `openProjectTab` selects and mounts the lead but never expands, so
+        //      the click gave you a terminal pane above ZERO worker rows.
+        //   2. A LEFTOVER BAND FILTER. The sidebar applies `statusFilter` to heads, so a `running`
+        //      orchestrator is not drawn at all if `running` is off — which a previous *rows*-
+        //      variant digest click turns off, by design.
+        //
+        // So the click ENFORCES its premise rather than assuming it: show every band, then expand
+        // EVERY head the line names. `rowHeadIds` is a list because grouping stays `project::band`
+        // — keying it per head instead was tried and reverted, since that fragments the common
+        // fleet shape into a card apiece and rebuilds the wall (roborev 53737). One line may span
+        // several orchestrators; expanding only the lead's would strand the rest.
         if (live.variant === "rowless") {
+          const ui = useUiStore.getState();
+          ui.showAllStatusBands();
+          // EVERY head the line stands for, not just the lead's: one line can span several
+          // in-motion orchestrators, and expanding one of them would strand the rest (roborev
+          // 53737). `expandOrchestrators` takes an array for exactly this.
+          ui.expandOrchestrators(live.rowHeadIds);
           openProjectTab(live.projectId, live.leadAgentId);
           return;
         }
@@ -1530,7 +1623,8 @@ export function ConciergeHost({
         const a = resolveAgent(n.id);
         if (!a) return;
         if (actionId === "show") {
-          openProjectTab(a.projectId, a.id);
+          // The card's own affordance has to keep the same promise its click does.
+          revealAgent(a);
         } else if (actionId === "approve") {
           void approve(a);
         } else if (actionId === "mute") {
@@ -1538,7 +1632,7 @@ export function ConciergeHost({
         }
       },
     }),
-    [resolveAgent, approve, send, redirect, attach, removeAttachment, toggleMic, play],
+    [resolveAgent, revealAgent, approve, send, redirect, attach, removeAttachment, toggleMic, play],
   );
 
   const pinnedProjectName = useMemo(() => {
@@ -1570,8 +1664,10 @@ export function ConciergeHost({
     // is several cards). What their line may not do is state a ROW count or filter a column that
     // has no rows to leave standing; that is the variant's job, not an exemption from digesting.
     // See `unrepresentedAgents` and services/conciergeDigest.DigestVariant.
-    const rowless = buildDigest(unrepresentedAgents(feed), "rowless");
-    const nudges = [...cards, ...rowless.cards].map(agentToNudge);
+    const rowless = buildDigest(nestedRowlessAgents(feed), "rowless");
+    // Never digested — every one of these keeps its own card, because its card is the only way to
+    // reach it. See `strandedAgents`.
+    const nudges = [...cards, ...rowless.cards, ...strandedAgents(feed)].map(agentToNudge);
     const digests: ConciergeMessage[] = [...groups, ...rowless.groups].map((g) => ({
       id: g.id,
       kind: "digest" as const,
