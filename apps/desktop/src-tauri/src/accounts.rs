@@ -1622,7 +1622,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A `(modified, len)` pair distinct from `base`, for the miss cases.
     /// Memo-test shorthand: a SpendRecord with only (ts, output) set — the shape the old
     /// (ts, tokens) tuple carried.
     fn rec(ts: i64, output: u64) -> SpendRecord {

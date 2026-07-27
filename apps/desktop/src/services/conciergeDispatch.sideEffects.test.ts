@@ -294,25 +294,6 @@ describe("dispatchConciergeAnswer — queueing a prompt for a PTY that isn't up 
     expect(pendingSendCount("a1")).toBe(0);
   });
 
-  it("a CLOUD agent is refused up front — no PTY write, no picker keystroke (roborev 46916)", async () => {
-    const { useProjectStore } = await import("../stores/projectStore");
-    const prior = useProjectStore.getState().projects;
-    useProjectStore.setState({
-      projects: [
-        ...prior,
-        { id: "p-cloud", name: "P", agents: [{ id: "cloudy", runtime: "cloud" }] },
-      ],
-    } as never);
-    const r = await dispatchConciergeAnswer("cloudy", "yes", { userPrompt: true });
-    expect(r.path).toBe("cloud-agent");
-    // The refusal short-circuits BEFORE the screen is even read: no PTY write, no keystroke,
-    // and no picker detection — there is no terminal to detect against.
-    expect(writePty).not.toHaveBeenCalled();
-    expect(submitPrompt).not.toHaveBeenCalled();
-    expect(detectTerminalPrompts).not.toHaveBeenCalled();
-    useProjectStore.setState({ projects: prior } as never);
-  });
-
   it("a Retry that republishes readiness makes the same prompt queue again", async () => {
     setPaneFailed("a1");
     setPaneReady("a1", false); // Retry re-entered the prepare flow: mounting again
@@ -573,5 +554,17 @@ describe("cloud agents have no local PTY (roborev 46916)", () => {
     expect(submitPrompt).not.toHaveBeenCalled();
     expect(detectTerminalPrompts).not.toHaveBeenCalled();
     expect(recordTrialSend).not.toHaveBeenCalled();
+    // …and the STORE-mutating side-effects are skipped too. The runtime check sits above the
+    // composer block; a regression that moved it below `appendPrompt`/`maybeAutoName` would still
+    // pass every assertion above, so pin the two effects that would survive it.
+    //
+    // POSITIVE CONTROL first: `promptsOf` returns `?? []`, so an empty result also means "no such
+    // agent" — without this the length check would pass just as happily if the fixture never
+    // landed in the store, pinning nothing at all (roborev 52972).
+    expect(
+      useProjectStore.getState().projects.flatMap((p) => p.agents).some((a) => a.id === "cloudy"),
+    ).toBe(true);
+    expect(promptsOf("cloudy")).toHaveLength(0);
+    expect(maybeAutoName).not.toHaveBeenCalled();
   });
 });

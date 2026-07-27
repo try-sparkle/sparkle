@@ -26,7 +26,12 @@ import {
   onConciergeError,
   startConciergeTurn,
 } from "../services/concierge";
-import { dispatchConciergeAnswer, onDeferredSendOutcome } from "../services/conciergeDispatch";
+import {
+  dispatchConciergeAnswer,
+  onDeferredSendOutcome,
+  type ConciergeDispatchPath,
+  type ConciergeDispatchResult,
+} from "../services/conciergeDispatch";
 import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
 import { useSpendPill } from "../stores/spendStore";
 
@@ -36,8 +41,98 @@ const nextId = (p: string) => `${p}-${(seq += 1)}`;
 /** What the concierge says when the server has refused the send: the free trial is spent. The
  *  dispatch path gates BEFORE delivery (services/trialMeter.trialSendAllowed), so nothing reached
  *  the agent — say so plainly rather than leaving the user waiting on a reply that isn't coming. */
-const TRIAL_SPENT_TEXT =
+export const TRIAL_SPENT_TEXT =
   "Your free trial is used up, so that didn't send. Upgrade and I'll pass it straight through.";
+
+/** The two voices a non-delivery is reported in: the nudge card's Approve relay, and the compose
+ *  box's user-authored prompt. Same facts, different remedy — "hit Retry" vs "then send again". */
+type RefusalVoice = "approval" | "prompt";
+
+/** The paths that mean NOT DELIVERED. `picker-option`/`free-text` are excluded because they DID
+ *  land; `queued` because it means HELD — the callers report that themselves, but only when `ok`,
+ *  so an `ok:false` queued result DOES reach `refusedPath` and comes back `null` for the generic
+ *  line (roborev 53044). Narrowing the parameter this way means handing a delivered path to
+ *  `refusalCopy` is a compile error at the call site rather than a misleading generic
+ *  "I couldn't send…" — the very dead end it exists to remove (roborev 52972). */
+type RefusedPath = Exclude<ConciergeDispatchPath, "picker-option" | "free-text" | "queued">;
+
+/**
+ * The refusal path of a result that did NOT deliver — or `null` when it did.
+ *
+ * `ok` stays the ONLY test for delivery. An earlier pass got the narrowing by widening the callers'
+ * success branch to `r.ok || r.path === "picker-option" || r.path === "free-text"`, which inverted
+ * that: an `{ ok: false, path: "free-text" }` would have reported "Sent to X." and, in
+ * `promptAgent`, returned true — DISCARDING the user's draft on a failure that used to restore it
+ * (roborev 53018). A cosmetic risk is not worth a real one. This predicate gives the same
+ * compile-time proof with `ok` still in charge.
+ */
+function refusedPath(r: ConciergeDispatchResult): RefusedPath | null {
+  if (r.ok) return null;
+  switch (r.path) {
+    // ok:false on a path that means "delivered" is a contradiction the type system can't yet rule
+    // out (ok and path are independent fields). Treat it as a plain refusal with no bespoke line
+    // rather than as a success — the user keeps their draft either way.
+    case "picker-option":
+    case "free-text":
+      return null;
+    // `queued` means HELD, not delivered — reachable here precisely BECAUSE the callers gate their
+    // held branch on `ok`. An ok:false hold is not a hold, so it takes the generic refusal line.
+    case "queued":
+      return null;
+    default:
+      return r.path;
+  }
+}
+
+/** THE one place a refused dispatch path becomes user-facing copy.
+ *
+ *  `approve` and `promptAgent` used to carry two near-identical `else if` ladders over the same
+ *  paths, and they drifted exactly as you'd expect: the truthful `agent-failed`/`cloud-agent` lines
+ *  landed on the prompt side a full commit before the approval side, so approving on a cloud agent
+ *  gave the generic "I couldn't send…" dead end for a week. An exhaustive `switch` makes that
+ *  impossible — a path added to ConciergeDispatchPath is a TYPE ERROR here (the `never` guard in
+ *  `default`) instead of a silent fall-through to the generic line.
+ *
+ *  Only NON-delivery is handled: the callers report the delivered/held paths themselves, because
+ *  what they do there differs (approve returns void; promptAgent returns whether to keep the draft). */
+function refusalCopy(path: RefusedPath | null, name: string, voice: RefusalVoice): string {
+  const approving = voice === "approval";
+  const generic = approving ? `I couldn't send the approval to ${name}.` : `I couldn't send that to ${name}.`;
+  if (path === null) return generic; // refused on a delivered-looking path — see refusedPath
+  switch (path) {
+    case "trial-spent":
+      return TRIAL_SPENT_TEXT;
+    case "agent-failed":
+      return approving
+        ? `${name} couldn't start, so I couldn't send the approval — open its pane and hit Retry.`
+        : `${name} couldn't start, so that didn't send — open its pane and hit Retry (or finish installing Claude Code), then send again.`;
+    case "cloud-agent":
+      return approving
+        ? `${name} runs in the cloud — I can't relay the approval from here yet; answer it in its own pane.`
+        : `${name} runs in the cloud, and prompting cloud agents from here isn't wired up yet — use its own pane for now.`;
+    case "pty-gone":
+      return approving
+        ? `${name}'s terminal has closed — I couldn't send the approval.`
+        : `${name}'s terminal has closed — that didn't send. Start it again and I'll pass it along.`;
+    case "ambiguous-picker":
+      return approving
+        ? `${name} is asking something I can't answer with a plain "approve" — open it to choose.`
+        : `${name} is waiting on a choice I can't map that to — open it and pick, or answer with just the option.`;
+    // No bespoke line: "empty" is a blank answer the UI already swallows, and "expired"/"abandoned"
+    // are DEFERRED outcomes reported by the onDeferredSendOutcome effect below, never returned to a
+    // caller synchronously. They are listed rather than folded into `default` on purpose — `default`
+    // has to stay unreachable for the exhaustiveness guard to have any teeth.
+    case "empty":
+    case "expired":
+    case "abandoned":
+      return generic;
+    default: {
+      const unhandled: never = path;
+      void unhandled;
+      return generic;
+    }
+  }
+}
 
 /** Flatten every agent across the feed (used to resolve a nudge back to its source agent). */
 function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
@@ -194,15 +289,12 @@ export function ConciergeHost({
     async (a: ConciergeAgent) => {
       try {
         const r = await dispatchConciergeAnswer(a.id, "approve", { userPrompt: false });
-        // "queued" is ok:true but NOT delivered — say so rather than claiming it was sent.
-        if (r.path === "queued") postSparkle(`${a.name} is still starting up — I'll approve as soon as it's ready.`);
+        // "queued" is ok:true but NOT delivered — say so rather than claiming it was sent. The `ok`
+        // conjunct is load-bearing: an ok:false queued result must NOT get the "I'll approve when
+        // it's ready" promise, which would be the same lie the refusal paths exist to avoid.
+        if (r.ok && r.path === "queued") postSparkle(`${a.name} is still starting up — I'll approve as soon as it's ready.`);
         else if (r.ok) postSparkle(`Approved — sent to ${a.name}.`);
-        else if (r.path === "pty-gone") postSparkle(`${a.name}'s terminal has closed — I couldn't send the approval.`);
-        else if (r.path === "agent-failed") postSparkle(`${a.name} couldn't start, so I couldn't send the approval — open its pane and hit Retry.`);
-        else if (r.path === "cloud-agent") postSparkle(`${a.name} runs in the cloud — I can't relay the approval from here yet; answer it in its own pane.`);
-        else if (r.path === "ambiguous-picker") postSparkle(`${a.name} is asking something I can't answer with a plain "approve" — open it to choose.`);
-        else if (r.path === "trial-spent") postSparkle(TRIAL_SPENT_TEXT);
-        else postSparkle(`I couldn't send the approval to ${a.name}.`);
+        else postSparkle(refusalCopy(refusedPath(r), a.name, "approval"));
       } catch {
         postSparkle(`I couldn't reach ${a.name}'s terminal to approve.`);
       }
@@ -223,24 +315,35 @@ export function ConciergeHost({
     async (target: ConciergePromptTarget, text: string): Promise<boolean> => {
       try {
         const r = await dispatchConciergeAnswer(target.agentId, text, { userPrompt: true });
-        if (r.path === "queued") {
+        // As in `approve`, `ok` gates the held branch: an ok:false queued result must not be
+        // promised ("I'll send it when ready") NOR keep the draft-discarding `return true`.
+        if (r.ok && r.path === "queued") {
           postSparkle(`${target.name} is still starting up — I'll send that the moment it's ready.`);
           return true;
         }
+        // `matchedLabel` is OPTIONAL on the result, so interpolating it unguarded would render the
+        // literal `I answered "undefined".` — the same untrue report this ladder exists to avoid.
+        // Today's only picker-option return always sets it; the type doesn't promise that, and a
+        // second return site would ship the bad string silently (roborev 53097).
+        //
+        // Degrade WITHIN the branch rather than falling through: on picker-option the user's text
+        // was NOT sent — dispatch matched it to a live option and wrote that option's keystroke —
+        // so "Sent to X." would report the one thing that definitely didn't happen. Losing the
+        // option's name is not the same as losing the fact that a question got answered
+        // (roborev 53111).
         if (r.ok && r.path === "picker-option") {
-          postSparkle(`${target.name} was asking something — I answered "${r.matchedLabel}".`);
+          postSparkle(
+            r.matchedLabel
+              ? `${target.name} was asking something — I answered "${r.matchedLabel}".`
+              : `${target.name} was asking something — I answered it.`,
+          );
           return true;
         }
         if (r.ok) {
           postSparkle(`Sent to ${target.name}.`);
           return true;
         }
-        if (r.path === "trial-spent") postSparkle(TRIAL_SPENT_TEXT);
-        else if (r.path === "agent-failed") postSparkle(`${target.name} couldn't start, so that didn't send — open its pane and hit Retry (or finish installing Claude Code), then send again.`);
-        else if (r.path === "cloud-agent") postSparkle(`${target.name} runs in the cloud, and prompting cloud agents from here isn't wired up yet — use its own pane for now.`);
-        else if (r.path === "pty-gone") postSparkle(`${target.name}'s terminal has closed — that didn't send. Start it again and I'll pass it along.`);
-        else if (r.path === "ambiguous-picker") postSparkle(`${target.name} is waiting on a choice I can't map that to — open it and pick, or answer with just the option.`);
-        else postSparkle(`I couldn't send that to ${target.name}.`);
+        postSparkle(refusalCopy(refusedPath(r), target.name, "prompt"));
         return false;
       } catch {
         postSparkle(`I couldn't reach ${target.name}'s terminal.`);
@@ -261,10 +364,27 @@ export function ConciergeHost({
         // Each non-delivery says what actually happened; a wrong reason is its own small lie
         // (roborev 46485-M — `abandoned` used to be reported as "the terminal closed", which is
         // false when the spawn failed and no terminal ever opened).
+        //
+        // `pty-gone` is its OWN arm rather than the catch-all: the terminal-closed wording is a
+        // specific claim, and letting any future path fall into it (say abandonPendingSends grows
+        // an `agent-failed` emit) is how 46485-M happened the first time. An unknown path gets a
+        // reason it can always stand behind (roborev 53162).
         if (r.ok) postSparkle(`${name} is up — I sent your message${quoted}.`);
         else if (r.path === "expired") postSparkle(`${name} never came up, so I dropped the message I was holding${quoted}. Send it again when it's running.`);
         else if (r.path === "abandoned") postSparkle(`${name} couldn't take the message I was holding${quoted}. Send it again once it's running.`);
-        else postSparkle(`${name}'s terminal closed before I could send the message I was holding${quoted}.`);
+        else if (r.path === "pty-gone") postSparkle(`${name}'s terminal closed before I could send the message I was holding${quoted}.`);
+        // LEXICALLY distinct from the `abandoned` arm — "didn't", not "couldn't". Identical copy
+        // silently un-pinned that arm once (roborev 53187), and merely dropping its remedy clause
+        // left this string a strict PREFIX of it, so the two were separable only by a `$` anchor in
+        // one test: any unanchored assertion written later would match both and lose the guarantee
+        // again (roborev 53198). Different words cost nothing and don't depend on regex discipline.
+        //
+        // Reason only, no remedy: the paths that could land here need DIFFERENT next steps —
+        // `agent-failed` wants a Retry, and a `cloud-agent` is never "running" locally at all — so
+        // "send it again once it's running" would be an instruction that never comes true. Those
+        // two are the known paths still routed here; neither reaches this listener today, and if
+        // one starts to, it should get its own arm with its own remedy rather than this bare line.
+        else postSparkle(`${name} didn't take the message I was holding${quoted}.`);
       }),
     [postSparkle],
   );

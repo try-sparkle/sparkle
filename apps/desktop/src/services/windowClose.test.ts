@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
   closeScopeProjectNames,
   killAllOpenAgents,
@@ -6,6 +6,7 @@ import {
   projectsWithOpenAgents,
   stopOpenProjectAgents,
 } from "./windowClose";
+import { resetPaneReadiness, setPaneFailed, setPaneReady } from "./paneReadiness";
 import type { Project } from "../types";
 
 const project = {
@@ -189,5 +190,80 @@ describe("never-mounted agents (lazy panes — roborev 46319)", () => {
     expect(close).toHaveBeenCalledWith("a1");
     expect(kill).not.toHaveBeenCalledWith("a2");
     expect(close).not.toHaveBeenCalledWith("a2");
+  });
+});
+
+// Everything above injects `isLive`, which keeps the invariants pane-free but leaves the PRODUCTION
+// default — the one the app actually ships — completely uncovered. These drive real paneReadiness
+// state and omit the argument, so `defaultIsLive`'s own rules are the thing under test (roborev
+// 47018/49297).
+describe("defaultIsLive — the shipped rule, driven by real pane readiness", () => {
+  const alpha = {
+    id: "p1", name: "Alpha", agents: [{ id: "a1" }],
+  } as unknown as Project;
+
+  beforeEach(() => resetPaneReadiness());
+  afterEach(() => resetPaneReadiness());
+
+  /** The states that mean "no process": the pane gave up, or was never mounted at all. Shared by
+   *  both tables below so a third such state gets added in one place (roborev 53044). */
+  const noProcessPanes = [
+    ["failed", (): void => setPaneFailed("a1")],
+    ["unmounted", (): void => undefined],
+  ] as const;
+
+  it.each([
+    ["ready", (): void => setPaneReady("a1", true)],
+    ["starting", (): void => setPaneReady("a1", false)],
+  ] as const)("a %s pane HAS a process, so it is in scope and gets swept", async (_state, arrange) => {
+    arrange();
+    expect(projectsWithOpenAgents([alpha], ["a1"])).toEqual([alpha]);
+    // The close prompt names it — the positive half of the "still running?" copy.
+    expect(closeScopeProjectNames([alpha], ["a1"], "p1")).toEqual(["Alpha"]);
+    const kill = vi.fn(async () => {});
+    const close = vi.fn();
+    await killAllOpenAgents([alpha], ["a1"], { kill, close });
+    expect(kill).toHaveBeenCalledWith("a1");
+    // …and it is dropped from the open set. Killing the PTY but skipping `close` would leave the
+    // agent to silently resume next launch — the mirror of the bug the negative case guards.
+    expect(close).toHaveBeenCalledWith("a1");
+  });
+
+  // killAllOpenAgents pre-filters through projectsWithOpenAgents, so the guard INSIDE
+  // stopOpenProjectAgents is never the deciding check up there. The single-project close path calls
+  // it directly, so cover its own default separately (roborev 52978) — for BOTH no-process states.
+  // `unmounted` matters most: the never-mounted agent is the original bug (roborev 46319), and it
+  // otherwise reaches this guard only through the sweep's pre-filter (roborev 53018).
+  it.each(noProcessPanes)(
+    "stopOpenProjectAgents applies the default rule itself for a %s pane, not just via the sweep's pre-filter",
+    async (_state, arrange) => {
+      arrange();
+      const kill = vi.fn(async () => {});
+      const close = vi.fn();
+      await stopOpenProjectAgents(alpha, new Set(["a1"]), { kill, close });
+      expect(kill).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(noProcessPanes)("a %s pane has NO process — out of scope, and the sweep leaves it alone", async (_state, arrange) => {
+    arrange();
+    // The "still running?" warning must not name it, and the sweep must not drop it from the open
+    // set: `failed` never spawned, so there is nothing to stop and removing it would silently
+    // prevent its resume next launch.
+    expect(projectsWithOpenAgents([alpha], ["a1"])).toEqual([]);
+    expect(closeScopeProjectNames([alpha], ["a1"], "p1")).toEqual([]);
+    const kill = vi.fn(async () => {});
+    const close = vi.fn();
+    await killAllOpenAgents([alpha], ["a1"], { kill, close });
+    expect(kill).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it("a Retry that republishes readiness puts a previously-failed pane back in scope", async () => {
+    setPaneFailed("a1");
+    expect(projectsWithOpenAgents([alpha], ["a1"])).toEqual([]);
+    setPaneReady("a1", false); // Retry re-entered the prepare flow: a process exists again
+    expect(projectsWithOpenAgents([alpha], ["a1"])).toEqual([alpha]);
   });
 });
