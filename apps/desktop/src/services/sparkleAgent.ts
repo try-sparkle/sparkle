@@ -180,8 +180,29 @@ export const RETRY_STILL_FAILS_EXIT = "If they decline, or it still fails,";
  *  Neither constant contains the other (`- Work` vs `, work`), so a test on one cannot be satisfied
  *  by the other arm of the same persona. */
 export const PROPOSE_ONLY_UNCONDITIONAL = "- Work PROPOSE-ONLY instead:";
+/** Worded as a DEFAULT ("unless and until"), not as a third condition. The first draft of this fix
+ *  read "- If they decline, or the retry still fails, work PROPOSE-ONLY instead:", which enumerated
+ *  the two ways the ask can end BADLY and thereby dropped the one where it does not end at all: the
+ *  user is asked, says nothing (or answers about something else, or the pane is closed), and the
+ *  prompt no longer states what to do. The flat tail this replaced covered that path by accident,
+ *  being unconditional. Enumerating conditions moved the sit-and-wait dead end from "declined" to
+ *  "unanswered" rather than removing it — so the fallback is the default and confirmation is what
+ *  lifts it, which leaves no third case to forget. See GH_ASK_NO_ANSWER for the explicit form. */
 export const PROPOSE_ONLY_AFTER_ASKING =
-  "- If they decline, or the retry still fails, work PROPOSE-ONLY instead:";
+  "- Unless and until they confirm AND the submission then succeeds, work PROPOSE-ONLY:";
+
+/** The unanswered case, said out loud as well as implied by the default above. An agent that has
+ *  asked a question tends to treat answering it as a precondition for finishing; this is the line
+ *  that says a finished pass does not wait on a reply that may never come.
+ *
+ *  Carries the ACTION and ends at a sentence boundary, per the contract documented for the decline
+ *  constants below. The first draft stopped at "…have not replied by the" — pinning the prohibition
+ *  and leaving "say you asked and got no reply, and take the propose-only path" anchored by nothing,
+ *  which is the plausible edit (trim the instruction, keep the framing) those constants exist to
+ *  catch. Splitting mid-sentence also lets an edit to the continuation produce a grammatically
+ *  broken prompt line that no assertion can see. */
+export const GH_ASK_NO_ANSWER =
+  "- Do not sit waiting on an answer. If they have not replied by the time your work is ready, say in your summary that you asked and got no reply, and take the propose-only path below.";
 
 /** The `setup-git` remedy, inlined into the askable arm. `notAuthenticated` sets `blocked`, which
  *  suppresses `ghAuthAdvice` at all three `whatYouDo` call sites — and that block was the ONLY
@@ -247,6 +268,8 @@ function submitBlockedSection(
           "  retry: it registers gh as git's credential helper, nothing more.",
           "  It works only after their login has landed — before that it exits 1 — so it is worth",
           "  exactly one attempt there, and none before.",
+          GH_ASK_NO_ANSWER,
+          "  An unanswered question is not a reason to hold a finished pass.",
           `${ASKABLE_COMMAND_PROHIBITION}, \`gh pr edit\`, \`git push\`, \`gh repo fork\`, or`,
           "  `gh auth login` YOURSELF: the first four fail without credentials, and `gh auth login` is",
           "  an interactive prompt only the user can answer.",

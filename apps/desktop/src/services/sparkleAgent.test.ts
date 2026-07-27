@@ -11,6 +11,7 @@ import {
   GH_AUTH_ATTENDED_DECLINE,
   GH_MISSING_ATTENDED_DECLINE,
   GH_AUTH_UNATTENDED_STOP,
+  GH_ASK_NO_ANSWER,
   GH_SETUP_GIT_AFTER_LOGIN,
   PROPOSE_ONLY_AFTER_ASKING,
   PROPOSE_ONLY_UNCONDITIONAL,
@@ -484,6 +485,30 @@ describe("sparklePersona — blocked verdicts that the present user can clear", 
     expect(p).not.toContain(PROPOSE_ONLY_UNCONDITIONAL);
     // Still reached, just no longer unconditionally: the fallback body is unchanged.
     expect(p).toContain("COMMIT to a local branch");
+  });
+
+  // The gap the FIRST version of (a) opened, and the reason its opener is a default rather than a
+  // list of conditions: "if they decline, or the retry still fails" enumerates the two ways the ask
+  // ends badly and forgets the one where it does not end at all. Asked, silence, pane closed — and
+  // an agent that has asked a question treats answering it as a precondition for finishing. The
+  // suppressed ghAuthAdvice block is the only OTHER place that says "do not sit waiting", and
+  // `blocked` strips it on exactly the verdicts this arm serves.
+  it.each(FIXABLE)("%s ATTENDED: names a terminal action for silence, not just refusal", (verdict) => {
+    const p = sparklePersona(LOG_DIR, REPO, "always", verdict, { attended: true });
+    // On the constant, which carries the ACTION ("say you asked and got no reply, and take the
+    // propose-only path") and not just the prohibition — a fragment ending at "…have not replied by
+    // the" would survive the plausible edit that trims the instruction and keeps the framing.
+    expect(p).toContain(GH_ASK_NO_ANSWER);
+    expect(p).toContain("An unanswered question is not a reason to hold a finished pass.");
+    // And the fallback opener is a DEFAULT, not a third condition to enumerate — so a case nobody
+    // thought of still lands somewhere.
+    expect(p).toContain("Unless and until they confirm");
+  });
+
+  it.each(FIXABLE)("%s UNATTENDED: no ask, so no unanswered-ask clause to carry", (verdict) => {
+    expect(sparklePersona(LOG_DIR, REPO, "always", verdict, { attended: false })).not.toContain(
+      GH_ASK_NO_ANSWER,
+    );
   });
 
   it.each(FIXABLE)("%s UNATTENDED: the tail stays unconditional — nobody is here to decline", (verdict) => {
