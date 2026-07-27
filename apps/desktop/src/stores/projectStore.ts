@@ -1337,6 +1337,15 @@ export const useProjectStore = create<ProjectState>()(
         })),
 
       selectAgent: (projectId, agentId) => {
+        // Re-selecting the agent that's already selected is a semantic no-op — bail before any work.
+        // Automated re-selection (attention reveal, cross-window reconcile, send-relay to background
+        // agents) calls this constantly with the id already shown; in the field ~18% of selections
+        // were redundant. Each one otherwise fired a phantom "switch" waterfall (inflating the metric)
+        // AND churned a fresh projects array — re-rendering every pane subscriber and re-running the
+        // Terminal become-active reveal (WebGL attach + full 8000-line repaint, ~369ms median). Piled
+        // up, those crossed the 1s jank threshold. Overlay dismissal is a separate action, so this
+        // never suppresses a real reveal.
+        if (get().projects.find((p) => p.id === projectId)?.selectedAgentId === agentId) return;
         // Switch waterfall: from this selection to the target pane actually painting (ended in
         // AgentPane's visibility effect, keyed "switch:<id>"). Only real selections, not deselects.
         if (agentId) perfStart(`switch:${agentId}`, "switch");
