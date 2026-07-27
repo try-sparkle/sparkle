@@ -83,6 +83,22 @@ describe("startJankMonitor window labelling", () => {
     expect(rollup?.[2]).toMatchObject({ count: 1, win: "w-7" });
   });
 
+  // The merge-guard test. `win` (PR #460) and `during` (PR #489) were added to the SAME severe-stall
+  // warn by two different branches, so resolving that conflict is exactly where one of them gets
+  // silently dropped — it happened once already. `win` is pinned by the tests above; `during` was
+  // only covered at the openTraceKinds() unit level, so deleting it from the warn meta left the
+  // whole suite green. Assert both on one line.
+  it("carries BOTH the window label and the in-flight interaction on a severe stall", async () => {
+    const { startJankMonitor, perfStart } = await import("./perfTrace");
+    startJankMonitor(150, "w-7");
+    perfStart("agent-1", "spawn");
+    tick(0);
+    tick(1200);
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(lastMeta(warn)).toMatchObject({ ms: 1200, win: "w-7", during: "spawn" });
+  });
+
   it("labels the startup line and a suspend resume too", async () => {
     const { startJankMonitor } = await import("./perfTrace");
     startJankMonitor(150, "w-7");

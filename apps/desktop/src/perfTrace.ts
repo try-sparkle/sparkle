@@ -69,6 +69,22 @@ export function perfCancel(key: string): void {
   traces.delete(key);
 }
 
+/** Compact summary of the interaction traces open RIGHT NOW, as kind counts (e.g. "spawn×2, switch"),
+ *  or undefined when nothing is in flight. Emits only the static `kind` labels — never the trace KEYS
+ *  (agent ids, paths), so it's safe to write to the shared log. Used to attribute a jank stall to
+ *  whatever interaction was mid-flight when the main thread froze: on macOS WKWebView the Long Tasks
+ *  API is absent, so this is the only cheap attribution the rAF monitor has. A trace being open spans
+ *  many frames, so this is a CORRELATION HINT (what was in flight), not proof this trace caused the
+ *  stall. O(open traces), only computed when a stall actually fires. Exported for its test. */
+export function openTraceKinds(): string | undefined {
+  if (traces.size === 0) return undefined;
+  const counts = new Map<string, number>();
+  for (const { kind } of traces.values()) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  return [...counts]
+    .map(([kind, n]) => (n > 1 ? `${kind}×${n}` : kind))
+    .join(", ");
+}
+
 // ── Suspend & background attribution (shared by the span and jank instruments) ─────────────────
 // Both instruments measure WALL CLOCK, so both can bill the app for time it was not running. The
 // jank monitor learned this the hard way (see classifyJankGap and SUSPEND_MS below); the span
@@ -600,7 +616,17 @@ export function startJankMonitor(thresholdMs = 150, windowLabel = "main"): void 
       log.debug("perf", "resume after suspend", { ms: Math.round(gap), win: windowLabel });
     } else if (verdict === "stall") {
       if (gap >= JANK_SEVERE_MS) {
-        log.warn("perf", "jank stall", { ms: Math.round(gap), heapMb: heapMb(), win: windowLabel });
+        // `during` attributes the stall to whatever interaction was mid-flight (kinds only, no
+        // keys). Only the severe branch carries it: a minor stall is reported as a coalesced
+        // rollup covering many frames, so a single snapshot of what was open would be attributing
+        // one window's worth of stalls to whatever happened to be in flight at flush time.
+        const during = openTraceKinds();
+        log.warn("perf", "jank stall", {
+          ms: Math.round(gap),
+          heapMb: heapMb(),
+          win: windowLabel,
+          ...(during ? { during } : {}),
+        });
       } else {
         if (minorCount === 0) openedAt = now;
         minorCount += 1;
