@@ -116,6 +116,70 @@ describe("bootstrapWorktreeDeps", () => {
   });
 });
 
+// The Rust side computes an explanatory `detail` for two cases that a bare status hides. Both were
+// unreachable when first written: the `installed` branch logged a fixed line that ignored `detail`,
+// and `skipped` logged nothing at all — so the text existed, was asserted by a Rust test that only
+// checked the field was POPULATED, and reached no human. A value nothing consumes is not a feature.
+describe("bootstrapWorktreeDeps — surfacing what the install actually did", () => {
+  test("says so when the install skipped the project's lifecycle scripts", async () => {
+    // npm (and pnpm below v10) cannot block third-party scripts without also blocking the repo's
+    // own. That tree is then cached by `plan_for` as bootstrapped forever, so an agent later hitting
+    // `Cannot find module` has no way back to the cause unless this is said out loud.
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    invoke.mockResolvedValue({
+      status: "installed",
+      detail: "lifecycle scripts were not run; if this project needs a build step, run the install yourself in this worktree",
+      manager: "npm",
+    });
+
+    bootstrapWorktreeDeps("/wt/a");
+    await settle();
+
+    expect(info).toHaveBeenCalled();
+    expect(info.mock.calls.flat().join(" ")).toContain("lifecycle scripts were not run");
+    info.mockRestore();
+  });
+
+  test("warns when the repo's package manager is one Sparkle will not drive", async () => {
+    // Without this the yarn/bun case is COMPLETE silence — no install, no message — and the agent
+    // still hits `vitest: command not found` with nothing pointing at why. Worse than the failure
+    // this module exists to fix, because at least that one was self-explanatory.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invoke.mockResolvedValue({
+      status: "skipped",
+      detail: "this repo uses yarn, which Sparkle does not install unattended; run the install yourself in this worktree",
+      manager: "yarn",
+    });
+
+    bootstrapWorktreeDeps("/wt/a");
+    await settle();
+
+    expect(warn).toHaveBeenCalled();
+    expect(warn.mock.calls.flat().join(" ")).toContain("yarn");
+    warn.mockRestore();
+  });
+
+  test("stays quiet for the ordinary skips", async () => {
+    // `AlreadyInstalled` and `NotAJsProject` are the common path — every agent mount on a reused
+    // slot, and every Rust/Go/Python repo. Logging those would drown the two cases above.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    invoke.mockResolvedValue({
+      status: "skipped",
+      detail: "node_modules already present",
+      manager: null,
+    });
+
+    bootstrapWorktreeDeps("/wt/a");
+    await settle();
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(info).not.toHaveBeenCalled();
+    warn.mockRestore();
+    info.mockRestore();
+  });
+});
+
 describe("abandonWorktreeBootstrap", () => {
   test("a queued install is dropped when its worktree is torn down first", async () => {
     // Teardown deletes the directory. An install that starts after that recreates it, leaving a

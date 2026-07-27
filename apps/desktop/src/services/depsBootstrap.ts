@@ -37,10 +37,15 @@ import { invoke } from "@tauri-apps/api/core";
 // not be able to rewrite someone's lockfile.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-/** What the Rust command reports back. `status` is the only field callers switch on. */
+/** What the Rust command reports back. */
 interface BootstrapOutcome {
   status: "installed" | "skipped" | "failed";
+  /** Why, when there is a why. Present on `failed`, on a skip that needs acting on, and on an
+   *  `installed` that came with a caveat — notably an install that could not run the project's own
+   *  lifecycle scripts, which `plan_for` will nonetheless treat as done forever. */
   detail: string | null;
+  /** The manager used — or, on an unsupported-manager skip, the one that was recognised and NOT
+   *  driven. That second case is what distinguishes a skip worth logging from the routine ones. */
   manager: string | null;
 }
 
@@ -114,10 +119,25 @@ export function bootstrapWorktreeDeps(worktreePath: string): void {
         // property abandon exists to preserve.
         if (!pending.abandoned) bootstrapped.add(worktreePath);
         // Logged without the path — a worktree path is the kind of thing this repo's logs keep out.
+        //
+        // `detail` is carried through on EVERY branch that has one. It used to be read only on
+        // `failed`: the `installed` line was fixed text that ignored it and `skipped` logged
+        // nothing, so the Rust side computed two explanatory strings that reached no human. The
+        // yarn/bun case was the worst of it — no install, no message, and an agent that still hits
+        // `vitest: command not found` with nothing pointing at why.
         if (outcome.status === "installed") {
-          console.info(`deps bootstrap: installed dependencies (${outcome.manager}) in a new worktree`);
+          const caveat = outcome.detail ? ` — ${outcome.detail}` : "";
+          console.info(
+            `deps bootstrap: installed dependencies (${outcome.manager}) in a new worktree${caveat}`,
+          );
         } else if (outcome.status === "failed") {
           console.warn(`deps bootstrap: install failed — ${outcome.detail ?? "no detail"}`);
+        } else if (outcome.manager) {
+          // A skip that NAMES a manager is the unsupported-manager case — the one skip a human has
+          // to act on. The ordinary skips (`node_modules` already present, not a JS project) carry
+          // no manager and stay silent: they are the common path, on every agent mount and every
+          // non-JS repo, and logging them would bury this.
+          console.warn(`deps bootstrap: ${outcome.detail ?? `${outcome.manager} is not driven`}`);
         }
       } catch (e) {
         // Never surfaced as a spawn failure: the agent still opens, it just opens without

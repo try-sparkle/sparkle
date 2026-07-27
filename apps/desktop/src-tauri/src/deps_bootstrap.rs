@@ -43,32 +43,88 @@ impl PackageManager {
         }
     }
 
+    /// Whether this module will actually DRIVE this manager, as opposed to merely recognising its
+    /// lockfile.
+    ///
+    /// Only pnpm and npm return true, and the reason is a bug this module already shipped once. The
+    /// first version drove all four and asserted its trust-boundary property by checking that
+    /// `--ignore-scripts` appeared in each arm's argv — an assertion that proves the flag is
+    /// PRESENT and says nothing about whether the manager accepts it. Yarn Berry has no
+    /// `--ignore-scripts` and rejects unknown options outright, so that arm failed before installing
+    /// anything, silently, because the entire path is fire-and-forget.
+    ///
+    /// pnpm and npm were each run for real against a probe package before their arguments were
+    /// written down. Yarn and bun are not installed on the machine this was developed on and could
+    /// not be. Re-enabling one means installing it and verifying its actual invocation — reading its
+    /// documentation is what produced the bug.
+    pub fn is_supported(self) -> bool {
+        matches!(self, PackageManager::Pnpm | PackageManager::Npm)
+    }
+
+    /// Whether the install leaves the project's OWN lifecycle scripts unrun, given the resolved
+    /// major version of the manager.
+    ///
+    /// True for npm always — it cannot separate "the dependency graph's scripts" from "this
+    /// project's", so blocking third-party `postinstall` necessarily blocks the repo's own — and for
+    /// pnpm below v10, where `--ignore-scripts` is the only lever available (see `install_args`).
+    ///
+    /// Surfaced in the outcome because, combined with `plan_for`'s short-circuit on an existing
+    /// `node_modules`, a scripts-less tree is cached as bootstrapped forever; a bare "installed"
+    /// would give nobody a way to tell why a later `Cannot find module` is happening.
+    pub fn skips_project_scripts(self, major: Option<u32>) -> bool {
+        self.install_args(major).contains(&"--ignore-scripts")
+    }
+
     /// The install invocation.
     ///
     /// Every one of these is a LOCKFILE-RESPECTING install, never a resolving one. A fresh worktree
     /// is not the place to re-resolve a dependency graph: doing so can produce a tree that differs
     /// from the one CI and the other worktrees use, and — worse — can rewrite the lockfile, which
     /// then shows up as an unexplained modification in the agent's very first `git status`.
-    pub fn install_args(self) -> &'static [&'static str] {
+    ///
+    /// On the trust boundary: the code worth refusing to run unattended is THIRD-PARTY —
+    /// `postinstall` from the dependency graph, which nobody reviewed. The project's own scripts are
+    /// not an escalation, because the user deliberately opened an agent on this repo and the agent
+    /// is about to run its tests and its build regardless.
+    ///
+    /// `major` is the manager's resolved major version, `None` when it could not be determined. It
+    /// is a parameter rather than a probe so this stays a pure function the tests can drive across
+    /// every version that changes the answer.
+    pub fn install_args(self, major: Option<u32>) -> &'static [&'static str] {
         match self {
             // `--prefer-offline` is what makes this 27s rather than a network round-trip per
             // package: the global store is already warm from the main checkout.
             //
-            // `--ignore-scripts` on EVERY arm is a trust-boundary decision, not a speed one — see
-            // `no_install_runs_dependency_lifecycle_scripts`. This install is unattended and fires
-            // from merely opening an agent, so it must not execute arbitrary `postinstall` code
-            // from the repo's dependency graph. pnpm v10 already gates build scripts this way by
-            // default; the flag makes that posture explicit and extends it to the managers that
-            // don't.
+            // The `--ignore-scripts` decision is VERSION-GATED, and that gate is a trust boundary,
+            // not a nicety. pnpm **v10** blocks third-party build scripts by default — the probe
+            // install printed "Ignored build scripts: @clerk/shared, core-js, esbuild, sharp,
+            // unrs-resolver" and the suite still ran — so on v10 the flag would only strip the
+            // repo's OWN `prepare`/`postinstall` and, because `plan_for` treats any existing
+            // `node_modules` as done, cache a tree that exists and does not work.
+            //
+            // pnpm 8 and 9 have no such default: they run every `preinstall`/`install`/`postinstall`
+            // in the dependency graph. And the version is not ours to assume — `resolve_manager`
+            // takes whatever `command -v pnpm` yields, which under a corepack shim is the TARGET
+            // REPO'S pinned `packageManager`. Sparkle opens agents on arbitrary repos, so trusting
+            // the default would let an untrusted repo pin `pnpm@9` and get arbitrary code execution
+            // from someone merely opening an agent on it.
+            //
+            // An UNKNOWN version is treated as unsafe for the same reason. Failing toward "run less
+            // code" costs a repo its own build step, which is visible and recoverable; failing the
+            // other way is not.
+            PackageManager::Pnpm if major.is_some_and(|m| m >= 10) => {
+                &["install", "--frozen-lockfile", "--prefer-offline"]
+            }
             PackageManager::Pnpm => {
                 &["install", "--frozen-lockfile", "--prefer-offline", "--ignore-scripts"]
             }
+            // npm has no equivalent of pnpm's default gate, so blocking third-party scripts
+            // necessarily blocks the project's own too. Taken deliberately and REPORTED — see
+            // `skips_project_scripts`.
             PackageManager::Npm => &["ci", "--prefer-offline", "--ignore-scripts"],
-            // Yarn Berry spells it `--immutable`; `--frozen-lockfile` is the v1 name and Berry
-            // rejects it. Berry is what ships today, so a v1 repo fails loudly here rather than
-            // silently re-resolving — which is the correct direction for this trade.
-            PackageManager::Yarn => &["install", "--immutable", "--ignore-scripts"],
-            PackageManager::Bun => &["install", "--frozen-lockfile", "--ignore-scripts"],
+            // Not driven — see `is_supported`. `plan_for` turns these into a Skip before any of
+            // this is reached; the arm exists so the match stays exhaustive if that ever changes.
+            PackageManager::Yarn | PackageManager::Bun => &[],
         }
     }
 }
@@ -87,6 +143,10 @@ pub enum SkipReason {
     /// and write a lockfile the repo never had — a real, committable side effect on someone's repo
     /// from a background convenience task. Refuse.
     NoLockfile,
+    /// The repo's lockfile names a manager this module does not drive (see
+    /// `PackageManager::is_supported`). Recognised so the log can say WHICH one, rather than
+    /// reporting the repo as having no lockfile at all.
+    UnsupportedManager(PackageManager),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,14 +155,9 @@ pub enum BootstrapPlan {
     Install(PackageManager),
 }
 
-/// Lockfile → package manager, in the order they are checked.
-///
-/// Order is load-bearing when a repo carries more than one, which happens after a migration leaves
-/// the old lockfile behind. pnpm is first because that is the direction migrations run in practice
-/// (npm/yarn → pnpm), so the newest lockfile is the one earliest in this list.
-/// Every manager this module can drive. Iterated by the tests that assert a property must hold for
-/// ALL of them, so adding a variant without satisfying those properties fails rather than slipping
-/// through an enumeration someone forgot to extend.
+/// Every manager this module knows about. Iterated by the tests that assert a property must hold
+/// for ALL of them, so adding a variant without satisfying those properties fails rather than
+/// slipping through an enumeration someone forgot to extend.
 #[cfg(test)]
 const ALL_MANAGERS: [PackageManager; 4] = [
     PackageManager::Pnpm,
@@ -111,6 +166,11 @@ const ALL_MANAGERS: [PackageManager; 4] = [
     PackageManager::Bun,
 ];
 
+/// Lockfile → package manager, in the order they are checked.
+///
+/// Order is load-bearing when a repo carries more than one, which happens after a migration leaves
+/// the old lockfile behind. pnpm is first because that is the direction migrations run in practice
+/// (npm/yarn → pnpm), so the newest lockfile is the one earliest in this list.
 const LOCKFILES: &[(&str, PackageManager)] = &[
     ("pnpm-lock.yaml", PackageManager::Pnpm),
     ("bun.lock", PackageManager::Bun),
@@ -134,7 +194,14 @@ pub fn plan_for(worktree: &Path) -> BootstrapPlan {
     }
     for (name, pm) in LOCKFILES {
         if worktree.join(name).is_file() {
-            return BootstrapPlan::Install(*pm);
+            return if pm.is_supported() {
+                BootstrapPlan::Install(*pm)
+            } else {
+                // Recognised but not driven. Reported as its own reason rather than as NoLockfile,
+                // because "we don't drive yarn" and "this repo has no lockfile" call for completely
+                // different follow-ups.
+                BootstrapPlan::Skip(SkipReason::UnsupportedManager(*pm))
+            };
         }
     }
     BootstrapPlan::Skip(SkipReason::NoLockfile)
@@ -149,8 +216,12 @@ pub fn plan_for(worktree: &Path) -> BootstrapPlan {
 pub struct BootstrapOutcome {
     /// `"installed"` | `"skipped"` | `"failed"`.
     pub status: &'static str,
-    /// Why it was skipped, or what went wrong. Present for `skipped` and `failed`, `None` for
-    /// `installed` — there is nothing to explain about a success.
+    /// Why it was skipped, what went wrong, or what a success did NOT do.
+    ///
+    /// Present for `skipped` and `failed`, and also for an `installed` that could not run the
+    /// project's own lifecycle scripts — a success with a caveat is not the same success, and
+    /// `plan_for` will treat the resulting `node_modules` as done forever either way. Every branch
+    /// that sets this is read by `depsBootstrap.ts`; a detail nothing logs is not a feature.
     pub detail: Option<String>,
     /// The package manager used, when one was.
     pub manager: Option<&'static str>,
@@ -162,13 +233,27 @@ impl BootstrapOutcome {
             status: "skipped",
             detail: Some(
                 match reason {
-                    SkipReason::AlreadyInstalled => "node_modules already present",
-                    SkipReason::NotAJsProject => "no package.json — not a JS project",
-                    SkipReason::NoLockfile => "package.json but no lockfile; refusing to resolve",
-                }
-                .to_string(),
+                    SkipReason::AlreadyInstalled => {
+                        "node_modules already present".to_string()
+                    }
+                    SkipReason::NotAJsProject => {
+                        "no package.json — not a JS project".to_string()
+                    }
+                    SkipReason::NoLockfile => {
+                        "package.json but no lockfile; refusing to resolve".to_string()
+                    }
+                    SkipReason::UnsupportedManager(pm) => format!(
+                        "this repo uses {}, which Sparkle does not install unattended; \
+                         run the install yourself in this worktree",
+                        pm.program()
+                    ),
+                },
             ),
-            manager: None,
+            // Named even though nothing ran, so the log can say WHICH manager went undriven.
+            manager: match reason {
+                SkipReason::UnsupportedManager(pm) => Some(pm.program()),
+                _ => None,
+            },
         }
     }
 }
@@ -183,16 +268,27 @@ impl BootstrapOutcome {
 /// status quo — a worktree without `node_modules`, which is what every worktree had before this
 /// module existed — and must not surface as a spawn error. `Err` is reserved for "the pass could
 /// not run at all", which the Tauri command maps from a bad path argument.
+/// The runner reports back the manager's resolved major version (`None` if it could not be read),
+/// because that is what decides whether the install ran the project's own scripts — and therefore
+/// what the outcome has to disclose.
 pub fn execute<F>(plan: BootstrapPlan, run: F) -> BootstrapOutcome
 where
-    F: FnOnce(PackageManager) -> Result<(), String>,
+    F: FnOnce(PackageManager) -> Result<Option<u32>, String>,
 {
     match plan {
         BootstrapPlan::Skip(reason) => BootstrapOutcome::skipped(reason),
         BootstrapPlan::Install(pm) => match run(pm) {
-            Ok(()) => BootstrapOutcome {
+            Ok(major) => BootstrapOutcome {
                 status: "installed",
-                detail: None,
+                // A success that skipped the project's own lifecycle scripts is NOT the same
+                // success as one that ran them, and `plan_for` will treat the resulting
+                // `node_modules` as done forever. Saying so here is the only thing standing
+                // between that and an unexplained `Cannot find module` later.
+                detail: pm.skips_project_scripts(major).then(|| {
+                    "lifecycle scripts were not run; if this project needs a build step, \
+                     run the install yourself in this worktree"
+                        .to_string()
+                }),
                 manager: Some(pm.program()),
             },
             // Caught and REPORTED, never propagated. See the contract above.
@@ -219,17 +315,6 @@ pub fn program_or_error(
     })
 }
 
-/// Run the real install for `pm` in `worktree`.
-///
-/// NOT UNIT-TESTED, and deliberately kept to glue over pieces that are: it resolves a program,
-/// spawns it, and maps the exit status. Every decision it could get wrong lives in `plan_for`,
-/// `execute`, `install_args` or `program_or_error` above.
-///
-/// NO TIMEOUT, on purpose. Killing a package manager mid-install leaves a half-written
-/// `node_modules` that is worse than no `node_modules` — the next `pnpm install` may consider it
-/// satisfied, and the agent then fails in a far more confusing way than "vitest not found". A hung
-/// install occupies one blocking thread and nothing else: this never runs on the spawn path (the
-/// caller does not await it) and never touches the UI thread.
 /// Locate the package manager. Unix form: the login-shell PATH probe.
 ///
 /// A Finder/Dock-launched Sparkle inherits a bare GUI PATH with no nvm, corepack or `~/.local/bin`,
@@ -251,11 +336,46 @@ fn resolve_manager(pm: PackageManager) -> Option<String> {
     crate::preflight::resolve_on_path(pm.program())
 }
 
-fn run_install(worktree: &Path, pm: PackageManager) -> Result<(), String> {
+/// Run the real install for `pm` in `worktree`.
+///
+/// NOT UNIT-TESTED, and deliberately kept to glue over pieces that are: it resolves a program,
+/// spawns it, and maps the exit status. Every decision it could get wrong lives in `plan_for`,
+/// `execute`, `install_args` or `program_or_error` above.
+///
+/// NO TIMEOUT, on purpose. Killing a package manager mid-install leaves a half-written
+/// `node_modules` that is worse than no `node_modules` — the next `pnpm install` may consider it
+/// satisfied, and the agent then fails in a far more confusing way than "vitest not found". A hung
+/// install occupies one blocking thread and nothing else: this never runs on the spawn path (the
+/// caller does not await it) and never touches the UI thread.
+/// Read the manager's major version by running `<program> --version`.
+///
+/// Returns `None` on any doubt — a failed spawn, a non-zero exit, or output that does not start with
+/// a number. Callers treat `None` as the unsafe case, so a garbled probe costs a build step rather
+/// than opening a hole.
+fn major_version(program: &str) -> Option<u32> {
+    let out = std::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        // `pnpm --version` prints a bare "10.7.1"; be tolerant of a leading "v".
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn run_install(worktree: &Path, pm: PackageManager) -> Result<Option<u32>, String> {
     let program = program_or_error(resolve_manager(pm), pm)?;
+    // Probed BEFORE the install, because it decides the argv — see `install_args`.
+    let major = major_version(&program);
     let output = std::process::Command::new(&program)
         .current_dir(worktree)
-        .args(pm.install_args())
+        .args(pm.install_args(major))
         // Package managers prompt (`pnpm approve-builds`, npm's audit fix prompts) and will sit
         // forever on a stdin that never closes. CI is the standard "nobody is watching" signal and
         // every one of these respects it.
@@ -264,7 +384,7 @@ fn run_install(worktree: &Path, pm: PackageManager) -> Result<(), String> {
         .output()
         .map_err(|e| format!("failed to run {program}: {e}"))?;
     if output.status.success() {
-        return Ok(());
+        return Ok(major);
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let msg = if stderr.is_empty() {
@@ -405,7 +525,7 @@ mod tests {
         let mut called = false;
         let outcome = execute(BootstrapPlan::Skip(SkipReason::AlreadyInstalled), |_| {
             called = true;
-            Ok(())
+            Ok(None)
         });
         assert!(!called, "a skipped plan must not invoke the package manager");
         assert_eq!(outcome.status, "skipped");
@@ -417,7 +537,7 @@ mod tests {
         let mut ran_with = None;
         let outcome = execute(BootstrapPlan::Install(PackageManager::Pnpm), |pm| {
             ran_with = Some(pm);
-            Ok(())
+            Ok(None)
         });
         assert_eq!(ran_with, Some(PackageManager::Pnpm));
         assert_eq!(outcome.status, "installed");
@@ -469,8 +589,11 @@ mod tests {
         // re-resolve the dependency graph, because that can rewrite the lockfile and surface as an
         // unexplained modification in the agent's first `git status`. Asserted over the whole set so
         // adding a package manager without a lockfile-respecting flag fails here.
-        for pm in ALL_MANAGERS {
-            let args = pm.install_args();
+        // Only the managers actually driven — an unsupported one never reaches `run_install`, so it
+        // carries no argv to constrain. Scoped by `is_supported` rather than by naming pnpm and npm,
+        // so re-enabling a manager automatically brings it under this assertion.
+        for pm in ALL_MANAGERS.into_iter().filter(|p| p.is_supported()) {
+            let args = pm.install_args(None);
             assert!(
                 args.iter()
                     .any(|a| *a == "--frozen-lockfile" || *a == "--immutable" || *a == "ci"),
@@ -482,27 +605,97 @@ mod tests {
     }
 
     #[test]
-    fn no_install_runs_dependency_lifecycle_scripts() {
-        // This is a TRUST BOUNDARY, not a preference. `preinstall`/`install`/`postinstall` scripts
-        // are arbitrary code from a repo's dependency graph, and this bootstrap fires automatically,
-        // in the background, merely because someone OPENED an agent on a project — no prompt, no
-        // deliberate action. Before it existed, that code only ran when a human chose to install.
+    fn only_managers_whose_flags_were_actually_verified_are_driven() {
+        // The previous version of this module drove all four managers and asserted the trust-boundary
+        // property by checking that `--ignore-scripts` appeared in each arm's argv. That assertion
+        // was worthless in the one way that mattered: it proved the flag was PRESENT, never that the
+        // manager ACCEPTS it. Yarn Berry has no `--ignore-scripts` — its `install` option set is
+        // `--immutable`, `--mode=…`, etc. — and Berry rejects unknown options outright, so that arm
+        // failed before installing anything, silently, because the whole path is fire-and-forget and
+        // the failure only reaches a `console.warn`.
         //
-        // `CI=1` does not suppress it. pnpm v10 happens to gate unapproved BUILD scripts by default
-        // (the probe install for this feature printed exactly that: "Ignored build scripts:
-        // @clerk/shared, core-js, esbuild, sharp, unrs-resolver" — and the suite still ran), but
-        // `npm ci`, `yarn install` and `bun install` run root and workspace lifecycle scripts
-        // unless told not to, and all three are reachable through LOCKFILES.
-        //
-        // So every manager is held to pnpm's posture explicitly. A repo that genuinely needs its
-        // build scripts gets them when an agent runs the install itself, deliberately.
+        // Only pnpm and npm are installed on the machine this was developed on, and both arms were
+        // run for real against a probe package before being written down. Yarn and bun could not be,
+        // and guessing a flag is precisely what broke yarn. So they are DETECTED (so the log can say
+        // what the repo uses) but not driven. Adding one back means installing it and verifying its
+        // real invocation — not reading its docs.
         for pm in ALL_MANAGERS {
-            assert!(
-                pm.install_args().contains(&"--ignore-scripts"),
-                "{:?} must not run lifecycle scripts from an unattended background install, got {:?}",
-                pm,
-                pm.install_args()
+            assert_eq!(
+                pm.is_supported(),
+                matches!(pm, PackageManager::Pnpm | PackageManager::Npm),
+                "{pm:?}: a manager is only driven once its actual invocation has been verified"
             );
         }
+    }
+
+    #[test]
+    fn an_unverified_manager_is_skipped_rather_than_run_blind() {
+        let d = TempDir::new("yarn");
+        d.touch("package.json");
+        d.touch("yarn.lock");
+        assert_eq!(
+            plan_for(d.path()),
+            BootstrapPlan::Skip(SkipReason::UnsupportedManager(PackageManager::Yarn))
+        );
+    }
+
+    #[test]
+    fn pnpm_below_v10_is_not_trusted_to_gate_dependency_scripts() {
+        // The default gate on third-party build scripts is a pnpm **v10** behaviour. On pnpm 8/9,
+        // `pnpm install` runs every `preinstall`/`install`/`postinstall` in the dependency graph.
+        //
+        // That matters more here than it would anywhere else, because `resolve_manager` takes
+        // whatever `command -v pnpm` yields — and under a corepack shim that resolves to the TARGET
+        // REPO'S pinned `packageManager` version. Sparkle opens agents on arbitrary repos, so
+        // without this check an untrusted repo picks the pnpm that decides whether its own
+        // dependencies' scripts run: pin `pnpm@9`, and merely opening an agent executes arbitrary
+        // code. Relying on an unverified default is not a trust boundary.
+        for major in [None, Some(8), Some(9)] {
+            assert!(
+                PackageManager::Pnpm.install_args(major).contains(&"--ignore-scripts"),
+                "pnpm {major:?} does not gate dependency scripts by default — it must be told to"
+            );
+            assert!(PackageManager::Pnpm.skips_project_scripts(major));
+        }
+    }
+
+    #[test]
+    fn pnpm_relies_on_its_own_default_rather_than_ignore_scripts() {
+        // The trust boundary worth defending is THIRD-PARTY code: `postinstall` from the dependency
+        // graph, which nobody reviewed. pnpm v10 already gates exactly that by default — the probe
+        // install printed "Ignored build scripts: @clerk/shared, core-js, esbuild, sharp,
+        // unrs-resolver" and the suite still ran.
+        //
+        // What pnpm still runs is the PROJECT'S OWN `prepare`/`postinstall`, and that is correct to
+        // keep: the user deliberately opened an agent on this repo, and the agent is about to run
+        // its tests and its build anyway, so the repo's own scripts are not an escalation. Adding
+        // `--ignore-scripts` here would have STRICTLY REDUCED the posture rather than made it
+        // explicit, and — because `plan_for` short-circuits on an existing `node_modules` — it would
+        // have cached a half-provisioned tree forever for any repo with a root `prepare` step. That
+        // fails as `Cannot find module …`, which is worse than the clean `vitest: command not found`
+        // this module exists to fix.
+        assert!(
+            !PackageManager::Pnpm.install_args(Some(10)).contains(&"--ignore-scripts"),
+            "pnpm v10's default already gates dependency build scripts; the flag only removes the \
+             project's own, which risks caching a half-provisioned worktree"
+        );
+        assert!(!PackageManager::Pnpm.skips_project_scripts(Some(10)));
+    }
+
+    #[test]
+    fn npm_blocks_dependency_scripts_and_says_so() {
+        // npm has no way to separate "the dependency graph's scripts" from "this project's", so
+        // blocking third-party `postinstall` necessarily blocks the project's too. That trade is
+        // taken deliberately, but it must not be SILENT: combined with the `AlreadyInstalled`
+        // short-circuit it can leave a tree that exists and does not work, and an outcome that
+        // just says "installed" gives no way to tell.
+        assert!(PackageManager::Npm.install_args(None).contains(&"--ignore-scripts"));
+        let outcome = execute(BootstrapPlan::Install(PackageManager::Npm), |_| Ok(None));
+        assert_eq!(outcome.status, "installed");
+        let detail = outcome.detail.unwrap_or_default();
+        assert!(
+            detail.contains("script"),
+            "an install that skipped lifecycle scripts must say so, got: {detail:?}"
+        );
     }
 }
