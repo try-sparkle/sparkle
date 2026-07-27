@@ -5,13 +5,11 @@
 // operation at all — it is a store write: select the project tab (and, when a specific agent was
 // asked for, select + mount that agent inside it).
 //
-// Why a service and not an inline store call: several surfaces open projects (the tab bar, the
-// sidebar's other-window rows, history search, the ⌘K palette, the menu-bar tray), and they must
-// land the user in exactly the same place. The tray runs in its OWN webview — its store writes
+// Why a service and not an inline store call: several surfaces open projects (the tab bar, history
+// search, the ⌘K palette, the menu-bar tray), and they must land the user in exactly the same
+// place. The tray runs in its OWN webview — its store writes
 // reach the main window through the cross-window sync, but the main window still has to be raised —
 // so the cross-context path is kept here too, next to the in-window one.
-//
-// (services/projectWindows.ts survives for now, unmounted, and is deleted by the legacy-purge unit.)
 import { useProjectStore } from "../stores/projectStore";
 import { useUiStore } from "../stores/uiStore";
 import { selectAndOpen } from "./agentReveal";

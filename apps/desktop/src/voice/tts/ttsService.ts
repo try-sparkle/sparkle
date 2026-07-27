@@ -31,8 +31,9 @@
 // server returns audio), per sparkle-rmd2. Until then, only build with the key set for
 // local use, and prefer a restricted/rotatable key.
 
-/** Which pipeline actually produced (or suppressed) the audio for a speak() call. */
-export type TtsPath = "elevenlabs" | "system-fallback" | "disabled";
+/** Which pipeline actually produced (or suppressed) the audio for a speak() call. "cancelled" =
+ *  a stopVoice() landed while this clip's audio was still being generated, so it never played. */
+export type TtsPath = "elevenlabs" | "system-fallback" | "disabled" | "cancelled";
 
 /** PRD §5 "friendlier voice settings" — validated on the prototype; do not tweak casually. */
 export const ELEVENLABS_VOICE_SETTINGS = {
@@ -102,6 +103,9 @@ let currentAudio: HTMLAudioElement | null = null;
 let finishActive: (() => void) | null = null;
 let voiceActive = false;
 let sysSpeaking = false;
+// Bumped by every stopVoice(). A speak() captures it before its fetch and abandons the clip if it
+// changed while the audio was being generated — see the barge-in note in speak() (roborev 48171).
+let stopGeneration = 0;
 
 // Object URLs keyed by voice/model/text so repeat lines replay with zero latency. Entries are
 // tiny (a URL string; the blob lives until revoked) and the overlay speaks a bounded script,
@@ -161,6 +165,8 @@ export function stopVoice(): void {
   disconnectAnalyser();
   voiceActive = false;
   sysSpeaking = false;
+  // Cancels clips that have no audio element yet — see speak()'s generation check.
+  stopGeneration += 1;
   const finish = finishActive;
   finishActive = null;
   finish?.();
@@ -237,14 +243,33 @@ export async function speak(text: string): Promise<TtsPath> {
     await sysSpeak(text);
     return "system-fallback";
   }
+  // Captured OUTSIDE the try so both the success path and the catch can compare against it.
+  // MUTABLE, and re-baselined after our own stopVoice() below — see the note there.
+  let generation = stopGeneration;
   try {
     // Interruption is DEFERRED here by design: we let any prior clip keep playing during
     // the (up to ~1–2s) fetch and only stopVoice() once the next clip is ready, so speech
     // is continuous rather than cutting to silence mid-generation. When the dialogue loop
     // lands (bead sparkle-c9zn / U5) — which owns the "thinking" burst that would mask that
     // silence — revisit whether to stopVoice() *before* the fetch for snappier barge-in.
+    //
+    // BUT a stopVoice() DURING the fetch must still cancel this clip (roborev 48171). Deferring
+    // the interruption is about the previous clip's tail; it must not mean "the clip you asked me
+    // to cancel starts a second later anyway". The concierge barges in on send and on the mic
+    // (ConciergeHost.onSend / useConciergeDictation.toggleMic) — before this, a reply whose audio
+    // was still generating spoke right over the user's next turn, which is the exact opposite of
+    // what those calls are for. Also what makes `play`'s "a new clip always supersedes the old
+    // one" true when the user clicks a second speaker button while the first is still fetching.
     const url = await fetchElevenAudio(text, cfg);
+    if (generation !== stopGeneration) return "cancelled";
     stopVoice();
+    // RE-BASELINE (roborev 53004). That stopVoice() was OURS — cutting the previous clip's tail
+    // now that this one is ready — and it bumped the counter. Without re-reading it here, every
+    // failure AFTER this point (a blocked-autoplay `a.play()` rejection, an AudioContext edge)
+    // would land in the catch, see a "changed" generation, and report "cancelled": the user would
+    // get silence where the system-voice fallback used to speak, and the early return would skip
+    // the cleanup, leaving voiceActive true so the overlay pulses for a clip that never plays.
+    generation = stopGeneration;
     const a = new Audio(url);
     a.preservesPitch = true;
     a.playbackRate = ELEVENLABS_PLAYBACK_RATE;
@@ -269,6 +294,14 @@ export async function speak(text: string): Promise<TtsPath> {
   } catch {
     // Network refusal, non-2xx, blocked autoplay — anything. Clear any half-started
     // playback, then degrade. Never throw.
+    //
+    // The SAME cancellation check as the success path, first (roborev 52362/52363): a stopVoice()
+    // that landed during a fetch which then REJECTED would otherwise fall straight through to the
+    // system voice and read the cancelled clip aloud anyway — the exact failure this guard exists
+    // to prevent, on the branch users hit whenever ElevenLabs is flaky. It also must come before
+    // the stopVoice() below, which would bump the counter again and cancel a genuinely newer clip
+    // that is still fetching.
+    if (generation !== stopGeneration) return "cancelled";
     stopVoice();
     await sysSpeak(text);
     return "system-fallback";

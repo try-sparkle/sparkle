@@ -64,13 +64,16 @@ describe("reattachCloudSessions", () => {
     expect(addAgent).toHaveBeenCalledTimes(1);
   });
 
-  it("is best-effort: a listSessions failure creates nothing and never throws", async () => {
+  it("is best-effort: a listSessions failure creates nothing, never throws, and is RETRYABLE", async () => {
+    // null, not [] (roborev 49295): [] means "asked, nothing to do" and settles the project for the
+    // session. With a cached cloudProjectId this fetch is the only call that can fail, so reporting
+    // it as [] left an offline cold boot unreconciled until relaunch.
     const { deps, addAgent, onError } = harness({
       sessions: async () => {
         throw new Error("offline");
       },
     });
-    await expect(reattachCloudSessions("proj", deps)).resolves.toEqual([]);
+    await expect(reattachCloudSessions("proj", deps)).resolves.toBeNull();
     expect(addAgent).not.toHaveBeenCalled();
     expect(onError).toHaveBeenCalledOnce();
   });

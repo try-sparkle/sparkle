@@ -5,6 +5,10 @@
 // store, fetches data, or writes to a PTY.
 
 import type { ReactNode } from "react";
+// The attachment RECORD is the one the removed AgentPane composer used (components/composer/
+// attachments.ts) — a pure, React-free, Tauri-free model, so importing it here does not break this
+// directory's "presentational only" rule, and it keeps the concierge off a parallel model.
+import type { Attachment } from "../composer/attachments";
 
 export type ConciergePriority = "p0" | "p1";
 
@@ -44,6 +48,16 @@ export interface ConciergeSparkleMessage {
   id: string;
   kind: "sparkle";
   text: string;
+  /** A BRAIN REPLY, i.e. something worth reading aloud — only these get a speaker button.
+   *  The host posts plenty of other `sparkle` lines that are bookkeeping, not speech ("Sent to
+   *  CI Hardening.", "…terminal has closed — that didn't send.", the deferred-outcome
+   *  reconciliations): offering to read those aloud, and letting `speakingMessageId` point at
+   *  one, is not what "exactly one REPLY reads as active" meant (roborev 48172).
+   *
+   *  REQUIRED, not optional (roborev 52363): defaulting to "not a reply" would let a future
+   *  brain-reply producer forget the flag and silently lose the speaker button — a missing
+   *  affordance, the hardest kind of regression to notice. Every construction site must decide. */
+  speakable: boolean;
 }
 
 /** A thin centered divider line ("All projects calm · nothing needs you"). */
@@ -65,6 +79,9 @@ export type WordmarkMode = "idle" | "listening" | "speaking";
 
 export type ConciergeAttachKind = "screenshot" | "image" | "files";
 
+/** Re-exported so consumers of the column's contract get the attachment shape from one place. */
+export type { Attachment };
+
 /** Where the compose box's next send goes. The concierge box is the app's ONLY composer (CM-U7),
  *  so it has to serve both jobs the user has: talking to Sparkle itself ("sparkle" — the headless
  *  brain), and sending a prompt straight into the selected agent's terminal ("agent" — what the
@@ -77,6 +94,10 @@ export type ConciergeSendTarget = "sparkle" | "agent";
 export interface ConciergeSendState {
   target: ConciergeSendTarget;
   agentName?: string;
+  /** Why no agent target is offered even though an agent IS selected (e.g. a cloud agent takes
+   *  prompts in its terminal). Drives the disabled toggle's title/aria so the user isn't told to
+   *  "select an agent" they already selected. */
+  unavailableReason?: string;
 }
 
 /** Everything the column renders, supplied by the integration layer. */
@@ -93,6 +114,12 @@ export interface ConciergeViewModel {
   typing?: boolean;
   /** Where a send goes and which agent it would reach. Omitted → the box only talks to Sparkle. */
   send?: ConciergeSendState;
+  /** Files riding along with the NEXT send (parity row #21), rendered as removable chips above the
+   *  compose row. The integration layer owns the list; the box only reports removals. */
+  attachments?: Attachment[];
+  /** True while a native file drag is over the compose box — lights the drop affordance. The
+   *  webview drag event is window-global, so only the integration layer can hit-test it. */
+  dropActive?: boolean;
 }
 
 /** Every gesture the column can emit. The integration layer supplies all of these. */
@@ -109,10 +136,15 @@ export interface ConciergeController {
   onToggleSendTarget?(): void;
   onMicToggle(): void;
   onAttach(kind: ConciergeAttachKind): void;
+  /** Drop one staged attachment by id. Optional: a column mounted without attachments has none. */
+  onRemoveAttachment?(id: string): void;
   /** Whole-card click: open the nudge's source project/agent. */
   onNudgeClick(nudge: ConciergeNudge): void;
   /** An action button on the card; never accompanied by onNudgeClick. */
   onNudgeAction(nudge: ConciergeNudge, actionId: string): void;
+  /** The speaker button on a Sparkle reply: speak it now, or stop if it is the one playing.
+   *  Optional — omit it and no reply renders a speaker at all (voice is an opt-in surface). */
+  onSpeak?(message: ConciergeSparkleMessage): void;
 }
 
 export interface ConciergeColumnProps {
@@ -127,4 +159,16 @@ export interface ConciergeColumnProps {
   /** Optional affordance rendered under the scope/vitals line — the shell drops the ⌘K palette
    *  trigger here (PRD §4: history search lives in the concierge). */
   searchSlot?: ReactNode;
+  /** Live, uncommitted dictation transcript for the compose box; "" when nothing is being said. */
+  interim?: string;
+  /** Handed straight to the compose box so the integration layer can receive committed segments.
+   *  Must be referentially stable. */
+  registerInsert?: (append: ((text: string) => void) | null) => void;
+  /** The id of the reply currently being spoken, so exactly one speaker button reads as active. */
+  speakingMessageId?: string | null;
+  /** The user typed or deleted in the compose box (not a dictated segment, not the send clear). */
+  onTextEdit?: (text: string) => void;
+  /** The last FINISHED line for the thread's hidden live region — a completed reply or a status
+   *  notice. Never a streaming chunk: the region would then re-announce on every delta. */
+  announcement?: string;
 }

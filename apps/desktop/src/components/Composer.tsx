@@ -37,7 +37,7 @@ import { parseControlAction, CLOSE_AGENT_ACTION } from "../services/suggestions/
 import type { SuggestionButton } from "../services/suggestions/types";
 import { trialSendAllowed, recordTrialSend } from "../services/trialMeter";
 import { safeUnlisten } from "../services/safeUnlisten";
-import { isOverDndTarget, NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
+import { isOverFileDropTarget } from "../services/dndTargets";
 import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 import { useHandoffStore } from "../stores/handoffStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -750,27 +750,38 @@ export function Composer({
     [inputRef, setMinimized],
   );
 
+  // Drop targets that own the file themselves, so this composer must stand down over them:
+  // "+ New Build Agent" (useNewBuildAgentDrop spawns an agent and attaches there) and the
+  // concierge compose box (useConciergeAttachments stages it for the next prompt). The list lives
+  // in services/dndTargets (FILE_DROP_TARGETS) because useDragVisionHint needs the same answer —
+  // keeping a private copy here is how one of the two silently misses a new target. Every listener
+  // hit-tests independently, so nothing depends on listener ORDER and no file double-attaches.
+  const overOtherTarget = useCallback(
+    (position: { x: number; y: number }) => isOverFileDropTarget(position),
+    [],
+  );
+
   // Native file drag-and-drop: drag a file (image or otherwise) onto the active composer
   // and it becomes a tile above the textarea. The tile carries the file's absolute path,
   // prefixed to the message on send so the agent reads it straight from disk (same trick as
   // screenshot attachments). Tauri's webview drag-drop event carries real filesystem paths; a
   // plain HTML5 drop in a sandboxed webview does not. Only the visible pane listens (others
-  // stay mounted). One carve-out: the "+ New Build Agent" button is its OWN drop target
-  // (useNewBuildAgentDrop spawns a new agent and attaches the files there), so we hit-test
-  // every position ourselves and stand down over the button — no dropped-on-the-button file
-  // may land in THIS composer, and no listener-ordering assumption is needed.
+  // stay mounted). Two carve-outs (see overOtherTarget above): the "+ New Build Agent" button and
+  // the concierge compose box are their OWN drop targets, so we hit-test every position ourselves
+  // and stand down over either — no file dropped on them may also land in THIS composer, and no
+  // listener-ordering assumption is needed.
   useEffect(() => {
     if (!active) return;
     const unlistenPromise = getCurrentWebview()
       .onDragDropEvent((event) => {
         const p = event.payload;
         if (p.type === "enter" || p.type === "over") {
-          setDropActive(!isOverDndTarget(p.position, NEW_BUILD_AGENT_DND_TARGET));
+          setDropActive(!overOtherTarget(p.position));
         } else if (p.type === "leave") {
           setDropActive(false);
         } else if (p.type === "drop") {
           setDropActive(false);
-          if (isOverDndTarget(p.position, NEW_BUILD_AGENT_DND_TARGET)) return;
+          if (overOtherTarget(p.position)) return;
           const paths = p.paths ?? [];
           if (paths.length === 0) return;
           log.info("composer", `dropped ${paths.length} file(s) into chat`, describePaths(paths));
@@ -788,7 +799,7 @@ export function Composer({
       // torn down (and the Tauri teardown race is swallowed).
       void safeUnlisten(unlistenPromise);
     };
-  }, [active, attachPaths]);
+  }, [active, attachPaths, overOtherTarget]);
 
   // Files dropped on the "+ New Build Agent" button were queued for this agent BEFORE this
   // composer existed (the drop spawned the agent — see useNewBuildAgentDrop). Drain our entry

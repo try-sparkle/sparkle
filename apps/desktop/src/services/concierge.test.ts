@@ -11,7 +11,8 @@ const harness = vi.hoisted(() => ({
   handlers: new Map<string, Handler>(),
   invokes: [] as Array<{ cmd: string; args: unknown }>,
   // Per-test overrides keyed by COMMAND/EVENT NAME; return undefined to use the default.
-  invokeImpl: undefined as ((cmd: string) => Promise<void> | undefined) | undefined,
+  // concierge_turn resolves with the turn's id now, so this is `unknown`, not `void`.
+  invokeImpl: undefined as ((cmd: string) => Promise<unknown> | undefined) | undefined,
   listenImpl: undefined as ((name: string) => Promise<() => void> | undefined) | undefined,
 }));
 
@@ -40,6 +41,7 @@ import {
   onConciergeError,
   resetConciergeSession,
   startConciergeTurn,
+  SUPERSEDED_DETAILS,
 } from "./concierge";
 
 /** The args of the nth `concierge_turn` invoke (0-based). */
@@ -56,6 +58,14 @@ describe("concierge service", () => {
     harness.invokeImpl = undefined;
     harness.listenImpl = undefined;
     _resetConciergeForTests();
+  });
+
+  it("returns the turn's id, so a caller can tell its events from a superseded turn's", async () => {
+    // concierge.rs emits deltas unconditionally — only the reap is token-gated — so a killed turn
+    // keeps flushing buffered stdout under its own id. Without the live token the UI can only
+    // infer supersession from ids it happens to have seen (roborev 53051).
+    harness.invokeImpl = (cmd) => (cmd === "concierge_turn" ? Promise.resolve("42") : undefined);
+    await expect(startConciergeTurn("go")).resolves.toBe("42");
   });
 
   it("invokes concierge_turn with the prompt and a null resume on the first turn", async () => {
@@ -131,13 +141,32 @@ describe("concierge service", () => {
     expect(turnArgs(1).resumeSessionId).toBeNull();
   });
 
+  it.each(SUPERSEDED_DETAILS.map((d) => [d] as const))(
+    "a send rejected with %s resolves null SILENTLY — no error bubble, no typing reset",
+    async (detail) => {
+      // Both are ordinary outcomes of two fast sends. Surfacing them would post "I couldn't reach
+      // my brain just now" and clear the typing indicator for the turn that IS running: a local
+      // error carries no turn id, so it bypasses supersededTurn entirely (roborev 53186). Driven
+      // from the exported constant, not re-typed literals, so a reword fails here (roborev 53205).
+      harness.invokeImpl = (cmd) =>
+        cmd === "concierge_turn" ? Promise.reject(new Error(detail)) : undefined;
+      const errors: Array<{ id: string; detail: string }> = [];
+      onConciergeError((e) => errors.push(e));
+
+      await expect(startConciergeTurn("go")).resolves.toBeNull();
+      expect(errors).toEqual([]);
+    },
+  );
+
   it("a rejected invoke never throws — it surfaces as a synthetic local error event", async () => {
     harness.invokeImpl = (cmd) =>
       cmd === "concierge_turn" ? Promise.reject(new Error("claude binary not found")) : undefined;
     const errors: Array<{ id: string; detail: string }> = [];
     onConciergeError((e) => errors.push(e));
 
-    await expect(startConciergeTurn("go")).resolves.toBeUndefined();
+    // null, not a turn id: there is no turn to identify (roborev 53051). Callers key their
+    // supersession bookkeeping on the returned id, so a rejected invoke must not hand back one.
+    await expect(startConciergeTurn("go")).resolves.toBeNull();
     expect(errors).toEqual([
       { id: CONCIERGE_LOCAL_ERROR_ID, detail: "claude binary not found" },
     ]);
@@ -184,7 +213,9 @@ describe("concierge service", () => {
     // startConciergeTurn must not throw even when wiring fails; wiring is a precondition for a
     // turn (a turn whose stream nobody can hear is useless), so the invoke is withheld and the
     // failure is delivered to the LOCAL error fan-out (which needs no Tauri bus).
-    await expect(startConciergeTurn("go")).resolves.toBeUndefined();
+    // null, not a turn id: there is no turn to identify (roborev 53051). Callers key their
+    // supersession bookkeeping on the returned id, so a rejected invoke must not hand back one.
+    await expect(startConciergeTurn("go")).resolves.toBeNull();
     expect(harness.invokes.some((c) => c.cmd === "concierge_turn")).toBe(false);
     expect(errors).toEqual([
       { id: CONCIERGE_LOCAL_ERROR_ID, detail: "event bus unavailable" },

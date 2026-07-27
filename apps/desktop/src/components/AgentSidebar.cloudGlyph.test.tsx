@@ -72,6 +72,17 @@ describe("AgentSidebar — cloud glyph", () => {
     expect(screen.queryByTestId("cloud-glyph")).toBeNull();
   });
 
+  it("shows the glyph after an existing tab's runtime flips to cloud", () => {
+    // The cloud create flow updates a tab by REPLACING objects in the store (mapAgent produces a
+    // new project AND a new tab). This pins the user-visible outcome — a store update surfaces the
+    // glyph. (It cannot isolate the comparator's `prev.a === next.a` clause: the row's memo
+    // short-circuits on project identity first, and a changed tab implies a changed project.)
+    const { rerender } = render(<AgentSidebar project={mkProject([mkAgent("local")])} />);
+    expect(screen.queryByTestId("cloud-glyph")).toBeNull();
+    rerender(<AgentSidebar project={mkProject([mkAgent("cloud")])} />);
+    expect(screen.getAllByTestId("cloud-glyph").length).toBeGreaterThan(0);
+  });
+
   it("marks only the cloud row when both runtimes are present", () => {
     render(
       <AgentSidebar project={mkProject([mkAgent("local", "a1"), mkAgent("cloud", "a2")])} />,

@@ -141,13 +141,70 @@ describe("ComposeBox — send target", () => {
     expect(screen.getByRole("textbox", { name: "Message CI Hardening" })).toBeTruthy();
   });
 
-  it("is disabled with no agent to aim at (rather than offering a dead target)", () => {
+  it("refuses with no agent to aim at (rather than offering a dead target)", () => {
     const onToggleSendTarget = vi.fn();
     setup({ send: { target: "sparkle" }, onToggleSendTarget });
     const toggle = screen.getByTestId("send-target-toggle") as HTMLButtonElement;
-    expect(toggle.disabled).toBe(true);
+    // aria-disabled, not `disabled` (roborev 49295): a disabled control receives no pointer
+    // events, so its title — the only explanation a SIGHTED user gets — never appears. It stays
+    // hoverable/focusable and simply does nothing. The ABSENCE of the native attribute is the
+    // actual invariant (roborev 52648/52649): re-adding `disabled` alongside `aria-disabled` would
+    // restore the bug with every assertion still green, because jsdom routes the synthetic click
+    // either way.
+    expect(toggle.getAttribute("aria-disabled")).toBe("true");
+    expect(toggle.hasAttribute("disabled")).toBe(false);
+    expect(toggle.getAttribute("title")).toBeTruthy();
     fireEvent.click(toggle);
     expect(onToggleSendTarget).not.toHaveBeenCalled();
+  });
+
+  it("un-aiming is never refused, even when the SELECTED tab can't be prompted", () => {
+    // Aimed at local agent A, then the user selects a cloud tab: the host supplies agentName (from
+    // the pin) and unavailableReason (from the selection) at the same time. Refusing the toggle
+    // here would strand the user pinned to A with no way back to Sparkle chat (roborev 53051).
+    const onToggleSendTarget = vi.fn();
+    setup({
+      send: {
+        target: "agent",
+        agentName: "A",
+        unavailableReason: "Cloud agents take prompts in the terminal for now",
+      },
+      onToggleSendTarget,
+    });
+    const toggle = screen.getByTestId("send-target-toggle");
+    expect(toggle.getAttribute("aria-disabled")).toBe("false");
+    expect(toggle.getAttribute("aria-label")).toBe("Sending to A — switch to Sparkle");
+    fireEvent.click(toggle);
+    expect(onToggleSendTarget).toHaveBeenCalledTimes(1);
+  });
+
+  it("…and still fires when there IS an agent to aim at", () => {
+    // The other half of `onClick={canToggle ? … : undefined}`: refusing must not cost the happy path.
+    const onToggleSendTarget = vi.fn();
+    setup({ send: { target: "sparkle", agentName: "CI Hardening" }, onToggleSendTarget });
+    const toggle = screen.getByTestId("send-target-toggle");
+    expect(toggle.getAttribute("aria-disabled")).toBe("false");
+    fireEvent.click(toggle);
+    expect(onToggleSendTarget).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows WHY the target is unavailable, in the tooltip AND the accessible name", () => {
+    // A cloud tab is selected: "no agent selected" would be a lie, and replacing the whole
+    // accessible name with the bare reason drops the "Sending to Sparkle" context a screen-reader
+    // user needs to know where their message IS going (roborev 49295).
+    setup({
+      send: {
+        target: "sparkle",
+        unavailableReason: "Cloud agents take prompts in the terminal for now",
+      },
+      onToggleSendTarget: vi.fn(),
+    });
+    const toggle = screen.getByTestId("send-target-toggle");
+    expect(toggle.hasAttribute("disabled")).toBe(false);
+    expect(toggle.getAttribute("title")).toBe("Cloud agents take prompts in the terminal for now");
+    expect(toggle.getAttribute("aria-label")).toBe(
+      "Sending to Sparkle — Cloud agents take prompts in the terminal for now",
+    );
   });
 
   it("an 'agent' target with no agent name still renders (and reads as) Sparkle", () => {

@@ -25,7 +25,7 @@ const model: ConciergeViewModel = {
   vitals: { p0: 1, p1: 2 },
   spend: { amountText: "$4.12" },
   messages: [
-    { id: "m1", kind: "sparkle", text: "Morning — I'm watching every open project." },
+    { id: "m1", kind: "sparkle", text: "Morning — I'm watching every open project.", speakable: true },
     { id: "m2", kind: "you", text: "Thanks, keep me posted." },
     { id: "m3", kind: "batch", text: "All projects calm · nothing needs you" },
     nudge,

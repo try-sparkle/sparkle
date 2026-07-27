@@ -176,10 +176,9 @@ function AgentPaneInner({
   // Drag-vision hint (spec 2026-07-02): an image dragged onto the terminal shows a pill explaining
   // that this isn't where images go. Only the visible pane listens — the webview drag event is
   // window-global, so gating on `visible` keeps every background pane from popping its own pill.
-  // Armed for EVERY user, and entitlement no longer enters into it (roborev 46485): NO surface
-  // accepts a dropped image today — the terminal target went with the pane composer and the
-  // concierge box's pickers are still stubs — so the pill is purely informational, and there is
-  // nothing to sell anyone. Its one action moves the caret to the compose box.
+  // Armed for EVERY user (roborev 46351): the pill's only action is the redirect to the concierge
+  // compose box — the one place images DO go — and that flow checks no entitlement at all, so the
+  // pill no longer reads auth state (roborev 46925 retired its upgrade CTA).
   const dragHint = useDragVisionHint(visible);
 
   // Publish this agent's "mark a prompt at the current terminal row" capability while its pane is

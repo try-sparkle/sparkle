@@ -3,15 +3,31 @@
 // submits. Purely presentational: submit reports trimmed text via onSend and clears; the mic
 // button only reports onMicToggle — micLive (the armed state) is a prop, owned upstream.
 //
+// ATTACHMENTS (parity row #21). The attach buttons report a KIND; the host runs the picker and owns
+// the resulting list, which comes back as `attachments` and renders as removable chips. The box
+// stays Tauri-free — it never opens a dialog, reads a file, or listens for a drop. It only marks
+// itself `data-dnd-target` so the host's window-global drag listener can hit-test it, and paints
+// `dropActive`. With something attached, an EMPTY message is still sendable (an image alone is a
+// message), which is the one place attachments change the submit rule.
+//
 // SEND TARGET. Because this box replaced the AgentPane composer as well as being the chat with
 // Sparkle, it carries an explicit target toggle: "→ Sparkle" (the brain) or "→ <agent>" (a real
 // prompt into that agent's terminal). Explicit, never inferred — guessing would either bury a
 // prompt in a chat thread or fire an agent turn the user didn't ask for. The toggle is a prop
 // pair (`send` + `onToggleSendTarget`); this file owns none of that state.
+//
+// Dictation (bead sparkle-4562.2 / CM-U9) keeps that contract. The box knows nothing about the
+// mic pipeline: it hands its append fn to the integration layer through registerInsert (mirroring
+// dictationStore registerInsert, which is what the agent composer already does) and renders
+// whatever live transcript arrives back as the interim prop. COMMITTED segments land in the
+// textarea and are editable and sendable like typed text; the INTERIM preview stays outside the
+// textarea, because Deepgram replaces it word-by-word and a send that captured it would ship a
+// half-heard phrase that is about to be superseded.
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
-import { FiCamera, FiImage, FiMic, FiPaperclip, FiTerminal, FiZap } from "react-icons/fi";
+import { FiCamera, FiFile, FiImage, FiMic, FiPaperclip, FiTerminal, FiX, FiZap } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL_DARK } from "../../theme/colors";
-import type { ConciergeAttachKind, ConciergeSendState } from "./types";
+import { CONCIERGE_COMPOSE_DND_TARGET } from "../../services/dndTargets";
+import type { Attachment, ConciergeAttachKind, ConciergeSendState } from "./types";
 import { useUiStore } from "../../stores/uiStore";
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
@@ -35,22 +51,54 @@ const ATTACHMENTS: { kind: ConciergeAttachKind; label: string; Icon: typeof FiCa
   { kind: "files", label: "Files", Icon: FiPaperclip, title: "Attach files from your desktop" },
 ];
 
+/** Where a committed dictation segment goes in the box: appended, space-separated, never
+ *  double-spaced. Pure so the commit rule is testable without a mic. */
+export function appendDictated(current: string, segment: string): string {
+  const chunk = segment.trim();
+  if (!chunk) return current;
+  if (!current) return chunk;
+  return current.endsWith(" ") ? `${current}${chunk}` : `${current} ${chunk}`;
+}
+
+/** The dead-toggle default. Actionable on purpose: with `aria-disabled` (not `disabled`) the
+ *  tooltip is the one explanation a sighted user gets, so it says what to DO, not just what is. */
+const NO_AGENT_HINT = "No agent selected — select an agent to send it a prompt";
+
 export function ComposeBox({
   onSend,
   onMicToggle,
   onAttach,
+  onRemoveAttachment,
+  attachments = [],
+  dropActive = false,
   micLive = false,
   send,
   onToggleSendTarget,
+  interim = "",
+  registerInsert,
+  onTextEdit,
 }: {
-  /** Reports the trimmed text. May return a promise resolving FALSE when the send failed, in
-   *  which case the box restores the draft (see submit). */
+  /** Reports the trimmed text (empty only when something is attached). May return a promise
+   *  resolving FALSE when the send failed, in which case the box restores the draft (see submit). */
   onSend: (text: string) => void | Promise<boolean>;
   onMicToggle: () => void;
   onAttach: (kind: ConciergeAttachKind) => void;
+  onRemoveAttachment?: (id: string) => void;
+  /** Staged files, owned by the host — rendered as chips, cleared by the host on send. */
+  attachments?: Attachment[];
+  /** A native file drag is over this box (the host hit-tests the window-global event). */
+  dropActive?: boolean;
   micLive?: boolean;
   send?: ConciergeSendState;
   onToggleSendTarget?: () => void;
+  /** Live, uncommitted transcript; rendered as a ghost line, never submitted. */
+  interim?: string;
+  /** Must be referentially STABLE (useCallback upstream) — the box re-registers whenever it
+   *  changes, and an unstable identity would churn the app-wide dictation target every render. */
+  registerInsert?: (append: ((text: string) => void) | null) => void;
+  /** The user TYPED (or deleted) — reports the new value. Not fired for dictated segments or the
+   *  clear-on-send, so the host can see the box being emptied by hand. */
+  onTextEdit?: (text: string) => void;
 }) {
   const [text, setText] = useState("");
   // Focus-on-request seam: any component can call uiStore.requestComposeFocus() (e.g. the
@@ -72,20 +120,40 @@ export function ComposeBox({
   const toAgent = send?.target === "agent" && !!send.agentName;
   // No agent to aim at → the toggle is inert (and says so), rather than offering a target that
   // would silently fall back to the brain.
-  const canToggle = !!onToggleSendTarget && !!send?.agentName;
+  // One fact drives the label, the tooltip AND the click (roborev 53010): a reason means PINNING is
+  // refused, so the control must not announce a switch it won't perform — and the tooltip must not
+  // explain a refusal on a control that works.
+  //
+  // But flipping OFF is ALWAYS allowed (roborev 53051). `aim` and the reason are supplied
+  // independently by the host, so "aimed at local agent A, then a cloud tab gets selected" delivers
+  // both at once — and refusing the toggle there would strand the user pinned to A with no way back
+  // to Sparkle chat until they selected a local tab again. Un-aiming never depends on what the
+  // selected tab's runtime is; only pinning does.
+  const canToggle =
+    !!onToggleSendTarget && (toAgent || (!!send?.agentName && !send?.unavailableReason));
+
+  useEffect(() => {
+    if (!registerInsert) return;
+    const append = (segment: string) => setText((prev) => appendDictated(prev, segment));
+    registerInsert(append);
+    return () => registerInsert(null);
+  }, [registerInsert]);
 
   // Clear optimistically (the send almost always lands), but PUT THE DRAFT BACK if the host reports
   // a failure — the removed composer did exactly this, and having to retype a paragraph because an
   // agent's terminal had closed is the worst possible outcome of a failed send. Only restored when
   // the box is still empty, so it can never clobber something the user started typing meanwhile.
+  // An attachment alone IS a message — the removed composer allowed attachments-only sends — so the
+  // gate is "text or attachments", not "text".
+  const canSend = text.trim().length > 0 || attachments.length > 0;
   const submit = () => {
+    if (!canSend) return;
     const v = text.trim();
-    if (!v) return;
     const outcome = onSend(v);
     setText("");
     if (outcome && typeof outcome.then === "function") {
       void outcome.then((ok) => {
-        if (!ok) setText((cur) => (cur === "" ? v : cur));
+        if (!ok && v) setText((cur) => (cur === "" ? v : cur));
       });
     }
   };
@@ -98,13 +166,68 @@ export function ComposeBox({
 
   return (
     <div
+      // The hit-test handle for the host's window-global drag listener (services/dndTargets).
+      data-dnd-target={CONCIERGE_COMPOSE_DND_TARGET}
       style={{
         flex: "none",
         borderTop: `1px solid ${line}`,
         padding: "10px 12px 12px",
-        background: "rgba(0,0,0,0.16)",
+        background: dropActive ? `color-mix(in srgb, ${C.teal} 10%, rgba(0,0,0,0.16))` : "rgba(0,0,0,0.16)",
+        outline: dropActive ? `1.5px dashed ${C.teal}` : "none",
+        outlineOffset: -2,
       }}
     >
+      {attachments.length > 0 && (
+        <div
+          data-testid="concierge-attachment-chips"
+          style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}
+        >
+          {attachments.map((a) => (
+            <span
+              key={a.id}
+              title={a.name}
+              style={{
+                ...attachStyle,
+                cursor: "default",
+                maxWidth: 170,
+                color: C.cream,
+                background: `color-mix(in srgb, ${C.teal} 10%, transparent)`,
+              }}
+            >
+              {a.dataUrl ? (
+                <img
+                  src={a.dataUrl}
+                  alt=""
+                  style={{ width: 16, height: 16, objectFit: "cover", borderRadius: 3 }}
+                />
+              ) : (
+                <FiFile size={12} aria-hidden />
+              )}
+              <span
+                style={{ overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}
+              >
+                {a.name}
+              </span>
+              <button
+                type="button"
+                aria-label={`Remove ${a.name}`}
+                onClick={() => onRemoveAttachment?.(a.id)}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  border: "none",
+                  background: "transparent",
+                  color: C.conciergeMuted,
+                  cursor: "pointer",
+                  padding: 0,
+                }}
+              >
+                <FiX size={12} aria-hidden />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
       <div style={{ display: "flex", gap: 6, marginBottom: 8, alignItems: "center" }}>
         {ATTACHMENTS.map(({ kind, label, Icon, title }) => (
           <button
@@ -125,18 +248,33 @@ export function ComposeBox({
             aria-label={
               toAgent
                 ? `Sending to ${send.agentName} — switch to Sparkle`
-                : send.agentName
+                : canToggle
                   ? `Sending to Sparkle — switch to ${send.agentName}`
-                  : "Sending to Sparkle — no agent selected"
+                  : // The reason EXTENDS the state, never replaces it: aria-label overrides the
+                    // accessible name outright, so returning the bare reason left a screen-reader
+                    // user hearing "Cloud agents take prompts in the terminal for now" with no clue
+                    // that this control is the send target or where the message is going now
+                    // (roborev 49295).
+                    `Sending to Sparkle — ${send.unavailableReason ?? NO_AGENT_HINT}`
             }
             aria-pressed={toAgent}
             title={
-              send.agentName
+              // Only a REFUSED toggle explains itself; a working one describes what it does. Gating
+              // on canToggle (not on "is there a reason?") keeps the tooltip from claiming cloud
+              // agents can't be prompted while the box is aimed at a local one (roborev 53010).
+              canToggle || toAgent
                 ? "Where your message goes: Sparkle (chat) or the selected agent (a real prompt)"
-                : "Select an agent to send it a prompt"
+                : // Same words as the accessible name's default, so the two readings of a dead
+                  // toggle can't diverge, and both stay ACTIONABLE — the tooltip is the only
+                  // explanation a sighted user gets (roborev 52648/53010).
+                  (send.unavailableReason ?? NO_AGENT_HINT)
             }
-            disabled={!canToggle}
-            onClick={onToggleSendTarget}
+            // aria-disabled, NOT `disabled`: browsers don't dispatch pointer events to a disabled
+            // form control, so its `title` never appears — the one place the honest reason was
+            // shown to a SIGHTED user was unreachable by construction. The click is a no-op
+            // instead, which keeps the control hoverable and focusable while still refusing.
+            aria-disabled={!canToggle}
+            onClick={canToggle ? onToggleSendTarget : undefined}
             style={{
               ...attachStyle,
               marginLeft: "auto",
@@ -160,6 +298,27 @@ export function ComposeBox({
           </button>
         )}
       </div>
+      {interim ? (
+        <div
+          data-testid="concierge-interim"
+          // aria-live="off", deliberately (roborev 48171): Deepgram replaces this preview word by
+          // word, so a polite region hands the screen reader a fresh announcement per partial and
+          // the queue never drains — drowning out everything else. The text is decorative and
+          // immediately superseded. What matters — the finished reply, and each send outcome — is
+          // announced by the column's hidden role="status" node (ConciergeColumn), which is fed
+          // FINISHED lines only. Not the thread: it renders the streaming transcript, so a live
+          // region there re-announces the reply on every chunk (roborev 52648/53010/53088).
+          aria-live="off"
+          style={{
+            fontSize: 12,
+            fontStyle: "italic",
+            color: C.muted,
+            padding: "0 2px 6px",
+          }}
+        >
+          {interim}
+        </div>
+      ) : null}
       <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
         <button
           type="button"
@@ -190,7 +349,13 @@ export function ComposeBox({
           // also permanently wrong for anyone who just presses the button.
           placeholder={toAgent ? `Prompt ${send!.agentName}…` : "Talk to Sparkle…"}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            // Only the user's OWN edits report — dictation appends go through setText directly.
+            // That is what lets the host tell "this box was emptied by hand" (which retires the
+            // dictated-origin latch) from "a segment just landed in it".
+            onTextEdit?.(e.target.value);
+          }}
           onKeyDown={onKeyDown}
           style={{
             flex: 1,
@@ -209,7 +374,7 @@ export function ComposeBox({
         <button
           type="button"
           onClick={submit}
-          disabled={text.trim().length === 0}
+          disabled={!canSend}
           aria-label="Send"
           // Carries the shortcut the placeholder no longer spends its text on — without this the
           // keybinding would have no on-screen discoverability at all.
@@ -222,8 +387,8 @@ export function ComposeBox({
             border: "none",
             borderRadius: 12,
             padding: "10px 15px",
-            cursor: text.trim().length === 0 ? "default" : "pointer",
-            opacity: text.trim().length === 0 ? 0.45 : 1,
+            cursor: canSend ? "pointer" : "default",
+            opacity: canSend ? 1 : 0.45,
             height: 42,
           }}
         >

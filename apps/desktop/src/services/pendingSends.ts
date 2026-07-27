@@ -17,11 +17,18 @@
 // submitPrompt call and the prompt side-effects; this module only holds and hands back.
 
 /** One held send. `userPrompt` rides along so the side-effects decision made at dispatch time
- *  (see ConciergeDispatchOptions) is preserved across the wait. */
+ *  (see ConciergeDispatchOptions) is preserved across the wait — and so do the other two
+ *  renderings of the message, or a held attachment send would flush with the raw payload in the
+ *  pinned header and the naming basis (roborev 46911/46925). */
 export interface PendingSend {
   agentId: string;
+  /** The wire payload — what actually gets written to the PTY. */
   text: string;
   userPrompt: boolean;
+  /** What the user-visible prompt surfaces show; undefined → same as `text`. */
+  display?: string;
+  /** What auto-naming and ghost-text learn from; undefined → same as `text`, "" → skip naming. */
+  namingBasis?: string;
   /** When it was queued (epoch ms), for the staleness sweep on drain. */
   at: number;
 }
@@ -43,10 +50,25 @@ function live(q: PendingSend[], nowMs: number): PendingSend[] {
  * Hold `entry` until its agent's PTY is ready. Returns false when this agent's queue is already
  * full of LIVE entries — the caller must then report the send as failed rather than pretend it
  * landed. Stale entries are pruned first, so five expired holds can't refuse a fresh prompt.
+ *
+ * `onPruned` receives anything the prune dropped, oldest first. Those entries were PROMISED
+ * ("I'll send that when it's ready") and would otherwise vanish with no outcome at all — the same
+ * "worst of both worlds" takePendingSends' comment describes, on a path that never reaches it
+ * (roborev 53015). It also keeps the producer/consumer counts balanced for callers that pair
+ * something with each queued send: without it, one silent prune puts every later outcome one slot
+ * out of step, forever.
  */
-export function queuePendingSend(entry: Omit<PendingSend, "at"> & { at?: number }): boolean {
+export function queuePendingSend(
+  entry: Omit<PendingSend, "at"> & { at?: number },
+  onPruned?: (dropped: PendingSend[]) => void,
+): boolean {
   const now = entry.at ?? Date.now();
-  const q = live(queues.get(entry.agentId) ?? [], now);
+  const all = queues.get(entry.agentId) ?? [];
+  const q = live(all, now);
+  if (onPruned && q.length !== all.length) {
+    const kept = new Set(q);
+    onPruned(all.filter((e) => !kept.has(e)));
+  }
   if (q.length >= MAX_PER_AGENT) {
     queues.set(entry.agentId, q); // keep the pruned list even when refusing
     return false;

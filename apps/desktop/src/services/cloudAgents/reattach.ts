@@ -22,18 +22,26 @@ export interface ReattachDeps {
 /**
  * Reconcile one project's persisted tabs against the server's live cloud sessions, creating a
  * `runtime: "cloud"` tab for each live session that lacks one. Returns the ids created (possibly
- * empty). Never throws.
+ * empty), or NULL when the listing itself never landed. Never throws.
+ *
+ * `[]` and `null` mean different things to the caller and must not be collapsed (roborev 49295):
+ * `[]` is "the server answered and there was nothing to do" — settled, don't ask again — while
+ * `null` is "we never got an answer" (offline, 500, a token still settling), which is what keeps
+ * the project eligible for a retry. Returning `[]` for a failed fetch is why an offline cold boot
+ * on an already-bound project stayed unreconciled until the next relaunch: the cached
+ * cloudProjectId means findCloudProjectId never makes a request, so the listing here is the ONLY
+ * call that can fail, and it was reporting failure as success.
  */
 export async function reattachCloudSessions(
   projectId: string,
   deps: ReattachDeps,
-): Promise<string[]> {
+): Promise<string[] | null> {
   let sessions;
   try {
     sessions = await deps.api.listSessions(projectId);
   } catch (err) {
     deps.onError?.(err);
-    return []; // offline / signed out / server error → don't disrupt startup
+    return null; // offline / signed out / server error → retryable, and never disrupts startup
   }
 
   const { toCreate } = reconcileCloudSessions({

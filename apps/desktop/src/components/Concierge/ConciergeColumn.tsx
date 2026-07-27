@@ -30,6 +30,11 @@ export function ConciergeColumn({
   wordmarkMode,
   width = 380,
   searchSlot,
+  interim = "",
+  registerInsert,
+  speakingMessageId = null,
+  onTextEdit,
+  announcement = "",
 }: ConciergeColumnProps) {
   const mode = wordmarkMode ?? deriveWordmarkMode(micLive, model.typing ?? false);
   return (
@@ -67,14 +72,39 @@ export function ConciergeColumn({
         typing={model.typing}
         onNudgeClick={controller.onNudgeClick}
         onNudgeAction={controller.onNudgeAction}
+        onSpeak={controller.onSpeak}
+        speakingMessageId={speakingMessageId}
       />
+      {/* The column's ONE live region. Visually hidden, polite, and fed only completed lines, so a
+          screen-reader user hears the reply once — not once per chunk (roborev 52648/53010). */}
+      <div
+        data-testid="concierge-announcer"
+        role="status"
+        aria-live="polite"
+        style={{
+          position: "absolute",
+          width: 1,
+          height: 1,
+          overflow: "hidden",
+          clip: "rect(0 0 0 0)",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {announcement}
+      </div>
       <ComposeBox
         onSend={controller.onSend}
         onMicToggle={controller.onMicToggle}
         onAttach={controller.onAttach}
+        onRemoveAttachment={controller.onRemoveAttachment}
+        attachments={model.attachments}
+        dropActive={model.dropActive}
         micLive={micLive}
         send={model.send}
         onToggleSendTarget={controller.onToggleSendTarget}
+        interim={interim}
+        registerInsert={registerInsert}
+        onTextEdit={onTextEdit}
       />
     </section>
   );

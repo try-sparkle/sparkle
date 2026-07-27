@@ -18,17 +18,21 @@ import { reattachCloudSessions } from "./reattach";
 
 /**
  * Reconcile one local project's tabs against its live cloud sessions. Returns the ids of the tabs
- * created (empty when there was nothing to do, or when anything failed). Never throws.
+ * created (empty when the server was consulted and there was nothing to do), or null when the
+ * attempt never reached a useful answer — auth/entitlement not (yet) ready, or the lookup failed
+ * (offline, 500). Callers use null to keep the project eligible for a retry: on a cold launch the
+ * auth store resolves asynchronously, so the first attempt can fire before tokenPresent settles.
+ * Never throws.
  */
-export async function reattachProjectOnOpen(localProjectId: string): Promise<string[]> {
+export async function reattachProjectOnOpen(localProjectId: string): Promise<string[] | null> {
   const ps = useProjectStore.getState();
   const project = ps.projects.find((p) => p.id === localProjectId);
-  if (!project) return [];
+  if (!project) return null;
 
   // The capability gate, read the same way every other cloud surface reads it: absent ⇒ off. A
   // local-only user never issues a single request from this path.
   const auth = useAuthStore.getState();
-  if (auth.me?.cloudAgentsEnabled !== true || !auth.tokenPresent) return [];
+  if (auth.me?.cloudAgentsEnabled !== true || !auth.tokenPresent) return null;
 
   try {
     // Look up WITHOUT creating: opening a project must not mint a server project row for one that
@@ -54,6 +58,6 @@ export async function reattachProjectOnOpen(localProjectId: string): Promise<str
   } catch (err) {
     // findCloudProjectId is the only throwing call above; a failure here is offline/signed-out/500.
     log.debug("cloud-agents", "re-attach lookup failed", err);
-    return [];
+    return null;
   }
 }

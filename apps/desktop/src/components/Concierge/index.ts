@@ -8,6 +8,7 @@ export { useCommandPalette, isPaletteShortcut } from "./useCommandPalette";
 export type { CommandPaletteController } from "./useCommandPalette";
 export { ConciergeTopRight, KebabMenu } from "./KebabMenu";
 export type {
+  Attachment,
   ConciergeAttachKind,
   ConciergeBatchMessage,
   ConciergeColumnProps,

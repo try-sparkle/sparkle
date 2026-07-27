@@ -7,10 +7,13 @@
 //
 // The pill is now purely INFORMATIONAL and shows for everyone. Both former actions are gone: the
 // entitled branch flipped a `composer` flag that mounts nothing since CM-U7, and the not-entitled
-// branch sold AI Features — but with the attach pickers still stubbed, buying them still leaves
-// nowhere to hand an agent an image, which made the upsell the last (and only paid) dead end on
-// this surface. THE COPY IS PINNED BELOW ON PURPOSE: it must not promise delivery, in the body or
-// in the accessible name, until the pickers actually land.
+// branch sold AI Features — and now that the attach pickers HAVE landed (parity row #21), the flow
+// this pill recommends checks no entitlement anywhere, so the upsell was selling a feature the
+// recommended flow does not need (roborev 46485-M / 46925). THE COPY IS PINNED BELOW ON PURPOSE:
+// the box takes files now, so the pill may name its Image / Files buttons — but it still must not
+// claim the image reaches the AGENT whose terminal was dragged over, in the body or in the
+// accessible name (the box aims at Sparkle until the user pins an agent with the send-target
+// toggle).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
@@ -34,38 +37,27 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("DragVisionHintPill", () => {
-  it("renders the redirect copy and the two surviving actions", () => {
+  it("renders the redirect copy and the compose-box action", () => {
     render(<DragVisionHintPill onDismiss={vi.fn()} />);
-    expect(screen.getByText(/doesn.t send it/i)).toBeTruthy();
+    expect(screen.getByText(/Drop it on the Sparkle box instead/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Go to the Sparkle box" })).toBeTruthy();
     expect(screen.getByRole("button", { name: /Learn more/i })).toBeTruthy();
   });
 
-  it("offers NO paid unlock — there is nothing to unlock yet (roborev 46485-M)", () => {
+  it("points at the concierge pickers by name, and still promises no more than that", () => {
+    // Landed in parity row #21: the box takes files now, so the pill may say so. What it still may
+    // NOT say is that the image reaches the agent whose terminal was dragged over — the box aims at
+    // Sparkle until the user pins an agent with the send-target toggle.
     render(<DragVisionHintPill onDismiss={vi.fn()} />);
-    expect(screen.queryByRole("button", { name: /Enable AI Features/i })).toBeNull();
-    expect(screen.getByRole("dialog").textContent ?? "").not.toMatch(/AI Features/i);
-  });
-
-  it("promises NOTHING the app can't do yet — body AND accessible name (roborev 46485-H/L)", () => {
-    // The pickers behind the compose box's Image/Files buttons are stubs (ConciergeHost.onAttach
-    // is a no-op), and the box aims at Sparkle unless the user pins an agent — so neither
-    // "attach it there" nor "it reaches this agent" may appear. The aria-label is checked too:
-    // textContent excludes attributes, so an overpromising accessible name (what a screen-reader
-    // user actually hears) would otherwise slip past. Retire these only with the pickers.
-    render(<DragVisionHintPill onDismiss={vi.fn()} />);
-    const dialog = screen.getByRole("dialog");
-    for (const text of [dialog.textContent ?? "", dialog.getAttribute("aria-label") ?? ""]) {
-      expect(text).not.toMatch(/attach (them|it) in the Sparkle box/i);
-      expect(text).not.toMatch(/reach(es)? this agent/i);
-      expect(text).not.toMatch(/drag.and.drop/i);
-      // Same claim, re-worded: the box aims at the concierge unless the user pins the agent with
-      // the send-target toggle, and this pill's action does not pin it (roborev 46897).
-      expect(text).not.toMatch(/hand (the work|it) to this agent/i);
-    }
+    const body = screen.getByRole("dialog").textContent ?? "";
+    expect(body).toMatch(/Image \/ Files buttons/i);
+    expect(body).not.toMatch(/reach(es)? this agent/i);
   });
 
   it("primary action focuses the compose box and dismisses — no URL, no flag flip", () => {
+    // The pill's ONE positive behaviour. My consolidation of the three overlapping negative tests
+    // took this with it (roborev 52969), leaving only "the button exists" — so a regression that
+    // made it inert, or made it navigate somewhere, would have passed green.
     const onDismiss = vi.fn();
     const seqBefore = useUiStore.getState().composeFocusSeq;
     render(<DragVisionHintPill onDismiss={onDismiss} />);
@@ -74,6 +66,36 @@ describe("DragVisionHintPill", () => {
     expect(mockLaunch).not.toHaveBeenCalled();
     expect(useSettingsStore.getState().aiComposer).toBe(false);
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers no upsell anywhere: no CTA, no entitlement caveat, no pricing URL", () => {
+    // ONE negative-copy test (roborev 51593/51594): the union merge had left three that re-asserted
+    // the same invariant from different angles. The pill sold "Enable AI Features" from when the
+    // terminal drop fed a paid vision path; the flow it now recommends — the concierge pickers /
+    // drop-to-attach — checks no entitlement anywhere, so both the CTA and the "(Vision also needs
+    // AI Features enabled.)" line were selling a feature it does not need (roborev 46485-M/46925).
+    render(<DragVisionHintPill onDismiss={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /Enable AI Features/i })).toBeNull();
+    expect(screen.getByRole("dialog").textContent ?? "").not.toMatch(/AI Features/i);
+    // Learn more is the only launch on this pill, and it goes to the docs.
+    fireEvent.click(screen.getByRole("button", { name: /Learn more/i }));
+    for (const [url] of mockLaunch.mock.calls) expect(url).not.toMatch(/pricing/i);
+    expect(useSettingsStore.getState().aiComposer).toBe(false);
+  });
+
+  it("promises NOTHING the app can't do yet — body AND accessible name (roborev 46485-H/L)", () => {
+    // The box stages the file for the NEXT message and aims at Sparkle unless the user pins an
+    // agent, so "it reaches this agent" may never appear. The aria-label is checked too:
+    // textContent excludes attributes, so an overpromising accessible name (what a screen-reader
+    // user actually hears) would otherwise slip past.
+    render(<DragVisionHintPill onDismiss={vi.fn()} />);
+    const dialog = screen.getByRole("dialog");
+    for (const text of [dialog.textContent ?? "", dialog.getAttribute("aria-label") ?? ""]) {
+      expect(text).not.toMatch(/reach(es)? this agent/i);
+      // Same claim, re-worded: the box aims at the concierge unless the user pins the agent with
+      // the send-target toggle, and this pill's action does not pin it (roborev 46897).
+      expect(text).not.toMatch(/hand (the work|it) to this agent/i);
+    }
   });
 
   it("Learn more opens the docs deep link and dismisses", () => {

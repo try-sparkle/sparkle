@@ -40,6 +40,16 @@ export interface ConciergeErrorEvent {
   detail: string;
 }
 
+/** The Rust side's sentinels for "this send was superseded / cancelled" (concierge.rs). Matched as
+ *  substrings because Tauri wraps a command's Err string. Kept in one place so the silent-outcome
+ *  rule is visible next to the error path it bypasses, and EXPORTED so the test matches on these
+ *  rather than re-typing them — the Rust side pins its own literals in a sibling test, so a reword
+ *  on either side fails somewhere instead of silently un-silencing the outcome (roborev 53205). */
+export const SUPERSEDED_DETAILS = [
+  "concierge_turn: superseded before install",
+  "concierge_turn: cancelled",
+] as const;
+
 /** The `id` used for errors synthesized on THIS side of the bridge (a rejected invoke/listen),
  *  where no Rust turn token exists. */
 export const CONCIERGE_LOCAL_ERROR_ID = "local";
@@ -124,22 +134,43 @@ function ensureWired(): Promise<void> {
 /**
  * Run one concierge turn over `prompt` (a snapshot of app state, or the user's message).
  * Continuity is automatic: the session id from the last `done` is passed as the resume target
- * unless `resumeSessionId` explicitly overrides it. Resolves when the turn has been ACCEPTED
- * (the reply streams via the subscriptions); never rejects — failures surface on
+ * unless `resumeSessionId` explicitly overrides it. Never rejects — failures surface on
  * `onConciergeError`.
+ *
+ * RESOLVES WITH THE TURN'S ID — the same id its `concierge:*` events carry — or `null` when the
+ * turn never started (a rejected invoke). Callers key supersession bookkeeping on it, so the null
+ * contract matters: no id means there is no turn to attribute anything to (roborev 53088).
  */
-export async function startConciergeTurn(prompt: string, resumeSessionId?: string): Promise<void> {
+export async function startConciergeTurn(
+  prompt: string,
+  resumeSessionId?: string,
+): Promise<string | null> {
   try {
     // Wire listeners BEFORE the invoke so a fast first delta/done can't slip past the manager.
     await ensureWired();
     const resume = resumeSessionId ?? currentSessionId ?? undefined;
-    await invoke("concierge_turn", { prompt, resumeSessionId: resume ?? null });
+    const id = await invoke<string>("concierge_turn", { prompt, resumeSessionId: resume ?? null });
     // Only advance the session id once the turn was ACCEPTED — a rejected invoke must not leave a
     // resume target (esp. an explicit override) for a turn that never ran.
     if (resume) currentSessionId = resume;
+    // The turn's id — the same one its `concierge:*` events carry. Callers use it to tell this
+    // turn's events from a SUPERSEDED turn's stragglers (concierge.rs emits deltas unconditionally;
+    // only the reap is token-gated), which they cannot do from the ids they happen to have seen
+    // when the previous turn produced no event at all before this send (roborev 53051).
+    return typeof id === "string" ? id : null;
   } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    // NOT a failure: the user sent again (or cancelled) before this turn could start. Both are
+    // ordinary outcomes of two fast sends, and surfacing them would post "I couldn't reach my
+    // brain just now" AND clear the typing indicator — for the live turn that is still streaming,
+    // since a local error carries no turn id and so bypasses supersededTurn (roborev 53186).
+    if (SUPERSEDED_DETAILS.some((d) => detail.includes(d))) {
+      console.warn("concierge: turn superseded before it started:", detail);
+      return null;
+    }
     console.warn("concierge: failed to start turn:", e);
-    dispatchLocalError(e instanceof Error ? e.message : String(e));
+    dispatchLocalError(detail);
+    return null;
   }
 }
 

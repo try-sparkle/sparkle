@@ -2,18 +2,19 @@
 // drags an image onto the terminal — which is NOT where images go since CM-U7 removed the pane
 // composer.
 //
-// WHAT THIS PILL MAY PROMISE (roborev 46485-H): only what exists. The terminal drop target is gone
-// and the concierge box's Image/Files pickers are still stubs (ConciergeHost.onAttach is a no-op,
-// PRD §7 "Concierge attach pickers" ⬜), so there is currently NOWHERE to hand an image to an agent.
-// The pill therefore says exactly that. Its one action still earns its place — it puts the caret
-// in the one surface that DOES take input, so the user can type what they wanted to show — but it
-// must not claim the image goes anywhere, and it must not claim it reaches "this agent" (the box
-// aims at Sparkle unless the user pins an agent with the send-target toggle).
+// WHAT THIS PILL MAY PROMISE: only what exists. The terminal drop target is gone, but the concierge
+// compose box now takes files — its Screenshot/Image/Files pickers are real and it is itself a drop
+// target (parity row #21, useConciergeAttachments). So the pill is a POINTER to them: drop it on the
+// Sparkle box, or use the buttons there. It still must not claim the image reaches "this agent" —
+// the box aims at Sparkle unless the user pins an agent with the send-target toggle — so the copy
+// names the box, never the agent whose terminal was dragged over.
 //
-// The paid "Enable AI Features" CTA is gone for the same reason (roborev 46485-M): with no picker
-// anywhere, buying the entitlement still leaves nowhere to hand an agent an image — an upsell into
-// a dead end is worse than the informational pill, because it costs money. When the pickers land,
-// the copy and the CTA come back together.
+// NOT AN UPSELL (roborev 46925). It used to carry "(Vision also needs AI Features enabled.)" and an
+// "Enable AI Features" CTA, from when the terminal drop fed a paid vision path. The flow this pill
+// now recommends checks no entitlement anywhere — conciergeAttach, useConciergeAttachments and the
+// dispatch/brain paths never consult aiFeatureNow — so the parenthetical was simply false and the
+// CTA sold a feature the recommended flow does not need. Both are gone, and with them the
+// `entitled` prop: there is no longer anything for it to gate.
 //
 // Rendered through a portal (like SelectionPopup.tsx) so the terminal's overflow:hidden can't clip
 // it, and positioned with viewport-clamped fixed coords just ABOVE the terminal pane. Styling
@@ -78,8 +79,8 @@ export function DragVisionHintPill({
     setPos({ left, top });
   }, [anchorRef]);
 
-  // Primary action: put the caret in the one surface that takes input, so the user can SAY what
-  // they were trying to show. Deliberately not sold as "your image goes here" — see the header.
+  // Primary action: put the caret in the one surface that takes BOTH text and files, which is where
+  // the user should have dropped the image.
   const onGoToCompose = () => {
     useUiStore.getState().requestComposeFocus();
     onDismissRef.current();
@@ -94,7 +95,7 @@ export function DragVisionHintPill({
     <div
       ref={cardRef}
       role="dialog"
-      aria-label="Images can't be dropped on the terminal"
+      aria-label="Images go in the Sparkle box, not the terminal"
       style={{
         position: "fixed",
         left: pos.left,
@@ -140,9 +141,9 @@ export function DragVisionHintPill({
       <div style={{ display: "flex", gap: 8, alignItems: "flex-start", paddingRight: 18 }}>
         <FiEye size={16} style={{ flex: "none", color: C.teal, marginTop: 1 }} aria-hidden />
         <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
-          Dropping an image here doesn&apos;t send it — the terminal takes typed input only, and
-          image attachments aren&apos;t wired up anywhere yet. The Sparkle box on the left is where you
-          type; describe what you wanted to show.
+          Dropping an image here doesn&apos;t send it — the terminal takes typed input only. Drop
+          it on the Sparkle box instead, or use the Image / Files buttons there, and it rides along
+          with your next message.
         </div>
       </div>
 

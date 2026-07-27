@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import type {
   ConciergeDispatchPath,
   ConciergeDispatchResult,
@@ -22,7 +22,7 @@ type DeferredOutcome = ConciergeDispatchResult;
 const h = vi.hoisted(() => ({
   feed: null as unknown,
   openProjectTab: vi.fn(),
-  startConciergeTurn: vi.fn(async (_prompt: string) => {}),
+  startConciergeTurn: vi.fn(async (_prompt: string): Promise<string | null> => null),
   // `path` is the real union, not bare `string`: typed loosely, a `path: "pty-gonw"` typo compiles
   // and quietly exercises refusalCopy's generic arm while the row's regex still matches the generic
   // line — a test passing on a path production can never produce (roborev 53097). matchedLabel
@@ -37,7 +37,7 @@ const h = vi.hoisted(() => ({
   brain: {} as {
     delta?: (e: { id: string; text: string }) => void;
     done?: (e: { id: string; text: string }) => void;
-    error?: () => void;
+    error?: (e: { id: string; detail: string }) => void;
   },
 }));
 // Single-window shell (CM-U7): "show me" is a TAB switch + agent reveal, not a bare select.
@@ -57,7 +57,7 @@ vi.mock("../services/concierge", () => ({
     h.brain.done = cb;
     return () => {};
   },
-  onConciergeError: (cb: () => void) => {
+  onConciergeError: (cb: (e: { id: string; detail: string }) => void) => {
     h.brain.error = cb;
     return () => {};
   },
@@ -70,6 +70,25 @@ vi.mock("../services/conciergeDispatch", () => ({
     return () => {};
   },
 }));
+// The voice stack (CM-U9) is mocked in EVERY host test, not just the voice one (roborev 48171):
+// the host imports it unconditionally, so without this the base tests run the real dictation hook
+// and the real stopVoice() on every simulated send — mutating global dictation state and coupling
+// these tests to the mic pipeline.
+vi.mock("../useConciergeDictation", () => ({
+  useConciergeDictation: () => ({
+    micLive: false,
+    interim: "",
+    toggleMic: vi.fn(),
+    registerInsert: vi.fn(),
+  }),
+}));
+vi.mock("../services/conciergeVoice", () => ({
+  speakConciergeReply: vi.fn(async () => "elevenlabs" as const),
+  speakOnDemand: vi.fn(async () => "elevenlabs" as const),
+  stopConciergeVoice: vi.fn(),
+  shouldSpeakConciergeReply: vi.fn(() => true),
+}));
+vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 vi.mock("../stores/sparklePrefsStore", () => ({
   useSparklePrefsStore: { getState: () => ({ setInterruptPreference: h.setInterruptPreference }) },
 }));
@@ -107,19 +126,27 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+/** Queries scoped to the VISIBLE transcript. The column also renders a hidden `role="status"` live
+ *  region carrying the last finished line (roborev 53010), so a document-wide getByText would match
+ *  the same string twice — and would pass even if the visible thread stopped rendering it. */
+const thread = () => screen.getByTestId("concierge-thread");
+const inThread = (re: RegExp | string) => within(thread()).getByText(re);
+const findInThread = (re: RegExp | string) => within(thread()).findByText(re);
+const queryInThread = (re: RegExp | string) => within(thread()).queryByText(re);
+
 describe("ConciergeHost", () => {
   it("surfaces an in-scope needing agent as a nudge with an Approve action", () => {
     h.feed = feedWith("approval", 0);
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     expect(screen.getAllByText(/CI Hardening/).length).toBeGreaterThan(0);
-    expect(screen.getByText("Approve")).toBeTruthy();
-    expect(screen.getByText("Show me")).toBeTruthy();
+    expect(inThread("Approve")).toBeTruthy();
+    expect(inThread("Show me")).toBeTruthy();
   });
 
   it("Approve relays the answer into the agent's terminal", () => {
     h.feed = feedWith("approval", 0);
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.click(screen.getByText("Approve"));
+    fireEvent.click(inThread("Approve"));
     // userPrompt: false — "approve" is machine-authored; it must not enter prompt history,
     // debit a trial prompt, or feed the auto-name ladder (roborev 46251-H1).
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "approve", { userPrompt: false });
@@ -129,14 +156,14 @@ describe("ConciergeHost", () => {
   it("Show me opens the source project's TAB and selects the agent", () => {
     h.feed = feedWith("approval", 0);
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.click(screen.getByText("Show me"));
+    fireEvent.click(inThread("Show me"));
     expect(h.openProjectTab).toHaveBeenCalledWith("p1", "ag1");
   });
 
   it("Mute records a do-not-interrupt preference for the agent", () => {
     h.feed = feedWith("blocked", 1);
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.click(screen.getByText("Mute"));
+    fireEvent.click(inThread("Mute"));
     expect(h.setInterruptPreference).toHaveBeenCalledWith("ag1", "mute");
   });
 
@@ -150,7 +177,7 @@ describe("ConciergeHost", () => {
     expect(snapshot).toContain("CI Hardening");
     expect(snapshot).toContain("what needs me?");
     // the user's message shows in the thread
-    expect(screen.getByText("what needs me?")).toBeTruthy();
+    expect(inThread("what needs me?")).toBeTruthy();
   });
 
   it("streams a brain reply into the thread (delta then done)", () => {
@@ -158,16 +185,30 @@ describe("ConciergeHost", () => {
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     act(() => h.brain.delta?.({ id: "7", text: "On " }));
     act(() => h.brain.delta?.({ id: "7", text: "it." }));
-    expect(screen.getByText("On it.")).toBeTruthy();
+    expect(inThread("On it.")).toBeTruthy();
     act(() => h.brain.done?.({ id: "7", text: "On it — approving CI Hardening." }));
-    expect(screen.getByText("On it — approving CI Hardening.")).toBeTruthy();
+    expect(inThread("On it — approving CI Hardening.")).toBeTruthy();
+  });
+
+  it("announces the FINISHED reply once, never the streaming chunks (roborev 53010)", () => {
+    // The column's one live region. It must not carry the growing text: a value that changes per
+    // delta hands a screen reader an announcement per chunk — the flooding the interim dictation
+    // preview was silenced for, which putting role=log on the transcript would have re-created.
+    h.feed = feedWith("approval", 0);
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    const announcer = () => screen.getByTestId("concierge-announcer");
+    act(() => h.brain.delta?.({ id: "7", text: "On " }));
+    act(() => h.brain.delta?.({ id: "7", text: "it." }));
+    expect(announcer().textContent).toBe("");
+    act(() => h.brain.done?.({ id: "7", text: "" }));
+    expect(announcer().textContent).toBe("On it.");
   });
 
   it("shows an error bubble when the brain can't be reached", async () => {
     h.feed = feedWith("approval", 0);
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    act(() => h.brain.error?.());
-    expect(await screen.findByText(/couldn't reach my brain/i)).toBeTruthy();
+    act(() => h.brain.error?.({ id: "t1", detail: "spawn failed" }));
+    expect(await findInThread(/couldn't reach my brain/i)).toBeTruthy();
   });
 
   // Each refused path gets its OWN remedy, and the remedies genuinely differ: Retry for a pane that
@@ -190,22 +231,22 @@ describe("ConciergeHost", () => {
     h.feed = feedWith("approval", 0);
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: false, path });
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.click(screen.getByText("Approve"));
-    expect(await screen.findByText(remedy)).toBeTruthy();
+    fireEvent.click(inThread("Approve"));
+    expect(await findInThread(remedy)).toBeTruthy();
     // …and NOT the generic dead end, nor any prompt-voice phrasing bleeding across.
-    expect(screen.queryByText(/^I couldn't send the approval to/)).toBeNull();
-    expect(screen.queryByText(/then send again|isn't wired up yet|pass it along/)).toBeNull();
+    expect(queryInThread(/^I couldn't send the approval to/)).toBeNull();
+    expect(queryInThread(/then send again|isn't wired up yet|pass it along/)).toBeNull();
   });
 
   it("an Approve refused as trial-spent says EXACTLY the shared trial line", async () => {
     h.feed = feedWith("approval", 0);
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: false, path: "trial-spent" });
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.click(screen.getByText("Approve"));
+    fireEvent.click(inThread("Approve"));
     // Exact string, not a fragment: trial-spent is the one branch both voices are meant to share,
     // and its prompt-side twin asserts the same literal. A fragment match would let the two drift
     // apart while still passing, which is precisely the design claim (roborev 53018).
-    expect(await screen.findByText(TRIAL_SPENT_TEXT)).toBeTruthy();
+    expect(await findInThread(TRIAL_SPENT_TEXT)).toBeTruthy();
   });
 
   // The approve-side mirror of the prompt table below: `approve` carried the identical widening,
@@ -217,15 +258,15 @@ describe("ConciergeHost", () => {
       h.feed = feedWith("approval", 0);
       h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: false, path });
       render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-      fireEvent.click(screen.getByText("Approve"));
+      fireEvent.click(inThread("Approve"));
       // Pin that the dispatch actually happened with the approve arguments. The catch path can't
       // satisfy these rows TODAY (it posts "I couldn't reach X's terminal to approve.", which the
       // regex below doesn't match) — this is a forward-guard: a change routing the catch through
       // refusalCopy would otherwise let them pass on a path they never meant to cover.
       expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "approve", { userPrompt: false });
-      expect(await screen.findByText(/I couldn't send the approval to/)).toBeTruthy();
-      expect(screen.queryByText(/^Approved — sent to/)).toBeNull();
-      expect(screen.queryByText(/still starting up/)).toBeNull();
+      expect(await findInThread(/I couldn't send the approval to/)).toBeTruthy();
+      expect(queryInThread(/^Approved — sent to/)).toBeNull();
+      expect(queryInThread(/still starting up/)).toBeNull();
     },
   );
 
@@ -238,9 +279,9 @@ describe("ConciergeHost", () => {
     h.feed = feedWith("approval", 0);
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: true, path: "free-text" });
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.click(screen.getByText("Approve"));
-    expect(await screen.findByText(/^Approved — sent to CI Hardening\.$/)).toBeTruthy();
-    expect(screen.queryByText(/still starting up|I couldn't send the approval/)).toBeNull();
+    fireEvent.click(inThread("Approve"));
+    expect(await findInThread(/^Approved — sent to CI Hardening\.$/)).toBeTruthy();
+    expect(queryInThread(/still starting up|I couldn't send the approval/)).toBeNull();
   });
 
   // The THROWING path — the other half of "ALWAYS give the user feedback… Also swallows the
@@ -252,12 +293,12 @@ describe("ConciergeHost", () => {
     h.feed = feedWith("approval", 0);
     h.dispatchConciergeAnswer.mockRejectedValueOnce(new Error("pty write failed"));
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.click(screen.getByText("Approve"));
-    expect(await screen.findByText(/^I couldn't reach CI Hardening's terminal to approve\.$/)).toBeTruthy();
-    expect(screen.queryByText(/^Approved — sent to/)).toBeNull();
+    fireEvent.click(inThread("Approve"));
+    expect(await findInThread(/^I couldn't reach CI Hardening's terminal to approve\.$/)).toBeTruthy();
+    expect(queryInThread(/^Approved — sent to/)).toBeNull();
     // States WHICH failure voice this row pins: the catch's copy, not refusalCopy's — the same
     // distinction the refusal table's forward-guard comment relies on.
-    expect(screen.queryByText(/I couldn't send the approval to/)).toBeNull();
+    expect(queryInThread(/I couldn't send the approval to/)).toBeNull();
   });
 
   // The POSITIVE queued case, which `promptAgent` has and `approve` did not. Without it, deleting
@@ -268,9 +309,9 @@ describe("ConciergeHost", () => {
     h.feed = feedWith("approval", 0);
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: true, path: "queued" });
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.click(screen.getByText("Approve"));
-    expect(await screen.findByText(/is still starting up — I'll approve as soon as it's ready/)).toBeTruthy();
-    expect(screen.queryByText(/^Approved — sent to/)).toBeNull();
+    fireEvent.click(inThread("Approve"));
+    expect(await findInThread(/is still starting up — I'll approve as soon as it's ready/)).toBeTruthy();
+    expect(queryInThread(/^Approved — sent to/)).toBeNull();
   });
 });
 
@@ -300,10 +341,15 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     renderWithTarget();
     fireEvent.click(screen.getByTestId("send-target-toggle"));
     send("rebase onto main and re-run CI");
+    // With nothing attached, all three renderings are the same string (see the dispatch options).
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith(
       "ag1",
       "rebase onto main and re-run CI",
-      { userPrompt: true },
+      {
+        userPrompt: true,
+        display: "rebase onto main and re-run CI",
+        namingBasis: "rebase onto main and re-run CI",
+      },
     );
     // The brain is NOT also asked — the prompt went to the agent instead.
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
@@ -321,7 +367,11 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
   it("the toggle is inert when there is no agent to prompt", () => {
     renderWithTarget(null);
     const toggle = screen.getByTestId("send-target-toggle") as HTMLButtonElement;
-    expect(toggle.disabled).toBe(true);
+    // aria-disabled, not `disabled`: a disabled control gets no pointer events, so its title —
+    // the only place a sighted user reads WHY — could never appear (roborev 49295). The click is
+    // a no-op instead, which is what this case pins.
+    expect(toggle.getAttribute("aria-disabled")).toBe("true");
+    expect(toggle.hasAttribute("disabled")).toBe(false);
     fireEvent.click(toggle);
     send("still chat");
     expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
@@ -333,7 +383,7 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     renderWithTarget();
     fireEvent.click(screen.getByTestId("send-target-toggle"));
     send("ship it");
-    expect(await screen.findByText(/Sent to CI Hardening/)).toBeTruthy();
+    expect(await findInThread(/Sent to CI Hardening/)).toBeTruthy();
   });
 
   it("surfaces the trial-spent refusal instead of pretending the prompt landed", async () => {
@@ -343,7 +393,7 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     send("one more");
     // Exact string — the approve-side twin asserts the same literal, which is what pins that the
     // one branch both voices share actually stays shared.
-    expect(await screen.findByText(TRIAL_SPENT_TEXT)).toBeTruthy();
+    expect(await findInThread(TRIAL_SPENT_TEXT)).toBeTruthy();
   });
 
   it("says a queued prompt is waiting on the agent's start-up", async () => {
@@ -353,7 +403,7 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     send("start on the docs");
     // Full phrase, not the /still starting up/ fragment both voices share: mis-wiring this branch
     // to the APPROVAL wording ("I'll approve as soon as it's ready") would pass on the fragment.
-    expect(await screen.findByText(/still starting up — I'll send that the moment it's ready/)).toBeTruthy();
+    expect(await findInThread(/still starting up — I'll send that the moment it's ready/)).toBeTruthy();
   });
 
   // The positive picker-option branch — the last untested "ok:true but not a plain send" report.
@@ -366,8 +416,8 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     renderWithTarget();
     fireEvent.click(screen.getByTestId("send-target-toggle"));
     send("yes");
-    expect(await screen.findByText(/was asking something — I answered "Yes"/)).toBeTruthy();
-    expect(screen.queryByText(/^Sent to CI Hardening\.$/)).toBeNull();
+    expect(await findInThread(/was asking something — I answered "Yes"/)).toBeTruthy();
+    expect(queryInThread(/^Sent to CI Hardening\.$/)).toBeNull();
     // It returns true, so the draft is consumed rather than restored.
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
   });
@@ -384,9 +434,9 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     send("yes");
     // "I answered it" — NOT "Sent to X.", which would report the one thing that didn't happen:
     // on picker-option the text was matched to an option, not sent as a prompt.
-    expect(await screen.findByText(/^CI Hardening was asking something — I answered it\.$/)).toBeTruthy();
-    expect(screen.queryByText(/undefined/)).toBeNull();
-    expect(screen.queryByText(/^Sent to CI Hardening\.$/)).toBeNull();
+    expect(await findInThread(/^CI Hardening was asking something — I answered it\.$/)).toBeTruthy();
+    expect(queryInThread(/undefined/)).toBeNull();
+    expect(queryInThread(/^Sent to CI Hardening\.$/)).toBeNull();
     // It still returns true, so the draft is consumed — a regression that treated the missing
     // label as a failure would restore the draft after a SUCCESSFUL send.
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
@@ -397,7 +447,7 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     renderWithTarget();
     fireEvent.click(screen.getByTestId("send-target-toggle"));
     send("too late");
-    expect(await screen.findByText(/didn't send/i)).toBeTruthy();
+    expect(await findInThread(/didn't send/i)).toBeTruthy();
   });
 
   // The prompt-side twins of the Approve cases above — same paths, deliberately different copy (a
@@ -415,10 +465,10 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     renderWithTarget();
     fireEvent.click(screen.getByTestId("send-target-toggle"));
     send("worth not retyping");
-    expect(await screen.findByText(remedy)).toBeTruthy();
-    expect(screen.queryByText(/^I couldn't send that to/)).toBeNull();
+    expect(await findInThread(remedy)).toBeTruthy();
+    expect(queryInThread(/^I couldn't send that to/)).toBeNull();
     // No approval-voice phrasing bleeding across the shared table.
-    expect(screen.queryByText(/the approval|open it to choose/)).toBeNull();
+    expect(queryInThread(/the approval|open it to choose/)).toBeNull();
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("worth not retyping");
   });
 
@@ -434,10 +484,10 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
       renderWithTarget();
       fireEvent.click(screen.getByTestId("send-target-toggle"));
       send("must not vanish");
-      expect(await screen.findByText(/I couldn't send that to CI Hardening\./)).toBeTruthy();
-      expect(screen.queryByText(/^Sent to CI Hardening\.$/)).toBeNull();
+      expect(await findInThread(/I couldn't send that to CI Hardening\./)).toBeTruthy();
+      expect(queryInThread(/^Sent to CI Hardening\.$/)).toBeNull();
       // …and no "I'll send it the moment it's ready" promise either — that lie is the same shape.
-      expect(screen.queryByText(/still starting up/)).toBeNull();
+      expect(queryInThread(/still starting up/)).toBeNull();
       expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("must not vanish");
     },
   );
@@ -449,8 +499,8 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     renderWithTarget();
     fireEvent.click(screen.getByTestId("send-target-toggle"));
     send("worth not retyping");
-    expect(await screen.findByText(/^I couldn't reach CI Hardening's terminal\.$/)).toBeTruthy();
-    expect(screen.queryByText(/^Sent to CI Hardening\.$/)).toBeNull();
+    expect(await findInThread(/^I couldn't reach CI Hardening's terminal\.$/)).toBeTruthy();
+    expect(queryInThread(/^Sent to CI Hardening\.$/)).toBeNull();
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("worth not retyping");
   });
 
@@ -459,7 +509,7 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     renderWithTarget();
     fireEvent.click(screen.getByTestId("send-target-toggle"));
     send("a paragraph nobody wants to retype");
-    await screen.findByText(/didn't send/i);
+    await findInThread(/didn't send/i);
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
       "a paragraph nobody wants to retype",
     );
@@ -470,7 +520,7 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     renderWithTarget();
     fireEvent.click(screen.getByTestId("send-target-toggle"));
     send("landed fine");
-    await screen.findByText(/Sent to CI Hardening/);
+    await findInThread(/Sent to CI Hardening/);
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
   });
 
@@ -491,6 +541,8 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     send("for the agent I aimed at");
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "for the agent I aimed at", {
       userPrompt: true,
+      display: "for the agent I aimed at",
+      namingBasis: "for the agent I aimed at",
     });
   });
 
@@ -525,7 +577,7 @@ describe("ConciergeHost — reconciling a queued prompt", () => {
     // interpolation passed — and the quote is the only thing telling the user WHICH held message
     // an outcome refers to when several were queued (roborev 53123).
     expect(
-      await screen.findByText(/CI Hardening is up — I sent your message \("start on the docs"\)\./),
+      await findInThread(/CI Hardening is up — I sent your message \("start on the docs"\)\./),
     ).toBeTruthy();
   });
 
@@ -536,7 +588,7 @@ describe("ConciergeHost — reconciling a queued prompt", () => {
     // send it again, and flushPendingSends emits one expired outcome per aged-out entry, so an
     // unattributable message is the costliest of the three (roborev 53162).
     expect(
-      await screen.findByText(/never came up, so I dropped the message I was holding \("never sent"\)\./),
+      await findInThread(/never came up, so I dropped the message I was holding \("never sent"\)\./),
     ).toBeTruthy();
   });
 
@@ -544,7 +596,7 @@ describe("ConciergeHost — reconciling a queued prompt", () => {
     renderHost();
     act(() => h.deferred?.({ ok: false, path: "pty-gone", agentId: "ag1", sent: "gone" }));
     expect(
-      await screen.findByText(/closed before I could send the message I was holding \("gone"\)\./),
+      await findInThread(/closed before I could send the message I was holding \("gone"\)\./),
     ).toBeTruthy();
   });
 
@@ -563,13 +615,13 @@ describe("ConciergeHost — reconciling a queued prompt", () => {
     renderHost();
     act(() => h.deferred?.({ ok: false, path: "agent-failed", agentId: "ag1", sent: "held" }));
     expect(
-      await screen.findByText(/^CI Hardening didn't take the message I was holding \("held"\)\.$/),
+      await findInThread(/^CI Hardening didn't take the message I was holding \("held"\)\.$/),
     ).toBeTruthy();
-    expect(screen.queryByText(/terminal closed before I could send/)).toBeNull();
+    expect(queryInThread(/terminal closed before I could send/)).toBeNull();
     // Not the `abandoned` arm's wording, and no remedy: `agent-failed` needs a Retry and a cloud
     // agent is never "running" locally, so that instruction would never come true.
-    expect(screen.queryByText(/couldn't take the message/)).toBeNull();
-    expect(screen.queryByText(/Send it again once it's running/)).toBeNull();
+    expect(queryInThread(/couldn't take the message/)).toBeNull();
+    expect(queryInThread(/Send it again once it's running/)).toBeNull();
   });
 
   // The ABANDONED arm — the one branch here that ALREADY shipped a falsehood once. Its own comment
@@ -587,11 +639,11 @@ describe("ConciergeHost — reconciling a queued prompt", () => {
     // separates this arm from the catch-all, so matching only the reason would let a mis-gated
     // `abandoned` fall through and still pass (roborev 53187).
     expect(
-      await screen.findByText(
+      await findInThread(
         /^CI Hardening couldn't take the message I was holding \("held"\)\. Send it again once it's running\.$/,
       ),
     ).toBeTruthy();
-    expect(screen.queryByText(/terminal closed before I could send|never came up/)).toBeNull();
+    expect(queryInThread(/terminal closed before I could send|never came up/)).toBeNull();
   });
 
   // The `?? "that agent"` fallback is a LIVE path: the outcome can arrive after the agent has left
@@ -601,7 +653,25 @@ describe("ConciergeHost — reconciling a queued prompt", () => {
   it("names an agent that has left the feed generically, never 'undefined'", async () => {
     renderHost();
     act(() => h.deferred?.({ ok: true, path: "free-text", agentId: "gone-from-feed", sent: "x" }));
-    expect(await screen.findByText(/^that agent is up — I sent your message \("x"\)\.$/)).toBeTruthy();
-    expect(screen.queryByText(/undefined/)).toBeNull();
+    expect(await findInThread(/^that agent is up — I sent your message \("x"\)\.$/)).toBeTruthy();
+    expect(queryInThread(/undefined/)).toBeNull();
+  });
+
+  it("quotes the DISPLAY rendering back, never the payload with its temp paths", async () => {
+    // The whole point of the three-way split (roborev 46911/46925): `sent` is the wire payload.
+    // Quoting it here would print '/var/folders/…png look at this' into the thread — the one
+    // surface `display` exists to protect — three lines below the code that avoids exactly that.
+    renderHost();
+    act(() =>
+      h.deferred?.({
+        ok: true,
+        path: "free-text",
+        agentId: "ag1",
+        sent: "'/var/folders/x9/T/sparkle-shot-1753.png' look at this",
+        display: "look at this · 1 image",
+      }),
+    );
+    expect(await findInThread(/"look at this · 1 image"/)).toBeTruthy();
+    expect(within(thread()).queryByText(/sparkle-shot-1753\.png/)).toBeNull();
   });
 });

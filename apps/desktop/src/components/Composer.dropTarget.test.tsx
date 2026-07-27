@@ -62,19 +62,29 @@ import { useDictationStore } from "../stores/dictationStore";
 import { useUiStore } from "../stores/uiStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
 import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
-import { NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
+import {
+  CONCIERGE_COMPOSE_DND_TARGET,
+  NEW_BUILD_AGENT_DND_TARGET,
+} from "../services/dndTargets";
 
-// jsdom has no elementFromPoint — stub it to place the "cursor" over the marked button or not.
+// jsdom has no elementFromPoint — stub it to place the "cursor" over one of the two surfaces that
+// own a dropped file themselves (services/dndTargets.FILE_DROP_TARGETS), or over neither.
 const button = document.createElement("button");
 button.setAttribute("data-dnd-target", NEW_BUILD_AGENT_DND_TARGET);
+const conciergeBox = document.createElement("div");
+conciergeBox.setAttribute("data-dnd-target", CONCIERGE_COMPOSE_DND_TARGET);
 let overButton = false;
-document.elementFromPoint = vi.fn(() => (overButton ? button : document.body));
+let overConciergeBox = false;
+document.elementFromPoint = vi.fn(() =>
+  overButton ? button : overConciergeBox ? conciergeBox : document.body,
+);
 
 const fire = (payload: unknown) => act(() => captured.handler!({ payload }));
 
 beforeEach(() => {
   vi.mocked(loadAttachment).mockClear();
   overButton = false;
+  overConciergeBox = false;
   captured.handler = null;
   useDictationStore.setState({ insertTarget: null, enabled: true, status: "idle", interim: "" });
   useUiStore.getState().setComposerMinimized(false);
@@ -110,6 +120,29 @@ describe("Composer — new-build-agent drop target", () => {
     // Nothing loads and no tile appears — the file belongs to the NEW agent's composer.
     expect(loadAttachment).not.toHaveBeenCalled();
     expect(screen.queryByText("notes.txt")).toBeNull();
+  });
+
+  // The concierge compose box is the OTHER surface that owns its drops (useConciergeAttachments
+  // stages the file for the next prompt). Both carve-outs come from one list now, but only the
+  // button half had ever been pinned (roborev 51593) — and the failure mode is the one the code
+  // comment warns about: the same file attaching twice, here AND in the concierge box.
+  it("ignores a drop on the concierge compose box (it stages the file itself)", async () => {
+    renderComposer();
+    overConciergeBox = true;
+    fire({ type: "drop", position: { x: 10, y: 10 }, paths: ["/tmp/notes.txt"] });
+    expect(loadAttachment).not.toHaveBeenCalled();
+    expect(screen.queryByText("notes.txt")).toBeNull();
+  });
+
+  it("suppresses the drop-here visual over the concierge box too", () => {
+    renderComposer();
+    const dropHint = () =>
+      (screen.getByRole("textbox") as HTMLTextAreaElement).placeholder.startsWith("Drop the file");
+    fire({ type: "enter", position: { x: 400, y: 400 }, paths: ["/tmp/a.png"] });
+    expect(dropHint()).toBe(true);
+    overConciergeBox = true;
+    fire({ type: "over", position: { x: 10, y: 10 } });
+    expect(dropHint()).toBe(false);
   });
 
   it("suppresses the drop-here visual while the drag is over the button", () => {

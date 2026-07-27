@@ -45,6 +45,10 @@ vi.mock("../services/controlListener", () => ({
   startControlListener: () => Promise.resolve(() => {}),
 }));
 vi.mock("../services/crossWindowSync", () => ({ subscribeToCrossWindowSync: () => () => {} }));
+// Cloud re-attach: observed, not run. `null` is its "never got a useful answer" contract, which is
+// what makes a project eligible for a retry (roborev 52648/52649).
+const reattach = vi.hoisted(() => vi.fn(async (_id: string): Promise<string[] | null> => []));
+vi.mock("../services/cloudAgents/startup", () => ({ reattachProjectOnOpen: reattach }));
 vi.mock("../services/sparkleAgent", () => ({
   sparkleAgentIdFor: () => "sparkle",
   sparkleOpenSetWhitelist: () => [],
@@ -86,6 +90,8 @@ vi.mock("./NewProjectDialog", () => ({ NewProjectDialog: () => null }));
 
 import { Workspace, WINDOW_TITLE } from "./Workspace";
 import { useProjectStore } from "../stores/projectStore";
+import { useAuthStore } from "../stores/authStore";
+import { useConnectionStore } from "../stores/connectionStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -123,6 +129,14 @@ beforeEach(() => {
   useRuntimeStore.setState({ openAgentIds: ["a1", "b1"], status: {} } as never);
   useUiStore.setState({ activeSpecial: null, workMode: "build", pinnedProjectId: null } as never);
   useSettingsStore.setState({ beadsEnabled: true } as never);
+  reattach.mockClear();
+  reattach.mockResolvedValue([]);
+  useAuthStore.setState({
+    me: { clerkUserId: "u1", entitled: true, balanceCents: 500, tokenVersion: 1, cloudAgentsEnabled: true },
+    tokenPresent: true,
+    loading: false,
+  } as never);
+  useConnectionStore.setState({ isOnline: true } as never);
   resetVisitedProjects();
   setTitleSpy.mockClear();
 });
@@ -330,5 +344,69 @@ describe("Workspace — Plan mode collapses columns 2+3", () => {
     render(<Workspace />);
     await act(async () => useUiStore.getState().setActiveSpecial("board"));
     expect(screen.queryByTestId("plan-column")).toBeNull();
+  });
+});
+
+// The re-attach effect's retry rule. A cloud session keeps running while the laptop is closed, so
+// the ONE reconciliation pass a project gets is the difference between finding your agent where you
+// left it and an empty sidebar with an invisible meter still billing.
+describe("Workspace — cloud re-attach is attempted once, and retried when it never answered", () => {
+  it("does not even try while the cloud capability is absent (a local-only user)", async () => {
+    useAuthStore.setState({ me: { clerkUserId: "u1", entitled: true, balanceCents: 0, tokenVersion: 1 }, tokenPresent: true } as never);
+    render(<Workspace />);
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeTruthy());
+    expect(reattach).not.toHaveBeenCalled();
+  });
+
+  it("reconciles the selected project exactly once when the answer lands", async () => {
+    render(<Workspace />);
+    await waitFor(() => expect(reattach).toHaveBeenCalledWith("p1"));
+    const calls = reattach.mock.calls.length;
+    // A re-render must not re-list: re-listing resurrects a cloud tab the user deliberately removed.
+    act(() => {
+      useUiStore.setState({ workMode: "plan" } as never);
+    });
+    expect(reattach.mock.calls.length).toBe(calls);
+  });
+
+  it("retries when AUTH settles after the first attempt (cold-boot token race)", async () => {
+    useAuthStore.setState({ me: { clerkUserId: "u1", entitled: true, balanceCents: 0, tokenVersion: 1 }, tokenPresent: false } as never);
+    render(<Workspace />);
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeTruthy());
+    expect(reattach).not.toHaveBeenCalled();
+
+    reattach.mockResolvedValueOnce(null); // the attempt that races the settling token
+    act(() => {
+      useAuthStore.setState({
+        me: { clerkUserId: "u1", entitled: true, balanceCents: 0, tokenVersion: 1, cloudAgentsEnabled: true },
+        tokenPresent: true,
+      } as never);
+    });
+    await waitFor(() => expect(reattach).toHaveBeenCalledWith("p1"));
+  });
+
+  it("retries when the network comes back — the OTHER half of the retryable null", async () => {
+    // An offline cold boot for an already-signed-in user: the persisted token rehydrates, so auth
+    // is ready on the first frame and never transitions. Only connectivity can fire the retry.
+    reattach.mockResolvedValueOnce(null);
+    useConnectionStore.setState({ isOnline: false } as never);
+    render(<Workspace />);
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeTruthy());
+    expect(reattach).not.toHaveBeenCalled();
+
+    act(() => {
+      useConnectionStore.setState({ isOnline: true } as never);
+    });
+    await waitFor(() => expect(reattach).toHaveBeenCalledWith("p1"));
+    expect(reattach.mock.calls.length).toBe(1);
+
+    // …and the null it returned leaves the project eligible, so a later trigger tries again.
+    act(() => {
+      useConnectionStore.setState({ isOnline: false } as never);
+    });
+    act(() => {
+      useConnectionStore.setState({ isOnline: true } as never);
+    });
+    await waitFor(() => expect(reattach.mock.calls.length).toBe(2));
   });
 });

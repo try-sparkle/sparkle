@@ -15,12 +15,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 class MockAudio {
   static instances: MockAudio[] = [];
+  /** Set to make the NEXT play() reject, e.g. a blocked-autoplay policy (NotAllowedError). */
+  static rejectNextPlay = false;
   src: string;
   preservesPitch = false;
   playbackRate = 1;
   onended: (() => void) | null = null;
   onerror: (() => void) | null = null;
-  play = vi.fn(async () => {});
+  play = vi.fn(async () => {
+    if (MockAudio.rejectNextPlay) {
+      MockAudio.rejectNextPlay = false;
+      throw new Error("NotAllowedError");
+    }
+  });
   pause = vi.fn();
   constructor(src: string) {
     this.src = src;
@@ -91,6 +98,7 @@ async function loadService() {
 
 beforeEach(() => {
   MockAudio.instances = [];
+  MockAudio.rejectNextPlay = false;
   synth = makeSynth();
   fetchMock = okFetch();
   nowMs = 1_000_000;
@@ -154,6 +162,73 @@ describe("speak — ElevenLabs path", () => {
     audio.onended?.();
     await expect(p).resolves.toBe("elevenlabs");
     expect(synth.speak).not.toHaveBeenCalled();
+  });
+
+  it("a stopVoice() DURING the fetch cancels the clip — it never plays (roborev 48171)", async () => {
+    // Barge-in: the user hits Send (or the mic) while a reply's audio is still generating.
+    // Interruption is deferred until the fetch resolves so the PREVIOUS clip's tail isn't cut —
+    // but that must not mean the cancelled clip starts a second later anyway.
+    stubElevenEnv();
+    const svc = await loadService();
+    let release!: (v: { ok: boolean; blob: () => Promise<Blob> }) => void;
+    fetchMock.mockImplementationOnce(
+      () => new Promise((res) => { release = res; }),
+    );
+
+    const p = svc.speak("the reply nobody waited for");
+    await flush();
+    expect(MockAudio.instances).toHaveLength(0); // still generating
+
+    svc.stopVoice();
+    release({ ok: true, blob: async () => new Blob(["mp3"]) });
+
+    await expect(p).resolves.toBe("cancelled");
+    expect(MockAudio.instances).toHaveLength(0); // and nothing was ever played
+  });
+
+  it("a REJECTED fetch after a stopVoice() stays cancelled — no system-voice consolation prize", async () => {
+    // The flaky-ElevenLabs branch: without the same check in the catch, the clip the user just
+    // barged in on gets read aloud by the system voice instead (roborev 52362/52363).
+    stubElevenEnv();
+    const svc = await loadService();
+    let fail!: (e: Error) => void;
+    fetchMock.mockImplementationOnce(() => new Promise((_res, rej) => { fail = rej; }));
+
+    const p = svc.speak("the reply nobody waited for");
+    await flush();
+    svc.stopVoice();
+    fail(new Error("offline"));
+
+    await expect(p).resolves.toBe("cancelled");
+    expect(synth.speak).not.toHaveBeenCalled();
+    expect(MockAudio.instances).toHaveLength(0);
+  });
+
+  it("a BLOCKED autoplay still falls back to the system voice — not silence (roborev 53004)", async () => {
+    // The failure that happens AFTER speak()'s own stopVoice(). Comparing against a generation
+    // captured before that self-stop would read it as "someone cancelled me" and return silence,
+    // with voiceActive left true so the overlay keeps pulsing for a clip that never played.
+    stubElevenEnv();
+    const svc = await loadService();
+    MockAudio.rejectNextPlay = true;
+
+    const p = svc.speak("say this out loud");
+    await flush();
+    expect(synth.speak).toHaveBeenCalledTimes(1);
+    synth.utterances[0]!.onend?.();
+    await expect(p).resolves.toBe("system-fallback");
+  });
+
+  it("a stopVoice() BEFORE the clip is asked for doesn't cancel the next one", async () => {
+    // The counter must gate on "stopped while I was fetching", not "stopped at any point".
+    stubElevenEnv();
+    const svc = await loadService();
+    svc.stopVoice();
+    const p = svc.speak("say this");
+    await flush();
+    expect(MockAudio.instances).toHaveLength(1);
+    MockAudio.instances[0]!.onended?.();
+    await expect(p).resolves.toBe("elevenlabs");
   });
 
   it("honors a VITE_ELEVENLABS_MODEL override", async () => {

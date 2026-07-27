@@ -74,6 +74,29 @@ one short line per item with your recommendation.";
 /// this turn's `concierge:*` events, so the frontend can correlate deltas with their done/error.
 static TURN_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Every turn whose token is BELOW this is retired: the user has sent again (or cancelled), so it
+/// must stop emitting immediately — even though it may still be holding the slot.
+///
+/// The slot alone is too late (roborev 53105). `concierge_turn` only takes the slot AFTER it has
+/// resolved the claude path, prepared the cwd and spawned a fresh `zsh`/`claude` — hundreds of
+/// milliseconds during which the OLD turn still legitimately owns it, and any first tokens it
+/// produces in that window were emitted as if live, stranding a bubble that answers the previous
+/// question (and, since that turn is then killed, never gets a terminal event to clear it). This
+/// is published at the TOP of a send, before any of that work, so "the user moved on" takes effect
+/// the instant they act rather than whenever the replacement process happens to finish starting.
+static RETIRE_BELOW: AtomicU64 = AtomicU64::new(0);
+
+/// Bumped by every cancel. A send reads it on entry and again after its prep: a change across that
+/// window means the user cancelled the very turn being started, before it had a token or a child —
+/// the state no floor and no slot can describe, because it has neither yet (roborev 53147).
+static CANCEL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Sentinels for the two NON-failures a send can end in: the user superseded it or cancelled it.
+/// Stable strings because the frontend matches on them to stay silent — neither is something to
+/// tell the user about, and both are ordinary outcomes of two fast sends (roborev 53186).
+pub const SUPERSEDED_ERR: &str = "concierge_turn: superseded before install";
+pub const CANCELLED_ERR: &str = "concierge_turn: cancelled";
+
 /// One in-flight concierge turn: the child (kept for kill/reap) tagged with its turn token.
 struct ConciergeTurn {
     child: Child,
@@ -102,6 +125,99 @@ impl Drop for ConciergeManager {
 /// `claude_chat.rs`): a panicked reader must not brick the concierge for the rest of the process.
 fn lock_turn(m: &Mutex<Option<ConciergeTurn>>) -> MutexGuard<'_, Option<ConciergeTurn>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// May this turn still SPEAK? Two facts: the send-time retirement floor (checked first, lock-free,
+/// because it covers the window in which this turn still holds the slot but the user has already
+/// moved on) and the slot itself.
+///
+/// Gates the delta emit ONLY — its single caller. The reap does its own inline slot match in
+/// `drain_turn` and deliberately does NOT consult the floor: a retired turn that still holds the
+/// slot is the one that must reap its own child and emit its terminal event, or the process leaks
+/// and the frontend's turn never ends (roborev 53130).
+fn still_owns_turn(app: &AppHandle, token: u64) -> bool {
+    // Retired at send time — checked FIRST, and without the lock, because it covers the window in
+    // which this turn still holds the slot but the user has already moved on (see RETIRE_BELOW).
+    if is_retired(token, RETIRE_BELOW.load(Ordering::Relaxed)) {
+        return false;
+    }
+    let manager = app.state::<ConciergeManager>();
+    let slot = lock_turn(&manager.turn);
+    matches!(slot.as_ref(), Some(t) if t.token == token)
+}
+
+/// Is the turn in the slot ours to tear down? Only one strictly OLDER than us: our floor retired
+/// it, so it is silenced-but-running unless we kill it. A NEWER occupant owns both the floor and
+/// the slot — killing it is how a refused older send murders the live turn (roborev 53205).
+///
+/// A real function called by both teardown sites, not a rule each restates: the fifth round of that
+/// finding, and it was right every time.
+fn mine_to_tear_down(token: u64, slot_holds: Option<u64>) -> bool {
+    matches!(slot_holds, Some(t) if t < token)
+}
+
+/// Did a cancel land while this send was preparing? A REAL function, called from `concierge_turn`,
+/// so a test drives the production control flow rather than a copy of the comparison — deleting
+/// the call then leaves a dead-code warning instead of a silent hole (roborev 53181).
+fn cancelled_during_prep(entry_epoch: u64) -> bool {
+    CANCEL_EPOCH.load(Ordering::Relaxed) != entry_epoch
+}
+
+/// May this turn take the slot? A REAL function, called from the install site under the lock, so
+/// a test can drive the actual rule (roborev 53186 — four rounds running, a test asserting against
+/// a local copy of a predicate would have stayed green with the call site deleted).
+///
+/// No when we have been retired, and no when the slot already holds a NEWER turn: spawns finish
+/// out of order, so an older send must never stomp the entry of the one the user is waiting on.
+fn may_install(token: u64, retire_below: u64, slot_holds: Option<u64>) -> bool {
+    !is_retired(token, retire_below) && !matches!(slot_holds, Some(t) if t > token)
+}
+
+/// Pure half of the retirement rule: a turn is retired once a LATER send (or a cancel) has
+/// published a floor above its token. Split out so the rule is testable without a Tauri app.
+fn is_retired(token: u64, retire_below: u64) -> bool {
+    token < retire_below
+}
+
+/// Claim the next turn token AND retire everything below it, in that order. Called immediately
+/// before the spawn — AFTER the cheap fallible prep (claude path, app-data dir, `create_dir_all`),
+/// deliberately, so a send that fails before it ever spawns cannot silence a turn it never
+/// replaced. See the note at the call site.
+///
+/// Reserving first is what makes it correct under two concurrent sends (`concierge_turn` is an
+/// async command; nothing serializes two rapid ones). Publishing `TURN_SEQ.load()` without taking
+/// a token loses that race: send B can read 5 and store 5 while send A has not yet taken token 5,
+/// so A — the OLDER turn — ends up unretired by the very send that superseded it. Taking the token
+/// first means the floor is always "strictly below ME", which is true by construction.
+///
+/// `fetch_max`, not `store`: floors only ever rise, so a slower thread can't lower one a newer
+/// send has already published.
+fn reserve_turn_token() -> u64 {
+    let token = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
+    RETIRE_BELOW.fetch_max(token, Ordering::Relaxed);
+    token
+}
+
+/// A token for the SAME logical turn, continuing — the stale-resume retry, which re-runs a turn
+/// the user already asked for. Deliberately publishes NO floor (roborev 53130): the retry is not a
+/// new send, and flooring at its token would retire a turn the user sent while the first attempt
+/// was failing. `run_reader` only reaches the retry while it still owns the slot, so this is
+/// narrow either way — but "a continuation silences the user's newer question" is not a trade
+/// worth making for a token.
+fn reserve_continuation_token() -> u64 {
+    TURN_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Retire every turn RESERVED so far — for cancel, which starts nothing itself.
+///
+/// The floor alone cannot stop a send that has not reached its reservation yet, whatever it is
+/// derived from: a barrier token would simply land above that send's later token, exactly as this
+/// load does (roborev 53147 proposed the barrier; it moves the arithmetic without closing the
+/// gap). What covers "Escape while Enter is still resolving the claude path" is CANCEL_EPOCH,
+/// which `concierge_turn` re-checks after its prep.
+fn retire_issued_turns() {
+    CANCEL_EPOCH.fetch_add(1, Ordering::Relaxed);
+    RETIRE_BELOW.fetch_max(TURN_SEQ.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
 /// Kill a turn and everything it spawned, then reap it. The child is placed in its own process
@@ -230,6 +346,9 @@ fn spawn_turn(
     cwd: &std::path::Path,
     claude_path: &str,
     resume_session_id: Option<&str>,
+    // Reserved by the CALLER before any of this work began (see reserve_turn_token) — minting it
+    // here would mean the previous turn stays live until the new child finishes spawning.
+    token: u64,
 ) -> Result<(std::process::ChildStdout, std::process::ChildStderr, u64), String> {
     let script = build_concierge_exec(claude_path, prompt, resume_session_id);
     tracing::info!(
@@ -275,12 +394,45 @@ fn spawn_turn(
         }
     };
 
-    let token = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Install CONDITIONALLY, under the same lock (roborev 53165). Two sends race on separate
+    // spawn_blocking threads and the spawns can finish out of order, so an unconditional replace
+    // lets an OLDER turn stomp the newer one's entry — killing the child the user is actually
+    // waiting on. The floor already stops that turn from speaking; without this it could still take
+    // the slot, leaving the live turn dead with no `done` and the typing indicator hung forever.
+    //
+    // Refuse when this turn is retired, or when the slot holds a NEWER token, and take our own
+    // just-spawned child down with us. That makes "who owns the slot" agree with "who owns the
+    // floor" by construction, for the stale-resume retry as much as for a send.
+    // Held in an Option so the child can be moved into the slot under the lock, and is still ours
+    // to kill if we refuse — a `slot.replace` in one branch would conditionally move it and leave
+    // the refuse path with a running, unreferenced `claude`.
+    let mut ours = Some(child);
     let superseded = {
         let manager = app.state::<ConciergeManager>();
         let mut slot = lock_turn(&manager.turn);
-        slot.replace(ConciergeTurn { child, token })
+        let allowed = may_install(
+            token,
+            RETIRE_BELOW.load(Ordering::Relaxed),
+            slot.as_ref().map(|t| t.token),
+        );
+        // Total, not `expect` (roborev 53186): a panic here would fire while holding the turn
+        // mutex, and `Child::drop` neither signals nor reaps — the failure mode of the assertion
+        // would be exactly the orphaned process group this Option exists to prevent.
+        match (allowed, ours.take()) {
+            (true, Some(child)) => slot.replace(ConciergeTurn { child, token }),
+            (_, kept) => {
+                ours = kept;
+                None
+            }
+        }
     };
+    if let Some(mut orphan) = ours {
+        // We never installed: the turn we just spawned is already superseded. Take it down rather
+        // than leaving an unreferenced claude running with no cancel handle.
+        tracing::info!(token, "concierge_turn: superseded before install; killing the new child");
+        kill_turn_group(&mut orphan);
+        return Err(SUPERSEDED_ERR.into());
+    }
     if let Some(mut old) = superseded {
         tracing::info!("concierge_turn superseded an in-flight turn; killing the old child (group)");
         kill_turn_group(&mut old.child);
@@ -302,6 +454,15 @@ fn drain_stderr(stderr: std::process::ChildStderr) -> std::thread::JoinHandle<St
 /// EOF (emitting `concierge:delta` per text chunk via the shared `handle_event` parser), then —
 /// ONLY if the slot still holds OUR token — reap the child and return the outcome. Factored out
 /// of `concierge_turn` so the stale-resume retry can run it a second time.
+///
+/// THE DELTA EMIT IS GATED TOO (roborev 53088/53105), not just the reap. It used to be
+/// unconditional, so a superseded reader kept flushing whatever stdout it had already buffered
+/// under its own id, interleaved with the turn that replaced it — and the frontend cannot sort
+/// that out after the fact, because those deltas are emitted before `concierge_turn` returns and
+/// Tauri gives no ordering guarantee between events and an invoke response. The gate is
+/// `still_owns_turn`, which answers "does the user still want this?" from two facts: the
+/// send-time retirement floor (RETIRE_BELOW — set BEFORE the replacement child is spawned, which
+/// is the window a slot-only check misses) and the slot itself.
 fn run_reader(
     app: &AppHandle,
     id: &str,
@@ -309,6 +470,39 @@ fn run_reader(
     stdout: std::process::ChildStdout,
     stderr_handle: std::thread::JoinHandle<String>,
 ) -> TurnOutcome {
+    drain_turn(app, id, stdout, stderr_handle, token, &|| still_owns_turn(app, token))
+}
+
+/// What one turn's stdout yielded, minus anything that needs an app handle.
+struct DrainedStream {
+    session_id: String,
+    final_text: String,
+    /// The streamed chunks, concatenated — the fallback text when no `result` carried a final.
+    acc: String,
+    result_subtype: Option<String>,
+    is_error: bool,
+    error_detail: Option<String>,
+}
+
+/// Parse a turn's NDJSON stdout to EOF, emitting each text chunk through `emit` — but ONLY while
+/// `owns` says this turn is still the one the user is waiting on.
+///
+/// No AppHandle, so the gate is drivable in a test against the REAL loop (roborev 53105): the
+/// previous test declared its own `false` and asserted that `if false {}` skips, which would have
+/// stayed green with the production gate deleted.
+///
+/// The gate is checked once per LINE and LATCHED. Ownership is one-way — a superseded turn never
+/// becomes live again — so after the first `false` there is nothing to re-ask, and the check is
+/// per line rather than per chunk because `--include-partial-messages` makes a chunk roughly a
+/// token while the check contends with the UI thread for the manager's mutex on every send.
+/// Parsing continues either way, so `session_id`/`final_text` stay coherent for the caller's
+/// ownership check.
+fn drain_stream(
+    stdout: impl std::io::Read,
+    owns: &dyn Fn() -> bool,
+    retired: &dyn Fn() -> bool,
+    emit: &mut dyn FnMut(&str),
+) -> DrainedStream {
     use std::io::BufRead;
     let mut reader = std::io::BufReader::new(stdout);
     let mut session_id = String::new();
@@ -318,6 +512,7 @@ fn run_reader(
     let mut is_error = false;
     let mut error_detail: Option<String> = None;
     let mut line: Vec<u8> = Vec::new();
+    let mut live = true;
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
@@ -328,12 +523,21 @@ fn run_reader(
                 if trimmed.is_empty() {
                     continue;
                 }
+                if live {
+                    live = owns();
+                }
                 if let Ok(ev) = serde_json::from_str::<Value>(trimmed) {
                     handle_event(&ev, &mut session_id, &mut final_text, &mut acc, &mut |txt| {
-                        let _ = app.emit(
-                            "concierge:delta",
-                            ConciergeDelta { id: id.to_string(), text: txt.to_string() },
-                        );
+                        // Two checks, deliberately: the per-line one above takes the manager's
+                        // mutex and is hoisted out of the hot path, while this one is a relaxed
+                        // atomic load — cheap enough to run per chunk, and it closes the window in
+                        // which a send lands DURING this line's JSON parse (roborev 53130). One
+                        // admitted chunk is the whole failure mode: a delta for a never-before-seen
+                        // id paints a bubble that then never receives a terminal event.
+                        if !live || retired() {
+                            return;
+                        }
+                        emit(txt);
                     });
                     capture_result_status(&ev, &mut result_subtype, &mut is_error, &mut error_detail);
                 } else {
@@ -343,6 +547,33 @@ fn run_reader(
             Err(_) => break,
         }
     }
+    DrainedStream { session_id, final_text, acc, result_subtype, is_error, error_detail }
+}
+
+/// The drain loop, with the ownership gate INJECTED so it can be driven in a test — the previous
+/// version's test asserted a locally-declared `false` and would have stayed green with the gate
+/// deleted, which is the one regression it existed to prevent (roborev 53105).
+fn drain_turn(
+    app: &AppHandle,
+    id: &str,
+    stdout: impl std::io::Read,
+    stderr_handle: std::thread::JoinHandle<String>,
+    token: u64,
+    owns: &dyn Fn() -> bool,
+) -> TurnOutcome {
+    let drained = drain_stream(
+        stdout,
+        owns,
+        &|| is_retired(token, RETIRE_BELOW.load(Ordering::Relaxed)),
+        &mut |txt| {
+            let _ = app.emit(
+                "concierge:delta",
+                ConciergeDelta { id: id.to_string(), text: txt.to_string() },
+            );
+        },
+    );
+    let DrainedStream { session_id, final_text, acc, result_subtype, is_error, error_detail } =
+        drained;
 
     // Reap — but only if the slot still holds OUR turn (token match). A cancel or a newer turn
     // took the slot first (and killed/reaped the child); the frontend initiated that teardown,
@@ -428,15 +659,29 @@ fn emit_outcome(app: &AppHandle, id: &str, outcome: TurnOutcome) {
 /// `async` + `spawn_blocking` (same as `claude_chat_send`): the spawn and — critically — the
 /// kill+wait of a superseded child run OFF the Tauri main thread, so a rapid re-send can't
 /// freeze the UI.
+///
+/// RETURNS the turn's id (the monotonic token as a string) — the same id every `concierge:*` event
+/// for this turn carries, so the frontend can correlate a delta with its own done/error.
+///
+/// It is NOT the straggler guard (roborev 53105). It cannot be: an invoke response has no ordering
+/// guarantee against the event channel, so it can lose to deltas already in flight. Retirement is
+/// enforced at the source instead, by `reserve_turn_token()` below — the floor is this sender's
+/// OWN token, published after the cheap fallible prep and before the spawn, so every earlier turn
+/// is retired before the replacement child exists and `drain_stream`'s gate sees it. (Not
+/// `retire_issued_turns`, which is the cancel path; and not "the instant the user sends" — the
+/// prep runs first, deliberately, so a send that fails before spawning cannot silence a turn it
+/// never replaced. roborev 53165.) The id is defence in depth on top.
 #[tauri::command]
 pub async fn concierge_turn(
     app: AppHandle,
     prompt: String,
     resume_session_id: Option<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     if prompt.trim().is_empty() {
         return Err("concierge_turn: prompt must be non-empty".into());
     }
+    // Read BEFORE the prep below; re-read after it. A cancel in between is aimed at this send.
+    let cancel_epoch = CANCEL_EPOCH.load(Ordering::Relaxed);
     let claude_path = cached_claude_path()
         .ok_or_else(|| "concierge_turn: claude binary not found (is Claude Code installed?)".to_string())?;
     // The concierge runs in the app-data dir — NOT a repo worktree (it observes; it doesn't own
@@ -445,17 +690,87 @@ pub async fn concierge_turn(
     let cwd = crate::dev_identity::app_data_dir(&app).map_err(|e| format!("concierge_turn: {e}"))?;
     std::fs::create_dir_all(&cwd).map_err(|e| format!("concierge_turn: app data dir unavailable: {e}"))?;
 
+    // Reserve + retire HERE: after the fallible prep, immediately before the spawn.
+    //
+    // Not at the top of the command (roborev 53130): the path lookup, the app-data dir and
+    // `create_dir_all` can all fail, and retirement is not rolled back — so a send that never
+    // spawned would leave the previous turn permanently silenced but still RUNNING (nothing killed
+    // it, since `spawn_turn` never ran), burning a claude process while its reply stopped
+    // mid-sentence and the typing indicator hung for the session. Those steps are cheap; the
+    // process spawn below is the window that actually matters, and it is still fully covered.
+    // Reserve FIRST, then check (roborev 53181). Checking first leaves a gap exactly one
+    // instruction wide: cancel can bump the epoch after our read and floor at `TURN_SEQ` before
+    // our `fetch_add`, so the floor lands ON the token we then take, `is_retired` is false, the
+    // slot is empty so cancel killed nothing — and the turn spawns as if Escape was never pressed.
+    // With the reservation first, every cancel falls on one side by construction: it either bumps
+    // the epoch before our read (refused here) or loads TURN_SEQ after our fetch_add, flooring
+    // above us so the install guard refuses.
+    let token = reserve_turn_token();
+    if cancelled_during_prep(cancel_epoch) {
+        tracing::info!("concierge_turn: cancelled before spawn; not starting the turn");
+        // The floor has risen by now, so the previous turn is retired: same teardown as any other
+        // post-reservation failure, and same rule — only a turn older than ours.
+        let ours_to_kill = {
+            let manager = app.state::<ConciergeManager>();
+            let mut slot = lock_turn(&manager.turn);
+            if mine_to_tear_down(token, slot.as_ref().map(|t| t.token)) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(mut turn) = ours_to_kill {
+            kill_turn_group(&mut turn.child);
+        }
+        return Err(CANCELLED_ERR.into());
+    }
     let blk_app = app.clone();
     let blk_prompt = prompt.clone();
     let blk_resume = resume_session_id.clone();
     let blk_cwd = cwd.clone();
     let blk_claude = claude_path.clone();
-    let (stdout, stderr, token) = tauri::async_runtime::spawn_blocking(move || {
-        spawn_turn(&blk_app, &blk_prompt, &blk_cwd, &blk_claude, blk_resume.as_deref())
+    let spawned = tauri::async_runtime::spawn_blocking(move || {
+        spawn_turn(&blk_app, &blk_prompt, &blk_cwd, &blk_claude, blk_resume.as_deref(), token)
     })
     .await
-    .map_err(|e| format!("concierge_turn task failed: {e}"))??;
+    .map_err(|e| format!("concierge_turn task failed: {e}"))
+    .and_then(|r| r);
+    // ANY failure after the floor was published (the spawn itself, a missing pipe, a join error)
+    // leaves the previous turn retired — muted by the gate — but still RUNNING, because
+    // `slot.replace` never happened: a claude process burning on, its reply stopped mid-sentence,
+    // and its `done` dropped by the frontend's own send-time floor, so the typing indicator hangs
+    // for the session (roborev 53165). A `fetch_max` floor cannot be rolled back, so teardown is
+    // the only coherent direction: make "the previous turn is dead" true.
+    let (stdout, stderr, token) = match spawned {
+        Ok(v) => v,
+        Err(e) => {
+            // ONLY a turn strictly older than ours (roborev 53186). "Take whatever is in the slot"
+            // kills the LIVE turn on the most likely path into here: A refuses to install because
+            // B already owns the floor and the slot, and then this teardown pulls B out and kills
+            // it — the newest question dying unanswered with no terminal event, which is the whole
+            // failure this guard exists to prevent. A newer occupant is not ours to clean up: it
+            // owns both the floor and the slot, so there is nothing of ours left behind.
+            let ours_to_kill = {
+                let manager = app.state::<ConciergeManager>();
+                let mut slot = lock_turn(&manager.turn);
+                if mine_to_tear_down(token, slot.as_ref().map(|t| t.token)) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(mut turn) = ours_to_kill {
+                tracing::info!(
+                    "concierge_turn failed after retiring the previous turn; killing it rather \
+                     than leaving it silenced and running"
+                );
+                kill_turn_group(&mut turn.child);
+            }
+            return Err(e);
+        }
+    };
 
+    let started_id = token.to_string();
     let read_app = app.clone();
     std::thread::spawn(move || {
         let id = token.to_string();
@@ -466,12 +781,20 @@ pub async fn concierge_turn(
             return;
         }
 
-        if should_retry_without_resume(outcome.ok, resume_session_id.as_deref()) {
+        // A retry is a self-heal for a turn the user is still waiting on. If they have moved on,
+        // it must not run at all: `spawn_turn` would take the slot from — and kill — the live turn
+        // (roborev 53147). The reap above consults the slot only, so `owned` can still be true here
+        // for a turn the floor has already retired.
+        let retired = is_retired(token, RETIRE_BELOW.load(Ordering::Relaxed));
+        if retired {
+            tracing::info!(id = %id, "concierge: turn was superseded; not retrying the stale resume");
+        }
+        if !retired && should_retry_without_resume(outcome.ok, resume_session_id.as_deref()) {
             tracing::info!(
                 id = %id,
                 "concierge_turn: turn failed with a resume session id; retrying once without --resume"
             );
-            match spawn_turn(&read_app, &prompt, &cwd, &claude_path, None) {
+            match spawn_turn(&read_app, &prompt, &cwd, &claude_path, None, reserve_continuation_token()) {
                 Ok((stdout2, stderr2, token2)) => {
                     let stderr_handle2 = drain_stderr(stderr2);
                     // Emit the retry under the ORIGINAL `id`: the self-heal is a transparent
@@ -500,7 +823,7 @@ pub async fn concierge_turn(
         }
     });
 
-    Ok(())
+    Ok(started_id)
 }
 
 /// Cancel the in-flight concierge turn — the whole process group, so nothing it spawned keeps
@@ -508,6 +831,8 @@ pub async fn concierge_turn(
 /// gone) on EOF and stays silent, so no late done/error races the cancel.
 #[tauri::command]
 pub fn concierge_cancel(manager: State<ConciergeManager>) -> Result<(), String> {
+    // Same floor as a send: a cancelled turn must go quiet immediately, not merely lose the slot.
+    retire_issued_turns();
     let turn = lock_turn(&manager.turn).take();
     if let Some(mut turn) = turn {
         tracing::info!("concierge_cancel: killing in-flight turn (group)");
@@ -602,6 +927,210 @@ mod tests {
         // A blank detail is ignored — fall through to the synthesized message.
         let m = failure_detail("", Some(1), None, false, Some("   "));
         assert_eq!(m, "claude exited (code 1) with no output");
+    }
+
+    /// The comparison itself (the relationship between the floor and a real reservation is covered
+    /// by the two tests below, which drive the actual functions).
+    #[test]
+    fn a_send_retires_every_turn_issued_before_it() {
+        // Tokens 5 and 6 are in flight; the user sends again and that send takes token 7.
+        assert!(is_retired(5, 7));
+        assert!(is_retired(6, 7));
+        // Its own floor must not retire it…
+        assert!(!is_retired(7, 7));
+        // …nor anything after it.
+        assert!(!is_retired(8, 7));
+        // Nothing is retired before the first send.
+        assert!(!is_retired(1, 0));
+    }
+
+    /// The turn statics are process globals and cargo runs tests in parallel, so every test that
+    /// touches TURN_SEQ / RETIRE_BELOW takes this first (roborev 53147).
+    static TEST_SEQ_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Reserve-THEN-publish, monotonic, and driving the REAL functions — a local re-implementation
+    /// would stay green with `reserve_turn_token` reverted or its call deleted, which is the whole
+    /// regression (roborev 53147; the same criticism accepted one level down last round).
+    #[test]
+    fn two_concurrent_sends_still_retire_the_older_one() {
+        let _guard = TEST_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Interleaved worst case: both sends reserve before either has spawned anything.
+        let a = reserve_turn_token();
+        let b = reserve_turn_token();
+        assert!(a < b);
+        let floor = RETIRE_BELOW.load(Ordering::Relaxed);
+        assert!(is_retired(a, floor), "the send that arrived first must be retired by the second");
+        assert!(!is_retired(b, floor), "the newest send is the live one");
+
+        // A continuation (the stale-resume retry) claims a token WITHOUT publishing a floor, so it
+        // cannot silence a turn the user sent while the first attempt was failing.
+        let cont = reserve_continuation_token();
+        assert!(cont > b);
+        assert_eq!(RETIRE_BELOW.load(Ordering::Relaxed), floor, "a continuation publishes no floor");
+        assert!(!is_retired(b, RETIRE_BELOW.load(Ordering::Relaxed)));
+    }
+
+    /// A send that fails AFTER publishing its floor tears down only what IT retired. Killing
+    /// "whatever is in the slot" takes out the live turn on the most likely path in — an older
+    /// send refusing to install because a newer one already owns the floor and the slot
+    /// (roborev 53186).
+    #[test]
+    fn a_failed_send_kills_only_a_turn_older_than_itself() {
+        // The REAL function both teardown sites call (roborev 53205).
+        // The previous turn, which our floor retired: ours to take down.
+        assert!(mine_to_tear_down(6, Some(5)));
+        // A NEWER turn owns both the floor and the slot — killing it is how a refused older send
+        // murders the turn the user is waiting on.
+        assert!(!mine_to_tear_down(5, Some(6)));
+        // Nothing installed at all.
+        assert!(!mine_to_tear_down(5, None));
+        // Our own entry can't be there: we failed before installing.
+        assert!(!mine_to_tear_down(5, Some(5)));
+    }
+
+    /// The two sentinels are matched by the FRONTEND (apps/desktop/src/services/concierge.ts,
+    /// `SUPERSEDED_DETAILS`) to keep a superseded or cancelled send silent. Nothing else ties the
+    /// two languages together, so reword either side and the frontend quietly stops matching —
+    /// fast second sends go back to posting "I couldn't reach my brain just now" and clearing the
+    /// typing indicator for the turn that is still streaming (roborev 53205). This test fails when
+    /// the Rust side drifts; the TS test imports the constant so its own side is pinned too.
+    #[test]
+    fn the_silent_outcome_sentinels_are_the_strings_the_frontend_matches() {
+        assert_eq!(SUPERSEDED_ERR, "concierge_turn: superseded before install");
+        assert_eq!(CANCELLED_ERR, "concierge_turn: cancelled");
+    }
+
+    /// The REAL drain loop, gate injected: emissions stop the moment ownership is lost, MID-STREAM,
+    /// and the parse keeps running so the reap sees a coherent turn. The constant-closure tests
+    /// below cannot cover this — hoisting the per-line check out of the loop leaves them green
+    /// while a superseded reader flushes the rest of its buffer (roborev 53181; I deleted this test
+    /// by writing the cancel cases over it and did not notice, which is exactly its point).
+    #[test]
+    fn the_drain_goes_quiet_the_moment_ownership_is_lost() {
+        let ndjson = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sess-Q"}"#, "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"live "}}}"#, "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"and retired"}}}"#, "\n",
+            r#"{"type":"result","subtype":"success","session_id":"sess-Q","result":"live and retired"}"#, "\n",
+        );
+        // Ownership is lost after the reader has already asked twice — mid-stream, as a send lands
+        // while the previous turn is talking.
+        let asks = AtomicU64::new(0);
+        let owns = || asks.fetch_add(1, Ordering::Relaxed) < 2;
+        let mut seen: Vec<String> = Vec::new();
+
+        let out = drain_stream(ndjson.as_bytes(), &owns, &|| false, &mut |t| seen.push(t.to_string()));
+
+        assert_eq!(seen, vec!["live "], "everything after the supersede must be silent");
+        // Parsing continued regardless, so the reap's ownership check sees a coherent turn.
+        assert_eq!(out.session_id, "sess-Q");
+        assert_eq!(out.final_text, "live and retired");
+        // Latched: once lost, the gate stops taking the manager's mutex (4 lines, 3 asks).
+        assert_eq!(asks.load(Ordering::Relaxed), 3);
+    }
+
+    /// Cancel while a send is still PREPARING — the state neither the floor nor the slot can
+    /// describe, because that send has neither a token nor a child yet. Drives the REAL
+    /// `cancelled_during_prep` the command calls (roborev 53147/53181).
+    #[test]
+    fn a_cancel_during_the_prep_stops_the_send_that_had_not_started() {
+        let _guard = TEST_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // What concierge_turn reads on entry, before the claude-path lookup and the cwd prep.
+        let on_entry = CANCEL_EPOCH.load(Ordering::Relaxed);
+        assert!(!cancelled_during_prep(on_entry), "an uneventful send proceeds");
+
+        retire_issued_turns(); // Escape, while that prep is in flight
+        assert!(
+            cancelled_during_prep(on_entry),
+            "a cancel must be visible to a send that has not reached its reservation",
+        );
+
+        // A send that starts AFTER the cancel is unaffected by it.
+        let fresh = CANCEL_EPOCH.load(Ordering::Relaxed);
+        let _ = reserve_turn_token();
+        assert!(!cancelled_during_prep(fresh));
+    }
+
+    /// The install decision — the rule that keeps "who owns the slot" agreeing with "who owns the
+    /// floor". Two sends race on separate threads and their spawns can finish out of order, so an
+    /// unconditional replace lets an OLDER turn stomp the newer one's entry and kill the child the
+    /// user is waiting on (roborev 53165).
+    #[test]
+    fn an_older_or_retired_turn_never_takes_the_slot() {
+        // The REAL function the install site calls (roborev 53186) — a local copy would have
+        // stayed green with that call deleted.
+        // The live turn installs over an older entry.
+        assert!(may_install(6, 6, Some(5)));
+        // …but the older one, spawning a moment later, must NOT stomp it.
+        assert!(!may_install(5, 6, Some(6)));
+        // Retired even with an empty slot (the floor moved while we were spawning).
+        assert!(!may_install(5, 6, None));
+        // First turn of the session.
+        assert!(may_install(1, 0, None));
+        // Equal tokens cannot happen (each reservation is unique), but re-installing over yourself
+        // is not a supersession either way.
+        assert!(may_install(7, 7, Some(7)));
+    }
+
+    /// Cancel still retires everything already RESERVED — the turns that do have a token, whether
+    /// or not their child has spawned.
+    #[test]
+    fn cancel_retires_every_reserved_turn() {
+        let _guard = TEST_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let live = reserve_turn_token();
+        assert!(!is_retired(live, RETIRE_BELOW.load(Ordering::Relaxed)));
+        retire_issued_turns();
+        assert!(is_retired(live, RETIRE_BELOW.load(Ordering::Relaxed)));
+    }
+
+    /// The per-CHUNK floor check: a send that lands during a line's parse still silences that
+    /// line's chunks. The per-line check is hoisted for the mutex, so this is the half that closes
+    /// the parse-width window — and one admitted chunk is the whole failure mode, since a delta for
+    /// a never-before-seen id paints a bubble that never gets a terminal event (roborev 53130).
+    #[test]
+    fn a_send_landing_mid_parse_still_silences_that_line() {
+        let ndjson = concat!(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"too late"}}}"#, "\n",
+        );
+        let mut seen: Vec<String> = Vec::new();
+        // Owns the slot (the replacement child has not spawned yet) but the floor has already risen.
+        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| true, &mut |t| seen.push(t.to_string()));
+        assert!(seen.is_empty(), "a retired turn must not emit even while it holds the slot: {seen:?}");
+        assert_eq!(out.acc, "too late", "…and the parse still ran");
+    }
+
+    /// The floor and the token come from the SAME reservation — the relationship the previous test
+    /// only asserted in a comment (roborev 53130). Exercises the real statics.
+    #[test]
+    fn a_reserved_token_is_live_and_retires_the_one_before_it() {
+        let _guard = TEST_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let first = reserve_turn_token();
+        assert!(!is_retired(first, RETIRE_BELOW.load(Ordering::Relaxed)), "a send's own token is live");
+        let second = reserve_turn_token();
+        assert!(second > first);
+        let floor = RETIRE_BELOW.load(Ordering::Relaxed);
+        assert!(is_retired(first, floor), "the newer send retires the older turn immediately");
+        assert!(!is_retired(second, floor));
+        // A continuation (the stale-resume retry) takes a token WITHOUT publishing a floor, so it
+        // cannot silence a turn the user sent while the first attempt was failing.
+        let cont = reserve_continuation_token();
+        assert!(cont > second);
+        assert_eq!(RETIRE_BELOW.load(Ordering::Relaxed), floor, "a continuation publishes no floor");
+        assert!(!is_retired(second, RETIRE_BELOW.load(Ordering::Relaxed)));
+    }
+
+    /// A reader that has ALREADY lost the slot when the drain starts says nothing at all.
+    #[test]
+    fn a_reader_that_never_owned_the_turn_emits_nothing() {
+        let ndjson = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sess-OLD"}"#, "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"the dead turn's buffered output"}}}"#, "\n",
+        );
+        let mut seen: Vec<String> = Vec::new();
+        let out = drain_stream(ndjson.as_bytes(), &|| false, &|| false, &mut |t| seen.push(t.to_string()));
+        assert!(seen.is_empty(), "a superseded reader must not emit: {seen:?}");
+        assert_eq!(out.session_id, "sess-OLD");
+        assert_eq!(out.acc, "the dead turn's buffered output");
     }
 
     /// The shared parser (`claude_chat::handle_event`) drives this module's delta emission and

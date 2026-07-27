@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MAX_AGE_MS,
   MAX_PER_AGENT,
@@ -58,6 +58,35 @@ describe("pendingSends", () => {
     expect(queuePendingSend({ agentId: "a1", text: "new", userPrompt: true, at: MAX_AGE_MS + 1 })).toBe(true);
     expect(pendingSendCount("a1", MAX_AGE_MS + 1)).toBe(1);
     expect(takePendingSends("a1", MAX_AGE_MS + 1).due.map((e) => e.text)).toEqual(["new"]);
+  });
+
+  it("reports what the queue-time prune dropped, oldest first and exactly once", () => {
+    // The prune inside queuePendingSend used to swallow aged entries with no outcome at all — a
+    // prompt the concierge had promised, vanishing (roborev 53015). It also has to be reported for
+    // callers that pair state with each queued send: one silent drop and every later outcome is a
+    // slot out of step, permanently.
+    queuePendingSend({ agentId: "a1", text: "stale-1", userPrompt: true, at: 0 });
+    queuePendingSend({ agentId: "a1", text: "stale-2", userPrompt: true, at: 1 });
+    const dropped: string[][] = [];
+    queuePendingSend(
+      { agentId: "a1", text: "fresh", userPrompt: true, at: MAX_AGE_MS + 2 },
+      (d) => dropped.push(d.map((e) => e.text)),
+    );
+    expect(dropped).toEqual([["stale-1", "stale-2"]]);
+    // …and the next queue call has nothing left to report.
+    const again: string[][] = [];
+    queuePendingSend(
+      { agentId: "a1", text: "fresher", userPrompt: true, at: MAX_AGE_MS + 3 },
+      (d) => again.push(d.map((e) => e.text)),
+    );
+    expect(again).toEqual([]);
+  });
+
+  it("does not call onPruned when nothing aged out", () => {
+    queuePendingSend({ agentId: "a1", text: "young", userPrompt: true, at: 1 });
+    const onPruned = vi.fn();
+    queuePendingSend({ agentId: "a1", text: "also young", userPrompt: true, at: 2 }, onPruned);
+    expect(onPruned).not.toHaveBeenCalled();
   });
 
   it("clearPendingSends discards without delivering", () => {

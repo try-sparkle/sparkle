@@ -35,7 +35,7 @@ export const PILL_MIN_CHARS = 2000;
 // HEIC is intentionally excluded: Chromium WebViews can't render it in an <img>/data
 // URL, so a HEIC drop falls through to a (downloadable) file tile rather than showing a
 // broken preview.
-const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
+export const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
 
 /** Line count by newline boundaries. Empty string is zero lines; a trailing newline
  *  counts the empty final line (so "a\nb\n" is 3), matching a textarea's own row count. */

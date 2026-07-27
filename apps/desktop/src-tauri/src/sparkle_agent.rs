@@ -139,9 +139,9 @@ pub async fn ensure_sparkle_repo(app: AppHandle) -> Result<SparkleWorkspace, Str
 
 /// Core (AppHandle-free, testable): remove every PER-WINDOW Sparkle worktree under
 /// `<app_data>/worktrees/sparkle-self` whose agent id is NOT the canonical one, returning how many
-/// were removed. Improve Sparkle is per-window — each secondary window (`win-<uuid>`) cuts its own
-/// worktree — but secondary windows are never restored across an app restart (multi-window session
-/// restore is deferred), so their worktrees would accumulate forever. The canonical worktree (shared
+/// were removed. In the multi-window era each secondary window (`win-<uuid>`) cut its own Improve
+/// Sparkle worktree, and those were never restored across an app restart — so leftovers from old
+/// builds accumulate forever unless reaped here. The canonical worktree (shared
 /// by the main window's pane and the hourly pass) is always preserved. Idempotent: a missing
 /// worktrees dir is a no-op (`Ok(0)`), and per-entry failures are skipped so one bad dir can't
 /// strand the rest. For each reaped worktree we also drop its `sparkle/agent-<id>` branch (which

@@ -8,6 +8,8 @@ import { ConciergeHost } from "./ConciergeHost";
 import { CommandPalette, PaletteTrigger, useCommandPalette } from "./Concierge";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { useConnectionStore } from "../stores/connectionStore";
+import { useCloudAgentsEnabled } from "../hooks/useCloudAgents";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useNewAgent } from "../hooks/useNewAgent";
 import { reattachProjectOnOpen } from "../services/cloudAgents/startup";
@@ -31,7 +33,7 @@ import {
 } from "../windowContext";
 import { useConciergeFeed } from "../useConciergeFeed";
 import { firstVisibleAgentId } from "../engine/agentOrdering";
-import { resolvePinnedProjectId, resolvePromptTarget } from "../engine/shellResolve";
+import { decidePromptTarget, resolvePinnedProjectId } from "../engine/shellResolve";
 import {
   markProjectVisited,
   onVisitedProjectsChange,
@@ -310,8 +312,11 @@ export function Workspace() {
   // agent. This is what re-homes the removed AgentPane composer — with a target the box can send a
   // real prompt into a terminal instead of only chatting with the brain. Null → the box is
   // Sparkle-only, and its target toggle renders inert.
-  const promptTarget = useMemo(
-    () => resolvePromptTarget(project, activeAgentId),
+  // The compose box's target AND the honest reason when there isn't one, from ONE decision — two
+  // memos over identical deps computed the resolution twice, and two functions meant a future
+  // refusal could ship without its copy (roborev 49295/52649).
+  const { target: promptTarget, refusal: promptTargetUnavailableReason } = useMemo(
+    () => decidePromptTarget(project, activeAgentId),
     [project, activeAgentId],
   );
   // Lets the empty-state start button create a build agent exactly like the sidebar's "+ New Build
@@ -321,19 +326,40 @@ export function Workspace() {
   const cloudCreateOpen = useUiStore((s) => s.cloudCreateOpen);
   const setCloudCreateOpen = useUiStore((s) => s.setCloudCreateOpen);
   // Cloud re-attach (Service B): a cloud session keeps running while the laptop is closed, so when
-  // a project opens in this window we reconcile its tabs against the server's LIVE sessions and
+  // a project's tab is first selected we reconcile its tabs against the server's LIVE sessions and
   // recreate any that lost their tab. Best-effort and silent — signed out, offline, feature off, or
   // "this project has never run a cloud agent" all resolve to "created nothing" (see startup.ts).
-  // Keyed on the project id so switching this window's project re-runs it for the new project, and
-  // guarded by a ref so a re-render can't fire a second listing for the same project.
-  const reattachedFor = useRef<string | null>(null);
+  // Once per project per Workspace MOUNT (per session today — the shell never unmounts it), not
+  // once per tab switch: in the tabbed shell `project` is the selected tab, so a last-id guard
+  // would re-list on every A→B→A flip — and re-listing would also resurrect a cloud tab the user
+  // deliberately removed while its server session was still live. Marked BEFORE the await so a
+  // re-render can't double-fire, and un-marked when the attempt never got a useful answer (null:
+  // auth still settling on a cold boot, offline) so a later attempt retries instead of the project
+  // staying silently unreconciled until relaunch.
+  //
+  // AUTH IS IN THE DEPS, not just the project id (roborev 49295): the motivating null — "the token
+  // hadn't landed yet on a cold boot" — resolves seconds later without anything about the project
+  // changing. Keyed on the id alone, a user with ONE project (or who simply doesn't flip tabs) got
+  // exactly one attempt and the un-mark had nothing to trigger it again, which made the retry a
+  // no-op for the very case it was written for. Now the settling token IS the retry trigger.
+  // The same gate every other cloud surface reads (services/cloudAgents/gating, via the hook) —
+  // not a fourth hand-rolled copy of `tokenPresent && me?.cloudAgentsEnabled` (roborev 52648).
+  const cloudAuthReady = useCloudAgentsEnabled();
+  // …and CONNECTIVITY, because auth-settling is only half of what produces a retryable null. On an
+  // offline cold boot for an already-signed-in user the persisted token rehydrates `tokenPresent`
+  // true on the first frame, so `cloudAuthReady` never transitions and the un-mark had nothing to
+  // fire it: a single-project user got exactly one attempt and stayed unreconciled until relaunch
+  // (roborev 52648/52649). The offline→online transition is the trigger for that half.
+  const online = useConnectionStore((s) => s.isOnline);
+  const reattachedProjects = useRef<Set<string>>(new Set());
   useEffect(() => {
     const id = project?.id ?? null;
-    if (!id || reattachedFor.current === id) return;
-    reattachedFor.current = id;
-    void reattachProjectOnOpen(id);
-  }, [project?.id]);
-
+    if (!id || !cloudAuthReady || !online || reattachedProjects.current.has(id)) return;
+    reattachedProjects.current.add(id);
+    void reattachProjectOnOpen(id).then((r) => {
+      if (r === null) reattachedProjects.current.delete(id);
+    });
+  }, [project?.id, cloudAuthReady, online]);
   // Files dropped on either "+ New Build Agent" button spawn a new build agent with the files
   // attached. Mounted here (not in a composer) so it also works when no agent exists yet — the
   // empty-state button has no pane to piggyback on.
@@ -496,6 +522,7 @@ export function Workspace() {
           width={360}
           feed={feed}
           promptTarget={promptTarget}
+          promptTargetUnavailableReason={promptTargetUnavailableReason}
           searchSlot={<PaletteTrigger onOpen={palette.openPalette} />}
         />
         {/* ② + ③. Position:relative so Plan mode can lay ONE wide card column over both of them —

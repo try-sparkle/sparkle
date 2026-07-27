@@ -77,6 +77,10 @@ beforeEach(() => {
 });
 
 describe("dispatchConciergeAnswer — re-homed composer side-effects", () => {
+  // The cloud-agent refusal (this branch called it "cloud-unsupported", main "cloud-agent" — the
+  // same guard, converged independently) lives in the "cloud agents have no local PTY" describe at
+  // the bottom of this file: ONE copy, the strongest of the three that the merge left behind, which
+  // also pins that the screen is never read and nothing is charged (roborev 51593/51594).
   it("records the delivered prompt in the agent's history", async () => {
     await dispatchConciergeAnswer("a1", "ship the docs pass", { userPrompt: true });
     const history = promptsOf("a1");
@@ -487,6 +491,33 @@ describe("dispatchConciergeAnswer / flushPendingSends — the queue is honest", 
     expect(results.map((r) => r.path)).toEqual(["expired"]);
     expect(seen).toEqual([{ path: "expired", sent: "held too long" }]);
     expect(submitPrompt).toHaveBeenCalledTimes(1); // only the original, failed attempt
+  });
+
+  it("reports a hold the QUEUE-TIME prune drops, before the send that displaced it", async () => {
+    // The other way a held prompt can disappear: not on flush, but when the next queue call prunes
+    // it as stale. That path emitted nothing at all (roborev 53015) — a promise silently broken,
+    // and a permanent slot desync for anything the caller pairs with each queued send. Ordering
+    // matters too: the dropped entry's outcome must precede the new send's own.
+    resetPendingSends();
+    queuePendingSend({
+      agentId: "a1",
+      text: "'/tmp/shot.png' look",
+      display: "look · 1 image",
+      userPrompt: true,
+      at: 0,
+    });
+    const seen: { path: string; display?: string }[] = [];
+    const off = onDeferredSendOutcome((r) => seen.push({ path: r.path, display: r.display }));
+
+    setPaneReady("a1", false);
+    await rejectPtyGoneOnce();
+    const r = await dispatchConciergeAnswer("a1", "the newer one", { userPrompt: true });
+    off();
+
+    expect(r.path).toBe("queued");
+    // The safe rendering survives the drop — the thread quotes `display`, never the payload.
+    expect(seen).toEqual([{ path: "expired", display: "look · 1 image" }]);
+    expect(pendingSendCount("a1")).toBe(1); // only the new hold remains
   });
 
   it("a listener that throws can't break a delivery that already landed", async () => {

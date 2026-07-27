@@ -86,8 +86,12 @@ export interface ConciergeDispatchResult {
   ok: boolean;
   path: ConciergeDispatchPath;
   agentId: string;
-  /** The exact string written to the PTY (present only when ok). */
+  /** The exact string written to the PTY (present only when ok). May contain attachment paths —
+   *  never quote this at the user; quote `display`. */
   sent?: string;
+  /** `sent` as the user should SEE it (counts, not temp paths). Present whenever `sent` is, so a
+   *  caller that reconciles a deferred outcome in the thread has something safe to quote. */
+  display?: string;
   /** The option that matched (present for path "picker-option"). */
   matchedLabel?: string;
   /** The live options offered (present for "ambiguous-picker") so the UI can prompt the user to pick. */
@@ -97,9 +101,25 @@ export interface ConciergeDispatchResult {
 /** How a dispatch should be treated. `userPrompt` marks the text as something the USER authored
  *  (the concierge compose box aimed at an agent) — the only case that records history, drops a
  *  marker, meters the trial and feeds auto-naming. Machine-authored text (the nudge Approve
- *  fallback) leaves `userPrompt` at its default of false and is delivered with no side-effects. */
+ *  fallback) leaves `userPrompt` at its default of false and is delivered with no side-effects.
+ *
+ *  THREE RENDERINGS OF ONE MESSAGE (roborev 46911/46925). The removed composer built three strings
+ *  and used each in exactly one place; collapsing them onto the wire text leaks attachment temp
+ *  paths into surfaces the user reads:
+ *    • `text` (the wire payload) — paths + typed text, the only one written to the PTY;
+ *    • `display` — the typed text plus compact counts, for the pinned prompt header and the
+ *      history dropdown (PinnedPrompt renders these verbatim);
+ *    • `namingBasis` — the TYPED text only, for the ghost-suggestion corpus and the auto-name
+ *      model. EMPTY for an attachments-only send, which is what makes naming skip it rather than
+ *      handing the model a bare `/tmp/sparkle-shot-1753.png`.
+ *  Both default to `text`, so a caller with no attachments is unaffected. */
 export interface ConciergeDispatchOptions {
   userPrompt?: boolean;
+  /** What the prompt-history surfaces show. Defaults to the wire text. */
+  display?: string;
+  /** What ghost-text and auto-naming learn from; "" deliberately skips naming. Defaults to the
+   *  wire text. */
+  namingBasis?: string;
 }
 
 // WHOLE-PHRASE anchored (roborev 46311): the entire trimmed answer must be a member of the
@@ -214,7 +234,18 @@ export async function dispatchConciergeAnswer(
       // history entry, because that entry counts toward the naming ladder's promptCount and would
       // consume the first-turn deferral a self-reporting agent relies on.
       if (opts.userPrompt) recordPickerAnswer(agentId, match.label);
-      return { ok: true, path: "picker-option", agentId, sent, matchedLabel: match.label };
+      // `display` is the LABEL, not the keystroke frame: `sent` here is "2\r" / "y\r", which is
+      // the one thing no user-facing surface should ever quote back (roborev 49293/49294 —
+      // `display` is documented as present whenever `sent` is, and this was the return that broke
+      // that promise).
+      return {
+        ok: true,
+        path: "picker-option",
+        agentId,
+        sent,
+        display: match.label,
+        matchedLabel: match.label,
+      };
     } catch (err) {
       if (err instanceof PtyGoneError) return { ok: false, path: "pty-gone", agentId };
       throw err;
@@ -237,10 +268,11 @@ export async function dispatchConciergeAnswer(
   const wasStarting = paneState(agentId) === "starting";
 
   // Free text (strict: rejects a dead PTY).
+  const display = opts.display ?? text;
   try {
     await submitPrompt(agentId, text);
-    if (opts.userPrompt) recordPromptSideEffects(agentId, text);
-    return { ok: true, path: "free-text", agentId, sent: text };
+    if (opts.userPrompt) recordPromptSideEffects(agentId, text, opts);
+    return { ok: true, path: "free-text", agentId, sent: text, display };
   } catch (err) {
     if (err instanceof PtyGoneError) {
       // RE-READ the pane state after the await (roborev 47018): prepare() can fail while the
@@ -252,12 +284,37 @@ export async function dispatchConciergeAnswer(
       if (
         wasStarting &&
         (nowState === "starting" || nowState === "ready") &&
-        queuePendingSend({ agentId, text, userPrompt: opts.userPrompt === true })
+        queuePendingSend(
+          {
+            agentId,
+            text,
+            userPrompt: opts.userPrompt === true,
+            // Carry the other two renderings across the wait: the flush below re-runs the side
+            // effects, and a queued attachment send must not degrade to the raw payload just
+            // because it was held for a few seconds (roborev 46911/46925).
+            display: opts.display,
+            namingBasis: opts.namingBasis,
+          },
+          // Anything the queue's staleness prune drops was promised to the user and would
+          // otherwise disappear without a word — report it exactly as a flush-time expiry does
+          // (roborev 53015).
+          (dropped) => {
+            for (const e of dropped) {
+              emitOutcome({
+                ok: false,
+                path: "expired",
+                agentId,
+                sent: e.text,
+                display: e.display ?? e.text,
+              });
+            }
+          },
+        )
       ) {
         // If the pane became ready while we were in flight, its own flush effect has already run
         // against an empty queue — drain here or this entry would sit until the TTL swept it.
         if (paneState(agentId) === "ready") void flushPendingSends(agentId);
-        return { ok: true, path: "queued", agentId, sent: text };
+        return { ok: true, path: "queued", agentId, sent: text, display };
       }
       return { ok: false, path: "pty-gone", agentId };
     }
@@ -298,19 +355,26 @@ export async function flushPendingSends(agentId: string): Promise<ConciergeDispa
   const { due, expired } = takePendingSends(agentId);
   const out: ConciergeDispatchResult[] = [];
   for (const entry of expired) {
-    const r: ConciergeDispatchResult = { ok: false, path: "expired", agentId, sent: entry.text };
+    const r: ConciergeDispatchResult = {
+      ok: false,
+      path: "expired",
+      agentId,
+      sent: entry.text,
+      display: entry.display ?? entry.text,
+    };
     out.push(r);
     emitOutcome(r);
   }
   for (const entry of due) {
+    const display = entry.display ?? entry.text;
     let r: ConciergeDispatchResult;
     try {
       await submitPrompt(agentId, entry.text);
-      if (entry.userPrompt) recordPromptSideEffects(agentId, entry.text);
-      r = { ok: true, path: "free-text", agentId, sent: entry.text };
+      if (entry.userPrompt) recordPromptSideEffects(agentId, entry.text, entry);
+      r = { ok: true, path: "free-text", agentId, sent: entry.text, display };
     } catch (err) {
       if (!(err instanceof PtyGoneError)) throw err;
-      r = { ok: false, path: "pty-gone", agentId, sent: entry.text };
+      r = { ok: false, path: "pty-gone", agentId, sent: entry.text, display };
     }
     out.push(r);
     emitOutcome(r);
@@ -327,7 +391,13 @@ export async function flushPendingSends(agentId: string): Promise<ConciergeDispa
 export function abandonPendingSends(agentId: string): void {
   const { due, expired } = takePendingSends(agentId);
   for (const entry of [...expired, ...due]) {
-    emitOutcome({ ok: false, path: "abandoned", agentId, sent: entry.text });
+    emitOutcome({
+      ok: false,
+      path: "abandoned",
+      agentId,
+      sent: entry.text,
+      display: entry.display ?? entry.text,
+    });
   }
 }
 
@@ -365,25 +435,33 @@ function recordPickerAnswer(agentId: string, label: string): void {
  *  DELIVERED (see the side-effects note in the file header). Best-effort by construction: an agent
  *  whose project can't be resolved simply gets no history entry, and an unmounted terminal no
  *  marker — neither is a reason to fail a send that already landed. */
-function recordPromptSideEffects(agentId: string, text: string): void {
+function recordPromptSideEffects(
+  agentId: string,
+  text: string,
+  renderings: Pick<ConciergeDispatchOptions, "display" | "namingBasis"> = {},
+): void {
   // Debit one free-trial prompt on the server. Self-gates: a no-op for entitled users, and it
   // never throws (see trialMeter).
   void recordTrialSend();
+  // Each surface gets the rendering meant for it (see ConciergeDispatchOptions). Both fall back to
+  // the wire text, which is exactly right when nothing was attached.
+  const shown = (renderings.display ?? text).trim();
+  const basis = (renderings.namingBasis ?? text).trim();
   // The composer's fifth side-effect: teach the ghost-text suggestions from what the user actually
-  // types. Global (not per-agent), and it self-ignores empties/over-long prompts.
-  const basis = text.trim();
+  // TYPED — never an attachment path, which would poison the corpus with unrepeatable temp names.
+  // Global (not per-agent), and it self-ignores empties/over-long prompts.
   usePromptHistoryStore.getState().record(basis);
   const project = useProjectStore
     .getState()
     .projects.find((p) => p.agents.some((a) => a.id === agentId));
   if (!project) return;
-  // Record the TRIMMED text: leading/trailing whitespace would otherwise land in the pinned header
-  // while naming (below) used the trimmed form — two readings of the same prompt.
-  const promptId = useProjectStore.getState().appendPrompt(project.id, agentId, basis);
+  // Record the TRIMMED display text: leading/trailing whitespace would otherwise land in the
+  // pinned header while naming (below) used the trimmed form — two readings of the same prompt.
+  const promptId = useProjectStore.getState().appendPrompt(project.id, agentId, shown);
   markAgentPrompt(agentId, promptId);
   // Fire-and-forget: no-ops if the name is pinned or no API key is configured. Gated on the
   // auto-rename AI feature, and skipped for an empty basis so the naming model is never asked to
-  // summarize nothing.
+  // summarize nothing — which is precisely the attachments-only send.
   if (basis && aiFeatureNow("autoRename")) void maybeAutoName(project.id, agentId, basis);
 }
 

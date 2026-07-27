@@ -89,7 +89,9 @@ describe("reattachProjectOnOpen", () => {
   it("does nothing at all — not one request — when the capability isn't advertised", async () => {
     const pid = seedProject({ cloudProjectId: "srv-1" });
     useAuthStore.setState({ me: me(false), tokenPresent: true });
-    await expect(reattachProjectOnOpen(pid)).resolves.toEqual([]);
+    // null = "never got a useful answer" — the caller keeps the project eligible for a retry,
+    // because on a cold boot this same shape means "auth hasn't settled yet".
+    await expect(reattachProjectOnOpen(pid)).resolves.toBeNull();
     expect(listSessions).not.toHaveBeenCalled();
     expect(listProjects).not.toHaveBeenCalled();
   });
@@ -97,7 +99,7 @@ describe("reattachProjectOnOpen", () => {
   it("does nothing when signed out", async () => {
     const pid = seedProject({ cloudProjectId: "srv-1" });
     useAuthStore.setState({ me: me(true), tokenPresent: false });
-    await expect(reattachProjectOnOpen(pid)).resolves.toEqual([]);
+    await expect(reattachProjectOnOpen(pid)).resolves.toBeNull();
     expect(listSessions).not.toHaveBeenCalled();
   });
 
@@ -119,17 +121,22 @@ describe("reattachProjectOnOpen", () => {
   });
 
   it("is silent and harmless when the lookup or the listing fails (offline)", async () => {
+    // BOTH failures are retryable (roborev 49295). The listing one is the common shape and was the
+    // one reported as `[]`: once a project has a cached cloudProjectId, findCloudProjectId answers
+    // from the cache without a request, so listSessions is the ONLY call left that can fail — and
+    // `[]` ("asked, nothing to do") settles the project for the whole session.
     const pid = seedProject({ cloudProjectId: "srv-1" });
     listSessions.mockRejectedValue(new Error("Failed to fetch"));
-    await expect(reattachProjectOnOpen(pid)).resolves.toEqual([]);
+    await expect(reattachProjectOnOpen(pid)).resolves.toBeNull();
 
     const pid2 = seedProject();
     listProjects.mockRejectedValue(new Error("Failed to fetch"));
-    await expect(reattachProjectOnOpen(pid2)).resolves.toEqual([]);
+    // The lookup never answered — null keeps the project retryable once back online.
+    await expect(reattachProjectOnOpen(pid2)).resolves.toBeNull();
   });
 
   it("no-ops for a project this window doesn't have", async () => {
-    await expect(reattachProjectOnOpen("nope")).resolves.toEqual([]);
+    await expect(reattachProjectOnOpen("nope")).resolves.toBeNull();
     expect(listSessions).not.toHaveBeenCalled();
   });
 });
