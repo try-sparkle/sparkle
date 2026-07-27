@@ -52,6 +52,7 @@ import {
 } from "../services/concierge";
 import {
   agentCanAcceptInput,
+  answersLivePicker,
   dispatchConciergeAnswer,
   onDeferredSendOutcome,
   type ConciergeDispatchPath,
@@ -1068,9 +1069,22 @@ export function ConciergeHost({
       maybePauseOnSubmit();
       const id = nextId("you");
       const submitted = targetRef.current;
+      // IS THIS A PICKER ANSWER? Asked BEFORE the payload is built, because the answer changes how
+      // it is built. The prefix `attachedPayload` adds is quoted temp paths, and every arm of
+      // `matchAnswerToOption` is anchored — so with a file staged and a picker on screen, "Yes"
+      // arrives as `"/var/folders/…/shot.png" Yes`, matches nothing, and comes back
+      // `ambiguous-picker`. The box then restores the draft AND the chips, so retyping reproduces
+      // it exactly: a loop whose only exit is guessing that the attachments are the problem, which
+      // the refusal copy never says.
+      //
+      // So a terse answer to a live picker sends UNPREFIXED and KEEPS its attachments staged for
+      // the next message. Holding them is the honest half: the picker answer is a keystroke, not a
+      // message that could carry a file, so consuming them would silently cost the user the picking
+      // for nothing. The chips stay on screen, which is also the only signal that they weren't sent.
+      const answersPicker = !!submitted && answersLivePicker(submitted.agentId, text);
       // Take the staged files in the SAME tick the text leaves, so the next message starts clean
       // and a second Send can't deliver the same attachments twice.
-      const staged = takeAttachments();
+      const staged = answersPicker ? [] : takeAttachments();
       // THREE renderings of one message, exactly as the removed composer built them:
       //   payload — the attachments' real paths prefixed to the text, for the PTY only;
       //   display — the typed text plus compact counts, for the thread AND every prompt-history

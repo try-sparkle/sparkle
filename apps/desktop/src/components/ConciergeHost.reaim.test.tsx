@@ -1,0 +1,298 @@
+// @vitest-environment jsdom
+//
+// RE-AIMING the compose box between two agents, through the REAL suggestion engine.
+//
+// ConciergeHost.test.tsx STUBS both `ConciergeSuggestions` and the dispatch layer, so its rows test
+// the host's routing rather than the engine — which is right for those rows and useless for this
+// one. The finding here is precisely that the hook's state used to outlive a change of `agentId`,
+// and a stub that returns a constant cannot express it. This file therefore mounts the real
+// component and the real hook (with only their leaf dependencies mocked) and re-aims the box the
+// way the app does: by moving `promptTarget`, which is what selecting a different agent does.
+//
+// What must not ship: agent A's computed buttons rendering under agent B's name, because a click in
+// that window sends A's prompt into B's TERMINAL.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+
+const h = vi.hoisted(() => ({
+  openProjectTab: vi.fn(),
+  startConciergeTurn: vi.fn(async (_p: string): Promise<string | null> => null),
+  dispatchConciergeAnswer: vi.fn(
+    async (_agentId: string, _text: string, _opts?: unknown) => ({ ok: true, path: "free-text" }),
+  ),
+  setInterruptPreference: vi.fn(),
+  computeSuggestions: vi.fn(),
+  pushSuggestions: vi.fn(),
+  /** Per-agent terminal screens. Two agents are live at once here, which is the whole point. */
+  screens: {} as Record<string, string>,
+}));
+
+vi.mock("../services/openProjectTab", () => ({
+  openProjectTab: h.openProjectTab,
+  requestProjectTabFromOtherWindow: vi.fn(),
+}));
+vi.mock("../services/concierge", () => ({
+  startConciergeTurn: h.startConciergeTurn,
+  onConciergeDelta: () => () => {},
+  onConciergeDone: () => () => {},
+  onConciergeError: () => () => {},
+  isSupersededDetail: () => false,
+  SUPERSEDED_DETAILS: [],
+}));
+vi.mock("../services/conciergeDispatch", () => ({
+  dispatchConciergeAnswer: h.dispatchConciergeAnswer,
+  flushPendingSends: vi.fn(async () => []),
+  agentCanAcceptInput: () => true,
+  liveOptionsFor: () => [],
+  isTerseAnswer: () => false,
+  matchAnswerToOption: () => null,
+  answersLivePicker: () => false, // no picker on screen in these rows
+  onDeferredSendOutcome: () => () => {},
+}));
+vi.mock("../services/conciergeRouter", () => ({
+  routeMessage: vi.fn(async () => ({ target: "sparkle", reason: "test", source: "heuristic" })),
+}));
+vi.mock("../stores/sparklePrefsStore", () => ({
+  useSparklePrefsStore: { getState: () => ({ setInterruptPreference: h.setInterruptPreference }) },
+}));
+vi.mock("../useConciergeDictation", () => ({
+  useConciergeDictation: () => ({
+    micLive: false,
+    interim: "",
+    toggleMic: vi.fn(),
+    registerInsert: vi.fn(),
+  }),
+}));
+vi.mock("../services/conciergeVoice", () => ({
+  speakConciergeReply: vi.fn(async () => "elevenlabs" as const),
+  speakOnDemand: vi.fn(async () => "elevenlabs" as const),
+  stopConciergeVoice: vi.fn(),
+  shouldSpeakConciergeReply: vi.fn(() => true),
+}));
+vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
+
+// The suggestion engine's leaves — everything BELOW useSuggestions. The hook itself is REAL.
+const { SuggestionOfflineError, AiUnavailableError, AiUnreachableError } = vi.hoisted(() => {
+  class SuggestionOfflineError extends Error {}
+  class AiUnavailableError extends Error {}
+  class AiUnreachableError extends Error {}
+  return { SuggestionOfflineError, AiUnavailableError, AiUnreachableError };
+});
+vi.mock("../services/suggestions/engine", () => ({
+  computeSuggestions: (...a: unknown[]) => h.computeSuggestions(...a),
+  SuggestionOfflineError,
+}));
+vi.mock("../services/anthropic", () => ({ AiUnavailableError, AiUnreachableError }));
+vi.mock("../services/terminalScrollback", () => ({
+  getAgentScrollback: (id: string) => h.screens[id] ?? null,
+}));
+// `useHasAiCredits` is a newer gate on the compute path (added to aiGate on main after this
+// suite was written). Omit it from the mock and the module factory throws; return false and the
+// engine never runs, so every pill assertion below would pass VACUOUSLY. These tests are about
+// which agent the engine is scoped to, not about billing — so credits are present throughout.
+vi.mock("../services/aiGate", () => ({
+  useAiFeature: () => true,
+  aiFeatureNow: () => false,
+  useHasAiCredits: () => true,
+}));
+vi.mock("../services/relayClient", () => ({ pushSuggestions: h.pushSuggestions }));
+// Both agents are your-turn; neither has a stage that yields a CTA (no branchStatus / stage →
+// building_unsaved → deriveCta returns null), so the pill shows the raw computed set.
+const RUNTIME = {
+  status: { ag1: "idle", ag2: "idle" },
+  workflowShipped: {},
+  workflowStage: {},
+  workflowState: {},
+  branchStatus: {},
+};
+vi.mock("../stores/runtimeStore", () => ({
+  useRuntimeStore: Object.assign((sel: (s: typeof RUNTIME) => unknown) => sel(RUNTIME), {
+    getState: () => RUNTIME,
+  }),
+}));
+vi.mock("../stores/spendStore", () => ({ useSpendPill: () => "$—" }));
+
+import { ConciergeHost, type ConciergePromptTarget } from "./ConciergeHost";
+import { resetSuggestionMemory } from "../services/suggestions/useSuggestions";
+import type { ConciergeFeed } from "../useConciergeFeed";
+import { useConnectionStore } from "../stores/connectionStore";
+import type { SuggestionButton } from "../services/suggestions/types";
+
+/** A's recommended action. `value` is what a click SENDS — the string that must never reach B. */
+const A_ACTION: SuggestionButton = {
+  id: "a-land",
+  label: "Land A to Main",
+  value: "Land agent A's work to main.",
+  kind: "prompt",
+  source: "control",
+};
+const B_ACTION: SuggestionButton = {
+  id: "b-tests",
+  label: "Fix B's tests",
+  value: "Fix agent B's tests.",
+  kind: "prompt",
+  source: "control",
+};
+
+function agent(id: string, name: string) {
+  return {
+    id,
+    name,
+    projectId: "p1",
+    projectName: "sparkle",
+    kind: "build" as const,
+    status: "idle",
+    statusColor: "#e0533f",
+    statusLabel: "Idle",
+    // `done`, not `needs_you`: these rows are about the compose box, and a surfaced agent would
+    // add nudge cards that have nothing to do with what is being tested.
+    band: "done" as const,
+    inScope: true,
+    muted: false,
+  };
+}
+const COUNTS = { needs_you: 0, running: 0, done: 2 };
+const FEED = {
+  projects: [
+    {
+      id: "p1",
+      name: "sparkle",
+      inScope: true,
+      counts: COUNTS,
+      agents: [agent("ag1", "Agent A"), agent("ag2", "Agent B")],
+    },
+  ],
+  counts: COUNTS,
+  scopedCounts: COUNTS,
+  pinnedProjectId: null,
+} as unknown as ConciergeFeed;
+
+const AIM_A: ConciergePromptTarget = { projectId: "p1", agentId: "ag1", name: "Agent A" };
+const AIM_B: ConciergePromptTarget = { projectId: "p1", agentId: "ag2", name: "Agent B" };
+
+const box = () => screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
+
+beforeEach(() => {
+  h.computeSuggestions.mockReset();
+  h.dispatchConciergeAnswer.mockClear();
+  h.pushSuggestions.mockReset();
+  resetSuggestionMemory();
+  h.screens = { ag1: "Agent A is done. Committed abc.", ag2: "Agent B is done. Committed def." };
+  useConnectionStore.setState({ browserOnline: true, probeOk: true, isOnline: true });
+});
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+describe("ConciergeHost — the box re-aimed from one agent to another", () => {
+  /** Aim at A, let A's action compute, then re-aim at B the way selecting another agent does. */
+  async function aimAtAThenB(bResult?: { buttons: SuggestionButton[] }) {
+    h.computeSuggestions.mockResolvedValue({ buttons: [A_ACTION] });
+    const { rerender } = render(<ConciergeHost feed={FEED} promptTarget={AIM_A} />);
+    await screen.findByText(A_ACTION.label);
+    h.computeSuggestions.mockReset();
+    if (bResult) h.computeSuggestions.mockResolvedValue(bResult);
+    // B's compute never settles, so anything on screen afterwards can only be A's.
+    else h.computeSuggestions.mockReturnValue(new Promise(() => {}));
+    await act(async () => {
+      rerender(<ConciergeHost feed={FEED} promptTarget={AIM_B} />);
+    });
+    return { rerender };
+  }
+
+  it("stops offering A's action once the box points at B", async () => {
+    await aimAtAThenB();
+    // The pill is gone entirely — not merely relabelled.
+    expect(screen.queryByText(A_ACTION.label)).toBeNull();
+    expect(screen.queryByTestId("suggestion-pill")).toBeNull();
+  });
+
+  // THE finding, stated as the harm rather than the symptom. The click is performed for real if any
+  // pill is up, so a regression that re-renders A's action under B doesn't just fail a
+  // queryByText — it actually dispatches, and the routing assertion below catches it by name.
+  it("cannot route A's prompt into B's terminal", async () => {
+    await aimAtAThenB();
+    // Click A's action if it is anywhere on screen. `queryByText` on the LABEL (not the pill's
+    // container div, which carries no handler) is what makes this a real click rather than a
+    // no-op that would pass regardless.
+    const stale = screen.queryByText(A_ACTION.label);
+    if (stale) fireEvent.click(stale);
+    await Promise.resolve();
+    // The routing assertion is by VALUE, so it names the exact harm: A's prose reaching B's PTY.
+    const sentToB = h.dispatchConciergeAnswer.mock.calls.filter((c) => c[1] === A_ACTION.value);
+    expect(sentToB).toEqual([]);
+    // …and nothing at all was dispatched, because there was nothing to click.
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+  });
+
+  // The user's DRAFT must survive a re-aim. Resetting the suggestion state by remounting the COLUMN
+  // (the other candidate fix) would have taken ComposeBox's text down with it — turning a fix for
+  // one silent data loss into another, on the surface whose own comments call retyping a paragraph
+  // "the worst possible outcome of a failed send". The keyed remount that IS used is scoped to
+  // ConciergeSuggestions, a sibling of the compose box, precisely so this holds.
+  it("keeps the user's typed draft across the re-aim", async () => {
+    h.computeSuggestions.mockResolvedValue({ buttons: [A_ACTION] });
+    const { rerender } = render(<ConciergeHost feed={FEED} promptTarget={AIM_A} />);
+    fireEvent.change(box(), { target: { value: "a paragraph nobody wants to retype" } });
+    await act(async () => {
+      rerender(<ConciergeHost feed={FEED} promptTarget={AIM_B} />);
+    });
+    expect(box().value).toBe("a paragraph nobody wants to retype");
+  });
+
+  // …and the box keeps working afterwards: a draft that survives but can no longer be sent, or is
+  // sent to the agent the user aimed AWAY from, would be a hollow guarantee.
+  it("sends that surviving draft to B, not to A", async () => {
+    h.computeSuggestions.mockReturnValue(new Promise(() => {}));
+    const { rerender } = render(<ConciergeHost feed={FEED} promptTarget={AIM_A} />);
+    fireEvent.change(box(), { target: { value: "carry on" } });
+    await act(async () => {
+      rerender(<ConciergeHost feed={FEED} promptTarget={AIM_B} />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    });
+    // The router is stubbed to "sparkle", so nothing reaches a PTY — what matters is that the
+    // draft was still there to send and the box cleared normally.
+    expect(box().value).toBe("");
+    expect(h.startConciergeTurn).toHaveBeenCalledWith(expect.stringContaining("carry on"));
+  });
+
+  it("offers B's OWN action once B's compute lands, and sends B's text", async () => {
+    await aimAtAThenB({ buttons: [B_ACTION] });
+    await screen.findByText(B_ACTION.label);
+    await act(async () => {
+      fireEvent.click(screen.getByText(B_ACTION.label));
+    });
+    // Through the SAME dispatch a typed message takes — userPrompt: true, with the display and
+    // naming renderings a typed prompt would carry.
+    await waitFor(() =>
+      expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag2", B_ACTION.value, {
+        userPrompt: true,
+        display: B_ACTION.value,
+        namingBasis: B_ACTION.value,
+      }),
+    );
+  });
+
+  // The engine is re-scoped to the agent the box now points at — it must not keep reading (and,
+  // with learned actions on, keep BUYING computes against) the agent the user aimed away from.
+  it("re-scopes the engine to B rather than continuing to compute for A", async () => {
+    await aimAtAThenB();
+    await waitFor(() => expect(h.computeSuggestions).toHaveBeenCalled());
+    for (const call of h.computeSuggestions.mock.calls as [{ agentId: string }][]) {
+      expect(call[0].agentId).toBe("ag2");
+    }
+  });
+
+  // Default cross-project Sparkle mode: no agent selected. The row must show NOTHING, and the
+  // engine must be fully inert — no scrollback read, no metered compute.
+  it("shows no pill and buys no compute when the box is aimed at no agent", async () => {
+    h.computeSuggestions.mockResolvedValue({ buttons: [A_ACTION] });
+    render(<ConciergeHost feed={FEED} promptTarget={null} />);
+    await act(async () => {});
+    expect(screen.queryByTestId("suggestion-pill")).toBeNull();
+    expect(h.computeSuggestions).not.toHaveBeenCalled();
+  });
+});

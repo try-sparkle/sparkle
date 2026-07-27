@@ -49,6 +49,28 @@ export interface ComposeHeightInput {
   userH: number | null;
   /** See `composeMaxH`. */
   availableH: number;
+  /** Natural height of the RICH PLACEHOLDER overlay currently painted over the textarea, or
+   *  null/0 when none is (the box has text in it, or the host paints no overlay).
+   *
+   *  The concierge box replaced its native `placeholder=` with a styled overlay — a SIBLING of the
+   *  textarea, not its content — so `contentH` cannot see it: an empty box measures one line while
+   *  the copy over it runs three. Feeding it in here is what keeps "the box is as tall as what it
+   *  displays" true for the empty state too. It matters most for the voice-error notice, which is
+   *  the tallest copy in the slot AND the only one carrying controls (Dismiss / Open System
+   *  Settings) — clipping those out of reach would strand the user at a broken mic. */
+  placeholderH?: number | null;
+}
+
+/**
+ * The floor auto-grow may not go below: whatever the placeholder overlay needs, in the same units
+ * the height is spent in (its natural content height plus the textarea's own chrome).
+ *
+ * Capped at COMPOSE_CAP_H so a pathologically long notice still can't eat the conversation — past
+ * that it clips at the box's edge exactly as a native placeholder would.
+ */
+export function composePlaceholderFloorH(placeholderH: number | null | undefined): number {
+  if (placeholderH == null || placeholderH <= 0) return COMPOSE_MIN_H;
+  return clamp(placeholderH + COMPOSE_CHROME_H, COMPOSE_MIN_H, COMPOSE_CAP_H);
 }
 
 /**
@@ -70,18 +92,32 @@ export function composeMaxH(availableH: number): number {
 /**
  * The height to render at.
  *
- * - No drag yet → auto-grow with the content, clamped to [MIN, CAP]. Past the cap the textarea
- *   scrolls its own overflow.
+ * - No drag yet → auto-grow to fit what the box DISPLAYS — the typed content, or the placeholder
+ *   overlay when there is none — clamped to [MIN, CAP]. Past the cap the textarea scrolls its own
+ *   overflow.
  * - Dragged → the user's height wins, clamped to [MIN, ceiling]. It may exceed the auto cap; that
  *   is the point of the handle. It does NOT shrink to fit less content, because a box that
- *   collapsed under you as you deleted a line would fight the size you just chose.
+ *   collapsed under you as you deleted a line would fight the size you just chose — and for the
+ *   same reason an explicit drag outranks the placeholder floor below. Dragging back down to
+ *   resting releases the box to auto-grow, which is where that floor reappears.
  */
-export function composeRenderH({ contentH, userH, availableH }: ComposeHeightInput): number {
+export function composeRenderH({
+  contentH,
+  userH,
+  availableH,
+  placeholderH,
+}: ComposeHeightInput): number {
   const max = composeMaxH(availableH);
   if (userH != null) return clamp(userH, COMPOSE_MIN_H, max);
   // `contentH` is the raw scrollHeight, which already includes the padding — but not the borders.
   const desired = contentH == null ? COMPOSE_MIN_H : contentH + 2;
-  return clamp(desired, COMPOSE_MIN_H, COMPOSE_CAP_H);
+  // The floor, not a separate branch: a box holding BOTH a draft and (transiently) an overlay
+  // takes whichever is taller, and neither can clip the other.
+  return clamp(
+    Math.max(desired, composePlaceholderFloorH(placeholderH)),
+    COMPOSE_MIN_H,
+    COMPOSE_CAP_H,
+  );
 }
 
 /**

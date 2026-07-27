@@ -18,10 +18,36 @@
 // receipt naming where it went, with a one-tap redirect (§3). If you are ever tempted to route
 // silently, put the toggle back instead.
 //
-// The placeholder is deliberately empty (the founder's ask: "just an empty compose window"), so
-// the ⌘↩ hint lives on the Send button's tooltip and its aria-keyshortcuts rather than being lost.
-// The aria-labels are not visible text, so the box still reads as empty while staying usable with
-// a screen reader.
+// THE PLACEHOLDER IS A RICH OVERLAY, NOT AN EMPTY STRING. This box shipped with `placeholder=""`
+// on the founder's ask for "just an empty compose window". Shown both renderings side by side, the
+// user chose the RICH one, so the native placeholder stays "" and composer/RichPlaceholder paints
+// the copy over the textarea instead. An overlay is not a flourish: a native `placeholder=` is one
+// flat string and cannot render the wake phrase bold + brand blue inside an otherwise muted
+// sentence, which is the whole point of the copy.
+//
+// What survives from the empty-box era, unchanged:
+//   • the ⌘↩ hint stays on the Send button's tooltip + aria-keyshortcuts. Do NOT put a
+//     "(⌘↩ to send)" tail back into the placeholder — it was deliberately removed in PR #631.
+//   • nothing here NAMES A DESTINATION. The slot's `off` fallback (CONCIERGE_PLACEHOLDER) says
+//     what the box is FOR, never where a send would land — the host routes, per message, and the
+//     box cannot make that promise before the user has written anything (see SEND TARGET above).
+//
+// ACCESSIBILITY, corrected. The old header claimed "the box still reads as empty to a screen
+// reader". That is still true of the ORDINARY copy — the decorative overlay is aria-hidden, so the
+// textarea's own accessible name ("Message") is all that is announced — but it is deliberately NOT
+// true of the two FAILURE states. A dictation error and a refused out-of-credits arm each carry a
+// control (Dismiss / Refill), and aria-hidden hides a whole subtree with no way for a descendant to
+// opt back in, so each gets its OWN sibling overlay with role="status". They are announced on
+// purpose: this box is the app's only composer, so a mic failure has no other home.
+//
+// HEIGHT is measured, never fixed — and the placeholder counts as content. The box auto-grows with
+// what you type up to a ten-line cap, past which it scrolls, and a drag handle on its top edge
+// overrides that (policy in engine/composeBoxHeight; this file measures and listens). The overlay
+// above forces one addition to that scheme: a textarea's scrollHeight cannot see a SIBLING, so an
+// empty box measures one line while three lines of placeholder are painted over it. So the overlay
+// is measured too and feeds `placeholderH`, a FLOOR under auto-grow. Get that wrong and the rich
+// placeholder is clipped to its first fragment — which is the exact bug it replaced
+// `placeholder=""` to fix, and it would fail silently, since nothing about a clipped overlay throws.
 //
 // Dictation (bead sparkle-4562.2 / CM-U9) keeps that contract. The box knows nothing about the
 // mic pipeline: it hands its append fn to the integration layer through registerInsert (mirroring
@@ -46,6 +72,13 @@ import { CONCIERGE_COMPOSE_DND_TARGET } from "../../services/dndTargets";
 import type { Attachment, ConciergeAttachKind } from "./types";
 import { useUiStore } from "../../stores/uiStore";
 import {
+  ComposerVoiceError,
+  RichPlaceholderOverlay,
+  VoicePlaceholderCopy,
+} from "../composer/RichPlaceholder";
+import { ComposerOutOfCreditsNotice } from "../OutOfCreditsNotice";
+import { useVoicePlaceholder } from "../../voice/useVoicePlaceholder";
+import {
   COMPOSE_MIN_H,
   CONCIERGE_THREAD_TESTID,
   composeDragH,
@@ -54,6 +87,42 @@ import {
 } from "../../engine/composeBoxHeight";
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
+
+/** What the box is FOR, painted in the placeholder slot whenever the mic makes no voice promise —
+ *  i.e. master mute, which is the DEFAULT (ambient listening is opt-in, dictationStore
+ *  `enabled: false`), so this is what a fresh install reads. The build Composer renders nothing at
+ *  all in that state and can afford to: it sits under an agent's terminal, which says what it is.
+ *  This box floats under a chat thread with no label of its own, so an empty slot would leave the
+ *  app's only composer unexplained.
+ *
+ *  It deliberately names NO DESTINATION. The reference rendering for this slot read "Talk to
+ *  Sparkle — …" (and, when aimed at an agent, "Prompt <agent> — this goes straight to its
+ *  terminal"), which was true while the box carried an explicit send-target toggle. Auto-routing
+ *  removed that toggle: the host decides per message, so the box cannot promise a destination
+ *  before the user has typed anything, and ComposeBox.test.tsx pins that it never tries. */
+export const CONCIERGE_PLACEHOLDER = "Ask about any project, or say what to build.";
+
+/** How wide the textarea's TEXT column actually is at the shipped column width, and therefore the
+ *  budget any right-edge reservation would have to fit inside. From Workspace's 360px: the
+ *  column's own 12px×2 padding, the mic button (~31), the Send button (~63), the row's two 8px
+ *  gaps, and the textarea's 12px×2 padding + 1px×2 border all come off. Approximate on purpose —
+ *  it exists to be COMPARED against SUGGESTION_PILL_ZONE, and the two are far enough apart that a
+ *  few pixels either way cannot change the answer. Exported so that comparison is a test rather
+ *  than a claim in a comment (see ComposeBox.placeholder.test.tsx). */
+export const CONCIERGE_TEXTAREA_TEXT_WIDTH = 360 - 24 - 31 - 63 - 16 - 26;
+
+/** The textarea's border (1px) + padding (10px/12px): where a native placeholder's first line would
+ *  land, and therefore where the overlay must paint.
+ *
+ *  `bottom` is kept even though the box AUTO-GROWS to fit this overlay (engine/composeBoxHeight's
+ *  placeholder floor), because that growth stops at COMPOSE_CAP_H. Copy past the cap has to go
+ *  somewhere, and clipping at the box's edge — which is what `bottom` plus the overlay's
+ *  `overflow: hidden` buys — is what a native placeholder does. Without it that copy would spill
+ *  out over the composer's neighbours instead. Belt and braces: the floor means it should never
+ *  actually bite. */
+const PLACEHOLDER_INSET = { top: 11, left: 13, right: 13, bottom: 11 };
+/** Must match the textarea's own type ramp below, or the overlay won't sit on row one. */
+const PLACEHOLDER_TYPE = { fontFamily: "inherit", fontSize: 13, lineHeight: 1.4 };
 
 const attachStyle: CSSProperties = {
   fontSize: 11,
@@ -116,6 +185,16 @@ export function ComposeBox({
   onTextEdit?: (text: string) => void;
 }) {
   const [text, setText] = useState("");
+  // The voice state behind the placeholder copy, read from the store rather than taken as a prop.
+  // Deliberate: deriveMicPresentation exists so every mic surface renders the SAME state for one
+  // store snapshot, and a second path to it through this component's prop contract is exactly how
+  // the "sidebar says Actively listening, composer says Mic paused" desync comes back. See
+  // voice/useVoicePlaceholder.
+  const { micPresentation, wakeWord, stopWord, modelProgress, errorNotice } = useVoicePlaceholder();
+  // The overlay stands in for a native placeholder, so it shows on exactly the same terms one
+  // would: an empty textarea. Staged attachments and a live interim transcript each render in
+  // their OWN row above the textarea (see below), so neither competes for this slot.
+  const showRichPlaceholder = text === "";
   // Focus-on-request seam: any component can call uiStore.requestComposeFocus() (e.g. the
   // drag-vision pill pointing at the one surface that takes input) and this box takes the caret.
   //
@@ -146,6 +225,10 @@ export function ComposeBox({
   const userH = useUiStore((s) => s.conciergeComposeH);
   const setUserH = useUiStore((s) => s.setConciergeComposeH);
   const [contentH, setContentH] = useState<number | null>(null);
+  // The placeholder overlay's natural height — the other thing this box displays, and invisible to
+  // the textarea's own scrollHeight. See the layout effect below.
+  const slotRef = useRef<HTMLDivElement>(null);
+  const [placeholderH, setPlaceholderH] = useState<number | null>(null);
   // The space this box's TEXTAREA and the THREAD share — not the window, and not the box's whole
   // root either. Two distinct traps, both of which clip the Send row off the bottom (roborev
   // 53572 / 53586):
@@ -225,9 +308,34 @@ export function ComposeBox({
     const next = ta.scrollHeight;
     ta.style.height = prev;
     setContentH((cur) => (cur === next ? cur : next));
-  }, [text, interim]);
 
-  const height = composeRenderH({ contentH, userH: userH ?? null, availableH });
+    // The same measurement for the RICH PLACEHOLDER, which the scrollHeight above cannot see: the
+    // overlay is a SIBLING of the textarea, not its content, so an empty box measures one line
+    // while the copy painted over it runs three. Auto-grow alone would therefore reproduce exactly
+    // the clipping this branch replaced `placeholder=""` to fix — and worst for the voice-error
+    // notice, the tallest copy in the slot and the only one carrying controls (Dismiss / Open
+    // System Settings) that must not be clipped out of reach.
+    //
+    // Everything in the slot that is not the textarea IS an overlay, so no marker attribute is
+    // needed; at most one failure overlay and the decorative one are up at once, and the taller
+    // wins. Releasing `bottom` first is the same collapse-then-measure trick as above and is
+    // load-bearing for the same reason: scrollHeight can never report LESS than the box we already
+    // sized, so measuring it in place would ratchet the floor up and never let it back down.
+    const slot = slotRef.current;
+    let overlayH = 0;
+    if (slot) {
+      for (const el of Array.from(slot.children)) {
+        if (el === ta || !(el instanceof HTMLElement)) continue;
+        const prevBottom = el.style.bottom;
+        el.style.bottom = "auto";
+        overlayH = Math.max(overlayH, el.scrollHeight);
+        el.style.bottom = prevBottom;
+      }
+    }
+    setPlaceholderH((cur) => (cur === overlayH ? cur : overlayH));
+  }, [text, interim, showRichPlaceholder, micPresentation, errorNotice, modelProgress, wakeWord, stopWord]);
+
+  const height = composeRenderH({ contentH, userH: userH ?? null, availableH, placeholderH });
 
   // Drag the top edge. Pointer capture keeps the gesture alive when the cursor leaves the 6px
   // handle — without it a fast drag drops on the first frame that outruns the element.
@@ -442,50 +550,121 @@ export function ComposeBox({
         >
           <FiMic size={15} aria-hidden />
         </button>
-        <textarea
-          ref={textareaRef}
-          // "Message", not "Message Sparkle": the box no longer knows where a send will go — the
-          // host routes it per message — so naming a destination here would be a claim it can't
-          // keep. Not visible text, so the box still reads as empty to a sighted user.
-          aria-label="Message"
-          // EMPTY, on purpose (PRD/sparkle/concierge-auto-routing.md §1). This used to name the
-          // destination ("Talk to Sparkle…" / "Prompt <agent>…"), which the target toggle made
-          // true; with routing there is no destination to name before the user has written
-          // anything. The ⌘↩ hint it never carried lives on the Send button below.
-          placeholder=""
-          value={text}
-          onChange={(e) => {
-            setText(e.target.value);
-            // Only the user's OWN edits report — dictation appends go through setText directly.
-            // That is what lets the host tell "this box was emptied by hand" (which retires the
-            // dictated-origin latch) from "a segment just landed in it".
-            onTextEdit?.(e.target.value);
-          }}
-          onKeyDown={onKeyDown}
-          style={{
-            flex: 1,
-            // `resize: none` stays: the browser's own corner grip resizes only the textarea, which
-            // would desync it from the row's buttons and from the persisted height. The handle
-            // above is the one resize affordance.
-            resize: "none",
-            height,
-            // Past the auto cap the content scrolls INSIDE the box rather than the box growing on
-            // forever. `auto` (not `scroll`) so a one-line draft shows no dead scrollbar gutter.
-            overflowY: "auto",
-            // barSurface, not forest: this box is one of the two surfaces barSurface is FOR (the
-            // top bar and the COMPOSER input box). It read `forest` while forest was a mid navy
-            // and the difference didn't show; under the black-and-gold palette forest is the
-            // near-black TERMINAL plane, which punches a hole through the composer.
-            background: C.barSurface,
-            border: `1px solid ${line}`,
-            borderRadius: 12,
-            color: C.cream,
-            padding: "10px 12px",
-            fontSize: 13,
-            fontFamily: "inherit",
-            outline: "none",
-          }}
-        />
+        {/* Positioning context for the placeholder overlays. They are absolutely placed over the
+            textarea's first text line, so the textarea cannot be their own parent.
+
+            It is also what the height measurement walks: everything in here that is NOT the
+            textarea is an overlay, which is how the box learns how tall its placeholder is. */}
+        <div ref={slotRef} style={{ position: "relative", flex: 1, display: "flex" }}>
+          <textarea
+            ref={textareaRef}
+            // "Message", not "Message Sparkle": the box no longer knows where a send will go — the
+            // host routes it per message — so naming a destination here would be a claim it can't
+            // keep. This is what a screen reader announces for the box; the decorative overlay
+            // below is aria-hidden precisely so it does not compete with it.
+            aria-label="Message"
+            // EMPTY, on purpose — but no longer because the slot is empty. The RichPlaceholderOverlay
+            // below paints this state's copy, and a native placeholder cannot style a substring
+            // (the wake phrase must be bold + brand blue), so the two must never both render.
+            // Nothing here names a destination either way (PRD/sparkle/concierge-auto-routing.md §1),
+            // and the ⌘↩ hint stays on the Send button below rather than in this text.
+            placeholder=""
+            value={text}
+            onChange={(e) => {
+              setText(e.target.value);
+              // Only the user's OWN edits report — dictation appends go through setText directly.
+              // That is what lets the host tell "this box was emptied by hand" (which retires the
+              // dictated-origin latch) from "a segment just landed in it".
+              onTextEdit?.(e.target.value);
+            }}
+            onKeyDown={onKeyDown}
+            style={{
+              flex: 1,
+              // `resize: none` stays: the browser's own corner grip resizes only the textarea, which
+              // would desync it from the row's buttons and from the persisted height. The handle
+              // above is the one resize affordance.
+              resize: "none",
+              height,
+              // Past the auto cap the content scrolls INSIDE the box rather than the box growing on
+              // forever. `auto` (not `scroll`) so a one-line draft shows no dead scrollbar gutter.
+              overflowY: "auto",
+              // barSurface, not forest: under the black-and-gold palette forest is the
+              // near-black TERMINAL plane and punches a hole through the composer.
+              background: C.barSurface,
+              border: `1px solid ${line}`,
+              borderRadius: 12,
+              color: C.cream,
+              padding: "10px 12px",
+              fontSize: 13,
+              lineHeight: PLACEHOLDER_TYPE.lineHeight,
+              fontFamily: "inherit",
+              outline: "none",
+              // BELOW the overlays (zIndex 2) so a control inside one of them — Refill, Dismiss —
+              // can actually receive its click instead of being buried under the textarea.
+              position: "relative",
+              zIndex: 1,
+            }}
+          />
+          {/* The two FAILURE states each take the slot over as their OWN sibling overlay, because
+              each carries a control the decorative (aria-hidden) overlay would bury: aria-hidden
+              hides a whole subtree with no way for a descendant to opt back in. role="status"
+              instead, so the failure is both seen AND announced — this box is the app's only
+              composer, so a mic that just broke has nowhere else to say so.
+
+              They occupy the same slot on the same terms as the decorative overlay, and
+              VoicePlaceholderCopy returns null for both states, so the two can never double up. */}
+          {showRichPlaceholder && micPresentation === "error" && errorNotice && (
+            <RichPlaceholderOverlay
+              announce
+              testId="compose-voice-error"
+              inset={PLACEHOLDER_INSET}
+              type={PLACEHOLDER_TYPE}
+              hasSuggestionPill={false}
+            >
+              <ComposerVoiceError notice={errorNotice} />
+            </RichPlaceholderOverlay>
+          )}
+          {showRichPlaceholder && micPresentation === "outOfCredits" && (
+            <RichPlaceholderOverlay
+              announce
+              testId="compose-out-of-credits"
+              inset={PLACEHOLDER_INSET}
+              type={PLACEHOLDER_TYPE}
+              hasSuggestionPill={false}
+            >
+              <ComposerOutOfCreditsNotice />
+            </RichPlaceholderOverlay>
+          )}
+          {showRichPlaceholder && (
+            <RichPlaceholderOverlay
+              testId="compose-placeholder"
+              inset={PLACEHOLDER_INSET}
+              type={PLACEHOLDER_TYPE}
+              // FALSE, and measured rather than assumed. SuggestionRow reserves room at the
+              // textarea's trailing-right edge only in its "overlay" layout; the concierge column
+              // renders it with layout="row" — a static strip in its own box ABOVE this one
+              // (ConciergeColumn's suggestionsSlot) — so nothing is painted over this textarea and
+              // there is nothing to wrap early around. That choice is forced, not stylistic: the
+              // pill zone (SUGGESTION_PILL_ZONE, 253px) is WIDER than this textarea's whole text
+              // column (CONCIERGE_TEXTAREA_TEXT_WIDTH, ~200px), so an overlay pill and this copy
+              // are mutually exclusive here. Pinned by ComposeBox.placeholder.test.tsx so a future
+              // column widening reopens the question instead of silently colliding.
+              hasSuggestionPill={false}
+            >
+              <VoicePlaceholderCopy
+                micPresentation={micPresentation}
+                wakeWord={wakeWord}
+                stopWord={stopWord}
+                modelProgress={modelProgress}
+                // `off` (master mute) is the ONLY state that reaches this, and it is the default —
+                // see CONCIERGE_PLACEHOLDER. `error` and `outOfCredits` deliberately render NOTHING
+                // here rather than falling through to it: inviting someone to speak is the one
+                // thing this slot must not do at the moment the mic failed or was refused.
+                fallback={CONCIERGE_PLACEHOLDER}
+              />
+            </RichPlaceholderOverlay>
+          )}
+        </div>
         <button
           type="button"
           onClick={submit}

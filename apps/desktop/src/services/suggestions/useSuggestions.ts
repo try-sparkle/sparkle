@@ -252,6 +252,11 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // Guards against a duplicate concurrent (paid) compute while one is in flight. `retryTick` lets a
   // discarded compute re-trigger the effect so a state we returned to still gets suggestions.
   const computing = useRef(false);
+  // Which compute currently OWNS `computing`. Bumped per compute and, critically, by the re-aim
+  // cleanup below: a compute started for the previous agent resolves long after the guard has been
+  // handed to the new one, and its `.finally` would otherwise clear a guard it no longer owns —
+  // letting a second (metered) compute start for an agent that already has one in flight.
+  const computeToken = useRef(0);
   const [retryTick, setRetryTick] = useState(0);
   // Pending failure-retry timer (see retryBackoffMs). Held in a ref so the effect cleanup can cancel
   // it when the state moves on before the backoff fires, and so we never stack overlapping timers.
@@ -353,6 +358,83 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // getAgentScrollback() on every render and re-scanning a 4000-char tail for no new information.
   const [questionPending, setQuestionPending] = useState(false);
 
+  // ---------------------------------------------------------------------------
+  // RE-POINTING THIS INSTANCE AT A DIFFERENT AGENT
+  // ---------------------------------------------------------------------------
+  //
+  // Everything above is per-AGENT state living in a per-INSTANCE holder. That was safe while every
+  // caller mounted one instance per agent, and it is why ConciergeSuggestions mounts this with
+  // `key={agentId}`. But nothing in the hook ENFORCED it: called with a changing id, none of the
+  // state or refs above resets on that change, and `idle` is in YOUR_TURN — so agent A's computed
+  // buttons stayed on screen under agent B's name until a compute for B committed (a network round
+  // trip, or up to SETTLE_TICK_MS). The click handler resolves the target at CLICK time, so a click
+  // in that window sent A's prompt into B's TERMINAL. That is irreversible, and a pill only has to
+  // be up for ONE FRAME for it to happen.
+  //
+  // Fixed here, INSIDE the hook, so the invariant no longer rests on every caller remembering the
+  // key. `key=` remains correct and stays where it is; this makes it an optimisation rather than
+  // the only thing standing between a re-aim and a misdelivered prompt.
+  //
+  // The split between the two halves below is load-bearing:
+  //
+  //   • STATE is reset DURING RENDER. React re-runs a component that sets its own state while
+  //     rendering and DISCARDS the first pass, so no committed frame ever carries the previous
+  //     agent's buttons — there is no frame to click in. Doing this in an effect instead would
+  //     commit exactly one frame of (agent B, A's buttons), which is the whole bug.
+  //   • REFS are reset in an EFFECT CLEANUP, because a ref written during render would be written
+  //     on the discarded pass too, and because the cleanup is the one place that still sees the
+  //     OLD agent — which is what lets it retire that agent's phone copy.
+  //
+  // A keyed REMOUNT of the compose box was the other candidate fix and was rejected: remounting
+  // takes ComposeBox's `text` down with it, destroying the user's typed draft on every re-aim —
+  // trading one silent data loss for another, on the surface whose own comments call retyping a
+  // paragraph "the worst possible outcome of a failed send".
+  const [aimedAt, setAimedAt] = useState(agentId);
+  if (aimedAt !== agentId) {
+    setAimedAt(agentId);
+    // A's buttons must not survive into B's frame — this is THE line the misdelivery hangs on.
+    setButtons([]);
+    // A's dismissals are about A's buttons; carried over they would silently hide B's.
+    setDismissed(new Set());
+    // A note about a prompt on A's screen, rendered under B's name, is simply false.
+    setAutoApproved(null);
+    setQuestionPending(false);
+    // B starts with a fresh CTA: `ctaCleared` records that the user acted on A's pill.
+    setCtaCleared(false);
+  }
+
+  // The ref half. Declared BEFORE the compute effect so its cleanup runs first: React runs every
+  // changed effect's cleanup (in declaration order) before running any of the new effects, so the
+  // refs are clean by the time the compute effect fires for the new agent.
+  useEffect(
+    () => () => {
+      // `lastHash` is what tells the compute effect "already computed this screen". Carried across
+      // a re-aim onto a matching screen (two workers on one repo settling on the same "Done." tail
+      // is ordinary) it would refuse B the compute it never had a turn at.
+      lastHash.current = null;
+      // The retry budget is spent PER FAILING STATE and read relative to its hash. A's exhausted
+      // budget must not refuse B on an identical screen — B simply never gets suggestions.
+      fail.current = NO_FAILURES;
+      // Disown any in-flight compute (see computeToken) and hand the guard to the new agent
+      // immediately, so B doesn't wait out A's round trip.
+      computeToken.current += 1;
+      computing.current = false;
+      // A pending retry belongs to the state we just aimed away from.
+      if (retryTimer.current !== null) {
+        window.clearTimeout(retryTimer.current);
+        retryTimer.current = null;
+      }
+      // A's phone copy is a live tap target. The desktop is no longer offering it for A, so a tap
+      // would fire an action no surface is showing — retire it. This also resets `lastPushedRef`
+      // and `pushedNonEmpty`, the two remaining refs. `retire` closes over the OLD agentId, which
+      // is exactly what a cleanup needs. It runs on UNMOUNT too, which is the other way an instance
+      // stops owning an agent (a closed pane must not leave buttons armed on the phone).
+      retire();
+    },
+    // `retire` is itself memoised on agentId, so it changes exactly when the aim does.
+    [retire],
+  );
+
   // Stage-derived primary + computed alternates. deriveCta returns null when there's nothing to
   // nudge (no committed work yet), in which case the ordinary suggestions stand on their own.
   // NOTE this is used only at RENDER (see `shown`), never inside the compute effect — keeping it out
@@ -441,6 +523,8 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       return;
     }
     computing.current = true;
+    // This compute's claim on the guard above. Only the owner may release it — see the `.finally`.
+    const myToken = (computeToken.current += 1);
     let alive = true;
     // Whether the finally block should bump retryTick. The bump must happen AFTER the in-flight
     // guard clears: if the re-render it triggers is processed between .catch and .finally (React
@@ -599,8 +683,14 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         }
       })
       .finally(() => {
-        // ALWAYS clear the guard, so a rejected compute can never permanently lock out future
-        // computes for this agent (the guard at the top of the effect keys off this flag).
+        // DISOWNED — this compute belongs to an agent the box has since aimed away from. The
+        // re-aim cleanup already released the guard (and may have handed it to a compute that is
+        // still running for the NEW agent), so clearing it here would let a second metered compute
+        // start for that agent. Its retry bump is equally irrelevant: it would re-trigger work for
+        // a state nobody is looking at.
+        if (computeToken.current !== myToken) return;
+        // Otherwise ALWAYS clear the guard, so a rejected compute can never permanently lock out
+        // future computes for this agent (the guard at the top of the effect keys off this flag).
         computing.current = false;
         // Bump only now that the guard is clear — see retryAfter above. A failed compute waits out
         // its backoff first (retryDelay); a superseded one (retryDelay 0) re-triggers immediately.

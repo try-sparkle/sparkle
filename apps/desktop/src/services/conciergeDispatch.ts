@@ -227,6 +227,36 @@ export function liveOptionsFor(agentId: string): SuggestionButton[] {
 }
 
 /**
+ * Would `text` be taken as an answer to a picker the agent has on screen RIGHT NOW?
+ *
+ * A mirror of the two conditions `dispatchConciergeAnswer` applies below — a live-option match plus
+ * terseness — exported for callers that must know the disposition BEFORE they build a payload.
+ * Change the gate there and change it here.
+ *
+ * The caller that needs it is the concierge compose box. It prefixes the quoted paths of any staged
+ * attachments onto the text it sends (`attachedPayload`), unconditionally — and that prefix defeats
+ * the matcher completely: every arm of `matchAnswerToOption` is anchored (`YES_WORDS` is `^…$`), so
+ * `"/var/folders/…/shot.png" Yes` matches nothing and comes back `ambiguous-picker`. With a file
+ * staged and a picker up, typing "Yes" and typing "2" were BOTH refused, the draft and the chips
+ * were restored, and retyping produced the identical refusal — a loop with no way out but noticing
+ * the attachments and removing them, which the refusal copy never mentions.
+ *
+ * So a terse picker answer sends UNPREFIXED and the caller HOLDS its attachments for the next send.
+ * (Clicking a terminal-kind suggestion pill is unaffected: `applySuggestion` writes the keystroke
+ * straight to the PTY and never reaches this module.)
+ *
+ * Reads the CURRENT screen, exactly as the dispatch does. The two reads happen at different moments
+ * — this at submit, the dispatch after routing — so they can disagree if the picker clears in
+ * between. That degrades to the ordinary prompt path with the attachments still staged, which is
+ * recoverable and visible (the chips are still there); the reverse ordering could not be.
+ */
+export function answersLivePicker(agentId: string, text: string): boolean {
+  const options = liveOptionsFor(agentId);
+  if (options.length === 0) return false;
+  return isTerseAnswer(text, options) && matchAnswerToOption(text, options) !== null;
+}
+
+/**
  * Route a user's concierge answer to `agentId`'s terminal. Re-reads the CURRENT screen so we only
  * answer a still-present prompt. Returns a structured result; the concierge surfaces it (e.g. "sent",
  * "which option?", or "that agent's terminal has closed"). Never throws for the expected outcomes.
@@ -255,6 +285,10 @@ export async function dispatchConciergeAnswer(
     // answer (a bare number, an exact option label, or a whole-phrase yes/no) may take the
     // keystroke path; anything else is refused WITH the options so the user can pick deliberately.
     // Machine callers (the nudge Approve relay) send a bare "approve", so they are unaffected.
+    //
+    // These two conditions — a live-option match plus terseness — are what `answersLivePicker`
+    // above mirrors for callers that must know the disposition BEFORE they build a payload. Change
+    // the gate here and change it there.
     if (opts.userPrompt && !isTerseAnswer(text, options)) {
       return { ok: false, path: "ambiguous-picker", agentId, options };
     }

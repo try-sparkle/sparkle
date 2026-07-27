@@ -1,19 +1,55 @@
 // The recommended-action row for the actively-shown build agent, as a CONNECTED component.
 //
-// WHY THIS IS ITS OWN COMPONENT, AND WHY IT MUST BE KEYED BY agentId.
-// `useSuggestions` is written on the assumption that one hook instance owns ONE agent for its
+// WHY THIS IS ITS OWN COMPONENT, AND WHY IT IS STILL KEYED BY agentId.
+// `useSuggestions` was written on the assumption that one hook instance owns ONE agent for its
 // lifetime — its own comments say so ("Per-agent (this hook instance owns one agent)" on
-// handledSigs; "Deliberately NOT … shared across agents" on memo). It resets on the agent leaving
-// your-turn, NOT on the agent id changing. Calling it once in ConciergeHost with a changing id
-// broke every one of those assumptions at once, and the worst consequence was not cosmetic:
-// `idle` is in YOUR_TURN, so switching from agent A to agent B kept A's buttons on screen until a
-// compute for B committed (a round trip, or up to SETTLE_TICK_MS) — and the click handler resolves
-// the target at click time, so clicking A's stale pill wrote A's keystroke into B's PTY. That is
-// irreversible. handledSigs leaking across agents was as bad in a quieter way: an identical
-// permission prompt on B would be suppressed without ever being answered.
+// handledSigs). It reset on the agent leaving your-turn, NOT on the agent id changing. Calling it
+// once in ConciergeHost with a changing id broke every one of those assumptions at once, and the
+// worst consequence was not cosmetic: `idle` is in YOUR_TURN, so switching from agent A to agent B
+// kept A's buttons on screen until a compute for B committed (a round trip, or up to
+// SETTLE_TICK_MS) — and the click handler resolves the target at click time, so clicking A's stale
+// pill wrote A's keystroke into B's PTY. That is irreversible.
 //
 // Mounting this with `key={agentId}` gives each agent a genuinely fresh hook instance, which is
-// what the hook was always written to expect. Do not "optimise" the key away.
+// what the hook was always written to expect.
+//
+// THE KEY IS NO LONGER THE ONLY THING STANDING BETWEEN A RE-AIM AND A MISDELIVERED PROMPT.
+// useSuggestions now resets its own state on an agentId change — during RENDER, so no committed
+// frame carries the previous agent's buttons — and its refs (plus the phone copy) in an effect
+// cleanup. See the "RE-POINTING THIS INSTANCE AT A DIFFERENT AGENT" block there, and
+// useSuggestions.reaim.test.tsx, which re-points a single un-keyed instance precisely because
+// `key=` is what makes that case unreachable from here.
+//
+// The key stays anyway: it is free, it is the clearer expression of the ownership model, and
+// belt-and-braces is the right posture for an irreversible PTY write. What CHANGED is that
+// removing it would now be a performance regression rather than a correctness one.
+//
+// ---------------------------------------------------------------------------
+// TWO "HONESTY RULES" THAT DO NOT APPLY HERE — do not re-derive them
+// ---------------------------------------------------------------------------
+// An earlier design for this row started from "the concierge box is cross-project and its only
+// channel into an agent is TEXT (onSend → dispatchConciergeAnswer)", and drew two rules from it:
+// drop `kind:"control"` buttons as un-routable, and send a `kind:"terminal"` button's LABEL
+// ("2 · Yes") rather than its raw keystroke ("2\n"). Both are sound FROM THAT PREMISE, and the
+// premise is false here — this row does not go through the compose box's text path at all, it goes
+// through `applySuggestion`:
+//   • control → executed as an APP action (closeBuildAgent). It touches no PTY, so it is not
+//     "silently dead" in a text-only host; dropping it would remove a working Close Build Agent.
+//   • terminal → the raw keystroke straight to the PTY, which is what a raw-mode Ink picker takes,
+//     with nothing re-matching it. Sending the label as text instead would hand a live picker a
+//     string to re-match — strictly more ways to mis-select. The readable label already IS what
+//     reaches prompt history (`recordPickerTurn`), which is the concern that rule was reaching for.
+//   • prompt → the host's own delivery (`onDeliverPrompt`), so it gets the same outcome reporting
+//     and the same queue a typed message does.
+// Pinned by services/suggestions/applySuggestion.test.ts, so re-deriving the rules fails there.
+//
+// Likewise `composerEmpty: true` below is NOT an oversight of the original row's "hide while the
+// user is typing" term. That term exists because the build Composer's pill is an ABSOLUTE OVERLAY
+// sitting on top of the textarea. This row is `layout="row"` — a static strip in its own box above
+// the compose box — so it never covers anything the user is writing, and hiding it the moment they
+// start typing would take the recommendation away exactly when they are deciding whether to type it
+// out by hand. See also ComposeBox's placeholder overlay, which reserves no pill room for the same
+// reason: at the 360px column the pill zone is wider than the whole textarea text column.
 import { useCallback } from "react";
 import { SuggestionRow } from "../composer/SuggestionRow";
 import { applySuggestion } from "../../services/suggestions/applySuggestion";

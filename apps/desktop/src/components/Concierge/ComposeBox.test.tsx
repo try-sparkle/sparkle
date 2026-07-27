@@ -106,13 +106,19 @@ describe("ComposeBox — submit", () => {
   });
 });
 
-// THE BOX IS EMPTY (PRD/sparkle/concierge-auto-routing.md §1). The placeholder used to name the
-// destination ("Talk to Sparkle…" / "Prompt <agent>…"), which the send-target toggle made true.
+// THE BOX NAMES NO DESTINATION (PRD/sparkle/concierge-auto-routing.md §1). The placeholder used to
+// name one ("Talk to Sparkle…" / "Prompt <agent>…"), which the send-target toggle made true.
 // Routing removed both the toggle and the destination-before-you-type, so these guard the reversal:
 // nothing in the box may name a target, and the shortcut the placeholder never carried has to stay
 // reachable — including to a screen reader, which a hover-only tooltip is not.
-describe("ComposeBox — the empty box", () => {
-  it("shows no placeholder text at all", () => {
+//
+// NOTE the box is no longer VISUALLY empty. It now paints a rich placeholder overlay (the user was
+// shown both renderings and chose that one) — but the native `placeholder` attribute stays "", and
+// that is what the first test below still pins: the overlay and a native placeholder would
+// otherwise double-render the same slot. What the overlay actually says, and that it still names no
+// destination, is covered in ComposeBox.placeholder.test.tsx.
+describe("ComposeBox — the box names no destination", () => {
+  it("leaves the NATIVE placeholder empty (the styled overlay owns that slot)", () => {
     setup();
     expect(box().getAttribute("placeholder")).toBe("");
   });
@@ -127,7 +133,9 @@ describe("ComposeBox — the empty box", () => {
     expect(container.textContent).not.toMatch(/talk to sparkle|prompt /i);
   });
 
-  it("keeps the \u2318\u21a9 hint on Send now that the placeholder is gone", () => {
+  // Still on Send, NOT in the placeholder. The rich overlay gave the slot room for a "(\u2318\u21a9 to send)"
+  // tail again; it was removed deliberately in PR #631 and must stay removed.
+  it("keeps the \u2318\u21a9 hint on Send rather than in the placeholder copy", () => {
     setup();
     expect(screen.getByRole("button", { name: "Send" }).getAttribute("title")).toContain("\u2318\u21a9");
   });

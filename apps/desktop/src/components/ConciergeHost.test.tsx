@@ -102,6 +102,9 @@ vi.mock("../services/conciergeDispatch", () => ({
   liveOptionsFor: vi.fn(() => []),
   isTerseAnswer: vi.fn(() => false),
   matchAnswerToOption: vi.fn(() => null),
+  // Not exercised in these rows (no picker on screen), but the host imports it — and Vitest
+  // throws on ACCESS to an export a factory omits, so a partial mock breaks the whole file.
+  answersLivePicker: () => false,
   onDeferredSendOutcome: (cb: (r: DeferredOutcome) => void) => {
     h.deferred = cb;
     return () => {};
