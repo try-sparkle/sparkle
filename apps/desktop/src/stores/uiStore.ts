@@ -187,6 +187,11 @@ interface UiState {
   collapsedOrchestrators: Record<string, boolean>;
   isOrchestratorCollapsed: (id: string) => boolean;
   toggleOrchestratorCollapsed: (id: string) => void;
+  /** Force these orchestrators expanded (auto-expand on spawn — see engine/workerExpansion). Batch,
+   *  because a fan-out can add workers to several parents in one tick and N separate set() calls
+   *  would be N renders. A no-op when they are all already expanded, so it can be called from an
+   *  effect on every tick without churning the store. */
+  expandOrchestrators: (ids: readonly string[]) => void;
   // Deep-open request for the ⋯ settings dialog: a component anywhere (e.g. BalanceBadge) asks
   // for a category; the shell's kebab menu (which owns the dialog) opens it there and clears the
   // request on close. Transient — NOT persisted (see partialize), a relaunch must never restore a dialog.
@@ -280,6 +285,16 @@ export const useUiStore = create<UiState>()(
         set((s) => {
           const cur = s.collapsedOrchestrators[id] ?? true;
           return { collapsedOrchestrators: { ...s.collapsedOrchestrators, [id]: !cur } };
+        }),
+      expandOrchestrators: (ids) =>
+        set((s) => {
+          // Identity-stable when there is nothing to do: the caller is an effect that runs on every
+          // agent-set change, and returning a fresh object each time would re-render every consumer
+          // of collapsedOrchestrators for no reason.
+          if (ids.every((id) => s.collapsedOrchestrators[id] === false)) return s;
+          const next = { ...s.collapsedOrchestrators };
+          for (const id of ids) next[id] = false;
+          return { collapsedOrchestrators: next };
         }),
       settingsRequest: null,
       openSettings: (cat) => set({ settingsRequest: cat }),

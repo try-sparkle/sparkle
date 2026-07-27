@@ -16,7 +16,7 @@
 //
 //   1. `unmerged` is NOT red. Landing state is carried by the workflow line + ✓, not by the alarm
 //      color. It still sorts above the calm tier — and stays out of the concierge's calm band, which
-//      is what the sidebar dims — so unlanded work stays visible.
+//      is what the calm treatment desaturates — so unlanded work stays visible.
 //   2. The red COLOR tier (windowStatus.isRedStatus) and the "needs you NOW" set
 //      (attention.needsAttention) are different sets, and code that means one must not reach for the
 //      other. `blocked` is the status that separates them.
@@ -108,9 +108,14 @@ describe("unmerged: no interruption, but not dimmed either", () => {
     expect(isCalmBand("blocked")).toBe(false);
   });
 
-  it("is NOT in the calm band the sidebar grayscales", () => {
-    // The predicate AgentSidebar actually calls. Asserting the band instead would stay green while
-    // the dimming silently came back.
+  it("is NOT in the calm band the terminal desaturates", () => {
+    // The predicate the calm treatment actually calls. Asserting the band instead would stay green
+    // while the dimming silently came back.
+    //
+    // This used to say "the sidebar grayscales". The sidebar's row filter was removed on
+    // 2026-07-27 (it desaturated the dot of every RUNNING agent); the predicate now governs the
+    // terminal's xterm theme alone. The carve-out it protects is unchanged: `unmerged` must stay
+    // legible, because "your work hasn't landed" is exactly what you should still see.
     expect(isCalmBand("unmerged")).toBe(false);
   });
 

@@ -442,16 +442,21 @@ export function Workspace() {
   const promptTargetShown = !sparkleActive && !boardActive && activeIsOpen;
 
   // Calm terminal (PRD §3 / prototype `.terminal.calm`): when the agent you're looking at has
-  // nothing for you, its terminal TEXT desaturates along with the calm sidebar rows, so only a
-  // screen that wants something from you carries color. Read from the same feed the tabs and the
-  // concierge use, so "calm" means one thing app-wide.
+  // nothing for you, its terminal TEXT desaturates, so only a screen that wants something from you
+  // carries color. Read from the same feed the tabs and the concierge use, so "calm" means one
+  // thing app-wide.
   //
-  // It asks `isCalmBand(status)` — the SAME predicate AgentSidebar dims its rows with — and not the
-  // agent's status BAND. Those are different sets by design and `unmerged` is the difference: it
-  // bands `done` (it must not buy a nudge card) but is NOT calm (unlanded work is exactly what you
-  // should still see). Reading the band here meant selecting an unmerged agent desaturated its
-  // terminal while its sidebar row stayed fully colored — the two surfaces disagreeing about the one
-  // status the split exists to protect.
+  // This is now the ONLY calm treatment. It used to run alongside a matching one in the sidebar —
+  // a `grayscale(1) opacity(.72)` filter over any row this same predicate called calm — which was
+  // removed on 2026-07-27 because `working` is in the calm set, so it desaturated the status dot of
+  // every agent that was actually running. Do not restore a row filter here or there; the sidebar
+  // carries status by DOT COLOR now. See services/conciergeFeed.isCalmBand for the full note.
+  //
+  // It asks `isCalmBand(status)` and not the agent's status BAND. Those are different sets by
+  // design and `unmerged` is the difference: it bands `done` (it must not buy a nudge card) but is
+  // NOT calm (unlanded work is exactly what you should still see). Reading the band here meant
+  // selecting an unmerged agent desaturated its terminal while its sidebar row stayed fully colored
+  // — the two surfaces disagreeing about the one status the split exists to protect.
   //
   // Only ever true for a VISIBLE AGENT PANE (roborev 46254-M1). It used to default to `true` with
   // no agent selected and ignore the overlays, while the treatment was a `filter` on the whole

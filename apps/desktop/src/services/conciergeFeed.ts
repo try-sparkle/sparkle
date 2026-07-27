@@ -178,7 +178,22 @@ export function conciergeBand(status: AgentTabStatus | undefined): StatusBand {
   return status === undefined ? "done" : bandOfStatus(status);
 }
 
-/** Should the sidebar render this row GRAYSCALED and dimmed (`grayscale(1) opacity(.72)`)?
+/** Should this agent's TERMINAL desaturate — i.e. render in the calm xterm theme?
+ *
+ *  HISTORY, because this predicate used to mean something bigger and the old name still shows in
+ *  places: it also drove a `grayscale(1) opacity(.72)` CSS filter over the agent's SIDEBAR ROW, so
+ *  that only the rows asking for you carried color. That was removed on 2026-07-27 and must not
+ *  come back. `working` is in the calm set (see below), so the filter desaturated the green dot of
+ *  every agent that was actually running — erasing the one thing the Build column exists to show at
+ *  a glance. The row treatment is gone entirely rather than gated; see
+ *  AgentSidebar.liveStatusDots.test.tsx, which fails if any row regains an inline filter.
+ *
+ *  What survives is the TERMINAL treatment (Workspace.tsx → AgentPane → Terminal → xtermTheme),
+ *  which desaturates a landed agent's own text through the theme rather than a filter over the
+ *  stage. That distinction has its own history — see the `calm is a terminal theme, not a filter
+ *  over the pane` commits.
+ *
+ *  The SET is unchanged, and the reasoning below is why it is shaped the way it is.
  *
  *  Deliberately NOT "is this row's band `done`", and deliberately NOT "is it anything but
  *  needs_you" alone. The set is {idle, done, stopped, working, no-status}: everything that is not

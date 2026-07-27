@@ -64,11 +64,11 @@ import {
 import { StageSectionHeader } from "./StageSectionHeader";
 import { StatusFilterBar } from "./StatusFilterBar";
 import { withUnstartedWorkerAttention, withRedWorkerAttention } from "../engine/workerAttention";
+import { expandOnGrowth, workerCounts } from "../engine/workerExpansion";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { withUnmergedWork } from "../engine/unmergedAttention";
 import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode } from "../engine/workMode";
-import { isCalmBand } from "../services/conciergeFeed";
 import { PlanBuildToggle, FADE_3 } from "./PlanBuildToggle";
 import { StatusDot } from "./StatusDot";
 import { FittedAgentName } from "./FittedAgentName";
@@ -988,6 +988,39 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     return { topLevelAgents, childrenByParent };
   }, [project]);
 
+  // Which orchestrators have their worker subtree collapsed. Subscribed (not read via getState) so
+  // a chevron click re-renders the list. A Set of the COLLAPSED ids, derived from the persisted
+  // record, keeping uiStore's "absent → collapsed" default: an id is collapsed unless it is
+  // explicitly `false`. Membership is what the row map tests, so the default lives in exactly one
+  // expression rather than at every call site.
+  const collapsedRecord = useUiStore((s) => s.collapsedOrchestrators);
+  const collapsed = useMemo(() => {
+    const out = new Set<string>();
+    for (const a of project?.agents ?? []) {
+      if (a.kind === "build" && collapsedRecord[a.id] !== false) out.add(a.id);
+    }
+    return out;
+  }, [project?.agents, collapsedRecord]);
+  const toggleOrchestratorCollapsed = useUiStore((s) => s.toggleOrchestratorCollapsed);
+
+  // AUTO-EXPAND ON SPAWN. collapsedOrchestrators reads a missing entry as COLLAPSED, so without
+  // this a freshly-spawned worker would land in a subtree nobody can see and the spawn would look
+  // like it did nothing. Driven off a count COMPARISON rather than a spawn callback because workers
+  // also arrive via reconcileWorkersFromDisk and cross-window adopt, neither of which runs through
+  // spawnWorker. expandOnGrowth deliberately ignores a parent's first sighting, so boot does not
+  // blow open every subtree the user had collapsed — see engine/workerExpansion.
+  // Starts EMPTY, and that is the whole first-mount story: expandOnGrowth skips any id absent from
+  // the previous snapshot, so the first pass records a baseline and expands nothing. There is
+  // deliberately no second `first render?` guard here — one rule, in the tested pure helper, rather
+  // than two that can drift.
+  const prevWorkerCounts = useRef<Record<string, number>>({});
+  useEffect(() => {
+    const next = workerCounts(project?.agents ?? []);
+    const grown = expandOnGrowth(prevWorkerCounts.current, next);
+    prevWorkerCounts.current = next;
+    if (grown.length > 0) useUiStore.getState().expandOrchestrators(grown);
+  }, [project?.agents]);
+
   // The stage ladder the list renders: top-level rows bucketed into workflow-stage sections, in
   // `project.agents` order within each section (that order is the user's own drag arrangement), with
   // rows whose status band is filtered off removed and any section thereby emptied dropped entirely.
@@ -1186,19 +1219,14 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             // O(1) lookup into the memoized parentId→children bucket (built once above), in place of
             // an O(agents) `.filter` per orchestrator. Same set, same insertion order — see childrenByParent.
             const workers = top.kind === "build" ? childrenByParent.get(top.id) ?? [] : [];
-            // The orchestrator's chevron rolls up its workers (overall = least-advanced worker);
-            // with no workers it just shows its own git stage. A worker/think/shell row shows
-            // its own. (Think has no worktree, so it resolves to the harmless start stage and
-            // we simply don't render a tracker for it — see renderRow.)
-            const workerStages = workers.map((w) => stageOf(w.id));
-            const rollup = rollupStages(workerStages);
-            // EVERY worker renders as a named, clickable inline line INSIDE the orchestrator's own
-            // AgentRow — its name (red when it needs you) beside its own progress bar — plus an
-            // expanded detail block on the head's hover card. There is no separate pop-out row: a
-            // worker that needs attention is shown by its inline name going red (and the attention
-            // still bubbles red up to the orchestrator's own row + the TopBar dot, so it's noticed).
-            // Pre-compute the minimal per-worker view-model here, where stageOf/status/branchStatus/
-            // shippedOf are in scope.
+            // (A `rollup`/`workerStages` pair used to be computed here and never read — the head's
+            // stage comes from headStageOf below, which does its own roll-up. Removed rather than
+            // renamed to `_rollup`: it was a second, drifting answer to a question already owned by
+            // headStageOf, and roborev 53371 is what happens when two of those disagree.)
+            //
+            // The per-worker view-model, still built here where stageOf/status/branchStatus/
+            // shippedOf are in scope. It feeds the head's hover-card detail blocks; each worker's
+            // own ROW is rendered separately below from `childrenByParent`.
             const workerDetails = workers.map((w) => {
               const wst = status[w.id] ?? "stopped";
               const wcolor =
@@ -1260,7 +1288,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               depth={depth}
               isActive={isActive}
               st={st}
-              calm={isCalmBand(effectiveStatus[a.id])}
               statusColor={color}
               alertControl={alertControl}
               onDismissAlert={() => dismissAlert(project.id, a.id, trueSt)}
@@ -1270,6 +1297,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               shipped={rowShipped}
               workerCount={a.id === top.id ? workers.length : 0}
               workers={a.id === top.id ? workerDetails : []}
+              // The disclosure only belongs on a head that HAS workers; a childless row would show
+              // a control that toggles nothing. Children never carry one (no grandchildren).
+              subtreeCollapsed={
+                a.id === top.id && workers.length > 0 ? collapsed.has(top.id) : null
+              }
+              onToggleSubtree={() => toggleOrchestratorCollapsed(top.id)}
               rowSection={rowSection}
               dragSection={dragSection}
               dragActive={dragId != null}
@@ -1290,13 +1323,30 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             // (roborev 53371). Shell agents have no git workflow → no tracker (null).
             const headStage: WorkflowStageId | null =
               top.kind === "shell" ? null : headStageOf(top.id);
-            // The orchestrator's head row owns ALL its workers, passed via AgentRow's `workers` prop.
-            // Collapsed, the head shows only its own title (auto-promoted from its representative
-            // worker) + this rollup bar — no inline worker rows. Every worker renders as a stacked
-            // detail block inside the CLICK-opened detail card (see CardDetail / WorkerNameButton).
-            // A worker that needs attention still bubbles red up to this head row + the TopBar dot, so
-            // it's noticed without being expanded.
-            return <div key={top.id}>{renderRow(top, headStage, section.id)}</div>;
+            // Every worker gets its OWN indented row under its orchestrator, revealed by the head's
+            // chevron. Hiding workers was tried and abandoned: five surfaces each leaked them
+            // independently (PRD/sparkle/hide-worker-agents-from-sidebar.md), and a worker with no
+            // row is unreachable and unattributable — a spawn moves selection to the new worker, so
+            // the terminal would show an agent no row is highlighting.
+            //
+            // The children are rendered HERE, inside the head's own section wrapper, rather than
+            // fed through the ladder. That is not a style choice: groupAgentsByStage buckets PER
+            // ROW by workflow stage, so a worker at a different stage than its parent would be
+            // torn out of the subtree and filed under another section header. topLevelAgents is
+            // therefore left excluding workers, and row position stays a pure function of the
+            // PARENT's stage plus insertion order — the invariant engine/agentOrdering.ts warns
+            // about at length.
+            //
+            // Children are likewise NOT re-filtered by the status-band chips. The chips decide
+            // which top-level rows the ladder shows; applying them again per child would leave an
+            // expanded parent with an empty subtree, or hide a working worker under a visible head.
+            const kids = collapsed.has(top.id) ? [] : workers;
+            return (
+              <div key={top.id}>
+                {renderRow(top, headStage, section.id)}
+                {kids.map((w) => renderRow(w, stageOf(w.id)))}
+              </div>
+            );
               })}
             </div>
           ));
@@ -1394,6 +1444,11 @@ export function AgentSidebar({ project }: { project: Project | null }) {
 // same spot whether the card is collapsed or expanded — on hover the card only grows DOWNWARD,
 // so the eye never sees the pickaxe or title jump. Module-level so the elapsed timer can match it.
 const GLYPH_SLOT_H = 20;
+// Width of the subtree-disclosure slot at the head of every row. Reserved even on rows that have no
+// chevron, so a childless agent's status disc lines up with a delegating one's rather than sitting
+// 12px further left — the column is scanned down the disc, and one row's disc out of line reads as
+// a rendering fault.
+const CHEVRON_SLOT_W = 12;
 
 // Radius of the concave fillets that flare the active row's right edge open into the terminal.
 const ACTIVE_FILLET = 8;
@@ -1601,11 +1656,11 @@ type AgentRowProps = {
   depth: number;
   isActive: boolean;
   st: AgentTabStatus;
-  /** This row recedes (PRD §3 / prototype `.arow.p2`): P2 in the CONCIERGE's banding, which is
-   *  what the tab badges, the feed and the terminal all read. Computed by the parent from
-   *  `publishedStatusFor` — deriving it here from `st` made the sidebar disagree with every other
-   *  surface for an orchestrator whose worker is red (roborev 46254-M4). */
-  calm: boolean;
+  /** Is this row's worker subtree collapsed? `null` means "no disclosure here" — a row with no
+   *  workers, or a worker row itself. Only a head with ≥1 worker gets a chevron. */
+  subtreeCollapsed: boolean | null;
+  /** Flip this row's subtree. Only called when `subtreeCollapsed` is non-null. */
+  onToggleSubtree: () => void;
   statusColor: string;
   /** The alert toggle to show on this row's expanded card: "dismiss" (truly red, not dismissed),
    *  "reenable" (red-underneath but dismissed), or null (not red). Computed from the TRUE status. */
@@ -1691,7 +1746,7 @@ function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
     prev.depth === next.depth &&
     prev.isActive === next.isActive &&
     prev.st === next.st &&
-    prev.calm === next.calm &&
+    prev.subtreeCollapsed === next.subtreeCollapsed &&
     prev.statusColor === next.statusColor &&
     prev.alertControl === next.alertControl &&
     prev.bs === next.bs &&
@@ -1712,7 +1767,8 @@ const AgentRow = memo(function AgentRow({
   depth,
   isActive,
   st,
-  calm: calmBand,
+  subtreeCollapsed,
+  onToggleSubtree,
   statusColor,
   alertControl,
   onDismissAlert,
@@ -1907,17 +1963,29 @@ const AgentRow = memo(function AgentRow({
   // running, gray = done) — it replaced the ⚒ pick-and-axe on 2026-07-26. Two things changed at
   // once and both matter: the row's TEXT went back to a neutral ink (the whole row used to take the
   // status color, which made a column of agents read as a wall of red), and the status moved into a
-  // single small shape that's easy to scan down. Worker (↳) and shell (▶) rows keep their glyph —
-  // they're structural markers, and a worker's status already reads from its parent's card.
-  const kindGlyph = a.kind === "worker" ? "↳" : a.kind === "shell" ? "▶" : null;
+  // single small shape that's easy to scan down. Shell (▶) rows keep their glyph — it's a
+  // structural marker, not a status.
+  //
+  // WORKERS take the disc too, as of the child-rows change. They used to render a ↳ because they
+  // had no row of their own — the arrow marked an inline line inside the parent's card, where
+  // nesting was not otherwise visible. Now that a worker IS a row, its indent carries the nesting
+  // and the ↳ would be saying it twice while displacing the one thing the row is missing: its own
+  // live status. A worker's status is no longer "already readable from its parent's card"; the
+  // card is not open most of the time, and a running worker is exactly what the column should show.
+  const kindGlyph = a.kind === "shell" ? "▶" : null;
   // Width of the leading glyph slot, kept identical for the glyph and its hover-state × so the
-  // name never shifts horizontally when the row expands.
-  const glyphWidth = a.kind === "build" ? 24 : 12;
+  // name never shifts horizontally when the row expands. Workers size with build rows now: they
+  // carry the same disc, and a narrower slot would make the child dots visibly smaller than their
+  // parent's for no reason.
+  const glyphWidth = a.kind === "shell" ? 12 : 24;
   // On a BUILD row the status is carried ENTIRELY by the leading disc, so the text is neutral ink.
   // Colouring the name too was what turned a column of working agents into a wall of green and a
   // column of finished ones into a wall of red — at which point the color stopped meaning anything.
-  // Worker/shell rows keep the status ink: an inline worker's name going red is its ONLY attention
-  // signal (it has no disc of its own), so removing it there would silently drop the cue.
+  // Worker/shell rows keep the status ink. For workers this is no longer the ONLY attention signal
+  // — they have their own disc now — but it is kept deliberately: a child row is smaller and set
+  // back from the parent, so a red name is what makes one stand out inside an expanded subtree. The
+  // wall-of-color risk that drove build rows to neutral ink does not apply, since workers are only
+  // on screen while their parent is expanded.
   const nameColor = a.kind === "build" ? C.cream : statusColor;
   // Same reasoning for the elapsed timer — metadata, not a status readout.
   const metaColor = a.kind === "build" ? C.muted : statusColor;
@@ -2071,6 +2139,58 @@ const AgentRow = memo(function AgentRow({
   const CardHeader = ({ expanded, ownsInput }: { expanded: boolean; ownsInput: boolean }) => (
     <>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 8, minWidth: 0 }}>
+        {/* Subtree disclosure, ahead of the glyph slot so the status discs of a parent and its
+            children stay on one vertical line (the chevron's fixed width is absorbed by the row's
+            own depth indent, not by the glyph).
+
+            The BOX is always rendered — every row, and on the hover card too. Only the button
+            inside it is conditional. That matters because the card is pinned to the row's exact
+            rect (cardLeft = rect.left) and this is a flex child in a gap:8 row, so omitting the box
+            on the card would slide the disc, title and everything after it 20px left the instant
+            the card opened. The surrounding comments assert twice that nothing shifts between the
+            collapsed row and the card standing over it; this is what keeps that true (roborev
+            53672-M). It is also why the box is reserved on childless rows: the column is scanned
+            down the disc, and one row's disc out of line reads as a rendering fault. */}
+        <div
+          style={{
+            flex: "0 0 auto",
+            width: CHEVRON_SLOT_W,
+            height: GLYPH_SLOT_H,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          {/* No disclosure ON the card: it is a floating overlay, and a chevron there would toggle
+              the very rows the card is covering. */}
+          {!expanded && subtreeCollapsed !== null && (
+              <button
+                type="button"
+                aria-expanded={!subtreeCollapsed}
+                aria-label={`${subtreeCollapsed ? "Show" : "Hide"} workers for ${a.name}`}
+                onClick={(e) => {
+                  // The row div's own onClick is openCard — without this a chevron click would
+                  // open the hover card over the very rows it just revealed.
+                  e.stopPropagation();
+                  onToggleSubtree();
+                }}
+                style={{
+                  padding: 0,
+                  border: "none",
+                  background: "transparent",
+                  color: C.muted,
+                  fontSize: 9,
+                  lineHeight: 0,
+                  cursor: "pointer",
+                  // Rotate rather than swap glyphs, so the control reads as one thing moving.
+                  transform: subtreeCollapsed ? "rotate(-90deg)" : "none",
+                  transition: "transform .15s ease",
+                }}
+              >
+                ▾
+              </button>
+          )}
+        </div>
         {/* Leading glyph slot — a FIXED-height box so the glyph (and the title beside it) sit at the
             same vertical spot collapsed or expanded; the card only grows downward on hover. The
             glyph IS the status indicator (its color = the agent's status) and on hover it morphs
@@ -2388,23 +2508,20 @@ const AgentRow = memo(function AgentRow({
   // live terminal, which is exactly what this floating card is; it is a lift above this column in
   // both themes, and every ink the card paints clears AA on it in both themes.
   const mergeIntoTerminal = isActive;
+  // `C.barSurface` (not CHAT_USER_BUBBLE) comes from main: it is the token for a surface that
+  // FRAMES the live terminal, which is what this floating card is — see the note just above.
   const cardBg = isActive ? C.forest : C.barSurface;
-  // Calm rows recede (PRD §3 / prototype `.arow.p2`): a P2 agent — nothing for you to answer — goes
-  // grayscale and dims, so ONLY the P0/P1 rows carry color and the eye lands on what needs you. The
-  // selected row is exempt: it's docked into the terminal you're reading, and graying it would gray
-  // that join. The BAND comes from the parent (see the `calm` prop): computing it here from `st`
-  // read a different status map than the concierge feed, so an orchestrator with a red worker was
-  // listed under Needs you by the concierge and grayscaled by its own row at the same time.
-  const calm = !isActive && calmBand;
-  // One definition, spread where it's needed — this used to be three copy-pasted blocks, two of
-  // them mis-indented. NOT applied to the hover card: that card is the thing the user deliberately
-  // opened, it floats over live terminal text, and its whole legibility story is the thick border
-  // separating it from what's behind it (roborev 46254-L1).
-  const calmStyle = {
-    filter: calm ? "grayscale(1) opacity(0.72)" : undefined,
-    // Transitioned so a row fading out of the red zone settles rather than snaps.
-    transition: "filter .3s ease",
-  } as const;
+  // NO FILTER GOES ON THIS ROW. Rows used to render `filter: grayscale(1) opacity(.72)` when their
+  // status banded "calm" (isCalmBand — everything not asking for you), lifted from the concierge
+  // prototype's `.arow.p2` so only P0/P1 carried color. `working` is deliberately inside that band,
+  // so a RUNNING agent's green dot came out desaturated — and sparkle-pulse (opacity 1 → .35)
+  // compounded it to about a quarter opacity. The column's job is to show what is live; that
+  // treatment erased exactly that. Removed outright rather than gated, because a conditional leaves
+  // the same trap one isCalmBand edit away. See AgentSidebar.liveStatusDots.test.tsx.
+  //
+  // isCalmBand still exists and is still right for what it now governs — the TERMINAL's own xterm
+  // theme (Workspace.tsx), which desaturates a landed agent's text without touching the sidebar.
+  // Do not re-wire it to a row style.
   // Show the slide-out only while hovering AND not renaming. Suppressing it during a rename means
   // the in-flow row is the SOLE owner of the rename <input> — the field never swaps mount points on
   // a hover change, so a trailing unmount-blur can't silently commit a half-typed name.
@@ -2470,7 +2587,6 @@ const AgentRow = memo(function AgentRow({
           // drag grabs the card instead of highlighting the name underneath the cursor. Gated on
           // !editing (like dragProps) so the rename <input> keeps normal text selection.
           userSelect: rowSection != null && !editing ? "none" : undefined,
-          ...calmStyle,
           // Active = the terminal's own color (merges into it); the hover state's fill lives on the
           // unified card, not here. Cleared while the card is open (showOverlay) so the row reads as
           // empty behind the stand-in card.

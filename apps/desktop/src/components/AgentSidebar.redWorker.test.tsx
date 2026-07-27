@@ -25,6 +25,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
+import { expectedDotColor, filterOn } from "./statusDotTestUtils";
 
 function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
   return {
@@ -111,28 +112,98 @@ describe("AgentSidebar — attention workers stay reachable via the card", () =>
   });
 });
 
-// The row's CALM treatment (PRD §3 `.arow.p2`) has to band the same way the concierge feed does,
-// or the one row that needs you is the one that recedes: the feed applies the worker overlays
-// (publishedStatusFor), so an orchestrator whose worker is red bands as Needs you there — while a calm derived
-// from the row's own effectiveStatus grayscaled it (roborev 46254-M4).
-describe("AgentSidebar — calm banding agrees with the concierge feed", () => {
+// A head row's appearance must agree with the concierge feed, which applies the worker overlays
+// (publishedStatusFor). Deriving it from the row's own un-overlaid status instead is roborev
+// 46254-M4: an orchestrator listed under "Needs you" by the concierge while its own row rendered
+// calm. The overlays are what carry a WORKER's red up to the head that owns it.
+//
+// This block used to test that agreement through the CALM treatment — `filter: grayscale(1)
+// opacity(.72)` — because that filter was what the derivation drove. The filter is gone (see
+// AgentSidebar.liveStatusDots.test.tsx: it made a working agent's green dot invisible), so
+// asserting `filter === ""` now passes for every seed no matter what the derivation does. That is
+// an inert test, not a guard.
+//
+// The agreement is therefore pinned where it actually lives now: the head's rendered DOT COLOR,
+// which comes from `st` (= `effectiveStatus[a.id]`) at the AgentRow call site.
+//
+// Be precise about WHICH revert each case catches, because the overlays are layered and the names
+// are easy to mix up (roborev 53676 caught an earlier version of this comment overclaiming):
+//   • `liveStatus`      — the raw runtime map, NO overlays.
+//   • `status`          — liveStatus + withUnstartedWorkerAttention + withRedWorkerAttention.
+//                         The WORKER overlays are already in here.
+//   • `effectiveStatus` — status + withUnmergedWork + withDismissedAlerts.
+// Case by case, so this comment cannot drift into claiming coverage that is not here:
+//   • "takes its worker's RED"      — catches a revert to `liveStatus` (goes gray). Not `status`.
+//   • "goes red for an UNSTARTED"   — catches a revert to `liveStatus` (goes gray). Not `status`.
+//   • "stays gray when … working"   — catches NEITHER. a1 has no status of its own, so the head
+//                                     reads `stopped` under every map in the chain. It is the
+//                                     contrast that stops "always red" from passing case 1, not a
+//                                     guard against any revert.
+//   • "reads a DISMISSED red …"     — the only seed where `status` and `effectiveStatus` disagree,
+//                                     so the only one that catches `effectiveStatus → status`.
+// Measured, not assumed: reverting to `liveStatus` fails 3 (the two above plus the dismissed case);
+// reverting to `status` fails 1 (the dismissed case).
+describe("AgentSidebar — a head row's color agrees with the concierge feed", () => {
   const headRow = () => screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
+  /** The head row's own status disc (its children's discs live in their own rows). */
+  const headDot = () => headRow().querySelector<HTMLElement>('span[title]');
 
-  it("does NOT gray an orchestrator whose worker is red", () => {
+  it("takes its worker's RED, rather than its own quiet status", () => {
     const { project } = seed("errored");
     render(<AgentSidebar project={project} />);
-    expect(headRow().style.filter).toBe("");
+    // a1 has no status of its own — it reads `stopped`, which is GRAY. Red here can only have come
+    // from the worker overlay, so this asserts the overlay chain end-to-end at the render site.
+    expect(headDot()?.style.background).toBe(expectedDotColor("errored"));
+    expect(headDot()?.style.background).not.toBe(expectedDotColor("stopped"));
+    expect(filterOn(headRow())).toBe("");
   });
 
-  it("grays a quiet orchestrator whose worker is quiet too", () => {
+  it("stays gray when its worker is quietly working", () => {
     const { project } = seed("working");
     render(<AgentSidebar project={project} />);
-    expect(headRow().style.filter).toContain("grayscale");
+    // CONTRAST CASE, not a guard — see the per-layer note above. a1 has no status of its own, so
+    // this reads `stopped` no matter which map the row consults; it survives every revert in the
+    // chain. Its job is to stop "always red" from passing the case above: a working worker is not
+    // an attention signal and must not bubble. Do not count it toward overlay coverage.
+    expect(headDot()?.style.background).toBe(expectedDotColor("stopped"));
+    expect(filterOn(headRow())).toBe("");
   });
 
-  it("does NOT gray an orchestrator with an UNSTARTED worker (the feed calls that attention)", () => {
+  it("goes red for an UNSTARTED worker (the feed calls a strand attention)", () => {
     const { project } = seed(null); // parent open, worker never mounted
     render(<AgentSidebar project={project} />);
-    expect(headRow().style.filter).toBe("");
+    // withUnstartedWorkerAttention synthesizes the red; a stranded worker that signalled nothing is
+    // the failure this overlay exists for.
+    expect(headDot()?.style.background).toBe(expectedDotColor("errored"));
+    expect(filterOn(headRow())).toBe("");
+  });
+
+  // The ONE seed where `status` and `effectiveStatus` differ, and so the only case that pins the
+  // outermost overlay layer. a1 is genuinely `errored` and the user has DISMISSED that episode
+  // (dismissedSeq === seq), so withDismissedAlerts de-escalates errored → stopped. Read the raw or
+  // the merely worker-overlaid map and the row stays RED — i.e. a dismissal the user performed
+  // would silently stop working, on the dot, the glyph and the tooltip alike.
+  it("reads a DISMISSED red as de-escalated, not as red", () => {
+    const orchestrator = mkAgent("a1", "Alpha", {
+      namePinned: true,
+      alert: { seq: 1, lastRed: "errored", dismissedSeq: 1 },
+    });
+    const project: Project = {
+      id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
+      createdAt: new Date(0).toISOString(), selectedAgentId: null,
+      agents: [orchestrator],
+    };
+    useProjectStore.setState({ projects: [project] } as never);
+    useRuntimeStore.setState({
+      branchStatus: {}, workflowStage: {},
+      status: { a1: "errored" } as Record<string, AgentTabStatus>,
+      openAgentIds: ["a1"],
+      open: vi.fn(),
+      pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    render(<AgentSidebar project={project} />);
+
+    expect(headDot()?.style.background).toBe(expectedDotColor("stopped"));
+    expect(headDot()?.style.background).not.toBe(expectedDotColor("errored"));
   });
 });
