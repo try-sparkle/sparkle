@@ -16,7 +16,11 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { safeUnlisten } from "./safeUnlisten";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
-import { useRuntimeStore } from "../stores/runtimeStore";
+import {
+  useRuntimeStore,
+  mergeOpenAgentIds,
+  readPersistedOpenAgentIds,
+} from "../stores/runtimeStore";
 import { useUiStore, type ThemePref } from "../stores/uiStore";
 import type { StatusBand } from "../engine/buildSections";
 import { getConfig, setConfigValue, setConfigValues } from "./config";
@@ -125,6 +129,21 @@ function resolveTargetId(req: ControlRequest): string {
   return typeof t === "string" && t ? t : req.callerAgentId;
 }
 
+/** How much of the roster get_state returns. The roster is the single largest thing this API can
+ *  put into an agent's context — it is ~250 chars per agent and PERMANENT (an MCP tool result is
+ *  never evicted for the rest of the session), so a 57-agent roster cost ~3,500 tokens EVERY call.
+ *  Most of those rows were dormant closed tabs (status "stopped") that no caller was asking about,
+ *  which is why "active" — not "all" — is the default. */
+export type StateScope = "self" | "active" | "all";
+
+/** Coerce the caller-supplied `scope` to a known value, defaulting to the cheap one. Unknown or
+ *  non-string input falls back to "active" rather than erroring: the MCP layer already rejects a
+ *  bad enum, so anything odd arriving here is a misbehaving client, and quietly serving it the
+ *  narrow (safe, cheap) roster beats failing a read op. */
+function resolveScope(raw: unknown): StateScope {
+  return raw === "self" || raw === "all" || raw === "active" ? raw : "active";
+}
+
 /** Whether a caller may run PRIVILEGED ops (set_theme / set_config). Fails CLOSED: the caller must
  *  resolve to a known, NON-worker (interactive) agent. Workers run unattended and auto-approve every
  *  tool call (dangerouslySkipPermissions), so persona prose alone can't stop one from changing the
@@ -154,8 +173,12 @@ function callerMayAdminister(callerAgentId: string): boolean {
  *    unmerged                     — finished, committed work not yet on main (gray, not an alarm)
  *    idle | done                  — finished its turn, nothing left for you
  *    stopped                      — no live process (also the default for an agent with no entry) */
-function handleGetState(): {
+function handleGetState(req: ControlRequest): {
   agents: unknown[];
+  scope: StateScope;
+  totalAgents: number;
+  omitted: number;
+  omittedIds: string[];
   theme: ThemePref;
   models: string[];
   statusFilter: Record<StatusBand, boolean>;
@@ -164,7 +187,8 @@ function handleGetState(): {
   const { projects } = useProjectStore.getState();
   const status = useRuntimeStore.getState().status;
   const ui = useUiStore.getState();
-  const agents = projects.flatMap((p) =>
+  const scope = resolveScope(req.payload.scope);
+  const all = projects.flatMap((p) =>
     p.agents.map((a) => ({
       id: a.id,
       name: a.name,
@@ -174,12 +198,46 @@ function handleGetState(): {
       activity: a.activity ?? null,
     })),
   );
+  // Liveness for scope "active" must NOT come from `status` alone. That map is window-local and
+  // never persisted (runtimeStore: "live-only"), while control:request is broadcast to EVERY window
+  // and whichever replies first answers — so a window has no status entries for agents mounted in
+  // OTHER windows. Filtering on status alone would DROP those agents entirely (they read as
+  // "stopped"), turning a merely-mislabeled row into a missing one, and the same gap opens
+  // transiently after relaunch before each pane's router has reported. `openAgentIds` IS persisted
+  // and merged across windows (), so the union of it and this window's live statuses is
+  // the app-wide signal. Found by roborev #53406.
+  const openIds = new Set(
+    mergeOpenAgentIds(useRuntimeStore.getState().openAgentIds, readPersistedOpenAgentIds()),
+  );
+  const agents = all.filter((a) => {
+    if (scope === "all") return true;
+    if (scope === "self") return a.id === req.callerAgentId;
+    // "active" = has a live status, OR is open in ANY window, OR is one of the caller's own
+    // children. That last clause is not a nicety: "stopped" is also what an agent with NO runtime
+    // entry reads as, which is exactly a just-spawned worker (no pane mounted yet) or a permanently
+    // stranded one — the case workerAttention paints RED as needing you. Without it an orchestrator
+    // that calls spawn_worker twice and then get_state() sees `agents: [self], omitted: 2` and
+    // concludes its workers do not exist. Your own fleet is never hidden from you. roborev #53407.
+    return openIds.has(a.id) || a.status !== "stopped" || a.parentId === req.callerAgentId;
+  });
+  const omittedIds = all.filter((a) => !agents.includes(a)).map((a) => a.id);
   // Additive Phase-3 fields so an agent can read before writing: the model ids it may pass to
   // set_agent_model and the current zoom. Existing fields (agents, theme) are unchanged.
   // `agentOrdering` was dropped when the sidebar stopped sorting by status; `statusFilter` replaces
   // it as the one view preference a caller might want to read (which status bands are on screen).
+  //
+  // `totalAgents`/`omitted`/`omittedIds` are NOT decoration: the default scope hides rows, and a
+  // silently truncated roster reads as "that's everyone" when it isn't. Reporting what was dropped
+  // is what lets a caller resolve a specific agent without re-asking with scope:"all".
   return {
     agents,
+    scope,
+    totalAgents: all.length,
+    omitted: omittedIds.length,
+    // The dropped IDS, not just a count: a caller that needs one omitted agent can resolve it
+    // directly instead of paying for a full scope:"all" re-read, which was the whole point of
+    // narrowing the roster. Ids are ~40 chars vs the ~226 chars a full row costs.
+    omittedIds,
     theme: ui.themePref,
     models: getModelCatalog().map((m) => m.id),
     statusFilter: ui.statusFilter,
@@ -400,7 +458,7 @@ async function dispatch(req: ControlRequest): Promise<void> {
     let result: unknown;
     switch (req.op) {
       case "get_state":
-        result = handleGetState();
+        result = handleGetState(req);
         break;
       case "rename_agent":
         result = handleRename(req);

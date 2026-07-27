@@ -11,25 +11,48 @@ import {
   WORKER_RESULT_RELPATH,
 } from "./buildAgent";
 
-describe("sparkleControlProtocol — rename_agent is the mandatory first tool call", () => {
-  it("demands rename_agent as the FIRST tool call, before any other work", () => {
+describe("sparkleControlProtocol — name yourself early, but never in a turn of your own", () => {
+  it("still demands rename_agent in the agent's FIRST tool-calling turn", () => {
     // Naming defers a build/worker's first paid call (agentNaming.ts's deferred_first_turn branch)
     // on the bet that the agent names itself. The old copy merely described rename_agent as
     // available, so agents named themselves late or never and the sidebar sat on "Build 4" for many
-    // turns (founder screenshot, 2026-07-15).
+    // turns (founder screenshot, 2026-07-15). That EARLINESS requirement survives the batching
+    // rule below — "batched" must never be read as "later".
     const p = sparkleControlProtocol();
-    expect(p).toMatch(/FIRST tool call/);
-    expect(p).toMatch(/before any other/i);
+    expect(p).toMatch(/FIRST turn/);
+    expect(p).toMatch(/rename_agent/);
   });
 
-  it("the demand rides in every code-producing persona, not just the snippet", () => {
+  it("forbids spending a whole turn on a control call (the 39%-of-usage regression)", () => {
+    // Every control op is a full API round-trip that re-bills the entire context to deliver ~40
+    // bytes. Measured 2026-07-27 across this app's transcripts: 1,545 narration turns, 100% of them
+    // solo, ~82.5k billed tokens each — 33-51% of a short session's spend. The fix is purely this
+    // prose (batch the call into a turn that also does real work), so if the rule ever falls out of
+    // the persona the cost silently comes back.
+    const p = sparkleControlProtocol();
+    expect(p).toMatch(/NEVER send a control call as a turn BY ITSELF/);
+    expect(p).toMatch(/SAME assistant turn/);
+  });
+
+  it("tells the agent to narrate at phase boundaries, not per sub-task", () => {
+    expect(sparkleControlProtocol()).toMatch(/PHASE boundaries/);
+  });
+
+  it("warns that get_state is expensive and offers the narrowing scope", () => {
+    const p = sparkleControlProtocol();
+    expect(p).toMatch(/get_state\(\{ scope \}\)/);
+    expect(p).toMatch(/EXPENSIVE/);
+  });
+
+  it("the demands ride in every code-producing persona, not just the snippet", () => {
     // The snippet is appended to both personas via --append-system-prompt; if it ever stops being
-    // included, the whole self-naming bet silently reverts to the deferred-forever behavior.
+    // included, the self-naming bet reverts to deferred-forever AND the batching rule is lost.
     for (const persona of [
       workerPersona({ parentBranch: "main", resultPath: ".sparkle/result.json" }),
       orchestrationPersona({ ownBranch: "b", maxConcurrentWorkers: 3 }),
     ]) {
-      expect(persona).toMatch(/FIRST tool call/);
+      expect(persona).toMatch(/FIRST turn/);
+      expect(persona).toMatch(/NEVER send a control call as a turn BY ITSELF/);
     }
   });
 });
