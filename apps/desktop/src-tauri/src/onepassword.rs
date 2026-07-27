@@ -865,6 +865,12 @@ fn backup_one(op: &str, args: &OpBackupArgs) -> Result<OpBackupRecord, String> {
 /// `op document get` straight to `dest`, retrying the alternate output flag when the first spelling
 /// is rejected (see [`DOC_GET_OUT_FLAGS`]). `op` writes the file itself — the bytes never enter this
 /// process.
+///
+/// CONTRACT: `dest` should be a caller-owned scratch path that is EMPTY on entry, because success
+/// is judged by a file existing there afterwards. This is mildly destructive to honour that — on a
+/// retry it removes what the previous attempt left — but only when `dest` was empty on entry, so it
+/// can never delete something the caller put there. [`download_document_atomically`] is the sole
+/// owner of the clear that runs before the first attempt.
 fn download_document(op: &str, item_id: &str, dest: &Path) -> Result<(), String> {
     let dest_s = dest.to_string_lossy().into_owned();
     let mut last: Option<String> = None;
