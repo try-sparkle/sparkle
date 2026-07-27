@@ -420,6 +420,12 @@ export function useAmbientVoice(): void {
     const store = useDictationStore.getState();
     if (enabled) {
       store.setError(null);
+      // Optimistic: the real arm can be minutes of model download away, and a dead-looking button is
+      // worse. KNOWN GAP: if that start aborts (a stop landed first), nothing retracts this — the
+      // ring keeps claiming to listen until the else-branch below settles it on the next mute. A
+      // `dictation://not-armed` broadcast was tried and removed; matching it to per-window intent
+      // needs a monotonic start id echoed back from Rust. See
+      // PRD/sparkle/mic-multi-window-start-stop-race.md.
       store.setStatus("listening");
       // Wait until the dictation listeners are attached before starting capture,
       // so the first VAD segment after launch isn't dropped.

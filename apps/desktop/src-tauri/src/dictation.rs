@@ -194,6 +194,77 @@ pub(crate) enum StartAfterLoad {
     Arm,
 }
 
+/// What `start_dictation` should do in its FIRST critical section, before committing to the slow
+/// model load. Added after a live incident (2026-07-26) in which one mic toggle produced ~18
+/// concurrent `start_dictation` calls — one per open Sparkle window — each of which queued its own
+/// model load on the blocking pool. A burst of `stop_dictation`s then advanced the epoch, so all 18
+/// were dead on arrival, yet each still occupied a load slot before discovering it. They drained one
+/// at a time over 3.5 minutes (the pool was saturated by ~10 running agents), and for that whole
+/// window the mic could not arm: every start aborted, and the user saw a mic ring that claimed to be
+/// listening with no waveform behind it.
+///
+///   - `FastPathArmed`: already armed — refresh focus and reconcile (the pre-existing fast path).
+///   - `CoalesceWithInFlight`: another start sampled THIS SAME epoch and is still loading. It
+///     represents the identical user intent, and the session it arms is app-global, so a second load
+///     would buy nothing. Return without loading and let the in-flight one arm for everyone.
+///   - `Load(epoch)`: no equivalent start is in flight — sample the epoch and load.
+///
+/// Coalescing is keyed on the epoch, NOT merely "is something in flight", and that is the whole
+/// subtlety: a start that sampled a NEWER epoch than the in-flight one represents a LATER intent
+/// (the user muted, then unmuted again), so it must run its own load or the final unmute is lost and
+/// the mic stays dead. Same epoch = duplicate fan-out, collapse it; newer epoch = real re-arm, honour it.
+#[derive(Debug, PartialEq)]
+pub(crate) enum BeginStart {
+    FastPathArmed,
+    CoalesceWithInFlight,
+    Load(u64),
+}
+
+/// CALLER CONTRACT: all three inputs MUST be read from the same locked critical section that then
+/// acts on the result, so the decision and the `start_in_flight` claim are atomic.
+pub(crate) fn begin_start_decision(
+    armed: bool,
+    stop_epoch: u64,
+    start_in_flight: Option<u64>,
+) -> BeginStart {
+    if armed {
+        return BeginStart::FastPathArmed;
+    }
+    if start_in_flight == Some(stop_epoch) {
+        return BeginStart::CoalesceWithInFlight;
+    }
+    BeginStart::Load(stop_epoch)
+}
+
+/// Whether a `stop_dictation` has anything to do. Every open window runs its own copy of the
+/// `enabled` effect, so ONE mute broadcasts N stops — during the 2026-07-26 incident they arrived in
+/// clusters of 3-6 within 0-8ms of each other. Each one unconditionally advanced the single
+/// app-global stop epoch, so a single mute could invalidate in-flight starts many times over and
+/// spam teardown work that had already happened.
+///
+/// A stop is a no-op exactly when there is no live session AND no start that could still arm.
+///
+/// `start_could_still_arm` is load-bearing and must not be dropped as redundant: during a start's
+/// model load `armed` is still false and no capture/transcriber is installed yet, so without it a
+/// genuine mute landing mid-load would look like "nothing to stop", skip the epoch bump, and let the
+/// load resurrect a mic the user just muted — the exact resurrect race the epoch exists to close.
+///
+/// But it must be "a start that can STILL ARM", not merely "a start exists" — the distinction is the
+/// whole fix. Nothing clears the in-flight claim until the load returns, so a bare `is_some()` stays
+/// true for the entire load, and the N-1 stops that follow the first would each keep advancing the
+/// epoch. That reproduces the very amplification this function exists to stop, in precisely the case
+/// the commit is about (a mute during a load). Once the first stop has moved the epoch, the in-flight
+/// claim is already stale — that start is doomed and has nothing left to cancel — so every later stop
+/// in the same broadcast is genuinely a no-op. The caller passes `start_in_flight == Some(stop_epoch)`.
+pub(crate) fn stop_is_noop(
+    armed: bool,
+    has_capture: bool,
+    has_transcriber: bool,
+    start_could_still_arm: bool,
+) -> bool {
+    !armed && !has_capture && !has_transcriber && !start_could_still_arm
+}
+
 pub(crate) fn start_after_load(sampled_epoch: u64, current_epoch: u64, armed: bool) -> StartAfterLoad {
     if current_epoch != sampled_epoch {
         StartAfterLoad::AbortMutedDuringLoad
@@ -412,6 +483,16 @@ pub struct DictationSession {
     /// arm path would otherwise flip back to true). Guarded by the session Mutex; a plain counter
     /// is enough since it's only ever read/written while holding that lock.
     stop_epoch: u64,
+    /// The stop epoch sampled by the `start_dictation` currently doing a model load, if any — the
+    /// claim that lets duplicate fan-out starts collapse onto it instead of queuing their own load
+    /// (see `begin_start_decision`). `None` = no load in flight.
+    ///
+    /// Every open window runs its own `enabled` effect, so one mic toggle calls `start_dictation`
+    /// once per window; on 2026-07-26 that put ~18 loads on a blocking pool saturated by running
+    /// agents, and they drained one at a time over 3.5 minutes with the mic dead throughout. Holding
+    /// the sampled epoch rather than a bare bool is what keeps a LATER intent (mute, then unmute
+    /// again) from being coalesced away into an earlier one. Guarded by the session Mutex.
+    start_in_flight: Option<u64>,
 }
 
 /// `.0` is the session; `.1` is a monotonic focus generation used to coalesce window-to-window
@@ -978,17 +1059,48 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
     // Mutex is a std::sync::Mutex, and holding one across an await would both make this future
     // !Send (it wouldn't compile as a command) and risk deadlocking the runtime.
     let stop_epoch_at_start = {
-        let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
-        if sess.armed {
-            // Fast path (a second window mounting, or a re-arm): resume capture to match focus.
-            // Reconcile OFF the lock — is_focused()/Capture::start block on the main thread, and
-            // holding the session lock across them from this worker is the sparkle-sfxu deadlock.
-            drop(sess);
-            state.reconcile_capture(&app);
-            return Ok(());
+        let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+        match begin_start_decision(sess.armed, sess.stop_epoch, sess.start_in_flight) {
+            BeginStart::FastPathArmed => {
+                // Fast path (a second window mounting, or a re-arm): resume capture to match focus.
+                // Reconcile OFF the lock — is_focused()/Capture::start block on the main thread, and
+                // holding the session lock across them from this worker is the sparkle-sfxu deadlock.
+                drop(sess);
+                state.reconcile_capture(&app);
+                return Ok(());
+            }
+            BeginStart::CoalesceWithInFlight => {
+                // Another window already has a load running for this exact intent. Its arm is
+                // app-global, so it covers us too — returning here is what stops one toggle from
+                // queuing a model load per open window (the 2026-07-26 lockout).
+                tracing::info!(
+                    target: "dictation",
+                    "start_dictation coalesced onto the in-flight load (same intent, another window)"
+                );
+                return Ok(());
+            }
+            BeginStart::Load(epoch) => {
+                // Claim the load so the duplicates that follow us coalesce rather than queue.
+                sess.start_in_flight = Some(epoch);
+                epoch
+            }
         }
-        sess.stop_epoch
     };
+
+    // Release the in-flight claim on EVERY exit path below (abort, error, or arm) — a claim left
+    // behind would make every later start coalesce onto a load that is no longer running, leaving the
+    // mic permanently unarmable. Only clear it if it is still ours: a newer intent may have replaced
+    // it while we loaded, and stealing that claim would let duplicates queue loads again.
+    struct InFlightClaim<'a>(&'a DictationState, u64);
+    impl Drop for InFlightClaim<'_> {
+        fn drop(&mut self) {
+            let mut sess = self.0 .0.lock().unwrap_or_else(|p| p.into_inner());
+            if sess.start_in_flight == Some(self.1) {
+                sess.start_in_flight = None;
+            }
+        }
+    }
+    let _claim = InFlightClaim(&state, stop_epoch_at_start);
 
     // Ask macOS for the mic BEFORE the model download, not after.
     //
@@ -1020,6 +1132,35 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
         .await
         .map_err(|e| format!("microphone permission check failed: {e}"))??;
 
+    // Early-out: re-check the epoch BEFORE committing to the load. The permission check above is
+    // itself an await, and on a busy machine `spawn_blocking` can sit queued behind other work for a
+    // long time, so a mute can easily land before we have loaded anything. The post-load check would
+    // catch it too — but only after this start has occupied a model-load slot it was always going to
+    // throw away. On 2026-07-26 that wasted slot was the difference between a 3.5-minute mic outage
+    // and none: a backlog of already-doomed starts drained one at a time while the user's genuine
+    // re-arm waited behind them.
+    {
+        let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+        if sess.stop_epoch != stop_epoch_at_start {
+            tracing::info!(
+                target: "dictation",
+                "start_dictation aborted before the model load (a stop landed first; mic stays muted)"
+            );
+            // TWO THINGS BEFORE YOU ADD ANYTHING HERE:
+            //  1. `sess` is still held to end of scope. Anything that emits to the webview must
+            //     `drop(sess)` FIRST — `app.emit` fans out to every window and this file has a
+            //     documented main-thread deadlock history (sparkle-sfxu).
+            //  2. This path leaves the UI asserting something false: the `[enabled]` effect sets
+            //     `status = "listening"` optimistically before invoking, and nothing here retracts
+            //     it, so the ring keeps claiming to listen until that effect's else-branch settles it
+            //     on the next mute. A `dictation://not-armed` event was tried and removed — a
+            //     broadcast can't be matched to per-window intent without an identity. Doing it
+            //     properly needs a monotonic start id passed to this command and echoed back; see
+            //     PRD/sparkle/mic-multi-window-start-stop-race.md.
+            return Ok(());
+        }
+    }
+
     // Not yet armed: load the on-device model (slow, no lock held) before claiming the session.
     //
     // NOTE: this await is what makes the "resurrect" race REAL rather than theoretical. While this
@@ -1049,6 +1190,9 @@ pub async fn start_dictation(app: AppHandle, state: State<'_, DictationState>) -
             // The user muted mid-download: a stop advanced the epoch after we sampled it. Do NOT
             // re-arm (that's the resurrect race) — our freshly loaded transcriber drops here.
             tracing::info!(target: "dictation", "start_dictation aborted: a stop landed during model load (mic stays muted)");
+            // Same two caveats as the pre-load abort above: `sess` is still held (drop it before any
+            // webview emit — sparkle-sfxu), and this leaves the ring optimistically claiming to
+            // listen until the `[enabled]` effect settles it.
             return Ok(());
         }
         StartAfterLoad::AlreadyArmed => {
@@ -1353,6 +1497,19 @@ pub fn stop_cloud_stream(state: State<DictationState>) {
 pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
     let (transcriber, cloud_session, worker) = {
         let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+        // Idempotence: one mute is broadcast to every open window, so this command arrives N times
+        // for a single user action (observed in clusters of 3-6 within 0-8ms). Only the first has
+        // anything to do; the rest must NOT advance the epoch again, or one mute invalidates
+        // in-flight starts N times over — the amplifier behind the 2026-07-26 lockout.
+        let start_could_still_arm = sess.start_in_flight == Some(sess.stop_epoch);
+        if stop_is_noop(
+            sess.armed,
+            sess.capture.is_some(),
+            sess.transcriber.is_some(),
+            start_could_still_arm,
+        ) {
+            return;
+        }
         sess.armed = false;             // disarm so a later focus event can't resurrect the mic
         // Advance the stop epoch so an in-flight start_dictation still loading the model observes
         // that a stop landed during its load and aborts instead of re-arming a muted mic.
@@ -1384,9 +1541,9 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 #[cfg(test)]
 mod tests {
     use super::{AppHandle, State,
-        capture_should_be_live, choose_engine, cloud_reuse, frame_speaking, park_cloud_for_blur, plan_capture,
+        begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_speaking, park_cloud_for_blur, plan_capture,
         segment_fingerprint, should_emit_blur, should_install_cloud, should_keep_warm_on_stop,
-        should_resume_on_focus, should_standby_on_blur, start_after_load, unpark_cloud_for_focus, CapturePlan,
+        should_resume_on_focus, should_standby_on_blur, start_after_load, stop_is_noop, unpark_cloud_for_focus, BeginStart, CapturePlan,
         CloudReuse, DeepgramSession, DictationState, Engine, Installed, ReconcileStep, StartAfterLoad,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1812,26 +1969,48 @@ mod tests {
     struct Guards {
         stop_epoch: u64,
         armed: bool,
+        /// Mirrors `DictationSession::start_in_flight`: the epoch sampled by the start currently
+        /// loading, so duplicate fan-out starts can be collapsed onto it.
+        start_in_flight: Option<u64>,
+        /// Model loads actually launched. The fan-out bug was invisible to the old harness because
+        /// it never counted the WORK a decision commits to — only which decision came out.
+        loads_started: u32,
     }
 
     impl Guards {
-        /// `start_dictation`'s first critical section. `None` = the armed fast path (return at once,
-        /// no load); `Some(epoch)` = the sampled stop epoch, carried across the slow load.
-        fn begin_start(&self) -> Option<u64> {
-            if self.armed {
-                return None;
+        /// `start_dictation`'s first critical section. `None` = no load runs (either the armed fast
+        /// path or a coalesced duplicate); `Some(epoch)` = the sampled stop epoch, carried across
+        /// the slow load.
+        fn begin_start(&mut self) -> Option<u64> {
+            match begin_start_decision(self.armed, self.stop_epoch, self.start_in_flight) {
+                BeginStart::FastPathArmed | BeginStart::CoalesceWithInFlight => None,
+                BeginStart::Load(epoch) => {
+                    self.start_in_flight = Some(epoch);
+                    self.loads_started += 1;
+                    Some(epoch)
+                }
             }
-            Some(self.stop_epoch)
         }
 
-        /// `stop_dictation`: disarm AND advance the epoch.
+        /// `stop_dictation`: disarm AND advance the epoch — but only when there is something to
+        /// stop, so a broadcast mute doesn't advance the epoch once per open window.
         fn stop(&mut self) {
+            // Mirrors the real command: "a start that could still arm", NOT "a start exists".
+            let start_could_still_arm = self.start_in_flight == Some(self.stop_epoch);
+            if stop_is_noop(self.armed, false, self.armed, start_could_still_arm) {
+                return;
+            }
             self.armed = false;
             self.stop_epoch = self.stop_epoch.wrapping_add(1);
         }
 
         /// `start_dictation`'s second critical section, once its load returns.
         fn finish_start(&mut self, sampled: u64) -> StartAfterLoad {
+            // Release the in-flight claim only if it's still OURS: a newer start may have replaced
+            // it while we loaded, and clearing that would let yet another duplicate start a load.
+            if self.start_in_flight == Some(sampled) {
+                self.start_in_flight = None;
+            }
             let decision = start_after_load(sampled, self.stop_epoch, self.armed);
             if decision == StartAfterLoad::Arm {
                 self.armed = true;
@@ -1840,25 +2019,188 @@ mod tests {
         }
     }
 
-    /// Two rapid mic clicks. Newly reachable: with the load off-thread, B's first critical section
-    /// runs while A is still downloading — and since A hasn't armed yet, B does NOT take the fast
-    /// path and starts its own load (model.rs's temp-dir sweep spares concurrent downloads for
-    /// exactly this reason). Whichever finishes second must find the session already armed and
-    /// DISCARD its transcriber rather than overwrite a live one without finalize().
+    /// Two rapid mic clicks. B's first critical section runs while A is still loading and A hasn't
+    /// armed yet, so B does not take the fast path — but B sampled the SAME epoch as A, so it is the
+    /// same user intent arriving twice and it now COALESCES onto A's load instead of queuing a second
+    /// one. A alone arms, for both.
+    ///
+    /// This test used to assert the opposite (that B loaded too). That was the behaviour behind the
+    /// 2026-07-26 lockout: with ~10 windows open, one toggle queued ~18 model loads on a blocking
+    /// pool already saturated by running agents, and they drained one at a time over 3.5 minutes.
     #[test]
-    fn two_concurrent_starts_arm_exactly_once() {
+    fn two_concurrent_starts_load_once_and_arm_exactly_once() {
         let mut g = Guards::default();
         let a = g.begin_start().expect("nothing armed yet, so A loads");
-        let b = g.begin_start().expect("A is still loading and hasn't armed, so B loads too");
-        assert_eq!(a, b, "both sampled the same epoch; no stop has happened");
-
-        assert_eq!(g.finish_start(a), StartAfterLoad::Arm, "the first to finish arms");
         assert_eq!(
-            g.finish_start(b),
-            StartAfterLoad::AlreadyArmed,
-            "the second must NOT overwrite the live transcriber — no double-arm"
+            g.begin_start(),
+            None,
+            "B sampled A's epoch — same intent, so it must coalesce rather than load again"
         );
+        assert_eq!(g.loads_started, 1, "exactly one model load for one intent");
+
+        assert_eq!(g.finish_start(a), StartAfterLoad::Arm, "A arms on behalf of both");
         assert!(g.armed, "and the session ends armed exactly once");
+
+        // The AlreadyArmed guard is now defence-in-depth rather than a routine outcome (coalescing
+        // stops two same-epoch loads existing at all), so pin it directly: if a second load ever does
+        // land on an armed session, it must discard its transcriber, never overwrite a live one.
+        assert_eq!(
+            start_after_load(a, g.stop_epoch, true),
+            StartAfterLoad::AlreadyArmed,
+            "a late duplicate must not overwrite the live transcriber without finalize()"
+        );
+    }
+
+    /// The amplifier behind the incident: every open window runs its own `enabled` effect, so ONE
+    /// mute broadcasts N `stop_dictation` calls (observed in clusters of 3-6 within 0-8ms). Each used
+    /// to advance the single app-global epoch, so one mute could invalidate in-flight starts N times.
+    /// One mute must move the epoch exactly once.
+    #[test]
+    fn a_mute_broadcast_to_every_window_advances_the_epoch_once() {
+        let mut g = Guards::default();
+        let a = g.begin_start().expect("armed by the user's unmute");
+        assert_eq!(g.finish_start(a), StartAfterLoad::Arm);
+        let before = g.stop_epoch;
+
+        for _ in 0..8 {
+            g.stop(); // eight windows, one broadcast mute
+        }
+
+        assert_eq!(
+            g.stop_epoch,
+            before + 1,
+            "one mute = one epoch advance, however many windows relayed it"
+        );
+        assert!(!g.armed, "and the mic is genuinely muted");
+    }
+
+    /// The same broadcast, but landing DURING a model load — the case the fix is actually about, and
+    /// the one the armed-session test above cannot reach.
+    ///
+    /// Nothing clears the in-flight claim until the load returns, so a bare "a start exists" test
+    /// stays true for the whole load and every one of the N stops would keep advancing the epoch.
+    /// See `stop_is_noop` for the invariant that makes the stops after the first genuine no-ops.
+    #[test]
+    fn a_mute_broadcast_during_a_load_also_advances_the_epoch_once() {
+        let mut g = Guards::default();
+        let a = g.begin_start().expect("a load is in flight");
+        let before = g.stop_epoch;
+
+        for _ in 0..8 {
+            g.stop(); // eight windows relay one mute, mid-download
+        }
+
+        assert_eq!(
+            g.stop_epoch,
+            before + 1,
+            "one mute during a load must still advance the epoch exactly once"
+        );
+        // The doomed start must still be doomed — de-amplifying must not reopen the resurrect race.
+        assert_eq!(g.finish_start(a), StartAfterLoad::AbortMutedDuringLoad);
+        assert!(!g.armed, "the mic the user muted must stay muted");
+    }
+
+    /// Interleaved fan-out: windows relay the mute and the re-arm interleaved (stop, start, stop,
+    /// start, …) rather than as two clean bursts.
+    ///
+    /// KNOWN LIMITATION, asserted rather than described: this still costs one load per window,
+    /// because each stop/start pair genuinely moves the epoch and the next window's start therefore
+    /// reads a newer intent. Deduplicating it needs the frontend to stop relaying one user action
+    /// from N windows (single-owner mic intent) — a larger change, tracked as the follow-up. The
+    /// count is pinned so neither a regression toward the original incident shape nor a future fix
+    /// that improves it can pass silently.
+    ///
+    /// What the incident was actually about DOES hold here: the mic is never left dead.
+    #[test]
+    fn interleaved_stop_start_fan_out_still_ends_armed() {
+        const WINDOWS: usize = 8;
+        let mut g = Guards::default();
+        let a = g.begin_start().expect("a load is already in flight when the mute arrives");
+
+        let mut sampled = vec![a];
+        for _ in 0..WINDOWS {
+            g.stop();
+            if let Some(e) = g.begin_start() {
+                sampled.push(e);
+            }
+        }
+
+        assert_eq!(
+            g.loads_started as usize,
+            WINDOWS + 1,
+            "known limitation: interleaved fan-out still costs one load per window"
+        );
+
+        // Every stale claim aborts; the last one standing is the live intent and must arm. Landing
+        // them oldest-first is the order a saturated blocking pool actually produces.
+        let live = *sampled.last().expect("at least one load ran");
+        for epoch in sampled.iter().copied().filter(|e| *e != live) {
+            assert_eq!(
+                g.finish_start(epoch),
+                StartAfterLoad::AbortMutedDuringLoad,
+                "a stale claim must never arm"
+            );
+        }
+        assert_eq!(g.finish_start(live), StartAfterLoad::Arm);
+        assert!(g.armed, "no lockout: the user's re-arm wins even interleaved");
+    }
+
+    /// The 2026-07-26 lockout, end to end: eight windows, unmute → mute → unmute. The user's final
+    /// intent is ON, so the mic MUST end armed — and the whole sequence must cost two model loads
+    /// (one per real intent), not sixteen.
+    ///
+    /// Before the fix this sequence queued a load per window per toggle, and the mid-sequence mute
+    /// advanced the epoch eight times, leaving every queued load dead on arrival: 18 consecutive
+    /// `start_dictation aborted` lines over 3.5 minutes with the mic ring still claiming to listen.
+    #[test]
+    fn the_multi_window_mic_lockout_does_not_recur() {
+        const WINDOWS: usize = 8;
+        let mut g = Guards::default();
+
+        let first: Vec<u64> = (0..WINDOWS).filter_map(|_| g.begin_start()).collect();
+        for _ in 0..WINDOWS {
+            g.stop();
+        }
+        let second: Vec<u64> = (0..WINDOWS).filter_map(|_| g.begin_start()).collect();
+
+        assert_eq!(first.len(), 1, "the first unmute loads once, not once per window");
+        assert_eq!(second.len(), 1, "and so does the second");
+        assert_eq!(g.loads_started, 2, "two real intents = two loads, not {WINDOWS} * 2");
+        // Asserted alongside the load count because they can diverge: the epoch is the state that
+        // DECIDES the work, so counting loads alone can look correct while it still over-advances.
+        assert_eq!(g.stop_epoch, 1, "the single mute advanced the epoch exactly once");
+
+        // Both loads land, stale one first — the order the saturated pool actually produced.
+        assert_eq!(
+            g.finish_start(first[0]),
+            StartAfterLoad::AbortMutedDuringLoad,
+            "the pre-mute load is stale and must not resurrect the mic"
+        );
+        assert_eq!(g.finish_start(second[0]), StartAfterLoad::Arm);
+        assert!(g.armed, "the user's final intent was ON — the mic must be live");
+    }
+
+    /// The load-bearing half of `stop_is_noop`: a mute landing DURING a model load must still bump
+    /// the epoch. At that moment `armed` is false and nothing is installed yet, so dropping the
+    /// `start_in_flight` term would make the stop look like a no-op, skip the bump, and let the load
+    /// resurrect a mic the user just muted.
+    #[test]
+    fn a_mute_during_a_load_is_never_treated_as_a_no_op() {
+        assert!(
+            !stop_is_noop(false, false, false, true),
+            "a start is in flight — this stop has something to cancel"
+        );
+        assert!(
+            stop_is_noop(false, false, false, false),
+            "nothing live and nothing loading: genuinely nothing to stop"
+        );
+
+        // And end to end: the mic must stay muted.
+        let mut g = Guards::default();
+        let a = g.begin_start().expect("not armed, so we load");
+        g.stop();
+        assert_eq!(g.finish_start(a), StartAfterLoad::AbortMutedDuringLoad);
+        assert!(!g.armed, "the resurrect race must stay closed");
     }
 
     /// The freeze bug's own scenario, now that it can actually happen: fresh install → first click

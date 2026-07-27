@@ -62,6 +62,31 @@ function emit(name: string, payload: unknown) {
 // Tests
 // ---------------------------------------------------------------------------
 
+/**
+ * Resets BOTH pieces of shared module state, file-level so it runs before every describe block's own
+ * `beforeEach`. No describe-level hook resets either one, and this project's vite config sets no
+ * `mockReset`/`restoreMocks`/`clearMocks`. Doing it once here is what makes that safe by
+ * construction instead of by each block remembering.
+ *
+ * `invoke`: `mockClear` wipes call history but LEAVES any `mockImplementation` in place, so an
+ * implementation installed by the last test of one block (a never-resolving `start_dictation`, or an
+ * unconsumed `mockRejectedValueOnce`) would survive across the describe boundary — the next
+ * `await ctrl.toggle()` then hangs to the vitest timeout with nothing pointing at the cause.
+ *
+ * `listeners`: the mock event bus is module-level and `emit()` broadcasts to every registration, so a
+ * controller left registered by a previous block keeps receiving events and fires phantom
+ * `onSegment` calls in the next one.
+ *
+ * Kept in this file rather than `mockReset: true` in vite.config.ts: the global flag would reset
+ * mocks for all 355 test files AND wipe the module-level `invoke.mockResolvedValue`, leaving `invoke`
+ * returning undefined instead of a promise — far more blast radius than the problem warrants.
+ */
+beforeEach(() => {
+  invoke.mockReset();
+  invoke.mockResolvedValue(undefined);
+  for (const k of Object.keys(listeners)) delete listeners[k];
+});
+
 describe("dictationStore", () => {
   beforeEach(() => {
     // Reset to known initial state between tests
@@ -127,7 +152,7 @@ describe("createDictationController (hook logic without renderHook)", () => {
   let ctrl: Awaited<ReturnType<typeof createDictationController>>;
 
   beforeEach(async () => {
-    invoke.mockClear();
+    // `invoke` is reset by the file-level beforeEach above, which covers every describe block.
     // Reset store
     useDictationStore.setState({
       status: "idle",
@@ -135,8 +160,6 @@ describe("createDictationController (hook logic without renderHook)", () => {
       error: null,
       modelProgress: null,
     });
-    // Reset listener registry
-    for (const k of Object.keys(listeners)) delete listeners[k];
 
     onSegment = vi.fn();
     // A single controller per test; its toggle/cleanup are reused below so we
@@ -344,7 +367,6 @@ describe("multi-window routing (isWindowActive gate)", () => {
   // text. We model two windows by registering two controllers with opposite focus predicates and
   // asserting the broadcast (emit fans out to both listeners) lands in only the active one.
   beforeEach(() => {
-    for (const k of Object.keys(listeners)) delete listeners[k];
     useDictationStore.setState({ interim: "", modelProgress: null });
   });
 
@@ -399,8 +421,6 @@ describe("dictation://focus (window-focus capture gate)", () => {
   let ctrl: Awaited<ReturnType<typeof createDictationController>>;
 
   beforeEach(async () => {
-    invoke.mockClear();
-    for (const k of Object.keys(listeners)) delete listeners[k];
     useDictationStore.setState({
       status: "listening",
       level: 0.6,
@@ -440,7 +460,10 @@ describe("dictation://focus (window-focus capture gate)", () => {
   });
 
   it("refocus (true) while still ACTIVE resumes the cloud stream without a wake word", async () => {
-    for (const k of Object.keys(listeners)) delete listeners[k];
+    // Drop the block's own controller (beforeEach registered one) so only the controller this case
+    // creates receives the broadcast. Targeted rather than purging the whole registry, which would
+    // orphan `ctrl` and quietly turn its afterEach cleanup into a no-op. Double-cleanup is safe.
+    ctrl.cleanup();
     const onResumeActive = vi.fn();
     const c = await createDictationController({ onSegment: vi.fn(), onResumeActive });
     useDictationStore.setState({ status: "idle", phase: "active", enabled: true });
@@ -453,7 +476,10 @@ describe("dictation://focus (window-focus capture gate)", () => {
   });
 
   it("refocus (true) while PASSIVE does not resume a cloud stream", async () => {
-    for (const k of Object.keys(listeners)) delete listeners[k];
+    // Drop the block's own controller (beforeEach registered one) so only the controller this case
+    // creates receives the broadcast. Targeted rather than purging the whole registry, which would
+    // orphan `ctrl` and quietly turn its afterEach cleanup into a no-op. Double-cleanup is safe.
+    ctrl.cleanup();
     const onResumeActive = vi.fn();
     const c = await createDictationController({ onSegment: vi.fn(), onResumeActive });
     useDictationStore.setState({ status: "idle", phase: "passive", enabled: true });
@@ -484,8 +510,6 @@ describe("per-window cloud-stream ownership on window-to-window switch (sparkle-
   // keep streaming after the user moved to another window. notifyWindowFocus() is the per-window OS
   // focus signal (wired to DOM window focus/blur in the real webview) that closes that gap.
   beforeEach(() => {
-    invoke.mockClear();
-    for (const k of Object.keys(listeners)) delete listeners[k];
     useDictationStore.setState({
       status: "listening",
       level: 0.6,
@@ -569,7 +593,6 @@ describe("per-window cloud-stream ownership on window-to-window switch (sparkle-
 
 describe("multi-window level/speaking gate (background windows must not animate — sparkle-ozvr)", () => {
   beforeEach(() => {
-    for (const k of Object.keys(listeners)) delete listeners[k];
     useDictationStore.setState({ level: 0, speaking: false, modelProgress: null });
   });
 
@@ -648,7 +671,6 @@ describe("multiple mounted composers (regression: dictation must not leak across
   // registerInsert(), and its cleanup guard (insertTarget === append) avoids a
   // stale pane clobbering a newer one. These tests drive that real mechanism.
   beforeEach(() => {
-    for (const k of Object.keys(listeners)) delete listeners[k];
     useDictationStore.setState({
       status: "idle",
       level: 0,
