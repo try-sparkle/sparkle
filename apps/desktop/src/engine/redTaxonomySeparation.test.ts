@@ -24,9 +24,8 @@ import { describe, expect, it } from "vitest";
 import { AGENT_STATUS, type AgentTabStatus } from "@sparkle/ui";
 import { isRedStatus } from "../services/windowStatus";
 import { needsAttention } from "./attention";
-import { sortAgentsByAttention } from "./agentOrdering";
 import { withUnmergedWork } from "./unmergedAttention";
-import { conciergePriority, isCalmBand } from "../services/conciergeFeed";
+import { conciergeBand, isCalmBand } from "../services/conciergeFeed";
 
 // ── 1. `unmerged` is not an alarm ────────────────────────────────────────────────────────────────
 
@@ -45,29 +44,12 @@ describe("unmerged is not red", () => {
     expect(AGENT_STATUS.unmerged.label).toBe("Needs merge");
   });
 
-  it("still sorts above the calm tier, but below every genuine red", () => {
-    const ids = [
-      { id: "idle" },
-      { id: "unmerged" },
-      { id: "waiting" },
-      { id: "working" },
-      { id: "blocked" },
-    ];
-    const status: Record<string, AgentTabStatus> = {
-      idle: "idle",
-      unmerged: "unmerged",
-      waiting: "waiting",
-      working: "working",
-      blocked: "blocked",
-    };
-    // waiting + blocked are both red (tier 0, insertion order); unmerged slots between them and idle.
-    expect(sortAgentsByAttention(ids, status).map((a) => a.id)).toEqual([
-      "waiting",
-      "blocked",
-      "unmerged",
-      "idle",
-      "working",
-    ]);
+  it("no longer moves rows around — position is workflow stage, not status", () => {
+    // This used to assert an attention SORT put unmerged between the reds and the calm tier. That
+    // sort is gone (engine/agentOrdering header): `unmerged` still says what it needs via its label
+    // and via WHICH STAGE SECTION its row sits in, but it no longer relocates the row. The banding
+    // that survives is the concierge interruption budget, asserted below.
+    expect(AGENT_STATUS.unmerged.label).toBe("Needs merge");
   });
 
   it("escalation still fires — the status is applied, it just isn't an alarm color", () => {
@@ -107,13 +89,23 @@ describe("the sets are not interchangeable", () => {
 
 // ── 3. Band ≠ dimming: the two questions `unmerged` must answer differently ──────────────────────
 // This is the trap the series fell into from both sides in consecutive commits. The concierge band is
-// an INTERRUPTION budget (`priority < 2` renders a nudge card, counts into "N need attention", lights
-// a project tab); dimming is a LEGIBILITY treatment. `unmerged` must be quiet in the first and not
+// an INTERRUPTION budget (`needs_you` renders a nudge card, counts into "N Need you", lights a
+// project tab); dimming is a LEGIBILITY treatment. `unmerged` must be quiet in the first and not
 // muted in the second, so anything that conflates them breaks one or the other.
 describe("unmerged: no interruption, but not dimmed either", () => {
-  it("does not buy a concierge interruption (P2 — no nudge card, no count, no tab glow)", () => {
-    // 27 of 51 agents sat in this band on the reported fleet. At P1 that was 27 nudge cards.
-    expect(conciergePriority("unmerged")).toBe(2);
+  it("does not buy a concierge interruption (`done` — no nudge card, no count, no tab glow)", () => {
+    // 27 of 51 agents sat in this band on the reported fleet. Banded needs_you that was 27 nudge cards.
+    expect(conciergeBand("unmerged")).toBe("done");
+  });
+
+  it("`blocked` joins the reds in ONE band — the amber tier is gone", () => {
+    // The status that separates isRedStatus from needsAttention (section 2) no longer gets its own
+    // interruption tier: a gold "wants you eventually" card and a red "answer now" card both meant
+    // "go look", so the second alarm color bought a distinction nobody acted on. It bands with the
+    // asks, and the sidebar/tab/nudge treatments it drives are the same red as theirs.
+    expect(conciergeBand("blocked")).toBe("needs_you");
+    expect(conciergeBand("waiting")).toBe("needs_you");
+    expect(isCalmBand("blocked")).toBe(false);
   });
 
   it("is NOT in the calm band the sidebar grayscales", () => {
@@ -123,6 +115,8 @@ describe("unmerged: no interruption, but not dimmed either", () => {
   });
 
   it("the genuinely calm statuses still dim, and no red one does", () => {
+    // `working` is its own BAND now (Running) and still calm: the band split changed where a row
+    // sorts and what it counts toward, not what desaturates.
     for (const s of ["idle", "done", "stopped", "working"] as const) {
       expect(isCalmBand(s)).toBe(true);
     }

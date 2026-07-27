@@ -7,7 +7,8 @@
 //! whatever the user was looking at, which is precisely the opposite of what a floating helper is
 //! for.
 //!
-//! Vitals (P0/P1) are PUSHED here by the main window rather than computed locally. The concierge
+//! Vitals (the Needs-you / Running counts) are PUSHED here by the main window rather than computed
+//! locally. The concierge
 //! feed depends on `useRuntimeStore`, which is per-window and not persisted, so a separate webview
 //! would start empty and render numbers that disagree with the app (spec §4.5).
 
@@ -23,10 +24,18 @@ use crate::frontmost::HELPER_LABEL;
 const ISLAND_W: f64 = 268.0;
 const ISLAND_H: f64 = 44.0;
 
+/// The two status bands the island shows. `done` is deliberately absent: on a resting fleet it is
+/// nearly every agent, so a permanent large number would drown the two counts that actually move.
+///
+/// `rename_all = "camelCase"` is load-bearing — the TS `Vitals` interface in services/helper.ts
+/// reads `needsYou`, and this struct is serialized straight into the `helper://vitals-changed`
+/// payload and the `get_helper_vitals` return. Drop it and the island silently renders `undefined`
+/// for both counts, with no type error on either side to catch it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Vitals {
-    pub p0: u32,
-    pub p1: u32,
+    pub needs_you: u32,
+    pub running: u32,
 }
 
 #[derive(Default)]
@@ -46,8 +55,8 @@ fn read_vitals(state: &HelperVitals) -> Vitals {
 /// Called by the main window whenever its concierge feed recomputes. The main window is the sole
 /// authority on these numbers.
 #[tauri::command]
-pub fn publish_helper_vitals(app: AppHandle, state: State<HelperVitals>, p0: u32, p1: u32) {
-    let v = Vitals { p0, p1 };
+pub fn publish_helper_vitals(app: AppHandle, state: State<HelperVitals>, needs_you: u32, running: u32) {
+    let v = Vitals { needs_you, running };
     set_vitals(&state, v);
     let _ = app.emit("helper://vitals-changed", v);
 }
@@ -124,18 +133,18 @@ mod tests {
 
     #[test]
     fn vitals_default_to_zero() {
-        assert_eq!(Vitals::default(), Vitals { p0: 0, p1: 0 });
+        assert_eq!(Vitals::default(), Vitals { needs_you: 0, running: 0 });
     }
 
     #[test]
     fn store_replaces_previous_vitals() {
         let state = HelperVitals::default();
-        set_vitals(&state, Vitals { p0: 3, p1: 7 });
-        assert_eq!(read_vitals(&state), Vitals { p0: 3, p1: 7 });
+        set_vitals(&state, Vitals { needs_you: 3, running: 7 });
+        assert_eq!(read_vitals(&state), Vitals { needs_you: 3, running: 7 });
         // A drop back to zero must actually land — the island showing a stale "3 P0" after
         // everything is answered would be worse than showing nothing.
-        set_vitals(&state, Vitals { p0: 0, p1: 1 });
-        assert_eq!(read_vitals(&state), Vitals { p0: 0, p1: 1 });
+        set_vitals(&state, Vitals { needs_you: 0, running: 1 });
+        assert_eq!(read_vitals(&state), Vitals { needs_you: 0, running: 1 });
     }
 
     #[test]
@@ -143,16 +152,16 @@ mod tests {
         // Every other lock site in this codebase uses unwrap_or_else(|e| e.into_inner()); a panic
         // elsewhere must not brick the island into never updating again.
         let state = HelperVitals::default();
-        set_vitals(&state, Vitals { p0: 2, p1: 2 });
+        set_vitals(&state, Vitals { needs_you: 2, running: 2 });
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = state.0.lock().unwrap();
             panic!("poison the mutex");
         }));
         assert!(poisoned.is_err());
         assert!(state.0.is_poisoned());
-        assert_eq!(read_vitals(&state), Vitals { p0: 2, p1: 2 });
-        set_vitals(&state, Vitals { p0: 5, p1: 6 });
-        assert_eq!(read_vitals(&state), Vitals { p0: 5, p1: 6 });
+        assert_eq!(read_vitals(&state), Vitals { needs_you: 2, running: 2 });
+        set_vitals(&state, Vitals { needs_you: 5, running: 6 });
+        assert_eq!(read_vitals(&state), Vitals { needs_you: 5, running: 6 });
     }
 
     #[test]

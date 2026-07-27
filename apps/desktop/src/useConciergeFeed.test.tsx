@@ -36,30 +36,32 @@ beforeEach(() => {
 describe("useConciergeFeed", () => {
   it("returns the live feed and re-renders when a status changes", () => {
     const { result } = renderHook(() => useConciergeFeed());
-    expect(result.current.scopedCounts).toEqual({ p0: 1, p1: 0 });
+    // a1 waiting → needs_you; b1 working → running.
+    expect(result.current.scopedCounts).toEqual({ needs_you: 1, running: 1, done: 0 });
 
     act(() => {
       useRuntimeStore.setState({ status: { a1: "waiting", b1: "blocked" } });
     });
-    expect(result.current.scopedCounts).toEqual({ p0: 1, p1: 1 });
+    // b1 moved out of Running and joined a1 in Needs-you — `blocked` is no longer its own tier.
+    expect(result.current.scopedCounts).toEqual({ needs_you: 2, running: 0, done: 0 });
   });
 
   it("re-renders when a mute rule lands, dimming the item out of the scoped counts", () => {
     const { result } = renderHook(() => useConciergeFeed());
-    expect(result.current.scopedCounts.p0).toBe(1);
+    expect(result.current.scopedCounts.needs_you).toBe(1);
 
     act(() => {
       useSparklePrefsStore.getState().setInterruptPreference("a1", "mute");
     });
-    expect(result.current.scopedCounts.p0).toBe(0);
+    expect(result.current.scopedCounts.needs_you).toBe(0);
     const a1 = result.current.projects[0]!.agents.find((a) => a.id === "a1")!;
     expect(a1.muted).toBe(true); // still listed — the UI dims it, the concierge stays quiet
   });
 
   it("scopes to the pinned project while still listing everything", () => {
     const { result } = renderHook(() => useConciergeFeed({ pinnedProjectId: "pB" }));
-    expect(result.current.scopedCounts).toEqual({ p0: 0, p1: 0 }); // pA's waiting is out of scope
-    expect(result.current.counts).toEqual({ p0: 1, p1: 0 }); // full truth unchanged
+    expect(result.current.scopedCounts).toEqual({ needs_you: 0, running: 1, done: 0 }); // pA is out of scope
+    expect(result.current.counts).toEqual({ needs_you: 1, running: 1, done: 0 }); // full truth unchanged
     expect(result.current.projects).toHaveLength(2);
   });
 

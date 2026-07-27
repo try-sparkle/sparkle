@@ -4,23 +4,22 @@
 // scopes the concierge to it ("disregard all other project alerts so you can focus").
 //
 // Presentational + prop-driven so it's decoupled from the stores and unit-testable: the integration
-// (Workspace) supplies the projects, selection, pin state, and per-project P0/P1 counts (from the
-// concierge feed), plus the callbacks.
+// (Workspace) supplies the projects, selection, pin state, and per-project status-band counts (from
+// the concierge feed), plus the callbacks.
 
 import { type CSSProperties, type KeyboardEvent, type ReactNode, useEffect } from "react";
 import { MdOutlinePushPin } from "react-icons/md";
 import { FiPlus } from "react-icons/fi";
+import type { StatusBand } from "../engine/buildSections";
+import { bandColor, bandCountLabel } from "../engine/statusBandLabels";
 import { C } from "../theme/colors";
 
 export interface ProjectTabItem {
   id: string;
   name: string;
 }
-/** Per-project attention counts (from the concierge feed) that drive the tab glow + count badge. */
-export interface ProjectTabCounts {
-  p0: number;
-  p1: number;
-}
+/** Per-project status-band counts (from the concierge feed) that drive the tab glow + count badge. */
+export type ProjectTabCounts = Record<StatusBand, number>;
 
 export interface ProjectTabsProps {
   projects: ProjectTabItem[];
@@ -46,16 +45,22 @@ export function pinTitle(isPinned: boolean): string {
     : "Pin this project and Sparkle will disregard all other project alerts so you can focus";
 }
 
-/** The priority a tab's glow/badge should reflect: "p0" (red) beats "p1" (yellow) beats null. */
-export function tabPriority(counts: ProjectTabCounts | undefined): "p0" | "p1" | null {
+/** The band a tab's glow/badge reflects: `needs_you` when anything in the project is asking for you,
+ *  otherwise nothing.
+ *
+ *  There is exactly ONE alarm treatment now. The old two-tier version also lit a YELLOW glow for the
+ *  "wants you eventually" tier, so a bar of tabs carried two competing alarm colors for a
+ *  distinction the user never acted on differently — both meant "go look". `running` and `done`
+ *  deliberately do NOT badge: a tab that glows whenever any agent is working glows permanently, and
+ *  a signal that is always on is not a signal. */
+export function tabBand(counts: ProjectTabCounts | undefined): StatusBand | null {
   if (!counts) return null;
-  if (counts.p0 > 0) return "p0";
-  if (counts.p1 > 0) return "p1";
-  return null;
+  return counts.needs_you > 0 ? "needs_you" : null;
 }
 
-const RED = "#e0533f";
-const YELLOW = "#ffd76a";
+// The one alarm color, taken from the band itself so the tab, the dots it counts, and the sidebar's
+// filter chips can't drift apart.
+const RED = bandColor("needs_you");
 
 /** How wide a tab's project name may get before it ellipsizes. Sized so a typical repo folder name
  *  fits whole and only genuinely long ones truncate — the point is a bar of UNIFORM-height tabs, not
@@ -118,13 +123,8 @@ export function ProjectTabs({
         const active = p.id === selectedProjectId;
         const pinned = p.id === pinnedProjectId;
         const counts = countsByProject[p.id];
-        const prio = tabPriority(counts);
-        const glow =
-          prio === "p0"
-            ? `0 0 0 1px ${RED}73, 0 -2px 14px ${RED}29`
-            : prio === "p1"
-              ? `0 0 0 1px ${YELLOW}66, 0 -2px 14px ${YELLOW}24`
-              : undefined;
+        const band = tabBand(counts);
+        const glow = band ? `0 0 0 1px ${RED}73, 0 -2px 14px ${RED}29` : undefined;
         return (
           <div
             key={p.id}
@@ -203,7 +203,7 @@ export function ProjectTabs({
             >
               {p.name}
             </span>
-            {prio && (
+            {band && (
               <span
                 data-testid={`count-${p.id}`}
                 style={{
@@ -211,11 +211,12 @@ export function ProjectTabs({
                   fontSize: 9,
                   padding: "1px 5px",
                   borderRadius: 5,
-                  color: prio === "p0" ? "#ff9a9a" : YELLOW,
-                  border: `1px solid ${prio === "p0" ? `${RED}99` : `${YELLOW}8c`}`,
+                  color: "#ff9a9a",
+                  border: `1px solid ${RED}99`,
                 }}
               >
-                {prio === "p0" ? `${counts!.p0}·P0` : `${counts!.p1}·P1`}
+                {/* "1 Needs you" / "3 Need you" — the shared helper owns the agreement. */}
+                {bandCountLabel(band, counts![band])}
               </span>
             )}
           </div>

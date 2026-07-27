@@ -522,16 +522,16 @@ export function useAttentionNotifications(): void {
         },
       );
     };
-    // A P0/P1 chiclet on the floating helper island: raise the window and put that tier in front
-    // of the user. Deliberately does NOT mount an agent or spawn a PTY — the click means "show me
+    // A band chiclet on the floating helper island: raise the window and put that band in front of
+    // the user. Deliberately does NOT mount an agent or spawn a PTY — the click means "show me
     // what's urgent", not "open this specific agent", which is why it is its own event.
     const handleFocusTier = (p: FocusTierPayload) => {
       void bringToFront();
-      // Deliberately does NOT touch agentOrdering: that is a PERSISTED user preference, and one
-      // chiclet click permanently destroying a deliberate "manual" ordering — with no undo and no
-      // indication it happened — is not a trade the click is worth. The tier filter alone surfaces
-      // the urgent rows.
-      useUiStore.getState().setAttentionTierFocus(p.tier);
+      // Isolating writes the SAME statusFilter the sidebar's chips render, so the click's effect is
+      // visible in the chip bar and clearable by the ordinary "Show all" — rather than an invisible
+      // mode with its own bespoke dismiss control. (The older note here worried about clobbering
+      // `agentOrdering`; that preference no longer exists — the column has one ordering now.)
+      useUiStore.getState().isolateStatusBand(p.band);
     };
     // Keep the listen() promise; safeUnlisten awaits it on cleanup so a listener that resolves
     // AFTER unmount is still torn down (and the Tauri teardown race is swallowed).

@@ -8,7 +8,7 @@ afterEach(cleanup);
 
 const noop = () => {};
 const base = {
-  vitals: { p0: 3, p1: 7 },
+  vitals: { needsYou: 3, running: 7 },
   captureBusy: false,
   captureError: null,
   onCapture: noop,
@@ -20,25 +20,35 @@ const base = {
 const captureBtn = () => screen.getByRole("button", { name: /capture/i }) as HTMLButtonElement;
 
 describe("HelperIsland", () => {
-  it("renders the published P0 and P1 counts", () => {
+  it("renders the published band counts, with the verb agreeing in number", () => {
     render(<HelperIsland {...base} />);
-    expect(screen.getByTestId("helper-p0").textContent).toContain("3");
-    expect(screen.getByTestId("helper-p1").textContent).toContain("7");
+    expect(screen.getByTestId("helper-needs-you").textContent).toContain("3 Need you");
+    expect(screen.getByTestId("helper-running").textContent).toContain("7 Running");
+  });
+
+  it("says '1 Needs you', not '1 Need you', at the singular boundary", () => {
+    render(<HelperIsland {...base} vitals={{ needsYou: 1, running: 1 }} />);
+    expect(screen.getByTestId("helper-needs-you").textContent).toContain("1 Needs you");
   });
 
   it("renders zeros rather than blanks when no vitals have arrived", () => {
-    render(<HelperIsland {...base} vitals={{ p0: 0, p1: 0 }} />);
-    expect(screen.getByTestId("helper-p0").textContent).toContain("0");
-    expect(screen.getByTestId("helper-p1").textContent).toContain("0");
+    render(<HelperIsland {...base} vitals={{ needsYou: 0, running: 0 }} />);
+    expect(screen.getByTestId("helper-needs-you").textContent).toContain("0");
+    expect(screen.getByTestId("helper-running").textContent).toContain("0");
   });
 
-  it("calls onChiclet with the tier that was clicked", () => {
+  it("offers no `done` chiclet — it would sit at a large constant and drown the other two", () => {
+    render(<HelperIsland {...base} />);
+    expect(screen.queryByTestId("helper-done")).toBeNull();
+  });
+
+  it("calls onChiclet with the band that was clicked", () => {
     const onChiclet = vi.fn();
     render(<HelperIsland {...base} onChiclet={onChiclet} />);
-    fireEvent.click(screen.getByTestId("helper-p0"));
-    expect(onChiclet).toHaveBeenCalledWith("p0");
-    fireEvent.click(screen.getByTestId("helper-p1"));
-    expect(onChiclet).toHaveBeenCalledWith("p1");
+    fireEvent.click(screen.getByTestId("helper-needs-you"));
+    expect(onChiclet).toHaveBeenCalledWith("needs_you");
+    fireEvent.click(screen.getByTestId("helper-running"));
+    expect(onChiclet).toHaveBeenCalledWith("running");
   });
 
   it("calls onCapture when Capture is clicked", () => {
@@ -70,7 +80,7 @@ describe("HelperIsland", () => {
     const onDragStart = vi.fn();
     render(<HelperIsland {...base} onDragStart={onDragStart} />);
     fireEvent.pointerDown(captureBtn());
-    fireEvent.pointerDown(screen.getByTestId("helper-p0"));
+    fireEvent.pointerDown(screen.getByTestId("helper-needs-you"));
     expect(onDragStart).not.toHaveBeenCalled();
   });
 

@@ -4,6 +4,11 @@ import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import { migratePersistedUi } from "./composerPersist";
 import type { Runtime } from "../types";
+// TYPE-ONLY import, deliberately: engine/buildSections → engine/workflowStage → theme/colors, and
+// theme/theme.ts imports THIS store. A value import would close that loop into a runtime cycle; a
+// type import is erased at compile time, so it can't. The default below is spelled inline for the
+// same reason (rather than calling allBandsVisible()).
+import type { StatusBand } from "../engine/buildSections";
 
 // Settings-dialog category ids. Defined HERE (not SettingsDialog.tsx) so the store never depends
 // on a component file — SettingsDialog imports and re-exports it for its own consumers.
@@ -34,9 +39,6 @@ const TRANSIENT_UI_KEYS = [
   "composeFocusSeq",
   "newAgentRuntime",
   "cloudCreateOpen",
-  // The helper island's tier filter: a live view state, not a preference — it must not survive a
-  // relaunch, or the island comes back filtered to a tier the user can no longer see they picked.
-  "attentionTierFocus",
   "zeroCreditBannerDismissed",
   "zeroCreditBannerDismissedFor",
 ] as const satisfies readonly (keyof UiState)[];
@@ -76,15 +78,17 @@ const clampZoom = (z: number) =>
 // circular dependency — theme.ts depends on the store, never the reverse.
 export type ThemePref = "auto" | "light" | "dark";
 
-// Sidebar agent ordering. "attention" reorders the top-level agent stack so the agents
-// that need you (red — waiting/approval) float to the top and happily-building ones sink
-// down (see engine/agentOrdering.ts). "manual" keeps insertion order, like before this
-// feature. Default is "attention" — reordering is the out-of-the-box behavior.
-export type AgentOrdering = "attention" | "manual";
+// NOTE: `AgentOrdering` ("attention" | "manual") was REMOVED here. The Build column no longer
+// sorts rows by live status at all — rows are grouped into the workflow-stage ladder
+// (engine/buildSections.ts) and ordered WITHIN a stage by the user's own drag arrangement. There
+// is nothing left for the preference to select between, so the setting and its toggle are gone.
+// The persisted `agentOrdering` key is dropped by the v2 migration below.
 
-/** The urgency tiers the helper island's chiclets can narrow the sidebar to. Mirrors the
- *  concierge's own P0/P1 banding (services/conciergeFeed.ts). */
-export type AttentionTier = "p0" | "p1";
+// NOTE: `AttentionTier` ("p0" | "p1") was REMOVED here along with `attentionTierFocus`. The helper
+// island's chiclets used to set their own filter state, which the sidebar then applied on top of
+// its own — two independent stores both answering "which rows does the Build column show". The
+// chiclets now call `isolateStatusBand`, so their effect lands in the SAME `statusFilter` the chips
+// render: clicking one is visibly a filter, and clearing it is the ordinary "Show all".
 
 // Sidebar workflow mode — which of the Plan / Build chevrons is active. Lifted out of
 // AgentSidebar's local state into the store so other components can switch tabs by calling
@@ -124,14 +128,21 @@ interface UiState {
   // to set <html data-theme> before first paint and avoid a flash of the wrong theme.
   themePref: ThemePref;
   setThemePref: (v: ThemePref) => void;
-  // Sidebar agent ordering preference (see AgentOrdering). Persisted in `sparkle-ui`.
-  agentOrdering: AgentOrdering;
-  setAgentOrdering: (v: AgentOrdering) => void;
-  // Which urgency tier the sidebar is narrowed to, set by clicking a P0/P1 chiclet on the
-  // floating helper island. null = show everything. Transient — NOT persisted (see partialize):
-  // a filter that silently survived a relaunch would look like agents had vanished.
-  attentionTierFocus: AttentionTier | null;
-  setAttentionTierFocus: (t: AttentionTier | null) => void;
+  // Which status bands the Build column currently SHOWS (the "Need you / Running / Done" filter
+  // chips above the stage ladder). All three start on; clicking a chip toggles its rows out of the
+  // column. Persisted, so the focus you chose survives a relaunch — this is a deliberate view
+  // preference, not a transient one. A section left with no visible rows hides entirely, so
+  // filtering never leaves empty headers behind (see engine/buildSections.groupAgentsByStage).
+  //
+  // Turning ALL THREE off is allowed and shows an empty column with an explanatory hint. We do NOT
+  // silently re-arm the last chip: a user who clicked three times meant it, and a filter that
+  // refuses to reach its stated state is worse than an empty list that explains itself.
+  statusFilter: Record<StatusBand, boolean>;
+  toggleStatusBand: (b: StatusBand) => void;
+  showAllStatusBands: () => void;
+  /** Show ONLY this band — the helper island's chiclets. Writes the same `statusFilter` the chips
+   *  render, so the resulting state is visible and clearable exactly like a hand-toggled one. */
+  isolateStatusBand: (b: StatusBand) => void;
   // Active sidebar workflow mode (Plan/Build chevrons). Shared so non-sidebar components can
   // switch tabs. NOT persisted (see partialize) — resets to "build" each launch like the old local state.
   workMode: WorkMode;
@@ -224,10 +235,13 @@ export const useUiStore = create<UiState>()(
       setActiveSpecial: (v) => set({ activeSpecial: v }),
       themePref: "auto",
       setThemePref: (v) => set({ themePref: v }),
-      agentOrdering: "attention",
-      setAgentOrdering: (v) => set({ agentOrdering: v }),
-      attentionTierFocus: null,
-      setAttentionTierFocus: (t) => set({ attentionTierFocus: t }),
+      statusFilter: { needs_you: true, running: true, done: true },
+      toggleStatusBand: (b) =>
+        set((s) => ({ statusFilter: { ...s.statusFilter, [b]: !s.statusFilter[b] } })),
+      showAllStatusBands: () =>
+        set({ statusFilter: { needs_you: true, running: true, done: true } }),
+      isolateStatusBand: (b) =>
+        set({ statusFilter: { needs_you: b === "needs_you", running: b === "running", done: b === "done" } }),
       workMode: "build",
       setWorkMode: (m) => set({ workMode: m }),
       boardFocusBeadId: null,
@@ -294,7 +308,9 @@ export const useUiStore = create<UiState>()(
       // migratePersistedUi resets only users still parked on the OLD default, preserving a
       // height anyone deliberately dragged to. (composerMinimized hydrates from its default
       // via the usual shallow merge — no migration needed for the new field.)
-      version: 1,
+      // v2: drops the retired `agentOrdering` preference and repairs `statusFilter` into a
+      // complete record, so a partial blob can't hide a band with no visible cause.
+      version: 2,
       migrate: (persisted, version) =>
         migratePersistedUi(persisted as Record<string, unknown>, version, COMPOSER_SNAP) as unknown as UiState,
       // Strip the transient keys on the way IN as well. `partialize` only stops us WRITING them;

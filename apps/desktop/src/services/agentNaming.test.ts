@@ -279,7 +279,6 @@ function agentTab(over: Partial<AgentTab>): AgentTab {
     autoNameBasis: null,
     autoNameVariants: null,
     shellCommand: null,
-    pinnedIndex: null,
     ...over,
   };
 }

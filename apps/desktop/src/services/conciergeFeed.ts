@@ -1,35 +1,39 @@
-// Cross-project roster + P0/P1/P2 priority feed for Concierge Mode (bead sparkle-ld0t, CM-U3).
+// Cross-project roster + status-band feed for Concierge Mode (bead sparkle-ld0t, CM-U3).
 //
 // This is the data layer the concierge column reads: ONE view of everything across all projects,
-// with each agent banded into the priority tiers the prototype renders (P0 red · P1 yellow · P2
-// gray). The core is a PURE builder (like useRosterPublisher.buildRoster) so it unit-tests without
-// a DOM or Tauri; useConciergeFeed.ts wires it to the live stores.
+// with each agent placed in one of the three STATUS BANDS the whole app now speaks in —
+// "Needs you" · "Running" · "Done". The core is a PURE builder (like useRosterPublisher.buildRoster)
+// so it unit-tests without a DOM or Tauri; useConciergeFeed.ts wires it to the live stores.
 //
-// PRIORITY IS REUSED, NOT INVENTED — the bands are exactly the two existing attention tiers:
-//   P0 = engine/attention.needsAttention  (waiting | approval | errored — "answer this NOW")
-//   P1 = "wants you eventually" — the red-but-not-asking `blocked`. NOT `unmerged`, which is P2 on
-//        purpose: this band buys an INTERRUPTION (see conciergePriority), and landing state must not.
-//   P2 = everything else                   (working | idle | done | stopped — calm)
+// THE VOCABULARY IS IMPORTED, NOT INVENTED — `bandOfStatus`/`STATUS_BANDS` live in
+// engine/buildSections, where the Build column's filter chips read them, so a status can never band
+// one way in the sidebar and another in the concierge:
+//   needs_you ← waiting | approval | blocked | errored   ("this cannot proceed without you")
+//   running   ← working
+//   done      ← idle | done | stopped | unmerged
+// This replaced a P0/P1/P2 scheme that split `blocked` off into its own amber tier and lumped
+// `working` in with the finished rows. The split that matters to a user is the one that survived:
+// in-flight work is not finished work. The one that didn't — "asks you now" vs "wants you
+// eventually" — bought a second alarm color for a distinction nobody acted on differently, so
+// `blocked` now reads RED like every other Needs-you status and there is exactly ONE red treatment.
+//
+// `unmerged` is in `done`, and that is load-bearing: the band buys an INTERRUPTION (see
+// `conciergeBand`), and landing state must not. It is kept out of the DIMMING predicate separately —
+// see `isCalmBand`, and do not collapse the two.
+//
 // The status each agent is banded ON is the same overlaid status the sidebar colors its rows with
 // and the cross-window channel broadcasts: useAttentionNotifications.publishedStatusFor (unstarted-
 // worker red → worker-red bubble → unmerged escalation → alert-dismissal de-escalation, in that
 // contractual order). A red worker therefore also paints its orchestrator here, exactly as it does
 // everywhere else.
 import { AGENT_STATUS, type AgentTabStatus } from "@sparkle/ui";
-import { needsAttention } from "../engine/attention";
 import { agentDisplayName } from "../engine/agentDisplayName";
-import { isRedStatus } from "./windowStatus";
+import { STATUS_BANDS, bandOfStatus, type StatusBand } from "../engine/buildSections";
 import { resolveStage, type WorkflowStageId } from "../engine/workflowStage";
 import { publishedStatusFor } from "../useAttentionNotifications";
 import type { BranchStatus } from "./branchStatus";
 import type { Roster } from "./rosterTypes";
 import type { AgentKind, Project } from "../types";
-
-/** 0 = answer now (red, badge tier) · 1 = wants you eventually (`blocked`) · 2 = everything else.
- *
- *  P2 is NOT "the rows the sidebar grayscales" — that is `isCalmBand`, which excludes `unmerged`.
- *  Keep the two apart; conflating them is what this file's two 2026-07-26 regressions both were. */
-export type ConciergeAgentPriority = 0 | 1 | 2;
 
 export interface ConciergeAgent {
   id: string;
@@ -40,7 +44,7 @@ export interface ConciergeAgent {
   status: AgentTabStatus;
   statusColor: string;
   statusLabel: string;
-  priority: ConciergeAgentPriority;
+  band: StatusBand;
   /** Epoch ms of the user's last touch of this agent (interactionStore.lastAt / promptHistory) —
    *  the within-tier recency tiebreak. Absent when the agent was never touched this session. */
   since?: number;
@@ -54,9 +58,13 @@ export interface ConciergeAgent {
   muted: boolean;
 }
 
-export interface ConciergeCounts {
-  p0: number;
-  p1: number;
+/** How many agents sit in each band. Every band is counted — a surface that only cares about
+ *  "Needs you" reads that one field rather than the feed having to guess which ones matter. */
+export type ConciergeCounts = Record<StatusBand, number>;
+
+/** All-zero counts — the shape every accumulator starts from. */
+export function emptyCounts(): ConciergeCounts {
+  return { needs_you: 0, running: 0, done: 0 };
 }
 
 export interface ConciergeProject {
@@ -64,9 +72,10 @@ export interface ConciergeProject {
   name: string;
   /** False only when a pin scopes the concierge to a different project. */
   inScope: boolean;
-  /** This project's raw P0/P1 totals (mute/scope ignored) — the per-tab glow + count. */
+  /** This project's raw per-band totals (mute/scope ignored) — the per-tab glow + count. */
   counts: ConciergeCounts;
-  /** Sorted P0 → P1 → P2; within a tier, live questions first, then most recent, then name. */
+  /** Sorted Needs you → Running → Done; within a band, live questions first, then most recent,
+   *  then name. */
   agents: ConciergeAgent[];
 }
 
@@ -75,7 +84,7 @@ export interface ConciergeFeed {
   /** Raw totals across ALL projects, mute/scope ignored — the full truth. */
   counts: ConciergeCounts;
   /** What the concierge actually surfaces: in-scope (per the pin) AND not muted. This is the
-   *  vitals line (U1's `vitals: { p0, p1 }`) and the "needs surfacing" gate. */
+   *  vitals line (U1's `vitals`) and the "needs surfacing" gate. */
   scopedCounts: ConciergeCounts;
   pinnedProjectId: string | null;
 }
@@ -108,37 +117,47 @@ const DEFAULT_STATUS: AgentTabStatus = "stopped";
 /** The name the concierge shows — the one shared rule (engine/agentDisplayName). */
 const displayName = agentDisplayName;
 
-/** The priority band for a status: P0 "needs you now" (needsAttention) → P1 "wants you eventually"
- *  (the red-but-not-asking `blocked`) → P2 calm.
+/** The status band for a status, tolerating "no status at all" (an agent no window is running):
+ *  that reads as `done`, the same place `stopped` — the builder's default — lands.
  *
- *  `unmerged` is P2. This band is the concierge's INTERRUPTION budget, not a display tier:
- *  `priority < 2` is what `ConciergeHost.surfacedAgents` renders as a nudge card, what feeds
- *  `counts.p1` / the "N need attention" line, and what lights a project tab's glow via
- *  `ProjectTabs.tabPriority`. On the fleet that started all this — 27 of 51 agents in the
- *  committed-but-unlanded band — putting `unmerged` at P1 would mean 27 nudge cards and
- *  "27 P1 need attention": the same undismissable pile the taxonomy fix exists to remove, in yellow
- *  instead of red (roborev on f7b43dc8). Landing state must not buy an interruption.
+ *  A thin `undefined`-shim over engine/buildSections.bandOfStatus, NOT a second opinion about where
+ *  a status belongs. Adding an arm here instead of there is how the sidebar's filter chips and the
+ *  concierge start disagreeing about the same agent.
  *
- *  It must not buy a DIMMING either, which is the trap that made P1 tempting — see `isCalmBand`. */
-export function conciergePriority(status: AgentTabStatus | undefined): ConciergeAgentPriority {
-  if (needsAttention(status)) return 0;
-  if (isRedStatus(status)) return 1;
-  return 2;
+ *  `unmerged` bands `done`. This band is the concierge's INTERRUPTION budget, not a display tier:
+ *  `band === "needs_you"` is what `ConciergeHost.surfacedAgents` renders as a nudge card, what feeds
+ *  the "N Need you" line, and what lights a project tab's glow via `ProjectTabs.tabBand`. On the
+ *  fleet that started all this — 27 of 51 agents in the committed-but-unlanded band — banding
+ *  `unmerged` as needs_you would mean 27 nudge cards and "27 Need you": the same undismissable pile
+ *  the taxonomy fix exists to remove (roborev on f7b43dc8). Landing state must not buy an
+ *  interruption.
+ *
+ *  It must not buy a DIMMING either, which is the trap the other direction — see `isCalmBand`. */
+export function conciergeBand(status: AgentTabStatus | undefined): StatusBand {
+  return status === undefined ? "done" : bandOfStatus(status);
 }
 
 /** Should the sidebar render this row GRAYSCALED and dimmed (`grayscale(1) opacity(.72)`)?
  *
- *  Deliberately NOT `conciergePriority(status) === 2`, which is what AgentSidebar used to ask. Those
- *  two questions look identical and are not: the band is an interruption budget, dimming is a
- *  legibility treatment, and `unmerged` needs opposite answers from them — no nudge card (so P2), but
- *  not visually muted either, because "your work hasn't landed" is exactly the thing you should still
- *  be able to see at a glance.
+ *  Deliberately NOT "is this row's band `done`", and deliberately NOT "is it anything but
+ *  needs_you" alone. The set is {idle, done, stopped, working, no-status}: everything that is not
+ *  asking for you, MINUS `unmerged`.
+ *
+ *  Those questions look identical to the band and are not: the band is an interruption budget,
+ *  dimming is a legibility treatment, and `unmerged` needs opposite answers from them — no nudge
+ *  card (so, `done`), but not visually muted either, because "your work hasn't landed" is exactly
+ *  the thing you should still be able to see at a glance.
  *
  *  Conflating them is a two-way trap that this series hit from BOTH sides in consecutive commits:
- *  P2 silently dimmed every "Needs merge" row, and the P1 fix for that silently turned each one into
- *  a concierge nudge. Naming the predicate is what stops the next person rediscovering it. */
+ *  the calm band silently dimmed every "Needs merge" row, and the fix for that silently turned each
+ *  one into a concierge nudge. Naming the predicate is what stops the next person rediscovering it.
+ *
+ *  Note `working` is in here even though it is its own band now: a running agent is not asking you
+ *  for anything, and the terminal you are watching desaturating the moment it starts working would
+ *  be a treatment nobody wants. The band split running from done for POSITION and COUNTS; it did not
+ *  change what dims. */
 export function isCalmBand(status: AgentTabStatus | undefined): boolean {
-  return conciergePriority(status) === 2 && status !== "unmerged";
+  return conciergeBand(status) !== "needs_you" && status !== "unmerged";
 }
 
 /** The do-not-interrupt topics a feed item is keyed under, for sparklePrefsStore.shouldInterrupt:
@@ -166,24 +185,33 @@ export function trayStatusMap(
   return out;
 }
 
-// Within-tier rank: a live question (waiting/approval — the user is actively blocking) outranks
-// the rest of its tier. Mirrors windowStatus.attentionRank (module-private there).
+// Within-band rank: a live question (waiting/approval — the user is actively blocking) outranks
+// the rest of its band. Mirrors windowStatus.attentionRank (module-private there).
 function tierRank(status: AgentTabStatus): number {
   return status === "waiting" || status === "approval" ? 0 : 1;
 }
 
-// P0 → P1 → P2; within a tier live questions first, then most-recently-touched, then name — a
-// total order (name last) so the rendered list is stable across rebuilds.
+// Sort key for a band, read off STATUS_BANDS' declared order rather than a second table here — the
+// chips render top-to-bottom in that order, and the feed must not be able to disagree with them.
+function bandRank(band: StatusBand): number {
+  const i = STATUS_BANDS.findIndex((b) => b.id === band);
+  return i === -1 ? STATUS_BANDS.length : i;
+}
+
+// Needs you → Running → Done; within a band live questions first, then most-recently-touched, then
+// name — a total order (name last) so the rendered list is stable across rebuilds. Red still sorts
+// above calm; what changed is that a RUNNING agent now sorts above a finished one instead of tying
+// with it.
 function compareAgents(a: ConciergeAgent, b: ConciergeAgent): number {
   return (
-    a.priority - b.priority ||
+    bandRank(a.band) - bandRank(b.band) ||
     tierRank(a.status) - tierRank(b.status) ||
     (b.since ?? 0) - (a.since ?? 0) ||
     a.name.localeCompare(b.name)
   );
 }
 
-/** Build the concierge's cross-project priority feed. Pure — no store reads, no Tauri. */
+/** Build the concierge's cross-project status-band feed. Pure — no store reads, no Tauri. */
 export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
   const {
     projects,
@@ -209,23 +237,22 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
     resolveStage(branchStatus[id], workflowStage[id]),
   );
 
-  const counts: ConciergeCounts = { p0: 0, p1: 0 };
-  const scopedCounts: ConciergeCounts = { p0: 0, p1: 0 };
+  const counts = emptyCounts();
+  const scopedCounts = emptyCounts();
   const outProjects: ConciergeProject[] = projects.map((p) => {
     const inScope = pinnedProjectId === null || p.id === pinnedProjectId;
-    const projectCounts: ConciergeCounts = { p0: 0, p1: 0 };
+    const projectCounts = emptyCounts();
     const agents = p.agents.map((a): ConciergeAgent => {
       const status = derived[a.id] ?? DEFAULT_STATUS;
       const tok = AGENT_STATUS[status] ?? AGENT_STATUS[DEFAULT_STATUS];
-      const priority = conciergePriority(status);
+      const band = conciergeBand(status);
       const muted = conciergeTopics(a.id, status).some((t) => !shouldInterrupt(t));
       const since = interaction[a.id];
-      if (priority === 0) projectCounts.p0++;
-      else if (priority === 1) projectCounts.p1++;
-      if (priority < 2 && inScope && !muted) {
-        if (priority === 0) scopedCounts.p0++;
-        else scopedCounts.p1++;
-      }
+      projectCounts[band]++;
+      // The scoped view applies the SAME two gates to every band (in scope per the pin, not muted),
+      // so "3 Running" shrinks when you pin exactly the way "3 Need you" does. The old shape only
+      // ever scoped the interrupting tiers because it had no field for the rest.
+      if (inScope && !muted) scopedCounts[band]++;
       return {
         id: a.id,
         name: displayName(a),
@@ -235,15 +262,14 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
         status,
         statusColor: tok.color,
         statusLabel: tok.label,
-        priority,
+        band,
         ...(since !== undefined && since > 0 ? { since } : {}),
         inScope,
         muted,
       };
     });
     agents.sort(compareAgents);
-    counts.p0 += projectCounts.p0;
-    counts.p1 += projectCounts.p1;
+    for (const b of STATUS_BANDS) counts[b.id] += projectCounts[b.id];
     return { id: p.id, name: p.name, inScope, counts: projectCounts, agents };
   });
 

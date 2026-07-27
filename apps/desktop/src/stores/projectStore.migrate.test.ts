@@ -7,7 +7,9 @@ type HealedAgent = {
   kind?: string;
   namePinned: boolean;
   selfNamed?: boolean;
-  pinnedIndex: number | null;
+  // Still read off the PERSISTED shape: a blob written before 2026-07-26 can carry this key even
+  // though AgentTab no longer declares it. The v9 heal reads it; nothing writes it any more.
+  pinnedIndex?: number | null;
 };
 
 /** Read back a single agent from the migrated shape. */
@@ -26,19 +28,22 @@ describe("migratePersisted — v9 stale self-name pin heal (sparkle-pel7 residue
         id: "p1",
         agents: [
           // (1) stale self-name pin on a build agent — the bug. Heal it.
-          { id: "build-stale", name: "Stripe Checkout Button", kind: "build", namePinned: true, selfNamed: false, pinnedIndex: null },
+          { id: "build-stale", name: "Stripe Checkout Button", kind: "build", namePinned: true, selfNamed: false },
           // (2) same fingerprint on a worker — heal it.
-          { id: "worker-stale", name: "Auto-Approve Builder", kind: "worker", namePinned: true, pinnedIndex: null },
-          // (3) a real drag/manual pin (pinnedIndex set) — deliberate, leave it.
+          { id: "worker-stale", name: "Auto-Approve Builder", kind: "worker", namePinned: true },
+          // (3) a legacy drag pin that still carries pinnedIndex on disk. v9 reads that key off the
+          //     persisted shape (see projectStore's `{ pinnedIndex?: number | null }` cast) and treats
+          //     it as the marker of a DELIBERATE pin, so this record is left alone — even though
+          //     nothing writes the key any more.
           { id: "manual-pin", name: "My Pinned Row", kind: "build", namePinned: true, selfNamed: false, pinnedIndex: 3 },
           // (4) a think agent pinned to its epic title (pinnedIndex null) — legit, leave it.
-          { id: "think-epic", name: "Ship the pin fix", kind: "think", namePinned: true, selfNamed: false, pinnedIndex: null },
+          { id: "think-epic", name: "Ship the pin fix", kind: "think", namePinned: true, selfNamed: false },
           // (5) a shell "run as command" tab, name-pinned by design (addAgent opts.name) — leave it.
-          { id: "shell-cmd", name: "npm test", kind: "shell", namePinned: true, selfNamed: false, pinnedIndex: null },
+          { id: "shell-cmd", name: "npm test", kind: "shell", namePinned: true, selfNamed: false },
           // (6) an already-correct self-named agent — no pin, nothing to do.
-          { id: "self-ok", name: "Prospect Radar MVP", kind: "build", namePinned: false, selfNamed: true, pinnedIndex: null },
+          { id: "self-ok", name: "Prospect Radar MVP", kind: "build", namePinned: false, selfNamed: true },
           // (7) a plain auto-named agent — untouched.
-          { id: "auto", name: "Build 1", kind: "build", namePinned: false, selfNamed: false, pinnedIndex: null },
+          { id: "auto", name: "Build 1", kind: "build", namePinned: false, selfNamed: false },
         ],
       },
     ],
@@ -50,7 +55,8 @@ describe("migratePersisted — v9 stale self-name pin heal (sparkle-pel7 residue
     expect(buildStale.namePinned).toBe(false);
     expect(buildStale.selfNamed).toBe(true);
     expect(buildStale.name).toBe("Stripe Checkout Button"); // name preserved
-    expect(buildStale.pinnedIndex).toBeNull();
+    // The record never carried pinnedIndex, and the migration no longer adds it.
+    expect(buildStale.pinnedIndex).toBeUndefined();
 
     const workerStale = a.find((x) => x.id === "worker-stale")!;
     expect(workerStale.namePinned).toBe(false);
@@ -60,7 +66,7 @@ describe("migratePersisted — v9 stale self-name pin heal (sparkle-pel7 residue
 
   it("leaves deliberate pins and correct records untouched", () => {
     const a = agentsOf(migratePersisted(staleFingerprint(), 8));
-    // (3) real manual/drag pin keeps its anchor + pin
+    // (3) a legacy record carrying pinnedIndex on disk is still read as a deliberate pin
     expect(a.find((x) => x.id === "manual-pin")!.namePinned).toBe(true);
     expect(a.find((x) => x.id === "manual-pin")!.pinnedIndex).toBe(3);
     // (4) think-epic pin preserved
@@ -78,7 +84,7 @@ describe("migratePersisted — v9 stale self-name pin heal (sparkle-pel7 residue
   it("ambiguous pre-unified-pin manual rename: folded into selfNamed (documented trade-off)", () => {
     // Before bbea8ac4 (2026-06-27), a MANUAL sidebar rename of a build/worker agent called
     // renameAgent() without an index, producing the IDENTICAL fingerprint as the pel7 residue
-    // (namePinned:true, pinnedIndex:null, !selfNamed, build/worker). The migration cannot tell them
+    // (namePinned:true, !selfNamed, build/worker). The migration cannot tell them
     // apart, so it heals this record too: the NAME is preserved and stays frozen against auto-naming
     // (via selfNamed), only the pin chip is dropped. The single behavioral divergence — resetAutoName
     // clearing a selfNamed (not namePinned) name on genuine slot reuse — is exercised by the
@@ -88,7 +94,7 @@ describe("migratePersisted — v9 stale self-name pin heal (sparkle-pel7 residue
         {
           id: "p1",
           agents: [
-            { id: "manual-legacy", name: "Payments Refactor", kind: "build", namePinned: true, selfNamed: false, pinnedIndex: null },
+            { id: "manual-legacy", name: "Payments Refactor", kind: "build", namePinned: true, selfNamed: false },
           ],
         },
       ],
@@ -108,7 +114,7 @@ describe("migratePersisted — v9 stale self-name pin heal (sparkle-pel7 residue
         {
           id: "p1",
           agents: [
-            { id: "fresh-pin", name: "Kept", kind: "build", namePinned: true, selfNamed: false, pinnedIndex: null },
+            { id: "fresh-pin", name: "Kept", kind: "build", namePinned: true, selfNamed: false },
           ],
         },
       ],
@@ -118,8 +124,8 @@ describe("migratePersisted — v9 stale self-name pin heal (sparkle-pel7 residue
   });
 });
 
-describe("migratePersisted — v8 pinnedIndex backfill", () => {
-  it("backfills pinnedIndex: null without touching namePinned", () => {
+describe("migratePersisted — the retired v8 pinnedIndex backfill", () => {
+  it("no longer writes pinnedIndex, and still leaves namePinned alone", () => {
     const persisted = {
       projects: [
         {
@@ -131,14 +137,17 @@ describe("migratePersisted — v8 pinnedIndex backfill", () => {
         },
       ],
     };
+    // Row anchoring is gone (see types.ts), so the field is not backfilled onto new records. A blob
+    // that already has the key keeps it — inert, read only by the v9 heal — because rewriting every
+    // agent to delete one dead key isn't worth a migration step.
     const out = migratePersisted(persisted, 7) as {
-      projects: { agents: { id: string; namePinned: boolean; pinnedIndex: number | null }[] }[];
+      projects: { agents: { id: string; namePinned: boolean; pinnedIndex?: number | null }[] }[];
     };
     const agents = out.projects[0]!.agents;
     const a1 = agents.find((a) => a.id === "a1")!;
     const a2 = agents.find((a) => a.id === "a2")!;
-    expect(a1.pinnedIndex).toBeNull();
-    expect(a2.pinnedIndex).toBeNull();
+    expect(a1.pinnedIndex).toBeUndefined();
+    expect(a2.pinnedIndex).toBeUndefined();
     expect(a1.namePinned).toBe(true); // unchanged — nothing freezes on upgrade
     expect(a2.namePinned).toBe(false);
   });

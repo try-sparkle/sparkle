@@ -1,4 +1,4 @@
-// Live cross-project priority feed for the Concierge column (bead sparkle-ld0t, CM-U3).
+// Live cross-project status-band feed for the Concierge column (bead sparkle-ld0t, CM-U3).
 //
 // Thin subscription shell over the pure buildConciergeFeed (services/conciergeFeed.ts): subscribes
 // to the live stores (projects, status, stage inputs, interaction times, mute rules) plus the Rust
@@ -21,14 +21,16 @@ import type { Roster } from "./services/rosterTypes";
 export { selectAndOpen } from "./useAttentionNotifications";
 export {
   buildConciergeFeed,
-  conciergePriority,
+  conciergeBand,
   conciergeTopics,
+  emptyCounts,
+  isCalmBand,
   type ConciergeFeed,
   type ConciergeProject,
   type ConciergeAgent,
-  type ConciergeAgentPriority,
   type ConciergeCounts,
 } from "./services/conciergeFeed";
+export type { StatusBand } from "./engine/buildSections";
 
 export interface UseConciergeFeedOpts {
   /** Scope the concierge to one project (the pinned tab); omit/null to follow all projects. */

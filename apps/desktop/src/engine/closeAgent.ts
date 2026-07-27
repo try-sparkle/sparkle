@@ -4,7 +4,7 @@
 import { stageIndex, type WorkflowStageId } from "./workflowStage";
 import { firstVisibleAgentId } from "./agentOrdering";
 import type { BranchStatus } from "../services/branchStatus";
-import type { AgentKind, AgentTabStatus } from "../types";
+import type { AgentKind } from "../types";
 
 /** Whether closing an agent should pop the Ship/Save/Discard choice instead of silently tearing it
  *  down. Only a deliverable BUILD agent with UNMERGED work at risk prompts:
@@ -41,7 +41,6 @@ export type CloseSelectionAgent = {
   id: string;
   kind: AgentKind;
   parentId: string | null;
-  pinnedIndex: number | null;
 };
 
 /**
@@ -60,11 +59,20 @@ export function selectionAfterClose<T extends CloseSelectionAgent>(
   agentsBefore: readonly T[],
   agentsAfter: readonly T[],
   mode: "plan" | "build",
-  agentOrdering: "attention" | "manual",
-  statusMap: Record<string, AgentTabStatus>,
+  // The genuinely-first VISIBLE row, supplied by the caller when it knows the rendered ladder order
+  // and the active status filter (the sidebar does; other callers don't). Falls back to the first
+  // top-level agent in array order. Threading it as a value — rather than re-deriving an ordering
+  // preference in here — is what keeps this helper pure and lets the sidebar guarantee selection
+  // never lands on a row the user has filtered out of sight.
+  preferredNext?: string | null,
 ): { reselect: boolean; next: string | null } {
   const removed = new Set<string>([removedRootId]);
   for (const a of agentsBefore) if (a.parentId === removedRootId) removed.add(a.id);
   if (!selectedId || !removed.has(selectedId)) return { reselect: false, next: selectedId };
-  return { reselect: true, next: firstVisibleAgentId(agentsAfter, mode, agentOrdering, statusMap) };
+  // Only trust `preferredNext` if that agent actually survived the close.
+  const survives = preferredNext != null && agentsAfter.some((a) => a.id === preferredNext);
+  return {
+    reselect: true,
+    next: survives ? preferredNext : firstVisibleAgentId(agentsAfter, mode),
+  };
 }

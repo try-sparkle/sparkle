@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { RosterPayload } from "./relayClient";
 import type { Roster } from "./rosterTypes";
+import type { StatusBand } from "../engine/buildSections";
 
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -82,15 +83,14 @@ export function emitFocusAgent(p: FocusAgentPayload): void {
   );
 }
 
-/** Which urgency tier the helper island's chiclet was clicked for. */
-export type FocusTier = "p0" | "p1";
-
+/** Which status band the helper island's chiclet was clicked for. Was "p0" | "p1" until the
+ *  P0/P1 vocabulary was retired; it is now the app-wide band (engine/buildSections). */
 export interface FocusTierPayload {
-  tier: FocusTier;
+  band: StatusBand;
 }
 
 /**
- * "Show me what's P0" from the floating helper island — a tier, not a specific agent.
+ * "Show me what needs me" from the floating helper island — a band, not a specific agent.
  *
  * Its OWN event rather than a variant of focus-agent, for the same reason select-project is
  * separate (see the note below): focus-agent mounts an agent and spawns its PTY, which is far too

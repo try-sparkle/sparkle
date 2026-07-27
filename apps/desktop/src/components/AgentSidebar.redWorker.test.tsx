@@ -31,8 +31,7 @@ function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentT
     id, name, kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
-    ...over,
+    autoNameVariants: null, shellCommand: null,    ...over,
   };
 }
 
@@ -114,7 +113,7 @@ describe("AgentSidebar — attention workers stay reachable via the card", () =>
 
 // The row's CALM treatment (PRD §3 `.arow.p2`) has to band the same way the concierge feed does,
 // or the one row that needs you is the one that recedes: the feed applies the worker overlays
-// (publishedStatusFor), so an orchestrator whose worker is red is P0 there — while a calm derived
+// (publishedStatusFor), so an orchestrator whose worker is red bands as Needs you there — while a calm derived
 // from the row's own effectiveStatus grayscaled it (roborev 46254-M4).
 describe("AgentSidebar — calm banding agrees with the concierge feed", () => {
   const headRow = () => screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;

@@ -1,0 +1,270 @@
+// @vitest-environment jsdom
+//
+// The Build column's stage ladder + status filter, end to end through the real sidebar.
+//
+// The bug this feature fixes: rows used to be sorted by live PTY status, so a `working ⇄ idle ⇄
+// waiting` flip moved a row across a whole tier and the column re-shuffled under the cursor — even
+// on the silent 15s poll tick. The load-bearing assertion in this file is "a status change does not
+// move a row"; everything else is the scaffolding that makes that readable.
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn(() => Promise.resolve()),
+  revealItemInDir: vi.fn(() => Promise.resolve()),
+}));
+vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
+vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
+vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
+
+import { AgentSidebar } from "./AgentSidebar";
+import { useProjectStore } from "../stores/projectStore";
+import { useRuntimeStore } from "../stores/runtimeStore";
+import { useUiStore } from "../stores/uiStore";
+import type { AgentTab, AgentTabStatus, Project } from "../types";
+import type { WorkflowStageId } from "../engine/workflowStage";
+
+function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
+  return {
+    id, name, kind: "build", parentId: null, runtime: "local",
+    worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
+    promptHistory: [], namePinned: false, autoNameBasis: null,
+    autoNameVariants: null, shellCommand: null, ...over,
+  };
+}
+
+function seed(agents: AgentTab[]): Project {
+  const project: Project = {
+    id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: null,
+    createdAt: new Date(0).toISOString(), selectedAgentId: null, agents,
+  };
+  useProjectStore.setState({ projects: [project] } as never);
+  return project;
+}
+
+const proj = () => useProjectStore.getState().projects[0]!;
+
+/** Put each agent at a workflow stage via the runtime store's stage override. */
+function setStages(stages: Record<string, WorkflowStageId>) {
+  useRuntimeStore.setState({ workflowStage: stages } as never);
+}
+function setStatuses(status: Record<string, AgentTabStatus>) {
+  useRuntimeStore.setState({ status } as never);
+}
+
+/** Row names in rendered DOM order — the thing the user actually sees. */
+function renderedNames(names: string[]): string[] {
+  const found = names
+    .map((n) => ({ n, el: screen.queryByText(n) }))
+    .filter((x): x is { n: string; el: HTMLElement } => x.el != null);
+  return found
+    .sort((a, b) =>
+      a.el.compareDocumentPosition(b.el) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1,
+    )
+    .map((x) => x.n);
+}
+
+beforeEach(() => {
+  useRuntimeStore.setState({ status: {}, workflowStage: {}, branchStatus: {} } as never);
+  useUiStore.getState().showAllStatusBands();
+});
+afterEach(() => cleanup());
+
+describe("AgentSidebar — the stage ladder", () => {
+  it("groups rows under their stage section, in ladder order", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta"), mkAgent("a3", "Gamma")]);
+    setStages({ a1: "pull_request", a2: "building_unsaved", a3: "merged" });
+    render(<AgentSidebar project={project} />);
+
+    // Beta (uncommitted) → Alpha (PR) → Gamma (merged), regardless of array order.
+    expect(renderedNames(["Alpha", "Beta", "Gamma"])).toEqual(["Beta", "Alpha", "Gamma"]);
+    expect(screen.getByTestId("stage-header-local_uncommitted")).toBeTruthy();
+    expect(screen.getByTestId("stage-header-remote_pr")).toBeTruthy();
+    expect(screen.getByTestId("stage-header-remote_merged")).toBeTruthy();
+  });
+
+  it("renders NO header for a stage with no rows", () => {
+    const project = seed([mkAgent("a1", "Alpha")]);
+    setStages({ a1: "pull_request" });
+    render(<AgentSidebar project={project} />);
+    expect(screen.getByTestId("stage-header-remote_pr")).toBeTruthy();
+    expect(screen.queryByTestId("stage-header-local_committed")).toBeNull();
+    expect(screen.queryByTestId("stage-header-remote_shipped")).toBeNull();
+  });
+
+  it("does NOT move a row when its status changes — the whole point", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta"), mkAgent("a3", "Gamma")]);
+    setStages({ a1: "building_saved", a2: "building_saved", a3: "building_saved" });
+    setStatuses({ a1: "idle", a2: "idle", a3: "idle" });
+    const { rerender } = render(<AgentSidebar project={project} />);
+    expect(renderedNames(["Alpha", "Beta", "Gamma"])).toEqual(["Alpha", "Beta", "Gamma"]);
+
+    // Beta starts asking a question and Gamma starts working. Under the OLD attention sort Beta
+    // (rank 0) would jump to the top and Gamma (rank 2) to the bottom.
+    setStatuses({ a1: "idle", a2: "waiting", a3: "working" });
+    rerender(<AgentSidebar project={proj()} />);
+    expect(renderedNames(["Alpha", "Beta", "Gamma"])).toEqual(["Alpha", "Beta", "Gamma"]);
+
+    // And an errored row still doesn't move.
+    setStatuses({ a1: "errored", a2: "idle", a3: "idle" });
+    rerender(<AgentSidebar project={proj()} />);
+    expect(renderedNames(["Alpha", "Beta", "Gamma"])).toEqual(["Alpha", "Beta", "Gamma"]);
+  });
+
+  it("DOES move a row when its stage advances", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
+    setStages({ a1: "building_unsaved", a2: "merged" });
+    const { rerender } = render(<AgentSidebar project={project} />);
+    expect(renderedNames(["Alpha", "Beta"])).toEqual(["Alpha", "Beta"]);
+
+    // Alpha's PR merges — it joins Beta in the Merged section, below it (array order within a stage).
+    setStages({ a1: "merged", a2: "merged" });
+    rerender(<AgentSidebar project={proj()} />);
+    expect(screen.queryByTestId("stage-header-local_uncommitted")).toBeNull();
+    expect(renderedNames(["Alpha", "Beta"])).toEqual(["Alpha", "Beta"]);
+  });
+});
+
+describe("AgentSidebar — the status filter", () => {
+  it("shows all three chips with their counts, all on by default", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta"), mkAgent("a3", "Gamma")]);
+    setStatuses({ a1: "waiting", a2: "working", a3: "idle" });
+    render(<AgentSidebar project={project} />);
+    expect(screen.getByTestId("status-chip-needs_you").textContent).toContain("1 Needs you");
+    expect(screen.getByTestId("status-chip-running").textContent).toContain("1 Running");
+    expect(screen.getByTestId("status-chip-done").textContent).toContain("1 Done");
+    for (const b of ["needs_you", "running", "done"]) {
+      expect(screen.getByTestId(`status-chip-${b}`).getAttribute("data-on")).toBe("true");
+    }
+  });
+
+  it("pluralizes the verb: '1 Needs you' but '2 Need you'", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
+    setStatuses({ a1: "waiting", a2: "approval" });
+    render(<AgentSidebar project={project} />);
+    expect(screen.getByTestId("status-chip-needs_you").textContent).toContain("2 Need you");
+    expect(screen.getByTestId("status-chip-needs_you").textContent).not.toContain("2 Needs you");
+  });
+
+  it("clicking a chip hides that band's rows", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
+    setStages({ a1: "building_saved", a2: "building_saved" });
+    setStatuses({ a1: "working", a2: "idle" });
+    render(<AgentSidebar project={project} />);
+    expect(screen.queryByText("Alpha")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("status-chip-running"));
+    expect(screen.queryByText("Alpha")).toBeNull(); // the working row is gone
+    expect(screen.queryByText("Beta")).toBeTruthy(); // the idle one stays
+    expect(screen.getByTestId("status-chip-running").getAttribute("data-on")).toBe("false");
+  });
+
+  it("keeps showing the count of a HIDDEN band, so nothing is silently lost", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
+    setStatuses({ a1: "working", a2: "idle" });
+    render(<AgentSidebar project={project} />);
+    fireEvent.click(screen.getByTestId("status-chip-running"));
+    // Still says 1 — counted over the UNFILTERED rows. A hidden band reading "0" would leave the
+    // user with no idea anything is behind it.
+    expect(screen.getByTestId("status-chip-running").textContent).toContain("1 Running");
+  });
+
+  it("hides a section the filter emptied, header and all", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
+    setStages({ a1: "building_unsaved", a2: "pull_request" });
+    setStatuses({ a1: "working", a2: "idle" });
+    render(<AgentSidebar project={project} />);
+    expect(screen.getByTestId("stage-header-local_uncommitted")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("status-chip-running"));
+    expect(screen.queryByTestId("stage-header-local_uncommitted")).toBeNull();
+    expect(screen.getByTestId("stage-header-remote_pr")).toBeTruthy();
+  });
+
+  it("offers a way back when every band is toggled off", () => {
+    const project = seed([mkAgent("a1", "Alpha")]);
+    setStatuses({ a1: "idle" });
+    render(<AgentSidebar project={project} />);
+    for (const b of ["needs_you", "running", "done"]) {
+      fireEvent.click(screen.getByTestId(`status-chip-${b}`));
+    }
+    expect(screen.queryByText("Alpha")).toBeNull();
+    // An empty column with no explanation reads as data loss; the escape hatch has to be visible.
+    const showAll = screen.getByText("Show all");
+    fireEvent.click(showAll);
+    expect(screen.queryByText("Alpha")).toBeTruthy();
+  });
+
+  it("does not render the filter at all when the project has no agents", () => {
+    const project = seed([]);
+    render(<AgentSidebar project={project} />);
+    expect(screen.queryByTestId("status-filter-bar")).toBeNull();
+  });
+});
+
+describe("AgentSidebar — drag is confined to a stage section", () => {
+  const draggableCards = () =>
+    Array.from(document.querySelectorAll<HTMLElement>('[draggable="true"]'));
+
+  it("offers drop targets only within the dragged row's own section", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta"), mkAgent("a3", "Gamma")]);
+    // Alpha + Beta share a section; Gamma is alone in another.
+    setStages({ a1: "building_saved", a2: "building_saved", a3: "merged" });
+    render(<AgentSidebar project={project} />);
+
+    fireEvent.dragStart(draggableCards()[0]!); // grab Alpha, in local_committed
+    // Two targets, not three: Gamma's row (a different section) offers none. A row that lights up
+    // and then refuses the drop reads as a bug, so it never lights up.
+    expect(screen.getAllByTestId("agent-drop-target")).toHaveLength(2);
+  });
+
+  it("reorders within a section", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
+    setStages({ a1: "building_saved", a2: "building_saved" });
+    render(<AgentSidebar project={project} />);
+    fireEvent.dragStart(draggableCards()[1]!); // grab Beta
+    fireEvent.drop(screen.getAllByTestId("agent-drop-target")[0]!); // onto Alpha's row
+    expect(proj().agents.map((a) => a.id)).toEqual(["a2", "a1"]);
+  });
+});
+
+describe("AgentSidebar — an orchestrator's section matches its own progress bar", () => {
+  it("buckets a delegating orchestrator by the WORKER ROLL-UP, not its own bare git state", () => {
+    // The two signals used to be computed differently: the section from the head's own git state,
+    // the bar from rollupStages(workers). For any orchestrator that delegates they disagreed BY
+    // CONSTRUCTION — a head with no commits of its own sat under "Local: Uncommitted" ("closing
+    // this agent loses them") while the bar on that very row showed its workers at "In PR"
+    // (roborev 53371). The section is the load-bearing claim about where the work got to, so the
+    // two must come from one value.
+    const head = mkAgent("h1", "Orchestrator");
+    const worker = mkAgent("w1", "Worker", { kind: "worker", parentId: "h1" });
+    const project = seed([head, worker]);
+    // Head has no commits of its own; its single worker has an open PR.
+    setStages({ h1: "building_unsaved", w1: "pull_request" });
+    render(<AgentSidebar project={project} />);
+
+    expect(screen.getByTestId("stage-header-remote_pr")).toBeTruthy();
+    expect(screen.queryByTestId("stage-header-local_uncommitted")).toBeNull();
+  });
+
+  it("rolls up to the LEAST-advanced worker — the whole build isn't done until every unit is", () => {
+    const head = mkAgent("h1", "Orchestrator");
+    const project = seed([
+      head,
+      mkAgent("w1", "Fast", { kind: "worker", parentId: "h1" }),
+      mkAgent("w2", "Slow", { kind: "worker", parentId: "h1" }),
+    ]);
+    setStages({ h1: "merged", w1: "merged", w2: "building_saved" });
+    render(<AgentSidebar project={project} />);
+    // One laggard worker holds the whole row at Committed, even though the head itself has landed.
+    expect(screen.getByTestId("stage-header-local_committed")).toBeTruthy();
+    expect(screen.queryByTestId("stage-header-remote_merged")).toBeNull();
+  });
+
+  it("falls back to its own stage when it has no workers", () => {
+    const project = seed([mkAgent("h1", "Solo")]);
+    setStages({ h1: "pushed" });
+    render(<AgentSidebar project={project} />);
+    expect(screen.getByTestId("stage-header-remote_pushed")).toBeTruthy();
+  });
+});

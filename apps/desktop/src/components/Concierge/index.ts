@@ -16,11 +16,11 @@ export type {
   ConciergeMessage,
   ConciergeNudge,
   ConciergeNudgeAction,
-  ConciergePriority,
   ConciergeSendState,
   ConciergeSendTarget,
   ConciergeSparkleMessage,
   ConciergeUserMessage,
   ConciergeViewModel,
+  StatusBand,
   WordmarkMode,
 } from "./types";

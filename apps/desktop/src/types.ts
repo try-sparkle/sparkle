@@ -114,10 +114,11 @@ export interface AgentTab {
   // inherit the user's own Claude Code default (no flag). Optional so legacy records need no
   // migration step.
   model?: string;
-  // Manual reorder anchor (spec: manual-agent-reorder-pin). When non-null, this top-level
-  // agent is pinned to this row index and does NOT attention-sort; unpinned agents flow
-  // around it. Set together with `namePinned` on drag/rename; cleared together on unpin.
-  pinnedIndex: number | null;
+  // NOTE: `pinnedIndex` was REMOVED on 2026-07-26. It anchored a top-level row against the
+  // attention sort; that sort is gone (rows group by workflow stage, then render in
+  // `project.agents` order), so there is nothing left to anchor against and reordering just
+  // permutes the array. `namePinned` survives and now means ONLY "the human named this, don't
+  // auto-rename it". See engine/buildSections.ts and projectStore.reorderAgent.
   // The alert-episode record backing "Dismiss Alert" (AgentAlertRecord above). Undefined until the
   // agent first enters a red status; advanced by projectStore.advanceAlerts on red transitions.
   alert?: AgentAlertRecord;

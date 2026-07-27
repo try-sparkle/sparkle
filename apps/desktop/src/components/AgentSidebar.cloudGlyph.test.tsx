@@ -35,7 +35,6 @@ function mkAgent(runtime: Runtime, id = "a1"): AgentTab {
     autoNameBasis: null,
     autoNameVariants: null,
     shellCommand: null,
-    pinnedIndex: null,
   };
 }
 

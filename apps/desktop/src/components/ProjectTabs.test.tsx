@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { ProjectTabs, pinTitle, tabPriority, TAB_LABEL_MAX_WIDTH } from "./ProjectTabs";
+import type { StatusBand } from "../engine/buildSections";
+import { ProjectTabs, pinTitle, tabBand, TAB_LABEL_MAX_WIDTH } from "./ProjectTabs";
+
+/** Counts with only the named bands set — a tab takes the full per-band Record. */
+function counts(over: Partial<Record<StatusBand, number>> = {}): Record<StatusBand, number> {
+  return { needs_you: 0, running: 0, done: 0, ...over };
+}
 
 const projects = [
   { id: "sparkle", name: "sparkle" },
@@ -39,11 +45,13 @@ describe("pure helpers", () => {
     expect(pinTitle(false)).toMatch(/disregard all other project alerts/i);
     expect(pinTitle(true)).toMatch(/across all projects again/i);
   });
-  it("tabPriority: p0 beats p1 beats null", () => {
-    expect(tabPriority(undefined)).toBeNull();
-    expect(tabPriority({ p0: 0, p1: 0 })).toBeNull();
-    expect(tabPriority({ p0: 0, p1: 2 })).toBe("p1");
-    expect(tabPriority({ p0: 1, p1: 2 })).toBe("p0");
+  it("tabBand: only Needs-you badges — running and done never do", () => {
+    expect(tabBand(undefined)).toBeNull();
+    expect(tabBand(counts())).toBeNull();
+    expect(tabBand(counts({ needs_you: 1 }))).toBe("needs_you");
+    // A tab that glowed while anything was merely working would glow permanently, and a signal
+    // that is always on is not a signal.
+    expect(tabBand(counts({ running: 4, done: 9 }))).toBeNull();
   });
 });
 
@@ -67,18 +75,23 @@ describe("ProjectTabs", () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
-  it("shows a P0 count badge when a project has P0 work", () => {
-    renderTabs({ countsByProject: { website: { p0: 2, p1: 1 } } });
-    expect(screen.getByTestId("count-website").textContent).toContain("2·P0");
+  it("badges a project whose agents need you, agreeing in number", () => {
+    renderTabs({ countsByProject: { website: counts({ needs_you: 2, running: 1 }) } });
+    expect(screen.getByTestId("count-website").textContent).toBe("2 Need you");
   });
 
-  it("shows a P1 badge when there is P1 but no P0", () => {
-    renderTabs({ countsByProject: { website: { p0: 0, p1: 3 } } });
-    expect(screen.getByTestId("count-website").textContent).toContain("3·P1");
+  it("uses the singular verb for exactly one", () => {
+    renderTabs({ countsByProject: { website: counts({ needs_you: 1 }) } });
+    expect(screen.getByTestId("count-website").textContent).toBe("1 Needs you");
+  });
+
+  it("shows no badge for a project that is only running or done", () => {
+    renderTabs({ countsByProject: { website: counts({ running: 3, done: 5 }) } });
+    expect(screen.queryByTestId("count-website")).toBeNull();
   });
 
   it("shows no badge when a project is calm", () => {
-    renderTabs({ countsByProject: { sparkle: { p0: 0, p1: 0 } } });
+    renderTabs({ countsByProject: { sparkle: counts() } });
     expect(screen.queryByTestId("count-sparkle")).toBeNull();
   });
 

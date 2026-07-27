@@ -31,8 +31,7 @@ function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentT
     id, name, kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
-    ...over,
+    autoNameVariants: null, shellCommand: null,    ...over,
   };
 }
 

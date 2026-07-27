@@ -1,15 +1,25 @@
-// A cross-project nudge card in the concierge thread: gold for P1, red for P0, with a
-// priority badge + project chip naming where it came from. The WHOLE card is a click target
-// ("take me to the source"); its action buttons stopPropagation so an action never doubles
-// as a card click. A div with role="button" (not <button>) because buttons can't nest.
+// A cross-project nudge card in the concierge thread: ONE red treatment, with a band badge +
+// project chip naming where it came from. The WHOLE card is a click target ("take me to the
+// source"); its action buttons stopPropagation so an action never doubles as a card click. A div
+// with role="button" (not <button>) because buttons can't nest.
 import type { CSSProperties, KeyboardEvent } from "react";
+import { bandLabel } from "../../engine/statusBandLabels";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../../theme/colors";
-import type { ConciergeNudge, ConciergePriority } from "./types";
+import type { ConciergeNudge } from "./types";
 
-/** The prototype's gold/red accent, mapped onto brand tokens: P1 → amber, P0 → sienna.
- *  Exported pure so tests pin the mapping without parsing color-mix strings out of jsdom. */
-export function nudgeAccent(priority: ConciergePriority): string {
-  return priority === "p0" ? C.sienna : C.amber;
+/** The card's accent — brand sienna, for every nudge.
+ *
+ *  There used to be two: amber for the "wants you eventually" tier (`blocked`) and sienna for the
+ *  asks. That split cost a second alarm color for a distinction nobody acted on differently — a gold
+ *  card and a red card both mean "go look at this" — so the tiers merged into one `needs_you` band
+ *  and the gold accent went with them. Kept as a function, not inlined at the three use sites, so
+ *  the accent still has ONE named source and a test can pin it.
+ *
+ *  Deliberately takes no band: a card that isn't `needs_you` is never surfaced (see
+ *  ConciergeHost.surfacedAgents), so a per-band mapping here would be untestable dead branches
+ *  inviting the amber back. */
+export function nudgeAccent(): string {
+  return C.sienna;
 }
 
 const badgeStyle = (accent: string): CSSProperties => ({
@@ -32,7 +42,8 @@ export function NudgeCard({
   onNudgeClick: (nudge: ConciergeNudge) => void;
   onNudgeAction: (nudge: ConciergeNudge, actionId: string) => void;
 }) {
-  const accent = nudgeAccent(nudge.priority);
+  const accent = nudgeAccent();
+  const label = bandLabel(nudge.band);
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
@@ -43,8 +54,8 @@ export function NudgeCard({
     <div
       role="button"
       tabIndex={0}
-      data-priority={nudge.priority}
-      aria-label={`${nudge.priority.toUpperCase()} — ${nudge.agentName} (${nudge.projectName})`}
+      data-band={nudge.band}
+      aria-label={`${label} — ${nudge.agentName} (${nudge.projectName})`}
       onClick={() => onNudgeClick(nudge)}
       onKeyDown={onKeyDown}
       style={{
@@ -69,7 +80,7 @@ export function NudgeCard({
           marginBottom: 6,
         }}
       >
-        <span style={badgeStyle(accent)}>{nudge.priority.toUpperCase()}</span>
+        <span style={badgeStyle(accent)}>{label}</span>
         <span
           style={{
             fontSize: 9.5,

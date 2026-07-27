@@ -1,4 +1,4 @@
-// The open island: sparkle glyph, P0/P1 chiclets, Capture, collapse handle (spec §2).
+// The open island: sparkle glyph, Needs-you / Running chiclets, Capture, collapse handle (spec §2).
 //
 // Presentational only — every interaction is a prop. That keeps the drag/visibility/IPC wiring in
 // HelperApp and lets this file be tested with plain render+click, no Tauri.
@@ -6,8 +6,13 @@ import { C } from "@sparkle/ui";
 import { CaptureIcon } from "./CaptureIcon";
 import { ISLAND_H } from "./helperGeometry";
 import type { Vitals } from "../services/helper";
+import { bandCountLabel } from "../engine/statusBandLabels";
+import type { StatusBand } from "../engine/buildSections";
 
-export type Tier = "p0" | "p1";
+// The island offers the two bands worth interrupting for. `done` is deliberately not a chiclet:
+// on a resting fleet it is nearly every agent, so it would sit at a large constant number and
+// drown the two that move. Clicking one ISOLATES that band in the Build column.
+export type Tier = StatusBand;
 
 const chiclet = {
   all: "unset" as const,
@@ -72,25 +77,25 @@ export function HelperIsland({
       <img src="/sparkle-logo.svg" alt="Sparkle" style={{ height: 16, flex: "0 0 auto" }} />
 
       <button
-        data-testid="helper-p0"
-        title="Agents that need you now"
+        data-testid="helper-needs-you"
+        title="Agents that need you — click to show only these"
         style={chiclet}
         onPointerDown={(e) => e.stopPropagation()}
-        onClick={() => onChiclet("p0")}
+        onClick={() => onChiclet("needs_you")}
       >
         <Dot color={C.sienna} />
-        {vitals.p0} P0
+        {bandCountLabel("needs_you", vitals.needsYou)}
       </button>
 
       <button
-        data-testid="helper-p1"
-        title="Agents waiting on you soon"
+        data-testid="helper-running"
+        title="Agents building right now — click to show only these"
         style={chiclet}
         onPointerDown={(e) => e.stopPropagation()}
-        onClick={() => onChiclet("p1")}
+        onClick={() => onChiclet("running")}
       >
-        <Dot color={C.amber} />
-        {vitals.p1} P1
+        <Dot color={C.success} />
+        {bandCountLabel("running", vitals.running)}
       </button>
 
       <div style={{ flex: 1 }} />

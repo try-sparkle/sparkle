@@ -60,11 +60,7 @@ export function ConciergeColumn({
       <div style={{ position: "relative", flex: "none", padding: "16px 16px 12px" }}>
         <SpendPill amountText={model.spend.amountText} />
         <StarfieldWordmark mode={mode} />
-        <ScopeVitals
-          pinnedProjectName={model.scope.pinnedProjectName}
-          p0={model.vitals.p0}
-          p1={model.vitals.p1}
-        />
+        <ScopeVitals pinnedProjectName={model.scope.pinnedProjectName} counts={model.vitals} />
         {searchSlot && <div style={{ marginTop: 10 }}>{searchSlot}</div>}
       </div>
       <ConciergeThread

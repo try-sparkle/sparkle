@@ -21,7 +21,7 @@ import { safeUnlisten } from "../services/safeUnlisten";
 import { emitFocusTier, quitApp } from "../services/attention";
 import { captureScreenRegion, showCaptureWindow } from "../screenshot";
 
-const ZERO: Vitals = { p0: 0, p1: 0 };
+const ZERO: Vitals = { needsYou: 0, running: 0 };
 const FALLBACK_SCREEN: Rect = { x: 0, y: 0, width: 0, height: 0 };
 
 /** Read the monitor layout in LOGICAL pixels. Tauri reports monitor geometry in PHYSICAL pixels,
@@ -285,8 +285,8 @@ export function HelperApp() {
     window.addEventListener("pointerup", onUp);
   }, [renderMode, width, height, pillW, pillH, setPosition, setEdge]);
 
-  const onChiclet = useCallback((tier: Tier) => {
-    emitFocusTier({ tier });
+  const onChiclet = useCallback((band: Tier) => {
+    emitFocusTier({ band });
   }, []);
 
   const visible = shouldShowHelper({ enabled, sparkleFrontmost: frontmost });

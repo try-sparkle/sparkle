@@ -27,7 +27,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 // Capture the handlers the hook registers, so a test can play the broadcast.
 let onFocus: ((p: FocusAgentPayload) => void) | null = null;
 let onSelect: ((p: SelectProjectPayload) => void) | null = null;
-let onTier: ((p: { tier: "p0" | "p1" }) => void) | null = null;
+let onTier: ((p: { band: StatusBand }) => void) | null = null;
 vi.mock("./services/attention", () => ({
   reportAttentionCount: vi.fn(),
   notifyAttention: vi.fn(),
@@ -41,7 +41,7 @@ vi.mock("./services/attention", () => ({
     return Promise.resolve(() => {});
   },
   // The helper island's P0/P1 chiclet broadcast.
-  onFocusTier: (cb: (p: { tier: "p0" | "p1" }) => void) => {
+  onFocusTier: (cb: (p: { band: StatusBand }) => void) => {
     onTier = cb;
     return Promise.resolve(() => {});
   },
@@ -66,14 +66,14 @@ import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useUiStore } from "./stores/uiStore";
 import type { AgentTab, Project } from "./types";
+import type { StatusBand } from "./engine/buildSections";
 
 function mkAgent(id: string): AgentTab {
   return {
     id, name: id, kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
-  };
+    autoNameVariants: null, shellCommand: null,  };
 }
 function mkProject(id: string, agents: AgentTab[]): Project {
   return {
@@ -213,36 +213,42 @@ describe("focus-agent routing", () => {
 });
 
 describe("focus-tier routing (helper island chiclets)", () => {
-  it("raises the window and narrows the sidebar to the clicked tier", async () => {
+  beforeEach(() => useUiStore.getState().showAllStatusBands());
+
+  it("raises the window and isolates the clicked band in the sidebar filter", async () => {
     await mount();
-    onTier!({ tier: "p0" });
+    onTier!({ band: "needs_you" });
     await waitFor(() => expect(bringToFront).toHaveBeenCalled());
-    expect(useUiStore.getState().attentionTierFocus).toBe("p0");
+    // Writes the SAME statusFilter the sidebar chips render, so the click's effect is visible in
+    // the chip bar and clearable by the ordinary "Show all" — not an invisible mode with its own
+    // bespoke dismiss control (which is what the retired attentionTierFocus needed).
+    expect(useUiStore.getState().statusFilter).toEqual({
+      needs_you: true,
+      running: false,
+      done: false,
+    });
   });
 
-  it("leaves the persisted agentOrdering preference alone", async () => {
-    // One chiclet click must not silently destroy a deliberate "manual" ordering choice.
-    useUiStore.getState().setAgentOrdering("manual");
+  it("does NOT mount an agent — a band is not an agent", async () => {
     await mount();
-    onTier!({ tier: "p0" });
-    await waitFor(() => expect(useUiStore.getState().attentionTierFocus).toBe("p0"));
-    expect(useUiStore.getState().agentOrdering).toBe("manual");
-  });
-
-  it("does NOT mount an agent — a tier is not an agent", async () => {
-    await mount();
-    onTier!({ tier: "p1" });
-    await waitFor(() => expect(useUiStore.getState().attentionTierFocus).toBe("p1"));
-    // Same contract as select-project: no PTY is spawned for a click that asked to SEE a tier.
+    onTier!({ band: "running" });
+    await waitFor(() => expect(useUiStore.getState().statusFilter.running).toBe(true));
+    // Same contract as select-project: no PTY is spawned for a click that asked to SEE a band.
     expect(useRuntimeStore.getState().openAgentIds).toEqual([]);
   });
 
-  it("replaces the previous tier rather than accumulating", async () => {
+  it("replaces the previous band rather than accumulating", async () => {
     await mount();
-    onTier!({ tier: "p0" });
-    await waitFor(() => expect(useUiStore.getState().attentionTierFocus).toBe("p0"));
-    onTier!({ tier: "p1" });
-    await waitFor(() => expect(useUiStore.getState().attentionTierFocus).toBe("p1"));
+    onTier!({ band: "needs_you" });
+    await waitFor(() => expect(useUiStore.getState().statusFilter.needs_you).toBe(true));
+    onTier!({ band: "running" });
+    await waitFor(() =>
+      expect(useUiStore.getState().statusFilter).toEqual({
+        needs_you: false,
+        running: true,
+        done: false,
+      }),
+    );
   });
 });
 

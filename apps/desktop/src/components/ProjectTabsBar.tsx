@@ -1,7 +1,7 @@
 // The live project tab bar — the top chrome of the single-window concierge shell
 // (bead sparkle-qd80 / CM-U7, PRD §3). This is the integration layer around the presentational
-// ProjectTabs: it supplies the projects, the selection, the pin, the per-project P0/P1 counts from
-// the concierge feed, and the top-right cluster — and it REPLACES TopBar, which is no longer
+// ProjectTabs: it supplies the projects, the selection, the pin, the per-project status-band counts
+// from the concierge feed, and the top-right cluster — and it REPLACES TopBar, which is no longer
 // mounted (its Recent list is redundant when every project is a tab, and its replace-vs-new-window
 // question has no meaning in a single window).
 //
@@ -29,10 +29,10 @@ import { resolveOpenTarget } from "../services/openTarget";
 import { openProjectTab } from "../services/openProjectTab";
 import type { ConciergeFeed } from "../services/conciergeFeed";
 
-/** Per-project P0/P1 totals, keyed by project id — the tab glow + count badge (ProjectTabs). */
+/** Per-project status-band totals, keyed by project id — the tab glow + count badge (ProjectTabs). */
 export function countsFromFeed(feed: ConciergeFeed): Record<string, ProjectTabCounts> {
   const out: Record<string, ProjectTabCounts> = {};
-  for (const p of feed.projects) out[p.id] = { p0: p.counts.p0, p1: p.counts.p1 };
+  for (const p of feed.projects) out[p.id] = { ...p.counts };
   return out;
 }
 

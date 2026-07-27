@@ -102,16 +102,15 @@ function feed(): ConciergeFeed {
     status: "approval",
     statusColor: "#e0533f",
     statusLabel: "Approve?",
-    priority: 0,
+    band: "needs_you" as const,
     inScope: true,
     muted: false,
   };
+  const counts = { needs_you: 1, running: 0, done: 0 };
   return {
-    projects: [
-      { id: "p1", name: "sparkle", inScope: true, counts: { p0: 1, p1: 0 }, agents: [agent] },
-    ],
-    counts: { p0: 1, p1: 0 },
-    scopedCounts: { p0: 1, p1: 0 },
+    projects: [{ id: "p1", name: "sparkle", inScope: true, counts, agents: [agent] }],
+    counts,
+    scopedCounts: counts,
     pinnedProjectId: null,
   } as unknown as ConciergeFeed;
 }

@@ -139,14 +139,13 @@ export interface ProjectState {
    *  epic pill immediately, before any of its workers bind to a bead). */
   setAgentEpicId: (projectId: string, agentId: string, epicId: string) => void;
   removeAgent: (projectId: string, agentId: string) => void;
-  /** Manual rename: sets the name AND pins it (freezes auto-naming, shows the pin icon). When
-   *  the caller passes `pinnedIndex` (the agent's current displayed slot), also anchor the row
-   *  there — the unified pin (manual-agent-reorder-pin). */
-  renameAgent: (projectId: string, agentId: string, name: string, pinnedIndex?: number) => void;
+  /** Manual rename: sets the name AND freezes it against auto-renaming (shows the chip). It no
+   *  longer anchors the row — row order is the human's drag arrangement (see reorderAgent). */
+  renameAgent: (projectId: string, agentId: string, name: string) => void;
   /** Self-name: the AGENT names ITSELF via the sparkle-control `rename_agent` op. Sets the name and
    *  marks it authoritative (`selfNamed` — freezes auto-naming, skips paid Haiku, survives rehydrate)
-   *  WITHOUT pinning the row: no pin chip, no `pinnedIndex` anchor, so the human can still reorder and
-   *  there is nothing to "unpin". A human pin (`namePinned`) still wins — a self-name is a no-op over it. */
+   *  WITHOUT freezing it against the human: no chip, so there is nothing to "unpin". A human rename
+   *  (`namePinned`) still wins — a self-name is a no-op over it. */
   selfNameAgent: (projectId: string, agentId: string, name: string) => void;
   /** Auto-rename from the naming model. No-op if the user has pinned the name. Records the
    *  basis prompt so we can later detect when the work has shifted enough to re-name. Pass
@@ -174,9 +173,18 @@ export interface ProjectState {
    *  PRIOR occupant's auto-name. No-op when the name is pinned — a manual rename is the user's
    *  choice and survives a fresh start. */
   resetAutoName: (projectId: string, agentId: string) => void;
-  /** Drag-pin a top-level agent at `index`: freeze the name AND anchor the row there. */
-  pinAgentAt: (projectId: string, agentId: string, index: number) => void;
-  /** Release a pin: clear the name freeze AND the row anchor (re-enables auto-naming + sort). */
+  /** Move `agentId` so it sits immediately BEFORE `beforeAgentId` in `project.agents` (or at the
+   *  end when that is null). This is the ONE source of row order in the Build column: rows are
+   *  grouped into the stage ladder (engine/buildSections.ts) and, within a stage, render in
+   *  `project.agents` order — so reordering the array IS the user's arrangement, and it persists
+   *  with the project like any other agent field.
+   *
+   *  Replaces the old `pinAgentAt`/`pinnedIndex` anchor, which existed only to hold a row still
+   *  against the attention sort. With nothing re-sorting rows behind the user's back there is
+   *  nothing to anchor against, so the pin concept is gone entirely. */
+  reorderAgent: (projectId: string, agentId: string, beforeAgentId: string | null) => void;
+  /** Release a manual name freeze so the agent auto-names again. (Formerly also cleared a row
+   *  anchor; row anchoring no longer exists — see reorderAgent.) */
   unpinAgent: (projectId: string, agentId: string) => void;
   /** Advance every agent's alert-episode record for the current (pre-dismissal) status map
    *  (engine/alertDismissal.ts). Called from the sidebar whenever the overlaid status map changes;
@@ -366,7 +374,7 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
       agents: (p.agents ?? []).map((a) => {
         const isStaleSelfNamePin =
           a.namePinned === true &&
-          (a as AgentTab).pinnedIndex == null &&
+          (a as { pinnedIndex?: number | null }).pinnedIndex == null &&
           !a.selfNamed &&
           (a.kind === "build" || a.kind === "worker");
         return isStaleSelfNamePin ? { ...a, namePinned: false, selfNamed: true } : a;
@@ -413,9 +421,10 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
       autoNameVariants: a.autoNameVariants ?? null,
       promptHistory: a.promptHistory ?? [],
       shellCommand: (a as AgentTab).shellCommand ?? null,
-      // v8 (manual-agent-reorder-pin): the manual reorder anchor. Default null so existing
-      // agents keep attention-sorting; do NOT touch namePinned — nothing freezes on upgrade.
-      pinnedIndex: (a as AgentTab).pinnedIndex ?? null,
+      // NOTE: the v8 `pinnedIndex` backfill was dropped — the field no longer exists on AgentTab
+      // (row anchoring is gone; see types.ts). A blob persisted before 2026-07-26 may still carry
+      // the key on disk; it is inert and simply ignored rather than migrated away, since nothing
+      // reads it and rewriting every agent to delete one dead key isn't worth a migration step.
     })),
   }));
   return state;
@@ -1033,7 +1042,6 @@ export const useProjectStore = create<ProjectState>()(
               // records have ONE canonical form and consumers can compare raw values safely (the
               // "default" sentinel stays a UI-only dropdown value).
               model: isDefaultModel(opts?.model) ? undefined : opts?.model,
-              pinnedIndex: null,
             };
             // A freshly-opened BUILD agent floats to the top of the non-alerting sidebar rows
             // until a newer build agent is opened ("until you open a newer one" — the fresh slot
@@ -1127,20 +1135,18 @@ export const useProjectStore = create<ProjectState>()(
         });
       },
 
-      renameAgent: (projectId, agentId, name, pinnedIndex) =>
+      renameAgent: (projectId, agentId, name) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
-            // A manual rename pins the name: from here on it won't auto-change. Clear the
-            // auto-name variants too — pinned means "`name` only" (see types.ts), and the
+            // A manual rename freezes the name: from here on it won't auto-change. Clear the
+            // auto-name variants too — frozen means "`name` only" (see types.ts), and the
             // sidebar prefers variants over `name`, so leaving them would keep showing the
-            // stale auto-name instead of the user's chosen one. When the sidebar passes the
-            // agent's current displayed index, anchor the row there too (the unified pin).
+            // stale auto-name instead of the user's chosen one.
             mapAgent(p, agentId, (a) => ({
               ...a,
               name: name.trim() || a.name,
               namePinned: true,
               autoNameVariants: null,
-              ...(pinnedIndex != null ? { pinnedIndex } : {}),
             })),
           ),
         })),
@@ -1245,26 +1251,45 @@ export const useProjectStore = create<ProjectState>()(
           ),
         })),
 
-      pinAgentAt: (projectId, agentId, index) =>
+      reorderAgent: (projectId, agentId, beforeAgentId) =>
         set((s) => ({
-          projects: mapProject(s.projects, projectId, (p) =>
-            // Drag-pin: freeze the name AND anchor the row. Unlike renameAgent, the NAME is not
-            // changing here — a pure reorder — so keep autoNameVariants intact. Clearing them
-            // would drop the width-fitted display back to the stale `name`, visibly changing the
-            // label on a drag (roborev 12870).
-            mapAgent(p, agentId, (a) => ({
-              ...a,
-              namePinned: true,
-              pinnedIndex: index,
-            })),
-          ),
+          projects: mapProject(s.projects, projectId, (p) => {
+            const from = p.agents.findIndex((a) => a.id === agentId);
+            // Unknown agent, or a drop on itself — nothing to do. Returning `p` UNCHANGED (not a
+            // fresh object) matters: mapProject hands the identical reference back, so a no-op drag
+            // doesn't hand every projects consumer a new array and re-render the column.
+            if (from < 0 || agentId === beforeAgentId) return p;
+            const moved = p.agents[from] as AgentTab;
+            const targetAt = beforeAgentId == null ? -1 : p.agents.findIndex((a) => a.id === beforeAgentId);
+            const rest = p.agents.filter((a) => a.id !== agentId);
+            // Resolve the anchor AFTER removing the dragged row, so the index is correct whether the
+            // row moved up or down (computing it against the original array is the classic
+            // off-by-one that lands a downward drag one slot short).
+            const to = beforeAgentId == null ? rest.length : rest.findIndex((a) => a.id === beforeAgentId);
+            // A missing anchor (target closed mid-drag) appends rather than throwing away the move.
+            let at = to < 0 ? rest.length : to;
+            // DIRECTION MATTERS. Dropping onto a row means "take that row's slot", so a row dragged
+            // DOWNWARD lands AFTER the target, not before it. Inserting before unconditionally made
+            // a downward drag onto the ADJACENT row a complete no-op — [a, b], drag a onto b, and
+            // `a` is removed then re-inserted at index 0, i.e. exactly where it started. The user
+            // drags, nothing moves, and the control reads as broken (roborev 53371).
+            if (targetAt >= 0 && from < targetAt) at = Math.min(at + 1, rest.length);
+            const agents = [...rest.slice(0, at), moved, ...rest.slice(at)];
+            // Deliberately does NOT touch namePinned or autoNameVariants: this is a pure reorder and
+            // the NAME is not changing. The old drag-pin froze the name as a side effect, which
+            // silently disabled auto-naming for any row the user ever dragged — and clearing the
+            // variants would drop the width-fitted label back to the stale `name`, visibly changing
+            // it on a drag (roborev 12870).
+            return { ...p, agents };
+          }),
         })),
 
       unpinAgent: (projectId, agentId) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
-            // Release both: name auto-renames again and the row rejoins the attention sort.
-            mapAgent(p, agentId, (a) => ({ ...a, namePinned: false, pinnedIndex: null })),
+            // Release the NAME freeze only — auto-naming resumes. There is no row anchor to clear
+            // any more; row order is the array order (see reorderAgent).
+            mapAgent(p, agentId, (a) => ({ ...a, namePinned: false })),
           ),
         })),
 
@@ -1360,7 +1385,6 @@ export const useProjectStore = create<ProjectState>()(
               autoNameVariants: null,
               shellCommand: null,
               model: undefined,
-              pinnedIndex: null,
             };
             // Append WITHOUT changing selectedAgentId — the self-heal must be invisible to the user.
             return { ...p, agents: [...p.agents, agent] };
@@ -1403,8 +1427,7 @@ export const useProjectStore = create<ProjectState>()(
       // v4 backfills autoNameVariants (width-fitted names) to null. v5 backfills promptHistory
       // (the pinned-header dropdown) as an empty array. v6 backfills shellCommand: null for the
       // Run-as-cmd "shell" agent kind (folded in from PR #62). v7 remaps the legacy
-      // "brainstorm" agent kind to "think" (the Think rename). v8 backfills pinnedIndex: null
-      // (manual reorder anchor) without touching namePinned. v9 heals the sparkle-pel7 residue:
+      // "brainstorm" agent kind to "think" (the Think rename). v8 backfills      // (manual reorder anchor) without touching namePinned. v9 heals the sparkle-pel7 residue:
       // build/worker rows frozen (namePinned:true, pinnedIndex null) by the OLD self-name path get
       // unpinned + marked selfNamed so the erroneous pin chip clears while the name is preserved.
       // v10 backfills promptHistory[].source: "composer" (picker-tagging, Task 2.3).

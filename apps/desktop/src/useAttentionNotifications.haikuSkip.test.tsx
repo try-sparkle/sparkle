@@ -59,7 +59,6 @@ const agent = (activity?: string): AgentTab =>
     kind: "build",
     name: "Builder",
     parentId: null,
-    pinnedIndex: null,
     autoNameVariants: null,
     namePinned: false,
     shellCommand: null,

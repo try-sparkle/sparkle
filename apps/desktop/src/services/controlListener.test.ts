@@ -106,7 +106,6 @@ describe("controlListener", () => {
     // It is marked selfNamed so the auto-namer still won't clobber it. Regression sparkle-pel7.
     expect(agent.selfNamed).toBe(true);
     expect(agent.namePinned).toBe(false);
-    expect(agent.pinnedIndex).toBeNull();
   });
 
   it("rename_agent does NOT re-pin after the human unpins (sparkle-pel7)", async () => {
@@ -120,7 +119,6 @@ describe("controlListener", () => {
     const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!;
     expect(agent.name).toBe("Second Name");
     expect(agent.namePinned).toBe(false);
-    expect(agent.pinnedIndex).toBeNull();
   });
 
   it("rename_agent honors an explicit targetAgentId", async () => {
@@ -245,15 +243,22 @@ describe("controlListener", () => {
   });
 
   // ── Phase-3 breadth ops ────────────────────────────────────────────────────────────────────
-  it("get_state additively reports models, agentOrdering, and zoom", async () => {
-    useUiStore.getState().setAgentOrdering("manual");
+  it("get_state additively reports models, statusFilter, and zoom", async () => {
+    useUiStore.getState().showAllStatusBands();
+    useUiStore.getState().toggleStatusBand("running");
     useUiStore.getState().setZoom(1.3);
     fire({ reqId: "gs2", op: "get_state", callerAgentId: callerId, payload: {} });
     await flush();
-    const res = lastReply() as { models: string[]; agentOrdering: string; zoom: number };
+    const res = lastReply() as {
+      models: string[];
+      statusFilter: Record<string, boolean>;
+      zoom: number;
+    };
     expect(Array.isArray(res.models)).toBe(true);
     expect(res.models).toContain("claude-opus-4-8"); // curated catalog fallback id
-    expect(res.agentOrdering).toBe("manual");
+    // agentOrdering was dropped with the attention sort; statusFilter took its slot.
+    expect((res as Record<string, unknown>).agentOrdering).toBeUndefined();
+    expect(res.statusFilter).toEqual({ needs_you: true, running: false, done: true });
     expect(res.zoom).toBe(1.3);
   });
 
@@ -272,34 +277,29 @@ describe("controlListener", () => {
     });
   });
 
-  it("pin_agent pins the target's row and denies a worker caller", async () => {
+  it("pin_agent is REFUSED — row anchoring no longer exists", async () => {
+    // Refused rather than accepted-and-ignored: a no-op {ok:true} would let a caller believe it had
+    // moved itself, and the error text is where a confused agent learns why it can't.
     fire({ reqId: "pin1", op: "pin_agent", callerAgentId: callerId, payload: { targetAgentId: otherId, index: 2 } });
     await flush();
-    expect(lastReply()).toEqual({ ok: true });
-    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === otherId)!;
-    expect(agent.pinnedIndex).toBe(2);
-    expect(agent.namePinned).toBe(true);
+    const reply = lastReply() as { ok: boolean; error?: string };
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toMatch(/pin_agent was removed/);
+  });
 
-    // A worker caller is privileged-denied.
+  it("pin_agent stays privileged — a worker caller is denied before it even reaches the handler", async () => {
     fire({ reqId: "pin2", op: "pin_agent", callerAgentId: otherId, payload: { index: 0 } });
     await flush();
     expect(lastReply()).toMatchObject({ ok: false });
   });
 
-  it("pin_agent rejects a non-integer index", async () => {
-    fire({ reqId: "pin3", op: "pin_agent", callerAgentId: callerId, payload: { index: -1 } });
-    await flush();
-    expect(lastReply()).toMatchObject({ ok: false });
-  });
-
-  it("unpin_agent releases the target's row (build caller allowed)", async () => {
-    useProjectStore.getState().pinAgentAt(projectId, otherId, 1);
+  it("unpin_agent still releases the target's NAME freeze (build caller allowed)", async () => {
+    useProjectStore.getState().renameAgent(projectId, otherId, "Human Choice");
+    expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === otherId)!.namePinned).toBe(true);
     fire({ reqId: "unpin1", op: "unpin_agent", callerAgentId: callerId, payload: { targetAgentId: otherId } });
     await flush();
     expect(lastReply()).toEqual({ ok: true });
-    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === otherId)!;
-    expect(agent.pinnedIndex).toBe(null);
-    expect(agent.namePinned).toBe(false);
+    expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === otherId)!.namePinned).toBe(false);
   });
 
   it("set_agent_model sets a catalog model and rejects an unknown one", async () => {
@@ -319,17 +319,18 @@ describe("controlListener", () => {
     expect(lastReply()).toMatchObject({ ok: false });
   });
 
-  it("set_agent_ordering switches the sidebar mode (build caller), denies a worker", async () => {
-    useUiStore.getState().setAgentOrdering("attention");
+  it("set_agent_ordering is REFUSED — there is only one ordering now", async () => {
     fire({ reqId: "ord1", op: "set_agent_ordering", callerAgentId: callerId, payload: { mode: "manual" } });
     await flush();
-    expect(lastReply()).toEqual({ ok: true });
-    expect(useUiStore.getState().agentOrdering).toBe("manual");
+    const reply = lastReply() as { ok: boolean; error?: string };
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toMatch(/set_agent_ordering was removed/);
+  });
 
+  it("set_agent_ordering stays privileged — a worker caller is denied", async () => {
     fire({ reqId: "ord2", op: "set_agent_ordering", callerAgentId: otherId, payload: { mode: "attention" } });
     await flush();
     expect(lastReply()).toMatchObject({ ok: false });
-    expect(useUiStore.getState().agentOrdering).toBe("manual"); // unchanged by the denied worker
   });
 
   it("set_zoom sets and clamps the zoom (build caller)", async () => {

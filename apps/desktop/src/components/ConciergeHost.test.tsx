@@ -98,8 +98,13 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 // copy here would turn a wording tweak into a red test for a non-bug (roborev 53044).
 import { ConciergeHost, TRIAL_SPENT_TEXT } from "./ConciergeHost";
 import type { ConciergeFeed } from "../useConciergeFeed";
+import type { StatusBand } from "../engine/buildSections";
 
-function feedWith(status: string, priority: 0 | 1) {
+const EMPTY_COUNTS: Record<StatusBand, number> = { needs_you: 0, running: 0, done: 0 };
+
+/** A one-agent feed. The band defaults to `needs_you` because that IS the surfacing gate — an agent
+ *  in any other band produces no nudge card, which is what the `done` case below pins. */
+function feedWith(status: string, band: StatusBand = "needs_you") {
   const agent = {
     id: "ag1",
     name: "CI Hardening",
@@ -109,14 +114,15 @@ function feedWith(status: string, priority: 0 | 1) {
     status,
     statusColor: "#e0533f",
     statusLabel: "Approve?",
-    priority,
+    band,
     inScope: true,
     muted: false,
   };
+  const counts = { needs_you: 0, running: 0, done: 0, [band]: 1 };
   return {
-    projects: [{ id: "p1", name: "sparkle", inScope: true, counts: { p0: priority === 0 ? 1 : 0, p1: priority === 1 ? 1 : 0 }, agents: [agent] }],
-    counts: { p0: priority === 0 ? 1 : 0, p1: priority === 1 ? 1 : 0 },
-    scopedCounts: { p0: priority === 0 ? 1 : 0, p1: priority === 1 ? 1 : 0 },
+    projects: [{ id: "p1", name: "sparkle", inScope: true, counts, agents: [agent] }],
+    counts,
+    scopedCounts: counts,
     pinnedProjectId: null,
   };
 }
@@ -136,7 +142,7 @@ const queryInThread = (re: RegExp | string) => within(thread()).queryByText(re);
 
 describe("ConciergeHost", () => {
   it("surfaces an in-scope needing agent as a nudge with an Approve action", () => {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     expect(screen.getAllByText(/CI Hardening/).length).toBeGreaterThan(0);
     expect(inThread("Approve")).toBeTruthy();
@@ -144,7 +150,7 @@ describe("ConciergeHost", () => {
   });
 
   it("Approve relays the answer into the agent's terminal", () => {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.click(inThread("Approve"));
     // userPrompt: false — "approve" is machine-authored; it must not enter prompt history,
@@ -154,21 +160,38 @@ describe("ConciergeHost", () => {
   });
 
   it("Show me opens the source project's TAB and selects the agent", () => {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.click(inThread("Show me"));
     expect(h.openProjectTab).toHaveBeenCalledWith("p1", "ag1");
   });
 
+  it("does NOT surface an agent whose band is `done` — that includes `unmerged`", () => {
+    // The regression this pins: 27 of 51 agents on the reported fleet were committed-but-unlanded.
+    // Surfacing the `done` band is 27 nudge cards nobody can dismiss.
+    h.feed = feedWith("unmerged", "done");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    expect(screen.queryByText("Show me")).toBeNull();
+    expect(screen.queryByText("Mute")).toBeNull();
+  });
+
+  it("surfaces `blocked` — it bands Needs-you now, with the same red as an approval", () => {
+    h.feed = feedWith("blocked");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    // One band label on the card, not a "P1" badge in a second alarm color.
+    expect(screen.getAllByText("Needs you").length).toBeGreaterThan(0);
+    expect(screen.queryByText("P1")).toBeNull();
+  });
+
   it("Mute records a do-not-interrupt preference for the agent", () => {
-    h.feed = feedWith("blocked", 1);
+    h.feed = feedWith("blocked");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.click(inThread("Mute"));
     expect(h.setInterruptPreference).toHaveBeenCalledWith("ag1", "mute");
   });
 
   it("sending a message starts a brain turn with a grounded snapshot", () => {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
     fireEvent.click(screen.getByText("Send"));
@@ -181,7 +204,7 @@ describe("ConciergeHost", () => {
   });
 
   it("streams a brain reply into the thread (delta then done)", () => {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     act(() => h.brain.delta?.({ id: "7", text: "On " }));
     act(() => h.brain.delta?.({ id: "7", text: "it." }));
@@ -194,7 +217,7 @@ describe("ConciergeHost", () => {
     // The column's one live region. It must not carry the growing text: a value that changes per
     // delta hands a screen reader an announcement per chunk — the flooding the interim dictation
     // preview was silenced for, which putting role=log on the transcript would have re-created.
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval", "needs_you");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     const announcer = () => screen.getByTestId("concierge-announcer");
     act(() => h.brain.delta?.({ id: "7", text: "On " }));
@@ -205,7 +228,7 @@ describe("ConciergeHost", () => {
   });
 
   it("shows an error bubble when the brain can't be reached", async () => {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     act(() => h.brain.error?.({ id: "t1", detail: "spawn failed" }));
     expect(await findInThread(/couldn't reach my brain/i)).toBeTruthy();
@@ -228,7 +251,7 @@ describe("ConciergeHost", () => {
     ["pty-gone", /I couldn't send the approval\./],
     ["ambiguous-picker", /open it to choose/],
   ] as const)("an Approve refused as %s speaks in the APPROVAL voice", async (path, remedy) => {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: false, path });
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.click(inThread("Approve"));
@@ -239,7 +262,7 @@ describe("ConciergeHost", () => {
   });
 
   it("an Approve refused as trial-spent says EXACTLY the shared trial line", async () => {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: false, path: "trial-spent" });
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.click(inThread("Approve"));
@@ -255,7 +278,7 @@ describe("ConciergeHost", () => {
   it.each(["free-text", "picker-option", "queued"] as const)(
     "an ok:false Approve carrying the delivered path %s is still a refusal",
     async (path) => {
-      h.feed = feedWith("approval", 0);
+      h.feed = feedWith("approval");
       h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: false, path });
       render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
       fireEvent.click(inThread("Approve"));
@@ -276,7 +299,7 @@ describe("ConciergeHost", () => {
   // NOTHING and left the suite green. That silence is precisely what `approve`'s own comment
   // promises never happens ("ALWAYS give the user feedback") (roborev 53097).
   it("a delivered Approve is confirmed in the thread", async () => {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: true, path: "free-text" });
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.click(inThread("Approve"));
@@ -290,7 +313,7 @@ describe("ConciergeHost", () => {
   // pins the copy that the refusal table's forward-guard comment cites as its rationale
   // (roborev 53111).
   it("a THROWING Approve still says something rather than leaving the user waiting", async () => {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     h.dispatchConciergeAnswer.mockRejectedValueOnce(new Error("pty write failed"));
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.click(inThread("Approve"));
@@ -306,7 +329,7 @@ describe("ConciergeHost", () => {
   // posts "Approved — sent to X." for something that was only HELD — the exact lie this series
   // exists to remove — with the whole suite still green (roborev 53062).
   it("an Approve that is only QUEUED says so, and does not claim it was sent", async () => {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: true, path: "queued" });
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.click(inThread("Approve"));
@@ -321,7 +344,7 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
   const target = { projectId: "p1", agentId: "ag1", name: "CI Hardening" };
 
   function renderWithTarget(t: typeof target | null = target) {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     return render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={t} />);
   }
 
@@ -551,7 +574,7 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     fireEvent.click(screen.getByTestId("send-target-toggle"));
     expect(screen.getByTestId("send-target-toggle").getAttribute("aria-pressed")).toBe("true");
     // The agent is gone (closed / deleted): the feed no longer carries it.
-    const empty = { projects: [], counts: { p0: 0, p1: 0 }, scopedCounts: { p0: 0, p1: 0 }, pinnedProjectId: null };
+    const empty = { projects: [], counts: EMPTY_COUNTS, scopedCounts: EMPTY_COUNTS, pinnedProjectId: null };
     await act(async () => {
       rerender(<ConciergeHost feed={empty as unknown as ConciergeFeed} promptTarget={null} />);
     });
@@ -566,7 +589,7 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
 // has to come back into the thread, or the user is told something that never becomes true.
 describe("ConciergeHost — reconciling a queued prompt", () => {
   function renderHost() {
-    h.feed = feedWith("approval", 0);
+    h.feed = feedWith("approval");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
   }
 

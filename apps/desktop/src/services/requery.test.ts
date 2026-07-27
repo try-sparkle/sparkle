@@ -40,7 +40,6 @@ function agent(id: string, kind: AgentKind): AgentTab {
     autoNameBasis: null,
     autoNameVariants: null,
     shellCommand: null,
-    pinnedIndex: null,
   };
 }
 

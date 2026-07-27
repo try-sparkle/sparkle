@@ -77,8 +77,8 @@ import type { ConciergeFeed } from "../useConciergeFeed";
 
 const calmFeed = {
   projects: [],
-  counts: { p0: 0, p1: 0 },
-  scopedCounts: { p0: 0, p1: 0 },
+  counts: { needs_you: 0, running: 0, done: 0 },
+  scopedCounts: { needs_you: 0, running: 0, done: 0 },
   pinnedProjectId: null,
 };
 
@@ -96,7 +96,7 @@ const feedWithAgent = {
       id: "p1",
       name: "sparkle",
       inScope: true,
-      counts: { p0: 0, p1: 0 },
+      counts: { needs_you: 0, running: 0, done: 0 },
       agents: [
         {
           id: "ag1",
@@ -107,15 +107,15 @@ const feedWithAgent = {
           status: "working",
           statusColor: "#8fb08a",
           statusLabel: "Working",
-          priority: 2,
+          band: "done" as const,
           inScope: true,
           muted: false,
         },
       ],
     },
   ],
-  counts: { p0: 0, p1: 0 },
-  scopedCounts: { p0: 0, p1: 0 },
+  counts: { needs_you: 0, running: 0, done: 0 },
+  scopedCounts: { needs_you: 0, running: 0, done: 0 },
   pinnedProjectId: null,
 };
 const AIM = { projectId: "p1", agentId: "ag1", name: "CI Hardening" };

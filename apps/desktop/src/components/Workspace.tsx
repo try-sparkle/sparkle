@@ -31,7 +31,7 @@ import {
   useIsMainWindow,
   useCurrentWindowLabel,
 } from "../windowContext";
-import { useConciergeFeed } from "../useConciergeFeed";
+import { isCalmBand, useConciergeFeed } from "../useConciergeFeed";
 import { firstVisibleAgentId } from "../engine/agentOrdering";
 import { decidePromptTarget, resolvePinnedProjectId } from "../engine/shellResolve";
 import {
@@ -118,7 +118,6 @@ export function Workspace() {
   const workMode = useUiStore((s) => s.workMode);
   const setWorkMode = useUiStore((s) => s.setWorkMode);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
-  const agentOrdering = useUiStore((s) => s.agentOrdering);
   const pinnedProjectId = useUiStore((s) => s.pinnedProjectId);
   // Resolve the pin DEFENSIVELY: it is persisted and load-bearing (it scopes the concierge vitals),
   // but a project can be deleted from another webview or a stale blob can name one that no longer
@@ -140,7 +139,7 @@ export function Workspace() {
   const zoomOut = useUiStore((s) => s.zoomOut);
   const resetZoom = useUiStore((s) => s.resetZoom);
 
-  // The cross-project priority feed (CM-U3) drives BOTH the per-tab P0/P1 glow and the concierge
+  // The cross-project status-band feed (CM-U3) drives BOTH the per-tab Needs-you glow and the concierge
   // column. Built ONCE here and passed down: two `useConciergeFeed`s meant two tray-roster fetches,
   // two roster listeners, two full recomputes per status tick — and two copies that could disagree
   // across render commits, so a tab badge and the vitals line could show different counts.
@@ -424,9 +423,16 @@ export function Workspace() {
   const planCollapsed = boardActive;
 
   // Calm terminal (PRD §3 / prototype `.terminal.calm`): when the agent you're looking at has
-  // nothing for you (P2), its terminal TEXT desaturates along with the calm sidebar rows, so ONLY a
-  // P0/P1 agent's screen carries color. Read from the same feed the tabs and the concierge use, so
-  // "calm" means one thing app-wide.
+  // nothing for you, its terminal TEXT desaturates along with the calm sidebar rows, so only a
+  // screen that wants something from you carries color. Read from the same feed the tabs and the
+  // concierge use, so "calm" means one thing app-wide.
+  //
+  // It asks `isCalmBand(status)` — the SAME predicate AgentSidebar dims its rows with — and not the
+  // agent's status BAND. Those are different sets by design and `unmerged` is the difference: it
+  // bands `done` (it must not buy a nudge card) but is NOT calm (unlanded work is exactly what you
+  // should still see). Reading the band here meant selecting an unmerged agent desaturated its
+  // terminal while its sidebar row stayed fully colored — the two surfaces disagreeing about the one
+  // status the split exists to protect.
   //
   // Only ever true for a VISIBLE AGENT PANE (roborev 46254-M1). It used to default to `true` with
   // no agent selected and ignore the overlays, while the treatment was a `filter` on the whole
@@ -438,7 +444,9 @@ export function Workspace() {
   const terminalCalm = useMemo(() => {
     if (sparkleActive || boardActive || !activeAgentId || !activeIsOpen) return false;
     const p = feed.projects.find((x) => x.id === currentProjectId);
-    return (p?.agents.find((a) => a.id === activeAgentId)?.priority ?? 2) === 2;
+    // An agent the feed doesn't know reads `undefined`, which isCalmBand treats as calm — the same
+    // answer the old `?? 2` default gave.
+    return isCalmBand(p?.agents.find((a) => a.id === activeAgentId)?.status);
   }, [feed, currentProjectId, activeAgentId, activeIsOpen, sparkleActive, boardActive]);
 
   // Plan/Build handlers for the collapsed Plan column's header. Deliberately simpler than the
@@ -452,13 +460,7 @@ export function Workspace() {
     setActiveSpecial(null);
     if (!project) return;
     // Land the selection on the row the Build list will render first, so the pane matches the mode.
-    const next = firstVisibleAgentId(
-      project.agents,
-      "build",
-      agentOrdering,
-      liveStatus,
-      project.freshBuildAgentId,
-    );
+    const next = firstVisibleAgentId(project.agents, "build");
     useProjectStore.getState().selectAgent(project.id, next);
     if (next) open(next);
   };

@@ -108,8 +108,7 @@ function mkAgent(id: string): AgentTab {
     id, name: id, kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
-  };
+    autoNameVariants: null, shellCommand: null,  };
 }
 function mkProject(id: string, name: string, agents: AgentTab[], selectedAgentId: string): Project {
   return {
@@ -257,10 +256,10 @@ describe("Workspace — project tabs drive the shell", () => {
 });
 
 describe("Workspace — depth layers + calm desaturation", () => {
-  it("hands calm to the VISIBLE pane while its agent is calm (P2)", async () => {
+  it("hands calm to the VISIBLE pane while its agent is calm", async () => {
     render(<Workspace />);
     await screen.findByTestId("pane-a1");
-    // No live status → the feed bands the agent P2 (calm).
+    // No live status → the agent reads `stopped`, which is calm.
     expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("true");
     expect(screen.getByTestId("pane-a1").dataset.calm).toBe("true");
     // The desaturation is the PANE's (its terminal theme), never a filter on the stage: that
@@ -269,12 +268,55 @@ describe("Workspace — depth layers + calm desaturation", () => {
     expect(screen.getByTestId("terminal-stage").style.filter).toBe("");
   });
 
-  it("restores color the moment that agent needs you (P0)", async () => {
+  it("restores color the moment that agent needs you", async () => {
     render(<Workspace />);
     await screen.findByTestId("pane-a1");
     await act(async () => useRuntimeStore.setState({ status: { a1: "waiting" } } as never));
     expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("false");
     expect(screen.getByTestId("pane-a1").dataset.calm).toBe("false");
+  });
+
+  // `unmerged` is the ONE status where the band and the calm predicate must disagree: it bands
+  // `done` (so it buys no concierge nudge) but is NOT calm (unlanded work is exactly what you should
+  // still see). terminalCalm used to read the BAND, so selecting an unmerged agent desaturated its
+  // terminal while AgentSidebar — which asks `isCalmBand` — kept its row fully colored. Two surfaces
+  // disagreeing about the one status the split exists to protect.
+  it("does NOT desaturate an agent whose work is committed but not landed (unmerged)", async () => {
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    await act(async () =>
+      useRuntimeStore.setState({
+        // idle + committed-but-unlanded → publishedStatusFor escalates the status to `unmerged`.
+        status: { a1: "idle" },
+        workflowStage: { a1: "building_saved" },
+        branchStatus: {},
+      } as never),
+    );
+    expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("false");
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("false");
+  });
+
+  it("DOES desaturate a genuinely landed agent, so the unmerged contrast is real", async () => {
+    // Without this, the test above would pass trivially if the calm treatment broke entirely.
+    // `merged` is past the unlanded band, so the status stays plain `idle`.
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    await act(async () =>
+      useRuntimeStore.setState({
+        status: { a1: "idle" },
+        workflowStage: { a1: "merged" },
+        branchStatus: {},
+      } as never),
+    );
+    expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("true");
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("true");
+  });
+
+  it("keeps a WORKING agent calm — the Running band changed sorting, not desaturation", async () => {
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    await act(async () => useRuntimeStore.setState({ status: { a1: "working" } } as never));
+    expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("true");
   });
 
   it("keeps color while the Plan board is up — calm is a property of a VISIBLE agent pane", async () => {

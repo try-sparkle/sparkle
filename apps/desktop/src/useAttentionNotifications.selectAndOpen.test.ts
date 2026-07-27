@@ -31,7 +31,6 @@ const agent = (id: string, kind: AgentTab["kind"]): AgentTab =>
     kind,
     name: id,
     parentId: null,
-    pinnedIndex: null,
     autoNameVariants: null,
     namePinned: false,
     shellCommand: null,

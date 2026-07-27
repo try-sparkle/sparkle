@@ -11,7 +11,6 @@ import { useUiStore, type CategoryId } from "../stores/uiStore";
 import { AiFeaturesMenu } from "./AiFeaturesMenu";
 import { NotificationsMenu } from "./NotificationsMenu";
 import { ThemeToggle } from "./ThemeToggle";
-import { AgentOrderToggle } from "./AgentOrderToggle";
 import { BranchCleanupToggle } from "./BranchCleanupToggle";
 import { WorkerLimitControl } from "./WorkerLimitControl";
 import { AdvancedConfigMenu } from "./AdvancedConfigMenu";
@@ -484,10 +483,6 @@ function AppearancePane() {
             +
           </button>
         </div>
-      </div>
-      <div>
-        <div style={subLabel}>Agent order</div>
-        <AgentOrderToggle />
       </div>
       <div>
         <div style={subLabel}>After merge to main</div>

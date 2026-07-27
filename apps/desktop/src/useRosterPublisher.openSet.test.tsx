@@ -35,8 +35,7 @@ function mkProject(id: string, agentId: string): Project {
         id: agentId, name: agentId, kind: "build", parentId: null, runtime: "local",
         worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
         promptHistory: [], namePinned: false, autoNameBasis: null,
-        autoNameVariants: null, shellCommand: null, pinnedIndex: null,
-      } as AgentTab,
+        autoNameVariants: null, shellCommand: null,      } as AgentTab,
     ],
   };
 }

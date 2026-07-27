@@ -62,24 +62,23 @@ describe("selectionAfterClose", () => {
     id: string,
     kind: AgentKind,
     parentId: string | null = null,
-    pinnedIndex: number | null = null,
-  ): CloseSelectionAgent => ({ id, kind, parentId, pinnedIndex });
+  ): CloseSelectionAgent => ({ id, kind, parentId });
   const before = [ag("b1", "build"), ag("b2", "build")];
 
   it("closing the OPEN build agent re-selects the first visible row", () => {
     const after = [ag("b2", "build")]; // b1 removed
-    const d = selectionAfterClose("b1", "b1", before, after, "build", "manual", {});
+    const d = selectionAfterClose("b1", "b1", before, after, "build");
     expect(d).toEqual({ reselect: true, next: "b2" });
   });
 
   it("closing the LAST build agent clears selection → blank first-load state", () => {
-    const d = selectionAfterClose("b1", "b1", [ag("b1", "build")], [], "build", "manual", {});
+    const d = selectionAfterClose("b1", "b1", [ag("b1", "build")], [], "build");
     expect(d).toEqual({ reselect: true, next: null });
   });
 
   it("closing a NON-open row leaves selection put", () => {
     const after = [ag("b1", "build")]; // closed b2, but b1 is open
-    const d = selectionAfterClose("b2", "b1", before, after, "build", "manual", {});
+    const d = selectionAfterClose("b2", "b1", before, after, "build");
     expect(d).toEqual({ reselect: false, next: "b1" });
   });
 
@@ -88,13 +87,49 @@ describe("selectionAfterClose", () => {
     // it), so selection is invalidated and must move to the first visible row.
     const withWorker = [ag("b1", "build"), ag("w1", "worker", "b1"), ag("b2", "build")];
     const after = [ag("b2", "build")]; // b1 + its worker w1 removed
-    const d = selectionAfterClose("b1", "w1", withWorker, after, "build", "manual", {});
+    const d = selectionAfterClose("b1", "w1", withWorker, after, "build");
     expect(d).toEqual({ reselect: true, next: "b2" });
   });
 
   it("does nothing when nothing is selected", () => {
     const after = [ag("b2", "build")];
-    const d = selectionAfterClose("b1", null, before, after, "build", "manual", {});
+    const d = selectionAfterClose("b1", null, before, after, "build");
     expect(d).toEqual({ reselect: false, next: null });
+  });
+});
+
+describe("selectionAfterClose — the caller's preferred next row", () => {
+  const ag = (id: string, kind: AgentKind, parentId: string | null = null): CloseSelectionAgent => ({
+    id,
+    kind,
+    parentId,
+  });
+
+  it("honors a preferred row supplied by the sidebar over plain array order", () => {
+    // The sidebar knows the rendered ladder AND the active status filter; array order does not.
+    // Selecting the array-first agent when the user has filtered it out of sight would leave the
+    // main pane showing an agent with no row in the column.
+    const before = [ag("hidden", "build"), ag("visible", "build")];
+    const after = [ag("hidden", "build"), ag("visible", "build")];
+    const d = selectionAfterClose("gone", "gone", [...before, ag("gone", "build")], after, "build", "visible");
+    expect(d).toEqual({ reselect: true, next: "visible" });
+  });
+
+  it("falls back to array order when the preferred row did NOT survive the close", () => {
+    // A stale preference must never select a torn-down agent.
+    const after = [ag("b2", "build")];
+    const d = selectionAfterClose("b1", "b1", [ag("b1", "build"), ag("b2", "build")], after, "build", "b1");
+    expect(d).toEqual({ reselect: true, next: "b2" });
+  });
+
+  it("falls back to array order when no preference is given", () => {
+    const after = [ag("b2", "build")];
+    const d = selectionAfterClose("b1", "b1", [ag("b1", "build"), ag("b2", "build")], after, "build");
+    expect(d).toEqual({ reselect: true, next: "b2" });
+  });
+
+  it("clears selection when the ladder is empty even though a preference was passed", () => {
+    const d = selectionAfterClose("b1", "b1", [ag("b1", "build")], [], "build", null);
+    expect(d).toEqual({ reselect: true, next: null });
   });
 });

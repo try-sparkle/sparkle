@@ -50,8 +50,7 @@ function seed(
     id: "a1", name: "Agent 1", kind: "build", parentId: null, runtime,
     worktreePath: null, branch: null, baseBranch: "main", lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null, autoNameVariants: null,
-    shellCommand: null, pinnedIndex: null,
-  };
+    shellCommand: null,  };
   const agents: AgentTab[] = [agent];
   if (opts.withCloudChild) {
     agents.push({

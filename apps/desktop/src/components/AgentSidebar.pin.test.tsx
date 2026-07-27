@@ -1,8 +1,11 @@
 // @vitest-environment jsdom
 //
-// Sidebar ordering + unpin: a pinned (anchored) agent holds its row via orderAgents, and the
-// pin icon clears both the name-freeze and the row anchor. Heavy leaf components + the Tauri
-// opener are mocked so the sidebar renders.
+// The NAME-freeze chip. `namePinned` used to mean two things — "don't auto-rename" AND "hold this
+// row's position". Row anchoring is gone (rows group by workflow stage; order within a stage is the
+// human's drag arrangement), so the flag now means exactly one thing and the chip says so. The
+// ordering assertions that used to live here are gone with pinnedIndex; the property that replaced
+// them — that status never moves a row — is asserted in engine/buildSections.test.ts.
+// Heavy leaf components + the Tauri opener are mocked so the sidebar renders.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -24,7 +27,7 @@ function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentT
     id, name, kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null, pinnedIndex: null, ...over,
+    autoNameVariants: null, shellCommand: null, ...over,
   };
 }
 
@@ -37,29 +40,13 @@ function seed(agents: AgentTab[]): Project {
   return project;
 }
 
-// Reset the shared runtime store between tests so a per-test `status` map (used to force an
-// attention-sort order) can't leak into the next test and make the suite order-dependent.
 beforeEach(() => useRuntimeStore.setState({ status: {} }));
 afterEach(() => cleanup());
 
-describe("AgentSidebar — manual pin ordering", () => {
-  it("an anchored agent holds its row (orderAgents), ahead of an unpinned one", () => {
-    // Alpha is first by insertion; Beta is anchored to row 0 → Beta must render before Alpha.
-    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta", { namePinned: true, pinnedIndex: 0 })]);
-    render(<AgentSidebar project={project} />);
-    const beta = screen.getByText("Beta");
-    const alpha = screen.getByText("Alpha");
-    // DOCUMENT_POSITION_FOLLOWING (4) set ⇒ alpha comes after beta in the DOM.
-    expect(beta.compareDocumentPosition(alpha) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  });
-
-  it("renaming a top-level agent anchors it at its DISPLAYED row, not its insertion index", () => {
-    // Insertion order is [Alpha, Beta]. Attention sort floats Beta (waiting) above Alpha
-    // (working), so Alpha is DISPLAYED at row 1 even though it's array index 0.
+describe("AgentSidebar — the name-freeze chip", () => {
+  it("renaming a top-level agent freezes its name but does NOT anchor its row", () => {
     const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
-    useRuntimeStore.setState({ status: { a1: "working", a2: "waiting" } });
     render(<AgentSidebar project={project} />);
-    // Enter rename on Alpha (double-click the name), change it, blur to commit.
     fireEvent.doubleClick(screen.getByText("Alpha"));
     const input = screen.getByDisplayValue("Alpha");
     fireEvent.change(input, { target: { value: "Alpha2" } });
@@ -67,15 +54,22 @@ describe("AgentSidebar — manual pin ordering", () => {
     const a1 = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === "a1")!;
     expect(a1.name).toBe("Alpha2");
     expect(a1.namePinned).toBe(true);
-    expect(a1.pinnedIndex).toBe(1); // displayed row, NOT the insertion index 0
+    // The row did not move: array order is untouched by a rename.
+    expect(useProjectStore.getState().projects[0]!.agents.map((a) => a.id)).toEqual(["a1", "a2"]);
   });
 
-  it("clicking the pin icon unpins (clears namePinned + pinnedIndex)", () => {
-    const project = seed([mkAgent("a1", "Alpha", { namePinned: true, pinnedIndex: 0 })]);
+  it("clicking the chip releases the name freeze so the agent auto-names again", () => {
+    const project = seed([mkAgent("a1", "Alpha", { namePinned: true })]);
     render(<AgentSidebar project={project} />);
-    fireEvent.click(screen.getByTitle(/^Pinned/));
+    fireEvent.click(screen.getByTitle(/^Renamed by you/));
     const a1 = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === "a1")!;
     expect(a1.namePinned).toBe(false);
-    expect(a1.pinnedIndex).toBeNull();
+  });
+
+  it("the chip's tooltip no longer claims to control ordering", () => {
+    const project = seed([mkAgent("a1", "Alpha", { namePinned: true })]);
+    render(<AgentSidebar project={project} />);
+    const chip = screen.getByTitle(/^Renamed by you/);
+    expect(chip.getAttribute("title")).not.toMatch(/reorder/i);
   });
 });

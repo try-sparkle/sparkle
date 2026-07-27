@@ -28,7 +28,6 @@ function agent(over: Partial<AgentTab> & { id: string; kind: AgentTab["kind"] })
     autoNameBasis: null,
     autoNameVariants: null,
     shellCommand: null,
-    pinnedIndex: null,
     ...over,
   } as AgentTab;
 }

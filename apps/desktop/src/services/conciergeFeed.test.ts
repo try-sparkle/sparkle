@@ -1,10 +1,13 @@
 import { describe, it, expect } from "vitest";
 import {
   buildConciergeFeed,
-  conciergePriority,
+  conciergeBand,
   conciergeTopics,
+  emptyCounts,
+  isCalmBand,
   trayStatusMap,
 } from "./conciergeFeed";
+import { bandOfStatus, type StatusBand } from "../engine/buildSections";
 import { AGENT_STATUS } from "@sparkle/ui";
 import type { Roster } from "./rosterTypes";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
@@ -45,48 +48,87 @@ function flat(feed: ReturnType<typeof buildConciergeFeed>) {
   return feed.projects.flatMap((p) => p.agents);
 }
 
-describe("conciergePriority — reuses the existing attention tiers", () => {
-  it.each<[AgentTabStatus, 0 | 1 | 2]>([
-    ["waiting", 0],
-    ["approval", 0],
-    ["errored", 0],
-    ["blocked", 1],
-    // `unmerged` is P2: this band is the concierge's INTERRUPTION budget (priority < 2 renders a
-    // nudge card, counts into "N need attention", lights a tab glow), and landing state must not buy
-    // an interruption — 27 of 51 agents were in that band on the reported fleet. It is kept out of
-    // the DIMMING predicate separately; see isCalmBand.
-    ["unmerged", 2],
-    ["working", 2],
-    ["idle", 2],
-    ["done", 2],
-    ["stopped", 2],
-  ])("%s → P%i", (status, want) => {
-    expect(conciergePriority(status)).toBe(want);
+describe("conciergeBand — the app's one status vocabulary", () => {
+  it.each<[AgentTabStatus, StatusBand]>([
+    ["waiting", "needs_you"],
+    ["approval", "needs_you"],
+    ["errored", "needs_you"],
+    // `blocked` used to be its own amber "wants you eventually" tier. It is Needs-you now: a gold
+    // card and a red card both meant "go look", so the second alarm color bought nothing.
+    ["blocked", "needs_you"],
+    // `unmerged` bands `done`: the band is the concierge's INTERRUPTION budget (needs_you renders a
+    // nudge card, counts into "N Need you", lights a tab glow), and landing state must not buy an
+    // interruption — 27 of 51 agents were in that band on the reported fleet. It is kept out of the
+    // DIMMING predicate separately; see isCalmBand.
+    ["unmerged", "done"],
+    // The split the new vocabulary ADDS: in-flight work is not finished work.
+    ["working", "running"],
+    ["idle", "done"],
+    ["done", "done"],
+    ["stopped", "done"],
+  ])("%s → %s", (status, want) => {
+    expect(conciergeBand(status)).toBe(want);
   });
 
-  it("no status at all is calm", () => {
-    expect(conciergePriority(undefined)).toBe(2);
+  it("no status at all bands `done` — same place `stopped`, the builder's default, lands", () => {
+    expect(conciergeBand(undefined)).toBe("done");
+  });
+
+  it("is a pure `undefined` shim over the engine's bandOfStatus, never a second opinion", () => {
+    const all: AgentTabStatus[] = [
+      "working", "idle", "waiting", "approval", "blocked", "errored", "unmerged", "done", "stopped",
+    ];
+    for (const s of all) expect(conciergeBand(s)).toBe(bandOfStatus(s));
   });
 });
 
-describe("buildConciergeFeed — priority banding + status tokens", () => {
-  it("bands a waiting agent P0 with the red token, a blocked one P1, an idle one P2", () => {
+// The two predicates that MUST disagree. redTaxonomySeparation.test.ts owns the cross-module story;
+// what is pinned here is the exact membership of `isCalmBand`, because it is defined in this file and
+// the band is the tempting thing to define it as.
+describe("isCalmBand is NOT the band", () => {
+  it("unmerged bands `done` but is not calm — the whole reason they are two predicates", () => {
+    expect(conciergeBand("unmerged")).toBe("done");
+    expect(isCalmBand("unmerged")).toBe(false);
+  });
+
+  it("keeps `working` calm even though it is now its own band", () => {
+    // The running/done split is about POSITION and COUNTS. A terminal that desaturates the moment
+    // its agent starts working would be a treatment nobody asked for.
+    expect(conciergeBand("working")).toBe("running");
+    expect(isCalmBand("working")).toBe(true);
+  });
+
+  it("is exactly {idle, done, stopped, working, no-status}", () => {
+    for (const s of ["idle", "done", "stopped", "working"] as const) {
+      expect(isCalmBand(s)).toBe(true);
+    }
+    expect(isCalmBand(undefined)).toBe(true);
+    for (const s of ["waiting", "approval", "errored", "blocked", "unmerged"] as const) {
+      expect(isCalmBand(s)).toBe(false);
+    }
+  });
+});
+
+describe("buildConciergeFeed — status banding + status tokens", () => {
+  it("bands waiting AND blocked as needs_you (both red), working as running, idle as done", () => {
     const feed = buildConciergeFeed({
-      projects: [project("p1", [agent("ask"), agent("stuck"), agent("calm")])],
-      status: { ask: "waiting", stuck: "blocked", calm: "idle" },
+      projects: [project("p1", [agent("ask"), agent("stuck"), agent("busy"), agent("calm")])],
+      status: { ask: "waiting", stuck: "blocked", busy: "working", calm: "idle" },
     });
     const byId = Object.fromEntries(flat(feed).map((a) => [a.id, a]));
     expect(byId["ask"]).toMatchObject({
-      priority: 0, status: "waiting", statusColor: RED, statusLabel: "Needs you",
+      band: "needs_you", status: "waiting", statusColor: RED, statusLabel: "Needs you",
     });
-    expect(byId["stuck"]).toMatchObject({ priority: 1, status: "blocked", statusColor: RED });
-    expect(byId["calm"]).toMatchObject({ priority: 2, status: "idle", statusColor: GRAY });
+    // Same band AND the same red as `waiting` — there is one red treatment, no amber tier.
+    expect(byId["stuck"]).toMatchObject({ band: "needs_you", status: "blocked", statusColor: RED });
+    expect(byId["busy"]).toMatchObject({ band: "running", status: "working", statusColor: GREEN });
+    expect(byId["calm"]).toMatchObject({ band: "done", status: "idle", statusColor: GRAY });
   });
 
-  it("defaults an agent with no status anywhere to stopped/P2/gray (buildRoster's default)", () => {
+  it("defaults an agent with no status anywhere to stopped/done/gray (buildRoster's default)", () => {
     const feed = buildConciergeFeed({ projects: [project("p1", [agent("a1")])], status: {} });
     expect(flat(feed)[0]).toMatchObject({
-      status: "stopped", priority: 2, statusColor: GRAY, statusLabel: "Stopped",
+      status: "stopped", band: "done", statusColor: GRAY, statusLabel: "Stopped",
     });
   });
 
@@ -115,13 +157,13 @@ describe("buildConciergeFeed — priority banding + status tokens", () => {
     });
     expect(flat(feed)[0]).toMatchObject({
       status: "unmerged",
-      priority: 2,
+      band: "done",
       statusColor: AGENT_STATUS.idle.color,
     });
     expect(flat(feed)[0]?.statusColor).not.toBe(RED);
   });
 
-  it("bubbles a red worker onto its idle orchestrator, so both band P0", () => {
+  it("bubbles a red worker onto its idle orchestrator, so both band needs_you", () => {
     const feed = buildConciergeFeed({
       projects: [
         project("p1", [
@@ -132,13 +174,13 @@ describe("buildConciergeFeed — priority banding + status tokens", () => {
       status: { boss: "idle", w1: "waiting" },
     });
     const byId = Object.fromEntries(flat(feed).map((a) => [a.id, a]));
-    expect(byId["w1"]).toMatchObject({ status: "waiting", priority: 0 });
-    expect(byId["boss"]).toMatchObject({ status: "waiting", priority: 0 });
+    expect(byId["w1"]).toMatchObject({ status: "waiting", band: "needs_you" });
+    expect(byId["boss"]).toMatchObject({ status: "waiting", band: "needs_you" });
   });
 });
 
 describe("buildConciergeFeed — sort order", () => {
-  it("sorts P0 → P1 → P2, live questions before errored within P0, then most-recent touch first", () => {
+  it("sorts Needs you → Running → Done, live questions first within a band, then recent touch", () => {
     const feed = buildConciergeFeed({
       projects: [
         project("p1", [
@@ -147,6 +189,7 @@ describe("buildConciergeFeed — sort order", () => {
           agent("crashed"),
           agent("ask-old"),
           agent("ask-new"),
+          agent("busy"),
         ]),
       ],
       status: {
@@ -155,17 +198,30 @@ describe("buildConciergeFeed — sort order", () => {
         crashed: "errored",
         "ask-old": "waiting",
         "ask-new": "waiting",
+        busy: "working",
       },
       interaction: { "ask-old": 1_000, "ask-new": 2_000 },
     });
     expect(flat(feed).map((a) => a.id)).toEqual([
-      "ask-new", // P0, waiting, touched most recently
-      "ask-old", // P0, waiting, touched earlier
-      "crashed", // P0, errored ranks after live questions
-      // Both P2 now (unmerged buys no interruption); within a band the tiebreak is name order.
+      "ask-new", // needs_you, waiting, touched most recently
+      "ask-old", // needs_you, waiting, touched earlier
+      "crashed", // needs_you, errored ranks after live questions
+      // `working` is its own band now, so in-flight work sorts ABOVE finished work instead of
+      // tying with it — the one ordering change the new vocabulary makes.
+      "busy",
+      // Both `done` (unmerged buys no interruption); within a band the tiebreak is name order.
       "calm",
       "merge-me",
     ]);
+  });
+
+  it("sorts blocked with the other reds, not into a tier of its own", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("zzz-blocked"), agent("aaa-busy"), agent("mmm-idle")])],
+      status: { "zzz-blocked": "blocked", "aaa-busy": "working", "mmm-idle": "idle" },
+    });
+    // Name order would put the blocked agent LAST; its band puts it first.
+    expect(flat(feed).map((a) => a.id)).toEqual(["zzz-blocked", "aaa-busy", "mmm-idle"]);
   });
 
   it("carries `since` from the interaction map and omits it when never touched", () => {
@@ -193,22 +249,30 @@ describe("buildConciergeFeed — counts", () => {
     "b-work": "working",
   };
 
-  it("aggregates p0/p1 across all projects and per project", () => {
+  it("aggregates every band across all projects and per project", () => {
     const feed = buildConciergeFeed({ projects: twoProjects, status });
-    expect(feed.counts).toEqual({ p0: 2, p1: 1 });
+    // a-wait + a-block + b-appr are all needs_you now (blocked stopped being its own tier).
+    expect(feed.counts).toEqual({ needs_you: 3, running: 1, done: 1 });
     expect(feed.projects.map((p) => p.counts)).toEqual([
-      { p0: 1, p1: 1 },
-      { p0: 1, p1: 0 },
+      { needs_you: 2, running: 0, done: 1 },
+      { needs_you: 1, running: 1, done: 0 },
     ]);
     // Unpinned + unmuted: the scoped view equals the full truth.
-    expect(feed.scopedCounts).toEqual({ p0: 2, p1: 1 });
+    expect(feed.scopedCounts).toEqual({ needs_you: 3, running: 1, done: 1 });
     expect(feed.pinnedProjectId).toBeNull();
+  });
+
+  it("emptyCounts is the all-zero shape every accumulator starts from", () => {
+    expect(emptyCounts()).toEqual({ needs_you: 0, running: 0, done: 0 });
+    const feed = buildConciergeFeed({ projects: [project("pEmpty", [])], status: {} });
+    expect(feed.counts).toEqual(emptyCounts());
   });
 
   it("pin scope: scoped counts collapse to the pinned project while the full feed lists all", () => {
     const feed = buildConciergeFeed({ projects: twoProjects, status, pinnedProjectId: "pB" });
-    expect(feed.scopedCounts).toEqual({ p0: 1, p1: 0 }); // only pB's approval
-    expect(feed.counts).toEqual({ p0: 2, p1: 1 }); // full truth unchanged
+    // Only pB's two agents. The pin scopes EVERY band, not just the interrupting one.
+    expect(feed.scopedCounts).toEqual({ needs_you: 1, running: 1, done: 0 });
+    expect(feed.counts).toEqual({ needs_you: 3, running: 1, done: 1 }); // full truth unchanged
     expect(feed.projects.map((p) => p.id)).toEqual(["pA", "pB"]); // nothing hidden
     expect(feed.projects.map((p) => p.inScope)).toEqual([false, true]);
     const byId = Object.fromEntries(flat(feed).map((a) => [a.id, a]));
@@ -226,10 +290,13 @@ describe("buildConciergeFeed — mute (sparklePrefsStore.shouldInterrupt)", () =
       shouldInterrupt: (topic) => topic !== "hushed",
     });
     const byId = Object.fromEntries(flat(feed).map((a) => [a.id, a]));
-    expect(byId["hushed"]).toMatchObject({ muted: true, priority: 0 }); // still listed, dimmed
+    // still listed, dimmed
+    expect(byId["hushed"]).toMatchObject({ muted: true, band: "needs_you" });
     expect(byId["loud"]).toMatchObject({ muted: false });
-    expect(feed.scopedCounts).toEqual({ p0: 1, p1: 0 }); // hushed doesn't surface
-    expect(feed.counts).toEqual({ p0: 2, p1: 0 }); // full truth keeps it
+    // hushed doesn't surface
+    expect(feed.scopedCounts).toEqual({ needs_you: 1, running: 0, done: 0 });
+    // full truth keeps it
+    expect(feed.counts).toEqual({ needs_you: 2, running: 0, done: 0 });
   });
 
   it("a muted event-kind slug (status:approval) mutes every agent in that state", () => {
@@ -241,7 +308,7 @@ describe("buildConciergeFeed — mute (sparklePrefsStore.shouldInterrupt)", () =
     const byId = Object.fromEntries(flat(feed).map((a) => [a.id, a]));
     expect(byId["appr"]!.muted).toBe(true);
     expect(byId["ask"]!.muted).toBe(false);
-    expect(feed.scopedCounts).toEqual({ p0: 1, p1: 0 });
+    expect(feed.scopedCounts).toEqual({ needs_you: 1, running: 0, done: 0 });
   });
 
   it("conciergeTopics keys by agent id and status slug", () => {
@@ -282,7 +349,7 @@ describe("buildConciergeFeed — cross-window completeness via the tray roster",
       roster: roster,
     });
     const byId = Object.fromEntries(flat(feed).map((a) => [a.id, a]));
-    expect(byId["far"]).toMatchObject({ status: "waiting", priority: 0 }); // from the tray
+    expect(byId["far"]).toMatchObject({ status: "waiting", band: "needs_you" }); // from the tray
     expect(byId["bogus"]).toMatchObject({ status: "working", statusColor: GREEN }); // local wins
   });
 });

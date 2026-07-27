@@ -17,7 +17,8 @@ import { safeUnlisten } from "./safeUnlisten";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useUiStore, type ThemePref, type AgentOrdering } from "../stores/uiStore";
+import { useUiStore, type ThemePref } from "../stores/uiStore";
+import type { StatusBand } from "../engine/buildSections";
 import { getConfig, setConfigValue, setConfigValues } from "./config";
 import { getModelCatalog } from "./models";
 import { reportControlOp } from "./selfReportObservability";
@@ -157,7 +158,7 @@ function handleGetState(): {
   agents: unknown[];
   theme: ThemePref;
   models: string[];
-  agentOrdering: AgentOrdering;
+  statusFilter: Record<StatusBand, boolean>;
   zoom: number;
 } {
   const { projects } = useProjectStore.getState();
@@ -174,13 +175,14 @@ function handleGetState(): {
     })),
   );
   // Additive Phase-3 fields so an agent can read before writing: the model ids it may pass to
-  // set_agent_model, the current sidebar ordering mode, and the current zoom. Existing fields
-  // (agents, theme) are unchanged.
+  // set_agent_model and the current zoom. Existing fields (agents, theme) are unchanged.
+  // `agentOrdering` was dropped when the sidebar stopped sorting by status; `statusFilter` replaces
+  // it as the one view preference a caller might want to read (which status bands are on screen).
   return {
     agents,
     theme: ui.themePref,
     models: getModelCatalog().map((m) => m.id),
-    agentOrdering: ui.agentOrdering,
+    statusFilter: ui.statusFilter,
     zoom: ui.zoom,
   };
 }
@@ -268,20 +270,22 @@ function flattenConfig(prefix: string, value: Record<string, unknown>): Record<s
   return out;
 }
 
-/** pin_agent → freeze THAT agent's sidebar row at `index` (defaults target to caller). Privileged. */
-function handlePinAgent(req: ControlRequest): Record<string, unknown> {
-  const targetId = resolveTargetId(req);
-  const index = req.payload.index;
-  if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
-    return { ok: false, error: "index must be a non-negative integer" };
-  }
-  const found = findAgent(targetId);
-  if (!found) return { ok: false, error: `unknown agent ${targetId}` };
-  useProjectStore.getState().pinAgentAt(found.projectId, targetId, index);
-  return { ok: true };
+/** pin_agent → RETIRED. Sidebar rows are no longer sorted by status, so there is no attention sort
+ *  to anchor a row against: position is the row's workflow stage (engine/buildSections.ts) plus the
+ *  human's own drag order within that stage. An agent choosing its own row index would fight the
+ *  human's arrangement for no benefit, so this is refused rather than silently accepted — a no-op
+ *  `{ok: true}` would let a caller believe it had moved itself. */
+function handlePinAgent(_req: ControlRequest): Record<string, unknown> {
+  return {
+    ok: false,
+    error:
+      "pin_agent was removed: rows are grouped by workflow stage and ordered by the human's drag arrangement, so there is no row anchor to set",
+  };
 }
 
-/** unpin_agent → release THAT agent's row back into the attention sort (defaults to caller). */
+/** unpin_agent → release THAT agent's NAME freeze so it auto-names again (defaults to caller).
+ *  This used to release a row anchor as well; row anchoring no longer exists (see handlePinAgent),
+ *  so the name freeze is all that remains — which is still worth exposing. */
 function handleUnpinAgent(req: ControlRequest): Record<string, unknown> {
   const targetId = resolveTargetId(req);
   const found = findAgent(targetId);
@@ -305,14 +309,15 @@ function handleSetAgentModel(req: ControlRequest): Record<string, unknown> {
   return { ok: true };
 }
 
-/** set_agent_ordering → the sidebar ordering mode ("attention" | "manual"). Global. Privileged. */
-function handleSetAgentOrdering(req: ControlRequest): Record<string, unknown> {
-  const mode = req.payload.mode;
-  if (mode !== "attention" && mode !== "manual") {
-    return { ok: false, error: 'mode must be "attention" | "manual"' };
-  }
-  useUiStore.getState().setAgentOrdering(mode);
-  return { ok: true };
+/** set_agent_ordering → RETIRED alongside pin_agent. The sidebar has exactly one ordering now
+ *  (workflow stage, then the human's drag order), so there is no mode to choose. Refused rather
+ *  than accepted-and-ignored, for the same reason as handlePinAgent. */
+function handleSetAgentOrdering(_req: ControlRequest): Record<string, unknown> {
+  return {
+    ok: false,
+    error:
+      "set_agent_ordering was removed: the Build column always groups rows by workflow stage, ordered by the human's drag arrangement",
+  };
 }
 
 /** set_zoom → the terminal text zoom. Global. The store clamps to [ZOOM_MIN, ZOOM_MAX]; we only

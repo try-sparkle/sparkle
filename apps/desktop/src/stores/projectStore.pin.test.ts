@@ -3,77 +3,152 @@ import { useProjectStore } from "./projectStore";
 import { useUiStore } from "./uiStore";
 import type { AgentTab, Project } from "../types";
 
-function mkAgent(): AgentTab {
+function mkAgent(id = "a1", name = "A1"): AgentTab {
   return {
-    id: "a1", name: "A1", kind: "build", parentId: null, runtime: "local",
+    id, name, kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
+    autoNameVariants: null, shellCommand: null,
   };
 }
 
-function seed() {
+function seed(agents: AgentTab[] = [mkAgent()]) {
   const project: Project = {
     id: "p1", name: "P", rootPath: "/tmp/p", defaultBranch: null,
-    createdAt: new Date(0).toISOString(), selectedAgentId: null, agents: [mkAgent()],
+    createdAt: new Date(0).toISOString(), selectedAgentId: null, agents,
   };
   useProjectStore.setState({ projects: [project] } as never);
 }
 
+const order = () => useProjectStore.getState().projects[0]!.agents.map((a) => a.id);
+
 const agent = () => useProjectStore.getState().projects[0]!.agents[0]!;
 
-describe("projectStore pin mutators", () => {
-  beforeEach(seed);
+// Row ORDER is now `project.agents` order (the ladder groups by stage, then renders in array
+// order), so the drag handler reorders the array itself. `pinnedIndex` and pinAgentAt are gone —
+// there is no attention sort left to anchor a row against.
+describe("projectStore reorderAgent", () => {
+  beforeEach(() => seed([mkAgent("a"), mkAgent("b"), mkAgent("c")]));
 
-  it("pinAgentAt sets namePinned + pinnedIndex", () => {
-    useProjectStore.getState().pinAgentAt("p1", "a1", 2);
+  it("moves a row UP, landing it immediately before the target", () => {
+    useProjectStore.getState().reorderAgent("p1", "c", "a");
+    expect(order()).toEqual(["c", "a", "b"]);
+  });
+
+  it("moves a row DOWN, landing it AT the target's slot", () => {
+    // Dropping onto a row means "take that row's slot". Inserting before the target unconditionally
+    // is what made a downward drag land one slot short (roborev 53371).
+    useProjectStore.getState().reorderAgent("p1", "a", "c");
+    expect(order()).toEqual(["b", "c", "a"]);
+  });
+
+  it("a downward drag onto the ADJACENT row actually moves it", () => {
+    // The regression that shipped: [a, b] + drag a onto b removed `a` and re-inserted it at index 0
+    // — exactly where it started. The user drags, nothing moves, the control reads as broken. The
+    // old test asserted the buggy order and so could never catch this.
+    seed([mkAgent("a"), mkAgent("b")]);
+    useProjectStore.getState().reorderAgent("p1", "a", "b");
+    expect(order()).toEqual(["b", "a"]);
+  });
+
+  it("an upward drag onto the adjacent row moves it too (the mirror case)", () => {
+    seed([mkAgent("a"), mkAgent("b")]);
+    useProjectStore.getState().reorderAgent("p1", "b", "a");
+    expect(order()).toEqual(["b", "a"]);
+  });
+
+  it("every single-step drag in a 3-row section changes the order", () => {
+    // Exhaustive over adjacent pairs in both directions — the shape of bug that hides in exactly
+    // one direction is the one a hand-picked example misses.
+    for (const [drag, target, want] of [
+      ["a", "b", ["b", "a", "c"]],
+      ["b", "c", ["a", "c", "b"]],
+      ["b", "a", ["b", "a", "c"]],
+      ["c", "b", ["a", "c", "b"]],
+    ] as const) {
+      seed([mkAgent("a"), mkAgent("b"), mkAgent("c")]);
+      useProjectStore.getState().reorderAgent("p1", drag, target);
+      expect(order(), `drag ${drag} onto ${target}`).toEqual([...want]);
+    }
+  });
+
+  it("appends when the target is null", () => {
+    useProjectStore.getState().reorderAgent("p1", "a", null);
+    expect(order()).toEqual(["b", "c", "a"]);
+  });
+
+  it("appends rather than dropping the move when the target vanished mid-drag", () => {
+    useProjectStore.getState().reorderAgent("p1", "a", "ghost");
+    expect(order()).toEqual(["b", "c", "a"]);
+  });
+
+  it("is a no-op for a self-drop, and does NOT hand out a new project reference", () => {
+    const before = useProjectStore.getState().projects[0]!;
+    useProjectStore.getState().reorderAgent("p1", "b", "b");
+    // Identity, not just equality: a fresh object would re-render every projects consumer for a
+    // drag that visually did nothing.
+    expect(useProjectStore.getState().projects[0]!).toBe(before);
+  });
+
+  it("is a no-op for an unknown agent", () => {
+    const before = useProjectStore.getState().projects[0]!;
+    useProjectStore.getState().reorderAgent("p1", "nope", "a");
+    expect(useProjectStore.getState().projects[0]!).toBe(before);
+  });
+
+  it("does NOT freeze the name — a pure reorder must leave auto-naming alone", () => {
+    // The old drag-pin set namePinned as a side effect, silently disabling auto-naming for any row
+    // the user ever dragged.
+    useProjectStore.getState().reorderAgent("p1", "a", "c");
+    const moved = useProjectStore.getState().projects[0]!.agents.find((x) => x.id === "a")!;
+    expect(moved.namePinned).toBe(false);
+  });
+
+  it("preserves autoNameVariants (a drag must not change the visible label)", () => {
+    const variants = { title: "Long Name", description: "does a thing" };
+    seed([{ ...mkAgent("a"), autoNameVariants: variants }, mkAgent("b")]);
+    useProjectStore.getState().reorderAgent("p1", "a", null);
+    const moved = useProjectStore.getState().projects[0]!.agents.find((x) => x.id === "a")!;
+    expect(moved.autoNameVariants).toEqual(variants);
+  });
+
+  it("keeps every agent — a reorder is a permutation, never a drop", () => {
+    useProjectStore.getState().reorderAgent("p1", "b", "a");
+    expect([...order()].sort()).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("projectStore unpinAgent — now a NAME-freeze release only", () => {
+  beforeEach(() => seed());
+
+  it("clears namePinned so the agent auto-names again", () => {
+    useProjectStore.getState().renameAgent("p1", "a1", "Human Choice");
     expect(agent().namePinned).toBe(true);
-    expect(agent().pinnedIndex).toBe(2);
-  });
-
-  it("pinAgentAt preserves autoNameVariants (a drag-reorder must not change the label)", () => {
-    const variants = { short: "S", medium: "M", long: "Long Name" };
-    useProjectStore.setState({
-      projects: [
-        { ...useProjectStore.getState().projects[0]!, agents: [{ ...mkAgent(), autoNameVariants: variants }] },
-      ],
-    } as never);
-    useProjectStore.getState().pinAgentAt("p1", "a1", 0);
-    expect(agent().autoNameVariants).toEqual(variants);
-  });
-
-  it("unpinAgent clears both", () => {
-    useProjectStore.getState().pinAgentAt("p1", "a1", 2);
     useProjectStore.getState().unpinAgent("p1", "a1");
     expect(agent().namePinned).toBe(false);
-    expect(agent().pinnedIndex).toBeNull();
   });
+});
 
-  it("renameAgent with an index pins the name and anchors the row", () => {
-    useProjectStore.getState().renameAgent("p1", "a1", "New", 1);
+describe("projectStore renameAgent", () => {
+  beforeEach(() => seed());
+
+  it("freezes the name against the auto-namer", () => {
+    useProjectStore.getState().renameAgent("p1", "a1", "New");
     expect(agent().name).toBe("New");
     expect(agent().namePinned).toBe(true);
-    expect(agent().pinnedIndex).toBe(1);
-  });
-
-  it("renameAgent without an index leaves pinnedIndex unchanged", () => {
-    useProjectStore.getState().pinAgentAt("p1", "a1", 3);
-    useProjectStore.getState().renameAgent("p1", "a1", "New2");
-    expect(agent().pinnedIndex).toBe(3);
   });
 });
 
 // selfNameAgent — the sparkle-control rename_agent path. It makes the name authoritative WITHOUT
 // pinning the row (regression sparkle-pel7: agents self-naming looked pinned and couldn't be unpinned).
 describe("projectStore selfNameAgent", () => {
-  beforeEach(seed);
+  beforeEach(() => seed());
 
-  it("sets the name + selfNamed but NEVER namePinned or pinnedIndex", () => {
+  it("sets the name + selfNamed but NEVER namePinned", () => {
     useProjectStore.getState().selfNameAgent("p1", "a1", "Parser Builder");
     expect(agent().name).toBe("Parser Builder");
     expect(agent().selfNamed).toBe(true);
-    expect(agent().namePinned).toBe(false); // no pin chip
-    expect(agent().pinnedIndex).toBeNull(); // no row anchor
+    expect(agent().namePinned).toBe(false); // no name-freeze chip
   });
 
   it("clears autoNameVariants so the chosen label shows verbatim", () => {
@@ -81,7 +156,7 @@ describe("projectStore selfNameAgent", () => {
       projects: [
         {
           ...useProjectStore.getState().projects[0]!,
-          agents: [{ ...mkAgent(), autoNameVariants: { short: "S", medium: "M", long: "Stale Auto Name" } }],
+          agents: [{ ...mkAgent(), autoNameVariants: { title: "Stale Auto Name", description: "stale" } }],
         },
       ],
     } as never);
@@ -96,7 +171,7 @@ describe("projectStore selfNameAgent", () => {
   });
 
   it("is a no-op over a human pin (namePinned wins)", () => {
-    useProjectStore.getState().renameAgent("p1", "a1", "Human Choice", 0);
+    useProjectStore.getState().renameAgent("p1", "a1", "Human Choice");
     useProjectStore.getState().selfNameAgent("p1", "a1", "Agent Choice");
     expect(agent().name).toBe("Human Choice");
     expect(agent().namePinned).toBe(true);

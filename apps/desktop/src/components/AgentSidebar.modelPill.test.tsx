@@ -49,7 +49,6 @@ function mkAgent(over: Partial<AgentTab> = {}): AgentTab {
     autoNameBasis: null,
     autoNameVariants: { title: TITLE, description: "" },
     shellCommand: null,
-    pinnedIndex: null,
     ...over,
   };
 }

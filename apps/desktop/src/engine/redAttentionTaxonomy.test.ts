@@ -5,7 +5,8 @@ import { needsAttention } from "./attention";
 import { mightNeedFollowup } from "../services/turnFollowup";
 import type { AgentTabStatus } from "../types";
 
-// Cross-surface regression guard for the P0 "reliable RED needs-you" contract, consolidating the
+// Cross-surface regression guard for the top-priority "reliable RED needs-you" contract,
+// consolidating the
 // three beads that make up one subsystem: sparkle-vgub (feature), sparkle-blpf (blocked-on-user),
 // sparkle-pqxh (mid-stream API failure). The individual units are covered in depth by their own
 // suites (screenClassifier / streamFailure / statusEngine / attention / turnFollowup); this file

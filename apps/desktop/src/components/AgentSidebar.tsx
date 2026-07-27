@@ -22,7 +22,7 @@ import { WEB_BASE_URL } from "../services/sparkleApi";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useUiStore, type AttentionTier } from "../stores/uiStore";
+import { useUiStore } from "../stores/uiStore";
 import { useHelperPrefs } from "../helper/helperPrefs";
 import { APP_WINDOW_LABEL } from "../windowContext";
 import { useInteractionStore } from "../stores/interactionStore";
@@ -47,13 +47,22 @@ import { consentPillLabel, sparkleBarState, type SparkleBarState } from "./spark
 import { useBeadsStore } from "../stores/beadsStore";
 import { beadLabel, epicForBuild, epicPillFor } from "../services/planView";
 import { type Bead } from "../services/beads";
-import { orderedTopLevelAgents, firstVisibleAgentId } from "../engine/agentOrdering";
+import { topLevelAgents as topLevelOf, firstVisibleAgentId } from "../engine/agentOrdering";
+import {
+  bandOfStatus,
+  flattenSections,
+  groupAgentsByStage,
+  type BuildSectionId,
+  type StatusBand,
+} from "../engine/buildSections";
+import { StageSectionHeader } from "./StageSectionHeader";
+import { StatusFilterBar } from "./StatusFilterBar";
 import { withUnstartedWorkerAttention, withRedWorkerAttention } from "../engine/workerAttention";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { withUnmergedWork } from "../engine/unmergedAttention";
 import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode } from "../engine/workMode";
-import { isCalmBand, conciergePriority } from "../services/conciergeFeed";
+import { isCalmBand } from "../services/conciergeFeed";
 import { PlanBuildToggle, FADE_3 } from "./PlanBuildToggle";
 import { StatusDot } from "./StatusDot";
 import { LogoWaveform } from "./LogoWaveform";
@@ -311,10 +320,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // Plan" button — can switch tabs. Behavior is identical to the old local useState.
   const mode = useUiStore((s) => s.workMode);
   const setMode = useUiStore((s) => s.setWorkMode);
-  const agentOrdering = useUiStore((s) => s.agentOrdering);
-  // Set by a P0/P1 chiclet on the floating helper island; narrows the stack below.
-  const attentionTierFocus = useUiStore((s) => s.attentionTierFocus);
-  const setAttentionTierFocus = useUiStore((s) => s.setAttentionTierFocus);
+  // Which status bands the column currently shows (the filter chips above the ladder).
+  const statusFilter = useUiStore((s) => s.statusFilter);
+  const toggleStatusBand = useUiStore((s) => s.toggleStatusBand);
+  const showAllStatusBands = useUiStore((s) => s.showAllStatusBands);
   // The workflow stage an agent's own git state + any known override resolves to.
   const stageOf = (id: string): WorkflowStageId =>
     resolveStage(branchStatus[id], workflowStage[id]);
@@ -507,15 +516,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       return;
     }
     // Switching INTO Build: move selection to the first Build row so the pane matches the chevron
-    // (or clear it → the empty Build state with "+ New Build Agent"). Pass the fresh build agent so
-    // selection lands on the same top row the list renders.
-    const next = firstVisibleAgentId(
-      project.agents,
-      "build",
-      agentOrdering,
-      status,
-      project.freshBuildAgentId,
-    );
+    // (or clear it → the empty Build state with "+ New Build Agent").
+    const next = firstVisibleAgentId(project.agents, "build");
     selectAgent(project.id, next);
     if (next) open(next);
   };
@@ -577,26 +579,38 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     if (!project) return;
     const fresh = useProjectStore.getState().projects.find((p) => p.id === project.id);
     if (!fresh) return;
-    // Read ALL inputs FRESH (not the render-scope `status`/`mode`/`agentOrdering`): now that AgentRow
-    // is memoized, the `onClose` closure that reaches here may have been captured a few renders ago.
-    // `agentOrdering` in particular is reachable-stale — toggling attention-ordering keeps a row whose
-    // orderedIndex didn't change mounted, so its captured closure would otherwise pick the next
-    // selection against the old ordering (sparkle-alrm.3).
+    // Read ALL inputs FRESH (not the render-scope `status`/`mode`/`statusFilter`): now that AgentRow
+    // is memoized, the `onClose` closure that reaches here may have been captured a few renders ago
+    // (sparkle-alrm.3).
     const rt = useRuntimeStore.getState();
-    const { workMode: freshMode, agentOrdering: freshOrdering } = useUiStore.getState();
+    const { workMode: freshMode, statusFilter: freshFilter } = useUiStore.getState();
     const freshStatus = withUnstartedWorkerAttention(
       fresh.agents,
       rt.status,
       new Set(rt.openAgentIds),
     );
+    // Selection must land on a row the user can actually SEE. Re-derive the rendered ladder from
+    // fresh state and take its first row: with the filter chips, the first agent in array order can
+    // easily be one the user has hidden, and selecting a hidden row leaves the main pane showing an
+    // agent with no corresponding row in the column — the exact incoherence this helper exists to
+    // prevent. Falls through to the array-order default inside selectionAfterClose when the ladder
+    // is empty (everything filtered out, or nothing left).
+    const preferredNext =
+      flattenSections(
+        groupAgentsByStage(
+          topLevelOf(fresh.agents, freshMode),
+          (id) => resolveStage(rt.branchStatus[id], rt.workflowStage[id]),
+          (id) => freshStatus[id] ?? "stopped",
+          freshFilter,
+        ),
+      )[0]?.id ?? null;
     const decision = selectionAfterClose(
       removedRootId,
       project.selectedAgentId,
       project.agents,
       fresh.agents,
       freshMode,
-      freshOrdering,
-      freshStatus,
+      preferredNext,
     );
     if (decision.reselect) selectAgent(project.id, decision.next);
   };
@@ -726,17 +740,35 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // are closed by the orchestrator's spin-down, or manually via a row's × (→ teardownAgent →
   // spinDownWorker). See CloseAgentPrompt below for the Build-agent Ship/Save/Discard choice, which
   // is still shown — but only on an explicit user close of a top-level agent, never auto-popped.
-  // Manual reorder drag state (spec: manual-agent-reorder-pin). The id of the top-level agent
-  // currently being dragged by its grip; drop pins it at the target row via pinAgentAt.
-  const pinAgentAt = useProjectStore((s) => s.pinAgentAt);
+  // Manual reorder drag state. The id of the top-level agent currently being dragged by its grip;
+  // dropping it on another row moves it to that row's slot in `project.agents`, which IS the order
+  // rows render in within a stage section (see engine/buildSections.groupAgentsByStage).
+  const reorderAgent = useProjectStore((s) => s.reorderAgent);
   const [dragId, setDragId] = useState<string | null>(null);
-  const onAgentDragStart = (id: string) => setDragId(id);
-  const onAgentDragEnd = () => setDragId(null);
-  const onAgentDrop = (index: number, targetId: string) => {
-    // Skip a self-drop (released on the agent's own row): it's a no-op move, so don't pin/freeze
-    // the name for a drag that visually did nothing (roborev 13174/13175).
-    if (dragId && project && dragId !== targetId) pinAgentAt(project.id, dragId, index);
+  // The ladder section the dragged row came FROM. Tracked alongside the id so every potential drop
+  // target can decide, at hover time, whether it would accept this drag — that's what lets rows in
+  // other sections stay visibly inert instead of lighting up and then silently rejecting the drop.
+  const [dragSection, setDragSection] = useState<BuildSectionId | null>(null);
+  const onAgentDragStart = (id: string, section?: BuildSectionId) => {
+    setDragId(id);
+    setDragSection(section ?? null);
+  };
+  const onAgentDragEnd = () => {
     setDragId(null);
+    setDragSection(null);
+  };
+  // A drop is only honored WITHIN a stage section. Dragging across sections is refused rather than
+  // applied, because a row's section is derived from its git state — dropping a PR-open agent into
+  // "Local: Uncommitted" would have to either un-open its PR (absurd) or silently snap back, and a
+  // control that silently undoes itself reads as broken. `dropSectionOf` lets the drop target tell
+  // us which section the cursor is over; a cross-section drop just cancels the drag.
+  const onAgentDrop = (targetId: string, targetSection?: BuildSectionId) => {
+    // Skip a self-drop (released on the agent's own row) — a no-op move, so don't churn the store
+    // for a drag that visually did nothing (roborev 13174/13175) — and skip a cross-section drop.
+    if (dragId && project && dragId !== targetId && targetSection === dragSection) {
+      reorderAgent(project.id, dragId, targetId);
+    }
+    onAgentDragEnd();
   };
 
   // Whether the agent list overflows its viewport. Drives where the "+ New … Agent" button lives:
@@ -945,41 +977,71 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     return { topLevelAgents, childrenByParent };
   }, [project]);
 
-  // The ordered top-level stack the list renders. Memoized (sparkle-alrm.3) so it only re-sorts when
-  // the agent set, overlaid status, mode, or ordering actually change — not on every unrelated
-  // re-render. Sorts on `effectiveStatus` (dismissed reds de-escalated) so a dismissed row drops out
-  // of the red zone. Shares orderedTopLevelAgents + the same attention-ordering and dismissal overlays
-  // with the TopBar dot cluster, so the two stay in lockstep for those (see TopBar effStatus for the
-  // one pre-existing gap: TopBar omits withRedWorkerAttention's worker→orchestrator red bubble).
-  const orderedAll = useMemo(
-    () =>
-      project
-        ? orderedTopLevelAgents(
-            project.agents,
-            effectiveStatus,
-            mode,
-            agentOrdering === "attention",
-            project.freshBuildAgentId,
-          )
-        : [],
-    [project, effectiveStatus, mode, agentOrdering],
+  // The stage ladder the list renders: top-level rows bucketed into workflow-stage sections, in
+  // `project.agents` order within each section (that order is the user's own drag arrangement), with
+  // rows whose status band is filtered off removed and any section thereby emptied dropped entirely.
+  //
+  // NOTE what is NOT here: any sort. A row's vertical position is a function of its workflow STAGE
+  // and nothing else, which is the whole point — see engine/buildSections.ts for why the old
+  // attention sort was removed. `effectiveStatus` is still read, but only to decide VISIBILITY (the
+  // filter) and the row's dot COLOR, never its position.
+  // The ONE stage per top-level row, used by BOTH the ladder section and the row's own progress
+  // tracker. An orchestrator that delegates rolls up its workers (overall = the LEAST-advanced
+  // worker, since the whole thing isn't done until every unit is); with no workers it is just its
+  // own git stage.
+  //
+  // These were two different values until roborev 53371: the section used the orchestrator's OWN
+  // git state while the tracker used the worker roll-up, so for any delegating orchestrator they
+  // disagreed BY CONSTRUCTION — a head with no commits of its own sat under "Local: Uncommitted"
+  // ("closing this agent loses them") while the bar on that very row showed its workers at "In PR".
+  // The section is the load-bearing new claim about where the work got to, so two adjacent signals
+  // contradicting each other undercut the whole feature.
+  const headStageOf = useCallback(
+    (id: string): WorkflowStageId => {
+      const kids = childrenByParent.get(id) ?? [];
+      const rollup = rollupStages(kids.map((w) => resolveStage(branchStatus[w.id], workflowStage[w.id])));
+      return rollup ? rollup.stage : resolveStage(branchStatus[id], workflowStage[id]);
+    },
+    [childrenByParent, branchStatus, workflowStage],
   );
 
-  // Narrow the stack to one urgency tier when a helper-island chiclet asked for it, using the same
-  // conciergePriority(status) the island's counts derive from.
-  //
-  // The two populations are NOT the same, though, and the UI must not pretend otherwise: the
-  // island counts the whole fleet (every project, every window, workers included), while this
-  // filters only the CURRENT project's top-level rows in THIS window. So "3 P0" on the island can
-  // legitimately yield zero rows here. That is why the empty case below renders an explicit
-  // explanation instead of a blank list — a silently empty sidebar reads as "my agents vanished".
-  //
-  // Never persisted (see uiStore.partialize), so a filter cannot outlive the session.
-  const ordered = useMemo(() => {
-    if (!attentionTierFocus) return orderedAll;
-    const want = attentionTierFocus === "p0" ? 0 : 1;
-    return orderedAll.filter((a) => conciergePriority(effectiveStatus[a.id]) === want);
-  }, [orderedAll, attentionTierFocus, effectiveStatus]);
+  const sections = useMemo(
+    () =>
+      project
+        ? groupAgentsByStage(
+            topLevelOf(project.agents, mode),
+            headStageOf,
+            (id) => effectiveStatus[id] ?? "stopped",
+            statusFilter,
+          )
+        : [],
+    [project, effectiveStatus, mode, headStageOf, statusFilter],
+  );
+  // The flat rendered order, used for the empty-state check and by anything that needs "the rows,
+  // top to bottom" without caring about section boundaries.
+  const ordered = useMemo(() => flattenSections(sections), [sections]);
+
+  // Per-band counts for the filter chips. Counted over the UNFILTERED top-level rows on purpose: a
+  // chip must keep showing how many rows it would reveal while it is toggled OFF, otherwise a
+  // hidden band reads "0" and the user has no idea anything is behind it.
+  const bandCounts = useMemo(() => {
+    const counts: Record<StatusBand, number> = { needs_you: 0, running: 0, done: 0 };
+    if (!project) return counts;
+    for (const a of topLevelOf(project.agents, mode)) {
+      counts[bandOfStatus(effectiveStatus[a.id] ?? "stopped")] += 1;
+    }
+    return counts;
+  }, [project, effectiveStatus, mode]);
+  // Did the FILTER (rather than an empty project) hide everything? Drives which empty state shows —
+  // "you filtered everything out, here's the way back" vs "you have no agents yet".
+  const hiddenByFilter = ordered.length === 0 && Object.values(bandCounts).some((n) => n > 0);
+
+  // NOTE: a SECOND filter used to live here — the helper island's P0/P1 `attentionTierFocus`,
+  // which narrowed this same list by `conciergePriority`. It was removed when the island's chiclets
+  // were rewired to drive `statusFilter` directly (the chips above), because two independent stores
+  // deciding "which rows does the Build column show" is a race with no winner. The island now
+  // ISOLATES a band through the same state the chips render, so its effect is visible in the chip
+  // bar rather than being an invisible mode you can only exit via a special dismiss chip.
 
   // The active mode's "+ New Build Agent" button (null in Plan / no project).
   // Rendered in ONE of two slots in the scroll container below, chosen by listOverflows.
@@ -1060,14 +1122,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           chevron strip; hidden in Plan mode (the sidebar is kept clear for the board). */}
       {project && mode !== "plan" && <HistorySearch currentProjectId={project.id} />}
 
-      {attentionTierFocus && (
-        <TierFilterChip
-          tier={attentionTierFocus}
-          empty={ordered.length === 0}
-          onClear={() => setAttentionTierFocus(null)}
-        />
-      )}
-
       <div
         ref={listScrollRef}
         data-testid="agent-list-scroll"
@@ -1094,17 +1148,30 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             {newAgentButton}
           </div>
         )}
+        {/* The status-band filter. Above the ladder because it governs the whole ladder; hidden in
+            Plan (no rows) and when the project has no top-level agents at all (nothing to filter,
+            so the chips would just be three dead controls above an empty-state hint). */}
+        {project && mode !== "plan" && ordered.length + (hiddenByFilter ? 1 : 0) > 0 && (
+          <StatusFilterBar
+            counts={bandCounts}
+            visible={statusFilter}
+            onToggle={toggleStatusBand}
+          />
+        )}
         {(() => {
           if (!project) return null;
           if (mode === "plan") return null; // Plan: sidebar list stays clear (board shows in main pane)
-          // Top-level agents (the orchestrators — build agents in Build mode, think agents in Think;
-          // workers are never top-level rows), mode-filtered and attention-ordered. Shared with the
-          // TopBar dot cluster via orderedTopLevelAgents so
-          // the header dots can't drift out of sync with these rows. Only the top-level stack
-          // reorders; nested workers stay under their parent in insertion order. Selection is
-          // tracked by id (project.selectedAgentId), so re-sorting never changes which agent is open.
-          // `ordered` is memoized in the component body above (sparkle-alrm.3).
-          return ordered.map((top, orderedIndex) => {
+          // The stage ladder: one group per NON-EMPTY workflow-stage section, top to bottom, each
+          // with a header and its rows in the user's drag order. Sections with no visible rows are
+          // absent entirely (groupAgentsByStage drops them), so the column shows only the rungs that
+          // currently have work on them.
+          //
+          // Selection is tracked by id (project.selectedAgentId), so a row changing section never
+          // changes which agent is open. Nested workers stay under their parent in insertion order.
+          return sections.map((section) => (
+            <div key={section.id} data-testid={`stage-section-${section.id}`}>
+              <StageSectionHeader meta={section.meta} count={section.rows.length} />
+              {section.rows.map((top) => {
             // O(1) lookup into the memoized parentId→children bucket (built once above), in place of
             // an O(agents) `.filter` per orchestrator. Same set, same insertion order — see childrenByParent.
             const workers = top.kind === "build" ? childrenByParent.get(top.id) ?? [] : [];
@@ -1147,7 +1214,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             const renderRow = (
               a: (typeof project.agents)[number],
               trackerStage: WorkflowStageId | null,
-              rowIndex?: number,
+              // Which ladder section this row is rendered in. Passed down so a drop target can tell
+              // a same-section reorder (honored) from a cross-section drag (refused — a row's
+              // section is derived from git state, not something a drag may change).
+              rowSection?: BuildSectionId,
             ) => {
           // The EFFECTIVE status (dismissed reds de-escalated) drives the whole row's appearance —
           // color, glyph, tooltip — so a dismissed row reads calm. The TRUE status is read separately
@@ -1189,7 +1259,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
               shipped={rowShipped}
               workerCount={a.id === top.id ? workers.length : 0}
               workers={a.id === top.id ? workerDetails : []}
-              orderedIndex={rowIndex}
+              rowSection={rowSection}
+              dragSection={dragSection}
               dragActive={dragId != null}
               onDragStartAgent={onAgentDragStart}
               onDragEndAgent={onAgentDragEnd}
@@ -1203,28 +1274,49 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           );
             }; // end renderRow
 
-            // The orchestrator's own chevron: the roll-up of its workers, or its own git stage when
-            // it has none. Shell agents have no git workflow → no tracker (null).
+            // The orchestrator's own chevron — the SAME headStageOf the ladder bucketed this row
+            // by, so the section header and the bar under it can never tell different stories
+            // (roborev 53371). Shell agents have no git workflow → no tracker (null).
             const headStage: WorkflowStageId | null =
-              top.kind === "shell"
-                ? null
-                : rollup
-                  ? rollup.stage
-                  : stageOf(top.id);
+              top.kind === "shell" ? null : headStageOf(top.id);
             // The orchestrator's head row owns ALL its workers, passed via AgentRow's `workers` prop.
             // Collapsed, the head shows only its own title (auto-promoted from its representative
             // worker) + this rollup bar — no inline worker rows. Every worker renders as a stacked
             // detail block inside the CLICK-opened detail card (see CardDetail / WorkerNameButton).
             // A worker that needs attention still bubbles red up to this head row + the TopBar dot, so
             // it's noticed without being expanded.
-            return <div key={top.id}>{renderRow(top, headStage, orderedIndex)}</div>;
-          });
+            return <div key={top.id}>{renderRow(top, headStage, section.id)}</div>;
+              })}
+            </div>
+          ));
         })()}
         {/* Default placement: below the last row, when the list fits without scrolling. (When it
             doesn't fit, the sticky top slot above renders the button instead.) Same wrapper as the
             sticky slot minus the pinning, so the button adds the same height either way. */}
         {newAgentButton && !listOverflows && (
           <div style={NEW_AGENT_SLOT_STYLE}>{newAgentButton}</div>
+        )}
+        {/* Everything hidden by the FILTER, not by an empty project. Distinct from the "no agents
+            yet" hint below, and it offers the way back — a user who has toggled all three chips off
+            sees an empty column, and without this has to work out that they did it to themselves. */}
+        {project && mode === "build" && hiddenByFilter && (
+          <div style={{ color: C.muted, fontSize: 12, padding: "2px 10px 10px", lineHeight: 1.5 }}>
+            All agents are hidden by the status filter.{" "}
+            <button
+              onClick={showAllStatusBands}
+              style={{
+                background: "none",
+                border: "none",
+                padding: 0,
+                font: "inherit",
+                color: C.accent,
+                cursor: "pointer",
+                textDecoration: "underline",
+              }}
+            >
+              Show all
+            </button>
+          </div>
         )}
         {/* Empty hint: the dashed "+ New Build Agent" row above is the call to action. */}
         {project && mode === "build" && topLevelAgents.length === 0 && (
@@ -1524,11 +1616,17 @@ type AgentRowProps = {
   // The agent's current row in the ordered top-level stack (undefined for nested workers).
   // Passed to renameAgent so a manual rename anchors the row there (the unified pin). Also the
   // drop index for drag-reorder. The drag props are only acted on for top-level rows.
-  orderedIndex?: number;
+  // Which ladder section this row renders in (undefined for a nested worker row, which is not
+  // independently draggable). Drag-reorder is only offered WITHIN a section — see dragSection.
+  rowSection?: BuildSectionId;
+  // The section the in-flight drag STARTED in, or null when nothing is being dragged. A row only
+  // presents itself as a drop target when this matches its own section, so a cross-section drag
+  // shows no landing spots at all rather than lighting up and then silently refusing the drop.
+  dragSection: BuildSectionId | null;
   dragActive: boolean;
-  onDragStartAgent: (id: string) => void;
+  onDragStartAgent: (id: string, section?: BuildSectionId) => void;
   onDragEndAgent: () => void;
-  onDropAgent: (index: number, targetId: string) => void;
+  onDropAgent: (targetId: string, targetSection?: BuildSectionId) => void;
   editing: boolean;
   setEditing: (id: string | null) => void;
   onSelect: () => void;
@@ -1589,7 +1687,8 @@ function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
     prev.trackerStage === next.trackerStage &&
     prev.shipped === next.shipped &&
     prev.workerCount === next.workerCount &&
-    prev.orderedIndex === next.orderedIndex &&
+    prev.rowSection === next.rowSection &&
+    prev.dragSection === next.dragSection &&
     prev.dragActive === next.dragActive &&
     prev.editing === next.editing &&
     workerDetailsEqual(prev.workers, next.workers)
@@ -1612,7 +1711,8 @@ const AgentRow = memo(function AgentRow({
   shipped,
   workerCount,
   workers,
-  orderedIndex,
+  rowSection,
+  dragSection,
   dragActive,
   onDragStartAgent,
   onDragEndAgent,
@@ -1792,10 +1892,24 @@ const AgentRow = memo(function AgentRow({
   // The behind/ahead pill + its branch-status geometry now live in AgentDetailLines, which renders
   // the Location/Status/Progress block for this row AND for each inline worker (same logic, no dupe).
 
-  const kindGlyph = a.kind === "worker" ? "↳" : a.kind === "shell" ? "▶" : "⚒";
+  // A BUILD row's leading mark is a plain colored disc carrying its status (red = needs you, green =
+  // running, gray = done) — it replaced the ⚒ pick-and-axe on 2026-07-26. Two things changed at
+  // once and both matter: the row's TEXT went back to a neutral ink (the whole row used to take the
+  // status color, which made a column of agents read as a wall of red), and the status moved into a
+  // single small shape that's easy to scan down. Worker (↳) and shell (▶) rows keep their glyph —
+  // they're structural markers, and a worker's status already reads from its parent's card.
+  const kindGlyph = a.kind === "worker" ? "↳" : a.kind === "shell" ? "▶" : null;
   // Width of the leading glyph slot, kept identical for the glyph and its hover-state × so the
   // name never shifts horizontally when the row expands.
   const glyphWidth = a.kind === "build" ? 24 : 12;
+  // On a BUILD row the status is carried ENTIRELY by the leading disc, so the text is neutral ink.
+  // Colouring the name too was what turned a column of working agents into a wall of green and a
+  // column of finished ones into a wall of red — at which point the color stopped meaning anything.
+  // Worker/shell rows keep the status ink: an inline worker's name going red is its ONLY attention
+  // signal (it has no disc of its own), so removing it there would silently drop the cue.
+  const nameColor = a.kind === "build" ? C.cream : statusColor;
+  // Same reasoning for the elapsed timer — metadata, not a status readout.
+  const metaColor = a.kind === "build" ? C.muted : statusColor;
 
   // Rebase a branch (this row's, or one of its inline workers') onto its base. Parameterized by id +
   // base so the orchestrator's own Status pill and each worker's Status pill share one code path.
@@ -1854,14 +1968,17 @@ const AgentRow = memo(function AgentRow({
     void applyModelToRunningAgent(a.id, modelId);
   };
 
-  // The pin chip (manual pin: name frozen + row anchored). Click to release. Shared by both states.
+  // The name-freeze chip. `namePinned` used to mean two things — "don't auto-rename" AND "hold this
+  // row's position" — but row anchoring is gone (rows only move when their workflow stage changes,
+  // so there is nothing to anchor against). The flag now means exactly one thing, and the tooltip
+  // says so. Click to release and let the agent name itself from its work again.
   const pinChip = a.namePinned ? (
     <span
       onClick={(e) => {
         e.stopPropagation();
         unpinAgent(project.id, a.id);
       }}
-      title="Pinned — won't auto-rename or reorder. Click to unpin."
+      title="Renamed by you — won't auto-rename. Click to release."
       style={{ display: "inline-flex", flex: "0 0 auto", cursor: "pointer", lineHeight: 1, color: C.muted }}
     >
       <TbPinFilled size={11} />
@@ -1949,19 +2066,24 @@ const AgentRow = memo(function AgentRow({
               a visible way to close it (the status stays legible via the status-colored title). */}
           {expanded || isActive ? (
             <CloseAgentButton onClose={onClose} width={glyphWidth} />
-          ) : (
+          ) : kindGlyph ? (
             <span
               title={`${a.kind} — ${AGENT_STATUS[st].label}`}
               style={{
-                fontSize: a.kind === "build" ? 28.8 : 12,
+                fontSize: 12,
                 color: statusColor,
-                // line-height 0 lets the enlarged ⚒ overflow its line box (staying centered in the
-                // slot) without driving the row's height.
+                // line-height 0 keeps the glyph centered in the slot without driving row height.
                 lineHeight: 0,
               }}
             >
               {kindGlyph}
             </span>
+          ) : (
+            // Build row: the status disc. Sized to hold the visual weight the ⚒ used to carry in
+            // this slot. `working` pulses (StatusDot's own class), which is the one place motion
+            // earns its keep — it distinguishes "running right now" from "done" at a glance without
+            // needing the row to change color.
+            <StatusDot status={st} size={12} />
           )}
         </div>
         <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
@@ -1979,7 +2101,7 @@ const AgentRow = memo(function AgentRow({
                 // Only commit a real change. A no-op blur (double-click to edit, then click away
                 // without typing) must NOT pin the name or wipe the auto-name.
                 const next = e.target.value;
-                if (next.trim() && next !== a.name) renameAgent(project.id, a.id, next, orderedIndex);
+                if (next.trim() && next !== a.name) renameAgent(project.id, a.id, next);
                 setEditing(null);
               }}
               onKeyDown={(e) => {
@@ -2013,7 +2135,7 @@ const AgentRow = memo(function AgentRow({
             // No title tooltip (the user finds it noise). gap:8 matches the collapsed row.
             <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, height: GLYPH_SLOT_H }}>
               {lastTouchAt != null && (
-                <ElapsedTimer since={lastTouchAt} now={clockNow} color={statusColor} />
+                <ElapsedTimer since={lastTouchAt} now={clockNow} color={metaColor} />
               )}
               <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 4 }}>
                 <div
@@ -2032,7 +2154,7 @@ const AgentRow = memo(function AgentRow({
                 >
                   <span
                     style={{
-                      color: statusColor,
+                      color: nameColor,
                       fontSize: 13,
                       fontWeight: isActive ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
                     }}
@@ -2040,7 +2162,7 @@ const AgentRow = memo(function AgentRow({
                     {fullTitle}
                   </span>
                   {description && (
-                    <span style={{ color: statusColor, fontSize: 13, fontWeight: FONT_WEIGHT.regular }}>
+                    <span style={{ color: nameColor, fontSize: 13, fontWeight: FONT_WEIGHT.regular }}>
                       {`:  ${description}`}
                     </span>
                   )}
@@ -2075,13 +2197,13 @@ const AgentRow = memo(function AgentRow({
             // Fixed to the glyph-slot height so the title line aligns with the glyph.
             <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, height: GLYPH_SLOT_H }}>
               {lastTouchAt != null && (
-                <ElapsedTimer since={lastTouchAt} now={clockNow} color={statusColor} />
+                <ElapsedTimer since={lastTouchAt} now={clockNow} color={metaColor} />
               )}
               <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 4, minWidth: 0 }}>
                 <FittedAgentName
                   title={autoTitle}
                   name={a.name}
-                  color={statusColor}
+                  color={nameColor}
                   active={isActive}
                   onDoubleClick={(e) => {
                     e.stopPropagation();
@@ -2235,7 +2357,7 @@ const AgentRow = memo(function AgentRow({
   // selected row is exempt: it's docked into the terminal you're reading, and graying it would gray
   // that join. The BAND comes from the parent (see the `calm` prop): computing it here from `st`
   // read a different status map than the concierge feed, so an orchestrator with a red worker was
-  // listed as P0 by the concierge and grayscaled by its own row at the same time.
+  // listed under Needs you by the concierge and grayscaled by its own row at the same time.
   const calm = !isActive && calmBand;
   // One definition, spread where it's needed — this used to be three copy-pasted blocks, two of
   // them mis-indented. NOT applied to the hover card: that card is the thing the user deliberately
@@ -2259,7 +2381,7 @@ const AgentRow = memo(function AgentRow({
   // bottom-of-viewport row, the cursor may sit over the detail (not the strip) when it opens, so the
   // whole card is grabbable rather than the strip alone.
   const dragProps =
-    orderedIndex != null && !editing
+    rowSection != null && !editing
       ? {
           draggable: true,
           // Signal draggability to assistive tech without an aria-label (which would override the
@@ -2267,7 +2389,7 @@ const AgentRow = memo(function AgentRow({
           "aria-roledescription": "draggable agent card",
           onDragStart: (e: ReactDragEvent) => {
             e.stopPropagation();
-            onDragStartAgent(a.id);
+            onDragStartAgent(a.id, rowSection);
           },
           onDragEnd: onDragEndAgent,
         }
@@ -2300,7 +2422,7 @@ const AgentRow = memo(function AgentRow({
           // The whole card is a drag handle for reorderable rows — suppress text selection so a
           // drag grabs the card instead of highlighting the name underneath the cursor. Gated on
           // !editing (like dragProps) so the rename <input> keeps normal text selection.
-          userSelect: orderedIndex != null && !editing ? "none" : undefined,
+          userSelect: rowSection != null && !editing ? "none" : undefined,
           ...calmStyle,
           // Active = the terminal's own color (merges into it); the hover state's CHAT_USER_BUBBLE
           // lives on the unified card, not here. Cleared while the card is open (showOverlay) so the
@@ -2357,15 +2479,18 @@ const AgentRow = memo(function AgentRow({
             />
           </>
         )}
-        {/* Drop target — only while a drag is in flight and only on top-level rows. Dropping here
-            pins the dragged agent at THIS row's index (manual-agent-reorder-pin). */}
-        {orderedIndex != null && dragActive && (
+        {/* Drop target — live only while a drag is in flight, only on top-level rows, and only when
+            the drag STARTED in this row's own section. Moving a row between sections is not a thing
+            the user can do: a row's section is derived from its git state, so "drag it into Merged"
+            would have to either merge the branch or snap back. Refusing to offer the target at all
+            is honest; offering it and rejecting the drop reads as a bug. */}
+        {rowSection != null && dragActive && dragSection === rowSection && (
           <div
             data-testid="agent-drop-target"
             onDragOver={(e) => e.preventDefault()}
             onDrop={(e) => {
               e.preventDefault();
-              onDropAgent(orderedIndex, a.id);
+              onDropAgent(a.id, rowSection);
             }}
             style={{ position: "absolute", inset: 0, zIndex: 2 }}
           />
@@ -2421,7 +2546,7 @@ const AgentRow = memo(function AgentRow({
                 gap: 4,
                 padding: "8px 10px",
                 cursor: "pointer",
-                userSelect: orderedIndex != null && !editing ? "none" : undefined,
+                userSelect: rowSection != null && !editing ? "none" : undefined,
                 background: cardBg,
                 // The card fill is the terminal's own color so it reads as part of the terminal; a
                 // 4px border in the SIDEBAR color (C.deepForest, lighter than C.forest) then outlines
@@ -2463,7 +2588,7 @@ const AgentRow = memo(function AgentRow({
                 // same 8px so its RIGHT edge stays anchored at the terminal edge — the card grows into
                 // the column rather than sliding left and pulling short on the right.
                 width: mergeIntoTerminal ? ext + 8 : ext,
-                userSelect: orderedIndex != null && !editing ? "none" : undefined,
+                userSelect: rowSection != null && !editing ? "none" : undefined,
                 // flex-shrink + scroll within the wrapper's maxH budget (minus the strip), so the
                 // detail's scroll boundary lands inside the viewport even for a tall card.
                 flex: "1 1 auto",
@@ -3078,52 +3203,3 @@ function ShowHelperButton() {
   );
 }
 
-/** The "showing P0 only" chip, shown while a helper-island chiclet has narrowed the stack.
- *  A visible, dismissible filter matters here: without it, a narrowed sidebar is indistinguishable
- *  from agents having disappeared. */
-function TierFilterChip({
-  tier,
-  empty,
-  onClear,
-}: {
-  tier: AttentionTier;
-  /** True when the filter matched nothing in this project — see the note on `ordered`. */
-  empty: boolean;
-  onClear: () => void;
-}) {
-  const color = tier === "p0" ? C.sienna : C.amber;
-  const label = empty
-    ? `No ${tier.toUpperCase()} agents in this project`
-    : `Showing ${tier.toUpperCase()} only`;
-  return (
-    <div
-      data-testid="tier-filter-chip"
-      style={{
-        margin: "0 8px 6px",
-        padding: "4px 8px",
-        display: "flex",
-        alignItems: "center",
-        gap: 6,
-        background: C.forest,
-        border: `1px solid ${color}`,
-        borderRadius: 6,
-        fontSize: 11,
-        color: C.cream,
-      }}
-    >
-      <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: "50%", background: color }} />
-      <span style={{ flex: 1 }}>{label}</span>
-      <button
-        aria-label="Clear filter"
-        style={{ all: "unset", cursor: "pointer", color: C.muted, padding: "0 2px" }}
-        onClick={onClear}
-      >
-        {/* Feather x, inlined — no emoji. */}
-        <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor"
-             strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
-        </svg>
-      </button>
-    </div>
-  );
-}

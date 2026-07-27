@@ -1,11 +1,11 @@
 // ConciergeHost — the integration layer (bead sparkle-qd80 / CM-U7) that turns the presentational
 // ConciergeColumn (CM-U1) into the live, cross-project concierge: it builds the view-model from the
-// real priority feed (CM-U3), streams the headless brain (CM-U2) into the thread, and routes the
+// real status-band feed (CM-U3), streams the headless brain (CM-U2) into the thread, and routes the
 // user's answers into the right agent's terminal via the dispatch relay (CM-U4).
 //
 // Mounted UNCONDITIONALLY as the persistent left column of the workspace — the concierge IS the
 // experience, not a flagged addition to an older UI (PRD/sparkle/concierge-mode.md §6). It owns
-// all concierge state; the column stays a pure renderer. The priority feed is built ONCE by
+// all concierge state; the column stays a pure renderer. The status-band feed is built ONCE by
 // Workspace (it drives the tab badges too) and passed in, so there is a single subscription, a
 // single tray-roster fetch, and no chance of the tab counts and the vitals line disagreeing.
 //
@@ -25,6 +25,7 @@ import {
   type ConciergeViewModel,
 } from "./Concierge";
 import type { ConciergeAgent, ConciergeFeed } from "../useConciergeFeed";
+import { bandCountLabel, bandLabel } from "../engine/statusBandLabels";
 import { oneLine } from "./promptHistory";
 import { openProjectTab } from "../services/openProjectTab";
 import {
@@ -157,9 +158,14 @@ function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
   return feed.projects.flatMap((p) => p.agents);
 }
 
-/** The agents the concierge should surface right now: in scope, un-muted, needing attention. */
+/** The agents the concierge should surface right now: in scope, un-muted, needing you.
+ *
+ *  `band === "needs_you"` is the interruption gate. It covers exactly what the old `priority < 2`
+ *  did — waiting, approval, blocked, errored — and, critically, still excludes `unmerged`, which
+ *  bands `done`. On the reported fleet 27 of 51 agents were committed-but-unlanded; surfacing them
+ *  here is 27 nudge cards (see services/conciergeFeed.conciergeBand). */
 function surfacedAgents(feed: ConciergeFeed): ConciergeAgent[] {
-  return allAgents(feed).filter((a) => a.inScope && !a.muted && a.priority < 2);
+  return allAgents(feed).filter((a) => a.inScope && !a.muted && a.band === "needs_you");
 }
 
 function actionsFor(a: ConciergeAgent): ConciergeNudgeAction[] {
@@ -177,7 +183,7 @@ function agentToNudge(a: ConciergeAgent): ConciergeNudge {
   return {
     id: a.id, // the source agent id — resolved back via the feed on click/action
     kind: "nudge",
-    priority: a.priority === 0 ? "p0" : "p1",
+    band: a.band,
     projectName: a.projectName,
     agentName: a.name,
     text: `${a.statusLabel} — ${a.name} in ${a.projectName}.`,
@@ -189,14 +195,14 @@ function agentToNudge(a: ConciergeAgent): ConciergeNudge {
 function buildSnapshot(feed: ConciergeFeed, userText: string): string {
   const surfaced = surfacedAgents(feed);
   const lines = surfaced.map(
-    (a) => `- [${a.projectName}] ${a.name}: ${a.statusLabel} (P${a.priority})`,
+    (a) => `- [${a.projectName}] ${a.name}: ${a.statusLabel} (${bandLabel(a.band)})`,
   );
   // Keep the project count SCOPED to what's actually surfaced so it can't misstate scope (e.g. say
   // "5 projects" while only counting in-scope agents).
   const scopedProjects = new Set(surfaced.map((a) => a.projectId)).size;
   const state =
     surfaced.length > 0
-      ? `${feed.scopedCounts.p0} P0 and ${feed.scopedCounts.p1} P1 need attention across ${scopedProjects} project(s):\n${lines.join("\n")}`
+      ? `${bandCountLabel("needs_you", feed.scopedCounts.needs_you)} across ${scopedProjects} project(s):\n${lines.join("\n")}`
       : `All projects are calm right now.`;
   return `${state}\n\nThe user says: ${userText}\n\nReply briefly and recommend the next action.`;
 }
@@ -216,7 +222,7 @@ export function ConciergeHost({
   width,
   searchSlot,
 }: {
-  /** The cross-project priority feed, built once by Workspace (see the file header). */
+  /** The cross-project status-band feed, built once by Workspace (see the file header). */
   feed: ConciergeFeed;
   /** The agent the compose box can prompt directly; null → the box only talks to Sparkle. */
   promptTarget?: ConciergePromptTarget | null;
@@ -760,7 +766,7 @@ export function ConciergeHost({
     const nudges = surfacedAgents(feed).map(agentToNudge);
     return {
       scope: { pinnedProjectName },
-      vitals: { p0: feed.scopedCounts.p0, p1: feed.scopedCounts.p1 },
+      vitals: feed.scopedCounts,
       spend: { amountText: spendText },
       messages: [...chat, ...nudges],
       typing,

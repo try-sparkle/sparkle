@@ -1,4 +1,4 @@
-// Publishes the authoritative P0/P1 counts to the floating helper island (spec §4.5).
+// Publishes the authoritative Needs-you / Running counts to the floating helper island (spec §4.5).
 //
 // The island CANNOT compute these itself: useConciergeFeed depends on useRuntimeStore, which is
 // per-window and not persisted, so a separate webview would start empty and render numbers that
@@ -15,14 +15,16 @@ export function useHelperVitalsPublisher(): void {
   const feed = useConciergeFeed();
   // The island follows the WHOLE fleet, so this is `counts`, not `scopedCounts` — the concierge
   // column uses the scoped variant because it respects the pinned tab; the island does not.
-  const { p0, p1 } = feed.counts;
+  // `done` is not published: the island shows only the bands worth interrupting for (see Vitals).
+  const needsYou = feed.counts.needs_you;
+  const running = feed.counts.running;
   // Only push on CHANGE. The feed memo recomputes on many inputs that don't move the counts, and
   // each publish is a main-thread Tauri IPC.
-  const last = useRef<{ p0: number; p1: number } | null>(null);
+  const last = useRef<{ needsYou: number; running: number } | null>(null);
 
   useEffect(() => {
-    if (last.current && last.current.p0 === p0 && last.current.p1 === p1) return;
-    last.current = { p0, p1 };
-    publishHelperVitals(p0, p1);
-  }, [p0, p1]);
+    if (last.current && last.current.needsYou === needsYou && last.current.running === running) return;
+    last.current = { needsYou, running };
+    publishHelperVitals(needsYou, running);
+  }, [needsYou, running]);
 }

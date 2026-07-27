@@ -34,7 +34,7 @@ vi.mock("../services/attention", () => ({
 // Captured so a test can fire the global capture shortcut the way Rust does.
 let fireCaptureShortcut: (() => void) | null = null;
 vi.mock("../services/helper", () => ({
-  getHelperVitals: async () => ({ p0: 3, p1: 7 }),
+  getHelperVitals: async () => ({ needsYou: 3, running: 7 }),
   onHelperVitalsChanged: async () => () => {},
   getFrontmost: async () => false,
   onFrontmostChanged: async () => () => {},
@@ -79,8 +79,8 @@ describe("HelperApp", () => {
 
   it("renders the island with vitals fetched on mount", async () => {
     render(<HelperApp />);
-    await waitFor(() => expect(screen.getByTestId("helper-p0").textContent).toContain("3"));
-    expect(screen.getByTestId("helper-p1").textContent).toContain("7");
+    await waitFor(() => expect(screen.getByTestId("helper-needs-you").textContent).toContain("3"));
+    expect(screen.getByTestId("helper-running").textContent).toContain("7");
   });
 
   it("renders nothing while the helper is disabled", () => {
@@ -91,7 +91,7 @@ describe("HelperApp", () => {
 
   it("collapsing switches to the tab and persists the mode", async () => {
     render(<HelperApp />);
-    await screen.findByTestId("helper-p0");
+    await screen.findByTestId("helper-needs-you");
     fireEvent.click(screen.getByRole("button", { name: /minimize helper/i }));
     expect(await screen.findByRole("button", { name: /show sparkle helper/i })).toBeTruthy();
     expect(useHelperPrefs.getState().mode).toBe("tab");
@@ -101,14 +101,14 @@ describe("HelperApp", () => {
     useHelperPrefs.setState({ ...DEFAULTS, mode: "tab" } as never);
     render(<HelperApp />);
     fireEvent.click(await screen.findByRole("button", { name: /show sparkle helper/i }));
-    expect(await screen.findByTestId("helper-p0")).toBeTruthy();
+    expect(await screen.findByTestId("helper-needs-you")).toBeTruthy();
   });
 
   it("capture hides the island BEFORE capturing, then shows the capture window", async () => {
     const shot = { path: "/tmp/a.png" };
     captureScreenRegion.mockResolvedValue(shot);
     render(<HelperApp />);
-    await screen.findByTestId("helper-p0");
+    await screen.findByTestId("helper-needs-you");
     fireEvent.click(screen.getByRole("button", { name: /capture/i }));
     await waitFor(() => expect(showCaptureWindow).toHaveBeenCalledWith(shot));
     // The island must be out of frame before the crosshairs appear, or it lands in the shot.
@@ -121,7 +121,7 @@ describe("HelperApp", () => {
   it("an Esc at the crosshairs (null) opens no capture window and shows no error", async () => {
     captureScreenRegion.mockResolvedValue(null);
     render(<HelperApp />);
-    await screen.findByTestId("helper-p0");
+    await screen.findByTestId("helper-needs-you");
     fireEvent.click(screen.getByRole("button", { name: /capture/i }));
     await waitFor(() => expect(captureScreenRegion).toHaveBeenCalled());
     expect(showCaptureWindow).not.toHaveBeenCalled();
@@ -131,7 +131,7 @@ describe("HelperApp", () => {
   it("a failed capture surfaces the Screen Recording notice", async () => {
     captureScreenRegion.mockRejectedValue(new Error("TCC denied"));
     render(<HelperApp />);
-    await screen.findByTestId("helper-p0");
+    await screen.findByTestId("helper-needs-you");
     fireEvent.click(screen.getByRole("button", { name: /capture/i }));
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("Screen Recording");
@@ -173,7 +173,7 @@ describe("HelperApp", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("Screen Recording");
     // The island is what's on screen...
-    expect(screen.getByTestId("helper-p0")).toBeTruthy();
+    expect(screen.getByTestId("helper-needs-you")).toBeTruthy();
     // ...but the user's collapsed preference is untouched.
     expect(useHelperPrefs.getState().mode).toBe("tab");
   });
@@ -278,16 +278,16 @@ describe("HelperApp", () => {
 
   it("clicking a chiclet asks the app to focus that tier", async () => {
     render(<HelperApp />);
-    await screen.findByTestId("helper-p0");
-    fireEvent.click(screen.getByTestId("helper-p0"));
-    expect(emitFocusTier).toHaveBeenCalledWith({ tier: "p0" });
-    fireEvent.click(screen.getByTestId("helper-p1"));
-    expect(emitFocusTier).toHaveBeenCalledWith({ tier: "p1" });
+    await screen.findByTestId("helper-needs-you");
+    fireEvent.click(screen.getByTestId("helper-needs-you"));
+    expect(emitFocusTier).toHaveBeenCalledWith({ band: "needs_you" });
+    fireEvent.click(screen.getByTestId("helper-running"));
+    expect(emitFocusTier).toHaveBeenCalledWith({ band: "running" });
   });
 
   it("right-click → Hide Helper disables it and persists the choice", async () => {
     render(<HelperApp />);
-    await screen.findByTestId("helper-p0");
+    await screen.findByTestId("helper-needs-you");
     fireEvent.contextMenu(screen.getByTestId("helper-root"));
     fireEvent.click(await screen.findByRole("button", { name: /hide helper/i }));
     expect(useHelperPrefs.getState().enabled).toBe(false);
@@ -295,7 +295,7 @@ describe("HelperApp", () => {
 
   it("right-click → Quit Sparkle exits the app", async () => {
     render(<HelperApp />);
-    await screen.findByTestId("helper-p0");
+    await screen.findByTestId("helper-needs-you");
     fireEvent.contextMenu(screen.getByTestId("helper-root"));
     fireEvent.click(await screen.findByRole("button", { name: /quit sparkle/i }));
     expect(quitApp).toHaveBeenCalledTimes(1);
@@ -303,7 +303,7 @@ describe("HelperApp", () => {
 
   it("dismisses the context menu on an outside click", async () => {
     render(<HelperApp />);
-    await screen.findByTestId("helper-p0");
+    await screen.findByTestId("helper-needs-you");
     fireEvent.contextMenu(screen.getByTestId("helper-root"));
     expect(screen.getByRole("menu")).toBeTruthy();
     fireEvent.click(screen.getByTestId("helper-menu-scrim"));

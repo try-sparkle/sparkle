@@ -7,7 +7,7 @@ vi.mock("./services/helper", () => ({
   publishHelperVitals: (...a: unknown[]) => publishHelperVitals(...a),
 }));
 
-let feed = { counts: { p0: 0, p1: 0 } };
+let feed = { counts: { needs_you: 0, running: 0, done: 0 } };
 vi.mock("./useConciergeFeed", () => ({ useConciergeFeed: () => feed }));
 
 import { useHelperVitalsPublisher } from "./useHelperVitalsPublisher";
@@ -15,11 +15,11 @@ import { useHelperVitalsPublisher } from "./useHelperVitalsPublisher";
 describe("useHelperVitalsPublisher", () => {
   beforeEach(() => {
     publishHelperVitals.mockClear();
-    feed = { counts: { p0: 0, p1: 0 } };
+    feed = { counts: { needs_you: 0, running: 0, done: 0 } };
   });
 
   it("publishes the current counts on mount", () => {
-    feed = { counts: { p0: 3, p1: 7 } };
+    feed = { counts: { needs_you: 3, running: 7, done: 0 } };
     renderHook(() => useHelperVitalsPublisher());
     expect(publishHelperVitals).toHaveBeenCalledWith(3, 7);
   });
@@ -32,7 +32,7 @@ describe("useHelperVitalsPublisher", () => {
   it("republishes when the counts change", () => {
     const { rerender } = renderHook(() => useHelperVitalsPublisher());
     expect(publishHelperVitals).toHaveBeenCalledWith(0, 0);
-    feed = { counts: { p0: 1, p1: 2 } };
+    feed = { counts: { needs_you: 1, running: 2, done: 0 } };
     rerender();
     expect(publishHelperVitals).toHaveBeenLastCalledWith(1, 2);
   });
@@ -48,9 +48,9 @@ describe("useHelperVitalsPublisher", () => {
   });
 
   it("republishes a drop back to zero", () => {
-    feed = { counts: { p0: 4, p1: 1 } };
+    feed = { counts: { needs_you: 4, running: 1, done: 0 } };
     const { rerender } = renderHook(() => useHelperVitalsPublisher());
-    feed = { counts: { p0: 0, p1: 0 } };
+    feed = { counts: { needs_you: 0, running: 0, done: 0 } };
     rerender();
     expect(publishHelperVitals).toHaveBeenLastCalledWith(0, 0);
   });

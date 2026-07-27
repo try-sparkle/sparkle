@@ -48,11 +48,12 @@ function mkProject(id: string, name: string): Project {
 
 const feed: ConciergeFeed = {
   projects: [
-    { id: "p1", name: "Alpha", inScope: true, counts: { p0: 2, p1: 1 }, agents: [] },
-    { id: "p2", name: "Beta", inScope: true, counts: { p0: 0, p1: 3 }, agents: [] },
+    // Alpha needs you twice over; Beta only has work in flight, which must not badge.
+    { id: "p1", name: "Alpha", inScope: true, counts: { needs_you: 2, running: 1, done: 0 }, agents: [] },
+    { id: "p2", name: "Beta", inScope: true, counts: { needs_you: 0, running: 3, done: 4 }, agents: [] },
   ],
-  counts: { p0: 2, p1: 4 },
-  scopedCounts: { p0: 2, p1: 4 },
+  counts: { needs_you: 2, running: 4, done: 4 },
+  scopedCounts: { needs_you: 2, running: 4, done: 4 },
   pinnedProjectId: null,
 };
 
@@ -74,8 +75,11 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("countsFromFeed", () => {
-  it("keys each project's raw P0/P1 totals by project id", () => {
-    expect(countsFromFeed(feed)).toEqual({ p1: { p0: 2, p1: 1 }, p2: { p0: 0, p1: 3 } });
+  it("keys each project's raw per-band totals by project id", () => {
+    expect(countsFromFeed(feed)).toEqual({
+      p1: { needs_you: 2, running: 1, done: 0 },
+      p2: { needs_you: 0, running: 3, done: 4 },
+    });
   });
   it("is empty for an empty feed (no tab claims a count it doesn't have)", () => {
     expect(countsFromFeed({ ...feed, projects: [] })).toEqual({});
@@ -83,14 +87,18 @@ describe("countsFromFeed", () => {
 });
 
 describe("ProjectTabsBar", () => {
-  it("badges each tab from the feed — P0 wins over P1", () => {
+  it("badges each tab from the feed — only Needs-you badges, and it agrees in number", () => {
     render(<ProjectTabsBar feed={feed} onOpenProjectSettings={() => {}} />);
-    expect(screen.getByTestId("count-p1").textContent).toBe("2·P0");
-    expect(screen.getByTestId("count-p2").textContent).toBe("3·P1");
+    expect(screen.getByTestId("count-p1").textContent).toBe("2 Need you");
+    // Beta is 3 running / 4 done and gets NO badge — in-flight work is not an alert.
+    expect(screen.queryByTestId("count-p2")).toBeNull();
   });
 
   it("shows no badge for a calm project", () => {
-    const calm = { ...feed, projects: feed.projects.map((p) => ({ ...p, counts: { p0: 0, p1: 0 } })) };
+    const calm = {
+      ...feed,
+      projects: feed.projects.map((p) => ({ ...p, counts: { needs_you: 0, running: 0, done: 0 } })),
+    };
     render(<ProjectTabsBar feed={calm} onOpenProjectSettings={() => {}} />);
     expect(screen.queryByTestId("count-p1")).toBeNull();
   });

@@ -86,7 +86,6 @@ function seedAgent(over: Partial<AgentTab> = {}): void {
     autoNameBasis: null,
     autoNameVariants: null,
     shellCommand: null,
-    pinnedIndex: null,
     ...over,
   };
   const project: Project = {

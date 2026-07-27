@@ -19,8 +19,7 @@ function mkAgent(over: Partial<AgentTab> & { id: string }): AgentTab {
     name: over.id.toUpperCase(), kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
-    ...over,
+    autoNameVariants: null, shellCommand: null,    ...over,
   };
 }
 

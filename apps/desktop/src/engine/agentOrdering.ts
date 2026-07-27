@@ -1,186 +1,64 @@
-// Pure attention-based ordering for the sidebar agent stack (spec:
-// docs/superpowers/specs/2026-06-24-attention-based-agent-reordering-design.md).
-// Agents that need YOUR support float to the top; agents happily building sink down.
-// This is a pure reordering — same agents in, same agents out — so the caller's
-// selection (tracked by agent id, not position) is never disturbed.
-import type { AgentKind, AgentTabStatus } from "../types";
-
-// Where `unmerged` sits: below every red, above everything calm. Declared before STATUS_RANK so the
-// map can name it rather than repeating a bare 0.75 whose meaning lives only in a comment. Private:
-// STATUS_RANK is the public surface, and callers compare ranks rather than naming this one.
-const UNMERGED_RANK = 0.75;
-
-// Lower rank = higher in the stack. Grouped into tiers; ties keep insertion order
-// (the sort below is stable). Tune the taxonomy → tier mapping here, nothing else
-// hardcodes it. A status absent from this map sorts to the bottom (see STATUS_RANK_FALLBACK).
-export const STATUS_RANK: Record<AgentTabStatus, number> = {
-  // Tier 0 — RED: needs YOU before its work is truly done, so it floats to the top. This is exactly
-  // the red-COLOR tier (packages/ui/tokens.ts): the live asks (waiting/approval) and the stuck
-  // states (errored crash/stall, `blocked` gone-quiet). Ranking any of them at the bottom would make
-  // a red agent SINK instead of floating up, contradicting the dot color (sparkle-pqxh). Note this
-  // is the color tier, which is BROADER than engine/attention's badge/notification set
-  // (waiting/approval/errored) — `blocked` recolors + reorders but doesn't ping.
-  waiting: 0,
-  approval: 0,
-  errored: 0,
-  blocked: 0,
-  // Tier 0.75 — NOT red, but not nothing either: finished, with committed work that hasn't reached
-  // main. It sits between the alarms and the calm tier so unlanded work stays where you'll see it
-  // without claiming to be an emergency (it stopped being red on 2026-07-26 — see tokens.ts). This
-  // is the ONE rank that is neither a red nor a resting tier, which is the point: "you'll want to
-  // land this eventually" is genuinely a third thing.
-  unmerged: UNMERGED_RANK,
-  // Tier 1 — finished its turn, nothing left for you (no question, nothing to merge).
-  idle: 1,
-  done: 1,
-  // Tier 2 — green: actively building, leave it be.
-  working: 2,
-  // Tier 3 — dormant: not asking, not running, nothing pending.
-  stopped: 3,
-};
-
-// Any status not present in STATUS_RANK (shouldn't happen given the closed union, but
-// guards against a future status landing here unmapped) sinks to the bottom.
-const STATUS_RANK_FALLBACK = 99;
-
-// The just-opened build agent floats to the TOP of the non-alerting group: below tier 0
-// (red / needs-you, rank 0) but above unmerged/idle/done/working/dormant. A fractional rank between
-// tier 0 and tier 1 does exactly that without a fixed row index, so it tracks the bottom of
-// however many red rows exist at any moment. Only applied while the agent isn't itself red
-// (a red fresh agent already sits in tier 0 and must not be demoted below its red siblings).
+// Which agents are TOP-LEVEL rows in the sidebar, and which one selection should land on.
 //
-// NOTE it also outranks UNMERGED_RANK (0.75): a fresh build agent that ALSO has unlanded work sorts
-// by its freshness, not its unmerged-ness. That's the intent — you just opened it, so it belongs at
-// the top of what isn't shouting — and it could not arise before `unmerged` left tier 0.
-export const FRESH_BUILD_RANK = 0.5;
-
-function rankOf(
-  id: string,
-  statusMap: Record<string, AgentTabStatus>,
-  freshId?: string | null,
-): number {
-  // Missing from the map → "stopped" (matches the sidebar's own default), bottom tier.
-  const st = statusMap[id] ?? "stopped";
-  const base = STATUS_RANK[st] ?? STATUS_RANK_FALLBACK;
-  // Boost the freshly-opened build agent above the non-red tiers, but never above (or into
-  // the middle of) the red tier — `base > FRESH_BUILD_RANK` leaves a red agent (base 0) alone.
-  if (freshId != null && id === freshId && base > FRESH_BUILD_RANK) return FRESH_BUILD_RANK;
-  return base;
-}
+// HISTORY — read this before adding a sort here. This module used to attention-ORDER the stack:
+// agents needing you (red) floated to the top, happily-building ones sank. That was removed on
+// 2026-07-26. The reason is that it made a row's POSITION a function of its live PTY status, so
+// every `working ⇄ idle ⇄ waiting` flip moved a row across a tier and the column re-shuffled under
+// the cursor — including on the silent 15s poll tick. A worker's status bubbled into its
+// orchestrator's rank too, so a transient worker blip re-sorted the parent. Users read the column
+// by position; having position mean "how loud is this right now" made it unreadable.
+//
+// Row position is now decided by WORKFLOW STAGE (engine/buildSections.ts) plus the user's own drag
+// arrangement within a stage, and status is carried by the row's colored dot instead. If you are
+// tempted to re-introduce sorting here, note that it will reintroduce exactly that bug: the
+// stability IS the feature. STATUS_RANK, FRESH_BUILD_RANK, sortAgentsByAttention and orderAgents
+// were all deleted with it. (The tray keeps its own, separate STATUS_RANK in tray/trayRoster.ts —
+// that one is untouched and still sorts, which is fine: the tray is a glanceable digest, not a
+// spatial map the user navigates by memory.)
+import type { AgentKind } from "../types";
 
 /**
- * Return a new array of `agents` ordered by how much support each needs, top-first:
- * red (waiting/approval/errored/blocked) → unmerged → idle/done → working → stopped. Stable within
- * a tier, so rows only move across tier boundaries. Does NOT mutate the input.
- *
- * Agents missing from `statusMap` are treated as "stopped" (matches the sidebar's own
- * `status[a.id] ?? "stopped"` default), so they land in the bottom tier.
- */
-export function sortAgentsByAttention<T extends { id: string }>(
-  agents: readonly T[],
-  statusMap: Record<string, AgentTabStatus>,
-  freshId?: string | null,
-): T[] {
-  // Decorate-sort-undecorate with the original index as the stable tiebreaker, since
-  // Array.prototype.sort is only guaranteed stable in modern engines for adjacent equal
-  // keys — being explicit keeps tier ties in insertion order regardless of engine.
-  return agents
-    .map((agent, index) => ({ agent, index, rank: rankOf(agent.id, statusMap, freshId) }))
-    .sort((a, b) => a.rank - b.rank || a.index - b.index)
-    .map((d) => d.agent);
-}
-
-/**
- * Order the top-level agent stack with manual pins (spec: manual-agent-reorder-pin).
- * Agents with a numeric `pinnedIndex` are anchored to that row; the rest attention-sort
- * (via sortAgentsByAttention) and fill the remaining rows around the anchors. Pure and
- * id-preserving — output is a permutation of the input, so selection (by id) is safe.
- *
- * Anchoring wins over the fresh-agent boost: a `freshId` that is ALSO pinned goes through the
- * anchor path (its explicit row), so the FRESH_BUILD_RANK float is ignored for it. That's the
- * intended precedence — a user's manual pin is a stronger signal than "just opened" — and in
- * practice a brand-new agent is never pinned (addAgent sets pinnedIndex: null).
- */
-export function orderAgents<T extends { id: string; pinnedIndex: number | null }>(
-  agents: readonly T[],
-  statusMap: Record<string, AgentTabStatus>,
-  freshId?: string | null,
-): T[] {
-  const anchored = agents.filter((a) => a.pinnedIndex != null);
-  const result: T[] = sortAgentsByAttention(
-    agents.filter((a) => a.pinnedIndex == null),
-    statusMap,
-    freshId,
-  );
-  // Insert anchors by ascending target index. Splicing into the growing result lands each
-  // anchor at its requested row (clamped to the current length); ties resolve by anchored
-  // array order. Sorting first means earlier rows are filled before later ones.
-  for (const agent of anchored.sort((x, y) => x.pinnedIndex! - y.pinnedIndex!)) {
-    const at = Math.max(0, Math.min(agent.pinnedIndex!, result.length));
-    result.splice(at, 0, agent);
-  }
-  return result;
-}
-
-/**
- * The single source of truth for the agent stack BOTH the sidebar list and the TopBar dot
- * cluster render: top-level agents (the build orchestrators), then attention-ordered the same way.
- * Keeping both consumers on this one helper is what stops the header dots from drifting out of sync
- * with the rows — the bug this was extracted to prevent. Pure and id-preserving. `workMode` is
- * accepted for signature stability with its callers; the rows are the same for Plan and Build (Plan
- * renders a board in the main pane, not a different agent list).
+ * The top-level agent stack the sidebar renders, in `project.agents` order.
  *
  * Workers are NEVER top-level rows (`kind !== "worker"`). The user works with orchestrators; a
  * worker is reached only by opening its parent orchestrator's card, which nests its own workers
  * afterward. This unconditionally excludes workers — even one orphaned by a missing parent —
- * because a worker flashing into the sidebar (during spawn/spin-down windows or after its parent
+ * because a worker flashing into the sidebar (during spawn/spin-down windows, or after its parent
  * closes) is exactly the distraction we're removing. A worker's red attention still bubbles up to
  * its orchestrator elsewhere; it just never claims a row of its own here.
+ *
+ * Pure and id-preserving: a filtered view of the input in input order. The caller then groups these
+ * into the stage ladder (buildSections.groupAgentsByStage), which is what decides vertical position.
+ * `workMode` is accepted for signature stability with its callers; the rows are the same for Plan
+ * and Build (Plan renders a board in the main pane, not a different agent list).
  */
-export function orderedTopLevelAgents<
-  T extends { id: string; kind: AgentKind; parentId: string | null; pinnedIndex: number | null },
->(
-  agents: readonly T[],
-  statusMap: Record<string, AgentTabStatus>,
-  _workMode: "plan" | "build",
-  attentionOrder: boolean,
-  freshId?: string | null,
-): T[] {
+export function topLevelAgents<
+  T extends { id: string; kind: AgentKind; parentId: string | null },
+>(agents: readonly T[], _workMode: "plan" | "build" = "build"): T[] {
   const buildIds = new Set(agents.filter((a) => a.kind === "build").map((a) => a.id));
-  const topLevel = agents
+  return agents
     .filter((a) => a.kind !== "worker")
     .filter((a) => !a.parentId || !buildIds.has(a.parentId));
-  return attentionOrder ? orderAgents(topLevel, statusMap, freshId) : topLevel;
 }
 
 /**
- * The agent to land selection on for a given work mode: the FIRST row of
- * `orderedTopLevelAgents` (the same stack the sidebar + TopBar render), or `null` when that
- * mode has no such row.
+ * The agent to land selection on for a given work mode: the first top-level row, or `null` when
+ * that mode has no such row.
  *
- * `"plan"` is treated like `"build"` here ON PURPOSE: the plan-mode sidebar renders no rows
- * (it shows a board in the main pane), but selection still persists for when the user switches
- * back to Build, so we pick the first build-side row rather than clearing it. This is a
- * selection helper, not a 1:1 mirror of which rows the plan sidebar paints.
+ * `"plan"` is treated like `"build"` here ON PURPOSE: the plan-mode sidebar renders no rows (it
+ * shows a board in the main pane), but selection still persists for when the user switches back to
+ * Build, so we pick the first build-side row rather than clearing it.
  *
- * Used to keep selection coherent after a close: picking the first row (or `null` → blank
- * first-load state) keeps the main pane and the sidebar in agreement.
+ * NOTE this is `project.agents` order, NOT the rendered ladder order — the ladder needs each
+ * agent's workflow stage, which this pure helper has no access to. The two can disagree when the
+ * first agent in the array sits in a later stage section than some other agent. That is deliberate
+ * and harmless: this only picks a fallback selection after a close, and any live agent is a valid
+ * answer. The sidebar, which DOES know the stages and the active filter, overrides this with the
+ * genuinely-first VISIBLE row (see AgentSidebar's reselectAfterClose) so selection never lands on a
+ * row the user has filtered out of sight.
  */
 export function firstVisibleAgentId<
-  T extends { id: string; kind: AgentKind; parentId: string | null; pinnedIndex: number | null },
->(
-  agents: readonly T[],
-  mode: "plan" | "build",
-  agentOrdering: "attention" | "manual",
-  statusMap: Record<string, AgentTabStatus>,
-  freshId?: string | null,
-): string | null {
-  const ordered = orderedTopLevelAgents(
-    agents,
-    statusMap,
-    mode,
-    agentOrdering === "attention",
-    freshId,
-  );
-  return ordered[0]?.id ?? null;
+  T extends { id: string; kind: AgentKind; parentId: string | null },
+>(agents: readonly T[], mode: "plan" | "build"): string | null {
+  return topLevelAgents(agents, mode)[0]?.id ?? null;
 }

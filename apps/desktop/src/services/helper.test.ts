@@ -62,9 +62,11 @@ describe("helper bindings inside Tauri", () => {
     mod = await import("./helper");
   });
 
-  it("publishes vitals as publish_helper_vitals { p0, p1 }", () => {
+  it("publishes vitals as publish_helper_vitals { needsYou, running }", () => {
     mod.publishHelperVitals(3, 7);
-    expect(invoke).toHaveBeenCalledWith("publish_helper_vitals", { p0: 3, p1: 7 });
+    // camelCase on the wire: the Rust Vitals struct carries #[serde(rename_all = "camelCase")],
+    // and a mismatch here renders `undefined` on the island with no type error on either side.
+    expect(invoke).toHaveBeenCalledWith("publish_helper_vitals", { needsYou: 3, running: 7 });
   });
 
   it("seeds vitals via get_helper_vitals", () => {

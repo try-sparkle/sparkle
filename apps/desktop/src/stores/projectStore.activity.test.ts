@@ -7,8 +7,7 @@ function mkAgent(): AgentTab {
     id: "a1", name: "A1", kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
-  };
+    autoNameVariants: null, shellCommand: null,  };
 }
 
 function seed() {

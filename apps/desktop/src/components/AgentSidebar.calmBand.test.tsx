@@ -5,14 +5,15 @@
 // `unmerged` stopped being red on 2026-07-26 so it would stop competing for the eye. The first
 // attempt did that by leaving it in the concierge's calm band — and the sidebar derives its `calm`
 // flag from that band and renders calm rows `grayscale(1) opacity(.72)`, so "not red" silently became
-// "greyed out like idle". The fix for THAT moved it to P1, which handed every unlanded agent a
-// concierge nudge card instead. It resolved only once the two questions were separated:
-// `conciergePriority` (an interruption budget) and `isCalmBand` (a legibility treatment).
+// "greyed out like idle". The fix for THAT promoted it into the interrupting tier, which handed every
+// unlanded agent a concierge nudge card instead. It resolved only once the two questions were
+// separated: the band (an interruption budget — `unmerged` sits in `done`) and `isCalmBand`
+// (a legibility treatment, which excludes it).
 //
 // engine/redTaxonomySeparation.test.ts unit-tests `isCalmBand` itself. This file exists because that
-// is not enough: roborev pointed out that reverting AgentSidebar's single call site back to
-// `conciergePriority(...) === 2` re-dims every "Needs merge" row with a fully green suite. So the
-// WIRING gets its own assertion, at the enforcement site, against the rendered style.
+// is not enough: roborev pointed out that reverting AgentSidebar's single call site back to a band
+// check re-dims every "Needs merge" row with a fully green suite. So the WIRING gets its own
+// assertion, at the enforcement site, against the rendered style.
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -40,8 +41,7 @@ function mkAgent(id: string, name: string): AgentTab {
     id, name, kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
     promptHistory: [], namePinned: true, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
-  } as AgentTab;
+    autoNameVariants: null, shellCommand: null,  } as AgentTab;
 }
 
 /** Two top-level agents: `Unlanded` (idle + committed work → escalates to `unmerged`) and `Finished`

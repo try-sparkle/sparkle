@@ -58,7 +58,7 @@ function buildAgentProject(beadId?: string): Project {
     id: "a1", name: "Build 1", kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: "main", lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null, autoNameVariants: null,
-    shellCommand: null, pinnedIndex: null, beadId,
+    shellCommand: null, beadId,
   };
   const project: Project = {
     id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",

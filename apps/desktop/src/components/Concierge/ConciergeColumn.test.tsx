@@ -13,7 +13,7 @@ afterEach(() => cleanup());
 const nudge: ConciergeNudge = {
   id: "n1",
   kind: "nudge",
-  priority: "p1",
+  band: "needs_you",
   projectName: "drodio-website",
   agentName: "OG Image Pipeline",
   text: "A build warning needs your call.",
@@ -22,7 +22,7 @@ const nudge: ConciergeNudge = {
 
 const model: ConciergeViewModel = {
   scope: {},
-  vitals: { p0: 1, p1: 2 },
+  vitals: { needs_you: 1, running: 2, done: 0 },
   spend: { amountText: "$4.12" },
   messages: [
     { id: "m1", kind: "sparkle", text: "Morning — I'm watching every open project.", speakable: true },
@@ -48,7 +48,7 @@ describe("ConciergeColumn — view-model → rendered output", () => {
     expect(screen.getByText("Sparkle")).toBeTruthy();
     expect(screen.getByText("$4.12")).toBeTruthy();
     expect(screen.getByText("Following all projects")).toBeTruthy();
-    expect(container.textContent).toContain("1·P0 · 2·P1");
+    expect(container.textContent).toContain("1 Needs you · 2 Running");
     expect(screen.getByText("Morning — I'm watching every open project.")).toBeTruthy();
     expect(screen.getByText("Thanks, keep me posted.")).toBeTruthy();
     expect(screen.getByText("All projects calm · nothing needs you")).toBeTruthy();

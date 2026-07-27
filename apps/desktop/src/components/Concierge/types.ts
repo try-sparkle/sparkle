@@ -5,12 +5,16 @@
 // store, fetches data, or writes to a PTY.
 
 import type { ReactNode } from "react";
+import type { StatusBand } from "../../engine/buildSections";
 // The attachment RECORD is the one the removed AgentPane composer used (components/composer/
 // attachments.ts) — a pure, React-free, Tauri-free model, so importing it here does not break this
 // directory's "presentational only" rule, and it keeps the concierge off a parallel model.
 import type { Attachment } from "../composer/attachments";
 
-export type ConciergePriority = "p0" | "p1";
+// The column speaks the app's ONE status vocabulary — "Needs you" / "Running" / "Done" — rather
+// than a private P0/P1 scale. Re-exported so consumers of this module's public surface don't have
+// to reach into the engine for the type of a field they're already handed.
+export type { StatusBand };
 
 /** One clickable action button on a nudge card ("Show me", "Auto-fix", "Park it", …). */
 export interface ConciergeNudgeAction {
@@ -26,7 +30,9 @@ export interface ConciergeNudgeAction {
 export interface ConciergeNudge {
   id: string;
   kind: "nudge";
-  priority: ConciergePriority;
+  /** The source agent's band. Every nudge surfaced today is `needs_you` (that IS the surfacing
+   *  gate); the field is carried rather than assumed so the card labels itself from data. */
+  band: StatusBand;
   /** The project chip ("drodio-website") — how a cross-project alert names its origin. */
   projectName: string;
   /** The agent the alert came from ("OG Image Pipeline"). */
@@ -104,8 +110,9 @@ export interface ConciergeSendState {
 export interface ConciergeViewModel {
   /** Pinned → "Pinned to <name>" in gold; absent → "Following all projects". */
   scope: { pinnedProjectName?: string };
-  /** In-scope attention counts; both zero renders "all calm". */
-  vitals: { p0: number; p1: number };
+  /** In-scope per-band counts. Nothing needing you and nothing running renders "all calm" —
+   *  see ScopeVitals.vitalsParts for why `done` is not a vital sign. */
+  vitals: Record<StatusBand, number>;
   /** Pre-formatted spend text for the top-right pill (e.g. "$4.12"). */
   spend: { amountText: string };
   /** The thread, oldest first. Nudges are messages of kind "nudge". */

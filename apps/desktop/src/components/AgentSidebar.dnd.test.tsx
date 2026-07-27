@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
 //
-// Drag-to-pin: dragging a top-level agent CARD (the whole row is the drag handle) and dropping it
-// onto a row pins it at that row's index. Heavy leaf components + the Tauri opener are mocked so
-// the sidebar renders.
+// Drag-to-reorder: dragging a top-level agent CARD (the whole row is the drag handle) and dropping
+// it onto another row moves it to that row's slot in project.agents — which IS the order rows render
+// in within a stage section. Every agent here has no branch status, so they all resolve to the same
+// "Local: Uncommitted" section and are therefore all valid drop targets for each other.
+// Heavy leaf components + the Tauri opener are mocked so the sidebar renders.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -31,8 +33,7 @@ function mkAgent(id: string, name: string): AgentTab {
     id, name, kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
-  };
+    autoNameVariants: null, shellCommand: null,  };
 }
 
 function seed(agents?: AgentTab[]): Project {
@@ -49,32 +50,42 @@ function seed(agents?: AgentTab[]): Project {
 beforeEach(() => useUiStore.setState({ collapsedOrchestrators: {} }));
 afterEach(() => cleanup());
 
-describe("AgentSidebar — drag to pin", () => {
-  it("dropping an agent onto a row pins it at that index", () => {
+const agentOrder = () => useProjectStore.getState().projects[0]!.agents.map((a) => a.id);
+
+describe("AgentSidebar — drag to reorder", () => {
+  it("dropping an agent onto a row moves it to that row's slot", () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
     const cards = draggableCards();
     expect(cards).toHaveLength(3);
-    // Drag Gamma (a3, last) onto the first row (index 0).
+    // Drag Gamma (a3, last) onto the first row.
     fireEvent.dragStart(cards[2]!);
     const targets = screen.getAllByTestId("agent-drop-target");
     fireEvent.dragOver(targets[0]!);
     fireEvent.drop(targets[0]!);
-    const a3 = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === "a3")!;
-    expect(a3.namePinned).toBe(true);
-    expect(a3.pinnedIndex).toBe(0);
+    expect(agentOrder()).toEqual(["a3", "a1", "a2"]);
   });
 
-  it("dropping an agent on its OWN row is a no-op (does not pin/freeze the name)", () => {
+  it("a reorder does NOT freeze the name — that side effect of the old drag-pin is gone", () => {
+    // The old pinAgentAt set namePinned on every drag, silently disabling auto-naming for any row
+    // the user had ever dragged.
+    const project = seed();
+    render(<AgentSidebar project={project} />);
+    const cards = draggableCards();
+    fireEvent.dragStart(cards[2]!);
+    fireEvent.drop(screen.getAllByTestId("agent-drop-target")[0]!);
+    const a3 = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === "a3")!;
+    expect(a3.namePinned).toBe(false);
+  });
+
+  it("dropping an agent on its OWN row is a no-op", () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
     const cards = draggableCards();
     fireEvent.dragStart(cards[2]!); // Gamma (a3) at row 2
     const targets = screen.getAllByTestId("agent-drop-target");
     fireEvent.drop(targets[2]!); // released on its own row
-    const a3 = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === "a3")!;
-    expect(a3.namePinned).toBe(false);
-    expect(a3.pinnedIndex).toBeNull();
+    expect(agentOrder()).toEqual(["a1", "a2", "a3"]);
   });
 
   it("drag-end without a drop clears the drag state (no lingering drop targets)", () => {

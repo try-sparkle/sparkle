@@ -7,16 +7,19 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const noopUnlisten: UnlistenFn = () => {};
 
-/** P0/P1 counts as computed by the MAIN window's concierge feed. */
+/** Band counts as computed by the MAIN window's concierge feed. The island shows the two bands
+ *  worth interrupting for; `done` is deliberately absent — on a resting fleet it is nearly every
+ *  agent, so a permanent "40 Done" would drown the two numbers that actually change. Field names
+ *  match the Rust `Vitals` struct in src-tauri/src/helper.rs. */
 export interface Vitals {
-  p0: number;
-  p1: number;
+  needsYou: number;
+  running: number;
 }
 
 /** Push the authoritative counts to the island. Main window only. */
-export function publishHelperVitals(p0: number, p1: number): void {
+export function publishHelperVitals(needsYou: number, running: number): void {
   if (!hasTauri) return;
-  void invoke("publish_helper_vitals", { p0, p1 }).catch((e) =>
+  void invoke("publish_helper_vitals", { needsYou, running }).catch((e) =>
     console.debug("publish_helper_vitals failed", e),
   );
 }

@@ -11,7 +11,6 @@ describe("uiStore theme", () => {
       composerHeight: COMPOSER_DEFAULT,
       zoom: ZOOM_DEFAULT,
       activeSpecial: null,
-      agentOrdering: "attention",
     });
   });
 
@@ -41,33 +40,88 @@ describe("uiStore theme", () => {
   });
 });
 
-describe("uiStore agentOrdering", () => {
+describe("uiStore statusFilter", () => {
   afterEach(() => {
     localStorage.clear();
-    useUiStore.setState({ agentOrdering: "attention" });
+    useUiStore.getState().showAllStatusBands();
   });
 
-  it("defaults agentOrdering to 'attention' (reordering on by default)", () => {
-    expect(useUiStore.getState().agentOrdering).toBe("attention");
+  it("defaults to showing all three bands", () => {
+    expect(useUiStore.getState().statusFilter).toEqual({
+      needs_you: true,
+      running: true,
+      done: true,
+    });
   });
 
-  it("setAgentOrdering switches to 'manual' and back", () => {
-    useUiStore.getState().setAgentOrdering("manual");
-    expect(useUiStore.getState().agentOrdering).toBe("manual");
-    useUiStore.getState().setAgentOrdering("attention");
-    expect(useUiStore.getState().agentOrdering).toBe("attention");
+  it("toggleStatusBand flips one band without touching the others", () => {
+    useUiStore.getState().toggleStatusBand("running");
+    expect(useUiStore.getState().statusFilter).toEqual({
+      needs_you: true,
+      running: false,
+      done: true,
+    });
+    useUiStore.getState().toggleStatusBand("running");
+    expect(useUiStore.getState().statusFilter.running).toBe(true);
   });
 
-  // Migration: an existing user's persisted blob predates agentOrdering. Rehydrating it
-  // must fall back to the default rather than leaving the field undefined.
-  it("falls back to 'attention' when the persisted blob has no agentOrdering", async () => {
+  it("allows turning EVERY band off — a filter that refuses its stated state is worse than an empty list", () => {
+    for (const b of ["needs_you", "running", "done"] as const) {
+      useUiStore.getState().toggleStatusBand(b);
+    }
+    expect(useUiStore.getState().statusFilter).toEqual({
+      needs_you: false,
+      running: false,
+      done: false,
+    });
+  });
+
+  it("showAllStatusBands is the way back from that", () => {
+    useUiStore.getState().toggleStatusBand("done");
+    useUiStore.getState().showAllStatusBands();
+    expect(useUiStore.getState().statusFilter).toEqual({
+      needs_you: true,
+      running: true,
+      done: true,
+    });
+  });
+
+  // Migration v2: a blob from before the filter existed (and carrying the retired agentOrdering)
+  // must rehydrate to all-visible rather than leaving bands undefined — an undefined band reads as
+  // falsy and would silently hide a third of the user's agents.
+  it("rehydrates a pre-filter blob to all bands visible, dropping agentOrdering", async () => {
     localStorage.setItem(
       "sparkle-ui",
-      JSON.stringify({ state: { composerHeight: 180, zoom: 1.0, activeSpecial: null }, version: 0 }),
+      JSON.stringify({
+        state: { composerHeight: 180, zoom: 1.0, activeSpecial: null, agentOrdering: "manual" },
+        version: 1,
+      }),
     );
     await useUiStore.persist.rehydrate();
-    expect(useUiStore.getState().agentOrdering).toBe("attention");
+    expect(useUiStore.getState().statusFilter).toEqual({
+      needs_you: true,
+      running: true,
+      done: true,
+    });
     expect(useUiStore.getState().composerHeight).toBe(180);
+    expect((useUiStore.getState() as unknown as Record<string, unknown>).agentOrdering).toBeUndefined();
+  });
+
+  it("repairs a PARTIAL persisted filter instead of trusting it", async () => {
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({
+        state: { statusFilter: { needs_you: false } },
+        version: 1,
+      }),
+    );
+    await useUiStore.persist.rehydrate();
+    // The band the user really did hide is preserved; the missing ones default to VISIBLE.
+    expect(useUiStore.getState().statusFilter).toEqual({
+      needs_you: false,
+      running: true,
+      done: true,
+    });
   });
 });
 
@@ -231,7 +285,7 @@ describe("uiStore pinnedProjectId", () => {
 describe("uiStore persistence — exactly these keys reach the blob", () => {
   const PERSISTED = [
     "activeSpecial",
-    "agentOrdering",
+    "statusFilter",
     "collapsedOrchestrators",
     "composerHeight",
     "composerMinimized",
@@ -254,7 +308,6 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
       composeFocusSeq: 0,
       newAgentRuntime: "local",
       cloudCreateOpen: false,
-      attentionTierFocus: null,
       zeroCreditBannerDismissed: false,
       zeroCreditBannerDismissedFor: null,
       themePref: "auto",
@@ -273,7 +326,6 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
       composeFocusSeq: 7,
       newAgentRuntime: "cloud",
       cloudCreateOpen: true,
-      attentionTierFocus: "p0",
       zeroCreditBannerDismissed: true,
       zeroCreditBannerDismissedFor: "acct-1",
     });
@@ -304,7 +356,6 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
       composeFocusSeq: 0,
       newAgentRuntime: "local",
       cloudCreateOpen: false,
-      attentionTierFocus: null,
       zeroCreditBannerDismissed: false,
       zeroCreditBannerDismissedFor: null,
       themePref: "auto",
@@ -327,7 +378,6 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
           composeFocusSeq: 7,
           newAgentRuntime: "cloud",
           cloudCreateOpen: true,
-          attentionTierFocus: "p0",
           zeroCreditBannerDismissed: true,
           zeroCreditBannerDismissedFor: "acct-1",
         },
@@ -347,7 +397,6 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
     expect(s.composeFocusSeq).toBe(0);
     expect(s.newAgentRuntime).toBe("local");
     expect(s.cloudCreateOpen).toBe(false);
-    expect(s.attentionTierFocus).toBeNull();
     expect(s.zeroCreditBannerDismissed).toBe(false);
     expect(s.zeroCreditBannerDismissedFor).toBeNull();
   });

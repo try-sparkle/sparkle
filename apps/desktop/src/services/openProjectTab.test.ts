@@ -22,8 +22,7 @@ function mkAgent(id: string): AgentTab {
     id, name: id, kind: "build", parentId: null, runtime: "local",
     worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
     promptHistory: [], namePinned: false, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
-  };
+    autoNameVariants: null, shellCommand: null,  };
 }
 function mkProject(id: string, agents: AgentTab[] = [], selectedAgentId: string | null = null): Project {
   return {
