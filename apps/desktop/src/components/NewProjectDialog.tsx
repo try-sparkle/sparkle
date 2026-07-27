@@ -79,11 +79,20 @@ const inputStyle: CSSProperties = {
   fontFamily: '"IBM Plex Sans", sans-serif',
 };
 
+/** A project that exists but has no tab — offered for one-click reopen on the folder tab. */
+export interface ReopenableProject {
+  id: string;
+  name: string;
+  rootPath: string;
+}
+
 export function NewProjectDialog({
   onClose,
   onOpenFromFolder,
   onCloned,
   onSignInGithub,
+  reopenable = [],
+  onReopen,
 }: {
   onClose: () => void;
   /** Runs today's exact folder flow (startOpen). Lifted in so it stays byte-identical. */
@@ -92,6 +101,11 @@ export function NewProjectDialog({
   onCloned: (name: string, path: string) => void;
   /** Override the GitHub sign-in/connect handoff (tests inject a spy). */
   onSignInGithub?: () => void;
+  /** Projects whose tab was closed, most recently opened first. Empty (the default) hides the
+   *  section entirely, so a user who has never closed a tab sees exactly the old dialog. */
+  reopenable?: ReopenableProject[];
+  /** Reopen one of the above. Required for the list to render. */
+  onReopen?: (projectId: string) => void;
 }) {
   const [tab, setTab] = useState<"folder" | "github">("folder");
   // GitHub import tool gate ([tools].github). Off → the "From GitHub" path is hidden entirely and
@@ -129,6 +143,8 @@ export function NewProjectDialog({
             onClose();
             onOpenFromFolder();
           }}
+          reopenable={onReopen ? reopenable : []}
+          onReopen={onReopen}
         />
       ) : (
         <GithubTab onClose={onClose} onCloned={onCloned} onSignInGithub={onSignInGithub} />
@@ -137,7 +153,15 @@ export function NewProjectDialog({
   );
 }
 
-function FolderTab({ onChoose }: { onChoose: () => void }) {
+function FolderTab({
+  onChoose,
+  reopenable,
+  onReopen,
+}: {
+  onChoose: () => void;
+  reopenable: ReopenableProject[];
+  onReopen?: (projectId: string) => void;
+}) {
   return (
     <div>
       <div style={{ color: C.muted, fontSize: 13, marginBottom: 18, lineHeight: 1.5 }}>
@@ -147,6 +171,73 @@ function FolderTab({ onChoose }: { onChoose: () => void }) {
       <button style={primaryBtn} onClick={onChoose}>
         Choose a folder…
       </button>
+      {/* Closed projects, one click from having their tab back. Without this, undoing a close means
+          remembering the folder and walking the native picker to it — a needlessly one-way door,
+          and the reason "you can close it but not find it again" would be a bug rather than a
+          missing nicety. Rendered only when something is actually closed. */}
+      {reopenable.length > 0 && onReopen && (
+        <div style={{ marginTop: 22 }} data-testid="reopen-section">
+          <div
+            style={{
+              color: C.muted,
+              fontSize: 12,
+              fontWeight: FONT_WEIGHT.semibold,
+              textTransform: "uppercase",
+              letterSpacing: 0.6,
+              marginBottom: 8,
+            }}
+          >
+            Closed projects
+          </div>
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 2,
+              maxHeight: 200,
+              overflowY: "auto",
+            }}
+          >
+            {reopenable.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                data-testid={`reopen-${p.id}`}
+                onClick={() => onReopen(p.id)}
+                title={p.rootPath}
+                style={{
+                  display: "flex",
+                  alignItems: "baseline",
+                  gap: 10,
+                  width: "100%",
+                  textAlign: "left",
+                  background: "transparent",
+                  border: "none",
+                  borderRadius: 6,
+                  padding: "7px 8px",
+                  cursor: "pointer",
+                  color: C.cream,
+                  fontSize: 13,
+                  fontFamily: '"IBM Plex Sans", sans-serif',
+                }}
+              >
+                <span style={{ fontWeight: FONT_WEIGHT.semibold }}>{p.name}</span>
+                <span
+                  style={{
+                    color: C.muted,
+                    fontSize: 11,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {p.rootPath}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

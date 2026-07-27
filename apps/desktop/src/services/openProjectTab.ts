@@ -16,6 +16,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useUiStore } from "../stores/uiStore";
 import { selectAndOpen } from "./agentReveal";
 import { emitFocusAgent, emitSelectProject } from "./attention";
+import { markProjectOpen } from "./projectTabs";
 
 /**
  * Select `projectId`'s tab. With `agentId`, also leave any Plan/Sparkle overlay, switch to Build,
@@ -24,10 +25,30 @@ import { emitFocusAgent, emitSelectProject } from "./attention";
  *
  * Selecting a tab bumps the project's recency (projectStore.selectProject), which is what keeps the
  * tab order's "most recently used" reading honest.
+ *
+ * It also OPENS the tab if the project was closed (services/projectTabs.markProjectOpen), so a
+ * closed project is reopened by whatever reveals it — the "+" flow's folder picker and its reopen
+ * list, a concierge alert, ⌘K history, the tray's select-project broadcast — rather than only by
+ * one blessed path.
+ *
+ * "Rather than only by one blessed path" is the goal, NOT a claim that this function is the sole
+ * funnel. There are THREE seams that call markProjectOpen, and each owns the paths that reach it:
+ *
+ *   • this one — the "+" flow, ⌘K history, a tray select-project broadcast;
+ *   • `useReplaceCurrentProject` (windowContext) — "show this project instead", used by the
+ *     capture hand-off and by the notification handler WHEN the reveal changes projects;
+ *   • `selectAndOpen` (services/agentReveal) — every agent reveal, unconditionally.
+ *
+ * The third is load-bearing and was added last, after two review rounds: the notification handler
+ * guards its `useReplaceCurrentProject` call with `p.projectId !== mine`, so a reveal into a project
+ * that is ALREADY selected but closed reopened nothing at all. Spelling the division out because
+ * two successively narrower versions of this comment each claimed a coverage guarantee the call
+ * sites did not provide, and the second one was documenting a live bug as covered.
  */
 export function openProjectTab(projectId: string, agentId?: string | null): void {
   const store = useProjectStore.getState();
   if (!store.projects.some((p) => p.id === projectId)) return; // unknown/deleted project — no-op
+  markProjectOpen(projectId);
   store.selectProject(projectId);
   // `activeSpecial` is APP-global, not per-project. Improve Sparkle ("sparkle") is an app-owned
   // pane that covers column ③ — leaving it up means clicking another project's tab visibly does
@@ -70,6 +91,18 @@ export function requestProjectTabFromOtherWindow(
   if (!project) return;
   // Claim the selection here too: this store write is what the main window reads (through the
   // cross-window sync) to land on the right tab, even if nothing is listening for the event.
+  //
+  // Deliberately NOT markProjectOpen. The open set lives in uiStore, and uiStore is NOT
+  // cross-window synced — services/crossWindowSync wires projectStore and dictationStore only — so
+  // the write would never reach the main window's in-memory state anyway. What it WOULD do is make
+  // a secondary webview persist the whole shared `sparkle-ui` blob from its own hydrated snapshot,
+  // clobbering main-window UI preferences; that hazard is exactly why the helper island keeps its
+  // own small record instead (helper/helperPrefs.ts). The tab still reopens, in the right place and
+  // in the main window's own uiStore: `select-project` lands in
+  // useAttentionNotifications.handleSelectProject, which routes through `openProjectTab`; the
+  // `focus-agent` broadcast lands in `selectAndOpen` (services/agentReveal), which calls
+  // markProjectOpen itself. Naming both precisely — an earlier version of this comment credited the
+  // focus-agent handler with a reopen it did not perform, which hid a real bug.
   store.selectProject(projectId);
   const target = agentId && project.agents.some((a) => a.id === agentId) ? agentId : null;
   if (target) emitFocusAgent({ projectId, agentId: target });

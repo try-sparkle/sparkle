@@ -7,7 +7,10 @@
 import { useEffect, useMemo, type ReactNode } from "react";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
+import { useUiStore } from "./stores/uiStore";
 import { useDictationStore } from "./stores/dictationStore";
+import { bootSelection } from "./engine/openProjects";
+import { markProjectOpen } from "./services/projectTabs";
 import { setWindowProject, clearWindowProject, resetWindowRegistry } from "./services/windowRegistry";
 import { resetWindowStatus } from "./services/windowStatus";
 import { parseAgentIdFromSearch, parseProjectIdFromSearch } from "./services/windowIdentity";
@@ -19,6 +22,13 @@ export const APP_WINDOW_LABEL = "main";
 /** The multi-window era's per-window session snapshot. Its module (services/windowSession) is gone;
  *  the key is named here only so AppBoot can clear the orphaned blob. Delete with that cleanup. */
 const LEGACY_WINDOW_SESSION_KEY = "sparkle-window-session";
+
+/** How long the boot selection waits for uiStore to hydrate before settling against the in-memory
+ *  default. uiStore persists to synchronous localStorage, so in practice it has ALREADY hydrated by
+ *  the time AppBoot's effect runs and this timer never arms — it exists so a hydration that never
+ *  finishes (see the resolver) degrades to "everything open" instead of stalling boot forever.
+ *  Short enough to be invisible, long enough to cover a genuinely deferred hydrate. */
+export const UI_HYDRATION_GRACE_MS = 250;
 
 /** Deep-link: a `?agent=` param (notification hand-off from a cold start) selects + mounts that
  *  agent once its project is present. A closed/unknown agent id is silently ignored. */
@@ -66,29 +76,99 @@ export function AppBoot({ children }: { children: ReactNode }) {
     const search = typeof window !== "undefined" ? window.location.search : "";
     const paramProjectId = parseProjectIdFromSearch(search);
     const paramAgentId = parseAgentIdFromSearch(search);
-    let unsub: (() => void) | null = null;
+    let unsubs: Array<() => void> = [];
+    // Once true, resolve() stops waiting on uiStore and settles against whatever is in memory.
+    let uiWaitOver = useUiStore.persist.hasHydrated();
+    let graceTimer: ReturnType<typeof setTimeout> | null = null;
+    const detach = () => {
+      for (const u of unsubs) u();
+      unsubs = [];
+      if (graceTimer !== null) {
+        clearTimeout(graceTimer);
+        graceTimer = null;
+      }
+    };
     const resolve = (): boolean => {
       const st = useProjectStore.getState();
       if (st.projects.length === 0) return false;
+      // The open set lives in uiStore, which has its OWN hydration schedule. Settling before it
+      // lands would read the default `null` ("everything open") and could restore a CLOSED project
+      // — and this resolver runs exactly once, so nothing would ever correct it.
+      //
+      // A SUCCESSFUL hydrate releases this through `onFinishHydration` below — not through a store
+      // subscription, which provably cannot see it (see the note there).
+      //
+      // The wait is also BOUNDED, because "not hydrated yet" and "hydration failed" are
+      // indistinguishable from here and only one of them ever ends. zustand sets `hasHydrated` (and
+      // fires its finish listeners) inside a `.then()` that a `.catch()` bypasses, and
+      // `createJSONStorage().getItem` JSON.parses with no guard — so a truncated `sparkle-ui` blob,
+      // a throwing migrate, or a `localStorage` that throws leaves `hasHydrated` false FOREVER and
+      // fires no finish listener either. Gating unconditionally would turn a corrupt
+      // UI-preferences blob (which used to cost only preferences) into "the app boots with tabs and
+      // nothing selected, and a cold-start notification hand-off is silently dropped". After the
+      // grace window we settle against the in-memory default — `openProjectIds === null`, i.e.
+      // every project open, which is precisely the state the gate was waiting to confirm.
+      if (!uiWaitOver && !useUiStore.persist.hasHydrated()) return false;
       const has = (id: string | null) => !!id && st.projects.some((p) => p.id === id);
-      const target = has(paramProjectId)
-        ? paramProjectId
-        : has(st.selectedProjectId)
-          ? st.selectedProjectId
-          : (st.projects[0]?.id ?? null);
-      if (!target) return false;
-      // Detach BEFORE writing: the writes below are store `set`s that would re-enter this
-      // subscription and recurse.
-      unsub?.();
-      unsub = null;
+      // Detach BEFORE any write: everything below is a store `set` that would re-enter this
+      // resolver through its own subscriptions and recurse. Hoisted above the branch, because
+      // `markProjectOpen` is itself such a write and this effect now subscribes to uiStore too —
+      // on the deferred path (empty store at mount, `?project=` naming a closed project, projects
+      // hydrating after) it would have re-entered synchronously, resolved the whole thing, and then
+      // let the outer frame run `setSelectedProject` + `openDeepLinkAgent` a SECOND time. Harmless
+      // only by accident (runtimeStore.open unions and selectAgent is idempotent), which is the
+      // callees upholding this function's "resolve ONCE" contract for it. Safe to detach here: the
+      // resolver has already committed to answering.
+      detach();
+      let target: string | null;
+      if (paramProjectId && has(paramProjectId)) {
+        // A `?project=` deep link is an explicit "show me this one", so it OPENS a closed project
+        // rather than being skipped — landing on a project with no tab is the incoherence to avoid,
+        // and a deep link earns its tab.
+        markProjectOpen(paramProjectId);
+        target = paramProjectId;
+      } else {
+        // Only OPEN projects are eligible; bootSelection falls back to the first open one, and to
+        // null when the user closed every tab (the welcome state, not a phantom selection).
+        target = bootSelection(
+          st.projects.map((p) => p.id),
+          useUiStore.getState().openProjectIds,
+          st.selectedProjectId,
+        );
+      }
       // setSelectedProject, not selectProject: adopting a tab at boot must not rewrite recency.
       if (st.selectedProjectId !== target) st.setSelectedProject(target);
-      openDeepLinkAgent(target, paramAgentId);
+      // `target === null` — every tab is closed — is a SETTLED answer, not "try again": the shell
+      // shows its welcome hint and the next tab click owns the selection from there.
+      if (target) openDeepLinkAgent(target, paramAgentId);
       return true;
     };
     if (resolve()) return;
-    unsub = useProjectStore.subscribe(() => resolve());
-    return () => unsub?.();
+    unsubs = [useProjectStore.subscribe(() => resolve())];
+    if (!uiWaitOver) {
+      // Release the wait from the API that actually SIGNALS hydration. A plain
+      // `useUiStore.subscribe` cannot do it: zustand applies the stored state with
+      // `set(stateFromStorage, true)` in one `.then()` and flips `hasHydrated` in the NEXT one
+      // (zustand/esm/middleware.mjs:421 vs :431), so the single `set` hydration ever fires reaches a
+      // store subscriber while `hasHydrated()` is still false — it bails, and no further `set`
+      // follows. The gate's only exit would be the timer below, which means a hydrate landing after
+      // the grace window settles against `openProjectIds === null` ("everything open") and restores
+      // a CLOSED project: exactly the incoherence the gate exists to prevent, arrived at silently.
+      unsubs.push(
+        useUiStore.persist.onFinishHydration(() => {
+          uiWaitOver = true;
+          resolve();
+        }),
+      );
+      // The timer is now purely the corrupt-blob backstop: `onFinishHydration` listeners live in
+      // the same `.then()` that a `.catch()` bypasses, so a throwing storage/migrate fires neither.
+      graceTimer = setTimeout(() => {
+        graceTimer = null;
+        uiWaitOver = true;
+        resolve();
+      }, UI_HYDRATION_GRACE_MS);
+    }
+    return () => detach();
   }, []);
 
   // Keep the (single-entry) window registry pointing at the selected project, so the surfaces
@@ -111,13 +191,24 @@ export const useCurrentProjectId = (): string | null =>
 export const useIsMainWindow = (): boolean => true;
 export const useCurrentWindowLabel = (): string => APP_WINDOW_LABEL;
 
-/** Legacy seam: "show this project instead". Now simply selects its tab. */
+/** Legacy seam: "show this project instead". Now simply selects its tab — and OPENS that tab if the
+ *  project was closed. Without the open, this is the one "show me this project" path that could
+ *  select a project the tab bar doesn't list: the notification-banner reveal
+ *  (useAttentionNotifications' focus-agent handler) routes through here, and Rust posts that
+ *  notification against whatever project was current at the time, which the user may have closed
+ *  since. The result would be the exact incoherence the open set exists to prevent — the workspace
+ *  showing Alpha's agent while no tab is selected — and it would self-heal in the WRONG direction,
+ *  since the next close treats a selection with no tab as stale and yanks the user elsewhere
+ *  (engine/openProjects.selectionAfterClose). Kept here rather than at the two call sites so the
+ *  seam itself cannot reintroduce it. */
 export const useReplaceCurrentProject = (): ((id: string | null) => void) => {
   return useMemo(
     () => (id: string | null) => {
       const st = useProjectStore.getState();
-      if (id) st.selectProject(id);
-      else st.setSelectedProject(null);
+      if (id) {
+        markProjectOpen(id);
+        st.selectProject(id);
+      } else st.setSelectedProject(null);
     },
     [],
   );

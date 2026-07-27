@@ -7,9 +7,10 @@
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { AppBoot, useCurrentProjectId } from "./windowContext";
+import { AppBoot, UI_HYDRATION_GRACE_MS, useCurrentProjectId } from "./windowContext";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
+import { useUiStore } from "./stores/uiStore";
 import { useDictationStore } from "./stores/dictationStore";
 import type { AgentTab, Project } from "./types";
 
@@ -45,6 +46,9 @@ function ProjectIdProbe() {
 beforeEach(() => {
   useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
   useRuntimeStore.setState({ openAgentIds: [] } as never);
+  // Closable tabs: `null` = never seeded, i.e. every project is open. uiStore is a module singleton,
+  // so without this reset one test's closed tabs would decide the next test's boot selection.
+  useUiStore.setState({ openProjectIds: null } as never);
   useDictationStore.setState({ phase: "passive" });
 });
 afterEach(() => {
@@ -259,5 +263,237 @@ describe("AppBoot — main-window restore hint", () => {
     expect(getByTestId("pid").textContent).toBe("p1");
     act(() => useProjectStore.getState().selectProject("p2"));
     expect(getByTestId("pid").textContent).toBe("p2");
+  });
+});
+
+// Closable project tabs: the boot selection must never land on a project the tab bar doesn't list.
+// It used to fall back to `projects[0]`, which after that change could restore a CLOSED project and
+// show the shell a project with no tab — the exact incoherence the open set exists to prevent.
+describe("AppBoot — boot selection respects closed tabs", () => {
+  function seedTwo(): void {
+    const mk = (id: string): Project => ({
+      id, name: id, rootPath: `/tmp/${id}`, defaultBranch: null,
+      createdAt: new Date(0).toISOString(), selectedAgentId: null, agents: [],
+    });
+    useProjectStore.setState({ projects: [mk("p1"), mk("p2")] } as never);
+  }
+  const boot = () =>
+    render(
+      <AppBoot>
+        <ProjectIdProbe />
+      </AppBoot>,
+    );
+
+  /** Watches the ONE timer the boot resolver owns — the `UI_HYDRATION_GRACE_MS` backstop.
+   *
+   *  `vi.getTimerCount()` cannot answer "is the backstop armed?", because it is a GLOBAL count and
+   *  boot is not the only thing arming timers: jsdom's Storage schedules a `setTimeout(…, 0)` per
+   *  `localStorage.setItem` to dispatch the `storage` event (jsdom/living/webstorage/Storage-impl.js
+   *  — `setTimeout(this._dispatchStorageEvent.bind(this), 0, …)`), and a single `boot()` writes
+   *  storage several times (windowRegistry, plus every `persist`-wrapped store it touches). So the
+   *  global count is 2-4 with no boot timer armed at all.
+   *
+   *  That read is environment-dependent, which is how it passed locally and failed on CI: on Node
+   *  >=25 the runtime defines its own `localStorage` global that vitest's jsdom env leaves in place,
+   *  `test-setup.ts` feature-detects it as unusable and swaps in MemoryStorage — which arms nothing —
+   *  so the count really is 0. CI runs Node 22, which has no such global, so jsdom's real Storage
+   *  stays and its timers get counted. Measuring only OUR delay makes the assertion mean the same
+   *  thing on both. */
+  function traceGraceTimer(): { armed: () => number; pending: () => number; restore: () => void } {
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const pending = new Set<unknown>();
+    let armed = 0;
+    globalThis.setTimeout = ((handler: TimerHandler, ms?: number, ...rest: unknown[]) => {
+      if (ms !== UI_HYDRATION_GRACE_MS || typeof handler !== "function")
+        return realSetTimeout(handler as never, ms, ...(rest as never[]));
+      armed += 1;
+      let id: unknown;
+      // A timer that FIRES is no longer pending — without this, "still armed" and "already ran"
+      // would be indistinguishable and a leak check could never fail honestly.
+      id = realSetTimeout(
+        ((...args: unknown[]) => {
+          pending.delete(id);
+          (handler as (...a: unknown[]) => void)(...args);
+        }) as never,
+        ms,
+        ...(rest as never[]),
+      );
+      pending.add(id);
+      return id;
+    }) as typeof globalThis.setTimeout;
+    globalThis.clearTimeout = ((id?: unknown) => {
+      pending.delete(id);
+      return realClearTimeout(id as never);
+    }) as typeof globalThis.clearTimeout;
+    return {
+      armed: () => armed,
+      pending: () => pending.size,
+      restore: () => {
+        globalThis.setTimeout = realSetTimeout;
+        globalThis.clearTimeout = realClearTimeout;
+      },
+    };
+  }
+
+  it("refuses to restore a CLOSED project, taking the first OPEN one instead", () => {
+    seedTwo();
+    useUiStore.setState({ openProjectIds: ["p2"] } as never); // p1 closed
+    useProjectStore.setState({ selectedProjectId: "p1" } as never);
+    setSearch("");
+    expect(boot().getByTestId("pid").textContent).toBe("p2");
+  });
+
+  it("keeps a persisted selection that is still open", () => {
+    seedTwo();
+    useUiStore.setState({ openProjectIds: ["p1", "p2"] } as never);
+    useProjectStore.setState({ selectedProjectId: "p2" } as never);
+    setSearch("");
+    expect(boot().getByTestId("pid").textContent).toBe("p2");
+  });
+
+  it("selects NOTHING when every tab is closed — the welcome state, not a phantom selection", () => {
+    seedTwo();
+    useUiStore.setState({ openProjectIds: [] } as never);
+    useProjectStore.setState({ selectedProjectId: "p1" } as never);
+    setSearch("");
+    expect(boot().getByTestId("pid").textContent).toBe("none");
+    expect(useProjectStore.getState().selectedProjectId).toBeNull();
+  });
+
+  it("a ?project= deep link REOPENS a closed project rather than being skipped", () => {
+    // A deep link is an explicit "show me this one", so it earns its tab.
+    seedTwo();
+    useUiStore.setState({ openProjectIds: ["p1"] } as never); // p2 closed
+    setSearch("?project=p2");
+    expect(boot().getByTestId("pid").textContent).toBe("p2");
+    expect(useUiStore.getState().openProjectIds).toContain("p2");
+  });
+
+  // The wait on uiStore hydration must be BOUNDED. zustand sets `hasHydrated` inside a `.then()`
+  // that its `.catch()` bypasses, and createJSONStorage().getItem JSON.parses with no guard — so a
+  // truncated `sparkle-ui` blob, a throwing migrate, or a localStorage that throws leaves
+  // `hasHydrated` false forever AND fires no further `set` for the subscription to notice. An
+  // unconditional gate would turn that (previously: "you lose your UI preferences") into "the app
+  // boots with tabs and nothing selected, and a cold-start notification hand-off is dropped".
+  it("settles anyway when uiStore hydration never finishes", () => {
+    vi.useFakeTimers();
+    const spy = vi.spyOn(useUiStore.persist, "hasHydrated").mockReturnValue(false);
+    try {
+      // No selection yet, so the probe can only read "p1" if the boot resolver actually ran.
+      seedTwo();
+      setSearch("");
+      const { getByTestId } = boot();
+      // Still waiting — the gate is real, not decorative.
+      expect(getByTestId("pid").textContent).toBe("none");
+      expect(useProjectStore.getState().selectedProjectId).toBeNull();
+      // …but it gives up, and falls back to the in-memory default (openProjectIds null = all open),
+      // which is exactly the state it was waiting to confirm.
+      act(() => void vi.advanceTimersByTime(UI_HYDRATION_GRACE_MS));
+      expect(getByTestId("pid").textContent).toBe("p1");
+      expect(useProjectStore.getState().selectedProjectId).toBe("p1");
+    } finally {
+      // Restored in `finally`: a failed assertion above would otherwise leave every later test in
+      // this file looking at a store that claims it never hydrated.
+      spy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  // The wait must be released by hydration FINISHING, not only by its timeout. A plain
+  // `useUiStore.subscribe` cannot do it, and this test models exactly why: zustand applies the
+  // stored state with `set(stateFromStorage, true)` in one `.then()` and flips `hasHydrated` in the
+  // NEXT one (zustand/esm/middleware.mjs:421 vs :431), so the single `set` hydration ever fires
+  // arrives while `hasHydrated()` is still false. Sequenced below in that order on purpose — with
+  // the two collapsed, a store-subscription implementation would pass and prove nothing.
+  it("settles as soon as hydration FINISHES, without waiting out the grace window", () => {
+    vi.useFakeTimers();
+    let finish: (() => void) | undefined;
+    const hasHydrated = vi.spyOn(useUiStore.persist, "hasHydrated").mockReturnValue(false);
+    const onFinish = vi
+      .spyOn(useUiStore.persist, "onFinishHydration")
+      .mockImplementation((fn) => {
+        finish = fn as () => void;
+        return () => {};
+      });
+    const grace = traceGraceTimer();
+    try {
+      seedTwo();
+      setSearch("");
+      const { getByTestId } = boot();
+      expect(getByTestId("pid").textContent).toBe("none"); // gated, as intended
+      // The backstop IS armed on this path — otherwise "detach() cleared it" below would pass
+      // vacuously against a timer that never existed.
+      expect(grace.armed()).toBe(1);
+      expect(grace.pending()).toBe(1);
+
+      // Step 1 — the state `set` lands while hasHydrated is still FALSE. A store subscriber sees
+      // this and must bail; nothing may settle yet.
+      act(() => void useUiStore.setState({ openProjectIds: ["p2"] } as never)); // p1 closed
+      expect(getByTestId("pid").textContent).toBe("none");
+
+      // Step 2 — hasHydrated flips in the next microtask with NO further `set`; only the
+      // finish-hydration listeners are called. This is the signal that has to do the work.
+      act(() => {
+        hasHydrated.mockReturnValue(true);
+        finish?.();
+      });
+
+      // Settled against the HYDRATED open set (p1 is closed, so p2), and with no timer advance —
+      // a deferred hydrate must not cost the full grace window.
+      expect(getByTestId("pid").textContent).toBe("p2");
+      expect(useProjectStore.getState().selectedProjectId).toBe("p2");
+      expect(grace.pending()).toBe(0); // detach() cleared the backstop
+    } finally {
+      grace.restore();
+      hasHydrated.mockRestore();
+      onFinish.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not arm the grace timer at all when uiStore is already hydrated", () => {
+    // The normal path: synchronous localStorage means hydration is done before AppBoot's effect
+    // runs, so boot selection settles in the first pass with no timer involved.
+    vi.useFakeTimers();
+    const grace = traceGraceTimer();
+    try {
+      seedTwo();
+      setSearch("");
+      expect(boot().getByTestId("pid").textContent).toBe("p1");
+      expect(grace.armed()).toBe(0);
+    } finally {
+      grace.restore();
+      vi.useRealTimers();
+    }
+  });
+
+  // The DEFERRED path: an empty store at mount (persist snapshot not applied yet), a `?project=`
+  // naming a closed project, and `projects` arriving afterwards. `markProjectOpen` is a store write,
+  // and this effect subscribes to uiStore — so it re-enters the resolver through its own
+  // subscription unless `detach()` has already run. Every other AppBoot case seeds `projects` before
+  // render, so `resolve()` succeeds synchronously and never subscribes: only this one reaches it.
+  it("resolves exactly ONCE when a late-hydrating deep link reopens a closed project", () => {
+    useUiStore.setState({ openProjectIds: [] } as never); // p1 exists nowhere yet, but is closed
+    setSearch("?project=p1&agent=a2");
+    const { getByTestId } = boot();
+    expect(getByTestId("pid").textContent).toBe("none"); // nothing to resolve against yet
+
+    const openSpy = vi.spyOn(useRuntimeStore.getState(), "open");
+    act(() => {
+      const mk = (id: string): Project => ({
+        id, name: id, rootPath: `/tmp/${id}`, defaultBranch: null,
+        createdAt: new Date(0).toISOString(), selectedAgentId: null, agents: [mkAgent("a2")],
+      });
+      useProjectStore.setState({ projects: [mk("p1")] } as never);
+    });
+
+    expect(getByTestId("pid").textContent).toBe("p1");
+    expect(useUiStore.getState().openProjectIds).toEqual(["p1"]);
+    // The deep-link landing must run once, not twice. It is idempotent today (runtimeStore.open
+    // unions, selectAgent is a plain set), so a double-run is invisible in the resulting state —
+    // the call count is what actually pins "resolve ONCE".
+    expect(openSpy).toHaveBeenCalledTimes(1);
+    openSpy.mockRestore();
   });
 });

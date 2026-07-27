@@ -8,6 +8,7 @@
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { markProjectOpen } from "./projectTabs";
 
 /** Mount the agent (so its pane exists) and make it the selected tab — and crucially REVEAL it.
  *  A cross-window "needs attention" jump lands here in the owning window, but that window may be
@@ -25,6 +26,23 @@ export function selectAndOpen(projectId: string, agentId: string): void {
   // id can't drop the Plan board while leaving workMode on plan (roborev 46353), and never enters
   // `openAgentIds` as a phantom.
   if (!agent) return;
+  // A revealed agent's project MUST have a tab, or the shell shows that agent while the tab bar has
+  // no tab for it and every tab reads aria-selected="false" — and it self-heals the wrong way, since
+  // the next × treats a selection with no tab as stale and yanks the user elsewhere
+  // (engine/openProjects.selectionAfterClose).
+  //
+  // It lives HERE, in the shared seam, rather than in the callers, because the callers only reopen
+  // CONDITIONALLY: useAttentionNotifications guards its `setProject` with `p.projectId !== mine`
+  // (:504 and :525), so a reveal into a project that is ALREADY selected but closed reopened
+  // nothing. That case is reachable, not theoretical — requestProjectTabFromOtherWindow writes
+  // `selectedProjectId` before emitting `focus-agent`, and projectStore IS cross-window synced with
+  // synchronous storage, so the main window can already be on that project when the event lands.
+  // Repro: close Beta's tab, then click Beta's agent row in the tray popover.
+  //
+  // Deliberately AFTER the `!agent` bail: a stale id must not resurrect a tab for a reveal that
+  // isn't going to happen. Idempotent (markProjectOpen writes nothing when already open), so it is
+  // free on the common path.
+  markProjectOpen(projectId);
   useUiStore.getState().setActiveSpecial(null);
   // Every agent's pane is a terminal now, surfaced under the Build chevron — switch to it so the
   // revealed agent is actually shown (rather than sitting behind the Plan board).

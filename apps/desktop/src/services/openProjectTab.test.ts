@@ -39,8 +39,38 @@ beforeEach(() => {
     selectedProjectId: "p1",
   } as never);
   useRuntimeStore.setState({ openAgentIds: [] } as never);
+  // Closable tabs: `null` = never seeded, i.e. every project is open (uiStore is a module
+  // singleton, so the closed-tab cases below must not leak into the rest of the file).
+  useUiStore.setState({ openProjectIds: null } as never);
   useUiStore.getState().setActiveSpecial("board");
   useUiStore.getState().setWorkMode("plan");
+});
+
+// Closable tabs: openProjectTab reopens the tab for the surfaces that route through IT. It is not
+// the only such seam — `useReplaceCurrentProject` and `selectAndOpen` (services/agentReveal) each
+// call markProjectOpen for the paths that reach them instead — so this block pins this one's share
+// of the contract, not a claim that everything funnels here.
+describe("openProjectTab — reopening a closed tab", () => {
+  it("reopens a project whose tab was closed", () => {
+    useUiStore.setState({ openProjectIds: ["p1"] } as never); // p2 closed
+    openProjectTab("p2");
+    expect(useUiStore.getState().openProjectIds).toEqual(["p1", "p2"]);
+    expect(useProjectStore.getState().selectedProjectId).toBe("p2");
+  });
+
+  it("writes NOTHING to the open set when the project is already open", () => {
+    // Load-bearing: this runs on every tab click. Seeding here would freeze the set to whatever
+    // projects existed at that instant, so a project arriving later would render no tab.
+    openProjectTab("p2");
+    expect(useUiStore.getState().openProjectIds).toBeNull();
+  });
+
+  it("does not reopen — or select — an unknown project", () => {
+    useUiStore.setState({ openProjectIds: ["p1"] } as never);
+    openProjectTab("ghost");
+    expect(useUiStore.getState().openProjectIds).toEqual(["p1"]);
+    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
+  });
 });
 
 describe("openProjectTab", () => {
@@ -125,6 +155,20 @@ describe("requestProjectTabFromOtherWindow", () => {
   it("degrades to a tab request when the named agent no longer exists", () => {
     requestProjectTabFromOtherWindow("p2", "gone");
     expect(emitFocusAgent).not.toHaveBeenCalled();
+    expect(emitSelectProject).toHaveBeenCalledWith({ projectId: "p2" });
+  });
+
+  // Closable tabs: this path must NOT touch the open set. uiStore is not cross-window synced
+  // (services/crossWindowSync wires projectStore + dictationStore only), so the write could never
+  // reach the main window's in-memory state — while it WOULD make a secondary webview persist the
+  // whole shared `sparkle-ui` blob from its own snapshot, clobbering main-window UI preferences.
+  // The tab still reopens: the main window's select-project handler routes through openProjectTab.
+  it("does NOT write the open set — the main window reopens the tab when it handles the event", () => {
+    useUiStore.setState({ openProjectIds: ["p1"] } as never); // p2 closed
+    requestProjectTabFromOtherWindow("p2");
+    expect(useUiStore.getState().openProjectIds).toEqual(["p1"]);
+    // The selection IS claimed here — projectStore is synced, so that half does cross over.
+    expect(useProjectStore.getState().selectedProjectId).toBe("p2");
     expect(emitSelectProject).toHaveBeenCalledWith({ projectId: "p2" });
   });
 

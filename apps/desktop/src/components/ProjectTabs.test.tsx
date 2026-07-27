@@ -150,3 +150,73 @@ describe("ProjectTabs — long names truncate rather than wrap", () => {
     }
   });
 });
+
+// The close control. Presentational half only — what closing DOES to the stores is
+// ProjectTabsBar.close.test.tsx's job.
+describe("the close ×", () => {
+  it("renders no close control at all when onClose is omitted", () => {
+    // The pre-close tab bar. Callers that don't pass it get exactly the old markup.
+    renderTabs();
+    expect(screen.queryByTestId("close-sparkle")).toBeNull();
+  });
+
+  it("calls onClose with the project id", () => {
+    const onClose = vi.fn();
+    renderTabs({ onClose });
+    fireEvent.click(screen.getByTestId("close-website"));
+    expect(onClose).toHaveBeenCalledWith("website");
+  });
+
+  it("closing a tab does NOT also select it", () => {
+    // Both handlers stopPropagation: a <button> turns Enter/Space into a click, and BOTH events
+    // bubble to the tab's own onClick/onKeyDown.
+    const onClose = vi.fn();
+    const { onSelect } = renderTabs({ onClose });
+    fireEvent.click(screen.getByTestId("close-website"));
+    expect(onClose).toHaveBeenCalledWith("website");
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("closing via the keyboard does not select the tab either", () => {
+    const onClose = vi.fn();
+    const { onSelect } = renderTabs({ onClose });
+    const btn = screen.getByTestId("close-website");
+    fireEvent.keyDown(btn, { key: "Enter" });
+    fireEvent.keyDown(btn, { key: " " });
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("double-clicking × does not open project settings", () => {
+    const onClose = vi.fn();
+    const onOpenSettings = vi.fn();
+    renderTabs({ onClose, onOpenSettings });
+    fireEvent.doubleClick(screen.getByTestId("close-website"));
+    expect(onOpenSettings).not.toHaveBeenCalled();
+  });
+
+  it("is a real button with a per-project accessible name", () => {
+    // Keyboard-reachable by construction, and N tabs must not present N identical "Close" buttons.
+    // The name also says what closing does NOT do — a bare × beside a project reads as "delete".
+    renderTabs({ onClose: vi.fn() });
+    const btn = screen.getByTestId("close-website");
+    expect(btn.tagName).toBe("BUTTON");
+    expect(btn.getAttribute("type")).toBe("button");
+    expect(btn.getAttribute("aria-label")).toBe(
+      "Close drodio-website — the project and its agents are kept",
+    );
+    expect(btn.getAttribute("title")).toBe(btn.getAttribute("aria-label"));
+    // Reachable by NAME, not just by test id — this is the screen-reader/keyboard contract.
+    expect(screen.getByRole("button", { name: /Close drodio-website/ })).toBe(btn);
+  });
+
+  it("keeps the × visible on the ACTIVE tab, and hover-reveals it on the others", () => {
+    // A permanently-hidden control is an undiscoverable one; an always-visible one on every tab
+    // makes an idle bar noisy. data-active drives the CSS rule that splits the two.
+    renderTabs({ onClose: vi.fn() });
+    expect(screen.getByTestId("close-sparkle").getAttribute("data-active")).toBe("true");
+    expect(screen.getByTestId("close-website").getAttribute("data-active")).toBe("false");
+    const css = document.getElementById("concierge-tabs-styles")!.textContent!;
+    expect(css).toContain(".concierge-tab:focus-within .concierge-tab-close");
+    expect(css).toContain('.concierge-tab-close[data-active="true"]');
+  });
+});

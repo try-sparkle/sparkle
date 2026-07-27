@@ -11,7 +11,14 @@
 //   - Project settings (rename / move) → double-click a tab (the ProjectModal the ⚙ used to open).
 //   - The open-PR menu, the trial counter + Unlock, and the signed-in avatar (now inside
 //     ConciergeTopRight together with the kebab that owns settings/version/changelog/support).
-import { useState } from "react";
+//
+// Only OPEN projects get a tab. "Exists in the project store" is a weaker fact than "is open right
+// now" — the bar used to render the former, so it only ever grew and a repo you tried once had a tab
+// forever. The open set and its rules live in engine/openProjects; the writes live in
+// services/projectTabs. Closing (the tab's ×) hides the tab and NOTHING else: the project, its
+// agents and its live PTYs all survive, and the "+" dialog lists what you closed for one-click
+// reopen.
+import { useMemo, useState } from "react";
 import type { Project } from "../types";
 import { ProjectTabs, type ProjectTabCounts } from "./ProjectTabs";
 import { ConciergeTopRight } from "./Concierge/KebabMenu";
@@ -27,6 +34,8 @@ import { performTrialUnlock } from "../services/trialUnlock";
 import { pickProjectFolder, basename } from "../services/dialog";
 import { resolveOpenTarget } from "../services/openTarget";
 import { openProjectTab } from "../services/openProjectTab";
+import { closeProjectTab, closedProjects } from "../services/projectTabs";
+import { openProjectsOf } from "../engine/openProjects";
 import type { ConciergeFeed } from "../services/conciergeFeed";
 
 /** Per-project status-band totals, keyed by project id — the tab glow + count badge (ProjectTabs). */
@@ -50,8 +59,23 @@ export function ProjectTabsBar({
   const addProject = useProjectStore((s) => s.addProject);
   const pinnedProjectId = useUiStore((s) => s.pinnedProjectId);
   const togglePinnedProject = useUiStore((s) => s.togglePinnedProject);
+  const openProjectIds = useUiStore((s) => s.openProjectIds);
 
   const [newProjectOpen, setNewProjectOpen] = useState(false);
+
+  // Only OPEN projects get a tab. `openProjectIds === null` (nobody has opened or closed anything
+  // yet — every install upgrading into this) means "all of them", so the bar is unchanged until the
+  // user actually closes something. See engine/openProjects.
+  const openProjects = useMemo(
+    () => openProjectsOf(projects, openProjectIds),
+    [projects, openProjectIds],
+  );
+  // The projects with no tab — offered for one-click reopen inside the "+" dialog, so closing is
+  // never a one-way door that costs a trip through the folder picker to undo.
+  const reopenable = useMemo(
+    () => closedProjects(projects, openProjectIds),
+    [projects, openProjectIds],
+  );
 
   // Trial counter + Unlock, kept visible in the new chrome (parity #14). Same derivation and the
   // same shared paywall handler the TopBar used, so a signed-in user still converts in one click.
@@ -92,7 +116,7 @@ export function ProjectTabsBar({
   return (
     <>
       <ProjectTabs
-        projects={projects.map((p) => ({ id: p.id, name: p.name }))}
+        projects={openProjects.map((p) => ({ id: p.id, name: p.name }))}
         selectedProjectId={selectedProjectId}
         pinnedProjectId={pinnedProjectId}
         countsByProject={countsFromFeed(feed)}
@@ -102,6 +126,7 @@ export function ProjectTabsBar({
           const p = projects.find((x) => x.id === id);
           if (p) onOpenProjectSettings(p);
         }}
+        onClose={closeProjectTab}
         onAddProject={() => setNewProjectOpen(true)}
         topRight={
           <>
@@ -127,6 +152,13 @@ export function ProjectTabsBar({
         <NewProjectDialog
           onClose={() => setNewProjectOpen(false)}
           onOpenFromFolder={() => void pickAndOpen("Open or create a project folder")}
+          // Reopen list: a project you closed is right here, one click away — you don't have to
+          // remember where its folder lives to get its tab back.
+          reopenable={reopenable.map((p) => ({ id: p.id, name: p.name, rootPath: p.rootPath }))}
+          onReopen={(id) => {
+            setNewProjectOpen(false);
+            openProjectTab(id);
+          }}
           // Clone & Open: create + select the cloned project's tab (no window question to ask).
           onCloned={(name, path) => openProjectTab(addProject(name, path))}
         />

@@ -293,6 +293,10 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     "composerHeight",
     "composerMinimized",
     "composerUserSized",
+    // Closable project tabs: which projects have a tab MUST survive a relaunch, or every close
+    // would silently undo itself on the next launch. Its default is `null` (never seeded = every
+    // project open), which is serializable, so it shows up in the blob from the very first write.
+    "openProjectIds",
     "pinnedProjectId",
     "themePref",
     "zoom",
@@ -402,5 +406,71 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
     expect(s.cloudCreateOpen).toBe(false);
     expect(s.zeroCreditBannerDismissed).toBe(false);
     expect(s.zeroCreditBannerDismissedFor).toBeNull();
+  });
+});
+
+// Closable project tabs: the open set is only meaningful if it OUTLIVES the process. A close that
+// silently undid itself on the next launch would be worse than no close at all, so the round trip
+// through the persisted blob gets its own assertions rather than riding on the key inventory above.
+describe("uiStore — the open project set survives a relaunch", () => {
+  // Restore everything this block touches, not just openProjectIds: the upgrade-path test below
+  // rehydrates a blob carrying themePref/composerHeight into a module-level singleton, and vitest's
+  // per-file isolation does not help a test appended after this one.
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({
+      openProjectIds: null,
+      themePref: "auto",
+      composerHeight: COMPOSER_DEFAULT,
+    });
+  });
+
+  it("writes the closed-tab decision to the blob and reads it back", async () => {
+    useUiStore.getState().setOpenProjectIds(["p1", "p3"]); // p2 closed
+    const written = localStorage.getItem("sparkle-ui") ?? "{}";
+    expect(JSON.parse(written).state.openProjectIds).toEqual(["p1", "p3"]);
+
+    // A fresh launch reading that blob. The in-memory reset has to come FIRST and the blob be put
+    // back AFTER it, because `setState` itself re-persists — resetting after capturing the blob
+    // would overwrite the very thing we are about to rehydrate from, and the test would pass or
+    // fail for reasons that have nothing to do with persistence.
+    useUiStore.setState({ openProjectIds: null });
+    localStorage.setItem("sparkle-ui", written);
+    await useUiStore.persist.rehydrate();
+    expect(useUiStore.getState().openProjectIds).toEqual(["p1", "p3"]);
+  });
+
+  it("preserves the [] vs null distinction across a rehydrate", async () => {
+    // [] ("I closed every tab") and null ("nothing has ever written this") mean opposite things:
+    // null must render every tab, [] must render none. Collapsing them on rehydrate would either
+    // resurrect every closed tab or blank the bar of someone who never closed anything.
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({ version: 2, state: { openProjectIds: [] } }),
+    );
+    await useUiStore.persist.rehydrate();
+    expect(useUiStore.getState().openProjectIds).toEqual([]);
+    expect(useUiStore.getState().openProjectIds).not.toBeNull();
+  });
+
+  it("stays null — never seeded — for an install that predates the feature", async () => {
+    // THE upgrade path, and the one outcome nobody may ship: an existing blob has no
+    // openProjectIds, and rehydrating it must leave the value null, which engine/openProjects reads
+    // as "every project is open". If the migration invented a `[]` here, every existing user's tab
+    // bar would come back empty after the update.
+    //
+    // The store starts at its launch default (null) rather than a planted sentinel on purpose:
+    // zustand merges `{...current, ...stored}`, so a key ABSENT from the blob keeps whatever is in
+    // memory — planting one would test the merge's passthrough, not the upgrade a real launch does.
+    useUiStore.setState({ openProjectIds: null });
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({ version: 2, state: { themePref: "dark", composerHeight: 200 } }),
+    );
+    await useUiStore.persist.rehydrate();
+    expect(useUiStore.getState().openProjectIds).toBeNull();
+    // Sanity: the blob really did rehydrate, so the null above isn't a no-op passing by default.
+    expect(useUiStore.getState().themePref).toBe("dark");
+    expect(useUiStore.getState().composerHeight).toBe(200);
   });
 });

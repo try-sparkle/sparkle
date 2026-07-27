@@ -205,6 +205,15 @@ interface UiState {
   pinnedProjectId: string | null;
   togglePinnedProject: (id: string) => void;
   setPinnedProject: (id: string | null) => void;
+  // Which projects currently have a TAB (engine/openProjects). "Exists in the project store" and
+  // "is open right now" are different facts: before this, every project the store had ever heard of
+  // rendered a tab forever, with no way to put one away. Persisted so a closed project stays closed
+  // across a relaunch — and NULLABLE, which is load-bearing: `null` means "nothing has written this
+  // yet", i.e. every existing install upgrading into the feature, and resolves to "everything is
+  // open" so nobody's tab bar blanks on upgrade. `[]` is the genuinely different state "the user
+  // closed the last tab". The rules live in the engine; the store just holds the value.
+  openProjectIds: string[] | null;
+  setOpenProjectIds: (ids: string[]) => void;
   // Whether the user has ✕'d the "$0 credit balance" banner (see ZeroCreditBanner). Transient —
   // NOT persisted (see partialize), so the warning returns on the next launch: the balance is
   // still zero and the AI extras are still dark, which the user deserves to be reminded of.
@@ -281,6 +290,8 @@ export const useUiStore = create<UiState>()(
       togglePinnedProject: (id) =>
         set((s) => ({ pinnedProjectId: s.pinnedProjectId === id ? null : id })),
       setPinnedProject: (id) => set({ pinnedProjectId: id }),
+      openProjectIds: null,
+      setOpenProjectIds: (ids) => set({ openProjectIds: ids }),
       zeroCreditBannerDismissed: false,
       zeroCreditBannerDismissedFor: null,
       dismissZeroCreditBanner: (userId) =>

@@ -126,7 +126,14 @@ beforeEach(() => {
     selectedProjectId: "p1",
   } as never);
   useRuntimeStore.setState({ openAgentIds: ["a1", "b1"], status: {} } as never);
-  useUiStore.setState({ activeSpecial: null, workMode: "build", pinnedProjectId: null } as never);
+  useUiStore.setState({
+    activeSpecial: null,
+    workMode: "build",
+    pinnedProjectId: null,
+    // Closable tabs: `null` = never seeded, i.e. every project is open. Reset per test so one
+    // block's close can't decide another's tab bar (uiStore is a module singleton).
+    openProjectIds: null,
+  } as never);
   useSettingsStore.setState({ beadsEnabled: true } as never);
   reattach.mockClear();
   reattach.mockResolvedValue([]);
@@ -252,6 +259,79 @@ describe("Workspace — project tabs drive the shell", () => {
     expect(useUiStore.getState().pinnedProjectId).toBe("p1"); // replaced, not added
     fireEvent.click(screen.getByTestId("pin-p1"));
     expect(useUiStore.getState().pinnedProjectId).toBeNull(); // pinning the pinned one unpins
+  });
+});
+
+// Closing a project tab is a VIEW operation, and this is the contract that makes that claim true.
+// A Terminal unmount kills its PTY with no scrollback replay, so if putting a project away tore its
+// panes down, the [x] would quietly destroy running work — the single worst way this feature could
+// go wrong. Pane mounting is driven by `projects` × the visited set × `openAgentIds` (Workspace's
+// `live` memo), and closing a tab writes none of them; these tests are what keep that true.
+describe("Workspace — closing a tab must not kill that project's agents", () => {
+  it("keeps a closed project's panes MOUNTED (its PTYs keep running)", async () => {
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    // Visit Beta so both projects have live panes, then come back to Alpha.
+    fireEvent.click(screen.getByTestId("tab-p2"));
+    fireEvent.click(screen.getByTestId("tab-p1"));
+    expect(screen.getByTestId("pane-b1")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("close-p2"));
+
+    expect(screen.queryByTestId("tab-p2")).toBeNull(); // the tab is gone…
+    expect(screen.getByTestId("pane-b1")).toBeTruthy(); // …the agent is not
+    expect(screen.getByTestId("pane-b1").dataset.visible).toBe("false");
+    // The runtime's open set is untouched, so nothing was stopped.
+    expect(useRuntimeStore.getState().openAgentIds).toContain("b1");
+  });
+
+  it("keeps the panes of the project you just closed AND were looking at", async () => {
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    fireEvent.click(screen.getByTestId("close-p1")); // closing the SELECTED tab
+    expect(useProjectStore.getState().selectedProjectId).toBe("p2");
+    expect(screen.getByTestId("pane-a1")).toBeTruthy();
+    expect(screen.getByTestId("pane-a1").dataset.visible).toBe("false");
+  });
+
+  it("keeps them mounted even when the LAST tab closes and there is no selection at all", async () => {
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    fireEvent.click(screen.getByTestId("tab-p2"));
+    fireEvent.click(screen.getByTestId("close-p1"));
+    fireEvent.click(screen.getByTestId("close-p2"));
+    expect(useProjectStore.getState().selectedProjectId).toBeNull();
+    expect(screen.queryAllByRole("tab")).toHaveLength(0);
+    // Both projects' agents are still alive behind the welcome screen.
+    expect(screen.getByTestId("pane-a1")).toBeTruthy();
+    expect(screen.getByTestId("pane-b1")).toBeTruthy();
+    expect(useRuntimeStore.getState().openAgentIds).toEqual(["a1", "b1"]);
+  });
+
+  it("shows the welcome hint — not a blank shell — once the last tab is closed", async () => {
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    fireEvent.click(screen.getByTestId("close-p1"));
+    fireEvent.click(screen.getByTestId("close-p2"));
+    expect(screen.getByText("Welcome to Sparkle")).toBeTruthy();
+    expect(screen.getByTestId("tab-add")).toBeTruthy(); // and the way back out of it
+  });
+
+  it("reopening a closed project shows its agent again, still the same live pane", async () => {
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    fireEvent.click(screen.getByTestId("tab-p2"));
+    const paneBefore = screen.getByTestId("pane-b1");
+    fireEvent.click(screen.getByTestId("close-p2"));
+    act(() => {
+      // The same call every reopen surface makes (the "+" dialog's list, a concierge alert, ⌘K).
+      useUiStore.getState().setOpenProjectIds(["p1", "p2"]);
+      useProjectStore.getState().selectProject("p2");
+    });
+    expect(screen.getByTestId("tab-p2")).toBeTruthy();
+    expect(screen.getByTestId("pane-b1").dataset.visible).toBe("true");
+    // Same DOM node throughout: the pane was never remounted, so the PTY was never restarted.
+    expect(screen.getByTestId("pane-b1")).toBe(paneBefore);
   });
 });
 

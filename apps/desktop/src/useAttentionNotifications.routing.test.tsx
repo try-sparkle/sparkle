@@ -7,7 +7,7 @@
 //   attention://focus-agent    → validate, raise, select the tab, mount + select the agent
 //   attention://select-project → validate, raise, select the tab, and touch NOTHING else
 //   attention://focus-tier     → raise and narrow the sidebar to a tier; mount NOTHING
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FocusAgentPayload, SelectProjectPayload } from "./services/attention";
 
@@ -109,6 +109,9 @@ beforeEach(() => {
   useRuntimeStore.setState({ openAgentIds: [] } as never);
   useUiStore.getState().setActiveSpecial(null);
   useUiStore.getState().setWorkMode("build");
+  // Closable tabs: `null` = never seeded, i.e. every project is open (uiStore is a module singleton,
+  // so the closed-tab cases below must not leak into the rest of the file).
+  useUiStore.setState({ openProjectIds: null } as never);
 });
 afterEach(cleanup);
 
@@ -120,6 +123,79 @@ describe("focus-agent routing", () => {
     expect(useProjectStore.getState().selectedProjectId).toBe("p2");
     expect(useProjectStore.getState().projects.find((p) => p.id === "p2")?.selectedAgentId).toBe("a2");
     expect(useRuntimeStore.getState().isOpen("a2")).toBe(true);
+  });
+
+  // Closable tabs. Rust posts the notification against whatever project was current at the time,
+  // and the user may have CLOSED that project's tab before clicking the banner. Revealing it must
+  // put the tab back — otherwise the workspace shows Alpha's agent while the tab bar has no Alpha
+  // tab and every tab reads aria-selected="false". Worse, it self-heals the wrong way: the next
+  // close of any other tab sees a selection with no tab, calls it stale, and yanks the user
+  // elsewhere (engine/openProjects.selectionAfterClose). This is the one "show me this project"
+  // path that does NOT go through openProjectTab — it routes via useReplaceCurrentProject.
+  it("reopens a CLOSED project's tab when its agent is revealed from a notification", async () => {
+    useUiStore.setState({ openProjectIds: ["p1"] } as never); // p2 closed
+    await mount();
+    onFocus!({ projectId: "p2", agentId: "a2" });
+    await waitFor(() => expect(useProjectStore.getState().selectedProjectId).toBe("p2"));
+    expect(useUiStore.getState().openProjectIds).toContain("p2");
+    expect(useRuntimeStore.getState().isOpen("a2")).toBe(true);
+  });
+
+  // The case the test above does NOT cover, and the one that was actually broken: the target
+  // project is closed but ALREADY SELECTED. The handler guards its setProject with
+  // `p.projectId !== mine`, so the reopen was skipped exactly when the guard said "nothing to do".
+  // Reachable via the tray, not theoretical: requestProjectTabFromOtherWindow writes
+  // selectedProjectId BEFORE emitting focus-agent, and projectStore is cross-window synced over
+  // synchronous storage — so the main window is already on that project when the event lands.
+  // Repro: close Beta's tab, then click Beta's agent row in the tray popover.
+  it("reopens a CLOSED project that is ALREADY the selected one", async () => {
+    // Order matters, and getting it wrong makes this test pass against the bug: the harness mounts
+    // AppBoot, whose boot selection REFUSES a closed project and would move the selection to p2 —
+    // restoring the `p.projectId !== mine` inequality and hiding the defect. So mount first, let
+    // boot settle, and only then reproduce the real sequence: the tray writes selectedProjectId
+    // (cross-window synced, synchronous storage) BEFORE emitting focus-agent, so the window is
+    // already sitting on the closed project when the event lands.
+    await mount();
+    act(() => {
+      useUiStore.setState({ openProjectIds: ["p2"] } as never); // p1 closed…
+      useProjectStore.setState({ selectedProjectId: "p1" } as never); // …and already selected
+    });
+    // ctx.current.projectId is now "p1", so the handler's guard is FALSE and its setProject —
+    // the only other markProjectOpen on this path — is skipped entirely.
+    onFocus!({ projectId: "p1", agentId: "a1" });
+    await waitFor(() => expect(useRuntimeStore.getState().isOpen("a1")).toBe(true));
+    // The reveal happened, so the tab must exist for it.
+    expect(useUiStore.getState().openProjectIds).toContain("p1");
+    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
+  });
+
+  it("reopens the tab for a STALE agent id too, because the window still lands on that project", async () => {
+    // A stale agent id doesn't reach selectAndOpen at all: `agentExists` fails, and the deferred
+    // branch falls through to `openProjectTab(p.projectId)` — the established "still raises and
+    // lands on its project, but opens no phantom agent" behaviour tested above. Since the window
+    // DOES land there, that project needs its tab; reopening is the consistent answer, not an
+    // over-reach. (markProjectOpen still sits after selectAndOpen's own `!agent` bail, which guards
+    // the narrower race where the agent vanishes between the exists-check and the reveal.)
+    useUiStore.setState({ openProjectIds: ["p2"] } as never); // p1 closed
+    useProjectStore.setState({ selectedProjectId: "p1" } as never);
+    await mount();
+    onFocus!({ projectId: "p1", agentId: "gone" });
+    await waitFor(() => expect(useUiStore.getState().openProjectIds).toContain("p1"));
+    // …and no phantom agent was mounted on the way.
+    expect(useRuntimeStore.getState().isOpen("gone")).toBe(false);
+  });
+
+  it("reopens a CLOSED project when the reveal is DEFERRED until it rehydrates", async () => {
+    // Same contract on the late-arrival branch, which lands through a different call site.
+    useUiStore.setState({ openProjectIds: ["p1", "p2"] } as never); // "late-p" is not open
+    await mount();
+    onFocus!({ projectId: "late-p", agentId: "late-a" });
+    await new Promise((r) => setTimeout(r, 20));
+    useProjectStore.setState({
+      projects: [...useProjectStore.getState().projects, mkProject("late-p", [mkAgent("late-a")])],
+    } as never);
+    await waitFor(() => expect(useProjectStore.getState().selectedProjectId).toBe("late-p"));
+    expect(useUiStore.getState().openProjectIds).toContain("late-p");
   });
 
   it("reveals an agent in the CURRENT project without re-selecting the tab", async () => {

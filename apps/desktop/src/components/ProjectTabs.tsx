@@ -9,7 +9,7 @@
 
 import { type CSSProperties, type KeyboardEvent, type ReactNode, useEffect } from "react";
 import { MdOutlinePushPin } from "react-icons/md";
-import { FiPlus } from "react-icons/fi";
+import { FiPlus, FiX } from "react-icons/fi";
 import type { StatusBand } from "../engine/buildSections";
 import { bandColor, bandCountLabel } from "../engine/statusBandLabels";
 import { C } from "../theme/colors";
@@ -33,9 +33,20 @@ export interface ProjectTabsProps {
   /** Double-click a tab → that project's settings (rename / move). This is where the old TopBar's
    *  project button lived; omit it and a double-click is just two selects. */
   onOpenSettings?: (projectId: string) => void;
+  /** Close a project's tab — put the project away WITHOUT deleting it (deleting lives in project
+   *  settings). Omit it and tabs render with no close control at all, which is what the pre-close
+   *  tab bar was. */
+  onClose?: (projectId: string) => void;
   onAddProject?: () => void;
   /** Top-right cluster (kebab menu + avatar) rendered flush-right in the tab bar. */
   topRight?: ReactNode;
+}
+
+/** The close button's accessible name. Names the PROJECT, so a screen reader hears "Close Alpha"
+ *  rather than N identical "Close" buttons — and says what closing does not do, because "×" next to
+ *  a project is otherwise easy to read as "delete this project". */
+export function closeTitle(projectName: string): string {
+  return `Close ${projectName} — the project and its agents are kept`;
 }
 
 /** The pin tooltip describes what pinning DOES — asymmetric copy for pin vs unpin. */
@@ -78,6 +89,15 @@ const TAB_STYLES = `
 .concierge-tab:hover .concierge-tab-pin:not([data-pinned="true"]),
 .concierge-tab:focus-within .concierge-tab-pin:not([data-pinned="true"]) { opacity: .65; }
 .concierge-tab-pin[data-pinned="true"] { opacity: 1; transform: rotate(45deg); }
+/* The close ×, same hover-reveal as the pin so an idle bar stays quiet — except on the ACTIVE tab,
+   where it is always visible (the tab you're on is the one you're most likely to want to put away,
+   and a permanently-hidden control is an undiscoverable one). :focus-within covers the keyboard
+   path: tabbing to the button reveals it, so focus is never on something invisible. */
+.concierge-tab-close { opacity: 0; transition: opacity .13s; }
+.concierge-tab:hover .concierge-tab-close,
+.concierge-tab:focus-within .concierge-tab-close { opacity: .65; }
+.concierge-tab-close[data-active="true"] { opacity: .8; }
+.concierge-tab-close:hover, .concierge-tab-close:focus-visible { opacity: 1 !important; }
 `;
 function ensureTabStyles(): void {
   if (typeof document === "undefined" || document.getElementById(STYLE_ID)) return;
@@ -112,6 +132,7 @@ export function ProjectTabs({
   onSelect,
   onTogglePin,
   onOpenSettings,
+  onClose,
   onAddProject,
   topRight,
 }: ProjectTabsProps) {
@@ -218,6 +239,41 @@ export function ProjectTabs({
                 {/* "1 Needs you" / "3 Need you" — the shared helper owns the agreement. */}
                 {bandCountLabel(band, counts![band])}
               </span>
+            )}
+            {onClose && (
+              <button
+                type="button"
+                className="concierge-tab-close"
+                data-active={active}
+                title={closeTitle(p.name)}
+                aria-label={closeTitle(p.name)}
+                data-testid={`close-${p.id}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onClose(p.id);
+                }}
+                // Both handlers stop the event reaching the tab. A <button> turns Enter/Space into
+                // a click, and BOTH events bubble to the tab's own onClick/onKeyDown — so without
+                // this, activating × would also fire onSelect on the tab being closed.
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+                }}
+                // A double-click on × must not also open project settings (the tab's onDoubleClick).
+                onDoubleClick={(e) => e.stopPropagation()}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  lineHeight: 0,
+                  background: "transparent",
+                  border: "none",
+                  padding: 0,
+                  marginLeft: -2,
+                  cursor: "pointer",
+                  color: active ? C.cream : C.muted,
+                }}
+              >
+                <FiX size={13} />
+              </button>
             )}
           </div>
         );
