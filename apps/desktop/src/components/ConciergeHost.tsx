@@ -23,13 +23,20 @@
 //   • routing failure falls back to `sparkle`, the recoverable direction (the router's own rule);
 //   • sends are SERIALIZED (enqueue), because routing is a network round trip and two messages
 //     sent in quick succession would otherwise reach the PTY out of submit order.
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import {
   ConciergeColumn,
   deriveWordmarkMode,
   receiptText,
   type ConciergeAnnouncement,
-  type ConciergeAttachKind,
   type ConciergeDigestMessage,
   type ConciergeMessage,
   type ConciergeNudge,
@@ -40,6 +47,7 @@ import {
 } from "./Concierge";
 import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";
 import type { ConciergeAgent, ConciergeFeed } from "../useConciergeFeed";
+import type { AgentTabStatus } from "../types";
 import { bandCountLabel, bandLabel } from "../engine/statusBandLabels";
 import { oneLine } from "./promptHistory";
 import { openProjectTab } from "../services/openProjectTab";
@@ -58,6 +66,17 @@ import {
   type ConciergeDispatchPath,
   type ConciergeDispatchResult,
 } from "../services/conciergeDispatch";
+import type { DispatchAuthority } from "../services/dispatchAuthority";
+import {
+  armIntent,
+  armedIntents,
+  cancelIntent,
+  confirmIntent,
+  countdownAnnouncement,
+  resumeQueuedIntents,
+  subscribeIntents,
+} from "../services/dispatchIntent";
+import { CountdownBanner } from "./Concierge/CountdownBanner";
 import { routeMessage } from "../services/conciergeRouter";
 import { buildDigest } from "../services/conciergeDigest";
 import { createArrivalOrder, orderByArrival } from "../engine/conciergeStreamOrder";
@@ -75,6 +94,18 @@ import { maybePauseOnSubmit } from "../services/dictationControls";
 import { useConciergeDictation } from "../useConciergeDictation";
 import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { usePresenceStore, type PresenceMode } from "../stores/presenceStore";
+// `setConciergeChat` is aliased to `setChat` AT THE IMPORT so it stays module-scoped: that is what
+// keeps `react-hooks/exhaustive-deps` from demanding it in five dependency arrays below (a store
+// setter isn't on the rule's known-stable list the way `useState`'s is, even though this one never
+// changes identity). See the store for the full reasoning.
+import { useConciergeThread, setConciergeChat as setChat } from "../stores/conciergeThreadStore";
+import {
+  buildRecap,
+  recapSummary,
+  type AwaySnapshot,
+  type RecapAgentInfo,
+} from "../services/conciergeRecap";
 
 let seq = 0;
 const nextId = (p: string) => `${p}-${(seq += 1)}`;
@@ -192,6 +223,14 @@ function refusalCopy(path: RefusedPath | null, name: string, voice: RefusalVoice
       return approving
         ? `${name} is asking something I can't answer with a plain "approve" — open it to choose.`
         : `${name} is waiting on a choice I can't map that to — open it and pick, or answer with just the option.`;
+    case "unauthorized":
+      // Should be unreachable: `authority` is required and non-defaulted, so a call site that omits
+      // it does not compile. Reachable only if a malformed authority is built dynamically — a bug,
+      // not a user error. Say the honest thing (it did NOT send) without inventing a remedy the
+      // user could act on, and let the log line carry the diagnosis.
+      return approving
+        ? `Something went wrong on my side, so I didn't send the approval to ${name}.`
+        : `Something went wrong on my side, so I didn't send that to ${name}. Try again.`;
     // No bespoke line: "empty" is a blank answer the UI already swallows, and "expired"/"abandoned"
     // are DEFERRED outcomes reported by the onDeferredSendOutcome effect below, never returned to a
     // caller synchronously. They are listed rather than folded into `default` on purpose — `default`
@@ -211,6 +250,36 @@ function refusalCopy(path: RefusedPath | null, name: string, voice: RefusalVoice
 /** Flatten every agent across the feed (used to resolve a nudge back to its source agent). */
 function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
   return feed.projects.flatMap((p) => p.agents);
+}
+
+/**
+ * The fleet's statuses AS THE CARDS SEE THEM, for the Away recap's two edges.
+ *
+ * Read from the FEED, never from `runtimeStore.status`, and that is the whole point (roborev
+ * 53631-H2). The feed's per-agent status is the DERIVED/published one — the cross-window merged
+ * roster plus the unstarted-worker, red-worker, unmerged and dismissed-alert overlays
+ * (services/conciergeFeed → publishedStatusFor) — and it is what every `statusLabel` and every
+ * nudge card in this thread already speaks. Diffing the raw store against feed-supplied labels made
+ * them two vocabularies, with two visible failures:
+ *
+ *   • `runtimeStore.status` only holds agents THIS window hosts (useConciergeFeed), so a
+ *     roster-fed agent was absent from BOTH sides of the diff and `newlyEntered` skipped it — the
+ *     recap said nothing about an agent in another window that went `waiting` while the same
+ *     thread rendered a nudge card for it. On a concierge column pinned to a project this window
+ *     does not host, the recap could never fire at all.
+ *   • A red the user had DISMISSED reads de-escalated (`idle`/`stopped`) in the feed but still
+ *     `waiting` in the raw store, so the recap filed it under "Wants you" while printing the feed's
+ *     "Done — your turn" beside it — resurfacing an alarm the user had explicitly silenced.
+ *
+ * Building both sides here makes status, label and card one vocabulary by construction, and picks
+ * up cross-window agents for free.
+ */
+function feedStatuses(feed: ConciergeFeed): Omit<AwaySnapshot, "at"> {
+  const agents = allAgents(feed);
+  return {
+    status: Object.fromEntries(agents.map((a): [string, AgentTabStatus] => [a.id, a.status])),
+    agentIds: agents.map((a) => a.id),
+  };
 }
 
 /** EVERYTHING column one accounts for right now: in scope, un-muted, needing you, and not already
@@ -353,11 +422,23 @@ export function ConciergeHost({
   // building. Assign-once semantics keep a digest that flickers (a group needs >= 2 agents, so it
   // collapses at 1 and re-forms at 2) from leaping to the bottom of the thread each time.
   const arrivalRef = useRef(createArrivalOrder());
+  // Agents seen WORKING during the current away stretch — the recap's evidence that a finish was
+  // real rather than an overlay repopulating (services/conciergeRecap.buildRecap sawWorking,
+  // roborev 53669-M). Accumulated here because this effect is the only thing that observes the
+  // MIDDLE of the stretch: the feed keeps updating while the window is blurred, whereas the
+  // presence subscription only ever sees its two ends. Cleared at both edges by the recap effect.
+  const sawWorking = useRef<Set<string>>(new Set());
   useEffect(() => {
     feedRef.current = feed;
+    if (usePresenceStore.getState().mode !== "away") return;
+    for (const a of allAgents(feed)) if (a.status === "working") sawWorking.current.add(a.id);
   }, [feed]);
 
-  const [chat, setChat] = useState<ConciergeMessage[]>([]);
+  // The thread lives in a persisted store, not component state, so it SURVIVES AN APP RESTART
+  // (spec §3 subsystem C2). `setChat` is the module-scoped setter imported above and keeps the same
+  // signature, so every `setChat((prev) => …)` below is unchanged — see stores/conciergeThreadStore
+  // for what reaches disk (conversation only; digests, nudges and the recap card are feed-derived).
+  const chat = useConciergeThread();
   // What the thread's hidden live region says. Written ONLY with finished lines — a completed brain
   // reply, or a status notice — because a value that changed per streamed chunk would hand a screen
   // reader one announcement per delta, the flooding this region exists to avoid (roborev 53010).
@@ -408,8 +489,30 @@ export function ConciergeHost({
   // Monotonic send counter: lets an async send outcome know whether it is still the latest turn.
   const sendSeqRef = useRef(0);
 
+  // The compose box's own insert fn, kept so a send that dies AFTER the box already cleared can put
+  // the user's words back. See `restoreDraft`.
+  const insertRef = useRef<((text: string) => void) | null>(null);
+
+  /**
+   * Put a draft back in the compose box.
+   *
+   * Arming changed WHEN the box clears relative to when a send actually lands. `deliver` now
+   * resolves true the moment an intent is armed, so ComposeBox has cleared long before a countdown
+   * is cancelled or its delivery fails — its own "onSend resolved false → restore" path can no
+   * longer cover either case, and without this the user silently loses what they typed.
+   *
+   * Best-effort by construction: an unmounted box simply drops it, and the words are still visible
+   * in the thread bubble regardless. Takes the TYPED text, never the payload — restoring quoted
+   * attachment temp paths into the box would be the leak roborev 46911/46925 removed.
+   */
+  const restoreDraft = useCallback((text: string) => {
+    if (text.trim() === "") return;
+    insertRef.current?.(text);
+  }, []);
+
   const registerInsert = useCallback(
     (append: ((text: string) => void) | null) => {
+      insertRef.current = append;
       // A box going away takes the latch with it (roborev 46922): the ComposeBox resets its own
       // `text` on remount, and a latch that outlived the words that set it would make the next
       // TYPED turn look dictated.
@@ -574,7 +677,10 @@ export function ConciergeHost({
         next[i] = {
           ...cur,
           kind: "sparkle",
-          text: replace ? text : (cur.text ?? "") + text,
+          // `cur` is always the sparkle bubble for this turn — it was found by the turn's own key —
+          // but the union now contains a variant with no `text` at all (the recap card), so the
+          // narrowing has to be explicit rather than a defensive `?? ""`.
+          text: replace ? text : (cur.kind === "sparkle" ? cur.text : "") + text,
           speakable: true,
         };
         return next;
@@ -700,6 +806,65 @@ export function ConciergeHost({
     announce(text);
   }, [announce]);
 
+  // ── Return-from-Away recap (design §3 A5) ────────────────────────────────────────────────────
+  // Snapshot the fleet's statuses the moment presence goes Away; on the way back, diff and post one
+  // card. Subscribed imperatively rather than through the `usePresenceStore` hook because this is an
+  // EDGE, not a value we render: a hook would re-run the effect on every unrelated store write and
+  // would give us the new mode without the old one.
+  const awaySnapshot = useRef<AwaySnapshot | null>(null);
+  useEffect(() => {
+    const onPresence = (mode: PresenceMode, prevMode: PresenceMode) => {
+      if (mode === prevMode) return;
+      if (mode === "away") {
+        awaySnapshot.current = { ...feedStatuses(feedRef.current), at: Date.now() };
+        // A fresh stretch starts with no evidence — anything seen working during the LAST one
+        // would otherwise vouch for a finish in this one.
+        sawWorking.current = new Set();
+        return;
+      }
+      // The user is back — start draining any sends the precedence rule held while they were out.
+      // BEFORE the recap's early return below: a held send must come back whether or not anything
+      // else changed in the fleet, and `resumeQueuedIntents` presents only the HEAD (the next
+      // follows as each resolves), so this can never stack countdowns nobody is watching.
+      resumeQueuedIntents();
+
+      const snapshot = awaySnapshot.current;
+      awaySnapshot.current = null;
+      const worked = sawWorking.current;
+      sawWorking.current = new Set();
+      if (!snapshot) return; // came back Here without ever having gone Away through this host
+      // Names come from the LIVE feed, not the snapshot: a rename while the user was out should
+      // show the name they'll actually see when they go looking.
+      const info: Record<string, RecapAgentInfo> = {};
+      for (const a of allAgents(feedRef.current)) {
+        info[a.id] = { name: a.name, projectName: a.projectName, statusLabel: a.statusLabel };
+      }
+      const recap = buildRecap({
+        snapshot,
+        // The SAME map, rebuilt from the feed on the return edge — see feedStatuses.
+        next: feedStatuses(feedRef.current).status,
+        info,
+        // Middle-of-the-stretch evidence, so an agent that started AND finished while you were out
+        // is reported even though both its endpoints look resting.
+        sawWorking: worked,
+        // NO_GATE_DECISIONS — the integration seam. The gate that logs sent/queued/cancelled while
+        // Away lives on the sibling A1 branch; wiring it is replacing this literal with that log
+        // filtered to `at >= snapshot.at`. See services/conciergeRecap.GateDecision.
+        decisions: [],
+        now: Date.now(),
+        id: nextId("recap"),
+      });
+      // Null when nothing happened — no card at all. A recap that always appears is chrome the user
+      // learns to skip, and we'd lose the one time it matters.
+      if (!recap) return;
+      setChat((prev) => [...prev, recap]);
+      // Through the column's EXISTING single role="status" node — never a live region on the card.
+      // A second region double-announces (learned during the auto-routing work).
+      announce(recapSummary(recap));
+    };
+    return usePresenceStore.subscribe((s, prev) => onPresence(s.mode, prev.mode));
+  }, [announce]);
+
   // Files that rode a QUEUED send, per agent, oldest first. A queued send resolves ok:TRUE (it is
   // held, not lost), so the synchronous restore below never runs for it — and if the hold later
   // ages out or the terminal dies, the thread says "Send it again" while the attachments have
@@ -753,7 +918,11 @@ export function ConciergeHost({
         // main has always shown for the throwing path to the generic refusal.
         const r = await enqueue<ConciergeDispatchResult | "threw" | null>(
           () =>
-            dispatchConciergeAnswer(a.id, "approve", { userPrompt: false }).catch(
+            // The user clicked Approve on a nudge card — the gesture IS the authorization.
+            dispatchConciergeAnswer(a.id, "approve", {
+              authority: { kind: "nudge-approve", agentId: a.id },
+              userPrompt: false,
+            }).catch(
               () => "threw" as const,
             ),
           null,
@@ -810,9 +979,15 @@ export function ConciergeHost({
        *  REQUIRED, so a future call site has to decide rather than inherit a default that is wrong
        *  for it. */
       announceSuccess: boolean,
+      /** WHY this text may reach the agent's terminal (services/dispatchAuthority). REQUIRED and
+       *  non-defaulted — that requirement IS the forwarding-bug fix, so a default here would undo
+       *  the whole gate at the one call site that matters most. Appended rather than inserted so
+       *  the diff against a branch that also edits this file stays as small as possible. */
+      authority: DispatchAuthority,
     ): Promise<boolean> => {
       try {
         const r = await dispatchConciergeAnswer(target.agentId, text, {
+          authority,
           userPrompt: true,
           ...renderings,
         });
@@ -1000,29 +1175,126 @@ export function ConciergeHost({
         // A prompt into an agent's terminal produces no brain reply, so nothing is queued to be
         // spoken — leaving the flag set would autoplay the NEXT brain turn the user typed.
         voiceTurnRef.current = false;
-        // announceSuccess: false — the receipt below already reads "→ Sent to <agent>".
-        const ok = await promptAgent(aim, payload, { display, namingBasis: text }, staged, false);
-        // A FAILED delivery gets no receipt: promptAgent has already said what went wrong in the
-        // thread, and "→ Sent to X" over a message that never arrived would be a plain lie.
-        if (ok) {
-          setReceipt(id, {
-            target: "agent",
-            agentName: aim.name,
-            agentId: aim.agentId,
-            redirectable: true,
-          });
-          return true;
-        }
-        // A failed delivery must not cost the user their files any more than their words — nor
-        // the fact that they SPOKE them. The box puts the draft back, and a restored draft that
-        // reads as typed would silently never be spoken (roborev 46922/48172/49293).
-        restoreAttachments(staged);
-        // RE-ARM only — never clear (roborev 52363): the user may have dictated fresh speech into
-        // the box while this send was in flight, and `spokenTurn === false` would wipe a latch
-        // that belongs to those newer words. And only while THIS send is still the latest: a turn
-        // sent after it has already made its own classification (roborev 52362).
-        if (spokenTurn && sendSeqRef.current === mySend) dictatedRef.current = true;
-        return false;
+
+        // ══ THE FORWARDING-BUG FIX ══════════════════════════════════════════════════════════════
+        // This used to dispatch, right here, on the router's verdict alone — an agent with a live
+        // prompt plus terse concierge-aimed text matched `looksLikeAnswer` and the user's words went
+        // into a terminal with no warning and no way back. The router is RIGHT to be here (see
+        // conciergeRouter's header, and PRs #644/#651 — it and all of its tests stay); what was
+        // wrong was that its verdict went straight to the PTY.
+        //
+        // So it now ARMS an intent instead. The send becomes visible, counts down, and can be
+        // cancelled; only an expiry the user didn't stop dispatches, and it does so carrying
+        // `{ kind: "countdown", intentId }`. That is why there is no `router` arm in
+        // DispatchAuthority and must never be one — a heuristic verdict is not a user gesture, and
+        // the union having no legal variant for it is what makes the old behavior unrepresentable
+        // rather than merely discouraged.
+        const armed = armIntent({
+          text: payload,
+          // The BANNER and the live region quote this, never `payload`. `attachedPayload` prefixes
+          // each attachment's quoted temp path, so quoting it would make the column announce
+          // `I'll tell Kraken Auth: "'/var/folders/x9/T/sparkle-shot-1753.png' what is wrong here?"`
+          // — the exact leak the "temp paths must never reach any of them but the first" invariant
+          // above forbids. Same string that goes to promptAgent's `display` a few lines down.
+          display,
+          targetAgentId: aim.agentId,
+          targetName: aim.name,
+          // ══ PRESENCE ════════════════════════════════════════════════════════════════════════
+          // The REAL store, read at expiry rather than captured at arm time — the user can walk
+          // away during the very seconds the countdown is running, which is the window the
+          // precedence rule exists to cover. `mode` is stored, not derived, so this is a plain
+          // synchronous field read (see stores/presenceStore's header).
+          //
+          // This used to be the literal `() => "here"` while the presence store lived on a
+          // parallel branch. That was fail-OPEN: forgetting this line produced no type error and
+          // no red test, and destructive sends fired at an unattended machine. `presence` is a
+          // required field for that reason — do not give it a default.
+          presence: () => usePresenceStore.getState().mode,
+          onDispatch: (_intent, authority) => {
+            // Through the queue, so a send that armed first still lands first — the countdown must
+            // not silently reorder messages relative to an Approve or a redirect.
+            void enqueue(async () => {
+              // Seconds have passed since the route decision. The agent can be closed inside the
+              // countdown window, and dispatching at a corpse would report a delivery that cannot
+              // happen — the same re-check `deliver` does around the route call, for the same
+              // reason and over a much wider gap.
+              if (!agentStillExists(aim.agentId)) {
+                postSparkle(`${aim.name} isn't open any more, so I didn't send that.`);
+                restoreDraft(text);
+                restoreAttachments(staged);
+                if (spokenTurn && sendSeqRef.current === mySend) dictatedRef.current = true;
+                return false;
+              }
+              // announceSuccess: false — the receipt below already reads "→ Sent to <agent>".
+              const ok = await promptAgent(
+                aim,
+                payload,
+                { display, namingBasis: text },
+                staged,
+                false,
+                authority,
+              );
+              // A FAILED delivery gets no receipt: promptAgent has already said what went wrong in
+              // the thread, and "→ Sent to X" over a message that never arrived would be a plain lie.
+              if (ok) {
+                setReceipt(id, {
+                  target: "agent",
+                  agentName: aim.name,
+                  agentId: aim.agentId,
+                  redirectable: true,
+                });
+                return true;
+              }
+              // A failed delivery must not cost the user their files any more than their words —
+              // nor the fact that they SPOKE them (roborev 46922/48172/49293).
+              restoreDraft(text);
+              restoreAttachments(staged);
+              // RE-ARM only — never clear (roborev 52363): the user may have dictated fresh speech
+              // while this send was in flight, and `spokenTurn === false` would wipe a latch that
+              // belongs to those newer words. And only while THIS send is still the latest
+              // (roborev 52362).
+              if (spokenTurn && sendSeqRef.current === mySend) dictatedRef.current = true;
+              return false;
+            }, false);
+          },
+          // The precedence rule held it: destructive, and nobody is at the machine. Say so plainly
+          // — a queued action the user never hears about is its own silent failure, the mirror of
+          // the one this whole change removes.
+          //
+          // NOTHING IS RESTORED HERE, and that is the point of the change. This used to hand the
+          // draft and the files back and tell the user to send again, which is a DROP dressed up
+          // as a hold: their message was gone. The intent now survives in the queue owning both
+          // the text and `staged` (still captured by the dispatch closure above), and comes back
+          // in front of them when they return. Restoring the draft as well would duplicate the
+          // message and re-stage files the pending send is still holding.
+          onQueue: () => {
+            postSparkle(
+              `That looked like it could break something and you were away, so I'm holding it rather than sending it to ${aim.name}. I'll bring it back when you return.`,
+            );
+          },
+          // Back from the queue and in front of the user again. Feed the column's ONE live region:
+          // a re-presented send nobody announces is exactly as silent as the bug this fixes.
+          onRepresent: (intent) => {
+            announce(countdownAnnouncement(intent, Date.now()));
+          },
+          onCancel: () => {
+            // Everything the send was carrying comes back — the draft, the files, and the
+            // spoken-turn latch — for exactly the reasons the failure path above restores them.
+            // Cancelling must cost the user nothing, or they learn not to use the button.
+            restoreDraft(text);
+            restoreAttachments(staged);
+            if (spokenTurn && sendSeqRef.current === mySend) dictatedRef.current = true;
+            postSparkle(`Okay — I didn't send that to ${aim.name}.`);
+          },
+        });
+        // Feed the column's ONE live region (see setReceipt): a countdown a screen-reader user
+        // can't hear is a countdown they can't cancel. Through `announce`, never `setAnnouncement`
+        // — two identical consecutive sends to the same agent produce the same sentence, and a bare
+        // setState React bails out of would swallow the repeat (roborev 53392).
+        announce(countdownAnnouncement(armed, Date.now()));
+        // TRUE — the text is in hand: armed, visible, and cancellable. The box clears its draft, and
+        // the cancel/failure paths above are what put it (and the files) back if it never lands.
+        return true;
       }
       // The BRAIN gets the payload, not the bare text: the concierge's headless `claude -p` reads
       // attachment paths from disk exactly as an agent does (services/conciergeAttach), so
@@ -1039,7 +1311,17 @@ export function ConciergeHost({
       });
       return true;
     },
-    [askSparkle, promptAgent, setReceipt, agentStillExists, restoreAttachments],
+    [
+      askSparkle,
+      promptAgent,
+      setReceipt,
+      agentStillExists,
+      restoreAttachments,
+      restoreDraft,
+      enqueue,
+      postSparkle,
+      announce,
+    ],
   );
 
   /**
@@ -1159,7 +1441,13 @@ export function ConciergeHost({
         // No files are staged for a redirect — they rode the original send and were consumed
         // there — so nothing can be held or handed back, and `[]` is the honest argument.
         const ok = await enqueue(
-          () => promptAgent(aim, replay, { display: text, namingBasis: text }, [], false),
+          () =>
+            // The user tapped redirect on this message's routing receipt. Authorized by that tap,
+            // and named by the message it belongs to.
+            promptAgent(aim, replay, { display: text, namingBasis: text }, [], false, {
+              kind: "redirect",
+              receiptId: messageId,
+            }),
           false,
         );
         if (ok) setReceipt(messageId, { ...receipt, alsoSentTo: "agent", redirectable: false });
@@ -1259,6 +1547,13 @@ export function ConciergeHost({
     return feed.projects.find((p) => p.id === feed.pinnedProjectId)?.name;
   }, [feed]);
 
+  // Sends that are armed and counting down (services/dispatchIntent). A module-level registry
+  // rather than component state on purpose: an intent must outlive any one render and must not be
+  // lost if this host re-mounts mid-countdown, which would strand a timer with no way to cancel it.
+  // `armedIntents` returns a snapshot with STABLE identity between mutations — a fresh array per
+  // call would make useSyncExternalStore re-render forever.
+  const pendingIntents = useSyncExternalStore(subscribeIntents, armedIntents, armedIntents);
+
   // NOTE (bead sparkle-y4ft): `messages` below gets a fresh ARRAY IDENTITY on every feed tick —
   // this memo is keyed on `feed`, which changes whenever any agent's status or a scoped count
   // moves, and clicking an item ticks the feed. ConciergeThread must therefore never treat a new
@@ -1304,46 +1599,64 @@ export function ConciergeHost({
   }, [feed, chat, typing, pinnedProjectName, attachments, dropActive]);
 
   return (
-    <ConciergeColumn
-      model={model}
-      controller={controller}
-      micLive={micLive}
-      wordmarkMode={deriveWordmarkMode(micLive, typing)}
-      width={width}
-      searchSlot={searchSlot}
-      // KEYED BY AGENT. useSuggestions owns one agent per instance by design; a shared instance
-      // with a changing id kept the previous agent's buttons on screen and would write their
-      // keystroke into the newly-selected agent's PTY. See ConciergeSuggestions' header.
-      //
-      // Keyed off `target`, NOT `routingTarget`: the engine must keep running while the user looks
-      // at the Plan board (auto-approve lives inside the hook). Only the ROW follows the view.
-      suggestionsSlot={
-        target ? (
-          <ConciergeSuggestions
-            key={target.agentId}
-            agentId={target.agentId}
-            agentName={target.name}
-            visible={promptTargetShown}
-            // QUEUE ONCE. onApply wraps the WHOLE action, so the delivery it calls must NOT queue
-            // again: applySuggestion awaits deliverPrompt from inside the chain, and a second
-            // enqueue would chain onto the very promise that is awaiting it. Circular wait — broken
-            // only by the task timeout, i.e. a 30s stall of every send, redirect and Approve, and
-            // then a keystroke arriving anyway (roborev 53196).
-            onApply={(run) => enqueue(run, false)}
-            // announceSuccess: TRUE — a suggestion click posts no receipt, so without this a
-            // delivered recommended action would be the one silent success in the column.
-            onDeliverPrompt={(t) =>
-              promptAgent(target, t, { display: t, namingBasis: t }, [], true)
-            }
-            onFailure={postSparkle}
+    <>
+      <ConciergeColumn
+        model={model}
+        controller={controller}
+        micLive={micLive}
+        wordmarkMode={deriveWordmarkMode(micLive, typing)}
+        width={width}
+        searchSlot={searchSlot}
+        // Armed sends, each cancellable, directly above the box. `cancelIntent` runs the arm site's
+        // own onCancel (which restores the files and posts to the thread), so the controller here
+        // has nothing to remember — see services/dispatchIntent.
+        countdownSlot={
+          <CountdownBanner
+            intents={pendingIntents}
+            onCancel={cancelIntent}
+            onConfirm={confirmIntent}
           />
-        ) : null
-      }
-      interim={dictation.interim}
-      registerInsert={registerInsert}
-      speakingMessageId={speakingId}
-      onTextEdit={onTextEdit}
-      announcement={announcement}
-    />
+        }
+        interim={dictation.interim}
+        registerInsert={registerInsert}
+        speakingMessageId={speakingId}
+        onTextEdit={onTextEdit}
+        announcement={announcement}
+      />
+      {/* The recommended-action pill. Mounted HERE — where its delivery wiring lives — but it
+          renders over the target agent's terminal, which it reaches by portal (see
+          ConciergeSuggestions). It was a `suggestionsSlot` in the column until the pill moved onto
+          the terminal; a fragment sibling costs no layout, since a portal renders elsewhere.
+          KEYED BY AGENT. useSuggestions owns one agent per instance by design; a shared instance
+          with a changing id kept the previous agent's buttons on screen and would write their
+          keystroke into the newly-selected agent's PTY. See ConciergeSuggestions' header.
+
+          Keyed off `target`, NOT `routingTarget`: the engine must keep running while the user looks
+          at the Plan board (auto-approve lives inside the hook). Only the PILL follows the view. */}
+      {target ? (
+        <ConciergeSuggestions
+          key={target.agentId}
+          agentId={target.agentId}
+          agentName={target.name}
+          visible={promptTargetShown}
+          // QUEUE ONCE. onApply wraps the WHOLE action, so the delivery it calls must NOT queue
+          // again: applySuggestion awaits deliverPrompt from inside the chain, and a second
+          // enqueue would chain onto the very promise that is awaiting it. Circular wait — broken
+          // only by the task timeout, i.e. a 30s stall of every send, redirect and Approve, and
+          // then a keystroke arriving anyway (roborev 53196).
+          onApply={(run) => enqueue(run, false)}
+          // announceSuccess: TRUE — a suggestion click posts no receipt, so without this a
+          // delivered recommended action would be the one silent success in the column.
+          // The user clicked a recommended-action pill — an explicit, targeted gesture.
+          onDeliverPrompt={(t) =>
+            promptAgent(target, t, { display: t, namingBasis: t }, [], true, {
+              kind: "suggestion",
+              agentId: target.agentId,
+            })
+          }
+          onFailure={postSparkle}
+        />
+      ) : null}
+    </>
   );
 }

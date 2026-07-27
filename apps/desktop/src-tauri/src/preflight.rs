@@ -623,22 +623,61 @@ pub struct ClaudeSessionInfo {
     latest_session_id: Option<String>,
 }
 
+impl ClaudeSessionInfo {
+    /// Nothing found (also the best-effort result when the probe task dies).
+    fn none() -> Self {
+        ClaudeSessionInfo { has_session: false, latest_session_id: None }
+    }
+
+    fn from_probe((has_session, latest_session_id): (bool, Option<String>)) -> Self {
+        ClaudeSessionInfo { has_session, latest_session_id }
+    }
+}
+
 #[tauri::command]
 pub async fn claude_session_info(
     worktree_path: String,
     config_dir: Option<String>,
 ) -> ClaudeSessionInfo {
     tauri::async_runtime::spawn_blocking(move || {
-        let latest = crate::claude::claude_latest_session_id_sync(
+        ClaudeSessionInfo::from_probe(crate::claude::claude_session_info_sync(
             &worktree_path,
             config_dir.as_deref(),
-        );
-        let has_session =
-            crate::claude::claude_has_session_sync(&worktree_path, config_dir.as_deref());
-        ClaudeSessionInfo { has_session, latest_session_id: latest }
+        ))
     })
     .await
-    .unwrap_or(ClaudeSessionInfo { has_session: false, latest_session_id: None })
+    .unwrap_or_else(|_| ClaudeSessionInfo::none())
+}
+
+/// The same probe, aimed at the CONCIERGE's conversation instead of an agent worktree's.
+///
+/// The concierge is not a worktree agent, which is the only reason this needs its own command: it
+/// runs headless `claude -p` with its cwd set to Sparkle's app-data dir (`concierge.rs` →
+/// `dev_identity::app_data_dir`), so Claude Code files its transcripts under THAT path's slug like
+/// any other project. The frontend cannot name that dir — it is build-flavored (`-dev` in debug) and
+/// Tauri-resolved — so the path is resolved here and handed to the identical scan. Restoring the
+/// pointer at boot is what lets the concierge remember a conversation across an app restart; the
+/// transcript itself was never the thing that was lost (see `docs/superpowers/specs/
+/// 2026-07-27-concierge-control-design.md` §3, subsystem C).
+///
+/// `config_dir` is None ON PURPOSE, and that is not the same "None" the worktree probe takes as a
+/// default. An agent spawn picks a Claude account and sets `CLAUDE_CONFIG_DIR` on the CHILD, so its
+/// probe must be told which account to look under. The concierge spawn sets no such var, so its
+/// transcripts land under whatever Sparkle's own process env resolves — exactly what `None` means
+/// here. If the concierge ever becomes account-aware, this argument has to move with it.
+#[tauri::command]
+pub async fn concierge_session_info<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> ClaudeSessionInfo {
+    let Ok(cwd) = crate::dev_identity::app_data_dir(&app) else {
+        return ClaudeSessionInfo::none();
+    };
+    let cwd = cwd.to_string_lossy().into_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        ClaudeSessionInfo::from_probe(crate::claude::claude_session_info_sync(&cwd, None))
+    })
+    .await
+    .unwrap_or_else(|_| ClaudeSessionInfo::none())
 }
 
 /// Clear the cached claude/node paths (e.g. the user just installed Claude Code); the next preflight

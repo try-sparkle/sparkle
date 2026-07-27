@@ -102,8 +102,8 @@ import { C as BRAND, AGENT_STATUS } from "@sparkle/ui";
 // moved to `barSurface`, and why the three 10px secondary lines on AgentPane's selected account
 // row take `cream` there instead. See theme/chromeContrast.test.ts for the measurement.
 export const THEME_HEX = {
-  dark: { forest: "#05070d", deepForest: "#0f1220", conciergeSurface: "#191d2d", conciergeMuted: "#8b90a6", barSurface: "#161a2b", hairline: "#63698c", pillFill: "#454d71", cream: "#ece7da", muted: "#8b90a6", chatBubble: "#354065", chatBubbleActive: "#4e5a90", accentInk: "#34e0f0", agentIdle: "#8b90a6", successInk: "#34c759", dangerInk: "#e87b7b", goldInk: "#f5c26b", goldHotInk: "#ffe9b8", goldFill: "#f5c26b", onGoldFill: "#090b14" },
-  light: { forest: "#ffffff", deepForest: "#d9dce1", conciergeSurface: "#eceef2", conciergeMuted: "#536280", barSurface: "#f1f4fa", hairline: "#6e7a93", pillFill: "#929bad", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#92ade5", chatBubbleActive: "#5f87e0", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d", dangerInk: "#aa241d", goldInk: "#7a5205", goldHotInk: "#5c3f05", goldFill: "#9a6a00", onGoldFill: "#ffffff" },
+  dark: { forest: "#05070d", deepForest: "#0f1220", conciergeSurface: "#191d2d", conciergeMuted: "#8b90a6", barSurface: "#161a2b", hairline: "#63698c", pillFill: "#454d71", cream: "#ece7da", muted: "#8b90a6", chatBubble: "#354065", chatBubbleActive: "#4e5a90", accentInk: "#34e0f0", agentIdle: "#8b90a6", successInk: "#34c759", dangerInk: "#e87b7b", goldInk: "#f5c26b", goldHotInk: "#ffe9b8", goldFill: "#f5c26b", onGoldFill: "#090b14", amberInk: "#ecb968" },
+  light: { forest: "#ffffff", deepForest: "#d9dce1", conciergeSurface: "#eceef2", conciergeMuted: "#536280", barSurface: "#f1f4fa", hairline: "#6e7a93", pillFill: "#929bad", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#92ade5", chatBubbleActive: "#5f87e0", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d", dangerInk: "#aa241d", goldInk: "#7a5205", goldHotInk: "#5c3f05", goldFill: "#9a6a00", onGoldFill: "#ffffff", amberInk: "#664200" },
 } as const;
 
 // Themed token object for component inline styles. The four theme-dependent tokens become
@@ -184,6 +184,16 @@ export const C = {
   // the ✓ "Landed" mark, the ahead pill's label/border); keep BRAND.success (constant green) for
   // fills, alpha tints, and status dots, the same split as accentInk vs accent.
   successInk: "var(--c-success-ink)",
+  // Brand amber as TEXT, the fourth member of the accentInk/agentIdle/successInk family — except
+  // that this one has to move in BOTH themes, which the others don't. #e0982f is a warm mid-tone,
+  // and the surface it has to work on is the presence slider's active Away segment: a 16% amber
+  // tint over the composer scrim. That plate is mid-gray in light (1.3:1) and mid-navy in dark
+  // (3.6:1), so the brand value fails AA on both. Light goes to a dark ochre, dark to a lightened
+  // amber; both stay in the amber family, because Away being amber is the point of the control.
+  // Use this for amber TEXT only — keep BRAND.amber for fills, tints and borders, which is where
+  // amber belongs (everywhere else in the app it is a fill behind dark ink, not ink itself).
+  // Measured, not asserted: theme/amberInk.test.ts.
+  amberInk: "var(--c-amber-ink)",
   // ALARM RED as TEXT — the fourth instance of the accent/ink split, and the one that was missing.
   // BRAND.sienna is the fill/rail/tint colour and passes through unthemed everywhere it is a
   // SHAPE; as an INK it does not clear the floor at either end. That value paints the nudge card's
@@ -275,6 +285,30 @@ export const INK_MIN_CONTRAST = 4.5;
 // token could have made those legible (see the stated exception in THE NEUTRAL LADDER), so the card
 // moved to `barSurface`, where the plane inks are correct by construction. What is left on this
 // token is what its name says: chat bubbles and row fills, carrying `cream`.
+
+
+// ── The washes the concierge paints OVER `conciergeSurface`, as percentages ─────────────────────
+// Ink contrast has to be measured against the plate a control actually sits on. Checking it against
+// the column's base color flatters every one of these components, and shipping a check that did is
+// how an under-AA control got past review once already: the Away segment was measured on
+// `barSurface` (the BUILDER's chrome) when it renders on the composer's scrim, which is a full
+// stop of contrast away in both themes (roborev 53655-H). These live here, with the palette, so the
+// components and theme/amberInk.test.ts composite from ONE number — change a wash and the contrast
+// rows re-measure instead of quietly going stale.
+/** ComposeBox's scrim over the concierge column — colour and alpha, with the `rgba()` the component
+ *  paints DERIVED from both, so a scrim that stops being black can't leave the test measuring black
+ *  (roborev 53665-M). */
+export const COMPOSE_SCRIM_HEX = "#000000";
+export const COMPOSE_SCRIM_PCT = 16;
+export const COMPOSE_SCRIM = `rgba(${[1, 3, 5]
+  .map((i) => parseInt(COMPOSE_SCRIM_HEX.slice(i, i + 2), 16))
+  .join(", ")}, ${COMPOSE_SCRIM_PCT / 100})`;
+/** The accent wash behind a concierge CARD (RecapCard). */
+export const CARD_WASH_PCT = 6;
+/** The tint behind the ACTIVE presence segment — the topmost wash of the stack `amberInk` is tuned
+ *  against, so it belongs here rather than as a literal in the component. */
+export const PRESENCE_SEGMENT_TINT_PCT = 16;
+
 export const CHAT_USER_BUBBLE = "var(--c-chat-bubble)";
 
 // The starker active-row fill — one notch more contrast than CHAT_USER_BUBBLE so three states read

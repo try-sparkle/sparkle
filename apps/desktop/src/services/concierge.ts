@@ -18,6 +18,7 @@
 // the concierge column always has something to render.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { conciergeSessionInfo, type ClaudeSessionInfo } from "../preflight";
 
 /** Incremental assistant text for the turn `id` (`concierge:delta`). */
 export interface ConciergeDeltaEvent {
@@ -73,12 +74,33 @@ const doneCallbacks = new Set<Callback<ConciergeDoneEvent>>();
 const errorCallbacks = new Set<Callback<ConciergeErrorEvent>>();
 
 /** The concierge's ongoing Claude Code session, captured from the last `concierge:done`.
- *  Module-level (not store state): it mirrors a real process-side resource in THIS webview and
- *  must reset with the page. */
+ *  Module-level (not store state): it mirrors a real process-side resource, so it is never
+ *  serialized — but it IS re-derived at boot from the transcript on disk, see
+ *  {@link restoreConciergeSession}. */
 let currentSessionId: string | null = null;
+
+/** The last session id we know is RECOVERABLE — one the on-disk transcript reported at boot, or one
+ *  a `concierge:done` confirmed actually ran. This is the "on-disk fallback" the error path falls
+ *  back to instead of dropping all the way to null (spec §3 subsystem C1).
+ *
+ *  Why it has to exist separately from `currentSessionId`: that one also advances OPTIMISTICALLY on
+ *  an accepted invoke (see `startConciergeTurn`), including an explicit `resumeSessionId` override
+ *  the caller passed us. A failed turn must be able to discard THAT without discarding the
+ *  conversation the user has actually been having. */
+let fallbackSessionId: string | null = null;
 
 /** Resolves once the internal Tauri listeners are registered; null until first needed. */
 let wiring: Promise<void> | null = null;
+
+/** Resolves once the boot restore below has run (or decided not to); null until first needed. */
+let restoring: Promise<void> | null = null;
+
+/** Bumped by every DELIBERATE write to the session id ({@link setConciergeSessionId},
+ *  {@link resetConciergeSession}). The boot restore is an async read-modify-write, so it snapshots
+ *  this and refuses to apply if anything authoritative moved while its probe was in flight —
+ *  otherwise a user who hits "start over" during the first second of app launch gets the old
+ *  conversation handed back to them a moment later. */
+let sessionEpoch = 0;
 
 function dispatch<T>(callbacks: Set<Callback<T>>, event: T): void {
   for (const cb of callbacks) {
@@ -106,7 +128,14 @@ function ensureWired(): Promise<void> {
       const results = await Promise.allSettled([
         listen<ConciergeDeltaEvent>("concierge:delta", (ev) => dispatch(deltaCallbacks, ev.payload)),
         listen<ConciergeDoneEvent>("concierge:done", (ev) => {
-          if (ev.payload.sessionId) currentSessionId = ev.payload.sessionId;
+          // A turn that COMPLETED is the strongest evidence a session exists and is resumable, so it
+          // refreshes the fallback too — including after Rust's stale-resume self-heal, where the id
+          // that comes back is a brand-new session and the old fallback now points at the transcript
+          // claude just abandoned.
+          if (ev.payload.sessionId) {
+            currentSessionId = ev.payload.sessionId;
+            fallbackSessionId = ev.payload.sessionId;
+          }
           dispatch(doneCallbacks, ev.payload);
         }),
         listen<ConciergeErrorEvent>("concierge:error", (ev) => {
@@ -118,7 +147,16 @@ function ensureWired(): Promise<void> {
           // Dropping the id there costs the concierge its whole conversation — the next turn starts
           // a fresh Claude session and forgets everything the user has said. The session is this
           // module's to protect; the host filters the same sentinels for the UI.
-          if (!isSupersededDetail(ev.payload.detail)) currentSessionId = null;
+          //
+          // And "start fresh" means BACK TO THE ON-DISK FALLBACK, not back to nothing (spec §3 C1).
+          // Once the boot restore exists, nulling here would re-orphan the conversation the restore
+          // just recovered — the very bug this subsystem fixes — on the first transient error of the
+          // session. Resuming a genuinely dead id is not the risk it looks like either: `concierge.rs`
+          // already re-runs a failed resuming turn ONCE without `--resume`
+          // (`should_retry_without_resume`), so a stale fallback self-heals on the next turn and the
+          // `done` above replaces it with the fresh id. With no fallback (no transcript on disk yet)
+          // the behavior is unchanged: null, and the next turn starts fresh.
+          if (!isSupersededDetail(ev.payload.detail)) currentSessionId = fallbackSessionId;
           dispatch(errorCallbacks, ev.payload);
         }),
       ]);
@@ -150,6 +188,91 @@ function ensureWired(): Promise<void> {
 }
 
 /**
+ * Re-derive the ongoing session from the transcript on disk, ONCE per page.
+ *
+ * This is the whole of C1. The concierge's conversation was never actually lost across an app
+ * restart — `claude -p` writes a real transcript under the app-data dir's slug, the same as any
+ * build agent's — but the only pointer to it lived in the module-level `let` above and died with the
+ * webview. Build agents already re-discover their session by probing the transcript dir at spawn
+ * (`AgentPane` → `claudeSessionInfo`); nobody ran that probe for the concierge's cwd. That asymmetry
+ * WAS the bug (spec §3 subsystem C).
+ *
+ * Deliberately non-destructive and never throwing:
+ *   - it only SEEDS. If a `concierge:done` already landed (a turn finished before the probe
+ *     returned), that id is live process state and outranks anything on disk.
+ *   - a rejected invoke (no Tauri, an unresolvable app-data dir) leaves the session null, i.e. the
+ *     pre-restore behavior — a fresh conversation, not a broken one.
+ *
+ * Only the pointer is restored, not the visible bubbles; those persist separately
+ * (`stores/conciergeThreadStore`). The two can drift — the resumed session remembers turns the
+ * capped bubble log has evicted, and vice versa. Rehydrating both from the transcript would fix that
+ * but needs an NDJSON reader; the design defers it as a follow-up.
+ */
+export function restoreConciergeSession(): Promise<void> {
+  if (restoring) return restoring;
+  {
+    const startedAt = sessionEpoch;
+    let failed = false;
+    const r = (async () => {
+      try {
+        // Typed as possibly-absent on purpose: the Rust command always returns the struct, but this
+        // module must survive a bridge that isn't there (a mocked invoke, a non-Tauri host) without
+        // throwing a destructuring TypeError into the console on every page load.
+        const info: ClaudeSessionInfo | undefined = await conciergeSessionInfo();
+        // `hasSession` is deliberately not consulted: the id is the thing we need, and a truthy id
+        // already implies a transcript was found. Trusting `hasSession` separately would let the two
+        // halves disagree (Rust pins that they cannot — see `session_info_halves_agree...`).
+        const latestSessionId = info?.latestSessionId;
+        // Seed only. A `concierge:done` that landed while the probe was in flight is live process
+        // state and wins; a deliberate set/reset in that window (epoch moved) wins too.
+        if (latestSessionId && currentSessionId === null && sessionEpoch === startedAt) {
+          currentSessionId = latestSessionId;
+          fallbackSessionId = latestSessionId;
+        }
+      } catch (e) {
+        console.warn("concierge: session restore failed; starting a fresh conversation:", e);
+        failed = true;
+      }
+    })();
+    restoring = r;
+
+    // DROP THE CACHE ON FAILURE, so a later call retries (roborev 53666-M).
+    //
+    // A resolved-but-failed promise is indistinguishable from "probed, found nothing", so caching
+    // it meant one bad probe left the concierge amnesiac for the whole page — the exact bug this
+    // subsystem exists to fix. That got worse when the probe moved from the first send (a user
+    // gesture on a settled webview, seconds after launch) to three MOUNT-time call sites, where a
+    // transient failure during window init is far likelier. `startConciergeTurn` awaits this, so
+    // without the drop it would just await an already-resolved failure and never recover.
+    //
+    // Same policy `ensureWired` states 120 lines above, for the same reason.
+    //
+    // Checked TWICE, and both are load-bearing. A probe that throws SYNCHRONOUSLY (no bridge at
+    // all, so `conciergeSessionInfo()` throws before its first await) runs the catch before
+    // `restoring = r` executes, so the post-settle callback would find the cache already set and
+    // clear nothing was ever wrong — hence the immediate call. Everything else fails after an
+    // await, hence the `.then`. Guarded on identity so a stale probe cannot clear a newer one's
+    // cache.
+    //
+    // AND GUARDED ON THE EPOCH, which is what keeps this from re-opening the reset hole (roborev
+    // 53689-M). `resetConciergeSession` deliberately marks `restoring` DONE rather than null —
+    // `restoring ??= Promise.resolve()` — precisely so a probe already in flight cannot land after
+    // the reset and undo it. A bare identity check would hand that protection straight back: the
+    // user hits "start over" while the bridge is still coming up, the in-flight probe rejects, the
+    // cache is dropped, and the NEXT call re-probes with an epoch captured after the reset — so
+    // both of the body's guards pass and it seeds the very conversation the user just discarded,
+    // installing the old id as the fallback too. Retry only when no reset (and no explicit
+    // `setConciergeSessionId`) happened while this probe was running.
+    const dropIfFailed = () => {
+      if (failed && restoring === r && sessionEpoch === startedAt) restoring = null;
+    };
+    dropIfFailed();
+    void r.then(dropIfFailed);
+    return r;
+  }
+}
+
+/**
  * Run one concierge turn over `prompt` (a snapshot of app state, or the user's message).
  * Continuity is automatic: the session id from the last `done` is passed as the resume target
  * unless `resumeSessionId` explicitly overrides it. Never rejects — failures surface on
@@ -164,8 +287,12 @@ export async function startConciergeTurn(
   resumeSessionId?: string,
 ): Promise<string | null> {
   try {
-    // Wire listeners BEFORE the invoke so a fast first delta/done can't slip past the manager.
-    await ensureWired();
+    // Wire listeners BEFORE the invoke so a fast first delta/done can't slip past the manager, and
+    // finish the boot restore before `resume` is computed — a probe still in flight would let the
+    // FIRST turn after a restart start a fresh session, which is exactly the symptom (the user's
+    // opening message is the one that most needs the prior context). Both are once-per-page and
+    // cached, so this costs one extra IPC round-trip on the first turn only.
+    await Promise.all([ensureWired(), restoreConciergeSession()]);
     const resume = resumeSessionId ?? currentSessionId ?? undefined;
     const id = await invoke<string>("concierge_turn", { prompt, resumeSessionId: resume ?? null });
     // Only advance the session id once the turn was ACCEPTED — a rejected invoke must not leave a
@@ -205,6 +332,11 @@ export async function cancelConciergeTurn(): Promise<void> {
 export function onConciergeDelta(cb: Callback<ConciergeDeltaEvent>): () => void {
   deltaCallbacks.add(cb);
   void ensureWired().catch((e) => console.warn("concierge: event wiring failed:", e));
+  // Start the disk probe at MOUNT rather than leaving it on the first send's critical path.
+  // `startConciergeTurn` still awaits it — this only moves the latency off the send, it does not
+  // replace the guarantee. Fire-and-forget is safe: the function never rejects, and it is cached, so
+  // the three subscribe helpers racing here still produce exactly one probe.
+  void restoreConciergeSession();
   return () => deltaCallbacks.delete(cb);
 }
 
@@ -212,6 +344,7 @@ export function onConciergeDelta(cb: Callback<ConciergeDeltaEvent>): () => void 
 export function onConciergeDone(cb: Callback<ConciergeDoneEvent>): () => void {
   doneCallbacks.add(cb);
   void ensureWired().catch((e) => console.warn("concierge: event wiring failed:", e));
+  void restoreConciergeSession();
   return () => doneCallbacks.delete(cb);
 }
 
@@ -220,6 +353,7 @@ export function onConciergeDone(cb: Callback<ConciergeDoneEvent>): () => void {
 export function onConciergeError(cb: Callback<ConciergeErrorEvent>): () => void {
   errorCallbacks.add(cb);
   void ensureWired().catch((e) => console.warn("concierge: event wiring failed:", e));
+  void restoreConciergeSession();
   return () => errorCallbacks.delete(cb);
 }
 
@@ -228,16 +362,42 @@ export function getConciergeSessionId(): string | null {
   return currentSessionId;
 }
 
-/** Forget the ongoing session so the next turn starts fresh (e.g. a user-requested reset). */
-export function resetConciergeSession(): void {
-  currentSessionId = null;
+/** Point the next turn at `id` (the boot restore's seam, and anything else that learns the session
+ *  from outside the event stream). Treated as KNOWN-GOOD: it becomes the on-disk fallback too, so a
+ *  later failed turn drops back to it rather than to a fresh conversation.
+ *
+ *  Pass "" or null to mean "no session" — same as {@link resetConciergeSession}, so a caller
+ *  forwarding a probe result straight through can't accidentally set an empty resume target that
+ *  `concierge.rs` would then have to treat as no-resume anyway. */
+export function setConciergeSessionId(id: string | null): void {
+  if (!id) {
+    resetConciergeSession();
+    return;
+  }
+  sessionEpoch++;
+  currentSessionId = id;
+  fallbackSessionId = id;
 }
 
-/** Test-only: drop all module state (subscribers, wiring, session) between vitest cases. */
+/** Forget the ongoing session so the next turn starts fresh (e.g. a user-requested reset).
+ *
+ *  Clears the FALLBACK as well, and that is the point: a user asking to start over must not have the
+ *  old conversation resurrected by the next transient error, and the boot restore must not run after
+ *  it and undo it either (hence `restoring` is marked done rather than left null). */
+export function resetConciergeSession(): void {
+  sessionEpoch++;
+  currentSessionId = null;
+  fallbackSessionId = null;
+  restoring ??= Promise.resolve();
+}
+
+/** Test-only: drop all module state (subscribers, wiring, session, restore) between vitest cases. */
 export function _resetConciergeForTests(): void {
   deltaCallbacks.clear();
   doneCallbacks.clear();
   errorCallbacks.clear();
   currentSessionId = null;
+  fallbackSessionId = null;
   wiring = null;
+  restoring = null;
 }

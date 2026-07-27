@@ -55,7 +55,9 @@
 // agent — and flushed by the pane on ptyReady (see services/pendingSends + flushPendingSends).
 
 import { PtyGoneError, submitPrompt, writePty } from "../pty";
+import { describeAuthority, isDispatchAuthority, type DispatchAuthority } from "./dispatchAuthority";
 import { frameSubmit } from "./relayGate";
+import { log } from "../logger";
 import { getAgentScrollback } from "./terminalScrollback";
 import { markAgentPrompt } from "./terminalMarkers";
 import { detectTerminalPrompts } from "./suggestions/heuristics";
@@ -80,6 +82,7 @@ export type ConciergeDispatchPath =
   | "abandoned" // the pane closed or errored while the send was held (NOT delivered)
   | "agent-failed" // the pane GAVE UP (spawn error / Claude missing) — Retry is the remedy (NOT delivered)
   | "cloud-agent" // the target runs in the cloud — there is no local PTY to write to (NOT delivered)
+  | "unauthorized" // no valid DispatchAuthority — nobody declared why this may be sent (NOT delivered)
   | "pty-gone"; // the agent's PTY was dead (answer NOT delivered)
 
 export interface ConciergeDispatchResult {
@@ -114,6 +117,22 @@ export interface ConciergeDispatchResult {
  *      handing the model a bare `/tmp/sparkle-shot-1753.png`.
  *  Both default to `text`, so a caller with no attachments is unaffected. */
 export interface ConciergeDispatchOptions {
+  /**
+   * WHY is this text allowed to reach a build agent's terminal? See services/dispatchAuthority.
+   *
+   * REQUIRED and NON-DEFAULTED, which is the entire point (design §3 A1). The reported bug — user
+   * text typed at the concierge silently forwarded to an agent — was not a stray code path; it was
+   * `conciergeRouter` deciding a destination and this function delivering on the strength of that
+   * decision alone. A default here (or an optional field) would let the next call site re-create it
+   * with no type error, so there is deliberately no way to call this without naming the user gesture
+   * that authorized the write.
+   *
+   * Note there is no `router` arm in the union, and there must never be one: a heuristic verdict is
+   * not a user gesture. The router's verdict becomes legal only once it has been through
+   * services/dispatchIntent and come out the other side as `{ kind: "countdown" }` — i.e. only once
+   * the user has been shown the send and declined to stop it.
+   */
+  authority: DispatchAuthority;
   userPrompt?: boolean;
   /** What the prompt-history surfaces show. Defaults to the wire text. */
   display?: string;
@@ -264,8 +283,25 @@ export function answersLivePicker(agentId: string, text: string): boolean {
 export async function dispatchConciergeAnswer(
   agentId: string,
   text: string,
-  opts: ConciergeDispatchOptions = {},
+  /** No default, deliberately — `authority` must be declared. See ConciergeDispatchOptions. */
+  opts: ConciergeDispatchOptions,
 ): Promise<ConciergeDispatchResult> {
+  // THE GATE, and it runs before everything — ahead of the emptiness check, the cloud check and any
+  // screen read. TypeScript already stops a call site that forgets `authority`; this is the belt for
+  // the shapes the compiler never sees (a JS consumer, an object rebuilt off the wire, a future
+  // store round trip). It FAILS CLOSED like every other check in this module: an unknown kind or a
+  // blank id is not an authority, and we refuse rather than guess.
+  if (!isDispatchAuthority(opts.authority)) {
+    log.warn("concierge", "refused an un-authorized dispatch", { agentId });
+    return { ok: false, path: "unauthorized", agentId };
+  }
+  // The audit line the union exists to make possible: a "why did it type that?" complaint resolves
+  // to the gesture that permitted the write, not to a guess. `debug` because it is per-send and
+  // debug forwarding is off outside DEV (see logger) — the devtools console still shows it.
+  log.debug("concierge", `dispatching — ${describeAuthority(opts.authority)}`, {
+    agentId,
+    authority: opts.authority.kind,
+  });
   if (text.trim() === "") return { ok: false, path: "empty", agentId };
   // A CLOUD agent has no local PTY — every write primitive here targets one, so refusing up
   // front with its own path beats the lie "its terminal has closed" (roborev 46916). Wiring a
@@ -416,6 +452,11 @@ function emitOutcome(r: ConciergeDispatchResult): void {
  * broadcast (onDeferredSendOutcome) so the concierge can reconcile the promise it made when the
  * prompt was queued — including entries that aged out and were never delivered.
  */
+// NO authority re-check here, and that is correct rather than an oversight: a queued entry only
+// exists because a dispatch already PASSED the gate above and then found the PTY still coming up.
+// The flush is the second half of that one authorized send, not a new one. Re-deriving an authority
+// at flush time would mean inventing one — exactly the "dispatch because the code decided to" the
+// gate exists to eliminate.
 export async function flushPendingSends(agentId: string): Promise<ConciergeDispatchResult[]> {
   const { due, expired } = takePendingSends(agentId);
   const out: ConciergeDispatchResult[] = [];

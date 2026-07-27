@@ -336,6 +336,36 @@ pub(crate) fn claude_latest_session_id_sync(worktree_path: &str, config_dir: Opt
     claude_latest_session_id_in(config_dir.as_deref(), home.as_deref(), worktree_path)
 }
 
+/// Pure form of the combined probe: `(has_session, latest_session_id)` for `worktree_path` under
+/// the given config/home. Both halves scan the SAME transcript dir, so callers that need both (the
+/// spawn path, and the concierge's boot restore) resolve config/home once instead of twice.
+pub(crate) fn claude_session_info_in(
+    config_dir: Option<&Path>,
+    home: Option<&Path>,
+    worktree_path: &str,
+) -> (bool, Option<String>) {
+    (
+        claude_has_session_in(config_dir, home, worktree_path),
+        claude_latest_session_id_in(config_dir, home, worktree_path),
+    )
+}
+
+/// Sync core of the combined probe: resolves config/home from the env exactly like
+/// [`claude_has_session_sync`] / [`claude_latest_session_id_sync`], then runs
+/// [`claude_session_info_in`]. `pub(crate)` for `preflight`'s two session-info commands, which are
+/// already on a blocking task.
+pub(crate) fn claude_session_info_sync(
+    worktree_path: &str,
+    config_dir: Option<&str>,
+) -> (bool, Option<String>) {
+    let env = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let config_dir = resolve_session_config_dir(config_dir, env);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    claude_session_info_in(config_dir.as_deref(), home.as_deref(), worktree_path)
+}
+
 #[tauri::command]
 pub async fn claude_latest_session_id(worktree_path: String, config_dir: Option<String>) -> Option<String> {
     // `async` + `spawn_blocking`: the `read_dir` transcript-directory scan is filesystem I/O that
@@ -698,6 +728,55 @@ mod tests {
         assert_eq!(
             claude_latest_session_id_in(None, Some(&home), worktree),
             Some("22222222-bbbb".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // The concierge's restore path (spec §3 subsystem C). `preflight::concierge_session_info` hands
+    // this probe Sparkle's APP-DATA dir rather than a git worktree, because that is the cwd
+    // `concierge.rs` spawns headless `claude -p` in — so Claude Code files the concierge's
+    // transcripts under that path's slug. Nothing else pins that: the command itself needs an
+    // AppHandle and can't be unit-tested, so if the slug encoding and the real transcript layout ever
+    // disagreed for an app-data-shaped path, the concierge would silently restore nothing and the
+    // conversation would look lost exactly as before the fix.
+    //
+    // The path shape is the point — `~/Library/Application Support/ai.sparkle.desktop` carries a
+    // SPACE, which Claude encodes to `-`, and the `-dev` suffix a debug build appends.
+    #[test]
+    fn session_info_finds_the_concierge_transcript_under_the_app_data_dir() {
+        let home = unique_home("concierge-appdata");
+        for cwd in [
+            "/Users/x/Library/Application Support/ai.sparkle.desktop",
+            "/Users/x/Library/Application Support/ai.sparkle.desktop-dev",
+        ] {
+            // Nothing seeded yet: a first-run install must report "no session" rather than a
+            // half-answer the caller would restore into.
+            assert_eq!(claude_session_info_in(None, Some(&home), cwd), (false, None));
+
+            seed_session(&claude_session_dir_for(&home_root(&home), cwd));
+            assert_eq!(
+                claude_session_info_in(None, Some(&home), cwd),
+                (true, Some("b3d4494a-3b98".to_string())),
+                "app-data cwd {cwd} must resolve to the transcript dir Claude Code actually writes"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // The two halves must agree. They are separate scans of the same directory, so a caller that
+    // trusted `has_session` and then found `latest_session_id` empty (or vice-versa) would resume
+    // into nothing — worth pinning now that both ship as one value.
+    #[test]
+    fn session_info_halves_agree_with_the_probes_they_replace() {
+        let home = unique_home("session-info-agree");
+        let worktree = "/tmp/proj/.sparkle/worktrees/agree";
+        seed_session(&claude_session_dir_for(&home_root(&home), worktree));
+        assert_eq!(
+            claude_session_info_in(None, Some(&home), worktree),
+            (
+                claude_has_session_in(None, Some(&home), worktree),
+                claude_latest_session_id_in(None, Some(&home), worktree),
+            )
         );
         let _ = std::fs::remove_dir_all(&home);
     }

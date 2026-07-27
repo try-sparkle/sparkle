@@ -99,6 +99,7 @@ vi.mock("../services/conciergeAttach", async (orig) => {
 import { ConciergeHost } from "./ConciergeHost";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { Attachment } from "./composer/attachments";
+import { armedIntents, clearAllIntents, fireIntent } from "../services/dispatchIntent";
 
 const shot: Attachment = {
   id: "s1",
@@ -160,7 +161,26 @@ const clickSend = async () => {
     await Promise.resolve();
     await Promise.resolve();
   });
+  await elapseCountdowns();
 };
+
+/**
+ * Let every armed send's countdown run out.
+ *
+ * An agent-bound send now ARMS an intent (services/dispatchIntent) the user can cancel, and only
+ * the uncancelled expiry delivers — so a suite asserting that the files reached the PTY has to pass
+ * through the gate. Fired directly rather than by advancing timers, so this suite keeps real timers.
+ */
+async function elapseCountdowns() {
+  const pending = armedIntents();
+  if (pending.length === 0) return;
+  await act(async () => {
+    for (const i of pending) fireIntent(i.id);
+    // Generously many: the expiry re-enters the send QUEUE and the delivery it runs is several
+    // awaits deep, so too few ticks reads as "the send never happened" rather than as a race.
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+  });
+}
 
 beforeEach(() => {
   h.deferred = undefined; // no stale subscription answering for an unmounted host
@@ -176,7 +196,11 @@ beforeEach(() => {
  *  removed send-target toggle. */
 const routeToAgent = () =>
   h.route.mockResolvedValue({ target: "agent", reason: "test", source: "heuristic" });
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  // See ConciergeHost.test.tsx: a module-level armed intent would leak into the next test.
+  clearAllIntents();
+});
 
 /** Queries scoped to the VISIBLE transcript. The column also renders a hidden `role="status"` live
  *  region carrying the last finished line (roborev 53010), so a document-wide getByText would match
@@ -221,10 +245,44 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
     await clickSend();
     // Three renderings, one message (roborev 46911/46925): only the WIRE payload carries the path.
     expect(h.dispatch).toHaveBeenCalledWith("ag1", "/tmp/shot.png what is wrong here?", {
+      // Routed sends now reach the PTY only by way of the countdown gate, so the authority is a
+      // `countdown` naming the intent that elapsed (services/dispatchIntent). The id is generated,
+      // hence expect.any — what matters is that it is a countdown and not a silent router send.
+      authority: { kind: "countdown", intentId: expect.any(String) },
       userPrompt: true,
       display: "what is wrong here? · 1 image",
       namingBasis: "what is wrong here?",
     });
+  });
+
+  // roborev 53670. The leak that shipped was in the WIRING, not in the formatters: the host had
+  // both renderings in scope at the arm site and put the wire payload on the intent. A test that
+  // hand-builds an intent cannot see that — and the realistic recurrence, `display: payload`, is
+  // two strings that are both in scope on the same line, so it compiles and leaves every other
+  // suite green while the banner speaks /tmp/shot.png again. Assert the ARMED intent, before the
+  // countdown consumes it, on a send that carries a real attachment.
+  it("arms the countdown with the user's words, never the attachment path", async () => {
+    mount();
+    await attachImage();
+    routeToAgent();
+    type("what is wrong here?");
+    await act(async () => {
+      fireEvent.click(screen.getByText("Send"));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const armed = armedIntents()[0];
+    expect(armed, "the send should have armed an intent").toBeTruthy();
+    // The payload MUST carry the path — that is what lets the agent read the file.
+    expect(armed!.text).toContain("/tmp/shot.png");
+    // What the banner and the live region quote must not.
+    expect(armed!.display).toBe("what is wrong here? · 1 image");
+    expect(armed!.display).not.toContain("/tmp/shot.png");
+
+    await elapseCountdowns();
   });
 
   it("prefixes the path into the BRAIN snapshot too", async () => {
@@ -245,6 +303,10 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
     // An attachments-only send: the naming basis is EMPTY by construction, which is what makes
     // auto-naming skip it rather than naming the agent after a temp file.
     expect(h.dispatch).toHaveBeenCalledWith("ag1", "/tmp/shot.png", {
+      // Routed sends now reach the PTY only by way of the countdown gate, so the authority is a
+      // `countdown` naming the intent that elapsed (services/dispatchIntent). The id is generated,
+      // hence expect.any — what matters is that it is a countdown and not a silent router send.
+      authority: { kind: "countdown", intentId: expect.any(String) },
       userPrompt: true,
       display: "1 image",
       namingBasis: "",

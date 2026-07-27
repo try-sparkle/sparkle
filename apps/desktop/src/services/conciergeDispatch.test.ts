@@ -16,6 +16,12 @@ import { getAgentScrollback } from "./terminalScrollback";
 import { detectTerminalPrompts } from "./suggestions/heuristics";
 import { dispatchConciergeAnswer, matchAnswerToOption } from "./conciergeDispatch";
 
+/** Any valid authority. These suites predate the dispatch authority gate and exercise DELIVERY,
+ *  not authorization — the gate itself is covered by dispatchAuthority.test.ts and
+ *  conciergeDispatch.gate.test.ts. `authority` is required and non-defaulted (see
+ *  services/dispatchAuthority), so every call has to name one. */
+const TEST_AUTHORITY = { kind: "suggestion", agentId: "a1" } as const;
+
 const btn = (id: string, label: string, value: string): SuggestionButton => ({
   id,
   label,
@@ -75,7 +81,7 @@ describe("dispatchConciergeAnswer", () => {
 
   it("sends the matched option keystroke (CR-framed) when a picker is live", async () => {
     setPrompt(YN);
-    const r = await dispatchConciergeAnswer("agent-1", "approve");
+    const r = await dispatchConciergeAnswer("agent-1", "approve", { authority: TEST_AUTHORITY });
     expect(r).toMatchObject({ ok: true, path: "picker-option", agentId: "agent-1", matchedLabel: "Yes" });
     // frameSubmit normalizes "y\n" → exactly one trailing CR.
     expect(writePty).toHaveBeenCalledWith("agent-1", "y\r");
@@ -84,14 +90,14 @@ describe("dispatchConciergeAnswer", () => {
 
   it("re-reads the CURRENT scrollback before deciding", async () => {
     setPrompt(YN);
-    await dispatchConciergeAnswer("agent-1", "no");
+    await dispatchConciergeAnswer("agent-1", "no", { authority: TEST_AUTHORITY });
     expect(getAgentScrollback).toHaveBeenCalledWith("agent-1");
     expect(writePty).toHaveBeenCalledWith("agent-1", "n\r");
   });
 
   it("refuses (no keystroke) when a picker is live but the answer maps to no option", async () => {
     setPrompt(YN);
-    const r = await dispatchConciergeAnswer("agent-1", "maybe later");
+    const r = await dispatchConciergeAnswer("agent-1", "maybe later", { authority: TEST_AUTHORITY });
     expect(r).toMatchObject({ ok: false, path: "ambiguous-picker", options: YN });
     expect(writePty).not.toHaveBeenCalled();
     expect(submitPrompt).not.toHaveBeenCalled();
@@ -99,7 +105,7 @@ describe("dispatchConciergeAnswer", () => {
 
   it("sends free text via submitPrompt when no prompt is on screen", async () => {
     setPrompt([]);
-    const r = await dispatchConciergeAnswer("agent-1", "add a test for the webhook");
+    const r = await dispatchConciergeAnswer("agent-1", "add a test for the webhook", { authority: TEST_AUTHORITY });
     expect(r).toMatchObject({ ok: true, path: "free-text", sent: "add a test for the webhook" });
     expect(submitPrompt).toHaveBeenCalledWith("agent-1", "add a test for the webhook");
     expect(writePty).not.toHaveBeenCalled();
@@ -108,21 +114,21 @@ describe("dispatchConciergeAnswer", () => {
   it("reports pty-gone (not a silent success) when the free-text PTY is dead", async () => {
     setPrompt([]);
     (submitPrompt as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new PtyGoneError("dead"));
-    const r = await dispatchConciergeAnswer("agent-1", "hello");
+    const r = await dispatchConciergeAnswer("agent-1", "hello", { authority: TEST_AUTHORITY });
     expect(r).toMatchObject({ ok: false, path: "pty-gone" });
   });
 
   it("reports pty-gone when the picker write hits a dead PTY", async () => {
     setPrompt(YN);
     (writePty as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new PtyGoneError("dead"));
-    const r = await dispatchConciergeAnswer("agent-1", "yes");
+    const r = await dispatchConciergeAnswer("agent-1", "yes", { authority: TEST_AUTHORITY });
     expect(r).toMatchObject({ ok: false, path: "pty-gone" });
   });
 
   it("refuses a blank/whitespace answer without writing anything", async () => {
     setPrompt([]);
     for (const blank of ["", "   ", "\n"]) {
-      const r = await dispatchConciergeAnswer("agent-1", blank);
+      const r = await dispatchConciergeAnswer("agent-1", blank, { authority: TEST_AUTHORITY });
       expect(r).toMatchObject({ ok: false, path: "empty" });
     }
     expect(submitPrompt).not.toHaveBeenCalled();
@@ -132,7 +138,7 @@ describe("dispatchConciergeAnswer", () => {
   it("treats a null scrollback as no live prompt (free-text path)", async () => {
     (getAgentScrollback as unknown as ReturnType<typeof vi.fn>).mockReturnValueOnce(null);
     setPrompt([]); // detector on "" → no options
-    const r = await dispatchConciergeAnswer("agent-1", "hi there");
+    const r = await dispatchConciergeAnswer("agent-1", "hi there", { authority: TEST_AUTHORITY });
     expect(detectTerminalPrompts).toHaveBeenCalledWith("");
     expect(r).toMatchObject({ ok: true, path: "free-text" });
   });

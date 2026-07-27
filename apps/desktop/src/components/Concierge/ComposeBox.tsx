@@ -67,10 +67,12 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { FiCamera, FiFile, FiImage, FiMic, FiPaperclip, FiX } from "react-icons/fi";
-import { C, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
+import { C, COMPOSE_SCRIM, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
 import { CONCIERGE_COMPOSE_DND_TARGET } from "../../services/dndTargets";
 import type { Attachment, ConciergeAttachKind } from "./types";
 import { useUiStore } from "../../stores/uiStore";
+import { PresenceSlider } from "./PresenceSlider";
+import { usePresenceStore } from "../../stores/presenceStore";
 import {
   ComposerVoiceError,
   RichPlaceholderOverlay,
@@ -411,7 +413,9 @@ export function ComposeBox({
         flex: "none",
         borderTop: `1px solid ${line}`,
         padding: "10px 12px 12px",
-        background: dropActive ? `color-mix(in srgb, ${C.teal} 10%, rgba(0,0,0,0.16))` : "rgba(0,0,0,0.16)",
+        // COMPOSE_SCRIM, not a literal: it is the plate every control in this row sits on, so the
+        // contrast tests have to composite from the same number (theme/colors.ts, roborev 53655-H).
+        background: dropActive ? `color-mix(in srgb, ${C.teal} 10%, ${COMPOSE_SCRIM})` : COMPOSE_SCRIM,
         outline: dropActive ? `1.5px dashed ${C.teal}` : "none",
         outlineOffset: -2,
       }}
@@ -480,6 +484,11 @@ export function ComposeBox({
             {label}
           </button>
         ))}
+        {/* Right-aligned in the attach row, which puts it directly ABOVE the Send button — the
+            action whose autonomy it governs. It reads and writes presenceStore itself rather than
+            taking props; see PresenceSlider's header for why, and note this box already reads
+            useUiStore for the same class of reason. */}
+        <PresenceSlider />
       </div>
       {interim ? (
         <div
@@ -572,6 +581,12 @@ export function ComposeBox({
             value={text}
             onChange={(e) => {
               setText(e.target.value);
+              // One of the two things that resets the five-minute idle timer (the other is
+              // a terminal keystroke, Terminal.tsx's onData). Deliberately on the USER's
+              // edits only, for the same reason onTextEdit is: a dictated segment landing in
+              // the box, or the clear-on-send, would otherwise keep the app reporting Here
+              // while nobody is at the keyboard.
+              usePresenceStore.getState().noteInput();
               // Only the user's OWN edits report — dictation appends go through setText directly.
               // That is what lets the host tell "this box was emptied by hand" (which retires the
               // dictated-origin latch) from "a segment just landed in it".

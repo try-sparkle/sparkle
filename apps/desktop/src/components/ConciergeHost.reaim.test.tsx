@@ -110,13 +110,13 @@ vi.mock("../stores/runtimeStore", () => ({
     getState: () => RUNTIME,
   }),
 }));
-vi.mock("../stores/spendStore", () => ({ useSpendPill: () => "$—" }));
 
 import { ConciergeHost, type ConciergePromptTarget } from "./ConciergeHost";
 import { resetSuggestionMemory } from "../services/suggestions/useSuggestions";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import { useConnectionStore } from "../stores/connectionStore";
 import type { SuggestionButton } from "../services/suggestions/types";
+import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
 
 /** A's recommended action. `value` is what a click SENDS — the string that must never reach B. */
 const A_ACTION: SuggestionButton = {
@@ -172,7 +172,35 @@ const AIM_B: ConciergePromptTarget = { projectId: "p1", agentId: "ag2", name: "A
 
 const box = () => screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
 
+// THE PILL LIVES ON THE TERMINAL NOW, so it needs a stage to portal into.
+//
+// `ConciergeSuggestions` renders through a portal into the aimed agent's terminal stage (published
+// by AgentPane's callback ref into stores/terminalOverlayStore) rather than into a strip above the
+// compose box. This suite renders the HOST alone — there is no AgentPane, so without a registered
+// stage the portal has no target and every pill assertion below fails on an element that was never
+// mounted. Registering one detached div per agent is the smallest thing that restores what these
+// rows are actually about: which agent the suggestions are SCOPED to when the box re-aims.
+// ATTACHED to document.body, not merely created: testing-library's queries walk the document, so a
+// detached stage node would host the portal somewhere `screen` can never see and every row would
+// fail exactly as if the pill had not rendered at all.
+function registerStages() {
+  for (const id of ["ag1", "ag2"]) {
+    const el = document.createElement("div");
+    el.dataset.stage = id;
+    document.body.appendChild(el);
+    useTerminalOverlayStore.getState().setStage(id, el);
+  }
+}
+
+function clearStages() {
+  for (const id of ["ag1", "ag2"]) {
+    useTerminalOverlayStore.getState().setStage(id, null);
+    document.querySelector(`[data-stage="${id}"]`)?.remove();
+  }
+}
+
 beforeEach(() => {
+  registerStages();
   h.computeSuggestions.mockReset();
   h.dispatchConciergeAnswer.mockClear();
   h.pushSuggestions.mockReset();
@@ -182,6 +210,9 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  // The overlay store is module-level and the stage nodes are real DOM, so both outlive `cleanup()`
+  // and would leak a stale portal target into the next row.
+  clearStages();
   vi.clearAllMocks();
 });
 
@@ -266,12 +297,16 @@ describe("ConciergeHost — the box re-aimed from one agent to another", () => {
       fireEvent.click(screen.getByText(B_ACTION.label));
     });
     // Through the SAME dispatch a typed message takes — userPrompt: true, with the display and
-    // naming renderings a typed prompt would carry.
+    // naming renderings a typed prompt would carry, and now the authority every concierge-
+    // originated dispatch must declare (services/dispatchAuthority). A pill click is a direct user
+    // gesture on a named agent, so it carries `suggestion` and dispatches IMMEDIATELY — no
+    // countdown, unlike a routed typed message, which arms an intent first.
     await waitFor(() =>
       expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag2", B_ACTION.value, {
         userPrompt: true,
         display: B_ACTION.value,
         namingBasis: B_ACTION.value,
+        authority: { kind: "suggestion", agentId: "ag2" },
       }),
     );
   });

@@ -45,12 +45,12 @@ export function ConciergeColumn({
   wordmarkMode,
   width = 380,
   searchSlot,
-  suggestionsSlot,
   interim = "",
   registerInsert,
   speakingMessageId = null,
   onTextEdit,
   announcement = EMPTY_ANNOUNCEMENT,
+  countdownSlot,
 }: ConciergeColumnProps) {
   const mode = wordmarkMode ?? deriveWordmarkMode(micLive, model.typing ?? false);
   return (
@@ -124,11 +124,18 @@ export function ConciergeColumn({
         onRedirect={controller.onRedirect}
         onDigestClick={controller.onDigestClick}
       />
-      {/* Recommended actions for the actively-shown build agent, pinned directly above the box —
-          where they sat in the removed AgentPane composer. A SLOT, not a view-model field: the row
-          owns a per-agent hook that must remount when the agent changes, so the host mounts it
-          keyed (see ConciergeSuggestions) and this column stays a pure renderer. */}
-      {suggestionsSlot}
+      {/* NO RECOMMENDED-ACTION ROW HERE any more. It used to sit in a `suggestionsSlot` directly
+          above the compose box; it now renders over the terminal itself, pinned bottom-right on the
+          CLI's input line, because the action is about the agent you are looking at. The host still
+          mounts it (keyed per agent) — it just portals its output into the pane. See
+          Concierge/ConciergeSuggestions. */}
+      {/* Armed sends counting down (Concierge/CountdownBanner), directly above the box — the last
+          thing between the user's words and an agent's terminal, so it sits where the eye already
+          is after hitting Send. A SLOT, not a view-model field: the banner reads a module-level
+          intent registry, and this column stays a pure renderer.
+          It deliberately carries NO live region of its own — the single announcer below is fed by
+          the host when an intent arms (a second region double-announces). */}
+      {countdownSlot}
       {/* The column's ONE live region. Visually hidden, polite, and fed only completed lines, so a
           screen-reader user hears the reply once — not once per chunk (roborev 52648/53010).
           Routing receipts land here too: with the send-target toggle gone this is the only way a

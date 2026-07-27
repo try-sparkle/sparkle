@@ -7,6 +7,7 @@ import { C, CHAT_USER_BUBBLE } from "../../theme/colors";
 import { Markdown } from "../Markdown";
 import { bandColor } from "../../engine/statusBandLabels";
 import { NudgeCard } from "./NudgeCard";
+import { RecapCard } from "./RecapCard";
 import { RoutingReceipt } from "./RoutingReceipt";
 import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
 import type {
@@ -153,6 +154,7 @@ export function ConciergeThread({
               onNudgeAction={onNudgeAction}
             />
           );
+        if (m.kind === "recap") return <RecapCard key={m.id} recap={m} />;
         if (m.kind === "you")
           return (
             <div

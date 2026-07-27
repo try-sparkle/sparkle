@@ -81,9 +81,9 @@ vi.mock("../stores/runtimeStore", () => {
     }),
   };
 });
-vi.mock("../stores/spendStore", () => ({ useSpendPill: () => "$—" }));
 
 import { ConciergeHost } from "./ConciergeHost";
+import { armedIntents, clearAllIntents, fireIntent } from "../services/dispatchIntent";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { Attachment } from "./composer/attachments";
 
@@ -137,14 +137,36 @@ async function attachImage() {
     fireEvent.click(screen.getByRole("button", { name: "Image" }));
   });
 }
+/**
+ * Let every armed send's countdown run out.
+ *
+ * An agent-bound send ARMS an intent (services/dispatchIntent) the user can cancel, and only the
+ * uncancelled expiry delivers — so a suite asserting what reached the PTY has to pass through the
+ * gate. Fired directly rather than by advancing timers, so this suite keeps real timers.
+ */
+async function elapseCountdowns() {
+  const pending = armedIntents();
+  if (pending.length === 0) return;
+  await act(async () => {
+    for (const i of pending) fireIntent(i.id);
+    // Generously many: the expiry re-enters the send queue and the delivery it runs is several
+    // awaits deep, so too few ticks reads as "the send never happened" rather than as a race.
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+  });
+}
+
 async function send(text: string) {
   fireEvent.change(box(), { target: { value: text } });
   await act(async () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
   });
+  await elapseCountdowns();
 }
 
 beforeEach(() => {
+  // Intents are a module-level registry, so one suite's armed send would otherwise leak into the
+  // next row's `armedIntents()` and be fired against a fresh render.
+  clearAllIntents();
   h.dispatch.mockClear();
   h.pick.mockReset();
   h.answersLivePicker.mockReset();

@@ -53,6 +53,12 @@ import { PtyGoneError } from "../pty";
 import { dispatchConciergeAnswer, flushPendingSends } from "./conciergeDispatch";
 import { resetPendingSends } from "./pendingSends";
 
+/** Any valid authority. These suites predate the dispatch authority gate and exercise DELIVERY,
+ *  not authorization — the gate itself is covered by dispatchAuthority.test.ts and
+ *  conciergeDispatch.gate.test.ts. `authority` is required and non-defaulted (see
+ *  services/dispatchAuthority), so every call has to name one. */
+const TEST_AUTHORITY = { kind: "suggestion", agentId: "a1" } as const;
+
 const SHOT = "/var/folders/x9/T/sparkle-shot-1753.png";
 // What ConciergeHost builds for "look at this" + one screenshot.
 const PAYLOAD = `'${SHOT}' look at this`;
@@ -78,6 +84,7 @@ afterEach(() => vi.clearAllMocks());
 describe("conciergeDispatch — payload / display / naming basis stay separate", () => {
   it("writes the PAYLOAD to the PTY but never lets a path reach a prompt surface", async () => {
     const r = await dispatchConciergeAnswer("a1", PAYLOAD, {
+      authority: TEST_AUTHORITY,
       userPrompt: true,
       display: DISPLAY,
       namingBasis: TYPED,
@@ -92,6 +99,7 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
 
   it("routes each rendering to its own destination", async () => {
     await dispatchConciergeAnswer("a1", PAYLOAD, {
+      authority: TEST_AUTHORITY,
       userPrompt: true,
       display: DISPLAY,
       namingBasis: TYPED,
@@ -109,6 +117,7 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
     // typed. Collapsed onto the payload, the model would instead be asked to name the agent after
     // a bare `/var/folders/...png`.
     await dispatchConciergeAnswer("a1", `'${SHOT}'`, {
+      authority: TEST_AUTHORITY,
       userPrompt: true,
       display: "1 image",
       namingBasis: "",
@@ -120,7 +129,7 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
   });
 
   it("defaults both renderings to the wire text when nothing was attached", async () => {
-    await dispatchConciergeAnswer("a1", "just words", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "just words", { authority: TEST_AUTHORITY, userPrompt: true });
 
     expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", "just words");
     expect(h.record).toHaveBeenCalledWith("just words");
@@ -128,7 +137,7 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
   });
 
   it("a machine-authored relay still records nothing at all", async () => {
-    await dispatchConciergeAnswer("a1", "approve", { userPrompt: false });
+    await dispatchConciergeAnswer("a1", "approve", { authority: TEST_AUTHORITY, userPrompt: false });
     expect(surfacedStrings()).toEqual([]);
   });
 
@@ -138,6 +147,7 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
     h.submitPrompt.mockRejectedValueOnce(new PtyGoneError("not up"));
 
     const queued = await dispatchConciergeAnswer("a1", PAYLOAD, {
+      authority: TEST_AUTHORITY,
       userPrompt: true,
       display: DISPLAY,
       namingBasis: TYPED,
@@ -162,7 +172,7 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
     (detectTerminalPrompts as unknown as ReturnType<typeof vi.fn>).mockReturnValueOnce([
       { id: "1", label: "Yes, proceed", value: "y\n", kind: "terminal", source: "heuristic" },
     ]);
-    const r = await dispatchConciergeAnswer("a1", "yes", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "yes", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.path).toBe("picker-option");
     expect(r.display).toBe("Yes, proceed");
     expect(r.sent).not.toBe(r.display);
@@ -172,6 +182,7 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
     h.paneState.mockReturnValue("starting");
     h.submitPrompt.mockRejectedValueOnce(new PtyGoneError("not up"));
     const queued = await dispatchConciergeAnswer("a1", PAYLOAD, {
+      authority: TEST_AUTHORITY,
       userPrompt: true,
       display: DISPLAY,
       namingBasis: TYPED,

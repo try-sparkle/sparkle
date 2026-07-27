@@ -118,6 +118,19 @@ export function claudeSessionInfo(
   return invoke<ClaudeSessionInfo>("claude_session_info", { worktreePath, configDir });
 }
 
+/** The same probe aimed at the CONCIERGE's conversation rather than a build agent's worktree.
+ *
+ *  Takes no path ON PURPOSE. The concierge runs headless `claude -p` with its cwd set to Sparkle's
+ *  app-data dir, so Claude Code files its transcripts under that path's slug like any other
+ *  project — but that dir is build-flavored (`-dev` in debug) and Tauri-resolved, so only Rust can
+ *  name it. It resolves the path and runs the identical scan (`preflight::concierge_session_info`).
+ *
+ *  This is what makes the concierge remember a conversation across an app restart: the transcript
+ *  was never lost, only the POINTER to it. See services/concierge.ts's boot restore. */
+export function conciergeSessionInfo(): Promise<ClaudeSessionInfo> {
+  return invoke<ClaudeSessionInfo>("concierge_session_info");
+}
+
 /** True if this worktree already has a prior `claude` conversation we can resume
  * (drives `claude --continue` vs a fresh `claude` when (re)opening an agent).
  *

@@ -16,14 +16,16 @@ import { bottomRowIndices } from "../engine/composerOcclusion";
 import { registerScrollback, serializeScrollback } from "../services/terminalScrollback";
 import { useUiStore } from "../stores/uiStore";
 import { useInteractionStore } from "../stores/interactionStore";
+import { usePresenceStore } from "../stores/presenceStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
 import { isComposerToggleKey } from "./composerToggle";
 import { shouldReclaimPlainDrag } from "./terminalSelectionReclaim";
 import { isCopySelectionKey } from "./copySelectionKey";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
 import { resolveTerminalOverlay } from "./terminalOverlay";
-import { makeLineScanState, scanSubmittedLines } from "./terminalSubmit";
+import { makeLineScanState, scanSubmittedLines, hasPendingInput } from "./terminalSubmit";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { isMeasuredSize, spawnSize } from "./terminalSize";
 import { PtyAckBatcher, PtyFlowController } from "./terminalFlow";
@@ -505,8 +507,19 @@ export function Terminal({
     const lineScan = makeLineScanState();
     term.onData((d) => {
       useInteractionStore.getState().touch(agentId);
+      // Same signal, second consumer: this is the app's only evidence that a user typing into a
+      // terminal — rather than into the compose box — is still at the keyboard. Without it the
+      // presence store would call someone Away after five minutes of driving an agent by hand, and
+      // the concierge would start acting alone with the user watching (stores/presenceStore).
+      usePresenceStore.getState().noteInput();
       const submits = scanSubmittedLines(lineScan, d);
       for (let i = 0; i < submits; i += 1) onSubmitLineRef.current?.();
+      // The same scan answers "is the user mid-line at the CLI prompt right now?", which is what
+      // the terminal-anchored action pill hides on — there is no React `value` to read here, the
+      // input line is painted by the CLI inside this canvas. Published rather than passed up as a
+      // prop because the pill is owned by the concierge, not by this pane. The store no-ops unless
+      // emptiness actually FLIPS, so this stays one write per word, not one per keystroke.
+      useTerminalOverlayStore.getState().setDraft(agentId, hasPendingInput(lineScan));
       transport.write(d);
     });
 
@@ -884,6 +897,10 @@ export function Terminal({
       // re-render, a queued rAF/ResizeObserver tick) sees it and no-ops via safeFit/safeRefresh.
       disposedRef.current = true;
       unregisterScrollback();
+      // The half-typed line dies with the PTY. Without this, an agent torn down mid-compose would
+      // leave `drafts[agentId]` true forever, and the action pill would stay hidden on the fresh
+      // terminal a "Start again" (or an account switch) remounts here.
+      useTerminalOverlayStore.getState().clearDraft(agentId);
       if (focusRef) focusRef.current = null;
       if (apiRef) apiRef.current = null;
       ro.disconnect();

@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import {
@@ -57,6 +57,8 @@ import { TerminalDropPill } from "./TerminalDropPill";
 import { useTerminalDrop } from "../hooks/useTerminalDrop";
 import { Onboarding } from "./Onboarding";
 import { paneVisibilityStyle } from "./paneVisibility";
+import { TERMINAL_STAGE_PADDING } from "./terminalStageAnchor";
+import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
 import { perfRender, perfMark, perfEnd, perfCancel } from "../perfTrace";
 
 type Phase = "preparing" | "ready" | "no-claude" | "error";
@@ -76,9 +78,6 @@ type Phase = "preparing" | "ready" | "no-claude" | "error";
  * string-embedded substitution, so trailing backslashes / unclosed quotes in the selection
  * can't escape into the surrounding script.
  */
-// Inner padding of the terminal stage (the wrapper's `padding: 6` below).
-const TERMINAL_STAGE_PADDING = 6;
-
 export function buildShellSpawnArgs(shell: string, cmd: string): string[] {
   return ["-l", "-c", 'eval "$1"; exec "$0" -l', shell, cmd];
 }
@@ -174,6 +173,18 @@ function AgentPaneInner({
   const terminalApiRef = useRef<TerminalApi | null>(null);
   // The terminal pane box, so the drag-vision hint pill can anchor just above it.
   const terminalStageRef = useRef<HTMLDivElement>(null);
+  // …and so the concierge's recommended-action pill can render INSIDE it. The pill is wired to the
+  // concierge (delivery queue, failure relay) but belongs on the agent it acts on, so it portals in
+  // here; publishing the node is how the two subtrees meet. A callback ref rather than a plain one
+  // because the store write has to happen on attach/detach, not on some later render — and it must
+  // clear on detach, or a closed agent's stale node would keep a portal alive on a dead element.
+  const setTerminalStage = useCallback(
+    (el: HTMLDivElement | null) => {
+      terminalStageRef.current = el;
+      useTerminalOverlayStore.getState().setStage(agent.id, el);
+    },
+    [agent.id],
+  );
   // Drop files on this terminal to attach them to this agent's next message. Replaces the old
   // drag-vision hint, whose whole content was "images have nowhere to go, drop them on the Sparkle
   // box instead" — that stopped being true when the terminal became a real drop target, and a pill
@@ -860,7 +871,7 @@ function AgentPaneInner({
         // composer mounts during "preparing" too — as the SAME element across the preparing→ready
         // transition — so a draft typed while the agent's workspace spins up is preserved (the
         // element is never remounted) and an eager send is queued + auto-delivered when ready.
-        <div ref={terminalStageRef} style={{ position: "relative", flex: 1, minHeight: 0 }}>
+        <div ref={setTerminalStage} style={{ position: "relative", flex: 1, minHeight: 0 }}>
           {/* Drag-over affordance. Sits directly in this positioned box so it covers the terminal
               whatever `phase` is rendering — a file dropped while the workspace is still preparing
               is staged just the same, so refusing to say so would be the misleading half. */}
@@ -955,6 +966,10 @@ function AgentPaneInner({
               concierge"). The prompt side-effects it used to own — appendPrompt, the jump-to-prompt
               terminal marker, auto-rename and the trial debit — now run in
               services/conciergeDispatch when the concierge delivers a prompt to this agent. */}
+          {/* The recommended-action pill for this agent renders here too, pinned bottom-right over
+              the CLI's input line — but it is PORTALED in by the concierge rather than rendered by
+              this pane (see Concierge/ConciergeSuggestions), because its delivery wiring is the
+              concierge's. The stage node published above is the container it lands in. */}
           {/* Account badge: which Claude account this agent runs under, click to pin a different
               one. Only shown once at least one account exists (multi Claude Max support). */}
           {accounts.length > 0 && chosenAccount && (

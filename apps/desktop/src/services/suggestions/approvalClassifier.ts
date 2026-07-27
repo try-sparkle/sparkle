@@ -101,7 +101,18 @@ function looksLikePermission(buttons: SuggestionButton[]): boolean {
   return hasPlainYes && hasNo;
 }
 
-function classifyCategory(region: string): ApprovalCategory {
+/**
+ * Which APPROVAL_CATEGORIES class does this text read as? First rule wins (see CATEGORY_RULES);
+ * anything unrecognized is `other`.
+ *
+ * EXPORTED so the dispatch tier classifier (services/dispatchClass) reads the SAME taxonomy rather
+ * than growing a parallel destructive-list beside it — a locked decision in the concierge-control
+ * design (§1, decision 3): two lists would drift and eventually contradict the auto-approve settings
+ * in front of the user. The rules were tuned on permission-prompt HEADERS, so on free-form user text
+ * they are conservative (an unrecognized instruction lands in `other`); broadening them belongs
+ * here, in the one taxonomy, never in a fork of it.
+ */
+export function classifyCategory(region: string): ApprovalCategory {
   for (const [cat, re] of CATEGORY_RULES) {
     if (re.test(region)) return cat;
   }

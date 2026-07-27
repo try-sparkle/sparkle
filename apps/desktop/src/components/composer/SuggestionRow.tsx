@@ -41,6 +41,10 @@ export const SUGGESTION_PILL_LABEL_MAX = 176;
 // overrun by a near-max-width label). The caret's footprint is always reserved even for a single
 // candidate: over-reserving ~20px just wraps a long placeholder a touch early, which is harmless.
 export const SUGGESTION_PILL_ZONE = SUGGESTION_PILL_LABEL_MAX + 18 + 20 + 23 + 8 + 8;
+// Rendered height of the pill. Exported because the terminal anchor has to centre a zero-height
+// rail on it (see terminalStageAnchor.ts) — a copy of "32" over there would drift the moment this
+// one changed, and the pill would silently start floating off its intended line.
+export const SUGGESTION_PILL_HEIGHT = 32;
 
 // Ties the caret (aria-controls) to the disclosure popover it opens. Only one composer/suggestion
 // row is ever mounted, so a stable id is safe.
@@ -154,7 +158,7 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss, layout = "
           pointerEvents: "auto",
           display: "flex",
           alignItems: "center",
-          height: 32,
+          height: SUGGESTION_PILL_HEIGHT,
           borderRadius: 8,
           background: isCta ? C.successInk : "rgba(255,255,255,0.06)",
           border: isCta ? "none" : `1px solid ${C.muted}`,

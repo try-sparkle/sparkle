@@ -4,7 +4,7 @@
 // terminal-adjacent composer must not lose what it did around a send: record the prompt
 // (appendPrompt), drop the jump-to-prompt terminal marker (markPrompt), auto-name from the work
 // (maybeAutoName), feed the ghost-text history and debit one free-trial prompt. They now run on the
-// concierge dispatch path — and only for a genuine USER prompt (`{ userPrompt: true }`), so the
+// concierge dispatch path — and only for a genuine USER prompt (`{ authority: TEST_AUTHORITY, userPrompt: true }`), so the
 // nudge card's machine-authored "approve" fallback can't rename an agent or spend a trial prompt.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SuggestionButton } from "./suggestions/types";
@@ -47,6 +47,12 @@ import { useProjectStore } from "../stores/projectStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
 import type { AgentTab, Project } from "../types";
 
+/** Any valid authority. These suites predate the dispatch authority gate and exercise DELIVERY,
+ *  not authorization — the gate itself is covered by dispatchAuthority.test.ts and
+ *  conciergeDispatch.gate.test.ts. `authority` is required and non-defaulted (see
+ *  services/dispatchAuthority), so every call has to name one. */
+const TEST_AUTHORITY = { kind: "suggestion", agentId: "a1" } as const;
+
 function mkAgent(id: string): AgentTab {
   return {
     id, name: id, kind: "build", parentId: null, runtime: "local",
@@ -81,7 +87,7 @@ describe("dispatchConciergeAnswer — re-homed composer side-effects", () => {
   // the bottom of this file: ONE copy, the strongest of the three that the merge left behind, which
   // also pins that the screen is never read and nothing is charged (roborev 51593/51594).
   it("records the delivered prompt in the agent's history", async () => {
-    await dispatchConciergeAnswer("a1", "ship the docs pass", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "ship the docs pass", { authority: TEST_AUTHORITY, userPrompt: true });
     const history = promptsOf("a1");
     expect(history.map((h) => h.text)).toContain("ship the docs pass");
     expect(useProjectStore.getState().projects[0]!.agents[0]!.lastPrompt).toBe("ship the docs pass");
@@ -90,27 +96,27 @@ describe("dispatchConciergeAnswer — re-homed composer side-effects", () => {
   it("drops a terminal marker under the recorded prompt's id (jump-to-prompt keeps working)", async () => {
     const mark = vi.fn();
     registerPromptMarker("a1", mark);
-    await dispatchConciergeAnswer("a1", "ship the docs pass", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "ship the docs pass", { authority: TEST_AUTHORITY, userPrompt: true });
     const recorded = promptsOf("a1").at(-1);
     expect(recorded).toBeTruthy();
     expect(mark).toHaveBeenCalledWith(recorded!.id);
   });
 
   it("auto-names from the prompt when the autoRename feature is on", async () => {
-    await dispatchConciergeAnswer("a1", "  ship the docs pass  ", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "  ship the docs pass  ", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(maybeAutoName).toHaveBeenCalledWith("p1", "a1", "ship the docs pass");
   });
 
   it("does NOT auto-name when the autoRename feature is off", async () => {
     aiFeatureNow.mockReturnValue(false);
-    await dispatchConciergeAnswer("a1", "ship the docs pass", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "ship the docs pass", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(maybeAutoName).not.toHaveBeenCalled();
     // …but the prompt is still recorded — naming is the only thing the flag gates.
     expect(promptsOf("a1").map((h) => h.text)).toContain("ship the docs pass");
   });
 
   it("debits exactly one free-trial prompt per delivered prompt", async () => {
-    await dispatchConciergeAnswer("a1", "one", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "one", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(recordTrialSend).toHaveBeenCalledTimes(1);
   });
 
@@ -124,7 +130,7 @@ describe("dispatchConciergeAnswer — re-homed composer side-effects", () => {
     ]);
     const mark = vi.fn();
     registerPromptMarker("a1", mark);
-    const r = await dispatchConciergeAnswer("a1", "yes", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "yes", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.path).toBe("picker-option");
     const history = promptsOf("a1");
     expect(history).toHaveLength(1);
@@ -136,11 +142,11 @@ describe("dispatchConciergeAnswer — re-homed composer side-effects", () => {
   });
 
   it("keeps picker answers out of the DISPLAY surfaces (composerPrompts filters them)", async () => {
-    await dispatchConciergeAnswer("a1", "the real request", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "the real request", { authority: TEST_AUTHORITY, userPrompt: true });
     (detectTerminalPrompts as unknown as ReturnType<typeof vi.fn>).mockReturnValue([
       { id: "1", label: "Unlisted — direct link only", value: "1\n", kind: "terminal", source: "heuristic" },
     ]);
-    await dispatchConciergeAnswer("a1", "1", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "1", { authority: TEST_AUTHORITY, userPrompt: true });
     const { composerPrompts } = await import("../components/promptHistory");
     expect(promptsOf("a1")).toHaveLength(2);
     expect(composerPrompts(promptsOf("a1")).map((e) => e.text)).toEqual(["the real request"]);
@@ -151,7 +157,7 @@ describe("dispatchConciergeAnswer — re-homed composer side-effects", () => {
     (submitPrompt as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
       new (PtyGoneError as unknown as new () => Error)(),
     );
-    const r = await dispatchConciergeAnswer("a1", "never lands", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "never lands", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(false);
     expect(r.path).toBe("pty-gone");
     expect(promptsOf("a1")).toHaveLength(0);
@@ -160,19 +166,19 @@ describe("dispatchConciergeAnswer — re-homed composer side-effects", () => {
   });
 
   it("still delivers when the agent has no mounted terminal to mark (best-effort marker)", async () => {
-    const r = await dispatchConciergeAnswer("a1", "no pane mounted", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "no pane mounted", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(true);
     expect(promptsOf("a1").map((h) => h.text)).toContain("no pane mounted");
   });
 
   it("still delivers for an agent that belongs to no known project", async () => {
-    const r = await dispatchConciergeAnswer("orphan", "hello", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("orphan", "hello", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(true);
     expect(maybeAutoName).not.toHaveBeenCalled();
   });
 
   it("feeds the ghost-text prompt history with the trimmed text", async () => {
-    await dispatchConciergeAnswer("a1", "  wire the webhook  ", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "  wire the webhook  ", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(usePromptHistoryStore.getState().history).toEqual(["wire the webhook"]);
     // …and the recorded history entry is trimmed too, so the pinned header and the naming basis
     // read the same string.
@@ -185,7 +191,7 @@ describe("dispatchConciergeAnswer — side-effects are OPT-IN (the nudge Approve
     const mark = vi.fn();
     registerPromptMarker("a1", mark);
     // This is the Approve fallback: the picker scrolled off, so "approve" goes as free text.
-    const r = await dispatchConciergeAnswer("a1", "approve");
+    const r = await dispatchConciergeAnswer("a1", "approve", { authority: TEST_AUTHORITY });
     expect(r.ok).toBe(true);
     expect(r.path).toBe("free-text");
     expect(submitPrompt).toHaveBeenCalledWith("a1", "approve");
@@ -197,7 +203,7 @@ describe("dispatchConciergeAnswer — side-effects are OPT-IN (the nudge Approve
   });
 
   it("an explicit userPrompt: false is the same as omitting it", async () => {
-    await dispatchConciergeAnswer("a1", "approve", { userPrompt: false });
+    await dispatchConciergeAnswer("a1", "approve", { authority: TEST_AUTHORITY, userPrompt: false });
     expect(promptsOf("a1")).toHaveLength(0);
     expect(recordTrialSend).not.toHaveBeenCalled();
   });
@@ -206,7 +212,7 @@ describe("dispatchConciergeAnswer — side-effects are OPT-IN (the nudge Approve
 describe("dispatchConciergeAnswer — the free-trial PRE-SEND gate", () => {
   it("refuses BEFORE delivery when the server says the trial is spent", async () => {
     trialSendAllowed.mockReturnValue(false);
-    const r = await dispatchConciergeAnswer("a1", "one more thing", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "one more thing", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(false);
     expect(r.path).toBe("trial-spent");
     expect(submitPrompt).not.toHaveBeenCalled();
@@ -219,7 +225,7 @@ describe("dispatchConciergeAnswer — the free-trial PRE-SEND gate", () => {
     // The debit is scoped to userPrompt, so the gate is too: blocking a keystroke we deliberately
     // never charge would paywall the nudge Approve button for no revenue.
     trialSendAllowed.mockReturnValue(false);
-    const r = await dispatchConciergeAnswer("a1", "approve");
+    const r = await dispatchConciergeAnswer("a1", "approve", { authority: TEST_AUTHORITY });
     expect(r.ok).toBe(true);
     expect(r.path).toBe("free-text");
   });
@@ -229,7 +235,7 @@ describe("dispatchConciergeAnswer — the free-trial PRE-SEND gate", () => {
     (detectTerminalPrompts as unknown as ReturnType<typeof vi.fn>).mockReturnValue([
       { id: "1", label: "Yes", value: "y\n", kind: "terminal", source: "heuristic" },
     ]);
-    const r = await dispatchConciergeAnswer("a1", "yes", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "yes", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(true);
     expect(r.path).toBe("picker-option");
   });
@@ -246,7 +252,7 @@ describe("dispatchConciergeAnswer — queueing a prompt for a PTY that isn't up 
   it("queues (not drops) a prompt for an agent whose pane is mounting", async () => {
     setPaneReady("a1", false); // the pane is mounted, its PTY hasn't come up yet
     await rejectPtyGoneOnce();
-    const r = await dispatchConciergeAnswer("a1", "start on the docs", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "start on the docs", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(true);
     expect(r.path).toBe("queued");
     expect(pendingSendCount("a1")).toBe(1);
@@ -261,7 +267,7 @@ describe("dispatchConciergeAnswer — queueing a prompt for a PTY that isn't up 
     // nothing will ever flush — the dangle the failed state exists to prevent.
     setPaneFailed("a1");
     await rejectPtyGoneOnce();
-    const r = await dispatchConciergeAnswer("a1", "start on the docs", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "start on the docs", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(false);
     expect(r.path).toBe("agent-failed"); // its own path: the remedy is Retry, not "start it again"
     expect(pendingSendCount("a1")).toBe(0);
@@ -277,7 +283,7 @@ describe("dispatchConciergeAnswer — queueing a prompt for a PTY that isn't up 
       setPaneFailed("a1"); // prepare() gave up while the send was in flight
       throw new (PtyGoneError as unknown as new () => Error)();
     });
-    const r = await dispatchConciergeAnswer("a1", "start on the docs", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "start on the docs", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(false);
     expect(r.path).toBe("agent-failed");
     expect(pendingSendCount("a1")).toBe(0);
@@ -291,7 +297,7 @@ describe("dispatchConciergeAnswer — queueing a prompt for a PTY that isn't up 
       unregisterPane("a1"); // the pane closed for good while the send was in flight
       throw new (PtyGoneError as unknown as new () => Error)();
     });
-    const r = await dispatchConciergeAnswer("a1", "start on the docs", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "start on the docs", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(false);
     expect(r.path).toBe("pty-gone");
     expect(pendingSendCount("a1")).toBe(0);
@@ -301,7 +307,7 @@ describe("dispatchConciergeAnswer — queueing a prompt for a PTY that isn't up 
     setPaneFailed("a1");
     setPaneReady("a1", false); // Retry re-entered the prepare flow: mounting again
     await rejectPtyGoneOnce();
-    const r = await dispatchConciergeAnswer("a1", "start on the docs", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "start on the docs", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.path).toBe("queued");
     expect(pendingSendCount("a1")).toBe(1);
   });
@@ -309,7 +315,7 @@ describe("dispatchConciergeAnswer — queueing a prompt for a PTY that isn't up 
   it("flushes the queue once the pane reports ready, with the side-effects it was queued with", async () => {
     setPaneReady("a1", false); // the pane is mounted, its PTY hasn't come up yet
     await rejectPtyGoneOnce();
-    await dispatchConciergeAnswer("a1", "start on the docs", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "start on the docs", { authority: TEST_AUTHORITY, userPrompt: true });
     const results = await flushPendingSends("a1");
     expect(results.map((r) => r.path)).toEqual(["free-text"]);
     expect(submitPrompt).toHaveBeenLastCalledWith("a1", "start on the docs");
@@ -320,7 +326,7 @@ describe("dispatchConciergeAnswer — queueing a prompt for a PTY that isn't up 
 
   it("still reports pty-gone for an agent with no pane at all", async () => {
     await rejectPtyGoneOnce();
-    const r = await dispatchConciergeAnswer("a1", "nobody home", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "nobody home", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(false);
     expect(r.path).toBe("pty-gone");
     expect(pendingSendCount("a1")).toBe(0);
@@ -346,7 +352,7 @@ describe("dispatchConciergeAnswer — a user PROMPT is not a picker answer", () 
   it("refuses (with the options) rather than collapsing a sentence onto one keystroke", async () => {
     // "yes, but rename the flag first" starts with a yes-word; taking the y-keystroke would throw
     // the rest of the user's instruction away and answer the picker with something they didn't say.
-    const r = await dispatchConciergeAnswer("a1", "yes, but rename the flag first", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "yes, but rename the flag first", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(false);
     expect(r.path).toBe("ambiguous-picker");
     expect(r.options).toHaveLength(2);
@@ -355,28 +361,28 @@ describe("dispatchConciergeAnswer — a user PROMPT is not a picker answer", () 
   });
 
   it("still takes a terse user answer — a single word", async () => {
-    const r = await dispatchConciergeAnswer("a1", "yes", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "yes", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.path).toBe("picker-option");
   });
 
   it("still takes a bare option number and an exact multi-word label", async () => {
-    expect((await dispatchConciergeAnswer("a1", "2", { userPrompt: true })).path).toBe("picker-option");
+    expect((await dispatchConciergeAnswer("a1", "2", { authority: TEST_AUTHORITY, userPrompt: true })).path).toBe("picker-option");
     (detectTerminalPrompts as unknown as ReturnType<typeof vi.fn>).mockReturnValue([
       { id: "1", label: "Unlisted — direct link only", value: "1\n", kind: "terminal", source: "heuristic" },
     ]);
-    const r = await dispatchConciergeAnswer("a1", "Unlisted — direct link only", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "Unlisted — direct link only", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.path).toBe("picker-option");
   });
 
   it("leaves the MACHINE relay path alone (one word, always terse)", async () => {
-    const r = await dispatchConciergeAnswer("a1", "approve");
+    const r = await dispatchConciergeAnswer("a1", "approve", { authority: TEST_AUTHORITY });
     expect(r.path).toBe("picker-option");
   });
 
   it("records NOTHING for a machine picker answer (it isn't a user turn)", async () => {
     // An appendPrompt(..., "picker") entry counts toward the naming ladder's promptCount, so a bot
     // approval would consume the first-turn deferral a self-reporting agent relies on.
-    await dispatchConciergeAnswer("a1", "approve");
+    await dispatchConciergeAnswer("a1", "approve", { authority: TEST_AUTHORITY });
     expect(promptsOf("a1")).toHaveLength(0);
   });
 });
@@ -442,7 +448,7 @@ describe("dispatchConciergeAnswer / flushPendingSends — the queue is honest", 
     // comes (the pane's flush only fires on a ready TRANSITION).
     setPaneReady("a1", true);
     await rejectPtyGoneOnce();
-    const r = await dispatchConciergeAnswer("a1", "too late", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "too late", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(false);
     expect(r.path).toBe("pty-gone");
     expect(pendingSendCount("a1")).toBe(0);
@@ -457,7 +463,7 @@ describe("dispatchConciergeAnswer / flushPendingSends — the queue is honest", 
       setPaneReady("a1", true);
       throw new (PtyGoneError as unknown as new () => Error)();
     });
-    const r = await dispatchConciergeAnswer("a1", "beat the race", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "beat the race", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.path).toBe("queued");
     await Promise.resolve();
     await Promise.resolve();
@@ -468,7 +474,7 @@ describe("dispatchConciergeAnswer / flushPendingSends — the queue is honest", 
   it("broadcasts a delivered queued prompt so the concierge can reconcile its promise", async () => {
     setPaneReady("a1", false);
     await rejectPtyGoneOnce();
-    await dispatchConciergeAnswer("a1", "later", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "later", { authority: TEST_AUTHORITY, userPrompt: true });
     const seen: string[] = [];
     const off = onDeferredSendOutcome((r) => seen.push(`${r.path}:${String(r.ok)}`));
     await flushPendingSends("a1");
@@ -479,7 +485,7 @@ describe("dispatchConciergeAnswer / flushPendingSends — the queue is honest", 
   it("broadcasts an EXPIRED hold instead of silently dropping a promised prompt", async () => {
     setPaneReady("a1", false);
     await rejectPtyGoneOnce();
-    await dispatchConciergeAnswer("a1", "held too long", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "held too long", { authority: TEST_AUTHORITY, userPrompt: true });
     // Age the entry past the TTL by re-queueing it with an old timestamp.
     resetPendingSends();
     queuePendingSend({ agentId: "a1", text: "held too long", userPrompt: true, at: 0 });
@@ -510,7 +516,7 @@ describe("dispatchConciergeAnswer / flushPendingSends — the queue is honest", 
 
     setPaneReady("a1", false);
     await rejectPtyGoneOnce();
-    const r = await dispatchConciergeAnswer("a1", "the newer one", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("a1", "the newer one", { authority: TEST_AUTHORITY, userPrompt: true });
     off();
 
     expect(r.path).toBe("queued");
@@ -522,7 +528,7 @@ describe("dispatchConciergeAnswer / flushPendingSends — the queue is honest", 
   it("a listener that throws can't break a delivery that already landed", async () => {
     setPaneReady("a1", false);
     await rejectPtyGoneOnce();
-    await dispatchConciergeAnswer("a1", "resilient", { userPrompt: true });
+    await dispatchConciergeAnswer("a1", "resilient", { authority: TEST_AUTHORITY, userPrompt: true });
     const off = onDeferredSendOutcome(() => {
       throw new Error("boom");
     });
@@ -575,7 +581,7 @@ describe("cloud agents have no local PTY (roborev 46916)", () => {
         { ...base, id: "p-cloud", agents: [{ ...base.agents[0]!, id: "cloudy", runtime: "cloud" as const }] },
       ],
     });
-    const r = await dispatchConciergeAnswer("cloudy", "yes", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("cloudy", "yes", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.ok).toBe(false);
     expect(r.path).toBe("cloud-agent");
     // The refusal short-circuits BEFORE the screen is even read: no PTY write, no keystroke,

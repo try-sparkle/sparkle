@@ -1,7 +1,19 @@
 // The recommended-action row for the actively-shown build agent, as a CONNECTED component.
 //
-// WHY THIS IS ITS OWN COMPONENT, AND WHY IT IS STILL KEYED BY agentId.
-// `useSuggestions` was written on the assumption that one hook instance owns ONE agent for its
+// WHERE IT RENDERS: ON the terminal, pinned bottom-right, so it sits over the CLI's own input line
+// — not in a strip above the concierge compose box, where it used to live (the `suggestionsSlot` in
+// ConciergeColumn, now gone). The action is about the agent you are looking at, so it belongs on
+// that agent's pane; a pill three hundred pixels away in another column made the user hunt for it.
+//
+// It gets there by PORTAL, because the two facts it needs live in different subtrees: the wiring
+// (deliver, queue, report) is the concierge's, and the container is AgentPane's. Note carefully
+// WHERE the portal is — inside this component's own render, not around it. This component stays
+// mounted at a stable position in ConciergeHost's tree and only its OUTPUT moves. Portaling it from
+// the outside instead (mount it only once a stage is registered) would tie the hook's lifetime to
+// the stage's, and the hook must outlive it — see `visible` below.
+//
+// WHY THIS IS ITS OWN COMPONENT, AND WHY IT MUST BE KEYED BY agentId.
+// `useSuggestions` is written on the assumption that one hook instance owns ONE agent for its
 // lifetime — its own comments say so ("Per-agent (this hook instance owns one agent)" on
 // handledSigs). It reset on the agent leaving your-turn, NOT on the agent id changing. Calling it
 // once in ConciergeHost with a changing id broke every one of those assumptions at once, and the
@@ -51,10 +63,13 @@
 // out by hand. See also ComposeBox's placeholder overlay, which reserves no pill room for the same
 // reason: at the 360px column the pill zone is wider than the whole textarea text column.
 import { useCallback } from "react";
-import { SuggestionRow } from "../composer/SuggestionRow";
+import { createPortal } from "react-dom";
+import { SuggestionRow, SUGGESTION_PILL_HEIGHT } from "../composer/SuggestionRow";
+import { terminalSuggestionAnchorStyle } from "../terminalStageAnchor";
 import { applySuggestion } from "../../services/suggestions/applySuggestion";
 import { useSuggestions } from "../../services/suggestions/useSuggestions";
 import { useRuntimeStore } from "../../stores/runtimeStore";
+import { useTerminalOverlayStore } from "../../stores/terminalOverlayStore";
 import type { SuggestionButton } from "../../services/suggestions/types";
 import type { AgentTabStatus } from "../../types";
 
@@ -97,12 +112,19 @@ export function ConciergeSuggestions({
   onApply: (run: () => Promise<boolean>) => Promise<boolean>;
   onFailure: (message: string) => void;
 }) {
-  // `composerEmpty` is TRUE unconditionally: this is a chat compose, not the terminal's, and hiding
-  // the recommended action the moment the user starts typing would take it away exactly when they
-  // are deciding whether to type it out themselves.
+  // `composerEmpty` is TRUE unconditionally. The hook's own emptiness gate reads a React composer
+  // `value`, and there is no React composer on this surface any more — the input line the pill sits
+  // over is painted by the CLI inside the xterm canvas. Emptiness for THAT line is gated below
+  // instead, off the terminal's own keystroke scanner.
   const { buttons, dismiss, clear } = useSuggestions(agentId, true);
   const status = useRuntimeStore((s) => s.status[agentId]);
   const disabled = status !== undefined && NO_PTY.has(status);
+  // The pane's terminal stage, once it has one. Absent while the pane is in its error / no-claude /
+  // pre-spawn states — the pill simply has nowhere to render then, which is correct.
+  const stage = useTerminalOverlayStore((s) => s.stages[agentId]);
+  // The user is mid-line at the CLI prompt: get out of their way. Restores itself the moment the
+  // line is submitted or cancelled (Enter / Ctrl-C / Ctrl-U / Escape) — see terminalSubmit.ts.
+  const typing = useTerminalOverlayStore((s) => !!s.drafts[agentId]);
 
   const onClick = useCallback(
     (b: SuggestionButton) => {
@@ -128,13 +150,25 @@ export function ConciergeSuggestions({
     [agentId, agentName, disabled, onDeliverPrompt, onApply, onFailure, clear],
   );
 
-  return (
-    <SuggestionRow
-      layout="row"
-      buttons={buttons}
-      visible={visible}
-      onClick={onClick}
-      onDismiss={dismiss}
-    />
+  // No stage to hang on — render nothing, but note that we got here AFTER useSuggestions ran. The
+  // hook is what keeps auto-approve, auto-resume and the phone push alive; an early return above it
+  // would stop them for an agent whose pane happens to be mid-spawn.
+  if (!stage) return null;
+
+  // A CLICK RUNS IMMEDIATELY — no countdown, no confirm dialog, destructive commands included.
+  // That is a deliberate, user-confirmed exception to the escape-hatch pattern the rest of the
+  // concierge design uses: this pill only ever appears when the agent is already waiting on you,
+  // and the whole point is that it is one tap. Do not add a confirmation step here.
+  return createPortal(
+    <div data-testid="terminal-suggestion-anchor" style={terminalSuggestionAnchorStyle(SUGGESTION_PILL_HEIGHT)}>
+      <SuggestionRow
+        layout="overlay"
+        buttons={buttons}
+        visible={visible && !typing}
+        onClick={onClick}
+        onDismiss={dismiss}
+      />
+    </div>,
+    stage,
   );
 }

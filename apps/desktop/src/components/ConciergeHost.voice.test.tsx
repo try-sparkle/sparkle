@@ -92,6 +92,7 @@ vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: h.maybePau
 
 import { ConciergeHost } from "./ConciergeHost";
 import type { ConciergeFeed } from "../useConciergeFeed";
+import { armedIntents, clearAllIntents, fireIntent } from "../services/dispatchIntent";
 
 const calmFeed = {
   projects: [],
@@ -100,8 +101,29 @@ const calmFeed = {
   pinnedProjectId: null,
 };
 
+/**
+ * Let every armed send's countdown run out.
+ *
+ * An agent-bound send now ARMS an intent (services/dispatchIntent) that the user can cancel, and
+ * only the uncancelled expiry delivers — so a suite asserting on delivery has to pass through the
+ * gate. Fired directly rather than by advancing timers, so this suite keeps real timers.
+ */
+async function elapseCountdowns() {
+  const pending = armedIntents();
+  if (pending.length === 0) return;
+  await act(async () => {
+    for (const i of pending) fireIntent(i.id);
+    // Generously many: the expiry re-enters the send QUEUE and the delivery it runs is several
+    // awaits deep (promptAgent → dispatchConciergeAnswer → the outcome ladder), so too few ticks
+    // here shows up as a delivery that "did not happen" rather than as a timing failure.
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+  });
+}
+
 afterEach(() => {
   cleanup();
+  // See ConciergeHost.test.tsx: a module-level armed intent would leak into the next test.
+  clearAllIntents();
   vi.clearAllMocks();
   h.dictation.micLive = false;
   h.dictation.interim = "";
@@ -163,6 +185,7 @@ function mount(opts: { aimable?: boolean } = {}) {
         await Promise.resolve();
         await Promise.resolve();
       });
+      await elapseCountdowns();
     },
     /** Point the router at the AGENT: the next send goes to its terminal, not the brain. This is
      *  the routed replacement for flipping the removed send-target toggle. */

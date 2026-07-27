@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type {
   ConciergeDispatchPath,
@@ -168,12 +168,23 @@ import { ConciergeHost, TRIAL_SPENT_TEXT } from "./ConciergeHost";
 import { SUPERSEDED_DETAILS } from "../services/concierge";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { StatusBand } from "../engine/buildSections";
+// The REAL stores, not mocks: the recap rows below assert the host's wiring between them, and a
+// stubbed presence store would let the subscription contract drift without a row going red.
+import { usePresenceStore } from "../stores/presenceStore";
+import { useRuntimeStore } from "../stores/runtimeStore";
+import type { AgentTabStatus } from "../types";
+import {
+  armedIntents,
+  clearAllIntents,
+  fireIntent,
+  queuedIntents,
+} from "../services/dispatchIntent";
 
 const EMPTY_COUNTS: Record<StatusBand, number> = { needs_you: 0, running: 0, done: 0 };
 
 /** A one-agent feed. The band defaults to `needs_you` because that IS the surfacing gate — an agent
  *  in any other band produces no nudge card, which is what the `done` case below pins. */
-function feedWith(status: string, band: StatusBand = "needs_you") {
+function feedWith(status: string, band: StatusBand = "needs_you", statusLabel = "Approve?") {
   const agent = {
     id: "ag1",
     name: "CI Hardening",
@@ -182,7 +193,7 @@ function feedWith(status: string, band: StatusBand = "needs_you") {
     kind: "build" as const,
     status,
     statusColor: "#e0533f",
-    statusLabel: "Approve?",
+    statusLabel,
     band,
     inScope: true,
     muted: false,
@@ -203,6 +214,12 @@ function feedWith(status: string, band: StatusBand = "needs_you") {
 
 afterEach(() => {
   cleanup();
+  // Presence is app-global state, so a row that goes Away would leak into the next one.
+  usePresenceStore.getState().reset();
+  useRuntimeStore.setState({ status: {} });
+  // Armed sends are a MODULE-level registry, so one left counting down would fire inside the next
+  // test and dispatch into its mocks. Silent by contract — this is teardown, not a user cancel.
+  clearAllIntents();
   h.suggestionMounts = [];
   h.suggestionVisible = undefined;
   h.suggestionProps = undefined;
@@ -225,10 +242,48 @@ function routeToAgent() {
 /** Let the queued send finish. Routing is async now (tier 2 is a network round trip) and every
  *  delivery chains behind the previous one, so nothing lands in the same tick as the click. */
 async function settle() {
+  await flush();
+  await elapseCountdowns();
+}
+
+/**
+ * Let routing resolve, and STOP THERE — before any countdown elapses.
+ *
+ * The half of `settle` that suites about the GATE need: they assert on the armed intent, which
+ * `settle` would already have fired. Split out rather than inlined so "routing has resolved" and
+ * "the send has landed" stay two distinct, nameable moments — the whole point of the change is that
+ * they are no longer the same one.
+ */
+async function flush() {
   await act(async () => {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
+  });
+}
+
+/**
+ * Let every armed send's countdown run out.
+ *
+ * `deliver` no longer dispatches on the router's verdict — it ARMS an intent (services/
+ * dispatchIntent) that the user gets 3s (5s destructive) to cancel, and only an uncancelled expiry
+ * delivers. So "the send settled" now includes "the countdown elapsed", and a suite asserting on
+ * DELIVERY has to pass through it. That is the behaviour change, not a testing workaround: the
+ * assertions below still prove the text reaches the terminal, they now also prove it only gets
+ * there by way of the gate.
+ *
+ * Fires the intents directly rather than advancing timers, so these suites keep real timers and
+ * their existing microtask flushing.
+ */
+async function elapseCountdowns() {
+  const pending = armedIntents();
+  if (pending.length === 0) return;
+  await act(async () => {
+    for (const i of pending) fireIntent(i.id);
+    // Generously many: the expiry re-enters the send QUEUE and the delivery it runs is several
+    // awaits deep (promptAgent → dispatchConciergeAnswer → the outcome ladder), so too few ticks
+    // here shows up as a delivery that "did not happen" rather than as a timing failure.
+    for (let i = 0; i < 8; i++) await Promise.resolve();
   });
 }
 
@@ -258,7 +313,11 @@ describe("ConciergeHost", () => {
     await settle();
     // userPrompt: false — "approve" is machine-authored; it must not enter prompt history,
     // debit a trial prompt, or feed the auto-name ladder (roborev 46251-H1).
-    expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "approve", { userPrompt: false });
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "approve", {
+      // The user clicked Approve on the nudge card — that click IS the authorization.
+      authority: { kind: "nudge-approve", agentId: "ag1" },
+      userPrompt: false,
+    });
     expect(h.openProjectTab).not.toHaveBeenCalled();
   });
 
@@ -438,7 +497,11 @@ describe("ConciergeHost", () => {
       // satisfy these rows TODAY (it posts "I couldn't reach X's terminal to approve.", which the
       // regex below doesn't match) — this is a forward-guard: a change routing the catch through
       // refusalCopy would otherwise let them pass on a path they never meant to cover.
-      expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "approve", { userPrompt: false });
+      expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "approve", {
+      // The user clicked Approve on the nudge card — that click IS the authorization.
+      authority: { kind: "nudge-approve", agentId: "ag1" },
+      userPrompt: false,
+    });
       expect(await findInThread(/I couldn't send the approval to/)).toBeTruthy();
       expect(queryInThread(/^Approved — sent to/)).toBeNull();
       expect(queryInThread(/still starting up/)).toBeNull();
@@ -515,9 +578,79 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
     await settle();
   }
 
+  /** Submit and let ROUTING resolve, stopping before the countdown does. */
+  async function arm(text: string) {
+    type(text);
+    await flush();
+  }
+
   it("the box offers NO target affordance — the user never picks", () => {
     renderWithTarget();
     expect(screen.queryByTestId("send-target-toggle")).toBeNull();
+  });
+
+  // ── THE REPORTED BUG ─────────────────────────────────────────────────────────────────────────
+  // Design §2(b) and §4: an agent has a live prompt on screen, the user types something terse that
+  // was meant for the concierge, `looksLikeAnswer` matches, and the router says "agent". That is
+  // the router working as designed — and it used to put the user's word into a terminal with no
+  // warning and no way back.
+  //
+  // The fix is not to stop routing. It is that the verdict now ARMS a visible, cancellable intent.
+  // So this row asserts the negative that matters: at the moment routing resolves, NOTHING has been
+  // dispatched, and what exists instead is an intent the user can still stop.
+  it("REGRESSION: a live ask plus terse concierge-aimed text ARMS an intent, it does not dispatch", async () => {
+    // A live permission prompt on the agent's screen — the precondition for `looksLikeAnswer`.
+    h.feed = feedWith("approval");
+    routeToAgent();
+    renderWithTarget();
+    // `arm`, not `send`: `send` also elapses the countdown, which is exactly the step this row
+    // exists to observe the near side of.
+    await arm("yes");
+
+    // NOT DELIVERED. This is the whole regression: before the gate, "yes" was already in the PTY.
+    expect(
+      h.dispatchConciergeAnswer,
+      "a router verdict alone must never reach a terminal",
+    ).not.toHaveBeenCalled();
+
+    // Held instead — visible, attributable, and stoppable.
+    const armed = armedIntents();
+    expect(armed, "the send must be armed rather than lost").toHaveLength(1);
+    expect(armed[0]!.text).toBe("yes");
+    expect(armed[0]!.targetAgentId).toBe("ag1");
+    // And the user can actually see it: the banner names the agent and the words.
+    expect(screen.getByTestId("countdown-banner")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Cancel sending to CI Hardening" }),
+    ).toBeTruthy();
+
+    // Only the uncancelled expiry delivers, and it says why it was allowed to.
+    await elapseCountdowns();
+    await waitFor(() =>
+      expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "yes", {
+        authority: { kind: "countdown", intentId: armed[0]!.id },
+        userPrompt: true,
+        display: "yes",
+        namingBasis: "yes",
+      }),
+    );
+  });
+
+  it("REGRESSION: cancelling the armed send keeps it out of the terminal for good", async () => {
+    routeToAgent();
+    renderWithTarget();
+    await arm("yes");
+    expect(armedIntents()).toHaveLength(1);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel sending to CI Hardening" }));
+    });
+    expect(armedIntents()).toHaveLength(0);
+    // The banner is gone, the user is told, and no expiry can resurrect the send.
+    expect(screen.queryByTestId("countdown-banner")).toBeNull();
+    expect(await findInThread(/I didn't send that to CI Hardening/)).toBeTruthy();
+    await elapseCountdowns();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
   });
 
   it("asks the router where the message goes, with the agent in view", async () => {
@@ -544,6 +677,10 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
       "ag1",
       "rebase onto main and re-run CI",
       {
+        // A router verdict alone can no longer reach a terminal: it arms an intent, and only the
+        // uncancelled expiry dispatches — hence a `countdown` authority rather than none at all.
+        // There is deliberately no union arm that would let the old silent send type-check.
+        authority: { kind: "countdown", intentId: expect.any(String) },
         userPrompt: true,
         display: "rebase onto main and re-run CI",
         namingBasis: "rebase onto main and re-run CI",
@@ -771,8 +908,17 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
     await act(async () => {
       release!();
     });
+    // This row drives the queue by hand rather than through `send()`, so the countdown has to be
+    // elapsed explicitly. The intent is armed the moment routing resolves; waiting for it (rather
+    // than for the dispatch) is also what pins the fix — the send is HELD here, not delivered.
+    await waitFor(() => expect(armedIntents()).toHaveLength(1));
+    // …and it is aimed at the agent that was selected AT SUBMIT, not the one selected now.
+    expect(armedIntents()[0]!.targetAgentId).toBe("ag1");
+    await elapseCountdowns();
     await waitFor(() =>
       expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "for the agent I aimed at", {
+        // Routed sends reach the PTY only via the countdown gate — never a silent router dispatch.
+        authority: { kind: "countdown", intentId: expect.any(String) },
         userPrompt: true,
         display: "for the agent I aimed at",
         namingBasis: "for the agent I aimed at",
@@ -806,6 +952,13 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
     await act(async () => {
       releaseFirst!();
     });
+    // Both sends now ARM before either delivers, so the ordering guarantee has to hold across the
+    // gate as well: elapse them in the order they were armed (which is what the real timers do —
+    // same class, same delay, armed first fires first) and the PTY writes must still come out in
+    // submit order.
+    await waitFor(() => expect(armedIntents()).toHaveLength(2));
+    expect(armedIntents().map((i) => i.text)).toEqual(["first", "second"]);
+    await elapseCountdowns();
     await waitFor(() => expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(2));
     expect(h.dispatchConciergeAnswer.mock.calls.map((c) => c[1])).toEqual(["first", "second"]);
   });
@@ -866,6 +1019,128 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
   });
 });
 
+// ── The presence seam, wired for real ────────────────────────────────────────────────────────────
+// Design §5 "Integration obligation": `shouldDispatchOnExpiry` and its unit tests live in
+// services/dispatchIntent, but the WIRING — that the host reads the actual presenceStore rather
+// than a literal — is its own obligation, and these are the rows that fail until it exists.
+//
+// This is not belt-and-braces. The earlier draft passed a literal `"here"` into the arm site, which
+// type-checks, lints clean and passes every unit test in dispatchIntent while destructive sends fire
+// at an unattended machine. Only a test that moves the REAL store can tell the two apart.
+describe("ConciergeHost — presence governs what an expiry may do", () => {
+  const target = { projectId: "p1", agentId: "ag1", name: "CI Hardening" };
+
+  function renderWithTarget() {
+    h.feed = feedWith("approval");
+    return render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={target} />);
+  }
+
+  /** Submit and let routing resolve — stopping at ARMED, so the row itself chooses when (and under
+   *  which presence) the countdown elapses. That choice is the entire subject of this suite. */
+  async function send(text: string) {
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: text } });
+    fireEvent.click(screen.getByText("Send"));
+    await flush();
+  }
+
+  /** Move the REAL store, the way blur does. Not a mock — a stub here would let the host read a
+   *  literal and still pass, which is precisely the failure being guarded against. */
+  async function goAway() {
+    await act(async () => {
+      usePresenceStore.getState().setAway();
+    });
+  }
+  async function comeBack() {
+    await act(async () => {
+      usePresenceStore.getState().setHere();
+    });
+  }
+
+  beforeEach(() => {
+    h.routeMessage.mockResolvedValue({ target: "agent", reason: "test", source: "heuristic" });
+  });
+
+  it("a DESTRUCTIVE send expiring while Away queues — and is still retrievable", async () => {
+    renderWithTarget();
+    // Destructive off the SHARED approval taxonomy, not a bespoke list of scary verbs — locked
+    // decision 3 (design §1). `classifyCategory` reads this as `bash`, which the conservative
+    // auto-approve preset withholds, which is what makes it destructive here too.
+    await send("run the deploy command");
+    expect(armedIntents()[0]!.class, "this text must land in the 5s tier").toBe("destructive");
+
+    await goAway();
+    await elapseCountdowns();
+
+    expect(
+      h.dispatchConciergeAnswer,
+      "a destructive expiry at an unattended machine must not reach the PTY",
+    ).not.toHaveBeenCalled();
+    // HELD, not dropped — the message is still there, whole.
+    expect(queuedIntents()).toHaveLength(1);
+    expect(queuedIntents()[0]!.text).toBe("run the deploy command");
+    expect(await findInThread(/I'm holding it rather than sending it to CI Hardening/)).toBeTruthy();
+  });
+
+  it("a ROUTINE send expiring while Away still goes — the rule holds back one class, not all", async () => {
+    renderWithTarget();
+    await send("add retry logic to the webhook");
+    expect(armedIntents()[0]!.class).toBe("routine");
+
+    await goAway();
+    await elapseCountdowns();
+
+    await waitFor(() => expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1));
+    expect(queuedIntents()).toHaveLength(0);
+  });
+
+  it("coming back re-presents the held send with a fresh countdown, and it then delivers", async () => {
+    renderWithTarget();
+    await send("run the deploy command");
+    await goAway();
+    await elapseCountdowns();
+    expect(queuedIntents()).toHaveLength(1);
+
+    await comeBack();
+
+    // Back in front of the user, counting again — and back in the banner they can cancel from.
+    expect(queuedIntents()).toHaveLength(0);
+    expect(armedIntents()).toHaveLength(1);
+    expect(screen.getByTestId("countdown-banner")).toBeTruthy();
+
+    await elapseCountdowns();
+    await waitFor(() =>
+      expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith(
+        "ag1",
+        "run the deploy command",
+        expect.objectContaining({ authority: { kind: "countdown", intentId: expect.any(String) } }),
+      ),
+    );
+  });
+
+  it("re-presents TWO held sends one at a time — never two countdowns at once", async () => {
+    renderWithTarget();
+    await send("run the deploy command");
+    await send("bash scripts/land.sh");
+    await goAway();
+    await elapseCountdowns();
+    expect(queuedIntents(), "both destructive sends must be held").toHaveLength(2);
+
+    await comeBack();
+
+    // THE assertion the single announcer forces: one banner, one countdown, one thing to react to.
+    expect(armedIntents(), "only the head may arm on return").toHaveLength(1);
+    expect(screen.getAllByTestId("countdown-banner")).toHaveLength(1);
+    expect(queuedIntents()).toHaveLength(1);
+
+    // The second follows only once the first has resolved.
+    await elapseCountdowns();
+    await waitFor(() => expect(armedIntents()).toHaveLength(1));
+    expect(screen.getAllByTestId("countdown-banner")).toHaveLength(1);
+    await elapseCountdowns();
+    await waitFor(() => expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(2));
+  });
+});
+
 // The receipt is what makes inference defensible (PRD §3). Without it a misroute is silent, which
 // is precisely the objection the removed target toggle existed to answer.
 describe("ConciergeHost — routing receipts", () => {
@@ -915,6 +1190,8 @@ describe("ConciergeHost — routing receipts", () => {
     });
     await settle();
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "was that right?", {
+      // The user tapped redirect on THIS message's receipt.
+      authority: { kind: "redirect", receiptId: expect.any(String) },
       userPrompt: true,
       display: "was that right?",
       namingBasis: "was that right?",
@@ -1115,6 +1392,8 @@ describe("ConciergeHost — recommended actions", () => {
     });
     expect(delivered).toBe(true);
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith("ag1", "do the thing", {
+      // The user clicked a recommended-action pill.
+      authority: { kind: "suggestion", agentId: "ag1" },
       userPrompt: true,
       display: "do the thing",
       namingBasis: "do the thing",
@@ -1298,5 +1577,198 @@ describe("ConciergeHost — digest instead of a card wall", () => {
     act(() => h.brain.done?.({ id: "1", text: "Here is what needs you." }));
     expect(await findInThread("Here is what needs you.")).toBeTruthy();
     expect(screen.getAllByTestId("concierge-digest")).toHaveLength(1);
+  });
+});
+
+// ─── Return-from-Away recap (design §3 A5) ──────────────────────────────────────────────────────
+// The store's own transitions are exhaustively covered in stores/presenceStore.test.ts; these rows
+// test only the HOST's half — snapshot at the Away edge, diff and post one card on the way back.
+describe("ConciergeHost — Away → Here recap", () => {
+  // TWO THINGS THESE ROWS PIN, both of which the first cut got wrong (roborev 53631):
+  //
+  //  1. The diff reads the FEED's status, not runtimeStore's. The feed's is the derived/published
+  //     one every card and label in the thread already speaks (publishedStatusFor: cross-window
+  //     roster + the worker/unmerged/dismissed-alert overlays), and runtimeStore only holds agents
+  //     THIS window hosts. So a row drives a change by RE-RENDERING with a new feed — and one row
+  //     below leaves runtimeStore empty entirely, which is the cross-window agent's shape.
+  //  2. The recap is gated on stretch LENGTH (conciergeRecap.MIN_AWAY_MS), so every row has to
+  //     advance a clock. A ⌘-tab-length stretch is a full Away→Here cycle and must stay silent.
+  const T0 = 1_700_000_000_000;
+  let clockNow = T0;
+  let clock: { mockRestore: () => void } | null = null;
+
+  beforeEach(() => {
+    clockNow = T0;
+    clock = vi.spyOn(Date, "now").mockImplementation(() => clockNow);
+  });
+  // Restored HERE rather than by the file's afterEach: that one calls vi.resetAllMocks(), which
+  // would strip the implementation off this spy and leave `Date.now()` returning undefined for
+  // every later row. (Inner afterEach hooks run before outer ones, so this wins.)
+  afterEach(() => {
+    clock?.mockRestore();
+    clock = null;
+  });
+
+  const away = () => act(() => usePresenceStore.getState().setFocused(false));
+  const back = () => act(() => usePresenceStore.getState().setFocused(true));
+
+  const setStatus = (status: AgentTabStatus) =>
+    useRuntimeStore.setState({ status: { ag1: status } });
+
+  it("posts a card naming what changed, and announces the same sentence", () => {
+    h.feed = feedWith("working", "running");
+    setStatus("working");
+    const { rerender } = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    away();
+    clockNow += 12 * 60_000;
+    setStatus("waiting");
+    rerender(<ConciergeHost feed={feedWith("waiting", "needs_you", "Needs you") as ConciergeFeed} />);
+    back();
+
+    const card = within(thread()).getByTestId("concierge-recap");
+    expect(card.textContent).toContain("While you were away");
+    expect(card.textContent).toContain("1 needs you");
+    expect(within(card).getAllByTestId("recap-change")).toHaveLength(1);
+    // The SAME sentence, through the column's existing single live region — not a second one.
+    const live = screen.getByRole("status");
+    expect(live.textContent).toContain("While you were away");
+    expect(document.querySelectorAll('[role="status"]')).toHaveLength(1);
+  });
+
+  it("reports the ORDINARY finish — working → idle, the case the card exists for", () => {
+    // `idle` ("Done — your turn") is what the Stop hook emits; `done` also means LANDED and is
+    // rare. Every row here used to drive `done`, which is why none of them caught a recap that
+    // stayed silent on the walk-away-and-come-back case (roborev 53631-H1).
+    h.feed = feedWith("working", "running");
+    setStatus("working");
+    const { rerender } = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    away();
+    clockNow += 40 * 60_000;
+    setStatus("idle");
+    rerender(
+      <ConciergeHost feed={feedWith("idle", "done", "Done — your turn") as ConciergeFeed} />,
+    );
+    back();
+
+    const card = within(thread()).getByTestId("concierge-recap");
+    expect(card.textContent).toContain("1 finished");
+    expect(within(card).getByTestId("recap-change").getAttribute("data-status")).toBe("idle");
+    expect(card.textContent).toContain("Done — your turn");
+  });
+
+  it("reports an agent it does NOT host — the feed is the only place it exists", () => {
+    // A roster-fed agent from another window: absent from runtimeStore.status on both edges, so a
+    // diff of that map skipped it entirely while the thread rendered a nudge card for it. On a
+    // column pinned to a project this window doesn't host, that made the recap unable to fire.
+    useRuntimeStore.setState({ status: {} });
+    h.feed = feedWith("working", "running");
+    const { rerender } = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    away();
+    clockNow += 20 * 60_000;
+    rerender(<ConciergeHost feed={feedWith("waiting", "needs_you", "Needs you") as ConciergeFeed} />);
+    back();
+
+    const card = within(thread()).getByTestId("concierge-recap");
+    expect(within(card).getByTestId("recap-change").getAttribute("data-status")).toBe("waiting");
+    expect(useRuntimeStore.getState().status).toEqual({});
+  });
+
+  it("posts nothing when only a derived OVERLAY moved — no agent did anything", () => {
+    // The feed's status is the derived one, and `branchStatus` boots empty: after a relaunch a
+    // persisted agent reads `idle` until the first branch poll escalates it to `unmerged`. Launch,
+    // ⌘-tab away, come back — that must not be "1 finished" for every agent with an old branch
+    // (roborev 53652). Reading the derived map is right; treating its churn as news is not.
+    h.feed = feedWith("idle", "done", "Done — your turn");
+    const { rerender } = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    away();
+    clockNow += 15 * 60_000;
+    rerender(<ConciergeHost feed={feedWith("unmerged", "done", "Needs merge") as ConciergeFeed} />);
+    back();
+    expect(within(thread()).queryByTestId("concierge-recap")).toBeNull();
+  });
+
+  it("reports the ordinary finish even when both ENDS look identical", () => {
+    // idle → working → idle. The Stop hook maps a finished turn back to `idle`, so an agent that
+    // was resting when you left and is resting when you return may still have done a full unit of
+    // work in between — and the two-endpoint diff sees nothing at all (roborev 53674).
+    h.feed = feedWith("idle", "done", "Done — your turn");
+    const { rerender } = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    away();
+    clockNow += 5 * 60_000;
+    rerender(<ConciergeHost feed={feedWith("working", "running", "Working") as ConciergeFeed} />);
+    clockNow += 10 * 60_000;
+    rerender(<ConciergeHost feed={feedWith("idle", "done", "Done — your turn") as ConciergeFeed} />);
+    back();
+
+    const card = within(thread()).getByTestId("concierge-recap");
+    expect(card.textContent).toContain("1 finished");
+    expect(within(card).getByTestId("recap-change").getAttribute("data-status")).toBe("idle");
+  });
+
+  it("reports an agent that STARTED and finished while you were out", () => {
+    // Same two endpoints as the overlay row above — idle → unmerged — and the opposite meaning.
+    // The host is the only thing that sees the MIDDLE of the stretch (the feed keeps updating
+    // while the window is blurred), so it accumulates the evidence and hands it to buildRecap.
+    h.feed = feedWith("idle", "done", "Done — your turn");
+    const { rerender } = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    away();
+    clockNow += 5 * 60_000;
+    rerender(<ConciergeHost feed={feedWith("working", "running", "Working") as ConciergeFeed} />);
+    clockNow += 10 * 60_000;
+    rerender(<ConciergeHost feed={feedWith("unmerged", "done", "Needs merge") as ConciergeFeed} />);
+    back();
+
+    const card = within(thread()).getByTestId("concierge-recap");
+    expect(card.textContent).toContain("1 finished");
+    expect(within(card).getByTestId("recap-change").getAttribute("data-status")).toBe("unmerged");
+  });
+
+  it("posts NOTHING when nothing changed while away", () => {
+    h.feed = feedWith("working", "running");
+    setStatus("working");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    away();
+    clockNow += 12 * 60_000;
+    back();
+    expect(within(thread()).queryByTestId("concierge-recap")).toBeNull();
+  });
+
+  it("stays silent on a ⌘-tab-length stretch, however much moved", () => {
+    // Blur → Away is immediate and unconditional (a locked presence decision), so eight seconds in
+    // another app is a complete away stretch. A card here is the chrome the user learns to skip.
+    h.feed = feedWith("working", "running");
+    const { rerender } = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    away();
+    clockNow += 8_000;
+    rerender(<ConciergeHost feed={feedWith("waiting", "needs_you", "Needs you") as ConciergeFeed} />);
+    back();
+    expect(within(thread()).queryByTestId("concierge-recap")).toBeNull();
+    expect(screen.getByRole("status").textContent).not.toContain("While you were away");
+  });
+
+  it("posts nothing on a Here → Here no-op", () => {
+    h.feed = feedWith("working", "running");
+    setStatus("working");
+    const { rerender } = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    // Never went away, so there is no snapshot to diff against and no stretch to summarise.
+    act(() => usePresenceStore.getState().setHere());
+    clockNow += 12 * 60_000;
+    rerender(<ConciergeHost feed={feedWith("waiting", "needs_you", "Needs you") as ConciergeFeed} />);
+    act(() => usePresenceStore.getState().setHere());
+    expect(within(thread()).queryByTestId("concierge-recap")).toBeNull();
+  });
+
+  it("reports an agent that finished AND landed while you were out", () => {
+    h.feed = feedWith("working", "running");
+    setStatus("working");
+    const { rerender } = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    away();
+    clockNow += 12 * 60_000;
+    setStatus("done");
+    rerender(<ConciergeHost feed={feedWith("done", "done", "Done") as ConciergeFeed} />);
+    back();
+    const card = within(thread()).getByTestId("concierge-recap");
+    expect(card.textContent).toContain("1 finished");
+    expect(within(card).getByTestId("recap-change").getAttribute("data-status")).toBe("done");
   });
 });

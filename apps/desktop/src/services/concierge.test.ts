@@ -123,7 +123,7 @@ describe("concierge service", () => {
     expect(deltas).toEqual(["Hello", " world"]);
   });
 
-  it("an error event reaches subscribers, throws nothing, and drops the session for a fresh next turn", async () => {
+  it("an error event reaches subscribers, throws nothing, and keeps a CONFIRMED session", async () => {
     const errors: string[] = [];
     onConciergeError((e) => errors.push(e.detail));
     await startConciergeTurn("first");
@@ -135,11 +135,17 @@ describe("concierge service", () => {
       payload: { id: "2", detail: "Claude usage limit reached" },
     });
     expect(errors).toEqual(["Claude usage limit reached"]);
-    // The Rust side already retried the stale resume; a still-failed turn must not chain the
-    // same session into the next turn.
-    expect(getConciergeSessionId()).toBeNull();
+    // THIS ASSERTION USED TO BE `toBeNull()`, and that was the bug (spec §3 subsystem C1). A turn
+    // that COMPLETED wrote a real transcript to disk, so `sess-A` is recoverable by definition —
+    // dropping it here made the concierge forget the entire conversation on the first transient
+    // failure, which is the same amnesia a restart used to cause. Nothing is gained by dropping it
+    // either: `concierge.rs` already re-runs a failed resuming turn ONCE without `--resume`
+    // (`should_retry_without_resume`), so a genuinely dead id self-heals on the next turn and its
+    // `done` replaces it with the fresh session. See concierge.session.test.ts for the fallback rules
+    // in full, including the case where an UNCONFIRMED resume override is still discarded.
+    expect(getConciergeSessionId()).toBe("sess-A");
     await startConciergeTurn("second");
-    expect(turnArgs(1).resumeSessionId).toBeNull();
+    expect(turnArgs(1).resumeSessionId).toBe("sess-A");
   });
 
   // The OTHER half of the cross-language contract, and the half the parametrized test below cannot
@@ -187,11 +193,26 @@ describe("concierge service", () => {
     });
     expect(getConciergeSessionId()).toBe("sess-KEEP");
 
-    // A GENUINE failure still drops it, so a stale resume can't be retried into forever.
+    // Now the half that still tells the two paths apart. Since C1, a real failure no longer drops the
+    // session to NOTHING — it drops back to the last one a `done` (or the boot restore) confirmed. So
+    // the discriminating case is an UNCONFIRMED resume target: `startConciergeTurn` advances the
+    // session optimistically on an accepted invoke, including an explicit override, and only a real
+    // failure discards that.
+    await startConciergeTurn("third", "sess-UNCONFIRMED");
+    expect(getConciergeSessionId()).toBe("sess-UNCONFIRMED");
+
+    // Superseded — a no-op, exactly as above. The override stands.
     harness.handlers.get("concierge:error")?.({
-      payload: { id: "2", detail: "Claude usage limit reached" },
+      payload: { id: "3", detail: SUPERSEDED_DETAILS[0] },
     });
-    expect(getConciergeSessionId()).toBeNull();
+    expect(getConciergeSessionId()).toBe("sess-UNCONFIRMED");
+
+    // A GENUINE failure discards the unconfirmed guess, falling back to the confirmed conversation
+    // rather than starting the user over from scratch.
+    harness.handlers.get("concierge:error")?.({
+      payload: { id: "3", detail: "Claude usage limit reached" },
+    });
+    expect(getConciergeSessionId()).toBe("sess-KEEP");
   });
 
   it("isSupersededDetail matches the sentinels as substrings and nothing else", () => {

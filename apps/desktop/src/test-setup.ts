@@ -1,3 +1,5 @@
+import { beforeEach } from "vitest";
+
 // Vitest setup. The store tests run under node (no DOM), but our zustand stores use the
 // `persist` middleware against `localStorage`. Provide a tiny in-memory shim so persisting
 // during tests is a no-op write rather than a crash. Real DOM behavior isn't under test here.
@@ -54,6 +56,26 @@ if (!hasUsableStorage()) {
   });
 }
 
+// The concierge thread became a PERSISTED store so it survives an app restart (spec §3 subsystem
+// C2) — which means it is also a module-level singleton that outlives a `render()`. Without this,
+// every ConciergeHost test after the first mounts on top of the previous test's bubbles: 34 of them
+// went red on `getByRole` finding multiple matches, and the failure reads as a component bug rather
+// than as state bleed.
+//
+// Reset HERE rather than in each test file so a future test that mounts the host inherits the clean
+// slate for free — the leak is a property of the store, not of any one suite. `beforeEach`, not
+// `afterEach`: a suite that seeds the thread before rendering must not have its seed wiped.
+//
+// DYNAMIC import, and that is load-bearing: a static one is hoisted ABOVE the shim install below, so
+// `persist`'s `createJSONStorage(() => localStorage)` — which resolves its storage eagerly, at module
+// evaluation — would capture the unusable pre-shim global and every write would die on
+// `setItem is not a function`. Importing inside the hook defers evaluation until after the shim
+// exists. (Every other store escapes this only because test FILES import them, which already happens
+// after setup.)
+beforeEach(async () => {
+  const { useConciergeThreadStore } = await import("./stores/conciergeThreadStore");
+  useConciergeThreadStore.setState({ chat: [] });
+});
 /** jsdom implements no `PointerEvent`. Testing-library's `fireEvent.pointerDown/Move/Up` then falls
  *  back to a plain `Event`, which silently DROPS the coordinate fields — so `clientX`/`clientY`
  *  arrive `undefined` and any pointer-drag handler computes `NaN` instead of a delta. The handler

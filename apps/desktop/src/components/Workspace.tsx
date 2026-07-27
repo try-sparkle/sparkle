@@ -45,6 +45,7 @@ import {
   wasProjectVisited,
 } from "../services/sessionProjects";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
+import { startPresenceTracking } from "../stores/presenceStore";
 import { startOrchestrationListener } from "../services/orchestrationListener";
 import { startControlListener } from "../services/controlListener";
 import { closeScopeProjectNames, killAllOpenAgents, planWindowClose } from "../services/windowClose";
@@ -200,6 +201,13 @@ export function Workspace() {
 
   // Keep this window's project list in sync with changes made in other webviews (tray / capture).
   useEffect(() => subscribeToCrossWindowSync(), []);
+
+  // Presence (Here | Away) — frontmost subscription + the idle tick. App-level, not concierge-level:
+  // the signal is fed by TERMINAL keystrokes as much as by the compose box, and it must be current
+  // the moment anything reads it, so it cannot wait on whatever the user happens to have on screen.
+  // `startPresenceTracking` is ref-counted and returns an idempotent disposer, so a StrictMode/HMR
+  // double-mount installs one ticker and one listener (stores/presenceStore).
+  useEffect(() => startPresenceTracking(), []);
 
   // Start the orchestration listener singleton. The singleton guard in the listener prevents
   // double-registration under React StrictMode / HMR. An `unmounted` flag handles the race

@@ -25,6 +25,12 @@ vi.mock("./trialMeter", () => ({
 import { agentCanAcceptInput, dispatchConciergeAnswer } from "./conciergeDispatch";
 import { useProjectStore } from "../stores/projectStore";
 
+/** Any valid authority. These suites predate the dispatch authority gate and exercise DELIVERY,
+ *  not authorization — the gate itself is covered by dispatchAuthority.test.ts and
+ *  conciergeDispatch.gate.test.ts. `authority` is required and non-defaulted (see
+ *  services/dispatchAuthority), so every call has to name one. */
+const TEST_AUTHORITY = { kind: "suggestion", agentId: "a1" } as const;
+
 /** Seed the project store with one agent of the given runtime. */
 function seed(runtime: "local" | "cloud") {
   useProjectStore.setState({
@@ -64,7 +70,7 @@ describe("agentCanAcceptInput — the router's gate, fails CLOSED", () => {
 describe("the dispatcher's refusal — only on evidence", () => {
   it("refuses a cloud agent with its own path", async () => {
     seed("cloud");
-    const r = await dispatchConciergeAnswer("known", "hello", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("known", "hello", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r).toMatchObject({ ok: false, path: "cloud-agent" });
   });
 
@@ -73,7 +79,7 @@ describe("the dispatcher's refusal — only on evidence", () => {
   it("does NOT call an unknown agent a cloud agent", async () => {
     seed("local");
     expect(agentCanAcceptInput("ghost")).toBe(false); // router declines…
-    const r = await dispatchConciergeAnswer("ghost", "hello", { userPrompt: true });
+    const r = await dispatchConciergeAnswer("ghost", "hello", { authority: TEST_AUTHORITY, userPrompt: true });
     expect(r.path).not.toBe("cloud-agent"); // …but the dispatcher does not misreport why
   });
 });

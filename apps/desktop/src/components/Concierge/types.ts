@@ -100,11 +100,19 @@ export interface ConciergeDigestMessage {
   leadAgentId: string;
 }
 
+/** The return-from-Away briefing. Its shape lives with the DIFF that builds it
+ *  (services/conciergeRecap) rather than here, for the same reason `Attachment` does: it is a pure,
+ *  React-free model, and a second declaration of it is exactly how the card and the diff would
+ *  drift. Re-exported so consumers of this module's public surface get it from one place. */
+export type { ConciergeRecapMessage } from "../../services/conciergeRecap";
+import type { ConciergeRecapMessage } from "../../services/conciergeRecap";
+
 export type ConciergeMessage =
   | ConciergeUserMessage
   | ConciergeSparkleMessage
   | ConciergeBatchMessage
   | ConciergeDigestMessage
+  | ConciergeRecapMessage
   | ConciergeNudge;
 
 /** Drives the star-field wordmark: still firefly drift at rest, buzzy waveform while the
@@ -213,10 +221,6 @@ export interface ConciergeColumnProps {
   /** Optional affordance rendered under the scope/vitals line — the shell drops the ⌘K palette
    *  trigger here (PRD §4: history search lives in the concierge). */
   searchSlot?: ReactNode;
-  /** The recommended-action row for the actively-shown build agent, rendered directly above the
-   *  compose box. A slot rather than view-model data because it owns a per-agent hook that must
-   *  remount when the agent changes — see components/Concierge/ConciergeSuggestions. */
-  suggestionsSlot?: ReactNode;
   /** Live, uncommitted dictation transcript for the compose box; "" when nothing is being said. */
   interim?: string;
   /** Handed straight to the compose box so the integration layer can receive committed segments.
@@ -236,6 +240,14 @@ export interface ConciergeColumnProps {
    *  identical receipts are the common case rather than a corner one. That is exactly what `seq`
    *  below is for. */
   announcement?: ConciergeAnnouncement;
+  /** Armed sends counting down before they reach an agent's terminal
+   *  (components/Concierge/CountdownBanner), rendered between the suggestion row and the compose
+   *  box. A slot, not view-model data, because the banner subscribes to the module-level intent
+   *  registry (services/dispatchIntent) and this column renders nothing it isn't handed.
+   *
+   *  It must NOT contain a live region: the countdown is announced through `announcement` above,
+   *  and a second `aria-live` node would make a screen reader read every send twice. */
+  countdownSlot?: ReactNode;
 }
 
 /** One write to the column's live region. `seq` is a monotonic WRITE COUNTER, not data — it exists
