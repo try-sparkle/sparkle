@@ -60,9 +60,35 @@ export function setDebugForwarding(on: boolean): void {
 //     restored; firing onContextLoss" (our DOM-renderer fallback actually engaged) — forwarded.
 const LOG_FORWARD_DENYLIST = ["Couldn't find callback id", "webglcontextrestored event received"];
 
+// Not every third-party flood can be denylisted whole: xterm's IdleTaskQueue warns whenever one
+// of ITS OWN idle-callback tasks overruns its slice, and it carries the overrun in the message —
+// so the line is noise at one magnitude and real signal at another. Over a recent eight-day
+// window it fired 741 times, the top WARN by volume on most days, with a median overrun of 40ms
+// and a p95 of 197ms — imperceptible slices whose only stated remedy ("split the task into
+// sub-tasks") is addressed to xterm's maintainers, not to anything we can act on. But the tail
+// reached ~2s, which is a freeze a user feels, so dropping the message wholesale would throw
+// away the one shape of it worth keeping. Gate on the magnitude instead.
+const XTERM_TASK_QUEUE_OVERRUN = /task queue exceeded allotted deadline by (\d+)ms/;
+
+/** The overrun at which an xterm task-queue warning is worth a log line. Deliberately the same
+ *  knee as `JANK_SEVERE_MS` in perfTrace.ts — that constant's reasoning (a sub-second stall is a
+ *  dropped frame, and dropped frames matter as a RATE, not as individual lines) applies verbatim
+ *  here, and the two instruments describe the same main-thread freeze, so they should agree on
+ *  what counts as perceptible. Kept as a local copy rather than an import: perfTrace imports
+ *  `log` from this module, so reaching back the other way would close an import cycle. */
+const PERCEPTIBLE_STALL_MS = 1_000;
+
+/** True for an xterm task-queue overrun too short for the user to perceive (see above). A
+ *  non-matching message is never suppressed here, so this can only ever narrow that one line. */
+function isSubPerceptibleTaskQueueOverrun(message: string): boolean {
+  const m = XTERM_TASK_QUEUE_OVERRUN.exec(message);
+  return m !== null && Number(m[1]) < PERCEPTIBLE_STALL_MS;
+}
+
 /** Whether an auto-captured console line should be forwarded to the persistent log. */
 export function shouldForwardConsole(message: string): boolean {
-  return !LOG_FORWARD_DENYLIST.some((needle) => message.includes(needle));
+  if (LOG_FORWARD_DENYLIST.some((needle) => message.includes(needle))) return false;
+  return !isSubPerceptibleTaskQueueOverrun(message);
 }
 
 // Rejection signatures that originate INSIDE Tauri's own injected runtime, not our code, and

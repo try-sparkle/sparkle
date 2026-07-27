@@ -45,6 +45,31 @@ describe("shouldForwardConsole", () => {
     expect(shouldForwardConsole("webglcontextlost event received")).toBe(true);
     expect(shouldForwardConsole("webgl context not restored; firing onContextLoss")).toBe(true);
   });
+
+  // xterm's IdleTaskQueue warns once its own idle task overruns its slice by >20ms, and puts the
+  // overrun in the message. Sub-perceptible slices are the bulk of the volume and name a remedy
+  // only xterm can apply; the multi-second tail is a freeze the user feels. Gate on magnitude so
+  // the tail survives — the boundary is the same 1s knee perfTrace.ts uses for a severe jank stall.
+  describe("xterm task-queue overruns", () => {
+    it("drops sub-perceptible overruns (the bulk of the volume)", () => {
+      expect(shouldForwardConsole("task queue exceeded allotted deadline by 22ms")).toBe(false);
+      expect(shouldForwardConsole("task queue exceeded allotted deadline by 197ms")).toBe(false);
+      expect(shouldForwardConsole("task queue exceeded allotted deadline by 999ms")).toBe(false);
+    });
+
+    it("keeps overruns at or past the perceptibility knee", () => {
+      expect(shouldForwardConsole("task queue exceeded allotted deadline by 1000ms")).toBe(true);
+      expect(shouldForwardConsole("task queue exceeded allotted deadline by 1966ms")).toBe(true);
+    });
+
+    // The gate reads a magnitude out of the message, so it must not become a broad substring
+    // filter for anything that merely resembles the line: one without a parsable overrun keeps its
+    // log entry rather than being silently dropped.
+    it("forwards a task-queue line whose overrun it cannot parse", () => {
+      expect(shouldForwardConsole("task queue exceeded allotted deadline")).toBe(true);
+      expect(shouldForwardConsole("task queue exceeded allotted deadline by manyms")).toBe(true);
+    });
+  });
 });
 
 // The global unhandledrejection handler forwards every rejection at ERROR. Tauri's OWN injected
