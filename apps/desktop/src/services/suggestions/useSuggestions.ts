@@ -4,6 +4,7 @@ import { AiUnavailableError } from "../anthropic";
 import { getAgentScrollback } from "../terminalScrollback";
 import { AiUnreachableError } from "../anthropic";
 import { useAiFeature } from "../aiGate";
+import { OutOfCreditsError } from "../credits";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { useConnectionStore } from "../../stores/connectionStore";
@@ -94,6 +95,56 @@ export function isTerminalComputeError(message: string): boolean {
   const code = Number(m[1]);
   if (code === 408 || code === 429) return false;
   return code >= 400 && code < 500;
+}
+
+/**
+ * Whether a rejected compute should be DEFERRED rather than charged to this state's retry budget:
+ * the request is fine, an external condition is simply off, and the SAME compute succeeds unchanged
+ * once that condition flips. Every reason here has a corresponding effect dep, which is what makes
+ * deferral a recovery path rather than a dead end — the effect re-runs on the flip and recomputes
+ * the still-blocked state.
+ *
+ *   - `offline`  — SuggestionOfflineError (the pre-compute gate) and AiUnreachableError (a route
+ *                  that dropped inside the heartbeat's staleness window). Dep: `isOnline`.
+ *   - `credits`  — OutOfCreditsError. Dep: `learnedOn`, which ANDs the feature flag with the live
+ *                  credit gate, so a top-up re-runs the effect the way a reconnect does. See the
+ *                  RECOVERY CAVEAT below: that re-run happens, but it is not by itself sufficient.
+ *
+ * Deferring out-of-credits is safe for the reason the offline branch is: DISCOVERING it cannot be
+ * re-bought. Either `assertAiCredits` threw locally before any round-trip (free), or the server's
+ * 402 landed — and that path records the refusal via `noteCreditsRefused`, which raises the credit
+ * floor, closes `hasAiCredits`, and drops `learnedOn` to false. The next compute then returns from
+ * the engine's fail-closed gate without issuing a call at all. So the hazard that keeps an
+ * unavailable BACKEND on the budget-spending path ("every re-render buys another doomed call")
+ * has no analogue here: the first refusal shuts the door behind itself.
+ *
+ * What this replaces: a zero balance made every settled state, on every agent, spend its full
+ * 3-attempt budget on rejections that were never going to clear in ~5s of backoff, and emit a WARN
+ * per attempt. Roughly a quarter of those calls were retries 2 and 3 — pure waste — and the WARN
+ * volume during an episode buried unrelated signal in the log.
+ *
+ * RECOVERY CAVEAT (`credits` only — do NOT read this branch as "recovers on top-up"). Deferring
+ * leaves the budget unspent, which is necessary for a later recompute but not sufficient. The
+ * refusal closes the credit gate on its way out, so `learnedOn` drops to false and the effect
+ * re-runs IMMEDIATELY, before any top-up — and the learned tier is fail-closed by RESOLVING an
+ * empty set rather than rejecting (the `aiEnabled`/`entitled` gate in engine.ts). That empty
+ * resolution lands on the success path and commits `lastHash` plus the memo, so the top-up itself
+ * finds `shouldRecompute` false. In practice the state recovers on the next your-turn transition or
+ * scrollback change, NOT on the top-up.
+ *
+ * That commit-on-a-gate-closed-pass is pre-existing and is deliberately left alone here. It is load
+ * bearing in a non-obvious way: the settle watcher bails on `h === lastHash.current`, so simply
+ * declining to commit hands it a permanent ~1.2s recompute/re-render loop for every user whose
+ * learned tier is off (the watcher's own comment documents the pairing). Fixing the stranding needs
+ * an explicit "computed nothing because the gate was shut" state that BOTH the effect and the
+ * watcher respect — a larger change than this one, and out of scope for the retry-storm fix.
+ *
+ * Pure, for testing.
+ */
+export function computeDeferralReason(err: unknown): "offline" | "credits" | null {
+  if (err instanceof SuggestionOfflineError || err instanceof AiUnreachableError) return "offline";
+  if (err instanceof OutOfCreditsError) return "credits";
+  return null;
 }
 
 // Base delay before RETRYING a *failed* compute. The overwhelmingly common failure is a transient
@@ -635,8 +686,16 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // failure. Retrying it spends the budget on paid calls that cannot succeed. chatOnce has
         // already marked the store offline, so `isOnline` (an effect dep) re-runs this compute the
         // moment connectivity returns — the same recovery path as the gate above, not a dead end.
-        if (err instanceof SuggestionOfflineError || err instanceof AiUnreachableError) {
-          log.debug("suggestions", "compute deferred (offline)", { agentId });
+        //
+        // An exhausted credit balance takes the SAME disposition, and for the same reason: the
+        // compute is not wrong, a gate is shut, and it succeeds unchanged the moment the gate opens.
+        // Charging it to the budget bought three rejections per settled state that no amount of
+        // backoff could have cleared. `learnedOn` is the dep that reopens it — see
+        // computeDeferralReason for why deferring here cannot leak doomed calls the way an
+        // unavailable backend would.
+        const deferred = computeDeferralReason(err);
+        if (deferred) {
+          log.debug("suggestions", "compute deferred", { agentId, reason: deferred });
           return;
         }
         // The compute rejected — leave lastHash unadvanced and re-trigger so this state can retry,
@@ -644,10 +703,12 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // can't spin into an unbounded loop of paid computes. A genuine state change resets this.
         // An unavailable backend is the one rejection with NO transient hope: the retries are
         // guaranteed to hit the same wall, so spend the whole budget at once rather than paying for
-        // two more round-trips per state. Note this canNOT take the deferred (offline) path above:
-        // offline is detected locally and costs nothing, whereas learning the backend is down COSTS
-        // a request — so deferring without drawing down the budget would let every re-render buy
-        // another doomed call, which is worse than the bounded retries this replaces.
+        // two more round-trips per state. Note this canNOT take the deferred path above: nothing
+        // records that the backend is down, so the gate stays open and every re-render would buy
+        // another doomed call — worse than the bounded retries this replaces. That is the exact
+        // property the two deferrable reasons DO have (offline is detected locally and costs
+        // nothing; a credit refusal closes the credit gate on its way out), which is what separates
+        // them from this branch — not how transient the condition feels.
         const unavailable = err instanceof AiUnavailableError;
         const message = err instanceof Error ? err.message : String(err);
         // A permanent rejection can't be retried into a success, so burn the whole budget at once:

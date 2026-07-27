@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { renderHook, act, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
 
 // Mock every dependency the hook reaches so we can drive compute timing deterministically.
 const computeSuggestions = vi.fn();
@@ -40,7 +40,10 @@ const { AiUnavailableError, AiUnreachableError } = vi.hoisted(() => {
 });
 vi.mock("../anthropic", () => ({ AiUnavailableError, AiUnreachableError }));
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => "Done. Committed abc. Nothing further." }));
-vi.mock("../aiGate", () => ({ useAiFeature: () => true }));
+// Credit-gated, and drivable: `useAiFeature` ANDs the feature flag with the live credit balance, so
+// flipping this false→true is what a top-up looks like to the hook. Reset in beforeEach.
+let aiFeatureOn = true;
+vi.mock("../aiGate", () => ({ useAiFeature: () => aiFeatureOn }));
 vi.mock("../relayClient", () => ({ pushSuggestions: vi.fn() }));
 vi.mock("../../stores/runtimeStore", () => {
   const runtimeState = () => ({
@@ -73,8 +76,16 @@ vi.mock("../../stores/runtimeStore", () => {
   };
 });
 
-import { useSuggestions , resetSuggestionMemory } from "./useSuggestions";
+import {
+  useSuggestions,
+  resetSuggestionMemory,
+  SETTLE_TICK_MS,
+  RETRY_BACKOFF_MS,
+} from "./useSuggestions";
 import { useConnectionStore } from "../../stores/connectionStore";
+// NOT mocked: credits.ts pulls in nothing but a type, so the hook and this suite share the real
+// class and `instanceof` lines up without a stand-in.
+import { OutOfCreditsError } from "../credits";
 
 beforeEach(() => {
   // handledSigs/memo are per-AGENT module state now (they must survive a remount to stop
@@ -83,7 +94,18 @@ beforeEach(() => {
   computeSuggestions.mockReset();
   // Reset to the store's optimistic default so each test starts online.
   useConnectionStore.setState({ browserOnline: true, probeOk: true, isOnline: true });
+  aiFeatureOn = true; // and funded — the out-of-credits case opts out explicitly
 });
+
+// Unconditional teardown. This suite has no automatic RTL cleanup (vite.config.ts sets no
+// `globals: true` and test-setup.ts registers no afterEach(cleanup)), which is why every case
+// unmounts by hand — but a hand-rolled unmount only runs on the HAPPY path. The positive control
+// below mounts a hook that is unbounded BY DESIGN (the credits deferral commits no lastHash and
+// spends no budget, so the settle watcher bumps retryTick every SETTLE_TICK_MS while mounted), so a
+// timed-out assertion there would leak it into the rest of the file: it keeps calling the shared
+// computeSuggestions spy every ~1.2s, and the next cases — which sleep and assert exact counts —
+// fail too, turning one defect into three red tests with an ambiguous source.
+afterEach(cleanup);
 
 describe("useSuggestions concurrency guard", () => {
   it("does not start a second compute while one is in flight (same state)", async () => {
@@ -165,6 +187,114 @@ describe("useSuggestions concurrency guard", () => {
     // a late compute into the NEXT test's spy.
     unmount();
   });
+
+  it("an out-of-credits episode defers, then converges — no retry storm, no watcher spin", async () => {
+    // The balance ran out between this render and the call — the refusal arrives mid-flight, the
+    // way it does when several agents settle at once and the first 402 closes the gate under the
+    // rest. No amount of backoff clears a zero balance, so charging the retry budget bought three
+    // guaranteed rejections and three WARN lines for EVERY settled state, on every agent, for as
+    // long as the balance stayed empty.
+    //
+    // SCOPE: this pins the retry storm ONLY. It deliberately does not assert "recomputes on top-up"
+    // — that claim is false against the real engine, and a version of this test that made it passed
+    // for the wrong reason. The refusal closes the credit gate, so the effect re-runs immediately
+    // with the learned tier off; engine.ts's fail-closed branch RESOLVES empty rather than
+    // rejecting, and that success path commits lastHash, so the later top-up finds nothing to
+    // recompute. See the RECOVERY CAVEAT on computeDeferralReason. Asserting a top-up here would
+    // need the gate-closed commit fixed first, which cannot simply be dropped: the settle watcher
+    // bails on `h === lastHash.current` and would otherwise spin every ~1.2s.
+    // The mock MIRRORS the real engine: it rejects while the credit gate is open, and RESOLVES
+    // EMPTY once shut (engine.ts's fail-closed branch). That second shape is not decoration — it is
+    // the link that bounds this whole branch, so a mock that rejected unconditionally would leave
+    // the only safety property uncovered.
+    computeSuggestions.mockImplementation(({ aiEnabled }: { aiEnabled: boolean }) =>
+      aiEnabled
+        ? Promise.reject(new OutOfCreditsError(0))
+        : Promise.resolve({ agentId: "a1", buttons: [] }),
+    );
+
+    const { rerender, unmount } = renderHook(() => useSuggestions("a1", true));
+
+    await waitFor(() => expect(computeSuggestions).toHaveBeenCalledTimes(1));
+    // The usable read window is (RETRY_BACKOFF_MS, SETTLE_TICK_MS * 2) from mount. Below the lower
+    // bound a REGRESSED deferral's retry (scheduled at 700ms) hasn't fired yet and the test passes
+    // while the storm is back — a silent false pass. Above the upper bound the watcher's tick 2
+    // fires a legitimate bump (with the gate open the deferral commits no hash and spends no budget,
+    // so that tick is correct, not a bug) and the test flakes. Read at the MIDPOINT of that window,
+    // derived from the constants so the point moves with them.
+    //
+    // The upper bound is NOT tick 2 itself: the gate-close below (rerender → gate-closed empty
+    // resolve → lastHash commit) must also finish before tick 2, and it only starts once this sleep
+    // returns. If it overran, tick 2 would fire with the gate still open and bump retryTick — phase
+    // 2's waitFor would then resolve for the WRONG reason and the convergence assertion would see 3.
+    // So the read's real ceiling is tick 2 minus a gate-close allowance, and both allowances are
+    // stated here rather than one of them silently financing the other.
+    //
+    // Net: the window is (700, 1900), the read lands at 1300ms, and each bound gets ~600ms. That is
+    // the tightest the lower bound has been on this branch, and tighter still in practice since the
+    // sleep starts after the waitFor above resolves while the window is measured from mount — so if
+    // this flakes, the fix is fake timers, not a smaller allowance.
+    //
+    // The 500 is deliberately NOT derived: unlike the two constants it sits beside, it is a
+    // wall-clock allowance for a rerender plus a microtask-resolved compute plus a state commit on a
+    // loaded runner. There is no constant in the hook that expresses that, so a literal with a
+    // stated basis is more honest than a formula that implies a precision it doesn't have.
+    const GATE_CLOSE_ALLOWANCE_MS = 500;
+    const PHASE1_READ_MS =
+      RETRY_BACKOFF_MS +
+      (SETTLE_TICK_MS * 2 - GATE_CLOSE_ALLOWANCE_MS - RETRY_BACKOFF_MS) / 2;
+    await new Promise((r) => setTimeout(r, PHASE1_READ_MS));
+    expect(computeSuggestions).toHaveBeenCalledTimes(1);
+
+    // The 402 ratchets the credit floor, so useAiFeature goes false. Drive that here: the
+    // gate-closed pass resolves empty and COMMITS lastHash, which is precisely what makes the settle
+    // watcher bail (`h === lastHash.current`). Without this chain the deferral — which spends no
+    // budget and commits no hash — would leave the watcher bumping retryTick every ~1.2s forever.
+    aiFeatureOn = false;
+    await act(async () => {
+      rerender();
+    });
+    await waitFor(() => expect(computeSuggestions).toHaveBeenCalledTimes(2));
+
+    // THE CONVERGENCE ASSERTION. Hold across three settle ticks: the count must stop growing.
+    //
+    // SCOPE, precisely: this pins "GIVEN the gate closes, the gate-closed empty resolve commits
+    // lastHash and the watcher bails". It does NOT cover the 402 → noteCreditsRefused → credit-floor
+    // ratchet → useAiFeature half of the chain — `useAiFeature` is mocked to a bare module variable
+    // and the gate is closed by hand here, so that half is executed nowhere in this file. If the
+    // ratchet regresses, production spins and this test stays green; that link belongs to an
+    // authStore/credits test. The window derives from SETTLE_TICK_MS so raising the constant widens
+    // the hold instead of silently shrinking it to zero ticks.
+    await new Promise((r) => setTimeout(r, SETTLE_TICK_MS * 3 + 200));
+    expect(computeSuggestions).toHaveBeenCalledTimes(2);
+    unmount();
+  }, 15000);
+
+  it("positive control: the settle watcher IS live under this mock setup", async () => {
+    // The convergence assertion above is a pure ABSENCE assertion, so it would also pass if the
+    // watcher never ran at all — and its liveness depends on ambient mock state (idle status landing
+    // in YOUR_TURN, an empty composer, a non-empty constant scrollback). This is its known-failing
+    // counterpart: hold the gate OPEN, which is exactly the unbounded state (the credits deferral
+    // returns before committing lastHash and before touching the retry budget), and assert the count
+    // DOES grow. If a status-vocabulary change or a new watcher bail kills the tick, this fails and
+    // the absence assertion above is exposed as vacuous. NOT in that list: a raised SETTLE_TICK_MS —
+    // the deadline below is derived from the same constant, so it scales and the change is a
+    // non-event here by construction.
+    computeSuggestions.mockRejectedValue(new OutOfCreditsError(0));
+
+    const { unmount } = renderHook(() => useSuggestions("a1", true));
+    await waitFor(() => expect(computeSuggestions).toHaveBeenCalledTimes(1));
+
+    // Tick 1 is inert (prevTickHash null); tick 2 is the first that can bump retryTick. The deadline
+    // is generous on purpose: waitFor returns the instant the condition holds, so extra headroom
+    // costs nothing on the passing path (~2.4s), while a tight bound buys only a faster failure —
+    // worthless for a control whose entire job is to not flake. It is also measured from when THIS
+    // waitFor starts, not from mount, so the two aren't on the same clock.
+    await waitFor(() => expect(computeSuggestions).toHaveBeenCalledTimes(2), {
+      timeout: SETTLE_TICK_MS * 6,
+    });
+    unmount();
+  }, 15000);
 
   it("defers a mid-flight transport failure instead of retrying it", async () => {
     // The store still reads online (the reachability heartbeat is up to 30s stale), so the

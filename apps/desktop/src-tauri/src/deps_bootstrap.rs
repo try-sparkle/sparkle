@@ -318,11 +318,47 @@ fn resolve_manager(pm: PackageManager) -> Option<String> {
     crate::preflight::resolve_on_path(pm.program())
 }
 
+/// The PATH the install must run with, or `None` when the inherited one is all there is.
+///
+/// RESOLVING THE MANAGER IS NOT ENOUGH TO RUN IT. `resolve_manager` returns an absolute path off
+/// the login shell, so the spawn finds pnpm/npm even under a bare GUI PATH — but the child still
+/// inherits that bare PATH, and both managers are `#!/usr/bin/env node` scripts. When a
+/// Finder/Dock-launched Sparkle has no node on PATH (nvm, volta and fnm all put it somewhere only a
+/// shell profile knows about), the install dies before it starts with `env: node: No such file or
+/// directory` — reported through the normal `failed` path, so the agent just quietly gets no
+/// `node_modules`, which is the exact gap this module exists to close.
+///
+/// Prepending node's own directory is the same fix `lsp_command` applies for the same reason, and it
+/// is enough here because a node install puts `node` beside the manager shims it ships.
+///
+/// `None` (rather than an empty PATH) when node cannot be resolved: leaving the environment alone
+/// keeps the behavior identical for a Sparkle launched from a terminal, where the inherited PATH is
+/// already the user's real one.
+///
+/// UNIX ONLY, and not merely because the problem is. `path_with_dir_first` joins with `:`, which on
+/// Windows — where the separator is `;` — would fuse node's directory onto the first inherited entry
+/// as one nonsense path, adding nothing and destroying `system32` for the `cmd.exe` and git
+/// subprocesses the managers shell out to. Its already-first check would never match either, so
+/// every bootstrap would compound another corrupted prefix. There is nothing to gain against that:
+/// Windows has no `#!` handling, resolves the managers through their `.cmd` shims, and GUI apps
+/// there inherit the PATH already (see `resolve_manager`'s `#[cfg(not(unix))]` arm). Making
+/// `path_with_dir_first` platform-correct with `std::env::{split_paths, join_paths}` would fix this
+/// for `lsp_command` and `setup.rs` too, and is the better change — but it is a change to shared
+/// code that this fix does not need.
+#[cfg(unix)]
+pub fn install_path_env(node: Option<&str>, current: Option<&str>) -> Option<String> {
+    // `Path::new("node").parent()` is `Some("")`, not `None` — and prepending an empty entry to
+    // PATH means "the current directory", which for an install running inside an untrusted repo is
+    // the last thing to put ahead of `/usr/bin`.
+    let dir = Path::new(node?).parent().filter(|d| !d.as_os_str().is_empty())?;
+    Some(crate::preflight::path_with_dir_first(dir, current))
+}
+
 /// Run the real install for `pm` in `worktree`.
 ///
 /// NOT UNIT-TESTED, and deliberately kept to glue over pieces that are: it resolves a program,
 /// spawns it, and maps the exit status. Every decision it could get wrong lives in `plan_for`,
-/// `execute`, `install_args` or `program_or_error` above.
+/// `execute`, `install_args`, `program_or_error` or `install_path_env` above.
 ///
 /// NO TIMEOUT, on purpose. Killing a package manager mid-install leaves a half-written
 /// `node_modules` that is worse than no `node_modules` — the next `pnpm install` may consider it
@@ -331,14 +367,24 @@ fn resolve_manager(pm: PackageManager) -> Option<String> {
 /// caller does not await it) and never touches the UI thread.
 fn run_install(worktree: &Path, pm: PackageManager) -> Result<(), String> {
     let program = program_or_error(resolve_manager(pm), pm)?;
-    let output = std::process::Command::new(&program)
-        .current_dir(worktree)
+    let mut cmd = std::process::Command::new(&program);
+    cmd.current_dir(worktree)
         .args(pm.install_args())
         // Package managers prompt (`pnpm approve-builds`, npm's audit fix prompts) and will sit
         // forever on a stdin that never closes. CI is the standard "nobody is watching" signal and
         // every one of these respects it.
         .env("CI", "1")
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    // Without this the manager's `#!/usr/bin/env node` shebang has no node to find. Unix only, and
+    // the reason that is not an oversight is in `install_path_env`.
+    #[cfg(unix)]
+    if let Some(path) = install_path_env(
+        crate::preflight::resolve_node_path_cached().as_deref(),
+        std::env::var("PATH").ok().as_deref(),
+    ) {
+        cmd.env("PATH", path);
+    }
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to run {program}: {e}"))?;
     if output.status.success() {
@@ -644,5 +690,43 @@ mod tests {
             detail.contains("script"),
             "an install that skipped lifecycle scripts must say so, got: {detail:?}"
         );
+    }
+
+    // These three describe a unix PATH, in unix shape, for a fix that only applies there.
+    #[cfg(unix)]
+    #[test]
+    fn install_gets_node_on_path_even_when_the_gui_path_has_none() {
+        // The bare PATH a Finder/Dock-launched app inherits. Resolving pnpm absolutely gets it
+        // spawned; it is the `#!/usr/bin/env node` shebang that then fails, so node's own directory
+        // has to be on the PATH the child runs with.
+        let gui = "/usr/bin:/bin:/usr/sbin:/sbin";
+        let path = install_path_env(Some("/opt/node/v22/bin/node"), Some(gui))
+            .expect("a resolved node must produce a PATH");
+        assert!(
+            path.starts_with("/opt/node/v22/bin:"),
+            "node's directory must come FIRST, so it wins over any older node: {path:?}"
+        );
+        assert!(path.ends_with(gui), "the inherited PATH must be kept: {path:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unresolvable_node_leaves_the_environment_alone() {
+        // Not an empty PATH and not a bare node directory: when we cannot find node, the inherited
+        // environment is the best information there is — and for a terminal-launched Sparkle it is
+        // already the user's real PATH, which this must not degrade.
+        assert_eq!(install_path_env(None, Some("/usr/bin:/bin")), None);
+        // A program with no parent directory is equally uninformative.
+        assert_eq!(install_path_env(Some("node"), Some("/usr/bin")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_installs_do_not_grow_the_path() {
+        // Every worktree bootstraps, and each one re-reads the process PATH. Prepending
+        // unconditionally would be harmless once and absurd by the fiftieth agent.
+        let once = install_path_env(Some("/opt/node/bin/node"), Some("/usr/bin")).unwrap();
+        let twice = install_path_env(Some("/opt/node/bin/node"), Some(&once)).unwrap();
+        assert_eq!(once, twice);
     }
 }

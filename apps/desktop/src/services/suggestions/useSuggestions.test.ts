@@ -7,8 +7,38 @@ import {
   NO_FAILURES,
   retryBackoffMs,
   isTerminalComputeError,
+  computeDeferralReason,
   RETRY_BACKOFF_MS,
 } from "./useSuggestions";
+import { SuggestionOfflineError } from "./engine";
+import { AiUnavailableError, AiUnreachableError } from "../anthropic";
+import { OutOfCreditsError } from "../credits";
+
+describe("computeDeferralReason (a shut gate is not a failure of this state)", () => {
+  it("defers both offline shapes — the pre-compute gate and a mid-flight drop", () => {
+    expect(computeDeferralReason(new SuggestionOfflineError())).toBe("offline");
+    expect(computeDeferralReason(new AiUnreachableError())).toBe("offline");
+  });
+
+  it("defers an out-of-credits refusal — no backoff can clear a zero balance", () => {
+    expect(computeDeferralReason(new OutOfCreditsError(0))).toBe("credits");
+    // A 402 that reports a leftover balance too small for the server's hold is the same story.
+    expect(computeDeferralReason(new OutOfCreditsError(7))).toBe("credits");
+  });
+
+  it("does NOT defer an unavailable backend — nothing closes a gate behind it, so it stays on the bounded-retry path", () => {
+    expect(computeDeferralReason(new AiUnavailableError())).toBe(null);
+  });
+
+  it("does NOT defer ordinary rejections — those keep their retry budget", () => {
+    expect(computeDeferralReason(new Error("Claude request failed: ai request failed (HTTP 502)"))).toBe(
+      null,
+    );
+    expect(computeDeferralReason(new Error("bad JSON: unexpected token"))).toBe(null);
+    expect(computeDeferralReason("some string rejection")).toBe(null);
+    expect(computeDeferralReason(undefined)).toBe(null);
+  });
+});
 
 describe("isTerminalComputeError (skips retries that can't succeed)", () => {
   // The message shape the proxy/anthropic layer actually throws.
