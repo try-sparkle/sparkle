@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type {
   ConciergeDispatchPath,
   ConciergeDispatchResult,
@@ -407,6 +407,37 @@ describe("ConciergeHost — free-text prompt → the selected agent", () => {
     fireEvent.click(screen.getByTestId("send-target-toggle"));
     send("ship it");
     expect(await findInThread(/Sent to CI Hardening/)).toBeTruthy();
+  });
+
+  // Two IDENTICAL consecutive announcements — the most ordinary path there is: send twice to the
+  // same pinned agent and both outcomes read "Sent to CI Hardening." (roborev 53392). Fed a bare
+  // string, the second `setAnnouncement` is `Object.is`-equal, so React bails out of the update; and
+  // even re-rendered the text node is unchanged, while an `aria-live` region only speaks on a
+  // content CHANGE. The screen-reader user was told about the first send only.
+  //
+  // So this asserts the NODE was replaced, not merely that the text still reads the same — the text
+  // read the same the whole time it was broken, which is why the previous "fixed" claim on bbf596e
+  // survived with no nonce in the code and this suite green.
+  it("announces a SECOND, IDENTICAL outcome — the live region must not go quiet on a repeat", async () => {
+    h.dispatchConciergeAnswer
+      .mockResolvedValueOnce({ ok: true, path: "free-text" })
+      .mockResolvedValueOnce({ ok: true, path: "free-text" });
+    renderWithTarget();
+    fireEvent.click(screen.getByTestId("send-target-toggle"));
+    const announcer = () => screen.getByTestId("concierge-announcer");
+
+    send("ship it");
+    expect(await findInThread(/^Sent to CI Hardening\.$/)).toBeTruthy();
+    expect(announcer().textContent).toBe("Sent to CI Hardening.");
+    const spoken = announcer().firstElementChild;
+    const seq = spoken?.getAttribute("data-announce-seq");
+
+    send("ship it again");
+    // A different node carrying the same words: exactly the mutation the assistive technology
+    // listens for, and the thing a bare string could not produce.
+    await waitFor(() => expect(announcer().firstElementChild).not.toBe(spoken));
+    expect(announcer().textContent).toBe("Sent to CI Hardening.");
+    expect(announcer().firstElementChild?.getAttribute("data-announce-seq")).not.toBe(seq);
   });
 
   it("surfaces the trial-spent refusal instead of pretending the prompt landed", async () => {

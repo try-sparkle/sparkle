@@ -177,5 +177,17 @@ export interface ConciergeColumnProps {
   onTextEdit?: (text: string) => void;
   /** The last FINISHED line for the thread's hidden live region — a completed reply or a status
    *  notice. Never a streaming chunk: the region would then re-announce on every delta. */
-  announcement?: string;
+  announcement?: ConciergeAnnouncement;
+}
+
+/** One write to the column's live region. `seq` is a monotonic WRITE COUNTER, not data — it exists
+ *  so an IDENTICAL repeat is still a distinct write (roborev 53392). An `aria-live` region only
+ *  speaks when its content CHANGES, so passing the text alone made two consecutive identical lines
+ *  ("Sent to CI Hardening." on each of two sends to the same pinned agent) announce exactly once:
+ *  React bails out of an `Object.is`-equal setState, and even re-rendered the text node is
+ *  unchanged. The column keys the rendered node on `seq`, which turns every write into a real DOM
+ *  mutation for the assistive technology to notice. */
+export interface ConciergeAnnouncement {
+  seq: number;
+  text: string;
 }

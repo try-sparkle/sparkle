@@ -141,13 +141,33 @@ describe("concierge service", () => {
     expect(turnArgs(1).resumeSessionId).toBeNull();
   });
 
+  // The OTHER half of the cross-language contract, and the half the parametrized test below cannot
+  // give (roborev 53392/53397): feeding SUPERSEDED_DETAILS into its own matcher is tautological —
+  // reword either entry and the behaviour test stays green, because it rejects with whatever the
+  // constant now says and then asserts that same string matched. The Rust sibling
+  // (`the_silent_outcome_sentinels_are_the_strings_the_frontend_matches` in concierge.rs) pins only
+  // Rust's literals and never reads this file, so before this assertion existed NOTHING pinned that
+  // the two sides AGREE. A TS-side reword would have shipped green while `startConciergeTurn`
+  // silently stopped matching Rust's SUPERSEDED_ERR / CANCELLED_ERR — restoring "I couldn't reach my
+  // brain just now" plus a setTyping(false) over a turn that is still streaming.
+  //
+  // These literals are copied from concierge.rs's SUPERSEDED_ERR / CANCELLED_ERR ON PURPOSE. The
+  // duplication IS the guard: change one side and exactly one of the two tests goes red.
+  it("pins the sentinel literals Rust emits, so a reword on either side fails somewhere", () => {
+    expect(SUPERSEDED_DETAILS).toEqual([
+      "concierge_turn: superseded before install",
+      "concierge_turn: cancelled",
+    ]);
+  });
+
   it.each(SUPERSEDED_DETAILS.map((d) => [d] as const))(
     "a send rejected with %s resolves null SILENTLY — no error bubble, no typing reset",
     async (detail) => {
       // Both are ordinary outcomes of two fast sends. Surfacing them would post "I couldn't reach
       // my brain just now" and clear the typing indicator for the turn that IS running: a local
       // error carries no turn id, so it bypasses supersededTurn entirely (roborev 53186). Driven
-      // from the exported constant, not re-typed literals, so a reword fails here (roborev 53205).
+      // from the exported constant so the BEHAVIOUR is pinned for whatever the sentinels are; the
+      // literals themselves are pinned by the test above (roborev 53392).
       harness.invokeImpl = (cmd) =>
         cmd === "concierge_turn" ? Promise.reject(new Error(detail)) : undefined;
       const errors: Array<{ id: string; detail: string }> = [];

@@ -18,6 +18,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import {
   ConciergeColumn,
   deriveWordmarkMode,
+  type ConciergeAnnouncement,
   type ConciergeMessage,
   type ConciergeNudge,
   type ConciergeNudgeAction,
@@ -243,7 +244,18 @@ export function ConciergeHost({
   // What the thread's hidden live region says. Written ONLY with finished lines — a completed brain
   // reply, or a status notice — because a value that changed per streamed chunk would hand a screen
   // reader one announcement per delta, the flooding this region exists to avoid (roborev 53010).
-  const [announcement, setAnnouncement] = useState("");
+  //
+  // `{ seq, text }`, not a bare string (roborev 53392): every write must be a DISTINCT write, or an
+  // identical repeat is invisible to both React and the assistive technology. See `announce` below.
+  const [announcement, setAnnouncement] = useState<ConciergeAnnouncement>({ seq: 0, text: "" });
+  /** Say this in the live region — even if it is word-for-word what was just said. The seq bump is
+   *  the whole point: `setAnnouncement("Sent to X.")` twice in a row is an `Object.is`-equal
+   *  setState React bails out of, so the second send to the same pinned agent was never announced
+   *  at all (roborev 53392). Bumping a counter makes the state genuinely new; the column keys the
+   *  rendered node on it so the DOM genuinely changes. */
+  const announce = useCallback((text: string) => {
+    setAnnouncement((prev) => ({ seq: prev.seq + 1, text }));
+  }, []);
   const [typing, setTyping] = useState(false);
   // The mic is the dictation hook's now (CM-U9) — it owns armed state, the app-wide dictation
   // target and the live interim transcript, so there is no local micLive to keep in sync.
@@ -431,8 +443,9 @@ export function ConciergeHost({
       if (e.text) upsert(e.id, e.text, true);
       const full = brainTextRef.current[e.id] ?? "";
       delete brainTextRef.current[e.id];
-      // The reply is FINISHED here — announce it once, rather than per delta.
-      if (full) setAnnouncement(full);
+      // The reply is FINISHED here — announce it once, rather than per delta. Via `announce`, so
+      // the SAME reply twice in a row is still spoken twice (roborev 53392).
+      if (full) announce(full);
       const startedByVoice = voiceTurnRef.current;
       voiceTurnRef.current = false;
       if (startedByVoice && full) void play(key(e.id), full, "auto");
@@ -462,7 +475,7 @@ export function ConciergeHost({
       offDone();
       offError();
     };
-  }, [play]);
+  }, [announce, play]);
 
   const resolveAgent = useCallback(
     (id: string) => allAgents(feedRef.current).find((a) => a.id === id) ?? null,
@@ -476,9 +489,10 @@ export function ConciergeHost({
       ...prev,
       { id: nextId("sparkle"), kind: "sparkle", text, speakable: false },
     ]);
-    // A send outcome is exactly what a screen-reader user needs told, and it arrives whole.
-    setAnnouncement(text);
-  }, []);
+    // A send outcome is exactly what a screen-reader user needs told, and it arrives whole. Two
+    // sends to the same pinned agent produce the same line twice; both must be announced.
+    announce(text);
+  }, [announce]);
 
   // Files that rode a QUEUED send, per agent, oldest first. A queued send resolves ok:TRUE (it is
   // held, not lost), so the synchronous restore below never runs for it — and if the hold later

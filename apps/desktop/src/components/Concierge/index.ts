@@ -9,6 +9,7 @@ export type { CommandPaletteController } from "./useCommandPalette";
 export { ConciergeTopRight, KebabMenu } from "./KebabMenu";
 export type {
   Attachment,
+  ConciergeAnnouncement,
   ConciergeAttachKind,
   ConciergeBatchMessage,
   ConciergeColumnProps,

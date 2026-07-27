@@ -13,7 +13,10 @@ import { ConciergeThread } from "./ConciergeThread";
 import { ScopeVitals } from "./ScopeVitals";
 import { SpendPill } from "./SpendPill";
 import { StarfieldWordmark } from "./StarfieldWordmark";
-import type { ConciergeColumnProps, WordmarkMode } from "./types";
+import type { ConciergeAnnouncement, ConciergeColumnProps, WordmarkMode } from "./types";
+
+/** Nothing announced yet. Module-level so the default prop is referentially stable. */
+const EMPTY_ANNOUNCEMENT: ConciergeAnnouncement = { seq: 0, text: "" };
 
 /** The wordmark's drive when the integration doesn't pass one explicitly: buzz hard while
  *  the mic is live, gently while Sparkle types, still otherwise. Exported pure for tests. */
@@ -34,7 +37,7 @@ export function ConciergeColumn({
   registerInsert,
   speakingMessageId = null,
   onTextEdit,
-  announcement = "",
+  announcement = EMPTY_ANNOUNCEMENT,
 }: ConciergeColumnProps) {
   const mode = wordmarkMode ?? deriveWordmarkMode(micLive, model.typing ?? false);
   return (
@@ -72,7 +75,9 @@ export function ConciergeColumn({
         speakingMessageId={speakingMessageId}
       />
       {/* The column's ONE live region. Visually hidden, polite, and fed only completed lines, so a
-          screen-reader user hears the reply once — not once per chunk (roborev 52648/53010). */}
+          screen-reader user hears the reply once — not once per chunk (roborev 52648/53010).
+          The region element itself is STABLE (an aria-live node must exist before the content it
+          announces); only its child is replaced. */}
       <div
         data-testid="concierge-announcer"
         role="status"
@@ -86,7 +91,14 @@ export function ConciergeColumn({
           whiteSpace: "nowrap",
         }}
       >
-        {announcement}
+        {/* Keyed on the WRITE COUNTER, never the text (roborev 53392). Rendering the bare string
+            meant two identical consecutive lines — "Sent to CI Hardening." on each of two sends to
+            the same pinned agent — spoke only once, because an aria-live region reacts to a content
+            CHANGE and there wasn't one. The key makes React unmount and remount this node on every
+            write, so each announcement is a genuine mutation whatever the text says. */}
+        <span key={announcement.seq} data-announce-seq={announcement.seq}>
+          {announcement.text}
+        </span>
       </div>
       <ComposeBox
         onSend={controller.onSend}

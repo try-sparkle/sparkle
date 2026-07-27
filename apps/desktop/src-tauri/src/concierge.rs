@@ -163,14 +163,40 @@ fn cancelled_during_prep(entry_epoch: u64) -> bool {
     CANCEL_EPOCH.load(Ordering::Relaxed) != entry_epoch
 }
 
+/// Which of the two things a `spawn_turn` can be. The install rule differs between them because
+/// only ONE of them is evidence of fresh user intent (roborev 53397).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TurnKind {
+    /// A user send. Its token was reserved by `reserve_turn_token`, which floors at that token in
+    /// the same breath — so for a send, and ONLY for a send, "a higher token means the user asked
+    /// more recently" is true by construction.
+    Send,
+    /// The stale-resume retry: the same logical turn, continuing, under the token its send already
+    /// reserved. It publishes no floor and claims no recency.
+    Continuation,
+}
+
 /// May this turn take the slot? A REAL function, called from the install site under the lock, so
 /// a test can drive the actual rule (roborev 53186 — four rounds running, a test asserting against
 /// a local copy of a predicate would have stayed green with the call site deleted).
 ///
-/// No when we have been retired, and no when the slot already holds a NEWER turn: spawns finish
-/// out of order, so an older send must never stomp the entry of the one the user is waiting on.
-fn may_install(token: u64, retire_below: u64, slot_holds: Option<u64>) -> bool {
-    !is_retired(token, retire_below) && !matches!(slot_holds, Some(t) if t > token)
+/// No when we have been retired, and then it depends on WHAT is installing:
+///
+/// * A `Send` refuses only a strictly NEWER occupant. Spawns finish out of order, so an older send
+///   must never stomp the entry of the one the user is waiting on — but it may legitimately take
+///   the slot from a turn its own floor already retired.
+/// * A `Continuation` refuses ANY occupant (roborev 53397). The reap that precedes the retry
+///   emptied the slot itself, so whatever is in there now was installed AFTER that — i.e. by a send
+///   the user made while the first attempt was failing. Comparing tokens cannot express that: the
+///   continuation reuses its own turn's token, which is by definition older than that send's.
+fn may_install(kind: TurnKind, token: u64, retire_below: u64, slot_holds: Option<u64>) -> bool {
+    if is_retired(token, retire_below) {
+        return false;
+    }
+    match kind {
+        TurnKind::Send => !matches!(slot_holds, Some(t) if t > token),
+        TurnKind::Continuation => slot_holds.is_none(),
+    }
 }
 
 /// Pure half of the retirement rule: a turn is retired once a LATER send (or a cancel) has
@@ -198,14 +224,31 @@ fn reserve_turn_token() -> u64 {
     token
 }
 
-/// A token for the SAME logical turn, continuing — the stale-resume retry, which re-runs a turn
-/// the user already asked for. Deliberately publishes NO floor (roborev 53130): the retry is not a
-/// new send, and flooring at its token would retire a turn the user sent while the first attempt
-/// was failing. `run_reader` only reaches the retry while it still owns the slot, so this is
-/// narrow either way — but "a continuation silences the user's newer question" is not a trade
-/// worth making for a token.
-fn reserve_continuation_token() -> u64 {
-    TURN_SEQ.fetch_add(1, Ordering::Relaxed)
+/// How the stale-resume retry must be spawned: as a `Continuation`, under the SAME token the turn
+/// it continues already reserved. A real function called by the retry site, so a test drives the
+/// production rule instead of a restatement of it — and deleting the call leaves a dead-code
+/// warning rather than a silent hole (roborev 53397, same pattern as `cancelled_during_prep`).
+///
+/// It used to draw a FRESH token off `TURN_SEQ` "without publishing a floor", which looked
+/// conservative and was not: every comparison in this module reads a higher token as more recent
+/// user intent, and a fresh draw is higher than every send that exists. Turn 5 fails with a resume
+/// id and reaps; the user sends, taking token 6 and flooring at 6; the retry draws 7, is not
+/// retired by a floor of 6, and installs — killing turn 6's child. Turn 6's reader then finds the
+/// slot changed, returns `owned: false` and emits NOTHING, while the retry's answer to the previous
+/// question arrives under id "5", which the frontend has already retired. The user's newest
+/// question dies unanswered and the typing indicator hangs for the session.
+///
+/// Reusing the turn's own token makes the retry's position in the ordering its TRUE position — the
+/// moment the user asked this question — so every existing rule becomes correct for it for free:
+/// a later send's floor retires it (`is_retired`), and a later send that has not floored yet still
+/// out-ranks it at the install site and supersedes it there instead. Note that no reordering of a
+/// fresh `fetch_add` against the floor read could have closed this: a token above every send is
+/// wrong no matter when it is compared.
+///
+/// The retry needs no unique token of its own: the reap it comes after took its turn OUT of the
+/// slot, so there is nothing left to tell apart.
+fn continuation_install(original_token: u64) -> (TurnKind, u64) {
+    (TurnKind::Continuation, original_token)
 }
 
 /// Retire every turn RESERVED so far — for cancel, which starts nothing itself.
@@ -346,6 +389,9 @@ fn spawn_turn(
     cwd: &std::path::Path,
     claude_path: &str,
     resume_session_id: Option<&str>,
+    // A user send, or the stale-resume retry continuing one — they install under different rules
+    // (see may_install / continuation_install).
+    kind: TurnKind,
     // Reserved by the CALLER before any of this work began (see reserve_turn_token) — minting it
     // here would mean the previous turn stays live until the new child finishes spawning.
     token: u64,
@@ -400,9 +446,11 @@ fn spawn_turn(
     // waiting on. The floor already stops that turn from speaking; without this it could still take
     // the slot, leaving the live turn dead with no `done` and the typing indicator hung forever.
     //
-    // Refuse when this turn is retired, or when the slot holds a NEWER token, and take our own
-    // just-spawned child down with us. That makes "who owns the slot" agree with "who owns the
-    // floor" by construction, for the stale-resume retry as much as for a send.
+    // Refuse when this turn is retired, or when the slot holds a turn `kind` says is not ours to
+    // replace, and take our own just-spawned child down with us. That makes "who owns the slot"
+    // agree with "who owns the floor" by construction — for the stale-resume retry too, which is
+    // held to the stricter "any occupant wins" rule because its token predates that occupant by
+    // construction (roborev 53397).
     // Held in an Option so the child can be moved into the slot under the lock, and is still ours
     // to kill if we refuse — a `slot.replace` in one branch would conditionally move it and leave
     // the refuse path with a running, unreferenced `claude`.
@@ -411,6 +459,7 @@ fn spawn_turn(
         let manager = app.state::<ConciergeManager>();
         let mut slot = lock_turn(&manager.turn);
         let allowed = may_install(
+            kind,
             token,
             RETIRE_BELOW.load(Ordering::Relaxed),
             slot.as_ref().map(|t| t.token),
@@ -730,7 +779,15 @@ pub async fn concierge_turn(
     let blk_cwd = cwd.clone();
     let blk_claude = claude_path.clone();
     let spawned = tauri::async_runtime::spawn_blocking(move || {
-        spawn_turn(&blk_app, &blk_prompt, &blk_cwd, &blk_claude, blk_resume.as_deref(), token)
+        spawn_turn(
+            &blk_app,
+            &blk_prompt,
+            &blk_cwd,
+            &blk_claude,
+            blk_resume.as_deref(),
+            TurnKind::Send,
+            token,
+        )
     })
     .await
     .map_err(|e| format!("concierge_turn task failed: {e}"))
@@ -785,6 +842,11 @@ pub async fn concierge_turn(
         // it must not run at all: `spawn_turn` would take the slot from — and kill — the live turn
         // (roborev 53147). The reap above consults the slot only, so `owned` can still be true here
         // for a turn the floor has already retired.
+        //
+        // The floor is tested against OUR OWN token, and that is now the whole of it (roborev
+        // 53397): the retry runs under this turn's token rather than a fresh one, so there is no
+        // second, higher token to reason about and no reserve-versus-read gap to order. Whatever
+        // the floor says here, the install site is the backstop — see `continuation_install`.
         let retired = is_retired(token, RETIRE_BELOW.load(Ordering::Relaxed));
         if retired {
             tracing::info!(id = %id, "concierge: turn was superseded; not retrying the stale resume");
@@ -794,15 +856,17 @@ pub async fn concierge_turn(
                 id = %id,
                 "concierge_turn: turn failed with a resume session id; retrying once without --resume"
             );
-            match spawn_turn(&read_app, &prompt, &cwd, &claude_path, None, reserve_continuation_token()) {
-                Ok((stdout2, stderr2, token2)) => {
+            let (kind2, token2) = continuation_install(token);
+            match spawn_turn(&read_app, &prompt, &cwd, &claude_path, None, kind2, token2) {
+                Ok((stdout2, stderr2, installed)) => {
                     let stderr_handle2 = drain_stderr(stderr2);
                     // Emit the retry under the ORIGINAL `id`: the self-heal is a transparent
                     // continuation of the same logical turn, so the original id always receives a
                     // terminal event (no bubble left permanently in-progress if the first run
                     // streamed a delta before failing), and the `done` carries the full final text.
-                    // Ownership still uses the retry's own token2 for the slot check.
-                    let retry = run_reader(&read_app, &id, token2, stdout2, stderr_handle2);
+                    // The ownership token is the same one — id and token now agree, which is the
+                    // point of `continuation_install`.
+                    let retry = run_reader(&read_app, &id, installed, stdout2, stderr_handle2);
                     if !retry.owned {
                         return;
                     }
@@ -962,10 +1026,13 @@ mod tests {
         assert!(is_retired(a, floor), "the send that arrived first must be retired by the second");
         assert!(!is_retired(b, floor), "the newest send is the live one");
 
-        // A continuation (the stale-resume retry) claims a token WITHOUT publishing a floor, so it
-        // cannot silence a turn the user sent while the first attempt was failing.
-        let cont = reserve_continuation_token();
-        assert!(cont > b);
+        // A continuation (the stale-resume retry) claims NO token of its own — it reuses the one its
+        // turn was sent under — so it can neither silence nor outrank a turn the user sent while
+        // the first attempt was failing (roborev 53397).
+        let seq_before = TURN_SEQ.load(Ordering::Relaxed);
+        let (kind, cont) = continuation_install(a);
+        assert_eq!((kind, cont), (TurnKind::Continuation, a));
+        assert_eq!(TURN_SEQ.load(Ordering::Relaxed), seq_before, "a continuation takes no token");
         assert_eq!(RETIRE_BELOW.load(Ordering::Relaxed), floor, "a continuation publishes no floor");
         assert!(!is_retired(b, RETIRE_BELOW.load(Ordering::Relaxed)));
     }
@@ -992,8 +1059,13 @@ mod tests {
     /// `SUPERSEDED_DETAILS`) to keep a superseded or cancelled send silent. Nothing else ties the
     /// two languages together, so reword either side and the frontend quietly stops matching —
     /// fast second sends go back to posting "I couldn't reach my brain just now" and clearing the
-    /// typing indicator for the turn that is still streaming (roborev 53205). This test fails when
-    /// the Rust side drifts; the TS test imports the constant so its own side is pinned too.
+    /// typing indicator for the turn that is still streaming (roborev 53205).
+    ///
+    /// This test pins the RUST side. The TS side is pinned by its own literal assertion — the
+    /// `it("pins the sentinel literals Rust emits, …")` case in concierge.test.ts — NOT by the fact
+    /// that its other tests import the constant (roborev 53392): importing it and feeding it back
+    /// into its own matcher is tautological and stays green through any reword. The two mirrored
+    /// literal assertions are the whole guard, so neither may be deleted as "duplication".
     #[test]
     fn the_silent_outcome_sentinels_are_the_strings_the_frontend_matches() {
         assert_eq!(SUPERSEDED_ERR, "concierge_turn: superseded before install");
@@ -1060,16 +1132,47 @@ mod tests {
         // The REAL function the install site calls (roborev 53186) — a local copy would have
         // stayed green with that call deleted.
         // The live turn installs over an older entry.
-        assert!(may_install(6, 6, Some(5)));
+        assert!(may_install(TurnKind::Send, 6, 6, Some(5)));
         // …but the older one, spawning a moment later, must NOT stomp it.
-        assert!(!may_install(5, 6, Some(6)));
+        assert!(!may_install(TurnKind::Send, 5, 6, Some(6)));
         // Retired even with an empty slot (the floor moved while we were spawning).
-        assert!(!may_install(5, 6, None));
+        assert!(!may_install(TurnKind::Send, 5, 6, None));
         // First turn of the session.
-        assert!(may_install(1, 0, None));
+        assert!(may_install(TurnKind::Send, 1, 0, None));
         // Equal tokens cannot happen (each reservation is unique), but re-installing over yourself
         // is not a supersession either way.
-        assert!(may_install(7, 7, Some(7)));
+        assert!(may_install(TurnKind::Send, 7, 7, Some(7)));
+    }
+
+    /// The stale-resume retry installs under a STRICTER rule than a send: any occupant at all wins
+    /// (roborev 53397). Token order cannot stand in for it — the continuation's token predates that
+    /// occupant by construction, and the fresh token the retry used to draw was numerically ABOVE
+    /// every send in existence, which is how it came to kill a live turn.
+    #[test]
+    fn a_continuation_never_installs_over_an_occupied_slot() {
+        // The reap that precedes the retry emptied the slot itself, so this is the normal case.
+        assert!(may_install(TurnKind::Continuation, 5, 5, None));
+
+        // A send landed while the first attempt was failing and has already installed. The retry
+        // must stand down — killing turn 6's child strands the user's newest question, which gets
+        // no terminal event at all, while the retry answers the PREVIOUS one under a retired id.
+        assert!(!may_install(TurnKind::Continuation, 5, 6, Some(6)));
+
+        // THE REGRESSION ITSELF: the old code drew a fresh token for the retry, so it presented at
+        // the install site numerically ABOVE the live send it was about to stomp — and a
+        // send-shaped rule ("refuse only a strictly newer occupant") waves that straight through.
+        // Both halves of the fix are needed for this line: the kind-aware rule, and a token that no
+        // longer outranks a send.
+        assert!(!may_install(TurnKind::Continuation, 7, 6, Some(6)));
+        // Same shape with the slot older still — a continuation is never anyone's cleanup crew.
+        assert!(!may_install(TurnKind::Continuation, 7, 0, Some(1)));
+
+        // A send in the same position DOES install: it owns the floor, and the occupant is a turn
+        // its own floor retired. The two rules genuinely differ, so neither can be dropped.
+        assert!(may_install(TurnKind::Send, 7, 7, Some(6)));
+
+        // The floor still comes first, whatever the kind.
+        assert!(!may_install(TurnKind::Continuation, 5, 6, None));
     }
 
     /// Cancel still retires everything already RESERVED — the turns that do have a token, whether
@@ -1111,11 +1214,16 @@ mod tests {
         let floor = RETIRE_BELOW.load(Ordering::Relaxed);
         assert!(is_retired(first, floor), "the newer send retires the older turn immediately");
         assert!(!is_retired(second, floor));
-        // A continuation (the stale-resume retry) takes a token WITHOUT publishing a floor, so it
-        // cannot silence a turn the user sent while the first attempt was failing.
-        let cont = reserve_continuation_token();
-        assert!(cont > second);
+        // `first` failed with a stale resume id and retries. The continuation runs under `first`'s
+        // OWN token, so `second`'s floor retires it — the retry of a question the user has moved on
+        // from does not run (roborev 53397). A fresh token here would have landed ABOVE `second` and
+        // sailed through this very check.
+        let (kind, cont) = continuation_install(first);
+        assert_eq!(kind, TurnKind::Continuation);
+        assert_eq!(cont, first, "a continuation reuses its turn's token; it does not mint one");
+        assert!(cont < second);
         assert_eq!(RETIRE_BELOW.load(Ordering::Relaxed), floor, "a continuation publishes no floor");
+        assert!(is_retired(cont, floor), "a send after the failure retires the retry");
         assert!(!is_retired(second, RETIRE_BELOW.load(Ordering::Relaxed)));
     }
 
