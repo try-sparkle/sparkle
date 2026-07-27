@@ -1,9 +1,9 @@
 // The Concierge column shell — the persistent left column that is the user's cross-project
 // minder (PRD/sparkle/concierge-mode.md; look/feel from the canonical prototype). Fixed-width
-// flex column on the deepForest sidebar surface: header (remaining-credit badge top-right, the
-// Sparkle.ai mark centered inside the star field under it, then the voice waveform and scope +
-// vitals), the chat thread, and the compose box. Verdana per the approved design — the concierge
-// deliberately doesn't share the workspace's UI font.
+// flex column on the deepForest sidebar surface: header (one row carrying the Sparkle.ai mark top-
+// left and the remaining-credit pill top-right, then the voice waveform and scope + vitals), the
+// chat thread, and the compose box. Verdana per the approved design — the concierge deliberately
+// doesn't share the workspace's UI font.
 //
 // The THREAD is purely presentational: everything in it comes from the ConciergeViewModel and every
 // gesture leaves through the ConciergeController (see ./types). The two BRAND-CHROME pieces in the
@@ -19,8 +19,7 @@ import { SparkleLogoLink } from "../SparkleLogoLink";
 import { ComposeBox } from "./ComposeBox";
 import { ConciergeThread } from "./ConciergeThread";
 import { ScopeVitals } from "./ScopeVitals";
-import { StarfieldWordmark } from "./StarfieldWordmark";
-import type { ConciergeAnnouncement, ConciergeColumnProps, WordmarkMode } from "./types";
+import type { ConciergeAnnouncement, ConciergeColumnProps } from "./types";
 
 /** Nothing announced yet. Module-level so the default prop is referentially stable. */
 const EMPTY_ANNOUNCEMENT: ConciergeAnnouncement = { seq: 0, text: "" };
@@ -30,19 +29,10 @@ const EMPTY_ANNOUNCEMENT: ConciergeAnnouncement = { seq: 0, text: "" };
  *  line below instead of sitting inset by header-padding + its own. */
 const WAVEFORM_INSET = -14;
 
-/** The wordmark's drive when the integration doesn't pass one explicitly: buzz hard while
- *  the mic is live, gently while Sparkle types, still otherwise. Exported pure for tests. */
-export function deriveWordmarkMode(micLive: boolean, typing: boolean): WordmarkMode {
-  if (micLive) return "listening";
-  if (typing) return "speaking";
-  return "idle";
-}
-
 export function ConciergeColumn({
   model,
   controller,
   micLive = false,
-  wordmarkMode,
   width = 380,
   searchSlot,
   interim = "",
@@ -52,7 +42,6 @@ export function ConciergeColumn({
   announcement = EMPTY_ANNOUNCEMENT,
   countdownSlot,
 }: ConciergeColumnProps) {
-  const mode = wordmarkMode ?? deriveWordmarkMode(micLive, model.typing ?? false);
   return (
     <section
       aria-label="Sparkle concierge"
@@ -74,40 +63,38 @@ export function ConciergeColumn({
       }}
     >
       <div style={{ position: "relative", flex: "none", padding: "16px 16px 12px" }}>
-        {/* The remaining-credit badge, alone on its own row, hard right — the prototype's
-            top-right `.spend` pill position, as a flex row rather than the absolutely-positioned
-            pill that used to sit here: an absolute pill can only be kept off the star field by
-            hand-tuned offsets, and the field's canvas is the exact kind of neighbor that silently
-            ends up underneath one. This shows credits REMAINING (counting down), which is the
-            number the founder acts on — the deleted SpendPill showed a locally-derived trailing-24h
-            spend ESTIMATE that only ever counted up and was never billed. */}
+        {/* THE HEADER'S ONE ROW: brand mark hard left, remaining-credit pill hard right — the two
+            top corners, with `space-between` doing the pushing rather than a spacer or a margin.
+            Both are flex children of the same row, so neither can drift onto the other's line as
+            the column is resized.
+
+            The mark used to sit CENTERED on its own line below this row, nested inside a star-field
+            canvas that painted drifting particles behind it. Both are gone: the field is deleted
+            outright (not hidden — see SparkleLogo.placement.test), and with it the last reason the
+            mark needed a line of its own. That reclaims a whole row of header height above the
+            thread, which is the column's scarcest space.
+
+            The pill shows credits REMAINING (counting down) — the number the founder acts on. The
+            deleted SpendPill showed a locally-derived trailing-24h spend ESTIMATE that only ever
+            counted up and was never billed. */}
         <div
+          data-testid="concierge-brand-row"
           style={{
             display: "flex",
             alignItems: "center",
-            justifyContent: "flex-end",
+            justifyContent: "space-between",
             gap: 8,
             marginBottom: 8,
           }}
         >
+          <SparkleLogoLink />
           <BalanceBadge />
         </div>
-        {/* The ONE brand mark in this header: the Sparkle.ai logo, centered inside the star
-            field's box. The field used to paint the literal word "Sparkle" here, which — once the
-            logo moved into this column — put the brand name on screen twice within ~80px, left-
-            aligned above centered, with two adjacent elements whose accessible name was "Sparkle".
-            Nesting the logo in the field keeps the founder's requested mark AND the field's
-            voice-state animation (idle drift → buzz while listening/speaking), instead of trading
-            one away for the other. Centered to match the scope/vitals lines underneath. */}
-        <StarfieldWordmark mode={mode}>
-          <SparkleLogoLink />
-        </StarfieldWordmark>
-        {/* The always-listening voice ring + waveform, directly under the mark as its name says.
-            It followed the logo out of the builder column: the mic is Sparkle's, not a per-project
-            build tool, and it belongs beside the box you talk into. Two voice surfaces here, not
-            three, and they say different things: the star field is the CONVERSATION's state — it
-            buzzes while Sparkle types a reply, which a mic meter can't show — and the waveform is
-            the live level of your own microphone. */}
+        {/* The always-listening voice ring + waveform, directly under the brand row. It followed
+            the logo out of the builder column: the mic is Sparkle's, not a per-project build tool,
+            and it belongs beside the box you talk into. Now the header's ONLY voice surface — the
+            star field showed the CONVERSATION's state (it buzzed while Sparkle typed a reply), and
+            with it deleted this is the sole live indicator, reading your own microphone level. */}
         <div style={{ marginLeft: WAVEFORM_INSET, marginRight: WAVEFORM_INSET }}>
           <LogoWaveform />
         </div>

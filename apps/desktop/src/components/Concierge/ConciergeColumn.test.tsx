@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 //
 // The column shell: a full view-model renders every region (brand mark, scope, vitals, thread
-// with all four message kinds), gestures route through the controller, and the wordmark-mode
-// derivation is pinned. Per-piece behavior lives in the sibling tests.
+// with all four message kinds) and gestures route through the controller. Per-piece behavior
+// lives in the sibling tests.
 //
 // The two store-backed header pieces are stubbed. They read their own stores rather than the
 // view-model (see ConciergeColumn's header comment), so the real ones would drag a rAF audio loop
@@ -14,7 +14,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("../LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("../BalanceBadge", () => ({ BalanceBadge: () => null }));
 
-import { ConciergeColumn, deriveWordmarkMode } from "./ConciergeColumn";
+import { ConciergeColumn } from "./ConciergeColumn";
 import type { ConciergeController, ConciergeNudge, ConciergeViewModel } from "./types";
 
 afterEach(() => cleanup());
@@ -53,8 +53,8 @@ function controller(): ConciergeController {
 describe("ConciergeColumn — view-model → rendered output", () => {
   it("renders the brand mark, scope, vitals, and every message kind", () => {
     const { container } = render(<ConciergeColumn model={model} controller={controller()} />);
-    // The mark is the Sparkle.ai LOGO nested in the star field, not the literal word "Sparkle"
-    // the field used to paint — see SparkleLogo.placement.test for the one-mark contract.
+    // The mark is the Sparkle.ai LOGO, sharing the header's one row with the credit pill — see
+    // SparkleLogo.placement.test for the one-mark contract and the corner-to-corner placement.
     expect(screen.getByAltText("Sparkle")).toBeTruthy();
     expect(screen.getByText("Following all projects")).toBeTruthy();
     expect(container.textContent).toContain("1 Needs you · 2 Running");
@@ -91,14 +91,5 @@ describe("ConciergeColumn — view-model → rendered output", () => {
     expect(screen.queryByLabelText("Sparkle is typing")).toBeNull();
     rerender(<ConciergeColumn model={{ ...model, typing: true }} controller={controller()} />);
     expect(screen.getByLabelText("Sparkle is typing")).toBeTruthy();
-  });
-});
-
-describe("deriveWordmarkMode", () => {
-  it("mic wins, then typing, else idle", () => {
-    expect(deriveWordmarkMode(true, true)).toBe("listening");
-    expect(deriveWordmarkMode(true, false)).toBe("listening");
-    expect(deriveWordmarkMode(false, true)).toBe("speaking");
-    expect(deriveWordmarkMode(false, false)).toBe("idle");
   });
 });

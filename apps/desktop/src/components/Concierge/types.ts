@@ -115,10 +115,6 @@ export type ConciergeMessage =
   | ConciergeRecapMessage
   | ConciergeNudge;
 
-/** Drives the star-field wordmark: still firefly drift at rest, buzzy waveform while the
- *  user is talking (listening) or Sparkle is typing a reply (speaking). */
-export type WordmarkMode = "idle" | "listening" | "speaking";
-
 export type ConciergeAttachKind = "screenshot" | "image" | "files";
 
 /** Re-exported so consumers of the column's contract get the attachment shape from one place. */
@@ -212,10 +208,8 @@ export interface ConciergeController {
 export interface ConciergeColumnProps {
   model: ConciergeViewModel;
   controller: ConciergeController;
-  /** Mic armed/live — tints the mic button and (unless overridden) buzzes the wordmark. */
+  /** Mic armed/live — tints the mic button. */
   micLive?: boolean;
-  /** Explicit wordmark drive; defaults to listening while micLive, speaking while typing. */
-  wordmarkMode?: WordmarkMode;
   /** Column width in px (the shell is fixed-width; the workspace owns resizing). */
   width?: number;
   /** Optional affordance rendered under the scope/vitals line — the shell drops the ⌘K palette

@@ -34,7 +34,6 @@ import {
 } from "react";
 import {
   ConciergeColumn,
-  deriveWordmarkMode,
   receiptText,
   type ConciergeAnnouncement,
   type ConciergeDigestMessage,
@@ -1604,7 +1603,6 @@ export function ConciergeHost({
         model={model}
         controller={controller}
         micLive={micLive}
-        wordmarkMode={deriveWordmarkMode(micLive, typing)}
         width={width}
         searchSlot={searchSlot}
         // Armed sends, each cancellable, directly above the box. `cancelIntent` runs the arm site's

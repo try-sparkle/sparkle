@@ -12,9 +12,14 @@
 // and announced as an image, not a link.
 //
 // Two aftershocks of that move are pinned here too: the header must carry exactly ONE brand mark
-// (the star field's own "Sparkle" text was a second one, 8px from the logo, left-aligned against
+// (the star field's own "Sparkle" text was a second one, 8px from the logo, left-aligned above
 // centered, both named "Sparkle"), and the row the logo left behind in the builder must not render
 // when its last remaining child renders nothing.
+//
+// The star field is now DELETED outright and the mark sits top-left on the credit pill's row. Its
+// absence is asserted here rather than in a test of its own, because "the component is gone" and
+// "the canvas it mounted is gone" are separable failures and this file's whole subject is the
+// half-landed move.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -177,14 +182,27 @@ describe("the Sparkle.ai logo lives in column one, the concierge", () => {
     expect(screen.getAllByAltText("Sparkle")).toHaveLength(1);
   });
 
-  it("keeps the mark INSIDE the star field, so voice state still animates around it", () => {
+  it("shares the credit pill's row, hard left, with the pill hard right", () => {
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    const row = screen.getByTestId("concierge-brand-row");
+    const logo = screen.getByAltText("Sparkle");
+    const pill = screen.getByRole("button", { name: "Open credits" });
+    // ONE row holding both, not two stacked blocks.
+    expect(row.contains(logo)).toBe(true);
+    expect(row.contains(pill)).toBe(true);
+    // "To the left of", asserted as document order — the mark comes first.
+    expect(logo.compareDocumentPosition(pill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // …and pushed to OPPOSITE ENDS, not merely adjacent. Without this the pair renders as a
+    // left-clustered logo+pill, which is not the corner-to-corner layout that was asked for.
+    expect(row.style.justifyContent).toBe("space-between");
+  });
+
+  it("has no star field left anywhere in the column", () => {
     const { container } = render(<ConciergeColumn model={model} controller={controller()} />);
-    // Dropping the duplicate text must not have cost the field — the canvas that draws it is the
-    // logo's own relatively-positioned box, not a sibling further up the column.
-    const canvas = container.querySelector("canvas");
-    expect(canvas).toBeTruthy();
-    const field = canvas!.parentElement!;
-    expect(field.contains(screen.getByAltText("Sparkle"))).toBe(true);
+    // The field was a <canvas> painting drifting particles behind the mark. Deleting the component
+    // but leaving a canvas mounted — or the reverse — are both half-landings of exactly the kind
+    // this file exists to catch, so this asserts the absence of the ELEMENT, not of an import.
+    expect(container.querySelector("canvas")).toBeNull();
   });
 });
 

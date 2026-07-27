@@ -1,7 +1,6 @@
 // Public surface of the Concierge column (CM-U1). The integration unit (U7) imports from
 // here; the subcomponents stay internal except where a piece is independently useful.
-export { ConciergeColumn, deriveWordmarkMode } from "./ConciergeColumn";
-export { StarfieldWordmark } from "./StarfieldWordmark";
+export { ConciergeColumn } from "./ConciergeColumn";
 // The receipt's sentence, so the host can announce the same wording it renders.
 export { receiptText } from "./RoutingReceipt";
 // The pieces the shell (U7) mounts: ⌘K history search (U5) and the top-right kebab/avatar (U6).
@@ -26,5 +25,4 @@ export type {
   ConciergeUserMessage,
   ConciergeViewModel,
   StatusBand,
-  WordmarkMode,
 } from "./types";
