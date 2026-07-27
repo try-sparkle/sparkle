@@ -524,17 +524,36 @@ impl SpendRecord {
 /// Uses [`SpendRecord::limit_tokens`] (cache reads excluded), NOT `total_tokens`: these windows
 /// exist to predict a rate limit, and cache reads make that prediction both looser and unreadable.
 /// The spend path keeps `total_tokens` — counting every token processed is the right answer there.
-fn token_pairs(records: &[SpendRecord]) -> Vec<(i64, u64)> {
-    records.iter().map(|r| (r.ts, r.limit_tokens())).collect()
+///
+/// Takes an ITERATOR, not a slice, so it can be fed the borrowed output of
+/// [`dedupe_by_message_id`] without cloning every record into a flat vec first.
+fn token_pairs<'a>(records: impl IntoIterator<Item = &'a SpendRecord>) -> Vec<(i64, u64)> {
+    records
+        .into_iter()
+        .map(|r| (r.ts, r.limit_tokens()))
+        .collect()
 }
 
-/// Drop the duplicate copies a RESUME makes: `claude --resume` copies prior turns into the new
-/// transcript, so the same `message.id` appears in several files under the same root. Without this
-/// the pill counted a resumed session twice while the Spend pane (which has always deduped) did
-/// not — one more way the two surfaces disagreed about the same day.
+/// Window, then drop the duplicate copies a RESUME makes: `claude --resume` copies prior turns into
+/// the new transcript, so the same `message.id` appears in several files under the same root.
 ///
-/// Last copy wins, matching `spend::dedupe_window`. Records with no id can't be matched and are
-/// all kept (the same accepted limit the pane has).
+/// **Every consumer of a `SpendRecord` vector goes through this — there is exactly one copy of the
+/// rule on purpose.** It was originally wired into [`spend_summary`] alone, and the two LIMIT
+/// surfaces ([`usage_for_account`]'s 5h/7d tallies and [`ceiling_for_account`] via
+/// [`consumption_before`]) consumed the same vector raw, so a resumed session's copied turns were
+/// counted twice in exactly the tallies that decide when the user gets throttled: the cost pill read
+/// correctly while the limit read high, and the user was benched early against usage they never
+/// spent. A third divergent copy is how that happened; keep it at one.
+///
+/// Last copy wins IN INPUT ORDER, matching `spend::dedupe_window`. That makes the result
+/// order-dependent, which is why every caller must hand records over in the SAME order — the
+/// deterministic oldest-mtime-first order `collect_usage_records_across` produces. (Copies of one
+/// turn carry identical token counts, so the choice does not move a tally today; it would the moment
+/// one surface sorted and another didn't.)
+///
+/// Records with no id can't be matched and are all kept (the same accepted limit the pane has).
+///
+/// `first_ts`/`now` are INCLUSIVE bounds.
 fn dedupe_by_message_id(records: &[SpendRecord], first_ts: i64, now: i64) -> Vec<&SpendRecord> {
     let mut position: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut chosen: Vec<&SpendRecord> = Vec::new();
@@ -1308,11 +1327,22 @@ fn limit_episodes(mut times: Vec<i64>) -> Vec<i64> {
     eps
 }
 
-/// Sum `limit_tokens` over the 5h window ending at `at`. `records` must be sorted by `ts`.
+/// Sum `limit_tokens` over the 5h window ending at `at`, counting a resumed session's copied turns
+/// ONCE — through the same [`dedupe_by_message_id`] gate the pill and the 5h/7d tallies use.
+///
+/// Without the dedupe every learned ceiling sample was inflated by whatever the account's resumes
+/// had copied forward, so the median ceiling — the number the near-cap banner fires against — sat
+/// above the real limit.
+///
+/// The window is `[at - WINDOW_5H, at]`, inclusive at BOTH ends, which is `bucket_tokens`' 5h
+/// boundary. It used to be exclusive at the low end: a one-second disagreement between the tally
+/// that shows headroom and the sample that learns the cap, with no reason behind it.
+///
+/// `records` need not be sorted (this is a full scan), and must NOT be pre-sorted: the dedupe is
+/// last-copy-wins on input order, so every surface has to see the collection order.
 fn consumption_before(records: &[SpendRecord], at: i64) -> u64 {
-    records
-        .iter()
-        .filter(|r| r.ts > at - WINDOW_5H && r.ts <= at)
+    dedupe_by_message_id(records, at - WINDOW_5H, at)
+        .into_iter()
         .fold(0u64, |acc, r| acc.saturating_add(r.limit_tokens()))
 }
 
@@ -1354,7 +1384,10 @@ fn ceiling_for_account(acct: &Account, now: i64) -> AccountCeiling {
                 pass.id(),
             );
             finish_usage_pass(pass, touched > 0);
-            records.sort_by_key(|r| r.ts);
+            // NOT sorted by ts: `consumption_before` is a full scan that doesn't need it, and its
+            // resume dedupe is last-copy-wins on INPUT order. Sorting here would have handed this
+            // surface a different order than the pill and the 5h/7d tallies see, which is a fresh
+            // way for the three to disagree about one turn. Collection order everywhere.
             for ep in episodes {
                 let c = consumption_before(&records, ep);
                 // A zero-consumption sample means we have no usage data covering that episode
@@ -1425,7 +1458,13 @@ fn usage_for_account(acct: &Account, now: i64, generation: u64) -> (AccountUsage
             generation,
         );
     }
-    let (tokens_5h, tokens_7d) = bucket_tokens(&token_pairs(&records), now);
+    // Through the SHARED resume dedupe, on the same window the spend pill uses, before bucketing:
+    // a resumed session copies its earlier turns into the new transcript, and counting those twice
+    // inflates the very tallies that throttle the user (see `dedupe_by_message_id`). Deduped ONCE
+    // over the 7d window and then split into 5h/7d, so the two windows can't pick different copies
+    // of one turn — the same shape `spend_summary` uses for today/7d.
+    let (tokens_5h, tokens_7d) =
+        bucket_tokens(&token_pairs(dedupe_by_message_id(&records, now - WINDOW_7D, now)), now);
     (
         AccountUsage {
             id: acct.id.clone(),
@@ -2351,6 +2390,135 @@ mod tests {
         assert_eq!(usage.exhausted_until, None);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The bug this file's dedupe was originally only HALF fixed for: `spend_summary` deduped
+    /// resumed turns, `usage_for_account` did not, so the 5h/7d LIMIT tallies — the ones that drive
+    /// the headroom display and throttle the user — counted a resumed session's copied turns twice
+    /// and benched the account early against usage it never spent.
+    ///
+    /// End-to-end through the real scan: two transcripts under one root, the second a `--resume`
+    /// of the first, so it carries a COPY of the earlier turn (same `message.id`) plus its own new
+    /// one. Raw, that reads 17 + 17 + 100 = 134 in the 7d window; deduped it is 117.
+    #[test]
+    fn usage_tallies_count_a_resumed_turn_once() {
+        let base = unique_dir("usage-resume");
+        let config = base.join("acct-config");
+        let slug_dir = config.join("projects").join("-tmp-proj");
+        std::fs::create_dir_all(&slug_dir).unwrap();
+
+        let new_iso = "2026-06-25T21:20:25.931Z";
+        let now = parse_iso8601_to_epoch(new_iso).unwrap() + 10;
+        // The copied turn sits OUTSIDE the 5h window and inside 7d, so the two tallies are
+        // distinguishable: only the 7d one can double-count it.
+        let old_iso = "2026-06-25T12:00:00.000Z";
+        assert!(parse_iso8601_to_epoch(old_iso).unwrap() < now - WINDOW_5H);
+
+        // limit_tokens 17 (the 3 cache_read tokens never count toward a limit).
+        let old_turn = format!(
+            concat!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"assistant\",\"message\":{{\"id\":\"msg_old\",",
+                "\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,",
+                "\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":3}}}}}}\n"
+            ),
+            ts = old_iso
+        );
+        // The turn only the resumed session produced: limit_tokens 100.
+        let new_turn = format!(
+            concat!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"assistant\",\"message\":{{\"id\":\"msg_new\",",
+                "\"usage\":{{\"input_tokens\":100,\"output_tokens\":0}}}}}}\n"
+            ),
+            ts = new_iso
+        );
+        std::fs::write(slug_dir.join("a-original.jsonl"), &old_turn).unwrap();
+        std::fs::write(
+            slug_dir.join("b-resumed.jsonl"),
+            format!("{old_turn}{new_turn}"),
+        )
+        .unwrap();
+
+        let acct = sample("r1", false, config.to_str().unwrap());
+        let usage = usage_for_account(&acct, now, 1).0;
+        assert_eq!(usage.tokens_5h, 100, "only the new turn is inside 5h");
+        assert_eq!(
+            usage.tokens_7d, 117,
+            "the resumed copy of msg_old is counted ONCE (117, not 134)"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The same double-count reached the LEARNED CEILING: `ceiling_for_account` pairs each past
+    /// limit episode with the consumption preceding it, and consumption over a resumed session read
+    /// high, so every sample — and the median the near-cap banner fires against — sat above the real
+    /// cap. Raw this sample is 200; deduped it is 100.
+    #[test]
+    fn ceiling_samples_count_a_resumed_turn_once() {
+        let base = unique_dir("ceiling-resume");
+        let projects = base.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let usage_iso = "2026-07-20T09:00:00.000Z";
+        let limit_iso = "2026-07-20T10:00:00.000Z";
+        let turn = format!(
+            concat!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"assistant\",\"message\":{{\"id\":\"msg_c\",",
+                "\"usage\":{{\"input_tokens\":100,\"output_tokens\":0,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":9999}}}}}}\n"
+            ),
+            ts = usage_iso
+        );
+        let limit = format!("{}\n", limit_line(limit_iso, "resets 9pm (America/Los_Angeles)"));
+        std::fs::write(projects.join("a-original.jsonl"), format!("{turn}{limit}")).unwrap();
+        // The resume copies BOTH lines forward. The duplicate limit event collapses into the same
+        // episode (`limit_episodes`); the duplicate turn is what must not double the sample.
+        std::fs::write(projects.join("b-resumed.jsonl"), format!("{turn}{limit}")).unwrap();
+
+        let now = parse_iso8601_to_epoch("2026-07-21T00:00:00.000Z").unwrap();
+        let got = ceiling_for_account(&sample("c9", false, base.to_str().unwrap()), now);
+        assert_eq!(got.samples, vec![100], "one episode, and its consumption is 100 (not 200)");
+        assert_eq!(got.ceiling, None, "one sample is below CEILING_MIN_SAMPLES");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The three surfaces that consume a `SpendRecord` vector — the spend pill, the 5h/7d limit
+    /// tallies, and the ceiling learner — must all count a resumed turn exactly ONCE. They diverged
+    /// before because the dedupe lived at one call site; this pins them together so a fourth copy of
+    /// the rule can't quietly reappear.
+    #[test]
+    fn spend_and_limit_paths_agree_on_the_resume_dedupe() {
+        let now = 1_000_000_000;
+        let turn = || SpendRecord {
+            ts: now - 60,
+            message_id: Some("msg_shared".to_string()),
+            model: Some("claude-haiku-4-5".to_string()),
+            input: 1_000,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 7,
+        };
+        // The original and the copy a resume wrote — one turn, two records.
+        let records = vec![turn(), turn()];
+        let once = turn();
+
+        // Spend unit: every token processed, cache reads included.
+        let s = spend_summary(&records, now);
+        assert_eq!(s.tokens_today, once.total_tokens());
+        assert_eq!(s.tokens_7d, once.total_tokens(), "1007, not 2014");
+
+        // Limit unit: cache reads excluded. Same expression `usage_for_account` buckets.
+        let pairs = token_pairs(dedupe_by_message_id(&records, now - WINDOW_7D, now));
+        assert_eq!(
+            bucket_tokens(&pairs, now),
+            (once.limit_tokens(), once.limit_tokens()),
+            "1000 in each window, not 2000"
+        );
+
+        // Ceiling unit: the 5h consumption a limit episode would learn from.
+        assert_eq!(consumption_before(&records, now), once.limit_tokens());
     }
 
     #[test]
@@ -3444,12 +3612,13 @@ mod tests {
         let at = 100_000;
         let records = vec![
             rec(at - WINDOW_5H - 10, 1), // just outside → excluded
+            rec(at - WINDOW_5H, 32),     // ON the low boundary → included, as in `bucket_tokens`
             rec(at - WINDOW_5H + 10, 2), // inside
             rec(at - 10, 4),             // inside
             rec(at, 8),                  // at the boundary → included
             rec(at + 10, 16),            // after the limit → excluded
         ];
-        assert_eq!(consumption_before(&records, at), 2 + 4 + 8);
+        assert_eq!(consumption_before(&records, at), 32 + 2 + 4 + 8);
     }
 
     #[test]

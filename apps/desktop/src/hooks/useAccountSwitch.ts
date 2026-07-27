@@ -44,8 +44,11 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
   // Accounts the user has waved off. Keyed by account id so a fresh recommendation about a
   // DIFFERENT account still shows, but the dismissed one stays quiet.
   const dismissed = useRef<Set<string>>(new Set());
-  // Mirrors `plan` for the recommend loop, which must read the CURRENT value without re-subscribing
-  // its interval every time the plan advances. Synced in an effect, not during render.
+  // The live plan, readable from both interval loops without re-subscribing them on every advance:
+  // phase 1 reads it to stay quiet while a switch is running, phase 2 reads it as the input to the
+  // next advance. Every path that sets `plan` writes this ref in the same breath, so it never lags;
+  // the effect below is a backstop that keeps them in step if a new setter is ever added. Written
+  // in effects and callbacks, never during render.
   const planRef = useRef<SwitchPlan | null>(null);
   useEffect(() => {
     planRef.current = plan;
@@ -89,17 +92,27 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
   }, [pollMs]);
 
   // ---- phase 2: execute -----------------------------------------------------------------------
+  //
+  // The advance is computed OUTSIDE the `setPlan` updater, and the updater is never used at all.
+  // This is load-bearing, not style: `advanceSwitch` re-pins each agent (a persisted write) and
+  // re-spawns its PTY. React only guarantees an updater runs with the LATEST state — not that it
+  // runs exactly once, and a discarded or replayed render re-invokes it against the same prior
+  // state. Inside an updater, that tore down and re-spawned an agent's terminal twice on a single
+  // tick (bead sparkle-0t2o). Out here it runs once per interval tick, which is the contract we
+  // actually want. `planRef` is the source of truth for the current plan; it is written
+  // synchronously below so it can never lag the state it mirrors.
   useEffect(() => {
     if (!plan) return;
     const id = setInterval(() => {
+      const cur = planRef.current;
+      if (!cur) return;
       const statuses = useRuntimeStore.getState().status;
-      setPlan((cur) => {
-        if (!cur) return cur;
-        const { plan: next, movedNow } = advanceSwitch(cur, statuses, restartPane);
-        if (movedNow.length > 0) invalidateAccountState();
-        // Retire the plan once everyone has moved, which also re-arms recommendations.
-        return next.pending.length === 0 ? null : next;
-      });
+      const { plan: next, movedNow } = advanceSwitch(cur, statuses, restartPane);
+      if (movedNow.length > 0) invalidateAccountState();
+      // Retire the plan once everyone has moved, which also re-arms recommendations.
+      const settled = next.pending.length === 0 ? null : next;
+      planRef.current = settled;
+      setPlan(settled);
     }, SWITCH_ADVANCE_MS);
     return () => clearInterval(id);
   }, [plan]);
@@ -111,6 +124,9 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
     // Nothing running on that account: just record the preference so future spawns land correctly,
     // rather than leaving an empty plan spinning.
     if (fresh.pending.length === 0) return;
+    // Write the ref alongside the state — phase 2 reads the plan from the ref, so it must be
+    // current the instant a plan exists rather than one commit later.
+    planRef.current = fresh;
     setPlan(fresh);
   }, [recommendation]);
 
