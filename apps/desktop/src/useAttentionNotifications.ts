@@ -37,11 +37,14 @@ import {
   summarizeAttention,
   onFocusAgent,
   onSelectProject,
+  onFocusTier,
   type FocusAgentPayload,
   type SelectProjectPayload,
+  type FocusTierPayload,
 } from "./services/attention";
 import { agentExists, selectAndOpen } from "./services/agentReveal";
 import { openProjectTab } from "./services/openProjectTab";
+import { useUiStore } from "./stores/uiStore";
 import { emitAttention, emitResolved } from "./services/relayClient";
 import { reportAttentionSource } from "./services/selfReportObservability";
 import type { AttentionSource } from "./stores/selfReportMetrics";
@@ -263,7 +266,7 @@ export function useAttentionNotifications(): void {
     // could list this window's red agents at the top of its sidebar; CM-U7 part 2 deleted that
     // reader along with the multi-window shell, and a writer with no reader is a localStorage
     // write plus a Tauri emit on every status change, feeding nothing. What replaced it: one
-    // window shows every project (the tab bar surfaces other projects' reds), and the tray/phone
+    // window shows every project (the tab bar surfaces other projects' reds), and the island/phone
     // read the roster published by useRosterPublisher.
     const sameProject = prevProject.current === projectId;
     if (sameProject) {
@@ -422,7 +425,7 @@ export function useAttentionNotifications(): void {
   ctx.current = { projectId, label, isMain, replace };
   useEffect(() => {
     // A cross-webview payload can name a project/agent this window's store hasn't rehydrated yet
-    // (crossWindowSync coalesces up to 300ms — the tray adds a project, then immediately asks us
+    // (crossWindowSync coalesces up to 300ms — another webview adds a project, then immediately asks us
     // to show it). Dropping would be a dead click (roborev 46328-M2), so on an unknown id we
     // DEFER the whole response — raise included — and act once the id appears.
     //
@@ -462,7 +465,7 @@ export function useAttentionNotifications(): void {
     };
     const handle = (p: FocusAgentPayload) => {
       const { projectId: mine, replace: setProject } = ctx.current;
-      // VALIDATE FIRST. The broadcast can be stale (the tray's roster lags a deletion) or rogue,
+      // VALIDATE FIRST. The broadcast can be stale (the roster lags a deletion) or rogue,
       // and everything below is a side effect: `runtimeStore.open` does not check that the agent
       // exists, so a phantom id would sit in `openAgentIds` forever (roborev 46249-L1). But a
       // stale AGENT id must still raise the window and land on its project when that project
@@ -489,7 +492,7 @@ export function useAttentionNotifications(): void {
         );
         return;
       }
-      // If the click carried a specific prompt (tray breadcrumb), queue a scroll to that turn; the
+      // If the click carried a specific prompt (a breadcrumb), queue a scroll to that turn; the
       // target agent's AgentPane consumes it once its terminal is mounted + PTY-ready. Missing/
       // scrolled-out markers (or think agents with no terminal) simply open without scrolling.
       const jumpToPrompt = () => {
@@ -505,7 +508,7 @@ export function useAttentionNotifications(): void {
       selectAndOpen(p.projectId, p.agentId);
       jumpToPrompt();
     };
-    // "Show me this project" from the tray/capture webview: select the tab and raise the window,
+    // "Show me this project" from another webview (e.g. capture): select the tab and raise the window,
     // and NOTHING else — no agent is mounted, no PTY spawned, no workMode flip. That is the whole
     // difference from focus-agent, and the reason this is its own event (see services/attention).
     const handleSelectProject = (p: SelectProjectPayload) => {
@@ -519,13 +522,26 @@ export function useAttentionNotifications(): void {
         },
       );
     };
+    // A P0/P1 chiclet on the floating helper island: raise the window and put that tier in front
+    // of the user. Deliberately does NOT mount an agent or spawn a PTY — the click means "show me
+    // what's urgent", not "open this specific agent", which is why it is its own event.
+    const handleFocusTier = (p: FocusTierPayload) => {
+      void bringToFront();
+      // Deliberately does NOT touch agentOrdering: that is a PERSISTED user preference, and one
+      // chiclet click permanently destroying a deliberate "manual" ordering — with no undo and no
+      // indication it happened — is not a trade the click is worth. The tier filter alone surfaces
+      // the urgent rows.
+      useUiStore.getState().setAttentionTierFocus(p.tier);
+    };
     // Keep the listen() promise; safeUnlisten awaits it on cleanup so a listener that resolves
     // AFTER unmount is still torn down (and the Tauri teardown race is swallowed).
     const unlistenPromise = onFocusAgent(handle);
     const unlistenSelect = onSelectProject(handleSelectProject);
+    const unlistenTier = onFocusTier(handleFocusTier);
     return () => {
       void safeUnlisten(unlistenPromise);
       void safeUnlisten(unlistenSelect);
+      void safeUnlisten(unlistenTier);
       // Drop any deferral still watching the store: without this it fires into an unmounted tree
       // (and, in tests, into the NEXT case's stores — roborev 46485-M).
       cancelDeferral();

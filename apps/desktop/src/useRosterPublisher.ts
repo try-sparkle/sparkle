@@ -54,8 +54,8 @@ const RECENT_PROMPTS_MAX = 4;
 const RECENT_PROMPT_CHARS = 80;
 
 /** The most recent (~4) user prompts, oldest→newest, whitespace-collapsed and length-capped. Each
- *  keeps its promptHistory id so a tray click can scroll the terminal to that exact turn. Picker
- *  answers are excluded (composerPrompts) — the tray breadcrumb, like the desktop one, is for real
+ *  keeps its promptHistory id so a reveal can scroll the terminal to that exact turn. Picker
+ *  answers are excluded (composerPrompts) — the breadcrumb, like the desktop one, is for real
  *  messages, and a picker row's id has no scroll marker to jump to.
  *
  *  The cap goes through `safeTruncate`, NOT a bare `slice`: prompts contain emoji, and a UTF-16
@@ -83,7 +83,7 @@ export function openProjects(
   return projects.filter((p) => visited(p.id) || p.agents.some((a) => open.has(a.id)));
 }
 
-/** Build the roster payload published to BOTH the Rust tray aggregator and the phone relay.
+/** Build the roster payload published to BOTH the Rust roster aggregator and the phone relay.
  *
  *  The result is swept by `sanitizeJsonStrings` before it leaves: both consumers cross a JSON
  *  boundary where a single lone surrogate in ANY string rejects the whole payload (see

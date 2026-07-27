@@ -64,6 +64,10 @@ export type ThemePref = "auto" | "light" | "dark";
 // feature. Default is "attention" — reordering is the out-of-the-box behavior.
 export type AgentOrdering = "attention" | "manual";
 
+/** The urgency tiers the helper island's chiclets can narrow the sidebar to. Mirrors the
+ *  concierge's own P0/P1 banding (services/conciergeFeed.ts). */
+export type AttentionTier = "p0" | "p1";
+
 // Sidebar workflow mode — which of the Plan / Build chevrons is active. Lifted out of
 // AgentSidebar's local state into the store so other components can switch tabs by calling
 // setWorkMode. Deliberately NOT persisted (see partialize) so it defaults to "build" on every
@@ -105,6 +109,11 @@ interface UiState {
   // Sidebar agent ordering preference (see AgentOrdering). Persisted in `sparkle-ui`.
   agentOrdering: AgentOrdering;
   setAgentOrdering: (v: AgentOrdering) => void;
+  // Which urgency tier the sidebar is narrowed to, set by clicking a P0/P1 chiclet on the
+  // floating helper island. null = show everything. Transient — NOT persisted (see partialize):
+  // a filter that silently survived a relaunch would look like agents had vanished.
+  attentionTierFocus: AttentionTier | null;
+  setAttentionTierFocus: (t: AttentionTier | null) => void;
   // Active sidebar workflow mode (Plan/Build chevrons). Shared so non-sidebar components can
   // switch tabs. NOT persisted (see partialize) — resets to "build" each launch like the old local state.
   workMode: WorkMode;
@@ -199,6 +208,8 @@ export const useUiStore = create<UiState>()(
       setThemePref: (v) => set({ themePref: v }),
       agentOrdering: "attention",
       setAgentOrdering: (v) => set({ agentOrdering: v }),
+      attentionTierFocus: null,
+      setAttentionTierFocus: (t) => set({ attentionTierFocus: t }),
       workMode: "build",
       setWorkMode: (m) => set({ workMode: m }),
       boardFocusBeadId: null,
@@ -244,11 +255,11 @@ export const useUiStore = create<UiState>()(
       name: "sparkle-ui",
       storage: createJSONStorage(() => localStorage),
       // Persist everything EXCEPT workMode, buildAgentHover, boardFocusBeadId,
-      // settingsRequest, newAgentRuntime and zeroCreditBannerDismissed, so the active sidebar tab
-      // resets to "build" on each launch (matching the prior local-useState default) and the
-      // transient hover flag / one-shot board-focus handoff / one-shot settings deep-open / the
-      // dismissed $0 warning never persist, while every other UI preference still sticks.
-      // Spreading `rest` keeps all existing persisted keys.
+      // attentionTierFocus, settingsRequest, newAgentRuntime and zeroCreditBannerDismissed, so the
+      // active sidebar tab resets to "build" on each launch (matching the prior local-useState
+      // default) and the transient hover flag / one-shot board-focus handoff / one-shot settings
+      // deep-open / the helper island's tier filter / the dismissed $0 warning never persist,
+      // while every other UI preference still sticks. Spreading `rest` keeps all persisted keys.
       partialize: ({
         workMode: _workMode,
         buildAgentHover: _buildAgentHover,
@@ -257,6 +268,7 @@ export const useUiStore = create<UiState>()(
         composeFocusSeq: _composeFocusSeq,
         newAgentRuntime: _newAgentRuntime,
         cloudCreateOpen: _cloudCreateOpen,
+        attentionTierFocus: _attentionTierFocus,
         zeroCreditBannerDismissed: _zeroCreditBannerDismissed,
         zeroCreditBannerDismissedFor: _zeroCreditBannerDismissedFor,
         ...rest

@@ -696,14 +696,14 @@ impl DictationState {
     pub fn reconcile_capture(&self, app: &AppHandle) {
         // Snapshot the focus GENERATION before the off-lock sample. `set_focused` (driven by the
         // main-thread window-focus events) is the SOLE authority for `sess.focused`; our off-lock
-        // `any_window_focused()` merely SEEDS it at arm time (so the mic comes up without waiting for
+        // the panel-filtered focus poll merely SEEDS it at arm time (so the mic comes up without waiting for
         // the first focus event) — and only when no focus event has spoken since we sampled. If the
-        // generation moved, a Focused event landed while `any_window_focused()` was blocked on the
+        // generation moved, a Focused event landed while that poll was blocked on the
         // main thread, so our sample is stale and MUST NOT clobber the authoritative value. Without
         // this the worker could write a stale `focused=true` over a fresh blur and leave the mic live
         // while the window is unfocused (defeating the sparkle-9oz6 gate) — the TOCTOU roborev caught.
         let focus_gen = self.1.load(Ordering::SeqCst);
-        let sampled_focus = any_window_focused(app);
+        let sampled_focus = crate::frontmost::any_app_window_focused(app);
         match self.take_reconcile_step(sampled_focus, focus_gen) {
             ReconcileStep::Idle => {}
             // Drop OUTSIDE the lock: `Capture::drop` pauses the cpal stream and the worker join drains
@@ -852,7 +852,15 @@ impl DictationState {
         let focus_gen = self.1.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(FOCUS_BLUR_COALESCE_MS));
-            if should_emit_blur(my_gen, focus_gen.load(Ordering::SeqCst), any_window_focused(&app)) {
+            if should_emit_blur(
+                my_gen,
+                focus_gen.load(Ordering::SeqCst),
+                // MUST stay the panel-filtered helper (sparkle-9oz6): a non-activating panel can
+                // hold key focus while the user is in another app, and counting it here would
+                // suppress this blur and leave the microphone open indefinitely. Called directly,
+                // with no local wrapper that could drift back to an unfiltered fold.
+                crate::frontmost::any_app_window_focused(&app),
+            ) {
                 // The app may be tearing down by the time this deferred body runs — `state::<T>()`
                 // PANICS if the DictationState was already removed during shutdown (
                 // teardown window). `try_state` returns None instead, so we simply bail: a blur that
@@ -863,15 +871,6 @@ impl DictationState {
             }
         });
     }
-}
-
-/// True if at least one Sparkle window is currently the focused/active OS window. Used to seed the
-/// focus state at arm time (the frontend calls start_dictation on mount, normally while focused),
-/// so the mic comes up without waiting for the first focus event.
-fn any_window_focused(app: &AppHandle) -> bool {
-    app.webview_windows()
-        .values()
-        .any(|w| w.is_focused().unwrap_or(false))
 }
 
 /// Build the cpal capture stream and wire its callback to the transcription pipeline, plus the

@@ -22,7 +22,7 @@ import { isRedStatus } from "./windowStatus";
 import { resolveStage, type WorkflowStageId } from "../engine/workflowStage";
 import { publishedStatusFor } from "../useAttentionNotifications";
 import type { BranchStatus } from "./branchStatus";
-import type { TrayRoster } from "../tray/trayRoster";
+import type { Roster } from "./rosterTypes";
 import type { AgentKind, Project } from "../types";
 
 /** 0 = answer now (red, badge tier) · 1 = wants you eventually (`blocked`) · 2 = everything else.
@@ -92,11 +92,11 @@ export interface ConciergeFeedInput {
   openAgentIds?: readonly string[];
   /** Agent id → epoch ms of last user touch (interactionStore.lastAt). */
   interaction?: Record<string, number>;
-  /** The merged cross-window fleet (getTrayRoster/onTrayRosterChanged). Fills statuses for agents
+  /** The merged cross-window fleet (getRoster/onRosterChanged). Fills statuses for agents
    *  another window runs — this window's own `status` map only covers agents it hosts, and an
    *  agent covered by NEITHER falls back to "stopped" (same default as buildRoster). Local status
    *  always wins over the tray's. */
-  trayRoster?: TrayRoster | null;
+  roster?: Roster | null;
   /** The mute gate (sparklePrefsStore.shouldInterrupt). Defaults to allow-everything. */
   shouldInterrupt?: (topic: string) => boolean;
   /** Pin scope: set → only that project's alerts count toward scopedCounts; null/omitted → all. */
@@ -152,7 +152,7 @@ export function conciergeTopics(agentId: string, status: AgentTabStatus): string
 /** Flatten a tray roster to agent id → status, keeping only statuses in the AGENT_STATUS taxonomy
  *  (the tray's field is a plain string that crossed the Rust boundary). Null/absent roster → {}. */
 export function trayStatusMap(
-  roster: TrayRoster | null | undefined,
+  roster: Roster | null | undefined,
 ): Record<string, AgentTabStatus> {
   const out: Record<string, AgentTabStatus> = {};
   if (!roster) return out;
@@ -198,7 +198,7 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
   // Cross-window completeness: the tray's merged fleet fills statuses this window doesn't run;
   // the local live map wins wherever both know the agent.
   const mergedStatus: Record<string, AgentTabStatus> = {
-    ...trayStatusMap(input.trayRoster),
+    ...trayStatusMap(input.roster),
     ...input.status,
   };
 

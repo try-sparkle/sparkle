@@ -9,14 +9,14 @@
 // The jump action is selectAndOpen (re-exported below, NOT reimplemented) — the same "reveal the
 // agent wherever it is" path a notification click takes.
 import { useEffect, useMemo, useState } from "react";
-import { getTrayRoster, onTrayRosterChanged } from "./services/attention";
+import { getRoster, onRosterChanged } from "./services/attention";
 import { safeUnlisten } from "./services/safeUnlisten";
 import { buildConciergeFeed, type ConciergeFeed } from "./services/conciergeFeed";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useInteractionStore } from "./stores/interactionStore";
 import { useSparklePrefsStore } from "./stores/sparklePrefsStore";
-import type { TrayRoster } from "./tray/trayRoster";
+import type { Roster } from "./services/rosterTypes";
 
 export { selectAndOpen } from "./useAttentionNotifications";
 export {
@@ -36,7 +36,7 @@ export interface UseConciergeFeedOpts {
 }
 
 /** The live, memoized ConciergeFeed. Recomputes when projects, statuses, stage inputs,
- *  interaction times, mute rules, the tray's merged fleet, or the pin change. */
+ *  interaction times, mute rules, the merged cross-window fleet, or the pin change. */
 export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
   const pinnedProjectId = opts?.pinnedProjectId ?? null;
   const projects = useProjectStore((s) => s.projects);
@@ -58,14 +58,14 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
   // The merged cross-window fleet: seed with a fetch, then follow the aggregator's pushes. Both
   // are no-ops outside Tauri (tests/SSR), leaving the roster null — the builder treats that as
   // "no cross-window data" and falls back to local status only.
-  const [trayRoster, setTrayRoster] = useState<TrayRoster | null>(null);
+  const [roster, setRoster] = useState<Roster | null>(null);
   useEffect(() => {
     let cancelled = false;
-    void getTrayRoster().then((r) => {
-      if (!cancelled && r) setTrayRoster(r);
+    void getRoster().then((r) => {
+      if (!cancelled && r) setRoster(r);
     });
-    const unlistenPromise = onTrayRosterChanged((r) => {
-      if (!cancelled) setTrayRoster(r);
+    const unlistenPromise = onRosterChanged((r) => {
+      if (!cancelled) setRoster(r);
     });
     return () => {
       cancelled = true;
@@ -82,7 +82,7 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
         branchStatus,
         openAgentIds,
         interaction,
-        trayRoster,
+        roster,
         shouldInterrupt,
         pinnedProjectId,
       }),
@@ -93,7 +93,7 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
       branchStatus,
       openAgentIds,
       interaction,
-      trayRoster,
+      roster,
       shouldInterrupt,
       pinnedProjectId,
     ],

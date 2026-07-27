@@ -98,12 +98,12 @@ describe("useRosterPublisher — only OPEN projects leave the machine", () => {
     expect(publishedIds()).not.toContain("dormant");
   });
 
-  it("sends the tray aggregator the same slice as the relay", async () => {
+  it("sends the roster aggregator the same slice as the relay", async () => {
     useRuntimeStore.setState({ openAgentIds: ["a1"] } as never);
     markProjectVisited("touched");
     await publish();
-    const trayProjects = publishWindowRoster.mock.calls.at(-1)?.[1] as { id: string }[];
-    expect(trayProjects.map((p) => p.id)).toEqual(publishedIds());
+    const aggregated = publishWindowRoster.mock.calls.at(-1)?.[1] as { id: string }[];
+    expect(aggregated.map((p) => p.id)).toEqual(publishedIds());
   });
 
   it("re-publishes when a tab is selected for the first time (the visited set is not a store)", async () => {

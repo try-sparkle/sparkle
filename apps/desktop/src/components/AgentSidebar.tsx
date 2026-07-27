@@ -22,7 +22,8 @@ import { WEB_BASE_URL } from "../services/sparkleApi";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useUiStore } from "../stores/uiStore";
+import { useUiStore, type AttentionTier } from "../stores/uiStore";
+import { useHelperPrefs } from "../helper/helperPrefs";
 import { APP_WINDOW_LABEL } from "../windowContext";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -52,7 +53,7 @@ import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal"
 import { withUnmergedWork } from "../engine/unmergedAttention";
 import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode } from "../engine/workMode";
-import { isCalmBand } from "../services/conciergeFeed";
+import { isCalmBand, conciergePriority } from "../services/conciergeFeed";
 import { PlanBuildToggle, FADE_3 } from "./PlanBuildToggle";
 import { StatusDot } from "./StatusDot";
 import { LogoWaveform } from "./LogoWaveform";
@@ -311,6 +312,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const mode = useUiStore((s) => s.workMode);
   const setMode = useUiStore((s) => s.setWorkMode);
   const agentOrdering = useUiStore((s) => s.agentOrdering);
+  // Set by a P0/P1 chiclet on the floating helper island; narrows the stack below.
+  const attentionTierFocus = useUiStore((s) => s.attentionTierFocus);
+  const setAttentionTierFocus = useUiStore((s) => s.setAttentionTierFocus);
   // The workflow stage an agent's own git state + any known override resolves to.
   const stageOf = (id: string): WorkflowStageId =>
     resolveStage(branchStatus[id], workflowStage[id]);
@@ -947,7 +951,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // of the red zone. Shares orderedTopLevelAgents + the same attention-ordering and dismissal overlays
   // with the TopBar dot cluster, so the two stay in lockstep for those (see TopBar effStatus for the
   // one pre-existing gap: TopBar omits withRedWorkerAttention's worker→orchestrator red bubble).
-  const ordered = useMemo(
+  const orderedAll = useMemo(
     () =>
       project
         ? orderedTopLevelAgents(
@@ -960,6 +964,22 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         : [],
     [project, effectiveStatus, mode, agentOrdering],
   );
+
+  // Narrow the stack to one urgency tier when a helper-island chiclet asked for it, using the same
+  // conciergePriority(status) the island's counts derive from.
+  //
+  // The two populations are NOT the same, though, and the UI must not pretend otherwise: the
+  // island counts the whole fleet (every project, every window, workers included), while this
+  // filters only the CURRENT project's top-level rows in THIS window. So "3 P0" on the island can
+  // legitimately yield zero rows here. That is why the empty case below renders an explicit
+  // explanation instead of a blank list — a silently empty sidebar reads as "my agents vanished".
+  //
+  // Never persisted (see uiStore.partialize), so a filter cannot outlive the session.
+  const ordered = useMemo(() => {
+    if (!attentionTierFocus) return orderedAll;
+    const want = attentionTierFocus === "p0" ? 0 : 1;
+    return orderedAll.filter((a) => conciergePriority(effectiveStatus[a.id]) === want);
+  }, [orderedAll, attentionTierFocus, effectiveStatus]);
 
   // The active mode's "+ New Build Agent" button (null in Plan / no project).
   // Rendered in ONE of two slots in the scroll container below, chosen by listOverflows.
@@ -1021,6 +1041,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         </a>
         {/* Remaining AI-credit balance, top-right of the left column beside the wordmark. */}
         <BalanceBadge />
+        <ShowHelperButton />
       </div>
       <LogoWaveform />
 
@@ -1038,6 +1059,14 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       {/* Full-text search across all projects' prompts & responses. Lives directly under the
           chevron strip; hidden in Plan mode (the sidebar is kept clear for the board). */}
       {project && mode !== "plan" && <HistorySearch currentProjectId={project.id} />}
+
+      {attentionTierFocus && (
+        <TierFilterChip
+          tier={attentionTierFocus}
+          empty={ordered.length === 0}
+          onClear={() => setAttentionTierFocus(null)}
+        />
+      )}
 
       <div
         ref={listScrollRef}
@@ -3015,6 +3044,86 @@ function SparkleRowProgress({ state }: { state: SparkleBarState }) {
           }}
         />
       )}
+    </div>
+  );
+}
+
+/** "Show Helper" — the ONLY way back after right-click → Hide Helper on the floating island.
+ *  Renders only while the helper is hidden, so it costs nothing in the normal case. The helper
+ *  webview is a different JS context, but both share this localStorage-backed store by origin,
+ *  so flipping `enabled` here is seen there. */
+function ShowHelperButton() {
+  const enabled = useHelperPrefs((s) => s.enabled);
+  const setEnabled = useHelperPrefs((s) => s.setEnabled);
+  if (enabled) return null;
+  return (
+    <button
+      data-testid="show-helper"
+      title="Show the floating helper island"
+      style={{
+        all: "unset",
+        cursor: "pointer",
+        fontFamily: '"IBM Plex Sans", sans-serif',
+        fontSize: 11,
+        color: C.cream,
+        border: `1px solid ${C.muted}`,
+        borderRadius: 6,
+        padding: "3px 8px",
+        whiteSpace: "nowrap",
+      }}
+      onClick={() => setEnabled(true)}
+    >
+      Show Helper
+    </button>
+  );
+}
+
+/** The "showing P0 only" chip, shown while a helper-island chiclet has narrowed the stack.
+ *  A visible, dismissible filter matters here: without it, a narrowed sidebar is indistinguishable
+ *  from agents having disappeared. */
+function TierFilterChip({
+  tier,
+  empty,
+  onClear,
+}: {
+  tier: AttentionTier;
+  /** True when the filter matched nothing in this project — see the note on `ordered`. */
+  empty: boolean;
+  onClear: () => void;
+}) {
+  const color = tier === "p0" ? C.sienna : C.amber;
+  const label = empty
+    ? `No ${tier.toUpperCase()} agents in this project`
+    : `Showing ${tier.toUpperCase()} only`;
+  return (
+    <div
+      data-testid="tier-filter-chip"
+      style={{
+        margin: "0 8px 6px",
+        padding: "4px 8px",
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        background: C.forest,
+        border: `1px solid ${color}`,
+        borderRadius: 6,
+        fontSize: 11,
+        color: C.cream,
+      }}
+    >
+      <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: "50%", background: color }} />
+      <span style={{ flex: 1 }}>{label}</span>
+      <button
+        aria-label="Clear filter"
+        style={{ all: "unset", cursor: "pointer", color: C.muted, padding: "0 2px" }}
+        onClick={onClear}
+      >
+        {/* Feather x, inlined — no emoji. */}
+        <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+        </svg>
+      </button>
     </div>
   );
 }

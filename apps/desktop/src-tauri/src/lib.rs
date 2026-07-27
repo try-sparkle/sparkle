@@ -27,8 +27,10 @@ mod delivery;
 mod dev_identity;
 mod dictation;
 mod folder_picker;
+mod frontmost;
 mod github;
 mod history;
+mod helper;
 mod hooks;
 mod judge;
 mod logging;
@@ -49,7 +51,7 @@ mod sparkle_agent;
 mod sparkle_improve;
 mod support;
 mod transcript;
-mod tray;
+mod roster;
 mod trial;
 mod trial_remote;
 mod worktree;
@@ -84,7 +86,6 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_positioner::init())
         .manage(PtyManager::default())
         .manage(claude_chat::ClaudeChatManager::default())
         .manage(sparkle_improve::SparkleImproveManager::default())
@@ -97,17 +98,38 @@ pub fn run() {
         .manage(attention::BadgeCounts::default())
         .manage(accounts::AccountsLock::default())
         .manage(trial::TrialLock::default())
-        .manage(tray::TrayState::default())
-        // Gate mic capture on window focus (sparkle-9oz6): Sparkle must not capture audio while the
-        // user is looking at another app. Every Focused event is handed to the dictation state, which
-        // releases the OS mic when no Sparkle window is the active OS window and rebuilds it on return.
-        // Focus *loss* is coalesced (note_focus_event) so switching between two Sparkle windows — where
-        // macOS emits the old window's resignKey before the new window's becomeKey — keeps the mic live.
+        .manage(roster::RosterState::default())
+        .manage(frontmost::FrontmostState::default())
+        .manage(helper::HelperVitals::default())
+        // Every Focused event feeds TWO consumers, both of which need the same blur coalescing
+        // because macOS emits the outgoing window's resignKey BEFORE the incoming window's
+        // becomeKey:
+        //   - dictation (sparkle-9oz6): Sparkle must not capture audio while the user is looking at
+        //     another app, so this releases the OS mic when no Sparkle window is the active OS
+        //     window and rebuilds it on return. Coalescing keeps the mic live across an
+        //     internal window switch.
+        //   - frontmost (spec §4.6): drives the floating helper island's visibility. Coalescing
+        //     stops the island flashing on during an internal window switch.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Focused(focused) = event {
                 let app = window.app_handle();
+                // The helper and capture panels are non-activating: they emit Focused(true)
+                // WITHOUT activating the app, so neither consumer below may count them.
+                //
+                // This guard wraps BOTH calls deliberately. Letting the panels through to
+                // dictation would resume microphone capture the moment the user clicked the
+                // floating island while working in another app — the exact thing sparkle-9oz6's
+                // mic gating exists to prevent, and a worse failure than the island's own.
+                if !frontmost::is_app_window(window.label()) {
+                    return;
+                }
                 app.state::<dictation::DictationState>()
                     .note_focus_event(app, *focused);
+                frontmost::note_focus_event(
+                    app,
+                    &app.state::<frontmost::FrontmostState>(),
+                    *focused,
+                );
             }
         })
         .setup(|app| {
@@ -193,13 +215,15 @@ pub fn run() {
             if let Err(e) = config::init_and_watch(app.handle()) {
                 tracing::error!("config init/watch failed: {e}");
             }
-            if let Err(e) = tray::init_tray(app.handle()) {
-                tracing::error!("tray init failed: {e}");
-            }
             // Hidden transparent capture window (menu-bar capture flow). Best-effort:
             // a failure only loses the capture feature, never blocks boot.
             if let Err(e) = capture_window::init_capture_window(app.handle()) {
                 tracing::error!("capture window init failed: {e}");
+            }
+            // The floating helper island (spec §4.1). Fail-soft by contract: the app is entirely
+            // usable without it, and the frontend's show path will retry later.
+            if let Err(e) = helper::init_helper_window(app.handle()) {
+                tracing::error!("helper window init failed: {e}");
             }
             // Global shortcut (default Ctrl+Shift+R, [capture].popover_shortcut in
             // config.toml) toggling the menu-bar popover from anywhere. Fail-soft by
@@ -214,7 +238,16 @@ pub fn run() {
                         let registered =
                             app.handle().global_shortcut().on_shortcut(shortcut, |app, _, event| {
                                 if event.state == ShortcutState::Pressed {
-                                    tray::toggle_popover(app);
+                                    // Ask the island to run the capture flow, so the shortcut and
+                                    // the island's own Capture button share ONE code path instead
+                                    // of drifting apart.
+                                    //
+                                    // Deliberately does NOT show the island first. The helper
+                                    // webview stays mounted (and subscribed) even when hidden, so
+                                    // capture works regardless — and showing it would resurrect a
+                                    // helper the user explicitly hid, as well as putting it in the
+                                    // shot the capture is about to take.
+                                    let _ = app.emit("helper://capture-requested", ());
                                 }
                             });
                         if let Err(e) = registered {
@@ -478,11 +511,16 @@ pub fn run() {
             config::set_stage_definition,
             delivery::collect_delivery_evidence,
             delivery::tag_contains_commit,
-            tray::publish_window_roster,
-            tray::clear_window_roster,
-            tray::get_tray_roster,
-            tray::set_tray_image,
-            tray::quit_app,
+            roster::publish_window_roster,
+            roster::clear_window_roster,
+            roster::get_roster,
+            roster::quit_app,
+            helper::publish_helper_vitals,
+            helper::get_helper_vitals,
+            helper::show_helper,
+            helper::hide_helper,
+            helper::set_helper_bounds,
+            frontmost::get_frontmost,
             capture_window::show_capture_window,
             capture_window::hide_capture_window
         ])

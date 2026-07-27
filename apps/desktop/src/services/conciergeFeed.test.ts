@@ -6,7 +6,7 @@ import {
   trayStatusMap,
 } from "./conciergeFeed";
 import { AGENT_STATUS } from "@sparkle/ui";
-import type { TrayRoster } from "../tray/trayRoster";
+import type { Roster } from "./rosterTypes";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 
 // Colors from packages/ui/tokens.ts — literal hex so a token drift is caught, matching the
@@ -250,7 +250,7 @@ describe("buildConciergeFeed — mute (sparklePrefsStore.shouldInterrupt)", () =
 });
 
 describe("buildConciergeFeed — cross-window completeness via the tray roster", () => {
-  const roster: TrayRoster = {
+  const roster: Roster = {
     projects: [
       {
         id: "pB",
@@ -267,7 +267,6 @@ describe("buildConciergeFeed — cross-window completeness via the tray roster",
         ],
       },
     ],
-    counts: { red: 1, grey: 1, green: 0 },
   };
 
   it("trayStatusMap keeps only statuses in the taxonomy", () => {
@@ -280,7 +279,7 @@ describe("buildConciergeFeed — cross-window completeness via the tray roster",
       projects: [project("pB", [agent("far"), agent("bogus")])],
       // This window has its own (fresher) view of `bogus` and none of `far`.
       status: { bogus: "working" },
-      trayRoster: roster,
+      roster: roster,
     });
     const byId = Object.fromEntries(flat(feed).map((a) => [a.id, a]));
     expect(byId["far"]).toMatchObject({ status: "waiting", priority: 0 }); // from the tray

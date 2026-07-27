@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 //
-// The RECEIVING half of every cross-webview "show me this" click: a notification, a tray row, a
-// menu-bar Open. It is load-bearing (nothing else raises the app window) and was untested — the
-// tray's own test only asserts that it called a mock (roborev 46249-L4).
+// The RECEIVING half of every cross-webview "show me this" click: a notification, a capture-window
+// Open, a helper-island chiclet. It is load-bearing — nothing else raises the app window.
 //
-// Two events, two contracts:
+// Three events, three contracts:
 //   attention://focus-agent    → validate, raise, select the tab, mount + select the agent
 //   attention://select-project → validate, raise, select the tab, and touch NOTHING else
+//   attention://focus-tier     → raise and narrow the sidebar to a tier; mount NOTHING
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FocusAgentPayload, SelectProjectPayload } from "./services/attention";
@@ -27,6 +27,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 // Capture the handlers the hook registers, so a test can play the broadcast.
 let onFocus: ((p: FocusAgentPayload) => void) | null = null;
 let onSelect: ((p: SelectProjectPayload) => void) | null = null;
+let onTier: ((p: { tier: "p0" | "p1" }) => void) | null = null;
 vi.mock("./services/attention", () => ({
   reportAttentionCount: vi.fn(),
   notifyAttention: vi.fn(),
@@ -39,11 +40,16 @@ vi.mock("./services/attention", () => ({
     onSelect = cb;
     return Promise.resolve(() => {});
   },
+  // The helper island's P0/P1 chiclet broadcast.
+  onFocusTier: (cb: (p: { tier: "p0" | "p1" }) => void) => {
+    onTier = cb;
+    return Promise.resolve(() => {});
+  },
+  emitFocusTier: vi.fn(),
   publishWindowRoster: vi.fn(),
   clearWindowRoster: vi.fn(),
-  getTrayRoster: vi.fn(async () => null),
-  onTrayRosterChanged: vi.fn(() => Promise.resolve(() => {})),
-  setTrayImage: vi.fn(),
+  getRoster: vi.fn(async () => null),
+  onRosterChanged: vi.fn(() => Promise.resolve(() => {})),
   emitFocusAgent: vi.fn(),
   emitSelectProject: vi.fn(),
 }));
@@ -206,6 +212,40 @@ describe("focus-agent routing", () => {
   });
 });
 
+describe("focus-tier routing (helper island chiclets)", () => {
+  it("raises the window and narrows the sidebar to the clicked tier", async () => {
+    await mount();
+    onTier!({ tier: "p0" });
+    await waitFor(() => expect(bringToFront).toHaveBeenCalled());
+    expect(useUiStore.getState().attentionTierFocus).toBe("p0");
+  });
+
+  it("leaves the persisted agentOrdering preference alone", async () => {
+    // One chiclet click must not silently destroy a deliberate "manual" ordering choice.
+    useUiStore.getState().setAgentOrdering("manual");
+    await mount();
+    onTier!({ tier: "p0" });
+    await waitFor(() => expect(useUiStore.getState().attentionTierFocus).toBe("p0"));
+    expect(useUiStore.getState().agentOrdering).toBe("manual");
+  });
+
+  it("does NOT mount an agent — a tier is not an agent", async () => {
+    await mount();
+    onTier!({ tier: "p1" });
+    await waitFor(() => expect(useUiStore.getState().attentionTierFocus).toBe("p1"));
+    // Same contract as select-project: no PTY is spawned for a click that asked to SEE a tier.
+    expect(useRuntimeStore.getState().openAgentIds).toEqual([]);
+  });
+
+  it("replaces the previous tier rather than accumulating", async () => {
+    await mount();
+    onTier!({ tier: "p0" });
+    await waitFor(() => expect(useUiStore.getState().attentionTierFocus).toBe("p0"));
+    onTier!({ tier: "p1" });
+    await waitFor(() => expect(useUiStore.getState().attentionTierFocus).toBe("p1"));
+  });
+});
+
 describe("select-project routing", () => {
   it("selects the tab and raises the window — and opens NO agent", async () => {
     await mount();
@@ -239,7 +279,7 @@ describe("select-project routing", () => {
     expect(useProjectStore.getState().selectedProjectId).toBe("p1");
   });
 
-  it("DEFERS selection for a project that rehydrates just after the event (the tray race)", async () => {
+  it("DEFERS selection for a project that rehydrates just after the event (the cross-webview race)", async () => {
     await mount();
     onSelect!({ projectId: "late-p" });
     await new Promise((r) => setTimeout(r, 20));

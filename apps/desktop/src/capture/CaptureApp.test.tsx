@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 //
-// CaptureApp smoke + behavior, following TrayApp.test.tsx's no-backend pattern: the Tauri
+// CaptureApp smoke + behavior, following the helper island's no-backend pattern: the Tauri
 // boundary (captureEvents) is mocked so a synthetic `capture://shot` can be fired by hand, and
 // the app-level dictation controller is stubbed out (its own wiring is covered by
 // useDictation.test / the composer dictation tests — here we only exercise CaptureApp's glue).

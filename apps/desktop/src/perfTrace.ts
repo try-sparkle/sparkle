@@ -126,7 +126,7 @@ function bindVisibility(): void {
 }
 
 /** Snapshot the visibility state for a span about to start. Binds the listener on first use, so a
- *  window that never times an async span (tray, capture) pays nothing. */
+ *  window that never times an async span (helper, capture) pays nothing. */
 export function markVisibility(): VisibilityMark {
   bindVisibility();
   return { epoch: hiddenEpoch, hidden: typeof document !== "undefined" && document.hidden };

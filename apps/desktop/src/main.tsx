@@ -2,7 +2,7 @@ import ReactDOM from "react-dom/client";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { App } from "./App";
-import { TrayApp } from "./tray/TrayApp";
+import { HelperApp } from "./helper/HelperApp";
 import { CaptureApp } from "./capture/CaptureApp";
 import { ErrorBoundary, AppErrorFallback } from "./components/ErrorBoundary";
 import { initLogger } from "./logger";
@@ -32,13 +32,15 @@ initLogger();
 
 // Which webview this is (parsed before the boot side effects below, which gate on it).
 const view = new URLSearchParams(window.location.search).get("view");
-const isTray = view === "tray";
 const isCapture = view === "capture";
+// The floating helper island: another tiny, always-alive webview, so it joins the capture view
+// in every boot-side-effect guard below.
+const isHelper = view === "helper";
 
 // Main-thread stall detector (perfTrace): logs every frame gap > threshold as a "jank stall" so a
 // reproduction of the slowness surfaces exactly when the app froze and for how long, to correlate
 // against the spawn/switch/close/render lines. Only in the real app view — the hidden capture and
-// the tiny tray webviews aren't where the slowness lives and would just add noise. Every project
+// the tiny helper webviews aren't where the slowness lives and would just add noise. Every project
 // window runs its own monitor, so pass the window's label to keep their stalls tellable apart.
 //
 // The label comes from Tauri rather than the URL: the `?win=` parser this used to read lived in
@@ -47,24 +49,24 @@ const isCapture = view === "capture";
 // only inside a real webview — hence the guard, which mirrors the one on the self-show path below
 // and keeps the plain-browser dev/preview working.
 const jankWindowLabel = "__TAURI_INTERNALS__" in window ? getCurrentWindow().label : "main";
-if (!isTray && !isCapture) startJankMonitor(undefined, jankWindowLabel);
+if (!isCapture && !isHelper) startJankMonitor(undefined, jankWindowLabel);
 
 // Render counting is always on (a Map bump); the per-render LOG is gated off by default because
 // each line is a main-thread Tauri IPC (bead sparkle-abv2). This exposes the toggle and the
 // counters so `sparklePerf.counts()` / `sparklePerf.setRenderLogging(true)` work from devtools.
-if (!isTray && !isCapture) installPerfDevtools();
+if (!isCapture && !isHelper) installPerfDevtools();
 
 // Analytics (PostHog) — masked session replay + autocapture + lifecycle events.
 // No-ops when no key is configured. Started after the logger so init errors surface.
-// Skipped in the capture webview: it is created hidden at every launch and would add a
-// phantom PostHog session + APP_OPENED per boot (the tray predates this and is left as-is).
-if (!isCapture) initAnalytics();
+// Skipped in the capture and helper webviews: both are created hidden at every launch and would
+// add a phantom PostHog session + APP_OPENED per boot.
+if (!isCapture && !isHelper) initAnalytics();
 
 // Enforce the history retention window: read the active tier, prune once on launch, then once a
 // day. Best-effort — a failure here (e.g. backend not ready) must not block the UI from rendering.
-// Also skipped in the always-alive hidden capture webview — main/tray already prune.
+// Also skipped in the always-alive hidden capture/helper webviews — main already prunes.
 const HISTORY_PRUNE_INTERVAL_MS = 86_400_000; // 24h
-if (!isCapture) {
+if (!isCapture && !isHelper) {
   void (async () => {
     try {
       await useHistoryStore.getState().loadEntitlement();
@@ -84,13 +86,23 @@ if (!isCapture) {
 // theme in that webview so reused themed components (LogoWaveform) stay legible on the navy
 // card even when the app preference is Light.
 if (isCapture) document.documentElement.dataset.theme = "dark";
+// The helper island is a transparent window (see helper.rs). index.css paints `body` with the
+// opaque app background, which would fill the window's rounded corners with a square block of
+// navy — so clear it here. The island's own pill draws the only visible surface. Dark is pinned
+// for the same reason the capture takeover pins it: the pill is a dark chip regardless of the
+// app's light/dark preference.
+if (isHelper) {
+  document.documentElement.dataset.theme = "dark";
+  document.body.style.background = "transparent";
+}
 // Wrap the main app root in a top-level ErrorBoundary so an uncaught render exception degrades to a
 // recoverable "Something broke — Reload UI" card (with a Report path into the existing support/crash
-// pipeline) instead of unmounting the whole tree into a blank window. The tray and capture webviews
-// are tiny, single-purpose surfaces — left unwrapped so their minimal render paths stay untouched.
+// pipeline) instead of unmounting the whole tree into a blank window. The helper and capture
+// webviews are tiny, single-purpose surfaces — left unwrapped so their minimal render paths stay
+// untouched.
 ReactDOM.createRoot(document.getElementById("root")!).render(
-  isTray ? (
-    <TrayApp />
+  isHelper ? (
+    <HelperApp />
   ) : isCapture ? (
     <CaptureApp />
   ) : (
@@ -103,17 +115,17 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
 // Warm the per-agent model catalog from the user's BYOK Anthropic key (Phase 2, sparkle-i6rw).
 // Fire-and-forget: refreshModelCatalog swallows every failure (no host/key/network → the curated
 // list stands), and the ModelPill re-renders in place when fresh models land. Main webview only —
-// the tray never shows a model picker.
-if (!isTray) {
+// the helper island never shows a model picker.
+if (!isHelper) {
   void refreshModelCatalog();
 }
 
 // Anonymous usage telemetry → orchestration (AARRR funnel, task #4). Emit 'app_open' + open a
 // session on launch, and close it on quit/reload. Best-effort and fire-and-forget: the service
 // swallows every error, and no-ops when no install_id is resolvable (plain-browser dev/preview,
-// where the Tauri trial command is absent). Only the main webview counts — the tray shares the
+// where the Tauri trial command is absent). Only the main webview counts — the helper shares the
 // same install and would otherwise double-count launches (the capture webview likewise).
-if (!isTray && !isCapture) {
+if (!isCapture && !isHelper) {
   void usageTelemetry.trackAppOpen();
   // beforeunload is the pragmatic best-effort "app closing" hook in the webview (reload/close).
   // A dropped session_end is acceptable — the server can also reap stale sessions.
@@ -122,18 +134,18 @@ if (!isTray && !isCapture) {
   });
   // Flush any crash reports captured on a previous run (panic hook / native fatal-signal handler in
   // Rust). Fire-and-forget: Rust enforces the consent gate (uploads only on "always"; otherwise the
-  // reports stay on the user's disk). Main webview only — the tray/capture views share the install.
+  // reports stay on the user's disk). Main webview only — the helper/capture views share the install.
   void flushCrashReports();
 }
 
 // Show-on-ready (bead sparkle-alrm.5, #10). The main window is created hidden ("visible": false
 // in tauri.conf.json) so the user never sees a blank OS frame before React paints. Reveal it once
 // the first meaningful paint has landed (theme is already resolved synchronously above; the root
-// has rendered). The tray webview manages its own visibility, so skip it — and the capture
+// has rendered). The helper webview manages its own visibility, so skip it — and the capture
 // webview MUST be skipped: it is created hidden and only ever shown by Rust's
 // show_capture_window; a boot-time self-show would flash the takeover at launch. The
 // `__TAURI_INTERNALS__` guard no-ops in the plain-browser dev/preview (no OS window to show).
-if (!isTray && !isCapture && "__TAURI_INTERNALS__" in window) {
+if (!isCapture && !isHelper && "__TAURI_INTERNALS__" in window) {
   // A restored, non-active window (`?focus=0`) must be SHOWN but not self-focused: session restore
   // reopens several windows at once and focuses exactly one — the last-active — which the restore
   // orchestrator sets explicitly. Without this, whichever restored window paints last would steal
@@ -145,7 +157,7 @@ if (!isTray && !isCapture && "__TAURI_INTERNALS__" in window) {
       .show()
       .then(() => (suppressFocus ? undefined : w.setFocus()))
       // Tell the Rust show-on-ready backstop the frontend completed its first show, so its 8s
-      // last-resort net won't re-reveal a window the user may have since hidden to the tray. Chained
+      // last-resort net won't re-reveal a window the user may have since hidden. Chained
       // AFTER a successful show(): if show() rejects, the flag stays false and the backstop still
       // fires — otherwise a failed show would leave the window permanently hidden.
       .then(() => invoke("notify_frontend_shown"))

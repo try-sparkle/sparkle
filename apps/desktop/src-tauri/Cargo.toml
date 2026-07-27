@@ -17,7 +17,7 @@ cc = "1"
 [dependencies]
 # macos-private-api: required for the transparent capture-window takeover (capture_window.rs);
 # paired with "macOSPrivateApi": true in tauri.conf.json. Other windows stay opaque.
-tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"
@@ -66,9 +66,6 @@ tungstenite = { version = "0.24", default-features = false, features = ["rustls-
 bzip2 = "0.4"
 tar = "0.4"
 tauri-plugin-global-shortcut = "2"
-# Position the menu-bar popover under the tray icon (TrayCenter). tray-icon feature wires the
-# tray-event hook used in lib.rs. Cross-platform crate, so it stays in the common deps.
-tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

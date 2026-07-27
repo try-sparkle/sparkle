@@ -51,3 +51,25 @@ void sparkle_present_panel_key(void *ns_window) {
     NSWindow *win = (__bridge NSWindow *)ns_window;
     [win makeKeyAndOrderFront:nil];
 }
+
+// Give a panel rounded corners and a drop shadow.
+//
+// Used TOGETHER with Tauri's `.transparent(true)` (the `macos-private-api` feature IS enabled in
+// Cargo.toml, and the capture takeover already relies on it). Rounding alone is not enough: it
+// clips the CONTENT, but an opaque NSWindow still paints its background in the four corners, so
+// the pill would render inside a visible rectangle.
+//
+// masksToBounds on the content view clips the WKWebView inside it, so the webview's own square
+// corners don't punch through the rounding. invalidateShadow is required after changing the
+// clipped shape, or the shadow keeps the pre-clip rectangular outline.
+void sparkle_round_panel_corners(void *ns_window, double radius) {
+    if (!ns_window) return;
+    NSWindow *win = (__bridge NSWindow *)ns_window;
+    NSView *content = win.contentView;
+    if (!content) return;
+    content.wantsLayer = YES;
+    content.layer.cornerRadius = (CGFloat)radius;
+    content.layer.masksToBounds = YES;
+    win.hasShadow = YES;
+    [win invalidateShadow];
+}

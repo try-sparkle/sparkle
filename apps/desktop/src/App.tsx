@@ -23,6 +23,7 @@ import { LastFocusedProjectTracker } from "./capture/LastFocusedProjectTracker";
 import { initCaptureSendListener, type CaptureSendCtx } from "./services/captureSends";
 import { useAttentionNotifications } from "./useAttentionNotifications";
 import { useRosterPublisher } from "./useRosterPublisher";
+import { useHelperVitalsPublisher } from "./useHelperVitalsPublisher";
 import { useLimitSync } from "./hooks/useLimitSync";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { AccountSwitchHost } from "./components/AccountSwitchHost";
@@ -69,6 +70,9 @@ function AttentionController() {
 // and no longer throw outside it.) Paints no UI.
 function RosterPublisher() {
   useRosterPublisher();
+  // Feed the floating helper island its P0/P1 counts. Mounted HERE, not in ConciergeHost, which
+  // unmounts when no project is open — the island must stay correct regardless.
+  useHelperVitalsPublisher();
   return null;
 }
 

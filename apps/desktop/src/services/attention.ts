@@ -3,7 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { RosterPayload } from "./relayClient";
-import type { TrayRoster } from "../tray/trayRoster";
+import type { Roster } from "./rosterTypes";
 
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -60,7 +60,7 @@ export async function summarizeAttention(
 export interface FocusAgentPayload {
   projectId: string;
   agentId: string;
-  /** Optional: after focusing, scroll the agent's terminal to this promptHistory entry (tray breadcrumb). */
+  /** Optional: after focusing, scroll the agent's terminal to this promptHistory entry. */
   promptId?: string;
 }
 
@@ -82,18 +82,48 @@ export function emitFocusAgent(p: FocusAgentPayload): void {
   );
 }
 
+/** Which urgency tier the helper island's chiclet was clicked for. */
+export type FocusTier = "p0" | "p1";
+
+export interface FocusTierPayload {
+  tier: FocusTier;
+}
+
+/**
+ * "Show me what's P0" from the floating helper island — a tier, not a specific agent.
+ *
+ * Its OWN event rather than a variant of focus-agent, for the same reason select-project is
+ * separate (see the note below): focus-agent mounts an agent and spawns its PTY, which is far too
+ * much to do for what is really just "raise the window and put the urgent work in front of me".
+ * No-op outside Tauri.
+ */
+export function emitFocusTier(p: FocusTierPayload): void {
+  if (!hasTauri) return;
+  void emit("attention://focus-tier", p).catch((e) =>
+    console.debug("emit focus-tier failed", e),
+  );
+}
+
+/** Subscribe to a helper-island chiclet click. Returns an unlisten fn (no-op outside Tauri). */
+export function onFocusTier(cb: (p: FocusTierPayload) => void): Promise<UnlistenFn> {
+  if (!hasTauri) return Promise.resolve(() => {});
+  return listen<FocusTierPayload>("attention://focus-tier", (e) => cb(e.payload));
+}
+
 export interface SelectProjectPayload {
   projectId: string;
 }
 
 /**
- * "Show me this project" from another webview — the menu-bar tray's Open, the capture window.
+ * "Show me this project" from another webview — e.g. the capture window.
  *
  * SEPARATE from focus-agent on purpose (roborev 46249-H1/M2). Raising the app window used to be a
  * side effect of emitFocusAgent, which needs an agent to aim at: a project with no agents emitted
- * nothing at all (the tray's Open on a freshly added folder was a dead click), and a project WITH
+ * nothing at all, and a project WITH
  * agents got an invented target — mounting/resuming a PTY at real token cost and yanking the user
- * out of Plan/Sparkle for a click that only asked to see a project. This event carries no agent,
+ * out of Plan/Sparkle for a click that only asked to see a project. (The dead click was the old
+ * tray's Open on a freshly added folder; the tray is gone, the hazard is not.) This event carries
+ * no agent,
  * so it can do neither. Reserve focus-agent for genuine agent reveals.
  */
 export function onSelectProject(cb: (p: SelectProjectPayload) => void): Promise<UnlistenFn> {
@@ -109,8 +139,8 @@ export function emitSelectProject(p: SelectProjectPayload): void {
   );
 }
 
-/** Publish THIS window's open-project roster slice to the Rust tray aggregator. The backend merges
- *  every window's slice, recomputes red/grey/green counts, and repaints the menu bar. No-op outside Tauri. */
+/** Publish THIS window's open-project roster slice to the Rust aggregator, which merges every
+ *  window's slice into the cross-window fleet the concierge reasons over. No-op outside Tauri. */
 export function publishWindowRoster(label: string, projects: RosterPayload["projects"]): void {
   if (!hasTauri) return;
   void invoke("publish_window_roster", { label, projects }).catch((e) =>
@@ -118,7 +148,7 @@ export function publishWindowRoster(label: string, projects: RosterPayload["proj
   );
 }
 
-/** Drop this window's contribution to the tray roster (on window close). No-op outside Tauri. */
+/** Drop this window's contribution to the roster (on window close). No-op outside Tauri. */
 export function clearWindowRoster(label: string): void {
   if (!hasTauri) return;
   void invoke("clear_window_roster", { label }).catch((e) =>
@@ -126,26 +156,20 @@ export function clearWindowRoster(label: string): void {
   );
 }
 
-/** Fetch the current merged tray roster from the Rust aggregator. Resolves null outside Tauri. */
-export function getTrayRoster(): Promise<TrayRoster | null> {
+/** Fetch the current merged roster from the Rust aggregator. Resolves null outside Tauri. */
+export function getRoster(): Promise<Roster | null> {
   if (!hasTauri) return Promise.resolve(null);
-  return invoke<TrayRoster>("get_tray_roster").catch(() => null);
+  return invoke<Roster>("get_roster").catch(() => null);
 }
 
 /** Subscribe to roster-changed pushes from the Rust aggregator. Returns a no-op unlisten outside Tauri. */
-export function onTrayRosterChanged(cb: (r: TrayRoster) => void): Promise<UnlistenFn> {
+export function onRosterChanged(cb: (r: Roster) => void): Promise<UnlistenFn> {
   if (!hasTauri) return Promise.resolve(() => {});
-  return listen<TrayRoster>("tray://roster-changed", (e) => cb(e.payload));
+  return listen<Roster>("roster://changed", (e) => cb(e.payload));
 }
 
-/** Send a new menu-bar icon image to Tauri as a base64-encoded PNG. No-op outside Tauri. */
-export function setTrayImage(pngBase64: string): void {
-  if (!hasTauri) return;
-  void invoke("set_tray_image", { pngBase64 }).catch((e) => console.debug("set_tray_image failed", e));
-}
-
-/** Fully exit the app (the tray popover's "Quit Sparkle" button). Closing the main window only
- *  hides it behind the tray; this is the real quit. No-op outside Tauri. */
+/** Fully exit the app (the helper island's right-click "Quit Sparkle"). Closing the main window
+ *  only hides it; this is the real quit. No-op outside Tauri. */
 export function quitApp(): void {
   if (!hasTauri) return;
   void invoke("quit_app").catch((e) => console.debug("quit_app failed", e));
