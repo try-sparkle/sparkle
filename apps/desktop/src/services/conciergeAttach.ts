@@ -8,16 +8,17 @@
 // Rust command, and delivered by prefixing its absolute path to the prompt (`buildSendPayload`) so
 // the agent reads the file from disk.
 //
-// PICKER CHOICE. `image`/`files` go through `@tauri-apps/plugin-dialog`'s `open()` — the FILE
-// dialog, which is what attachmentsApi.ts already uses. Only the DIRECTORY dialog was moved off the
-// plugin (services/dialog.ts: AppKit returned nil from +[NSOpenPanel openPanel] and the plugin's
-// binding panicked); the file case never had that crash, so it stays on the plugin rather than
-// growing a second Rust command.
+// PICKER CHOICE. `image`/`files` go through `services/dialog.ts`'s `pickFiles`, NOT
+// `@tauri-apps/plugin-dialog`'s `open()`. They were on the plugin at first, on the theory that the
+// nil-panel crash which moved the DIRECTORY dialog off it was directory-specific. It is not:
+// `+[NSOpenPanel openPanel]` is one class method serving both, and the same panic pair (AppKit
+// returns nil, the generated binding unwraps it, the plugin then unwraps the resulting RecvError)
+// was observed from this file path too. Both modes now share one nil-checked Rust command.
 //
 // NEVER THROWS. A cancelled picker, a refused dialog, or a file that can't be read all resolve to
 // "nothing was attached" — a failed attach must not take down a compose box the user is mid-thought
 // in. Failures are logged.
-import { open } from "@tauri-apps/plugin-dialog";
+import { pickFiles } from "./dialog";
 import { captureScreenRegion } from "../screenshot";
 import {
   IMAGE_EXTENSIONS,
@@ -43,12 +44,6 @@ export async function loadAttachmentPaths(paths: string[]): Promise<Attachment[]
   return loaded.filter((a): a is Attachment => a !== null);
 }
 
-/** Normalize the dialog plugin's return (string | string[] | null) to a path list. */
-function toPaths(picked: string | string[] | null): string[] {
-  if (!picked) return [];
-  return Array.isArray(picked) ? picked : [picked];
-}
-
 /**
  * Run the picker for `kind` and resolve the attachments it produced — empty when the user
  * cancelled or the picker could not be opened. Never rejects.
@@ -64,16 +59,11 @@ export async function pickAttachments(kind: ConciergeAttachKind): Promise<Attach
       const shot = await captureScreenRegion();
       return shot ? [screenshotAttachment(shot.path, shot.dataUrl)] : [];
     }
-    const picked = await open(
+    const picked =
       kind === "image"
-        ? {
-            multiple: true,
-            title: "Attach images",
-            filters: [{ name: "Images", extensions: [...IMAGE_EXTENSIONS] }],
-          }
-        : { multiple: true, title: "Attach files" },
-    );
-    return await loadAttachmentPaths(toPaths(picked as string | string[] | null));
+        ? await pickFiles("Attach images", [...IMAGE_EXTENSIONS])
+        : await pickFiles("Attach files");
+    return await loadAttachmentPaths(picked);
   } catch (e) {
     log.error("composer", "concierge: attach picker failed", { kind, e });
     return [];

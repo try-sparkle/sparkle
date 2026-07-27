@@ -148,6 +148,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 # reasoning as above — already in the tree via wry, feature-pruned to what we touch.
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
+    "NSArray",
     "NSString",
     "NSURL",
 ] }

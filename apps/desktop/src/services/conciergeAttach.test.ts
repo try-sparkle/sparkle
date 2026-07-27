@@ -6,12 +6,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
-  open: vi.fn(),
+  pickFiles: vi.fn(),
   captureScreenRegion: vi.fn(),
   loadAttachment: vi.fn(),
 }));
 
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: h.open }));
+// The picker seam is services/dialog.ts's pickFiles, NOT the plugin's open() — see the guard test
+// at the bottom of this file for why that distinction is load-bearing.
+vi.mock("./dialog", async (orig) => {
+  const real = (await orig()) as Record<string, unknown>;
+  return { ...real, pickFiles: h.pickFiles };
+});
 vi.mock("../screenshot", () => ({ captureScreenRegion: h.captureScreenRegion }));
 // Only load_attachment is stubbed; screenshotAttachment stays real so the adapter is covered too.
 vi.mock("../components/composer/attachmentsApi", async (orig) => {
@@ -50,7 +55,7 @@ describe("pickAttachments — screenshot", () => {
     expect(out).toHaveLength(1);
     expect(out[0]?.kind).toBe("image");
     expect(out[0]?.path).toBe("/tmp/s.png");
-    expect(h.open).not.toHaveBeenCalled();
+    expect(h.pickFiles).not.toHaveBeenCalled();
   });
 
   it("stages nothing when the user presses Esc (the capture resolves null)", async () => {
@@ -65,43 +70,53 @@ describe("pickAttachments — screenshot", () => {
 });
 
 describe("pickAttachments — image / files", () => {
-  it("opens a multi-select image dialog and loads every pick", async () => {
-    h.open.mockResolvedValue(["/tmp/a.png", "/tmp/b.png"]);
+  it("opens an image picker narrowed to the image extensions and loads every pick", async () => {
+    h.pickFiles.mockResolvedValue(["/tmp/a.png", "/tmp/b.png"]);
     const out = await pickAttachments("image");
     expect(out.map((a) => a.path)).toEqual(["/tmp/a.png", "/tmp/b.png"]);
-    const opts = h.open.mock.calls[0]?.[0] as {
-      multiple: boolean;
-      filters?: { extensions: string[] }[];
-    };
-    expect(opts.multiple).toBe(true);
-    expect(opts.filters?.[0]?.extensions).toContain("png");
+    const [title, extensions] = h.pickFiles.mock.calls[0] as [string, string[]];
+    expect(title).toMatch(/image/i);
+    expect(extensions).toContain("png");
   });
 
-  it("opens an UNFILTERED multi-select dialog for files", async () => {
-    h.open.mockResolvedValue(["/tmp/log.txt"]);
+  it("opens an UNFILTERED picker for files", async () => {
+    h.pickFiles.mockResolvedValue(["/tmp/log.txt"]);
     const out = await pickAttachments("files");
     expect(out.map((a) => a.path)).toEqual(["/tmp/log.txt"]);
-    const opts = h.open.mock.calls[0]?.[0] as { multiple: boolean; filters?: unknown };
-    expect(opts.multiple).toBe(true);
-    expect(opts.filters).toBeUndefined();
+    const [title, extensions] = h.pickFiles.mock.calls[0] as [string, string[] | undefined];
+    expect(title).toMatch(/file/i);
+    expect(extensions).toBeUndefined();
   });
 });
 
 describe("pickAttachments — cancels and failures", () => {
-  it("accepts a single-path return as well as an array", async () => {
-    h.open.mockResolvedValue("/tmp/only.png");
-    const out = await pickAttachments("image");
-    expect(out.map((a) => a.path)).toEqual(["/tmp/only.png"]);
-  });
-
-  it("stages nothing when the picker is cancelled", async () => {
-    h.open.mockResolvedValue(null);
+  it("stages nothing when the picker is cancelled (an empty list)", async () => {
+    h.pickFiles.mockResolvedValue([]);
     expect(await pickAttachments("files")).toEqual([]);
   });
 
-  it("stages nothing (rather than rejecting) when the dialog cannot open", async () => {
-    h.open.mockRejectedValue(new Error("NSOpenPanel returned nil"));
+  // pickFiles already swallows a refused panel into [], so this is defence in depth: the compose box
+  // must survive a picker that rejects no matter which layer stopped catching.
+  it("stages nothing (rather than rejecting) when the picker throws", async () => {
+    h.pickFiles.mockRejectedValue(new Error("picker unavailable"));
     expect(await pickAttachments("files")).toEqual([]);
+  });
+});
+
+// The crash this guards against: +[NSOpenPanel openPanel] returns nil when the XPC service that
+// vends panels cannot be launched, objc2-app-kit's generated binding UNWRAPS that nil, and
+// tauri-plugin-dialog then panics a second time on the resulting RecvError. Two dead processes, no
+// recovery. The directory picker moved to our own nil-checked Rust command for that reason and this
+// path was left behind on the theory that files were unaffected — they were not, because it is one
+// class method serving both modes. Re-importing the plugin here re-arms the crash, so the import is
+// pinned rather than left to a comment.
+describe("picker seam", () => {
+  it("does NOT go through @tauri-apps/plugin-dialog", async () => {
+    // Assert the raw source actually LOADED first: a swallowed ?raw import would leave `undefined`
+    // to be stringified, which trivially fails to match and turns this guard into a no-op.
+    const src = await import("./conciergeAttach?raw");
+    expect(typeof src.default, "?raw import must yield the module source").toBe("string");
+    expect(String(src.default)).not.toMatch(/from\s+["']@tauri-apps\/plugin-dialog["']/);
   });
 });
 

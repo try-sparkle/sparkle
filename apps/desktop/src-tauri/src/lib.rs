@@ -371,6 +371,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             notify_frontend_shown,
             folder_picker::pick_folder,
+            folder_picker::pick_files,
             pty::pty_spawn,
             pty::pty_write,
             pty::pty_resize,

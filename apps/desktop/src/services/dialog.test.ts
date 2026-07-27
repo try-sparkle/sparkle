@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
 
-import { basename, pickProjectFolder } from "./dialog";
+import { basename, pickFiles, pickProjectFolder } from "./dialog";
 
 /** pickProjectFolder only reaches the native path when it believes it is inside Tauri. */
 function inTauri() {
@@ -68,6 +68,57 @@ describe("pickProjectFolder", () => {
     invoke.mockResolvedValue("/tmp/x");
     await pickProjectFolder();
     expect(invoke).toHaveBeenCalledWith("pick_folder", expect.anything());
+  });
+});
+
+// The file picker is the SAME command family for the same reason: +[NSOpenPanel openPanel] is one
+// class method serving directories and files alike, so the nil it can return kills either caller.
+describe("pickFiles", () => {
+  it("returns every chosen path and passes the extension filter through", async () => {
+    invoke.mockResolvedValue(["/tmp/a.png", "/tmp/b.png"]);
+    const paths = await pickFiles("Attach images", ["png", "jpg"]);
+    expect(paths).toEqual(["/tmp/a.png", "/tmp/b.png"]);
+    expect(invoke).toHaveBeenCalledWith("pick_files", {
+      title: "Attach images",
+      extensions: ["png", "jpg"],
+    });
+  });
+
+  it("sends a null filter — not an empty list — when no extensions are given", async () => {
+    // An empty list must read as "unfiltered" on the Rust side; sending [] where the command expects
+    // Option<Vec<String>> would be a panel narrowed to nothing if that ever changed meaning.
+    invoke.mockResolvedValue([]);
+    await pickFiles("Attach files");
+    expect(invoke).toHaveBeenCalledWith("pick_files", { title: "Attach files", extensions: null });
+    await pickFiles("Attach files", []);
+    expect(invoke).toHaveBeenLastCalledWith("pick_files", {
+      title: "Attach files",
+      extensions: null,
+    });
+  });
+
+  it("returns an empty list when the user cancels", async () => {
+    invoke.mockResolvedValue([]);
+    expect(await pickFiles("Attach files")).toEqual([]);
+  });
+
+  it("returns an empty list rather than throwing when the picker cannot be opened", async () => {
+    // The production failure mode, now on the file path too.
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    invoke.mockRejectedValue("macOS could not open the file picker.");
+    await expect(pickFiles("Attach files")).resolves.toEqual([]);
+    expect(err).toHaveBeenCalled();
+  });
+
+  it("drops a non-string or empty entry rather than staging a bogus path", async () => {
+    invoke.mockResolvedValue(["/tmp/a.png", "", null, 7, "/tmp/b.png"]);
+    expect(await pickFiles("Attach files")).toEqual(["/tmp/a.png", "/tmp/b.png"]);
+  });
+
+  it("returns an empty list outside Tauri, where there is no native panel", async () => {
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    expect(await pickFiles("Attach files")).toEqual([]);
+    expect(invoke).not.toHaveBeenCalled();
   });
 });
 
