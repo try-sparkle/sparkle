@@ -52,8 +52,16 @@ pub struct Account {
     pub id: String,
     pub nickname: String,
     /// The directory used as `CLAUDE_CONFIG_DIR` for jobs on this account. For an
-    /// added account this is `<app_data>/accounts/<id>/`; for the imported default
-    /// it's the user's real `~/.claude` (or `$CLAUDE_CONFIG_DIR`).
+    /// added account this is `<app_data>/accounts/<id>/`.
+    ///
+    /// EMPTY means "export no `CLAUDE_CONFIG_DIR` at all" — the imported default account, which
+    /// runs as the user's plain `claude` does (config at `$HOME/.claude.json`, transcripts under
+    /// `$HOME/.claude/projects`). It is a real value, not a missing one, so every consumer must
+    /// treat it as unset rather than joining onto it: see [`identity_json_path`] and
+    /// `claude::claude_projects_root`. Installs predating that fix carry a literal `$HOME/.claude`
+    /// here; that stays self-consistent (the spawn exports it, so Claude Code does put its config
+    /// under it) and is migrated only in the one shape where doing so cannot change which Anthropic
+    /// account the user runs as — see [`default_config_dir_needs_normalizing`].
     pub config_dir: String,
     pub is_default: bool,
     /// Epoch SECONDS the account was registered (Unix time). The frontend treats this
@@ -325,6 +333,48 @@ fn import_default_at(
     accounts.push(acct.clone());
     write_accounts_at(accounts_path, &accounts)?;
     Ok(acct)
+}
+
+/// Whether a pre-fix default record should be normalized to the empty "no override" sentinel.
+///
+/// True in exactly ONE shape, the only one where the rewrite is provably safe:
+///
+/// 1. the record is the default and literally points at `<home>/.claude`,
+/// 2. that directory holds NO completed login, and
+/// 3. `<home>/.claude.json` — where a plain `claude login` puts it — DOES.
+///
+/// That is a user who never finished the duplicate `claude login` the old bug pushed them toward.
+/// Rewriting their record cannot switch which Anthropic account their agents run as, because there
+/// is no account at `<home>/.claude/.claude.json` to switch away from; it only stops Sparkle
+/// reporting their real terminal login as "not signed in" and walking them into that second login.
+///
+/// Every other shape is left alone. In particular, a `<home>/.claude` that DOES hold a login is
+/// self-consistent — the spawn exports it, so Claude Code really does keep its config there — and
+/// migrating it would silently move the user onto a different Anthropic account.
+fn default_config_dir_needs_normalizing(acct: &Account, home: Option<&Path>) -> bool {
+    let Some(home) = home else { return false };
+    if !acct.is_default || Path::new(&acct.config_dir) != home.join(".claude") {
+        return false;
+    }
+    read_oauth_identity_at(Some(Path::new(&acct.config_dir)), None).is_none()
+        && read_oauth_identity_at(None, Some(home)).is_some()
+}
+
+/// Apply [`default_config_dir_needs_normalizing`], persisting only when something changed.
+/// Returns whether a record was rewritten. Runs on every app start (via `accounts_import_default`),
+/// so it must stay a cheap no-op in the overwhelmingly common case — it is: the shape check is two
+/// string comparisons before any file is opened.
+fn normalize_default_config_dir_at(accounts_path: &Path, home: Option<&Path>) -> Result<bool, String> {
+    let mut accounts = read_accounts_at(accounts_path)?;
+    let Some(acct) = accounts
+        .iter_mut()
+        .find(|a| default_config_dir_needs_normalizing(a, home))
+    else {
+        return Ok(false);
+    };
+    acct.config_dir = String::new();
+    write_accounts_at(accounts_path, &accounts)?;
+    Ok(true)
 }
 
 /// Persist a per-account exhausted-until epoch (the moment the rate limit resets).
@@ -900,10 +950,21 @@ fn latest_limit_event(
     }
 }
 
+/// The transcript root for one account, resolved the SAME way session detection does.
+///
+/// Passing `$HOME` matters: the default account stores an EMPTY `config_dir` (see
+/// [`Account::config_dir`]), and without a home to fall back on that resolves to `None` — the
+/// account would report no transcripts at all, hence zero usage, no learned ceiling, and no
+/// rate-limit events, while its sessions pile up under `$HOME/.claude/projects`.
+fn projects_root_for_account(acct: &Account) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    crate::claude::claude_projects_root(Some(Path::new(&acct.config_dir)), home.as_deref())
+}
+
 /// The newest rate-limit event for one account within the lookback window, or `None` if it hasn't
 /// hit a limit recently.
 fn limit_event_for_account(acct: &Account, now: i64) -> Option<AccountLimitEvent> {
-    let root = crate::claude::claude_projects_root(Some(Path::new(&acct.config_dir)), None)?;
+    let root = projects_root_for_account(acct)?;
     let mut best = None;
     latest_limit_event(&root, now - LIMIT_EVENT_LOOKBACK, &mut best);
     best.map(|(at_epoch, text)| AccountLimitEvent { id: acct.id.clone(), at_epoch, text })
@@ -1039,8 +1100,7 @@ fn median(sorted: &[u64]) -> u64 {
 /// preceded it. Pure given the filesystem; the caching wrapper is [`ceilings_cached`].
 fn ceiling_for_account(acct: &Account, now: i64) -> AccountCeiling {
     let mut samples = Vec::new();
-    if let Some(root) = crate::claude::claude_projects_root(Some(Path::new(&acct.config_dir)), None)
-    {
+    if let Some(root) = projects_root_for_account(acct) {
         let since = now - CEILING_LEARN_WINDOW;
         let mut times = Vec::new();
         collect_limit_event_times(&root, since, &mut times);
@@ -1084,9 +1144,7 @@ fn ceiling_cache() -> &'static std::sync::Mutex<CeilingCache> {
 /// `exhausted_until` is surfaced only while still in the future.
 fn usage_for_account(acct: &Account, now: i64) -> AccountUsage {
     let mut records = Vec::new();
-    if let Some(root) =
-        crate::claude::claude_projects_root(Some(Path::new(&acct.config_dir)), None)
-    {
+    if let Some(root) = projects_root_for_account(acct) {
         // Only files touched within the trailing 7d window can hold in-window records; older ones
         // are skipped by mtime before we open them (see collect_usage_records).
         collect_usage_records(&root, now - WINDOW_7D, &mut records);
@@ -1102,22 +1160,36 @@ fn usage_for_account(acct: &Account, now: i64) -> AccountUsage {
 
 // ---- real OAuth identity (pure) -----------------------------------------------
 
-/// Resolve which config dir to read the OAuth identity from: an explicit non-empty
-/// path (a named account's `<app_data>/accounts/<id>/` or the imported default's
-/// `~/.claude`), else fall back to `<home>/.claude`. Mirrors how the spawn path treats
-/// an empty `CLAUDE_CONFIG_DIR` as "use the default". Returns `None` only when neither
-/// a usable explicit dir nor a home is available.
-fn resolve_identity_config_dir(config_dir: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
-    if let Some(d) = config_dir {
-        if !d.as_os_str().is_empty() {
-            return Some(d.to_path_buf());
-        }
+/// The `.claude.json` file Claude Code actually reads for a given account.
+///
+/// Claude Code keeps that file in one of TWO places, and they are not the same directory:
+///
+/// * `CLAUDE_CONFIG_DIR=<dir>` set → `<dir>/.claude.json`
+/// * the variable UNSET          → `$HOME/.claude.json` — **not** `$HOME/.claude/.claude.json`
+///
+/// `$HOME/.claude` is the state directory (`projects/`, `settings.json`, …), which is exactly why
+/// the two get conflated. Verified against claude 2.1.220: `claude mcp add --scope user` writes
+/// `$HOME/.claude.json` with the variable unset and `<dir>/.claude.json` with it set.
+///
+/// Getting this wrong is not cosmetic. Reading `$HOME/.claude/.claude.json` for a user whose
+/// terminal login lives at `$HOME/.claude.json` reports "not signed in" for an account that IS
+/// signed in, which walks them into a second `claude login` — frequently as a DIFFERENT Anthropic
+/// account than the one their terminal uses. That is how a config dir ends up holding a login with
+/// nothing to do with the nickname typed when it was created, and how the terminal's real login
+/// ends up orphaned: registered nowhere, so nothing in Sparkle ever reads it.
+///
+/// An explicit non-empty `config_dir` means the spawn sets `CLAUDE_CONFIG_DIR` to it, so the first
+/// form applies; empty/absent means the spawn sets nothing, so the second does. Returns `None` only
+/// when neither a usable explicit dir nor a home is available.
+fn identity_json_path(config_dir: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    match config_dir.filter(|d| !d.as_os_str().is_empty()) {
+        Some(d) => Some(d.join(".claude.json")),
+        None => home.map(|h| h.join(".claude.json")),
     }
-    home.map(|h| h.join(".claude"))
 }
 
-/// Read the REAL authenticated identity Claude Code records in
-/// `<config_dir>/.claude.json` under `oauthAccount` (`emailAddress`,
+/// Read the REAL authenticated identity Claude Code records in its config file
+/// (see [`identity_json_path`]) under `oauthAccount` (`emailAddress`,
 /// `organizationName`). DEFENSIVE and never errors: a missing file, unparseable JSON,
 /// a missing/empty `oauthAccount`, or a missing/empty `emailAddress` all yield `None`
 /// (an account dir created but never logged into — "not signed in"). The org is `None`
@@ -1127,8 +1199,7 @@ fn read_oauth_identity_at(
     config_dir: Option<&Path>,
     home: Option<&Path>,
 ) -> Option<OauthIdentity> {
-    let dir = resolve_identity_config_dir(config_dir, home)?;
-    let bytes = std::fs::read(dir.join(".claude.json")).ok()?;
+    let bytes = std::fs::read(identity_json_path(config_dir, home)?).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let oauth = v.get("oauthAccount")?;
     let email = oauth
@@ -1212,7 +1283,27 @@ pub fn accounts_remove(
 }
 
 /// Idempotently import the user's existing default config dir as an account.
-/// `config_dir` = `$CLAUDE_CONFIG_DIR` if set, else `$HOME/.claude`.
+///
+/// `config_dir` = `$CLAUDE_CONFIG_DIR` if Sparkle itself was launched with one, else the EMPTY
+/// string — meaning "set no `CLAUDE_CONFIG_DIR` on the spawn at all".
+///
+/// Empty is load-bearing, not a missing value. It used to synthesize `$HOME/.claude` here, on the
+/// reasonable-looking assumption that `CLAUDE_CONFIG_DIR=$HOME/.claude` is what "no override" means.
+/// It isn't: setting the variable MOVES the config file from `$HOME/.claude.json` to
+/// `$HOME/.claude/.claude.json` (see [`identity_json_path`]). So importing the user's default
+/// pointed at a config Claude Code had never written — a blank, logged-out profile — while their
+/// real terminal login sat unread at `$HOME/.claude.json`. The account read "not signed in", the
+/// user logged in again (often as a different Anthropic account), and the nickname they had typed
+/// no longer described the login the dir held.
+///
+/// Storing the empty string instead makes the default account genuinely the terminal's account:
+/// the spawn omits the export, so Claude Code resolves `$HOME/.claude.json` and
+/// `$HOME/.claude/projects` exactly as `claude` does with no Sparkle involved.
+///
+/// Because `import_default_at` returns an existing default untouched, a fix here would otherwise
+/// only ever reach fresh installs — leaving every existing user still walking into the original
+/// trap. So this first runs [`normalize_default_config_dir_at`], which repairs the one pre-fix
+/// shape that can be repaired without changing which Anthropic account anyone runs as.
 #[tauri::command]
 pub fn accounts_import_default(
     app: AppHandle,
@@ -1220,13 +1311,12 @@ pub fn accounts_import_default(
 ) -> Result<Account, String> {
     let _guard = lock.guard();
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    normalize_default_config_dir_at(&accounts_json_path(&app_data), home.as_deref())?;
     let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))
-        .ok_or_else(|| "cannot resolve default config dir (no CLAUDE_CONFIG_DIR or HOME)".to_string())?
-        .to_string_lossy()
-        .into_owned();
+        .map(|s| PathBuf::from(s).to_string_lossy().into_owned())
+        .unwrap_or_default();
     let id = generate_account_id()?;
     import_default_at(&accounts_json_path(&app_data), config_dir, id, now_secs())
 }
@@ -1277,11 +1367,11 @@ pub async fn accounts_spend(app: AppHandle) -> Result<SpendSummary, String> {
         let mut records = Vec::new();
         let mut seen_roots = std::collections::HashSet::new();
         for a in &accounts {
-            if let Some(root) =
-                crate::claude::claude_projects_root(Some(Path::new(&a.config_dir)), None)
-            {
+            if let Some(root) = projects_root_for_account(a) {
                 // Dedupe: two account records with the same config dir would otherwise scan the
-                // same transcripts twice and double the spend total.
+                // same transcripts twice and double the spend total. This also collapses a pre-fix
+                // default (`$HOME/.claude`) and a post-fix one (`""`) — both resolve to
+                // `$HOME/.claude/projects` — so a migrated install can't double-count.
                 if seen_roots.insert(root.clone()) {
                     collect_usage_records(&root, now - WINDOW_7D, &mut records);
                 }
@@ -1385,9 +1475,11 @@ pub async fn accounts_ceilings(app: AppHandle) -> Result<Vec<AccountCeiling>, St
 /// Whether Claude Code has a completed sign-in for the given config dir — i.e. `claude login` wrote
 /// an `oauthAccount.emailAddress` into `<config_dir>/.claude.json`. Drives the first-run setup
 /// checklist's "Sign in to Claude Code" step: unlike a mere binary-presence check, this confirms the
-/// user actually authenticated. `config_dir` omitted/empty → the default `~/.claude` (the first-run
-/// case, before any named account exists). Never errors — an unreadable/missing file is "not signed
-/// in". Note: this detects the OAuth (`claude login`) flow, which is exactly what the step runs.
+/// user actually authenticated. `config_dir` omitted/empty → `$HOME/.claude.json`, where a plain
+/// `claude login` with no `CLAUDE_CONFIG_DIR` puts it (the first-run case, before any named account
+/// exists — see [`identity_json_path`] for why that is NOT `$HOME/.claude/.claude.json`). Never
+/// errors — an unreadable/missing file is "not signed in". Note: this detects the OAuth
+/// (`claude login`) flow, which is exactly what the step runs.
 ///
 /// `async` + `spawn_blocking`: reads `.claude.json` off the event loop. On a JoinError we default to
 /// `false` ("not signed in"), the same safe fallback the sync core returns for an unreadable file.
@@ -2087,38 +2179,58 @@ mod tests {
     }
 
     #[test]
-    fn resolve_identity_config_dir_falls_back_to_home_claude() {
-        // Empty / None config dir → <home>/.claude (the default account's real dir).
+    fn identity_json_path_uses_home_dot_claude_json_not_the_state_dir() {
+        // THE bug this function exists to prevent. With no CLAUDE_CONFIG_DIR, Claude Code's config
+        // is $HOME/.claude.json — the FILE beside the state dir, not a file inside it. Reading
+        // $HOME/.claude/.claude.json instead reports "not signed in" for a signed-in user.
         let home = Path::new("/home/me");
         assert_eq!(
-            resolve_identity_config_dir(None, Some(home)),
-            Some(PathBuf::from("/home/me/.claude"))
+            identity_json_path(None, Some(home)),
+            Some(PathBuf::from("/home/me/.claude.json"))
+        );
+        assert_ne!(
+            identity_json_path(None, Some(home)),
+            Some(PathBuf::from("/home/me/.claude/.claude.json")),
+            "the state dir is not the config file's home"
+        );
+        // An empty config dir is the default account and resolves the same way.
+        assert_eq!(
+            identity_json_path(Some(Path::new("")), Some(home)),
+            Some(PathBuf::from("/home/me/.claude.json"))
+        );
+        // An explicit dir means the spawn exports CLAUDE_CONFIG_DIR=<dir>, so the config lands
+        // INSIDE it — including when that dir happens to be ~/.claude (pre-fix installs).
+        assert_eq!(
+            identity_json_path(Some(Path::new("/data/accounts/x")), Some(home)),
+            Some(PathBuf::from("/data/accounts/x/.claude.json"))
         );
         assert_eq!(
-            resolve_identity_config_dir(Some(Path::new("")), Some(home)),
-            Some(PathBuf::from("/home/me/.claude"))
-        );
-        // An explicit non-empty dir wins over home.
-        assert_eq!(
-            resolve_identity_config_dir(Some(Path::new("/data/accounts/x")), Some(home)),
-            Some(PathBuf::from("/data/accounts/x"))
+            identity_json_path(Some(Path::new("/home/me/.claude")), Some(home)),
+            Some(PathBuf::from("/home/me/.claude/.claude.json"))
         );
         // No dir and no home → None.
-        assert_eq!(resolve_identity_config_dir(None, None), None);
+        assert_eq!(identity_json_path(None, None), None);
         // GUARD: an empty config dir WITHOUT a home fallback → None (the way `accounts_identities`
         // calls it for a NAMED account: passing home = None so an empty/missing dir can't
         // mislabel the home user's identity as this account's).
-        assert_eq!(resolve_identity_config_dir(Some(Path::new("")), None), None);
+        assert_eq!(identity_json_path(Some(Path::new("")), None), None);
         assert_eq!(read_oauth_identity_at(Some(Path::new("")), None), None);
     }
 
     #[test]
-    fn read_oauth_identity_defaults_to_home_claude_when_dir_absent() {
-        // With no explicit config dir, the reader looks in <home>/.claude/.claude.json.
+    fn read_oauth_identity_defaults_to_home_dot_claude_json_when_dir_absent() {
+        // End-to-end of the above: the identity of a user who just runs `claude` in a terminal.
         let home = unique_dir("identity-home");
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"default@example.com","organizationName":"Home Org"}}"#,
+        )
+        .unwrap();
+        // A stale config left in the STATE dir must not be mistaken for the live one — this is
+        // precisely the file pair that made Sparkle report the wrong account.
         write_claude_json(
             &home.join(".claude"),
-            r#"{"oauthAccount":{"emailAddress":"default@example.com","organizationName":"Home Org"}}"#,
+            r#"{"oauthAccount":{"emailAddress":"stale@example.com"}}"#,
         );
         assert_eq!(
             read_oauth_identity_at(None, Some(&home)),
@@ -2128,7 +2240,159 @@ mod tests {
                 account_uuid: None,
             })
         );
+        // And the same for the default account, which stores its config dir as "".
+        assert_eq!(
+            read_oauth_identity_at(Some(Path::new("")), Some(&home)).map(|i| i.email),
+            Some("default@example.com".to_string())
+        );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A `$HOME` stand-in: `.claude/` (state dir) plus optionally a login in either location.
+    /// `state_email` seeds `<home>/.claude/.claude.json`; `home_email` seeds `<home>/.claude.json`.
+    fn fake_home(tag: &str, state_email: Option<&str>, home_email: Option<&str>) -> PathBuf {
+        let home = unique_dir(tag);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        if let Some(e) = state_email {
+            write_claude_json(
+                &home.join(".claude"),
+                &format!(r#"{{"oauthAccount":{{"emailAddress":"{e}"}}}}"#),
+            );
+        }
+        if let Some(e) = home_email {
+            std::fs::write(
+                home.join(".claude.json"),
+                format!(r#"{{"oauthAccount":{{"emailAddress":"{e}"}}}}"#),
+            )
+            .unwrap();
+        }
+        home
+    }
+
+    fn default_at(home: &Path) -> Account {
+        sample("d", true, home.join(".claude").to_str().unwrap())
+    }
+
+    #[test]
+    fn pre_fix_default_is_normalized_only_when_the_rewrite_cannot_change_accounts() {
+        // THE case worth migrating: the user never completed the duplicate login the old bug
+        // pushed them toward, so `<home>/.claude` is empty and their real login sits unread at
+        // `<home>/.claude.json`. Rewriting to "" cannot switch accounts — there is none to leave.
+        let home = fake_home("norm-yes", None, Some("real@example.com"));
+        assert!(default_config_dir_needs_normalizing(&default_at(&home), Some(&home)));
+        let _ = std::fs::remove_dir_all(&home);
+
+        // The user DID log in under `<home>/.claude`. That record is self-consistent, and migrating
+        // it would silently move their agents from one Anthropic account to another.
+        let home = fake_home("norm-both", Some("sparkle@example.com"), Some("real@example.com"));
+        assert!(!default_config_dir_needs_normalizing(&default_at(&home), Some(&home)));
+        let _ = std::fs::remove_dir_all(&home);
+
+        // Nothing at `<home>/.claude.json` to migrate TO — leave it alone rather than blank the
+        // record and strand the account with no identity at all.
+        let home = fake_home("norm-neither", None, None);
+        assert!(!default_config_dir_needs_normalizing(&default_at(&home), Some(&home)));
+        // A NAMED account is never touched, whatever its dir holds.
+        let mut named = default_at(&home);
+        named.is_default = false;
+        assert!(!default_config_dir_needs_normalizing(&named, Some(&home)));
+        // Nor is a default pointing somewhere other than `<home>/.claude`.
+        assert!(!default_config_dir_needs_normalizing(
+            &sample("d", true, "/data/accounts/x"),
+            Some(&home)
+        ));
+        // Already migrated → no-op (and no re-entry loop on every app start).
+        assert!(!default_config_dir_needs_normalizing(&sample("d", true, ""), Some(&home)));
+        // No home to compare against → never guess.
+        assert!(!default_config_dir_needs_normalizing(&default_at(&home), None));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn normalize_rewrites_the_record_once_and_is_idempotent() {
+        let home = fake_home("norm-write", None, Some("real@example.com"));
+        let base = unique_dir("norm-write-accts");
+        let path = accounts_json_path(&base);
+        write_accounts_at(&path, &[default_at(&home), sample("n", false, "/data/x")]).unwrap();
+
+        assert!(normalize_default_config_dir_at(&path, Some(&home)).unwrap());
+        let after = read_accounts_at(&path).unwrap();
+        assert_eq!(after[0].config_dir, "", "default migrated to the no-override sentinel");
+        assert_eq!(after[1].config_dir, "/data/x", "named account untouched");
+
+        // Second pass changes nothing and reports no write.
+        assert!(!normalize_default_config_dir_at(&path, Some(&home)).unwrap());
+        assert_eq!(read_accounts_at(&path).unwrap(), after);
+
+        // And the migrated record now resolves to the terminal's real login.
+        assert_eq!(
+            read_oauth_identity_at(Some(Path::new(&after[0].config_dir)), Some(&home))
+                .map(|i| i.email),
+            Some("real@example.com".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn spend_and_usage_still_see_a_migrated_default() {
+        // Regression guard for the call site `accounts_spend` uses: with config_dir "", resolving
+        // WITHOUT a home yields None and the default account silently drops out of spend totals.
+        let home = fake_home("spend-empty", None, Some("real@example.com"));
+        let migrated = sample("d", true, "");
+        // Seed a transcript where a no-override spawn would actually write it.
+        let slug = home.join(".claude").join("projects").join("-tmp-proj");
+        std::fs::create_dir_all(&slug).unwrap();
+        std::fs::write(
+            slug.join("s.jsonl"),
+            b"{\"timestamp\":\"2099-01-01T00:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":20}}}\n",
+        )
+        .unwrap();
+
+        // The un-homed form is exactly what dropped the account; supplying the home is the fix.
+        // (Asserted against the resolver directly rather than through `projects_root_for_account`,
+        // which reads $HOME — mutating that would race every other test in this binary.)
+        assert_eq!(
+            crate::claude::claude_projects_root(Some(Path::new(&migrated.config_dir)), None),
+            None,
+            "this is the shape that silently skipped the default account"
+        );
+        let root = crate::claude::claude_projects_root(
+            Some(Path::new(&migrated.config_dir)),
+            Some(&home),
+        );
+        assert_eq!(root, Some(home.join(".claude").join("projects")));
+        let mut records = Vec::new();
+        collect_usage_records(&root.unwrap(), 0, &mut records);
+        assert!(!records.is_empty(), "a migrated default must still contribute usage records");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn import_default_stores_empty_config_dir_when_no_env_override() {
+        // "No CLAUDE_CONFIG_DIR" must be recorded as EMPTY, not as $HOME/.claude: exporting
+        // $HOME/.claude relocates the config to $HOME/.claude/.claude.json, so the imported
+        // "default" would be a blank profile rather than the terminal's actual login.
+        let base = unique_dir("import-default-empty");
+        let path = accounts_json_path(&base);
+        let acct = import_default_at(&path, String::new(), "d1".into(), 7).unwrap();
+        assert_eq!(acct.config_dir, "");
+        assert!(acct.is_default);
+
+        // Idempotent: a second import returns the SAME record rather than adding another default.
+        let again = import_default_at(&path, "/some/other".into(), "d2".into(), 9).unwrap();
+        assert_eq!(again, acct);
+        assert_eq!(read_accounts_at(&path).unwrap().len(), 1);
+
+        // An empty config dir must never be turned into a relative `projects/` root, and must
+        // never be deleted as if it were a real per-account dir.
+        assert_eq!(dir_to_remove_on_remove(&acct), None);
+        assert_eq!(
+            crate::claude::claude_projects_root(Some(Path::new("")), Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/home/me/.claude/projects"))
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

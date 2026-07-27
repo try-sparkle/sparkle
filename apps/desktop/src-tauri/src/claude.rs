@@ -35,11 +35,18 @@ fn encode_project_slug(path: &str) -> String {
 /// env var is set, else `$HOME/.claude/projects`. Returns `None` when neither is
 /// resolvable. Pure form (takes the env values) so it's testable.
 ///
+/// An EMPTY `config_dir` counts as unset, exactly as an `export CLAUDE_CONFIG_DIR=`
+/// does — otherwise the bare join yields a RELATIVE `projects/` rooted at whatever
+/// Sparkle's cwd happens to be, silently reporting zero transcripts (and so zero
+/// usage, no learned ceiling, and no rate-limit events) for that account. The
+/// default account stores exactly that empty string, because "no override" is what
+/// makes it the same account the user's terminal uses — see `accounts::Account::config_dir`.
+///
 /// `pub(crate)` so `accounts.rs` resolves an account's transcript root the SAME
 /// way session detection does (each account passes its own `config_dir` as
 /// `Some(..)`), instead of re-deriving the `projects` join independently.
 pub(crate) fn claude_projects_root(config_dir: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
-    match config_dir {
+    match config_dir.filter(|c| !c.as_os_str().is_empty()) {
         Some(cfg) => Some(cfg.join("projects")),
         None => home.map(|h| h.join(".claude").join("projects")),
     }
@@ -327,6 +334,25 @@ mod tests {
 
     fn home_root(home: &Path) -> PathBuf {
         claude_projects_root(None, Some(home)).unwrap()
+    }
+
+    #[test]
+    fn claude_projects_root_treats_an_empty_config_dir_as_unset() {
+        let home = Path::new("/home/me");
+        let expected = Some(PathBuf::from("/home/me/.claude/projects"));
+        // The default account stores config_dir = "" (meaning "export no CLAUDE_CONFIG_DIR").
+        // Joining onto it would yield a RELATIVE `projects/` rooted at Sparkle's cwd, which reads
+        // as zero transcripts — so zero usage, no learned ceiling, no rate-limit events.
+        assert_eq!(claude_projects_root(Some(Path::new("")), Some(home)), expected);
+        assert_eq!(claude_projects_root(None, Some(home)), expected);
+        // A real dir still wins, and stays absolute.
+        assert_eq!(
+            claude_projects_root(Some(Path::new("/data/accounts/x")), Some(home)),
+            Some(PathBuf::from("/data/accounts/x/projects"))
+        );
+        // Nothing resolvable at all → None (never a relative path).
+        assert_eq!(claude_projects_root(Some(Path::new("")), None), None);
+        assert_eq!(claude_projects_root(None, None), None);
     }
 
     #[test]
@@ -711,22 +737,22 @@ mod tests {
 
     #[test]
     fn empty_config_dir_is_treated_as_unset() {
-        // An empty `OsStr` (e.g. `export CLAUDE_CONFIG_DIR=`) must not produce a
-        // relative `projects/<slug>` root that skips the $HOME fallback. The
-        // public command applies the empty filter; here we assert the resolver
-        // contract it relies on: an empty path joins to a *relative* root, which
-        // is exactly what the filter exists to avoid — so the command's
-        // `.filter(|s| !s.is_empty())` must keep us on the $HOME branch.
+        // An empty `OsStr` (e.g. `export CLAUDE_CONFIG_DIR=`, or the default account's stored
+        // `config_dir: ""`) must not produce a relative `projects/<slug>` root that skips the $HOME
+        // fallback. The guard lives in `claude_projects_root` itself, not only in the callers that
+        // pre-filter: `accounts.rs` hands an account's raw `config_dir` straight through, and for
+        // the default account that string is empty by design.
         let empty = PathBuf::from("");
         let home = unique_home("emptyenv");
         let worktree = "/tmp/proj/.sparkle/worktrees/emptyenv";
         seed_session(&claude_session_dir_for(&home_root(&home), worktree));
 
-        // With the empty value naively kept, the lookup roots at a relative dir
-        // and misses the seeded session.
-        assert!(!claude_has_session_in(Some(&empty), Some(&home), worktree));
-        // Dropping the empty value (what the command does) finds it via $HOME.
+        // An empty value resolves via $HOME and finds the seeded session — same as omitting it.
+        assert!(claude_has_session_in(Some(&empty), Some(&home), worktree));
         assert!(claude_has_session_in(None, Some(&home), worktree));
+        // Without a home there is nothing to fall back to, and still no relative root.
+        assert_eq!(claude_projects_root(Some(&empty), None), None);
+        assert!(!claude_has_session_in(Some(&empty), None, worktree));
         let _ = std::fs::remove_dir_all(&home);
     }
 }
