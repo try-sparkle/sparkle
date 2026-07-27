@@ -61,18 +61,16 @@ impl PackageManager {
         matches!(self, PackageManager::Pnpm | PackageManager::Npm)
     }
 
-    /// Whether the install leaves the project's OWN lifecycle scripts unrun, given the resolved
-    /// major version of the manager.
+    /// Whether the install leaves the project's OWN lifecycle scripts unrun.
     ///
-    /// True for npm always — it cannot separate "the dependency graph's scripts" from "this
-    /// project's", so blocking third-party `postinstall` necessarily blocks the repo's own — and for
-    /// pnpm below v10, where `--ignore-scripts` is the only lever available (see `install_args`).
+    /// True for every supported manager, because `--ignore-scripts` is unconditional and neither
+    /// pnpm nor npm can separate "the dependency graph's scripts" from "this project's".
     ///
     /// Surfaced in the outcome because, combined with `plan_for`'s short-circuit on an existing
     /// `node_modules`, a scripts-less tree is cached as bootstrapped forever; a bare "installed"
     /// would give nobody a way to tell why a later `Cannot find module` is happening.
-    pub fn skips_project_scripts(self, major: Option<u32>) -> bool {
-        self.install_args(major).contains(&"--ignore-scripts")
+    pub fn skips_project_scripts(self) -> bool {
+        self.install_args().contains(&"--ignore-scripts")
     }
 
     /// The install invocation.
@@ -82,45 +80,32 @@ impl PackageManager {
     /// from the one CI and the other worktrees use, and — worse — can rewrite the lockfile, which
     /// then shows up as an unexplained modification in the agent's very first `git status`.
     ///
-    /// On the trust boundary: the code worth refusing to run unattended is THIRD-PARTY —
-    /// `postinstall` from the dependency graph, which nobody reviewed. The project's own scripts are
-    /// not an escalation, because the user deliberately opened an agent on this repo and the agent
-    /// is about to run its tests and its build regardless.
+    /// On the trust boundary: `--ignore-scripts` is UNCONDITIONAL, on every supported manager.
     ///
-    /// `major` is the manager's resolved major version, `None` when it could not be determined. It
-    /// is a parameter rather than a probe so this stays a pure function the tests can drive across
-    /// every version that changes the answer.
-    pub fn install_args(self, major: Option<u32>) -> &'static [&'static str] {
+    /// This install is triggered by nothing more deliberate than opening an agent on a repo, so it
+    /// must not execute that repo's dependency graph. An earlier version tried to be cleverer —
+    /// probe the manager's version and lean on pnpm v10's own default gate, keeping the repo's own
+    /// `prepare` step working. Two things killed it:
+    ///
+    ///   1. The probe is a separate process, so its answer can disagree with what the install uses.
+    ///      It first ran in Sparkle's CWD rather than the worktree, which under a corepack shim
+    ///      resolves an entirely different pnpm.
+    ///   2. Even a correct v10 reading is not a boundary, because **the gate is configured by files
+    ///      the untrusted repo controls** — `pnpm.onlyBuiltDependencies` and
+    ///      `dangerouslyAllowAllBuilds`. A hostile repo pins `packageManager: "pnpm@10.x"` so the
+    ///      probe honestly reports 10, lists a malicious dependency under `onlyBuiltDependencies`,
+    ///      and gets its install script executed.
+    ///
+    /// No probe can fix (2): the thing being probed is the attacker's to set. So there is no probe.
+    /// The cost is a repo's own `prepare` step, which is REPORTED via `skips_project_scripts` and
+    /// recovered by an agent running the install itself, deliberately.
+    pub fn install_args(self) -> &'static [&'static str] {
         match self {
             // `--prefer-offline` is what makes this 27s rather than a network round-trip per
             // package: the global store is already warm from the main checkout.
-            //
-            // The `--ignore-scripts` decision is VERSION-GATED, and that gate is a trust boundary,
-            // not a nicety. pnpm **v10** blocks third-party build scripts by default — the probe
-            // install printed "Ignored build scripts: @clerk/shared, core-js, esbuild, sharp,
-            // unrs-resolver" and the suite still ran — so on v10 the flag would only strip the
-            // repo's OWN `prepare`/`postinstall` and, because `plan_for` treats any existing
-            // `node_modules` as done, cache a tree that exists and does not work.
-            //
-            // pnpm 8 and 9 have no such default: they run every `preinstall`/`install`/`postinstall`
-            // in the dependency graph. And the version is not ours to assume — `resolve_manager`
-            // takes whatever `command -v pnpm` yields, which under a corepack shim is the TARGET
-            // REPO'S pinned `packageManager`. Sparkle opens agents on arbitrary repos, so trusting
-            // the default would let an untrusted repo pin `pnpm@9` and get arbitrary code execution
-            // from someone merely opening an agent on it.
-            //
-            // An UNKNOWN version is treated as unsafe for the same reason. Failing toward "run less
-            // code" costs a repo its own build step, which is visible and recoverable; failing the
-            // other way is not.
-            PackageManager::Pnpm if major.is_some_and(|m| m >= 10) => {
-                &["install", "--frozen-lockfile", "--prefer-offline"]
-            }
             PackageManager::Pnpm => {
                 &["install", "--frozen-lockfile", "--prefer-offline", "--ignore-scripts"]
             }
-            // npm has no equivalent of pnpm's default gate, so blocking third-party scripts
-            // necessarily blocks the project's own too. Taken deliberately and REPORTED — see
-            // `skips_project_scripts`.
             PackageManager::Npm => &["ci", "--prefer-offline", "--ignore-scripts"],
             // Not driven — see `is_supported`. `plan_for` turns these into a Skip before any of
             // this is reached; the arm exists so the match stays exhaustive if that ever changes.
@@ -268,23 +253,20 @@ impl BootstrapOutcome {
 /// status quo — a worktree without `node_modules`, which is what every worktree had before this
 /// module existed — and must not surface as a spawn error. `Err` is reserved for "the pass could
 /// not run at all", which the Tauri command maps from a bad path argument.
-/// The runner reports back the manager's resolved major version (`None` if it could not be read),
-/// because that is what decides whether the install ran the project's own scripts — and therefore
-/// what the outcome has to disclose.
 pub fn execute<F>(plan: BootstrapPlan, run: F) -> BootstrapOutcome
 where
-    F: FnOnce(PackageManager) -> Result<Option<u32>, String>,
+    F: FnOnce(PackageManager) -> Result<(), String>,
 {
     match plan {
         BootstrapPlan::Skip(reason) => BootstrapOutcome::skipped(reason),
         BootstrapPlan::Install(pm) => match run(pm) {
-            Ok(major) => BootstrapOutcome {
+            Ok(()) => BootstrapOutcome {
                 status: "installed",
                 // A success that skipped the project's own lifecycle scripts is NOT the same
                 // success as one that ran them, and `plan_for` will treat the resulting
                 // `node_modules` as done forever. Saying so here is the only thing standing
                 // between that and an unexplained `Cannot find module` later.
-                detail: pm.skips_project_scripts(major).then(|| {
+                detail: pm.skips_project_scripts().then(|| {
                     "lifecycle scripts were not run; if this project needs a build step, \
                      run the install yourself in this worktree"
                         .to_string()
@@ -336,74 +318,22 @@ fn resolve_manager(pm: PackageManager) -> Option<String> {
     crate::preflight::resolve_on_path(pm.program())
 }
 
-/// Pull the major version out of a `--version` line.
-///
-/// Pure, and separated from the spawn precisely so it can be tested: this parse is what decides the
-/// trust posture — `Some(10)` omits `--ignore-scripts`, everything else adds it — and it was the
-/// only logic on that path with no test behind it.
-///
-/// Anything not confidently a version number returns `None`, which callers treat as unsafe. A
-/// corepack shim that prints a download banner before the number must NOT be read as a version;
-/// misreading one is how the gate reopens.
-fn parse_major(version_output: &str) -> Option<u32> {
-    version_output
-        .trim()
-        // `pnpm --version` prints a bare "10.7.1"; tolerate a leading "v".
-        .trim_start_matches('v')
-        .split('.')
-        .next()?
-        .parse()
-        .ok()
-}
-
-/// Read the manager's major version by running `<program> --version` **in the worktree**.
-///
-/// The working directory is load-bearing, not incidental. Under a corepack shim — the exact threat
-/// this version check exists for — the pnpm behind the shim is resolved from the `packageManager`
-/// field of the nearest `package.json` walking up from the CURRENT DIRECTORY, not from the shim's
-/// own path. Probing in Sparkle's CWD therefore reads a different pnpm than the one that will
-/// install: Sparkle running where corepack resolves v10 probes `10`, drops `--ignore-scripts`, and
-/// then installs in a worktree where the target repo pins `pnpm@9` — running every third-party
-/// `preinstall`/`install`/`postinstall` in the graph, with the outcome reporting no caveat because
-/// the probe said v10. That is the whole hole this check was added to close.
-///
-/// `CI` is set for the same reason it is set on the install: without it the probe can hit an
-/// interactive corepack download prompt the install would never see, and hang on it.
-///
-/// Returns `None` on any doubt — a failed spawn, a non-zero exit, or unparseable output — so a
-/// garbled probe costs a repo its build step rather than opening the gate.
-fn major_version(worktree: &Path, program: &str) -> Option<u32> {
-    let out = std::process::Command::new(program)
-        .arg("--version")
-        .current_dir(worktree)
-        .env("CI", "1")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    parse_major(&String::from_utf8_lossy(&out.stdout))
-}
-
 /// Run the real install for `pm` in `worktree`.
 ///
 /// NOT UNIT-TESTED, and deliberately kept to glue over pieces that are: it resolves a program,
 /// spawns it, and maps the exit status. Every decision it could get wrong lives in `plan_for`,
-/// `execute`, `install_args`, `program_or_error` or `parse_major` above.
+/// `execute`, `install_args` or `program_or_error` above.
 ///
 /// NO TIMEOUT, on purpose. Killing a package manager mid-install leaves a half-written
 /// `node_modules` that is worse than no `node_modules` — the next `pnpm install` may consider it
 /// satisfied, and the agent then fails in a far more confusing way than "vitest not found". A hung
 /// install occupies one blocking thread and nothing else: this never runs on the spawn path (the
-/// caller does not await it) and never touches the UI thread. The same holds for the version probe
-/// below it, which under corepack may fetch a pinned manager before answering.
-fn run_install(worktree: &Path, pm: PackageManager) -> Result<Option<u32>, String> {
+/// caller does not await it) and never touches the UI thread.
+fn run_install(worktree: &Path, pm: PackageManager) -> Result<(), String> {
     let program = program_or_error(resolve_manager(pm), pm)?;
-    // Probed BEFORE the install because it decides the argv (see `install_args`), and probed IN THE
-    // WORKTREE so it reads the same manager the install will use.
-    let major = major_version(worktree, &program);
     let output = std::process::Command::new(&program)
         .current_dir(worktree)
-        .args(pm.install_args(major))
+        .args(pm.install_args())
         // Package managers prompt (`pnpm approve-builds`, npm's audit fix prompts) and will sit
         // forever on a stdin that never closes. CI is the standard "nobody is watching" signal and
         // every one of these respects it.
@@ -412,7 +342,7 @@ fn run_install(worktree: &Path, pm: PackageManager) -> Result<Option<u32>, Strin
         .output()
         .map_err(|e| format!("failed to run {program}: {e}"))?;
     if output.status.success() {
-        return Ok(major);
+        return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let msg = if stderr.is_empty() {
@@ -553,7 +483,7 @@ mod tests {
         let mut called = false;
         let outcome = execute(BootstrapPlan::Skip(SkipReason::AlreadyInstalled), |_| {
             called = true;
-            Ok(None)
+            Ok(())
         });
         assert!(!called, "a skipped plan must not invoke the package manager");
         assert_eq!(outcome.status, "skipped");
@@ -565,7 +495,7 @@ mod tests {
         let mut ran_with = None;
         let outcome = execute(BootstrapPlan::Install(PackageManager::Pnpm), |pm| {
             ran_with = Some(pm);
-            Ok(None)
+            Ok(())
         });
         assert_eq!(ran_with, Some(PackageManager::Pnpm));
         assert_eq!(outcome.status, "installed");
@@ -621,7 +551,7 @@ mod tests {
         // carries no argv to constrain. Scoped by `is_supported` rather than by naming pnpm and npm,
         // so re-enabling a manager automatically brings it under this assertion.
         for pm in ALL_MANAGERS.into_iter().filter(|p| p.is_supported()) {
-            let args = pm.install_args(None);
+            let args = pm.install_args();
             assert!(
                 args.iter()
                     .any(|a| *a == "--frozen-lockfile" || *a == "--immutable" || *a == "ci"),
@@ -668,64 +598,35 @@ mod tests {
     }
 
     #[test]
-    fn the_version_parse_reads_real_output_and_doubts_everything_else() {
-        // This parse decides the trust posture — `Some(10)` omits `--ignore-scripts`, anything else
-        // adds it — and it was the only untested logic on that path. Every ambiguous input must come
-        // back `None`, because `None` is the safe answer.
-        assert_eq!(parse_major("10.7.1"), Some(10)); // pnpm
-        assert_eq!(parse_major("11.17.0\n"), Some(11)); // npm, with the trailing newline
-        assert_eq!(parse_major("v9.1.0"), Some(9)); // tolerate a leading v
-        assert_eq!(parse_major("  10.7.1  "), Some(10)); // and surrounding whitespace
-
-        assert_eq!(parse_major(""), None);
-        assert_eq!(parse_major("not a version"), None);
-        // A corepack shim that prints a banner before the number, or any other unexpected shape,
-        // must not be read as a version — misreading one is what reopens the hole.
-        assert_eq!(parse_major("Downloading pnpm@9.1.0\n9.1.0"), None);
-        assert_eq!(parse_major("."), None);
-    }
-
-    #[test]
-    fn pnpm_below_v10_is_not_trusted_to_gate_dependency_scripts() {
-        // The default gate on third-party build scripts is a pnpm **v10** behaviour. On pnpm 8/9,
-        // `pnpm install` runs every `preinstall`/`install`/`postinstall` in the dependency graph.
+    fn no_unattended_install_ever_runs_dependency_scripts() {
+        // THE trust-boundary property, and now the only one — every supported manager blocks
+        // lifecycle scripts unconditionally.
         //
-        // That matters more here than it would anywhere else, because `resolve_manager` takes
-        // whatever `command -v pnpm` yields — and under a corepack shim that resolves to the TARGET
-        // REPO'S pinned `packageManager` version. Sparkle opens agents on arbitrary repos, so
-        // without this check an untrusted repo picks the pnpm that decides whether its own
-        // dependencies' scripts run: pin `pnpm@9`, and merely opening an agent executes arbitrary
-        // code. Relying on an unverified default is not a trust boundary.
-        for major in [None, Some(8), Some(9)] {
+        // The three tests this replaces encoded a cleverer policy: probe the manager's version and
+        // rely on pnpm v10's built-in gate rather than the flag. That was wrong twice over, and the
+        // second reason is the one that killed it:
+        //
+        //   1. The probe is a process spawn, so its answer can differ from what the install
+        //      actually uses. It first read Sparkle's CWD rather than the worktree, which under a
+        //      corepack shim resolves an entirely different pnpm.
+        //   2. Even with a correct v10 reading, the gate is CONFIGURED BY FILES THE UNTRUSTED REPO
+        //      CONTROLS — `pnpm.onlyBuiltDependencies` and `dangerouslyAllowAllBuilds`. A hostile
+        //      repo pins `packageManager: "pnpm@10.x"` so the probe honestly reports 10, lists a
+        //      malicious dependency under `onlyBuiltDependencies`, and gets its install script run
+        //      from someone merely opening an agent — with the outcome reporting no caveat.
+        //
+        // No probe can close (2), because the thing being probed is under the attacker's control.
+        // So the version logic is gone entirely: no probe, no parse, no version-dependent argv.
+        // The cost is that a repo's own `prepare` step does not run, which is REPORTED (see below)
+        // and fixed by the agent running the install itself.
+        for pm in ALL_MANAGERS.into_iter().filter(|p| p.is_supported()) {
             assert!(
-                PackageManager::Pnpm.install_args(major).contains(&"--ignore-scripts"),
-                "pnpm {major:?} does not gate dependency scripts by default — it must be told to"
+                pm.install_args().contains(&"--ignore-scripts"),
+                "{pm:?}: an unattended install triggered by merely opening an agent must never run \
+                 lifecycle scripts from a repo Sparkle does not trust"
             );
-            assert!(PackageManager::Pnpm.skips_project_scripts(major));
+            assert!(pm.skips_project_scripts());
         }
-    }
-
-    #[test]
-    fn pnpm_relies_on_its_own_default_rather_than_ignore_scripts() {
-        // The trust boundary worth defending is THIRD-PARTY code: `postinstall` from the dependency
-        // graph, which nobody reviewed. pnpm v10 already gates exactly that by default — the probe
-        // install printed "Ignored build scripts: @clerk/shared, core-js, esbuild, sharp,
-        // unrs-resolver" and the suite still ran.
-        //
-        // What pnpm still runs is the PROJECT'S OWN `prepare`/`postinstall`, and that is correct to
-        // keep: the user deliberately opened an agent on this repo, and the agent is about to run
-        // its tests and its build anyway, so the repo's own scripts are not an escalation. Adding
-        // `--ignore-scripts` here would have STRICTLY REDUCED the posture rather than made it
-        // explicit, and — because `plan_for` short-circuits on an existing `node_modules` — it would
-        // have cached a half-provisioned tree forever for any repo with a root `prepare` step. That
-        // fails as `Cannot find module …`, which is worse than the clean `vitest: command not found`
-        // this module exists to fix.
-        assert!(
-            !PackageManager::Pnpm.install_args(Some(10)).contains(&"--ignore-scripts"),
-            "pnpm v10's default already gates dependency build scripts; the flag only removes the \
-             project's own, which risks caching a half-provisioned worktree"
-        );
-        assert!(!PackageManager::Pnpm.skips_project_scripts(Some(10)));
     }
 
     #[test]
@@ -735,8 +636,8 @@ mod tests {
         // taken deliberately, but it must not be SILENT: combined with the `AlreadyInstalled`
         // short-circuit it can leave a tree that exists and does not work, and an outcome that
         // just says "installed" gives no way to tell.
-        assert!(PackageManager::Npm.install_args(None).contains(&"--ignore-scripts"));
-        let outcome = execute(BootstrapPlan::Install(PackageManager::Npm), |_| Ok(None));
+        assert!(PackageManager::Npm.install_args().contains(&"--ignore-scripts"));
+        let outcome = execute(BootstrapPlan::Install(PackageManager::Npm), |_| Ok(()));
         assert_eq!(outcome.status, "installed");
         let detail = outcome.detail.unwrap_or_default();
         assert!(
