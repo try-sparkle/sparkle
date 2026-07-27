@@ -868,7 +868,26 @@ fn backup_one(op: &str, args: &OpBackupArgs) -> Result<OpBackupRecord, String> {
 fn download_document(op: &str, item_id: &str, dest: &Path) -> Result<(), String> {
     let dest_s = dest.to_string_lossy().into_owned();
     let mut last: Option<String> = None;
-    for flag in DOC_GET_OUT_FLAGS {
+    // Was `dest` empty when we were called? The existence gate below only means "THIS attempt's
+    // `op` wrote a file" if each attempt starts from nothing, so on a retry we clear the previous
+    // attempt's debris — but only debris we can prove is ours. If something was already here at
+    // entry it belongs to the CALLER (concretely: the seed path treats a dangling symlink as
+    // absent, and `remove_file` would delete the user's LINK), so we never touch it.
+    let starts_empty = std::fs::symlink_metadata(dest).is_err();
+    for (attempt, flag) in DOC_GET_OUT_FLAGS.into_iter().enumerate() {
+        // BETWEEN attempts only — never before the first, which is the caller's to guarantee.
+        if attempt > 0 && starts_empty {
+            match std::fs::remove_file(dest) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(format!(
+                        "couldn't clear {} before retrying the download: {e}",
+                        display_name(dest)
+                    ));
+                }
+            }
+        }
         match run_op(op, &document_get_argv(item_id, &dest_s, flag), OP_TIMEOUT) {
             Ok(_) => {
                 // A zero exit is NOT proof the document landed. If `op` treats the output flag as a
@@ -876,8 +895,10 @@ fn download_document(op: &str, item_id: &str, dest: &Path) -> Result<(), String>
                 // document goes to stdout and exits 0 with nothing written — and we would report a
                 // successful restore for a file that does not exist. Every caller ensures the
                 // destination is absent before this call, so EXISTENCE is the discriminator: a file
-                // being there now can only mean `op` wrote it. Size must not be — a legitimately
-                // empty `.env` (a `touch`ed placeholder) is backed up at 0 bytes and has to restore.
+                // being there now can only mean `op` wrote it — the clear above keeps that true on
+                // a retry, so attempt 1's partial output can't be read as attempt 2's success.
+                // Size must not be the discriminator — a legitimately empty `.env` (a `touch`ed
+                // placeholder) is backed up at 0 bytes and has to restore.
                 // On an absent destination, fall through to the next flag spelling.
                 if dest.metadata().is_ok() {
                     set_owner_only_permissions(dest);
@@ -933,8 +954,24 @@ fn download_document_atomically(op: &str, item_id: &str, dest: &Path) -> Result<
         return Err(format!("{} is not a file path", display_name(dest)));
     };
 
-    // A leftover temp from a previous crash must not be mistaken for a fresh download.
-    let _ = std::fs::remove_file(&tmp);
+    // A leftover temp from a previous crash must not be mistaken for a fresh download, and if it
+    // can't be cleared we must REFUSE rather than download "over" it: [`download_document`] gates
+    // success on the temp existing, so stale bytes still sitting there would pass that gate and be
+    // renamed over the user's file as a "successful" restore. Anything but NotFound is fatal.
+    // This is also the sole owner of the pre-attempt-1 clear that gate depends on.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            // Name the TEMP — its NAME, not a path (the module's privacy rule) — and say where it
+            // lives, so the user knows what to remove to unblock every future restore of this file.
+            return Err(format!(
+                "a leftover restore temp ({}) sits next to the file being restored and couldn't be \
+                 removed: {e} — delete it, then restore again",
+                display_name(&tmp)
+            ));
+        }
+    }
 
     if let Err(e) = download_document(op, item_id, &tmp) {
         let _ = std::fs::remove_file(&tmp);
@@ -1013,22 +1050,52 @@ fn restore_write_target(dest: &Path) -> Result<PathBuf, String> {
 /// which has no bytes to hash at all.
 fn restore_one(op: &str, args: &OpRestoreArgs) -> Result<(), String> {
     let dest = PathBuf::from(&args.abs_path);
-    if std::fs::symlink_metadata(&dest).is_ok() {
-        // `dest.exists()` here separates "hashable bytes" from a dangling link, which reads as
-        // "differs" without an `op` round trip.
-        if dest.exists() {
-            let on_disk = sha256_of_file(&dest)?;
+    if let Ok(meta) = std::fs::symlink_metadata(&dest) {
+        // Only a genuinely DANGLING link is excused from hashing — it has no bytes, so it can never
+        // prove itself identical to the vault copy and takes the conservative "differs" branch.
+        // Dangling means the target is MISSING (NotFound) specifically, not merely unreachable: a
+        // LIVE link behind an unreadable parent (EACCES), or a symlink loop (ELOOP), must stay a
+        // hard error rather than be told its "target is missing" and then hand-resolved into a
+        // second, more confusing failure downstream.
+        let dangling = meta.file_type().is_symlink()
+            && matches!(std::fs::metadata(&dest), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        let on_disk = match sha256_of_file(&dest) {
+            Ok(h) => Some(h),
+            Err(_) if dangling => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(on_disk) = on_disk {
             let in_vault = item_sha256(op, &args.item_id, None)?;
             if in_vault.as_deref() == Some(on_disk.as_str()) {
                 return Ok(()); // byte-identical — a no-op either way
             }
         }
         if !args.overwrite {
-            return Err(format!(
-                "{} already exists on disk and differs from the backup. Restoring would discard \
-                 those local changes — confirm the overwrite to continue.",
-                display_name(&dest)
-            ));
+            // A dangling link gets its OWN message: "differs from the backup / discard those local
+            // changes" describes a file that isn't there. It locates where the bytes would land,
+            // but only when that can be done without emitting an absolute path (the module-wide
+            // privacy rule — these strings cross the IPC boundary and may be logged): a RELATIVE
+            // target is quoted verbatim, since it is what the user wrote and carries no machine
+            // specifics; an absolute one is reduced to a flat locator rather than leaked.
+            return Err(if dangling {
+                let points_at = match std::fs::read_link(&dest) {
+                    Ok(t) if t.is_relative() => format!(" ({})", t.to_string_lossy()),
+                    Ok(_) => " (an absolute path)".to_string(),
+                    Err(_) => String::new(),
+                };
+                format!(
+                    "{} already exists on disk as a symlink whose target{points_at} is missing. \
+                     Restoring will recreate the file the link points at — confirm the overwrite \
+                     to continue.",
+                    display_name(&dest)
+                )
+            } else {
+                format!(
+                    "{} already exists on disk and differs from the backup. Restoring would \
+                     discard those local changes — confirm the overwrite to continue.",
+                    display_name(&dest)
+                )
+            });
         }
         // Overwrite was granted — but the existing file is NOT removed here. It stays untouched
         // until a complete replacement exists next to it; see download_document_atomically.
@@ -2042,6 +2109,266 @@ fi
         assert_eq!(
             std::fs::read_to_string(d.path().join("shared/real.env")).unwrap(),
             "NEW=1\n"
+        );
+    }
+
+    #[test]
+    fn a_stale_leftover_temp_never_passes_as_a_fresh_download() {
+        // THE shape where the pre-clear is load-bearing: a crash left a temp holding STALE bytes,
+        // and this time `op` exits 0 WITHOUT writing (the stdout-positional case). If the stale
+        // temp survived it would satisfy the existence gate and be renamed over the destination as
+        // a "successful" restore. It is cleared first, so the restore FAILS and the stale bytes go
+        // nowhere.
+        let d = tmp();
+        let dest = d.path().join(".env");
+        std::fs::write(d.path().join(".env.sparkle-restore"), "STALE=1\n").unwrap();
+        let op = fake_op(
+            d.path(),
+            r#"
+if [ "$1" = "item" ]; then
+  printf '{"id":"I1","fields":[]}\n'
+else
+  exit 0
+fi
+"#,
+        );
+
+        let err = restore_one(
+            &op,
+            &OpRestoreArgs {
+                item_id: "I1".into(),
+                abs_path: dest.to_string_lossy().into_owned(),
+                overwrite: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("wrote nothing"), "got {err}");
+        assert!(!dest.exists(), "stale bytes must never be renamed into place");
+    }
+
+    #[test]
+    fn an_unclearable_leftover_temp_refuses_the_restore_without_touching_the_file() {
+        // Something unremovable (here: a directory) squats at the temp name. Downloading "over" it
+        // would let stale bytes pass the existence gate, so the restore refuses BEFORE any
+        // `op document` call — and the user's file stays byte-for-byte untouched.
+        let d = tmp();
+        let dest = d.path().join(".env");
+        std::fs::write(&dest, "PRECIOUS=1\n").unwrap();
+        std::fs::create_dir(d.path().join(".env.sparkle-restore")).unwrap();
+        let op = fake_op_with_sha(d.path(), "a-different-hash", "NEW=1\n");
+
+        let err = restore_one(
+            &op,
+            &OpRestoreArgs {
+                item_id: "I1".into(),
+                abs_path: dest.to_string_lossy().into_owned(),
+                overwrite: true,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("leftover restore temp"), "got {err}");
+        assert!(err.contains(".env.sparkle-restore"), "the message must name the temp: {err}");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "PRECIOUS=1\n");
+        assert!(
+            !argv_calls(d.path())
+                .iter()
+                .any(|c| c.first().map(|s| s == "document").unwrap_or(false)),
+            "no download may be attempted when the temp can't be cleared"
+        );
+    }
+
+    #[test]
+    fn debris_from_a_failed_flag_attempt_never_passes_as_the_next_attempts_success() {
+        // Attempt 1 (--out-file) partially writes, then dies with an unknown-flag-shaped error;
+        // attempt 2 exits 0 but streams to stdout, writing nothing. The existence gate must judge
+        // each attempt on ITS OWN output: without the between-attempt clear, attempt 1's debris is
+        // reported — and renamed into place — as attempt 2's success.
+        let d = tmp();
+        let dest = d.path().join(".env");
+        let op = fake_op(
+            d.path(),
+            r#"
+if [ "$4" = "--out-file" ]; then
+  printf 'DEBRIS=1' > "$5"
+  echo "unknown flag: --out-file" >&2; exit 1
+fi
+exit 0
+"#,
+        );
+        let err = download_document(&op, "I1", &dest).unwrap_err();
+        assert!(err.contains("wrote nothing"), "got {err}");
+        assert!(!dest.exists(), "attempt 1's debris must not survive as a 'restored' file");
+    }
+
+    #[test]
+    fn unremovable_debris_from_attempt_one_refuses_the_retry() {
+        // Attempt 1 leaves something unremovable (a non-empty directory) at the scratch path and
+        // dies with an unknown-flag error. The between-attempt clear refuses the retry — the
+        // hard-fail arm of that clear, which nothing else exercises.
+        let d = tmp();
+        let dest = d.path().join(".env");
+        let op = fake_op(
+            d.path(),
+            r#"
+if [ "$4" = "--out-file" ]; then
+  mkdir -p "$5/sub" && echo x > "$5/sub/x"
+  echo "unknown flag: --out-file" >&2; exit 1
+fi
+printf 'OK=1\n' > "$5"
+"#,
+        );
+        let err = download_document(&op, "I1", &dest).unwrap_err();
+        assert!(err.contains("before retrying"), "got {err}");
+    }
+
+    #[test]
+    fn the_between_attempt_clear_never_deletes_something_the_caller_left() {
+        // The guard on that clear. `download_document`'s contract is that `dest` starts empty, and
+        // the seed path satisfies it with `exists()` — which a DANGLING symlink passes while
+        // `remove_file` would delete the user's LINK. So when anything is present at entry the
+        // clear must stand down: attempt 1 writes nothing (unknown flag), attempt 2 also writes
+        // nothing, and the link must still be there afterwards.
+        let d = tmp();
+        let dest = d.path().join(".env");
+        std::os::unix::fs::symlink("shared/gone.env", &dest).unwrap();
+        let op = fake_op(
+            d.path(),
+            r#"
+if [ "$4" = "--out-file" ]; then
+  echo "unknown flag: --out-file" >&2; exit 1
+fi
+exit 0
+"#,
+        );
+        let err = download_document(&op, "I1", &dest).unwrap_err();
+        assert!(err.contains("wrote nothing"), "got {err}");
+        assert!(
+            std::fs::symlink_metadata(&dest).unwrap().file_type().is_symlink(),
+            "a caller-owned dangling link must survive the retry path"
+        );
+    }
+
+    #[test]
+    fn an_absolute_link_target_is_never_leaked_into_the_overwrite_message() {
+        // The privacy rule: error strings cross the IPC boundary and may be logged, so an ABSOLUTE
+        // link target is reduced to a flat "(an absolute path)" locator. Only a relative target —
+        // what the user wrote, carrying no machine specifics — is quoted verbatim.
+        let d = tmp();
+        let dest = d.path().join(".env");
+        std::os::unix::fs::symlink(d.path().join("shared").join(".env"), &dest).unwrap();
+        let op = fake_op_with_sha(d.path(), "vault-hash", "NEW=1\n");
+
+        let err = restore_one(
+            &op,
+            &OpRestoreArgs {
+                item_id: "I1".into(),
+                abs_path: dest.to_string_lossy().into_owned(),
+                overwrite: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("is missing"), "got {err}");
+        assert!(err.contains("an absolute path"), "the flat locator must appear: {err}");
+        let abs = d.path().to_string_lossy().into_owned();
+        assert!(!err.contains(&abs), "no absolute path may cross the boundary: {err}");
+    }
+
+    #[test]
+    fn a_relative_dangling_link_target_is_named_in_the_overwrite_message() {
+        // The other half: a relative target IS quoted, so the confirmation says where the bytes
+        // will land. Pins the branch the absolute case suppresses.
+        let d = tmp();
+        let dest = d.path().join(".env");
+        std::os::unix::fs::symlink("shared/gone.env", &dest).unwrap();
+        let op = fake_op_with_sha(d.path(), "vault-hash", "NEW=1\n");
+
+        let err = restore_one(
+            &op,
+            &OpRestoreArgs {
+                item_id: "I1".into(),
+                abs_path: dest.to_string_lossy().into_owned(),
+                overwrite: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("is missing"), "got {err}");
+        assert!(err.contains("shared/gone.env"), "the relative target must be quoted: {err}");
+        assert!(
+            !err.contains("local changes"),
+            "a dangling link has no local changes to discard: {err}"
+        );
+    }
+
+    #[test]
+    fn a_self_referential_symlink_fails_hard_not_as_dangling() {
+        // `.env -> .env`: metadata fails with ELOOP, which is not NotFound — so it must NOT be
+        // classified dangling (that message would offer to "recreate the file the link points at",
+        // i.e. itself) and the hash read's hard error surfaces instead. overwrite: false, so a
+        // misclassification WOULD reach the dangling message — keeping the negative assertion
+        // falsifiable.
+        let d = tmp();
+        let dest = d.path().join(".env");
+        std::os::unix::fs::symlink(Path::new(".env"), &dest).unwrap();
+        let op = fake_op_with_sha(d.path(), "vault-hash", "NEW=1\n");
+
+        let err = restore_one(
+            &op,
+            &OpRestoreArgs {
+                item_id: "I1".into(),
+                abs_path: dest.to_string_lossy().into_owned(),
+                overwrite: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("couldn't read"), "expected the hash-read hard error, got {err}");
+        assert!(!err.contains("is missing"), "a symlink loop is not a missing target: {err}");
+        assert!(std::fs::symlink_metadata(&dest).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn an_unreachable_live_link_is_a_hard_error_not_a_dangling_one() {
+        // A LIVE `.env -> shared/.env` whose parent directory is unreadable (EACCES). "Dangling"
+        // means the target is MISSING — an unreachable target must surface as a hard error, not as
+        // "target is missing" followed by a second confusing resolution failure.
+        let d = tmp();
+        let shared = d.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join(".env"), "S=1\n").unwrap();
+        let dest = d.path().join(".env");
+        std::os::unix::fs::symlink(Path::new("shared").join(".env"), &dest).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::metadata(&dest).is_ok() {
+            // Running as root — permissions don't bite, the scenario can't be constructed.
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping an_unreachable_live_link test: running as root");
+            return;
+        }
+        // The fake `op` is never reached (the hash read fails first) — it exists so a regression
+        // that DID reach op would fail on assertions rather than on a missing binary.
+        let op = fake_op_with_sha(d.path(), "vault-hash", "NEW=1\n");
+        let result = restore_one(
+            &op,
+            &OpRestoreArgs {
+                item_id: "I1".into(),
+                abs_path: dest.to_string_lossy().into_owned(),
+                overwrite: false,
+            },
+        );
+        // Restore permissions BEFORE any assertion can panic, so the tempdir always cleans up.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = result.unwrap_err();
+        assert!(err.contains("couldn't read"), "expected the hash-read hard error, got {err}");
+        assert!(!err.contains("is missing"), "an unreadable target is not a MISSING one: {err}");
+        assert!(std::fs::symlink_metadata(&dest).unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(shared.join(".env")).unwrap(),
+            "S=1\n",
+            "the live target must be untouched by the failed restore"
+        );
+        assert!(
+            !d.path().join(".env.sparkle-restore").exists()
+                && !shared.join(".env.sparkle-restore").exists(),
+            "no temp may be created before the destination is validated"
         );
     }
 
