@@ -133,7 +133,17 @@ function resolveTargetId(req: ControlRequest): string {
  *  put into an agent's context — it is ~250 chars per agent and PERMANENT (an MCP tool result is
  *  never evicted for the rest of the session), so a 57-agent roster cost ~3,500 tokens EVERY call.
  *  Most of those rows were dormant closed tabs (status "stopped") that no caller was asking about,
- *  which is why "active" — not "all" — is the default. */
+ *  which is why "active" — not "all" — is the default.
+ *
+ *  "active" is a ROSTER FILTER, NOT A PROCESS CHECK, and the name oversells it. It keeps: agents
+ *  this window has a status entry for, plus any with an open pane app-wide, plus the caller and the
+ *  caller's own workers. The open-pane set is persisted and cleared only on close, so after a
+ *  relaunch every tab that was open at quit is in it with no router having reported, and a finished
+ *  worker whose pane is still open elsewhere stays in "active" indefinitely. It was described as
+ *  "agents with a live process" until roborev 53556 pointed out that that is the same overclaim
+ *  `liveness` had just been corrected for, one level up — and the more dangerous one, since a caller
+ *  that trusts the scope contract ("I asked for live processes, I got N rows, so N workers are
+ *  running") never reaches the per-row `liveness` field at all. Count rows here, never processes. */
 export type StateScope = "self" | "active" | "all";
 
 /** Coerce the caller-supplied `scope` to a known value, defaulting to the cheap one. Unknown or
@@ -154,16 +164,29 @@ const OMITTED_IDS_CAP = 20;
  *  Necessary because `status` defaults to "stopped" for an agent with no runtime entry, and "stopped"
  *  is also the documented value for "no process at all". Once scope "active" started keeping rows on
  *  evidence OTHER than a live status entry (open in another window; the caller; the caller's own
- *  child), the reply contradicted itself: a scope advertised as "agents with a live process" handing
+ *  child), the reply contradicted itself: a scope then advertised as "agents with a live process"
+ *  (that wording is gone — see StateScope) handing
  *  back rows labelled dead. An orchestrator polling its fleet would read a live worker as "stopped"
  *  — the same value workerAttention paints RED — and could reasonably conclude it died and respawn
  *  it. `liveness` is the field that tells the two apart. Found by roborev 53476.
  *
  *    local        — this window has a runtime status entry; `status` is authoritative.
- *    other-window — no local entry, but the agent is open in SOME window (openAgentIds is persisted
- *                   and merged app-wide). It IS mounted; `status` merely defaulted. Not dead.
- *    unknown      — no local entry and not open anywhere. Genuinely stopped, OR a just-spawned
- *                   worker whose pane has not mounted yet. Do NOT conclude it died. */
+ *    other-window — no local entry, but a pane for this agent is open in SOME window (openAgentIds
+ *                   is persisted and merged app-wide). This window CANNOT OBSERVE its status: the
+ *                   agent may be running or may have finished. `status` here is a default, not a
+ *                   reading.
+ *    unknown      — no local entry and no open pane this window can see. Genuinely stopped, OR a
+ *                   just-spawned worker whose pane has not mounted yet.
+ *
+ *  NEITHER non-local label is a liveness ASSERTION — they mark the absence of an observation, and
+ *  that asymmetry is deliberate. `openAgentIds` is cleared only by runtimeStore.close() (tab close /
+ *  window close / worker despawn) and is persisted across relaunch, so a worker whose process has
+ *  exited keeps its id in the set. Reading "other-window" as "alive" would flip the original bug
+ *  into a worse one: instead of falsely respawning a live worker, a caller would never observe one
+ *  die and would wait on it forever. If you need a real death signal, ask something that observes
+ *  the process — an orchestrator has wait_for_workers and the worker's own result file; get_state
+ *  is a UI-roster read, not a process monitor. (roborev 53476 added the field, 53552 corrected what
+ *  it is allowed to claim.) */
 export type AgentLiveness = "local" | "other-window" | "unknown";
 
 function livenessOf(

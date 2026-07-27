@@ -215,18 +215,20 @@ describe("controlListener", () => {
     });
   });
 
-  it("get_state labels an agent open in ANOTHER window as 'other-window', not dead", async () => {
+  it("get_state labels an agent open in ANOTHER window as 'other-window' (status unobservable here)", async () => {
     useRuntimeStore.getState().setStatus(callerId, "working");
     useRuntimeStore.setState({ openAgentIds: [otherId] } as never); // open, but no status HERE
     fire({ reqId: "s10", op: "get_state", callerAgentId: callerId, payload: {} });
     await flush();
     const res = lastReply() as { agents: Array<Record<string, unknown>> };
     const worker = res.agents.find((a) => a.id === otherId)!;
-    // `status` still defaults to "stopped" — that is exactly why the label has to be here.
+    // `status` still defaults to "stopped" — that is exactly why the label has to be here. Note the
+    // label says "this window cannot see it", NOT "it is alive": openAgentIds is cleared only on
+    // close and survives relaunch, so a finished worker can sit here indefinitely (roborev 53552).
     expect(worker).toMatchObject({ status: "stopped", liveness: "other-window" });
   });
 
-  it("get_state labels a just-spawned worker (no entry, not open) as 'unknown', not dead", async () => {
+  it("get_state labels a just-spawned worker (no entry, not open) as 'unknown'", async () => {
     useRuntimeStore.getState().setStatus(callerId, "working");
     useRuntimeStore.setState({ openAgentIds: [] } as never); // otherId: worker, parentId=callerId
     fire({ reqId: "s11", op: "get_state", callerAgentId: callerId, payload: {} });
@@ -234,7 +236,8 @@ describe("controlListener", () => {
     const res = lastReply() as { agents: Array<Record<string, unknown>> };
     const worker = res.agents.find((a) => a.id === otherId)!;
     expect(worker).toMatchObject({ status: "stopped", liveness: "unknown" });
-    // The whole point: "stopped" here must NOT be readable as "this worker died".
+    // The point of the field: "stopped" here is a DEFAULT, not an observation, so it must not be
+    // readable as "this worker died" — only the "local" label carries an actual status reading.
     expect(worker.liveness).not.toBe("local");
   });
 

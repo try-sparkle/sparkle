@@ -50,10 +50,35 @@ describe("sparkleControlProtocol — name yourself early, but never in a turn of
     expect(p).toMatch(/LAST tool-using turn/);
   });
 
+  it("gives the carve-out a fallback, so it can never justify a solo control turn", () => {
+    // roborev 53552: an agent does not know a turn is its LAST until the results come back and it
+    // decides to stop — so the literal-compliance path is a narration issued after the last real
+    // tool call, i.e. exactly the solo turn the COST RULE forbids (~82,575 billed tokens). That
+    // would spend an Opus-tier context replay to avoid one Haiku summary: strictly worse than the
+    // thing it replaces. The exemption is only safe while the fallback rides with it.
+    const p = sparkleControlProtocol();
+    expect(p).toMatch(/if you only realize you're stopping AFTER your last tool call/i);
+    expect(p).toMatch(/do NOT send the narration/i);
+    expect(p).toMatch(/COST RULE wins/);
+  });
+
   it("warns that get_state is expensive and offers the narrowing scope", () => {
     const p = sparkleControlProtocol();
     expect(p).toMatch(/get_state\(\{ scope \}\)/);
     expect(p).toMatch(/EXPENSIVE/);
+  });
+
+  it("does not sell scope 'active' as a process check, and points at liveness", () => {
+    // roborev 53556: the per-row `liveness` label was corrected to stop asserting aliveness, but
+    // the SCOPE contract one level up still said "agents with a live process" — the same overclaim,
+    // and the more dangerous one: a caller that trusts it ("I asked for live processes, I got N
+    // rows, so N workers are running") never reaches the liveness field at all. The persona is the
+    // surface every agent reads unconditionally, so if it still claims live processes it silently
+    // contradicts the corrected MCP tool description sitting in the same context window.
+    const p = sparkleControlProtocol();
+    expect(p).not.toMatch(/agents with a live process/);
+    expect(p).toMatch(/not a process check/);
+    expect(p).toMatch(/liveness/);
   });
 
   it("the demands ride in every code-producing persona, not just the snippet", () => {
