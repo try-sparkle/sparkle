@@ -184,9 +184,11 @@ export function ComposeBox({
         <textarea
           ref={textareaRef}
           aria-label={toAgent ? `Message ${send!.agentName}` : "Message Sparkle"}
-          placeholder={
-            toAgent ? `Prompt ${send!.agentName}…  (⌘↩ to send)` : "Talk to Sparkle…  (⌘↩ to send)"
-          }
+          // No "(⌘↩ to send)" tail. The shortcut still works (see onKeyDown) — but a placeholder is
+          // prime real estate for saying what this box is FOR, and spending it on a keybinding the
+          // adjacent Send button already teaches made the prompt read like a manual. The hint was
+          // also permanently wrong for anyone who just presses the button.
+          placeholder={toAgent ? `Prompt ${send!.agentName}…` : "Talk to Sparkle…"}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
@@ -209,6 +211,9 @@ export function ComposeBox({
           onClick={submit}
           disabled={text.trim().length === 0}
           aria-label="Send"
+          // Carries the shortcut the placeholder no longer spends its text on — without this the
+          // keybinding would have no on-screen discoverability at all.
+          title="Send (⌘↩)"
           style={{
             fontSize: 13,
             fontWeight: FONT_WEIGHT.bold,

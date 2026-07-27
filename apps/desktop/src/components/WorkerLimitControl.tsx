@@ -19,8 +19,11 @@ export const WORKER_LIMIT_SLIDER_MAX = 50;
  */
 export function WorkerLimitControl() {
   const value = useSettingsStore((s) => s.maxConcurrentWorkers);
-  // What installed RAM actually allows (derived in Rust). When it's the smaller number, IT is the
-  // limit in force — the slider keeps showing the user's choice, and the hint below tells the truth.
+  // What the MACHINE actually allows — min(RAM-derived, cores × 2), derived in Rust. When it's the
+  // smaller number, IT is the limit in force; the slider keeps showing the user's choice and the
+  // hint below tells the truth. NOTE: the hint text is still RAM-only and can therefore be wrong on
+  // a core-bound machine — tracked as a follow-up (roborev 53087), needs the binding dimension
+  // plumbed through EffectiveConfig before the copy can branch correctly.
   const effective = useSettingsStore((s) => s.effectiveMaxConcurrentWorkers);
   const ramCapped = effective < value;
   const setLive = useSettingsStore((s) => s.setMaxConcurrentWorkers);

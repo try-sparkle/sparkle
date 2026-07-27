@@ -66,6 +66,12 @@ const NewCloudAgentDialog = lazy(() =>
   import("./NewCloudAgentDialog").then((m) => ({ default: m.NewCloudAgentDialog })),
 );
 
+/** The macOS titlebar / Window menu / dock tooltip text. A constant, not the project name — the
+ *  project tab bar is what says which project you're on. Matches tauri.conf.json's window title so
+ *  the runtime set_title can never disagree with the title the window is BORN with (a mismatch
+ *  shows up as a visible flicker from one name to another during boot). */
+export const WINDOW_TITLE = "Sparkle";
+
 /** Fills the pane slot with the app background while a lazy surface's chunk loads, so on-demand
  * loading never flashes a blank/white frame under the (eager) shell. */
 function PaneFallback() {
@@ -284,17 +290,20 @@ export function Workspace() {
   }, [zoomIn, zoomOut, resetZoom]);
 
   const project = projects.find((p) => p.id === currentProjectId) ?? null;
-  const projectName = project?.name ?? null;
 
-  // Title the window after the project the selected tab shows, so the macOS Window menu and the
-  // dock tooltip name the work rather than a generic "Sparkle".
+  // The window is titled "Sparkle", full stop — NOT the selected project's name.
+  //
+  // It used to name the project, on the theory that the macOS Window menu and dock tooltip should
+  // name the work. That reasoning died with the project TAB BAR: the tabs already say which project
+  // you're on, and much more precisely (they show every open project and which is selected, not
+  // just the one name). All the title added was a second, redundant answer to a question already
+  // answered on screen — and a confusing one, because a repo folder called e.g. "sparkle-desktop"
+  // made the chrome read as a different app than the one the user launched.
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
     // A rejection (e.g. window tearing down mid-call) must not surface as an unhandled rejection.
-    getCurrentWindow()
-      .setTitle(projectName?.trim() || "Sparkle")
-      .catch(() => {});
-  }, [projectName]);
+    getCurrentWindow().setTitle(WINDOW_TITLE).catch(() => {});
+  }, []);
 
   const activeAgentId = project?.selectedAgentId ?? null;
   // The agent the concierge compose box can prompt directly (CM-U7): the selected tab's selected

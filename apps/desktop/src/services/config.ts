@@ -18,9 +18,14 @@ export interface WorkflowConfig {
   drift: DriftConfig;
 }
 export interface WorkersConfig {
-  /** The user's requested ceiling. The number actually enforced is
-   *  `EffectiveConfig.effective_max_concurrent`, which also accounts for installed RAM. */
-  max_concurrent: number;
+  /** The user's PINNED ceiling, or null/absent for AUTO — the default, where the limit is derived
+   *  from the machine (RAM and CPU cores). Either way the number actually enforced is
+   *  `EffectiveConfig.effective_max_concurrent`.
+   *
+   *  Nullable deliberately, so the compiler forces every reader to handle auto. An unguarded
+   *  `Math.floor(max_concurrent)` on the auto case yields 0, which clamps to a single worker —
+   *  a silent, total throttle rather than a visible error. */
+  max_concurrent: number | null;
   /** Per-agent V8 heap cap in MiB (NODE_OPTIONS=--max-old-space-size). 0 = opt out.
    *  Optional so callers guard: a Rust backend predating this key omits it. */
   agent_heap_mb?: number;
@@ -144,9 +149,10 @@ export interface SparkleConfig {
 export interface EffectiveConfig {
   config: SparkleConfig;
   warnings: string[];
-  /** The concurrency limit to ENFORCE: `workers.max_concurrent` narrowed by how many agent-sized
-   *  heaps this machine's RAM can hold. Always ≤ max_concurrent. Optional so callers guard: a Rust
-   *  backend predating memory-aware concurrency omits it (fall back to `workers.max_concurrent`). */
+  /** The concurrency limit to ENFORCE: what the machine can carry, `min(RAM-derived, cores × 2)`.
+   *  Under AUTO (`max_concurrent: null`) this is the ONLY bound; with a pinned ceiling it is
+   *  additionally capped by it. Optional so callers guard: a Rust backend predating machine-aware
+   *  concurrency omits it (fall back to `workers.max_concurrent`, or 1 when that is null too). */
   effective_max_concurrent?: number;
 }
 export interface ConfigPaths {

@@ -4,6 +4,7 @@ import {
   aiFeatureMode,
   migrateSettings,
   useSettingsStore,
+  enforcedWorkerCap,
   AI_FEATURE_FIELD,
   type AiFeatureFlags,
 } from "./settingsStore";
@@ -220,7 +221,7 @@ describe("settingsStore — Chief doc state", () => {
 // computed in Rust. Spawning to the former is how 24 agents × ~4 GiB got a Mac jetsam-killed.
 describe("effectiveMaxConcurrentWorkers — the RAM-aware enforced cap", () => {
   /** Minimal effective-config payload; only the fields these tests care about vary. */
-  const eff = (max_concurrent: number, effective_max_concurrent?: number): EffectiveConfig =>
+  const eff = (max_concurrent: number | null, effective_max_concurrent?: number): EffectiveConfig =>
     ({
       config: {
         workflow: {
@@ -266,6 +267,30 @@ describe("effectiveMaxConcurrentWorkers — the RAM-aware enforced cap", () => {
     expect(s.maxConcurrentWorkers).toBe(20);
     // ...but the enforced cap is what the machine can hold.
     expect(s.effectiveMaxConcurrentWorkers).toBe(3);
+  });
+
+  // AUTO (max_concurrent absent) is the DEFAULT, so this is the path most installs take.
+  it("uses the machine-derived value when the user has pinned no ceiling", () => {
+    useSettingsStore.getState().hydrateFromConfig(eff(null, 40));
+    const s = useSettingsStore.getState();
+    expect(s.effectiveMaxConcurrentWorkers).toBe(40);
+    // Both fields agree, so enforcedWorkerCap's min() can't clamp against a stale default.
+    expect(s.maxConcurrentWorkers).toBe(40);
+    expect(enforcedWorkerCap(s)).toBe(40);
+  });
+
+  // THE bug this guard exists for: Math.floor(null) is 0, and Math.max(1, 0) is 1 — so an
+  // unguarded read would silently throttle every auto-configured install to ONE worker.
+  it("does not collapse to a single worker when no ceiling is pinned", () => {
+    useSettingsStore.getState().hydrateFromConfig(eff(null, 12));
+    const s = useSettingsStore.getState();
+    expect(s.effectiveMaxConcurrentWorkers).toBe(12);
+    expect(enforcedWorkerCap(s)).toBeGreaterThan(1);
+  });
+
+  it("auto still floors at 1 when the backend reports nothing usable", () => {
+    useSettingsStore.getState().hydrateFromConfig(eff(null, undefined));
+    expect(useSettingsStore.getState().effectiveMaxConcurrentWorkers).toBe(1);
   });
 
   it("never exceeds the configured ceiling even if the backend reports a larger value", () => {

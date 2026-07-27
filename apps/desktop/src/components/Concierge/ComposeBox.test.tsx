@@ -72,6 +72,31 @@ describe("ComposeBox — submit", () => {
   });
 });
 
+// The placeholder sells what the box is FOR; it does not document the keybinding. Regression guard
+// for the "(⌘↩ to send)" tail that used to trail both variants.
+describe("ComposeBox — placeholder", () => {
+  it("says what the box is for, with no keybinding tail", () => {
+    setup();
+    expect(box().placeholder).toBe("Talk to Sparkle…");
+  });
+
+  it("names the agent when aimed at one, still with no keybinding tail", () => {
+    setup({ send: { target: "agent", agentName: "Stripe Checkout" } });
+    const aimed = screen.getByRole("textbox", {
+      name: "Message Stripe Checkout",
+    }) as HTMLTextAreaElement;
+    expect(aimed.placeholder).toBe("Prompt Stripe Checkout…");
+  });
+
+  it("dropping the hint did NOT drop the shortcut — ⌘Enter still sends", () => {
+    const { onSend } = setup();
+    expect(box().placeholder).not.toMatch(/⌘|to send/);
+    fireEvent.change(box(), { target: { value: "still works" } });
+    fireEvent.keyDown(box(), { key: "Enter", metaKey: true });
+    expect(onSend).toHaveBeenCalledWith("still works");
+  });
+});
+
 describe("ComposeBox — mic + attachments", () => {
   it("the mic button reports onMicToggle and reflects micLive as aria-pressed", () => {
     const { onMicToggle } = setup({ micLive: true });

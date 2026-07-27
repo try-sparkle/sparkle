@@ -246,9 +246,10 @@ interface SettingsState {
    *  (floored at 1, otherwise unbounded). Adjustable via the slider in the ⋯ menu; the
    *  orchestration persona reads this same value so the cap it's told about always matches. */
   maxConcurrentWorkers: number;
-  /** The concurrency the app actually ENFORCES: `maxConcurrentWorkers` narrowed by how many
-   *  agent-sized V8 heaps this machine's RAM can hold (computed in Rust, see
-   *  `EffectiveConfig.effective_max_concurrent`). Always ≤ `maxConcurrentWorkers`, always ≥ 1.
+  /** The concurrency the app actually ENFORCES: what the MACHINE can carry, computed in Rust as
+   *  `min(RAM-derived, cores × AGENTS_PER_CORE)` — see `EffectiveConfig.effective_max_concurrent`.
+   *  Cores bind as often as RAM does (an agent runs git, builds and test suites), so this is not a
+   *  memory-only number. Always ≤ `maxConcurrentWorkers`, always ≥ 1.
    *
    *  Why it's separate from `maxConcurrentWorkers`: that one is the user's *request* and stays
    *  intact so the ⋯-menu slider keeps showing what they chose. This one is what the machine can
@@ -547,19 +548,27 @@ export const useSettingsStore = create<SettingsState>()(
 
       hydrateFromConfig: (eff) => {
         const { config, warnings } = eff;
+        // `workers.max_concurrent` is null/absent when the user has NOT pinned a ceiling — the
+        // default. The machine-derived limit is then the only bound, and it arrives already
+        // computed in `effective_max_concurrent`. Reading the raw field unguarded would be a
+        // silent catastrophe here: `Math.floor(null)` is 0, so `Math.max(1, 0)` would pin EVERY
+        // auto-configured install to a single worker.
+        const pinnedCeiling =
+          typeof config.workers.max_concurrent === "number"
+            ? Math.max(1, Math.floor(config.workers.max_concurrent))
+            : null;
+        // `?? pinnedCeiling` covers a backend predating memory-aware concurrency; with neither we
+        // have no basis at all, so fall back to 1 rather than inventing a number.
+        const derived = Math.max(1, Math.floor(eff.effective_max_concurrent ?? pinnedCeiling ?? 1));
         set({
-          // Concurrency + AI flags (also surfaced in the ⋯ menu controls).
-          maxConcurrentWorkers: Math.max(1, Math.floor(config.workers.max_concurrent)),
-          // `?? max_concurrent` covers a backend predating memory-aware concurrency. The extra
-          // Math.min re-asserts the ceiling here so a bad/large backend value can never RAISE the
-          // cap above what the user configured — this store field is what the spawn gate reads.
-          effectiveMaxConcurrentWorkers: Math.max(
-            1,
-            Math.min(
-              Math.floor(config.workers.max_concurrent),
-              Math.floor(eff.effective_max_concurrent ?? config.workers.max_concurrent),
-            ),
-          ),
+          // Concurrency + AI flags (also surfaced in the ⋯ menu controls). With no pinned ceiling
+          // the user's "request" IS the derived value, so the two agree and enforcedWorkerCap's
+          // min() is a no-op rather than a clamp to a stale default.
+          maxConcurrentWorkers: pinnedCeiling ?? derived,
+          // The extra Math.min re-asserts the ceiling here so a bad/large backend value can never
+          // RAISE the cap above what the user pinned — this store field is what the spawn gate reads.
+          effectiveMaxConcurrentWorkers:
+            pinnedCeiling === null ? derived : Math.max(1, Math.min(pinnedCeiling, derived)),
           aiAutoRename: config.ai.auto_rename,
           cloudDictation: config.ai.voice_dictation,
           aiComposer: config.ai.composer,

@@ -52,10 +52,19 @@ pub struct WorkflowConfig {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct WorkersConfig {
-    /// The user's requested ceiling on parallel agents. This is a CEILING only — the value the app
-    /// actually enforces is `EffectiveConfig::effective_max_concurrent`, which additionally caps
-    /// concurrency at what installed RAM can hold (see `memory_aware_concurrency`).
-    pub max_concurrent: u32,
+    /// The user's requested ceiling on parallel agents, or `None` for AUTO — let the machine decide.
+    ///
+    /// `None` is the default, and it is the important case: a fixed number cannot be right for both
+    /// an 8 GiB Air and a 192 GiB Studio, and the old hardcoded 20 silently throttled every machine
+    /// bigger than ~64 GiB to less than half of what it could run (the RAM clamp below only ever
+    /// ratcheted DOWN, so spare capacity was unreachable). Auto derives the limit from the hardware
+    /// — see `auto_concurrency_bound`.
+    ///
+    /// When set, it stays a CEILING ONLY: the app enforces `min(configured, auto)`, never more.
+    /// Pinning a big number on a small machine must not be able to re-create the jetsam incident
+    /// this whole module exists to prevent. Either way the enforced value is
+    /// `EffectiveConfig::effective_max_concurrent`, which is what every concurrency gate reads.
+    pub max_concurrent: Option<u32>,
     /// Per-agent V8 old-space cap in MiB, applied as `NODE_OPTIONS=--max-old-space-size=<n>` on
     /// every PTY child (pty.rs). 0 = opt out (agents then use V8's own ~4 GiB default, which is
     /// exactly the runaway that jetsam-killed a machine — see sparkle-01xv).
@@ -316,11 +325,12 @@ impl Default for SparkleConfig {
                     changed_lines: 1000,
                 },
             },
-            // NOTE: raised from the legacy settingsStore default of 4 (design decision, 2026-06-29).
-            // NOTE: `max_concurrent` is a ceiling, not a promise — installed RAM narrows it further
-            // (see EffectiveConfig::effective_max_concurrent). 3 GiB per agent sits well under
-            // V8's ~4 GiB default so the cap actually bites, while leaving a real agent room to work.
-            workers: WorkersConfig { max_concurrent: 20, agent_heap_mb: 3072 },
+            // `max_concurrent: None` = AUTO, derived from the machine (see `auto_concurrency_bound`).
+            // It replaced a hardcoded 20 — a number that fit a ~64 GiB Mac by coincidence and
+            // throttled everything larger to a fraction of its capacity, because the RAM clamp could
+            // only lower the configured value, never raise it. 3 GiB per agent sits well under V8's
+            // ~4 GiB default so the heap cap actually bites, while leaving a real agent room to work.
+            workers: WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 },
             ai: AiConfig {
                 auto_rename: true,
                 voice_dictation: true,
@@ -391,7 +401,7 @@ impl EffectiveConfig {
     /// warning when installed RAM forces the limit below what the user configured.
     fn derive(config: SparkleConfig, mut warnings: Vec<String>) -> Self {
         let (effective_max_concurrent, warn) =
-            memory_aware_concurrency(&config.workers, total_memory_bytes());
+            memory_aware_concurrency(&config.workers, total_memory_bytes(), cpu_core_count());
         if let Some(w) = warn {
             // `for_project` re-derives on top of warnings that already came from the global layer,
             // so guard against showing the user the same clamp twice.
@@ -583,8 +593,12 @@ fn apply_workflow(into: &mut WorkflowConfig, p: Option<PartialWorkflow>) {
 
 fn apply_workers(into: &mut WorkersConfig, p: Option<PartialWorkers>) {
     let Some(p) = p else { return };
+    // ABSENT means auto — and `into` already holds the default (None/auto), so leaving it alone is
+    // exactly right. A present value is wrapped, never unwrapped: `Some(n)` is the user pinning a
+    // ceiling. There is deliberately no way to write "auto" as a VALUE; deleting the key is how you
+    // ask for auto, which keeps one representation of the concept instead of two.
     if let Some(v) = p.max_concurrent {
-        into.max_concurrent = v;
+        into.max_concurrent = Some(v);
     }
     if let Some(v) = p.agent_heap_mb {
         into.agent_heap_mb = v;
@@ -777,6 +791,11 @@ fn apply_delivered(into: &mut DeliveredConfig, p: Option<PartialDelivered>) {
 /// Smallest per-agent heap worth allowing. Below this an agent OOMs before doing useful work.
 const MIN_AGENT_HEAP_MB: u32 = 512;
 
+/// The `max_concurrent` the app used to ship as a hardcoded default, before the limit became
+/// machine-derived. Installs carrying exactly this value are migrated to AUTO (see `validate`):
+/// the app wrote it for them, so it is not a choice we would be discarding.
+const LEGACY_DEFAULT_MAX_CONCURRENT: u32 = 20;
+
 /// V8's own default old-space ceiling on a 64-bit machine with plenty of RAM (~4 GiB — the machines
 /// in the incident reported 4.09 GiB). Used as the per-agent budget when the user opts OUT of our
 /// cap, since that is then exactly how big each agent can get.
@@ -800,29 +819,111 @@ fn ram_derived_concurrency(total_ram_bytes: u64, reserve_bytes: u64, agent_heap_
     (usable / per_agent).clamp(1, u32::MAX as u64) as u32
 }
 
-/// The concurrency the app will actually enforce, plus an optional warning when RAM forced it below
-/// what the user configured. `total_ram` is None when we can't measure it.
+/// How many agents each CPU core is allowed to carry. Agents are not memory-parked processes: each
+/// one runs a real Claude Code session doing git, builds and test suites, so cores bound throughput
+/// independently of RAM. Two per core keeps every core busy while an agent is blocked on I/O (which
+/// is most of the time) without the context-thrashing that made a big-RAM machine slower, not
+/// faster. This is the one tunable judgement in the derivation — RAM and core count are measured.
+const AGENTS_PER_CORE: u32 = 2;
+
+/// Logical CPU count, or None when we can't determine it. Memoized (fixed hardware property).
+fn cpu_core_count() -> Option<u32> {
+    static CORES: OnceLock<Option<u32>> = OnceLock::new();
+    *CORES.get_or_init(|| std::thread::available_parallelism().ok().map(|n| n.get() as u32))
+}
+
+/// How many agents this machine's cores can carry. Floored at 1 for the same reason
+/// `ram_derived_concurrency` is: zero would deadlock the orchestrator rather than degrade it.
+fn cpu_derived_concurrency(cores: u32) -> u32 {
+    cores.saturating_mul(AGENTS_PER_CORE).max(1)
+}
+
+/// Which measured dimension held the automatic limit down. Returned BY the derivation rather than
+/// re-inferred from its result: comparing the final value back against each dimension mis-attributes
+/// a TIE (both derive the same number), and a tie routed to the RAM branch tells the user to lower
+/// `agent_heap_mb` — advice that cannot work, because raising `by_ram` leaves `min()` unchanged when
+/// cores bind equally. That is exactly the "useless advice" this attribution exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bound {
+    Ram,
+    Cpu,
+    /// Both dimensions derive the same limit — neither remedy alone raises it.
+    Both,
+}
+
+/// The limit the MACHINE can carry (ignoring any configured ceiling) and the dimension that bound
+/// it: the smaller of what RAM can hold and what the cores can drive. Both dimensions are real and
+/// whichever binds first wins — RAM alone would let a 192 GiB / 8-core box run 62 agents that spend
+/// their lives waiting for a core, and cores alone would let a 64-core / 16 GiB box swap itself to
+/// death.
 ///
-/// The configured `max_concurrent` is a CEILING in both directions of reasoning: spare RAM never
-/// raises it (the user asked for at most N), and scarce RAM lowers it (the machine can't hold N).
-fn memory_aware_concurrency(w: &WorkersConfig, total_ram: Option<u64>) -> (u32, Option<String>) {
-    // No measurement means no basis to narrow anything — honor the configured value rather than
-    // inventing a limit that could throttle a big machine to nothing.
-    let Some(total) = total_ram else {
-        return (w.max_concurrent, None);
-    };
+/// A dimension we cannot MEASURE does not constrain: `None` means "no basis to narrow", not "zero".
+/// If neither is measurable this returns None and the caller honors the configured value as-is.
+fn auto_concurrency_bound(
+    w: &WorkersConfig,
+    total_ram: Option<u64>,
+    cores: Option<u32>,
+) -> Option<(u32, Bound)> {
     // Opting OUT of the heap cap must not also opt out of the concurrency clamp (roborev 40088) —
     // coupling them would restore the exact runaway this exists to prevent. With no cap, agents use
     // V8's own default, so that becomes the per-agent budget.
     let budget_mb = if w.agent_heap_mb > 0 { w.agent_heap_mb } else { V8_DEFAULT_HEAP_MB };
-    let by_ram = ram_derived_concurrency(total, MEMORY_RESERVE_BYTES, budget_mb);
-    if by_ram >= w.max_concurrent {
-        return (w.max_concurrent, None);
+    let by_ram = total_ram.map(|t| ram_derived_concurrency(t, MEMORY_RESERVE_BYTES, budget_mb));
+    let by_cpu = cores.map(cpu_derived_concurrency);
+    match (by_ram, by_cpu) {
+        (Some(r), Some(c)) => Some(match r.cmp(&c) {
+            std::cmp::Ordering::Less => (r, Bound::Ram),
+            std::cmp::Ordering::Greater => (c, Bound::Cpu),
+            std::cmp::Ordering::Equal => (r, Bound::Both),
+        }),
+        (Some(r), None) => Some((r, Bound::Ram)),
+        (None, Some(c)) => Some((c, Bound::Cpu)),
+        (None, None) => None,
     }
-    // The remedy differs by branch, and telling a user to "lower" a value that is already 0 is
-    // impossible advice — 0 maps to the LARGEST budget, so the fix there is to set a positive one
-    // (roborev 40311).
-    let (per_agent, remedy) = if w.agent_heap_mb > 0 {
+}
+
+/// The concurrency the app will actually enforce, plus an optional warning when the machine forced
+/// it below what the user configured. `total_ram` / `cores` are None when we can't measure them.
+///
+/// Two cases:
+///   - `max_concurrent = None` (AUTO, the default) → the machine-derived value, no warning. There is
+///     nothing to warn about: the user asked for "whatever fits" and got exactly that.
+///   - `max_concurrent = Some(n)` → `min(n, auto)`. A CEILING in both directions of reasoning: spare
+///     capacity never raises it (the user asked for at most N), and a machine that can't hold N
+///     lowers it, with a warning naming which dimension bound it.
+fn memory_aware_concurrency(
+    w: &WorkersConfig,
+    total_ram: Option<u64>,
+    cores: Option<u32>,
+) -> (u32, Option<String>) {
+    let derived = auto_concurrency_bound(w, total_ram, cores);
+    let Some(configured) = w.max_concurrent else {
+        // AUTO. With nothing measurable, fall back to a single agent rather than inventing a number:
+        // one always works, and the alternative is guessing on hardware we know nothing about.
+        return (derived.map_or(1, |(n, _)| n), None);
+    };
+    // No measurement means no basis to narrow anything — honor the configured value rather than
+    // inventing a limit that could throttle a big machine to nothing.
+    let Some((auto, bound)) = derived else {
+        return (configured, None);
+    };
+    if auto >= configured {
+        // The pin HOLDS — but say so when it is costing the user real capacity. A ceiling set on
+        // older/smaller hardware (or as a workaround, long since fixed) otherwise throttles the
+        // machine forever in complete silence: the clamp warning below only ever fires the other
+        // way. `>` not `>=`, so a pin that merely matches the machine says nothing.
+        let warning = (auto > configured).then(|| {
+            format!(
+                "[workers].max_concurrent is pinned to {configured}, but this machine can run \
+                 {auto}. Remove the line from config.toml to size automatically."
+            )
+        });
+        return (configured, warning);
+    }
+    let budget_mb = if w.agent_heap_mb > 0 { w.agent_heap_mb } else { V8_DEFAULT_HEAP_MB };
+    // Telling a user to "lower" a value that is already 0 is impossible advice — 0 maps to the
+    // LARGEST budget, so the fix there is to set a positive one (roborev 40311).
+    let (per_agent, ram_remedy) = if w.agent_heap_mb > 0 {
         (format!("{budget_mb} MiB per agent"), "Lower agent_heap_mb to allow more.".to_string())
     } else {
         (
@@ -830,17 +931,37 @@ fn memory_aware_concurrency(w: &WorkersConfig, total_ram: Option<u64>) -> (u32, 
             format!("Set a positive agent_heap_mb below {budget_mb} to allow more."),
         )
     };
+    let gib = |b: u64| b / (1024 * 1024 * 1024);
+    // Name the dimension that ACTUALLY bound it — "lower agent_heap_mb" is useless advice when the
+    // limit is the core count, and on a TIE neither remedy alone raises the value, so say that
+    // rather than offering one that cannot work.
+    let cause = match bound {
+        Bound::Ram => format!(
+            "this machine's RAM can hold (total {} GiB − {} GiB reserved, ÷ {}). {}",
+            total_ram.map_or(0, gib),
+            gib(MEMORY_RESERVE_BYTES),
+            per_agent,
+            ram_remedy,
+        ),
+        Bound::Cpu => format!(
+            "this machine's {} CPU cores can drive ({} agents per core).",
+            cores.unwrap_or(0),
+            AGENTS_PER_CORE,
+        ),
+        Bound::Both => format!(
+            "this machine can run — its RAM (÷ {}) and its {} CPU cores ({} per core) both cap it \
+             at {}, so raising either one alone changes nothing.",
+            per_agent,
+            cores.unwrap_or(0),
+            AGENTS_PER_CORE,
+            auto,
+        ),
+    };
     let warning = format!(
-        "[workers].max_concurrent ({}) is more than this machine's RAM can hold; using {} \
-         (total {} GiB − {} GiB reserved, ÷ {}). {}",
-        w.max_concurrent,
-        by_ram,
-        total / (1024 * 1024 * 1024),
-        MEMORY_RESERVE_BYTES / (1024 * 1024 * 1024),
-        per_agent,
-        remedy,
+        "[workers].max_concurrent ({configured}) is more than {cause} Using {auto}. \
+         Remove max_concurrent to size automatically."
     );
-    (by_ram, Some(warning))
+    (auto, Some(warning))
 }
 
 /// Installed physical RAM in bytes, or None when we can't determine it (in which case the caller
@@ -867,9 +988,17 @@ fn total_memory_bytes() -> Option<u64> {
 /// Clamp out-of-range values into something usable; collect a warning for each adjustment.
 /// Never errors — a bad value degrades gracefully rather than breaking the app.
 fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
-    if cfg.workers.max_concurrent < 1 {
+    // NOTE: the legacy-`max_concurrent = 20` migration deliberately does NOT live here. `validate`
+    // runs on every load and on the MERGED config, so doing it here was a standing rewrite rather
+    // than a migration (roborev 53140): a user who deliberately chose 20 would have had it discarded
+    // on every launch — permanently unsettable, with the ⋯-menu slider showing a value the app
+    // ignored — and a per-project 20 would have been erased too. It is now a real one-time,
+    // global-file-only migration in `migrate_global`.
+
+    // Only a PINNED value can be out of range; auto (None) is derived and already floored at 1.
+    if cfg.workers.max_concurrent == Some(0) {
         warnings.push("[workers].max_concurrent must be >= 1; using 1".to_string());
-        cfg.workers.max_concurrent = 1;
+        cfg.workers.max_concurrent = Some(1);
     }
     // 0 is the deliberate opt-out ("no cap"), so only a positive-but-unusable value is floored.
     // Below ~512 MiB an agent OOMs before it gets anything done, which reads as a hang, not a cap.
@@ -1065,12 +1194,23 @@ pub fn reload_global(app_data: &Path) -> EffectiveConfig {
         // Log the derived concurrency WITH its inputs, so a user asking "why is Sparkle only
         // running 3 agents?" can answer it from the daily log alone.
         tracing::info!(
-            configured_max_concurrent = guard.config.workers.max_concurrent,
+            // Rendered, not passed raw: `tracing` records a `None` as UNSET, so the field would
+            // simply vanish on the AUTO path — which is now the majority case — leaving no way to
+            // tell "auto" from "we forgot to log it".
+            configured_max_concurrent = %guard
+                .config
+                .workers
+                .max_concurrent
+                .map_or_else(|| "auto".to_string(), |n| n.to_string()),
             agent_heap_mb = guard.config.workers.agent_heap_mb,
             total_ram_bytes = ?total_memory_bytes(),
             reserve_bytes = MEMORY_RESERVE_BYTES,
+            // Cores bind as often as RAM does, so the log has to carry both inputs for the
+            // "why is Sparkle only running N agents?" question to be answerable from it.
+            cpu_cores = ?cpu_core_count(),
+            agents_per_core = AGENTS_PER_CORE,
             effective_max_concurrent = guard.effective_max_concurrent,
-            "resolved memory-aware worker concurrency"
+            "resolved machine-aware worker concurrency"
         );
     }
     guard.clone()
@@ -1186,6 +1326,13 @@ pub const DEFAULT_TEMPLATE: &str = r#"# ========================================
 # the app never fails to start over a bad edit. Edits take effect live (no restart needed).
 # ======================================================================================
 
+# --- Bookkeeping (written by Sparkle; you don't need to touch this) --------------------
+[meta]
+# Which one-time config migrations have already been applied to this file. Sparkle uses it to
+# know it has already upgraded you, so it never re-applies a migration and never overrides a
+# value you set yourself afterwards. Lowering or deleting this can re-run past migrations.
+config_version = 1
+
 # --- How agents land their work -------------------------------------------------------
 [workflow]
 # true  = an agent opens a Pull Request and you merge it (safer, reviewable).
@@ -1214,13 +1361,20 @@ changed_lines  = 1000    # ...or once the agent has changed this many lines (whi
 
 # --- How many agents run at once (per-machine; ignored in a project file) --------------
 [workers]
-# The most agents/worktrees an orchestrator may run in parallel. This is a CEILING, not a
-# promise: Sparkle also caps concurrency at what your RAM can hold — roughly
-#   (installed_RAM - 6 GiB reserved for the OS and Sparkle) / agent_heap_mb
-# — and uses whichever is smaller. So on a 16 GB Mac you get ~3 agents even if this says 20,
-# while lowering this to 4 always gives you 4. The resolved number is logged at startup.
-# Floored at 1; there is no hard upper limit.
-max_concurrent = 20
+# How many agents/worktrees run in parallel.
+#
+# LEFT OUT ON PURPOSE — with no value here, Sparkle sizes itself to YOUR machine, which is almost
+# always what you want. It takes the smaller of two real limits:
+#   by RAM   (installed_RAM - 6 GiB reserved for the OS and Sparkle) / agent_heap_mb
+#   by CPU   logical_cores x 2      (agents run builds and test suites; cores bound throughput too)
+# So a 16 GB laptop gets ~3, while a 128 GB machine gets up to ~40 depending on its core count,
+# instead of being held to a number picked for someone else's hardware. Whichever of the two limits
+# is smaller wins, and the resolved value (with both inputs) is logged at startup.
+#
+# Uncomment to pin your own CEILING. It only ever lowers the automatic value — setting 40 on a 16 GB
+# Mac still gets you ~3, because the point of the clamp is to keep the kernel from killing your
+# machine. To go back to automatic, delete the line rather than guessing a number.
+# max_concurrent = 8
 # Memory ceiling per agent, in MiB, applied as NODE_OPTIONS=--max-old-space-size. Agents are
 # Node processes, and Node's OWN default ceiling is ~4 GiB — high enough that a handful of
 # runaway agents can exhaust a Mac's RAM and get system daemons killed by the kernel. This caps
@@ -1458,6 +1612,139 @@ fn load_document(app_data: &Path) -> toml_edit::DocumentMut {
     let text = read_if_exists(&global_path(app_data)).unwrap_or_else(|| DEFAULT_TEMPLATE.to_string());
     text.parse::<toml_edit::DocumentMut>()
         .unwrap_or_else(|_| DEFAULT_TEMPLATE.parse().expect("default template is valid TOML"))
+}
+
+/// Schema revision of the on-disk global config. Bump when adding a one-time migration below.
+const CONFIG_MIGRATION_VERSION: i64 = 1;
+
+/// Apply one-time migrations to the global config FILE, recording the revision reached in
+/// `[meta].config_version`.
+///
+/// One-time is the whole point (roborev 53140). Migrating inside `validate` — which runs on every
+/// load, against the merged config — is not a migration but a standing rewrite: it would discard a
+/// deliberately-chosen value on every launch, making that value permanently unsettable and leaving
+/// the ⋯-menu slider displaying a number the app ignores. Recording the revision on disk means each
+/// migration fires at most once per install, so anything the user sets AFTERWARDS is theirs to keep.
+///
+/// Scoped to the GLOBAL file: the rationale ("the app wrote this value, the user never chose it")
+/// applies only to the file `set_value` rewrites whole. A per-project override is always deliberate.
+///
+/// Best-effort by design — a failure here must never block startup, so the caller logs and carries
+/// on. Worst case the migration is retried next launch.
+pub fn migrate_global(app_data: &Path) -> Result<(), String> {
+    let path = global_path(app_data);
+    // A config that doesn't exist yet has nothing to migrate, and CREATING one here would write a
+    // file the user never asked for. Fresh installs already default to auto.
+    let Some(text) = read_if_exists(&path) else {
+        return Ok(());
+    };
+    // Parse DIRECTLY — deliberately NOT via `load_document`, which falls back to DEFAULT_TEMPLATE on
+    // a syntax error (roborev 53240). That fallback is safe behind an explicit user write, but here
+    // it would stamp the template over a config the user merely typo'd and `write_atomic` it, wiping
+    // every setting AND the broken text they need in order to fix it — silently, since the write
+    // succeeds. `reload_global` keeps the last-good config and warns precisely so the file can be
+    // repaired; a migration must not undo that. Bail instead: the caller logs, and the migration is
+    // retried on the NEXT LAUNCH — not mid-session. The watcher only calls `reload_global`, so
+    // fixing the typo now reloads the config but does not re-run this.
+    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        format!("config.toml is not valid TOML; migration deferred until it is fixed: {e}")
+    })?;
+    let applied = doc
+        .get("meta")
+        .and_then(|m| m.get("config_version"))
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0);
+    if applied >= CONFIG_MIGRATION_VERSION {
+        return Ok(());
+    }
+
+    // v1 — adopt AUTO for installs still carrying the old hardcoded default.
+    //
+    // `max_concurrent` used to default to 20, and the config file is rewritten WHOLE on the first
+    // `set_value`, so every user who ever toggled an AI feature or opened the ⋯ Advanced editor has
+    // a literal `max_concurrent = 20` on disk they never chose. Under the new semantics that line is
+    // a PINNED CEILING, which would leave exactly the population this change exists to unblock
+    // (anything bigger than ~64 GiB) stuck at 20 forever — and silently, since `auto >= configured`
+    // warns about nothing. Removing the LINE (not just the parsed value) is what makes this stick:
+    // the next load sees no key at all, and a 20 the user sets later survives, because by then the
+    // recorded revision has moved past this migration.
+    let is_legacy_default = doc
+        .get("workers")
+        .and_then(|w| w.get("max_concurrent"))
+        .and_then(|v| v.as_integer())
+        == Some(LEGACY_DEFAULT_MAX_CONCURRENT as i64);
+    if is_legacy_default {
+        // Both TOML shapes: the standard `[workers]` header and a hand-written inline
+        // `workers = { … }`. `as_table_like_mut` covers both; `unset_dotted` rejects the inline form
+        // during traversal, which would strand that user on the legacy value forever.
+        //
+        // Belt-and-braces: unreachable by construction, because `is_legacy_default` above reads
+        // through `Item::get`, whose `Index for str` resolves exactly the two shapes
+        // `as_table_like_mut` accepts (`Table` and `Value::InlineTable`). Any other shape makes
+        // `is_legacy_default` false and never gets here. Kept anyway so the read and write paths
+        // can't silently drift apart later. (The reachable version of this hazard is the `meta`
+        // block below, where the write runs unconditionally.)
+        let Some(t) = doc.get_mut("workers").and_then(|w| w.as_table_like_mut()) else {
+            return Err(
+                "[workers] is not a table; migration deferred until config.toml is fixed".into()
+            );
+        };
+        t.remove("max_concurrent");
+        // Don't leave a dangling `[workers]` behind when that was its only key — the user opens this
+        // file in the Advanced editor, and a stanza attributable to nothing is clutter.
+        if doc.get("workers").and_then(|w| w.as_table_like()).is_some_and(|t| t.is_empty()) {
+            doc.remove("workers");
+        }
+        tracing::debug!(
+            "config migration v1: removing the legacy \
+             max_concurrent = {LEGACY_DEFAULT_MAX_CONCURRENT} (a default, not a choice)"
+        );
+    }
+
+    // Written table-shape-agnostically for the same reason as `workers` above: `set_dotted` demands
+    // a real `Table`, so a pre-existing inline `meta = { … }` would fail its traversal and defer the
+    // migration forever. Creating the table when absent keeps the common path unchanged.
+    //
+    // THIS is where the read/write mismatch is genuinely reachable: `applied` above was read with
+    // `Item::get`, but this write runs unconditionally — so a `meta` of any other shape (a string, an
+    // array, an array-of-tables) reaches here. It must DEFER rather than fall through, because
+    // stamping `config_version` on a config whose key we failed to remove would mark the migration
+    // applied when it wasn't: permanently un-migratable, and silent about it.
+    let meta_is_new = doc.get("meta").is_none();
+    if meta_is_new {
+        let mut table = toml_edit::Table::new();
+        // Explain the table we are inventing. A bare stanza appended to the end of the file is
+        // exactly what a user tidying their config deletes — which would re-arm every migration.
+        // The template carries the same explanation for fresh installs; this gives migrated ones
+        // parity. Set on the table BEFORE insertion, so there is no second lookup that advertises a
+        // fallible path which cannot actually fail.
+        table.decor_mut().set_prefix(
+            "\n# --- Bookkeeping (written by Sparkle; you don't need to touch this) ---\n\
+             # Which one-time config migrations have already been applied to this file. Sparkle\n\
+             # uses it to know it has already upgraded you, so it never re-applies a migration\n\
+             # and never overrides a value you set yourself afterwards. Lowering or deleting\n\
+             # this can re-run past migrations.\n",
+        );
+        doc.insert("meta", toml_edit::Item::Table(table));
+    }
+    let Some(meta) = doc.get_mut("meta").and_then(|m| m.as_table_like_mut()) else {
+        return Err("[meta] is not a table; migration deferred until config.toml is fixed".into());
+    };
+    meta.insert("config_version", toml_edit::value(CONFIG_MIGRATION_VERSION));
+    let text = doc.to_string();
+    // Same guard as `set_value`: never persist a document that would fail to parse, or every future
+    // load silently resets all settings.
+    parse_layer(&text)
+        .map_err(|e| format!("rejected: the migration would make config.toml invalid: {e}"))?;
+    write_atomic(&path, &text)?;
+    // Announced only after the write lands — the three exits above persist nothing.
+    if is_legacy_default {
+        tracing::info!(
+            "config migration v1: adopted automatic worker concurrency (removed the legacy \
+             max_concurrent = {LEGACY_DEFAULT_MAX_CONCURRENT}, which was a default, not a choice)"
+        );
+    }
+    Ok(())
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
@@ -1838,6 +2125,12 @@ pub fn init_and_watch(app: &AppHandle) -> Result<(), String> {
     let ad = app_data(app)?;
     // The dir must exist before we can watch it (first launch may predate any worktree creation).
     std::fs::create_dir_all(&ad).map_err(|e| format!("create app_data: {e}"))?;
+    // One-time on-disk migrations run BEFORE the first load, so `current()` reflects the migrated
+    // file rather than a value we are about to remove. Best-effort: a migration failure must never
+    // block startup — log it and load what's there; it will be retried next launch.
+    if let Err(e) = migrate_global(&ad) {
+        tracing::warn!("config migration skipped: {e}");
+    }
     // Initial load so `current()` is correct before the first event.
     let _ = reload_global(&ad);
 
@@ -1878,7 +2171,7 @@ mod tests {
     fn defaults_when_no_files() {
         let (cfg, warns, hard) = effective(None, None);
         assert_eq!(cfg, SparkleConfig::default());
-        assert_eq!(cfg.workers.max_concurrent, 20);
+        assert_eq!(cfg.workers.max_concurrent, None, "unset means AUTO, not a fixed number");
         assert!(warns.is_empty());
         assert!(!hard);
     }
@@ -1893,7 +2186,7 @@ mod tests {
         "#;
         let (cfg, _, _) = effective(Some(g), None);
         assert!(!cfg.workflow.require_pr);
-        assert_eq!(cfg.workers.max_concurrent, 8);
+        assert_eq!(cfg.workers.max_concurrent, Some(8));
         // Untouched fields keep their defaults.
         assert!(cfg.workflow.worktree_isolation);
         assert_eq!(cfg.workflow.default_branch, ""); // empty = auto-detect
@@ -1928,7 +2221,7 @@ mod tests {
         "#;
         let (cfg, warns, _) = effective(None, Some(p));
         // Per-project machine prefs do NOT apply.
-        assert_eq!(cfg.workers.max_concurrent, 20);
+        assert_eq!(cfg.workers.max_concurrent, None, "unset means AUTO, not a fixed number");
         assert!(cfg.ai.auto_rename);
         assert!(warns.iter().any(|w| w.contains("[workers]")));
         assert!(warns.iter().any(|w| w.contains("[ai]")));
@@ -2102,7 +2395,7 @@ mod tests {
     fn validate_floors_max_concurrent_at_one() {
         let g = "[workers]\nmax_concurrent = 0\n";
         let (cfg, warns, _) = effective(Some(g), None);
-        assert_eq!(cfg.workers.max_concurrent, 1);
+        assert_eq!(cfg.workers.max_concurrent, Some(1));
         assert!(warns.iter().any(|w| w.contains("max_concurrent")));
     }
 
@@ -2126,10 +2419,10 @@ mod tests {
         // Setting only the new key leaves its sibling at the default...
         let (cfg, _, _) = effective(Some("[workers]\nagent_heap_mb = 2048\n"), None);
         assert_eq!(cfg.workers.agent_heap_mb, 2048);
-        assert_eq!(cfg.workers.max_concurrent, 20);
+        assert_eq!(cfg.workers.max_concurrent, None, "unset means AUTO, not a fixed number");
         // ...and setting only the old key leaves the new one at the default.
         let (cfg, _, _) = effective(Some("[workers]\nmax_concurrent = 6\n"), None);
-        assert_eq!(cfg.workers.max_concurrent, 6);
+        assert_eq!(cfg.workers.max_concurrent, Some(6));
         assert_eq!(cfg.workers.agent_heap_mb, 3072);
     }
 
@@ -2169,26 +2462,363 @@ mod tests {
 
     #[test]
     fn configured_max_concurrent_is_a_ceiling_never_a_floor() {
-        let mut w = WorkersConfig { max_concurrent: 20, agent_heap_mb: 3072 };
+        let mut w = WorkersConfig { max_concurrent: Some(20), agent_heap_mb: 3072 };
         // RAM allows fewer than configured → RAM wins, and the clamp is surfaced as a warning.
-        let (n, warn) = memory_aware_concurrency(&w, Some(16 * GIB));
+        // Cores are plentiful here so RAM is unambiguously the binding dimension.
+        let (n, warn) = memory_aware_concurrency(&w, Some(16 * GIB), Some(64));
         assert_eq!(n, 3);
         let warn = warn.expect("a clamp must be diagnosable as a config warning");
         assert!(warn.contains("max_concurrent"), "warning names the key: {warn}");
+        assert!(warn.contains("RAM"), "warning names the binding dimension: {warn}");
 
-        // RAM allows MORE than configured → the config ceiling holds; nothing to warn about.
-        w.max_concurrent = 4;
-        let (n, warn) = memory_aware_concurrency(&w, Some(128 * GIB));
+        // RAM allows MORE than configured → the config ceiling holds. The value is never raised,
+        // but the user is now TOLD they are leaving capacity on the table (see
+        // `a_pin_below_what_the_machine_can_run_is_diagnosable`) rather than throttled in silence.
+        w.max_concurrent = Some(4);
+        let (n, warn) = memory_aware_concurrency(&w, Some(128 * GIB), Some(64));
         assert_eq!(n, 4, "an explicit max_concurrent must never be raised by spare RAM");
-        assert!(warn.is_none());
+        assert!(warn.expect("an under-pin is advisory, not silent").contains("pinned to 4"));
+    }
+
+    // THE regression this change exists to prevent: the old code could only ratchet DOWN from a
+    // hardcoded 20, so every machine bigger than ~64 GiB was throttled to a number that fit a
+    // smaller one. Auto must scale UP with the hardware.
+    #[test]
+    fn auto_scales_up_with_the_machine_instead_of_capping_at_a_fixed_number() {
+        let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 };
+        // 128 GiB − 6 = 122 ÷ 3 = 40 by RAM; 24 cores × 2 = 48 by CPU. RAM binds → 40.
+        assert_eq!(memory_aware_concurrency(&w, Some(128 * GIB), Some(24)), (40, None));
+        // The same machine under the OLD hardcoded ceiling would have been held to 20.
+        assert!(memory_aware_concurrency(&w, Some(128 * GIB), Some(24)).0 > 20);
+        // And it still scales DOWN: 16 GiB − 6 = 10 ÷ 3 = 3.
+        assert_eq!(memory_aware_concurrency(&w, Some(16 * GIB), Some(24)), (3, None));
+        // Auto never warns — the user asked for "whatever fits" and got exactly that.
+        assert!(memory_aware_concurrency(&w, Some(8 * GIB), Some(4)).1.is_none());
+    }
+
+    #[test]
+    fn cpu_cores_bound_concurrency_independently_of_ram() {
+        let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 };
+        // 192 GiB − 6 = 186 ÷ 3 = 62 by RAM, but only 8 cores × 2 = 16 by CPU. CPU binds.
+        assert_eq!(memory_aware_concurrency(&w, Some(192 * GIB), Some(8)), (16, None));
+        // Inverted: 64 cores × 2 = 128 by CPU, but 16 GiB holds only 3. RAM binds.
+        assert_eq!(memory_aware_concurrency(&w, Some(16 * GIB), Some(64)), (3, None));
+    }
+
+    #[test]
+    fn a_cpu_bound_clamp_names_cores_not_the_heap_size() {
+        // Telling a user to "lower agent_heap_mb" when the limit is their CORE COUNT is useless
+        // advice — the remedy must name the dimension that actually bound the value.
+        let w = WorkersConfig { max_concurrent: Some(40), agent_heap_mb: 3072 };
+        let (n, warn) = memory_aware_concurrency(&w, Some(512 * GIB), Some(4));
+        assert_eq!(n, 8, "4 cores × 2 = 8, well under what 512 GiB could hold");
+        let warn = warn.expect("a clamp must be diagnosable");
+        assert!(warn.contains("CPU cores"), "names cores: {warn}");
+        assert!(!warn.contains("agent_heap_mb"), "does not offer a RAM remedy: {warn}");
     }
 
     #[test]
     fn memory_aware_concurrency_no_ops_when_it_cannot_measure() {
-        let w = WorkersConfig { max_concurrent: 20, agent_heap_mb: 3072 };
-        // Unknown RAM (unsupported platform / sysctl failure): fall back to the configured value
-        // rather than guessing a number that could throttle a big machine to nothing.
-        assert_eq!(memory_aware_concurrency(&w, None), (20, None));
+        let w = WorkersConfig { max_concurrent: Some(20), agent_heap_mb: 3072 };
+        // Unknown RAM *and* cores (unsupported platform / sysctl failure): fall back to the
+        // configured value rather than guessing a number that could throttle a big machine.
+        assert_eq!(memory_aware_concurrency(&w, None, None), (20, None));
+        // One dimension missing still constrains by the other — a measurement we DO have is not
+        // discarded just because its partner is absent. Each still clamps (and warns) on its own.
+        let (n, warn) = memory_aware_concurrency(&w, Some(16 * GIB), None);
+        assert_eq!(n, 3, "RAM alone still bounds a pinned ceiling");
+        assert!(warn.expect("clamping a pinned value is diagnosable").contains("RAM"));
+        let (n, warn) = memory_aware_concurrency(&w, None, Some(2));
+        assert_eq!(n, 4, "cores alone still bound a pinned ceiling");
+        assert!(warn.expect("clamping a pinned value is diagnosable").contains("CPU cores"));
+    }
+
+    // roborev 53087 (High): the old default was written to disk for users who never chose it, and
+    // under the new semantics that line is a PINNED CEILING — so the very machines this change
+    // exists to unblock would have stayed at 20 forever, silently.
+    /// Write a global config.toml into a temp app-data dir and return the dir.
+    fn app_data_with(global: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(global_path(dir.path()), global).unwrap();
+        dir
+    }
+    fn global_text(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(global_path(dir.path())).unwrap()
+    }
+
+    #[test]
+    fn a_config_still_carrying_the_legacy_default_migrates_to_auto() {
+        let dir = app_data_with("[workers]\nmax_concurrent = 20\nagent_heap_mb = 3072\n");
+        migrate_global(dir.path()).unwrap();
+        let text = global_text(&dir);
+        assert!(!text.contains("max_concurrent"), "the LINE is removed, not just the value: {text}");
+        assert!(text.contains("agent_heap_mb = 3072"), "siblings untouched: {text}");
+        // The negative case for the empty-stanza cleanup: [workers] still holds a key, so it stays.
+        assert!(text.contains("[workers]"), "a still-populated table keeps its header: {text}");
+        let (cfg, _, _) = effective(Some(&text), None);
+        assert_eq!(cfg.workers.max_concurrent, None, "loads as AUTO");
+        // And the point of it all: the machine's own limit now applies instead of a flat 20.
+        let w = WorkersConfig { max_concurrent: cfg.workers.max_concurrent, agent_heap_mb: 3072 };
+        assert_eq!(memory_aware_concurrency(&w, Some(128 * GIB), Some(24)), (40, None));
+    }
+
+    // roborev 53140 (High): migrating on every load is a standing rewrite, not a migration — it
+    // would make 20 permanently unsettable and desync the ⋯-menu slider from the value in force.
+    // Both TOML shapes must migrate. An inline `workers = { ... }` is the one `unset_dotted` cannot
+    // touch (its traversal demands a real Table), so routing through it would strand that user at
+    // the legacy 20 forever — and the empty container must go in either shape.
+    #[test]
+    fn the_migration_handles_both_the_header_and_inline_table_shapes() {
+        for src in ["[workers]\nmax_concurrent = 20\n", "workers = { max_concurrent = 20 }\n"] {
+            let dir = app_data_with(src);
+            migrate_global(dir.path()).unwrap();
+            let text = global_text(&dir);
+            // Assert on STRUCTURE, not substrings: `!contains("workers = {")` would miss
+            // `workers={` and would false-fire on an unrelated `default_workers = { … }`.
+            let doc = text.parse::<toml_edit::DocumentMut>().expect("still valid TOML");
+            assert!(doc.get("workers").is_none(), "the emptied container goes ({src:?}): {text}");
+            let (cfg, _, _) = effective(Some(&text), None);
+            assert_eq!(cfg.workers.max_concurrent, None, "loads as AUTO ({src:?})");
+        }
+    }
+
+    #[test]
+    fn an_inline_workers_table_keeps_its_other_keys() {
+        let dir = app_data_with("workers = { max_concurrent = 20, agent_heap_mb = 2048 }\n");
+        migrate_global(dir.path()).unwrap();
+        let text = global_text(&dir);
+        let doc = text.parse::<toml_edit::DocumentMut>().expect("still valid TOML");
+        let workers = doc.get("workers").and_then(|w| w.as_table_like()).expect("container kept");
+        assert!(workers.get("max_concurrent").is_none(), "the legacy key goes: {text}");
+        assert!(workers.get("agent_heap_mb").is_some(), "its siblings stay: {text}");
+        let (cfg, _, _) = effective(Some(&text), None);
+        // The user-visible outcome the migration exists to produce.
+        assert_eq!(cfg.workers.max_concurrent, None, "loads as AUTO");
+        assert_eq!(cfg.workers.agent_heap_mb, 2048);
+    }
+
+    // The same class of bug the `workers` handling fixes, one step later: `set_dotted` demands a
+    // real Table, so an inline `meta = { … }` would have deferred the migration forever.
+    #[test]
+    fn a_pre_existing_inline_meta_table_still_migrates() {
+        let dir = app_data_with("meta = { note = \"hi\" }\n[workers]\nmax_concurrent = 20\n");
+        migrate_global(dir.path()).unwrap();
+        let text = global_text(&dir);
+        let doc = text.parse::<toml_edit::DocumentMut>().expect("still valid TOML");
+        let meta = doc.get("meta").and_then(|m| m.as_table_like()).expect("meta kept");
+        assert_eq!(
+            meta.get("config_version").and_then(|v| v.as_value()).and_then(|v| v.as_integer()),
+            Some(CONFIG_MIGRATION_VERSION),
+            "the marker is written into the existing inline table: {text}"
+        );
+        assert!(meta.get("note").is_some(), "its existing keys survive: {text}");
+        let (cfg, _, _) = effective(Some(&text), None);
+        assert_eq!(cfg.workers.max_concurrent, None, "and the migration actually ran");
+    }
+
+    #[test]
+    fn the_dotted_key_form_migrates_because_it_is_a_table() {
+        // `workers.max_concurrent = 20` in dotted-key form: toml_edit represents it as a Table, so
+        // the reader and the writer agree on it and it MIGRATES rather than defers.
+        let dir = app_data_with("workers.max_concurrent = 20\n");
+        migrate_global(dir.path()).unwrap();
+        let (cfg, _, _) = effective(Some(&global_text(&dir)), None);
+        assert_eq!(cfg.workers.max_concurrent, None, "dotted-key form migrates: it is a table");
+    }
+
+    // THE invariant this whole round exists to establish: when the migration cannot apply, it must
+    // leave the file completely alone — in particular it must NOT stamp `config_version`, because a
+    // config marked "migrated" that never was is permanently un-migratable and silent about it.
+    // `meta` is the reachable branch: `PartialConfig` has no `meta` field and does not deny unknown
+    // ones, so a non-table `meta` loads fine and is a config a user can really have.
+    #[test]
+    fn a_deferred_migration_writes_nothing_at_all() {
+        let src = "meta = \"hi\"\n[workers]\nmax_concurrent = 20\n";
+        let dir = app_data_with(src);
+        let err = migrate_global(dir.path()).expect_err("a shape the writer cannot edit defers");
+        assert!(err.contains("meta"), "the reason names the offending table: {err}");
+        assert_eq!(
+            global_text(&dir),
+            src,
+            "nothing is written — not the key removal, and above all not the version marker"
+        );
+        // The deferral is not permanent. REPAIR the offending shape rather than replacing the file
+        // (replacing it would just re-run a fixture another test already covers), so this pins the
+        // thing that matters: the same config, with only `meta` corrected, now migrates AND stamps.
+        std::fs::write(global_path(dir.path()), "[meta]\n[workers]\nmax_concurrent = 20\n").unwrap();
+        migrate_global(dir.path()).unwrap();
+        let text = global_text(&dir);
+        let (cfg, _, _) = effective(Some(&text), None);
+        assert_eq!(cfg.workers.max_concurrent, None, "the repaired file migrates");
+        let doc = text.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            doc.get("meta")
+                .and_then(|m| m.get("config_version"))
+                .and_then(|v| v.as_integer()),
+            Some(CONFIG_MIGRATION_VERSION),
+            "and is stamped, so it won't be migrated again: {text}"
+        );
+    }
+
+    #[test]
+    fn the_migration_runs_at_most_once_so_a_later_20_is_the_users_to_keep() {
+        let dir = app_data_with("[workers]\nmax_concurrent = 20\n");
+        migrate_global(dir.path()).unwrap();
+        let migrated = global_text(&dir);
+        assert!(!migrated.contains("max_concurrent"));
+        assert!(!migrated.contains("[workers]"), "the empty stanza goes too: {migrated}");
+        assert!(
+            migrated.contains("one-time config migrations"),
+            "the generated [meta] explains itself, so a tidying user doesn't delete it: {migrated}"
+        );
+
+        // The user now DELIBERATELY picks 20 — exactly the value the migration removes.
+        set_value(dir.path(), "workers.max_concurrent", &serde_json::json!(20)).unwrap();
+        // Every subsequent launch re-runs migrations. This one must not fire again.
+        migrate_global(dir.path()).unwrap();
+        migrate_global(dir.path()).unwrap();
+        let text = global_text(&dir);
+        assert!(text.contains("max_concurrent = 20"), "a chosen 20 survives forever: {text}");
+        let (cfg, _, _) = effective(Some(&text), None);
+        assert_eq!(cfg.workers.max_concurrent, Some(20));
+    }
+
+    #[test]
+    fn a_deliberately_chosen_value_is_never_migrated() {
+        // Any number that is NOT the old default is a real choice, at both layers.
+        for pinned in [1u32, 4, 19, 21, 32, 40] {
+            let dir = app_data_with(&format!("[workers]\nmax_concurrent = {pinned}\n"));
+            migrate_global(dir.path()).unwrap();
+            let (cfg, _, _) = effective(Some(&global_text(&dir)), None);
+            assert_eq!(cfg.workers.max_concurrent, Some(pinned), "kept {pinned}");
+        }
+    }
+
+    // roborev 53140 (Medium): `validate` sees the MERGED config, so migrating there also erased a
+    // per-project override — where "the app wrote it, not the user" was never true. roborev 53240
+    // (Low) correctly called the first version of this test vacuous: it never ran the migration.
+    // This one writes a real project file and asserts its BYTES survive.
+    #[test]
+    fn a_project_level_20_is_never_touched_by_the_migration() {
+        let dir = app_data_with("[workers]\nmax_concurrent = 20\n");
+        let project = dir.path().join("some-repo");
+        std::fs::create_dir_all(project.join(".sparkle")).unwrap();
+        let project_file = project.join(".sparkle").join("config.toml");
+        let original = "[workers]\nmax_concurrent = 20\n";
+        std::fs::write(&project_file, original).unwrap();
+
+        migrate_global(dir.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&project_file).unwrap(), original, "project untouched");
+        assert!(!global_text(&dir).contains("max_concurrent"), "global migrated");
+    }
+
+    // roborev 53240 (High): `load_document` falls back to DEFAULT_TEMPLATE on a parse error. Using
+    // it here would stamp the template over a config the user merely typo'd and write it — wiping
+    // every setting AND the broken text they need in order to fix it, silently.
+    #[test]
+    fn an_unparseable_config_survives_the_migration_byte_for_byte() {
+        let broken = "[workers\nmax_concurrent = 20\nthis is not toml";
+        let dir = app_data_with(broken);
+        let err = migrate_global(dir.path()).expect_err("a broken file defers, it does not clobber");
+        assert!(err.contains("not valid TOML"), "the reason is diagnosable: {err}");
+        assert_eq!(global_text(&dir), broken, "the user's file is untouched");
+    }
+
+    // roborev 53240 (Medium): the one-time guarantee is only as durable as the marker, and `reset`
+    // writes DEFAULT_TEMPLATE — so a template without [meta] would rewind the version to 0 and
+    // re-arm every migration, breaking the "a later 20 is yours" promise after any reset.
+    #[test]
+    fn the_default_template_carries_the_current_migration_version() {
+        let doc = DEFAULT_TEMPLATE.parse::<toml_edit::DocumentMut>().unwrap();
+        let v = doc
+            .get("meta")
+            .and_then(|m| m.get("config_version"))
+            .and_then(|v| v.as_integer())
+            .expect("the template must record the schema revision it ships at");
+        assert_eq!(
+            v, CONFIG_MIGRATION_VERSION,
+            "template and CONFIG_MIGRATION_VERSION drifted — bump the template when adding a migration"
+        );
+    }
+
+    #[test]
+    fn a_reset_does_not_re_arm_the_migration() {
+        let dir = app_data_with("[workers]\nmax_concurrent = 4\n");
+        reset(dir.path()).unwrap();
+        // After a reset the user deliberately pins the one value the migration would remove.
+        set_value(dir.path(), "workers.max_concurrent", &serde_json::json!(20)).unwrap();
+        migrate_global(dir.path()).unwrap();
+        assert!(
+            global_text(&dir).contains("max_concurrent = 20"),
+            "a reset must not rewind the marker and re-delete a chosen value"
+        );
+    }
+
+    #[test]
+    fn migration_does_not_create_a_config_file_that_did_not_exist() {
+        // A fresh install already defaults to auto; writing a file the user never asked for would
+        // be a side effect, not a migration.
+        let dir = tempfile::tempdir().unwrap();
+        migrate_global(dir.path()).unwrap();
+        assert!(!global_path(dir.path()).exists());
+    }
+
+    // A pin that costs the user capacity must SAY so. The clamp warning only ever fires the other
+    // way, so without this a ceiling set on older hardware throttles the machine in total silence.
+    #[test]
+    fn a_pin_below_what_the_machine_can_run_is_diagnosable() {
+        let w = WorkersConfig { max_concurrent: Some(8), agent_heap_mb: 3072 };
+        // 128 GiB → 40 by RAM, 24 cores → 48 by CPU; auto is 40, well above the pin of 8.
+        let (n, warn) = memory_aware_concurrency(&w, Some(128 * GIB), Some(24));
+        assert_eq!(n, 8, "the pin still holds — this is a notice, not an override");
+        let warn = warn.expect("a pin that costs capacity must be visible");
+        assert!(warn.contains("pinned to 8"), "names the pin: {warn}");
+        assert!(warn.contains("40"), "names what the machine could do: {warn}");
+
+        // A pin that exactly matches the machine has nothing to report.
+        let w = WorkersConfig { max_concurrent: Some(40), agent_heap_mb: 3072 };
+        assert_eq!(memory_aware_concurrency(&w, Some(128 * GIB), Some(24)), (40, None));
+    }
+
+    // roborev 53087 (Medium): attribution by value-comparison mis-reads a TIE, and routing a tie to
+    // the RAM branch offers "Lower agent_heap_mb" — advice that cannot work, because raising by_ram
+    // leaves min() unchanged while cores bind equally.
+    #[test]
+    fn a_tie_between_ram_and_cores_offers_neither_single_dimension_remedy() {
+        // 4 cores → 8 by CPU; 30 GiB − 6 = 24 ÷ 3 = 8 by RAM. Both bind at 8.
+        let w = WorkersConfig { max_concurrent: Some(40), agent_heap_mb: 3072 };
+        let (n, warn) = memory_aware_concurrency(&w, Some(30 * GIB), Some(4));
+        assert_eq!(n, 8);
+        let warn = warn.expect("a clamp must be diagnosable");
+        assert!(
+            warn.contains("raising either one alone changes nothing"),
+            "a tie says neither remedy suffices: {warn}"
+        );
+        assert!(!warn.contains("Lower agent_heap_mb"), "impossible remedy on a tie: {warn}");
+    }
+
+    #[test]
+    fn the_binding_dimension_is_reported_by_the_derivation_not_guessed_from_it() {
+        let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 };
+        // RAM 40 vs CPU 48 → RAM binds.
+        assert_eq!(auto_concurrency_bound(&w, Some(128 * GIB), Some(24)), Some((40, Bound::Ram)));
+        // RAM 62 vs CPU 16 → CPU binds.
+        assert_eq!(auto_concurrency_bound(&w, Some(192 * GIB), Some(8)), Some((16, Bound::Cpu)));
+        // Equal → neither alone.
+        assert_eq!(auto_concurrency_bound(&w, Some(30 * GIB), Some(4)), Some((8, Bound::Both)));
+        // A dimension we cannot measure is attributed to the one we can.
+        assert_eq!(auto_concurrency_bound(&w, Some(16 * GIB), None), Some((3, Bound::Ram)));
+        assert_eq!(auto_concurrency_bound(&w, None, Some(2)), Some((4, Bound::Cpu)));
+        assert_eq!(auto_concurrency_bound(&w, None, None), None);
+    }
+
+    #[test]
+    fn auto_on_an_unmeasurable_machine_degrades_to_one_agent() {
+        // Auto with NOTHING measurable: one agent always works. Inventing a number for hardware we
+        // know nothing about is how a small machine gets jetsam-killed.
+        let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 };
+        assert_eq!(memory_aware_concurrency(&w, None, None), (1, None));
     }
 
     #[test]
@@ -2197,27 +2827,40 @@ mod tests {
         // to let agents use bigger heaps would otherwise ALSO lose the RAM-derived concurrency
         // clamp — restoring the exact 20-agents × uncapped-heap runaway this whole change exists to
         // prevent. With no cap, agents use V8's own default, so that's the budget we divide by.
-        let w = WorkersConfig { max_concurrent: 20, agent_heap_mb: 0 };
+        let w = WorkersConfig { max_concurrent: Some(20), agent_heap_mb: 0 };
         // 16 GiB − 6 GiB reserve = 10 GiB ÷ V8's ~4 GiB default = 2.
-        let (n, warn) = memory_aware_concurrency(&w, Some(16 * GIB));
+        let (n, warn) = memory_aware_concurrency(&w, Some(16 * GIB), Some(64));
         assert_eq!(n, 2);
         let warn = warn.expect("the clamp must still be diagnosable when the cap is opted out");
         // The remedy must be actionable: "lower agent_heap_mb" is impossible at 0, which maps to
         // the LARGEST per-agent budget. The way out is a positive value (roborev 40311).
         assert!(warn.contains("Set a positive agent_heap_mb"), "actionable remedy: {warn}");
         assert!(!warn.contains("Lower agent_heap_mb"), "impossible remedy: {warn}");
-        // And the configured ceiling still wins when RAM is plentiful.
-        let w = WorkersConfig { max_concurrent: 4, agent_heap_mb: 0 };
-        assert_eq!(memory_aware_concurrency(&w, Some(128 * GIB)), (4, None));
+        // And the configured ceiling still wins when RAM is plentiful (with the advisory that the
+        // machine could do more — the pin is honored, not overridden).
+        let w = WorkersConfig { max_concurrent: Some(4), agent_heap_mb: 0 };
+        let (n, warn) = memory_aware_concurrency(&w, Some(128 * GIB), Some(64));
+        assert_eq!(n, 4);
+        assert!(warn.expect("an under-pin is advisory").contains("pinned to 4"));
     }
 
     #[test]
     fn effective_config_exposes_the_derived_concurrency() {
         // The frontend concurrency gate reads this field, so it must be populated (and never 0)
-        // on a plain default construction.
+        // on a plain default construction. The default is AUTO, so there is no configured ceiling
+        // to compare against — the guarantee is simply that a real machine gets a usable number.
         let eff = EffectiveConfig::derive(SparkleConfig::default(), Vec::new());
         assert!(eff.effective_max_concurrent >= 1);
-        assert!(eff.effective_max_concurrent <= eff.config.workers.max_concurrent);
+        assert_eq!(eff.config.workers.max_concurrent, None, "ships as auto, not a fixed number");
+    }
+
+    #[test]
+    fn a_pinned_ceiling_still_bounds_the_effective_value() {
+        let mut cfg = SparkleConfig::default();
+        cfg.workers.max_concurrent = Some(2);
+        let eff = EffectiveConfig::derive(cfg, Vec::new());
+        assert!(eff.effective_max_concurrent <= 2, "a pinned ceiling is never exceeded");
+        assert!(eff.effective_max_concurrent >= 1);
     }
 
     #[test]
@@ -2654,7 +3297,7 @@ mod tests {
         let text = std::fs::read_to_string(global_path(ad)).unwrap();
         let (cfg, _, hard) = effective(Some(&text), None);
         assert!(!hard);
-        assert_eq!(cfg.workers.max_concurrent, 7);
+        assert_eq!(cfg.workers.max_concurrent, Some(7));
     }
 
     #[test]
@@ -2713,7 +3356,7 @@ mod tests {
         assert!(!hard);
         assert!(!cfg.ai.auto_rename);
         assert!(!cfg.ai.composer);
-        assert_eq!(cfg.workers.max_concurrent, 3);
+        assert_eq!(cfg.workers.max_concurrent, Some(3));
         // Untouched key keeps its value.
         assert!(cfg.ai.voice_dictation);
     }

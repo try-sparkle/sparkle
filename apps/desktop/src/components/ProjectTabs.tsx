@@ -57,6 +57,11 @@ export function tabPriority(counts: ProjectTabCounts | undefined): "p0" | "p1" |
 const RED = "#e0533f";
 const YELLOW = "#ffd76a";
 
+/** How wide a tab's project name may get before it ellipsizes. Sized so a typical repo folder name
+ *  fits whole and only genuinely long ones truncate — the point is a bar of UNIFORM-height tabs, not
+ *  aggressive shortening. */
+export const TAB_LABEL_MAX_WIDTH = 160;
+
 // Pin hover-reveal + rotate is driven entirely by CSS (scoped to .concierge-tab so it can't leak to
 // other tab widgets) — NOT by inline opacity, which would override the non-!important :hover rule and
 // defeat the reveal. Injected ONCE into <head> rather than rendered per instance.
@@ -137,6 +142,12 @@ export function ProjectTabs({
               alignItems: "center",
               gap: 8,
               padding: "8px 12px",
+              // A flex item defaults to `min-width: auto`, which floors it at its content's
+              // min-content width. With the label now `nowrap`, that floor is the WHOLE label —
+              // so a bar full of long names would push past its container and squeeze the "+" and
+              // the top-right cluster instead of ellipsizing. `minWidth: 0` lets the tab shrink so
+              // the label's own `text-overflow` actually gets to do its job under crowding.
+              minWidth: 0,
               borderRadius: "9px 9px 0 0",
               cursor: "pointer",
               fontSize: 12,
@@ -177,7 +188,21 @@ export function ProjectTabs({
             >
               <MdOutlinePushPin size={14} />
             </button>
-            <span>{p.name}</span>
+            <span
+              data-testid={`tab-label-${p.id}`}
+              style={{
+                // A long folder name must TRUNCATE, never wrap. Wrapping made that one tab two rows
+                // tall while its neighbours stayed one row, so the whole bar grew and the tabs no
+                // longer lined up — the ragged look the ellipsis exists to prevent. The tab's
+                // `title` already carries the full name, so nothing is lost to the truncation.
+                maxWidth: TAB_LABEL_MAX_WIDTH,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {p.name}
+            </span>
             {prio && (
               <span
                 data-testid={`count-${p.id}`}

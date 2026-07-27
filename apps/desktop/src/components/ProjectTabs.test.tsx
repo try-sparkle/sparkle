@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { ProjectTabs, pinTitle, tabPriority } from "./ProjectTabs";
+import { ProjectTabs, pinTitle, tabPriority, TAB_LABEL_MAX_WIDTH } from "./ProjectTabs";
 
 const projects = [
   { id: "sparkle", name: "sparkle" },
@@ -107,5 +107,33 @@ describe("ProjectTabs", () => {
     const { onSelect } = renderTabs();
     fireEvent.keyDown(screen.getByTestId("tab-website"), { key: "Enter" });
     expect(onSelect).toHaveBeenCalledWith("website");
+  });
+});
+
+// A long folder name used to WRAP, making that one tab two rows tall while its neighbours stayed
+// one row — the bar grew and the tabs stopped lining up. Names must ellipsize on a single line.
+describe("ProjectTabs — long names truncate rather than wrap", () => {
+  const longName = "sparkle-desktop-experimental-rewrite-with-a-very-long-folder-name";
+
+  it("clamps the label to one line with an ellipsis", () => {
+    renderTabs({ projects: [{ id: "long", name: longName }] });
+    const label = screen.getByTestId("tab-label-long");
+    expect(label.style.whiteSpace).toBe("nowrap");
+    expect(label.style.textOverflow).toBe("ellipsis");
+    expect(label.style.overflow).toBe("hidden");
+    expect(label.style.maxWidth).toBe(`${TAB_LABEL_MAX_WIDTH}px`);
+  });
+
+  it("keeps the FULL name available on hover, so truncation loses nothing", () => {
+    renderTabs({ projects: [{ id: "long", name: longName }] });
+    expect(screen.getByTestId("tab-label-long").textContent).toBe(longName);
+    expect(screen.getByTestId("tab-long").getAttribute("title")).toContain(longName);
+  });
+
+  it("applies the same clamp to short names, so every tab is exactly one row tall", () => {
+    renderTabs();
+    for (const p of projects) {
+      expect(screen.getByTestId(`tab-label-${p.id}`).style.whiteSpace).toBe("nowrap");
+    }
   });
 });

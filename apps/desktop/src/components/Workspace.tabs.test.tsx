@@ -14,10 +14,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+// setTitle is a spy (hoisted, because vi.mock factories are) so the window-title contract below can
+// assert what the shell actually named the window.
+const setTitleSpy = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     onCloseRequested: () => Promise.resolve(() => {}),
-    setTitle: () => Promise.resolve(),
+    setTitle: setTitleSpy,
   }),
   getAllWindows: () => Promise.resolve([{}]),
 }));
@@ -81,7 +84,7 @@ vi.mock("./Concierge/KebabMenu", () => ({ ConciergeTopRight: () => null }));
 vi.mock("./OpenPrMenu", () => ({ OpenPrMenu: () => null, agentLinkForBranch: () => null }));
 vi.mock("./NewProjectDialog", () => ({ NewProjectDialog: () => null }));
 
-import { Workspace } from "./Workspace";
+import { Workspace, WINDOW_TITLE } from "./Workspace";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -121,8 +124,48 @@ beforeEach(() => {
   useUiStore.setState({ activeSpecial: null, workMode: "build", pinnedProjectId: null } as never);
   useSettingsStore.setState({ beadsEnabled: true } as never);
   resetVisitedProjects();
+  setTitleSpy.mockClear();
 });
 afterEach(() => cleanup());
+
+// The window is named for the APP, not the selected project — the tab bar is what says which
+// project you're on. Regression guard: the title used to track projectName, so a repo folder called
+// "sparkle-desktop" made the macOS titlebar read as a different app than the one you launched.
+describe("Workspace — window title", () => {
+  // The flag must stay set for the WHOLE test, not just the render (roborev 53003): the title
+  // effect early-returns without `__TAURI_INTERNALS__`, so tearing it down straight after mount
+  // would make the no-retitle guard below vacuous — it would pass even if the effect still had
+  // `[projectName]` as its dep, which is precisely the regression it claims to pin.
+  const w = window as unknown as Record<string, unknown>;
+  beforeEach(() => {
+    w.__TAURI_INTERNALS__ = {};
+  });
+  afterEach(() => {
+    delete w.__TAURI_INTERNALS__;
+  });
+
+  it('titles the window "Sparkle", not the selected project', async () => {
+    render(<Workspace />);
+    await waitFor(() => expect(setTitleSpy).toHaveBeenCalled());
+    expect(setTitleSpy).toHaveBeenCalledWith(WINDOW_TITLE);
+    expect(setTitleSpy).toHaveBeenCalledWith("Sparkle");
+    // "Alpha" is the selected project (see beforeEach) — it must never reach the titlebar.
+    expect(setTitleSpy).not.toHaveBeenCalledWith("Alpha");
+  });
+
+  it("does not re-title when you switch tabs — the name is constant", async () => {
+    render(<Workspace />);
+    await waitFor(() => expect(setTitleSpy).toHaveBeenCalled());
+    const callsAfterBoot = setTitleSpy.mock.calls.length;
+    act(() => {
+      fireEvent.click(screen.getByTestId("tab-p2"));
+    });
+    await waitFor(() => expect(screen.getByTestId("tab-p2").getAttribute("aria-selected")).toBe("true"));
+    // Beta is now selected. A projectName-keyed effect would have fired again here.
+    expect(setTitleSpy.mock.calls.length).toBe(callsAfterBoot);
+    expect(setTitleSpy).not.toHaveBeenCalledWith("Beta");
+  });
+});
 
 describe("Workspace — project tabs drive the shell", () => {
   it("mounts only the SELECTED project's open agents at boot (no cross-project spawn storm)", async () => {
