@@ -337,34 +337,43 @@ fn import_default_at(
 
 /// Whether a pre-fix default record should be normalized to the empty "no override" sentinel.
 ///
-/// True in exactly ONE shape, the only one where the rewrite is provably safe:
+/// True when the record is the default, points literally at `<home>/.claude`, and that directory
+/// holds NO completed login.
 ///
-/// 1. the record is the default and literally points at `<home>/.claude`,
-/// 2. that directory holds NO completed login, and
-/// 3. `<home>/.claude.json` — where a plain `claude login` puts it — DOES.
+/// The safety argument is entirely in that last clause: with no `oauthAccount` at
+/// `<home>/.claude/.claude.json` there is no Anthropic account to switch away from, so the rewrite
+/// cannot move the user between accounts. It only stops Sparkle forcing every spawn onto a config
+/// path their terminal `claude` will never read.
 ///
-/// That is a user who never finished the duplicate `claude login` the old bug pushed them toward.
-/// Rewriting their record cannot switch which Anthropic account their agents run as, because there
-/// is no account at `<home>/.claude/.claude.json` to switch away from; it only stops Sparkle
-/// reporting their real terminal login as "not signed in" and walking them into that second login.
+/// This deliberately does NOT also require a login at `<home>/.claude.json`. An earlier version did,
+/// reasoning that with neither file holding a login there was nothing to migrate to — but that
+/// leaves the record exporting `CLAUDE_CONFIG_DIR=$HOME/.claude`, so the user's very next sign-in
+/// (through Sparkle or the login modal) lands in `$HOME/.claude/.claude.json` and forks from their
+/// terminal login right then. That is the trap this exists to close, merely deferred; a fresh
+/// install with no login anywhere is the most common way to walk into it.
 ///
-/// Every other shape is left alone. In particular, a `<home>/.claude` that DOES hold a login is
-/// self-consistent — the spawn exports it, so Claude Code really does keep its config there — and
-/// migrating it would silently move the user onto a different Anthropic account.
+/// A `<home>/.claude` that DOES hold a login is still left alone: it is self-consistent — the spawn
+/// exports it, so Claude Code really does keep its config there — and migrating it would silently
+/// move the user onto a different Anthropic account.
 fn default_config_dir_needs_normalizing(acct: &Account, home: Option<&Path>) -> bool {
     let Some(home) = home else { return false };
     if !acct.is_default || Path::new(&acct.config_dir) != home.join(".claude") {
         return false;
     }
     read_oauth_identity_at(Some(Path::new(&acct.config_dir)), None).is_none()
-        && read_oauth_identity_at(None, Some(home)).is_some()
 }
 
-/// Apply [`default_config_dir_needs_normalizing`], persisting only when something changed.
-/// Returns whether a record was rewritten. Runs on every app start (via `accounts_import_default`),
-/// so it must stay a cheap no-op in the overwhelmingly common case — it is: the shape check is two
-/// string comparisons before any file is opened.
-fn normalize_default_config_dir_at(accounts_path: &Path, home: Option<&Path>) -> Result<bool, String> {
+/// Apply [`default_config_dir_needs_normalizing`], rewriting the record to `effective` — the value
+/// a spawn will actually see (see `claude::effective_spawn_config_dir`), which is usually "" but is
+/// the user's own path when their login shell exports one.
+///
+/// Returns whether a record was rewritten. Persists only on a real change, so a user whose login
+/// shell happens to export `$HOME/.claude` doesn't get a redundant write on every app start.
+fn normalize_default_config_dir_at(
+    accounts_path: &Path,
+    home: Option<&Path>,
+    effective: &str,
+) -> Result<bool, String> {
     let mut accounts = read_accounts_at(accounts_path)?;
     let Some(acct) = accounts
         .iter_mut()
@@ -372,7 +381,10 @@ fn normalize_default_config_dir_at(accounts_path: &Path, home: Option<&Path>) ->
     else {
         return Ok(false);
     };
-    acct.config_dir = String::new();
+    if acct.config_dir == effective {
+        return Ok(false);
+    }
+    acct.config_dir = effective.to_string();
     write_accounts_at(accounts_path, &accounts)?;
     Ok(true)
 }
@@ -1284,8 +1296,9 @@ pub fn accounts_remove(
 
 /// Idempotently import the user's existing default config dir as an account.
 ///
-/// `config_dir` = `$CLAUDE_CONFIG_DIR` if Sparkle itself was launched with one, else the EMPTY
-/// string — meaning "set no `CLAUDE_CONFIG_DIR` on the spawn at all".
+/// `config_dir` = the value a spawn will actually see (`claude::effective_spawn_config_dir`):
+/// Sparkle's own `$CLAUDE_CONFIG_DIR` if it was launched with one, else whatever the login shell
+/// exports, else the EMPTY string — meaning "set no `CLAUDE_CONFIG_DIR` on the spawn at all".
 ///
 /// Empty is load-bearing, not a missing value. It used to synthesize `$HOME/.claude` here, on the
 /// reasonable-looking assumption that `CLAUDE_CONFIG_DIR=$HOME/.claude` is what "no override" means.
@@ -1311,14 +1324,22 @@ pub fn accounts_import_default(
 ) -> Result<Account, String> {
     let _guard = lock.guard();
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
+    let accounts_path = accounts_json_path(&app_data);
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    normalize_default_config_dir_at(&accounts_json_path(&app_data), home.as_deref())?;
-    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|s| !s.is_empty())
-        .map(|s| PathBuf::from(s).to_string_lossy().into_owned())
-        .unwrap_or_default();
+
+    // Steady state — a default that exists and needs no repair — must cost one file read and
+    // nothing else. `effective_spawn_config_dir` may run a login shell (100-500ms of dotfiles) and
+    // this command is called on every app start, so resolve it only when it will be used.
+    if let Some(existing) = read_accounts_at(&accounts_path)?.iter().find(|a| a.is_default) {
+        if !default_config_dir_needs_normalizing(existing, home.as_deref()) {
+            return Ok(existing.clone());
+        }
+    }
+
+    let effective = crate::claude::effective_spawn_config_dir();
+    normalize_default_config_dir_at(&accounts_path, home.as_deref(), &effective)?;
     let id = generate_account_id()?;
-    import_default_at(&accounts_json_path(&app_data), config_dir, id, now_secs())
+    import_default_at(&accounts_path, effective, id, now_secs())
 }
 
 /// Record that an account hit a real rate limit, resetting at `until_epoch`.
@@ -2275,9 +2296,9 @@ mod tests {
 
     #[test]
     fn pre_fix_default_is_normalized_only_when_the_rewrite_cannot_change_accounts() {
-        // THE case worth migrating: the user never completed the duplicate login the old bug
-        // pushed them toward, so `<home>/.claude` is empty and their real login sits unread at
-        // `<home>/.claude.json`. Rewriting to "" cannot switch accounts — there is none to leave.
+        // The user never completed the duplicate login the old bug pushed them toward, so
+        // `<home>/.claude` is empty and their real login sits unread at `<home>/.claude.json`.
+        // Rewriting cannot switch accounts — there is none at `<home>/.claude` to leave.
         let home = fake_home("norm-yes", None, Some("real@example.com"));
         assert!(default_config_dir_needs_normalizing(&default_at(&home), Some(&home)));
         let _ = std::fs::remove_dir_all(&home);
@@ -2288,10 +2309,11 @@ mod tests {
         assert!(!default_config_dir_needs_normalizing(&default_at(&home), Some(&home)));
         let _ = std::fs::remove_dir_all(&home);
 
-        // Nothing at `<home>/.claude.json` to migrate TO — leave it alone rather than blank the
-        // record and strand the account with no identity at all.
+        // NO login anywhere — a fresh install. Still migrate: leaving the record exporting
+        // `$HOME/.claude` means the user's very NEXT sign-in lands there and forks from the
+        // terminal login right then, which is the whole trap merely deferred.
         let home = fake_home("norm-neither", None, None);
-        assert!(!default_config_dir_needs_normalizing(&default_at(&home), Some(&home)));
+        assert!(default_config_dir_needs_normalizing(&default_at(&home), Some(&home)));
         // A NAMED account is never touched, whatever its dir holds.
         let mut named = default_at(&home);
         named.is_default = false;
@@ -2315,13 +2337,13 @@ mod tests {
         let path = accounts_json_path(&base);
         write_accounts_at(&path, &[default_at(&home), sample("n", false, "/data/x")]).unwrap();
 
-        assert!(normalize_default_config_dir_at(&path, Some(&home)).unwrap());
+        assert!(normalize_default_config_dir_at(&path, Some(&home), "").unwrap());
         let after = read_accounts_at(&path).unwrap();
         assert_eq!(after[0].config_dir, "", "default migrated to the no-override sentinel");
         assert_eq!(after[1].config_dir, "/data/x", "named account untouched");
 
         // Second pass changes nothing and reports no write.
-        assert!(!normalize_default_config_dir_at(&path, Some(&home)).unwrap());
+        assert!(!normalize_default_config_dir_at(&path, Some(&home), "").unwrap());
         assert_eq!(read_accounts_at(&path).unwrap(), after);
 
         // And the migrated record now resolves to the terminal's real login.
@@ -2330,6 +2352,38 @@ mod tests {
                 .map(|i| i.email),
             Some("real@example.com".to_string())
         );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn normalize_stores_the_login_shells_dir_when_it_has_one() {
+        // A user whose `.zprofile` exports CLAUDE_CONFIG_DIR: the spawn (`zsh -l -c`) sources that
+        // FIRST, so the child really does use their dir. Recording "" would point every read —
+        // identity, transcripts, session detection — at $HOME while the child used /custom/dir.
+        let home = fake_home("norm-shell", None, Some("real@example.com"));
+        let base = unique_dir("norm-shell-accts");
+        let path = accounts_json_path(&base);
+        write_accounts_at(&path, &[default_at(&home)]).unwrap();
+
+        assert!(normalize_default_config_dir_at(&path, Some(&home), "/custom/dir").unwrap());
+        assert_eq!(read_accounts_at(&path).unwrap()[0].config_dir, "/custom/dir");
+        // Read and write sides now agree on where that account's transcripts live.
+        assert_eq!(
+            projects_root_for_account(&read_accounts_at(&path).unwrap()[0]),
+            Some(PathBuf::from("/custom/dir/projects"))
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&base);
+
+        // And when the shell's value IS `<home>/.claude`, the record already says that — no
+        // pointless rewrite on every app start.
+        let home = fake_home("norm-shell-same", None, None);
+        let base = unique_dir("norm-shell-same-accts");
+        let path = accounts_json_path(&base);
+        write_accounts_at(&path, &[default_at(&home)]).unwrap();
+        let same = home.join(".claude").to_string_lossy().into_owned();
+        assert!(!normalize_default_config_dir_at(&path, Some(&home), &same).unwrap());
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&base);
     }

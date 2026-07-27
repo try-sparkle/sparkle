@@ -52,6 +52,39 @@ pub(crate) fn claude_projects_root(config_dir: Option<&Path>, home: Option<&Path
     }
 }
 
+/// The `CLAUDE_CONFIG_DIR` a spawned `claude` will ACTUALLY see, as a string ("" = none).
+///
+/// Sparkle's own process env is not authoritative. Launched from Finder a macOS GUI app inherits
+/// almost nothing, and every spawn goes through `zsh -l -c`, which sources `.zprofile`/`.zlogin`
+/// FIRST. So a user who exports `CLAUDE_CONFIG_DIR` there has it applied to the child while Sparkle
+/// sees nothing — and recording "no override" for the default account would then point every read
+/// (identity, transcripts, session detection) at `$HOME` while the child used their directory.
+///
+/// Order: Sparkle's own env when it has one (the multi-account spawn sets the variable on children
+/// only, so a value here is the user's real one), else the login shell's, else "".
+///
+/// The probe is cached for the process and mirrors `claude_chat::cached_login_shell_path`'s policy —
+/// same shell, same graceful degradation: any failure yields "", which is exactly the pre-probe
+/// behavior. Callers should reach for this only when they actually need it; a login shell re-sources
+/// dotfiles and costs 100-500ms.
+pub(crate) fn effective_spawn_config_dir() -> String {
+    if let Some(v) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(v).to_string_lossy().into_owned();
+    }
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            std::process::Command::new("/bin/zsh")
+                .args(["-l", "-c", "printf %s \"$CLAUDE_CONFIG_DIR\""])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
 /// The directory Claude Code would use to store sessions for `worktree_path`.
 /// Pure form so it's testable without touching the environment.
 fn claude_session_dir_for(projects_root: &Path, worktree_path: &str) -> PathBuf {
