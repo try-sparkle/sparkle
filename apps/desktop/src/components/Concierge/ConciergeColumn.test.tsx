@@ -5,6 +5,12 @@
 // the wordmark-mode derivation is pinned. Per-piece behavior lives in the sibling tests.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// The wordmark is now the real brand mark, which opens sparkle.ai through the Tauri opener.
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn(() => Promise.resolve()),
+}));
+
 import { ConciergeColumn, deriveWordmarkMode } from "./ConciergeColumn";
 import type { ConciergeController, ConciergeNudge, ConciergeViewModel } from "./types";
 
@@ -45,7 +51,9 @@ function controller(): ConciergeController {
 describe("ConciergeColumn — view-model → rendered output", () => {
   it("renders the wordmark, spend pill, scope, vitals, and every message kind", () => {
     const { container } = render(<ConciergeColumn model={model} controller={controller()} />);
-    expect(screen.getByText("Sparkle")).toBeTruthy();
+    // The wordmark is the brand mark itself, not styled text — see SparkleLogo.placement.test.tsx
+    // for the full placement/accessibility contract.
+    expect(screen.getByRole("link", { name: "Sparkle" })).toBeTruthy();
     expect(screen.getByText("$4.12")).toBeTruthy();
     expect(screen.getByText("Following all projects")).toBeTruthy();
     expect(container.textContent).toContain("1 Needs you · 2 Running");

@@ -7,6 +7,7 @@
 // Purely presentational: everything rendered comes from the ConciergeViewModel, every gesture
 // leaves through the ConciergeController (see ./types). The integration unit mounts and
 // drives it; this file never touches app state.
+import { SparkleLogoLink } from "../SparkleLogoLink";
 import { C } from "../../theme/colors";
 import { ComposeBox } from "./ComposeBox";
 import { ConciergeThread } from "./ConciergeThread";
@@ -63,7 +64,14 @@ export function ConciergeColumn({
     >
       <div style={{ position: "relative", flex: "none", padding: "16px 16px 12px" }}>
         <SpendPill amountText={model.spend.amountText} />
-        <StarfieldWordmark mode={mode} />
+        {/* The Sparkle.ai mark heads this column (it used to sit in the builder column's header).
+            It goes INSIDE the star field rather than in a row above it: the field's job is to live
+            through the wordmark, and the wordmark is the logo — stacking the mark over the styled
+            "Sparkle" text this used to render would print the brand name twice, in two typefaces,
+            12px apart. */}
+        <StarfieldWordmark mode={mode}>
+          <SparkleLogoLink />
+        </StarfieldWordmark>
         <ScopeVitals pinnedProjectName={model.scope.pinnedProjectName} counts={model.vitals} />
         {searchSlot && <div style={{ marginTop: 10 }}>{searchSlot}</div>}
       </div>

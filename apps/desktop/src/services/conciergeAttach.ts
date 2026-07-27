@@ -95,7 +95,7 @@ const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
  *
  * NOT `buildDisplay`. That renders its counts with emoji as icons (`📷 1 image`), which was
  * tolerable inside the old composer's own tile row but is banned in the concierge surfaces —
- * icons come from react-icons/fi (see DragVisionHintPill's header), emoji never stand in for them
+ * icons come from react-icons/fi (see TerminalDropPill's header), emoji never stand in for them
  * (roborev 46911). `buildDisplay` keeps its glyphs for the Sparkle-pane Composer, which still
  * uses it; this is the concierge's own glyph-free rendering of the same counts.
  */

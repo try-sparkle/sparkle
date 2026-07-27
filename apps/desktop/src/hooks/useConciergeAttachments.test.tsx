@@ -38,6 +38,7 @@ vi.mock("../logger", () => ({
 
 import { useConciergeAttachments, type ConciergeAttachments } from "./useConciergeAttachments";
 import { CONCIERGE_COMPOSE_DND_TARGET, NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
+import { useTerminalDropStore } from "../stores/terminalDropStore";
 import type { Attachment } from "../components/composer/attachments";
 
 const file = (id: string): Attachment => ({
@@ -77,6 +78,7 @@ beforeEach(() => {
   );
   captured.pick.mockResolvedValue([]);
   captured.loadPaths.mockResolvedValue([]);
+  useTerminalDropStore.setState({ queue: [] });
   render(<Host />);
 });
 afterEach(() => cleanup());
@@ -217,5 +219,95 @@ describe("drop scoping", () => {
     cursorOver = "box";
     await fire({ type: "drop", position: at, paths: [] });
     expect(captured.loadPaths).not.toHaveBeenCalled();
+  });
+});
+
+// Files dropped on an agent's TERMINAL (hooks/useTerminalDrop) reach the box through this hook, so
+// they become the SAME chips the pickers produce and inherit remove / take / restore rather than
+// growing a second attachment mechanism beside them.
+describe("pickup of a terminal drop", () => {
+  it("stages what was dropped on the terminal, through the ordinary load path", async () => {
+    captured.loadPaths.mockResolvedValue([file("dropped")]);
+    await act(async () => {
+      useTerminalDropStore.getState().enqueue("agent-a", ["/tmp/shot.png"]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(captured.loadPaths).toHaveBeenCalledWith(["/tmp/shot.png"]);
+    expect(api.attachments.map((a) => a.id)).toEqual(["dropped"]);
+  });
+
+  it("takes the queue exactly once — a second pickup delivers nothing twice", async () => {
+    captured.loadPaths.mockResolvedValue([file("dropped")]);
+    await act(async () => {
+      useTerminalDropStore.getState().enqueue("agent-a", ["/tmp/shot.png"]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(useTerminalDropStore.getState().queue).toEqual([]);
+    expect(captured.loadPaths).toHaveBeenCalledTimes(1);
+    expect(api.attachments).toHaveLength(1);
+  });
+
+  it("appends to files already staged by the pickers rather than replacing them", async () => {
+    captured.pick.mockResolvedValue([file("picked")]);
+    await act(async () => {
+      api.attach("files");
+      await Promise.resolve();
+    });
+    captured.loadPaths.mockResolvedValue([file("dropped")]);
+    await act(async () => {
+      useTerminalDropStore.getState().enqueue("agent-a", ["/tmp/shot.png"]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(api.attachments.map((a) => a.id)).toEqual(["picked", "dropped"]);
+  });
+
+  it("accepts NON-IMAGE paths — the payload is paths the agent reads off disk", async () => {
+    captured.loadPaths.mockResolvedValue([file("server.log")]);
+    await act(async () => {
+      useTerminalDropStore.getState().enqueue("agent-a", ["/tmp/server.log"]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(captured.loadPaths).toHaveBeenCalledWith(["/tmp/server.log"]);
+    expect(api.attachments.map((a) => a.id)).toEqual(["server.log"]);
+  });
+
+  it("picks up a drop that landed BEFORE the column mounted", async () => {
+    // The drop can beat this effect by a tick; files staged nowhere would be silently lost.
+    cleanup();
+    useTerminalDropStore.getState().enqueue("agent-a", ["/tmp/early.png"]);
+    captured.loadPaths.mockResolvedValue([file("early")]);
+    await act(async () => {
+      render(<Host />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(api.attachments.map((a) => a.id)).toEqual(["early"]);
+  });
+
+  it("a dropped file is removable and restorable like any other", async () => {
+    // The whole point of feeding the existing list: a mis-drop is undoable without sending it, and
+    // a send that does not land hands the files back (ConciergeHost calls restore on failure).
+    captured.loadPaths.mockResolvedValue([file("dropped")]);
+    await act(async () => {
+      useTerminalDropStore.getState().enqueue("agent-a", ["/tmp/shot.png"]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    let staged: Attachment[] = [];
+    act(() => {
+      staged = api.take();
+    });
+    expect(staged.map((a) => a.id)).toEqual(["dropped"]);
+    expect(api.attachments).toEqual([]);
+
+    act(() => api.restore(staged));
+    expect(api.attachments.map((a) => a.id)).toEqual(["dropped"]);
+
+    act(() => api.remove("dropped"));
+    expect(api.attachments).toEqual([]);
   });
 });

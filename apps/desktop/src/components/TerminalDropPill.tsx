@@ -1,44 +1,49 @@
-// The drag-vision hint pill (spec: 2026-07-02-terminal-drag-hint, Unit A). Shown when the user
-// drags an image onto the terminal — which is NOT where images go since CM-U7 removed the pane
-// composer.
+// Confirmation pill for files dropped on an agent's terminal (hooks/useTerminalDrop). Successor to
+// DragVisionHintPill, which existed to say the opposite — that a dropped image had nowhere to go,
+// because CM-U7 removed the pane composer. The terminal IS a drop target now, so the pill reports
+// what landed and where it is waiting.
 //
-// WHAT THIS PILL MAY PROMISE: only what exists. The terminal drop target is gone, but the concierge
-// compose box now takes files — its Screenshot/Image/Files pickers are real and it is itself a drop
-// target (parity row #21, useConciergeAttachments). So the pill is a POINTER to them: drop it on the
-// Sparkle box, or use the buttons there. It still must not claim the image reaches "this agent" —
-// the box aims at Sparkle unless the user pins an agent with the send-target toggle — so the copy
-// names the box, never the agent whose terminal was dragged over.
-//
-// NOT AN UPSELL (roborev 46925). It used to carry "(Vision also needs AI Features enabled.)" and an
-// "Enable AI Features" CTA, from when the terminal drop fed a paid vision path. The flow this pill
-// now recommends checks no entitlement anywhere — conciergeAttach, useConciergeAttachments and the
-// dispatch/brain paths never consult aiFeatureNow — so the parenthetical was simply false and the
-// CTA sold a feature the recommended flow does not need. Both are gone, and with them the
-// `entitled` prop: there is no longer anything for it to gate.
+// WHAT THIS PILL MAY PROMISE: only what happened. The files are ATTACHED, not sent — they ride
+// along with the user's next message to this agent, and nothing moves until they hit Send. Saying
+// "sent" would be the same class of lie the old copy was written to avoid, and a worse one: a
+// terminal write cannot be taken back.
 //
 // Rendered through a portal (like SelectionPopup.tsx) so the terminal's overflow:hidden can't clip
-// it, and positioned with viewport-clamped fixed coords just ABOVE the terminal pane. Styling
-// mirrors the app's dark popovers / ModelPill. No emoji — icons come from react-icons/fi (Feather).
+// it, and positioned with viewport-clamped fixed coords just inside the terminal pane's top edge.
+// Styling mirrors the app's dark popovers / ModelPill. No emoji — icons come from react-icons/fi.
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import { FiEye, FiExternalLink, FiX } from "react-icons/fi";
+import { FiPaperclip, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { useUiStore } from "../stores/uiStore";
-import { launch } from "../services/sparkleApi";
 
-/** "Learn more" deep link into the docs. Points at the vision page itself, NOT the old
- *  `#dragging-images-into-the-terminal` anchor — that section describes a behavior this pill
- *  exists to say no longer happens (roborev 46485-L). */
-export const VISION_LEARN_MORE_URL = "https://sparkle.ai/docs/vision";
 /** Auto-dismiss the pill after this long if the user doesn't act. */
 const AUTO_DISMISS_MS = 8000;
 const WIDTH = 340;
 
-export function DragVisionHintPill({
+const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+
+/** "2 images", "1 file", "3 files (2 of them images)" — names what landed without ever calling a
+ *  non-image an image. Pure, so the copy is testable without a DOM. */
+export function describeDrop(count: number, images: number): string {
+  if (images === 0) return plural(count, "file");
+  if (images === count) return plural(count, "image");
+  return `${plural(count, "file")} (${images} of them images)`;
+}
+
+export function TerminalDropPill({
+  count,
+  images,
+  agentName,
   anchorRef,
   onDismiss,
 }: {
-  /** The terminal pane the pill floats above. Falls back to the top-center of the window. */
+  count: number;
+  /** How many of `count` are images — wording only; every dropped file is attached. */
+  images: number;
+  /** The agent the files were attached to — the pane that was dropped on. */
+  agentName: string;
+  /** The terminal pane the pill floats over. Falls back to the top-center of the window. */
   anchorRef?: RefObject<HTMLElement | null>;
   onDismiss: () => void;
 }) {
@@ -64,7 +69,7 @@ export function DragVisionHintPill({
     };
   }, []);
 
-  // Center the pill horizontally over the terminal pane and float it just above the pane's top
+  // Center the pill horizontally over the terminal pane and float it just inside the pane's top
   // edge, clamped into the viewport so it never renders off-screen.
   useLayoutEffect(() => {
     const w = cardRef.current?.offsetWidth ?? WIDTH;
@@ -79,23 +84,19 @@ export function DragVisionHintPill({
     setPos({ left, top });
   }, [anchorRef]);
 
-  // Primary action: put the caret in the one surface that takes BOTH text and files, which is where
-  // the user should have dropped the image.
+  // The drop already asked for the caret; this button is for the user who clicked away in the
+  // meantime, and re-asks for exactly the same thing.
   const onGoToCompose = () => {
     useUiStore.getState().requestComposeFocus();
-    onDismissRef.current();
-  };
-
-  const onLearnMore = () => {
-    void launch(VISION_LEARN_MORE_URL);
     onDismissRef.current();
   };
 
   return createPortal(
     <div
       ref={cardRef}
+      data-testid="terminal-drop-pill"
       role="dialog"
-      aria-label="Images go in the Sparkle box, not the terminal"
+      aria-label={`Attached to ${agentName}`}
       style={{
         position: "fixed",
         left: pos.left,
@@ -139,11 +140,10 @@ export function DragVisionHintPill({
       </button>
 
       <div style={{ display: "flex", gap: 8, alignItems: "flex-start", paddingRight: 18 }}>
-        <FiEye size={16} style={{ flex: "none", color: C.teal, marginTop: 1 }} aria-hidden />
+        <FiPaperclip size={16} style={{ flex: "none", color: C.teal, marginTop: 1 }} aria-hidden />
         <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
-          Dropping an image here doesn&apos;t send it — the terminal takes typed input only. Drop
-          it on the Sparkle box instead, or use the Image / Files buttons there, and it rides along
-          with your next message.
+          Attached {describeDrop(count, images)} to <strong>{agentName}</strong>. Nothing has been
+          sent yet — say what you want done with it in the Sparkle box and hit Send.
         </div>
       </div>
 
@@ -165,25 +165,6 @@ export function DragVisionHintPill({
           }}
         >
           Go to the Sparkle box
-        </button>
-        <button
-          type="button"
-          onClick={onLearnMore}
-          style={{
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 4,
-            background: "transparent",
-            border: "none",
-            color: C.teal,
-            fontSize: 12,
-            cursor: "pointer",
-            fontFamily: "inherit",
-            padding: "5px 2px",
-          }}
-        >
-          Learn more
-          <FiExternalLink size={12} aria-hidden />
         </button>
       </div>
     </div>,

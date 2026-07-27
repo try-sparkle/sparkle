@@ -51,6 +51,7 @@ import { closeScopeProjectNames, killAllOpenAgents, planWindowClose } from "../s
 import { clearWindowProject } from "../services/windowRegistry";
 import { clearWindowRoster } from "../services/attention";
 import { safeUnlisten } from "../services/safeUnlisten";
+import { TERMINAL_STAGE_DND_TARGET } from "../services/dndTargets";
 import { useImprovementScheduler } from "../useImprovementScheduler";
 import { ErrorBoundary, AgentPaneErrorCard } from "./ErrorBoundary";
 import { perfRender } from "../perfTrace";
@@ -585,6 +586,10 @@ export function Workspace() {
               shell tests read. */}
           <div
             data-testid="terminal-stage"
+            // Files dropped anywhere on the stage attach to the VISIBLE agent's next message
+            // (hooks/useTerminalDrop). Tauri's drag events are window-global and carry no target
+            // element, so this marker is what the hit-test resolves against (services/dndTargets).
+            data-dnd-target={TERMINAL_STAGE_DND_TARGET}
             data-calm={String(terminalCalm)}
             style={{
               flex: 1,

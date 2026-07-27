@@ -17,6 +17,16 @@ export const NEW_BUILD_AGENT_DND_TARGET = "new-build-agent";
  *  and the Sparkle pane's Composer); an unscoped concierge listener would double-attach. */
 export const CONCIERGE_COMPOSE_DND_TARGET = "concierge-compose";
 
+/** The terminal stage — the box in Workspace that every agent pane is stacked inside. Dropping
+ *  files here attaches them to the VISIBLE agent's next message (hooks/useTerminalDrop).
+ *
+ *  DELIBERATELY NOT in FILE_DROP_TARGETS below, even though it does own its drops. That list is
+ *  "surfaces the two window-global listeners must stand DOWN over", and the Sparkle pane's
+ *  Composer renders INSIDE this stage — listing it here would make that composer refuse drops on
+ *  its own box. The stage doesn't need the carve-out anyway: useTerminalDrop only listens while an
+ *  agent pane is visible, and no agent pane is visible while the Sparkle pane is. */
+export const TERMINAL_STAGE_DND_TARGET = "terminal-stage";
+
 /** True when the drag position (physical pixels) is over an element inside the named target. */
 export function isOverDndTarget(position: { x: number; y: number }, target: string): boolean {
   const scale = window.devicePixelRatio || 1;
@@ -25,12 +35,14 @@ export function isOverDndTarget(position: { x: number; y: number }, target: stri
   return !!el?.closest(`[data-dnd-target="${target}"]`);
 }
 
-/** Every surface that OWNS a dropped file itself. One list, because two window-global listeners
- *  need the same answer for opposite reasons and they used to keep their own copies (roborev
- *  46911/49294): Composer.tsx stands down over them so a file can't double-attach, and
- *  useDragVisionHint stays quiet over them because its pill exists to say "drop it somewhere that
- *  takes it". A third target added here is picked up by both; added to only one of two private
- *  copies, it silently regresses whichever was forgotten. */
+/** Surfaces a window-global listener must stand DOWN over, because something else owns the drop.
+ *  One shared list rather than a private copy per listener (roborev 46911/49294): Composer.tsx
+ *  reads it so a file can't double-attach, and a target added here reaches every consumer at once
+ *  instead of silently regressing whichever copy was forgotten.
+ *
+ *  NOT every drop target belongs here — TERMINAL_STAGE_DND_TARGET owns its drops and is
+ *  deliberately absent; see its comment above for why adding it would break the Sparkle pane's
+ *  composer. */
 export const FILE_DROP_TARGETS = [NEW_BUILD_AGENT_DND_TARGET, CONCIERGE_COMPOSE_DND_TARGET] as const;
 
 /** True when the drag position is over ANY surface that accepts the file itself. */

@@ -4,8 +4,11 @@ import { useAuthStore } from "../stores/authStore";
 import { useUiStore } from "../stores/uiStore";
 import { formatBalance } from "../services/creditPricing";
 
-// Shows the user's remaining AI-credit balance in the sidebar header — top-right of the left
-// column, beside the Sparkle.ai wordmark (design spec §7.3). Reads the entitlement that
+// Shows the user's remaining AI-credit balance in the builder sidebar header — top-right of that
+// column (design spec §7.3). It no longer sits beside the Sparkle.ai wordmark: the wordmark moved
+// to the concierge column, and this badge deliberately did NOT follow it, because that column
+// already carries the SpendPill and two money pills in one header read as a question rather than
+// as a summary. Reads the entitlement that
 // AuthGate already loaded; refreshes on mount so it's current after a top-up.
 // No outline and no ⚡ icon — just the dollar amount in a filled pill whose corner radius
 // matches the "Open" pill in the TopBar (8px, not a fully-rounded 999 capsule).

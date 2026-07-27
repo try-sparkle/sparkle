@@ -52,8 +52,9 @@ import { registerPromptMarker } from "../services/terminalMarkers";
 import { abandonPendingSends, flushPendingSends } from "../services/conciergeDispatch";
 import { setPaneFailed, setPaneReady, unregisterPane } from "../services/paneReadiness";
 import { isTypingInProgress } from "../engine/focusGuard";
-import { DragVisionHintPill } from "./DragVisionHintPill";
-import { useDragVisionHint } from "../hooks/useDragVisionHint";
+import { TerminalDropOverlay } from "./TerminalDropOverlay";
+import { TerminalDropPill } from "./TerminalDropPill";
+import { useTerminalDrop } from "../hooks/useTerminalDrop";
 import { Onboarding } from "./Onboarding";
 import { paneVisibilityStyle } from "./paneVisibility";
 import { perfRender, perfMark, perfEnd, perfCancel } from "../perfTrace";
@@ -173,13 +174,15 @@ function AgentPaneInner({
   const terminalApiRef = useRef<TerminalApi | null>(null);
   // The terminal pane box, so the drag-vision hint pill can anchor just above it.
   const terminalStageRef = useRef<HTMLDivElement>(null);
-  // Drag-vision hint (spec 2026-07-02): an image dragged onto the terminal shows a pill explaining
-  // that this isn't where images go. Only the visible pane listens — the webview drag event is
-  // window-global, so gating on `visible` keeps every background pane from popping its own pill.
-  // Armed for EVERY user (roborev 46351): the pill's only action is the redirect to the concierge
-  // compose box — the one place images DO go — and that flow checks no entitlement at all, so the
-  // pill no longer reads auth state (roborev 46925 retired its upgrade CTA).
-  const dragHint = useDragVisionHint(visible);
+  // Drop files on this terminal to attach them to this agent's next message. Replaces the old
+  // drag-vision hint, whose whole content was "images have nowhere to go, drop them on the Sparkle
+  // box instead" — that stopped being true when the terminal became a real drop target, and a pill
+  // saying it over an overlay saying "drop to attach" would be a contradiction on screen.
+  //
+  // Only the VISIBLE pane listens. The webview drag event is window-global and every visited pane
+  // stays mounted and stacked in the same stage, so `visible` is the ONLY thing that can name which
+  // agent a drop belongs to — see useTerminalDrop's header.
+  const terminalDrop = useTerminalDrop(visible, agent.id);
 
   // Publish this agent's "mark a prompt at the current terminal row" capability while its pane is
   // mounted, so the concierge dispatch path can drop the jump-to-prompt marker the composer used to
@@ -858,6 +861,10 @@ function AgentPaneInner({
         // transition — so a draft typed while the agent's workspace spins up is preserved (the
         // element is never remounted) and an eager send is queued + auto-delivered when ready.
         <div ref={terminalStageRef} style={{ position: "relative", flex: 1, minHeight: 0 }}>
+          {/* Drag-over affordance. Sits directly in this positioned box so it covers the terminal
+              whatever `phase` is rendering — a file dropped while the workspace is still preparing
+              is staged just the same, so refusing to say so would be the misleading half. */}
+          {terminalDrop.dropActive && <TerminalDropOverlay agentName={agent.name} />}
           {phase === "ready" && spawn ? (
           <div
             style={{
@@ -960,10 +967,16 @@ function AgentPaneInner({
               onPick={pickAccount}
             />
           )}
-          {/* Drag-vision hint: only appears when the composer is off and an image was dragged onto
-              the terminal (see useDragVisionHint / dragHint). Portaled, anchored above this pane. */}
-          {dragHint.show && (
-            <DragVisionHintPill anchorRef={terminalStageRef} onDismiss={dragHint.dismiss} />
+          {/* Confirmation of what a drop landed, to whom, and that it has NOT been sent (see
+              useTerminalDrop / TerminalDropPill). Portaled, anchored above this pane. */}
+          {terminalDrop.dropped && (
+            <TerminalDropPill
+              count={terminalDrop.dropped.count}
+              images={terminalDrop.dropped.images}
+              agentName={agent.name}
+              anchorRef={terminalStageRef}
+              onDismiss={terminalDrop.dismiss}
+            />
           )}
         </div>
       )}

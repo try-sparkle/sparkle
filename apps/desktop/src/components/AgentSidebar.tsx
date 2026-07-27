@@ -1082,37 +1082,26 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         height: "100%",
       }}
     >
-      {/* position:relative + zIndex keep the Sparkle.ai logo IN FRONT of the voice-orb glow
-          that the waveform paints below — the glow can bleed upward into this row, but the
-          logo must stay crisp on top of it, never washed out behind it. */}
+      {/* position:relative + zIndex keep this row's controls IN FRONT of the voice-orb glow that
+          the waveform paints below — the glow can bleed upward into this row, but the badge and
+          button must stay crisp on top of it, never washed out behind it. The lift was originally
+          added for the Sparkle.ai wordmark, which now heads column one (the concierge); it stays
+          because the controls left behind sit in the same bleed. */}
       <div
+        data-testid="sidebar-header"
         style={{
           padding: "14px 14px 6px",
           position: "relative",
           zIndex: 1,
           display: "flex",
           alignItems: "center",
-          justifyContent: "space-between",
+          // flex-end, not space-between: the wordmark used to anchor the left of this row, and
+          // with it gone space-between would strand the badge alone at the far left.
+          justifyContent: "flex-end",
           gap: 8,
         }}
       >
-        {/* Anchor (not a bare clickable <img>) so the logo is focusable and announced as a
-            link; the system browser is opened via the Tauri opener, so we preventDefault and
-            surface any opener failure rather than swallowing the promise. */}
-        <a
-          href="https://sparkle.ai"
-          title="Open sparkle.ai"
-          onClick={(e) => {
-            e.preventDefault();
-            openUrl("https://sparkle.ai").catch((err) =>
-              console.error("Failed to open sparkle.ai:", err),
-            );
-          }}
-          style={{ display: "inline-flex", cursor: "pointer" }}
-        >
-          <img src="/sparkle-logo.svg" alt="Sparkle" style={{ height: 25 }} />
-        </a>
-        {/* Remaining AI-credit balance, top-right of the left column beside the wordmark. */}
+        {/* Remaining AI-credit balance, top-right of the builder column. */}
         <BalanceBadge />
         <ShowHelperButton />
       </div>

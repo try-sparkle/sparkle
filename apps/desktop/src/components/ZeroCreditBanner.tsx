@@ -123,7 +123,7 @@ export function ZeroCreditBanner({ inline = false }: { inline?: boolean } = {}) 
         // reliably announced, invisible to keyboard users — so a button whose only child is
         // aria-hidden must not depend on it for its name. (A description identical to the computed
         // name is suppressed by ATs, so the pairing costs nothing; the em-dash case differs because
-        // there the title sits on an ANCESTOR.) The aria-label matches DragVisionHintPill's dismiss
+        // there the title sits on an ANCESTOR.) The aria-label matches TerminalDropPill's dismiss
         // control, which carries no tooltip. (roborev 53024/53047)
         aria-label="Dismiss"
         title="Dismiss"

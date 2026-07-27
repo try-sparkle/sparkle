@@ -44,7 +44,7 @@ export const CHROME_HINTS: Record<string, string> = {
   improve: "i",
   changelog: "c",
   account: "a",
-  credits: "d", // the balance pill beside the wordmark — d for "Dollars" (opens the Credits pane).
+  credits: "d", // the balance pill in the builder header — d for "Dollars" (opens the Credits pane).
 };
 
 // Letters available to agents beyond the 9th, with the reserved chrome letters removed so an

@@ -4,8 +4,8 @@
 // element, and with dragDropEnabled on there are no HTML5 drop events to lean on — so every drag
 // listener in the app hit-tests these helpers itself. That makes them the one place where
 // "who owns this drop?" is decided, and the reason FILE_DROP_TARGETS is shared rather than copied:
-// Composer stands down over those surfaces, useDragVisionHint stays quiet over them, and a third
-// target added here has to reach both (roborev 52362).
+// Composer stands down over those surfaces, and a target added there has to reach every consumer
+// at once (roborev 52362).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CONCIERGE_COMPOSE_DND_TARGET,

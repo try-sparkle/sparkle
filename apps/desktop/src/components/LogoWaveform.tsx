@@ -290,8 +290,8 @@ export function LogoWaveform() {
             glow stays even on all sides of the mic instead of pooling to one side. The whole
             composite swells with live audio `energy` and is pinned to opacity 0 in silence by
             the rAF loop (`paintOrb`), so there is NO glow without sound. zIndex 0 keeps it
-            behind the Sparkle.ai logo (which the sidebar lifts above it). Only while actually
-            listening. */}
+            behind the sidebar's header row (which the sidebar lifts above it). Only while
+            actually listening. */}
         {enabled && listening && (
           <div
             ref={orbRef}

@@ -1,9 +1,13 @@
 // Attachment state for the concierge compose box (parity row #21, bead sparkle-4562.3 / CM-U10).
 //
-// Owns the files staged for the NEXT send: the three attach buttons (screenshot / image / files)
-// and a native file drop ON the compose box both land here, and ConciergeHost drains the list at
-// send time. Lives beside useNewBuildAgentDrop / useDragVisionHint rather than in components/
-// Concierge, which is a Tauri-free presentational directory.
+// Owns the files staged for the NEXT send. THREE producers land here — the attach buttons
+// (screenshot / image / files), a native file drop ON the compose box, and a file drop on the
+// visible agent's TERMINAL (hooks/useTerminalDrop, handed over via stores/terminalDropStore) — and
+// ConciergeHost drains the list at send time. That is the point of routing the terminal drop
+// through this hook rather than giving it a list of its own: there is exactly ONE way an
+// attachment appears on the box, so removal, the send drain, and the restore-on-failed-send all
+// work for a dropped file without being written twice. Lives beside useNewBuildAgentDrop rather
+// than in components/Concierge, which is a Tauri-free presentational directory.
 //
 // DROP SCOPING. The webview drag event is window-global and there are two other listeners live
 // (useNewBuildAgentDrop, and the Sparkle pane's Composer), so this one hit-tests the compose box
@@ -23,6 +27,7 @@ import {
   CONCIERGE_COMPOSE_DND_TARGET,
   isOverDndTarget,
 } from "../services/dndTargets";
+import { useTerminalDropStore } from "../stores/terminalDropStore";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { log } from "../logger";
 import type { Attachment } from "../components/composer/attachments";
@@ -100,6 +105,26 @@ export function useConciergeAttachments(): ConciergeAttachments {
     },
     [apply],
   );
+
+  // PICKUP for files dropped on an agent's TERMINAL (hooks/useTerminalDrop). That drop is detected
+  // per-pane, on the other side of the tree, so it hands its paths to a store and this is where
+  // they join the list — the same list, the same chips, the same send-time drain as a picker.
+  //
+  // Anything ALREADY queued when the column mounts is taken too (the `drain()` below runs before
+  // the subscription): a drop can land in the tick before this effect runs, and files that were
+  // staged nowhere would be silently lost.
+  useEffect(() => {
+    const pickUp = (batches: { paths: string[] }[]) => {
+      const paths = batches.flatMap((b) => b.paths);
+      if (paths.length > 0) attachPaths(paths);
+    };
+    pickUp(useTerminalDropStore.getState().drain());
+    // Subscribing to the whole store rather than a selector: `drain()` empties the queue, so a
+    // selector on `queue` would fire a second time for the write that clears it.
+    return useTerminalDropStore.subscribe((s) => {
+      if (s.queue.length > 0) pickUp(useTerminalDropStore.getState().drain());
+    });
+  }, [attachPaths]);
 
   useEffect(() => {
     // The concierge column mounts in the plain-browser dev preview too, where there is no webview

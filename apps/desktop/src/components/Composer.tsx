@@ -762,9 +762,14 @@ export function Composer({
   // Drop targets that own the file themselves, so this composer must stand down over them:
   // "+ New Build Agent" (useNewBuildAgentDrop spawns an agent and attaches there) and the
   // concierge compose box (useConciergeAttachments stages it for the next prompt). The list lives
-  // in services/dndTargets (FILE_DROP_TARGETS) because useDragVisionHint needs the same answer —
-  // keeping a private copy here is how one of the two silently misses a new target. Every listener
-  // hit-tests independently, so nothing depends on listener ORDER and no file double-attaches.
+  // in services/dndTargets (FILE_DROP_TARGETS) rather than in a private copy here, which is how a
+  // consumer silently misses a newly added target. Every listener hit-tests independently, so
+  // nothing depends on listener ORDER and no file double-attaches.
+  //
+  // NOT in that list, and deliberately: the terminal stage (useTerminalDrop). This composer renders
+  // INSIDE the stage, so standing down over it would mean refusing drops on its own box — and the
+  // stage needs no carve-out here anyway, because useTerminalDrop only listens while an agent pane
+  // is visible and no agent pane is visible while this composer's Sparkle pane is.
   const overOtherTarget = useCallback(
     (position: { x: number; y: number }) => isOverFileDropTarget(position),
     [],

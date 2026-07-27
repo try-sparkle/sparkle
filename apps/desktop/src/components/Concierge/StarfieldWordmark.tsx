@@ -1,12 +1,18 @@
-// The "Sparkle" wordmark with a dense star field living THROUGH it — no background box or
+// The Sparkle wordmark with a dense star field living THROUGH it — no background box or
 // shading; the stars are part of the column. Still at rest (slow firefly drift + twinkle),
 // a buzzy waveform only while listening/speaking. Ported from the canonical prototype
 // (PRD/sparkle/concierge-mode/prototype.html); all motion math lives in ./starfieldMath so
-// this file owns only the canvas painting and the brand text.
+// this file owns only the canvas painting and the lift that keeps the mark off the stars.
+//
+// The mark itself is a CHILD, not a `text` prop: the wordmark it used to render as styled text
+// was the literal word "Sparkle", and the brand asset that moved into this column
+// (SparkleLogoLink) is the same word drawn properly. Rendering both stacked the word twice in
+// two typefaces, so the field now hosts the real logo instead of an approximation of it.
+import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
 // Brand amber is a literal hex constant (canvas can't consume var()); the gold/hot tints are
 // re-derived from it the same way SparkleOverlay maps the prototype's gold palette.
-import { C, FONT_WEIGHT } from "../../theme/colors";
+import { C } from "../../theme/colors";
 import { lightenHex } from "../SparkleOverlay/engine";
 import {
   advanceTwinkle,
@@ -51,11 +57,12 @@ function makeStarSprite(): HTMLCanvasElement | null {
 export function StarfieldWordmark({
   mode,
   height = 50,
-  text = "Sparkle",
+  children,
 }: {
   mode: WordmarkMode;
   height?: number;
-  text?: string;
+  /** The brand mark the field lives through — today the Sparkle.ai logo link. */
+  children?: ReactNode;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   // Long-lived animation state in refs so a mode change re-targets the loop WITHOUT rebuilding it
@@ -186,20 +193,23 @@ export function StarfieldWordmark({
           height: "calc(100% + 12px)",
         }}
       />
-      {/* The wordmark sits IN the field: a soft same-as-column shadow lifts the letters off
-          the stars without any box/shading behind them. */}
+      {/* The mark sits IN the field. position:relative + zIndex 2 are what hold it above the
+          canvas, which is a SIBLING painted underneath and bleeds past this box (inset -6/-8,
+          composite "lighter"). This is the column's own pre-existing z-order — the mark inherits
+          it by occupying this slot; nothing was lifted on the mark's account.
+          drop-shadow is the image-safe form of the same-as-column halo the styled text used to
+          get from textShadow: it follows the logo's alpha, so the letters read off the stars
+          without any box or shading behind them. */}
       <div
         style={{
           position: "relative",
           zIndex: 2,
-          fontWeight: FONT_WEIGHT.bold,
-          fontSize: 16,
-          letterSpacing: "0.08em",
-          color: HOT_HEX,
-          textShadow: `0 0 10px ${C.deepForest}, 0 0 6px ${C.deepForest}, 0 0 3px ${C.deepForest}`,
+          display: "flex",
+          alignItems: "center",
+          filter: `drop-shadow(0 0 10px ${C.deepForest}) drop-shadow(0 0 6px ${C.deepForest}) drop-shadow(0 0 3px ${C.deepForest})`,
         }}
       >
-        {text}
+        {children}
       </div>
     </div>
   );
