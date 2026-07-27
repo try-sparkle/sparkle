@@ -15,23 +15,40 @@ import {
   CONCIERGE_THREAD_TESTID,
 } from "../../engine/composeBoxHeight";
 
-/** Fire every live ResizeObserver callback — jsdom never will. Wrapped in `act` because the
- *  callback sets state, and an unflushed render would make the assertions read the OLD height. */
-let fireResize: () => void = () => {};
+/** Fire the ResizeObserver callbacks that are actually WATCHING `el` — jsdom never will.
+ *
+ *  Target-aware on purpose. A stub whose `observe()` is a no-op and which fires every callback
+ *  regardless of what changed cannot detect a dropped `observe(...)`: delete the line and the test
+ *  still passes, because the callback runs anyway. That is a test named for an invariant it cannot
+ *  see violated, and it is the only coverage the thread-observation fix has (roborev 53599). */
+let fireResize: (el: Element) => void = () => {};
+/** Which elements the component asked to observe, so tests can assert the wiring directly. */
+let observedTargets: Set<Element> = new Set();
 
 beforeEach(() => {
   useUiStore.getState().setConciergeComposeH(null);
-  const callbacks: (() => void)[] = [];
-  fireResize = () => act(() => callbacks.forEach((cb) => cb()));
+  const instances: { cb: () => void; targets: Set<Element> }[] = [];
+  observedTargets = new Set();
+  fireResize = (el: Element) =>
+    act(() => instances.forEach((i) => i.targets.has(el) && i.cb()));
   vi.stubGlobal(
     "ResizeObserver",
     class {
+      private targets = new Set<Element>();
       constructor(cb: () => void) {
-        callbacks.push(cb);
+        instances.push({ cb, targets: this.targets });
       }
-      observe() {}
-      disconnect() {}
-      unobserve() {}
+      observe(el: Element) {
+        this.targets.add(el);
+        observedTargets.add(el);
+      }
+      unobserve(el: Element) {
+        this.targets.delete(el);
+        observedTargets.delete(el);
+      }
+      disconnect() {
+        this.targets.clear();
+      }
     },
   );
 });
@@ -88,8 +105,8 @@ describe("the drag ceiling is measured, not assumed", () => {
   it("clamps to the THREAD+BOX pool, not to window.innerHeight", () => {
     // A small thread in a tall window: window-sizing would allow a far taller box.
     window.innerHeight = 2000;
-    renderColumn({ columnH: 500, chrome: 60 });
-    fireResize();
+    const { root } = renderColumn({ columnH: 500, chrome: 60 });
+    fireResize(root);
 
     fireEvent.pointerDown(handle(), { clientY: 1000, pointerId: 1 });
     fireEvent.pointerMove(handle(), { clientY: -5000, pointerId: 1 }); // greedy drag upward
@@ -106,7 +123,7 @@ describe("the drag ceiling is measured, not assumed", () => {
     window.innerHeight = 2000;
     const CHROME = 60;
     const { root, textareaH } = renderColumn({ columnH: 700, chrome: CHROME });
-    fireResize();
+    fireResize(root);
 
     fireEvent.pointerDown(handle(), { clientY: 1000, pointerId: 1 });
     fireEvent.pointerMove(handle(), { clientY: -5000, pointerId: 1 });
@@ -124,8 +141,11 @@ describe("the drag ceiling is measured, not assumed", () => {
     // resizes when that happens, so without observing the thread the ceiling stays stale and too
     // large — and the persisted height would reproduce it on every launch.
     window.innerHeight = 2000;
-    const { state } = renderColumn({ columnH: 1200, chrome: 60 });
-    fireResize();
+    const { state, root, thread } = renderColumn({ columnH: 1200, chrome: 60 });
+    // The wiring itself: if `observe(thread)` is ever dropped, this fails outright rather than
+    // being papered over by a stub that fires every callback regardless of target.
+    expect(observedTargets.has(thread)).toBe(true);
+    fireResize(root);
 
     fireEvent.pointerDown(handle(), { clientY: 1000, pointerId: 1 });
     fireEvent.pointerMove(handle(), { clientY: -5000, pointerId: 1 });
@@ -134,7 +154,9 @@ describe("the drag ceiling is measured, not assumed", () => {
 
     // A suggestions row mounts and takes 700px of the column away from the thread.
     state.columnH = 500;
-    fireResize();
+    // Driven through the THREAD, because in the real DOM that is the only element that resizes
+    // when a suggestions row mounts — neither the root nor the section does.
+    fireResize(thread);
     expect(px(box().style.height)).toBeLessThan(tall);
   });
 
@@ -142,7 +164,13 @@ describe("the drag ceiling is measured, not assumed", () => {
     // A standalone ComposeBox (as other tests render it) must still work rather than clamp to zero.
     window.innerHeight = 900;
     render(<ComposeBox onSend={vi.fn()} onMicToggle={vi.fn()} onAttach={vi.fn()} />);
-    fireResize();
-    expect(px(box().style.height)).toBeGreaterThan(0);
+    const root = box().closest("div[data-dnd-target]") as HTMLElement;
+    fireResize(root);
+    // DISCRIMINATING: the old assertion (`> 0`) could not fail for any pool, since composeRenderH
+    // floors at COMPOSE_MIN_H. Drag greedily and pin the ceiling to the WINDOW, which is what the
+    // fallback branch is for — if it stops returning window.innerHeight, this fails.
+    fireEvent.pointerDown(handle(), { clientY: 1000, pointerId: 1 });
+    fireEvent.pointerMove(handle(), { clientY: -9000, pointerId: 1 });
+    expect(px(box().style.height)).toBe(900 - COMPOSE_MIN_THREAD_H);
   });
 });

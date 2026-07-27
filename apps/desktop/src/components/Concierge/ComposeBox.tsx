@@ -160,18 +160,35 @@ export function ComposeBox({
   //
   // And because the dragged height is persisted, either mistake survives a relaunch.
   const rootRef = useRef<HTMLDivElement>(null);
+  // The thread node currently under observation. Tracked so `measure` re-observes only when the
+  // node IDENTITY changes (ConciergeThread remounting), never on every callback.
+  const observedThread = useRef<HTMLElement | null>(null);
   const [availableH, setAvailableH] = useState(() =>
     typeof window === "undefined" ? 800 : window.innerHeight,
   );
   useEffect(() => {
     const root = rootRef.current;
     if (!root || typeof ResizeObserver === "undefined") return;
-    let ro: ResizeObserver | null = null;
+    const findThread = () =>
+      root
+        .closest("section")
+        ?.querySelector<HTMLElement>(`[data-testid="${CONCIERGE_THREAD_TESTID}"]`) ?? null;
+
+    const ro = new ResizeObserver(() => measure());
     const measure = () => {
       const ta = textareaRef.current;
-      const thread = root
-        .closest("section")
-        ?.querySelector<HTMLElement>(`[data-testid="${CONCIERGE_THREAD_TESTID}"]`);
+      const thread = findThread();
+      // Keep the observation pointed at the LIVE thread node. Done here rather than inside the
+      // callback's measurement path so a remount is picked up even when the early return below
+      // fires, and guarded on identity because re-`observe`ing an already-observed target is
+      // specified to reset its last-reported size to (0,0) — which marks it active again and
+      // re-queues the callback. Blink and WebKit happen to early-return instead, but relying on
+      // that would be resting correctness on engine behaviour rather than the spec (roborev 53599).
+      if (thread !== observedThread.current) {
+        if (observedThread.current) ro.unobserve(observedThread.current);
+        if (thread) ro.observe(thread);
+        observedThread.current = thread;
+      }
       if (!thread || !ta) {
         setAvailableH(window.innerHeight);
         return;
@@ -181,21 +198,18 @@ export function ComposeBox({
       const chrome = Math.max(0, root.offsetHeight - ta.offsetHeight);
       const pool = thread.clientHeight + root.offsetHeight - chrome;
       setAvailableH(pool > 0 ? pool : window.innerHeight);
-      // The THREAD is the half of the pool that moves when anything else in the column appears:
-      // it is `flex: 1`, so a suggestions row or a search slot mounting shrinks it. Neither the
-      // root (height driven by React state) nor the section (window-sized) resizes when that
-      // happens, so without observing the thread the ceiling would stay stale at its old, larger
-      // value — with no event to correct it.
-      if (ro) ro.observe(thread);
     };
-    measure();
-    ro = new ResizeObserver(measure);
+
+    // The THREAD is the half of the pool that moves when anything else in the column appears: it is
+    // `flex: 1`, so a suggestions row or search slot mounting shrinks it. Neither the root (height
+    // driven by React state) nor the section (window-sized) resizes when that happens, so without
+    // observing the thread the ceiling would sit stale and too large with no event to correct it.
     ro.observe(root);
-    measure(); // re-run now that `ro` exists, so the thread gets observed too
+    measure();
     window.addEventListener("resize", measure);
     return () => {
-      ro?.disconnect();
-      ro = null;
+      ro.disconnect();
+      observedThread.current = null;
       window.removeEventListener("resize", measure);
     };
   }, []);

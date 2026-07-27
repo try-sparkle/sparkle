@@ -57,14 +57,26 @@ interface ArrivalEntry {
   lastSeenAt: number;
 }
 
-/** The arrival ledger: where each id sits and when it was last present. */
+/** The arrival ledger: where each id sits, when it was last present, and when this ledger was last
+ *  consulted at all (see `lastCallAt` — it is what separates "absent" from "not re-rendered"). */
 export interface ArrivalOrder {
   entries: Map<string, ArrivalEntry>;
   nextSlot: number;
+  /** Timestamp of the previous call. `-Infinity` before the first, so nothing reads as absent. */
+  lastCallAt: number;
 }
 
 export function createArrivalOrder(): ArrivalOrder {
-  return { entries: new Map(), nextSlot: 0 };
+  return { entries: new Map(), nextSlot: 0, lastCallAt: Number.NEGATIVE_INFINITY };
+}
+
+/** Monotonic by preference. `Date.now()` walks backwards on an NTP correction and jumps forward
+ *  across a sleep/wake, either of which would make on-screen ids look long-absent and re-slot the
+ *  whole thread at once. `performance.now()` cannot do that; the fallback is for non-DOM callers. */
+function defaultNow(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
 }
 
 /**
@@ -88,19 +100,32 @@ export function createArrivalOrder(): ArrivalOrder {
 export function orderByArrival<T extends { id: string }>(
   order: ArrivalOrder,
   items: readonly T[],
-  now: number = Date.now(),
+  now: number = defaultNow(),
 ): T[] {
+  // The PREVIOUS call's timestamp, read before we overwrite it. `lastSeenAt < lastCallAt` is the
+  // only honest test for "this id was missing from a build that actually happened".
+  const lastCallAt = order.lastCallAt;
   for (const item of items) {
     const prev = order.entries.get(item.id);
-    // Gone longer than the window ⇒ a NEW event that happens to reuse an id (an agent asking
-    // again), not the same one flickering. Fresh slot, so it lands at the bottom.
-    if (prev == null || now - prev.lastSeenAt > ARRIVAL_GRACE_MS) {
+    // Re-slot only when BOTH hold: the id was genuinely absent from at least one intervening
+    // rebuild, AND it has been gone longer than the window.
+    //
+    // Requiring the first is what stops a quiet stretch from re-slotting the entire thread. The
+    // memo only runs when its inputs change, so a reader who pauses for fifteen seconds produces
+    // no rebuild at all — and a lone elapsed-time test would then find EVERY on-screen id "stale"
+    // on the next keystroke and renumber all of them in the caller's `[chat, digests, nudges]`
+    // concatenation order. That is the original out-of-sequence layout this module exists to
+    // remove, delivered as a visible jump, triggered by nothing more than reading (roborev 53594).
+    const missedABuild = prev != null && prev.lastSeenAt < lastCallAt;
+    const goneTooLong = prev != null && now - prev.lastSeenAt > ARRIVAL_GRACE_MS;
+    if (prev == null || (missedABuild && goneTooLong)) {
       order.entries.set(item.id, { slot: order.nextSlot, lastSeenAt: now });
       order.nextSlot += 1;
     } else {
       prev.lastSeenAt = now;
     }
   }
+  order.lastCallAt = now;
   return sortBySlot(order, items);
 }
 

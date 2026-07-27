@@ -125,18 +125,43 @@ describe("orderByArrival — the grace window is WALL-CLOCK, not a rebuild count
     ]);
   });
 
-  it("draws the line at the window itself", () => {
+  it("draws the line at the window itself — with the id genuinely absent in between", () => {
+    // Both halves need an intervening call in which `x` is MISSING. Advancing the clock with no
+    // call at all means the id was continuously present and merely un-rebuilt, which must never
+    // re-slot anything (see the render-gap case below); an earlier version of this test skipped
+    // that call and so asserted the defect as the contract (roborev 53594).
     const justUnder = createArrivalOrder();
     const a = clock();
     orderByArrival(justUnder, [m("x"), m("y")], a.now());
-    a.advance(ARRIVAL_GRACE_MS); // absent, exactly at the boundary
+    a.advance(ARRIVAL_GRACE_MS);
+    orderByArrival(justUnder, [m("y")], a.now()); // x absent, exactly at the boundary
     expect(ids(orderByArrival(justUnder, [m("y"), m("x")], a.now()))).toEqual(["x", "y"]);
 
     const justOver = createArrivalOrder();
     const b = clock();
     orderByArrival(justOver, [m("x"), m("y")], b.now());
     b.advance(ARRIVAL_GRACE_MS + 1);
+    orderByArrival(justOver, [m("y")], b.now()); // x absent, just past it
     expect(ids(orderByArrival(justOver, [m("y"), m("x")], b.now()))).toEqual(["y", "x"]);
+  });
+
+  it("a long RENDER GAP re-slots nothing — reading is not absence", () => {
+    // The bug this pair of conditions exists to prevent. The memo only runs when its inputs change,
+    // so a reader who pauses produces no rebuild at all. An elapsed-time test on its own then finds
+    // EVERY on-screen id stale on the next keystroke and renumbers all of them into the caller's
+    // [chat, digests, nudges] order — the original out-of-sequence layout, delivered as a jump,
+    // triggered by nothing but reading (roborev 53594).
+    const o = createArrivalOrder();
+    const c = clock();
+    // digest sits BETWEEN the two chat turns, which is the placement being defended.
+    orderByArrival(o, [m("chat1"), m("digest"), m("chat2")], c.now());
+
+    // The user reads for half a minute. Nothing re-renders.
+    c.advance(30_000);
+
+    // Then types. The memo runs, concatenated as [chat…, digests…] — the order that must NOT win.
+    const after = orderByArrival(o, [m("chat1"), m("chat2"), m("chat3"), m("digest")], c.now());
+    expect(ids(after)).toEqual(["chat1", "digest", "chat2", "chat3"]);
   });
 
   it("a re-raised alert keeps its NEW slot afterwards", () => {
@@ -154,14 +179,16 @@ describe("orderByArrival — the grace window is WALL-CLOCK, not a rebuild count
   });
 
   it("a CONTINUOUSLY present id never goes stale, however long it stays", () => {
-    // Its lastSeenAt refreshes on every call, so a card the user leaves on screen for an hour must
-    // not silently re-slot itself out from under them.
+    // ORDER-SENSITIVE on purpose. Feeding the ids in the order the ledger already holds makes
+    // re-slotting invisible — the churned result matches the input either way, so the assertion
+    // passes while the ledger renumbers on every iteration (roborev 53594). Feeding the REVERSE
+    // order means only a ledger that held its slots can produce the expected output.
     const o = createArrivalOrder();
     const c = clock();
     orderByArrival(o, [m("alert"), m("chat")], c.now());
     for (let i = 0; i < 60; i++) {
       c.advance(60_000);
-      expect(ids(orderByArrival(o, [m("alert"), m("chat")], c.now()))).toEqual(["alert", "chat"]);
+      expect(ids(orderByArrival(o, [m("chat"), m("alert")], c.now()))).toEqual(["alert", "chat"]);
     }
   });
 });
