@@ -655,15 +655,22 @@ export function ComposeBox({
               testId="compose-placeholder"
               inset={PLACEHOLDER_INSET}
               type={PLACEHOLDER_TYPE}
-              // FALSE, and measured rather than assumed. SuggestionRow reserves room at the
-              // textarea's trailing-right edge only in its "overlay" layout; the concierge column
-              // renders it with layout="row" — a static strip in its own box ABOVE this one
-              // (ConciergeColumn's suggestionsSlot) — so nothing is painted over this textarea and
-              // there is nothing to wrap early around. That choice is forced, not stylistic: the
+              // FALSE, because the recommended-action pill is not on this surface at all: it
+              // renders over the agent's TERMINAL, portalled onto that pane's stage (see
+              // Concierge/ConciergeSuggestions). Nothing is painted over this textarea, so there is
+              // nothing to wrap early around.
+              //
+              // The reason used to be stated as "the column renders the row with layout='row', a
+              // static strip above this box (ConciergeColumn's suggestionsSlot)". Both halves are
+              // now false — the slot was deleted when the pill moved, and the row renders
+              // layout="overlay" — so anyone checking that premise would find "overlay" and flip
+              // this to `true`, wrongly reserving pill room and re-wrapping the copy early
+              // (roborev 53730-M). The VALUE is unchanged and still correct; only its reason moved.
+              //
+              // Worth keeping even though it no longer decides this flag: at the 360px column the
               // pill zone (SUGGESTION_PILL_ZONE, 253px) is WIDER than this textarea's whole text
               // column (CONCIERGE_TEXTAREA_TEXT_WIDTH, ~200px), so an overlay pill and this copy
-              // are mutually exclusive here. Pinned by ComposeBox.placeholder.test.tsx so a future
-              // column widening reopens the question instead of silently colliding.
+              // could never have coexisted here regardless. Pinned by ComposeBox.placeholder.test.tsx.
               hasSuggestionPill={false}
             >
               <VoicePlaceholderCopy

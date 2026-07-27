@@ -56,12 +56,19 @@
 // Pinned by services/suggestions/applySuggestion.test.ts, so re-deriving the rules fails there.
 //
 // Likewise `composerEmpty: true` below is NOT an oversight of the original row's "hide while the
-// user is typing" term. That term exists because the build Composer's pill is an ABSOLUTE OVERLAY
-// sitting on top of the textarea. This row is `layout="row"` — a static strip in its own box above
-// the compose box — so it never covers anything the user is writing, and hiding it the moment they
-// start typing would take the recommendation away exactly when they are deciding whether to type it
-// out by hand. See also ComposeBox's placeholder overlay, which reserves no pill room for the same
-// reason: at the 360px column the pill zone is wider than the whole textarea text column.
+// user is typing" term. It is passed unconditionally because there is no React composer value on
+// this surface to read — the single source for that is the comment at the `useSuggestions` call
+// below, not this paragraph.
+//
+// THE HIDE-WHILE-TYPING TERM IS STILL LOAD-BEARING HERE, and it is satisfied elsewhere. An earlier
+// version of this paragraph argued the opposite — that the row was `layout="row"`, a static strip
+// above the compose box that "never covers anything the user is writing", so the term was
+// unnecessary. That stopped being true when the pill moved: it now renders `layout="overlay"`
+// inside a `createPortal` onto the agent's TERMINAL stage, i.e. directly over the CLI's own input
+// line. Emptiness is therefore tracked through the terminal instead of a textarea — the
+// `drafts[agentId]` gate feeding `visible={visible && !typing}` below. Do not read that gate as
+// redundant and delete it; doing so puts the pill back on top of the line being typed at the CLI
+// prompt, which is the one thing this surface must never do (roborev 53730-M).
 import { useCallback } from "react";
 import { createPortal } from "react-dom";
 import { SuggestionRow, SUGGESTION_PILL_HEIGHT } from "../composer/SuggestionRow";
