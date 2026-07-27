@@ -52,9 +52,17 @@ export function migratePersistedUi(
     next = { ...next, composerHeight: snap };
   }
   if (version < 2) {
-    // Drop the retired ordering preference and guarantee a well-formed filter.
+    // Drop the retired ordering preference. Version-gated because it only ever needs to happen once.
     const { agentOrdering: _agentOrdering, ...rest } = next;
-    next = { ...rest, statusFilter: repairStatusFilter(next.statusFilter) };
+    next = rest;
   }
+  // The filter repair runs on EVERY rehydrate, deliberately NOT version-gated. uiStore's merge is a
+  // shallow one, so a persisted `statusFilter` REPLACES the default object wholesale rather than
+  // merging into it. Gate this on `version < 2` and the day someone adds a fourth band, every
+  // existing user (already at v2, so the migration is skipped) rehydrates a three-key filter,
+  // `visibleBands[newBand]` reads `undefined` → falsy, and that band's rows vanish from the Build
+  // column with no visible cause and nothing failing — precisely what this repair exists to stop.
+  // Running it unconditionally costs one object rebuild per launch and closes that hole for good.
+  next = { ...next, statusFilter: repairStatusFilter(next.statusFilter) };
   return next;
 }

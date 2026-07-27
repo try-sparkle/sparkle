@@ -33,6 +33,9 @@ import {
 } from "../windowContext";
 import { isCalmBand, useConciergeFeed } from "../useConciergeFeed";
 import { firstVisibleAgentId } from "../engine/agentOrdering";
+import { firstLadderRowId } from "../engine/ladderSelection";
+import { resolveStage, rollupStages } from "../engine/workflowStage";
+import { publishedStatusFor } from "../useAttentionNotifications";
 import { decidePromptTarget, resolvePinnedProjectId } from "../engine/shellResolve";
 import {
   markProjectVisited,
@@ -473,8 +476,30 @@ export function Workspace() {
     setWorkMode("build");
     setActiveSpecial(null);
     if (!project) return;
-    // Land the selection on the row the Build list will render first, so the pane matches the mode.
-    const next = firstVisibleAgentId(project.agents, "build");
+    // Land on the row the Build column ACTUALLY renders first, so the pane matches the mode. Uses
+    // the ladder + the live status filter — plain array order would happily select a row the user
+    // has filtered out of sight, leaving a terminal with no row beside it (roborev 53428/53439).
+    const stageFor = (id: string) =>
+      resolveStage(useRuntimeStore.getState().branchStatus[id], useRuntimeStore.getState().workflowStage[id]);
+    const headStageFor = (id: string) => {
+      const kids = project.agents.filter((a) => a.parentId === id);
+      const rollup = rollupStages(kids.map((w) => stageFor(w.id)));
+      return rollup ? rollup.stage : stageFor(id);
+    };
+    const published = publishedStatusFor(
+      project.agents,
+      useRuntimeStore.getState().status,
+      new Set(useRuntimeStore.getState().openAgentIds),
+      stageFor,
+    );
+    const next =
+      firstLadderRowId(
+        project.agents,
+        "build",
+        headStageFor,
+        (id) => published[id] ?? "stopped",
+        useUiStore.getState().statusFilter,
+      ) ?? firstVisibleAgentId(project.agents, "build");
     useProjectStore.getState().selectAgent(project.id, next);
     if (next) open(next);
   };

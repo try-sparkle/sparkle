@@ -6,7 +6,7 @@
 // waiting` flip moved a row across a whole tier and the column re-shuffled under the cursor — even
 // on the silent 15s poll tick. The load-bearing assertion in this file is "a status change does not
 // move a row"; everything else is the scaffolding that makes that readable.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -266,5 +266,45 @@ describe("AgentSidebar — an orchestrator's section matches its own progress ba
     setStages({ h1: "pushed" });
     render(<AgentSidebar project={project} />);
     expect(screen.getByTestId("stage-header-remote_pushed")).toBeTruthy();
+  });
+});
+
+describe("AgentSidebar — selection never lands on a filtered-out row", () => {
+  it("switching Plan→Build selects the first RENDERED row, not project.agents[0]", () => {
+    // The bug three reviews found independently (roborev 53428/53439/53440): both Plan→Build
+    // handlers used `firstVisibleAgentId`, which is plain array order and knows nothing about the
+    // ladder or the filter. Hide a band, switch modes, and the pane shows a terminal for an agent
+    // with no row beside it.
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
+    setStages({ a1: "building_saved", a2: "building_saved" });
+    setStatuses({ a1: "working", a2: "idle" });
+    useUiStore.getState().isolateStatusBand("done"); // Alpha (working) is now hidden
+
+    render(<AgentSidebar project={project} />);
+    // Sanity: the column really is rendering only Beta.
+    expect(screen.queryByText("Alpha")).toBeNull();
+    expect(screen.queryByText("Beta")).toBeTruthy();
+
+    // Switch to Plan and back to Build via the chevrons.
+    fireEvent.click(screen.getByText("Plan"));
+    fireEvent.click(screen.getByText("Build"));
+
+    // Selection must be Beta — the row actually on screen — not Alpha (array index 0, hidden).
+    expect(proj().selectedAgentId).toBe("a2");
+  });
+
+  it("isolateStatusBand shows exactly that band and nothing else", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta"), mkAgent("a3", "Gamma")]);
+    setStatuses({ a1: "waiting", a2: "working", a3: "idle" });
+    render(<AgentSidebar project={project} />);
+
+    // This is what a helper-island chiclet click does.
+    act(() => useUiStore.getState().isolateStatusBand("needs_you"));
+    expect(screen.queryByText("Alpha")).toBeTruthy();
+    expect(screen.queryByText("Beta")).toBeNull();
+    expect(screen.queryByText("Gamma")).toBeNull();
+    // And the chip bar SHOWS that state, so the user can see why and clear it the normal way.
+    expect(screen.getByTestId("status-chip-needs_you").getAttribute("data-on")).toBe("true");
+    expect(screen.getByTestId("status-chip-running").getAttribute("data-on")).toBe("false");
   });
 });

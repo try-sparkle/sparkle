@@ -66,3 +66,31 @@ describe("migratePersistedUi — statusFilter repair covers every band", () => {
     expect(out.statusFilter.needs_you).toBe(true);
   });
 });
+
+// The repair must NOT be version-gated: uiStore's merge is shallow, so a persisted statusFilter
+// replaces the default wholesale. A user already at the current version must still have a missing
+// band healed, or adding a band later silently hides its rows for everyone (roborev 53411).
+describe("migratePersistedUi — the filter repair is not version-gated", () => {
+  it("repairs a short filter even for a blob already at the CURRENT version", () => {
+    const out = migratePersistedUi({ statusFilter: { needs_you: true } }, 2, 72) as {
+      statusFilter: Record<string, boolean>;
+    };
+    expect(Object.keys(out.statusFilter).sort()).toEqual(STATUS_BANDS.map((b) => b.id).sort());
+    expect(out.statusFilter.running).toBe(true);
+    expect(out.statusFilter.done).toBe(true);
+  });
+
+  it("still preserves a deliberately-hidden band at the current version", () => {
+    const out = migratePersistedUi({ statusFilter: { needs_you: true, running: true, done: false } }, 2, 72) as {
+      statusFilter: Record<string, boolean>;
+    };
+    expect(out.statusFilter.done).toBe(false);
+  });
+
+  it("gives a blob with no filter at all a complete, all-visible one", () => {
+    const out = migratePersistedUi({ composerHeight: 90 }, 2, 72) as {
+      statusFilter: Record<string, boolean>;
+    };
+    for (const b of STATUS_BANDS) expect(out.statusFilter[b.id]).toBe(true);
+  });
+});

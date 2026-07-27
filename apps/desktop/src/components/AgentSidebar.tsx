@@ -48,6 +48,8 @@ import { useBeadsStore } from "../stores/beadsStore";
 import { beadLabel, epicForBuild, epicPillFor } from "../services/planView";
 import { type Bead } from "../services/beads";
 import { topLevelAgents as topLevelOf, firstVisibleAgentId } from "../engine/agentOrdering";
+import { firstLadderRowId } from "../engine/ladderSelection";
+import { publishedStatusFor } from "../useAttentionNotifications";
 import {
   bandOfStatus,
   flattenSections,
@@ -515,9 +517,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       spawnBuildAgent();
       return;
     }
-    // Switching INTO Build: move selection to the first Build row so the pane matches the chevron
-    // (or clear it → the empty Build state with "+ New Build Agent").
-    const next = firstVisibleAgentId(project.agents, "build");
+    // Switching INTO Build: move selection to the row the column actually renders FIRST, so the
+    // pane matches the chevron (or clear it → the empty Build state with "+ New Build Agent").
+    // Ladder- and filter-aware: array order would happily select a row the user has filtered out.
+    const next = firstRenderedRowId(project.agents, "build") ?? firstVisibleAgentId(project.agents, "build");
     selectAgent(project.id, next);
     if (next) open(next);
   };
@@ -570,6 +573,32 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       return false;
     }
   };
+  // The first row the Build column is ACTUALLY rendering, derived from fresh store state with the
+  // exact same inputs the render uses: the full overlay chain (publishedStatusFor) and the
+  // worker-roll-up stage. Every selection path goes through this, so none of them can drift from
+  // the column again (roborev 53411/53428/53439/53440 all found the same class of bug here).
+  const firstRenderedRowId = useCallback(
+    (agents: readonly AgentTab[], forMode: "plan" | "build"): string | null => {
+      const rt = useRuntimeStore.getState();
+      const stageFor = (id: string) => resolveStage(rt.branchStatus[id], rt.workflowStage[id]);
+      // Same roll-up the ladder buckets by: an orchestrator tracks its LEAST-advanced worker.
+      const headStageFor = (id: string): WorkflowStageId => {
+        const kids = agents.filter((a) => a.parentId === id);
+        const rollup = rollupStages(kids.map((w) => stageFor(w.id)));
+        return rollup ? rollup.stage : stageFor(id);
+      };
+      const published = publishedStatusFor(agents, rt.status, new Set(rt.openAgentIds), stageFor);
+      return firstLadderRowId(
+        agents,
+        forMode,
+        headStageFor,
+        (id) => published[id] ?? "stopped",
+        useUiStore.getState().statusFilter,
+      );
+    },
+    [],
+  );
+
   // After a close removes an agent (and its workers), keep selection coherent with the sidebar:
   // when the OPEN agent got torn down, re-point selection at the first visible row of the current
   // mode (or null → blank first-load state). Decision logic is the pure selectionAfterClose; here
@@ -579,31 +608,13 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     if (!project) return;
     const fresh = useProjectStore.getState().projects.find((p) => p.id === project.id);
     if (!fresh) return;
-    // Read ALL inputs FRESH (not the render-scope `status`/`mode`/`statusFilter`): now that AgentRow
-    // is memoized, the `onClose` closure that reaches here may have been captured a few renders ago
-    // (sparkle-alrm.3).
-    const rt = useRuntimeStore.getState();
-    const { workMode: freshMode, statusFilter: freshFilter } = useUiStore.getState();
-    const freshStatus = withUnstartedWorkerAttention(
-      fresh.agents,
-      rt.status,
-      new Set(rt.openAgentIds),
-    );
-    // Selection must land on a row the user can actually SEE. Re-derive the rendered ladder from
-    // fresh state and take its first row: with the filter chips, the first agent in array order can
-    // easily be one the user has hidden, and selecting a hidden row leaves the main pane showing an
-    // agent with no corresponding row in the column — the exact incoherence this helper exists to
-    // prevent. Falls through to the array-order default inside selectionAfterClose when the ladder
-    // is empty (everything filtered out, or nothing left).
-    const preferredNext =
-      flattenSections(
-        groupAgentsByStage(
-          topLevelOf(fresh.agents, freshMode),
-          (id) => resolveStage(rt.branchStatus[id], rt.workflowStage[id]),
-          (id) => freshStatus[id] ?? "stopped",
-          freshFilter,
-        ),
-      )[0]?.id ?? null;
+    // Read the mode FRESH (not the render-scope value): now that AgentRow is memoized, the
+    // `onClose` closure that reaches here may have been captured a few renders ago (sparkle-alrm.3).
+    const freshMode = useUiStore.getState().workMode;
+    // Selection must land on a row the user can actually SEE. With the filter chips, the first
+    // agent in array order can easily be one the user has hidden, and selecting a hidden row leaves
+    // the main pane showing an agent with no corresponding row in the column.
+    const preferredNext = firstRenderedRowId(fresh.agents, freshMode);
     const decision = selectionAfterClose(
       removedRootId,
       project.selectedAgentId,
