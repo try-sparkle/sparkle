@@ -45,7 +45,14 @@ interface AuthStore {
    *  floor is the whole balance and closes the gate for calls the balance might still have covered.
    *  That over-blocks after an unusually expensive refusal, which is why `refresh()` clears it —
    *  see there. Session-only (never persisted): a fact about the live balance, not a cached
-   *  identity, so a relaunch clears it too. */
+   *  identity, so a relaunch clears it too.
+   *
+   *  MONOTONIC within a session: a refusal that REPORTS a figure only ever raises it (see
+   *  `noteCreditsRefused`). The reported balance is not stable near zero — concurrent settles and
+   *  refunds move it by a cent or two between refusals — so a floor that simply adopted the latest
+   *  figure ratcheted DOWN on the low readings, and the next slightly-higher one cleared
+   *  `balance > floor` again. Only `refresh()` and `reset()` lower it, and both do so from evidence
+   *  (an authoritative /me, an explicit sign-out) rather than from jitter. */
   creditFloorCents: number;
   /** Record a server 402 (`insufficient_credits`), so the local gate stops letting calls through at
    *  a balance the server won't serve.
@@ -116,13 +123,25 @@ export const useAuthStore = create<AuthStore>()(
       // 402 that reports a POSITIVE balance (the hold was unaffordable, the balance wasn't zero)
       // raises `me.balanceCents` above zero, which must clear a latched $0 dismissal — otherwise the
       // banner never fires when the balance genuinely reaches zero later. (roborev 48271/53144)
+      // A REPORTED figure only ever RAISES the floor — see `creditFloorCents`. A refusal is evidence
+      // that the server would not serve THAT balance; a later refusal reporting less is not evidence
+      // that it would now serve more, so `Math.max` keeps the highest refused level and the gate
+      // stays shut across the cent-level jitter that reads at a near-zero balance. `me.balanceCents`
+      // still adopts the reported figure verbatim — the balance UI must stay honest about the money;
+      // only the INFERENCE ratchets.
+      //
+      // The null branch deliberately does NOT ratchet. It is the dormant no-amount contract (see the
+      // doc above), and it derives the floor from `me` rather than from the server — so for a `me`
+      // nulled by a mid-request sign-out it must write 0 outright, leaving no floor behind for the
+      // next session's identity to be gated against. Nothing to ratchet there anyway: that path
+      // never produced the flapping this guards, which needs two differing reported figures.
       noteCreditsRefused: (balanceCents) => {
         set((s) => {
           if (balanceCents === null) {
             return { creditFloorCents: s.me?.balanceCents ?? 0, me: s.me };
           }
           return {
-            creditFloorCents: balanceCents,
+            creditFloorCents: Math.max(s.creditFloorCents, balanceCents),
             me: s.me ? { ...s.me, balanceCents } : s.me,
           };
         });

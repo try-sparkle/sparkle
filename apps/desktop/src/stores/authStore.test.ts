@@ -5,7 +5,7 @@
 // when offline). Rust/keychain is mocked away — only the store's decision logic is under test.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Me } from "../services/entitlement";
-import { ENTITLEMENT_GRACE_MS } from "../services/entitlement";
+import { ENTITLEMENT_GRACE_MS, hasCreditsAbove } from "../services/entitlement";
 
 vi.mock("../services/sparkleApi", () => ({
   hasToken: vi.fn(),
@@ -194,6 +194,46 @@ describe("authStore.noteCreditsRefused — the server's 402 is authoritative", (
     useAuthStore.getState().noteCreditsRefused(7);
     expect(useAuthStore.getState().me).toBeNull();
     expect(useAuthStore.getState().creditFloorCents).toBe(7);
+  });
+
+  // The gate flapped here: refusals near zero report a jittering balance (a concurrent settle or a
+  // refund moves it by a cent or two), and a floor that adopted the LATEST figure ratcheted down on
+  // the low reading — so the next, slightly higher one cleared `balance > floor` and let another
+  // guaranteed-402 call out. Every AI surface then re-bought that refusal for every settled state.
+  it("keeps the HIGHEST refused level when a later refusal reports less", () => {
+    useAuthStore.setState({ me: me({ balanceCents: 11 }), tokenPresent: true });
+    useAuthStore.getState().noteCreditsRefused(11);
+    useAuthStore.getState().noteCreditsRefused(1); // same exhausted balance, read a cent lower
+    expect(useAuthStore.getState().creditFloorCents).toBe(11);
+    // The floor ratchets, but the reported balance is still adopted verbatim — the two are
+    // deliberately different facts, and the balance UI must keep showing the money.
+    expect(useAuthStore.getState().me?.balanceCents).toBe(1);
+  });
+
+  it("so the jitter above a lower reading can no longer reopen the gate", () => {
+    useAuthStore.setState({ me: me({ balanceCents: 3 }), tokenPresent: true });
+    useAuthStore.getState().noteCreditsRefused(3);
+    useAuthStore.getState().noteCreditsRefused(1);
+    // Balance drifts back up a cent or two without any top-up: still under the level the server
+    // already refused, so the gate must stay shut.
+    useAuthStore.getState().setMe(me({ balanceCents: 3 }));
+    const s = useAuthStore.getState();
+    expect(hasCreditsAbove(s.me, s.creditFloorCents)).toBe(false);
+  });
+
+  it("a genuine top-up still lifts the balance back above the floor", () => {
+    useAuthStore.setState({ me: me({ balanceCents: 1 }), tokenPresent: true });
+    useAuthStore.getState().noteCreditsRefused(1);
+    useAuthStore.getState().setMe(me({ balanceCents: 500 }));
+    const s = useAuthStore.getState();
+    expect(hasCreditsAbove(s.me, s.creditFloorCents)).toBe(true);
+  });
+
+  it("a later refusal at a HIGHER balance still raises the floor", () => {
+    useAuthStore.setState({ me: me({ balanceCents: 500 }), tokenPresent: true });
+    useAuthStore.getState().noteCreditsRefused(1);
+    useAuthStore.getState().noteCreditsRefused(11);
+    expect(useAuthStore.getState().creditFloorCents).toBe(11);
   });
 
   // Pins the store's CONTRACT, not a live path — no caller passes null today. Rationale and
