@@ -153,6 +153,40 @@ describe("controlListener", () => {
     expect(res.omitted).toBe(0);
   });
 
+  // roborev #53441: the caller is definitionally live — it is making the call — but nothing
+  // guarantees it a status entry (a different window may answer; a fresh worker's pane has not
+  // mounted). Without an explicit clause it could omit ITSELF, which also made "active" inconsistent
+  // with "self". Every other scope test sets the caller's status first, so this case was uncovered.
+  it("get_state scope 'active' always includes the CALLER, with no status entry and no open id", async () => {
+    useRuntimeStore.setState({ status: {}, openAgentIds: [] } as never);
+    fire({ reqId: "s8", op: "get_state", callerAgentId: callerId, payload: {} });
+    await flush();
+    const res = lastReply() as { agents: Array<Record<string, unknown>>; omittedIds: string[] };
+    expect(res.agents.map((a) => a.id)).toContain(callerId);
+    expect(res.omittedIds).not.toContain(callerId);
+  });
+
+  it("get_state omits omittedIds for scope 'self' — the cheap scope must not ship the whole backlog", async () => {
+    for (let i = 0; i < 5; i++) useProjectStore.getState().addAgent(projectId, { kind: "build" });
+    fire({ reqId: "s9", op: "get_state", callerAgentId: callerId, payload: { scope: "self" } });
+    await flush();
+    const res = lastReply() as { agents: unknown[]; omitted: number; omittedIds: string[] };
+    expect(res.agents).toHaveLength(1);
+    expect(res.omitted).toBe(6); // exact count still reported…
+    expect(res.omittedIds).toEqual([]); // …but no id list, which "self" cannot act on anyway
+  });
+
+  it("get_state caps omittedIds while keeping the exact count, so truncation stays visible", async () => {
+    useRuntimeStore.getState().setStatus(callerId, "working");
+    useRuntimeStore.getState().setStatus(otherId, "working");
+    for (let i = 0; i < 25; i++) useProjectStore.getState().addAgent(projectId, { kind: "build" });
+    fire({ reqId: "s10", op: "get_state", callerAgentId: callerId, payload: {} });
+    await flush();
+    const res = lastReply() as { omitted: number; omittedIds: string[] };
+    expect(res.omitted).toBe(25);
+    expect(res.omittedIds).toHaveLength(20);
+  });
+
   it("get_state reports the dropped IDS, not just a count, so a caller can resolve one without a full re-read", async () => {
     const strangerId = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
     useRuntimeStore.getState().setStatus(callerId, "working");

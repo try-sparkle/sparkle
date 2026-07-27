@@ -144,6 +144,11 @@ function resolveScope(raw: unknown): StateScope {
   return raw === "self" || raw === "all" || raw === "active" ? raw : "active";
 }
 
+/** Max ids reported in `omittedIds`. The field is a convenience for resolving a specific dropped
+ *  agent, not a second roster — left unbounded it would grow with the dormant-tab backlog and give
+ *  back the context cost the scope was added to remove. `omitted` remains the exact count. */
+const OMITTED_IDS_CAP = 20;
+
 /** Whether a caller may run PRIVILEGED ops (set_theme / set_config). Fails CLOSED: the caller must
  *  resolve to a known, NON-worker (interactive) agent. Workers run unattended and auto-approve every
  *  tool call (dangerouslySkipPermissions), so persona prose alone can't stop one from changing the
@@ -218,9 +223,27 @@ function handleGetState(req: ControlRequest): {
     // stranded one — the case workerAttention paints RED as needing you. Without it an orchestrator
     // that calls spawn_worker twice and then get_state() sees `agents: [self], omitted: 2` and
     // concludes its workers do not exist. Your own fleet is never hidden from you. roborev #53407.
-    return openIds.has(a.id) || a.status !== "stopped" || a.parentId === req.callerAgentId;
+    // The caller FIRST: it is definitionally live (it is making this call), but it has no
+    // guaranteed status entry — the window answering may not be the one hosting it, and a
+    // just-spawned worker's pane has not mounted, so neither `status` nor `openAgentIds` covers it.
+    // Without this clause a fresh worker calls get_state() and does not find ITSELF in the roster,
+    // which also made "active" inconsistent with "self" (that scope always returns the caller).
+    // roborev #53441.
+    return (
+      a.id === req.callerAgentId ||
+      openIds.has(a.id) ||
+      a.status !== "stopped" ||
+      a.parentId === req.callerAgentId
+    );
   });
-  const omittedIds = all.filter((a) => !agents.includes(a)).map((a) => a.id);
+  const omittedAll = all.filter((a) => !agents.includes(a)).map((a) => a.id);
+  // `omittedIds` exists so a caller can resolve a SPECIFIC dropped agent instead of re-reading the
+  // whole roster — which only makes sense for "active". Under "self" the caller asked for exactly
+  // one agent, so every other agent is "omitted": on the motivating 57-agent roster that would ship
+  // 56 ids (~600 permanently-resident tokens) back to the scope that is supposed to be nearly free.
+  // Capped as well, so the field can never grow with the dormant-tab backlog; `omitted` stays the
+  // EXACT count either way, so the truncation is always visible. roborev #53441.
+  const omittedIds = scope === "active" ? omittedAll.slice(0, OMITTED_IDS_CAP) : [];
   // Additive Phase-3 fields so an agent can read before writing: the model ids it may pass to
   // set_agent_model and the current zoom. Existing fields (agents, theme) are unchanged.
   // `agentOrdering` was dropped when the sidebar stopped sorting by status; `statusFilter` replaces
@@ -233,7 +256,7 @@ function handleGetState(req: ControlRequest): {
     agents,
     scope,
     totalAgents: all.length,
-    omitted: omittedIds.length,
+    omitted: omittedAll.length,
     // The dropped IDS, not just a count: a caller that needs one omitted agent can resolve it
     // directly instead of paying for a full scope:"all" re-read, which was the whole point of
     // narrowing the roster. Ids are ~40 chars vs the ~226 chars a full row costs.
