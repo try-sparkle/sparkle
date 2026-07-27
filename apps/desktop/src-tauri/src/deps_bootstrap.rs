@@ -336,32 +336,19 @@ fn resolve_manager(pm: PackageManager) -> Option<String> {
     crate::preflight::resolve_on_path(pm.program())
 }
 
-/// Run the real install for `pm` in `worktree`.
+/// Pull the major version out of a `--version` line.
 ///
-/// NOT UNIT-TESTED, and deliberately kept to glue over pieces that are: it resolves a program,
-/// spawns it, and maps the exit status. Every decision it could get wrong lives in `plan_for`,
-/// `execute`, `install_args` or `program_or_error` above.
+/// Pure, and separated from the spawn precisely so it can be tested: this parse is what decides the
+/// trust posture — `Some(10)` omits `--ignore-scripts`, everything else adds it — and it was the
+/// only logic on that path with no test behind it.
 ///
-/// NO TIMEOUT, on purpose. Killing a package manager mid-install leaves a half-written
-/// `node_modules` that is worse than no `node_modules` — the next `pnpm install` may consider it
-/// satisfied, and the agent then fails in a far more confusing way than "vitest not found". A hung
-/// install occupies one blocking thread and nothing else: this never runs on the spawn path (the
-/// caller does not await it) and never touches the UI thread.
-/// Read the manager's major version by running `<program> --version`.
-///
-/// Returns `None` on any doubt — a failed spawn, a non-zero exit, or output that does not start with
-/// a number. Callers treat `None` as the unsafe case, so a garbled probe costs a build step rather
-/// than opening a hole.
-fn major_version(program: &str) -> Option<u32> {
-    let out = std::process::Command::new(program)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    String::from_utf8_lossy(&out.stdout)
+/// Anything not confidently a version number returns `None`, which callers treat as unsafe. A
+/// corepack shim that prints a download banner before the number must NOT be read as a version;
+/// misreading one is how the gate reopens.
+fn parse_major(version_output: &str) -> Option<u32> {
+    version_output
         .trim()
-        // `pnpm --version` prints a bare "10.7.1"; be tolerant of a leading "v".
+        // `pnpm --version` prints a bare "10.7.1"; tolerate a leading "v".
         .trim_start_matches('v')
         .split('.')
         .next()?
@@ -369,10 +356,51 @@ fn major_version(program: &str) -> Option<u32> {
         .ok()
 }
 
+/// Read the manager's major version by running `<program> --version` **in the worktree**.
+///
+/// The working directory is load-bearing, not incidental. Under a corepack shim — the exact threat
+/// this version check exists for — the pnpm behind the shim is resolved from the `packageManager`
+/// field of the nearest `package.json` walking up from the CURRENT DIRECTORY, not from the shim's
+/// own path. Probing in Sparkle's CWD therefore reads a different pnpm than the one that will
+/// install: Sparkle running where corepack resolves v10 probes `10`, drops `--ignore-scripts`, and
+/// then installs in a worktree where the target repo pins `pnpm@9` — running every third-party
+/// `preinstall`/`install`/`postinstall` in the graph, with the outcome reporting no caveat because
+/// the probe said v10. That is the whole hole this check was added to close.
+///
+/// `CI` is set for the same reason it is set on the install: without it the probe can hit an
+/// interactive corepack download prompt the install would never see, and hang on it.
+///
+/// Returns `None` on any doubt — a failed spawn, a non-zero exit, or unparseable output — so a
+/// garbled probe costs a repo its build step rather than opening the gate.
+fn major_version(worktree: &Path, program: &str) -> Option<u32> {
+    let out = std::process::Command::new(program)
+        .arg("--version")
+        .current_dir(worktree)
+        .env("CI", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    parse_major(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Run the real install for `pm` in `worktree`.
+///
+/// NOT UNIT-TESTED, and deliberately kept to glue over pieces that are: it resolves a program,
+/// spawns it, and maps the exit status. Every decision it could get wrong lives in `plan_for`,
+/// `execute`, `install_args`, `program_or_error` or `parse_major` above.
+///
+/// NO TIMEOUT, on purpose. Killing a package manager mid-install leaves a half-written
+/// `node_modules` that is worse than no `node_modules` — the next `pnpm install` may consider it
+/// satisfied, and the agent then fails in a far more confusing way than "vitest not found". A hung
+/// install occupies one blocking thread and nothing else: this never runs on the spawn path (the
+/// caller does not await it) and never touches the UI thread. The same holds for the version probe
+/// below it, which under corepack may fetch a pinned manager before answering.
 fn run_install(worktree: &Path, pm: PackageManager) -> Result<Option<u32>, String> {
     let program = program_or_error(resolve_manager(pm), pm)?;
-    // Probed BEFORE the install, because it decides the argv — see `install_args`.
-    let major = major_version(&program);
+    // Probed BEFORE the install because it decides the argv (see `install_args`), and probed IN THE
+    // WORKTREE so it reads the same manager the install will use.
+    let major = major_version(worktree, &program);
     let output = std::process::Command::new(&program)
         .current_dir(worktree)
         .args(pm.install_args(major))
@@ -637,6 +665,24 @@ mod tests {
             plan_for(d.path()),
             BootstrapPlan::Skip(SkipReason::UnsupportedManager(PackageManager::Yarn))
         );
+    }
+
+    #[test]
+    fn the_version_parse_reads_real_output_and_doubts_everything_else() {
+        // This parse decides the trust posture — `Some(10)` omits `--ignore-scripts`, anything else
+        // adds it — and it was the only untested logic on that path. Every ambiguous input must come
+        // back `None`, because `None` is the safe answer.
+        assert_eq!(parse_major("10.7.1"), Some(10)); // pnpm
+        assert_eq!(parse_major("11.17.0\n"), Some(11)); // npm, with the trailing newline
+        assert_eq!(parse_major("v9.1.0"), Some(9)); // tolerate a leading v
+        assert_eq!(parse_major("  10.7.1  "), Some(10)); // and surrounding whitespace
+
+        assert_eq!(parse_major(""), None);
+        assert_eq!(parse_major("not a version"), None);
+        // A corepack shim that prints a banner before the number, or any other unexpected shape,
+        // must not be read as a version — misreading one is what reopens the hole.
+        assert_eq!(parse_major("Downloading pnpm@9.1.0\n9.1.0"), None);
+        assert_eq!(parse_major("."), None);
     }
 
     #[test]
