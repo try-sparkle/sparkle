@@ -67,6 +67,34 @@ describe("shouldRunImprovementPass", () => {
     expect(shouldRunImprovementPass(gate({ ...armed, paneStatus: "working" }))).toBe(false);
     expect(shouldRunImprovementPass(gate({ ...armed, lastRunAt: null }))).toBe(false);
   });
+
+  it("holds the slot instead of spending it on a known-offline launch", () => {
+    // The slot is due and nothing else blocks — only connectivity does. The pass needs the
+    // network from its first step, so running now would buy a certain failure and, because the
+    // scheduler stamps the clock at attempt time, forfeit the whole hour.
+    expect(shouldRunImprovementPass(gate({ isOnline: false }))).toBe(false);
+    expect(shouldRunImprovementPass(gate({ isOnline: true }))).toBe(true);
+    // Callers that don't model connectivity read as online, matching connectionStore's own
+    // optimistic default — so omitting the field can never silently mute the scheduler.
+    expect(shouldRunImprovementPass(gate({ isOnline: undefined }))).toBe(true);
+  });
+
+  it("does not let an armed retry fire into a network that is still down", () => {
+    // The shape this guards: a machine wakes from sleep, the pass dies unreachable, and the
+    // one re-attempt lands minutes later on the same dead network — spending the slot's whole
+    // budget without a single request reaching the API.
+    const armed = { lastRunAt: 0, now: HOUR / 2, retryDueAt: 0 };
+    expect(shouldRunImprovementPass(gate({ ...armed, isOnline: false }))).toBe(false);
+    expect(shouldRunImprovementPass(gate({ ...armed, isOnline: true }))).toBe(true);
+  });
+
+  it("stays due once connectivity returns, rather than waiting out another hour", () => {
+    // The point of skipping is that the clock is untouched, so the same slot is still due on
+    // the very next tick — well past the hour, since offline time keeps accruing against it.
+    const offline = { lastRunAt: 0, now: HOUR * 3, isOnline: false };
+    expect(shouldRunImprovementPass(gate(offline))).toBe(false);
+    expect(shouldRunImprovementPass(gate({ ...offline, isOnline: true }))).toBe(true);
+  });
 });
 
 describe("isTransientPassFailure", () => {

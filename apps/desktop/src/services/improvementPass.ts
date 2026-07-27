@@ -185,6 +185,10 @@ export interface PassGate {
   /** Epoch ms at which the connectivity re-attempt comes due, or null when none is armed
    *  (module-level latch below). Omitted by callers that don't model retries. */
   retryDueAt?: number | null;
+  /** The app's connectivity verdict (connectionStore.isOnline: navigator.onLine AND a real
+   *  reachability probe). Omitted by callers that don't model connectivity, which reads as
+   *  online — the same optimistic default the store itself launches with. */
+  isOnline?: boolean;
 }
 
 /** Has the hourly slot itself come due? The ONE definition of that threshold: the gate decides
@@ -201,6 +205,17 @@ export function shouldRunImprovementPass(gate: PassGate): boolean {
   if (gate.passRunning) return false;
   if (gate.paneStatus === "working") return false;
   if (gate.lastRunAt === null) return false; // scheduler seeds the clock on its first tick
+  // Known-offline: hold the slot rather than spend it. A pass needs the network from its very
+  // first step, so launching one now buys a guaranteed connectivity failure — and because the
+  // scheduler stamps the clock at ATTEMPT time, that doomed launch costs the whole hour AND the
+  // one re-attempt the slot was allowed. The characteristic shape is a machine waking from
+  // sleep: the tick fires before the interface is back, the pass dies unreachable, its retry
+  // fires into the same dead network minutes later, and the next real pass is an hour away.
+  // Skipping instead leaves `lastRunAt` untouched, so the slot stays due and the pass starts on
+  // the first tick after connectivity returns. This sits BELOW the seed guard (a launch with no
+  // clock still seeds) and ABOVE the retry short-circuit, since an armed re-attempt is exactly
+  // what must not be spent while offline.
+  if (gate.isOnline === false) return false;
   // An armed retry short-circuits the hourly wait, but NOT the guards above it: the pass still
   // must not double-run or share the worktree with a live pane session.
   if (gate.retryDueAt != null && gate.now >= gate.retryDueAt) return true;

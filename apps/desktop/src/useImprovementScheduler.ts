@@ -13,6 +13,7 @@ import {
   shouldRunImprovementPass,
 } from "./services/improvementPass";
 import { SPARKLE_AGENT_ID } from "./services/sparkleAgent";
+import { useConnectionStore } from "./stores/connectionStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useSettingsStore } from "./stores/settingsStore";
 
@@ -39,6 +40,10 @@ export function useImprovementScheduler(enabled: boolean) {
         // A pass that died because the network was unreachable never ran; it gets ONE early
         // re-attempt instead of forfeiting the slot (improvementPass.ts owns the latch).
         retryDueAt: passRetryDueAt(),
+        // Read fresh inside the tick, like every other input: a slot that comes due while the
+        // machine is offline waits for the network instead of burning itself on a launch that
+        // cannot reach the API.
+        isOnline: useConnectionStore.getState().isOnline,
       });
       if (!due) return;
       // Which kind of run this is, read BEFORE the stamp below overwrites the clock: the hourly

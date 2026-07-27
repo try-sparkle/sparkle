@@ -32,21 +32,38 @@ fn validate_id(label: &str, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a frontend/agent-supplied git ref before it reaches `git` as an argument. Branch
-/// names legitimately contain `/` (e.g. `release/2026`), so we don't allowlist; we reject the
-/// shapes that turn a ref into a weaponized argument: a leading `-` (parsed as an option such as
-/// `--upload-pack=` on fetch or `--exec=` on rebase → command execution) and whitespace/control
-/// characters (which git forbids in ref names anyway).
+/// Validate a frontend/agent-supplied git ref before it reaches `git` as an argument. Every caller
+/// passes a BRANCH NAME (never a rev expression like `HEAD~1`), so this checks branch-name shape.
+/// Names legitimately contain `/` (e.g. `release/2026`), so we don't allowlist; we reject the
+/// shapes that turn a ref into a weaponized argument:
+///
+///   * a leading `-` — parsed as an option (`--upload-pack=` on fetch, `--exec=` on rebase →
+///     command execution);
+///   * a leading `+` and any `:` — the two halves of a REFSPEC. `git fetch origin <arg>` reads its
+///     argument as `<src>:<dst>`, so `+refs/heads/evil:refs/heads/main` is not a branch to fetch
+///     but an instruction to force-overwrite a LOCAL ref. Sparkle reaches that sink automatically
+///     (the background status poll's origin refresh, and parking an agent worktree), and a base can
+///     arrive from a `.sparkle/config.toml` checked into a repo the user merely opened — so this
+///     shape would clobber a branch holding committed-but-unpushed work with no user action at all;
+///   * the remaining characters and sequences git itself forbids in a ref name (`~ ^ ? * [ \`, `..`,
+///     whitespace/control).
+///
+/// Nothing legitimate is lost: `git check-ref-format` rejects all of the above too, so a name that
+/// fails here could never have named a real branch.
 fn validate_ref(branch: &str) -> Result<(), String> {
     let b = branch.trim();
     if b.is_empty() {
         return Err("empty git ref".into());
     }
-    if b.starts_with('-') {
-        return Err(format!("refusing git ref starting with '-': {b:?}"));
+    if b.starts_with('-') || b.starts_with('+') {
+        return Err(format!("refusing git ref starting with '-'/'+': {b:?}"));
     }
     if b.bytes().any(|c| c.is_ascii_control() || c == b' ') {
         return Err(format!("git ref has whitespace/control chars: {b:?}"));
+    }
+    let forbidden = |c: u8| matches!(c, b':' | b'~' | b'^' | b'?' | b'*' | b'[' | b'\\');
+    if b.bytes().any(forbidden) || b.contains("..") {
+        return Err(format!("git ref has characters git forbids in a ref name: {b:?}"));
     }
     Ok(())
 }
@@ -583,12 +600,23 @@ fn git_networked(cwd: &str, args: &[&str]) -> Result<String, String> {
 /// Resolve the project's logical integration branch name. An explicit `[workflow].default_branch`
 /// from the editable config (per-project file beats global) wins; otherwise auto-detect in order:
 /// origin/HEAD symref → local `main` → local `master` → the branch currently checked out at `root`.
+///
+/// The configured value is `validate_ref`d before it is trusted. It reaches `git fetch origin
+/// <branch>` as a bare argument, and the per-project layer of that config is a file CHECKED INTO
+/// THE REPO — so an unvalidated `default_branch = "--upload-pack=…"` would be exactly the
+/// option-injection `validate_ref` exists to block, arriving from a repo the user merely opened.
+/// Callers that validate their OWN input still fall back here, so validating at the caller is not
+/// enough; rejecting an unsafe override falls through to auto-detection, which only ever yields
+/// names git itself produced.
 pub fn resolve_default_branch(root: &str) -> String {
     // Config override: a non-empty default_branch pins the base; empty means "auto-detect" below.
     let configured = crate::config::for_project(root).config.workflow.default_branch;
     let configured = configured.trim();
     if !configured.is_empty() {
-        return configured.to_string();
+        if validate_ref(configured).is_ok() {
+            return configured.to_string();
+        }
+        tracing::warn!("resolve_default_branch: unsafe [workflow].default_branch, auto-detecting");
     }
     if let Ok(symref) = git(root, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
         // e.g. "refs/remotes/origin/main" -> "main"; preserve slashes in names like
@@ -1369,9 +1397,21 @@ impl ParkOutcome {
 ///   * every commit reachable from HEAD *and* from the agent's own branch already exists on some
 ///     `origin/*` ref (`unpushed`) — this is the valve that protects a run which committed but
 ///     could not push (e.g. an unauthenticated `gh`), and a case-by-case draft awaiting review.
-/// Only then does it fetch and `checkout -B` the agent branch onto the fresh base. A failed fetch
-/// is non-fatal: it falls through to the last-known `origin/<base>`, so an offline machine still
-/// gets parked (just not freshened) rather than erroring.
+/// Only then does it `checkout -B` the agent branch onto the fresh base. A failed fetch is
+/// non-fatal: it falls through to the last-known `origin/<base>`, so an offline machine still gets
+/// parked (just not freshened) rather than erroring.
+///
+/// THE FETCH RUNS FIRST, before the containment proof and before every decline path, and both
+/// orderings are load-bearing:
+///   * Containment is a claim about origin AS IT IS NOW. Proving it against a stale snapshot of
+///     `refs/remotes/origin/*` reads a merged-and-pruned branch as `unpushed`: the pass's commits
+///     live in `origin/<base>` upstream, but the last local view predates the merge, so no local
+///     origin ref contains them and park refuses to touch a worktree that has nothing left to lose.
+///   * A decline is exactly when `origin/<base>` matters MOST. Declining leaves the pass to cut its
+///     own branch off `origin/<base>`, so fetching only on the success path handed the stalest base
+///     to the one run that had to rely on it. Worse, it was self-reinforcing — the decline suppressed
+///     the fetch that would have cleared the decline, so a single interrupted pass could keep the
+///     worktree drifting for as long as nothing else in the repo happened to fetch.
 pub fn park_worktree_on_base_at(
     root: &str,
     project_id: &str,
@@ -1385,6 +1425,17 @@ pub fn park_worktree_on_base_at(
         // Nothing to park — the caller creates it fresh from the base anyway.
         return Ok(ParkOutcome::declined("no-worktree"));
     }
+
+    // Freshen the base BEFORE anything reads an origin ref. Best-effort and time-bounded
+    // (git_networked): offline must degrade to "park on the last-known base", never to an error
+    // that blocks the run. Two things depend on this happening first — see the doc comment:
+    // the containment proof below, and the freshness of `origin/<base>` on every decline path.
+    let logical = if base_branch.trim().is_empty() || validate_ref(base_branch.trim()).is_err() {
+        resolve_default_branch(root)
+    } else {
+        base_branch.trim().to_string()
+    };
+    let _ = git_networked(root, &["fetch", "--quiet", "--no-tags", "origin", &logical]);
 
     // Never disturb work in progress. `--porcelain` covers untracked, staged, modified AND the
     // unmerged entries a halted rebase/merge leaves behind, so a mid-operation tree lands here too.
@@ -1413,14 +1464,6 @@ pub fn park_worktree_on_base_at(
         return Ok(ParkOutcome::declined("unpushed"));
     }
 
-    // Freshen the base. Best-effort and time-bounded (git_networked): offline must degrade to
-    // "park on the last-known base", never to an error that blocks the run.
-    let logical = if base_branch.trim().is_empty() || validate_ref(base_branch.trim()).is_err() {
-        resolve_default_branch(root)
-    } else {
-        base_branch.trim().to_string()
-    };
-    let _ = git_networked(root, &["fetch", "--quiet", "--no-tags", "origin", &logical]);
     let base = effective_base(root, &logical, false);
     let base_rev = format!("{base}^{{commit}}");
     let base_sha = match git(root, &["rev-parse", "--verify", "--quiet", &base_rev]) {
@@ -4678,6 +4721,30 @@ mod tests {
         (r, info.path, app_data)
     }
 
+    /// Advance `origin/main` from a THROWAWAY CLONE, leaving `root`'s own
+    /// `refs/remotes/origin/main` pointing at the old tip until something fetches.
+    ///
+    /// `advance_origin_main` pushes from `root` itself, and a push updates the remote-tracking ref
+    /// as a side effect — so every test built on it starts with a perfectly current view of origin,
+    /// which is the one state in which a stale-snapshot bug cannot show. This helper reproduces what
+    /// a real repo looks like between polls: upstream moved, we have not looked yet.
+    fn advance_origin_main_elsewhere(root: &str, tag: &str, name: &str) {
+        let url = git(root, &["remote", "get-url", "origin"]).unwrap().trim().to_string();
+        let clone = unique_root(&format!("{tag}-elsewhere"));
+        let clone_str = clone.to_string_lossy().to_string();
+        git(&clone_str, &["clone", "-q", &url, "."]).unwrap();
+        git(&clone_str, &["config", "user.email", "t@t"]).unwrap();
+        git(&clone_str, &["config", "user.name", "t"]).unwrap();
+        // The bare origin was `init --bare`d before `main` existed, so its HEAD names a branch that
+        // never got created and the clone lands on an unborn one. Pin the checkout to the real tip
+        // rather than committing a second root history that can never fast-forward.
+        git(&clone_str, &["checkout", "-q", "-B", "main", "refs/remotes/origin/main"]).unwrap();
+        std::fs::write(clone.join(format!("{name}.txt")), "upstream").unwrap();
+        git(&clone_str, &["add", "."]).unwrap();
+        git(&clone_str, &["commit", "-q", "-m", name]).unwrap();
+        git(&clone_str, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+    }
+
     /// Advance `origin/main` by one commit made directly in the source repo's main checkout.
     fn advance_origin_main(root: &str, name: &str) {
         std::fs::write(format!("{root}/{name}.txt"), "upstream").unwrap();
@@ -4778,6 +4845,79 @@ mod tests {
         create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
         let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
         assert_eq!(out, ParkOutcome::declined("unpushed"));
+    }
+
+    // Containment is a claim about origin AS IT IS NOW, so it has to be proven against a FRESHLY
+    // fetched origin. Proving it against the last local snapshot reads a merged-and-pruned branch as
+    // `unpushed`: the pass's commits sit in `origin/main` upstream, but the local view predates the
+    // merge and the branch's remote-tracking ref is gone, so nothing local contains them — and park
+    // refuses to touch a worktree that provably has nothing left to lose.
+    #[test]
+    fn park_proves_containment_against_a_freshly_fetched_origin() {
+        let (r, wt, app_data) = init_repo_with_origin("park-pruned");
+
+        // The previous pass committed on its own topic branch and pushed it for review.
+        git(&wt, &["checkout", "-q", "-b", "sparkle/last-pass-topic"]).unwrap();
+        std::fs::write(format!("{wt}/landed.txt"), "work that got merged").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "work from the previous pass"]).unwrap();
+        let landed = git(&wt, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        git(&wt, &["push", "-q", "origin", "HEAD:refs/heads/sparkle/last-pass-topic"]).unwrap();
+
+        // Upstream: the PR lands and the branch is deleted, then later work stacks on top.
+        let url = git(&r, &["remote", "get-url", "origin"]).unwrap().trim().to_string();
+        git(&url, &["update-ref", "refs/heads/main", &landed]).unwrap();
+        let _ = git(&url, &["update-ref", "-d", "refs/heads/sparkle/last-pass-topic"]);
+        advance_origin_main_elsewhere(&r, "park-pruned", "up1");
+
+        // Our view of origin predates all of it: pruned locally, and main never refetched. The
+        // deletion is load-bearing, not best-effort — the push above created that tracking ref, and
+        // containment consults ALL of `--remotes=origin`, so a surviving one would satisfy the check
+        // and make this test pass against the old ordering too.
+        git(&r, &["update-ref", "-d", "refs/remotes/origin/sparkle/last-pass-topic"]).unwrap();
+        // Assert the precondition with the exact predicate park evaluates, not a narrower proxy:
+        // ancestry against `origin/main` alone says nothing about the other origin refs.
+        assert_ne!(
+            git(&wt, &["rev-list", "--count", "HEAD", "--not", "--remotes=origin"]).unwrap().trim(),
+            "0",
+            "precondition: no LOCAL origin ref contains the landed commit"
+        );
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert!(out.parked, "work already on origin/main must not read as unpushed: {out:?}");
+        assert_eq!(
+            git(&wt, &["rev-list", "--count", "HEAD..origin/main"]).unwrap().trim(),
+            "0",
+            "and the worktree lands on the fresh base"
+        );
+    }
+
+    // A decline is exactly when `origin/<base>` matters MOST: the pass is left to cut its own branch
+    // off it. Fetching only on the success path handed the stalest base to the one run that had to
+    // rely on it — and made the decline self-reinforcing, since it suppressed the fetch that would
+    // have cleared it.
+    #[test]
+    fn park_freshens_the_base_even_when_it_declines() {
+        let (r, wt, app_data) = init_repo_with_origin("park-decline-fetch");
+        let before = git(&r, &["rev-parse", "refs/remotes/origin/main"]).unwrap().trim().to_string();
+        advance_origin_main_elsewhere(&r, "park-decline-fetch", "up1");
+        assert_eq!(
+            git(&r, &["rev-parse", "refs/remotes/origin/main"]).unwrap().trim(),
+            before,
+            "precondition: our view of origin/main is stale"
+        );
+
+        // Uncommitted work → park must still decline, and must not touch it.
+        std::fs::write(format!("{wt}/scratch.txt"), "uncommitted").unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert_eq!(out, ParkOutcome::declined("dirty"));
+        assert!(Path::new(&wt).join("scratch.txt").exists(), "uncommitted work must survive");
+
+        assert_ne!(
+            git(&r, &["rev-parse", "refs/remotes/origin/main"]).unwrap().trim(),
+            before,
+            "a declined park must still leave origin/main fresh for the pass about to branch off it"
+        );
     }
 
     // sparkle-zlic: the batched status command computes every agent in one pass and, crucially,
@@ -5718,6 +5858,16 @@ mod tests {
         assert!(validate_ref("   ").is_err());
         assert!(validate_ref("a b").is_err());
         assert!(validate_ref("a\nb").is_err());
+        // A REFSPEC is not an option, so the leading-'-' check never saw it — but `git fetch origin
+        // <arg>` reads `<src>:<dst>`, so this is an instruction to force-overwrite a LOCAL ref, not
+        // a branch to fetch. Both halves of the shape are rejected.
+        assert!(validate_ref("+refs/heads/evil:refs/heads/main").is_err());
+        assert!(validate_ref("refs/heads/evil:refs/heads/sparkle/agent-a1").is_err());
+        assert!(validate_ref("+main").is_err());
+        // The rest of what git itself forbids in a ref name.
+        for bad in ["a~1", "a^", "a?", "a*", "a[b", "a\\b", "a..b"] {
+            assert!(validate_ref(bad).is_err(), "must reject {bad:?}");
+        }
     }
 
     #[test]
@@ -7136,6 +7286,44 @@ mod tests {
 
         std::fs::write(&cfg, "[workflow]\ndefault_branch = \"   \"\n").unwrap();
         assert_eq!(resolve_default_branch(&root_str), "main");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The per-project layer of this config is a file CHECKED INTO THE REPO, and the resolved name
+    // reaches `git fetch origin <branch>` as a bare argument — so an override shaped like an option
+    // is the exact injection `validate_ref` exists to block, arriving from a repo the user merely
+    // opened. Callers that validate their own input fall back to this function, so it has to reject
+    // the value itself rather than trust a caller-side check.
+    #[test]
+    fn resolve_default_branch_rejects_an_option_shaped_config_override() {
+        let root = unique_root("rdb-unsafe");
+        let root_str = root.to_string_lossy().to_string();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+
+        let sparkle = root.join(".sparkle");
+        std::fs::create_dir_all(&sparkle).unwrap();
+        let cfg = sparkle.join("config.toml");
+
+        // The option shape, and the refspec shape that is not an option and so slipped past a
+        // not-an-option check — `git fetch origin <arg>` would read the latter as `<src>:<dst>` and
+        // force-overwrite a local branch on a poll tick.
+        let hostile_values = [
+            "--upload-pack=touch /tmp/pwned",
+            "-x",
+            "main\nfetch",
+            "+refs/heads/evil:refs/heads/main",
+            "refs/heads/evil:refs/heads/sparkle/agent-a1",
+        ];
+        for hostile in hostile_values {
+            std::fs::write(&cfg, format!("[workflow]\ndefault_branch = {hostile:?}\n")).unwrap();
+            assert_eq!(
+                resolve_default_branch(&root_str),
+                "main",
+                "an unsafe override must fall through to auto-detection, not reach git: {hostile:?}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
