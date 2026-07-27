@@ -21,33 +21,44 @@ let scrollback: string | null = "";
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => scrollback }));
 vi.mock("../aiGate", () => ({ useAiFeature: () => true }));
 vi.mock("../relayClient", () => ({ pushSuggestions: vi.fn() }));
-vi.mock("../../stores/runtimeStore", () => ({
+vi.mock("../../stores/runtimeStore", () => {
+  const runtimeState = () => ({
+    status: { a1: "idle" },
+    workflowShipped: {},
+    workflowStage: {},
+    workflowState: {},
+    branchStatus: {},
+  });
+  return {
   // No workflowStage entry AND no branchStatus for a1 → the resolved stage is building_unsaved, for
   // which deriveCta returns null, so these settle/retry tests see the raw computed set with no CTA
   // merged over it. The CTA's own wiring is covered by useSuggestions.cta.test.tsx.
-  useRuntimeStore: (
-    sel: (s: {
+  useRuntimeStore: Object.assign(
+    (sel: (s: {
       status: Record<string, string>;
       workflowShipped: Record<string, boolean>;
       workflowStage: Record<string, string>;
       workflowState: Record<string, unknown>;
       branchStatus: Record<string, unknown>;
     }) => unknown,
-  ) =>
-    sel({
-      status: { a1: "idle" },
-      workflowShipped: {},
-      workflowStage: {},
-      workflowState: {},
-      branchStatus: {},
-    }),
-}));
+  ) => sel(runtimeState()),
+    // getState is REQUIRED, not decoration: useSuggestions re-checks the LIVE status before typing
+    // a picker answer, so a mock without it makes that guard read undefined and bail — which looks
+    // like the hook computing nothing at all. A mock that models less than the real store fails
+    // open, and this one did (roborev 53203).
+    { getState: runtimeState },
+  ),
+  };
+});
 
-import { useSuggestions, SETTLE_TICK_MS, MAX_COMPUTE_ATTEMPTS } from "./useSuggestions";
+import { useSuggestions, SETTLE_TICK_MS, MAX_COMPUTE_ATTEMPTS , resetSuggestionMemory } from "./useSuggestions";
 
 const BTN = { id: "learned:0:x", label: "x", value: "x", kind: "prompt", source: "learned" };
 
 beforeEach(() => {
+  // handledSigs/memo are per-AGENT module state now (they must survive a remount to stop
+  // auto-approve re-firing), so each case has to start from a clean slate.
+  resetSuggestionMemory();
   vi.useFakeTimers();
   computeSuggestions.mockReset();
   scrollback = "";

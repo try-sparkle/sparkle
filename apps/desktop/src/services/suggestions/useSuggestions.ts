@@ -136,6 +136,86 @@ export function rememberComputed<T>(memo: Map<string, T>, hash: string, value: T
  * an empty composer and a changed scrollback; caches by scrollback hash so identical state never
  * recomputes. Returns the visible (non-dismissed) buttons plus per-button dismiss + a clear.
  */
+/** Per-AGENT (not per-instance) state, so a remount can't resurrect an already-answered prompt or
+ *  discard a paid compute. Keyed by agent id and never pruned during a session: an entry is a small
+ *  Set/Map, and an agent id is not reused. See the refs in useSuggestions for why these moved. */
+const HANDLED_SIGS = new Map<string, Set<string>>();
+const MEMOS = new Map<string, Map<string, { buttons: SuggestionButton[]; questionPending: boolean }>>();
+
+function handledSigsFor(agentId: string): Set<string> {
+  let s = HANDLED_SIGS.get(agentId);
+  if (!s) HANDLED_SIGS.set(agentId, (s = new Set()));
+  return s;
+}
+
+function memoFor(
+  agentId: string,
+): Map<string, { buttons: SuggestionButton[]; questionPending: boolean }> {
+  let m = MEMOS.get(agentId);
+  if (!m) MEMOS.set(agentId, (m = new Map()));
+  return m;
+}
+
+/**
+ * Clear an agent's answered-picker signatures. Exported because the invalidation CANNOT live in a
+ * mounted effect any more (roborev 53159).
+ *
+ * The signature is the option set alone, so every Claude Code bash permission prompt shares one —
+ * the set is only meant to stop ONE settled screen re-sending a keystroke while it re-hashes during
+ * a single your-turn. A later, genuinely distinct prompt with the same options must be answered
+ * again. The hook used to clear on the your-turn→working flip, which worked while one instance
+ * lived forever; now that the concierge mounts this only for the SELECTED agent, an agent that
+ * finishes its turn while you are looking at a different one would never be cleared — and on
+ * return, its next real prompt would be suppressed as "already handled", leaving the agent blocked
+ * forever while the UI claimed it was auto-approved. So the flip is watched at module level.
+ */
+export function clearHandledSignatures(agentId: string): void {
+  HANDLED_SIGS.get(agentId)?.clear();
+}
+
+/**
+ * Watch EVERY agent's status, not just the mounted one's, and clear the de-dupe set when an agent
+ * leaves your-turn. This is the module-level half of clearHandledSignatures' contract.
+ *
+ * Subscribed once at import. The store is a plain zustand store, so this costs one comparison per
+ * status write and needs no component to be alive — which is the entire point: the agent that most
+ * needs clearing is the one you are NOT looking at.
+ */
+/**
+ * The subscription body, exported so a test can drive it directly.
+ *
+ * Clears any agent NOT in your-turn, rather than watching for the your-turn→working TRANSITION. A
+ * transition needs a prior observation, and the watcher has none for an agent whose first observed
+ * status is already `working` — so the edge could be missed exactly once, which for this guard means
+ * an agent silently stuck. "Not in your-turn" needs no history and is strictly safer: an agent that
+ * is working has no live picker on screen, so a remembered signature can only do harm.
+ */
+export function onRuntimeStatusChange(status: Record<string, AgentTabStatus>): void {
+  for (const [id, s] of Object.entries(status)) {
+    if (!YOUR_TURN.has(s)) clearHandledSignatures(id);
+  }
+}
+
+// Guarded: this runs at IMPORT time, and several suites replace the runtime store with a bare
+// selector stub that has no `subscribe`. A module that throws while being imported takes the whole
+// file down, which is a far worse failure than this watcher being inactive in a unit test — the
+// behaviour it guards has its own coverage via onRuntimeStatusChange.
+if (typeof useRuntimeStore.subscribe === "function") {
+  useRuntimeStore.subscribe((state) => onRuntimeStatusChange(state.status));
+}
+
+/** Drop an agent's per-agent state — call when the agent is closed for good. Exported for tests,
+ *  which must not leak an answered-picker signature from one case into the next. */
+export function resetSuggestionMemory(agentId?: string): void {
+  if (agentId === undefined) {
+    HANDLED_SIGS.clear();
+    MEMOS.clear();
+    return;
+  }
+  HANDLED_SIGS.delete(agentId);
+  MEMOS.delete(agentId);
+}
+
 export function useSuggestions(agentId: string, composerEmpty: boolean) {
   const [buttons, setButtons] = useState<SuggestionButton[]>([]);
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
@@ -143,18 +223,32 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // Manage" note), or null. Cleared whenever normal buttons are shown or the state moves on.
   const [autoApproved, setAutoApproved] = useState<ApprovalCategory | null>(null);
   // Signatures of picker instances already auto-answered, so a re-rendered/settled scrollback can't
-  // re-send the keystroke. Per-agent (this hook instance owns one agent). See maybeAutoApprove.
-  const handledSigs = useRef<Set<string>>(new Set());
+  // re-send the keystroke. See maybeAutoApprove.
+  //
+  // MODULE-SCOPED, KEYED BY AGENT — not an instance ref. This is a de-dupe guard against an
+  // IRREVERSIBLE action (a keystroke into a live PTY), so it has to outlive the component. As an
+  // instance ref it died with the hook, and the concierge now mounts the row keyed by agent id:
+  // tabbing to another agent and back while the same permission prompt was still on screen
+  // remounted the hook with an empty set and auto-approve fired a SECOND time (roborev 53074).
+  // Per-agent state that guards a side effect belongs to the agent, not to a React instance.
+  // Read DIRECTLY each render, not through a ref. `useRef(handledSigsFor(agentId))` captures the
+  // entry for whatever id was present at FIRST render and ignores the argument forever after — so
+  // the state was per-instance-of-the-first-agent, the opposite of what it claims, and correctness
+  // rested entirely on the caller remembering `key={agentId}`. An O(1) map lookup makes the key an
+  // optimisation rather than a load-bearing invariant (roborev 53159).
+  const handledSigs = { current: handledSigsFor(agentId) };
   const lastHash = useRef<string | null>(null);
   // Results of past computes for THIS agent, keyed by scrollback hash. `lastHash` is nulled every
   // time the agent leaves your-turn (so a genuinely-repeated prompt recomputes), which means an
   // agent that flips out of and back into the SAME settled screen re-ran the whole compute — and
   // when learned actions are on, that is a metered Haiku call bought for a state we already have
   // the answer to. Surviving the reset lets that round-trip be served locally. Deliberately NOT
-  // persisted and not shared across agents: it's a within-session echo cache, nothing more.
-  const memo = useRef<Map<string, { buttons: SuggestionButton[]; questionPending: boolean }>>(
-    new Map(),
-  );
+  // persisted: it's a within-session echo cache, nothing more.
+  //
+  // Also module-scoped per agent, for the cheaper half of the same reason: a remount used to throw
+  // the cache away and re-buy a metered Haiku compute for a screen already computed — exactly what
+  // this cache exists to prevent.
+  const memo = { current: memoFor(agentId) }; // same reasoning as handledSigs above
   // Guards against a duplicate concurrent (paid) compute while one is in flight. `retryTick` lets a
   // discarded compute re-trigger the effect so a state we returned to still gets suggestions.
   const computing = useRef(false);
@@ -189,6 +283,15 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   const isOnline = useConnectionStore((s) => s.isOnline);
   const status = useRuntimeStore((s) => s.status[agentId]);
   const isYourTurn = status !== undefined && YOUR_TURN.has(status);
+  /** Is the agent STILL blocked on the user, right now? Reads the store rather than the render-time
+   *  `isYourTurn`, which is a snapshot: both the memo hit (effects flush after paint) and the async
+   *  compute (`.then` on a microtask) can run after a store write the closure never saw. Typing a
+   *  picker answer off a screen the agent has already left is wrong regardless of the de-dupe set,
+   *  so both auto-answer sites gate on this (roborev 53203/53248). */
+  const isLive = useCallback(
+    () => YOUR_TURN.has(useRuntimeStore.getState().status[agentId] as AgentTabStatus),
+    [agentId],
+  );
   // The LIVE stage — deliberately NOT `workflowShipped`, which is a latch-once watermark that trips
   // the first time work reaches main and clears only on close. Reading it here is what made an agent
   // that landed an earlier cycle offer "Close Build Agent" over fresh un-landed work. The watermark
@@ -306,6 +409,14 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
     // worth far more than the metered call it saves.
     const hit = memo.current.get(nextHash);
     if (hit) {
+      // Not live → commit NOTHING. Unlike the async path there is nothing here worth salvaging: a
+      // memo hit spent no metered call, so bailing costs only a cache read. Suppressing just the
+      // auto-answer while still committing lastHash and raising the buttons was the same defect the
+      // async path was fixed out of — a hash committed for work that was discarded — and it left a
+      // repeat permission prompt showing buttons instead of being auto-answered, with recovery
+      // depending on a render that the batched approval→working→approval transition skips
+      // (roborev 53286).
+      if (!isLive()) return;
       const autoCat = maybeAutoApprove(agentId, scrollback, handledSigs.current);
       lastHash.current = nextHash;
       // Unlike the success path below, this branch deliberately does NOT clear `fail`. It can't be
@@ -364,7 +475,27 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // "summary"/"full" (and the master toggle is on), the local detector types the matching
         // digit ONCE and we suppress the buttons — same post-fire cleanup as auto-approve. Checked
         // first because it shares the handledSigs de-dupe set and never overlaps a permission prompt.
-        const autoResume = maybeAutoResume(agentId, scrollback, handledSigs.current);
+        // RE-VALIDATE LIVENESS before typing anything. This compute started while the agent was
+        // blocked on the user; by the time its promise resolves the agent may have moved on, and
+        // typing a picker answer off a scrollback snapshot it has already left is wrong regardless
+        // of what the de-dupe set says.
+        //
+        // Gates ONLY the two auto-answers — the irreversible half. Bailing out of the whole `.then`
+        // (as this first did) threw away everything the metered call bought: rememberComputed never
+        // ran for exactly the leave-and-return transition the memo exists to serve, while lastHash
+        // had already advanced to a hash whose result was discarded. Recovering that needs the
+        // reset effect, which needs React to render with isYourTurn false — and two store writes in
+        // one task (approval → working → approval, a resume echo) auto-batch into a single render
+        // where it never does, leaving the screen with no suggestions at all (roborev 53248).
+        //
+        // It also stops depending on effect ordering. The clear used to live in the reset effect,
+        // which React runs AFTER the compute effect's cleanup sets `alive = false` — safe by
+        // construction. The module watcher fires synchronously inside the zustand `set`, before
+        // React has committed anything and while `alive` is still true, so a compute resolving on
+        // the next microtask would see a freshly-emptied set and auto-answer a SECOND time
+        // (roborev 53203). Checking the live status makes the watcher's timing irrelevant.
+        const live = isLive();
+        const autoResume = live ? maybeAutoResume(agentId, scrollback, handledSigs.current) : null;
         if (autoResume) {
           setAutoApproved(null); // not a category note; just suppress the pills for this prompt
           setButtons([]);
@@ -373,7 +504,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
           log.debug("suggestions", "auto-resumed", { agentId, mode: autoResume });
           return;
         }
-        const autoCat = maybeAutoApprove(agentId, scrollback, handledSigs.current);
+        const autoCat = live ? maybeAutoApprove(agentId, scrollback, handledSigs.current) : null;
         if (autoCat) {
           setAutoApproved(autoCat);
           setButtons([]);
@@ -544,7 +675,7 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       // during one your-turn. A later, genuinely-distinct prompt for the same command (e.g. the same
       // `rm -rf build/` run twice) hashes identically, so if the set persisted across turns that
       // second REAL prompt would be suppressed WITHOUT being answered — leaving the agent blocked.
-      handledSigs.current.clear();
+      clearHandledSignatures(agentId);
       lastHash.current = null;
       setCtaCleared(false); // the next your-turn starts with a fresh CTA
       setQuestionPending(false); // the agent is working again — whatever it asked has been answered

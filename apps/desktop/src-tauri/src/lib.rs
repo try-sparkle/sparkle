@@ -43,6 +43,7 @@ mod onepassword;
 mod preflight;
 mod pty;
 mod retention;
+mod route_classify;
 mod transcribe;
 mod screenshot;
 mod setup;
@@ -423,6 +424,7 @@ pub fn run() {
             logging::reveal_logs,
             logging::frontend_log,
             naming::generate_agent_name,
+            route_classify::route_classify,
             connectivity::probe_connectivity,
             chief::chief_pat,
             bridge::start_orchestration_bridge,

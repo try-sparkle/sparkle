@@ -35,7 +35,7 @@ function setup(over: { attachments?: Attachment[]; dropActive?: boolean } = {}) 
   return { onSend, onRemoveAttachment };
 }
 
-const box = () => screen.getByRole("textbox", { name: "Message Sparkle" }) as HTMLTextAreaElement;
+const box = () => screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
 const send = () => screen.getByRole("button", { name: "Send" }) as HTMLButtonElement;
 
 describe("ComposeBox — attachment chips", () => {

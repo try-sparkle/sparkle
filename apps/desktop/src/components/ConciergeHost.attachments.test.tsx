@@ -22,6 +22,7 @@ const h = vi.hoisted(() => ({
   dispatch: vi.fn(async (): Promise<{ ok: boolean; path?: string }> => ({ ok: true })),
   pick: vi.fn(),
   loadPaths: vi.fn(),
+  route: vi.fn(async () => ({ target: "sparkle" as "sparkle" | "agent", reason: "test", source: "heuristic" as const })),
 }));
 
 vi.mock("../services/openProjectTab", () => ({
@@ -37,6 +38,10 @@ vi.mock("../services/concierge", () => ({
 vi.mock("../services/conciergeDispatch", () => ({
   dispatchConciergeAnswer: h.dispatch,
   flushPendingSends: vi.fn(async () => []),
+  agentCanAcceptInput: vi.fn(() => true),
+  liveOptionsFor: vi.fn(() => []),
+  isTerseAnswer: vi.fn(() => false),
+  matchAnswerToOption: vi.fn(() => null),
   onDeferredSendOutcome: (
     cb: (r: {
       ok: boolean;
@@ -54,6 +59,11 @@ vi.mock("../services/conciergeDispatch", () => ({
     };
   },
 }));
+// The user no longer picks a destination — the host routes (PRD/sparkle/concierge-auto-routing).
+// `routeMessage` is a KNOB here: these rows are about which rendering reaches which destination,
+// not about how the decision is made (that is services/conciergeRouter.test.ts).
+vi.mock("../services/conciergeRouter", () => ({ routeMessage: h.route }));
+vi.mock("./Concierge/ConciergeSuggestions", () => ({ ConciergeSuggestions: () => null }));
 // The voice stack (CM-U9) is mocked in EVERY host test, not just the voice one (roborev 48171):
 // the host imports it unconditionally, so without this the base tests run the real dictation hook
 // and the real stopVoice() on every simulated send — mutating global dictation state and coupling
@@ -127,9 +137,13 @@ async function attachImage() {
 const type = (text: string) =>
   fireEvent.change(screen.getByRole("textbox"), { target: { value: text } });
 
+// Routing is async (tier 2 is a network round trip) and every delivery chains behind the previous
+// one, so nothing lands in the same tick as the click.
 const clickSend = async () => {
   await act(async () => {
     fireEvent.click(screen.getByText("Send"));
+    await Promise.resolve();
+    await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
   });
@@ -141,7 +155,14 @@ beforeEach(() => {
   h.pick.mockResolvedValue([shot]);
   h.loadPaths.mockResolvedValue([shot]);
   h.dispatch.mockResolvedValue({ ok: true, path: "free-text" });
+  h.route.mockResolvedValue({ target: "sparkle", reason: "test", source: "heuristic" });
+  h.startConciergeTurn.mockResolvedValue(null);
 });
+
+/** Point the router at the agent for the next send — the routed replacement for flipping the
+ *  removed send-target toggle. */
+const routeToAgent = () =>
+  h.route.mockResolvedValue({ target: "agent", reason: "test", source: "heuristic" });
 afterEach(() => cleanup());
 
 /** Queries scoped to the VISIBLE transcript. The column also renders a hidden `role="status"` live
@@ -182,7 +203,7 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
   it("prefixes the path when the prompt goes to the AGENT, as a user prompt", async () => {
     mount();
     await attachImage();
-    fireEvent.click(screen.getByTestId("send-target-toggle"));
+    routeToAgent();
     type("what is wrong here?");
     await clickSend();
     // Three renderings, one message (roborev 46911/46925): only the WIRE payload carries the path.
@@ -206,7 +227,7 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
   it("delivers an attachment with no typed text at all", async () => {
     mount();
     await attachImage();
-    fireEvent.click(screen.getByTestId("send-target-toggle"));
+    routeToAgent();
     await clickSend();
     // An attachments-only send: the naming basis is EMPTY by construction, which is what makes
     // auto-naming skip it rather than naming the agent after a temp file.
@@ -241,7 +262,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
     h.dispatch.mockResolvedValue({ ok: false, path: "pty-gone" });
     mount();
     await attachImage();
-    fireEvent.click(screen.getByTestId("send-target-toggle"));
+    routeToAgent();
     type("look");
     await clickSend();
     expect(screen.getByTestId("concierge-attachment-chips").textContent).toContain("shot.png");
@@ -254,7 +275,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
     h.dispatch.mockResolvedValue({ ok: true, path: "queued" });
     mount();
     await attachImage();
-    fireEvent.click(screen.getByTestId("send-target-toggle"));
+    routeToAgent();
     type("look");
     await clickSend();
     // Held: the box is clear while the promise stands.
@@ -274,7 +295,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
     h.dispatch.mockResolvedValue({ ok: true, path: "queued" });
     mount();
     // 1) a queued send carrying NOTHING…
-    fireEvent.click(screen.getByTestId("send-target-toggle"));
+    routeToAgent();
     type("just words");
     await clickSend();
     // 2) …then one carrying a file.
@@ -305,7 +326,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
     fireEvent.click(screen.getByText("Approve"));
     await act(async () => {});
     await attachImage();
-    fireEvent.click(screen.getByTestId("send-target-toggle"));
+    routeToAgent();
     type("look");
     await clickSend();
 
@@ -325,7 +346,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
     h.dispatch.mockResolvedValue({ ok: true, path: "queued" });
     mount();
     await attachImage();
-    fireEvent.click(screen.getByTestId("send-target-toggle"));
+    routeToAgent();
     type("look");
     await clickSend();
 

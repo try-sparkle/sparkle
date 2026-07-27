@@ -30,6 +30,7 @@ const h = vi.hoisted(() => ({
   stopConciergeVoice: vi.fn(),
   shouldSpeakConciergeReply: vi.fn(() => true),
   maybePauseOnSubmit: vi.fn(),
+  route: vi.fn(async () => ({ target: "sparkle" as "sparkle" | "agent", reason: "test", source: "heuristic" as const })),
 }));
 
 // The host reaches for openProjectTab (a nudge's "Show me"), not useConciergeFeed — the feed has
@@ -58,8 +59,17 @@ vi.mock("../services/concierge", () => ({
 vi.mock("../services/conciergeDispatch", () => ({
   dispatchConciergeAnswer: h.dispatchConciergeAnswer,
   flushPendingSends: vi.fn(async () => []),
+  agentCanAcceptInput: vi.fn(() => true),
+  liveOptionsFor: vi.fn(() => []),
+  isTerseAnswer: vi.fn(() => false),
+  matchAnswerToOption: vi.fn(() => null),
   onDeferredSendOutcome: () => () => {},
 }));
+// The user no longer PICKS a destination — the host routes (PRD/sparkle/concierge-auto-routing).
+// A knob here: what these rows care about is whether the reply is spoken, which turns on which
+// destination a send reached, not on how that decision was reached.
+vi.mock("../services/conciergeRouter", () => ({ routeMessage: h.route }));
+vi.mock("./Concierge/ConciergeSuggestions", () => ({ ConciergeSuggestions: () => null }));
 vi.mock("../stores/sparklePrefsStore", () => ({
   useSparklePrefsStore: { getState: () => ({ setInterruptPreference: vi.fn() }) },
 }));
@@ -132,9 +142,23 @@ function mount(opts: { aimable?: boolean } = {}) {
   return {
     box,
     type: (text: string) => fireEvent.change(box(), { target: { value: text } }),
-    send: () => fireEvent.click(screen.getByRole("button", { name: "Send" })),
-    /** Flip the send-target toggle: the next send goes to the pinned AGENT, not the brain. */
-    aim: () => fireEvent.click(screen.getByTestId("send-target-toggle")),
+    // Routing is async now and every delivery chains behind the previous one, so a send settles
+    // over several microtasks rather than in the click's own tick.
+    send: async () => {
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Send" }));
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    },
+    /** Point the router at the AGENT: the next send goes to its terminal, not the brain. This is
+     *  the routed replacement for flipping the removed send-target toggle. */
+    aim: () => h.route.mockResolvedValue({ target: "agent", reason: "test", source: "heuristic" }),
+    /** …and back: the next send is answered in chat. */
+    unaim: () =>
+      h.route.mockResolvedValue({ target: "sparkle", reason: "test", source: "heuristic" }),
     // The wrapped append the host handed down to the compose box.
     dictate: (segment: string) => {
       const calls = h.dictation.registerInsert.mock.calls as [Append | null][];
@@ -160,24 +184,24 @@ describe("ConciergeHost — spoken replies", () => {
   it("a TYPED turn is never spoken", async () => {
     const c = mount();
     c.type("approve the deploy");
-    c.send();
+    await c.send();
     c.reply("Approved.");
     expect(h.speakConciergeReply).not.toHaveBeenCalled();
   });
 
-  it("a DICTATED turn is spoken back, even though the mic went quiet before Send", () => {
+  it("a DICTATED turn is spoken back, even though the mic went quiet before Send", async () => {
     const c = mount();
     c.dictate("approve the deploy"); // the stop word then drops the mic; micLive stays false
-    c.send();
+    await c.send();
     c.reply("Approved.");
     expect(h.speakConciergeReply).toHaveBeenCalledWith("Approved.", { voiceTurn: true });
   });
 
-  it("a turn sent while the mic is still live is spoken back too", () => {
+  it("a turn sent while the mic is still live is spoken back too", async () => {
     h.dictation.micLive = true;
     const c = mount();
     c.type("approve the deploy");
-    c.send();
+    await c.send();
     c.reply("Approved.");
     expect(h.speakConciergeReply).toHaveBeenCalledWith("Approved.", { voiceTurn: true });
   });
@@ -185,43 +209,43 @@ describe("ConciergeHost — spoken replies", () => {
   // roborev 46922: the latch was set by dictated content arriving and cleared only on send, so
   // content that LEFT the box without being sent kept it armed — the exact inverse of the bug the
   // latch exists to fix, and Concierge v1's rule is that typing must never make the app speak.
-  it("emptying the box by hand retires the dictated-origin latch", () => {
+  it("emptying the box by hand retires the dictated-origin latch", async () => {
     const c = mount();
     c.dictate("scratch that");
     c.type(""); // select-all + delete
     c.type("a completely typed message");
-    c.send();
+    await c.send();
     c.reply("Done.");
     expect(h.speakConciergeReply).not.toHaveBeenCalled();
   });
 
-  it("editing dictated text without clearing it keeps the turn a VOICE turn", () => {
+  it("editing dictated text without clearing it keeps the turn a VOICE turn", async () => {
     // Only an EMPTY box retires the latch — fixing a transcription typo must not silence the reply.
     const c = mount();
     c.dictate("approve the deply");
     c.type("approve the deploy");
-    c.send();
+    await c.send();
     c.reply("Approved.");
     expect(h.speakConciergeReply).toHaveBeenCalledWith("Approved.", { voiceTurn: true });
   });
 
-  it("the voice origin does not leak into the NEXT turn", () => {
+  it("the voice origin does not leak into the NEXT turn", async () => {
     const c = mount();
     c.dictate("approve the deploy");
-    c.send();
+    await c.send();
     c.reply("Approved.");
     h.speakConciergeReply.mockClear();
 
     c.type("and now this one");
-    c.send();
+    await c.send();
     c.reply("Done.");
     expect(h.speakConciergeReply).not.toHaveBeenCalled();
   });
 
-  it("speaks the WHOLE streamed reply, not just the final chunk", () => {
+  it("speaks the WHOLE streamed reply, not just the final chunk", async () => {
     const c = mount();
     c.dictate("status?");
-    c.send();
+    await c.send();
     act(() => {
       h.brain.delta?.({ id: "t1", text: "All " });
       h.brain.delta?.({ id: "t1", text: "calm." });
@@ -232,11 +256,11 @@ describe("ConciergeHost — spoken replies", () => {
     expect(h.speakConciergeReply).toHaveBeenCalledWith("All calm.", { voiceTurn: true });
   });
 
-  it("a suppressed autoplay never reaches the TTS service", () => {
+  it("a suppressed autoplay never reaches the TTS service", async () => {
     h.shouldSpeakConciergeReply.mockReturnValueOnce(false);
     const c = mount();
     c.dictate("status?");
-    c.send();
+    await c.send();
     c.reply("All calm.");
     expect(h.speakConciergeReply).not.toHaveBeenCalled();
   });
@@ -248,9 +272,7 @@ describe("ConciergeHost — spoken replies", () => {
     const c = mount({ aimable: true });
     c.aim();
     c.dictate("rebase onto main");
-    await act(async () => {
-      c.send();
-    });
+    await c.send();
     expect(h.dispatchConciergeAnswer).toHaveBeenCalled();
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
     expect(h.speakConciergeReply).not.toHaveBeenCalled();
@@ -260,12 +282,10 @@ describe("ConciergeHost — spoken replies", () => {
     const c = mount({ aimable: true });
     c.aim();
     c.dictate("rebase onto main");
-    await act(async () => {
-      c.send();
-    });
-    c.aim(); // back to Sparkle
+    await c.send();
+    c.unaim(); // back to Sparkle
     c.type("and what about the docs?");
-    c.send();
+    await c.send();
     c.reply("They're fine.");
     expect(h.speakConciergeReply).not.toHaveBeenCalled();
   });
@@ -277,11 +297,9 @@ describe("ConciergeHost — spoken replies", () => {
     const c = mount({ aimable: true });
     c.aim();
     c.dictate("rebase onto main");
-    await act(async () => {
-      c.send();
-    });
-    c.aim(); // back to Sparkle, with the restored draft still in the box
-    c.send();
+    await c.send();
+    c.unaim(); // back to Sparkle, with the restored draft still in the box
+    await c.send();
     c.reply("Rebasing.");
     expect(h.speakConciergeReply).toHaveBeenCalledWith("Rebasing.", { voiceTurn: true });
   });
@@ -294,27 +312,27 @@ describe("ConciergeHost — spoken replies", () => {
     const done = (id: string, text: string) =>
       act(() => h.brain.done?.({ id, sessionId: "s1", text }));
 
-    it("a straggler from the OLD turn can't corrupt the new turn's spoken reply", () => {
+    it("a straggler from the OLD turn can't corrupt the new turn's spoken reply", async () => {
       const c = mount();
       c.dictate("first question");
-      c.send();
+      await c.send();
       delta("7", "part of the OLD answer");
       // The user asks again: the backend kills turn 7 and spawns turn 8.
       c.dictate("second question");
-      c.send();
+      await c.send();
       delta("7", " …and more of it"); // turn 7's reader flushing its buffer, post-kill
       delta("8", "The new answer.");
       done("8", "");
       expect(h.speakConciergeReply).toHaveBeenCalledWith("The new answer.", { voiceTurn: true });
     });
 
-    it("a DONE from the retired turn neither speaks nor steals the new turn's voice flag", () => {
+    it("a DONE from the retired turn neither speaks nor steals the new turn's voice flag", async () => {
       const c = mount();
       c.dictate("first question");
-      c.send();
+      await c.send();
       delta("7", "the old answer");
       c.dictate("second question");
-      c.send();
+      await c.send();
       done("7", "the old answer, finished"); // races the new send
       expect(h.speakConciergeReply).not.toHaveBeenCalled();
 
@@ -323,13 +341,13 @@ describe("ConciergeHost — spoken replies", () => {
       expect(h.speakConciergeReply).toHaveBeenCalledWith("The new answer.", { voiceTurn: true });
     });
 
-    it("an ERROR from the retired turn posts no bubble", () => {
+    it("an ERROR from the retired turn posts no bubble", async () => {
       const c = mount();
       c.type("first question");
-      c.send();
+      await c.send();
       delta("7", "partial");
       c.type("second question");
-      c.send();
+      await c.send();
       act(() => h.brain.error?.({ id: "7", detail: "killed" }));
       expect(within(thread()).queryByText(/couldn't reach my brain/i)).toBeNull();
     });
@@ -341,11 +359,11 @@ describe("ConciergeHost — spoken replies", () => {
       // 53051); the case below is the same race with the ordering production actually delivers.
       const c = mount();
       c.type("first");
-      c.send();
+      await c.send();
       delta("7", "the first answer");
       h.startConciergeTurn.mockResolvedValueOnce("9");
       c.type("second");
-      c.send();
+      await c.send();
       await act(async () => {}); // the token lands
       delta("8", "the dead turn's buffered output");
       expect(within(thread()).queryByText(/dead turn/)).toBeNull();
@@ -364,7 +382,7 @@ describe("ConciergeHost — spoken replies", () => {
       // frontend hardening read as a regression (roborev 53105).
       const c = mount();
       c.type("first");
-      c.send();
+      await c.send();
       delta("7", "the first answer");
 
       let settle!: (id: string | null) => void;
@@ -372,7 +390,7 @@ describe("ConciergeHost — spoken replies", () => {
         () => new Promise<string | null>((res) => { settle = res; }),
       );
       c.type("second");
-      c.send();
+      await c.send();
       await act(async () => {
         settle("9"); // the send that spawned turn 9 — registered AFTER the first send consumed none
       });
@@ -384,16 +402,16 @@ describe("ConciergeHost — spoken replies", () => {
     it("a LOCAL error id (not a token) always surfaces", async () => {
       const c = mount();
       c.type("anything");
-      c.send();
+      await c.send();
       act(() => h.brain.error?.({ id: "local", detail: "invoke rejected" }));
       expect(await findInThread(/couldn't reach my brain/i)).toBeTruthy();
     });
   });
 
-  it("sending stops whatever Sparkle was already saying", () => {
+  it("sending stops whatever Sparkle was already saying", async () => {
     const c = mount();
     c.type("stop talking");
-    c.send();
+    await c.send();
     expect(h.stopConciergeVoice).toHaveBeenCalled();
   });
 });
@@ -402,7 +420,7 @@ describe("ConciergeHost — speak on demand", () => {
   it("the speaker button reads a reply aloud", async () => {
     const c = mount();
     c.type("status?");
-    c.send();
+    await c.send();
     c.reply("All calm.");
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Speak this reply" }));
@@ -415,7 +433,7 @@ describe("ConciergeHost — speak on demand", () => {
     h.speakOnDemand.mockImplementationOnce(() => new Promise(() => {}));
     const c = mount();
     c.type("status?");
-    c.send();
+    await c.send();
     c.reply("All calm.");
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Speak this reply" }));
@@ -428,13 +446,13 @@ describe("ConciergeHost — speak on demand", () => {
 });
 
 describe("ConciergeHost — mic", () => {
-  it("the compose mic drives the real dictation toggle", () => {
+  it("the compose mic drives the real dictation toggle", async () => {
     mount();
     fireEvent.click(screen.getByRole("button", { name: "Talk to Sparkle" }));
     expect(h.dictation.toggleMic).toHaveBeenCalledTimes(1);
   });
 
-  it("a live mic buzzes the wordmark and paints the live transcript", () => {
+  it("a live mic buzzes the wordmark and paints the live transcript", async () => {
     h.dictation.micLive = true;
     h.dictation.interim = "approve the dep";
     mount();

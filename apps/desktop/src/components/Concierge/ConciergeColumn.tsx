@@ -33,6 +33,7 @@ export function ConciergeColumn({
   wordmarkMode,
   width = 380,
   searchSlot,
+  suggestionsSlot,
   interim = "",
   registerInsert,
   speakingMessageId = null,
@@ -73,9 +74,18 @@ export function ConciergeColumn({
         onNudgeAction={controller.onNudgeAction}
         onSpeak={controller.onSpeak}
         speakingMessageId={speakingMessageId}
+        onRedirect={controller.onRedirect}
+        onDigestClick={controller.onDigestClick}
       />
+      {/* Recommended actions for the actively-shown build agent, pinned directly above the box —
+          where they sat in the removed AgentPane composer. A SLOT, not a view-model field: the row
+          owns a per-agent hook that must remount when the agent changes, so the host mounts it
+          keyed (see ConciergeSuggestions) and this column stays a pure renderer. */}
+      {suggestionsSlot}
       {/* The column's ONE live region. Visually hidden, polite, and fed only completed lines, so a
           screen-reader user hears the reply once — not once per chunk (roborev 52648/53010).
+          Routing receipts land here too: with the send-target toggle gone this is the only way a
+          screen-reader user learns where their message went.
           The region element itself is STABLE (an aria-live node must exist before the content it
           announces); only its child is replaced. */}
       <div
@@ -108,8 +118,6 @@ export function ConciergeColumn({
         attachments={model.attachments}
         dropActive={model.dropActive}
         micLive={micLive}
-        send={model.send}
-        onToggleSendTarget={controller.onToggleSendTarget}
         interim={interim}
         registerInsert={registerInsert}
         onTextEdit={onTextEdit}

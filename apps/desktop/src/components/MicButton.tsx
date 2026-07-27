@@ -436,7 +436,11 @@ export function MicMenu({
  *  no waveform. It shares useMicToggle + micVisual with the top ring, so a click here takes the
  *  exact same action. It is only shown while the mic is ON (paused or active); when the mic is off
  *  it renders nothing, so it disappears from beside the composer. */
-export function ComposerMic() {
+export function ComposerMic({
+  /** Called before the toggle runs, so the compose box this mic belongs to can claim the single
+   *  global dictation slot. See the claim comments in Composer / Concierge ComposeBox. */
+  onArm,
+}: { onArm?: () => void } = {}) {
   const { state, onClick, ariaLabel, title } = useMicToggle();
   const [hover, setHover] = useState(false);
   // Hovering the mic reveals the three-option pill (see MicMenu). The pill opens UP because the
@@ -462,7 +466,10 @@ export function ComposerMic() {
       <button
         type="button"
         data-hint="composer-mic"
-        onClick={onClick}
+        onClick={() => {
+          onArm?.();
+          onClick();
+        }}
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
         aria-label={ariaLabel}

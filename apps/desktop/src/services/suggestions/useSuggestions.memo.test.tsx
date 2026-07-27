@@ -39,29 +39,40 @@ vi.mock("./pendingQuestion", () => ({ detectPendingQuestion: () => false }));
 // Mutable status so a test can flip the agent out of your-turn and back — the transition that
 // nulls `lastHash` and, before the memo, re-bought the compute for an unchanged screen.
 let status = "idle";
-vi.mock("../../stores/runtimeStore", () => ({
-  useRuntimeStore: (
-    sel: (s: {
+vi.mock("../../stores/runtimeStore", () => {
+  const runtimeState = () => ({
+    status: { a1: status },
+    workflowShipped: {},
+    workflowStage: {},
+    workflowState: {},
+    branchStatus: {},
+  });
+  return {
+  useRuntimeStore: Object.assign(
+    (sel: (s: {
       status: Record<string, string>;
       workflowShipped: Record<string, boolean>;
       workflowStage: Record<string, string>;
       workflowState: Record<string, unknown>;
       branchStatus: Record<string, unknown>;
     }) => unknown,
-  ) =>
-    sel({
-      status: { a1: status },
-      workflowShipped: {},
-      workflowStage: {},
-      workflowState: {},
-      branchStatus: {},
-    }),
-}));
+  ) => sel(runtimeState()),
+    // getState is REQUIRED, not decoration: useSuggestions re-checks the LIVE status before typing
+    // a picker answer, so a mock without it makes that guard read undefined and bail — which looks
+    // like the hook computing nothing at all. A mock that models less than the real store fails
+    // open, and this one did (roborev 53203).
+    { getState: runtimeState },
+  ),
+  };
+});
 
-import { useSuggestions, rememberComputed, MEMO_LIMIT } from "./useSuggestions";
+import { useSuggestions, rememberComputed, MEMO_LIMIT , resetSuggestionMemory } from "./useSuggestions";
 import { useConnectionStore } from "../../stores/connectionStore";
 
 beforeEach(() => {
+  // handledSigs/memo are per-AGENT module state now (they must survive a remount to stop
+  // auto-approve re-firing), so each case has to start from a clean slate.
+  resetSuggestionMemory();
   computeSuggestions.mockReset();
   maybeAutoApprove.mockReset();
   maybeAutoApprove.mockReturnValue(null);

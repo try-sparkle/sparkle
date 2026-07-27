@@ -14,17 +14,30 @@
 // reply is spoken back through services/conciergeVoice. Autoplay is narrow ON PURPOSE — only a turn
 // the user STARTED by voice is spoken, and only while the do-not-interrupt store allows it. Every
 // reply also carries a speaker button, which is how a typed turn gets read aloud.
+//
+// AUTO-ROUTING (PRD/sparkle/concierge-auto-routing.md). The compose box no longer carries a target
+// toggle: this host decides, per message, whether it goes to the selected agent's terminal or to
+// Sparkle's chat (services/conciergeRouter — heuristics first, then one Haiku tiebreak). Three
+// things make that defensible, and all three live in this file:
+//   • every send posts a RECEIPT naming where it went, with a one-tap redirect (setReceipt);
+//   • routing failure falls back to `sparkle`, the recoverable direction (the router's own rule);
+//   • sends are SERIALIZED (enqueue), because routing is a network round trip and two messages
+//     sent in quick succession would otherwise reach the PTY out of submit order.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ConciergeColumn,
   deriveWordmarkMode,
+  receiptText,
   type ConciergeAnnouncement,
+  type ConciergeAttachKind,
   type ConciergeMessage,
   type ConciergeNudge,
   type ConciergeNudgeAction,
+  type ConciergeReceipt,
   type ConciergeSparkleMessage,
   type ConciergeViewModel,
 } from "./Concierge";
+import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";
 import type { ConciergeAgent, ConciergeFeed } from "../useConciergeFeed";
 import { bandCountLabel, bandLabel } from "../engine/statusBandLabels";
 import { oneLine } from "./promptHistory";
@@ -36,11 +49,14 @@ import {
   startConciergeTurn,
 } from "../services/concierge";
 import {
+  agentCanAcceptInput,
   dispatchConciergeAnswer,
   onDeferredSendOutcome,
   type ConciergeDispatchPath,
   type ConciergeDispatchResult,
 } from "../services/conciergeDispatch";
+import { routeMessage } from "../services/conciergeRouter";
+import { buildDigest } from "../services/conciergeDigest";
 import { attachedDisplay, attachedPayload } from "../services/conciergeAttach";
 import { useConciergeAttachments } from "../hooks/useConciergeAttachments";
 import type { Attachment } from "./composer/attachments";
@@ -53,10 +69,44 @@ import {
 import { maybePauseOnSubmit } from "../services/dictationControls";
 import { useConciergeDictation } from "../useConciergeDictation";
 import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
+import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSpendPill } from "../stores/spendStore";
 
 let seq = 0;
 const nextId = (p: string) => `${p}-${(seq += 1)}`;
+
+/** How many sent messages keep their original text for a possible redirect. Only the newest bubble
+ *  is ever redirectable, so anything older is dead weight — and without a bound a long session with
+ *  pasted content grows the map forever. Kept well above 1 so the map still reads as a short
+ *  history rather than a single slot. */
+export const SENT_TEXT_LIMIT = 50;
+
+/**
+ * Ceiling on a single queued delivery, so a hung one can't wedge the shared chain forever. Well
+ * above any healthy send (routing has its own 4s deadline and a dispatch is local), so this only
+ * ever fires on something genuinely stuck.
+ *
+ * KNOWN RESIDUAL, accepted deliberately. A race is not a cancellation: an overrun task keeps
+ * running and could still reach the PTY after the queue has let later work past it — the reordering
+ * the chain exists to prevent. Making the chain wait for the real task instead would fix that and
+ * reintroduce the wedge this bound was added for (roborev 53119), where one hung delivery kills
+ * Approve — the button whose job is unsticking a blocked agent — for the rest of the session. A
+ * permanently dead Approve is worse than a pathological late write, so the bound stays and the
+ * residual is documented rather than papered over. Cancellation at the dispatch layer is what would
+ * actually resolve it.
+ */
+const QUEUE_TASK_TIMEOUT_MS = 30_000;
+
+/** Remember `text` for `id`, evicting the oldest entries past the cap (Map preserves insertion
+ *  order, so the first keys are the oldest). */
+export function rememberSentText(map: Map<string, string>, id: string, text: string): void {
+  map.set(id, text);
+  while (map.size > SENT_TEXT_LIMIT) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
 
 /** What the concierge says when the server has refused the send: the free trial is spent. The
  *  dispatch path gates BEFORE delivery (services/trialMeter.trialSendAllowed), so nothing reached
@@ -219,17 +269,25 @@ export interface ConciergePromptTarget {
 export function ConciergeHost({
   feed,
   promptTarget = null,
-  promptTargetUnavailableReason,
+  promptTargetShown = true,
   width,
   searchSlot,
 }: {
   /** The cross-project status-band feed, built once by Workspace (see the file header). */
   feed: ConciergeFeed;
-  /** The agent the compose box can prompt directly; null → the box only talks to Sparkle. */
+  /** The SELECTED build agent, whether or not its pane is on screen. Drives the suggestions
+   *  engine, which must keep running regardless of what the user is looking at. */
   promptTarget?: ConciergePromptTarget | null;
-  /** Why promptTarget is null even though an agent IS selected (e.g. a cloud agent) — shown on
-   *  the disabled send-target toggle instead of the misleading "no agent selected". */
-  promptTargetUnavailableReason?: string;
+  /** Whether that agent's pane is actually SHOWN (not the Plan board / Improve Sparkle / a closed
+   *  tab). Gates routing and the visibility of the recommended-action row — but NOT the engine.
+   *
+   *  The two are separate on purpose. This row is the only remaining host of `useSuggestions` for
+   *  build agents, and that hook does more than render pills: auto-approve, auto-resume and the
+   *  phone push all live inside it. Unmounting it whenever the user glances at the Plan board would
+   *  silently stop a running agent from being auto-approved — a background convenience the user
+   *  turned on precisely so agents don't stall — and resume on return. So the engine follows the
+   *  SELECTION and only the rendering follows the VIEW (roborev 53074). */
+  promptTargetShown?: boolean;
   width?: number;
   /** The shell's ⌘K palette trigger, rendered under the scope/vitals line (PRD §4). */
   searchSlot?: ReactNode;
@@ -346,29 +404,62 @@ export function ConciergeHost({
     take: takeAttachments,
     restore: restoreAttachments,
   } = useConciergeAttachments();
-  // Where the compose box aims. The AGENT IS PINNED at the moment the user flips the toggle, not
-  // resolved at send time: selection moves for reasons that have nothing to do with the box (a
-  // nudge's "Show me", a notification reveal, a tab click), so a live lookup would deliver a
-  // paragraph the user typed for one agent into whichever agent happened to be selected when they
-  // pressed Send. Null = talking to Sparkle.
-  const [aimedAt, setAimedAt] = useState<ConciergePromptTarget | null>(null);
-  // The aim, DROPPED when the agent it names is gone (closed, deleted, its project removed). The
-  // feed carries every project's every agent, so absence from it IS "no longer exists" — and
-  // leaving a pinned name on the pill for an agent that can't receive anything would be a lie.
-  // Derived rather than cleared in an effect: an effect would paint one frame with the dead aim
-  // still on the pill, and a send in that frame would route at a corpse.
-  const aim = useMemo(
-    () => (aimedAt && allAgents(feed).some((a) => a.id === aimedAt.agentId) ? aimedAt : null),
-    [aimedAt, feed],
+  // The agent a send could reach RIGHT NOW, dropped when it no longer exists (closed, deleted, its
+  // project removed). The feed carries every project's every agent, so absence from it IS "no
+  // longer exists" — routing at a corpse would report a delivery that never happened. Derived
+  // rather than cleared in an effect: an effect would paint one frame with the dead target still
+  // live, and a send in that frame would route at it.
+  //
+  // Resolved live at send time, NOT pinned. Pinning was the toggle's job: the user flipped it at a
+  // moment they chose, so the aim had to be frozen then. With inference there is no such moment —
+  // the message is about whatever the user is looking at when they press Send, which is exactly
+  // what promptTarget tracks. The aim is still captured SYNCHRONOUSLY at submit (see `send`), so
+  // nothing that moves the selection while a send is queued can redirect it.
+  const target = useMemo(
+    () =>
+      promptTarget && allAgents(feed).some((a) => a.id === promptTarget.agentId)
+        ? promptTarget
+        : null,
+    [promptTarget, feed],
   );
-  // Latest aim for the handlers, which are memoized on stable deps and run after render (same
+  // What a send may be ROUTED at: the shown agent only (see promptTargetShown). The suggestions row
+  // below keys off `target` instead, because its engine must keep running off-screen.
+  const routingTarget = promptTargetShown ? target : null;
+  // Latest target for the handlers, which are memoized on stable deps and run after render (same
   // pattern as feedRef above).
-  const targetRef = useRef(promptTarget);
-  const aimedAtRef = useRef(aim);
+  const targetRef = useRef(routingTarget);
   useEffect(() => {
-    targetRef.current = promptTarget;
-    aimedAtRef.current = aim;
-  }, [promptTarget, aim]);
+    targetRef.current = routingTarget;
+  }, [routingTarget]);
+  // Latest thread, for redirect (which needs a message's current receipt without re-memoizing the
+  // controller on every streamed delta).
+  const chatRef = useRef(chat);
+  useEffect(() => {
+    chatRef.current = chat;
+  }, [chat]);
+  // The message text behind each routed bubble, so a redirect can re-send the ORIGINAL words
+  // rather than reconstructing them from the rendered bubble. Keyed by message id; a ref because
+  // nothing renders from it and it must survive without re-rendering the column.
+  const sentTextRef = useRef<Map<string, string>>(new Map());
+  // The agent-bound form of the same messages (text with attachment paths prefixed). Capped through
+  // the SAME helper as sentTextRef so the two evict together — a bare set() left this one growing
+  // for the whole session while every entry past the cap was already unreachable, since redirect
+  // bails as soon as sentTextRef has evicted the id.
+  const sentPayloadRef = useRef<Map<string, string>>(new Map());
+  // Redirects currently in flight, so a double-tap can't deliver twice (see redirect).
+  const redirectingRef = useRef<Set<string>>(new Set());
+  // Approves currently in flight, per agent. Approve is deferred behind the send queue now, so a
+  // click during a still-routing send produces no immediate delivery — and with no feedback the
+  // natural reaction is to click again. A second queued approve lands AFTER the picker has already
+  // been answered, where it answers whatever prompt comes next or is typed as free text
+  // (roborev 53119). One in flight per agent, and the thread acknowledges the click immediately.
+  const approvingRef = useRef<Set<string>>(new Set());
+  // Serializes sends. Routing is ASYNC now (tier 2 is a network round trip), so two messages sent
+  // in quick succession race: the second can classify faster than the first and reach the PTY
+  // first, silently reordering the user's instructions. The toggle-era send had no await before
+  // delivery and so couldn't do this. Each send chains onto the previous one's completion, which
+  // guarantees delivery in SUBMIT order.
+  const sendChainRef = useRef<Promise<unknown>>(Promise.resolve());
 
   // Stream the brain into the thread: deltas append to a bubble keyed by the turn id; done finalizes.
   useEffect(() => {
@@ -482,6 +573,49 @@ export function ConciergeHost({
     [],
   );
 
+  /** Is this agent still in the feed? Absence IS "closed / deleted / project unloaded". */
+  const agentStillExists = useCallback(
+    (id: string | undefined) => !!id && allAgents(feedRef.current).some((a) => a.id === id),
+    [],
+  );
+
+  /**
+   * Run `fn` after every user-initiated delivery already queued, and resolve to its result.
+   *
+   * EVERY path that can write to a PTY on the user's behalf goes through here — compose sends,
+   * redirects, recommended-action clicks, and nudge Approves. Serializing only the compose path
+   * would make "delivery follows submit order" true of one surface and false of the app: a
+   * recommended-action tap or a redirect click while a send was still routing would land ahead of
+   * the earlier message.
+   *
+   * `.catch(() => onFailure)` is not decoration. Without it a rejecting delivery leaves a rejected
+   * promise parked in the chain (an unhandled rejection if no further send follows) and hands that
+   * rejection to ComposeBox, whose `.then(ok => …)` has no rejection arm — so the draft would NOT
+   * be restored and the user's text would be lost, which is the exact failure the restore logic
+   * exists to prevent. The chain therefore always settles fulfilled.
+   */
+  const enqueue = useCallback(<T,>(fn: () => Promise<T>, onFailure: T): Promise<T> => {
+    // BOUNDED. The chain is global, so one delivery that never settles (a hung invoke) would block
+    // every subsequent write for the session — including Approve, whose entire job is unsticking a
+    // blocked agent (roborev 53119). A task that overruns resolves to its failure value and the
+    // queue moves on; the abandoned promise settles unobserved.
+    const run = () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      // Clear the timer when the task settles — otherwise every delivery pinned a 30s timer for its
+      // full duration, including after the host unmounted.
+      const task = fn().catch(() => onFailure).finally(() => clearTimeout(timer));
+      return Promise.race([
+        task,
+        new Promise<T>((resolve) => {
+          timer = setTimeout(() => resolve(onFailure), QUEUE_TASK_TIMEOUT_MS);
+        }),
+      ]);
+    };
+    const queued = sendChainRef.current.then(run, run);
+    sendChainRef.current = queued;
+    return queued;
+  }, []);
+
   // Every postSparkle line is BOOKKEEPING — a send outcome, a refusal, a deferred reconciliation —
   // never a brain reply, so none of them offer to be read aloud (speakable: false, roborev 48172).
   const postSparkle = useCallback((text: string) => {
@@ -529,8 +663,37 @@ export function ConciergeHost({
   // debit a free-trial prompt, or become the agent's auto-name (see services/conciergeDispatch).
   const approve = useCallback(
     async (a: ConciergeAgent) => {
+      if (approvingRef.current.has(a.id)) return; // already approving this agent
+      approvingRef.current.add(a.id);
+      // Acknowledge the click NOW. The dispatch may sit behind a routing send for seconds, and a
+      // button that does nothing visible invites the second click the guard above just swallowed.
+      postSparkle(`Approving ${a.name}…`);
       try {
-        const r = await dispatchConciergeAnswer(a.id, "approve", { userPrompt: false });
+        // Through the SAME queue as every other user-initiated PTY write. Approve is one click away
+        // at all times, so an un-queued Approve while a compose send was still routing wrote
+        // "approve" into that agent's terminal AHEAD of the earlier-submitted message — exactly the
+        // reordering enqueue exists to prevent, on the most reachable surface in the app.
+        //
+        // A THROW is caught INSIDE the queued function, not left to `enqueue`'s own catch. Both
+        // produce "no result", but they mean different things to the user — a throw is a terminal
+        // that could not be reached, while `null` is the queue giving up on a task that overran
+        // its bound — and folding them together would silently downgrade the honest, specific line
+        // main has always shown for the throwing path to the generic refusal.
+        const r = await enqueue<ConciergeDispatchResult | "threw" | null>(
+          () =>
+            dispatchConciergeAnswer(a.id, "approve", { userPrompt: false }).catch(
+              () => "threw" as const,
+            ),
+          null,
+        );
+        if (r === "threw") {
+          postSparkle(`I couldn't reach ${a.name}'s terminal to approve.`);
+          return;
+        }
+        if (!r) {
+          postSparkle(`I couldn't send the approval to ${a.name}.`);
+          return;
+        }
         // "queued" is ok:true but NOT delivered — say so rather than claiming it was sent. The `ok`
         // conjunct is load-bearing: an ok:false queued result must NOT get the "I'll approve when
         // it's ready" promise, which would be the same lie the refusal paths exist to avoid — and
@@ -544,9 +707,11 @@ export function ConciergeHost({
         else postSparkle(refusalCopy(refusedPath(r), a.name, "approval"));
       } catch {
         postSparkle(`I couldn't reach ${a.name}'s terminal to approve.`);
+      } finally {
+        approvingRef.current.delete(a.id);
       }
     },
-    [postSparkle, holdAttachments],
+    [postSparkle, holdAttachments, enqueue],
   );
 
   // The composer's job, re-homed: deliver a USER-authored prompt into the PINNED agent's terminal,
@@ -566,6 +731,13 @@ export function ConciergeHost({
       /** What rode this send. REQUIRED (roborev 52969): a default would let a future call site
        *  silently hold nothing and re-introduce the lost-files bug with no type error. */
       staged: Attachment[],
+      /** Whether a PLAIN success ("Sent to X.") says so in the thread. FALSE for the two paths that
+       *  post a routing receipt — the receipt already reads "→ Sent to Kraken Auth", and saying it
+       *  twice made every successful prompt report itself twice. Every FAILURE still reports
+       *  regardless: silence on a non-delivery is the thing this whole surface exists to prevent.
+       *  REQUIRED, so a future call site has to decide rather than inherit a default that is wrong
+       *  for it. */
+      announceSuccess: boolean,
     ): Promise<boolean> => {
       try {
         const r = await dispatchConciergeAnswer(target.agentId, text, {
@@ -601,7 +773,7 @@ export function ConciergeHost({
           return true;
         }
         if (r.ok) {
-          postSparkle(`Sent to ${target.name}.`);
+          if (announceSuccess) postSparkle(`Sent to ${target.name}.`);
           return true;
         }
         postSparkle(refusalCopy(refusedPath(r), target.name, "prompt"));
@@ -658,82 +830,265 @@ export function ConciergeHost({
     [postSparkle, takeHeldAttachments, restoreAttachments],
   );
 
+  /**
+   * Start a Sparkle chat turn for `text`. Never fails visibly, so it reports no outcome.
+   *
+   * `spokenTurn` decides whether the reply is read back: a voice-started turn earns a spoken
+   * reply, a typed one stays silent (text-first v1). It is passed in rather than read here because
+   * it is captured at SUBMIT, and routing can queue this call for seconds behind another send.
+   */
+  const askSparkle = useCallback((text: string, spokenTurn: boolean) => {
+    voiceTurnRef.current = spokenTurn;
+    setTyping(true);
+    // SENDING retires every turn seen so far, here as well as in the backend (see
+    // supersededTurn). Their accumulated text is dropped as those events are rejected, not
+    // wiped here — clearing the map at send would truncate a turn that is still legitimately
+    // streaming.
+    //
+    // This floor can only retire ids we have SEEN an event for, so a turn killed before it
+    // emitted anything is not covered by it; the returned token below closes that half. Both
+    // are belt to concierge.rs's braces, which stops a superseded reader emitting at all
+    // (roborev 53088/53105/53130).
+    retireThroughRef.current = latestTurnRef.current;
+    void startConciergeTurn(buildSnapshot(feedRef.current, text)).then((id) => {
+      const n = id !== null && /^\d+$/.test(id) ? Number(id) : null;
+      if (n !== null) retireThroughRef.current = Math.max(retireThroughRef.current, n - 1);
+    });
+  }, []);
+
+  /** Stamp a receipt onto a user bubble. Clears `redirectable` from every OTHER bubble, so only
+   *  the newest routed message offers the button — a thread full of live redirects invites
+   *  redirecting something from ten turns ago, which is never what the user means. */
+  const setReceipt = useCallback((id: string, receipt: ConciergeReceipt) => {
+    // Feed the column's long-lived live region so the routing is ANNOUNCED, not merely rendered.
+    // With the target pill gone this is the only routing signal a screen-reader user gets, and the
+    // receipt line itself deliberately carries no aria-live (see RoutingReceipt's header).
+    //
+    // Through `announce`, never `setAnnouncement` directly (roborev 53392). Routing is STICKY —
+    // two messages in a row answered by Sparkle both produce "→ Answered here" — so an identical
+    // consecutive write is the COMMON case here, not a corner one, and a bare setState React bails
+    // out of would announce the first and silently swallow every repeat.
+    announce(receiptText(receipt));
+    setChat((prev) =>
+      prev.map((m) => {
+        if (m.kind !== "you") return m;
+        if (m.id === id) return { ...m, receipt };
+        return m.receipt?.redirectable
+          ? { ...m, receipt: { ...m.receipt, redirectable: false } }
+          : m;
+      }),
+    );
+  }, [announce]);
+
+  /**
+   * The one send path. Routes the text, delivers it, and posts the receipt that makes the routing
+   * visible and reversible. Resolves FALSE only when the text did NOT land anywhere, so the
+   * compose box restores the draft rather than making the user retype it.
+   */
+  const deliver = useCallback(
+    async (
+      id: string,
+      /** What the user actually WROTE — no attachment paths. Everything that reads the message as
+       *  language uses this: the router classifies it, and Sparkle answers it. Prefixing quoted
+       *  temp paths onto the text the classifier sees was a real mistake — "/var/folders/…/shot.png
+       *  add retry logic" is not what the user said. */
+      text: string,
+      /** What the AGENT receives: the same text with the quoted paths in front. PTY path only. */
+      payload: string,
+      /** What the THREAD already shows, reused as the prompt-history rendering. */
+      display: string,
+      /** The aim CAPTURED AT SUBMIT (see send). Not re-read here: by the time the queue reaches
+       *  this message the user may be looking at a different agent, and delivering there would be
+       *  the same irreversible misdelivery the removed pinned-aim guard prevented. */
+      submitted: ConciergePromptTarget | null,
+      /** The files that rode this send, so a refusal can hand them back. */
+      staged: Attachment[],
+      /** Whether the user SPOKE this turn, captured at submit (see askSparkle). */
+      spokenTurn: boolean,
+      /** This send's ordinal, so a late failure can tell "still mine" from "superseded". */
+      mySend: number,
+    ): Promise<boolean> => {
+      // An agent that has since LEFT the feed is gone (closed, deleted, project unloaded), and
+      // routing at it would report a delivery that cannot happen. Gone → the safe direction.
+      const aim = submitted && agentStillExists(submitted.agentId) ? submitted : null;
+      const status = aim ? useRuntimeStore.getState().status[aim.agentId] : undefined;
+      // The DISPATCHER's own precondition, asked up front: it refuses cloud agents outright, so
+      // telling the router turns a guaranteed delivery failure into a useful chat answer. One
+      // shared predicate rather than a copy here, so the two can't drift.
+      const canAcceptInput = aim ? agentCanAcceptInput(aim.agentId) : false;
+      const decision = await routeMessage(text, {
+        agent: aim ? { id: aim.agentId, name: aim.name, status, canAcceptInput } : null,
+      });
+
+      // Re-check AFTER the (network) route call too: the agent can be closed while we classify,
+      // and dispatching at a corpse surfaces as a pty-gone error where the router's own design
+      // says to take the safe direction.
+      const stillThere = !!aim && agentStillExists(aim.agentId);
+      if (decision.target === "agent" && aim && stillThere) {
+        // A prompt into an agent's terminal produces no brain reply, so nothing is queued to be
+        // spoken — leaving the flag set would autoplay the NEXT brain turn the user typed.
+        voiceTurnRef.current = false;
+        // announceSuccess: false — the receipt below already reads "→ Sent to <agent>".
+        const ok = await promptAgent(aim, payload, { display, namingBasis: text }, staged, false);
+        // A FAILED delivery gets no receipt: promptAgent has already said what went wrong in the
+        // thread, and "→ Sent to X" over a message that never arrived would be a plain lie.
+        if (ok) {
+          setReceipt(id, {
+            target: "agent",
+            agentName: aim.name,
+            agentId: aim.agentId,
+            redirectable: true,
+          });
+          return true;
+        }
+        // A failed delivery must not cost the user their files any more than their words — nor
+        // the fact that they SPOKE them. The box puts the draft back, and a restored draft that
+        // reads as typed would silently never be spoken (roborev 46922/48172/49293).
+        restoreAttachments(staged);
+        // RE-ARM only — never clear (roborev 52363): the user may have dictated fresh speech into
+        // the box while this send was in flight, and `spokenTurn === false` would wipe a latch
+        // that belongs to those newer words. And only while THIS send is still the latest: a turn
+        // sent after it has already made its own classification (roborev 52362).
+        if (spokenTurn && sendSeqRef.current === mySend) dictatedRef.current = true;
+        return false;
+      }
+      // The BRAIN gets the payload, not the bare text: the concierge's headless `claude -p` reads
+      // attachment paths from disk exactly as an agent does (services/conciergeAttach), so
+      // stripping them here would hand Sparkle a question about a screenshot it cannot see. Only
+      // the ROUTER is given the clean text — "/var/folders/…/shot.png add retry logic" is not what
+      // the user said, and classifying it as if it were is a real misroute.
+      askSparkle(payload, spokenTurn);
+      const here = stillThere ? aim : null;
+      setReceipt(id, {
+        target: "sparkle",
+        agentName: here?.name,
+        agentId: here?.agentId,
+        redirectable: true,
+      });
+      return true;
+    },
+    [askSparkle, promptAgent, setReceipt, agentStillExists, restoreAttachments],
+  );
+
+  /**
+   * The compose box's entry point.
+   *
+   * Everything that must reflect SUBMIT happens synchronously here — the user's bubble, the
+   * remembered text, the staged files, the dictated-origin latch, and the AIM. Only routing and
+   * delivery are queued.
+   *
+   * Both halves are load-bearing. Queuing the bubble left a second rapid send with no visible state
+   * at all: the box clears on submit, so the text was simply gone from the UI for up to the route
+   * deadline plus a round trip. And re-reading the aim inside the queued function would deliver to
+   * whichever agent the user happened to be looking at when the queue reached it — reintroducing,
+   * through the ordering fix itself, exactly the misdelivery the removed pinned-aim guard prevented.
+   */
+  const send = useCallback(
+    (text: string): Promise<boolean> => {
+      // Was this turn SPOKEN? Decided before anything clears (the latch is consumed here).
+      const spokenTurn = dictatedRef.current || micLiveRef.current;
+      dictatedRef.current = false;
+      // Which send this is, so a late async outcome can tell "still mine" from "superseded".
+      const mySend = ++sendSeqRef.current;
+      // Sending supersedes whatever Sparkle was saying.
+      stopConciergeVoice();
+      // Same courtesy the agent composer extends: honor the pause-on-submit voice setting so the
+      // mic does not keep transcribing the room while the send is handled.
+      maybePauseOnSubmit();
+      const id = nextId("you");
+      const submitted = targetRef.current;
+      // Take the staged files in the SAME tick the text leaves, so the next message starts clean
+      // and a second Send can't deliver the same attachments twice.
+      const staged = takeAttachments();
+      // THREE renderings of one message, exactly as the removed composer built them:
+      //   payload — the attachments' real paths prefixed to the text, for the PTY only;
+      //   display — the typed text plus compact counts, for the thread AND every prompt-history
+      //             surface (the pinned header, the history dropdown);
+      //   text    — what the user actually typed, for naming, the ghost-text corpus, and what the
+      //             ROUTER classifies. Empty on an attachments-only send.
+      // The temp paths must never reach any of them but the first (roborev 46911/46925).
+      const payload = attachedPayload(text, staged);
+      const display = attachedDisplay(text, staged);
+      setChat((prev) => [...prev, { id, kind: "you" as const, text: display }]);
+      // Remember BOTH: a redirect to the agent must replay the payload (paths included), a redirect
+      // to Sparkle must replay the plain text.
+      rememberSentText(sentTextRef.current, id, text);
+      rememberSentText(sentPayloadRef.current, id, payload);
+      return enqueue(
+        () => deliver(id, text, payload, display, submitted, staged, spokenTurn, mySend),
+        false,
+      );
+    },
+    [deliver, enqueue, takeAttachments],
+  );
+
+  /** Send an already-routed message the OTHER way. Additive: the first delivery stands (see
+   *  RoutingReceipt) — this adds a second one and records that both happened. */
+  const redirect = useCallback(
+    async (messageId: string) => {
+      const text = sentTextRef.current.get(messageId);
+      if (!text) return;
+      // The AGENT-bound form (attachment paths prefixed). The brain reads paths too, so BOTH
+      // directions replay this rather than the bare text; it falls back to `text` for a message
+      // that carried no files, where the two are the same string anyway.
+      const replay = sentPayloadRef.current.get(messageId) ?? text;
+      const current = chatRef.current.find((m) => m.id === messageId);
+      const receipt = current?.kind === "you" ? current.receipt : undefined;
+      if (!receipt || receipt.alsoSentTo) return;
+      // Claim the redirect BEFORE awaiting. The dispatch relay is async and the button stays
+      // mounted until the receipt updates, so without this a double-tap (or one impatient second
+      // click on a slow relay) passed the alsoSentTo guard twice and wrote the same text into the
+      // terminal twice — irreversible, and the receipt would still read as a single redirect.
+      if (redirectingRef.current.has(messageId)) return;
+      redirectingRef.current.add(messageId);
+      try {
+        if (receipt.target === "agent") {
+          // Redirecting INTO chat starts a typed turn: the user clicked a button, they did not
+          // speak it, so the reply is not read back.
+          askSparkle(replay, false);
+          setReceipt(messageId, { ...receipt, alsoSentTo: "sparkle", redirectable: false });
+          return;
+        }
+        // Chat → agent. Deliver to the agent the BUTTON NAMED, not to whatever is selected now:
+        // the label ("Also ask Kraken Auth") is an explicit promise, and the selection moves for
+        // reasons unrelated to this thread. Sending elsewhere would be exactly the misdelivery the
+        // removed pinned-aim guard existed to prevent (roborev 46284-M4), in the one place the UI
+        // has committed to a destination in advance.
+        const promised = receipt.agentId;
+        const live = targetRef.current;
+        const aim =
+          promised && live?.agentId === promised
+            ? live
+            : promised && receipt.agentName
+              ? { projectId: "", agentId: promised, name: receipt.agentName }
+              : null;
+        if (!aim || !agentStillExists(promised)) {
+          postSparkle(
+            `${receipt.agentName ?? "That agent"} isn't open any more, so I couldn't pass the message along.`,
+          );
+          return;
+        }
+        // Through the queue: a redirect clicked while a compose send is still routing must land
+        // AFTER it, not jump ahead of an earlier message.
+        //
+        // No files are staged for a redirect — they rode the original send and were consumed
+        // there — so nothing can be held or handed back, and `[]` is the honest argument.
+        const ok = await enqueue(
+          () => promptAgent(aim, replay, { display: text, namingBasis: text }, [], false),
+          false,
+        );
+        if (ok) setReceipt(messageId, { ...receipt, alsoSentTo: "agent", redirectable: false });
+      } finally {
+        redirectingRef.current.delete(messageId);
+      }
+    },
+    [askSparkle, promptAgent, postSparkle, setReceipt, agentStillExists, enqueue],
+  );
+
   const controller = useMemo(
     () => ({
-      onSend: (text: string): void | Promise<boolean> => {
-        // Was this turn SPOKEN? Decided before anything clears (the latch is consumed here), and
-        // applied only on the brain path below — an agent prompt starts no brain turn to speak back.
-        const spokenTurn = dictatedRef.current || micLiveRef.current;
-        dictatedRef.current = false;
-        // Which send this is, so a late async outcome can tell "still mine" from "superseded".
-        const mySend = ++sendSeqRef.current;
-        // Sending supersedes whatever Sparkle was saying.
-        stopConciergeVoice();
-        // Same courtesy the agent composer extends: honor the pause-on-submit voice setting so the
-        // mic does not keep transcribing the room while the send is handled.
-        maybePauseOnSubmit();
-        // Take the staged files in the SAME tick the text leaves, so the next message starts clean
-        // and a second Send can't deliver the same attachments twice.
-        const staged = takeAttachments();
-        // THREE renderings of one message, exactly as the removed composer built them:
-        //   payload — the attachments' real paths prefixed to the text, for the PTY only;
-        //   display — the typed text plus compact counts, for the thread AND every prompt-history
-        //             surface (the pinned header, the history dropdown);
-        //   text    — what the user actually typed, for naming and the ghost-text corpus. Empty on
-        //             an attachments-only send, which is what makes auto-naming skip it.
-        // The temp paths must never reach any of them but the first (roborev 46911/46925).
-        const payload = attachedPayload(text, staged);
-        const display = attachedDisplay(text, staged);
-        setChat((prev) => [...prev, { id: nextId("you"), kind: "you" as const, text: display }]);
-        // The PINNED aim (set when the toggle was flipped), read live from the ref because the
-        // memo's deps are stable. Not `promptTarget` — see the aimedAt comment.
-        const aim = aimedAtRef.current;
-        if (aim) {
-          // A prompt into an agent's terminal produces no brain reply, so nothing is queued to be
-          // spoken — leaving the flag set would autoplay the NEXT brain turn the user typed.
-          voiceTurnRef.current = false;
-          return promptAgent(aim, payload, { display, namingBasis: text }, staged).then((ok) => {
-            // A failed delivery must not cost the user their files any more than their words —
-            // nor the fact that they SPOKE them. The box puts the draft back, and a restored
-            // draft that reads as typed would silently never be spoken when the user re-aims it
-            // at Sparkle: the exact misclassification the latch exists to prevent (roborev
-            // 46922/48172/49293).
-            if (!ok) {
-              restoreAttachments(staged);
-              // RE-ARM only — never clear (roborev 52363): the user may have dictated fresh speech
-              // into the box while this send was in flight, and `spokenTurn === false` would wipe
-              // a latch that belongs to those newer words. And only while THIS send is still the
-              // latest: a turn sent after it has already made its own classification, which a late
-              // failure must not overwrite (roborev 52362).
-              if (spokenTurn && sendSeqRef.current === mySend) dictatedRef.current = true;
-            }
-            return ok;
-          });
-        }
-        // A voice-started turn earns a spoken reply; a typed one stays silent (text-first v1).
-        voiceTurnRef.current = spokenTurn;
-        setTyping(true);
-        // SENDING retires every turn seen so far, here as well as in the backend (see
-        // supersededTurn). Their accumulated text is dropped as those events are rejected, not
-        // wiped here — clearing the map at send would truncate a turn that is still legitimately
-        // streaming.
-        //
-        // This floor can only retire ids we have SEEN an event for, so a turn killed before it
-        // emitted anything is not covered by it; the returned token below closes that half. Both
-        // are belt to concierge.rs's braces, which stops a superseded reader emitting at all
-        // (roborev 53088/53105/53130).
-        retireThroughRef.current = latestTurnRef.current;
-        void startConciergeTurn(buildSnapshot(feedRef.current, payload)).then((id) => {
-          const n = id !== null && /^\d+$/.test(id) ? Number(id) : null;
-          if (n !== null) retireThroughRef.current = Math.max(retireThroughRef.current, n - 1);
-        });
-      },
-      // Flip ON pins the CURRENTLY selected agent; flip OFF goes back to Sparkle. Pinning at flip
-      // time is what makes the aim honest — nothing that moves the selection afterwards can
-      // redirect a prompt the user typed for this agent.
-      // Reads the LIVE (derived) aim, not the raw state: an aim whose agent has gone is already
-      // showing as "Sparkle", so the next flip must PIN — not clear a pin nobody can see.
-      onToggleSendTarget: () => setAimedAt(aimedAtRef.current ? null : targetRef.current),
+      onSend: send,
+      onRedirect: (messageId: string) => void redirect(messageId),
       onMicToggle: toggleMic,
       onSpeak: (m: ConciergeSparkleMessage) => {
         if (speakingIdRef.current === m.id) {
@@ -752,6 +1107,11 @@ export function ConciergeHost({
         const a = resolveAgent(n.id);
         if (a) openProjectTab(a.projectId, a.id);
       },
+      // The digest's whole purpose: hand off to column two instead of duplicating it.
+      onDigestClick: (d: { leadAgentId: string }) => {
+        const a = resolveAgent(d.leadAgentId);
+        if (a) openProjectTab(a.projectId, a.id);
+      },
       onNudgeAction: (n: ConciergeNudge, actionId: string) => {
         const a = resolveAgent(n.id);
         if (!a) return;
@@ -764,7 +1124,7 @@ export function ConciergeHost({
         }
       },
     }),
-    [resolveAgent, approve, promptAgent, attach, removeAttachment, takeAttachments, restoreAttachments, toggleMic, play],
+    [resolveAgent, approve, send, redirect, attach, removeAttachment, toggleMic, play],
   );
 
   const pinnedProjectName = useMemo(() => {
@@ -777,25 +1137,31 @@ export function ConciergeHost({
   const spendText = useSpendPill();
 
   const model: ConciergeViewModel = useMemo(() => {
-    const nudges = surfacedAgents(feed).map(agentToNudge);
+    // DIGEST, don't enumerate (bead sparkle-4562.4). One item of a priority keeps its card; two or
+    // more become a single line. Without this, eight P0s and nineteen P1s meant twenty-seven cards
+    // stacked above the compose box — the chat pushed off screen, and column one reduced to an
+    // unreadable copy of column two.
+    const { cards, groups } = buildDigest(surfacedAgents(feed));
+    const nudges = cards.map(agentToNudge);
+    const digests: ConciergeMessage[] = groups.map((g) => ({
+      id: g.id,
+      kind: "digest" as const,
+      band: g.band,
+      text: g.text,
+      leadAgentId: g.leadAgentId,
+    }));
     return {
       scope: { pinnedProjectName },
       vitals: feed.scopedCounts,
       spend: { amountText: spendText },
-      messages: [...chat, ...nudges],
+      // Digest lines first, then the individual cards: the collapsed groups are the summary and
+      // belong above the exceptions they summarise.
+      messages: [...chat, ...digests, ...nudges],
       typing,
-      // While aimed, the pill names the PINNED agent (the one a send actually reaches), not
-      // whatever is selected right now. Un-aimed, it offers the current selection as the thing the
-      // toggle would pin — and renders inert when there is nothing to pin.
-      send: {
-        target: aim ? ("agent" as const) : ("sparkle" as const),
-        agentName: aim?.name ?? promptTarget?.name,
-        unavailableReason: promptTargetUnavailableReason,
-      },
       attachments,
       dropActive,
     };
-  }, [feed, chat, typing, pinnedProjectName, spendText, promptTarget, promptTargetUnavailableReason, aim, attachments, dropActive]);
+  }, [feed, chat, typing, pinnedProjectName, spendText, attachments, dropActive]);
 
   return (
     <ConciergeColumn
@@ -805,6 +1171,34 @@ export function ConciergeHost({
       wordmarkMode={deriveWordmarkMode(micLive, typing)}
       width={width}
       searchSlot={searchSlot}
+      // KEYED BY AGENT. useSuggestions owns one agent per instance by design; a shared instance
+      // with a changing id kept the previous agent's buttons on screen and would write their
+      // keystroke into the newly-selected agent's PTY. See ConciergeSuggestions' header.
+      //
+      // Keyed off `target`, NOT `routingTarget`: the engine must keep running while the user looks
+      // at the Plan board (auto-approve lives inside the hook). Only the ROW follows the view.
+      suggestionsSlot={
+        target ? (
+          <ConciergeSuggestions
+            key={target.agentId}
+            agentId={target.agentId}
+            agentName={target.name}
+            visible={promptTargetShown}
+            // QUEUE ONCE. onApply wraps the WHOLE action, so the delivery it calls must NOT queue
+            // again: applySuggestion awaits deliverPrompt from inside the chain, and a second
+            // enqueue would chain onto the very promise that is awaiting it. Circular wait — broken
+            // only by the task timeout, i.e. a 30s stall of every send, redirect and Approve, and
+            // then a keystroke arriving anyway (roborev 53196).
+            onApply={(run) => enqueue(run, false)}
+            // announceSuccess: TRUE — a suggestion click posts no receipt, so without this a
+            // delivered recommended action would be the one silent success in the column.
+            onDeliverPrompt={(t) =>
+              promptAgent(target, t, { display: t, namingBasis: t }, [], true)
+            }
+            onFailure={postSparkle}
+          />
+        ) : null
+      }
       interim={dictation.interim}
       registerInsert={registerInsert}
       speakingMessageId={speakingId}

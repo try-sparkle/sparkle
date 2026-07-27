@@ -70,7 +70,7 @@ describe("ConciergeColumn — view-model → rendered output", () => {
   it("composing routes onSend through the controller", () => {
     const c = controller();
     render(<ConciergeColumn model={model} controller={c} />);
-    fireEvent.change(screen.getByRole("textbox", { name: "Message Sparkle" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
       target: { value: "approve it" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));

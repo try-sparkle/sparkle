@@ -12,11 +12,22 @@ import type { SuggestionButton } from "../../services/suggestions/types";
 // popover — opening UPWARD (the composer sits at the bottom of the window) — that lists the next
 // candidates (#2, #3) as clickable action pills. Every click routes through `onClick`, so history
 // recording (recordEvent) and terminal/prompt/control handling stay identical for all candidates.
+// LAYOUT. Two hosts, two shapes — the pill, popover, tooltip and dismiss behaviour are identical,
+// only the outer box differs:
+//   "overlay" (default) — the original: absolutely pinned to the trailing-right edge of a wide
+//     composer's textarea. Requires a positioned ancestor and SUGGESTION_PILL_ZONE reserved room.
+//   "row" — a static, left-aligned strip. Used by the concierge column, whose compose box is only
+//     ~380px wide: an overlay pill (~253px of pill zone) would cover most of the writing area.
+// Kept as one component rather than two so the learned re-ranking, the "more candidates" popover
+// and the dismiss path can't drift apart between the two surfaces.
+export type SuggestionLayout = "overlay" | "row";
+
 interface Props {
   buttons: SuggestionButton[];
   visible: boolean;
   onClick: (b: SuggestionButton) => void;
   onDismiss: (id: string) => void;
+  layout?: SuggestionLayout;
 }
 
 // Max width of the pill's label text (it ellipsizes past this). Kept modest because the pill is an
@@ -46,7 +57,7 @@ function CtaIcon({ b }: { b: SuggestionButton }) {
   return <Icon size={14} style={{ flexShrink: 0 }} />;
 }
 
-export function SuggestionRow({ buttons, visible, onClick, onDismiss }: Props) {
+export function SuggestionRow({ buttons, visible, onClick, onDismiss, layout = "overlay" }: Props) {
   // Local popover state: whether the "other candidates" list is open. Hooks must run before the
   // early return below, so they live at the top regardless of visibility.
   const [open, setOpen] = useState(false);
@@ -111,16 +122,30 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss }: Props) {
     // focus. Positioned relative so the upward popover can anchor to it, right-aligned.
     <div
       ref={wrapRef}
-      style={{
-        position: "absolute",
-        right: 8,
-        top: "50%",
-        transform: "translateY(-50%)",
-        zIndex: 2,
-        pointerEvents: "none",
-        display: "flex",
-        alignItems: "center",
-      }}
+      data-testid="suggestion-row"
+      style={
+        layout === "row"
+          ? {
+              // Static strip above its host's compose box. `position: relative` is still required —
+              // the "more candidates" popover anchors to this wrapper — but nothing is pinned or
+              // lifted out of flow, and pointer-events stay default because there is no textarea
+              // underneath to protect from stolen clicks.
+              position: "relative",
+              display: "flex",
+              alignItems: "center",
+              padding: "0 12px 8px",
+            }
+          : {
+              position: "absolute",
+              right: 8,
+              top: "50%",
+              transform: "translateY(-50%)",
+              zIndex: 2,
+              pointerEvents: "none",
+              display: "flex",
+              alignItems: "center",
+            }
+      }
     >
       <div
         data-testid="suggestion-pill"

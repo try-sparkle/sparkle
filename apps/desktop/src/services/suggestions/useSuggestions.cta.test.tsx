@@ -30,7 +30,7 @@ vi.mock("../relayClient", () => ({ pushSuggestions: (p: unknown) => h.pushSugges
 
 vi.mock("./approvalsRuntime", () => ({ maybeAutoApprove: () => null, maybeAutoResume: () => null }));
 
-import { useSuggestions } from "./useSuggestions";
+import { useSuggestions , resetSuggestionMemory } from "./useSuggestions";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useConnectionStore } from "../../stores/connectionStore";
 import { useSettingsStore } from "../../stores/settingsStore";
@@ -72,6 +72,9 @@ function seed(opts: {
 }
 
 beforeEach(() => {
+  // handledSigs/memo are per-AGENT module state now (they must survive a remount to stop
+  // auto-approve re-firing), so each case has to start from a clean slate.
+  resetSuggestionMemory();
   computeSuggestions.mockReset();
   computeSuggestions.mockResolvedValue({ agentId: "a1", buttons: [] });
   pushSuggestions.mockClear();

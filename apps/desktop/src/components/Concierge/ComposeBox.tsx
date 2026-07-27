@@ -10,11 +10,18 @@
 // `dropActive`. With something attached, an EMPTY message is still sendable (an image alone is a
 // message), which is the one place attachments change the submit rule.
 //
-// SEND TARGET. Because this box replaced the AgentPane composer as well as being the chat with
-// Sparkle, it carries an explicit target toggle: "→ Sparkle" (the brain) or "→ <agent>" (a real
-// prompt into that agent's terminal). Explicit, never inferred — guessing would either bury a
-// prompt in a chat thread or fire an agent turn the user didn't ask for. The toggle is a prop
-// pair (`send` + `onToggleSendTarget`); this file owns none of that state.
+// SEND TARGET — NOT HERE ANY MORE. This box used to carry an explicit "→ Sparkle" / "→ <agent>"
+// toggle, on the reasoning that inferring the target would either bury a prompt in a chat thread
+// or fire an agent turn the user didn't ask for. That call was reversed on 2026-07-26: the box is
+// EMPTY and the host ROUTES (services/conciergeRouter, PRD/sparkle/concierge-auto-routing.md §2).
+// What makes the inference safe is not better guessing — it's that every send posts a visible
+// receipt naming where it went, with a one-tap redirect (§3). If you are ever tempted to route
+// silently, put the toggle back instead.
+//
+// The placeholder is deliberately empty (the founder's ask: "just an empty compose window"), so
+// the ⌘↩ hint lives on the Send button's tooltip and its aria-keyshortcuts rather than being lost.
+// The aria-labels are not visible text, so the box still reads as empty while staying usable with
+// a screen reader.
 //
 // Dictation (bead sparkle-4562.2 / CM-U9) keeps that contract. The box knows nothing about the
 // mic pipeline: it hands its append fn to the integration layer through registerInsert (mirroring
@@ -24,10 +31,10 @@
 // textarea, because Deepgram replaces it word-by-word and a send that captured it would ship a
 // half-heard phrase that is about to be superseded.
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
-import { FiCamera, FiFile, FiImage, FiMic, FiPaperclip, FiTerminal, FiX, FiZap } from "react-icons/fi";
+import { FiCamera, FiFile, FiImage, FiMic, FiPaperclip, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL_DARK } from "../../theme/colors";
 import { CONCIERGE_COMPOSE_DND_TARGET } from "../../services/dndTargets";
-import type { Attachment, ConciergeAttachKind, ConciergeSendState } from "./types";
+import type { Attachment, ConciergeAttachKind } from "./types";
 import { useUiStore } from "../../stores/uiStore";
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
@@ -60,10 +67,6 @@ export function appendDictated(current: string, segment: string): string {
   return current.endsWith(" ") ? `${current}${chunk}` : `${current} ${chunk}`;
 }
 
-/** The dead-toggle default. Actionable on purpose: with `aria-disabled` (not `disabled`) the
- *  tooltip is the one explanation a sighted user gets, so it says what to DO, not just what is. */
-const NO_AGENT_HINT = "No agent selected — select an agent to send it a prompt";
-
 export function ComposeBox({
   onSend,
   onMicToggle,
@@ -72,8 +75,6 @@ export function ComposeBox({
   attachments = [],
   dropActive = false,
   micLive = false,
-  send,
-  onToggleSendTarget,
   interim = "",
   registerInsert,
   onTextEdit,
@@ -89,8 +90,6 @@ export function ComposeBox({
   /** A native file drag is over this box (the host hit-tests the window-global event). */
   dropActive?: boolean;
   micLive?: boolean;
-  send?: ConciergeSendState;
-  onToggleSendTarget?: () => void;
   /** Live, uncommitted transcript; rendered as a ghost line, never submitted. */
   interim?: string;
   /** Must be referentially STABLE (useCallback upstream) — the box re-registers whenever it
@@ -117,21 +116,6 @@ export function ComposeBox({
     handledFocusSeq.current = composeFocusSeq;
     textareaRef.current?.focus();
   }, [composeFocusSeq]);
-  const toAgent = send?.target === "agent" && !!send.agentName;
-  // No agent to aim at → the toggle is inert (and says so), rather than offering a target that
-  // would silently fall back to the brain.
-  // One fact drives the label, the tooltip AND the click (roborev 53010): a reason means PINNING is
-  // refused, so the control must not announce a switch it won't perform — and the tooltip must not
-  // explain a refusal on a control that works.
-  //
-  // But flipping OFF is ALWAYS allowed (roborev 53051). `aim` and the reason are supplied
-  // independently by the host, so "aimed at local agent A, then a cloud tab gets selected" delivers
-  // both at once — and refusing the toggle there would strand the user pinned to A with no way back
-  // to Sparkle chat until they selected a local tab again. Un-aiming never depends on what the
-  // selected tab's runtime is; only pinning does.
-  const canToggle =
-    !!onToggleSendTarget && (toAgent || (!!send?.agentName && !send?.unavailableReason));
-
   useEffect(() => {
     if (!registerInsert) return;
     const append = (segment: string) => setText((prev) => appendDictated(prev, segment));
@@ -241,62 +225,6 @@ export function ComposeBox({
             {label}
           </button>
         ))}
-        {send && (
-          <button
-            type="button"
-            data-testid="send-target-toggle"
-            aria-label={
-              toAgent
-                ? `Sending to ${send.agentName} — switch to Sparkle`
-                : canToggle
-                  ? `Sending to Sparkle — switch to ${send.agentName}`
-                  : // The reason EXTENDS the state, never replaces it: aria-label overrides the
-                    // accessible name outright, so returning the bare reason left a screen-reader
-                    // user hearing "Cloud agents take prompts in the terminal for now" with no clue
-                    // that this control is the send target or where the message is going now
-                    // (roborev 49295).
-                    `Sending to Sparkle — ${send.unavailableReason ?? NO_AGENT_HINT}`
-            }
-            aria-pressed={toAgent}
-            title={
-              // Only a REFUSED toggle explains itself; a working one describes what it does. Gating
-              // on canToggle (not on "is there a reason?") keeps the tooltip from claiming cloud
-              // agents can't be prompted while the box is aimed at a local one (roborev 53010).
-              canToggle || toAgent
-                ? "Where your message goes: Sparkle (chat) or the selected agent (a real prompt)"
-                : // Same words as the accessible name's default, so the two readings of a dead
-                  // toggle can't diverge, and both stay ACTIONABLE — the tooltip is the only
-                  // explanation a sighted user gets (roborev 52648/53010).
-                  (send.unavailableReason ?? NO_AGENT_HINT)
-            }
-            // aria-disabled, NOT `disabled`: browsers don't dispatch pointer events to a disabled
-            // form control, so its `title` never appears — the one place the honest reason was
-            // shown to a SIGHTED user was unreachable by construction. The click is a no-op
-            // instead, which keeps the control hoverable and focusable while still refusing.
-            aria-disabled={!canToggle}
-            onClick={canToggle ? onToggleSendTarget : undefined}
-            style={{
-              ...attachStyle,
-              marginLeft: "auto",
-              maxWidth: 150,
-              overflow: "hidden",
-              whiteSpace: "nowrap",
-              textOverflow: "ellipsis",
-              cursor: canToggle ? "pointer" : "default",
-              opacity: canToggle ? 1 : 0.55,
-              ...(toAgent
-                ? {
-                    color: C.cream,
-                    borderColor: C.teal,
-                    background: `color-mix(in srgb, ${C.teal} 14%, transparent)`,
-                  }
-                : null),
-            }}
-          >
-            {toAgent ? <FiTerminal size={12} aria-hidden /> : <FiZap size={12} aria-hidden />}
-            {toAgent ? send.agentName : "Sparkle"}
-          </button>
-        )}
       </div>
       {interim ? (
         <div
@@ -342,12 +270,15 @@ export function ComposeBox({
         </button>
         <textarea
           ref={textareaRef}
-          aria-label={toAgent ? `Message ${send!.agentName}` : "Message Sparkle"}
-          // No "(⌘↩ to send)" tail. The shortcut still works (see onKeyDown) — but a placeholder is
-          // prime real estate for saying what this box is FOR, and spending it on a keybinding the
-          // adjacent Send button already teaches made the prompt read like a manual. The hint was
-          // also permanently wrong for anyone who just presses the button.
-          placeholder={toAgent ? `Prompt ${send!.agentName}…` : "Talk to Sparkle…"}
+          // "Message", not "Message Sparkle": the box no longer knows where a send will go — the
+          // host routes it per message — so naming a destination here would be a claim it can't
+          // keep. Not visible text, so the box still reads as empty to a sighted user.
+          aria-label="Message"
+          // EMPTY, on purpose (PRD/sparkle/concierge-auto-routing.md §1). This used to name the
+          // destination ("Talk to Sparkle…" / "Prompt <agent>…"), which the target toggle made
+          // true; with routing there is no destination to name before the user has written
+          // anything. The ⌘↩ hint it never carried lives on the Send button below.
+          placeholder=""
           value={text}
           onChange={(e) => {
             setText(e.target.value);
@@ -377,8 +308,11 @@ export function ComposeBox({
           disabled={!canSend}
           aria-label="Send"
           // Carries the shortcut the placeholder no longer spends its text on — without this the
-          // keybinding would have no on-screen discoverability at all.
+          // keybinding would have no on-screen discoverability at all. A tooltip alone would hide
+          // it from keyboard and touch users entirely, so it is also declared to assistive tech,
+          // which announces it without anyone having to hover.
           title="Send (⌘↩)"
+          aria-keyshortcuts="Meta+Enter Control+Enter"
           style={{
             fontSize: 13,
             fontWeight: FONT_WEIGHT.bold,

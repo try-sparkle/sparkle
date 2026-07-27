@@ -13,7 +13,7 @@ import {
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { FiAlertTriangle, FiDownloadCloud, FiChevronDown } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
-import { submitPrompt, writePty, PtyGoneError } from "../pty";
+import { submitPrompt, PtyGoneError } from "../pty";
 import { SuggestionRow, SUGGESTION_PILL_ZONE } from "./composer/SuggestionRow";
 import { suggestionRowVisible } from "./composer/suggestionVisibility";
 import { useSuggestions } from "../services/suggestions/useSuggestions";
@@ -32,8 +32,7 @@ import { deriveContextTags } from "../services/suggestions/contextTags";
 import { getAgentScrollback } from "../services/terminalScrollback";
 import { describePaths, pathKind, scrubPaths } from "../services/logSafePaths";
 import { useSuggestionStore } from "../stores/suggestionStore";
-import { closeBuildAgent } from "../services/closeBuildAgent";
-import { parseControlAction, CLOSE_AGENT_ACTION } from "../services/suggestions/controlButtons";
+import { applySuggestion } from "../services/suggestions/applySuggestion";
 import type { SuggestionButton } from "../services/suggestions/types";
 import { trialSendAllowed, recordTrialSend } from "../services/trialMeter";
 import { safeUnlisten } from "../services/safeUnlisten";
@@ -466,6 +465,13 @@ export function Composer({
       });
     };
     useDictationStore.getState().registerInsert(append);
+    // MIRROR of the concierge box's claim (roborev 53304). The concierge column is unconditional
+    // and sits beside EVERY agent pane, so both compose surfaces are on screen together and there
+    // is one global insert slot. That box claims on focus and on arming its own mic; without the
+    // same claim here, clicking into the concierge box once sent every later segment there even
+    // after the user came back and armed THIS composer's mic — recoverable only by switching tabs
+    // so this effect re-runs. "The mic you clicked owns the transcript" has to hold both ways.
+    claimDictationRef.current = () => useDictationStore.getState().registerInsert(append);
     return () => {
       // Only clear if we're still the registered target (avoid clobbering a newer pane).
       const store = useDictationStore.getState();
@@ -557,6 +563,9 @@ export function Composer({
   // Always hold a local handle to the textarea for measuring, while still honoring the
   // optional inputRef the parent passes in (used for focus + insert()).
   const taRef = useRef<HTMLTextAreaElement | null>(null);
+  /** Take the global dictation slot for this composer. Assigned by the registration effect below;
+   *  called when the user focuses this box or arms its mic. */
+  const claimDictationRef = useRef<() => void>(() => {});
   const setTaRef = (el: HTMLTextAreaElement | null) => {
     taRef.current = el;
     if (inputRef) inputRef.current = el;
@@ -1075,57 +1084,36 @@ export function Composer({
   // keystrokes straight into the PTY (y/n, numbered choices); prompt-kind buttons go through the
   // normal message path as if the user had typed and sent them; control-kind buttons run an app
   // action (e.g. close this build agent). Then learn from the action and clear the row.
+  // The shared core (services/suggestions/applySuggestion) owns the parts that must not diverge
+  // between this composer and the concierge column's row: control routing, the PTY write plus its
+  // "picker" history turn, and the learning event. What stays here is genuinely host-local — the
+  // trial gate on this composer's send path, its attachment-aware deliverPrompt, and the
+  // auto-approve nudge, which renders into this composer and nowhere else.
   const onSuggestionClick = async (b: SuggestionButton) => {
-    if (b.kind === "control") {
-      // Control buttons touch nothing in the PTY and aren't a learnable "action", so they don't
-      // record to history and aren't gated by `disabled` (PTY not spawned). Route by action id.
-      const action = parseControlAction(b.value);
-      if (action === CLOSE_AGENT_ACTION) await closeBuildAgent(agentId);
-      clearSuggestions();
-      return;
-    }
-    if (disabled) return;
-    if (b.kind === "terminal") {
-      // Terminal-kind buttons come ONLY from the local heuristic detector and carry a bare control
-      // keystroke (y/n, a menu digit) — interactive terminal input, not a metered "send". So they
-      // intentionally bypass the trial-cap gate, exactly like typing into the terminal directly.
-      //
+    const acted = await applySuggestion(agentId, b, {
+      disabled,
       // Auto-approve nudge (spec §4): if the clicked button was the plain "Yes" on a classifiable
-      // permission prompt, the feature is on, and the category has no rule yet, offer to remember it.
-      // Read BEFORE writePty moves the terminal on. v1 fires only on the pill click (typed answers
-      // are a documented follow-up).
-      const classification = classifyApproval(getAgentScrollback(agentId) ?? "");
-      if (
-        classification &&
-        b.value === classification.approveOption &&
-        aiFeatureNow("autoApprove") &&
-        effectiveApprovalRule(approvalProjectRoot, classification.category) === undefined
-      ) {
-        setApprovalNudge(classification.category);
-      }
-      await writePty(agentId, b.value);
-      // Record the answer as a "picker" prompt turn (additive to the PTY write, never a
-      // replacement). It's not a metered send and stays out of every DISPLAY surface (composerPrompts
-      // filters it), but it advances promptHistory.length — the promptCount the naming ladder reads
-      // (agentNaming: deferred_first_turn on promptCount < 2). Without it a picker-driven build agent
-      // sits at promptCount 1 forever and is never named. Store the human-readable LABEL, not the
-      // bare "1\n" keystroke. No-op if the agent's project has been unloaded (project switch
-      // mid-click) — appendPrompt maps over the matching project only, so a stale id changes nothing.
-      const projectId = useProjectStore
-        .getState()
-        .projects.find((p) => p.agents.some((a) => a.id === agentId))?.id;
-      if (projectId) useProjectStore.getState().appendPrompt(projectId, agentId, b.label, "picker");
-    } else {
-      if (!trialSendAllowed()) return;
-      await deliverPrompt(b.value, [], []);
-    }
-    useSuggestionStore.getState().recordEvent({
-      contextTags: deriveContextTags(getAgentScrollback(agentId) ?? ""),
-      label: b.label,
-      value: b.value,
-      kind: b.kind,
+      // permission prompt, the feature is on, and the category has no rule yet, offer to remember
+      // it. Must read the screen BEFORE the keystroke moves the terminal on, which is exactly the
+      // guarantee beforeTerminalWrite gives. v1 fires only on the pill click (typed answers are a
+      // documented follow-up).
+      beforeTerminalWrite: () => {
+        const classification = classifyApproval(getAgentScrollback(agentId) ?? "");
+        if (
+          classification &&
+          b.value === classification.approveOption &&
+          aiFeatureNow("autoApprove") &&
+          effectiveApprovalRule(approvalProjectRoot, classification.category) === undefined
+        ) {
+          setApprovalNudge(classification.category);
+        }
+      },
+      deliverPrompt: async (text: string) => {
+        if (!trialSendAllowed()) return false; // veto — see ApplySuggestionOptions.deliverPrompt
+        await deliverPrompt(text, [], []);
+      },
     });
-    clearSuggestions();
+    if (acted) clearSuggestions();
   };
 
   // Accept the ghost completion: replace the input with the full past prompt and drop the
@@ -1492,7 +1480,7 @@ export function Composer({
         {/* Bare mic to the LEFT of the input box — same behavior as the top waveform ring, shown
             only while the mic is on (paused/active), top-aligned so it stays beside the first line
             when the box grows. Hidden entirely when the mic is off. */}
-        <ComposerMic />
+        <ComposerMic onArm={() => claimDictationRef.current()} />
         {/* gap:6 separates the failed-send notice from the textarea. The AttachmentRow that used
             to be this column's other child now lives ABOVE the whole row (see the comment there) —
             it is what the mic's flex-start alignment used to latch onto. */}
@@ -1572,6 +1560,10 @@ export function Composer({
                 syncCaret();
               }}
               onKeyDown={onKeyDown}
+              // Focusing this composer claims the dictation slot for it — the mirror of the
+              // concierge box's claim, so whichever compose surface the user is actually in owns
+              // the transcript (roborev 53304).
+              onFocus={() => claimDictationRef.current()}
               onPaste={onPaste}
               onKeyUp={syncCaret}
               onSelect={syncCaret}

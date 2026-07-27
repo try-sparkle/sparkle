@@ -185,6 +185,41 @@ export function matchAnswerToOption(
   return null;
 }
 
+/** The one store lookup behind both predicates below. */
+function findAgent(agentId: string) {
+  return useProjectStore
+    .getState()
+    .projects.flatMap((p) => p.agents)
+    .find((a) => a.id === agentId);
+}
+
+/**
+ * Is this agent DEFINITELY a cloud agent (no local PTY)? The dispatcher's refusal test.
+ *
+ * Deliberately only true when the store says so. An agent the store doesn't know about may still
+ * have a live PTY — a store/window sync gap, an agent mounted before its project row lands — and
+ * refusing it as "cloud-agent" would be a lie about why the send failed. Let the write attempt
+ * decide; it reports pty-gone honestly if there's nothing there.
+ */
+function isCloudAgent(agentId: string): boolean {
+  return findAgent(agentId)?.runtime === "cloud";
+}
+
+/**
+ * Am I CONFIDENT this agent can receive a message? The router's gate — a different question from
+ * `isCloudAgent`, and it fails the other way on purpose.
+ *
+ * The dispatcher is answering "must I refuse this?" and should only refuse on evidence. The router
+ * is answering "should I aim an irreversible PTY write here?" and must decline without evidence:
+ * an agent absent from the store usually means the project was unloaded or the agent removed,
+ * which is precisely when delivery is least likely to work. So "not found" is FALSE here and does
+ * not trigger a refusal there. Exported so the router asks this instead of copying the lookup.
+ */
+export function agentCanAcceptInput(agentId: string): boolean {
+  const agent = findAgent(agentId);
+  return !!agent && agent.runtime !== "cloud";
+}
+
 /** Read the agent's current terminal, detecting any live prompt options (empty if none on screen). */
 export function liveOptionsFor(agentId: string): SuggestionButton[] {
   const scrollback = getAgentScrollback(agentId) ?? "";
@@ -205,11 +240,7 @@ export async function dispatchConciergeAnswer(
   // A CLOUD agent has no local PTY — every write primitive here targets one, so refusing up
   // front with its own path beats the lie "its terminal has closed" (roborev 46916). Wiring a
   // cloud input path is tracked separately; until then the box is honest about the limit.
-  const targetAgent = useProjectStore
-    .getState()
-    .projects.flatMap((p) => p.agents)
-    .find((a) => a.id === agentId);
-  if (targetAgent?.runtime === "cloud") return { ok: false, path: "cloud-agent", agentId };
+  if (isCloudAgent(agentId)) return { ok: false, path: "cloud-agent", agentId };
   const options = liveOptionsFor(agentId);
 
   if (options.length > 0) {

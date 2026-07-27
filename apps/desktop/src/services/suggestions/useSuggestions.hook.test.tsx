@@ -42,33 +42,44 @@ vi.mock("../anthropic", () => ({ AiUnavailableError, AiUnreachableError }));
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => "Done. Committed abc. Nothing further." }));
 vi.mock("../aiGate", () => ({ useAiFeature: () => true }));
 vi.mock("../relayClient", () => ({ pushSuggestions: vi.fn() }));
-vi.mock("../../stores/runtimeStore", () => ({
+vi.mock("../../stores/runtimeStore", () => {
+  const runtimeState = () => ({
+    status: { a1: "idle" },
+    workflowShipped: {},
+    workflowStage: {},
+    workflowState: {},
+    branchStatus: {},
+  });
+  return {
   // status[agentId] === "idle" → a your-turn state, so the hook computes. No workflowStage entry AND
   // no branchStatus for a1 → the resolved stage is building_unsaved, for which deriveCta returns
   // null, so these concurrency tests see the raw computed set with no CTA merged over it. The CTA's
   // own wiring is covered by useSuggestions.cta.test.tsx.
-  useRuntimeStore: (
-    sel: (s: {
+  useRuntimeStore: Object.assign(
+    (sel: (s: {
       status: Record<string, string>;
       workflowShipped: Record<string, boolean>;
       workflowStage: Record<string, string>;
       workflowState: Record<string, unknown>;
       branchStatus: Record<string, unknown>;
     }) => unknown,
-  ) =>
-    sel({
-      status: { a1: "idle" },
-      workflowShipped: {},
-      workflowStage: {},
-      workflowState: {},
-      branchStatus: {},
-    }),
-}));
+  ) => sel(runtimeState()),
+    // getState is REQUIRED, not decoration: useSuggestions re-checks the LIVE status before typing
+    // a picker answer, so a mock without it makes that guard read undefined and bail — which looks
+    // like the hook computing nothing at all. A mock that models less than the real store fails
+    // open, and this one did (roborev 53203).
+    { getState: runtimeState },
+  ),
+  };
+});
 
-import { useSuggestions } from "./useSuggestions";
+import { useSuggestions , resetSuggestionMemory } from "./useSuggestions";
 import { useConnectionStore } from "../../stores/connectionStore";
 
 beforeEach(() => {
+  // handledSigs/memo are per-AGENT module state now (they must survive a remount to stop
+  // auto-approve re-firing), so each case has to start from a clean slate.
+  resetSuggestionMemory();
   computeSuggestions.mockReset();
   // Reset to the store's optimistic default so each test starts online.
   useConnectionStore.setState({ browserOnline: true, probeOk: true, isOnline: true });

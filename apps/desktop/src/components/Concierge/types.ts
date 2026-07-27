@@ -42,11 +42,13 @@ export interface ConciergeNudge {
   actions: ConciergeNudgeAction[];
 }
 
-/** Right-aligned user bubble. No "You" label — alignment + bubble chrome carry authorship. */
+/** Right-aligned user bubble. No "You" label — alignment + bubble chrome carry authorship.
+ *  Carries the routing receipt (where this message went) once the host has routed it. */
 export interface ConciergeUserMessage {
   id: string;
   kind: "you";
   text: string;
+  receipt?: ConciergeReceipt;
 }
 
 /** Left-aligned plain Sparkle reply. No "Sparkle" label, no glow — just warm text. */
@@ -73,10 +75,25 @@ export interface ConciergeBatchMessage {
   text: string;
 }
 
+/** A collapsed "3 Need you in drodio-website" line — the digest that replaces a stack of cards when
+ *  more than one agent of a band is surfaced for a project (bead sparkle-4562.4). Clicking it hands
+ *  off to column two (opens that project's tab) rather than duplicating it here. */
+export interface ConciergeDigestMessage {
+  id: string;
+  kind: "digest";
+  /** The band the collapsed agents share — the same vocabulary a nudge card carries, so a digest
+   *  line and the cards it stands in for read as one urgency rather than two. */
+  band: StatusBand;
+  text: string;
+  /** The agent to reveal when the line is clicked. */
+  leadAgentId: string;
+}
+
 export type ConciergeMessage =
   | ConciergeUserMessage
   | ConciergeSparkleMessage
   | ConciergeBatchMessage
+  | ConciergeDigestMessage
   | ConciergeNudge;
 
 /** Drives the star-field wordmark: still firefly drift at rest, buzzy waveform while the
@@ -88,22 +105,40 @@ export type ConciergeAttachKind = "screenshot" | "image" | "files";
 /** Re-exported so consumers of the column's contract get the attachment shape from one place. */
 export type { Attachment };
 
-/** Where the compose box's next send goes. The concierge box is the app's ONLY composer (CM-U7),
- *  so it has to serve both jobs the user has: talking to Sparkle itself ("sparkle" — the headless
- *  brain), and sending a prompt straight into the selected agent's terminal ("agent" — what the
- *  removed AgentPane composer did). The target is explicit rather than inferred: a guess here
- *  either drops a prompt into a chat or fires a real agent turn the user didn't ask for. */
+/** Where a send went. The concierge box is the app's ONLY composer (CM-U7), so it serves both jobs
+ *  the user has: talking to Sparkle itself ("sparkle" — the headless brain) and sending a prompt
+ *  straight into a build agent's terminal ("agent" — what the removed AgentPane composer did).
+ *
+ *  This used to be a target the user PICKED before sending, via a toggle on the compose box. That
+ *  call was reversed on 2026-07-26: it is now a destination the host INFERS per message
+ *  (services/conciergeRouter) and then REPORTS via ConciergeReceipt — so the type describes an
+ *  outcome, not a setting. What makes the inference safe is not better guessing; it is that every
+ *  send carries a visible receipt naming where it went, with a one-tap redirect. */
 export type ConciergeSendTarget = "sparkle" | "agent";
 
-/** The compose box's send-target affordance. `agentName` absent → there is no agent to send to
- *  (no project / no selected agent), and the toggle renders disabled on "sparkle". */
-export interface ConciergeSendState {
+/** The receipt line under a user bubble: where that message actually went, and the one-tap offer
+ *  to also send it the other way.
+ *
+ *  `redirectable` is what keeps inference honest — a misroute the user can see and fix in a click
+ *  is recoverable; a silent one is not. Only the LATEST receipt sets it, because redirecting a
+ *  message from ten turns ago is never what the user means.
+ *
+ *  A redirect RE-SENDS; it never retracts. Text already delivered into a PTY cannot be pulled
+ *  back, so `alsoSentTo` records that the message went to both places and the rendered wording
+ *  must never imply the first delivery was undone. */
+export interface ConciergeReceipt {
+  /** Where the router sent it. */
   target: ConciergeSendTarget;
+  /** The agent it reached (or would reach on redirect); absent when there is no build agent. */
   agentName?: string;
-  /** Why no agent target is offered even though an agent IS selected (e.g. a cloud agent takes
-   *  prompts in its terminal). Drives the disabled toggle's title/aria so the user isn't told to
-   *  "select an agent" they already selected. */
-  unavailableReason?: string;
+  /** The id behind `agentName`. Carried so a redirect can deliver to the agent the BUTTON NAMED,
+   *  not to whatever happens to be selected when the user gets around to clicking — the selection
+   *  moves for reasons unrelated to this thread, and the label is an explicit promise. */
+  agentId?: string;
+  /** Set once the user has redirected: the message ALSO went here, after the original target. */
+  alsoSentTo?: ConciergeSendTarget;
+  /** Whether to offer the one-tap redirect (latest receipt only). */
+  redirectable?: boolean;
 }
 
 /** Everything the column renders, supplied by the integration layer. */
@@ -119,8 +154,6 @@ export interface ConciergeViewModel {
   messages: ConciergeMessage[];
   /** True while Sparkle is composing a reply — renders the typing indicator row. */
   typing?: boolean;
-  /** Where a send goes and which agent it would reach. Omitted → the box only talks to Sparkle. */
-  send?: ConciergeSendState;
   /** Files riding along with the NEXT send (parity row #21), rendered as removable chips above the
    *  compose row. The integration layer owns the list; the box only reports removals. */
   attachments?: Attachment[];
@@ -132,19 +165,24 @@ export interface ConciergeViewModel {
 /** Every gesture the column can emit. The integration layer supplies all of these. */
 export interface ConciergeController {
   /** The user submitted trimmed non-empty text (Send button or ⌘/Ctrl+Enter). The integration
-   *  layer routes it by the CURRENT `model.send.target` — the column never decides.
+   *  layer decides where it goes (services/conciergeRouter) — the column never decides, and no
+   *  longer carries an affordance for the user to decide either.
    *
    *  May return a promise resolving FALSE when the send did not land; the compose box then puts
    *  the draft back rather than making the user retype it. Returning nothing means "assume it
    *  landed" (the chat path, which can't fail visibly). */
   onSend(text: string): void | Promise<boolean>;
-  /** Flip the compose box between talking to Sparkle and prompting the selected agent. Optional:
-   *  a column mounted without a send state has nothing to toggle. */
-  onToggleSendTarget?(): void;
-  onMicToggle(): void;
+  /** The user tapped the redirect on a routing receipt: send that same message the OTHER way.
+   *  Additive — the original delivery stands (see ConciergeReceipt). */
+  onRedirect?(messageId: string): void;
   onAttach(kind: ConciergeAttachKind): void;
   /** Drop one staged attachment by id. Optional: a column mounted without attachments has none. */
   onRemoveAttachment?(id: string): void;
+  /** A digest line was clicked — open that project's tab and reveal its lead agent. This is the
+   *  handoff to column two that the digest exists to make (bead sparkle-4562.4). */
+  onDigestClick?(digest: ConciergeDigestMessage): void;
+  /** Toggle the mic. The box owns no mic state — `micLive` comes down as a prop (CM-U9). */
+  onMicToggle(): void;
   /** Whole-card click: open the nudge's source project/agent. */
   onNudgeClick(nudge: ConciergeNudge): void;
   /** An action button on the card; never accompanied by onNudgeClick. */
@@ -166,6 +204,10 @@ export interface ConciergeColumnProps {
   /** Optional affordance rendered under the scope/vitals line — the shell drops the ⌘K palette
    *  trigger here (PRD §4: history search lives in the concierge). */
   searchSlot?: ReactNode;
+  /** The recommended-action row for the actively-shown build agent, rendered directly above the
+   *  compose box. A slot rather than view-model data because it owns a per-agent hook that must
+   *  remount when the agent changes — see components/Concierge/ConciergeSuggestions. */
+  suggestionsSlot?: ReactNode;
   /** Live, uncommitted dictation transcript for the compose box; "" when nothing is being said. */
   interim?: string;
   /** Handed straight to the compose box so the integration layer can receive committed segments.
@@ -175,8 +217,15 @@ export interface ConciergeColumnProps {
   speakingMessageId?: string | null;
   /** The user typed or deleted in the compose box (not a dictated segment, not the send clear). */
   onTextEdit?: (text: string) => void;
-  /** The last FINISHED line for the thread's hidden live region — a completed reply or a status
-   *  notice. Never a streaming chunk: the region would then re-announce on every delta. */
+  /** The last FINISHED line for the thread's hidden live region — a completed reply, a status
+   *  notice, or a ROUTING RECEIPT ("→ Sent to Kraken Auth"). Never a streaming chunk: the region
+   *  would then re-announce on every delta.
+   *
+   *  Routing has to reach this node. With the send-target toggle gone the receipt is the only
+   *  signal of where a message went, so a receipt that is rendered but not announced leaves a
+   *  screen-reader user with no routing information at all — and routing is STICKY, so consecutive
+   *  identical receipts are the common case rather than a corner one. That is exactly what `seq`
+   *  below is for. */
   announcement?: ConciergeAnnouncement;
 }
 

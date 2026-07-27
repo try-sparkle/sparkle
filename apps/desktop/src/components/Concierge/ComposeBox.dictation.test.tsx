@@ -38,7 +38,7 @@ function setup(over: { micLive?: boolean; interim?: string } = {}) {
   return { onSend, onMicToggle, onAttach, seen, dictate, view };
 }
 
-const box = () => screen.getByRole("textbox", { name: "Message Sparkle" }) as HTMLTextAreaElement;
+const box = () => screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
 const interimNode = () => screen.queryByTestId("concierge-interim");
 
 describe("appendDictated", () => {
@@ -130,7 +130,7 @@ describe("ComposeBox — dictation lifecycle", () => {
   it("without registerInsert the box behaves exactly as the text-only version did", () => {
     const onSend = vi.fn();
     render(<ComposeBox onSend={onSend} onMicToggle={vi.fn()} onAttach={vi.fn()} />);
-    const only = screen.getAllByRole("textbox", { name: "Message Sparkle" }).at(-1)!;
+    const only = screen.getAllByRole("textbox", { name: "Message" }).at(-1)!;
     fireEvent.change(only, { target: { value: "typed" } });
     fireEvent.keyDown(only, { key: "Enter", metaKey: true });
     expect(onSend).toHaveBeenCalledWith("typed");

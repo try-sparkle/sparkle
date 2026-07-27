@@ -311,10 +311,13 @@ export function Workspace() {
   // agent. This is what re-homes the removed AgentPane composer — with a target the box can send a
   // real prompt into a terminal instead of only chatting with the brain. Null → the box is
   // Sparkle-only, and its target toggle renders inert.
-  // The compose box's target AND the honest reason when there isn't one, from ONE decision — two
-  // memos over identical deps computed the resolution twice, and two functions meant a future
-  // refusal could ship without its copy (roborev 49295/52649).
-  const { target: promptTarget, refusal: promptTargetUnavailableReason } = useMemo(
+  // Only the TARGET is consumed now. `decidePromptTarget` also returns the honest `refusal` copy
+  // ("Cloud agents take prompts in their own terminal for now"), which existed to explain a
+  // DISABLED send-target toggle — and that toggle is gone (auto-routing, PRD §1). The refusal has
+  // no surface left: a target that can't take input simply routes to Sparkle, where the reply is
+  // recoverable, rather than sitting inert behind a tooltip. The decision function keeps returning
+  // it so the reason is one edit away if a surface ever wants it again.
+  const { target: promptTarget } = useMemo(
     () => decidePromptTarget(project, activeAgentId),
     [project, activeAgentId],
   );
@@ -422,6 +425,17 @@ export function Workspace() {
   // effects (alert episodes, branch polling, the close prompt) that must not restart on a mode flip.
   const planCollapsed = boardActive;
 
+  // Is the selected agent actually ON SCREEN? `project.selectedAgentId` stays non-null while the
+  // Plan board or the Improve Sparkle pane is showing, and while the agent's tab isn't open at all.
+  //
+  // This gates ROUTING, not the suggestions engine — the concierge needs both facts and they are
+  // deliberately separate (see ConciergeHost's promptTarget/targetShown props). Under the old
+  // target toggle the slack was harmless: the user had to flip a control to aim, so a stale
+  // selection could never receive anything by itself. The router infers "there is a build agent in
+  // view" from this, so ungated it would write an imperative typed while looking at the board into
+  // a terminal the user cannot see. See PRD/sparkle/concierge-auto-routing.md §2.
+  const promptTargetShown = !sparkleActive && !boardActive && activeIsOpen;
+
   // Calm terminal (PRD §3 / prototype `.terminal.calm`): when the agent you're looking at has
   // nothing for you, its terminal TEXT desaturates along with the calm sidebar rows, so only a
   // screen that wants something from you carries color. Read from the same feed the tabs and the
@@ -524,7 +538,7 @@ export function Workspace() {
           width={360}
           feed={feed}
           promptTarget={promptTarget}
-          promptTargetUnavailableReason={promptTargetUnavailableReason}
+          promptTargetShown={promptTargetShown}
           searchSlot={<PaletteTrigger onOpen={palette.openPalette} />}
         />
         {/* ② + ③. Position:relative so Plan mode can lay ONE wide card column over both of them —
