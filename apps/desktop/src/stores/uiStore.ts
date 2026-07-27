@@ -23,6 +23,24 @@ export type CategoryId =
   | "approvals"
   | "advanced";
 
+/** Keys that must never round-trip through the persisted blob — in EITHER direction. `partialize`
+ *  uses this shape on the write side and `merge` deletes them on the read side; a key present in one
+ *  place and missing from the other is how a transient flag comes back to life on the next launch. */
+const TRANSIENT_UI_KEYS = [
+  "workMode",
+  "buildAgentHover",
+  "boardFocusBeadId",
+  "settingsRequest",
+  "composeFocusSeq",
+  "newAgentRuntime",
+  "cloudCreateOpen",
+  // The helper island's tier filter: a live view state, not a preference — it must not survive a
+  // relaunch, or the island comes back filtered to a tier the user can no longer see they picked.
+  "attentionTierFocus",
+  "zeroCreditBannerDismissed",
+  "zeroCreditBannerDismissedFor",
+] as const satisfies readonly (keyof UiState)[];
+
 export const COMPOSER_MIN = 64;
 // Smallest usable textarea height (≈ one line + its vertical padding). Used as the floor's
 // reserved input space when screenshot thumbnails push the composer's chrome taller, so an
@@ -254,25 +272,24 @@ export const useUiStore = create<UiState>()(
     {
       name: "sparkle-ui",
       storage: createJSONStorage(() => localStorage),
-      // Persist everything EXCEPT workMode, buildAgentHover, boardFocusBeadId,
-      // attentionTierFocus, settingsRequest, newAgentRuntime and zeroCreditBannerDismissed, so the
-      // active sidebar tab resets to "build" on each launch (matching the prior local-useState
-      // default) and the transient hover flag / one-shot board-focus handoff / one-shot settings
-      // deep-open / the helper island's tier filter / the dismissed $0 warning never persist,
-      // while every other UI preference still sticks. Spreading `rest` keeps all persisted keys.
-      partialize: ({
-        workMode: _workMode,
-        buildAgentHover: _buildAgentHover,
-        boardFocusBeadId: _boardFocusBeadId,
-        settingsRequest: _settingsRequest,
-        composeFocusSeq: _composeFocusSeq,
-        newAgentRuntime: _newAgentRuntime,
-        cloudCreateOpen: _cloudCreateOpen,
-        attentionTierFocus: _attentionTierFocus,
-        zeroCreditBannerDismissed: _zeroCreditBannerDismissed,
-        zeroCreditBannerDismissedFor: _zeroCreditBannerDismissedFor,
-        ...rest
-      }) => rest,
+      // Persist everything EXCEPT the transient keys listed below, so the active sidebar tab resets
+      // to "build" on each launch (matching the prior local-useState default) and the transient
+      // hover flag / one-shot board-focus handoff / one-shot settings deep-open / the helper
+      // island's tier filter / the dismissed $0 warning never persist, while every other UI
+      // preference still sticks.
+      //
+      // This governs the WRITE path only — see `merge` below for why the read path needs the same
+      // list, and what goes wrong for the user when it doesn't have it.
+      partialize: (state) => {
+        // Driven off TRANSIENT_UI_KEYS, not a second hand-written destructure. Two lists is how the
+        // rehydrate bug was born: a key added to one and forgotten in the other drifts silently, and
+        // `satisfies keyof UiState` catches renames, not a list with one fewer entry. Behaviourally
+        // identical to the destructure — the spread carried the action functions too, and
+        // JSON.stringify drops them.
+        const out = { ...state } as Record<string, unknown>;
+        for (const key of TRANSIENT_UI_KEYS) delete out[key];
+        return out as Partial<UiState>;
+      },
       // v1: the rest height shrank from 128 to the compact COMPOSER_SNAP. The pure
       // migratePersistedUi resets only users still parked on the OLD default, preserving a
       // height anyone deliberately dragged to. (composerMinimized hydrates from its default
@@ -280,6 +297,17 @@ export const useUiStore = create<UiState>()(
       version: 1,
       migrate: (persisted, version) =>
         migratePersistedUi(persisted as Record<string, unknown>, version, COMPOSER_SNAP) as unknown as UiState,
+      // Strip the transient keys on the way IN as well. `partialize` only stops us WRITING them;
+      // zustand's default merge shallow-merges whatever the blob happens to contain, and
+      // migratePersistedUi passes unknown keys through untouched. So a blob written by any build
+      // before a key was excluded — or hand-edited — restores it at launch. Observed with
+      // zeroCreditBannerDismissed: dismiss the $0 banner once and every later launch starts
+      // dismissed, still at zero balance, with AI extras silently dark and nothing to undo it.
+      merge: (persisted, current) => {
+        const stored = { ...(persisted as Record<string, unknown>) };
+        for (const key of TRANSIENT_UI_KEYS) delete stored[key];
+        return { ...current, ...(stored as Partial<UiState>) };
+      },
     },
   ),
 );

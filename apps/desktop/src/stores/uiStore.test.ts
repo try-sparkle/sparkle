@@ -74,7 +74,7 @@ describe("uiStore agentOrdering", () => {
 describe("uiStore workMode", () => {
   afterEach(() => {
     localStorage.clear();
-    useUiStore.setState({ workMode: "build", themePref: "auto" });
+    useUiStore.setState({ workMode: "build" });
   });
 
   it("defaults workMode to 'build' (Build tab on launch)", () => {
@@ -88,22 +88,12 @@ describe("uiStore workMode", () => {
     expect(useUiStore.getState().workMode).toBe("build");
   });
 
-  // Not persisted (partialize drops it): switching the tab must never write workMode into the
-  // `sparkle-ui` blob, so the next launch hydrates the "build" default. Other prefs still persist.
-  it("never writes workMode to the persisted blob", () => {
-    useUiStore.getState().setWorkMode("plan");
-    useUiStore.getState().setThemePref("dark");
-    const blob = JSON.parse(localStorage.getItem("sparkle-ui") ?? "{}");
-    expect(blob.state).not.toHaveProperty("workMode");
-    // Sanity: a genuinely-persisted field from the same write did land in the blob.
-    expect(blob.state.themePref).toBe("dark");
-  });
 });
 
 describe("uiStore boardFocusBeadId (spec §8 pill → board handoff)", () => {
   afterEach(() => {
     localStorage.clear();
-    useUiStore.setState({ boardFocusBeadId: null, themePref: "auto" });
+    useUiStore.setState({ boardFocusBeadId: null });
   });
 
   it("defaults to null", () => {
@@ -117,16 +107,6 @@ describe("uiStore boardFocusBeadId (spec §8 pill → board handoff)", () => {
     expect(useUiStore.getState().boardFocusBeadId).toBeNull();
   });
 
-  // Transient one-shot handoff: it must NEVER persist, or a stale id would re-open an epic's
-  // DetailOverlay on the next launch. partialize drops it (like workMode/buildAgentHover).
-  it("never writes boardFocusBeadId to the persisted blob", () => {
-    useUiStore.getState().setBoardFocusBeadId("epic-42");
-    useUiStore.getState().setThemePref("dark");
-    const blob = JSON.parse(localStorage.getItem("sparkle-ui") ?? "{}");
-    expect(blob.state).not.toHaveProperty("boardFocusBeadId");
-    // Sanity: a genuinely-persisted field from the same write did land in the blob.
-    expect(blob.state.themePref).toBe("dark");
-  });
 });
 
 describe("uiStore orchestrator collapse", () => {
@@ -226,5 +206,149 @@ describe("uiStore pinnedProjectId", () => {
     useUiStore.getState().setPinnedProject("p1");
     useUiStore.getState().setPinnedProject(null);
     expect(useUiStore.getState().pinnedProjectId).toBeNull();
+  });
+});
+
+// The partialize exclusion list is hand-maintained prose plus a hand-maintained destructure, and it
+// was this branch's only merge conflict precisely because two branches each appended their own key.
+// Nothing fails when those lists drift.
+//
+// So the assertion runs on the PERSISTED side, not the transient one. A third hand-maintained list
+// of transient keys would catch a key being REMOVED from partialize (which is what a mutation test
+// exercises) while missing the failure mode that actually happened here: someone adds a tenth
+// transient key, forgets the list, and nothing goes red. Pinning the exact set of keys that reach
+// the blob inverts that — any newly-persisted key fails, whether or not anyone updates a list.
+//
+// One limit worth stating rather than over-promising: this reads keys back out of JSON, and
+// JSON.stringify omits properties whose value is `undefined` OR A FUNCTION — which is also why the
+// nine keys are all that show up, since partialize spreads the actions through too. So a future
+// transient key that defaults to undefined, or holds a callback, leaves no blob key until it is
+// set. Every field here has a concrete serializable default, so the pin holds today.
+//
+// What makes this more than hygiene is the pair this merge brought in: persist
+// zeroCreditBannerDismissed* by accident and a user who dismisses the $0 banner never sees it again
+// on any later launch — still at zero balance, AI extras silently dark — with nothing else red.
+describe("uiStore persistence — exactly these keys reach the blob", () => {
+  const PERSISTED = [
+    "activeSpecial",
+    "agentOrdering",
+    "collapsedOrchestrators",
+    "composerHeight",
+    "composerMinimized",
+    "composerUserSized",
+    "pinnedProjectId",
+    "themePref",
+    "zoom",
+  ];
+
+  // Restore everything this block touches, not just themePref: it writes ten transient non-defaults
+  // into a module-level singleton, and vitest's per-file isolation does not help a test appended
+  // after it.
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({
+      workMode: "build",
+      buildAgentHover: false,
+      boardFocusBeadId: null,
+      settingsRequest: null,
+      composeFocusSeq: 0,
+      newAgentRuntime: "local",
+      cloudCreateOpen: false,
+      attentionTierFocus: null,
+      zeroCreditBannerDismissed: false,
+      zeroCreditBannerDismissedFor: null,
+      themePref: "auto",
+    });
+  });
+
+  it("drops every transient key, whatever it is, and keeps the real preferences", () => {
+    // Non-defaults for each transient key, so none can pass merely by being absent from state.
+    // No `as never`: the point of writing them literally is that tsc verifies these names still
+    // exist on UiState, so a rename cannot leave a stale string here asserting nothing.
+    useUiStore.setState({
+      workMode: "plan",
+      buildAgentHover: true,
+      boardFocusBeadId: "epic-42",
+      settingsRequest: "accounts",
+      composeFocusSeq: 7,
+      newAgentRuntime: "cloud",
+      cloudCreateOpen: true,
+      attentionTierFocus: "p0",
+      zeroCreditBannerDismissed: true,
+      zeroCreditBannerDismissedFor: "acct-1",
+    });
+    useUiStore.getState().setThemePref("dark");
+
+    const blob = JSON.parse(localStorage.getItem("sparkle-ui") ?? "{}");
+    // Both sides sorted: nothing enforces the literal's order, and the natural way to add a new
+    // preference is to append it, which would otherwise fail as an order mismatch on correct content.
+    expect(Object.keys(blob.state).sort()).toEqual([...PERSISTED].sort());
+    // Sanity: the write really happened, so the assertion above isn't passing on an empty blob.
+    expect(blob.state.themePref).toBe("dark");
+  });
+});
+
+// partialize governs the WRITE path only. On rehydrate, migratePersistedUi passes unknown keys
+// through and zustand shallow-merges the stored object into state — so a blob that already contains
+// a transient key (written by any build before it was excluded, or hand-edited) restores it at
+// launch. That is the same user-visible harm from the other direction: dismiss the $0 banner once,
+// and every later launch starts dismissed at zero balance with AI extras dark.
+describe("uiStore rehydrate — a stale transient key in the blob must not be restored", () => {
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({
+      workMode: "build",
+      buildAgentHover: false,
+      boardFocusBeadId: null,
+      settingsRequest: null,
+      composeFocusSeq: 0,
+      newAgentRuntime: "local",
+      cloudCreateOpen: false,
+      attentionTierFocus: null,
+      zeroCreditBannerDismissed: false,
+      zeroCreditBannerDismissedFor: null,
+      themePref: "auto",
+    });
+  });
+
+  it("ignores every transient key present in a stored blob", async () => {
+    // All ten, mirroring the write-path block: a key stripped on write but forgotten in `merge`
+    // would otherwise stay green here for the six the earlier version didn't name.
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({
+        version: 1,
+        state: {
+          themePref: "dark",
+          workMode: "plan",
+          buildAgentHover: true,
+          boardFocusBeadId: "epic-42",
+          settingsRequest: "accounts",
+          composeFocusSeq: 7,
+          newAgentRuntime: "cloud",
+          cloudCreateOpen: true,
+          attentionTierFocus: "p0",
+          zeroCreditBannerDismissed: true,
+          zeroCreditBannerDismissedFor: "acct-1",
+        },
+      }),
+    );
+
+    await useUiStore.persist.rehydrate();
+
+    // The real preference in the same blob survives — so the rehydrate genuinely happened.
+    expect(useUiStore.getState().themePref).toBe("dark");
+    // ...and every transient one comes back at its store default instead.
+    const s = useUiStore.getState();
+    expect(s.workMode).toBe("build");
+    expect(s.buildAgentHover).toBe(false);
+    expect(s.boardFocusBeadId).toBeNull();
+    expect(s.settingsRequest).toBeNull();
+    expect(s.composeFocusSeq).toBe(0);
+    expect(s.newAgentRuntime).toBe("local");
+    expect(s.cloudCreateOpen).toBe(false);
+    expect(s.attentionTierFocus).toBeNull();
+    expect(s.zeroCreditBannerDismissed).toBe(false);
+    expect(s.zeroCreditBannerDismissedFor).toBeNull();
   });
 });

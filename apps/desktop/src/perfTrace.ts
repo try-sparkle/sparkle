@@ -548,12 +548,15 @@ export function classifyJankGap(
  *  slow": it catches EVERY stall, whatever the cause, so we can then correlate the timestamp against
  *  the spawn/switch/close/span/render lines. Idempotent; safe to call from multiple mounts.
  *
- *  `windowLabel` stamps every line with the webview it came from. Each project window runs its own
- *  monitor against its own rAF clock, so without it one wide freeze produces N near-identical warns
- *  a few hundred microseconds apart, differing only by a jitter in `ms` — indistinguishable from a
- *  single window double-logging, and hiding how wide the freeze actually was. The label is the
- *  window's opaque Tauri label, decoupled from the project it shows, so it identifies the webview
- *  without naming user content. */
+ *  `windowLabel` stamps every line with the webview it came from. The shell is single-window today,
+ *  so every caller takes the "main" default and the field is a constant — it earns its place only
+ *  once lines from more than one webview or process are read together: each monitor runs against its
+ *  own rAF clock, so one wide freeze produces N near-identical warns a few hundred microseconds
+ *  apart, differing only by a jitter in `ms`, which is indistinguishable from a single window
+ *  double-logging and hides how wide the freeze really was. Pass the window's opaque Tauri label,
+ *  never a project name or path — it must identify the webview without naming user content. Kept as
+ *  a parameter rather than inlined because that is the cheaper half of the trade: a second webview
+ *  then needs no change at any of the log sites below. */
 export function startJankMonitor(thresholdMs = 150, windowLabel = "main"): void {
   if (jankRunning || typeof requestAnimationFrame !== "function") return;
   jankRunning = true;

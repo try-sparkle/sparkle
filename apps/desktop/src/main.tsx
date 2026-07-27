@@ -40,16 +40,14 @@ const isHelper = view === "helper";
 // Main-thread stall detector (perfTrace): logs every frame gap > threshold as a "jank stall" so a
 // reproduction of the slowness surfaces exactly when the app froze and for how long, to correlate
 // against the spawn/switch/close/render lines. Only in the real app view — the hidden capture and
-// the tiny helper webviews aren't where the slowness lives and would just add noise. Every project
-// window runs its own monitor, so pass the window's label to keep their stalls tellable apart.
+// the tiny capture/helper webviews aren't where the slowness lives and would just add noise.
 //
-// The label comes from Tauri rather than the URL: the `?win=` parser this used to read lived in
-// projectWindows.url.ts, which was removed when window identity consolidated into windowIdentity.ts.
-// getCurrentWindow().label is the same opaque, non-user-facing value with no parsing, but it exists
-// only inside a real webview — hence the guard, which mirrors the one on the self-show path below
-// and keeps the plain-browser dev/preview working.
-const jankWindowLabel = "__TAURI_INTERNALS__" in window ? getCurrentWindow().label : "main";
-if (!isCapture && !isHelper) startJankMonitor(undefined, jankWindowLabel);
+// No label is passed: the shell is single-window, so the only webview that runs a monitor is the app
+// window, whose Tauri label is exactly `startJankMonitor`'s "main" default (see its doc for why the
+// field is stamped at all). Reading `getCurrentWindow().label` here would compute that same constant
+// at module scope, before createRoot — where a malformed `__TAURI_INTERNALS__` would throw and blank
+// the app. If secondary app windows ever return, pass their label in; nothing else needs to change.
+if (!isCapture && !isHelper) startJankMonitor();
 
 // Render counting is always on (a Map bump); the per-render LOG is gated off by default because
 // each line is a main-thread Tauri IPC (bead sparkle-abv2). This exposes the toggle and the

@@ -55,6 +55,11 @@ describe("jank minor-stall rollup", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    // Neither helper undoes a defineProperty, so a pinned `hidden` otherwise survives into the next
+    // test IN THIS FILE — that within-file leak is the concrete reason for the delete. It also
+    // restores jsdom's prototype getter, so `hidden` tracks `visibilityState` again. (Vitest's
+    // per-file isolation means it could not reach another file today regardless.)
+    delete (document as { hidden?: boolean }).hidden;
   });
 
   // The flood this exists to stop: a near-threshold stall is real but imperceptible, and there are
