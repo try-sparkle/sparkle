@@ -181,6 +181,43 @@ describe("HintOverlay", () => {
     await waitFor(() => expect(screen.queryByText("b")).toBeNull());
   });
 
+  it("binds the key listener ONCE and never rebinds it as the badges change", async () => {
+    // THE REGRESSION GUARD for the dropped keystroke (and the CI flake it surfaced as).
+    //
+    // The listener used to be bound from an effect that depended on `chiclets`, so every re-collect
+    // tore it down and bound a new one. React runs passive effects after paint, which opens a real
+    // window between "the new badges are on screen" and "the listener that knows about them is
+    // live". A key pressed in that window resolves against the STALE array, finds no match, and is
+    // swallowed by the printable-key guard — silently, because an unmatched label is a deliberate
+    // no-op. That window is exactly where this feature invites you to type: opening Recent with "r"
+    // keeps hint mode active precisely so you can pick a project in the same breath.
+    //
+    // Reading the live set through a ref removes the window. Asserting on the BINDING (rather than
+    // trying to lose a race on purpose) is what makes this deterministic — a timing test would be
+    // as flaky as the bug.
+    const add = vi.spyOn(window, "addEventListener");
+    const remove = vi.spyOn(window, "removeEventListener");
+    const keydownBinds = () => add.mock.calls.filter(([t]) => t === "keydown").length;
+    const keydownUnbinds = () => remove.mock.calls.filter(([t]) => t === "keydown").length;
+
+    render(<RecentDropdownHarness onFirst={vi.fn()} onSecond={vi.fn()} />);
+    controlTap();
+    const boundOnOpen = keydownBinds();
+    expect(boundOnOpen).toBeGreaterThan(0);
+
+    // Open the dropdown: the chiclet set is replaced wholesale with the recent-item rows.
+    fireEvent.keyDown(window, { key: "r" });
+    await waitFor(() => expect(screen.getByText("b")).toBeTruthy());
+
+    // The badges changed, so the OLD code would have unbound and rebound here. The listener must
+    // survive untouched instead.
+    expect(keydownBinds()).toBe(boundOnOpen);
+    expect(keydownUnbinds()).toBe(0);
+
+    add.mockRestore();
+    remove.mockRestore();
+  });
+
   it("a non-recent chrome control still closes the overlay and clicks the element", async () => {
     const onClick = vi.fn();
     render(

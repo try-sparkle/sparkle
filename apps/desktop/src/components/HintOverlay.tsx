@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { C, FONT, ON_BRAND_FILL_DARK } from "../theme/colors";
 import { useHintMode } from "../keyboardHints/useHintMode";
@@ -131,19 +131,44 @@ export function HintOverlay() {
   const { active, close } = useHintMode();
   const [chiclets, setChiclets] = useState<Chiclet[]>([]);
 
-  const refresh = useCallback(() => setChiclets(collectChiclets()), []);
+  // The keydown listener below reads the CURRENT chiclets through this ref rather than closing over
+  // the `chiclets` state. Those are not equivalent, and the difference was a dropped keystroke.
+  //
+  // Binding the listener from an effect that depends on `chiclets` means the handler that is live
+  // at any instant is the one from the last COMMITTED effect pass. React runs passive effects after
+  // paint, so between "the new badges are on screen" and "the listener that knows about them is
+  // bound" there is a real window. A key pressed in that window resolves against the stale array,
+  // finds no match, and is swallowed by the printable-key guard — silently, since an unmatched
+  // label is a deliberate no-op.
+  //
+  // That window is exactly where this feature asks the user to type. Opening the Recent dropdown
+  // with "r" keeps hint mode active precisely so a project can be picked in the same breath, so the
+  // fastest users — the ones the chaining flow is for — are the likeliest to lose the second key.
+  // It surfaced as a CI flake (HintOverlay.test.tsx, "an a–z letter selects that project"): under
+  // coverage instrumentation the effect flush shifts far enough to lose the race almost every run,
+  // which is the same defect the product has, just made reproducible.
+  //
+  // A ref updated in the same tick as the state has no such window: the handler always sees the
+  // latest placements. It also stops the listener being torn down and rebound on every re-collect.
+  const chicletsRef = useRef<Chiclet[]>([]);
+  const applyChiclets = useCallback((next: Chiclet[]) => {
+    chicletsRef.current = next;
+    setChiclets(next);
+  }, []);
+
+  const refresh = useCallback(() => applyChiclets(collectChiclets()), [applyChiclets]);
 
   // Compute placements as soon as we open (and on resize while open). Scroll dismisses instead of
   // re-placing (handled in useHintMode), so positions never go stale under the chiclets.
   useLayoutEffect(() => {
     if (!active) {
-      setChiclets([]);
+      applyChiclets([]);
       return;
     }
     refresh();
     window.addEventListener("resize", refresh);
     return () => window.removeEventListener("resize", refresh);
-  }, [active, refresh]);
+  }, [active, refresh, applyChiclets]);
 
   // Label-key selection. Capture phase so we intercept the key before xterm/inputs consume it.
   useEffect(() => {
@@ -151,7 +176,8 @@ export function HintOverlay() {
     const onKeyDown = (e: KeyboardEvent) => {
       // Nothing to select and nothing rendered (see the chiclets.length guard below) — don't
       // swallow keys, or an invisible-but-active overlay would silently eat keystrokes.
-      if (chiclets.length === 0) return;
+      const current = chicletsRef.current;
+      if (current.length === 0) return;
       if (e.key === "Escape" || e.key === "Meta" || e.metaKey || e.ctrlKey || e.altKey) return;
       const key = normalizeKey(e.key);
       // Non-printable keys (arrows, Tab, …) pass through so the user can still navigate/escape.
@@ -160,7 +186,7 @@ export function HintOverlay() {
       // stray non-hint key must NOT leak into the focused terminal/composer underneath.
       e.preventDefault();
       e.stopPropagation();
-      const hit = chiclets.find((c) => c.label === key);
+      const hit = current.find((c) => c.label === key);
       if (!hit) return; // unassigned key: no-op, stay open
       const { el } = hit;
       // Opening the Recent-projects dropdown by keyboard is a "chain straight into picking a
@@ -179,7 +205,7 @@ export function HintOverlay() {
             // Dropdown opened with rows → show their a–z badges and stay open to chain a pick.
             // Opened empty (no recent projects) → there's nothing to pick, so close instead of
             // stranding the user on a "stuck open" chrome overlay still showing the r badge.
-            if (next.some((c) => c.el.dataset.hint === RECENT_HINT)) setChiclets(next);
+            if (next.some((c) => c.el.dataset.hint === RECENT_HINT)) applyChiclets(next);
             else close();
           }),
         );
@@ -192,7 +218,9 @@ export function HintOverlay() {
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [active, chiclets, close]);
+    // `chiclets` is deliberately NOT a dependency: the handler reads chicletsRef, so rebinding on
+    // every re-collect would buy nothing and reintroduce the stale-listener window described above.
+  }, [active, close, applyChiclets]);
 
   if (!active || chiclets.length === 0) return null;
 
