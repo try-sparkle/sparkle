@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { loadAccountState } from "./accountSelection";
 import { createWorkerWorktree } from "../pty";
 import { abandonWorktreeSeed, seedWorktreeEnv } from "./envSeed";
+import { abandonWorktreeBootstrap, bootstrapWorktreeDeps } from "./depsBootstrap";
 import { useProjectStore } from "../stores/projectStore";
 
 export interface WorktreeInfo {
@@ -249,15 +250,45 @@ export function prepareAgentWorkspace(
   return withRepoLock(root, async () => {
     await ensureProjectRepo(root);
     const info = await createAgentWorktree(root, projectId, agentId, baseBranch);
+    // Recorded BEFORE either background task starts, and independently of whether either one
+    // decides it has work to do — teardown must be able to settle them regardless.
+    preparedPaths.set(seedKey(projectId, agentId), info.path);
     seedEnvInto(projectId, agentId, info.path);
+    bootstrapDepsInto(info.path);
     return info;
   });
 }
 
-/** Which worktree path each (project, agent/worker) pair was seeded into. Teardown is addressed by
- *  id, not by path, so this is how `removeAgentWorkspace` finds the seed aimed at the directory it
- *  is about to delete. */
-const seededPaths = new Map<string, string>();
+/** Kick off the dependency install for a newly cut worktree.
+ *
+ *  Deliberately NOT awaited, for the same reason as the env seed and then some: a `pnpm install`
+ *  measures ~27s even against a fully warm store, and nobody will wait that long to open an agent.
+ *
+ *  The try/catch enforces "bootstrapping never fails a spawn" AT THIS SEAM rather than trusting the
+ *  callee to stay throw-free — the same reasoning as seedEnvInto above. A machine with no pnpm on
+ *  its PATH must still be able to open agents; the worst case is the status quo, a worktree whose
+ *  tests cannot run, which is what every worktree had before this existed. */
+function bootstrapDepsInto(worktreePath: string): void {
+  try {
+    bootstrapWorktreeDeps(worktreePath);
+  } catch (e) {
+    console.warn("deps bootstrap: could not start the install for this worktree", e);
+  }
+}
+
+/** Which worktree path each (project, agent/worker) pair was prepared into. Teardown is addressed
+ *  by id, not by path, so this is how `removeAgentWorkspace` finds the directory it is about to
+ *  delete in order to settle the background work aimed at it.
+ *
+ *  Written by the PREPARE seams, not by either background task. It used to be written inside
+ *  `seedEnvInto`, BELOW its `if (!project) return` guard — which silently coupled the dependency
+ *  bootstrap's teardown handshake to whether the ENV SEED found a project record. When it did not
+ *  (an evicted record, a worker re-derived from its on-disk manifest, a store still rehydrating —
+ *  all documented real cases), an install was queued for a worktree that teardown then deleted
+ *  without waiting: a package manager writing into a directory git had just removed, leaving a
+ *  stray non-empty directory at a slot path a later `git worktree add` fails on. Recording the path
+ *  where the worktree is actually CUT is what makes the handshake unconditional. */
+const preparedPaths = new Map<string, string>();
 const seedKey = (projectId: string, agentId: string) => `${projectId}\u0000${agentId}`;
 
 /** Kick off the 1Password env-file restore for a newly cut worktree, if the user has turned it on.
@@ -281,7 +312,6 @@ function seedEnvInto(projectId: string, agentId: string, worktreePath: string): 
       console.warn(`env seed: no project record for ${projectId}; skipping seed`);
       return;
     }
-    seededPaths.set(seedKey(projectId, agentId), worktreePath);
     seedWorktreeEnv(project.name, worktreePath);
   } catch (e) {
     console.warn("env seed: could not start the seed for this worktree", e);
@@ -308,7 +338,12 @@ export function prepareWorkerWorkspace(args: {
     // Workers need this MORE than agents do: a fan-out cuts many worktrees at once, and every one
     // of them would otherwise start without the project's secrets. (envSeed queues them so the
     // fan-out doesn't turn into N concurrent `op` invocations.)
+    preparedPaths.set(seedKey(args.projectId, args.workerId), info.path);
     seedEnvInto(args.projectId, args.workerId, info.path);
+    // Workers need this at least as much as agents: a fan-out cuts many worktrees at once and every
+    // worker is expected to run the suite before reporting back. Without it, "tests passed" from a
+    // worker means "tests never ran".
+    bootstrapDepsInto(info.path);
     return info;
   });
 }
@@ -320,9 +355,10 @@ export function prepareWorkerWorkspace(args: {
  * `.git/index.lock`. Always route agent-close cleanup through this, never the raw
  * removeAgentWorktree bridge, so removal queues behind any in-flight prepare/remove.
  *
- * Also settles any env seed aimed at this worktree FIRST. Seeding is fire-and-forget and so
- * escapes this lock; without that step a `git worktree remove` can run while `op` is still
- * writing into the directory, which re-creates the tree git just deleted (see envSeed.ts).
+ * Also settles the two fire-and-forget writers aimed at this worktree FIRST — the env seed and the
+ * dependency bootstrap. Both escape this lock by design; without that step a `git worktree remove`
+ * can run while `op` or a package manager is still writing into the directory, which re-creates the
+ * tree git just deleted (see envSeed.ts / depsBootstrap.ts).
  */
 export function removeAgentWorkspace(
   root: string,
@@ -330,10 +366,20 @@ export function removeAgentWorkspace(
   agentId: string,
 ): Promise<void> {
   const key = seedKey(projectId, agentId);
-  const seedPath = seededPaths.get(key);
-  seededPaths.delete(key);
+  const preparedPath = preparedPaths.get(key);
+  preparedPaths.delete(key);
   return withRepoLock(root, async () => {
-    if (seedPath) await abandonWorktreeSeed(seedPath);
+    if (preparedPath) {
+      // CONCURRENTLY, not one after the other. Each wait is separately bounded at 5s and both run
+      // inside the per-root git lock that every other prepare/remove on this project queues behind.
+      // Serialized, the worst case is 10s — and since an install measures ~27s, hitting the bound
+      // is the common case when an agent is closed shortly after opening, multiplied by N because
+      // a project's agents are closed one at a time. There is no ordering requirement between them.
+      await Promise.all([
+        abandonWorktreeSeed(preparedPath),
+        abandonWorktreeBootstrap(preparedPath),
+      ]);
+    }
     return removeAgentWorktree(root, projectId, agentId);
   });
 }

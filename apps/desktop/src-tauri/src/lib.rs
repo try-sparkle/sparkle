@@ -26,6 +26,7 @@ mod crash;
 mod config;
 mod connectivity;
 mod delivery;
+mod deps_bootstrap;
 mod dev_identity;
 mod dictation;
 mod folder_picker;
@@ -430,6 +431,7 @@ pub fn run() {
             worktree::move_project,
             worktree::assert_workspace_integrity,
             worktree::install_worktree_guard,
+            deps_bootstrap::bootstrap_worktree_deps,
             hooks::install_agent_hooks,
             hooks::heal_agent_hooks,
             hooks::ensure_default_plugins_installed,

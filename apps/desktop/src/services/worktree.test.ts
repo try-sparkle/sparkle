@@ -9,6 +9,14 @@ vi.mock("./envSeed", () => ({
   abandonWorktreeSeed: vi.fn(() => Promise.resolve()),
 }));
 
+// The dependency bootstrap shells out to a package manager for ~27 seconds. Mocked for the same
+// reason as the seeder: what is under test here is the WIRING — which seams bootstrap, and that
+// none of them wait on it.
+vi.mock("./depsBootstrap", () => ({
+  bootstrapWorktreeDeps: vi.fn(),
+  abandonWorktreeBootstrap: vi.fn(() => Promise.resolve()),
+}));
+
 // Seeding needs the project's NAME (the vault item titles are keyed on it), which worktree.ts
 // reads from the store by id.
 vi.mock("../stores/projectStore", () => ({
@@ -18,6 +26,7 @@ vi.mock("../stores/projectStore", () => ({
 }));
 
 import { seedWorktreeEnv, abandonWorktreeSeed } from "./envSeed";
+import { bootstrapWorktreeDeps, abandonWorktreeBootstrap } from "./depsBootstrap";
 import {
   createAgentWorktree,
   assertWorkspaceIntegrity,
@@ -276,5 +285,135 @@ describe("worktree service — env seeding", () => {
     expect(invoke).toHaveBeenCalledWith("remove_agent_worktree", {
       root: "/root-seed-none", projectId: "p", agentId: "never-seeded",
     });
+  });
+});
+
+// A git worktree carries only TRACKED files, so `node_modules` is never in a fresh one and the
+// agent inside it cannot run the repo's tests (`vitest: command not found`). Measured: 44 of 84
+// live agent worktrees on this machine had none. Same wiring properties as the seeder above —
+// never wait, never fail, settle before teardown deletes the directory.
+describe("worktree service — dependency bootstrap", () => {
+  const bootstrapMock = vi.mocked(bootstrapWorktreeDeps);
+  const abandonBootstrapMock = vi.mocked(abandonWorktreeBootstrap);
+
+  beforeEach(() => {
+    invoke.mockReset();
+    bootstrapMock.mockReset();
+    abandonBootstrapMock.mockReset();
+    abandonBootstrapMock.mockResolvedValue(undefined);
+  });
+
+  it("bootstraps an agent worktree at the path that was just cut", async () => {
+    invoke.mockResolvedValue({ path: "/wt/p/a", branch: "sparkle/agent-a" });
+    await prepareAgentWorkspace("/root-deps-agent", "p", "a", "main");
+    expect(bootstrapMock).toHaveBeenCalledWith("/wt/p/a");
+  });
+
+  it("bootstraps a worker worktree too — a fan-out is where this hurts most", async () => {
+    // A fan-out cuts many worktrees at once and every one of them is expected to run tests before
+    // reporting back. Missing this seam is how workers end up committing unverified work.
+    invoke.mockResolvedValue({ path: "/wt/p/w1", branch: "sparkle/agent-w1" });
+    await prepareWorkerWorkspace({
+      root: "/root-deps-worker", projectId: "p", workerId: "w1", parentBranch: "main",
+    });
+    expect(bootstrapMock).toHaveBeenCalledWith("/wt/p/w1");
+  });
+
+  it("does NOT wait on the install — a spawn resolves while it is still running", async () => {
+    // 27 seconds, measured. The same never-settling-thenable trick the seeder test uses: awaiting a
+    // void would pass regardless, but the refactor that would actually break this — making the seam
+    // await the bootstrap — hangs here instead of passing.
+    const neverSettles = { then: () => {} } as unknown as void;
+    bootstrapMock.mockReturnValue(neverSettles);
+    invoke.mockResolvedValue({ path: "/wt/p/a", branch: "b" });
+    const info = await prepareAgentWorkspace("/root-deps-nonblocking", "p", "a", "main");
+    expect(info.path).toBe("/wt/p/a");
+    expect(bootstrapMock).toHaveBeenCalled();
+  });
+
+  it("does not fail the spawn when the bootstrap throws outright", async () => {
+    // A machine with no pnpm on its PATH must still be able to open agents.
+    bootstrapMock.mockImplementation(() => {
+      throw new Error("no pnpm");
+    });
+    invoke.mockResolvedValue({ path: "/wt/p/a", branch: "b" });
+    await expect(
+      prepareAgentWorkspace("/root-deps-throws", "p", "a", "main"),
+    ).resolves.toMatchObject({ path: "/wt/p/a" });
+  });
+
+  it("settles the in-flight install BEFORE removing the worktree it writes into", async () => {
+    // The bootstrap escapes the per-root git lock by design, so without this a `git worktree
+    // remove` can run while a package manager is mid-write — which re-creates the tree git just
+    // deleted and leaves a stray directory at a slot path a later `worktree add` then fails on.
+    invoke.mockResolvedValue({ path: "/wt/p/a", branch: "b" });
+    const root = "/root-deps-teardown";
+    await prepareAgentWorkspace(root, "p", "a", "main");
+
+    const order: string[] = [];
+    abandonBootstrapMock.mockImplementation(() => {
+      order.push("abandon-deps");
+      return Promise.resolve();
+    });
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "remove_agent_worktree") order.push("remove");
+      return Promise.resolve(undefined);
+    });
+
+    await removeAgentWorkspace(root, "p", "a");
+    expect(abandonBootstrapMock).toHaveBeenCalledWith("/wt/p/a");
+    expect(order).toEqual(["abandon-deps", "remove"]);
+  });
+
+  it("still settles the install when the project record is missing", async () => {
+    // The bootstrap runs unconditionally, but the teardown handshake used to hang off the path map
+    // the ENV SEED writes — and the seeder returns early, before writing it, when the project isn't
+    // in the store. That early return is a documented real case (an evicted record, a worker
+    // re-derived from its on-disk manifest, a store still rehydrating). In it, an install was
+    // queued for a worktree that teardown then deleted without waiting, which is exactly the
+    // stray-non-empty-slot hazard the handshake exists to prevent.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invoke.mockResolvedValue({ path: "/wt/ghost/a", branch: "b" });
+    const root = "/root-deps-ghost";
+    await prepareAgentWorkspace(root, "ghost", "a", "main");
+    expect(bootstrapMock).toHaveBeenCalledWith("/wt/ghost/a");
+
+    invoke.mockResolvedValue(undefined);
+    await removeAgentWorkspace(root, "ghost", "a");
+    expect(abandonBootstrapMock).toHaveBeenCalledWith("/wt/ghost/a");
+    warn.mockRestore();
+  });
+
+  it("waits out the two teardown settles concurrently, not one after the other", async () => {
+    // Both waits are bounded at 5s and run INSIDE the per-root git lock, which every other
+    // prepare/remove on that project queues behind. Awaited serially the worst case is 10s, and
+    // because an install measures ~27s, hitting the cap is the common case when an agent is closed
+    // shortly after opening — multiplied by N when a project's agents are closed one at a time.
+    invoke.mockResolvedValue({ path: "/wt/p/a", branch: "b" });
+    const root = "/root-deps-concurrent";
+    await prepareAgentWorkspace(root, "p", "a", "main");
+
+    // The distinguishing observation is whether the bootstrap wait STARTS while the seed wait is
+    // still pending. Merely checking that the seed was *called* first would pass under either
+    // arrangement, since a serial `await` also calls the seed first — it just then blocks on it.
+    let seedResolved = false;
+    let startedWhileSeedPending = false;
+    vi.mocked(abandonWorktreeSeed).mockImplementation(
+      () =>
+        new Promise((r) =>
+          setTimeout(() => {
+            seedResolved = true;
+            r();
+          }, 20),
+        ),
+    );
+    abandonBootstrapMock.mockImplementation(() => {
+      if (!seedResolved) startedWhileSeedPending = true;
+      return new Promise((r) => setTimeout(r, 20));
+    });
+    invoke.mockResolvedValue(undefined);
+
+    await removeAgentWorkspace(root, "p", "a");
+    expect(startedWhileSeedPending).toBe(true);
   });
 });
