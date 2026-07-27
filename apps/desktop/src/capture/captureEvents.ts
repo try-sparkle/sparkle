@@ -13,10 +13,14 @@ export function onCaptureShot(handler: (shot: CaptureShot) => void): Promise<Unl
   return listen<CaptureShot>("capture://shot", (e) => handler(e.payload));
 }
 
+/** Broadcast to every window: the owning project window routes the send, and the helper island
+ *  uses it as "the main window is ABOUT to be raised" (services/helper.ts' onCaptureSend). */
+export const CAPTURE_SEND = "capture://send";
+
 /** Broadcast a send to every window; the owning project window routes it (plan Task 4). */
 export function emitCaptureSend(payload: CaptureSendPayload): Promise<void> {
   if (!hasTauri) return Promise.resolve();
-  return emit("capture://send", payload);
+  return emit(CAPTURE_SEND, payload);
 }
 
 /** Hide the takeover window (Rust keeps it alive for the next capture). */

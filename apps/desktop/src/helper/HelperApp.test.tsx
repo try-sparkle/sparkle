@@ -9,6 +9,7 @@ const quitApp = vi.fn();
 const setHelperBounds = vi.fn();
 const hideHelper = vi.fn();
 const showHelper = vi.fn();
+const showMainWindow = vi.fn();
 
 // Two REAL displays, so the placement path runs for real instead of the degenerate zero-rect
 // fallback jsdom otherwise forces (availableMonitors rejects there, and every test then exercises
@@ -33,18 +34,43 @@ vi.mock("../services/attention", () => ({
 }));
 // Captured so a test can fire the global capture shortcut the way Rust does.
 let fireCaptureShortcut: (() => void) | null = null;
+// Likewise for `capture://closed`, which Rust emits from hide_capture_window when the user is done
+// with the takeover. Without a way to fire it, the takeover-suppression tests could only prove the
+// island stays hidden, never that it comes back.
+let fireCaptureClosed: (() => void) | null = null;
+// `capture://send`, emitted by CaptureApp.send() a beat BEFORE it asks Rust to hide the takeover.
+let fireCaptureSend: (() => void) | null = null;
+// …and the frontmost transitions, so a test can play the real send ordering: closed (frontmost
+// still false, the takeover is excluded from the policy) THEN the raise at the end of the dispatch.
+let fireFrontmost: ((f: boolean) => void) | null = null;
+// The seed. Mirrors getFrontmost/getHelperVitals; a test overrides it to mount the helper under an
+// already-open takeover, or to hand the recovery re-poll a "the takeover is gone" answer.
+const getTakeoverOpen = vi.fn(async (): Promise<boolean | null> => false);
 vi.mock("../services/helper", () => ({
   getHelperVitals: async () => ({ needsYou: 3, running: 7 }),
   onHelperVitalsChanged: async () => () => {},
   getFrontmost: async () => false,
-  onFrontmostChanged: async () => () => {},
+  onFrontmostChanged: async (cb: (f: boolean) => void) => {
+    fireFrontmost = cb;
+    return () => {};
+  },
   onCaptureRequested: async (cb: () => void) => {
     fireCaptureShortcut = cb;
     return () => {};
   },
+  onCaptureClosed: async (cb: () => void) => {
+    fireCaptureClosed = cb;
+    return () => {};
+  },
+  onCaptureSend: async (cb: () => void) => {
+    fireCaptureSend = cb;
+    return () => {};
+  },
+  getTakeoverOpen: () => getTakeoverOpen(),
   setHelperBounds: (...a: unknown[]) => setHelperBounds(...a),
   showHelper: (...a: unknown[]) => showHelper(...a),
   hideHelper: (...a: unknown[]) => hideHelper(...a),
+  showMainWindow: (...a: unknown[]) => showMainWindow(...a),
 }));
 
 import { availableMonitors } from "@tauri-apps/api/window";
@@ -63,6 +89,14 @@ describe("HelperApp", () => {
     vi.clearAllMocks();
     localStorage.clear();
     fireCaptureShortcut = null;
+    fireCaptureClosed = null;
+    fireCaptureSend = null;
+    fireFrontmost = null;
+    // Same restore-a-default pattern as availableMonitors below: mockReset drains any *Once queue a
+    // previous case left behind, and the explicit default NAMES what an unseeded test gets — no
+    // takeover on screen, which is the ordinary mount.
+    getTakeoverOpen.mockReset();
+    getTakeoverOpen.mockResolvedValue(false);
     // mockRejectedValue below is persistent, and clearAllMocks does not reset implementations —
     // restore the resolving default so one failure test cannot leak into the next case.
     vi.mocked(availableMonitors).mockResolvedValue([PRIMARY, SECOND] as never);
@@ -118,6 +152,123 @@ describe("HelperApp", () => {
     expect(hideAt).toBeLessThan(captureAt);
   });
 
+  // ---- the island must never float over the takeover (roborev 53320-M) ----
+  //
+  // showCaptureWindow resolves when the takeover is SHOWN, not when the user dismisses it. So
+  // captureBusy flips false while the annotation session is only just starting, the visibility
+  // effect re-runs, and — because the capture panel is deliberately excluded from `frontmost` —
+  // `frontmost` is STILL false, so the rule says "show". The island (always-on-top) then sat over
+  // the full-monitor takeover with a live Capture button, which starts a second crosshair capture
+  // on top of the open one. The deleted TrayApp did not have this bug.
+
+  it("does NOT re-show the island once the takeover is up", async () => {
+    captureScreenRegion.mockResolvedValue({ path: "/tmp/a.png" });
+    render(<HelperApp />);
+    await screen.findByTestId("helper-needs-you");
+    // The mount placement releases the first-show gate; forget that show so the assertion below is
+    // about the takeover and nothing else.
+    await waitFor(() => expect(showHelper).toHaveBeenCalled());
+    showHelper.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: /capture/i }));
+    await waitFor(() => expect(showCaptureWindow).toHaveBeenCalled());
+
+    // Let every pending effect settle — the bug is precisely a LATER effect run, so asserting
+    // immediately after the await would pass even unfixed.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(showHelper).not.toHaveBeenCalled();
+  });
+
+  it("brings the island back when the takeover closes", async () => {
+    // The other half: suppression that never lifts is just a differently-broken island.
+    captureScreenRegion.mockResolvedValue({ path: "/tmp/a.png" });
+    render(<HelperApp />);
+    await screen.findByTestId("helper-needs-you");
+    fireEvent.click(screen.getByRole("button", { name: /capture/i }));
+    await waitFor(() => expect(showCaptureWindow).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 20));
+    showHelper.mockClear();
+
+    await waitFor(() => expect(fireCaptureClosed).toBeTypeOf("function"));
+    fireCaptureClosed!();
+    await waitFor(() => expect(showHelper).toHaveBeenCalled());
+  });
+
+  // ---- the takeover latch must not flash, and must not strand (roborev 53339 / 53341-M) ----
+
+  /** Drive a capture through to an open takeover, then forget every show that got us there, so the
+   *  assertions below are about what happens NEXT and nothing else. */
+  async function openTakeover() {
+    captureScreenRegion.mockResolvedValue({ path: "/tmp/a.png" });
+    render(<HelperApp />);
+    await screen.findByTestId("helper-needs-you");
+    fireEvent.click(screen.getByRole("button", { name: /capture/i }));
+    await waitFor(() => expect(showCaptureWindow).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 20));
+    showHelper.mockClear();
+  }
+
+  it("does not flash the island between a send and the main window being raised", async () => {
+    // The primary flow, in its real order. CaptureApp.send() emits `capture://send` and then calls
+    // hideCaptureWindow(), so Rust's `capture://closed` arrives while `frontmost` is STILL false —
+    // the takeover is deliberately excluded from the frontmost policy and the main window has not
+    // been raised yet. Lifting the suppression on that edge showed the island, and the raise at the
+    // tail of handleCaptureSend (selectProject → dispatch → focusThisWindow) hid it again a beat
+    // later: pop-and-vanish on every send from outside Sparkle.
+    await openTakeover();
+    await waitFor(() => expect(fireCaptureSend).toBeTypeOf("function"));
+
+    fireCaptureSend!();
+    fireCaptureClosed!();
+
+    // Long enough to outlast the dismissal settle — the suppression must be held by the SEND, not
+    // merely deferred by a few frames. A dispatch is slower than this.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(showHelper).not.toHaveBeenCalled();
+
+    // …and when the raise finally lands, the rule hides the island because Sparkle is frontmost.
+    // It must never have been shown in between.
+    fireFrontmost!(true);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(showHelper).not.toHaveBeenCalled();
+    expect(hideHelper).toHaveBeenCalled();
+  });
+
+  it("seeds the takeover state on mount, so a helper that reloads under it does not paint over it",
+    async () => {
+    // `capture://closed` is an EDGE. A helper webview that mounts (or crashes and reloads) while
+    // the takeover is up misses every edge that came before it, so an event-only latch starts false
+    // and the island paints itself over the full-monitor takeover — the exact bug the latch was
+    // added to fix, reintroduced by the fix's own shape. Hence the seed, like vitals and frontmost.
+    getTakeoverOpen.mockResolvedValue(true);
+    render(<HelperApp />);
+    await screen.findByTestId("helper-needs-you");
+    // Placement lands and would otherwise release the first-show gate; wait past it.
+    await waitFor(() => expect(setHelperBounds).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 30));
+    expect(showHelper).not.toHaveBeenCalled();
+  });
+
+  it("recovers the island when `capture://closed` never arrives", async () => {
+    // ⌘W on the key window (the takeover, by design, while it is up), a webview crash, or a
+    // `win.hide()` that fails — all reach the same place: the close edge is never emitted. With one
+    // clearing edge and no fallback, the island is then suppressed for the REST OF THE SESSION with
+    // no way back: it is hidden, so its context menu is unreachable, and re-enabling it from the
+    // main window hits the same early return. The frontmost gain re-polls Rust instead of trusting
+    // the latch, so the suppression can never outlive the window it describes.
+    await openTakeover();
+    // The takeover really is gone; nothing told the island.
+    getTakeoverOpen.mockResolvedValue(false);
+    await waitFor(() => expect(fireFrontmost).toBeTypeOf("function"));
+
+    // The user Cmd-Tabs to Sparkle and back out again. No `capture://closed` at any point.
+    fireFrontmost!(true);
+    await new Promise((r) => setTimeout(r, 20));
+    fireFrontmost!(false);
+
+    await waitFor(() => expect(showHelper).toHaveBeenCalled());
+  });
+
   it("an Esc at the crosshairs (null) opens no capture window and shows no error", async () => {
     captureScreenRegion.mockResolvedValue(null);
     render(<HelperApp />);
@@ -126,6 +277,9 @@ describe("HelperApp", () => {
     await waitFor(() => expect(captureScreenRegion).toHaveBeenCalled());
     expect(showCaptureWindow).not.toHaveBeenCalled();
     expect(screen.queryByRole("alert")).toBeNull();
+    // No takeover opened, so nothing suppresses the island: it must come back on its own rather
+    // than wait for a `capture://closed` that Rust will never emit.
+    await waitFor(() => expect(showHelper).toHaveBeenCalled());
   });
 
   it("a failed capture surfaces the Screen Recording notice", async () => {
@@ -274,6 +428,42 @@ describe("HelperApp", () => {
     // placement of (0, 0, 268, 44) would satisfy any "on-screen" half-plane just as well, so
     // dropping the seed would silently revert this to covering clampToScreen only.
     expect(lastBounds()).toEqual([0, 0, TAB_W, TAB_H]);
+  });
+
+  // ---- the island must be PLACED before it is SHOWN (roborev 53320-M) ----
+
+  it("does not show the island until its geometry has landed", async () => {
+    // `init_helper_window` builds the window with no `.position(...)`, so a show before the first
+    // setHelperBounds puts it at whatever origin the OS assigned and it then jumps. The visibility
+    // effect wins that race by default: `frontmost` initialises false and `enabled` hydrates
+    // synchronously true, so showHelper() fired while placement was still behind `await
+    // readScreens()`. Every launch flashed the island in the wrong place.
+    render(<HelperApp />);
+    await waitFor(() => expect(showHelper).toHaveBeenCalled());
+    // Ordinals, not "was it called": both calls happen either way — only the ORDER is the bug.
+    expect(setHelperBounds.mock.invocationCallOrder[0]).toBeLessThan(
+      showHelper.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("still shows the island when the monitor query fails", async () => {
+    // The gate must be released on the DEGRADED placement path too, or an in-Tauri monitor failure
+    // would leave the island permanently invisible — a worse bug than the flash it replaces.
+    vi.mocked(availableMonitors).mockRejectedValue(new Error("no monitors"));
+    render(<HelperApp />);
+    await waitFor(() => expect(showHelper).toHaveBeenCalled());
+  });
+
+  it("right-click → Open Sparkle reveals the main window", async () => {
+    // The Dock icon is the documented way back, but it is not discoverable from out here, and the
+    // tray's "Open" item was deleted with the tray (roborev 53313-H).
+    render(<HelperApp />);
+    await screen.findByTestId("helper-needs-you");
+    fireEvent.contextMenu(screen.getByTestId("helper-root"));
+    fireEvent.click(await screen.findByRole("button", { name: /open sparkle/i }));
+    expect(showMainWindow).toHaveBeenCalledTimes(1);
+    // …and the menu closes behind it, like every other item.
+    expect(screen.queryByRole("menu")).toBeNull();
   });
 
   it("clicking a chiclet asks the app to focus that tier", async () => {

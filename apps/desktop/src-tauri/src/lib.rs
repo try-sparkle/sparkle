@@ -37,6 +37,7 @@ mod hooks;
 mod judge;
 mod logging;
 mod mac_panel;
+mod main_window;
 mod mic_permission;
 mod model;
 mod model_catalog;
@@ -118,23 +119,35 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Focused(focused) = event {
                 let app = window.app_handle();
-                // The helper and capture panels are non-activating: they emit Focused(true)
-                // WITHOUT activating the app, so neither consumer below may count them.
+                let label = window.label();
+                // TWO filters, not one — the consumers ask different questions (frontmost.rs).
+                // The routing itself lives in `frontmost::focus_consumers` so it can be unit-tested
+                // as a value: the predicates were never the bug, the dispatch was, and a test that
+                // hand-feeds `is_typing_window`/`is_app_window` cannot see which one is wired where.
                 //
-                // This guard wraps BOTH calls deliberately. Letting the panels through to
-                // dictation would resume microphone capture the moment the user clicked the
-                // floating island while working in another app — the exact thing sparkle-9oz6's
-                // mic gating exists to prevent, and a worse failure than the island's own.
-                if !frontmost::is_app_window(window.label()) {
-                    return;
+                // Dictation wants "can the caret be in Sparkle", which INCLUDES the capture
+                // takeover: it is a deliberately key-accepting panel and CaptureApp mounts
+                // useAmbientVoice, so dropping its focus events here left the mic permanently
+                // unbuilt and voice narration in the takeover dead on every invocation.
+                //
+                // The HELPER is filtered from both, and must stay that way (sparkle-9oz6): it is a
+                // non-activating panel, so letting it through to dictation would resume microphone
+                // capture the moment the user clicked the floating island while working in another
+                // app — a worse failure than the island's own.
+                let consumers = frontmost::focus_consumers(label);
+                if consumers.dictation {
+                    app.state::<dictation::DictationState>()
+                        .note_focus_event(app, *focused);
                 }
-                app.state::<dictation::DictationState>()
-                    .note_focus_event(app, *focused);
-                frontmost::note_focus_event(
-                    app,
-                    &app.state::<frontmost::FrontmostState>(),
-                    *focused,
-                );
+                // The island's visibility wants "is a REAL Sparkle window frontmost". The takeover
+                // is shown WITHOUT activating the app, so it must not count here.
+                if consumers.frontmost {
+                    frontmost::note_focus_event(
+                        app,
+                        &app.state::<frontmost::FrontmostState>(),
+                        *focused,
+                    );
+                }
             }
         })
         .setup(|app| {
@@ -556,6 +569,7 @@ pub fn run() {
             roster::clear_window_roster,
             roster::get_roster,
             roster::quit_app,
+            main_window::show_main_window,
             helper::publish_helper_vitals,
             helper::get_helper_vitals,
             helper::show_helper,
@@ -563,7 +577,8 @@ pub fn run() {
             helper::set_helper_bounds,
             frontmost::get_frontmost,
             capture_window::show_capture_window,
-            capture_window::hide_capture_window
+            capture_window::hide_capture_window,
+            capture_window::is_capture_open
         ])
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")
@@ -575,17 +590,17 @@ pub fn run() {
             // gated — without the cfg it's a hard compile error (E0599) off macOS.
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { has_visible_windows, .. } => {
-                if !has_visible_windows {
-                    // Prefer the canonical "main" window; fall back to any window. Our close path
-                    // only ever hide()s the last window (never destroys it), so there is normally
-                    // ≥1 window to reveal; the `if let Some` still guards the zero-window case.
-                    let win = app
-                        .get_webview_window("main")
-                        .or_else(|| app.webview_windows().into_values().next());
-                    if let Some(win) = win {
-                        let _ = win.show();
-                        let _ = win.set_focus();
-                    }
+                // IGNORE AppKit's `has_visible_windows` and ask our own windows instead. The helper
+                // island and the capture takeover are real NSWindows (non-activating panels), and
+                // the island is visible EXACTLY when Sparkle is not frontmost — which is the state
+                // the user is in when they click the Dock icon. AppKit therefore reports YES, the
+                // guard short-circuited, and the Dock icon did nothing at all once the main window
+                // had been hidden. `any_app_window_visible` counts only real app windows.
+                if main_window::should_reveal_on_reopen(
+                    has_visible_windows,
+                    frontmost::any_app_window_visible(app),
+                ) {
+                    main_window::reveal(app);
                 }
             }
             // Stop dictation capture before the process tears down (). RunEvent::Exit

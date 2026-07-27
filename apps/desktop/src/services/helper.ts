@@ -3,6 +3,9 @@
 // need to branch — same contract as services/attention.ts.
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+// Imported, not re-declared: the island and the takeover must agree on this name, and a second
+// literal is exactly how the CAPTURE_CLOSED contract below acquired a "must match" comment.
+import { CAPTURE_SEND } from "../capture/captureEvents";
 
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const noopUnlisten: UnlistenFn = () => {};
@@ -61,6 +64,55 @@ export function onFrontmostChanged(cb: (frontmost: boolean) => void): Promise<Un
 export function onCaptureRequested(cb: () => void): Promise<UnlistenFn> {
   if (!hasTauri) return Promise.resolve(noopUnlisten);
   return listen("helper://capture-requested", () => cb());
+}
+
+/** Must match CAPTURE_CLOSED_EVENT in src-tauri/src/capture_window.rs — asserted by a test there
+ *  (`the_typescript_listener_uses_the_same_event_name`), not merely by this comment. */
+const CAPTURE_CLOSED = "capture://closed";
+
+/** The takeover was dismissed. The island suppresses itself for the whole time the takeover is up
+ *  — it is always-on-top and the takeover fills the display — and `showCaptureWindow` resolves when
+ *  the takeover is SHOWN, not when the user is finished with it. This is the missing edge. */
+export function onCaptureClosed(cb: () => void): Promise<UnlistenFn> {
+  if (!hasTauri) return Promise.resolve(noopUnlisten);
+  return listen(CAPTURE_CLOSED, () => cb());
+}
+
+/** A send left the takeover, so the main window is ABOUT to be raised — `handleCaptureSend` routes
+ *  the payload and only then calls `focusThisWindow()` (services/captureSends.ts).
+ *
+ *  The island needs this because `capture://closed` fires FIRST, at the tail of `hide_capture_window`,
+ *  while `frontmost` is still false (the takeover is deliberately excluded from the frontmost
+ *  policy). Lifting the suppression there re-showed the island for the length of one dispatch and
+ *  then hid it again — a pop-and-vanish on every send from outside Sparkle, which is the primary
+ *  flow. Suppression instead holds until frontmost actually settles. */
+export function onCaptureSend(cb: () => void): Promise<UnlistenFn> {
+  if (!hasTauri) return Promise.resolve(noopUnlisten);
+  return listen(CAPTURE_SEND, () => cb());
+}
+
+/** Is the takeover on screen RIGHT NOW? The seed for the island's suppression, mirroring
+ *  `getFrontmost` and `getHelperVitals` — and for the same reason they exist: `capture://closed` is
+ *  a single edge, so a helper webview that mounts (or reloads, or crashes and reloads) while the
+ *  takeover is up would otherwise assume "closed" and paint over it, and a close edge that never
+ *  arrives would otherwise suppress the island for the rest of the session with no recovery.
+ *  Resolves null outside Tauri. */
+export function getTakeoverOpen(): Promise<boolean | null> {
+  if (!hasTauri) return Promise.resolve(null);
+  return invoke<boolean>("is_capture_open").catch((e) => {
+    console.debug("is_capture_open failed", e);
+    return null;
+  });
+}
+
+/** Reveal and focus the main window — the island's right-click "Open Sparkle".
+ *
+ *  Load-bearing, like quitApp beside it. Closing the main window only HIDES it, and the menu-bar
+ *  extra that used to carry an "Open" item is gone, so without this the only ways back in are the
+ *  macOS Dock icon and clicking a P0/P1 chiclet — neither of which reads as "open Sparkle". */
+export function showMainWindow(): void {
+  if (!hasTauri) return;
+  void invoke("show_main_window").catch((e) => console.debug("show_main_window failed", e));
 }
 
 export function showHelper(): void {

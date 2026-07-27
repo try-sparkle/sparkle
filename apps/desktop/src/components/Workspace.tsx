@@ -21,6 +21,7 @@ import { ProjectTabsBar } from "./ProjectTabsBar";
 import { OfflineBanner } from "./OfflineBanner";
 import { ZeroCreditBanner } from "./ZeroCreditBanner";
 import { ClosePrompt } from "./ClosePrompt";
+import { StatusStrip } from "./StatusStrip";
 import {
   shouldWarmSparkleAtLaunch,
   sparkleAgentIdFor,
@@ -716,6 +717,11 @@ export function Workspace() {
           )}
         </div>
       </div>
+
+      {/* The app's only bottom chrome: Changelog · Support · v{version}, hugging the bottom-right
+          corner. A real ROW of this column (not an overlay), so it can never occlude the terminal
+          stage, the composer, or any other bottom-anchored UI — they simply lay out above it. */}
+      <StatusStrip />
 
       {/* ⌘K history search across every project's conversations (CM-U5). */}
       <CommandPalette open={palette.open} onClose={palette.closePalette} />

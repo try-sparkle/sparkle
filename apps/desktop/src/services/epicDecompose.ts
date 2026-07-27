@@ -288,7 +288,7 @@ export function runDecomposeWatcherForPoll(
   projectPath: string,
   board: Board,
 ): Promise<void> {
-  // The APP window only — the tray/capture webviews (which carry `?view=`) must not run the
+  // The APP window only — the helper/capture webviews (which carry `?view=`) must not run the
   // decompose watcher. This used to test for an absent `?label=`, which nothing mints any more,
   // so every webview passed (roborev 46485-M).
   const isMain = typeof window !== "undefined" && isAppWindowSearch(window.location.search);

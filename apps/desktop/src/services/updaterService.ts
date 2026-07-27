@@ -91,7 +91,7 @@ function inTauri(): boolean {
  * with auto-apply on — N concurrent downloadAndInstall() calls racing to stage the same bundle.
  *
  * "Main" now means the APP window rather than "the window without a `?label=`" — nothing has
- * minted a label since CM-U7 part 2, which quietly made this predicate `true` in the tray and
+ * minted a label since CM-U7 part 2, which quietly made this predicate `true` in the helper and
  * capture webviews too (roborev 46485-M). The auxiliary webviews carry `?view=`. Kept as a pure
  * search-string predicate so it unit-tests in node (startUpdater itself is unreachable in tests
  * behind the packaged/dev guard).

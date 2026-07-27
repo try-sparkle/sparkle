@@ -15,7 +15,8 @@ import {
 } from "./helperGeometry";
 import {
   getHelperVitals, onHelperVitalsChanged, getFrontmost, onFrontmostChanged, onCaptureRequested,
-  setHelperBounds, showHelper, hideHelper, type Vitals,
+  onCaptureClosed, onCaptureSend, getTakeoverOpen, setHelperBounds, showHelper, hideHelper,
+  showMainWindow, type Vitals,
 } from "../services/helper";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { emitFocusTier, quitApp } from "../services/attention";
@@ -23,6 +24,18 @@ import { captureScreenRegion, showCaptureWindow } from "../screenshot";
 
 const ZERO: Vitals = { needsYou: 0, running: 0 };
 const FALLBACK_SCREEN: Rect = { x: 0, y: 0, width: 0, height: 0 };
+
+/** How long the island stays suppressed after a takeover DISMISSAL, waiting for `frontmost` to
+ *  settle. Short — nothing is being raised on this path, so this only absorbs the ordering race
+ *  between `capture://send` and `capture://closed` (two separate IPC messages from the same
+ *  webview, so their arrival order here is not guaranteed). */
+const CLOSE_SETTLE_MS = 250;
+/** …and after a SEND, where a raise really is coming. `handleCaptureSend` selects the project,
+ *  dispatches to a build agent or the plan flow, and only then calls `focusThisWindow()`, so this
+ *  has to outlast a dispatch. It is a safety valve, not a schedule: the first `frontmost = true`
+ *  clears it immediately, and it exists only so a send that never routes (no owning window, a
+ *  throw) cannot suppress the island forever. */
+const SEND_RAISE_GRACE_MS = 3000;
 
 /** Read the monitor layout in LOGICAL pixels. Tauri reports monitor geometry in PHYSICAL pixels,
  *  so everything is divided by the scale factor — helperGeometry works in logical space, and
@@ -66,10 +79,55 @@ export function HelperApp() {
   const [frontmost, setFrontmost] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [captureBusy, setCaptureBusy] = useState(false);
+  // The takeover is on screen. SEPARATE from captureBusy, which only spans the capture FLOW:
+  // showCaptureWindow resolves when the takeover is shown, not when the user dismisses it, so
+  // captureBusy flips false while the annotation session is just beginning. The island is
+  // always-on-top and the takeover fills the monitor, so without this the island floats over it
+  // for the whole session — with a live Capture button that starts a SECOND crosshair capture on
+  // top of the open takeover.
+  //
+  // NOT event-only. It is SEEDED on mount and RE-POLLED on every frontmost gain (`is_capture_open`),
+  // exactly like `vitals` and `frontmost` below, and for the same reason: `capture://closed` is a
+  // single edge, and an edge is the wrong shape for a webview that may mount, reload, or crash and
+  // reload at any point in the session. The event-only version broke both ways — a helper mounting
+  // under an open takeover started `false` and painted over it, and a close edge that never arrived
+  // (⌘W destroying the key window, a failed `win.hide()`, a webview crash) suppressed the island for
+  // the whole session with no route back: it is hidden, so its context menu is unreachable, and
+  // re-enabling it from the main window hits this same suppression (roborev 53341-M2).
+  const [takeoverOpen, setTakeoverOpen] = useState(false);
+  // A real takeover edge has been observed here (opened by this webview, or `capture://closed`), so
+  // the mount seed's in-flight round-trip must no longer overwrite it. Same staleness guard the
+  // vitals and frontmost seeds use, hoisted to a ref because two effects share it.
+  const sawTakeoverEdgeRef = useRef(false);
+  // Non-null while the island must stay suppressed WAITING FOR `frontmost` TO SETTLE, and the grace
+  // it is waiting out. Cleared by the first `frontmost = true`, or when the grace elapses.
+  //
+  // This is the send flash (roborev 53339-M1). `CaptureApp.send()` emits `capture://send` and calls
+  // `hideCaptureWindow()` immediately, so Rust emits `capture://closed` and the suppression lifts
+  // while `frontmost` is STILL false — the takeover is excluded from the frontmost policy and the
+  // main window has not been raised yet. The visibility rule then says "show", and the raise at the
+  // end of `handleCaptureSend` hides it again a beat later: the island popped onto the screen and
+  // vanished on every send from outside Sparkle, which is the primary flow. (Rust's added
+  // `frontmost::note_focus_event(false)` does not help — it re-polls to `false`, the value that
+  // causes the show.)
+  const [raiseGraceMs, setRaiseGraceMs] = useState<number | null>(null);
+  // Never SHORTENS an existing grace: a send arms the long one and the `capture://closed` that
+  // follows it must not downgrade that to the dismissal grace.
+  const armRaiseGrace = useCallback((ms: number) => {
+    setRaiseGraceMs((cur) => Math.max(cur ?? 0, ms));
+  }, []);
   const [captureError, setCaptureError] = useState<string | null>(null);
   // Synchronous re-entrancy guard: captureBusy is read from the render closure, so two fast
   // clicks could both pass a state-only check. Same reasoning as the old TrayApp guard.
   const captureBusyRef = useRef(false);
+  // True once the geometry effect has pushed a real position. The island must not be SHOWN before
+  // it has been PLACED: `init_helper_window` builds the window with no `.position(...)`, so it
+  // appears at whatever origin the OS assigned and then jumps. The visibility effect wins the race
+  // by default — `frontmost` initialises false and `enabled` hydrates synchronously true — so on
+  // every launch showHelper() fired while setHelperBounds was still behind `await readScreens()`.
+  //
+  // A ref would not do: this has to re-run the visibility effect once placement lands.
+  const [placed, setPlaced] = useState(false);
 
   // Where the window ACTUALLY is, including the computed default before the user has ever dragged
   // it. A drag must start from here, not from the persisted `x`/`y` — those are null on first run,
@@ -144,7 +202,13 @@ export function HelperApp() {
       hideHelper();
       setCaptureError(null);
       const shot = await captureScreenRegion();
-      if (shot) await showCaptureWindow(shot);
+      if (shot) {
+        await showCaptureWindow(shot);
+        // Only after it actually opened. An Esc at the crosshairs (null shot) and a throw both
+        // leave this false, so the island comes back as it should.
+        sawTakeoverEdgeRef.current = true;
+        setTakeoverOpen(true);
+      }
     } catch (e) {
       console.error("helper: capture flow failed", e);
       // A failure must not be indistinguishable from an Esc: the island is already hidden, so
@@ -169,13 +233,78 @@ export function HelperApp() {
     return () => { void safeUnlisten(un); };
   }, [capture]);
 
-  // The one place the OS window is shown or hidden. Skipped while a capture is in flight — that
-  // flow hides the island deliberately, and re-showing it here would put it back in the shot.
+  // Takeover state: seed once (covering a helper that mounted while the takeover was already up),
+  // then follow the closing edge. Same shape as the vitals seed above, and the same staleness
+  // guard — a real edge must win over a slower seed.
   useEffect(() => {
-    if (captureBusy) return;
+    let alive = true;
+    void getTakeoverOpen().then((open) => {
+      if (alive && !sawTakeoverEdgeRef.current && open !== null) setTakeoverOpen(open);
+    });
+    const un = onCaptureClosed(() => {
+      sawTakeoverEdgeRef.current = true;
+      setTakeoverOpen(false);
+      // NOT an immediate un-suppression: `frontmost` has not spoken yet. See raiseGraceMs.
+      armRaiseGrace(CLOSE_SETTLE_MS);
+    });
+    return () => { alive = false; void safeUnlisten(un); };
+  }, [armRaiseGrace]);
+
+  // A send is routing, so a raise is coming. Arms the long grace BEFORE `capture://closed` lands
+  // (CaptureApp emits the send first), which is the whole point — the close edge must not be able
+  // to un-suppress the island in the window between the takeover going away and the main window
+  // coming forward.
+  useEffect(() => {
+    const un = onCaptureSend(() => armRaiseGrace(SEND_RAISE_GRACE_MS));
+    return () => { void safeUnlisten(un); };
+  }, [armRaiseGrace]);
+
+  // The grace's own expiry. A safety valve only: the normal end of a grace is a `frontmost = true`
+  // below, which clears it at once. Without the timer, a send that never routes anywhere would
+  // suppress the island indefinitely — the failure mode this whole section exists to remove.
+  useEffect(() => {
+    if (raiseGraceMs === null) return;
+    const t = setTimeout(() => setRaiseGraceMs(null), raiseGraceMs);
+    return () => clearTimeout(t);
+  }, [raiseGraceMs]);
+
+  // Sparkle came forward: end any grace, and RE-POLL the takeover rather than trusting the latch.
+  //
+  // This is the recovery valve. `capture://closed` has exactly one emitter, and the ways it goes
+  // missing are real — ⌘W closing the key window (the takeover, while it is up), a webview crash or
+  // reload, a `win.hide()` that fails. Without a second opinion, any of those suppresses the island
+  // permanently. Re-polling is safe rather than merely tolerable: if the takeover really is still up
+  // it stays suppressed, and while Sparkle is frontmost the island is hidden by the ordinary rule
+  // anyway, so this can never race a show onto the screen.
+  //
+  // Both writes land in the re-poll's callback, not the effect body: the grace exists to bridge the
+  // gap until frontmost is known, and the answer to "is the takeover still up" arrives with it — so
+  // there is no moment where the grace has lifted while `takeoverOpen` is still the stale latch.
+  useEffect(() => {
+    if (!frontmost) return;
+    let alive = true;
+    void getTakeoverOpen().then((open) => {
+      if (!alive) return;
+      setRaiseGraceMs(null);
+      if (open !== null) setTakeoverOpen(open);
+    });
+    return () => { alive = false; };
+  }, [frontmost]);
+
+  // The one place the OS window is shown or hidden. Four suppressions, all of them "not yet":
+  //   - captureBusy: a capture is in flight; that flow hides the island deliberately and
+  //     re-showing it here would put it back in the shot.
+  //   - takeoverOpen: the full-monitor takeover is up and the island is always-on-top.
+  //   - raiseGraceMs: the takeover just went away but `frontmost` has not settled, so the rule
+  //     below would read a stale `false` and flash the island for one dispatch.
+  //   - !placed: geometry has not landed, so a show would flash the window at the OS-assigned
+  //     origin before jumping to its real position.
+  // The window is BUILT hidden, so skipping the hide() in those states is a no-op, not a leak.
+  useEffect(() => {
+    if (captureBusy || takeoverOpen || raiseGraceMs !== null || !placed) return;
     if (shouldShowHelper({ enabled, sparkleFrontmost: frontmost })) showHelper();
     else hideHelper();
-  }, [enabled, frontmost, captureBusy]);
+  }, [enabled, frontmost, captureBusy, takeoverOpen, raiseGraceMs, placed]);
 
   // Push geometry to the OS window whenever mode or position changes, clamped to the display the
   // window actually sits on — this is what rescues a position persisted against a monitor that
@@ -211,11 +340,17 @@ export function HelperApp() {
         if (snapped.edge !== edge) setEdge(snapped.edge);
         posRef.current = { x: snapped.x, y: snapped.y };
         setHelperBounds(snapped.x, snapped.y, width, height);
+        setPlaced(true);
         return;
       }
       const pos = clampToScreen(want, { width, height }, screen);
       posRef.current = { x: pos.x, y: pos.y };
       setHelperBounds(pos.x, pos.y, width, height);
+      // Releases the visibility effect's first-show gate. Set on BOTH placement paths and AFTER
+      // setHelperBounds, never before — the whole point is that the show follows the placement.
+      // readScreens() swallows its own failures and falls through to a fallback rect, so there is
+      // no branch that reaches here without having placed the window.
+      setPlaced(true);
     })();
     return () => { alive = false; };
   }, [renderMode, x, y, width, height, pillW, pillH, edge, setEdge]);
@@ -348,6 +483,13 @@ export function HelperApp() {
           // Any click inside the menu is handled by its buttons; a click elsewhere dismisses it.
           onPointerDown={(e) => e.stopPropagation()}
         >
+          {/* The discoverable way back into the app. The main window's close path only HIDES it,
+              the tray's "Open" item was deleted with the tray, and the macOS Dock icon — the
+              documented route — is not visible as an affordance from out here. The only other
+              remaining route is clicking a P0/P1 chiclet, which does not read as "open Sparkle". */}
+          <button style={menuItem} onClick={() => { setMenuOpen(false); showMainWindow(); }}>
+            Open Sparkle
+          </button>
           <button style={menuItem} onClick={() => { setMenuOpen(false); setEnabled(false); }}>
             Hide Helper
           </button>

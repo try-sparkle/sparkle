@@ -1,37 +1,15 @@
 // @vitest-environment jsdom
 //
-// The top-right kebab (CM-U6): menu open/close semantics (click, Escape peel, outside
-// pointerdown, arrow-key roving focus), and each entry invoking the RIGHT reused surface —
-// version popover (check for updates / logs / changelog), SupportModal, SettingsDialog
-// (including the uiStore deep-open seam + Manage-accounts hand-off), AuthStatusButton.
-// The reused surfaces are mocked at their module seams; this suite pins the wiring.
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+// The top-right kebab (CM-U6): menu open/close semantics (click, Escape, outside pointerdown,
+// arrow-key roving focus), and its entry invoking the RIGHT reused surface — SettingsDialog
+// (including the uiStore deep-open seam + Manage-accounts hand-off) and AuthStatusButton.
+// Version / Support / Changelog moved OUT of this menu into the bottom-right StatusStrip
+// (see ../StatusStrip.test.tsx); this suite pins what the kebab still owns.
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const openUrlMock = vi.fn<(url: string) => Promise<void>>(() => Promise.resolve());
-vi.mock("@tauri-apps/plugin-opener", () => ({
-  openUrl: (url: string) => openUrlMock(url),
-}));
-
-const revealLogsMock = vi.fn<() => Promise<void>>(() => Promise.resolve());
 vi.mock("../../logger", () => ({
-  getAppVersion: () => Promise.resolve("9.9.9"),
-  getLogDir: () => Promise.resolve("/tmp/sparkle-logs"),
-  revealLogs: () => revealLogsMock(),
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-}));
-
-const checkForUpdatesMock = vi.fn<() => Promise<string>>(() => Promise.resolve("up-to-date"));
-vi.mock("../../services/updaterService", () => ({
-  checkForUpdates: () => checkForUpdatesMock(),
-}));
-
-vi.mock("../SupportModal", () => ({
-  SupportModal: ({ onClose }: { onClose: () => void }) => (
-    <div data-testid="support-modal">
-      <button onClick={onClose}>close support</button>
-    </div>
-  ),
 }));
 
 vi.mock("../SettingsDialog", () => ({
@@ -91,7 +69,7 @@ vi.mock("../../services/accountSelection", () => ({
   invalidateAccountState: () => invalidateAccountStateMock(),
 }));
 
-import { CHANGELOG_URL, checkLabel, ConciergeTopRight, KebabMenu } from "./KebabMenu";
+import { ConciergeTopRight, KebabMenu } from "./KebabMenu";
 import { useUiStore } from "../../stores/uiStore";
 
 afterEach(() => {
@@ -102,26 +80,11 @@ afterEach(() => {
 
 const trigger = () => screen.getByRole("button", { name: "Sparkle menu" });
 
-/** Open the menu and wait for the version to resolve (the Version entry needs it). */
+/** Open the menu (synchronous now that nothing in it waits on an async version). */
 async function openMenu() {
   fireEvent.click(trigger());
-  await screen.findByText("Version v9.9.9");
+  await screen.findByRole("menu", { name: "Sparkle menu" });
 }
-
-async function openVersionPopover() {
-  await openMenu();
-  fireEvent.click(screen.getByRole("menuitem", { name: /Version v9\.9\.9/ }));
-  return screen.getByRole("menu", { name: "Version" });
-}
-
-describe("checkLabel (pure)", () => {
-  it("pins the manual-check strings", () => {
-    expect(checkLabel("idle")).toBe("Check for updates");
-    expect(checkLabel("checking")).toBe("Checking for updates…");
-    expect(checkLabel("uptodate")).toBe("You're up to date");
-    expect(checkLabel("error")).toBe("Check failed — retry");
-  });
-});
 
 describe("KebabMenu — open/close", () => {
   it("is closed by default; the trigger carries menu-button semantics", () => {
@@ -132,19 +95,22 @@ describe("KebabMenu — open/close", () => {
     expect(screen.queryByRole("menu")).toBeNull();
   });
 
-  it("click opens a menu with Version / Support / Settings items and focuses the first", async () => {
+  it("click opens a menu whose ONLY item is Settings, and focuses it", async () => {
     render(<KebabMenu />);
     await openMenu();
     expect(trigger().getAttribute("aria-expanded")).toBe("true");
-    const menu = screen.getByRole("menu", { name: "Sparkle menu" });
-    expect(menu).toBeTruthy();
     const items = screen.getAllByRole("menuitem");
-    expect(items.map((el) => el.textContent)).toEqual([
-      "Version v9.9.9",
-      "Support",
-      "Settings",
-    ]);
+    // Version / Support / Changelog live in the bottom-right StatusStrip now — not here.
+    expect(items.map((el) => el.textContent)).toEqual(["Settings"]);
     expect(document.activeElement).toBe(items[0]);
+  });
+
+  it("no longer carries Version / Support / Changelog (they moved to the StatusStrip)", async () => {
+    render(<KebabMenu />);
+    await openMenu();
+    expect(screen.queryByRole("menuitem", { name: /Version/ })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Support" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Changelog" })).toBeNull();
   });
 
   it("Escape closes the menu and returns focus to the trigger", async () => {
@@ -155,39 +121,24 @@ describe("KebabMenu — open/close", () => {
     expect(document.activeElement).toBe(trigger());
   });
 
-  it("Escape peels the version popover FIRST, back to the Version item", async () => {
+  it("outside pointerdown closes the menu", async () => {
     render(<KebabMenu />);
-    await openVersionPopover();
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(screen.queryByRole("menu", { name: "Version" })).toBeNull();
-    expect(screen.getByRole("menu", { name: "Sparkle menu" })).toBeTruthy();
-    expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: /Version/ }));
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(screen.queryByRole("menu")).toBeNull();
-  });
-
-  it("outside pointerdown closes everything", async () => {
-    render(<KebabMenu />);
-    await openVersionPopover();
+    await openMenu();
     fireEvent.pointerDown(document.body);
     expect(screen.queryByRole("menu")).toBeNull();
   });
 
-  it("arrow keys rove focus through the menu items and wrap", async () => {
+  it("arrow keys keep focus on the single item (roving still wraps onto itself)", async () => {
     render(<KebabMenu />);
     await openMenu();
-    const [first, second, third] = screen.getAllByRole("menuitem");
-    if (!first || !second || !third) throw new Error("expected three menu items");
-    fireEvent.keyDown(first, { key: "ArrowDown" });
-    expect(document.activeElement).toBe(second);
-    fireEvent.keyDown(second, { key: "ArrowDown" });
-    expect(document.activeElement).toBe(third);
-    fireEvent.keyDown(third, { key: "ArrowDown" });
-    expect(document.activeElement).toBe(first); // wraps
-    fireEvent.keyDown(first, { key: "ArrowUp" });
-    expect(document.activeElement).toBe(third); // wraps back
-    fireEvent.keyDown(third, { key: "Home" });
-    expect(document.activeElement).toBe(first);
+    const [only] = screen.getAllByRole("menuitem");
+    if (!only) throw new Error("expected one menu item");
+    fireEvent.keyDown(only, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(only);
+    fireEvent.keyDown(only, { key: "ArrowUp" });
+    expect(document.activeElement).toBe(only);
+    fireEvent.keyDown(only, { key: "End" });
+    expect(document.activeElement).toBe(only);
   });
 
   it("ArrowDown on the closed trigger opens the menu", async () => {
@@ -197,70 +148,7 @@ describe("KebabMenu — open/close", () => {
   });
 });
 
-describe("KebabMenu — version popover", () => {
-  it("opens with Check for updates / Open logs / Changelog and focuses its first item", async () => {
-    render(<KebabMenu />);
-    const popover = await openVersionPopover();
-    const labels = Array.from(popover.querySelectorAll('[role="menuitem"]')).map(
-      (el) => el.textContent,
-    );
-    expect(labels).toEqual(["Check for updates", "Open logs in Finder →", "Changelog"]);
-    expect(document.activeElement?.textContent).toBe("Check for updates");
-  });
-
-  it("Changelog opens the changelog URL and closes the menu", async () => {
-    render(<KebabMenu />);
-    await openVersionPopover();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Changelog" }));
-    expect(openUrlMock).toHaveBeenCalledWith(CHANGELOG_URL);
-    expect(screen.queryByRole("menu")).toBeNull();
-  });
-
-  it("Open logs reveals the log folder and closes the menu", async () => {
-    render(<KebabMenu />);
-    await openVersionPopover();
-    fireEvent.click(screen.getByRole("menuitem", { name: /Open logs in Finder/ }));
-    expect(revealLogsMock).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("menu")).toBeNull();
-  });
-
-  it("Check for updates → up-to-date shows the inline confirmation", async () => {
-    checkForUpdatesMock.mockResolvedValueOnce("up-to-date");
-    render(<KebabMenu />);
-    await openVersionPopover();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Check for updates" }));
-    expect(await screen.findByText("You're up to date")).toBeTruthy();
-    expect(checkForUpdatesMock).toHaveBeenCalledOnce();
-  });
-
-  it("Check for updates → error shows the retry affordance", async () => {
-    checkForUpdatesMock.mockResolvedValueOnce("error");
-    render(<KebabMenu />);
-    await openVersionPopover();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Check for updates" }));
-    expect(await screen.findByText("Check failed — retry")).toBeTruthy();
-  });
-
-  it("Check for updates → update-available closes the menu (the banner takes over)", async () => {
-    checkForUpdatesMock.mockResolvedValueOnce("update-available");
-    render(<KebabMenu />);
-    await openVersionPopover();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Check for updates" }));
-    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
-  });
-});
-
 describe("KebabMenu — reused surfaces", () => {
-  it("Support opens the reused SupportModal (menu closes); its onClose unmounts it", async () => {
-    render(<KebabMenu />);
-    await openMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Support" }));
-    expect(screen.queryByRole("menu")).toBeNull();
-    expect(screen.getByTestId("support-modal")).toBeTruthy();
-    fireEvent.click(screen.getByText("close support"));
-    expect(screen.queryByTestId("support-modal")).toBeNull();
-  });
-
   it("Settings opens the reused SettingsDialog (menu closes); its onClose unmounts it", async () => {
     render(<KebabMenu />);
     await openMenu();

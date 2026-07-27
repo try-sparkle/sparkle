@@ -139,13 +139,20 @@ describe("isMainWindowSearch (only the app window polls)", () => {
     expect(isMainWindowSearch("?project=p1")).toBe(true);
   });
 
-  it("the tray + capture webviews do NOT poll", () => {
+  it("the helper + capture webviews do NOT poll", () => {
     // These are the only auxiliary webviews, and `?view=` is the only marker they carry
-    // (src-tauri/src/tray.rs, capture_window.rs). The predicate used to test for an absent
+    // (src-tauri/src/helper.rs, capture_window.rs). The predicate used to test for an absent
     // `?label=`, which nothing has minted since CM-U7 part 2 — so both webviews polled too
-    // (roborev 46485-M).
-    expect(isMainWindowSearch("?view=tray")).toBe(false);
+    // (roborev 46485-M). It then pinned `?view=tray`, a webview that no longer exists, which is
+    // how the helper island shipped polling for updates a second time without failing a test.
+    expect(isMainWindowSearch("?view=helper")).toBe(false);
     expect(isMainWindowSearch("?view=capture")).toBe(false);
+  });
+
+  it("any future `?view=` webview is excluded from the poll before anyone updates this file", () => {
+    // The guard fails closed on an unrecognized view, so adding a webview in Rust cannot silently
+    // mint a second update poller (windowIdentity.isAppWindowSearch).
+    expect(isMainWindowSearch("?view=some-future-webview")).toBe(false);
   });
 
   it("a leftover ?label= from an older build no longer suppresses the poll", () => {

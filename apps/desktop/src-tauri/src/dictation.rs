@@ -703,7 +703,11 @@ impl DictationState {
         // this the worker could write a stale `focused=true` over a fresh blur and leave the mic live
         // while the window is unfocused (defeating the sparkle-9oz6 gate) — the TOCTOU roborev caught.
         let focus_gen = self.1.load(Ordering::SeqCst);
-        let sampled_focus = crate::frontmost::any_app_window_focused(app);
+        // The TYPING policy, not the frontmost one: the capture takeover is a key-accepting panel
+        // that mounts useAmbientVoice, so it must count as "focused" or the mic is never built for
+        // it (the takeover's whole reason to exist). The helper is still excluded — see
+        // frontmost::is_typing_window.
+        let sampled_focus = crate::frontmost::any_typing_window_focused(app);
         match self.take_reconcile_step(sampled_focus, focus_gen) {
             ReconcileStep::Idle => {}
             // Drop OUTSIDE the lock: `Capture::drop` pauses the cpal stream and the worker join drains
@@ -855,11 +859,13 @@ impl DictationState {
             if should_emit_blur(
                 my_gen,
                 focus_gen.load(Ordering::SeqCst),
-                // MUST stay the panel-filtered helper (sparkle-9oz6): a non-activating panel can
-                // hold key focus while the user is in another app, and counting it here would
-                // suppress this blur and leave the microphone open indefinitely. Called directly,
+                // MUST stay HELPER-filtered (sparkle-9oz6): that non-activating panel can hold key
+                // focus while the user is in another app, and counting it here would suppress this
+                // blur and leave the microphone open indefinitely. `any_typing_window_focused`
+                // excludes it for exactly that reason — it widens the policy to the CAPTURE
+                // takeover only, which is where the user is actively narrating. Called directly,
                 // with no local wrapper that could drift back to an unfiltered fold.
-                crate::frontmost::any_app_window_focused(&app),
+                crate::frontmost::any_typing_window_focused(&app),
             ) {
                 // The app may be tearing down by the time this deferred body runs — `state::<T>()`
                 // PANICS if the DictationState was already removed during shutdown (
