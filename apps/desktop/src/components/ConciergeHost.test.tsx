@@ -16,6 +16,9 @@ import type {
  *  The `dispatchConciergeAnswer` mock below keeps its own narrower literal ON PURPOSE — it models
  *  an optional `path`, which the production result does not have. */
 type DeferredOutcome = ConciergeDispatchResult;
+/** For `importOriginal` in the concierge mock below — the real module's type, so pulling a genuine
+ *  export through the factory is checked rather than `any`. */
+type Concierge = typeof import("../services/concierge");
 
 // Mock the data feed + the three side-effecting services so we test the HOST's wiring: user send →
 // brain, nudge actions → dispatch/select/mute, brain deltas → thread. ConciergeColumn renders for real.
@@ -72,7 +75,12 @@ vi.mock("../services/openProjectTab", () => ({
   openProjectTab: h.openProjectTab,
   requestProjectTabFromOtherWindow: vi.fn(),
 }));
-vi.mock("../services/concierge", () => ({
+vi.mock("../services/concierge", async (importOriginal) => ({
+  // The REAL sentinels and the REAL matcher, not hand-copies: the host now filters error EVENTS by
+  // detail (roborev 53460/53462), so a stubbed list or predicate would let the host and Rust drift
+  // while these rows stayed green.
+  SUPERSEDED_DETAILS: (await importOriginal<Concierge>()).SUPERSEDED_DETAILS,
+  isSupersededDetail: (await importOriginal<Concierge>()).isSupersededDetail,
   startConciergeTurn: h.startConciergeTurn,
   onConciergeDelta: (cb: (e: { id: string; text: string }) => void) => {
     h.brain.delta = cb;
@@ -152,6 +160,9 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 // string, and asserting the literal on each side is what pins that they stay shared. A hand-synced
 // copy here would turn a wording tweak into a red test for a non-bug (roborev 53044).
 import { ConciergeHost, TRIAL_SPENT_TEXT } from "./ConciergeHost";
+// Through the mock above, which re-exports the REAL array — so these rows use the same literals the
+// host filters on and the same ones Rust emits.
+import { SUPERSEDED_DETAILS } from "../services/concierge";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { StatusBand } from "../engine/buildSections";
 
@@ -339,6 +350,32 @@ describe("ConciergeHost", () => {
     act(() => h.brain.error?.({ id: "t1", detail: "spawn failed" }));
     expect(await findInThread(/couldn't reach my brain/i)).toBeTruthy();
   });
+
+  // A sentinel detail on the EVENT path (roborev 53460). startConciergeTurn silences these on the
+  // invoke-rejection path, but an error EVENT carrying the same string was not filtered by detail at
+  // all — its only guard was supersededTurn, and that misses a turn which failed before streaming
+  // anything, because the send-time floor can only retire ids an event has been SEEN for. The turn
+  // id here is deliberately one no delta ever arrived for, which is exactly that hole.
+  //
+  // Typing must stay ON: the turn that displaced this one is the one still talking.
+  it.each(SUPERSEDED_DETAILS.map((d) => [d] as const))(
+    "an error event whose detail is %s is silent — no bubble, no typing reset",
+    async (detail) => {
+      h.feed = feedWith("approval");
+      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+      // A brain turn has to be IN FLIGHT for "don't reset typing" to mean anything. Routing is a
+      // promise now, so the indicator only appears once the router has said "sparkle".
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
+      fireEvent.click(screen.getByText("Send"));
+      await settle();
+      expect(screen.queryByLabelText("Sparkle is typing")).toBeTruthy();
+
+      act(() => h.brain.error?.({ id: "9", detail }));
+      expect(queryInThread(/couldn't reach my brain/i)).toBeNull();
+      // Still typing — the displacing turn owns the indicator.
+      expect(screen.queryByLabelText("Sparkle is typing")).toBeTruthy();
+    },
+  );
 
   // Each refused path gets its OWN remedy, and the remedies genuinely differ: Retry for a pane that
   // gave up, "use its own pane" for a cloud agent. Falling back to the generic "I couldn't send the

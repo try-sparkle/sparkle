@@ -50,6 +50,18 @@ export const SUPERSEDED_DETAILS = [
   "concierge_turn: cancelled",
 ] as const;
 
+/** Is this failure detail one of those NON-failures? A real exported function rather than a rule
+ *  each site restates (roborev 53460/53462): there are three places that must agree — the
+ *  invoke-rejection catch, the `concierge:error` listener that owns `currentSessionId`, and the
+ *  host's error handler that owns the thread and the typing indicator — and a fourth will show up.
+ *  A site that open-codes `.some(...)` is a site that can be forgotten when the rule changes.
+ *
+ *  Substring, not equality: Tauri wraps a command's `Err` string, and the retry path can fold the
+ *  sentinel into a longer detail. */
+export function isSupersededDetail(detail: string): boolean {
+  return SUPERSEDED_DETAILS.some((d) => detail.includes(d));
+}
+
 /** The `id` used for errors synthesized on THIS side of the bridge (a rejected invoke/listen),
  *  where no Rust turn token exists. */
 export const CONCIERGE_LOCAL_ERROR_ID = "local";
@@ -100,7 +112,13 @@ function ensureWired(): Promise<void> {
         listen<ConciergeErrorEvent>("concierge:error", (ev) => {
           // The Rust side already retried a stale --resume once; if the turn still failed, drop the
           // session id so the NEXT turn starts fresh rather than resuming into the same failure.
-          currentSessionId = null;
+          //
+          // UNLESS it is a supersession sentinel (roborev 53460/53462): that turn did not fail, the
+          // user displaced it, and the turn that displaced it is still talking IN THAT SESSION.
+          // Dropping the id there costs the concierge its whole conversation — the next turn starts
+          // a fresh Claude session and forgets everything the user has said. The session is this
+          // module's to protect; the host filters the same sentinels for the UI.
+          if (!isSupersededDetail(ev.payload.detail)) currentSessionId = null;
           dispatch(errorCallbacks, ev.payload);
         }),
       ]);
@@ -164,7 +182,7 @@ export async function startConciergeTurn(
     // ordinary outcomes of two fast sends, and surfacing them would post "I couldn't reach my
     // brain just now" AND clear the typing indicator — for the live turn that is still streaming,
     // since a local error carries no turn id and so bypasses supersededTurn (roborev 53186).
-    if (SUPERSEDED_DETAILS.some((d) => detail.includes(d))) {
+    if (isSupersededDetail(detail)) {
       console.warn("concierge: turn superseded before it started:", detail);
       return null;
     }

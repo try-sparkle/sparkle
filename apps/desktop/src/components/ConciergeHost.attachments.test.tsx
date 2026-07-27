@@ -29,7 +29,12 @@ vi.mock("../services/openProjectTab", () => ({
   openProjectTab: h.openProjectTab,
   requestProjectTabFromOtherWindow: vi.fn(),
 }));
-vi.mock("../services/concierge", () => ({
+// Mirror EVERY export the tree touches: Vitest throws on access to a missing mock export, and the
+// host's error handler now calls `isSupersededDetail` (roborev 53460/53462). The real one, not a
+// stub, so this file can't disagree with the sentinels Rust emits.
+vi.mock("../services/concierge", async (importOriginal) => ({
+  isSupersededDetail: (await importOriginal<typeof import("../services/concierge")>())
+    .isSupersededDetail,
   startConciergeTurn: h.startConciergeTurn,
   onConciergeDelta: () => () => {},
   onConciergeDone: () => () => {},

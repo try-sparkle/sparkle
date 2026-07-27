@@ -47,6 +47,7 @@ import {
   onConciergeDone,
   onConciergeError,
   startConciergeTurn,
+  isSupersededDetail,
 } from "../services/concierge";
 import {
   agentCanAcceptInput,
@@ -543,6 +544,19 @@ export function ConciergeHost({
     });
     const offError = onConciergeError((e) => {
       if (supersededTurn(e.id)) {
+        delete brainTextRef.current[e.id];
+        return;
+      }
+      // A sentinel detail is never a failure to TELL the user about — it means their own newer send
+      // (or cancel) displaced this turn, and that newer turn is the one streaming (roborev 53460).
+      // `startConciergeTurn` already silences these on the invoke-rejection path; this closes the
+      // EVENT path, which was unfiltered by detail and whose only guard was `supersededTurn` above —
+      // and that guard misses a turn which failed before streaming anything, because the send-time
+      // floor can only retire ids an event has been seen for.
+      //
+      // Deliberately does NOT clear typing, exactly as the superseded branch above doesn't: the
+      // turn that displaced this one is still talking and owns the indicator.
+      if (isSupersededDetail(e.detail)) {
         delete brainTextRef.current[e.id];
         return;
       }

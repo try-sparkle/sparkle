@@ -199,6 +199,25 @@ fn may_install(kind: TurnKind, token: u64, retire_below: u64, slot_holds: Option
     }
 }
 
+/// Did a failed retry SPAWN fail because the user moved on, rather than because anything is wrong?
+/// Then it must emit nothing at all (roborev 53460) — the same silence the reader keeps for
+/// `!outcome.owned`.
+///
+/// Two independent signals, either sufficient, because they are read at slightly different moments:
+///
+/// * the error IS `SUPERSEDED_ERR`, which `spawn_turn` returns only when it refused to install; and
+/// * the floor is above our token, which is true for every refusal of a continuation by
+///   construction — a continuation is refused when it is retired, or when the slot is occupied, and
+///   an occupant can only be a send that published its floor above us before installing.
+///
+/// A REAL function called from the retry site, so the rule is testable and deleting the call leaves
+/// a dead-code warning (same pattern as `cancelled_during_prep`). A genuine spawn failure — no fork,
+/// no pipe — matches neither signal and is still surfaced to the user, which is the whole point of
+/// not simply always going quiet here.
+fn refused_retry_stays_silent(spawn_err: &str, token: u64, retire_below: u64) -> bool {
+    spawn_err == SUPERSEDED_ERR || is_retired(token, retire_below)
+}
+
 /// Pure half of the retirement rule: a turn is retired once a LATER send (or a cancel) has
 /// published a floor above its token. Split out so the rule is testable without a Tauri app.
 fn is_retired(token: u64, retire_below: u64) -> bool {
@@ -864,8 +883,28 @@ pub async fn concierge_turn(
                     emit_outcome(&read_app, &id, retry);
                 }
                 Err(e) => {
-                    // Couldn't even spawn the retry; surface the original failure, folding the
-                    // spawn error in only when the first run gave us nothing better to show.
+                    // REFUSED at the install site, rather than broken: stay silent, exactly as the
+                    // reader does for `!outcome.owned` (roborev 53460). The stricter continuation
+                    // rule makes this outcome newly reachable, and emitting here re-opens roborev
+                    // 53186 from the other side: a `concierge:error` for a turn the user has moved
+                    // past, carrying the internal sentinel as its detail. The frontend silences that
+                    // sentinel only in `startConciergeTurn`'s invoke-rejection catch — an error
+                    // EVENT with the same detail is not filtered — and its one remaining defence,
+                    // `supersededTurn`, does not cover this id: the send-time floor only retires ids
+                    // an event has been SEEN for, and a turn that failed before streaming anything
+                    // has none, so the id rides on the newer send's invoke response, which an event
+                    // can beat. The visible result would be "I couldn't reach my brain just now"
+                    // plus a setTyping(false) over the turn that IS streaming.
+                    if refused_retry_stays_silent(&e, token, RETIRE_BELOW.load(Ordering::Relaxed)) {
+                        tracing::info!(
+                            id = %id,
+                            "concierge: the retry was refused; a newer turn owns the conversation"
+                        );
+                        return;
+                    }
+                    // Genuinely couldn't spawn the retry (no fork, no pipe) and the user is still
+                    // waiting: surface the original failure, folding the spawn error in only when
+                    // the first run gave us nothing better to show.
                     let mut original = outcome;
                     if original.stderr.trim().is_empty() && original.error_detail.is_none() {
                         original.stderr = e;
@@ -1164,6 +1203,29 @@ mod tests {
 
         // The floor still comes first, whatever the kind.
         assert!(!may_install(TurnKind::Continuation, 5, 6, None));
+    }
+
+    /// A retry REFUSED at the install site emits nothing — the silence the reader keeps for
+    /// `!outcome.owned`. The stricter continuation rule above makes this reachable, and emitting
+    /// would re-open roborev 53186 from the other side: a user-facing "I couldn't reach my brain
+    /// just now" (sometimes carrying the internal sentinel verbatim) plus a typing reset, over the
+    /// newer turn that IS streaming (roborev 53460).
+    #[test]
+    fn a_retry_refused_at_the_install_site_says_nothing() {
+        // Refused: the sentinel says so outright…
+        assert!(refused_retry_stays_silent(SUPERSEDED_ERR, 5, 5));
+        // …and the floor says so independently, which is what covers a send that landed between the
+        // refusal and this check.
+        assert!(refused_retry_stays_silent("spawn failed: EAGAIN", 5, 6));
+
+        // A GENUINE spawn failure with the user still waiting must still be surfaced — going quiet
+        // unconditionally here would leave the bubble in-progress forever with no terminal event.
+        assert!(!refused_retry_stays_silent("concierge_turn: spawn failed: EAGAIN", 5, 5));
+        assert!(!refused_retry_stays_silent("concierge_turn: child has no stdout", 5, 5));
+
+        // Not a substring match: only the sentinel itself, so a stderr string that happens to quote
+        // it does not silence a real failure.
+        assert!(!refused_retry_stays_silent(&format!("wrapped: {SUPERSEDED_ERR}"), 5, 5));
     }
 
     /// Cancel still retires everything already RESERVED — the turns that do have a token, whether

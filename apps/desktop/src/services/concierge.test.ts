@@ -36,6 +36,7 @@ import {
   CONCIERGE_LOCAL_ERROR_ID,
   cancelConciergeTurn,
   getConciergeSessionId,
+  isSupersededDetail,
   onConciergeDelta,
   onConciergeDone,
   onConciergeError,
@@ -158,6 +159,48 @@ describe("concierge service", () => {
       "concierge_turn: superseded before install",
       "concierge_turn: cancelled",
     ]);
+  });
+
+  // A superseded turn is not a failed one, and only a FAILED turn should cost the session
+  // (roborev 53460/53462). The retry path can emit `concierge:error` carrying the sentinel for a turn
+  // the user displaced — dropping the id there makes the NEXT turn start a fresh Claude session, so
+  // the concierge forgets the entire conversation while the turn that displaced it is still talking
+  // in that very session.
+  it("a SUPERSEDED error event keeps the session; a real failure still drops it", async () => {
+    await startConciergeTurn("first");
+    harness.handlers.get("concierge:done")?.({
+      payload: { id: "1", sessionId: "sess-KEEP", text: "ok" },
+    });
+    expect(getConciergeSessionId()).toBe("sess-KEEP");
+
+    // Superseded — the session survives, and the next turn still resumes into it.
+    harness.handlers.get("concierge:error")?.({
+      payload: { id: "1", detail: SUPERSEDED_DETAILS[0] },
+    });
+    expect(getConciergeSessionId()).toBe("sess-KEEP");
+    await startConciergeTurn("second");
+    expect(turnArgs(1).resumeSessionId).toBe("sess-KEEP");
+
+    // Folded into a longer detail by the retry path — still a supersession, still not a failure.
+    harness.handlers.get("concierge:error")?.({
+      payload: { id: "1", detail: `something else; ${SUPERSEDED_DETAILS[1]}` },
+    });
+    expect(getConciergeSessionId()).toBe("sess-KEEP");
+
+    // A GENUINE failure still drops it, so a stale resume can't be retried into forever.
+    harness.handlers.get("concierge:error")?.({
+      payload: { id: "2", detail: "Claude usage limit reached" },
+    });
+    expect(getConciergeSessionId()).toBeNull();
+  });
+
+  it("isSupersededDetail matches the sentinels as substrings and nothing else", () => {
+    for (const d of SUPERSEDED_DETAILS) {
+      expect(isSupersededDetail(d)).toBe(true);
+      expect(isSupersededDetail(`wrapped: ${d} (code 1)`)).toBe(true);
+    }
+    expect(isSupersededDetail("Claude usage limit reached")).toBe(false);
+    expect(isSupersededDetail("")).toBe(false);
   });
 
   it.each(SUPERSEDED_DETAILS.map((d) => [d] as const))(
