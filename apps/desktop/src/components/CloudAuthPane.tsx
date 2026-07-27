@@ -216,7 +216,7 @@ const subLabel: CSSProperties = {
 
 const panel: CSSProperties = {
   background: C.forest,
-  border: `1px solid ${C.forest}`,
+  border: `1px solid ${C.hairline}`,
   borderRadius: 9,
   padding: "14px 16px",
   display: "flex",

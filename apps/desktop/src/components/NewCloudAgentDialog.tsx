@@ -249,7 +249,7 @@ const titleBar: CSSProperties = {
   alignItems: "center",
   justifyContent: "space-between",
   padding: "14px 16px",
-  borderBottom: `1px solid ${C.deepForest}`,
+  borderBottom: `1px solid ${C.hairline}`,
 };
 
 const closeBtn: CSSProperties = {

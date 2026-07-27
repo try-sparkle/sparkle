@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { C, FONT, ON_BRAND_FILL_DARK } from "../theme/colors";
+import { C, FONT, ON_GOLD_FILL } from "../theme/colors";
 import { useHintMode } from "../keyboardHints/useHintMode";
 import {
   AGENT_HINT,
@@ -245,13 +245,17 @@ export function HintOverlay() {
             // options" complaint. Centering ties each badge unambiguously to one row.
             top: Math.max(2, c.rect.top + c.rect.height / 2 - BADGE_H / 2),
             left: Math.max(2, c.rect.left - 6),
-            background: C.amber, // gold #e0982f
-            color: ON_BRAND_FILL_DARK, // dark navy #0a1a3f, constant across themes
+            // The themed opaque-gold PAIR (fill + the ink that sits on it): the prototype's
+            // gold under near-black in dark, a deep gold under light ink in light. These badges
+            // float over whatever is on screen, including light mode's white terminal. This said
+            // "gold #e0982f" while painting the amber STATUS token; the gold token exists now.
+            background: C.goldFill,
+            color: ON_GOLD_FILL,
             font: `700 ${BADGE_LINE_H}px/1 ${FONT.mono}`,
             letterSpacing: 0.5,
             padding: `${BADGE_PAD_Y}px ${BADGE_PAD_X}px`,
             borderRadius: 4,
-            border: `${BADGE_BORDER}px solid ${ON_BRAND_FILL_DARK}`,
+            border: `${BADGE_BORDER}px solid ${ON_GOLD_FILL}`,
             boxShadow: "0 1px 3px rgba(0,0,0,0.4)",
             textTransform: "uppercase",
           }}

@@ -74,7 +74,6 @@ import { maybePauseOnSubmit } from "../services/dictationControls";
 import { useConciergeDictation } from "../useConciergeDictation";
 import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useSpendPill } from "../stores/spendStore";
 
 let seq = 0;
 const nextId = (p: string) => `${p}-${(seq += 1)}`;
@@ -213,14 +212,61 @@ function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
   return feed.projects.flatMap((p) => p.agents);
 }
 
-/** The agents the concierge should surface right now: in scope, un-muted, needing you.
+/** EVERYTHING column one accounts for right now: in scope, un-muted, needing you, and not already
+ *  spoken for by an ancestor's row.
  *
  *  `band === "needs_you"` is the interruption gate. It covers exactly what the old `priority < 2`
  *  did — waiting, approval, blocked, errored — and, critically, still excludes `unmerged`, which
  *  bands `done`. On the reported fleet 27 of 51 agents were committed-but-unlanded; surfacing them
- *  here is 27 nudge cards (see services/conciergeFeed.conciergeBand). */
+ *  here is 27 nudge cards (see services/conciergeFeed.conciergeBand).
+ *
+ *  These are THE SAME THREE GATES `conciergeFeed` counts `scopedCounts` on, and that is the point:
+ *  the vitals line states `scopedCounts.needs_you` while the thread renders this list, so they are
+ *  one population by construction rather than two computations that have to be kept in step. They
+ *  did drift — `scopedCounts` counted a red worker AND the orchestrator that inherited its red, so
+ *  the line said "2 Need you" over a thread holding one card.
+ *
+ *  Note the remaining asymmetry is the SAFE direction. `muted` can make this set smaller than the
+ *  rows the filter leaves standing, so the sentence can under-state. That is fine — every row it
+ *  promised is there, plus one you asked not to be interrupted about. Over-stating is the bug,
+ *  because the missing rows do not exist to be shown. */
+function accountedAgents(feed: ConciergeFeed): ConciergeAgent[] {
+  return allAgents(feed).filter(
+    (a) => a.inScope && !a.muted && !a.representedElsewhere && a.band === "needs_you",
+  );
+}
+
+/** The half of {@link accountedAgents} that is OWED A ROW in column two — the digest's pool.
+ *
+ *  `topLevel` is what makes the digest's number honest. Every LINE this feeds is clickable, and the
+ *  click isolates that band in the Build column — which narrows top-level rows and nothing else.
+ *  Folding a worker into a line's count would state a number the click cannot produce: two blocked
+ *  workers rendered "2 Need you in web", and clicking it left an empty column plus an empty-state
+ *  chip. */
 function surfacedAgents(feed: ConciergeFeed): ConciergeAgent[] {
-  return allAgents(feed).filter((a) => a.inScope && !a.muted && a.band === "needs_you");
+  return accountedAgents(feed).filter((a) => a.topLevel);
+}
+
+/** The other half: accounted-for agents with NO row of their own, which therefore have to speak for
+ *  themselves.
+ *
+ *  They are digested by the SAME rule as everything else — one keeps its card, two or more become a
+ *  line — but as the `rowless` variant, because a normal line's count is a promise about rows and
+ *  these have none. This population is NOT bounded by one: gap 3 below fires once per blocked
+ *  worker, so several under an absent or in-motion parent used to be several cards, which is the
+ *  card wall the digest exists to prevent, reintroduced through the one path that skipped it.
+ *
+ *  What survives from the card era is the AFFORDANCE, not the shape: a single one still gets a card
+ *  whose "Show me" reveals it (`openProjectTab` selects it, and the sidebar pops a red worker out
+ *  under its orchestrator), and the collapsed line's click does that same reveal for its lead.
+ *
+ *  Non-empty only when a rowless agent's red reached nobody — a worker with no `parentId`, one whose
+ *  orchestrator is not in the fleet, or a `blocked` one whose bubble `withRedWorkerAttention`
+ *  suppressed while its orchestrator was in motion. Before this existed, the `topLevel` gate turned
+ *  all three into silence: no row, no card, no line, no count. See
+ *  `ConciergeAgent.representedElsewhere` for why the test is band equality and not kind. */
+function unrepresentedAgents(feed: ConciergeFeed): ConciergeAgent[] {
+  return accountedAgents(feed).filter((a) => !a.topLevel);
 }
 
 function actionsFor(a: ConciergeAgent): ConciergeNudgeAction[] {
@@ -248,7 +294,10 @@ function agentToNudge(a: ConciergeAgent): ConciergeNudge {
 
 /** Compact context handed to the headless brain so its reply is grounded in what's actually happening. */
 function buildSnapshot(feed: ConciergeFeed, userText: string): string {
-  const surfaced = surfacedAgents(feed);
+  // The FULL accounted population, rows and rowless alike — this states `scopedCounts.needs_you`
+  // right below, and listing only the row-owning half would hand the brain a count it can't see the
+  // items behind.
+  const surfaced = accountedAgents(feed);
   const lines = surfaced.map(
     (a) => `- [${a.projectName}] ${a.name}: ${a.statusLabel} (${bandLabel(a.band)})`,
   );
@@ -1129,16 +1178,52 @@ export function ConciergeHost({
         const a = resolveAgent(n.id);
         if (a) openProjectTab(a.projectId, a.id);
       },
-      // The digest's whole purpose: hand off to column two instead of duplicating it. Two halves:
-      // reveal the lead agent, AND narrow the Build column to the band the line is about — clicking
-      // "17 Need you" should leave you looking at those seventeen, not at all fifty with one of them
-      // selected. `isolateStatusBand` is the SAME state the sidebar's own filter chips render, so
-      // the effect is visible up there and clears with the ordinary "Show all" rather than being an
-      // invisible mode (see uiStore / engine/buildSections).
+      // The digest's whole purpose: hand off to column two instead of duplicating it.
+      //
+      // The founder's ask in full: "I just want Sparkle to be telling me that I have two agents that
+      // need my attention. If I click on the two agents part of that text then it filters the build
+      // column out to only show me the agents that need attention." Opening the project was only the
+      // first half — without the second, you click "3 Need you" and still face the whole list.
+      //
+      // RE-DERIVED FROM THE LIVE FEED, not from the message that was rendered. A digest line can sit
+      // on screen across several feed ticks, so the click has to ask what is true NOW: the group may
+      // have shrunk, or its lead agent may have answered and resolved. `buildDigest` groups by
+      // `project::band` and `ConciergeDigestGroup.id` is that key, so matching the clicked message's
+      // id against the freshly-built groups both finds the live group and, by finding nothing, is how
+      // a stale click declines to open a dead agent.
       onDigestClick: (d: ConciergeDigestMessage) => {
-        useUiStore.getState().isolateStatusBand(d.band);
-        const a = resolveAgent(d.leadAgentId);
-        if (a) openProjectTab(a.projectId, a.id);
+        // Re-derived from the population the line was BUILT from, so a stale rowless click can't be
+        // answered by a row group that happens to share a project and band (their ids differ for
+        // exactly this reason).
+        const feed = feedRef.current;
+        const live =
+          d.variant === "rowless"
+            ? buildDigest(unrepresentedAgents(feed), "rowless").groups.find((g) => g.id === d.id)
+            : buildDigest(surfacedAgents(feed)).groups.find((g) => g.id === d.id);
+        if (!live) return; // resolved out from under the click — open nothing, filter nothing
+        // A ROWLESS line REVEALS, it does not filter. Its agents have no row, so `isolateStatusBand`
+        // has nothing of theirs to leave standing — and worse, it would hide the very row the reveal
+        // needs: the gap-3 case is a blocked worker under an orchestrator that bands `running`, so
+        // isolating `needs_you` removes the orchestrator the worker pops out under. Opening the
+        // project on the lead agent is exactly what that agent's own card's "Show me" did, which is
+        // the honest affordance for a population that owns no rows.
+        if (live.variant === "rowless") {
+          openProjectTab(live.projectId, live.leadAgentId);
+          return;
+        }
+        // ORDER IS LOAD-BEARING. `isolateStatusBand` narrows whichever project is SELECTED, so
+        // selecting first is what makes the filter land on the list the sentence named. Filtering
+        // first narrows somebody else's column for the frame in between, which reads as "my agents
+        // just vanished".
+        openProjectTab(live.projectId, live.leadAgentId);
+        // The SAME `statusFilter` the sidebar's own chips write (stores/uiStore.isolateStatusBand),
+        // deliberately not a filter of the digest's own: one state means the chips render what the
+        // click did, "Show all" clears it like any hand-toggled filter, and the two can never
+        // disagree about what column two is showing.
+        //
+        // The revealed agent is safe from the filter it just turned on: `live.leadAgentId` comes
+        // from this band's surfaced set, so the selected row is one the filter keeps.
+        useUiStore.getState().isolateStatusBand(live.band);
       },
       onNudgeAction: (n: ConciergeNudge, actionId: string) => {
         const a = resolveAgent(n.id);
@@ -1160,10 +1245,6 @@ export function ConciergeHost({
     return feed.projects.find((p) => p.id === feed.pinnedProjectId)?.name;
   }, [feed]);
 
-  // Live cross-project spend "today" (CM-U8): a shared 60s poll + focus refresh, pre-formatted as
-  // "$X.XX" (or "$—" until the first read). See stores/spendStore.ts.
-  const spendText = useSpendPill();
-
   // NOTE (bead sparkle-y4ft): `messages` below gets a fresh ARRAY IDENTITY on every feed tick —
   // this memo is keyed on `feed`, which changes whenever any agent's status or a scoped count
   // moves, and clicking an item ticks the feed. ConciergeThread must therefore never treat a new
@@ -1176,11 +1257,18 @@ export function ConciergeHost({
     // stacked above the compose box — the chat pushed off screen, and column one reduced to an
     // unreadable copy of column two.
     const { cards, groups } = buildDigest(surfacedAgents(feed));
-    const nudges = cards.map(agentToNudge);
-    const digests: ConciergeMessage[] = groups.map((g) => ({
+    // Rowless agents go through the SAME rule, as the `rowless` variant — one card each is how the
+    // wall came back (a fleet with several blocked workers under absent or in-motion orchestrators
+    // is several cards). What their line may not do is state a ROW count or filter a column that
+    // has no rows to leave standing; that is the variant's job, not an exemption from digesting.
+    // See `unrepresentedAgents` and services/conciergeDigest.DigestVariant.
+    const rowless = buildDigest(unrepresentedAgents(feed), "rowless");
+    const nudges = [...cards, ...rowless.cards].map(agentToNudge);
+    const digests: ConciergeMessage[] = [...groups, ...rowless.groups].map((g) => ({
       id: g.id,
       kind: "digest" as const,
       band: g.band,
+      variant: g.variant,
       text: g.text,
       leadAgentId: g.leadAgentId,
     }));
@@ -1191,7 +1279,6 @@ export function ConciergeHost({
     return {
       scope: { pinnedProjectName },
       vitals: feed.scopedCounts,
-      spend: { amountText: spendText },
       // In arrival order. This used to be `[...chat, ...digests, ...nudges]`, which pinned every
       // notice below the entire conversation no matter when it arrived — so the digests read as
       // stuck to the bottom of the pane rather than as part of the thread.
@@ -1200,7 +1287,7 @@ export function ConciergeHost({
       attachments,
       dropActive,
     };
-  }, [feed, chat, typing, pinnedProjectName, spendText, attachments, dropActive]);
+  }, [feed, chat, typing, pinnedProjectName, attachments, dropActive]);
 
   return (
     <ConciergeColumn

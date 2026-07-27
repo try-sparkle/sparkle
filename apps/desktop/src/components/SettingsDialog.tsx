@@ -517,7 +517,7 @@ const dialog: CSSProperties = {
   display: "flex",
   flexDirection: "column",
   background: C.deepForest,
-  border: `1px solid ${C.forest}`,
+  border: `1px solid ${C.hairline}`,
   borderRadius: 12,
   boxShadow: "0 24px 64px rgba(0,0,0,0.5)",
   zIndex: 41,
@@ -530,7 +530,7 @@ const titleBar: CSSProperties = {
   alignItems: "center",
   justifyContent: "space-between",
   padding: "14px 18px",
-  borderBottom: `1px solid ${C.forest}`,
+  borderBottom: `1px solid ${C.hairline}`,
   flex: "none",
 };
 
@@ -554,7 +554,7 @@ const bodyRow: CSSProperties = {
 const rail: CSSProperties = {
   width: 184,
   flex: "none",
-  borderRight: `1px solid ${C.forest}`,
+  borderRight: `1px solid ${C.hairline}`,
   background: C.forest,
   padding: "12px 9px",
   display: "flex",
@@ -583,7 +583,11 @@ const searchInput: CSSProperties = {
   boxSizing: "border-box",
   background: C.deepForest,
   color: C.cream,
-  border: `1px solid ${C.deepForest}`,
+  // The FILL stays `deepForest` (a well sunk into the `forest` rail); the BORDER is a hairline.
+  // Excluding this as "already zero-contrast" only held for the border against its OWN fill —
+  // the field sits in a rail painted `C.forest`, and that pair fell from 1.50:1 to 1.11:1 with
+  // the repaint, so the box had no outer boundary left either. See theme/colors `hairline`.
+  border: `1px solid ${C.hairline}`,
   borderRadius: 8,
   padding: "7px 10px 7px 28px",
   fontSize: 13,

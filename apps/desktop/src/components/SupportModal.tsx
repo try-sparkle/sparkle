@@ -253,7 +253,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
                 <div
                   style={{
                     background: C.forest,
-                    border: `1px solid ${C.deepForest}`,
+                    border: `1px solid ${C.hairline}`,
                     borderRadius: 10,
                     padding: "8px 12px",
                   }}
@@ -317,7 +317,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               flex: "1 1 auto",
               resize: "none",
               background: C.forest,
-              border: `1px solid ${C.forest}`,
+              border: `1px solid ${C.hairline}`,
               borderRadius: 8,
               padding: "8px 10px",
               color: C.cream,
@@ -353,7 +353,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
         </div>
 
         {/* Always-visible ticket path (spec §7). */}
-        <div style={{ borderTop: `1px solid ${C.forest}`, marginTop: 16, paddingTop: 14 }}>
+        <div style={{ borderTop: `1px solid ${C.hairline}`, marginTop: 16, paddingTop: 14 }}>
           {!emailKnown && (
             <input
               type="email"
@@ -365,7 +365,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
                 boxSizing: "border-box",
                 marginBottom: 10,
                 background: C.forest,
-                border: `1px solid ${C.forest}`,
+                border: `1px solid ${C.hairline}`,
                 borderRadius: 8,
                 padding: "8px 10px",
                 color: C.cream,
@@ -430,7 +430,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
             alignItems: "center",
             gap: 8,
             background: C.forest,
-            border: `1px solid ${C.forest}`,
+            border: `1px solid ${C.hairline}`,
             borderRadius: 8,
             padding: "8px 10px",
             marginBottom: 14,
@@ -503,7 +503,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
             style={{
               flex: "0 0 auto",
               background: "transparent",
-              border: `1px solid ${C.forest}`,
+              border: `1px solid ${C.hairline}`,
               color: C.muted,
               borderRadius: 8,
               padding: "10px 16px",

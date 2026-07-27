@@ -51,7 +51,7 @@ export function RoborevConsentModal() {
           disabled={busy}
           style={{
             background: "transparent",
-            border: `1px solid ${C.forest}`,
+            border: `1px solid ${C.hairline}`,
             color: C.muted,
             borderRadius: 8,
             padding: "9px 16px",

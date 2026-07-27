@@ -1,15 +1,18 @@
 // @vitest-environment jsdom
 //
-// The column shell: a full view-model renders every region (wordmark, spend pill, scope,
-// vitals, thread with all four message kinds), gestures route through the controller, and
-// the wordmark-mode derivation is pinned. Per-piece behavior lives in the sibling tests.
+// The column shell: a full view-model renders every region (brand mark, scope, vitals, thread
+// with all four message kinds), gestures route through the controller, and the wordmark-mode
+// derivation is pinned. Per-piece behavior lives in the sibling tests.
+//
+// The two store-backed header pieces are stubbed. They read their own stores rather than the
+// view-model (see ConciergeColumn's header comment), so the real ones would drag a rAF audio loop
+// and an entitlement fetch into assertions about view-model rendering. WHERE they render is
+// SparkleLogo.placement.test's subject.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-// The wordmark is now the real brand mark, which opens sparkle.ai through the Tauri opener.
-vi.mock("@tauri-apps/plugin-opener", () => ({
-  openUrl: vi.fn(() => Promise.resolve()),
-}));
+vi.mock("../LogoWaveform", () => ({ LogoWaveform: () => null }));
+vi.mock("../BalanceBadge", () => ({ BalanceBadge: () => null }));
 
 import { ConciergeColumn, deriveWordmarkMode } from "./ConciergeColumn";
 import type { ConciergeController, ConciergeNudge, ConciergeViewModel } from "./types";
@@ -29,7 +32,6 @@ const nudge: ConciergeNudge = {
 const model: ConciergeViewModel = {
   scope: {},
   vitals: { needs_you: 1, running: 2, done: 0 },
-  spend: { amountText: "$4.12" },
   messages: [
     { id: "m1", kind: "sparkle", text: "Morning — I'm watching every open project.", speakable: true },
     { id: "m2", kind: "you", text: "Thanks, keep me posted." },
@@ -49,12 +51,11 @@ function controller(): ConciergeController {
 }
 
 describe("ConciergeColumn — view-model → rendered output", () => {
-  it("renders the wordmark, spend pill, scope, vitals, and every message kind", () => {
+  it("renders the brand mark, scope, vitals, and every message kind", () => {
     const { container } = render(<ConciergeColumn model={model} controller={controller()} />);
-    // The wordmark is the brand mark itself, not styled text — see SparkleLogo.placement.test.tsx
-    // for the full placement/accessibility contract.
-    expect(screen.getByRole("link", { name: "Sparkle" })).toBeTruthy();
-    expect(screen.getByText("$4.12")).toBeTruthy();
+    // The mark is the Sparkle.ai LOGO nested in the star field, not the literal word "Sparkle"
+    // the field used to paint — see SparkleLogo.placement.test for the one-mark contract.
+    expect(screen.getByAltText("Sparkle")).toBeTruthy();
     expect(screen.getByText("Following all projects")).toBeTruthy();
     expect(container.textContent).toContain("1 Needs you · 2 Running");
     expect(screen.getByText("Morning — I'm watching every open project.")).toBeTruthy();

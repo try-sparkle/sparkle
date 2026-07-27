@@ -86,6 +86,37 @@ describe("NudgeCard — rendering", () => {
   });
 });
 
+// The accent/ink split. `nudgeAccent()` stays the LITERAL sienna because it is interpolated into
+// color-mix() for the card's fill, border and glow (and read back here as jsdom's rgb()); the
+// BADGE on top of that fill is text, and raw sienna is under the AA floor on the near-black
+// concierge column — under it by a hair, which is exactly how it stays missed.
+//
+// The floor lives in theme/chromeContrast.test.ts, and note WHAT it measures: the badge's label
+// sits three layers up (the column, the card's sienna gradient, and then the badge's OWN
+// `color-mix(sienna 16%)` fill), so the guard composites all three. It used to stop at the
+// gradient, which let a `dangerInk` that clears 4.5 on the card but NOT on the badge ship under a
+// test named for the badge. Structural note for anyone editing `badgeStyle`: if the badge ever
+// stops painting its own fill, or paints a different percentage, that guard's stack has to move
+// with it — it is a model of this component, not of the token.
+describe("NudgeCard — the accent fills, dangerInk reads", () => {
+  it("the badge's label is the THEMED dangerInk, not the literal accent", () => {
+    render(<NudgeCard nudge={nudge} onNudgeClick={vi.fn()} onNudgeAction={vi.fn()} />);
+    const badge = screen.getByText("Needs you");
+    expect(badge.style.color).toBe(C.dangerInk);
+    expect(badge.style.color).not.toBe(rgb(C.sienna));
+    // …while the fill under it still composites the LITERAL, which is what color-mix() needs.
+    expect(badge.style.background).toContain(rgb(C.sienna));
+  });
+
+  it("the project chip is concierge GOLD — the prototype's `.nudge .proj`, never amber", () => {
+    render(<NudgeCard nudge={nudge} onNudgeClick={vi.fn()} onNudgeAction={vi.fn()} />);
+    const chip = screen.getByText("drodio-website");
+    expect(chip.style.color).toBe(C.goldInk);
+    expect(chip.style.color).not.toBe(rgb(C.amber));
+    expect(chip.style.border).toContain(rgb(C.gold));
+  });
+});
+
 describe("NudgeCard — click routing", () => {
   it("clicking the card body fires onNudgeClick with the nudge", () => {
     const onClick = vi.fn();

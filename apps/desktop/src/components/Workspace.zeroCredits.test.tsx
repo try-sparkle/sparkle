@@ -46,6 +46,12 @@ vi.mock("../services/sparkleAgent", () => ({
   shouldWarmSparkleAtLaunch: () => false,
 }));
 vi.mock("./AgentSidebar", () => ({ AgentSidebar: () => null }));
+// The concierge header's credit badge calls the REAL authStore.refresh() on mount, which asks the
+// keychain for a token over un-mocked Tauri IO, gets "no token", and clears `me` — wiping the
+// zero-balance identity these tests seed before the banner can read it. Stubbing it keeps this file
+// to its subject (WHERE the banner mounts) and honors its own header: all Tauri IO stubbed. The
+// badge's placement and refresh-on-mount are covered in SparkleLogo.placement.test.
+vi.mock("./BalanceBadge", () => ({ BalanceBadge: () => null }));
 vi.mock("./TopBar", () => ({ TopBar: () => null }));
 vi.mock("./AgentPane", () => ({ AgentPane: () => null }));
 vi.mock("./SparkleAgentPane", () => ({ SparkleAgentPane: () => null }));

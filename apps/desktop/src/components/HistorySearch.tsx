@@ -258,7 +258,7 @@ export function HistorySearch({
           boxSizing: "border-box",
           background: C.deepForest,
           color: C.cream,
-          border: `1px solid ${C.forest}`,
+          border: `1px solid ${C.hairline}`,
           borderRadius: 8,
           padding: "7px 10px",
           fontSize: 13,
@@ -271,7 +271,7 @@ export function HistorySearch({
         <div
           style={{
             marginTop: 6,
-            border: `1px solid ${C.forest}`,
+            border: `1px solid ${C.hairline}`,
             borderRadius: 8,
             overflow: "hidden",
             background: C.deepForest,
@@ -303,7 +303,7 @@ export function HistorySearch({
                       width: "100%",
                       textAlign: "left",
                       border: "none",
-                      borderBottom: `1px solid ${C.forest}`,
+                      borderBottom: `1px solid ${C.hairline}`,
                       background: "transparent",
                       color: C.cream,
                       cursor: disabled ? "default" : "pointer",
@@ -372,7 +372,7 @@ export function HistorySearch({
               alignItems: "center",
               gap: 6,
               padding: "6px 12px",
-              borderTop: `1px solid ${C.forest}`,
+              borderTop: `1px solid ${C.hairline}`,
               color: C.muted,
               fontSize: 11,
             }}

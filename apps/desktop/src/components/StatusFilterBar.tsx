@@ -65,7 +65,9 @@ export const StatusFilterBar = memo(function StatusFilterBar({
               borderStyle: "solid",
               // An ON chip carries its band's color at low alpha; an OFF chip keeps its shape but
               // drops to the neutral outline, so the row of chips never changes size on toggle.
-              borderColor: on ? dot : C.forest,
+              // That outline is `hairline`, not a depth plane: an OFF chip whose border is the
+              // plane below the sidebar has no shape left to keep under the near-black palette.
+              borderColor: on ? dot : C.hairline,
               background: on ? `${dot}1f` : "transparent",
               color: on ? statusInk(dot) : C.muted,
               fontFamily: FONT.ui,

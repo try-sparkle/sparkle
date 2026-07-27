@@ -37,6 +37,17 @@ function feedOf(n: number, band: StatusBand = "needs_you", projectName = "sparkl
     band,
     inScope: true,
     muted: false,
+    // A build agent that can claim a row of its own in column two. `surfacedAgents` filters on
+    // this, which is what keeps the count a digest line STATES equal to the rows the click leaves
+    // standing — workers surface nested under their orchestrator and can never be sidebar rows.
+    //
+    // Load-bearing in a fixture that `as unknown as ConciergeFeed`s its way past the compiler: an
+    // omitted `topLevel` is falsy, so leaving it out does not fail to compile, it silently drops
+    // every agent and the digest simply never renders. Production values only ever come from
+    // buildConciergeFeed, which stamps it.
+    topLevel: true,
+    // Nothing above it in the tree, so no ancestor row can be speaking for it.
+    representedElsewhere: false,
   }));
   const counts = { needs_you: 0, running: 0, done: 0, [band]: n };
   return {

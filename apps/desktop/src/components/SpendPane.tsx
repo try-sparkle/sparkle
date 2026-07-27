@@ -376,7 +376,7 @@ const subLabel: CSSProperties = {
 
 const panel: CSSProperties = {
   background: C.forest,
-  border: `1px solid ${C.forest}`,
+  border: `1px solid ${C.hairline}`,
   borderRadius: 9,
   padding: "14px 16px",
   display: "flex",
@@ -490,14 +490,14 @@ const th: CSSProperties = {
   fontSize: 10.5,
   textTransform: "uppercase",
   letterSpacing: 0.5,
-  borderBottom: `1px solid ${C.forest}`,
+  borderBottom: `1px solid ${C.hairline}`,
   whiteSpace: "nowrap",
 };
 
 const td: CSSProperties = {
   padding: "6px 8px",
   color: C.cream,
-  borderBottom: `1px solid ${C.forest}`,
+  borderBottom: `1px solid ${C.hairline}`,
   whiteSpace: "nowrap",
 };
 

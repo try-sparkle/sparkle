@@ -138,3 +138,34 @@ describe("AgentRow — ModelPill wiring", () => {
     expect(screen.getByTestId("model-pill")).toBeTruthy(); // the claude-terminal card has one
   });
 });
+
+// THE PILL IS A FILLED CHIP, AND IT RENDERS INSIDE THE HOVER CARD. When that card's surface moved
+// to `barSurface`, this chip's `C.deepForest` fill became a PLANE on a PLANE — 1.079/1.248
+// (dark/light) — so the "filled" chip had no visible fill left, in either theme and in both card
+// states (roborev 53616). `pillFill` is the token whose documented role is exactly this.
+//
+// Its caret moved with it. `muted` is a PLANE ink and clears the floor on no chrome fill at all
+// (the stated exception in THE NEUTRAL LADDER): on `pillFill` it would read 2.600/1.914. `cream` is
+// the ink every chrome fill carries — 6.662/6.097, which also beats the 5.886/3.890 it had before.
+// Numeric floors live in theme/chromeContrast.test.ts; what this pins is the token each site picks.
+describe("ModelPill — a filled chip on the hover card takes the FILL token, not a plane", () => {
+  const openCard = (project: Project) => {
+    seedProject(project);
+    render(<AgentSidebar project={project} />);
+    fireEvent.click(screen.getByText(TITLE));
+    return screen.getByTestId("model-pill").querySelector("button")!;
+  };
+
+  it("fills with pillFill rather than the deepForest plane", () => {
+    const button = openCard(mkProject([mkAgent()]));
+    expect(button.style.background).toBe("var(--c-pill-fill)");
+    expect(button.style.background).not.toBe("var(--c-deep-forest)");
+  });
+
+  it("its caret takes cream — the ink a chrome fill can carry — not the plane ink muted", () => {
+    const button = openCard(mkProject([mkAgent()]));
+    const caret = Array.from(button.querySelectorAll("span")).find((s) => s.textContent === "▾")!;
+    expect(caret.style.color).toBe("var(--c-cream)");
+    expect(caret.style.color).not.toBe("var(--c-muted)");
+  });
+});

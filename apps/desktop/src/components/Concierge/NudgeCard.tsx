@@ -22,13 +22,17 @@ export function nudgeAccent(): string {
   return C.sienna;
 }
 
-const badgeStyle = (accent: string): CSSProperties => ({
+/** `accent` paints the tinted fill and border (LITERAL, for color-mix); `ink` is the label on top
+ *  of it. They were one value until the near-black repaint: raw sienna is under the AA floor as
+ *  TEXT on the concierge column, so the label reads `dangerInk` — the same red, themed — while the
+ *  fill keeps the literal that color-mix() needs. See theme/colors `dangerInk`. */
+const badgeStyle = (accent: string, ink: string): CSSProperties => ({
   fontSize: 9.5,
   fontWeight: FONT_WEIGHT.bold,
   letterSpacing: "0.04em",
   padding: "2px 6px",
   borderRadius: 5,
-  color: accent,
+  color: ink,
   background: `color-mix(in srgb, ${accent} 16%, transparent)`,
   border: `1px solid color-mix(in srgb, ${accent} 60%, transparent)`,
 });
@@ -82,12 +86,15 @@ export function NudgeCard({
           marginBottom: 6,
         }}
       >
-        <span style={badgeStyle(accent)}>{label}</span>
+        <span style={badgeStyle(accent, C.dangerInk)}>{label}</span>
         <span
           style={{
             fontSize: 9.5,
-            color: C.amber,
-            border: `1px solid color-mix(in srgb, ${C.amber} 40%, transparent)`,
+            // Prototype `.nudge .proj { color: var(--gold); border: 1px solid rgba(gold,.4) }` —
+            // the project chip is concierge GOLD, not the amber status token it was standing in
+            // for. Themed ink on the label, literal gold in the color-mix border.
+            color: C.goldInk,
+            border: `1px solid color-mix(in srgb, ${C.gold} 40%, transparent)`,
             borderRadius: 5,
             padding: "1px 5px",
           }}
@@ -115,9 +122,10 @@ export function NudgeCard({
                 cursor: "pointer",
                 ...(act.kind === "primary"
                   ? {
-                      color: C.cream,
-                      background: `color-mix(in srgb, ${C.amber} 16%, transparent)`,
-                      border: `1px solid color-mix(in srgb, ${C.amber} 50%, transparent)`,
+                      // Prototype `.nudge button.primary` — a gold tint under a gold-hot label.
+                      color: C.goldHotInk,
+                      background: `color-mix(in srgb, ${C.gold} 16%, transparent)`,
+                      border: `1px solid color-mix(in srgb, ${C.gold} 50%, transparent)`,
                     }
                   : act.kind === "ghost"
                     ? {

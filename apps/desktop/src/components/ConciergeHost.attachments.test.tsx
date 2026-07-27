@@ -120,6 +120,11 @@ function feed(): ConciergeFeed {
     band: "needs_you" as const,
     inScope: true,
     muted: false,
+    // A parentless build agent — it gets a row of its own in column two, which is what the
+    // surfacing gate now also requires (see ConciergeHost.surfacedAgents).
+    topLevel: true,
+    // Nothing above it in the tree, so no ancestor row can be speaking for it.
+    representedElsewhere: false,
   };
   const counts = { needs_you: 1, running: 0, done: 0 };
   return {

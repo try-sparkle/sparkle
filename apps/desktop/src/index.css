@@ -43,32 +43,46 @@
    `:root` is the dark default; `:root[data-theme="light"]` overrides for light. Static CSS
    (not JS) so flipping <html data-theme> re-themes with no FOUC and no re-render. */
 :root {
-  --c-forest: #0a1a3f;
-  --c-deep-forest: #273962;
-  --c-concierge-surface: #33477a;
-  --c-concierge-muted: #adbfe0;
-  --c-bar-surface: #0f2350;
-  --c-cream: #eaf1ff;
-  --c-muted: #8aa0c4;
-  --c-chat-bubble: #1d3a7a;
-  --c-chat-bubble-active: #2c57b0;
+  --c-forest: #05070d;
+  --c-deep-forest: #0f1220;
+  --c-concierge-surface: #191d2d;
+  --c-concierge-muted: #8b90a6;
+  --c-bar-surface: #161a2b;
+  --c-hairline: #63698c;
+  --c-pill-fill: #454d71;
+  --c-cream: #ece7da;
+  --c-muted: #8b90a6;
+  --c-chat-bubble: #354065;
+  --c-chat-bubble-active: #4e5a90;
   --c-accent-ink: #34e0f0;
-  --c-agent-idle: #8aa0c4;
+  --c-agent-idle: #8b90a6;
   --c-success-ink: #34c759;
+  --c-danger-ink: #e87b7b;
+  --c-gold-ink: #f5c26b;
+  --c-gold-hot-ink: #ffe9b8;
+  --c-gold-fill: #f5c26b;
+  --c-on-gold-fill: #090b14;
 }
 :root[data-theme="light"] {
   --c-forest: #ffffff;
   --c-deep-forest: #d9dce1;
   --c-concierge-surface: #eceef2;
-  --c-concierge-muted: #5b6b8c;
+  --c-concierge-muted: #536280;
   --c-bar-surface: #f1f4fa;
+  --c-hairline: #6e7a93;
+  --c-pill-fill: #929bad;
   --c-cream: #0a1a3f;
   --c-muted: #5b6b8c;
-  --c-chat-bubble: #d6e0f5;
-  --c-chat-bubble-active: #bccdf2;
+  --c-chat-bubble: #92ade5;
+  --c-chat-bubble-active: #5f87e0;
   --c-accent-ink: #0a1a3f;
   --c-agent-idle: #3f4e6b;
   --c-success-ink: #15803d;
+  --c-danger-ink: #aa241d;
+  --c-gold-ink: #7a5205;
+  --c-gold-hot-ink: #5c3f05;
+  --c-gold-fill: #9a6a00;
+  --c-on-gold-fill: #ffffff;
 }
 
 * {

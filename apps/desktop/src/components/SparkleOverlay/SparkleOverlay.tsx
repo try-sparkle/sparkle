@@ -26,7 +26,6 @@ import {
   galaxyDim,
   galaxySizeFactor,
   hexToRgba,
-  lightenHex,
   particleCount,
   seedAtPerch,
   stepParticle,
@@ -41,11 +40,12 @@ import { deriveFlags, type Anchor, type Mode, type OverlayState } from "./state"
 import { orbTextMaxWidth, orbTextPosition, presize } from "./presize";
 import { sparkleOverlayEnabled } from "./flag";
 
-// The prototype's gold/hot/cool sprite trio, re-derived from the app palette: brand
-// amber is the "sparkle energy" gold, its near-white tint is the hot core, and the
-// brand cyan accent replaces the prototype's periwinkle as the cool minority sparkle.
-const GOLD_HEX = lightenHex(C.amber, 0.45);
-const HOT_HEX = lightenHex(C.amber, 0.8);
+// The prototype's gold/hot/cool sprite trio. The gold and hot core are now the prototype's own
+// `--gold` / `--gold-hot` (they were `lightenHex(C.amber, …)` re-derivations only because the
+// palette had no gold token); the brand cyan accent replaces the prototype's periwinkle as the
+// cool minority sparkle. All three stay literal hex — the sprite canvas can't consume var().
+const GOLD_HEX = C.gold;
+const HOT_HEX = C.goldHot;
 const COOL_HEX = C.accent;
 
 export interface SparkleOverlayController {

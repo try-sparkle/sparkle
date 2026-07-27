@@ -190,12 +190,20 @@ export function ConciergeThread({
           // `bandColor(m.band)` rather than NudgeCard's `nudgeAccent()` because a digest is not
           // necessarily a nudge: the grouping is keyed by band, and a future surfaced band would
           // otherwise be painted in the nudge's sienna regardless of what it means.
+          //
+          // THE TWO VARIANTS GET TWO TEST IDS, deliberately. A "rows" line's number is a promise
+          // that its click leaves exactly that many rows standing in column two, and the guards for
+          // that invariant read the DOM by this id (ConciergeHost.digestFilter.test.tsx). A
+          // "rowless" line stands for agents that have no row at all, so folding it under the same
+          // id would hand those guards a number they would then check against rows — and the
+          // honest answer would look like a regression. Same chrome, same band vocabulary,
+          // different promise.
           const tint = bandColor(m.band);
           return (
             <button
               key={m.id}
               type="button"
-              data-testid="concierge-digest"
+              data-testid={m.variant === "rowless" ? "concierge-rowless-digest" : "concierge-digest"}
               data-band={m.band}
               onClick={() => onDigestClick?.(m)}
               style={{

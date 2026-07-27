@@ -380,7 +380,7 @@ const noticeStyle: CSSProperties = {
   gap: 8,
   padding: 12,
   borderRadius: 8,
-  border: `1px solid ${C.forest}`,
+  border: `1px solid ${C.hairline}`,
 };
 const noticeTitle: CSSProperties = {
   display: "flex",
@@ -420,7 +420,7 @@ const selectStyle: CSSProperties = {
   width: "100%",
   padding: "6px 8px",
   borderRadius: 6,
-  border: `1px solid ${C.forest}`,
+  border: `1px solid ${C.hairline}`,
   background: "transparent",
   color: C.cream,
   fontSize: 12.5,
@@ -446,7 +446,7 @@ const fileRow: CSSProperties = {
   alignItems: "center",
   gap: 12,
   padding: "8px 2px",
-  borderBottom: `1px solid ${C.forest}`,
+  borderBottom: `1px solid ${C.hairline}`,
 };
 const fileTitle: CSSProperties = {
   fontSize: 12.5,

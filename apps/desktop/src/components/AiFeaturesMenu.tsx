@@ -39,7 +39,7 @@ const scopeBox: CSSProperties = {
   gap: 6,
   margin: "2px 0 6px 24px",
   paddingLeft: 10,
-  borderLeft: `2px solid ${C.forest}`,
+  borderLeft: `2px solid ${C.hairline}`,
 };
 
 const scopeRow: CSSProperties = { display: "flex", gap: 6 };

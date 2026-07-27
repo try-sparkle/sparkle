@@ -282,7 +282,7 @@ const inputStyle: React.CSSProperties = {
   width: "100%",
   boxSizing: "border-box",
   background: "transparent",
-  border: `1px solid ${C.forest}`,
+  border: `1px solid ${C.hairline}`,
   borderRadius: 8,
   padding: "8px 10px",
   color: C.cream,
@@ -293,7 +293,7 @@ const inputStyle: React.CSSProperties = {
 
 const secondaryStyle: React.CSSProperties = {
   background: "transparent",
-  border: `1px solid ${C.forest}`,
+  border: `1px solid ${C.hairline}`,
   color: C.muted,
   borderRadius: 8,
   padding: "9px 16px",

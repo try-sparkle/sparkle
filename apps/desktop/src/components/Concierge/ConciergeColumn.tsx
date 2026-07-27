@@ -1,23 +1,34 @@
 // The Concierge column shell — the persistent left column that is the user's cross-project
 // minder (PRD/sparkle/concierge-mode.md; look/feel from the canonical prototype). Fixed-width
-// flex column on the deepForest sidebar surface: star-field wordmark header (spend pill
-// top-right, scope + vitals under it), the chat thread, and the compose box. Verdana per the
-// approved design — the concierge deliberately doesn't share the workspace's UI font.
+// flex column on the deepForest sidebar surface: header (remaining-credit badge top-right, the
+// Sparkle.ai mark centered inside the star field under it, then the voice waveform and scope +
+// vitals), the chat thread, and the compose box. Verdana per the approved design — the concierge
+// deliberately doesn't share the workspace's UI font.
 //
-// Purely presentational: everything rendered comes from the ConciergeViewModel, every gesture
-// leaves through the ConciergeController (see ./types). The integration unit mounts and
-// drives it; this file never touches app state.
-import { SparkleLogoLink } from "../SparkleLogoLink";
+// The THREAD is purely presentational: everything in it comes from the ConciergeViewModel and every
+// gesture leaves through the ConciergeController (see ./types). The two BRAND-CHROME pieces in the
+// header — the voice waveform and the credit badge — are the deliberate exception: they moved here
+// from the builder column (PRD/sparkle/concierge-chrome-and-credits.md) and read their own stores,
+// exactly as they did there. Routing them through the view-model would have meant teaching the
+// concierge's data layer about the mic and the entitlement for no gain; the column stays a pure
+// renderer of everything it is actually GIVEN.
 import { C } from "../../theme/colors";
+import { BalanceBadge } from "../BalanceBadge";
+import { LogoWaveform } from "../LogoWaveform";
+import { SparkleLogoLink } from "../SparkleLogoLink";
 import { ComposeBox } from "./ComposeBox";
 import { ConciergeThread } from "./ConciergeThread";
 import { ScopeVitals } from "./ScopeVitals";
-import { SpendPill } from "./SpendPill";
 import { StarfieldWordmark } from "./StarfieldWordmark";
 import type { ConciergeAnnouncement, ConciergeColumnProps, WordmarkMode } from "./types";
 
 /** Nothing announced yet. Module-level so the default prop is referentially stable. */
 const EMPTY_ANNOUNCEMENT: ConciergeAnnouncement = { seq: 0, text: "" };
+
+/** LogoWaveform carries its own 14px side padding (it used to be a direct child of the builder
+ *  column, which had none). Pull it back out so the bars line up with the mark above and the scope
+ *  line below instead of sitting inset by header-padding + its own. */
+const WAVEFORM_INSET = -14;
 
 /** The wordmark's drive when the integration doesn't pass one explicitly: buzz hard while
  *  the mic is live, gently while Sparkle types, still otherwise. Exported pure for tests. */
@@ -63,15 +74,43 @@ export function ConciergeColumn({
       }}
     >
       <div style={{ position: "relative", flex: "none", padding: "16px 16px 12px" }}>
-        <SpendPill amountText={model.spend.amountText} />
-        {/* The Sparkle.ai mark heads this column (it used to sit in the builder column's header).
-            It goes INSIDE the star field rather than in a row above it: the field's job is to live
-            through the wordmark, and the wordmark is the logo — stacking the mark over the styled
-            "Sparkle" text this used to render would print the brand name twice, in two typefaces,
-            12px apart. */}
+        {/* The remaining-credit badge, alone on its own row, hard right — the prototype's
+            top-right `.spend` pill position, as a flex row rather than the absolutely-positioned
+            pill that used to sit here: an absolute pill can only be kept off the star field by
+            hand-tuned offsets, and the field's canvas is the exact kind of neighbor that silently
+            ends up underneath one. This shows credits REMAINING (counting down), which is the
+            number the founder acts on — the deleted SpendPill showed a locally-derived trailing-24h
+            spend ESTIMATE that only ever counted up and was never billed. */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "flex-end",
+            gap: 8,
+            marginBottom: 8,
+          }}
+        >
+          <BalanceBadge />
+        </div>
+        {/* The ONE brand mark in this header: the Sparkle.ai logo, centered inside the star
+            field's box. The field used to paint the literal word "Sparkle" here, which — once the
+            logo moved into this column — put the brand name on screen twice within ~80px, left-
+            aligned above centered, with two adjacent elements whose accessible name was "Sparkle".
+            Nesting the logo in the field keeps the founder's requested mark AND the field's
+            voice-state animation (idle drift → buzz while listening/speaking), instead of trading
+            one away for the other. Centered to match the scope/vitals lines underneath. */}
         <StarfieldWordmark mode={mode}>
           <SparkleLogoLink />
         </StarfieldWordmark>
+        {/* The always-listening voice ring + waveform, directly under the mark as its name says.
+            It followed the logo out of the builder column: the mic is Sparkle's, not a per-project
+            build tool, and it belongs beside the box you talk into. Two voice surfaces here, not
+            three, and they say different things: the star field is the CONVERSATION's state — it
+            buzzes while Sparkle types a reply, which a mic meter can't show — and the waveform is
+            the live level of your own microphone. */}
+        <div style={{ marginLeft: WAVEFORM_INSET, marginRight: WAVEFORM_INSET }}>
+          <LogoWaveform />
+        </div>
         <ScopeVitals pinnedProjectName={model.scope.pinnedProjectName} counts={model.vitals} />
         {searchSlot && <div style={{ marginTop: 10 }}>{searchSlot}</div>}
       </div>

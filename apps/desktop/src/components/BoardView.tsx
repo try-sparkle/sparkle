@@ -207,7 +207,7 @@ export function BoardView({ project }: { project: Project }) {
           alignItems: "center",
           gap: 12,
           padding: "12px 16px",
-          borderBottom: `1px solid ${C.deepForest}`,
+          borderBottom: `1px solid ${C.hairline}`,
           flexShrink: 0,
         }}
       >
@@ -420,7 +420,7 @@ function Card({
     <div
       style={{
         background: C.forest,
-        border: `1px solid ${C.deepForest}`,
+        border: `1px solid ${C.hairline}`,
         borderRadius: 8,
         padding: "10px 12px",
         display: "flex",
@@ -817,7 +817,7 @@ function DetailOverlay({
           maxHeight: "100%",
           overflowY: "auto",
           background: C.deepForest,
-          border: `1px solid ${C.forest}`,
+          border: `1px solid ${C.hairline}`,
           borderRadius: 12,
           boxShadow: "0 16px 48px rgba(0,0,0,0.5)",
           padding: 20,
@@ -836,7 +836,7 @@ function DetailOverlay({
             onClick={onClose}
             style={{
               background: "transparent",
-              border: `1px solid ${C.forest}`,
+              border: `1px solid ${C.hairline}`,
               borderRadius: 6,
               color: C.muted,
               cursor: "pointer",
@@ -869,7 +869,7 @@ function DetailOverlay({
                 textTransform: "uppercase",
                 letterSpacing: 0.5,
                 color: status === "done" ? C.teal : status === "in_progress" ? C.cream : C.muted,
-                border: `1px solid ${C.forest}`,
+                border: `1px solid ${C.hairline}`,
                 borderRadius: 4,
                 padding: "2px 10px",
               }}

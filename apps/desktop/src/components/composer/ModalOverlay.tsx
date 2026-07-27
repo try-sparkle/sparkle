@@ -47,7 +47,7 @@ export function ModalOverlay({
           display: "flex",
           flexDirection: "column",
           background: C.forest,
-          border: `1px solid ${C.deepForest}`,
+          border: `1px solid ${C.hairline}`,
           borderRadius: 12,
           boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
           overflow: "hidden",

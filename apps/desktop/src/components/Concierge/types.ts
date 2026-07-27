@@ -6,6 +6,10 @@
 
 import type { ReactNode } from "react";
 import type { StatusBand } from "../../engine/buildSections";
+// A TYPE ONLY, from the pure module that owns the digest rule (no stores, no Tauri) — so the two
+// halves of a digest line, the rule that builds it and the shape that renders it, cannot disagree
+// about what variants exist.
+import type { DigestVariant } from "../../services/conciergeDigest";
 // The attachment RECORD is the one the removed AgentPane composer used (components/composer/
 // attachments.ts) — a pure, React-free, Tauri-free model, so importing it here does not break this
 // directory's "presentational only" rule, and it keeps the concierge off a parallel model.
@@ -84,6 +88,13 @@ export interface ConciergeDigestMessage {
   /** The band the collapsed agents share — the same vocabulary a nudge card carries, so a digest
    *  line and the cards it stands in for read as one urgency rather than two. */
   band: StatusBand;
+  /** What this line's number is a promise about, and therefore what its click may do.
+   *
+   *  REQUIRED, not defaulted: a "rows" line's count is a promise that the click leaves exactly that
+   *  many rows standing, and a producer that forgot the flag would make that promise on behalf of
+   *  agents that have no rows at all — the empty-column bug the digest's whole invariant is about.
+   *  Every construction site must decide. */
+  variant: DigestVariant;
   text: string;
   /** The agent to reveal when the line is clicked. */
   leadAgentId: string;
@@ -148,8 +159,6 @@ export interface ConciergeViewModel {
   /** In-scope per-band counts. Nothing needing you and nothing running renders "all calm" —
    *  see ScopeVitals.vitalsParts for why `done` is not a vital sign. */
   vitals: Record<StatusBand, number>;
-  /** Pre-formatted spend text for the top-right pill (e.g. "$4.12"). */
-  spend: { amountText: string };
   /** The thread, oldest first. Nudges are messages of kind "nudge". */
   messages: ConciergeMessage[];
   /** True while Sparkle is composing a reply — renders the typing indicator row. */

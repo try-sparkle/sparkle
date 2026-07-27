@@ -141,7 +141,12 @@ export function ModelPill({
           display: "flex",
           alignItems: "center",
           gap: 4,
-          background: C.deepForest,
+          // `pillFill` — the FILLED-chip token — not the `deepForest` PLANE. This pill renders
+          // inside AgentSidebar's hover card, whose surface moved to `barSurface`, where a
+          // `deepForest` fill measured 1.079/1.248 (dark/light): a filled chip with no fill. It is
+          // 2.098/2.537 now, and 2.449/2.795 on the card's `forest` (active-row) state. Both inks
+          // it carries were re-measured on the new fill — see the caret below.
+          background: C.pillFill,
           border: `1px solid ${C.muted}`,
           borderRadius: 5,
           color: C.cream,
@@ -155,7 +160,11 @@ export function ModelPill({
         }}
       >
         <span>{current}</span>
-        <span style={{ color: C.muted }}>▾</span>
+        {/* `cream`, the ink every chrome FILL carries — `muted` is a PLANE ink and cannot clear the
+            floor on any of them (the stated exception in THE NEUTRAL LADDER). On the new `pillFill`
+            it would read 2.600/1.914; `cream` reads 6.662/6.097, which is also better than the
+            5.886/3.890 it had on the old plane fill. Same move AgentPane's selected row made. */}
+        <span style={{ color: C.cream }}>▾</span>
       </button>
       {open &&
         createPortal(
@@ -173,7 +182,7 @@ export function ModelPill({
                 right: menuPos?.right ?? 8,
                 minWidth: 200,
                 background: C.deepForest,
-                border: `1px solid ${C.forest}`,
+                border: `1px solid ${C.hairline}`,
                 borderRadius: 8,
                 boxShadow: "0 12px 32px rgba(0,0,0,0.45)",
                 padding: 6,
@@ -209,7 +218,9 @@ export function ModelPill({
                       fontFamily: FONT.ui,
                       fontSize: 12,
                       color: C.cream,
-                      background: active ? C.forest : "transparent",
+                      // pillFill, not forest: the selected row's fill IS the selection, and
+                      // forest is a hair from the deepForest menu it sits on.
+                      background: active ? C.pillFill : "transparent",
                       whiteSpace: "nowrap",
                     }}
                   >

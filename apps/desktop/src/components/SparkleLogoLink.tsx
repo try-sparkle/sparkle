@@ -1,14 +1,10 @@
 // The Sparkle.ai brand wordmark, as a LINK to sparkle.ai.
 //
-// Extracted from AgentSidebar when the mark moved from column two (builder agents) to column one
+// Extracted from AgentSidebar when the logo moved from column two (builder agents) to column one
 // (the persistent concierge). It lives in its own file rather than inline in ConciergeColumn for
 // two reasons: the column is a pure renderer driven by its view-model, and the accessibility
 // contract below is the kind of thing that quietly regresses when it is one anonymous <a> nested
 // three levels inside a layout block.
-//
-// Deliberately NOT used by HelperIsland or the capture window, which inline their own
-// <img src="/sparkle-logo.svg">: the island's is a bare non-interactive 16px mark and the capture
-// window's is 28px chrome in another window. Neither wants link behavior.
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 /**
@@ -33,7 +29,7 @@ export function SparkleLogoLink({ height = 25 }: { height?: number }) {
       }}
       style={{ display: "inline-flex", cursor: "pointer" }}
     >
-      <img src="/sparkle-logo.svg" alt="Sparkle" style={{ height, display: "block" }} />
+      <img src="/sparkle-logo.svg" alt="Sparkle" style={{ height }} />
     </a>
   );
 }

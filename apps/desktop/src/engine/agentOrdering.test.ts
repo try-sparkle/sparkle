@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { topLevelAgents, firstVisibleAgentId } from "./agentOrdering";
+import { topLevelAgents, firstVisibleAgentId, isTopLevelAgent } from "./agentOrdering";
 import type { AgentKind } from "../types";
 
 // This module used to attention-SORT the sidebar stack (STATUS_RANK / FRESH_BUILD_RANK /
@@ -83,5 +83,49 @@ describe("firstVisibleAgentId", () => {
     const agents = [ag("b1"), ag("b2")];
     expect(firstVisibleAgentId(agents, "build")).toBe("b1");
     expect(firstVisibleAgentId.length).toBeLessThanOrEqual(2); // (agents, mode) — no statusMap
+  });
+});
+
+// `isTopLevelAgent` — THE PREDICATE ITSELF, not the filter that wraps it (roborev 53562).
+//
+// It had no direct coverage, and it is the entire mechanism holding up the branch's headline
+// invariant: the concierge digest states "N Need you in web", the click isolates that band in the
+// Build column, and the number is only a promise the click can keep because BOTH sides ask this one
+// predicate. `topLevelAgents` exercising it incidentally is not the same thing — that route can only
+// ever ask it about a whole array, so the two properties below (it is CLOSED OVER a population, and
+// "nested" is judged only against BUILD parents) are invisible from there.
+describe("isTopLevelAgent — the shared predicate the sidebar and the concierge both ask", () => {
+  it("is closed over the population: the SAME agent answers differently as its parent comes and goes", () => {
+    const child = ag("c", "shell", "p");
+    const parent = ag("p");
+    // This is the property that makes it a predicate-over-a-population rather than a field on the
+    // agent. Nesting is only meaningful relative to a parent that is PRESENT.
+    expect(isTopLevelAgent([parent, child])(child)).toBe(false);
+    expect(isTopLevelAgent([child])(child)).toBe(true);
+  });
+
+  it("judges nesting against BUILD parents only — a parent of another kind does not nest a child", () => {
+    const child = ag("c", "shell", "p");
+    // Only a `build` parent is in `buildIds`, so only it nests the child; against any other kind of
+    // parent the child keeps a row of its own. Asserted per kind rather than as one "not build"
+    // case, because this is the clause that decides whether an agent is reachable in column two.
+    expect(isTopLevelAgent([ag("p", "shell"), child])(child)).toBe(true);
+    expect(isTopLevelAgent([ag("p", "worker"), child])(child)).toBe(true);
+    expect(isTopLevelAgent([ag("p", "build"), child])(child)).toBe(false);
+  });
+
+  it("excludes EVERY worker unconditionally — parented, orphaned, or parentless", () => {
+    const parented = ag("w1", "worker", "p");
+    const orphaned = ag("w2", "worker", "gone");
+    const parentless = ag("w3", "worker", null);
+    const pop = [ag("p"), parented, orphaned, parentless];
+    for (const w of [parented, orphaned, parentless]) {
+      expect(isTopLevelAgent(pop)(w)).toBe(false);
+    }
+  });
+
+  it("agrees with topLevelAgents by construction — one rule, not two", () => {
+    const pop = [ag("a"), ag("w", "worker", "a"), ag("s", "shell"), ag("n", "build", "a")];
+    expect(ids(topLevelAgents(pop))).toEqual(ids(pop.filter(isTopLevelAgent(pop))));
   });
 });

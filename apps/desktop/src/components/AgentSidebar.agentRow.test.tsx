@@ -217,7 +217,14 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     project.selectedAgentId = "a1"; // → isActive
     render(<AgentSidebar project={project} />);
     // Resting active row: the terminal color (var(--c-forest)), square right edge, pulled 8px right
-    // (past the list padding) so it meets the sidebar border / terminal with no seam.
+    // (past the list padding) so it reaches the sidebar's right border.
+    //
+    // This used to say "with no seam", on the reasoning that the row, that border and the terminal
+    // beyond it were all C.forest, so the row bled through an edge nobody had drawn. The column's
+    // border is C.hairline now — deliberately the app's most prominent structural edge — so the row
+    // DOCKS against a drawn boundary instead. The active state still reads: it is the only row
+    // painted the terminal's own colour, with a square corner and concave fillets shaping that edge
+    // into an opening. See the note at AgentSidebar's row style.
     const row = document.querySelector('[draggable="true"]') as HTMLElement;
     expect(row.style.background).toBe("var(--c-forest)");
     expect(row.style.marginRight).toBe("-8px");
@@ -227,9 +234,49 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     expect(["none", ""]).toContain(card.style.filter);
     const strip = (Array.from(card.children) as HTMLElement[])[0]!;
     expect(strip.style.background).toBe("var(--c-forest)");
-    // A thin border in the SIDEBAR color (deep-forest) outlines the card over the terminal so its
-    // text stays distinguishable from the terminal text behind it.
-    expect(strip.style.border).toContain("var(--c-deep-forest)");
+    // A border outlines the card over the terminal so its text stays distinguishable from the
+    // terminal text behind it. It is the `hairline` token, NOT a depth plane: it used to be
+    // deep-forest ("lighter than forest"), which the black-and-gold repaint leaves a hair from the
+    // terminal the card is outlined against — an outline you cannot see. `hairline`'s floor
+    // against every plane is enforced in theme/chromeContrast.test.ts.
+    expect(strip.style.border).toContain("var(--c-hairline)");
+    expect(strip.style.border).not.toContain("var(--c-deep-forest)");
+  });
+
+  it("a HOVER-only card is a plane, not a row-state fill — it carries the column's own inks", () => {
+    // The card had `background: CHAT_USER_BUBBLE` while being a full content panel: DetailLine's
+    // `muted` labels, PathReveal's `muted` path, the `successInk` landed mark. Those are PLANE inks,
+    // and no value of a chrome fill can carry them (theme/chromeContrast.test.ts measures that in
+    // both directions), so the surface moved rather than the token. `barSurface` is the plane for
+    // something that FRAMES the terminal, which is what a floating card over it is.
+    useUiStore.setState({ activeSpecial: null } as never);
+    const project = mkProject([mkAgent()]);
+    project.selectedAgentId = null; // → NOT active, so the card takes the hover-only treatment
+    render(<AgentSidebar project={project} />);
+    fireEvent.click(screen.getByText(TITLE));
+    const card = screen.getByTestId("agent-hover-card");
+    const [strip, detail] = Array.from(card.children) as HTMLElement[];
+    for (const half of [strip!, detail!]) {
+      expect(half.style.background).toBe("var(--c-bar-surface)");
+      expect(half.style.background).not.toBe("var(--c-chat-bubble)");
+    }
+    // And the inks inside it really are the column's — this is what the surface was chosen for.
+    const label = screen.getByText("Location:");
+    expect(label.style.color).toBe("var(--c-muted)");
+  });
+
+  // Two edges the first repaint sweep skipped, both left at 1.08:1. The column's right border was
+  // excluded as "a seam meant to match the terminal plane" — but a seam that matches is only
+  // invisible-on-purpose while the planes differ, and four near-black planes leave this boundary
+  // (the app's most prominent structural edge) with neither a fill step nor a line. The ticket-row
+  // separators were never in the exclusion list at all: a plane ruled onto a plane is exactly the
+  // divider defect `hairline` exists to remove. Floors in theme/chromeContrast.test.ts.
+  it("the column's right border against the terminal is a hairline, not the terminal plane", () => {
+    const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    const column = container.firstElementChild as HTMLElement;
+    expect(column.style.background).toBe("var(--c-deep-forest)");
+    expect(column.style.borderRight).toContain("var(--c-hairline)");
+    expect(column.style.borderRight).not.toContain("var(--c-forest)");
   });
 
   it("omits the description span entirely when the description is empty", () => {
@@ -482,5 +529,119 @@ describe("AgentSidebar — two-finger scroll works while a hover card is open", 
     const notPrevented = fireEvent.wheel(list, { deltaY: 48, clientX: 100, clientY: 100, cancelable: true });
     expect(list.scrollTop).toBe(0); // no forwarding — jsdom has no native scroll, so 0 proves we didn't touch it
     expect(notPrevented).toBe(true);
+  });
+});
+
+// THE LADDER'S SITES, PINNED AS SITES. The numeric floors live in theme/chromeContrast.test.ts, but
+// a floor only binds a token — it cannot notice that a COMPONENT reached for the wrong one. Every
+// case below is a site the ladder sweep missed precisely because nothing here named it (roborev
+// 53613 / 53614 / 53616), so each asserts the token the site reaches for, and the one it came from.
+describe("AgentSidebar — the chrome tokens the hover card and its chips reach for", () => {
+  const openOverlay = () => fireEvent.click(screen.getByText(TITLE));
+
+  // The ahead pill painted `${C.success}22` behind `successInk`. The ladder's table measured that
+  // ink on the BARE plane (light 4.552) and never on the wash it actually sits on, where it fell to
+  // 4.127 — under AA — in exchange for 1.103:1 of visible fill. The behind pill next to it was
+  // already transparent; these are one control in two states.
+  it("the ahead pill is untinted, like the behind pill it shares a control with", () => {
+    seedBranch("a1", bs({ ahead: 2 }));
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    openOverlay();
+    const ahead = screen.getByRole("button", { name: /ahead/i });
+    expect(ahead.style.background).toBe("transparent");
+    // The ink is what the wash was starving, so pin that it is still the one being protected.
+    expect(ahead.style.color).toBe("var(--c-success-ink)");
+  });
+
+  it("both branch pills read by their border, not by a fill", () => {
+    seedBranch("a1", bs({ behind: 3 }));
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    openOverlay();
+    expect(screen.getByRole("button", { name: /behind main/i }).style.background).toBe("transparent");
+  });
+
+  // `deepForest` is a PLANE. Filling a chip with it inside a `barSurface` card is a plane on a
+  // plane — 1.079/1.248, a filled chip with no visible fill. `pillFill` is the token whose
+  // documented role is exactly a filled chip.
+  it("the close button's hover pill fills with pillFill, not the deepForest plane", () => {
+    render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    openOverlay();
+    const close = screen.getByRole("button", { name: /close agent/i });
+    fireEvent.mouseEnter(close);
+    expect(close.style.background).toBe("var(--c-pill-fill)");
+    expect(close.style.background).not.toBe("var(--c-deep-forest)");
+  });
+});
+
+// The pinned "Improve Sparkle" footer row. It painted CHAT_USER_BUBBLE when active — a CHROME FILL —
+// under a comment claiming it matched the agent rows' selected treatment, which takes `C.forest`.
+// That made it the fourth consumer of a chrome fill carrying PLANE inks, and made the ladder's own
+// recorded claim ("what is left on this token is chat bubbles and row fills, carrying `cream`")
+// false for the second time. Everything the row carries is a plane ink: a `statusInk(...)` label, a
+// `muted`/`teal` consent pill, and the StatusDot the row is actually read by — which measured
+// 4.56/1.01 (dark/light) for green on the bubble, i.e. invisible in light mode.
+describe("AgentSidebar — the Improve Sparkle row is a plane when active, never a chrome fill", () => {
+  const sparkleRow = (container: HTMLElement) =>
+    container.querySelector<HTMLElement>('[data-hint="improve"]')!;
+
+  it("takes the terminal plane when active — the same token a selected agent row takes", () => {
+    useUiStore.setState({ workMode: "build", activeSpecial: "sparkle" } as never);
+    const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    const row = sparkleRow(container);
+    expect(row.style.background).toBe("var(--c-forest)");
+    // The token it came from, named so a revert cannot pass quietly.
+    expect(row.style.background).not.toBe("var(--c-chat-bubble)");
+  });
+
+  it("is transparent when inactive, so it sits on the column's own plane", () => {
+    useUiStore.setState({ workMode: "build", activeSpecial: null } as never);
+    const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    expect(sparkleRow(container).style.background).toBe("transparent");
+  });
+
+  // …AND THE PLANE IS NOT THE SELECTED STATE (roborev 53662). `forest` on the `deepForest` column
+  // measures 1.082 (dark) / 1.375 (light): on an AGENT row that is fine, because what carries
+  // selection there is the square right edge, the concave fillets opening onto the terminal, and
+  // the open card's `hairline` outline. This row has none of that geometry, so the move above left
+  // it with a fill nobody can see and nothing else — no selected state at all.
+  //
+  // The rail is the state, in the app's existing vocabulary: `CommandPalette`'s selected result row
+  // takes the same `3px solid C.goldFill`. Opaque gold is the one token that can read on this row
+  // without touching its inks, since it is a SHAPE beside them rather than a fill under them; the
+  // floor it clears against both the row's own fill and the column is in theme/chromeContrast.test.
+  it("carries its selected state on a gold rail — the fill step is invisible on this row", () => {
+    useUiStore.setState({ workMode: "build", activeSpecial: "sparkle" } as never);
+    const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    expect(sparkleRow(container).style.borderLeft).toBe("3px solid var(--c-gold-fill)");
+  });
+
+  it("keeps the rail's width when inactive, so selecting a row shifts nothing", () => {
+    useUiStore.setState({ workMode: "build", activeSpecial: null } as never);
+    const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    expect(sparkleRow(container).style.borderLeft).toBe("3px solid transparent");
+  });
+});
+
+// The epic pill is the THIRD chip in the card's top strip, and the one that could not follow the
+// other two onto `pillFill`: its ink is `C.teal`, which measures 1.828/1.610 there — the fill that
+// would make it a proper chip is the fill that destroys its ink. So it keeps the `deepForest` fill
+// and takes its boundary from its BORDER instead, which is what `hairline` exists for. The border
+// it had was `${C.teal}55`, measuring 1.376:1 against the dark `barSurface` card — under the chrome
+// floor, leaving the chip with no boundary from any direction. Same remedy as ApprovalsMenu's
+// notice well (roborev 53568/1). The numbers are floored in theme/chromeContrast.test.ts.
+describe("AgentSidebar — the epic pill takes a hairline border, not a teal tint", () => {
+  it("draws a border the card can actually show", () => {
+    render(<AgentSidebar project={mkProject([mkAgent({ epicId: "e1" })])} />);
+    fireEvent.click(screen.getByText(TITLE));
+    // TWO instances, and both are meant to be there: the collapsed column row renders the same
+    // strip the expanded hover card does. Assert on both rather than picking one — the card's is
+    // the copy the `barSurface` measurement is about, and the row's still has to clear the column.
+    const pills = screen.getAllByTitle(/^Epic e1 ·/);
+    expect(pills.length).toBeGreaterThan(0);
+    for (const pill of pills) {
+      expect(pill.style.border).toContain("var(--c-hairline)");
+      // The tint it replaced — named so a revert cannot pass quietly.
+      expect(pill.style.border).not.toContain("55");
+    }
   });
 });

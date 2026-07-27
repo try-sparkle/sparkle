@@ -50,10 +50,11 @@ const kindBadge = (kind: HistoryHit["kind"]): CSSProperties => ({
   fontWeight: FONT_WEIGHT.semibold,
   padding: "1px 5px",
   borderRadius: 5,
-  // Same accent treatment as the nudge-card badges: tinted fill + hairline, themed text.
-  color: kind === "prompt" ? C.amber : C.accentInk,
-  background: `color-mix(in srgb, ${kind === "prompt" ? C.amber : C.accent} 14%, transparent)`,
-  border: `1px solid color-mix(in srgb, ${kind === "prompt" ? C.amber : C.accent} 45%, transparent)`,
+  // Same accent treatment as the nudge-card badges: tinted fill + hairline, themed text — so it
+  // follows them onto the concierge gold (literal for the color-mix fill, themed ink for the label).
+  color: kind === "prompt" ? C.goldInk : C.accentInk,
+  background: `color-mix(in srgb, ${kind === "prompt" ? C.gold : C.accent} 14%, transparent)`,
+  border: `1px solid color-mix(in srgb, ${kind === "prompt" ? C.gold : C.accent} 45%, transparent)`,
 });
 
 export interface CommandPaletteProps {
@@ -205,7 +206,7 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
             borderBottom: `1px solid ${line}`,
           }}
         >
-          <FiSearch size={15} aria-hidden style={{ color: C.amber, flex: "0 0 auto" }} />
+          <FiSearch size={15} aria-hidden style={{ color: C.goldInk, flex: "0 0 auto" }} />
           <input
             ref={inputRef}
             value={query}
@@ -272,10 +273,13 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
                   onClick={() => activate(h)}
                   style={{
                     borderBottom: `1px solid ${line}`,
-                    // The selected row carries the concierge gold, like an active nudge.
-                    borderLeft: isSelected ? `3px solid ${C.amber}` : "3px solid transparent",
+                    // The selected row carries the concierge gold. The rail is OPAQUE, so it
+                    // takes the themed `goldFill` (BRAND.gold is a constant and vanishes on the
+                    // light palette's panel); the 8% wash below stays literal, because a
+                    // translucent tint composites against whatever is behind it.
+                    borderLeft: isSelected ? `3px solid ${C.goldFill}` : "3px solid transparent",
                     background: isSelected
-                      ? `color-mix(in srgb, ${C.amber} 8%, transparent)`
+                      ? `color-mix(in srgb, ${C.gold} 8%, transparent)`
                       : "transparent",
                     cursor: disabled ? "default" : "pointer",
                     opacity: disabled ? 0.5 : 1,

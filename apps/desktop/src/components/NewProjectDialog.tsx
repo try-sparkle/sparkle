@@ -124,7 +124,7 @@ export function NewProjectDialog({
         <div
           style={{
             display: "flex",
-            borderBottom: `1px solid ${C.forest}`,
+            borderBottom: `1px solid ${C.hairline}`,
             marginBottom: 18,
           }}
         >
@@ -377,7 +377,7 @@ function RepoRow({ repo, onSelect }: { repo: GithubRepo; onSelect: () => void })
         alignItems: "flex-start",
         gap: 10,
         background: C.barSurface,
-        border: `1px solid ${C.forest}`,
+        border: `1px solid ${C.hairline}`,
         borderRadius: 8,
         padding: "10px 12px",
         cursor: "pointer",

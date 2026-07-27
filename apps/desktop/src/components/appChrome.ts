@@ -135,7 +135,7 @@ export const menuSurface: CSSProperties = {
   minWidth: 200,
   padding: 6,
   background: C.deepForest,
-  border: `1px solid ${C.forest}`,
+  border: `1px solid ${C.hairline}`,
   borderRadius: 8,
   boxShadow: "0 12px 32px rgba(0,0,0,0.45)",
   zIndex: 1000,

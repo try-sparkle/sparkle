@@ -6,7 +6,7 @@
 // Spec: docs/superpowers/specs/2026-07-02-definable-done-delivered-design.md  (UX → Board)
 import { type CSSProperties } from "react";
 import { FiCheck, FiAlertTriangle } from "react-icons/fi";
-import { C, FONT_WEIGHT, ROW_ACTIVE_BUBBLE, ON_BRAND_FILL } from "../theme/colors";
+import { C, FONT_WEIGHT, ROW_ACTIVE_BUBBLE } from "../theme/colors";
 import type { BoardColumn } from "../services/beads";
 import type { StageKey } from "../services/stageDefs";
 
@@ -167,7 +167,12 @@ const ctaWrap: CSSProperties = {
 
 const ctaButton: CSSProperties = {
   background: ROW_ACTIVE_BUBBLE,
-  color: ON_BRAND_FILL,
+  // C.cream, NOT ON_BRAND_FILL. That constant exists for a fill that is constant across themes (the
+  // teal/cyan brand shapes), so it stays light in BOTH — but ROW_ACTIVE_BUBBLE is a THEMED token
+  // that goes to a mid blue in light mode, where a light ink on it falls under the floor. The fill
+  // is themed, so its ink has to be too; this matches DefineStageModal's primaryBtn, which paints
+  // the same token.
+  color: C.cream,
   border: "none",
   borderRadius: 8,
   padding: "8px 16px",

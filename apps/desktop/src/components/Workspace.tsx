@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, getAllWindows } from "@tauri-apps/api/window";
-import { C, FONT, FONT_WEIGHT, ON_BRAND_FILL, ON_BRAND_FILL_DARK } from "../theme/colors";
+import { C, FONT, FONT_WEIGHT, ON_BRAND_FILL, ON_GOLD_FILL } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { ConciergeHost } from "./ConciergeHost";
@@ -796,13 +796,15 @@ function KbdKey({ children }: { children: React.ReactNode }) {
         display: "inline-block",
         verticalAlign: "middle",
         margin: "0 3px",
-        background: C.amber, // gold #e0982f
-        color: ON_BRAND_FILL_DARK, // dark navy, constant across themes
+        // The themed opaque-gold PAIR — see theme/colors `goldFill` / ON_GOLD_FILL. This said
+        // "gold #e0982f" while painting the amber STATUS token.
+        background: C.goldFill,
+        color: ON_GOLD_FILL,
         font: `700 15px/1 ${FONT.mono}`,
         letterSpacing: 0.5,
         padding: "3px 8px",
         borderRadius: 5,
-        border: `1px solid ${ON_BRAND_FILL_DARK}`,
+        border: `1px solid ${ON_GOLD_FILL}`,
         boxShadow: "0 1px 3px rgba(0,0,0,0.4)",
         textTransform: "uppercase",
       }}

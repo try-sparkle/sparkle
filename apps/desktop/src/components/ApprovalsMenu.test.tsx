@@ -44,6 +44,22 @@ afterEach(() => cleanup());
 /** The two scope groups both carry a "Resume from summary" button; [0] = all-projects, [1] = this-project. */
 const summaryButtons = () => screen.getAllByRole("button", { name: "Resume from summary" });
 
+describe("ApprovalsMenu — the notice well has a boundary", () => {
+  it("the no-project notice is bounded by `hairline`, not by a second depth plane", () => {
+    // A well may be invisible on purpose, but only while EITHER the fill step or the border still
+    // carries the boundary — the rule SettingsDialog's search field was closed on. This box had
+    // `forest` inside the dialog's `deepForest` shell (a plane on a plane) AND a `barSurface`
+    // border (the same non-step one layer out), so nothing drew it from any direction. The fill is
+    // allowed to recede; the border is what has to be seen. Floors: theme/chromeContrast.test.ts.
+    currentProjectId = null; // → the "No project is in focus" notice renders
+    render(<ApprovalsMenu />);
+    const notice = screen.getByText(/No project is in focus/).closest("div") as HTMLElement;
+    expect(notice.style.border).toContain("var(--c-hairline)");
+    expect(notice.style.border).not.toContain("var(--c-bar-surface)");
+    expect(notice.style.border).not.toContain("var(--c-deep-forest)");
+  });
+});
+
 describe("ApprovalsMenu — Session resume row", () => {
   it("renders the three resume choices in both scope groups", () => {
     render(<ApprovalsMenu />);

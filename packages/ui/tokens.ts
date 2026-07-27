@@ -14,6 +14,25 @@ export const C = {
   amber: "#e0982f", // caution / progress / waiting (kept warm for legibility)
   sienna: "#e0533f", // dangerous actions / error / deny (kept red for legibility)
 
+  // Concierge GOLD — the founder-approved accent from the canonical prototype
+  // (PRD/sparkle/concierge-mode/prototype.html `--gold` / `--gold-hot`). This is the
+  // primary accent of the black-and-gold shell: the Send button, the wordmark, the
+  // pinned-scope line, the project chip on a nudge, the keycap chiclets.
+  //
+  // NOT the same thing as `amber`, and the distinction is the whole point. `amber` is the
+  // STATUS token — caution / waiting / in-progress — and for a long time the codebase had no
+  // gold at all, so every surface that wanted the prototype's gold substituted amber (or
+  // re-derived a tint from it with lightenHex, or hardcoded a #D4AF37). Those substitutions
+  // are gone; use `gold` for accent and keep `amber` for "this is waiting on something".
+  //
+  // These stay LITERAL hex (like every token here — mobile is React Native and web reads them
+  // at build, so neither can consume var()), and a canvas 2d gradient can't consume var()
+  // either, which is why the star field reads them straight. As TEXT in LIGHT mode they are
+  // far too pale — use the themed goldInk / goldHotInk from the desktop theme layer there, and
+  // the themed goldFill for anything OPAQUE.
+  gold: "#f5c26b", // prototype --gold: translucent tints, glows, canvas sprites
+  goldHot: "#ffe9b8", // prototype --gold-hot: the hot core / brightest tint
+
   // Text
   cream: "#eaf1ff", // headings, button labels, primary text (light on navy)
   muted: "#8aa0c4", // secondary text, timestamps, metadata (blue-gray)

@@ -183,6 +183,11 @@ function feedWith(status: string, band: StatusBand = "needs_you") {
     band,
     inScope: true,
     muted: false,
+    // A parentless build agent — it gets a row of its own in column two, which is what the
+    // surfacing gate now also requires (see ConciergeHost.surfacedAgents).
+    topLevel: true,
+    // Nothing above it in the tree, so no ancestor row can be speaking for it.
+    representedElsewhere: false,
   };
   const counts = { needs_you: 0, running: 0, done: 0, [band]: 1 };
   return {
@@ -1247,6 +1252,9 @@ describe("ConciergeHost — digest instead of a card wall", () => {
       band: "needs_you" as const,
       inScope: true,
       muted: false,
+      topLevel: true,
+      // Nothing above it in the tree, so no ancestor row can be speaking for it.
+      representedElsewhere: false,
     }));
     const counts: Record<StatusBand, number> = { ...EMPTY_COUNTS, needs_you: n };
     return {

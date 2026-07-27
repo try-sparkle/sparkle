@@ -612,7 +612,7 @@ const userLine: CSSProperties = {
 };
 
 const previewCard: CSSProperties = {
-  border: `1px solid ${C.forest}`,
+  border: `1px solid ${C.hairline}`,
   borderRadius: 10,
   padding: "10px 12px",
   background: C.forest,
@@ -649,7 +649,7 @@ const badge: CSSProperties = {
 const deliveredMeta: CSSProperties = {
   marginTop: 10,
   paddingTop: 8,
-  borderTop: `1px solid ${C.deepForest}`,
+  borderTop: `1px solid ${C.hairline}`,
   fontSize: 12,
   color: C.muted,
 };

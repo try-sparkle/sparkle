@@ -49,8 +49,9 @@ export function ScopeVitals({
         style={{
           fontSize: 10.5,
           marginTop: 8,
-          // Pinned scope reads gold — the same accent the pinned tab tilts to.
-          color: pinnedProjectName ? C.amber : C.muted,
+          // Prototype `.scope.pinned { color: var(--gold) }` — the same accent the pinned tab
+          // tilts to. The themed ink, since this is TEXT (see C.goldInk).
+          color: pinnedProjectName ? C.goldInk : C.muted,
         }}
       >
         {scopeText(pinnedProjectName)}

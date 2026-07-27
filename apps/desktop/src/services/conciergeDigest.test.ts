@@ -21,6 +21,9 @@ const agent = (over: Partial<ConciergeAgent> & { id: string }): ConciergeAgent =
     band: "needs_you",
     inScope: true,
     muted: false,
+    topLevel: true,
+    // Nothing above it in the tree, so no ancestor row can be speaking for it.
+    representedElsewhere: false,
     ...over,
   }) as ConciergeAgent;
 
@@ -117,5 +120,63 @@ describe("buildDigest", () => {
 
   it("handles an empty feed", () => {
     expect(buildDigest([])).toEqual({ cards: [], groups: [] });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE ROWLESS VARIANT — agents with no row of their own (workers nothing else speaks for).
+//
+// They used to bypass this module entirely and render one card each, which put the card wall back
+// on any fleet with several blocked workers under an absent or in-motion orchestrator. The grouping
+// rule is the same one; what the variant changes is the SENTENCE (a count that must not read as a
+// promise about rows) and the ID (both variants can hold the same project::band at once).
+// ─────────────────────────────────────────────────────────────────────────────
+describe("buildDigest — the rowless variant", () => {
+  it("collapses two or more into ONE line, exactly like every other population", () => {
+    const d = buildDigest([agent({ id: "w1" }), agent({ id: "w2" }), agent({ id: "w3" })], "rowless");
+    expect(d.cards).toEqual([]);
+    expect(d.groups).toHaveLength(1);
+    expect(d.groups[0]!.count).toBe(3);
+  });
+
+  it("says what they ARE, never a row count the click cannot deliver", () => {
+    const d = buildDigest([agent({ id: "w1" }), agent({ id: "w2" })], "rowless");
+    // The sentence in full, because the whole point is which words it does NOT use: the row
+    // variant's "2 Need you in sparkle-desktop" would promise two rows for agents that have none.
+    expect(d.groups[0]!.text).toBe("2 workers inside sparkle-desktop need you");
+  });
+
+  it("keeps a lone rowless agent as a card — one is not a wall", () => {
+    const d = buildDigest([agent({ id: "w1" })], "rowless");
+    expect(d.cards.map((c) => c.id)).toEqual(["w1"]);
+    expect(d.groups).toEqual([]);
+  });
+
+  it("carries its variant, so the click can tell a reveal from a filter", () => {
+    const d = buildDigest([agent({ id: "w1" }), agent({ id: "w2" })], "rowless");
+    expect(d.groups[0]!.variant).toBe("rowless");
+  });
+
+  it("defaults to the row-promising variant when none is asked for", () => {
+    const d = buildDigest([agent({ id: "a" }), agent({ id: "b" })]);
+    expect(d.groups[0]!.variant).toBe("rows");
+  });
+
+  // The two populations coexist in one project — two top-level asks beside two rowless workers —
+  // and their lines must not collide as React keys or as the key a click re-derives itself from.
+  it("gives the two variants distinct ids for the same project and band", () => {
+    const rows = buildDigest([agent({ id: "a" }), agent({ id: "b" })]);
+    const rowless = buildDigest([agent({ id: "w1" }), agent({ id: "w2" })], "rowless");
+    expect(rowless.groups[0]!.id).not.toBe(rows.groups[0]!.id);
+  });
+
+  // Forward-guard, same reason the row variant has one: widening what the column surfaces must not
+  // need a second copy of the copy rules.
+  it("still names the band when the band is not needs_you", () => {
+    const d = buildDigest(
+      [agent({ id: "w1", band: "running" }), agent({ id: "w2", band: "running" })],
+      "rowless",
+    );
+    expect(d.groups[0]!.text).toBe("2 workers inside sparkle-desktop are running");
   });
 });

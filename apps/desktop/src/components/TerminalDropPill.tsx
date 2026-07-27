@@ -105,7 +105,7 @@ export function TerminalDropPill({
         width: WIDTH,
         boxSizing: "border-box",
         background: C.deepForest,
-        border: `1px solid ${C.forest}`,
+        border: `1px solid ${C.hairline}`,
         borderRadius: 10,
         boxShadow: "0 12px 34px rgba(0,0,0,0.5)",
         fontFamily: '"IBM Plex Sans", sans-serif',
@@ -133,8 +133,18 @@ export function TerminalDropPill({
           color: C.muted,
           cursor: "pointer",
         }}
-        onMouseEnter={(e) => (e.currentTarget.style.background = C.forest)}
-        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        // The glyph moves with the fill. At rest it is `muted` on the card's `deepForest` plane,
+        // which is what `muted` is for; on hover the backdrop becomes a chrome fill, where `muted`
+        // cannot clear its floor in either theme (see THE NEUTRAL LADDER in theme/colors). Set
+        // together so the pair can never drift apart.
+        onMouseEnter={(e) => {
+          e.currentTarget.style.background = C.pillFill;
+          e.currentTarget.style.color = C.cream;
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.background = "transparent";
+          e.currentTarget.style.color = C.muted;
+        }}
       >
         <FiX size={14} />
       </button>

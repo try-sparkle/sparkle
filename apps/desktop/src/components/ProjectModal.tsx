@@ -91,7 +91,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
           width: 520,
           maxWidth: "90vw",
           background: C.deepForest,
-          border: `1px solid ${C.forest}`,
+          border: `1px solid ${C.hairline}`,
           borderRadius: 12,
           padding: 22,
           color: C.cream,

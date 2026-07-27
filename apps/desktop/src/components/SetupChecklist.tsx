@@ -274,7 +274,7 @@ function PrereqRowView({ row, onInstall }: { row: PrereqRow; onInstall: () => vo
         padding: "12px 14px",
         borderRadius: 10,
         background: C.deepForest,
-        border: `1px solid ${C.forest}`,
+        border: `1px solid ${C.hairline}`,
       }}
     >
       <Icon size={20} style={{ color: C.muted, flexShrink: 0 }} aria-hidden />
@@ -350,7 +350,7 @@ function LoginRow({
         padding: "12px 14px",
         borderRadius: 10,
         background: C.deepForest,
-        border: `1px solid ${C.forest}`,
+        border: `1px solid ${C.hairline}`,
         opacity: phase === "locked" ? 0.55 : 1,
       }}
     >
@@ -386,7 +386,7 @@ function LoginRow({
           <div
             style={{
               height: 300,
-              border: `1px solid ${C.forest}`,
+              border: `1px solid ${C.hairline}`,
               borderRadius: 8,
               overflow: "hidden",
               padding: 6,

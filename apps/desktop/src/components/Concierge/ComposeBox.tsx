@@ -41,7 +41,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { FiCamera, FiFile, FiImage, FiMic, FiPaperclip, FiX } from "react-icons/fi";
-import { C, FONT_WEIGHT, ON_BRAND_FILL_DARK } from "../../theme/colors";
+import { C, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
 import { CONCIERGE_COMPOSE_DND_TARGET } from "../../services/dndTargets";
 import type { Attachment, ConciergeAttachKind } from "./types";
 import { useUiStore } from "../../stores/uiStore";
@@ -428,11 +428,14 @@ export function ComposeBox({
           style={{
             ...attachStyle,
             padding: "7px 8px",
+            // Prototype `.composer .mic.live` — a gold-hot glyph in a gold-bordered gold tint.
+            // The BORDER is opaque, so it takes the themed goldFill; the 12% wash stays literal,
+            // because a translucent tint composites against whatever is behind it.
             ...(micLive
               ? {
-                  color: C.cream,
-                  borderColor: C.amber,
-                  background: `color-mix(in srgb, ${C.amber} 12%, transparent)`,
+                  color: C.goldHotInk,
+                  borderColor: C.goldFill,
+                  background: `color-mix(in srgb, ${C.gold} 12%, transparent)`,
                 }
               : null),
           }}
@@ -469,7 +472,11 @@ export function ComposeBox({
             // Past the auto cap the content scrolls INSIDE the box rather than the box growing on
             // forever. `auto` (not `scroll`) so a one-line draft shows no dead scrollbar gutter.
             overflowY: "auto",
-            background: C.forest,
+            // barSurface, not forest: this box is one of the two surfaces barSurface is FOR (the
+            // top bar and the COMPOSER input box). It read `forest` while forest was a mid navy
+            // and the difference didn't show; under the black-and-gold palette forest is the
+            // near-black TERMINAL plane, which punches a hole through the composer.
+            background: C.barSurface,
             border: `1px solid ${line}`,
             borderRadius: 12,
             color: C.cream,
@@ -493,8 +500,14 @@ export function ComposeBox({
           style={{
             fontSize: 13,
             fontWeight: FONT_WEIGHT.bold,
-            color: ON_BRAND_FILL_DARK,
-            background: C.amber,
+            // Prototype `.composer .send { color: var(--ink); background: var(--gold) }` — the
+            // single loudest gold in the shell, and the reason the gold token exists. `goldFill`,
+            // not BRAND.gold: this button has no border, so the fill's contrast with the column
+            // behind it IS its edge, and the literal is a cross-theme constant that disappears on
+            // light mode's concierge surface. The themed pair keeps the prototype's gold in dark
+            // and goes deep gold + light ink in light, so the button reads as a button in both.
+            color: ON_GOLD_FILL,
+            background: C.goldFill,
             border: "none",
             borderRadius: 12,
             padding: "10px 15px",

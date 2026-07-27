@@ -157,7 +157,7 @@ export function SelectionPopup({
         zIndex: 9999,
         width: WIDTH,
         background: C.deepForest,
-        border: `1px solid ${C.forest}`,
+        border: `1px solid ${C.hairline}`,
         borderRadius: 10,
         boxShadow: "0 12px 34px rgba(0,0,0,0.5)",
         fontFamily: '"IBM Plex Sans", sans-serif',
@@ -175,7 +175,7 @@ export function SelectionPopup({
           fontSize: 11,
           color: C.muted,
           background: C.forest,
-          border: `1px solid ${C.forest}`,
+          border: `1px solid ${C.hairline}`,
           borderRadius: 5,
           padding: "5px 8px",
           margin: "8px 10px",
@@ -237,13 +237,15 @@ function Grid({ actions }: { actions: Action[] }) {
             fontSize: 12,
             fontFamily: "inherit",
             // Primary action sits on the constant blue teal fill — keep its text light in both
-            // themes (C.cream flips to navy in light). Non-primary is transparent/forest, where
-            // the themed ink is correct.
+            // themes (C.cream flips to navy in light). Non-primary is transparent over the
+            // popup's own deepForest, where the themed ink is correct.
             color: a.primary ? ON_BRAND_FILL : C.cream,
             background: a.primary ? C.teal : "transparent",
           }}
           onMouseEnter={(e) => {
-            if (!a.primary) (e.currentTarget as HTMLButtonElement).style.background = C.forest;
+            // pillFill, not forest: the hover fill has to be a step AWAY from the popup's own
+            // surface, and forest is a step nobody can see under the near-black palette.
+            if (!a.primary) (e.currentTarget as HTMLButtonElement).style.background = C.pillFill;
           }}
           onMouseLeave={(e) => {
             if (!a.primary) (e.currentTarget as HTMLButtonElement).style.background = "transparent";

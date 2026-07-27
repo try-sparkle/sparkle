@@ -245,15 +245,22 @@ const row: CSSProperties = {
   justifyContent: "space-between",
   gap: 12,
   paddingBottom: 12,
-  borderBottom: `1px solid ${C.forest}`,
+  borderBottom: `1px solid ${C.hairline}`,
 };
 
+// An inset well inside the SettingsDialog shell (`C.deepForest`). A well may be invisible on
+// purpose, but only while EITHER the fill step or the border still carries the boundary — the rule
+// SettingsDialog's own search field was closed on. Here neither did: `forest` inside `deepForest`
+// is a plane painted on a plane, and a `barSurface` border on a `deepForest` panel is the same
+// non-step one layer out, so the box had no edge at all from any direction. The fill stays (this is
+// a well, and it should recede); the boundary moves onto the token whose whole job is to be a line
+// you can see on any plane.
 const noticeBox: CSSProperties = {
   fontSize: 12,
   color: C.muted,
   lineHeight: 1.5,
   background: C.forest,
-  border: `1px solid ${C.barSurface}`,
+  border: `1px solid ${C.hairline}`,
   borderRadius: 8,
   padding: "8px 10px",
 };

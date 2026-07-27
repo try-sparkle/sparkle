@@ -1,10 +1,14 @@
-import { FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT, ON_GOLD_FILL } from "../theme/colors";
 import { useConnectionStore } from "../stores/connectionStore";
 
-// A true gold (not the theme's warmer amber) so it reads as the "connection offline" notice the
-// user asked for. Dark text keeps it legible on gold in both light and dark themes.
-const GOLD = "#D4AF37";
-const GOLD_TEXT = "#1a1205";
+// The shell's opaque-gold PAIR — the fill and the ink that sits on it, themed together. This was
+// a hardcoded #D4AF37 whose comment explained it needed "a true gold, not the theme's warmer
+// amber" — i.e. it was describing a token that didn't exist yet. It does now, so the banner is on
+// the same gold as the Send button and the chiclets instead of a fourth one nobody can keep in
+// sync. `goldFill`, not the literal BRAND.gold: a full-width band of #f5c26b under near-black ink
+// is the prototype's dark shell, but on light mode's near-white chrome it is a smudge.
+const GOLD = C.goldFill;
+const GOLD_TEXT = ON_GOLD_FILL;
 
 /** Full-width gold banner shown at the very top of the app whenever connectivity is down.
  *  Renders nothing when online. Sits in the flex column (pushes content down, never overlays). */

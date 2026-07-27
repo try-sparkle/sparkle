@@ -47,7 +47,11 @@ import { consentPillLabel, sparkleBarState, type SparkleBarState } from "./spark
 import { useBeadsStore } from "../stores/beadsStore";
 import { beadLabel, epicForBuild, epicPillFor } from "../services/planView";
 import { type Bead } from "../services/beads";
-import { topLevelAgents as topLevelOf, firstVisibleAgentId } from "../engine/agentOrdering";
+import {
+  topLevelAgents as topLevelOf,
+  isTopLevelAgent,
+  firstVisibleAgentId,
+} from "../engine/agentOrdering";
 import { firstLadderRowId } from "../engine/ladderSelection";
 import { publishedStatusFor } from "../useAttentionNotifications";
 import {
@@ -67,7 +71,6 @@ import { reconcileWorkMode } from "../engine/workMode";
 import { isCalmBand } from "../services/conciergeFeed";
 import { PlanBuildToggle, FADE_3 } from "./PlanBuildToggle";
 import { StatusDot } from "./StatusDot";
-import { LogoWaveform } from "./LogoWaveform";
 import { FittedAgentName } from "./FittedAgentName";
 import { ModelPill } from "./ModelPill";
 import { applyModelToRunningAgent } from "../services/agentModel";
@@ -79,7 +82,6 @@ import { useNewAgent } from "../hooks/useNewAgent";
 import { NewAgentRuntimeToggle } from "./NewAgentRuntimeToggle";
 import { NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
 import { CloseAgentPrompt } from "./CloseAgentPrompt";
-import { BalanceBadge } from "./BalanceBadge";
 
 /**
  * Left column: the current project's agents as a vertical list (spec layout, revised).
@@ -971,20 +973,18 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         childrenByParent: new Map<string, AgentTab[]>(),
       };
     const childrenByParent = new Map<string, AgentTab[]>();
-    const buildIds = new Set<string>();
     for (const a of project.agents) {
-      if (a.kind === "build") buildIds.add(a.id);
       if (a.parentId) {
         const arr = childrenByParent.get(a.parentId);
         if (arr) arr.push(a);
         else childrenByParent.set(a.parentId, [a]);
       }
     }
-    // Mirror orderedTopLevelAgents' rule: workers are never top-level rows (they nest under their
-    // orchestrator's card), so orphaned/in-flight workers can't flash into the sidebar list.
-    const topLevelAgents = project.agents.filter(
-      (a) => a.kind !== "worker" && (!a.parentId || !buildIds.has(a.parentId)),
-    );
+    // The rule itself comes from engine/agentOrdering.isTopLevelAgent — the SAME predicate the
+    // ladder's `topLevelOf` and the concierge feed's `topLevel` stamp use. It used to be re-spelled
+    // inline here ("mirror orderedTopLevelAgents' rule"), which is precisely how the digest's count
+    // and the column's rows are able to stop agreeing; there is one copy now.
+    const topLevelAgents = project.agents.filter(isTopLevelAgent(project.agents));
     return { topLevelAgents, childrenByParent };
   }, [project]);
 
@@ -1068,6 +1068,13 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       </>
     ) : null;
 
+  // Gates the top row below. It is the SAME condition ShowHelperButton applies to itself — lifted
+  // up because that button is now the row's only child, so when it returns null the row is an empty
+  // <div> still charging 14px+6px of padding: ~20px of dead space above the Plan/Build toggle, in
+  // the DEFAULT case (helper islands are enabled out of the box). The button keeps its own guard;
+  // this only decides whether the row that would hold it exists at all.
+  const helperHidden = !useHelperPrefs((s) => s.enabled);
+
   return (
     <SidebarScrollContext.Provider value={sidebarScroll}>
     <div
@@ -1076,36 +1083,40 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         flex: "0 0 auto",
         position: "relative",
         background: C.deepForest,
-        borderRight: `1px solid ${C.forest}`,
+        // The app's most prominent structural edge: this column against the terminal. It used to
+        // be a SEAM — `forest` deliberately matching the terminal plane on the other side — but
+        // under the near-black repaint that boundary has neither a fill step (1.08:1) nor a line,
+        // so it stopped existing rather than staying subtle. See theme/colors `hairline`.
+        borderRight: `1px solid ${C.hairline}`,
         display: "flex",
         flexDirection: "column",
         height: "100%",
       }}
     >
-      {/* position:relative + zIndex keep this row's controls IN FRONT of the voice-orb glow that
-          the waveform paints below — the glow can bleed upward into this row, but the badge and
-          button must stay crisp on top of it, never washed out behind it. The lift was originally
-          added for the Sparkle.ai wordmark, which now heads column one (the concierge); it stays
-          because the controls left behind sit in the same bleed. */}
-      <div
-        data-testid="sidebar-header"
-        style={{
-          padding: "14px 14px 6px",
-          position: "relative",
-          zIndex: 1,
-          display: "flex",
-          alignItems: "center",
-          // flex-end, not space-between: the wordmark used to anchor the left of this row, and
-          // with it gone space-between would strand the badge alone at the far left.
-          justifyContent: "flex-end",
-          gap: 8,
-        }}
-      >
-        {/* Remaining AI-credit balance, top-right of the builder column. */}
-        <BalanceBadge />
-        <ShowHelperButton />
-      </div>
-      <LogoWaveform />
+      {/* The brand chrome that used to top this column — the Sparkle.ai logo, the voice waveform
+          under it, and the remaining-credit badge — now tops column ①, the concierge, which is
+          mounted for the life of the app rather than only while a project is open
+          (PRD/sparkle/concierge-chrome-and-credits.md). What's left is the builder's own control:
+          the helper-island button, right-aligned as it was. There is no longer a voice orb painting
+          underneath, so the position:relative/zIndex lift that protected this row from its glow
+          went with the waveform.
+          The row renders only when that button will: with nothing else in it, an always-rendered
+          row is 20px of padding around nothing, pushing the Plan/Build toggle down for no reason
+          in the case that is the DEFAULT (helper enabled). */}
+      {helperHidden && (
+        <div
+          data-testid="builder-helper-row"
+          style={{
+            padding: "14px 14px 6px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "flex-end",
+            gap: 8,
+          }}
+        >
+          <ShowHelperButton />
+        </div>
+      )}
 
       {/* Column-2 header (PRD §3): the Plan / Build segmented toggle. Build keeps its two-stage
           behavior here — a second click on the active chevron spawns a fresh build agent. */}
@@ -2029,7 +2040,20 @@ const AgentRow = memo(function AgentRow({
         borderRadius: 4,
         background: C.deepForest,
         color: C.teal,
-        border: `1px solid ${C.teal}55`,
+        // `C.hairline`, not a teal tint. This chip sits INSIDE the hover card, whose surface moved
+        // to `barSurface`, and its old `${C.teal}55` edge measured 1.376:1 against that card in
+        // dark — under the chrome floor, so the chip had no boundary from any direction (its fill is
+        // `deepForest`, a plane on a plane at 1.079:1). `hairline` is the token for a 1px rule that
+        // has to be SEEN and clears every plane: 3.230/3.915 on the barSurface card, 3.769/4.314 on
+        // the `forest` one. Same remedy as ApprovalsMenu's notice well (roborev 53568/1).
+        //
+        // The FILL deliberately stays `deepForest` rather than moving to `pillFill` like the two
+        // chips below: this chip's ink is `C.teal`, which measures 1.828/1.610 on `pillFill` — the
+        // fill that makes it a proper chip is the one that destroys its ink. See the STATED
+        // EXCEPTION in PRD/sparkle/pr676-finding-drain.md; `teal` on `deepForest` (4.139/3.272) is
+        // a pre-existing brand-ink gap, and this change strictly improves the chip's boundary
+        // without touching it.
+        border: `1px solid ${C.hairline}`,
       }}
     >
       {epicPillData.title}
@@ -2345,13 +2369,26 @@ const AgentRow = memo(function AgentRow({
   const MIN_CARD_H = 180;
   const cardTop = rect ? Math.max(8, Math.min(rect.top, window.innerHeight - 16 - MIN_CARD_H)) : 0;
   const maxH = rect ? window.innerHeight - cardTop - 16 : undefined;
-  // Three shading states read at a glance: the row you're IN is the TERMINAL color (C.forest) so the
-  // active card reads as an extension of the terminal it opens over; a row you're merely hovering
-  // (not selected) is CHAT_USER_BUBBLE; idle rows are transparent. When active, the card "merges"
-  // into the terminal — no right border, no drop-shadow — so there's no seam between the column and
-  // the terminal window (mergeIntoTerminal below drives that).
+  // Three row states, but they do NOT all read by contrast, and it is worth being exact about
+  // which is which. Idle rows are transparent. The row you're IN is the TERMINAL color (C.forest),
+  // which under the near-black palette is ~1.08:1 against this column — that is not an oversight to
+  // be fixed by nudging the planes, it is the point: the active card reads as an EXTENSION of the
+  // terminal it opens over, merging into it (no right border, no drop-shadow — mergeIntoTerminal
+  // below drives that), and what separates it from the terminal text behind it is the card's
+  // `hairline` outline, not a fill step. Don't read the phrase "three states" as three contrast
+  // steps; two of them are.
+  //
+  // THE HOVER CARD IS A PANEL, SO IT TAKES A PLANE. It used to take CHAT_USER_BUBBLE — a row-state
+  // FILL — while being a full content surface: DetailLine's `muted` labels, PathReveal's `muted`
+  // path (hovering to `accentInk`), the "Up to date with…" line, the `successInk` "✓ Landed". Those
+  // are the COLUMN's inks, designed against the depth planes, and they do not clear their floor on
+  // a chrome fill in either theme — nor could any value of that token make them, since every fill
+  // far enough from the planes to read as a fill is already past what `muted` can be read on (see
+  // THE NEUTRAL LADDER in theme/colors). `barSurface` is the token for a surface that FRAMES the
+  // live terminal, which is exactly what this floating card is; it is a lift above this column in
+  // both themes, and every ink the card paints clears AA on it in both themes.
   const mergeIntoTerminal = isActive;
-  const cardBg = isActive ? C.forest : CHAT_USER_BUBBLE;
+  const cardBg = isActive ? C.forest : C.barSurface;
   // Calm rows recede (PRD §3 / prototype `.arow.p2`): a P2 agent — nothing for you to answer — goes
   // grayscale and dims, so ONLY the P0/P1 rows carry color and the eye lands on what needs you. The
   // selected row is exempt: it's docked into the terminal you're reading, and graying it would gray
@@ -2412,10 +2449,20 @@ const AgentRow = memo(function AgentRow({
           padding: "8px 10px",
           marginLeft: depth * 16,
           // Active row is the TERMINAL color, extending past the list's 8px right padding
-          // (marginRight:-8) to the sidebar's right border — which is also C.forest, as is the
-          // terminal beyond it — so the row flows into the terminal window. Left corners round into
-          // the sidebar (8px); the right edge is square here, with CONCAVE fillets (below) flaring it
-          // open into the terminal rather than a convex "button" corner. Idle rows are fully rounded.
+          // (marginRight:-8) so it reaches the sidebar's right border. Left corners round into the
+          // sidebar (8px); the right edge is square here, with CONCAVE fillets (below) shaping it
+          // into an opening rather than a convex "button" corner. Idle rows are fully rounded.
+          //
+          // THIS USED TO SAY the row "flows into the terminal window", because the sidebar's right
+          // border was ALSO C.forest, matching the terminal on the other side — the row bled through
+          // an edge that wasn't drawn. That border is C.hairline now (see the column's own note
+          // above): the app's most prominent structural boundary, deliberately made visible because
+          // a seam that matches on a near-black palette is not subtle, it is absent. So the row no
+          // longer bleeds through; it DOCKS against a drawn edge. What still carries the active
+          // state is the fill being the terminal's own colour where every other row is transparent,
+          // plus the square corner and fillets shaping that edge into an opening — and, once the
+          // card is open, its 4px `hairline` outline. Not the fill step against the column, which is
+          // ~1.08:1 and never was the signal.
           borderRadius: isActive ? "8px 0 0 8px" : 8,
           marginRight: isActive ? -8 : 0,
           cursor: "pointer",
@@ -2424,9 +2471,9 @@ const AgentRow = memo(function AgentRow({
           // !editing (like dragProps) so the rename <input> keeps normal text selection.
           userSelect: rowSection != null && !editing ? "none" : undefined,
           ...calmStyle,
-          // Active = the terminal's own color (merges into it); the hover state's CHAT_USER_BUBBLE
-          // lives on the unified card, not here. Cleared while the card is open (showOverlay) so the
-          // row reads as empty behind the stand-in card.
+          // Active = the terminal's own color (merges into it); the hover state's fill lives on the
+          // unified card, not here. Cleared while the card is open (showOverlay) so the row reads as
+          // empty behind the stand-in card.
           background: !showOverlay && isActive ? C.forest : "transparent",
           marginBottom: 2,
           // NOTE: visibility is NOT toggled on the whole row anymore — only the strip content below is
@@ -2548,12 +2595,21 @@ const AgentRow = memo(function AgentRow({
                 cursor: "pointer",
                 userSelect: rowSection != null && !editing ? "none" : undefined,
                 background: cardBg,
-                // The card fill is the terminal's own color so it reads as part of the terminal; a
-                // 4px border in the SIDEBAR color (C.deepForest, lighter than C.forest) then outlines
-                // the card shape so its text is distinguishable from the terminal text behind it.
-                // (Doubled from 2px so the card is easier to tell apart from the terminal content.)
-                // Hover-only (non-active) cards keep the thinner forest border on their bubble fill.
-                border: `${mergeIntoTerminal ? "4px" : "2px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
+                // ACTIVE: the fill is the terminal's own color so the card reads as part of the
+                // terminal. HOVER-ONLY: `barSurface`, a lift above this column — the card is a
+                // floating panel there, not an extension of the terminal, and it carries the
+                // column's own inks (see `cardBg`). Either way a border outlines the card shape so
+                // its text is distinguishable from the terminal text behind it, 4px when active
+                // (easier to tell apart from terminal content) and 2px on a hover-only card.
+                //
+                // That border used to be a DEPTH PLANE — C.deepForest for the active card "because
+                // it is lighter than C.forest", C.forest for the hover card. Under the black-and-gold
+                // palette those planes are a hair apart, so the active card's outline would be drawn
+                // in a colour indistinguishable from the terminal it is supposed to be outlined
+                // against: no outline at all. It is `hairline` now, in both states — the token whose
+                // whole job is to be a line you can see on any plane (see theme/colors, and the floor
+                // in theme/chromeContrast.test.ts).
+                border: `${mergeIntoTerminal ? "4px" : "2px"} solid ${C.hairline}`,
                 borderRadius: "8px 8px 0 8px",
               }}
             >
@@ -2597,11 +2653,11 @@ const AgentRow = memo(function AgentRow({
                 padding: "2px 10px 8px",
                 cursor: "pointer",
                 background: cardBg,
-                // Same outline as the strip (4px sidebar color when active) continues down the L's
-                // left/right/bottom so the whole card is encapsulated against the terminal behind it.
-                borderLeft: `${mergeIntoTerminal ? "4px" : "2px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
-                borderRight: `${mergeIntoTerminal ? "4px" : "2px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
-                borderBottom: `${mergeIntoTerminal ? "4px" : "2px"} solid ${mergeIntoTerminal ? C.deepForest : C.forest}`,
+                // Same outline as the strip (4px when active) continues down the L's left/right/
+                // bottom so the whole card is encapsulated against the terminal behind it.
+                borderLeft: `${mergeIntoTerminal ? "4px" : "2px"} solid ${C.hairline}`,
+                borderRight: `${mergeIntoTerminal ? "4px" : "2px"} solid ${C.hairline}`,
+                borderBottom: `${mergeIntoTerminal ? "4px" : "2px"} solid ${C.hairline}`,
                 borderRadius: "0 0 8px 8px",
               }}
             >
@@ -2705,7 +2761,14 @@ function AgentDetailLines({
               style={{
                 ...pillBase,
                 color: pillInk,
-                background: `${C.success}22`,
+                // TRANSPARENT, like the BEHIND variant above — these are one control in two states
+                // and there is no reason for one to be tinted. It carried `${C.success}22`, and the
+                // ladder's justification table measured `successInk` on the BARE plane (light
+                // 4.552 on `barSurface`) rather than on the stack it is actually composited over.
+                // Measured there, the 13.3% green wash took it to 4.127 in light — under the AA
+                // floor — while buying 1.103:1 against the card, i.e. nothing anyone can see. The
+                // chip reads by its border, which is what the behind variant already relies on.
+                background: "transparent",
                 border: `1px solid ${pillInk}`,
                 cursor: "pointer",
               }}
@@ -2813,7 +2876,11 @@ function CloseAgentButton({ onClose, width }: { onClose: () => void; width: numb
         cursor: "pointer",
         borderRadius: 999,
         border: `1px solid ${hover ? C.muted : "transparent"}`,
-        background: hover ? C.deepForest : "transparent",
+        // `pillFill` — the token whose role IS a filled chip — not `deepForest`, which is a PLANE
+        // and measured 1.079/1.248 against the hover card it opens on (`barSurface`), so the hover
+        // pill was a fill you could not see. 2.098/2.537 now, and 2.449/2.795 on the `forest` card.
+        // The hover ink is `accentInk`, which clears it comfortably (5.118/6.097).
+        background: hover ? C.pillFill : "transparent",
         transition: "background 120ms ease, border-color 120ms ease, color 120ms ease",
       }}
     >
@@ -2854,9 +2921,37 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
         padding: "8px 10px",
         borderRadius: 8,
         cursor: "pointer",
-        // Match the agent rows' selected treatment: a clean lighter lift, no accent bar.
-        background: active ? CHAT_USER_BUBBLE : "transparent",
-        borderTop: `1px solid ${C.forest}`,
+        // THE FILL IS A PLANE, AND THE PLANE IS NOT THE SIGNAL. Both halves matter.
+        //
+        // Plane, because this row's contents are all PLANE inks — the label is
+        // `statusInk(AGENT_STATUS[...].color)` and the consent pill is `muted`/`teal` — plus a
+        // StatusDot, and a chrome fill cannot carry any of them (THE NEUTRAL LADDER, theme/colors:
+        // every fill far enough from the planes to read as a fill is already past what a plane ink
+        // can be read on). On CHAT_USER_BUBBLE, which this row painted until roborev 53613, the
+        // label measured 3.20/3.71 (dark/light), the Off pill 3.20/2.38, and the status DOT
+        // 2.64/1.70 red and 4.56/1.01 green — the dot the whole row reads by, invisible in light.
+        // On `forest` those become 6.37/8.36, 6.37/5.35, 5.25/3.83 and 9.07/2.22, better at both
+        // ends than the sidebar's own `deepForest` plane, so the active fill stays here.
+        //
+        // But `forest` on a `deepForest` column is 1.08/1.38 — the fill step is not visible and
+        // never was (roborev 53662). On an AGENT row that is fine: what carries selection there is
+        // the square right edge plus the concave fillets shaping it into an opening onto the
+        // terminal, and the card's `hairline` outline once open. THIS row has none of that
+        // geometry, so moving it onto `forest` left it with no selected state at all.
+        //
+        // So the state is carried by a RAIL, in the app's established selected-row vocabulary:
+        // `CommandPalette`'s selected result takes `3px solid C.goldFill` for exactly this job.
+        // Opaque gold clears the non-text CONTROL floor against both the row's own fill and the
+        // column behind it, at both ends of the theme (measured in theme/chromeContrast.test.ts),
+        // which is the one thing no neutral fill on this row can do without taking its inks with
+        // it. Transparent when inactive rather than absent, so selecting a row shifts nothing.
+        //
+        // NO GOLD WASH under it, deliberately: an 8% wash buys 1.15 (dark) / 1.02 (light) against
+        // the column — nothing in light, where the row is exactly as invisible as before — while
+        // tinting the backdrop every one of those plane inks is measured on. The rail is the signal.
+        background: active ? C.forest : "transparent",
+        borderLeft: `3px solid ${active ? C.goldFill : "transparent"}`,
+        borderTop: `1px solid ${C.hairline}`,
       }}
     >
       <StatusDot status={status} />
@@ -3061,7 +3156,9 @@ const SupportTicketRow = memo(function SupportTicketRow() {
                   padding: "7px 10px",
                   cursor: "pointer",
                   background: C.deepForest,
-                  borderTop: i === 0 ? "none" : `1px solid ${C.forest}`,
+                  // A row separator, not a seam: one near-black plane ruled onto another is the
+                  // exact "plane used as a divider" defect `hairline` exists to remove (1.08:1).
+                  borderTop: i === 0 ? "none" : `1px solid ${C.hairline}`,
                 }}
               >
                 <span
@@ -3174,7 +3271,9 @@ function SparkleRowProgress({ state }: { state: SparkleBarState }) {
 }
 
 /** "Show Helper" — the ONLY way back after right-click → Hide Helper on the floating island.
- *  Renders only while the helper is hidden, so it costs nothing in the normal case. The helper
+ *  Renders only while the helper is hidden, so it costs nothing in the normal case. Its caller
+ *  gates the ROW on the same condition (see `helperHidden`) so the layout costs nothing either;
+ *  this guard stays because whether the button shows is the button's own contract. The helper
  *  webview is a different JS context, but both share this localStorage-backed store by origin,
  *  so flipping `enabled` here is seen there. */
 function ShowHelperButton() {

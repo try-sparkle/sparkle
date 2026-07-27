@@ -17,7 +17,9 @@ const badge: CSSProperties = {
   alignItems: "center",
   padding: "3px 9px",
   borderRadius: 8,
-  background: C.forest,
+  // pillFill, not forest: this badge is a FILLED chip on the concierge column, and a plane
+  // fill on a near-black plane is not a chip. See theme/colors `pillFill`.
+  background: C.pillFill,
   color: C.cream,
   fontSize: 12,
   fontVariantNumeric: "tabular-nums",

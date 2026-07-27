@@ -229,7 +229,7 @@ export function PinnedPrompt({
           // chrome, so it uses the lighter barSurface (not the darker sidebar deepForest). The
           // history dropdown it opens (below) stays deepForest, like the app's other menus.
           background: C.barSurface,
-          borderBottom: `1px solid ${C.forest}`,
+          borderBottom: `1px solid ${C.hairline}`,
           display: "flex",
           gap: 8,
           alignItems: "center",
@@ -537,7 +537,7 @@ function RowButton({ label, onClick }: { label: string; onClick: () => void }) {
       style={{
         background: C.deepForest,
         color: C.cream,
-        border: `1px solid ${C.forest}`,
+        border: `1px solid ${C.hairline}`,
         borderRadius: 6,
         padding: "3px 10px",
         fontSize: 12,

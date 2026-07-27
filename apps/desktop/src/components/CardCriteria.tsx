@@ -149,7 +149,7 @@ const progressChip: CSSProperties = {
   alignItems: "center",
   gap: 5,
   background: "transparent",
-  border: `1px solid ${C.deepForest}`,
+  border: `1px solid ${C.hairline}`,
   borderRadius: 6,
   padding: "2px 8px",
   fontSize: 11,

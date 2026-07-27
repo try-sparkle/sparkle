@@ -119,6 +119,18 @@ describe("SettingsDialog", () => {
     );
   });
 
+  // The search box was excluded from the repaint's border sweep as "already zero-contrast", which
+  // was only true of its border against its OWN fill. The field is a `deepForest` well sunk into a
+  // `forest` rail, and that pair fell from 1.50:1 to 1.11:1 — so post-repaint the box had no
+  // boundary at all, inner or outer. The FILL stays a well; the BORDER is a hairline.
+  it("the search field keeps a visible boundary: hairline border over the deep-forest well", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    const search = screen.getByLabelText("Search settings") as HTMLInputElement;
+    expect(search.style.background).toBe("var(--c-deep-forest)");
+    expect(search.style.border).toContain("var(--c-hairline)");
+    expect(search.style.border).not.toContain("var(--c-deep-forest)");
+  });
+
   it("fires onClose from the close button", () => {
     const onClose = vi.fn();
     render(<SettingsDialog onClose={onClose} onManageAccounts={vi.fn()} />);

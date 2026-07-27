@@ -44,7 +44,7 @@ export function ImageLightbox({ att, onClose }: { att: Attachment; onClose: () =
           justifyContent: "space-between",
           gap: 12,
           padding: "10px 12px",
-          borderBottom: `1px solid ${C.deepForest}`,
+          borderBottom: `1px solid ${C.hairline}`,
           flex: "0 0 auto",
         }}
       >

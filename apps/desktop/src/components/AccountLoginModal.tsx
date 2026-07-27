@@ -70,7 +70,7 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
           display: "flex",
           flexDirection: "column",
           background: C.deepForest,
-          border: `1px solid ${C.forest}`,
+          border: `1px solid ${C.hairline}`,
           borderRadius: 12,
           padding: 16,
           color: C.cream,
@@ -115,7 +115,7 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
             ? "This is your system-wide Claude login (~/.claude). Signing in as someone else here changes the account Claude Code uses everywhere, not just in Sparkle."
             : "Credentials are stored in this account’s own config folder, separate from your other accounts."}
         </p>
-        <div style={{ flex: 1, minHeight: 0, border: `1px solid ${C.forest}`, borderRadius: 8, overflow: "hidden", padding: 6 }}>
+        <div style={{ flex: 1, minHeight: 0, border: `1px solid ${C.hairline}`, borderRadius: 8, overflow: "hidden", padding: 6 }}>
           {spawn ? (
             <Terminal
               agentId={`account-login-${account.id}`}

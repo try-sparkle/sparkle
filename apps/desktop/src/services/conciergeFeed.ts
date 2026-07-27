@@ -28,6 +28,7 @@
 // everywhere else.
 import { AGENT_STATUS, type AgentTabStatus } from "@sparkle/ui";
 import { agentDisplayName } from "../engine/agentDisplayName";
+import { isTopLevelAgent } from "../engine/agentOrdering";
 import { STATUS_BANDS, bandOfStatus, type StatusBand } from "../engine/buildSections";
 import { resolveStage, type WorkflowStageId } from "../engine/workflowStage";
 import { publishedStatusFor } from "../useAttentionNotifications";
@@ -56,6 +57,46 @@ export interface ConciergeAgent {
    *  item's topics (see conciergeTopics). A muted item stays listed so the UI can dim it, but is
    *  excluded from scopedCounts — the concierge doesn't surface what you asked it not to. */
   muted: boolean;
+  /** Whether this agent gets a ROW OF ITS OWN in the Build column, per the one shared rule
+   *  (engine/agentOrdering.isTopLevelAgent) — i.e. it is not a worker, and not nested under a build
+   *  agent that is present in the same project.
+   *
+   *  Stamped here, on the feed, because the digest's count is a PROMISE the click has to keep:
+   *  clicking "2 Need you in web" isolates that band in column two, which narrows top-level rows and
+   *  nothing else. A digest that counted workers would state a number column two cannot produce —
+   *  two blocked workers gave the user "2" and an empty column. The feed still LISTS workers (it is
+   *  the full cross-project truth, and a worker's red still bubbles to its orchestrator); this field
+   *  is what lets the surfacing gate count only what is clickable-to. */
+  topLevel: boolean;
+  /** True when this agent gets NO row of its own AND a present ancestor ALREADY carries its band —
+   *  so the concierge would be saying the same thing twice if it counted both.
+   *
+   *  This is the other half of `topLevel`, and the two only make sense together. `topLevel` says
+   *  "can the Build column show this?"; a rowless agent that nothing else speaks for still has to
+   *  reach the user SOMEHOW, or the `topLevel` gate turns it into silence. That is precisely what
+   *  happened: `isTopLevelAgent` excludes every worker unconditionally, while
+   *  `engine/workerAttention.withRedWorkerAttention` bubbles a worker's red to its orchestrator only
+   *  sometimes — it skips a worker with no `parentId`, it writes to a status-map key with no agent
+   *  behind it when the parent is not in the fleet, and it deliberately SUPPRESSES a non-ask red
+   *  (`blocked`) while the orchestrator is still in motion. A worker in any of those three cases had
+   *  no row, no card, no digest line and no count.
+   *
+   *  So the rule is representation, not kind: counted once, at whichever agent actually stands for
+   *  the work. Represented → the ancestor's row speaks for it. Not represented → it speaks for
+   *  itself (ConciergeHost surfaces it as its own nudge card, never folded into a digest line's
+   *  count, because a line's count is a promise about ROWS).
+   *
+   *  BAND EQUALITY is the test, not mere parenthood: a `blocked` worker under a `working`
+   *  orchestrator is NOT represented (the orchestrator's row is banded Running — the Needs-you
+   *  filter hides it), while a `waiting` worker under the orchestrator that inherited that exact
+   *  `waiting` IS. It also keeps the `running` band honest in the other direction: a `working`
+   *  worker under an `idle` parent still counts, because nothing else is reporting that work.
+   *
+   *  Walked over the FLATTENED fleet, so a worker whose orchestrator lives in another project is
+   *  represented by that orchestrator's row — which is where `publishedStatusFor` put its red.
+   *  Mute and scope are deliberately NOT consulted: they are applied to the agent itself, and a
+   *  user who muted an orchestrator muted its build, workers included. */
+  representedElsewhere: boolean;
 }
 
 /** How many agents sit in each band. Every band is counted — a surface that only cares about
@@ -237,22 +278,67 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
     resolveStage(branchStatus[id], workflowStage[id]),
   );
 
+  // Band + parent for EVERY agent in the fleet, so representation can be resolved across projects
+  // (a worker's orchestrator may live in another one — that is where publishedStatusFor, which runs
+  // over this same flattened list, put its red).
+  const bandById = new Map<string, StatusBand>();
+  const parentById = new Map<string, string | null>();
+  for (const a of allAgents) {
+    bandById.set(a.id, conciergeBand(derived[a.id] ?? DEFAULT_STATUS));
+    parentById.set(a.id, a.parentId);
+  }
+
+  /** Does a present ancestor already carry this agent's band? See `ConciergeAgent.representedElsewhere`.
+   *
+   *  Walks the chain rather than checking only the parent so a deeper nesting can't silently open the
+   *  same hole, and carries a `seen` set because `parentId` is persisted data — a cycle in it must
+   *  not hang the feed. An ABSENT ancestor ends the walk with `false`: a bubble aimed at an agent
+   *  that is not in the fleet lands nowhere, which is the very case this exists to catch. */
+  const isRepresented = (agent: { id: string; parentId: string | null }): boolean => {
+    const band = bandById.get(agent.id);
+    const seen = new Set<string>([agent.id]);
+    let pid = agent.parentId;
+    while (pid !== null && !seen.has(pid)) {
+      seen.add(pid);
+      const parentBand = bandById.get(pid);
+      if (parentBand === undefined) return false; // parent not in the fleet — nothing speaks for it
+      if (parentBand === band) return true;
+      pid = parentById.get(pid) ?? null;
+    }
+    return false;
+  };
+
   const counts = emptyCounts();
   const scopedCounts = emptyCounts();
   const outProjects: ConciergeProject[] = projects.map((p) => {
     const inScope = pinnedProjectId === null || p.id === pinnedProjectId;
     const projectCounts = emptyCounts();
+    // Closed over THIS PROJECT's agents, matching AgentSidebar exactly: the sidebar asks
+    // `isTopLevelAgent(project.agents)`, so nesting is judged against the same population on both
+    // sides. Judging it against the flattened fleet instead would call a worker whose orchestrator
+    // lives in another project "nested" here, where it has no parent row to nest under.
+    const isTopLevel = isTopLevelAgent(p.agents);
     const agents = p.agents.map((a): ConciergeAgent => {
       const status = derived[a.id] ?? DEFAULT_STATUS;
       const tok = AGENT_STATUS[status] ?? AGENT_STATUS[DEFAULT_STATUS];
       const band = conciergeBand(status);
       const muted = conciergeTopics(a.id, status).some((t) => !shouldInterrupt(t));
       const since = interaction[a.id];
+      const topLevel = isTopLevel(a);
+      // A rowless agent an ancestor already speaks for. See `representedElsewhere` — this is what
+      // stops one piece of work being counted twice (the red worker AND the orchestrator that
+      // inherited its red), which is what made the vitals line and the thread disagree.
+      const representedElsewhere = !topLevel && isRepresented(a);
       projectCounts[band]++;
-      // The scoped view applies the SAME two gates to every band (in scope per the pin, not muted),
-      // so "3 Running" shrinks when you pin exactly the way "3 Need you" does. The old shape only
-      // ever scoped the interrupting tiers because it had no field for the rest.
-      if (inScope && !muted) scopedCounts[band]++;
+      // The scoped view applies the SAME gates to every band (in scope per the pin, not muted, not
+      // already spoken for), so "3 Running" shrinks when you pin exactly the way "3 Need you" does.
+      // The old shape only ever scoped the interrupting tiers because it had no field for the rest.
+      //
+      // These are the counts column one STATES, and `ConciergeHost` derives the thread from the same
+      // three gates — so the vitals number and the items the thread accounts for are one population
+      // by construction, not two computations that happen to agree. `counts` above stays the raw
+      // truth (every agent, once per agent), which is what the per-project tab badges read.
+      if (inScope && !muted && !representedElsewhere) scopedCounts[band]++;
       return {
         id: a.id,
         name: displayName(a),
@@ -266,6 +352,8 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
         ...(since !== undefined && since > 0 ? { since } : {}),
         inScope,
         muted,
+        topLevel,
+        representedElsewhere,
       };
     });
     agents.sort(compareAgents);

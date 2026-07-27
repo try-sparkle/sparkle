@@ -598,7 +598,7 @@ const rowStyle: CSSProperties = {
   alignItems: "flex-start",
   gap: 12,
   padding: "10px 2px",
-  borderBottom: `1px solid ${C.forest}`,
+  borderBottom: `1px solid ${C.hairline}`,
 };
 
 const descStyle: CSSProperties = {

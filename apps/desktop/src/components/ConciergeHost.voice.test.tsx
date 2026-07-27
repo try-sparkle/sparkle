@@ -125,6 +125,9 @@ const feedWithAgent = {
           band: "done" as const,
           inScope: true,
           muted: false,
+          topLevel: true,
+          // Nothing above it in the tree, so no ancestor row can be speaking for it.
+          representedElsewhere: false,
         },
       ],
     },

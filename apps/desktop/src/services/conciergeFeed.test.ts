@@ -353,3 +353,149 @@ describe("buildConciergeFeed — cross-window completeness via the tray roster",
     expect(byId["bogus"]).toMatchObject({ status: "working", statusColor: GREEN }); // local wins
   });
 });
+
+// REPRESENTATION — "who speaks for this piece of work?" — the rule that stops `scopedCounts` from
+// counting a red worker AND the orchestrator that inherited its red, and stops the concierge's
+// `topLevel` surfacing gate from turning an un-bubbled worker into silence. See
+// `ConciergeAgent.representedElsewhere`.
+describe("buildConciergeFeed — representedElsewhere", () => {
+  const worker = (id: string, parentId: string | null) =>
+    agent(id, { kind: "worker", parentId });
+  /** Every agent live, so the unstarted-worker overlay can't invent an `approval` and change the
+   *  bands out from under these cases. */
+  const build = (projects: Project[], status: Record<string, AgentTabStatus>) =>
+    buildConciergeFeed({
+      projects,
+      status,
+      openAgentIds: projects.flatMap((p) => p.agents.map((a) => a.id)),
+    });
+  const by = (feed: ReturnType<typeof buildConciergeFeed>) =>
+    Object.fromEntries(flat(feed).map((a) => [a.id, a]));
+
+  it("a worker whose red bubbled to its orchestrator is represented, and counted once", () => {
+    const feed = build([project("p1", [agent("orch"), worker("w1", "orch")])], {
+      orch: "idle",
+      w1: "waiting",
+    });
+    const byId = by(feed);
+    expect(byId["orch"]).toMatchObject({ band: "needs_you", representedElsewhere: false });
+    expect(byId["w1"]).toMatchObject({ band: "needs_you", representedElsewhere: true });
+    // ONE piece of work, one count — the orchestrator's row is the thing that carries it.
+    expect(feed.scopedCounts.needs_you).toBe(1);
+    expect(feed.counts.needs_you).toBe(2); // the raw truth still lists both
+  });
+
+  it("a blocked worker whose orchestrator is still MOVING is not represented — the bubble is suppressed", () => {
+    const feed = build([project("p1", [agent("orch"), worker("w1", "orch")])], {
+      orch: "working",
+      w1: "blocked",
+    });
+    const byId = by(feed);
+    // Different bands: the orchestrator's row is Running, so the Needs-you filter hides it. Nothing
+    // is speaking for w1.
+    expect(byId["orch"]!.band).toBe("running");
+    expect(byId["w1"]).toMatchObject({ band: "needs_you", representedElsewhere: false });
+    expect(feed.scopedCounts).toEqual({ needs_you: 1, running: 1, done: 0 });
+  });
+
+  it("a parentless worker is never represented", () => {
+    const feed = build([project("p1", [worker("w1", null)])], { w1: "waiting" });
+    expect(by(feed)["w1"]).toMatchObject({ topLevel: false, representedElsewhere: false });
+    expect(feed.scopedCounts.needs_you).toBe(1);
+  });
+
+  it("a worker whose orchestrator is not in the fleet is never represented", () => {
+    const feed = build([project("p1", [worker("w1", "gone")])], { w1: "blocked" });
+    expect(by(feed)["w1"]).toMatchObject({ representedElsewhere: false });
+    expect(feed.scopedCounts.needs_you).toBe(1);
+  });
+
+  it("a top-level agent is never represented, whatever else is in the fleet", () => {
+    const feed = build([project("p1", [agent("a"), agent("b")])], { a: "waiting", b: "waiting" });
+    expect(Object.values(by(feed)).every((a) => a.representedElsewhere === false)).toBe(true);
+    expect(feed.scopedCounts.needs_you).toBe(2);
+  });
+
+  it("representation is BAND equality, not parenthood: a working worker under an idle parent still counts", () => {
+    const feed = build([project("p1", [agent("orch"), worker("w1", "orch")])], {
+      orch: "idle",
+      w1: "working",
+    });
+    const byId = by(feed);
+    // The parent bands `done`; nothing else is reporting that this work is in flight.
+    expect(byId["orch"]!.band).toBe("done");
+    expect(byId["w1"]).toMatchObject({ band: "running", representedElsewhere: false });
+    expect(feed.scopedCounts).toEqual({ needs_you: 0, running: 1, done: 1 });
+  });
+
+  it("resolves an orchestrator in ANOTHER project — the fleet is flattened before the red bubbles", () => {
+    const feed = build(
+      [project("p1", [worker("w1", "orch")]), project("p2", [agent("orch")])],
+      { w1: "waiting", orch: "idle" },
+    );
+    const byId = by(feed);
+    expect(byId["orch"]!.band).toBe("needs_you"); // publishedStatusFor ran over the flat fleet
+    expect(byId["w1"]!.representedElsewhere).toBe(true);
+    expect(feed.scopedCounts.needs_you).toBe(1);
+  });
+
+  it("a parentId cycle terminates instead of hanging the feed", () => {
+    // `parentId` is persisted data; a cycle must be survivable, not fatal.
+    const feed = build(
+      [project("p1", [worker("w1", "w2"), worker("w2", "w1")])],
+      { w1: "waiting", w2: "waiting" },
+    );
+    // Each is in the other's chain and shares its band, so both read as represented — the point of
+    // the test is that this RETURNS at all.
+    expect(flat(feed)).toHaveLength(2);
+    expect(feed.counts.needs_you).toBe(2);
+  });
+});
+
+// `ConciergeAgent.topLevel` — the field the digest's whole promise rests on (roborev 53562).
+//
+// The predicate itself is covered in engine/agentOrdering.test.ts; what is pinned HERE is that the
+// feed stamps it from that predicate, closed over the RIGHT population. That choice is load-bearing
+// and easy to get wrong in a way no other test would notice: closed over the flattened fleet, a
+// worker whose orchestrator lives in another project would read "nested" in a project where it has
+// no parent row to nest under, and the digest's count would stop matching the Build column's rows.
+describe("buildConciergeFeed — topLevel is stamped from the ONE shared predicate", () => {
+  const worker = (id: string, parentId: string | null) =>
+    agent(id, { kind: "worker", parentId });
+  const by = (feed: ReturnType<typeof buildConciergeFeed>) =>
+    Object.fromEntries(flat(feed).map((a) => [a.id, a]));
+
+  it("a parentless build agent is top-level; a worker never is", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("orch"), worker("w1", "orch"), worker("w2", null)])],
+      status: { orch: "idle", w1: "idle", w2: "idle" },
+    });
+    const byId = by(feed);
+    expect(byId["orch"]!.topLevel).toBe(true);
+    expect(byId["w1"]!.topLevel).toBe(false);
+    // Orphaned mid-spawn — still never a row.
+    expect(byId["w2"]!.topLevel).toBe(false);
+  });
+
+  it("a build agent nested under another build agent in the SAME project is not top-level", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("parent"), agent("child", { parentId: "parent" })])],
+      status: { parent: "idle", child: "idle" },
+    });
+    expect(by(feed)["child"]!.topLevel).toBe(false);
+  });
+
+  it("closes over the PROJECT's agents, not the flattened fleet — a same-id parent elsewhere does not nest it", () => {
+    // `child` names a parent that exists only in the OTHER project. Judged against the flattened
+    // fleet it would read as nested; judged against its own project — which is the population
+    // AgentSidebar asks about, and therefore the rows the digest's click narrows — it is a row.
+    const feed = buildConciergeFeed({
+      projects: [
+        project("p1", [agent("child", { parentId: "faraway" })]),
+        project("p2", [agent("faraway")]),
+      ],
+      status: { child: "idle", faraway: "idle" },
+    });
+    expect(by(feed)["child"]!.topLevel).toBe(true);
+  });
+});

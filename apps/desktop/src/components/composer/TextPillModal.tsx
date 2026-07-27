@@ -22,7 +22,7 @@ export function TextPillModal({
           justifyContent: "space-between",
           gap: 12,
           padding: "12px 16px",
-          borderBottom: `1px solid ${C.deepForest}`,
+          borderBottom: `1px solid ${C.hairline}`,
           flex: "0 0 auto",
         }}
       >
@@ -78,7 +78,7 @@ export function TextPillModal({
           justifyContent: "flex-end",
           gap: 10,
           padding: "12px 16px",
-          borderTop: `1px solid ${C.deepForest}`,
+          borderTop: `1px solid ${C.hairline}`,
           flex: "0 0 auto",
         }}
       >

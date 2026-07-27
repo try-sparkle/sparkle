@@ -653,7 +653,8 @@ const smallBtn: CSSProperties = {
 };
 
 const selectStyle: CSSProperties = {
-  background: C.forest,
+  // pillFill — a filled control on a deepForest panel; see theme/colors.
+  background: C.pillFill,
   color: C.cream,
   border: `1px solid ${C.muted}`,
   borderRadius: 6,

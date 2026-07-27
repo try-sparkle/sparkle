@@ -1018,7 +1018,10 @@ export const AgentPane = memo(AgentPaneInner, arePanePropsEqual);
  * open a dropdown of all accounts and pin a different one for this agent (takes effect next spawn).
  * The pinned/active account is marked. Styling mirrors the app's other dark popovers (TopBar menus).
  */
-function AccountBadge({
+/* Exported for AgentPane.accountBadge.test.tsx — the selected row's ink pairing is a live
+   consumer of the neutral ladder (see theme/colors) and needs a guard of its own; the rest of
+   AgentPane cannot be rendered in a test without the Tauri runtime. */
+export function AccountBadge({
   accounts,
   identities,
   chosen,
@@ -1088,7 +1091,7 @@ function AccountBadge({
               marginTop: 4,
               minWidth: 180,
               background: C.deepForest,
-              border: `1px solid ${C.forest}`,
+              border: `1px solid ${C.hairline}`,
               borderRadius: 8,
               boxShadow: "0 12px 32px rgba(0,0,0,0.45)",
               padding: 6,
@@ -1102,6 +1105,14 @@ function AccountBadge({
               // becomes a secondary alias line whenever it differs from the email.
               const primary = accountLabel(a, identity);
               const alias = identity?.email && a.nickname !== identity.email ? a.nickname : null;
+              // The 10px secondary lines (alias, "not signed in", "default") are `muted` on an
+              // unselected row — a transparent row, so they are read on the menu's `deepForest`
+              // plane, which is what `muted` is for. On the SELECTED row the backdrop is
+              // `C.pillFill`, and `muted` cannot clear the ink floor on that or any other chrome
+              // fill in either theme — no palette value fixes it, so the ink moves rather than the
+              // token (see THE NEUTRAL LADDER in theme/colors). `cream` is the on-fill ink; these
+              // lines stay secondary by size, which is the distinction the row already used.
+              const secondaryInk = active ? C.cream : C.muted;
               return (
                 <div
                   key={a.id}
@@ -1117,7 +1128,9 @@ function AccountBadge({
                     fontFamily: '"IBM Plex Sans", sans-serif',
                     fontSize: 12,
                     color: C.cream,
-                    background: active ? C.forest : "transparent",
+                    // pillFill, not forest — see the same note in ModelPill: forest on a
+                    // deepForest menu draws no selection under the near-black palette.
+                    background: active ? C.pillFill : "transparent",
                   }}
                 >
                   <span
@@ -1135,15 +1148,15 @@ function AccountBadge({
                       {primary}
                     </span>
                     {alias && (
-                      <span style={{ display: "block", color: C.muted, fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <span style={{ display: "block", color: secondaryInk, fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         {alias}
                       </span>
                     )}
                     {!identity?.email && (
-                      <span style={{ display: "block", color: C.muted, fontSize: 10 }}>not signed in</span>
+                      <span style={{ display: "block", color: secondaryInk, fontSize: 10 }}>not signed in</span>
                     )}
                   </span>
-                  {a.isDefault && <span style={{ color: C.muted, fontSize: 10, flexShrink: 0 }}>default</span>}
+                  {a.isDefault && <span style={{ color: secondaryInk, fontSize: 10, flexShrink: 0 }}>default</span>}
                 </div>
               );
             })}

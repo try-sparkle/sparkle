@@ -5,6 +5,7 @@
 // reports its kind.
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { C, ON_GOLD_FILL } from "../../theme/colors";
 import { ComposeBox } from "./ComposeBox";
 import { useUiStore } from "../../stores/uiStore";
 
@@ -28,6 +29,41 @@ function setup(
 
 // "Message", not "Message Sparkle": the box no longer knows where a send goes — the host routes it.
 const box = () => screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
+
+
+// THE OPAQUE-GOLD PAIR, pinned at the loudest gold in the shell. Two ways this regresses and
+// neither fails anything else: the Send button falls back to the amber STATUS token (which is what
+// it painted before the gold token existed), or the fill goes to the LITERAL BRAND.gold — a
+// cross-theme constant that has no visible edge on light mode's near-white column, and this button
+// has no border, so that contrast IS its edge. The fill's floor lives in
+// theme/chromeContrast.test.ts; this pins that the button actually reaches for it.
+//
+// `expect(send.style.background).toBe(C.goldFill)` is the WHOLE guard, and it is enough: the themed
+// token serializes as the `var()` string and BOTH fallbacks serialize as rgb() triples, so an
+// equality against the token already excludes them.
+//
+// This used to carry two extra `not.toBe(rgb(...))` lines naming the fallbacks. They were dead —
+// once the equality above has constrained the value, a following negative on the same value cannot
+// fail under any code change. (Routing them through `rgb()` fixed their comparison FORM, which is
+// why the earlier round's fix looked like it worked; it did not make them able to fail.) A dead
+// assertion dressed as a guard is worse than no assertion: it makes the case look broader than it
+// is, so the next reader stops looking. The value the token resolves TO is pinned separately, in
+// theme/chromeContrast.test.ts ("dark keeps the prototype's own gold") and by the index.css mirror.
+describe("ComposeBox — the Send button carries the concierge gold", () => {
+  it("uses the THEMED goldFill + its paired ink, never amber and never the literal gold", () => {
+    setup();
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(send.style.background).toBe(C.goldFill);
+    expect(send.style.color).toBe(ON_GOLD_FILL);
+  });
+
+  it("the LIVE mic borders in the same themed gold, with the gold-hot glyph", () => {
+    setup({ micLive: true });
+    const mic = screen.getByRole("button", { name: "Talk to Sparkle" });
+    expect(mic.style.borderColor).toBe(C.goldFill);
+    expect(mic.style.color).toBe(C.goldHotInk);
+  });
+});
 
 describe("ComposeBox — submit", () => {
   it("Send click submits the trimmed text and clears the box", () => {

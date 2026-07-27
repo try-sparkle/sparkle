@@ -1,68 +1,96 @@
 // @vitest-environment jsdom
 //
-// WHERE the Sparkle.ai logo lives, asserted from both ends.
+// WHERE the app's brand chrome lives, asserted from both ends.
 //
-// It used to sit in column two (the builder sidebar) and now tops column one (the persistent
-// concierge). A move like this is exactly the kind of change that half-lands: the new copy gets
-// added and the old one is never deleted, so the mark renders twice in one shell and nobody
-// notices until a screenshot. So this file asserts the ABSENCE in the sidebar as hard as the
-// presence in the concierge column, and pins the accessibility contract that made it an anchor in
-// the first place — a bare clickable <img> is unreachable by keyboard and announced as an image,
-// not a link.
-import { cleanup, render, screen } from "@testing-library/react";
+// Three pieces made the same trip together: the Sparkle.ai logo, the voice waveform under it, and
+// the remaining-credit badge. All three used to sit in column two (the builder sidebar) and now top
+// column one (the persistent concierge). A move like this is exactly the kind of change that
+// half-lands: the new copy gets added and the old one is never deleted, so the mark renders twice
+// in one shell and nobody notices until a screenshot. So this file asserts the ABSENCE in the
+// sidebar as hard as the presence in the concierge column, and pins the accessibility contract that
+// made the logo an anchor in the first place — a bare clickable <img> is unreachable by keyboard
+// and announced as an image, not a link.
+//
+// Two aftershocks of that move are pinned here too: the header must carry exactly ONE brand mark
+// (the star field's own "Sparkle" text was a second one, 8px from the logo, left-aligned against
+// centered, both named "Sparkle"), and the row the logo left behind in the builder must not render
+// when its last remaining child renders nothing.
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(() => Promise.resolve()),
   revealItemInDir: vi.fn(() => Promise.resolve()),
 }));
-vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
+// A STAND-IN, not a null: this file's job is to say where the waveform renders, so the double has
+// to be findable. Mocked at all because the real one drives a rAF loop off the mic stores — that is
+// LogoWaveform.render.test's subject, not this file's.
+vi.mock("./LogoWaveform", () => ({
+  LogoWaveform: () => <div data-testid="logo-waveform" />,
+}));
 vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
+vi.mock("../services/branchStatus", () => ({
+  refreshAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
+  landAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
+  // The sidebar's mount effect polls this; stubbing it keeps the run free of a rejected-promise
+  // log that has nothing to do with what's asserted here.
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
+}));
 
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { AgentSidebar } from "./AgentSidebar";
 import { ConciergeColumn } from "./Concierge";
 import type { ConciergeController, ConciergeViewModel } from "./Concierge";
+import { useHelperPrefs } from "../helper/helperPrefs";
+import { useAuthStore } from "../stores/authStore";
+import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
-import type { AgentTab, Project } from "../types";
+import type { AgentTab, AgentTabStatus, Project } from "../types";
 
-const AGENT_NAME = "Builder";
-
-function mkProject(): Project {
-  const agent: AgentTab = {
-    id: "a1",
-    name: AGENT_NAME,
-    kind: "build",
-    parentId: null,
-    runtime: "local",
-    worktreePath: "/tmp/demo/.worktrees/a1",
-    branch: "sparkle/agent-a1",
-    baseBranch: "main",
-    lastPrompt: "",
-    promptHistory: [],
-    namePinned: true,
-    autoNameBasis: null,
-    autoNameVariants: null,
-    shellCommand: null,
-  };
+function mkAgent(id: string, name: string): AgentTab {
   return {
-    id: "p1",
-    name: "Demo",
-    rootPath: "/tmp/demo",
-    defaultBranch: "main",
-    createdAt: new Date(0).toISOString(),
-    selectedAgentId: null,
-    agents: [agent],
+    id, name, kind: "build", parentId: null, runtime: "local",
+    worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
+    promptHistory: [], namePinned: true, autoNameBasis: null,
+    autoNameVariants: null, shellCommand: null, pinnedIndex: null,
+  } as AgentTab;
+}
+
+function seed(): Project {
+  const project: Project = {
+    id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
+    createdAt: new Date(0).toISOString(), selectedAgentId: null,
+    agents: [mkAgent("a1", "Builder")],
   };
+  useProjectStore.setState({ projects: [project] } as never);
+  useRuntimeStore.setState({
+    branchStatus: {},
+    workflowStage: {},
+    status: { a1: "idle" } as Record<string, AgentTabStatus>,
+    openAgentIds: ["a1"],
+    open: vi.fn(),
+    pollBranchStatus: vi.fn(() => Promise.resolve()),
+  } as never);
+  return project;
 }
 
 const model: ConciergeViewModel = {
   scope: {},
   vitals: { needs_you: 0, running: 0, done: 0 },
-  spend: { amountText: "$4.12" },
   messages: [],
 };
+
+/** The badge renders `me.balanceCents` and calls `refresh()` on mount. Stub the refresh — the real
+ *  one reaches the orchestration server, and what's under test here is placement, not the fetch. */
+const REMAINING_CENTS = 15_387;
+function seedBalance(balanceCents = REMAINING_CENTS) {
+  useAuthStore.setState({
+    me: { clerkUserId: "u1", entitled: true, balanceCents, tokenVersion: 1 },
+    refresh: vi.fn(async () => {}),
+  } as never);
+}
 
 function controller(): ConciergeController {
   return {
@@ -75,9 +103,11 @@ function controller(): ConciergeController {
 }
 
 beforeEach(() => {
-  useRuntimeStore.setState({ branchStatus: {}, status: {} });
-  // Build mode, so the build agent under test is actually listed (Think/Plan would filter it out).
-  useUiStore.setState({ workMode: "build" });
+  useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+  // The helper island's shipped default, restored per test: it decides whether the builder's
+  // leftover top row renders at all (see the last describe).
+  useHelperPrefs.setState({ enabled: true });
+  seedBalance();
 });
 afterEach(cleanup);
 
@@ -97,21 +127,146 @@ describe("the Sparkle.ai logo lives in column one, the concierge", () => {
     expect(link.contains(screen.getByAltText("Sparkle"))).toBe(true);
   });
 
-  it("renders the brand name exactly ONCE — the mark replaced the styled wordmark text", () => {
+  // THE OTHER HALF OF THE CONTRACT SparkleLogoLink EXISTS FOR (roborev 53557).
+  //
+  // Its own header says it lives in its own file because "the accessibility contract below is the
+  // kind of thing that quietly regresses when it is one anonymous <a> nested three levels inside a
+  // layout block" — and then nothing asserted the behavioural half of it. `href` was pinned above;
+  // what the click DOES was not, in a file that already installs the opener mock.
+  //
+  // All three clauses matter and each fails differently. We are in a WebView: without
+  // preventDefault a real navigation REPLACES THE RUNNING APP. Without `openUrl` the link goes
+  // nowhere at all. And a swallowed rejection means a broken opener looks exactly like a working
+  // one — the comment specifically calls for "a surfaced opener failure rather than a swallowed
+  // promise", which is a claim about the `.catch`, not about the happy path.
+  it("opens sparkle.ai through the Tauri opener instead of navigating the WebView", async () => {
     render(<ConciergeColumn model={model} controller={controller()} />);
-    // The star field used to draw the literal word "Sparkle" as text. The logo IS that word, so a
-    // stray text node here would mean the column prints the brand name twice, stacked.
-    expect(screen.queryByText("Sparkle")).toBeNull();
-    expect(screen.getAllByAltText("Sparkle")).toHaveLength(1);
+    const link = screen.getByRole("link", { name: "Sparkle" });
+    // `cancelable` so the return value of dispatch actually reports preventDefault — fireEvent.click
+    // defaults to cancelable already, but stating it keeps the assertion from depending on that.
+    const notPrevented = fireEvent.click(link, { cancelable: true });
+    expect(notPrevented).toBe(false); // the WebView navigation was cancelled
+    expect(openUrl).toHaveBeenCalledWith("https://sparkle.ai");
+  });
+
+  it("SURFACES an opener failure rather than swallowing the promise", async () => {
+    const boom = new Error("no opener");
+    vi.mocked(openUrl).mockRejectedValueOnce(boom);
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    fireEvent.click(screen.getByRole("link", { name: "Sparkle" }));
+    // Flush the rejection's microtask — without this the .catch has not run and the test passes
+    // whether or not one exists.
+    await Promise.resolve();
+    expect(err).toHaveBeenCalledWith("Failed to open sparkle.ai:", boom);
+    err.mockRestore();
   });
 
   it("does NOT render it in the builder sidebar any more", () => {
-    render(<AgentSidebar project={mkProject()} />);
+    const project = seed();
+    render(<AgentSidebar project={project} />);
     expect(screen.queryByAltText("Sparkle")).toBeNull();
     expect(screen.queryByRole("link", { name: "Sparkle" })).toBeNull();
-    // The header row itself is still there — the row survived the move, only the logo left.
-    expect(screen.getByTestId("sidebar-header")).toBeTruthy();
-    // …and so did the rest of the sidebar.
-    expect(screen.getByText(AGENT_NAME)).toBeTruthy();
+  });
+
+  it("is the header's ONLY mark — no second brand wordmark under it", () => {
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    // The star field used to paint the literal word "Sparkle" directly beneath the logo: two brand
+    // marks inside ~80px, left-aligned above centered, two neighbors both named "Sparkle".
+    expect(screen.queryAllByText("Sparkle")).toHaveLength(0);
+    expect(screen.getAllByAltText("Sparkle")).toHaveLength(1);
+  });
+
+  it("keeps the mark INSIDE the star field, so voice state still animates around it", () => {
+    const { container } = render(<ConciergeColumn model={model} controller={controller()} />);
+    // Dropping the duplicate text must not have cost the field — the canvas that draws it is the
+    // logo's own relatively-positioned box, not a sibling further up the column.
+    const canvas = container.querySelector("canvas");
+    expect(canvas).toBeTruthy();
+    const field = canvas!.parentElement!;
+    expect(field.contains(screen.getByAltText("Sparkle"))).toBe(true);
+  });
+});
+
+// What's left of the builder's old brand row, once the logo/waveform/badge moved out.
+describe("the builder sidebar's brand row is gone unless it has something to hold", () => {
+  it("renders no row at all in the default case — helper island enabled", () => {
+    useHelperPrefs.setState({ enabled: true });
+    const project = seed();
+    render(<AgentSidebar project={project} />);
+    // ShowHelperButton is the row's only remaining child and returns null while the island is
+    // enabled, which is the DEFAULT. An always-rendered row would be an empty <div> charging
+    // "14px 14px 6px" of padding above the Plan/Build toggle.
+    expect(screen.queryByTestId("show-helper")).toBeNull();
+    expect(screen.queryByTestId("builder-helper-row")).toBeNull();
+  });
+
+  it("brings the row back when the island is hidden, so Show Helper has somewhere to live", () => {
+    useHelperPrefs.setState({ enabled: false });
+    const project = seed();
+    render(<AgentSidebar project={project} />);
+    const row = screen.getByTestId("builder-helper-row");
+    expect(row.contains(screen.getByTestId("show-helper"))).toBe(true);
+  });
+});
+
+describe("the voice waveform followed the logo into column one", () => {
+  it("renders under the mark in the concierge header", () => {
+    const { container } = render(<ConciergeColumn model={model} controller={controller()} />);
+    const wave = screen.getByTestId("logo-waveform");
+    // "Directly under the mark", asserted as document order rather than as pixels: the logo's row
+    // must precede the waveform. DOCUMENT_POSITION_FOLLOWING is set on b when b comes after a.
+    const logo = screen.getByAltText("Sparkle");
+    expect(logo.compareDocumentPosition(wave) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // …and both are inside the header block, not stranded further down the column.
+    expect(container.querySelector("section")?.contains(wave)).toBe(true);
+  });
+
+  it("is GONE from the builder sidebar", () => {
+    const project = seed();
+    render(<AgentSidebar project={project} />);
+    expect(screen.queryByTestId("logo-waveform")).toBeNull();
+  });
+});
+
+describe("the credit badge shows REMAINING credits, in column one", () => {
+  it("renders the remaining balance from me.balanceCents in the concierge header", () => {
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    // 15_387¢ → "$153.87". Read off the entitlement the server reports, NOT off any locally
+    // derived spend figure: this number counts DOWN as credits are consumed.
+    expect(screen.getByText("$153.87")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Open credits" })).toBeTruthy();
+  });
+
+  it("tracks the balance rather than pinning a constant", () => {
+    const { rerender } = render(<ConciergeColumn model={model} controller={controller()} />);
+    expect(screen.getByText("$153.87")).toBeTruthy();
+    seedBalance(9_900);
+    rerender(<ConciergeColumn model={model} controller={controller()} />);
+    expect(screen.getByText("$99.00")).toBeTruthy();
+    expect(screen.queryByText("$153.87")).toBeNull();
+  });
+
+  it("refreshes the entitlement on mount in its new home", () => {
+    const refresh = vi.fn(async () => {});
+    useAuthStore.setState({
+      me: { clerkUserId: "u1", entitled: true, balanceCents: REMAINING_CENTS, tokenVersion: 1 },
+      refresh,
+    } as never);
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    // The badge's whole reason for calling refresh is that a top-up done elsewhere must show here.
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("is the ONLY money pill in the shell — the spend pill is gone from both columns", () => {
+    const project = seed();
+    const { unmount } = render(<ConciergeColumn model={model} controller={controller()} />);
+    // Exactly one dollar figure in column one. The deleted SpendPill rendered a second one on this
+    // same corner (a trailing-24h total counting UP), which is the confusion this move resolved.
+    expect(screen.getAllByText(/^\$\d/).length).toBe(1);
+    unmount();
+    render(<AgentSidebar project={project} />);
+    expect(screen.queryByText(/^\$\d/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open credits" })).toBeNull();
   });
 });

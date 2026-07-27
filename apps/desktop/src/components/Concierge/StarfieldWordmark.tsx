@@ -1,19 +1,21 @@
-// The Sparkle wordmark with a dense star field living THROUGH it — no background box or
-// shading; the stars are part of the column. Still at rest (slow firefly drift + twinkle),
-// a buzzy waveform only while listening/speaking. Ported from the canonical prototype
+// The brand mark with a dense star field living THROUGH it — no background box or shading;
+// the stars are part of the column. Still at rest (slow firefly drift + twinkle), a buzzy
+// waveform only while listening/speaking. Ported from the canonical prototype
 // (PRD/sparkle/concierge-mode/prototype.html); all motion math lives in ./starfieldMath so
-// this file owns only the canvas painting and the lift that keeps the mark off the stars.
+// this file owns only the canvas painting and the punch-out that lifts the mark off the stars.
 //
-// The mark itself is a CHILD, not a `text` prop: the wordmark it used to render as styled text
-// was the literal word "Sparkle", and the brand asset that moved into this column
-// (SparkleLogoLink) is the same word drawn properly. Rendering both stacked the word twice in
-// two typefaces, so the field now hosts the real logo instead of an approximation of it.
+// The mark itself is passed IN as children rather than being the literal word "Sparkle" the
+// prototype hardcoded. The prototype had no logo asset; this app does, and the founder asked for
+// it in this column — so rendering both put the brand name on screen twice inside ~80px, at two
+// different alignments, with two adjacent elements whose accessible name was "Sparkle". Making the
+// field a container instead of a wordmark keeps ONE mark and still wraps it in the voice-state
+// animation, which is the half of this component that isn't decoration.
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
-// Brand amber is a literal hex constant (canvas can't consume var()); the gold/hot tints are
-// re-derived from it the same way SparkleOverlay maps the prototype's gold palette.
+// The gold tokens are literal hex, which is what a canvas 2d gradient needs — it can't consume
+// var(). These were `lightenHex(C.amber, …)` re-derivations back when there was no gold token;
+// now they're the prototype's own `--gold` / `--gold-hot` straight through.
 import { C } from "../../theme/colors";
-import { lightenHex } from "../SparkleOverlay/engine";
 import {
   advanceTwinkle,
   buzzLevel,
@@ -27,8 +29,8 @@ import {
 } from "./starfieldMath";
 import type { WordmarkMode } from "./types";
 
-const GOLD_HEX = lightenHex(C.amber, 0.45);
-const HOT_HEX = lightenHex(C.amber, 0.8);
+const GOLD_HEX = C.gold;
+const HOT_HEX = C.goldHot;
 
 /** matchMedia is absent under jsdom — treat "can't ask" as "no reduction requested". */
 function prefersReducedMotion(): boolean {
@@ -61,8 +63,8 @@ export function StarfieldWordmark({
 }: {
   mode: WordmarkMode;
   height?: number;
-  /** The brand mark the field lives through — today the Sparkle.ai logo link. */
-  children?: ReactNode;
+  /** The brand mark to sit IN the field — the Sparkle.ai logo at the one call site. */
+  children: ReactNode;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   // Long-lived animation state in refs so a mode change re-targets the loop WITHOUT rebuilding it
@@ -193,20 +195,38 @@ export function StarfieldWordmark({
           height: "calc(100% + 12px)",
         }}
       />
-      {/* The mark sits IN the field. position:relative + zIndex 2 are what hold it above the
-          canvas, which is a SIBLING painted underneath and bleeds past this box (inset -6/-8,
-          composite "lighter"). This is the column's own pre-existing z-order — the mark inherits
-          it by occupying this slot; nothing was lifted on the mark's account.
-          drop-shadow is the image-safe form of the same-as-column halo the styled text used to
-          get from textShadow: it follows the logo's alpha, so the letters read off the stars
-          without any box or shading behind them. */}
+      {/* The mark sits IN the field: a soft same-as-column glow lifts it off the stars without
+          any box/shading behind it. Prototype `.brand { text-shadow: … var(--bg-sparkle) }`,
+          restated as drop-shadow so it punches out ARBITRARY content (the logo's glyph alpha)
+          and not just text. The glow's whole job is to be the color of the surface the mark
+          actually sits on — the CONCIERGE column, not the builder's deepForest. */}
       <div
         style={{
           position: "relative",
           zIndex: 2,
-          display: "flex",
-          alignItems: "center",
-          filter: `drop-shadow(0 0 10px ${C.deepForest}) drop-shadow(0 0 6px ${C.deepForest}) drop-shadow(0 0 3px ${C.deepForest})`,
+          display: "inline-flex",
+          // Prototype `.brand { text-shadow: … var(--bg-sparkle) }`, restated as drop-shadow.
+          // The mark is no longer the literal word "Sparkle" this component used to paint — it is
+          // whatever is passed as children (today, the Sparkle.ai logo), and text-shadow cannot
+          // lift an <img> off the stars; drop-shadow follows the glyph's alpha and can.
+          //
+          // TWO PASSES, NOT THE PROTOTYPE'S THREE, AND THE RADII ARE SMALLER — because the two
+          // properties do NOT compose the same way (roborev 53605). A `text-shadow` LIST draws
+          // every layer from the SAME glyph alpha, so three of them at 10/6/3px reach 10px and
+          // simply stack density near the mark. Chained `drop-shadow()` filter functions apply
+          // SEQUENTIALLY: each takes the previous function's OUTPUT as its input, so a 6px pass
+          // shadows the logo *plus its 10px glow*, and a 3px pass shadows that in turn — reach
+          // compounds to ~19px and the alpha piles up close to opaque. In a 50px field around a
+          // 25px logo that is a near-solid conciergeSurface disc spilling past the field's edges,
+          // erasing the very stars this component exists to show. So: 6 + 4 keeps TOTAL reach at
+          // the prototype's ~10px while still giving the core the extra density the third layer
+          // was there for.
+          //
+          // The glow must be the colour of the surface the mark ACTUALLY sits on — the CONCIERGE
+          // column. It was keyed to deepForest (the BUILDER column), a different surface in both
+          // themes; that was a real bug, and StarfieldWordmark.test.tsx pins it so the plausible-
+          // but-wrong token name cannot come back.
+          filter: `drop-shadow(0 0 6px ${C.conciergeSurface}) drop-shadow(0 0 4px ${C.conciergeSurface})`,
         }}
       >
         {children}

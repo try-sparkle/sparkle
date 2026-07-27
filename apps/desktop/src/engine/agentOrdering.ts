@@ -24,8 +24,17 @@ import type { AgentKind } from "../types";
  * worker is reached only by opening its parent orchestrator's card, which nests its own workers
  * afterward. This unconditionally excludes workers — even one orphaned by a missing parent —
  * because a worker flashing into the sidebar (during spawn/spin-down windows, or after its parent
- * closes) is exactly the distraction we're removing. A worker's red attention still bubbles up to
- * its orchestrator elsewhere; it just never claims a row of its own here.
+ * closes) is exactly the distraction we're removing.
+ *
+ * DO NOT read this as "a worker's red always reaches the user some other way." It does not.
+ * `engine/workerAttention.withRedWorkerAttention` bubbles a worker's red to its orchestrator only
+ * SOMETIMES: it skips a worker with a null `parentId`, it writes the bubble to a status-map key
+ * with no agent behind it when the parent is absent from the fleet, and it deliberately suppresses
+ * a non-ask red (`blocked`) while the orchestrator is in motion. This predicate was already correct
+ * — a worker genuinely has no row — but a surface that gates SURFACING on it inherits those three
+ * holes and turns them into silence, which is exactly what happened to the concierge column
+ * (services/conciergeFeed.ConciergeAgent.representedElsewhere is the fix, and states the rule).
+ * Any new consumer of this predicate has to answer "and what speaks for the ones it excludes?"
  *
  * Pure and id-preserving: a filtered view of the input in input order. The caller then groups these
  * into the stage ladder (buildSections.groupAgentsByStage), which is what decides vertical position.
@@ -35,10 +44,26 @@ import type { AgentKind } from "../types";
 export function topLevelAgents<
   T extends { id: string; kind: AgentKind; parentId: string | null },
 >(agents: readonly T[], _workMode: "plan" | "build" = "build"): T[] {
+  return agents.filter(isTopLevelAgent(agents));
+}
+
+/**
+ * THE rule `topLevelAgents` filters by, exposed as a predicate closed over the population it is
+ * asked about (a nested agent is only nested relative to a parent that is PRESENT, so the answer is
+ * not a property of the agent alone — pass the same project's agents both sides ask about).
+ *
+ * Extracted so surfaces OUTSIDE the sidebar can ask the same question and get the same answer.
+ * The concierge digest is the one that made this necessary: it says "2 Need you in web" and its
+ * click hands off to the sidebar's status-band filter, which narrows exactly this population — so a
+ * digest counting a DIFFERENT population makes a numeric promise the click cannot keep. With both
+ * asks being workers the user clicked "2" and got an empty column, because a worker never claims a
+ * row of its own. Two copies of the rule drift; one copy cannot.
+ */
+export function isTopLevelAgent<
+  T extends { id: string; kind: AgentKind; parentId: string | null },
+>(agents: readonly T[]): (a: T) => boolean {
   const buildIds = new Set(agents.filter((a) => a.kind === "build").map((a) => a.id));
-  return agents
-    .filter((a) => a.kind !== "worker")
-    .filter((a) => !a.parentId || !buildIds.has(a.parentId));
+  return (a) => a.kind !== "worker" && (!a.parentId || !buildIds.has(a.parentId));
 }
 
 /**

@@ -108,8 +108,16 @@ pub struct AccountUsage {
     pub exhausted_until: Option<i64>,
 }
 
-/// Cross-project Claude Code spend, returned by [`accounts_spend`] and rendered by the concierge
-/// spend pill. `spend_today_usd` is the estimated USD value of every account's token usage in the
+/// Cross-project Claude Code spend, returned by [`accounts_spend`].
+///
+/// NOTHING IN THE UI RENDERS THIS TODAY. It backed the concierge spend pill, which was deleted:
+/// this is an unbilled trailing-24h LIST-PRICE estimate that only counts UP, and it sat 8px from
+/// the remaining credit balance (`me.balanceCents`, real money, counting DOWN) with both rendered
+/// as "$…". See PRD/sparkle/concierge-chrome-and-credits.md. The command stays registered because
+/// the transcript scan and price table below are the expensive part; a future spend surface should
+/// re-add the TS binding in `services/accountStore.ts` and label the figure as an estimate.
+///
+/// `spend_today_usd` is the estimated USD value of every account's token usage in the
 /// trailing 24h (`WINDOW_24H`), priced per-model through `spend::estimate_cost_usd` — the Spend
 /// pane's table; the 7d figures are the same over the longer window. `fallback_model_records`
 /// counts in-window records whose model has NO published rate: their TOKENS are counted and their
@@ -159,8 +167,9 @@ pub struct OauthIdentity {
     pub account_uuid: Option<String>,
 }
 
-/// Trailing usage windows, in seconds. `WINDOW_24H` ("today") backs the concierge spend pill; the
-/// 5h/7d pair backs the per-account near-cap tallies.
+/// Trailing usage windows, in seconds. `WINDOW_24H` ("today") backs [`accounts_spend`], which no
+/// UI calls since the concierge spend pill was deleted; the 5h/7d pair backs the per-account
+/// near-cap tallies, which are still rendered.
 const WINDOW_5H: i64 = 5 * 60 * 60;
 const WINDOW_24H: i64 = 24 * 60 * 60;
 const WINDOW_7D: i64 = 7 * 24 * 60 * 60;
@@ -434,8 +443,11 @@ fn sum_usage_tokens(usage: &serde_json::Value) -> u64 {
 
 // ---- per-model USD pricing (pure) --------------------------------------------------------------
 //
-// The spend pill needs a dollar figure, so we value each usage record at Anthropic list price by
-// model — through `spend::estimate_cost_usd`, NOT a table of our own. This module used to carry
+// [`accounts_spend`] reports a dollar figure, so we value each usage record at Anthropic list price
+// by model — through `spend::estimate_cost_usd`, NOT a table of our own. (The pill this originally
+// fed is gone and no UI calls the command today; see [`SpendSummary`]. References to "the pill"
+// below are the historical consumer, kept because they explain WHY these bugs were fixed this way.)
+// This module used to carry
 // one (four models, everything else priced at the Sonnet rate), which is how the same day's
 // transcripts came out 5x low in the pill for `claude-opus-4-*`, ~40% low for `claude-opus-4-5-*`,
 // and with an invented price for models the pane honestly reported as unpriced. NOTE these value
@@ -1678,15 +1690,22 @@ pub async fn accounts_usage(app: AppHandle) -> Result<Vec<AccountUsage>, String>
     .map_err(|e| format!("accounts_usage task failed: {e}"))?
 }
 
-/// Cross-project Claude Code spend "today" (trailing 24h) plus a 7d figure — the concierge spend
-/// pill's data source. Scans the same roots as the Spend pane (`spend::transcript_roots`) plus any
-/// account whose config dir lives outside app-data, dedupes resumed turns by message id, and values
-/// each record through the pane's price table (see [`spend_summary`] / [`SpendRecord::cost_usd`]).
+/// Cross-project Claude Code spend "today" (trailing 24h) plus a 7d figure. Scans the same roots as
+/// the Spend pane (`spend::transcript_roots`) plus any account whose config dir lives outside
+/// app-data, dedupes resumed turns by message id, and values each record through the pane's price
+/// table (see [`spend_summary`] / [`SpendRecord::cost_usd`]).
 ///
-/// The windows are the pill's own and deliberately ROLLING (trailing 24h / 7d), where the pane
-/// buckets by UTC civil day — that difference is intentional and visible in the labels ("today" vs
-/// a dated calendar). Everything else — roots, dedupe, prices — is shared, because those three
-/// disagreeing is just three wrong numbers.
+/// NO UI CALLS THIS. Its only consumer was the concierge spend pill, deleted because an unbilled
+/// list-price estimate that counts UP was being read as the credit balance, which counts DOWN (see
+/// [`SpendSummary`]). Kept registered rather than removed: the scan and pricing below are the
+/// expensive part and would only have to be rebuilt. A future spend surface reconnects by re-adding
+/// the binding in `services/accountStore.ts`. Do not confuse this with Settings → History & Spend,
+/// which is the separate `spend_report` command.
+///
+/// The windows are deliberately ROLLING (trailing 24h / 7d), where the pane buckets by UTC civil
+/// day — that difference is intentional and was visible in the labels ("today" vs a dated
+/// calendar). Everything else — roots, dedupe, prices — is shared, because those three disagreeing
+/// is just three wrong numbers.
 ///
 /// `async` + `spawn_blocking`: scans every account's transcript tree (the same heavy IO as
 /// `accounts_usage`), so it must stay off the Tauri event-loop thread.
@@ -3339,6 +3358,93 @@ mod tests {
         let s = spend_summary(&[turn(1_000_000), turn(2_000_000)], now);
         assert_eq!(s.tokens_today, 2_000_000, "one turn, not two");
         assert!((s.spend_today_usd - 2.0).abs() < 1e-9, "haiku $1/MTok × 2M, got {}", s.spend_today_usd);
+    }
+
+    // ── A REGISTERED COMMAND WITH NO CALLER (roborev 53601) ───────────────────────────────────────
+    // `accounts_spend` is still in lib.rs's invoke_handler, but the concierge spend pill that used
+    // to call it was deleted along with `stores/spendStore.ts` — so nothing in the app exercises it
+    // end-to-end any more. That is a deliberate decision (the transcript scan and price table are
+    // the expensive part and would only have to be rebuilt), but it means the ONLY thing standing
+    // between this command and silent rot is what is asserted here.
+    //
+    // The three tests above already cover `spend_summary`'s arithmetic — windows, dedupe, bucketing,
+    // the unpriced-model flag. What they do NOT cover is the two things that can break with no
+    // compile error anywhere in the workspace, precisely because there is no TS caller left to break.
+
+    #[test]
+    fn accounts_spend_stays_registered_so_a_future_binding_has_something_to_call() {
+        // Deleting the handler line compiles fine and breaks nothing — until someone re-adds the
+        // frontend binding and gets "command not found" at runtime. Read from lib.rs's own source,
+        // the same include_str! coherence trick worktree.rs and capture_window.rs use.
+        let lib_rs = include_str!("lib.rs");
+        assert!(
+            lib_rs.contains("accounts::accounts_spend"),
+            "accounts_spend was dropped from lib.rs's invoke_handler. It has no TS caller today \
+             (the concierge spend pill was deleted), so nothing else would have failed. Either \
+             restore the registration or delete the command, SpendSummary and these tests together."
+        );
+    }
+
+    #[test]
+    fn spend_summary_serializes_the_camelCase_wire_shape_a_future_binding_needs() {
+        // The field NAMES are the contract a re-added `services/accountStore.ts` binding would be
+        // written against, and `#[serde(rename_all = "camelCase")]` means a Rust-side rename changes
+        // the JSON key silently — no compile error, and no TS consumer left to notice. Asserted as
+        // the exact key set rather than field-by-field so an ADDED field also has to be considered.
+        let s = spend_summary(&[], 1_000_000_000);
+        let v = serde_json::to_value(&s).expect("SpendSummary serializes");
+        let obj = v.as_object().expect("SpendSummary is a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "fallbackModelRecords",
+                "spend7dUsd",
+                "spendTodayUsd",
+                "tokens7d",
+                "tokensToday",
+            ],
+            "the SpendSummary wire shape changed; a re-added TS binding would read undefined"
+        );
+    }
+
+    #[test]
+    fn spend_summary_today_is_always_a_subset_of_7d() {
+        // The invariant that makes the two windows readable together, and the one a future edit to
+        // the bucketing is most likely to break: "today" is the trailing 24h INSIDE the trailing 7d,
+        // so neither its dollars nor its tokens can ever exceed the wider window's.
+        let now = 1_000_000_000;
+        let rec = |ts: i64, id: &str| SpendRecord {
+            ts,
+            message_id: Some(id.to_string()),
+            model: Some("claude-haiku-4-5".to_string()),
+            input: 1_000_000,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        };
+        for records in [
+            vec![],
+            vec![rec(now - 60, "a")],
+            vec![rec(now - 60, "a"), rec(now - WINDOW_24H - 60, "b")],
+            vec![rec(now - WINDOW_24H - 60, "b"), rec(now - WINDOW_7D - 60, "c")],
+        ] {
+            let s = spend_summary(&records, now);
+            assert!(
+                s.spend_today_usd <= s.spend_7d_usd + 1e-9,
+                "today ${} exceeds 7d ${}",
+                s.spend_today_usd,
+                s.spend_7d_usd
+            );
+            assert!(
+                s.tokens_today <= s.tokens_7d,
+                "today {} tokens exceeds 7d {}",
+                s.tokens_today,
+                s.tokens_7d
+            );
+        }
     }
 
     #[test]

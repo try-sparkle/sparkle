@@ -124,27 +124,20 @@ export function getIdentities(): Promise<Identity[]> {
   return invoke<Identity[]>("accounts_identities");
 }
 
-/** Cross-project Claude Code spend, aggregated across every account's transcripts and valued
- *  per-model at Anthropic list price by the Rust side (`accounts_spend`). `spendTodayUsd` is the
- *  trailing-24h figure the concierge spend pill renders; the 7d figures back a longer view.
- *  `fallbackModelRecords` counts trailing-7d records whose model has NO published rate. Their
- *  tokens ARE counted; their dollars are not — the Rust side refuses to invent a price, matching
- *  the Spend pane and the published Builder Index row. So nonzero means the dollar figure
- *  UNDER-states, and by how much is unknown; note its window is 7d, wider than the 24h figure the
- *  pill shows. Nothing renders it yet (bead sparkle-1m8c).
- *  These are DOLLARS (not cents) and are an estimate of list-price value, not a billed amount. */
-export interface Spend {
-  spendTodayUsd: number;
-  tokensToday: number;
-  spend7dUsd: number;
-  tokens7d: number;
-  fallbackModelRecords: number;
-}
-
-/** Current cross-project spend summary (see {@link Spend}). */
-export function getSpend(): Promise<Spend> {
-  return invoke<Spend>("accounts_spend");
-}
+// NO TypeScript binding for the Rust `accounts_spend` command lives here any more. It backed the
+// concierge SPEND pill — a trailing-24h estimate of cross-project token value at Anthropic LIST
+// price, in dollars, that only ever counted UP and was never billed. It sat 8px from the remaining
+// BALANCE badge (`me.balanceCents`, real credits, counting DOWN), both rendered as "$…", and the
+// resulting "which number is my money?" is why the pill was deleted
+// (PRD/sparkle/concierge-chrome-and-credits.md). The `Spend` interface and `getSpend()` went with
+// it, along with `stores/spendStore.ts`.
+//
+// The Rust side is deliberately still there and still registered — the transcript scan and the
+// per-model list pricing are the expensive part, and re-deriving them later would be strictly worse
+// than leaving them. A FUTURE spend surface should re-add the binding here, next to the other
+// `invoke` wrappers, and must present the figure as an unbilled list-price ESTIMATE — never beside
+// the credit balance without saying which is which. Note that Settings → History & Spend is a
+// DIFFERENT feature entirely (`services/spendApi.ts` → the Rust `spend_report` command).
 
 /** The authoritative label to show for an account: its REAL logged-in email when known, otherwise
  *  the user-typed nickname (an account never `claude login`ed has no identity yet). Use this — not
