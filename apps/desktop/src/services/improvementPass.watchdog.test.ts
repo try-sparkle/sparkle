@@ -64,7 +64,12 @@ import {
   resetPassRetryForTests,
   runImprovementPass,
 } from "./improvementPass";
-import { SPARKLE_AGENT_ID, SPARKLE_PROJECT_ID } from "./sparkleAgent";
+import {
+  GH_AUTH_ASK_USER,
+  GH_AUTH_UNATTENDED_STOP,
+  SPARKLE_AGENT_ID,
+  SPARKLE_PROJECT_ID,
+} from "./sparkleAgent";
 import { useRuntimeStore } from "../stores/runtimeStore";
 
 /** Let the pass's async preamble (preflight → repo → worktree → listeners → invoke) settle
@@ -150,6 +155,34 @@ describe("runImprovementPass watchdog", () => {
     // Listeners were torn down, so a late event can't touch a future pass.
     expect(harness.handlers.size).toBe(0);
   });
+
+  it.each(["always", "case_by_case"] as const)(
+    "%s: the headless pass sends an UNATTENDED persona, whatever the consent mode",
+    async (consent) => {
+      // The call site is the thing two previous attempts got wrong, and until now only the pure
+      // function was covered. This pass is headless for EVERY mode that reaches it (never returns
+      // early), so an edit that passes attended:true here would tell an hourly run to wait on a
+      // user confirmation that can never arrive — with the sparkleAgent unit tests still green.
+      // Premise, stated rather than inherited: the default invoke mock resolves undefined for
+      // sparkle_submit_capability, which becomes the "unknown" verdict — and `unknown` is the only
+      // reason the auth-advice block is emitted at all (a blocked verdict suppresses it). A harness
+      // change that returned a blocked verdict by default would otherwise fail this test with
+      // nothing wrong in the code under test.
+      const pass = runImprovementPass(consent);
+      await untilRunInvoked();
+
+      const run = harness.invokes.find((c) => c.cmd === "sparkle_improve_run");
+      const persona = (run?.args as { persona?: string } | undefined)?.persona ?? "";
+      // On the exported constants: the same strings are asserted in the opposite direction in
+      // sparkleAgent.test.ts, and copying the prose into a second suite means a reword breaks two
+      // files that never mention each other.
+      expect(persona).not.toContain(GH_AUTH_ASK_USER);
+      expect(persona).toContain(GH_AUTH_UNATTENDED_STOP);
+
+      harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "" } });
+      await pass;
+    },
+  );
 
   it("a done event beats the timer: no cancel, latch released, status from IMPROVE_RESULT", async () => {
     const pass = runImprovementPass("case_by_case");

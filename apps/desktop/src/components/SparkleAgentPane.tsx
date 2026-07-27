@@ -115,6 +115,8 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
               wt.path,
               consent,
               submit?.verdict ?? "unknown",
+              // The pane IS the user sitting in the chat, so an auth failure is theirs to clear.
+              { attended: true },
             ),
             // "Never" = chat-only: don't even grant the agent read access to the log dir, and open
             // with an introduction instead of a log-review mission.

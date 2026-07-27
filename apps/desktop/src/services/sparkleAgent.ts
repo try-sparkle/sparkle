@@ -145,26 +145,222 @@ export function submitBlockedReason(verdict: SubmitVerdict, repo: string): strin
 }
 
 /** The persona section that turns the agent propose-only. Empty when submission is available. */
-function submitBlockedSection(verdict: SubmitVerdict): string[] {
+/** `notAuthenticated` and `ghMissing` are blocked-but-FIXABLE, and the person who can fix them in
+ *  one command may be sitting in the chat. Treating every blocked verdict as immutable is how an
+ *  attended session ends up doing a full pass and reporting the PR unsubmittable without ever
+ *  asking — the same giving-up this file's auth advice exists to prevent, one layer down. `noPush`
+ *  is genuinely immutable (the account lacks write access), so it keeps the flat wording. */
+function fixableWithTheUserPresent(verdict: SubmitVerdict): boolean {
+  return verdict === "notAuthenticated" || verdict === "ghMissing";
+}
+
+/** The command prohibition each arm of the blocked section carries, exported so BOTH can be
+ *  asserted. This bullet is the whole reason the permissive askable arm was considered safe — it is
+ *  what keeps an agent from hammering `gh pr create` against a machine already known to be
+ *  unauthenticated — and it was pinned on the final arm only, by a fragment (`"Do NOT run"`,
+ *  capital D) the askable arm's rewritten wording does not even match. Deleting the askable bullet
+ *  outright therefore left every suite green. Two constants, not one, because the arms must
+ *  discriminate: neither string is a substring of the other. */
+export const ASKABLE_COMMAND_PROHIBITION = "- Until then, do NOT run `gh pr create`";
+export const FINAL_COMMAND_PROHIBITION = "- Do NOT run `gh pr create`";
+
+/** The exit both attended retry arms must name. The `always` arm named two exits ("if they decline,
+ *  OR IT STILL FAILS"); the `case_by_case`/`never` arm named only one — and `case_by_case` is
+ *  DEFAULT_SPARKLE_CONSENT, so the most common attended configuration was precisely the one where
+ *  "the user logged in and the submission still failed" had no stated terminal action. That is the
+ *  dead-end shape this file exists to remove, so the clause is shared and asserted on both arms. */
+export const RETRY_STILL_FAILS_EXIT = "If they decline, or it still fails,";
+
+/** Openers of the propose-only tail — the fix for a contradiction that defeated the askable arm.
+ *  The permissive arm ends with "ask them to log in, then submit once more", and the tail that
+ *  followed it began, unconditionally and at the same list level, "- Work PROPOSE-ONLY instead: …
+ *  and stop there." Models weight the later, flatter instruction, so the attended path read as
+ *  "ask, then stop anyway" — the exact failure this branch exists to prevent. The tail is now
+ *  CONDITIONAL on the askable arm and unconditional only where nothing the user does can help.
+ *  Neither constant contains the other (`- Work` vs `, work`), so a test on one cannot be satisfied
+ *  by the other arm of the same persona. */
+export const PROPOSE_ONLY_UNCONDITIONAL = "- Work PROPOSE-ONLY instead:";
+export const PROPOSE_ONLY_AFTER_ASKING =
+  "- If they decline, or the retry still fails, work PROPOSE-ONLY instead:";
+
+/** The `setup-git` remedy, inlined into the askable arm. `notAuthenticated` sets `blocked`, which
+ *  suppresses `ghAuthAdvice` at all three `whatYouDo` call sites — and that block was the ONLY
+ *  place carrying "logged in but the push still fails on credentials: run `gh auth setup-git`".
+ *  The askable arm also drops `gh auth setup-git` from its prohibition list, so the command was
+ *  permitted but never prescribed: attended session, user runs `gh auth login`, git has no
+ *  credential helper, the retry this arm newly authorizes fails, and the one instruction that
+ *  fixes it appeared nowhere in the prompt. It is worth exactly one attempt, and only AFTER the
+ *  login lands — before that it exits 1 with "You are not logged into any GitHub hosts". */
+export const GH_SETUP_GIT_AFTER_LOGIN =
+  "- If they confirm the login and the push STILL fails on credentials, run `gh auth setup-git`";
+
+function submitBlockedSection(
+  verdict: SubmitVerdict,
+  attended: boolean,
+  consent: SparkleImprovementConsent,
+): string[] {
   if (!isSubmitBlocked(verdict)) return [];
+  const askable = attended && fixableWithTheUserPresent(verdict);
+  // This block is emitted AFTER the consent-mode instructions and claims to override them, so
+  // anything PERMISSIVE in here has to restate the limits it isn't overriding. Consent governs
+  // whether a PR may be opened without a per-PR go-ahead; clearing an auth block does not change
+  // that, and a user saying "ok, I'm logged in" is not approval of a pull request.
+  // Both arms must name BOTH exits — declined, and tried-but-still-failed. See
+  // RETRY_STILL_FAILS_EXIT for why the second one going missing on the DEFAULT consent mode was the
+  // dead end this file exists to remove.
+  const retryLines =
+    consent === "always"
+      ? [
+          "  If they confirm they have done it, try the submission once more rather than treating the",
+          `  verdict as final — it was measured before they acted. ${RETRY_STILL_FAILS_EXIT}`,
+          "  fall back to the propose-only flow below and say why.",
+        ]
+      : [
+          "  If they confirm they have done it, redo the PII SCRUB GATE and PRESENT the PR draft for",
+          "  their explicit approval as your consent mode requires, and submit only if they say so —",
+          `  logging in is not approval of a PR. ${RETRY_STILL_FAILS_EXIT} fall back to the`,
+          "  propose-only flow below and say why.",
+        ];
   return [
     "SUBMISSION IS NOT AVAILABLE ON THIS MACHINE — THIS OVERRIDES ANY INSTRUCTION ABOVE",
-    "- This machine cannot open pull requests against the upstream repo (no write access, or no",
-    "  usable GitHub CLI credentials). This was checked before your session started; it is a fact",
-    "  about the environment, not something you can retry your way past.",
-    "- Do NOT run `gh pr create`, `gh pr edit`, `git push`, `gh auth login`, `gh auth setup-git`,",
-    "  or `gh repo fork`. They will fail, and repeatedly retrying them wastes the whole pass.",
-    "- Work PROPOSE-ONLY instead: do the full job — investigate, spec, implement, and then",
-    "  COMMIT to a local branch — and stop there. Your final message is the deliverable: state the",
-    "  branch name, what changed and why, and the exact PR title + body you would have submitted",
-    "  (still scrubbed: the PII rules below apply in full — the user may submit this text",
-    "  themselves).",
+    ...(askable
+      ? [
+          "- This machine cannot open pull requests right now: " +
+            (verdict === "ghMissing"
+              ? "the GitHub CLI is not installed."
+              : "the GitHub CLI is installed but not logged in."),
+          "  That was checked before your session started, but the user IS here and can fix it.",
+          ...(verdict === "ghMissing"
+            ? [
+                "  Say what is blocking submission and ask them to install the GitHub CLI (on macOS,",
+                "  `brew install gh`; otherwise their platform's package manager) and then run",
+                "  `gh auth login` IN THEIR TERMINAL — that login is interactive, so you cannot complete",
+                "  it yourself even once gh exists.",
+              ]
+            : [
+                "  Say what is blocking submission and ask them to run `gh auth login` IN THEIR TERMINAL",
+                "  — it is interactive, so running it yourself just hangs your shell until the tool times",
+                "  out.",
+              ]),
+          ...retryLines,
+          `${GH_SETUP_GIT_AFTER_LOGIN} once and`,
+          "  retry: it registers gh as git's credential helper, nothing more.",
+          "  It works only after their login has landed — before that it exits 1 — so it is worth",
+          "  exactly one attempt there, and none before.",
+          `${ASKABLE_COMMAND_PROHIBITION}, \`gh pr edit\`, \`git push\`, \`gh repo fork\`, or`,
+          "  `gh auth login` YOURSELF: the first four fail without credentials, and `gh auth login` is",
+          "  an interactive prompt only the user can answer.",
+        ]
+      : [
+          "- This machine cannot open pull requests against the upstream repo (no write access, or no",
+          "  usable GitHub CLI credentials). This was checked before your session started; it is a fact",
+          "  about the environment, not something you can retry your way past.",
+          `${FINAL_COMMAND_PROHIBITION}, \`gh pr edit\`, \`git push\`, \`gh auth login\`, \`gh auth setup-git\`,`,
+          "  or `gh repo fork`. They will fail, and repeatedly retrying them wastes the whole pass.",
+        ]),
+    // CONDITIONAL on the askable arm: an unconditional "stop there" immediately after "ask them to
+    // log in, then submit once more" is read as the later, flatter instruction and cancels the ask.
+    askable ? PROPOSE_ONLY_AFTER_ASKING : PROPOSE_ONLY_UNCONDITIONAL,
+    "  do the full job — investigate, spec, implement, and then COMMIT to a local branch — and stop",
+    "  there. Your final message is the deliverable: state the branch name, what changed and why, and",
+    "  the exact PR title + body you would have submitted (still scrubbed: the PII rules below apply",
+    "  in full — the user may submit this text themselves).",
     "- The DEDUPE GATE below still applies, but `gh pr list` needs the same credentials you don't",
     "  have. If it fails, say so in your summary and dedupe against the local git history instead",
     "  (`git log --oneline origin/main -100`) rather than skipping the check silently.",
     "- Do not treat this as an error state or a reason to do nothing. A committed branch plus a",
     "  clear write-up is a complete, successful pass.",
     "",
+  ];
+}
+
+/** Header line of the auth-advice block. Exported so tests can assert on its PRESENCE/ABSENCE
+ *  structurally — a `not.toContain` on a prose fragment passes vacuously the moment someone
+ *  rewords the line, while the contradiction it guards against quietly returns. */
+export const GH_AUTH_ADVICE_HEADER = "If a push or `gh pr create` fails on auth, first check `gh auth status`:";
+
+/** First line of each attendance branch, exported for the same reason as the header: a test that
+ *  scans the whole persona for a prose fragment passes (or fails) for reasons unrelated to the
+ *  branch it names — several of these sentences legitimately appear on both sides. */
+export const GH_AUTH_ASK_USER = "ASK the user to run `gh auth login` in their terminal";
+export const GH_AUTH_UNATTENDED_STOP = "report that the PR could not be submitted because gh needs";
+// The two attended arms' decline fallbacks. Both obey the same contract, learned the hard way twice
+// on this branch:
+//   - Each is the ACTION, not the sentence explaining it, and is emitted as ONE array element. An
+//     anchor on the rationale survives the plausible edit (trim the instruction, keep the excuse),
+//     which leaves the behavior gone and the suite green.
+//   - Each is worded so its SIBLING cannot satisfy it ("to log in" vs "to install it"). They were
+//     once near-identical, and the shorter was a strict prefix of the longer, so one arm's
+//     assertion was being satisfied by the other arm of the same persona.
+//   - The terminating period lives INSIDE the constant, so no call site has to remember to append
+//     it — a later edit that moved it in would otherwise produce a silent ".." that `toContain`
+//     cannot see.
+
+/** Attended NOT-LOGGED-IN arm: what to do when the user won't run `gh auth login`. */
+export const GH_AUTH_ATTENDED_DECLINE =
+  "Only if they decline to log in, leave the work committed on its branch and report the PR as not submitted.";
+
+/** Attended GH-MISSING arm: what to do when the user won't install `gh`. */
+export const GH_MISSING_ATTENDED_DECLINE =
+  "Only if they decline to install it, leave the work committed on its branch and report the PR as not submitted.";
+
+/** What to do when a push or `gh pr create` fails on auth.
+ *
+ *  The previous wording — "if `git push` fails on auth, run `gh auth setup-git` once and retry" —
+ *  was a dead end in precisely the case it was offered for. `gh auth setup-git` only registers gh
+ *  as git's credential helper for an ALREADY-authenticated gh; with no logged-in host it exits 1
+ *  with "You are not logged into any GitHub hosts", so the retry it prescribes can never succeed.
+ *  An unattended hourly pass on such a machine did a full analysis + implementation + commit and
+ *  then dead-ended at the PR step every hour, with no instruction for what to do instead.
+ *
+ *  The right terminal action depends on whether a HUMAN IS PRESENT — which is a property of the
+ *  CALL SITE, not of the consent mode. The interactive pane and the headless hourly pass call this
+ *  with the same consent value; `case_by_case` is the DEFAULT and runs in both. So attendance is
+ *  threaded in from the caller and must never be inferred from `consent`: doing so tells a headless
+ *  pass to wait on a confirmation nobody will give, which is the very dead end this exists to remove.
+ *
+ *  Unattended, `gh auth login` is interactive and cannot be completed, so the correct outcome is to
+ *  stop with the work committed on its branch — nothing is lost, the PR can be opened later — rather
+ *  than burn retries. Attended, giving up would be wrong: the user can clear it in ten seconds, so
+ *  ASK and then retry. The `setup-git` half is identical either way, since that case is genuinely
+ *  fixable without a human.
+ *
+ *  Attended, a missing `gh` is likewise the user's to fix, which is what submitBlockedReason already
+ *  tells them in the pane. The PROMPT must not say so, though: a `ghMissing` verdict sets `blocked`
+ *  and suppresses this whole block, so these lines only ever reach the model on `canSubmit` /
+ *  `unknown` — exactly when the pane showed no such notice. Telling the model to cite a message the
+ *  user never saw is a new way for the agent and the UI to disagree, not a fix for one. */
+function ghAuthAdvice(attended: boolean, indent: string): string[] {
+  const i = indent;
+  return [
+    `${i}${GH_AUTH_ADVICE_HEADER}`,
+    ...(attended
+      ? [
+          `${i}- \`gh\` not found at all: retrying will not conjure it. TELL the user gh is not installed`,
+          `${i}  and retry once they confirm they have installed it.`,
+          `${i}  ${GH_MISSING_ATTENDED_DECLINE}`,
+          `${i}  Installing gh is a bigger ask than a login, so declining is likely: do not sit waiting.`,
+        ]
+      : [
+          `${i}- \`gh\` not found at all: nothing here is fixable by retrying. Leave the work committed on`,
+          `${i}  its branch, report that gh is not installed, and count the PR as not submitted.`,
+        ]),
+    ...(attended
+      ? [
+          `${i}- Not logged in: \`gh auth setup-git\` will NOT fix it (it only configures the credential`,
+          `${i}  helper for an already-authenticated gh, and exits 1 otherwise). Do not retry in a loop.`,
+          `${i}  ${GH_AUTH_ASK_USER} — they are here, and it takes them`,
+          `${i}  seconds — then retry the push once they confirm.`,
+          `${i}  ${GH_AUTH_ATTENDED_DECLINE}`,
+        ]
+      : [
+          `${i}- Not logged in: \`gh auth login\` is INTERACTIVE and you cannot complete it unattended, and`,
+          `${i}  \`gh auth setup-git\` will NOT fix it (it only configures the credential helper for an`,
+          `${i}  already-authenticated gh, and exits 1 otherwise). Do not retry in a loop. Leave your work`,
+          `${i}  committed on its branch, ${GH_AUTH_UNATTENDED_STOP}`,
+          `${i}  \`gh auth login\`, and count the PR as not submitted.`,
+        ]),
+    `${i}- Logged in but the push still fails on credentials: run \`gh auth setup-git\` once and retry.`,
   ];
 }
 
@@ -186,7 +382,13 @@ export function sparklePersona(
   repoPath: string,
   consent: SparkleImprovementConsent,
   submit: SubmitVerdict = "unknown",
+  /** Is a human in this session? The interactive pane passes true; the hourly pass passes false.
+   *  REQUIRED, not defaulted: this branch has now re-fixed the same consent-vs-attendance
+   *  conflation three times, and an optional flag makes "did the caller think about it?" a runtime
+   *  question. Required, tsc catches the third caller. */
+  opts: { attended: boolean },
 ): string {
+  const attended = opts.attended;
   const whatYouWorkOn = [
     "WHAT YOU WORK ON",
     `- You are working inside an app-owned clone of the open-source Sparkle client at: ${repoPath}`,
@@ -201,6 +403,11 @@ export function sparklePersona(
     );
   }
 
+  // When the probe says this machine cannot submit at all, submitBlockedSection below
+  // forbids `git push` / `gh auth login` / `gh auth setup-git` outright. Emitting the auth
+  // advice too would put two contradictory stories about auth in one system prompt, and a
+  // dead instruction is an invitation to attempt exactly the retry this is meant to stop.
+  const blocked = isSubmitBlocked(submit);
   let whatYouDo: string[];
   switch (consent) {
     case "always":
@@ -215,8 +422,8 @@ export function sparklePersona(
         "4. Implement focused changes on your own branch, commit, and — after the PR text passes the",
         "   PII SCRUB GATE below — submit the PR yourself with `gh pr create --base main`. The user",
         "   chose \"Always\" consent, so no per-PR approval is needed: submit automatically. Keep PRs",
-        "   small and single-purpose. If `git push` fails on auth, run `gh auth setup-git` once and",
-        "   retry.",
+        "   small and single-purpose.",
+        ...(blocked ? [] : ghAuthAdvice(attended, "   ")),
         "5. Prefer opening a spec/issue first for larger or ambiguous changes; ship a PR directly only",
         "   for clear, low-risk improvements.",
       ];
@@ -232,8 +439,8 @@ export function sparklePersona(
         "  codebase and implement changes they ask for on your own branch.",
         "- If the user asks you to open a PR: implement, commit, draft the PR title + body, run the",
         "  PII SCRUB GATE below, then present the draft in chat and get their explicit go-ahead",
-        "  before any `gh pr create`. If `git push` fails on auth, run `gh auth setup-git` once and",
-        "  retry.",
+        "  before any `gh pr create`.",
+        ...(blocked ? [] : ghAuthAdvice(attended, "  ")),
       ];
       break;
     case "case_by_case":
@@ -253,7 +460,8 @@ export function sparklePersona(
         "5. Instead: draft the PR title + body, run the PII SCRUB GATE below, then PRESENT the draft",
         "   (title, body, and a short summary of the diff) in the chat and STOP. Wait for the user",
         "   to tell you to submit; only then run `gh pr create --base main`. Keep PRs small and",
-        "   single-purpose. If `git push` fails on auth, run `gh auth setup-git` once and retry.",
+        "   single-purpose.",
+        ...(blocked ? [] : ghAuthAdvice(attended, "   ")),
       ];
       break;
   }
@@ -321,7 +529,7 @@ export function sparklePersona(
     "",
     // AFTER the mode instructions on purpose: when submission is impossible this block must
     // override whatever the consent mode just said about `gh pr create`.
-    ...submitBlockedSection(submit),
+    ...submitBlockedSection(submit, attended, consent),
     ...dedupeGate,
     "",
     ...scrubGate,

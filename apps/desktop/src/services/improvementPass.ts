@@ -402,7 +402,10 @@ export async function runImprovementPass(
           invoke("sparkle_improve_run", {
             cwd: wt.path,
             claudePath: claude.path,
-            persona: sparklePersona(ws.logDir, wt.path, consent, submit?.verdict ?? "unknown"),
+            // Headless: nobody is here to run `gh auth login`, whatever the consent mode says.
+            persona: sparklePersona(ws.logDir, wt.path, consent, submit?.verdict ?? "unknown", {
+              attended: false,
+            }),
             prompt: hourlyMissionPrompt(consent, submit?.verdict ?? "unknown"),
             logDir: ws.logDir,
           }).catch(fail);

@@ -43,6 +43,9 @@ vi.mock("../services/sparkleAgent", async (importOriginal) => {
 import { SparkleAgentPane } from "./SparkleAgentPane";
 import { claudeHasSession } from "../preflight";
 import { useSettingsStore, DEFAULT_SPARKLE_CONSENT } from "../stores/settingsStore";
+// The vi.mock above spreads importOriginal, so these are the real exported constants — the
+// same ones the headless mirror asserts on, so a reword cannot desynchronize the two suites.
+import { GH_AUTH_ASK_USER, GH_AUTH_UNATTENDED_STOP } from "../services/sparkleAgent";
 
 const LOG_DIR = "/app-data/logs/sparkle";
 
@@ -85,6 +88,17 @@ describe("SparkleAgentPane — spawn arg assembly per consent mode", () => {
     expect(exec).not.toContain(LOG_DIR);
     expect(exec).toContain("Introduce yourself briefly as the Sparkle Improvement Agent");
     expect(exec).not.toContain("Start your first improvement pass");
+  });
+
+  it("spawns an ATTENDED persona — the pane IS the user sitting in the chat", async () => {
+    // The mirror of the headless assertion in improvementPass.watchdog.test.ts, and the side where
+    // a regression is silent: this pane's user can clear an auth failure in seconds, so handing
+    // them "leave it committed, count the PR as not submitted" wastes a submission they could have
+    // unblocked. Asserted here rather than trusted to the call site, because the call site is
+    // exactly what this branch got wrong twice.
+    const { exec } = await spawned();
+    expect(exec).toContain(GH_AUTH_ASK_USER);
+    expect(exec).not.toContain(GH_AUTH_UNATTENDED_STOP);
   });
 
   it('consent "always" grants the log dir via --add-dir', async () => {
