@@ -1352,15 +1352,61 @@ pub async fn create_agent_worktree(
 ) -> Result<WorktreeInfo, String> {
     tracing::info!(%root, %project_id, %agent_id, %base_branch, "create_agent_worktree");
     let app_data = app_data_dir(&app)?;
+    let started = std::time::Instant::now();
     // Run the git worktree mechanics off the main thread so the subprocess work (and any residual
     // git I/O) can't freeze the UI. The network fetch is now backgrounded inside `create_worktree_at`,
     // so this task is bounded by local git only.
-    tauri::async_runtime::spawn_blocking(move || {
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
         create_worktree_at(&root, &project_id, &agent_id, &base_branch, &app_data)
             .inspect_err(|e| tracing::error!(%agent_id, error = %e, "create_agent_worktree failed"))
     })
     .await
-    .map_err(|e| format!("create_agent_worktree task failed: {e}"))?
+    .map_err(|e| format!("create_agent_worktree task failed: {e}"))?;
+    log_worktree_op_duration("create_agent_worktree", started.elapsed(), outcome.is_ok());
+    outcome
+}
+
+/// How long a worktree create/remove may take before its duration is worth a WARN rather than an
+/// INFO. Both operations sit on the spawn path — they serialize on the per-root git lock, so one
+/// slow teardown delays every prepare and remove queued behind it on the same project.
+///
+/// 10s is the top of the range the removal doc comment has always claimed (`git worktree remove
+/// --force` deletes the whole checkout from disk), so crossing it means the operation is outside
+/// the cost this code was written for rather than merely on a slow day.
+const WORKTREE_OP_SLOW_MS: u128 = 10_000;
+
+/// Record what a worktree create/remove actually COST, which until now was unrecorded.
+///
+/// Both commands logged only that they had started, so their duration could be recovered solely by
+/// diffing timestamps against whatever unrelated line happened to come next — and only when one
+/// did. That made a real regression invisible: with dependencies now installed into every fresh
+/// worktree, a teardown deletes a fully populated `node_modules` (a hundred thousand-odd hardlinked
+/// files), and the per-root git lock makes the next agent's prepare wait behind it. Observed on this
+/// path as a ~33s removal sitting in front of an unrelated agent's spawn, which surfaced to the user
+/// only as a spawn that took 39s to reach a prompt with no phase to blame it on.
+///
+/// Deliberately just a measurement: no timeout, no change to what either command does. The point is
+/// to make the cost show up in the logs as its own number so a fix can be aimed at it — and so it
+/// stays visible afterwards rather than silently regressing again.
+///
+/// No path, no id: the caller has already logged those, and the duration is the part that was
+/// missing.
+/// Is this duration past [`WORKTREE_OP_SLOW_MS`]? Split out from the logging so the boundary is
+/// testable — the logging itself is a `tracing` call with nothing to assert against.
+fn worktree_op_is_slow(elapsed: std::time::Duration) -> bool {
+    elapsed.as_millis() >= WORKTREE_OP_SLOW_MS
+}
+
+fn log_worktree_op_duration(op: &'static str, elapsed: std::time::Duration, ok: bool) {
+    let ms = elapsed.as_millis();
+    if worktree_op_is_slow(elapsed) {
+        tracing::warn!(
+            op, elapsed_ms = %ms, ok,
+            "worktree operation was slow; anything queued behind it on this project's git lock waited too"
+        );
+    } else {
+        tracing::info!(op, elapsed_ms = %ms, ok, "worktree operation finished");
+    }
 }
 
 /// What [`park_worktree_on_base_at`] did (or, when `parked` is false, why it declined). `reason`
@@ -3940,7 +3986,13 @@ fn discard_half_deleted_worktree(root: &str, wt: &Path) -> Result<(), String> {
 /// `async` + `spawn_blocking` so the slow part (`git worktree remove --force`,
 /// which deletes the whole worktree dir from disk) runs on the blocking thread
 /// pool instead of the main thread. A synchronous command would block the event
-/// loop and freeze the window for the 2–10s the deletion can take.
+/// loop and freeze the window for the seconds-to-tens-of-seconds the deletion can
+/// take. That range used to be documented as 2–10s; it grew once dependencies
+/// started being installed into every fresh worktree, because the deletion now has
+/// a fully populated `node_modules` to walk. Off the main thread the window stays
+/// responsive, but the per-root git lock is still held, so the next prepare on the
+/// same project waits — which is why the duration is now logged (see
+/// [`log_worktree_op_duration`]).
 #[tauri::command]
 pub async fn remove_agent_worktree(
     app: AppHandle,
@@ -3950,11 +4002,14 @@ pub async fn remove_agent_worktree(
 ) -> Result<(), String> {
     tracing::info!(%root, %project_id, %agent_id, "remove_agent_worktree");
     let app_data = app_data_dir(&app)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let started = std::time::Instant::now();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
         remove_worktree_at(&root, &project_id, &agent_id, &app_data)
     })
     .await
-    .map_err(|e| format!("worktree removal task failed: {e}"))?
+    .map_err(|e| format!("worktree removal task failed: {e}"))?;
+    log_worktree_op_duration("remove_agent_worktree", started.elapsed(), outcome.is_ok());
+    outcome
 }
 
 /// Move/rename a project folder on disk (rename = move within the same parent), then
@@ -8447,5 +8502,25 @@ mod tests {
         // A project with no worktrees dir yet → empty (not an error).
         assert!(scan_worker_manifests_at(&app_data, "no-such-project").unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The slow-operation boundary, pinned at the edges rather than in the middle.
+    ///
+    /// The values that matter are the ones either side of the threshold: an ordinary teardown must
+    /// stay an INFO (a WARN on every agent close is noise nobody reads), and the observed ~33s
+    /// removal that delayed an unrelated spawn must come out as a WARN — that case is the entire
+    /// reason the duration is recorded.
+    #[test]
+    fn slow_worktree_op_boundary() {
+        use std::time::Duration;
+        assert!(!worktree_op_is_slow(Duration::from_millis(0)));
+        assert!(!worktree_op_is_slow(Duration::from_secs(2)));
+        assert!(!worktree_op_is_slow(Duration::from_millis(
+            WORKTREE_OP_SLOW_MS as u64 - 1
+        )));
+        // The threshold itself is slow: the doc calls 10s the top of the expected range, so
+        // reaching it is already outside it.
+        assert!(worktree_op_is_slow(Duration::from_millis(WORKTREE_OP_SLOW_MS as u64)));
+        assert!(worktree_op_is_slow(Duration::from_secs(33)));
     }
 }
