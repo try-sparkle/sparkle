@@ -59,9 +59,62 @@ const ERROR_PATTERNS: RegExp[] = [
   /traceback \(most recent call last\)/i,
 ];
 
-// Claude Code's live "working" status line, re-drawn ~once a second while it is busy.
-// "esc to interrupt" is the stable marker across spinner glyph / wording changes.
-const WORKING_PATTERNS: RegExp[] = [/esc to interrupt/i];
+// Claude Code's live "working" status line, re-drawn ~once a second while a turn is running. Two
+// shapes have shipped, and BOTH must read as working:
+//
+//   today (>= ~2.1.218):  "✢ Metamorphosing… (40m 17s · ↓ 66.9k tokens)"
+//   legacy:               "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)"
+//
+// This was `[/esc to interrupt/i]` alone, tested against the WHOLE chunk. Claude Code then moved
+// that hint off the status line and into the persistent footer bar, which broke the signal in both
+// directions at once — and the suite stayed green, because every fixture here carried the old fused
+// shape (2026-07-28).
+//
+//   * FALSE GRAY: once spinner mode is latched, only a marker frame re-arms the settle timer. The
+//     status line redraws every second carrying no marker, so ~2s into every turn the engine
+//     recorded `idle` — a gray dot on a plainly working agent. That `idle` also opens the CTA gate
+//     (useSuggestions' YOUR_TURN set), which is how "Merge PR"/"Close Build Agent" came to be
+//     offered over live work, and it pins `isInMotion` false, which removes the in-motion
+//     suppression on the worker-red bubble in workerAttention.ts.
+//   * FALSE GREEN, the more dangerous one: the footer carries the hint whether or not a turn is
+//     running, so a whole-chunk match reads persistent chrome as proof of work and would pin every
+//     agent green forever — hiding a real question behind a healthy-looking dot.
+//
+// So the marker is now the SHAPE OF THE STATUS LINE, matched per redraw frame (see isSpinnerFrame):
+// the leading spinner glyph, plus a parenthetical carrying an elapsed clock and/or the token
+// counter. "esc to interrupt" survives as one accepted tail so older Claude builds keep working,
+// but it only counts ON a glyph-led frame — never on its own, which is what keeps the footer out.
+//
+// Retune point, like screenClassifier's markers: this tracks a Claude Code TUI detail that drifts.
+// Add a fixture in TODAY's shape whenever it moves, or a green suite will again say nothing.
+
+/** The rotating glyphs Claude leads its transient status line with. Kept in step with
+ *  engine/composerOcclusion.ts's SPINNER_GLYPH — the two answer the same question about the same
+ *  line, and letting them drift apart is how one of them silently stops matching. */
+const SPINNER_GLYPH = /^\s*[✻✽✢✶✳·*∗+]\s/;
+
+/** The parenthetical the status line carries: an elapsed clock ("(12s", "(40m 17s", "(3m"). */
+const SPINNER_ELAPSED = /\(\s*(?:\d+\s*h\s*)?(?:\d+\s*m\s*)?\d+\s*s\b|\(\s*\d+\s*m\b/;
+
+/** Accepted tails for a glyph-led frame. The token counter is the strongest of these — it only
+ *  climbs while the model is generating — and `esc to interrupt` is the legacy shape. */
+const WORKING_PATTERNS: RegExp[] = [SPINNER_ELAPSED, /\d+(?:\.\d+)?\s*[km]?\s*tokens/i, /esc to interrupt/i];
+
+/** Is ONE redraw frame Claude's live status line? Glyph-led AND carrying a clock/counter/legacy
+ *  tail. Feed it a single frame — never a whole chunk: the glyph is anchored, so a chunk whose
+ *  FIRST line happens to start with "* " (a markdown bullet, a diff line) would otherwise license
+ *  every tail match anywhere in it. `hasSpinnerFrame` does the splitting for you. */
+export function isSpinnerFrame(frame: string): boolean {
+  return SPINNER_GLYPH.test(frame) && WORKING_PATTERNS.some((re) => re.test(frame));
+}
+
+/** Does this cleaned chunk contain a live status-line redraw? The spinner redraws in place with
+ *  carriage returns, so one chunk holds several frames plus ordinary prose; we split and ask
+ *  per-frame rather than testing the whole chunk, which is what keeps the persistent footer — and
+ *  prose that merely mentions "12s" or "30k tokens" — from reading as a running turn. */
+function hasSpinnerFrame(chunk: string): boolean {
+  return chunk.split(/[\r\n]/).some(isSpinnerFrame);
+}
 
 // The spinner also carries a live token counter — "↑ 1.2k tokens", "↓ 2.1k tokens" — that only
 // climbs while the model is ACTIVELY GENERATING. Parse the number (k → ×1000, m → ×1000000) so a
@@ -99,7 +152,7 @@ export function latestSpinnerTokens(chunk: string): number | null {
   const frames = chunk.split(/[\r\n]/);
   for (let i = frames.length - 1; i >= 0; i--) {
     const frame = frames[i] ?? "";
-    if (!WORKING_PATTERNS.some((re) => re.test(frame))) continue;
+    if (!isSpinnerFrame(frame)) continue;
     const tokens = parseSpinnerTokens(frame);
     if (tokens !== null) return tokens;
   }
@@ -382,9 +435,10 @@ export class StatusEngine {
       trippedThisChunk = true;
     }
 
-    // The spinner status line is re-drawn in place (often no trailing newline), so test
-    // the whole cleaned chunk rather than only completed lines.
-    const hasSpinner = WORKING_PATTERNS.some((re) => re.test(clean));
+    // The spinner status line is re-drawn in place (often no trailing newline), so scan the whole
+    // cleaned chunk rather than only completed lines — but FRAME BY FRAME, so the persistent footer
+    // bar can't be mistaken for a running turn. See the WORKING_PATTERNS header.
+    const hasSpinner = hasSpinnerFrame(clean);
     if (hasSpinner) this.sawSpinner = true;
 
     // Token-advance recovery (sparkle-pqxh follow-up): after an API BANNER the request that failed

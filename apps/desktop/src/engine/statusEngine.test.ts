@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { StatusEngine, parseSpinnerTokens, latestSpinnerTokens } from "./statusEngine";
+import { StatusEngine, parseSpinnerTokens, latestSpinnerTokens, isSpinnerFrame } from "./statusEngine";
 import type { AgentTabStatus } from "../types";
 
 describe("parseSpinnerTokens", () => {
@@ -210,6 +210,52 @@ describe("StatusEngine", () => {
     engine.ingest(SPINNER);
     vi.advanceTimersByTime(60000); // long past the legacy BLOCKED_MS
     expect(statuses).not.toContain("blocked");
+  });
+
+  // TUI DRIFT (2026-07-28). Claude Code moved "esc to interrupt" OFF the live status line and into
+  // the persistent footer hint bar. Every fixture above still carries the old fused shape, which is
+  // why a green suite said nothing while working agents rendered GRAY in the app: the marker was the
+  // ONLY working signal, so ~2s into every turn the settle timer fired and recorded `idle`. That one
+  // fault also opened the CTA gate mid-turn (`idle` is in useSuggestions' YOUR_TURN set) and pinned
+  // `isInMotion` false, which in turn removed the in-motion suppression on the worker-red bubble.
+  //
+  // Both shapes must read as working, and the footer must NOT — it is chrome that is on screen for
+  // the whole session, so treating it as proof of a running turn would pin every agent green forever
+  // (the mirror-image bug, and the more dangerous one: a false green hides a real question).
+  const TODAY_SPINNER = "✢ Metamorphosing… (40m 17s · ↓ 66.9k tokens)";
+  const FOOTER_HINT = "▶▶ bypass permissions on (shift+tab to cycle) · PR #730 · esc to interrupt";
+
+  it("recognises BOTH status-line shapes, and refuses the footer bar", () => {
+    // The predicate directly, because it is the whole of the change and the engine-level tests
+    // below can be satisfied by the legacy any-output fallback rather than by spinner mode.
+    expect(isSpinnerFrame(TODAY_SPINNER)).toBe(true);
+    expect(isSpinnerFrame(SPINNER)).toBe(true); // legacy shape still works
+    expect(isSpinnerFrame("✻ Working… (3m · ↓ 900k tokens)")).toBe(true);
+    // The footer is drawn whether or not a turn is running, so it can never mean "working" —
+    // and it carries the legacy hint, which is exactly why a whole-chunk match was unsafe.
+    expect(isSpinnerFrame(FOOTER_HINT)).toBe(false);
+    // Prose that merely mentions a duration or a token count is not a status line.
+    expect(isSpinnerFrame("compacted 30k tokens")).toBe(false);
+    expect(isSpinnerFrame("the build took 12s")).toBe(false);
+    // A glyph-led line with no clock and no counter is not one either.
+    expect(isSpinnerFrame("* a markdown bullet")).toBe(false);
+  });
+
+  it("stays working on today's status line once spinner mode is latched (the gray-dot bug)", () => {
+    // THE REPRODUCTION. Ingesting today's line into a fresh engine proves little: with the spinner
+    // never latched it falls through to the LEGACY output-flow heuristic (case 4), which reports
+    // `working` for any output at all, so the drift hides there. It bites once `sawSpinner` is set —
+    // from then on ONLY a marker frame re-arms the settle timer, so a status line that redraws every
+    // second without matching leaves the turn recorded `idle` 2s in, while the agent is plainly
+    // running. That is the gray dot on a working agent, and the open CTA gate behind it.
+    const { engine, statuses, last } = makeEngine(() => IDLE_SCREEN);
+    engine.ingest(SPINNER); // latch spinner mode on the shape we already matched
+    for (let i = 0; i < 30; i++) {
+      engine.ingest(`✢ Metamorphosing… (${40 + i}m 17s · ↓ 66.9k tokens)`);
+      vi.advanceTimersByTime(1000);
+    }
+    expect(last()).toBe("working");
+    expect(statuses).not.toContain("idle");
   });
 
   // --- Settle-time RED/GRAY decision from the rendered screen snapshot ---
