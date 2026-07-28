@@ -121,3 +121,21 @@ describe("drop target", () => {
 
 // The `deriveWordmarkMode` block that stood here is gone: `main` removed the star-field wordmark
 // (and with it that helper) independently of this branch's §4. Nothing to re-test.
+
+// ── THE USER'S BUBBLE IS A FILL, NOT AN OUTLINED BOX ──────────────────────────────────────────
+// It carried `1px solid color-mix(muted 25%)` on top of its own fill, which says the same thing
+// twice and said it faintly. The founder called it out directly. The tail corner is what marks the
+// bubble as yours, so the identity survives losing the rule — this pins the absence so a future
+// "add an edge for definition" has to argue with the fill first.
+describe("the you-bubble", () => {
+  it("has a fill and NO drawn border", () => {
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    const bubble = screen.getByTestId("you-bubble");
+    // jsdom serializes an absent border to "", so assert on what must NOT be there.
+    expect(bubble.style.border).not.toContain("solid");
+    expect(bubble.style.borderWidth).toBe("");
+    // …and the two things that DO carry it are still present.
+    expect(bubble.style.background).toBeTruthy();
+    expect(bubble.style.borderRadius).toBe("14px 14px 4px 14px");
+  });
+});

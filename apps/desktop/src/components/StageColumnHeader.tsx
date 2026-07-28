@@ -59,10 +59,23 @@ export function StageColumnHeader({
     <span>{label}</span>
   );
 
+  // THE COUNT SITS UNDER THE TITLE, not beside it. Inline, it read as part of the lane name — the
+  // eye picks up "BACKLOG 12" as one string and has to parse where the label stops. Stacked, the
+  // title is the label and the number is a quiet second line, which is what a count is: a fact
+  // about the lane rather than part of its name. It also stops a long label and a three-digit count
+  // competing for the same row as the columns narrow.
   return (
     <div style={headerRow}>
-      {titleNode}
-      <span style={{ color: C.muted, opacity: 0.7 }}>{count}</span>
+      {/* The lane LABEL is addressable by id because it now collides with card text by design:
+          the terminal lane is "Shipped" and a card in it carries the stage badge "Shipped" too.
+          That agreement is the point — the lane and the ticker speak one vocabulary — but it makes
+          a bare getByText("Shipped") ambiguous, so tests target the lane through this. */}
+      <span data-testid={`lane-label-${columnKey}`} style={titleStack}>
+        {titleNode}
+        <span data-testid={`lane-count-${columnKey}`} style={countLine}>
+          {count}
+        </span>
+      </span>
       {/* Live status chip: Delivered reflects the monitor; Done shows a plain "defined" tick. */}
       {defined && stageKey === "delivered" && deliveryChip && (
         <span
@@ -116,7 +129,9 @@ export function DefineStageCta({
 // ── styles ───────────────────────────────────────────────────────────────────────────────────
 const headerRow: CSSProperties = {
   display: "flex",
-  alignItems: "center",
+  // The chips sit against the TITLE line, not centred against the whole two-line stack, so a lane
+  // with a status chip and one without still read as the same header height.
+  alignItems: "flex-start",
   gap: 8,
   padding: "10px 12px",
   fontSize: 12,
@@ -124,6 +139,25 @@ const headerRow: CSSProperties = {
   letterSpacing: 1,
   fontWeight: FONT_WEIGHT.semibold,
   color: C.muted,
+};
+
+/** Title over count. `min-width: 0` so a long lane label truncates rather than pushing the chips. */
+const titleStack: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "flex-start",
+  gap: 2,
+  minWidth: 0,
+};
+
+/** The count line: same muted ink, but out of the uppercase/tracked treatment the label carries —
+ *  a number rendered with 1px letter-spacing reads as a code, not a quantity. */
+const countLine: CSSProperties = {
+  fontSize: 11,
+  letterSpacing: 0,
+  textTransform: "none",
+  fontWeight: FONT_WEIGHT.regular,
+  opacity: 0.7,
 };
 
 const titleButton: CSSProperties = {

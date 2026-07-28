@@ -5,6 +5,7 @@
 import { create } from "zustand";
 import {
   listBeads,
+  blockedBeadIds,
   bucketBeads,
   ensureBeadsDb,
   isBeadsUnavailable,
@@ -93,8 +94,12 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     }
     set((s) => ({ loading: { ...s.loading, [projectId]: true } }));
     try {
-      const beads = await listBeads(projectPath);
-      const board = bucketBeads(beads);
+      // CONCURRENTLY, not in sequence. `list_beads` is the 5s-poll hot path the perf work in
+      // notes.rs targets, and the blocked query is independent of it — running them together costs
+      // one wall-clock round trip instead of two. `blockedBeadIds` never rejects (it degrades to an
+      // empty set), so this cannot turn a working board into a failed one.
+      const [beads, blocked] = await Promise.all([listBeads(projectPath), blockedBeadIds(projectPath)]);
+      const board = bucketBeads(beads, blocked);
       set((s) => ({
         byProject: { ...s.byProject, [projectId]: { beads, board, loadedAt: Date.now() } },
         loading: { ...s.loading, [projectId]: false },
@@ -114,8 +119,11 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
         autoInitAttempted.add(projectId);
         try {
           await ensureBeadsDb(projectPath);
-          const beads = await listBeads(projectPath);
-          const board = bucketBeads(beads);
+          const [beads, blocked] = await Promise.all([
+            listBeads(projectPath),
+            blockedBeadIds(projectPath),
+          ]);
+          const board = bucketBeads(beads, blocked);
           set((s) => ({
             byProject: { ...s.byProject, [projectId]: { beads, board, loadedAt: Date.now() } },
             loading: { ...s.loading, [projectId]: false },

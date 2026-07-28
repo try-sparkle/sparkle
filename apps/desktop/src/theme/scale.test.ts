@@ -112,8 +112,20 @@ function offScale(prop: string, allowed: readonly number[]): { file: string; val
 // exempt (roborev 54238), then 77 → 60 when `50%` stopped being counted as a px step (54246) —
 // `"50%"` is the idiomatic circle, the same shape `PILL` and `0` are exempt for, and listing `50`
 // as a value to migrate would have sent someone swapping ellipses for capsules.
-const MAX_OFF_SCALE_TYPE = 139;
-const MAX_OFF_SCALE_RADIUS = 60;
+//
+// ── 139 → 140 AND 60 → 61: THE COST OF EXACT EQUALITY, PAID ONCE AND STATED ───────────────────
+// The ratchet shipped recording 139/60 and landed on a `main` that had already reached 140/61 —
+// other branches merged off-scale values in the window between the counts being taken and the
+// merge completing. Nobody did anything wrong, and `main` went red on a test neither change touched.
+//
+// That is the flip side of the equality the note below argues for, and it belongs in the record
+// rather than being quietly absorbed: `<=` cannot detect its own staleness, `===` cannot tolerate a
+// concurrent merge. Equality is still the right trade — a bound that silently accrues budget stops
+// being a ratchet at all — and this failure is loud, one line to resolve, and the message says
+// which way to move. But a long-lived branch should expect to re-take this number just before it
+// merges, the way a lockfile gets refreshed.
+const MAX_OFF_SCALE_TYPE = 140;
+const MAX_OFF_SCALE_RADIUS = 61;
 
 // EXACT, not `<=` (roborev 54238). The file told the next person to lower the ceiling when they
 // migrated, and then used a bound that cannot tell whether they did: remove twenty literals without

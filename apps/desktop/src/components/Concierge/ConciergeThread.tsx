@@ -154,12 +154,20 @@ export function ConciergeThread({
               style={{ maxWidth: "92%", alignSelf: "flex-end", textAlign: "right" }}
             >
               <div
+                data-testid="you-bubble"
                 style={{
                   display: "inline-block",
                   textAlign: "left",
                   fontSize: 13,
                   background: CHAT_USER_BUBBLE,
-                  border: `1px solid color-mix(in srgb, ${C.muted} 25%, transparent)`,
+                  // NO BORDER. The bubble already has a FILL, and a fill is a shape — outlining it
+                  // says the same thing twice and, at a 25% wash of `muted`, said it faintly. The
+                  // founder called this out directly: the bubble should read as one solid object,
+                  // not a tinted box inside a hairline.
+                  //
+                  // The tail corner is what identifies it as YOURS (14/14/4/14 — square-ish into
+                  // the bottom-right, where the column's own edge is), which is the same
+                  // shape-not-hue reasoning the status dots and the palette badges use.
                   borderRadius: "14px 14px 4px 14px",
                   padding: "9px 12px",
                 }}

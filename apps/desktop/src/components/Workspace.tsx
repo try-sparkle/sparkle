@@ -5,6 +5,7 @@ import { C, FONT, FONT_WEIGHT, ON_BRAND_FILL, ON_GOLD_FILL } from "../theme/colo
 import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { ConciergeHost } from "./ConciergeHost";
+import { ColumnResizeTab } from "./ColumnResizeTab";
 import { CommandPalette, PaletteTrigger, useCommandPalette } from "./Concierge";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -89,6 +90,14 @@ function PaneFallback() {
   return <div style={{ position: "absolute", inset: 0, background: C.forest }} />;
 }
 
+/** The concierge column's persisted width, and the range a drag/arrow-key commit is clamped to.
+ *  360 is what the column shipped at as a hardcoded prop; the bounds are wider than the agent
+ *  column's because this column holds prose (the thread) rather than a list of short rows. */
+const CONCIERGE_WIDTH_KEY = "sparkle-concierge-width";
+const CONCIERGE_MIN_WIDTH = 280;
+const CONCIERGE_MAX_WIDTH = 560;
+const CONCIERGE_DEFAULT_WIDTH = 360;
+
 /**
  * THE app shell (Concierge Mode, bead sparkle-qd80 / CM-U7) — one window, three depth layers,
  * projects as TABS:
@@ -116,6 +125,20 @@ export function Workspace() {
   // (status flips, activity, prompt appends…) and re-renders the live pane list under it. This counter
   // exposes that render rate — the top-level driver of pane re-render thrash (perfTrace).
   perfRender("Workspace", "main");
+
+  // The concierge column's width, persisted. It lives HERE rather than inside ConciergeHost because
+  // the resize tab is a sibling of the column, not a child: the boundary belongs to the layout that
+  // owns both sides of it. Same storage shape as the agent column's width, and the same
+  // read-through validation — a persisted value outside the clamp is ignored rather than restored,
+  // so a stale entry from an older clamp cannot wedge the column off-screen.
+  const [conciergeWidth, setConciergeWidthRaw] = useState<number>(() => {
+    const saved = Number(localStorage.getItem(CONCIERGE_WIDTH_KEY));
+    return saved >= CONCIERGE_MIN_WIDTH && saved <= CONCIERGE_MAX_WIDTH ? saved : CONCIERGE_DEFAULT_WIDTH;
+  });
+  const setConciergeWidth = (next: number) => {
+    setConciergeWidthRaw(next);
+    localStorage.setItem(CONCIERGE_WIDTH_KEY, String(next));
+  };
   const projects = useProjectStore((s) => s.projects);
   const currentProjectId = useCurrentProjectId();
   const isMainWindow = useIsMainWindow();
@@ -630,11 +653,25 @@ export function Workspace() {
         {/* ① The persistent cross-project concierge column. Unconditional — the concierge IS the
             experience now, not a flagged addition to the old UI. */}
         <ConciergeHost
-          width={360}
+          width={conciergeWidth}
           feed={feed}
           promptTarget={promptTarget}
           promptTargetShown={promptTargetShown}
           searchSlot={<PaletteTrigger onOpen={palette.openPalette} />}
+        />
+        {/* THE CONCIERGE BOUNDARY IS DRAGGABLE NOW. This column shipped at a hardcoded 360 with no
+            way to move it, while the agent column beside it had a full resize strip — so of the
+            shell's two vertical seams, one was adjustable and the other was a wall. Same control,
+            same keyboard contract, and the 2×3 dot grip that fades in on hover; see
+            ColumnResizeTab for why the grip is hidden at rest and why it cannot take pointer
+            events. */}
+        <ColumnResizeTab
+          width={conciergeWidth}
+          onWidth={setConciergeWidth}
+          min={CONCIERGE_MIN_WIDTH}
+          max={CONCIERGE_MAX_WIDTH}
+          label="Sparkle column"
+          testId="concierge-resize-tab"
         />
         {/* ② + ③. Position:relative so Plan mode can lay ONE wide card column over both of them —
             covering, never unmounting: a Terminal unmount kills its PTY, so a mode flip must not

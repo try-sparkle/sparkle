@@ -448,6 +448,37 @@ pub async fn list_beads(project_path: String) -> Result<String, String> {
     .map_err(|e| format!("bd task failed: {e}"))?
 }
 
+/// List the beads that are BLOCKED — open, with at least one unmet blocker — via `bd blocked
+/// --json`. Returns bd's raw JSON stdout for the frontend to parse.
+///
+/// WHY THIS IS A SEPARATE CALL AND NOT A FIELD ON `list_beads`. `bd list --all --json` carries a
+/// `status`, but "blocked" is not one of the values this repo's beads store: it is DERIVED from
+/// dependency edges at query time. The row does expose `dependency_count`, and reading blocked off
+/// that would be wrong in the direction that matters — a bead whose dependencies are all CLOSED has
+/// a non-zero count and is perfectly ready. A lane that lies is worse than no lane, so the board
+/// asks bd the question bd can actually answer.
+///
+/// NEVER FATAL. A bd too old to know `blocked`, or any other failure, yields an empty list rather
+/// than an error: the Blocked lane going quiet is a far better failure than the whole board
+/// refusing to load because one derived column could not be computed. The caller runs this
+/// CONCURRENTLY with `list_beads` (see beadsStore.refresh) so the 5s poll pays one wall-clock cost,
+/// not two — that hot path is the one the perf work in this module targets.
+#[tauri::command]
+pub async fn blocked_beads(project_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        match run_bd(&project_path, &["blocked", "--json"]) {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok(if stdout.is_empty() { "[]".to_string() } else { stdout })
+            }
+            // Non-zero exit or a spawn failure: degrade to "nothing is blocked".
+            _ => Ok("[]".to_string()),
+        }
+    })
+    .await
+    .map_err(|e| format!("bd task failed: {e}"))?
+}
+
 /// Ensure `project_path` has a beads database, creating one with `bd init` if none resolves yet.
 /// Idempotent and safe to call on every board open: it first probes `bd where` (which honors
 /// BEADS_DIR / parent-directory / redirect resolution, so a project that legitimately inherits a

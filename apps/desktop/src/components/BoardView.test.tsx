@@ -145,6 +145,7 @@ const board: Board = {
     bead({ id: "p1-a1", title: "Backlog one", description: "First backlog task description." }),
     bead({ id: "p1-a2", title: "Backlog two" }),
   ],
+  blocked: [],
   inProgress: [bead({ id: "p1-b1", title: "Doing now", status: "in_progress" })],
   done: [bead({ id: "p1-c1", title: "Finished", status: "closed" })],
   delivered: [
@@ -184,11 +185,14 @@ describe("BoardView", () => {
 
   it("renders the four columns with their cards bucketed correctly", () => {
     render(<BoardView project={project} />);
-    // Column headers (count rendered alongside).
-    expect(screen.getByText("Backlog")).toBeTruthy();
-    expect(screen.getByText("In Progress")).toBeTruthy();
-    expect(screen.getByText("Done")).toBeTruthy();
-    expect(screen.getByText("Delivered")).toBeTruthy();
+    // Column headers, addressed by lane so they cannot be confused with card text — the terminal
+    // lane and the terminal STAGE badge are both "Shipped", deliberately (one vocabulary).
+    expect(screen.getByTestId("lane-label-backlog").textContent).toContain("Backlog");
+    expect(screen.getByTestId("lane-label-inProgress").textContent).toContain("Being built");
+    expect(screen.getByTestId("lane-label-done").textContent).toContain("Done");
+    expect(screen.getByTestId("lane-label-delivered").textContent).toContain("Shipped");
+    // The count renders UNDER the title, inside the same lane stack.
+    expect(screen.getByTestId("lane-count-backlog").textContent).toBe("2");
     // Cards land in the right buckets.
     expect(screen.getByText("Backlog one")).toBeTruthy();
     expect(screen.getByText("Backlog two")).toBeTruthy();
@@ -205,7 +209,12 @@ describe("BoardView", () => {
     expect(screen.getAllByText("Planned").length).toBeGreaterThanOrEqual(2); // two backlog beads
     expect(screen.getByText("Unsaved")).toBeTruthy(); // the in-progress bead
     expect(screen.getByText("Merged")).toBeTruthy(); // the done bead
-    expect(screen.getByText("Shipped")).toBeTruthy(); // the delivered bead
+    // "Shipped" is now BOTH the terminal lane label and this card's stage badge, so scope to the
+    // card: the lane's copy lives inside lane-label-delivered.
+    const shipped = screen.getAllByText("Shipped");
+    expect(shipped.length).toBe(2);
+    const lane = screen.getByTestId("lane-label-delivered");
+    expect(shipped.filter((el) => !lane.contains(el))).toHaveLength(1); // the delivered bead
   });
 
   it("shows the loading state when there is no snapshot yet", () => {
@@ -217,17 +226,18 @@ describe("BoardView", () => {
   it("shows an empty-column hint and keeps a prior snapshot visible on error", () => {
     snapshot = {
       beads: [],
-      board: { backlog: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
       loadedAt: Date.now(),
     };
     error = "bd blew up";
     render(<BoardView project={project} />);
     // Error surfaces but the (empty) board still renders.
     expect(screen.getByText("bd blew up")).toBeTruthy();
-    // Backlog + In Progress show the empty hint; undefined Done/Delivered show the Define CTA instead.
-    expect(screen.getAllByText("Nothing here yet").length).toBe(2);
+    // The three non-definable lanes (Backlog, Blocked, Being built) show the empty hint; the two
+    // definable ones (Done, Shipped) show the Define CTA instead.
+    expect(screen.getAllByText("Nothing here yet").length).toBe(3);
     expect(screen.getByText("Define “Done”")).toBeTruthy();
-    expect(screen.getByText("Define “Delivered”")).toBeTruthy();
+    expect(screen.getByText("Define “Shipped”")).toBeTruthy();
   });
 
   it("opens a detail overlay with the full description when a card is clicked", () => {
@@ -245,6 +255,7 @@ describe("BoardView", () => {
             labels: ["ui", "kanban"],
           }),
         ],
+        blocked: [],
         inProgress: [],
         done: [],
         delivered: [],
@@ -295,6 +306,7 @@ describe("BoardView — Build It (epic handoff)", () => {
       beads: [],
       board: {
         backlog: [bead({ id: "p1-e1", title: "Build the app", type: "epic", description })],
+        blocked: [],
         inProgress: [],
         done: [],
         delivered: [],
@@ -352,6 +364,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
       beads,
       board: {
         backlog: [epic],
+        blocked: [],
         inProgress: over.withChild === false ? [] : [child],
         done: [],
         delivered: [],
@@ -419,6 +432,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
       beads: [],
       board: {
         backlog: [bead({ id: "p1-t1", title: "Plain task", type: "task" })],
+        blocked: [],
         inProgress: [bead({ id: "p1-e2", title: "Running epic", type: "epic" })],
         done: [],
         delivered: [],
@@ -436,10 +450,10 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
     await waitFor(() => expect(getConfig).toHaveBeenCalledWith("/tmp/demo"));
     // Undefined Done/Delivered → centered blue Define CTA in the column body.
     expect(screen.getByText("Define “Done”")).toBeTruthy();
-    expect(screen.getByText("Define “Delivered”")).toBeTruthy();
+    expect(screen.getByText("Define “Shipped”")).toBeTruthy();
     // The inert columns never get a Define affordance.
     expect(screen.queryByText("Define “Backlog”")).toBeNull();
-    expect(screen.queryByText("Define “In Progress”")).toBeNull();
+    expect(screen.queryByText("Define “Being built”")).toBeNull();
   });
 
   it("opens the Define modal for the matching stage when a Done/Delivered header is clicked", async () => {
@@ -460,8 +474,8 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
 
   it("opens the Delivered modal from its empty-state CTA button", async () => {
     render(<BoardView project={project} />);
-    await waitFor(() => expect(screen.getByText("Define “Delivered”")).toBeTruthy());
-    fireEvent.click(screen.getByText("Define “Delivered”"));
+    await waitFor(() => expect(screen.getByText("Define “Shipped”")).toBeTruthy());
+    fireEvent.click(screen.getByText("Define “Shipped”"));
     expect(screen.getByTestId("define-modal").textContent).toContain("define-modal:delivered");
   });
 
@@ -469,7 +483,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
     defineDone();
     snapshot = {
       beads: [],
-      board: { backlog: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
       loadedAt: Date.now(),
     };
     render(<BoardView project={project} />);
@@ -484,6 +498,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
       beads: [],
       board: {
         backlog: [bead({ id: "p1-m1", title: "Needs review" })],
+        blocked: [],
         inProgress: [],
         done: [],
         delivered: [],
@@ -507,6 +522,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
       beads: [],
       board: {
         backlog: [bead({ id: "p1-m1", title: "Needs review" })],
+        blocked: [],
         inProgress: [],
         done: [],
         delivered: [],
@@ -529,6 +545,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
       beads: [],
       board: {
         backlog: [],
+        blocked: [],
         inProgress: [],
         done: [bead({ id: "p1-d9", title: "Landed feature", status: "closed" })],
         delivered: [],

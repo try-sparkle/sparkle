@@ -132,6 +132,30 @@ describe("columnFor", () => {
       "delivered",
     );
   });
+
+  // ── BLOCKED IS DERIVED, AND IT ONLY APPLIES TO OPEN BEADS ────────────────────────────────────
+  // bd computes blocked from dependency edges; it is not a stored status (BeadStatus is only
+  // open | in_progress | closed). The tempting shortcut — reading it off the `dependency_count`
+  // the list payload already carries — is wrong in the direction that matters: a bead whose
+  // dependencies are all CLOSED has a non-zero count and is perfectly ready.
+  it("open AND in the blocked set -> blocked", () => {
+    expect(columnFor(bead({ id: "a", status: "open" }), new Set(["a"]))).toBe("blocked");
+  });
+  it("open and NOT in the set -> backlog, and no set at all means nothing is blocked", () => {
+    expect(columnFor(bead({ id: "a", status: "open" }), new Set(["other"]))).toBe("backlog");
+    expect(columnFor(bead({ id: "a", status: "open" }))).toBe("backlog");
+  });
+  it("a bead being WORKED is not blocked, even if bd still lists it", () => {
+    // Someone is on it; surfacing it as blocked would be telling the user to act on something
+    // that is already moving.
+    expect(columnFor(bead({ id: "a", status: "in_progress" }), new Set(["a"]))).toBe("inProgress");
+  });
+  it("a CLOSED bead is never blocked", () => {
+    expect(columnFor(bead({ id: "a", status: "closed", labels: [] }), new Set(["a"]))).toBe("done");
+    expect(
+      columnFor(bead({ id: "a", status: "closed", labels: [DELIVERED_LABEL] }), new Set(["a"])),
+    ).toBe("delivered");
+  });
 });
 
 describe("bucketBeads", () => {

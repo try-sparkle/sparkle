@@ -504,6 +504,7 @@ pub fn run() {
             notes::read_prd,
             notes::copy_capture_asset,
             notes::list_beads,
+            notes::blocked_beads,
             notes::ensure_beads_db,
             notes::bead_show,
             notes::create_bead_full,

@@ -76,6 +76,27 @@ export async function listBeads(projectPath: string): Promise<Bead[]> {
   return parseBeadArray(raw, "list_beads");
 }
 
+/**
+ * The ids of beads bd considers BLOCKED — open, with at least one unmet blocker.
+ *
+ * Blocked is DERIVED from dependency edges, not stored: `BeadStatus` is only
+ * open | in_progress | closed, and this repo never writes a "blocked" status. The temptation is to
+ * read it off `dependency_count`, which the list payload already carries — that is wrong in the
+ * direction that matters, because a bead whose dependencies are all CLOSED has a non-zero count and
+ * is perfectly ready. So the board asks bd the question bd can answer.
+ *
+ * Never throws: the Rust side degrades a missing/failing `bd blocked` to an empty list, and a parse
+ * failure here does the same. A quiet Blocked lane beats a board that will not load.
+ */
+export async function blockedBeadIds(projectPath: string): Promise<Set<string>> {
+  try {
+    const raw = await invoke<string>("blocked_beads", { projectPath });
+    return new Set(parseBeadArray(raw, "blocked_beads").map((b) => b.id));
+  } catch {
+    return new Set();
+  }
+}
+
 /** Ensure the project has a beads database, creating one (`bd init`) if none resolves yet.
  *  Idempotent and best-effort — the board calls this once, on the first read that fails with
  *  "no beads database found", so a brand-new project self-heals into an empty board instead of
@@ -196,16 +217,20 @@ export function mergeShaOf(bead: Bead): string | null {
   return sha && sha.length > 0 ? sha : null;
 }
 
-export type BoardColumn = "backlog" | "inProgress" | "done" | "delivered";
+export type BoardColumn = "backlog" | "blocked" | "inProgress" | "done" | "delivered";
 
 /** A closed bead carrying this label lands in "delivered" instead of "done". */
 export const DELIVERED_LABEL = "delivered";
 
 /** Which board column a bead belongs in:
- *  open -> backlog; in_progress -> inProgress; closed+delivered-label -> delivered;
- *  closed (no label) -> done. */
-export function columnFor(bead: Bead): BoardColumn {
-  if (bead.status === "open") return "backlog";
+ *  open+blocked -> blocked; open -> backlog; in_progress -> inProgress;
+ *  closed+delivered-label -> delivered; closed (no label) -> done.
+ *
+ *  BLOCKED OUTRANKS BACKLOG, and only for OPEN beads. A bead someone is actively working
+ *  (in_progress) is not waiting on anything the user needs to see in a Blocked lane, and a closed
+ *  bead cannot be blocked at all — so the check is deliberately not "is it in the set". */
+export function columnFor(bead: Bead, blocked?: ReadonlySet<string>): BoardColumn {
+  if (bead.status === "open") return blocked?.has(bead.id) ? "blocked" : "backlog";
   if (bead.status === "in_progress") return "inProgress";
   // closed
   return bead.labels.includes(DELIVERED_LABEL) ? "delivered" : "done";
@@ -213,18 +238,22 @@ export function columnFor(bead: Bead): BoardColumn {
 
 export interface Board {
   backlog: Bead[];
+  blocked: Bead[];
   inProgress: Bead[];
   done: Bead[];
   delivered: Bead[];
 }
 
 /** Group beads into board columns, preserving input order within each column. */
-export function bucketBeads(beads: Bead[]): Board {
-  const board: Board = { backlog: [], inProgress: [], done: [], delivered: [] };
+export function bucketBeads(beads: Bead[], blocked?: ReadonlySet<string>): Board {
+  const board: Board = { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] };
   for (const bead of beads) {
-    switch (columnFor(bead)) {
+    switch (columnFor(bead, blocked)) {
       case "backlog":
         board.backlog.push(bead);
+        break;
+      case "blocked":
+        board.blocked.push(bead);
         break;
       case "inProgress":
         board.inProgress.push(bead);

@@ -59,11 +59,22 @@ interface StageDefs {
 }
 
 // The four board columns, in display order, paired with the Board snapshot key each reads.
-const COLUMNS: { key: "backlog" | "inProgress" | "done" | "delivered"; label: string }[] = [
+//
+// THE LABELS ARE THE FOUNDER'S WORDS; THE KEYS ARE THE DATA'S. They are deliberately allowed to
+// disagree. `inProgress`/`delivered` are the Board snapshot's keys and bd's own vocabulary, and
+// renaming them would be a data-layer change for a wording decision. What the user reads is
+// "Being built" and "Shipped" — plain-language states a non-developer can act on, which is the
+// whole point of this column being a window rather than a bug tracker.
+// BLOCKED SITS SECOND, between what hasn't started and what is being worked. That is where it
+// belongs in the reading order — you scan left to right asking "what's next", and a blocked item is
+// something that WOULD be next except it can't be. Putting it after "Being built" would file it as
+// a kind of progress, which is the opposite of what it is.
+const COLUMNS: { key: "backlog" | "blocked" | "inProgress" | "done" | "delivered"; label: string }[] = [
   { key: "backlog", label: "Backlog" },
-  { key: "inProgress", label: "In Progress" },
+  { key: "blocked", label: "Blocked" },
+  { key: "inProgress", label: "Being built" },
   { key: "done", label: "Done" },
-  { key: "delivered", label: "Delivered" },
+  { key: "delivered", label: "Shipped" },
 ];
 
 const DESC_PREVIEW = 120;
