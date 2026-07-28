@@ -67,7 +67,7 @@ function seedOrchestratorWithWorker(bs: BranchStatus): Project {
 function openOrchestratorCard() {
   const card = document.querySelector<HTMLElement>('[draggable="true"]');
   if (!card) throw new Error("orchestrator card not found");
-  fireEvent.click(card);
+  fireEvent.contextMenu(card);
 }
 
 beforeEach(() => useUiStore.setState({ collapsedOrchestrators: {} }));
@@ -122,7 +122,7 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
     // Clicking opens the card: the strip is HIDDEN (visibility:hidden — keeps its layout slot so rows
     // below don't jump) while the single card, anchored at the same spot and widening into the
     // terminal area, stands in for it. This is what keeps the name + progress bar from duplicating.
-    fireEvent.click(row);
+    fireEvent.contextMenu(row);
     expect(strip.style.visibility).toBe("hidden");
     // And the detail renders in the card — the Status line is present (the orchestrator's own + the
     // worker's both read "Up to date with main").

@@ -51,7 +51,13 @@ import type { AttentionSource } from "./stores/selfReportMetrics";
 import { getAgentScrollback } from "./services/terminalScrollback";
 import { suggestedRepliesFor } from "./services/suggestions/attentionReplies";
 import { safeUnlisten } from "./services/safeUnlisten";
-import { withDismissedAlerts } from "./engine/alertDismissal";
+import { withDismissedAlerts, alertControlKind } from "./engine/alertDismissal";
+import { isInMotion } from "./engine/inMotion";
+import {
+  rollupDotAccessor,
+  withWorkerRollupGreen,
+  type RollupDot,
+} from "./engine/workerRollup";
 import { withUnmergedWork } from "./engine/unmergedAttention";
 import { withRedWorkerAttention, withUnstartedWorkerAttention } from "./engine/workerAttention";
 import { resolveStage } from "./engine/workflowStage";
@@ -93,15 +99,66 @@ export function publishedStatusFor(
   status: StatusMap,
   openIds: ReadonlySet<string>,
   stageOf: (id: string) => ReturnType<typeof resolveStage>,
+  /** Optional out-param: receives the ids step (5) promoted from calm to `working`. Only the
+   *  away-recap needs it — see withWorkerRollupGreen. Everything else ignores it. */
+  promoted?: Set<string>,
 ): StatusMap {
-  return withDismissedAlerts(
+  const { published, dotOf } = composeRollup(agents, status, openIds, stageOf);
+  return withWorkerRollupGreen(agents, published, dotOf, promoted);
+}
+
+/** The Build column's view of the same composition: the rolled-up dot per row, plus the un-bubbled
+ *  `own` map the column needs to decide whether that dot overrides the row's own status.
+ *
+ *  EXPORTED SO THE COLUMN DOES NOT ASSEMBLE ITS OWN. AgentSidebar used to build `own`, the dismissed
+ *  set and the in-motion predicate inline — a second copy of `composeRollup`, and therefore a second
+ *  thing to keep in step with this file. Any slip in that copy (passing `effectiveStatus` where
+ *  `bubbled` is required, say, which silently returns null for every dismissed agent) would make the
+ *  column band differently from every other surface with nothing failing. That is the exact class of
+ *  drift this rollup has already shipped twice, so there is one composition and three consumers. */
+export function rollupViewFor(
+  agents: readonly AgentTab[],
+  status: StatusMap,
+  openIds: ReadonlySet<string>,
+  stageOf: (id: string) => ReturnType<typeof resolveStage>,
+): { own: StatusMap; dotOf: (id: string) => RollupDot } {
+  const { own, dotOf } = composeRollup(agents, status, openIds, stageOf);
+  return { own, dotOf };
+}
+
+/** Steps 1–4 plus the rollup accessor they feed. The single place the chain is spelled out. */
+function composeRollup(
+  agents: readonly AgentTab[],
+  status: StatusMap,
+  openIds: ReadonlySet<string>,
+  stageOf: (id: string) => ReturnType<typeof resolveStage>,
+): { published: StatusMap; own: StatusMap; dotOf: (id: string) => RollupDot } {
+  // (1)+(2): the two worker-attention bubbles. Kept as its own binding because the rollup below
+  // needs exactly this map — pre-unmerged, pre-dismissal — to answer "is this parent in motion?" and
+  // "which reds has the user dismissed?".
+  const bubbled = withRedWorkerAttention(
     agents,
-    withUnmergedWork(
-      agents,
-      withRedWorkerAttention(agents, withUnstartedWorkerAttention(agents, status, openIds)),
-      stageOf,
-    ),
+    withUnstartedWorkerAttention(agents, status, openIds),
   );
+  // (3)+(4) over the bubbled map: the published chain as it has always been.
+  const published = withDismissedAlerts(agents, withUnmergedWork(agents, bubbled, stageOf));
+  // The same chain with the worker bubbles left OUT. Without it the rollup reads a bubbled red as
+  // the head's OWN red and returns early, which makes every mixed subtree unreachable (the trap
+  // documented on rollupDotAccessor's `ownStatusOf`).
+  const own = withDismissedAlerts(agents, withUnmergedWork(agents, status, stageOf));
+  const dismissed = new Set(
+    agents.filter((a) => alertControlKind(a.alert, bubbled[a.id]) === "reenable").map((a) => a.id),
+  );
+  const dotOf = rollupDotAccessor(
+    agents,
+    (id) => published[id] ?? "stopped",
+    (id) => own[id] ?? "stopped",
+    {
+      isDismissed: (id) => dismissed.has(id),
+      isInMotion: (parentId) => isInMotion(parentId, agents, bubbled),
+    },
+  );
+  return { published, own, dotOf };
 }
 
 /** Cap the raw terminal `detail` we relay to the phone. The trigger sits at the BOTTOM of the

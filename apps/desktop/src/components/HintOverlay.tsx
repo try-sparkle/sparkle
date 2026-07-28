@@ -7,6 +7,7 @@ import {
   RECENT_HINT,
   RECENT_SWITCH_HINT,
   RECENT_TRIGGER_HINT,
+  HINT_JUMP_ATTR,
   assignLabels,
 } from "../keyboardHints/hintTargets";
 
@@ -214,7 +215,22 @@ export function HintOverlay() {
       close();
       // Fire the control's own click handler. Deferred a tick so React has torn down the overlay
       // first (a synchronous click could re-enter layout while we're mid-update).
-      setTimeout(() => el.click(), 0);
+      //
+      // MARKED while it fires. A hint jump means "take me to this thing", and a handler may
+      // reasonably do less for it than for a real click — the Build column's agent rows fold their
+      // worker subtree on click, and a jump that also folded (and PERSISTED that fold) made
+      // repeated jumps flip-flop a subtree the user never touched. The attribute is the explicit
+      // signal for that. Sniffing `event.detail === 0` was tried instead and is wrong: detail
+      // describes the DISPATCH MECHANISM, so AT activations (VoiceOver/Switch Control AXPress) look
+      // identical to this and would silently lose the fold too.
+      setTimeout(() => {
+        el.setAttribute(HINT_JUMP_ATTR, "");
+        try {
+          el.click();
+        } finally {
+          el.removeAttribute(HINT_JUMP_ATTR);
+        }
+      }, 0);
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);

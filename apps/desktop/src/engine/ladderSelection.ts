@@ -38,6 +38,21 @@ export function firstLadderRowId<
   statusOf: (id: string) => AgentTabStatus,
   visibleBands: Record<StatusBand, boolean>,
 ): string | null {
+  // NO rollup accessor here, deliberately — `statusOf` already carries it.
+  //
+  // This briefly called `rollupBandAccessor(agents, statusOf)`, which was wrong twice over once that
+  // accessor grew its `ownStatusOf` / dismissal / in-motion inputs, none of which this call site
+  // had: a head whose bubbled red the user dismissed banded `done` in the column and `needs_you`
+  // here, and a head in motion with a `blocked` worker banded `running` there and `needs_you` here.
+  // With a band chip toggled off, that hands selection to a row the column is not rendering — the
+  // precise failure this module was extracted to end (see the header).
+  //
+  // The fix is not to thread four more parameters through: `publishedStatusFor` composes the rollup
+  // itself now (step 5, withWorkerRollupGreen), so the map every caller already passes IS the
+  // rolled-up one, and plain `bandOfStatus` on it agrees with the column by construction — green via
+  // the promotion, red and orange via the pre-existing bubbling, calm via withDismissedAlerts.
+  // engine/workerRollup.test.ts pins that agreement as a matrix rather than leaving it to this
+  // comment. Passing a NON-published map here was already a contract violation; it still is.
   const sections = groupAgentsByStage(topLevelAgents(agents, mode), stageOf, statusOf, visibleBands);
   return flattenSections(sections)[0]?.id ?? null;
 }

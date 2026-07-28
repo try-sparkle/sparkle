@@ -12,10 +12,12 @@ import { C } from "../theme/colors";
 // Unfilled track: a faint muted rail so the remaining path reads as "to do" without looking broken.
 const TRACK_BG = "rgba(138,160,196,0.22)";
 
-// The sticky "shipped" check is the brand success green — the same "done" signal the full bar lands
-// on, even after the bar has reset for a new cycle. Uses the themed successInk so the ✓ stays
-// legible on the light-mode sidebar (darker green) instead of the too-light brand green as text.
-const SHIPPED_COLOR = C.successInk;
+// THE STICKY "LANDED" ✓ IS GONE, along with the `shipped` prop that drove it. It marked an agent
+// whose work had reached its base at least once, and it was worth its space back when the sidebar
+// was an unordered list where nothing else said so. The column is GROUPED BY STAGE now — a landed
+// agent sits under a section header that says as much in words — so the glyph was a second, smaller
+// rendering of a fact already stated above it, competing for room on a row stripped to a title.
+// The card's own detail lines still carry "Landed" in words. Don't re-add it here.
 
 // memo: all props are primitives, so the default shallow compare bails correctly. Defense-in-depth —
 // the parent AgentRow is itself memoized (agentRowPropsEqual), so this only re-renders when the row
@@ -23,15 +25,11 @@ const SHIPPED_COLOR = C.successInk;
 export const WorkflowLine = memo(function WorkflowLine({
   stage,
   expanded = false,
-  shipped = false,
   height = 2,
 }: {
   stage: WorkflowStageId;
   /** Row is hovered/expanded → reveal the status label to the right of the line. */
   expanded?: boolean;
-  /** This agent's work has reached main at least once — show a persistent ✓ even if the live
-   *  stage has since reset to a new cycle. */
-  shipped?: boolean;
   height?: number;
 }) {
   const frac = stageFraction(stage);
@@ -39,24 +37,6 @@ export const WorkflowLine = memo(function WorkflowLine({
   const meta = stageMeta(stage);
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", minWidth: 0 }}>
-      {shipped && (
-        <span
-          // "Landed", not "shipped to main": stage "main" means merged into the integration branch —
-          // local main for a build agent, the orchestrator's branch for a worker — which only implies
-          // real origin/main at the "merged" stage. Base-relative wording stays honest for both.
-          aria-label="Landed at least once"
-          title="Landed at least once"
-          style={{
-            flex: "0 0 auto",
-            fontSize: 11,
-            lineHeight: 1,
-            fontWeight: 700,
-            color: SHIPPED_COLOR,
-          }}
-        >
-          ✓
-        </span>
-      )}
       <div
         role="img"
         aria-label={`Workflow stage: ${meta.label}`}

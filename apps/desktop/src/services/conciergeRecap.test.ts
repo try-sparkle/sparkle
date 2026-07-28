@@ -380,3 +380,69 @@ describe("recapSummary", () => {
     );
   });
 });
+
+// ── A head standing in for its subtree is not a head that finished ────────────────────────────
+//
+// engine/workerRollup promotes a calm orchestrator to `working` when its workers roll up green, so
+// every surface bands the fleet the same way. The recap must NOT read that promotion as the head
+// doing a unit of work: without this, one worker finishing produced TWO "finished" rows — the
+// worker, and the orchestrator promoted on its behalf (roborev 53886/53917).
+describe("buildRecap — a rolled-up head does not report its worker's finish as its own", () => {
+  const both: Record<string, RecapAgentInfo> = {
+    orch: { name: "Kraken Auth", projectName: "sparkle", statusLabel: "Done" },
+    w1: { name: "Parser Worker", projectName: "sparkle", statusLabel: "Done" },
+  };
+
+  // THE COMMON SHAPE, and the one a first fix that only covered mid-stretch promotion left broken:
+  // the head was ALREADY promoted when the user walked away, so the snapshot holds `working` for it
+  // and the diff reads working → idle. Only `rolledUpGreen` on the snapshot can tell that apart from
+  // a head that was genuinely running.
+  it("skips a head promoted BEFORE the away edge", () => {
+    const recap = buildRecap({
+      snapshot: {
+        status: { orch: "working", w1: "working" },
+        agentIds: ["orch", "w1"],
+        rolledUpGreen: ["orch"],
+        at: T0,
+      },
+      next: { orch: "idle", w1: "idle" },
+      info: both,
+      decisions: [],
+      now: T0 + 12 * 60_000,
+      id: "recap-1",
+    });
+    expect(recap!.finished.map((f) => f.agentId)).toEqual(["w1"]);
+  });
+
+  // A head that really was working still reports — the fix must not silence genuine finishes.
+  it("keeps a head that was working under its own steam", () => {
+    const recap = buildRecap({
+      snapshot: {
+        status: { orch: "working", w1: "working" },
+        agentIds: ["orch", "w1"],
+        rolledUpGreen: [],
+        at: T0,
+      },
+      next: { orch: "idle", w1: "idle" },
+      info: both,
+      decisions: [],
+      now: T0 + 12 * 60_000,
+      id: "recap-1",
+    });
+    expect(recap!.finished.map((f) => f.agentId).sort()).toEqual(["orch", "w1"]);
+  });
+
+  // A snapshot written before the field existed reads as "none promoted" — the pre-rollup behavior,
+  // so an in-flight away stretch spanning an app update doesn't change meaning.
+  it("treats a missing rolledUpGreen as none", () => {
+    const recap = buildRecap({
+      snapshot: { status: { orch: "working", w1: "working" }, agentIds: ["orch", "w1"], at: T0 },
+      next: { orch: "idle", w1: "idle" },
+      info: both,
+      decisions: [],
+      now: T0 + 12 * 60_000,
+      id: "recap-1",
+    });
+    expect(recap!.finished.map((f) => f.agentId).sort()).toEqual(["orch", "w1"]);
+  });
+});

@@ -10,7 +10,8 @@
 // previous snapshot is empty, so every parent looks like it gained its workers — expanding all of
 // them and making the persisted collapse choice worthless on every relaunch. An id absent from the
 // previous snapshot is therefore a BASELINE, never growth.
-import type { AgentKind } from "../types";
+import { bandOfStatus } from "./buildSections";
+import type { AgentKind, AgentTabStatus } from "../types";
 
 /** Worker count per orchestrator id.
  *
@@ -56,4 +57,54 @@ export function expandOnGrowth(
     if (count > before) grown.push(id);
   }
   return grown;
+}
+
+/** RED workers per orchestrator id — the same shape and the same explicit-zero discipline as
+ *  {@link workerCounts}, and for the same reason: {@link expandOnRedWorker} reads a missing id as
+ *  "never observed" and skips it, so a parent omitted while calm would have its FIRST red worker
+ *  classified as a first sighting and stay folded — the one case the expansion exists for.
+ *
+ *  "Red" here is the DOT color (waiting | approval | blocked | errored), asked via `bandOfStatus`
+ *  so this can't drift from the taxonomy. Deliberately not `needsAttention`, which excludes
+ *  `blocked` — reaching for it in this exact situation is the bug that shipped twice. */
+export function redWorkerCounts<T extends { id: string; kind: AgentKind; parentId: string | null }>(
+  agents: readonly T[],
+  statusOf: (id: string) => AgentTabStatus,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const a of agents) {
+    if (a.kind === "build") out[a.id] = 0;
+  }
+  for (const a of agents) {
+    if (a.kind !== "worker" || !a.parentId) continue;
+    if (bandOfStatus(statusOf(a.id)) !== "needs_you") continue;
+    out[a.parentId] = (out[a.parentId] ?? 0) + 1;
+  }
+  return out;
+}
+
+/** The orchestrator ids whose subtree just went from NO red workers to at least one, and so should
+ *  pop open to show the worker that needs you.
+ *
+ *  Fires on the TRANSITION, exactly once, and never again while the worker stays red. That is the
+ *  whole design: a subtree the user deliberately folded after seeing the problem must stay folded,
+ *  or the control fights them every render for as long as the agent is stuck. What keeps the signal
+ *  alive afterwards is the head's own disc, which rolls its workers up (engine/workerRollup) and
+ *  goes red or orange regardless of the fold.
+ *
+ *  Ids absent from `prev` are skipped for the same reason as `expandOnGrowth`: on boot the previous
+ *  snapshot is empty, so every parent with an already-red worker would look like a fresh
+ *  transition, blowing open every such subtree on every relaunch and making the persisted collapse
+ *  choice worthless. */
+export function expandOnRedWorker(
+  prev: Record<string, number>,
+  next: Record<string, number>,
+): string[] {
+  const turned: string[] = [];
+  for (const [id, count] of Object.entries(next)) {
+    const before = prev[id];
+    if (before === undefined) continue; // first sighting is a baseline, not a transition
+    if (before === 0 && count > 0) turned.push(id);
+  }
+  return turned;
 }

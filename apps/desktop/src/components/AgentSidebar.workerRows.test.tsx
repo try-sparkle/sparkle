@@ -1,6 +1,14 @@
 // @vitest-environment jsdom
 //
-// Workers render as indented CHILD ROWS under their orchestrator, behind a chevron.
+// Workers render as indented CHILD ROWS under their orchestrator, folded behind the parent's row.
+//
+// The disclosure CHEVRON these tests were originally written against is gone. It sat ahead of the
+// status disc and cost 20px of left gutter on every row in the column — including the childless
+// ones, where the slot was reserved but empty just to keep the discs on one vertical line. Its two
+// jobs were split: the row's own left click now toggles the subtree (it already selected the agent,
+// so the fold is free), and a `+N` badge beside the title says how many workers are hidden rather
+// than merely that some are. The collapse STATE and its persistence are unchanged, so most of what
+// this file pins still holds — only the control that drives it moved.
 //
 // They used to have no row at all. Five separate surfaces each leaked them into the top-level list
 // independently and were each patched shut (PRD/sparkle/hide-worker-agents-from-sidebar.md); the
@@ -71,7 +79,9 @@ function seed(status: Record<string, AgentTabStatus> = {}): Project {
 const rowFor = (name: string) =>
   screen.getByText(name).closest('[data-hint="agent"]') as HTMLElement;
 const queryRow = (name: string) => screen.queryByText(name);
-const chevron = () => screen.getByRole("button", { name: /workers for Alpha/i });
+/** Fold/unfold Alpha's subtree. This is a plain left click on the head row — the same gesture that
+ *  selects it — since the chevron that used to own the toggle is gone. */
+const toggleAlpha = () => fireEvent.click(rowFor("Alpha"));
 /** The seeded project, read back fresh from the store. Throws rather than returning undefined so a
  *  vanished project fails as itself instead of as a confusing assertion on `undefined`. */
 function liveProject() {
@@ -104,9 +114,11 @@ describe("AgentSidebar — worker child rows", () => {
   it("indents a worker row one level below its parent", () => {
     const project = seedExpanded();
     render(<AgentSidebar project={project} />);
-    // depth * 16 — the head sits at 0, its children at 1.
+    // depth * DEPTH_INDENT — the head sits at 0, its children at 1. The indent went 16 → 32 when the
+    // chevron slot was removed, so that a worker's DISC lands where its parent's TITLE starts rather
+    // than at some arbitrary offset. AgentSidebar.rowChrome.test.tsx pins the arithmetic.
     expect(rowFor("Alpha").style.marginLeft).toBe("0px");
-    expect(rowFor("Parser Worker").style.marginLeft).toBe("16px");
+    expect(rowFor("Parser Worker").style.marginLeft).toBe("32px");
   });
 
   // uiStore's documented default: a missing entry reads as COLLAPSED.
@@ -123,10 +135,10 @@ describe("AgentSidebar — worker child rows", () => {
     render(<AgentSidebar project={project} />);
     expect(queryRow("Parser Worker")).toBeTruthy();
 
-    fireEvent.click(chevron());
+    toggleAlpha();
 
     expect(queryRow("Parser Worker")).toBeNull();
-    // The workers are still in the store — collapse is a view state, not a teardown. A chevron that
+    // The workers are still in the store — collapse is a view state, not a teardown. A fold that
     // could kill a running worker would be a catastrophic misread of the control.
     const fresh = liveProject();
     expect(fresh.agents.map((a) => a.id).sort()).toEqual(["a1", "w1", "w2"]);
@@ -135,58 +147,63 @@ describe("AgentSidebar — worker child rows", () => {
   it("persists the collapse choice through uiStore", () => {
     const project = seedExpanded();
     render(<AgentSidebar project={project} />);
-    fireEvent.click(chevron());
+    toggleAlpha();
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
-    fireEvent.click(chevron());
+    toggleAlpha();
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
   });
 
+  // Removing the chevron BUTTON must not remove the fold from assistive tech: the row inherited the
+  // job, so it inherits aria-expanded. Without this the change reads to a screen reader as "the
+  // feature is gone" rather than "the control moved".
   it("reports its state to assistive tech", () => {
     const project = seedExpanded();
     render(<AgentSidebar project={project} />);
-    expect(chevron().getAttribute("aria-expanded")).toBe("true");
-    fireEvent.click(chevron());
-    expect(chevron().getAttribute("aria-expanded")).toBe("false");
+    expect(rowFor("Alpha").getAttribute("aria-expanded")).toBe("true");
+    toggleAlpha();
+    expect(rowFor("Alpha").getAttribute("aria-expanded")).toBe("false");
   });
 
-  // The row div's own onClick is openCard. Without stopPropagation a chevron click would also open
-  // the hover card, covering the rows it just revealed.
-  it("does not open the hover card when the chevron is clicked", () => {
+  // Left click folds and selects; it does NOT throw the detail card over the rows it just revealed.
+  // The card moved to right-click for exactly this reason.
+  it("does not open the hover card when the row is clicked", () => {
     const project = seedExpanded();
     render(<AgentSidebar project={project} />);
-    fireEvent.click(chevron());
+    toggleAlpha();
     expect(screen.queryByTestId("agent-hover-card")).toBeNull();
   });
 
-  // The hover card is pinned to the row's exact rect, and the chevron slot is a flex child in a
-  // gap:8 row — so if the card omitted the slot, the disc/title/everything after it would jump 20px
-  // left the instant the card opened. The slot must exist on BOTH; only the button is conditional
-  // (a chevron on a floating card would toggle the rows the card is covering). roborev 53672-M.
+  // The hover card is pinned to the row's exact rect and its leading slot is a flex child in a gap:8
+  // row — so if the card sized that slot differently, the disc/title/everything after it would jump
+  // sideways the instant the card opened. Originally this guarded the chevron slot (roborev
+  // 53672-M); with the chevron gone it guards the disc slot, which is the same contract.
   it("keeps the row and its hover card horizontally aligned", () => {
     const project = seedExpanded();
     render(<AgentSidebar project={project} />);
     // Both leading slots are fixed-height boxes (GLYPH_SLOT_H), which identifies them without
     // depending on nesting depth — the row and the card wrap CardHeader at different levels, so a
     // `> div > div` path would silently return [] for one of them and "pass" by comparing nothing.
-    const leadingSlotWidths = (root: HTMLElement) =>
-      Array.from(root.querySelectorAll<HTMLElement>("div"))
-        .filter((d) => d.style.height === "20px" && d.style.width !== "")
-        .map((d) => d.style.width);
+    // The FIRST fixed-height slot only. The card also grows a TRAILING slot of the same size (the ×
+    // close control, which lives there on an expanded/active row), so comparing every slot would
+    // compare the row's one against the card's two and fail on a difference that is not a shift.
+    // What must not move is where the disc — and therefore the title after it — begins.
+    const leadingSlotWidth = (root: HTMLElement) =>
+      Array.from(root.querySelectorAll<HTMLElement>("div")).find(
+        (d) => d.style.height === "20px" && d.style.width !== "",
+      )?.style.width;
 
-    const rowSlots = leadingSlotWidths(rowFor("Alpha"));
-    expect(rowSlots.length).toBeGreaterThan(0); // guard: an empty selector must not pass silently
-    fireEvent.click(rowFor("Alpha"));
-    const cardSlots = leadingSlotWidths(screen.getByTestId("agent-hover-card"));
+    const rowSlot = leadingSlotWidth(rowFor("Alpha"));
+    expect(rowSlot).toBeTruthy(); // guard: an empty selector must not pass silently
+    fireEvent.contextMenu(rowFor("Alpha"));
+    const cardSlot = leadingSlotWidth(screen.getByTestId("agent-hover-card"));
 
-    // Same leading slot widths in the same order → nothing shifts when the card stands over the row.
-    expect(cardSlots).toEqual(rowSlots);
-    // And the card carries no disclosure button of its own.
-    expect(
-      screen.getByTestId("agent-hover-card").querySelector('[aria-label*="workers for"]'),
-    ).toBeNull();
+    // Same leading slot width → nothing shifts when the card stands over the row.
+    expect(cardSlot).toEqual(rowSlot);
+    // And no disclosure control survives anywhere — not on the row, not on the card.
+    expect(document.querySelector('[aria-label*="workers for"]')).toBeNull();
   });
 
-  it("gives no chevron to an orchestrator with no workers", () => {
+  it("gives an orchestrator with no workers neither a fold nor a count", () => {
     const project: Project = {
       id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
       createdAt: new Date(0).toISOString(), selectedAgentId: null,
@@ -198,7 +215,8 @@ describe("AgentSidebar — worker child rows", () => {
       openAgentIds: ["solo"], open, pollBranchStatus: vi.fn(() => Promise.resolve()),
     } as never);
     render(<AgentSidebar project={project} />);
-    expect(screen.queryByRole("button", { name: /workers for Solo/i })).toBeNull();
+    expect(rowFor("Solo").getAttribute("aria-expanded")).toBeNull();
+    expect(rowFor("Solo").textContent).not.toContain("+");
   });
 });
 
@@ -321,7 +339,7 @@ describe("AgentSidebar — a spawned worker auto-expands its parent", () => {
   it("does not re-expand a parent the user collapsed while its workers spin down", () => {
     const project = seedExpanded();
     const { rerender } = render(<AgentSidebar project={project} />);
-    fireEvent.click(chevron());
+    toggleAlpha();
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
 
     const shrunk: Project = { ...project, agents: project.agents.filter((a) => a.id !== "w2") };

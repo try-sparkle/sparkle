@@ -109,7 +109,7 @@ describe("AgentSidebar — drag to reorder", () => {
     const before = draggableCards();
     expect(before).toHaveLength(3);
 
-    fireEvent.click(before[0]!); // open the unified card over the first row
+    fireEvent.contextMenu(before[0]!); // open the unified card over the first row
     const after = draggableCards();
     expect(after.length).toBeGreaterThan(before.length); // the card strip adds a grab when open
     const strip = after.find((el) => !before.includes(el))!;
@@ -134,7 +134,7 @@ describe("AgentSidebar — drag to reorder", () => {
     try {
       render(<AgentSidebar project={project} />);
       const row = draggableCards()[0]!;
-      fireEvent.click(row);
+      fireEvent.contextMenu(row);
       const card = document.querySelector<HTMLElement>('[data-testid="agent-hover-card"]')!;
       expect(card).toBeTruthy();
       // Shifted up: top ≤ innerHeight - 16 - MIN_CARD_H = 400 - 16 - 180 = 204 (well above the row's 380).

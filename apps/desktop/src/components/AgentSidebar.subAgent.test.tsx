@@ -66,7 +66,7 @@ function seed(opts: { workerStatus: AgentTabStatus }): {
 // Click the orchestrator's head row to open its detail card (the "modal").
 function openHeadCard() {
   const head = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
-  fireEvent.click(head);
+  fireEvent.contextMenu(head);
   return head;
 }
 

@@ -38,13 +38,15 @@ describe("WorkflowLine", () => {
     expect(parseInt(track.style.minWidth, 10)).toBeGreaterThan(0);
   });
 
-  it("shows a sticky ✓ once shipped — even when the bar has reset to an earlier stage", () => {
-    // A new cycle resets the live stage back to Committed, but a prior ship keeps the ✓.
-    const { rerender } = render(<WorkflowLine stage="building_saved" shipped />);
-    expect(screen.getByLabelText("Landed at least once").textContent).toBe("✓");
-    // Not shipped → no ✓.
-    rerender(<WorkflowLine stage="building_saved" />);
+  // This used to assert the inverse — a sticky ✓ that survived the bar resetting for a new cycle.
+  // The glyph and its `shipped` prop were removed with the build-column cleanup: the column groups
+  // rows by workflow stage now, so a landed agent sits under a section header that says so in
+  // words, and the ✓ was a second, smaller rendering of that same fact competing for room on a row
+  // stripped down to a title. The card's detail lines still carry "Landed" in words.
+  it("renders no landed checkmark", () => {
+    render(<WorkflowLine stage="building_saved" />);
     expect(screen.queryByLabelText("Landed at least once")).toBeNull();
+    expect(screen.queryByText("✓")).toBeNull();
   });
 });
 

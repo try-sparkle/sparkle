@@ -65,7 +65,7 @@ function seed(
 
 function openHeadCard() {
   const head = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
-  fireEvent.click(head);
+  fireEvent.contextMenu(head);
 }
 
 beforeEach(() => {
@@ -158,14 +158,18 @@ describe("AgentSidebar — a head row's color agrees with the concierge feed", (
     expect(filterOn(headRow())).toBe("");
   });
 
-  it("stays gray when its worker is quietly working", () => {
+  it("goes GREEN, not red, when its worker is quietly working", () => {
     const { project } = seed("working");
     render(<AgentSidebar project={project} />);
-    // CONTRAST CASE, not a guard — see the per-layer note above. a1 has no status of its own, so
-    // this reads `stopped` no matter which map the row consults; it survives every revert in the
-    // chain. Its job is to stop "always red" from passing the case above: a working worker is not
-    // an attention signal and must not bubble. Do not count it toward overlay coverage.
-    expect(headDot()?.style.background).toBe(expectedDotColor("stopped"));
+    // CONTRAST CASE, not a guard — see the per-layer note above. Its job is to stop "always red"
+    // from passing the case above: a working worker is not an ATTENTION signal and must not bubble
+    // as one. That is what this test has always been for, and it still holds.
+    expect(headDot()?.style.background).not.toBe(expectedDotColor("errored"));
+    // What changed is the calm end. This used to assert GRAY, because a1 has no status of its own
+    // and so reads `stopped`. The head's disc now rolls its workers up (engine/workerRollup): a
+    // subtree is folded by default, so painting this row gray said "nothing happening here" about
+    // an orchestrator with live work under it. Working workers → green.
+    expect(headDot()?.style.background).toBe(expectedDotColor("working"));
     expect(filterOn(headRow())).toBe("");
   });
 

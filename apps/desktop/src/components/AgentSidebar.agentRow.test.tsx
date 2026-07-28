@@ -102,7 +102,7 @@ describe("AgentRow — rename input is a single instance across hover", () => {
 
     // Hover the collapsed row → the slide-out overlay mounts and reveals the Location line (an
     // overlay-only element). (mouseOver is how React's onMouseEnter is triggered in jsdom.)
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
     expect(screen.getByText("/tmp/demo/.worktrees/a1")).toBeTruthy();
 
     // Double-click the overlay's title to rename → the overlay is suppressed and the in-flow row
@@ -135,7 +135,7 @@ describe("AgentRow — rename input is a single instance across hover", () => {
 describe("AgentRow — Status line behind/ahead pill", () => {
   // The pill now lives on the hover card's "Status" line (not in the collapsed row), so each test
   // opens the slide-out first. mouseOver triggers React's onMouseEnter in jsdom.
-  const openOverlay = () => fireEvent.click(screen.getByText(TITLE));
+  const openOverlay = () => fireEvent.contextMenu(screen.getByText(TITLE));
 
   it("renders the behind pill as a clickable catch-up button", () => {
     seedBranch("a1", bs({ behind: 4 }));
@@ -177,7 +177,7 @@ describe("AgentRow — clickable path", () => {
   it("clicking the expanded path reveals the worktree folder in Finder", () => {
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
     // Path only shows in the hover-expanded overlay.
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
     fireEvent.click(screen.getByText("/tmp/demo/.worktrees/a1"));
     expect(revealItemInDir).toHaveBeenCalledWith("/tmp/demo/.worktrees/a1");
   });
@@ -190,7 +190,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     expect(screen.getByText(TITLE)).toBeTruthy();
     expect(document.body.textContent).not.toContain(DESCRIPTION);
     // Hover → the overlay reveals "Title:  description".
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
     expect(document.body.textContent).toContain(DESCRIPTION);
   });
 
@@ -200,7 +200,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     // taller over the column rows beneath it. (Earlier the description lived in the drop-down; the
     // single-line-ellipsis approach lets it sit beside the title without the column-growth bug.)
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
     const card = screen.getByTestId("agent-hover-card");
     const strip = (Array.from(card.children) as HTMLElement[])[0]!;
     expect(strip.textContent).toContain(TITLE);
@@ -229,7 +229,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     expect(row.style.background).toBe("var(--c-forest)");
     expect(row.style.marginRight).toBe("-8px");
     // Hover → the card is the terminal color with NO drop-shadow (it merges into the terminal).
-    fireEvent.click(row);
+    fireEvent.contextMenu(row);
     const card = screen.getByTestId("agent-hover-card");
     expect(["none", ""]).toContain(card.style.filter);
     const strip = (Array.from(card.children) as HTMLElement[])[0]!;
@@ -253,7 +253,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     const project = mkProject([mkAgent()]);
     project.selectedAgentId = null; // → NOT active, so the card takes the hover-only treatment
     render(<AgentSidebar project={project} />);
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
     const card = screen.getByTestId("agent-hover-card");
     const [strip, detail] = Array.from(card.children) as HTMLElement[];
     for (const half of [strip!, detail!]) {
@@ -281,7 +281,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
 
   it("omits the description span entirely when the description is empty", () => {
     render(<AgentSidebar project={mkProject([mkAgent({ autoNameVariants: { title: TITLE, description: "" } })])} />);
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
     expect(screen.getByText("/tmp/demo/.worktrees/a1")).toBeTruthy(); // overlay is open…
     // …but with no description there is no leading "colon-space-space" run anywhere in the card.
     expect(document.body.textContent).not.toContain(":  ");
@@ -290,14 +290,14 @@ describe("AgentRow — hover card title + description and detail lines", () => {
   it("Status line reads 'Up to date' when the branch is neither ahead nor behind", () => {
     seedBranch("a1", bs({ ahead: 0, behind: 0 }));
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
     expect(document.body.textContent).toContain("Up to date with main");
   });
 
   it("Progress line shows percent-only (no worker count) for a leaf agent", () => {
     seedBranch("a1", bs({ behind: 1 })); // behind copy avoids the word 'worker' in the Status line
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
     const body = document.body.textContent ?? "";
     expect(body).toMatch(/% complete\./);
     expect(body).not.toContain("% complete overall"); // leaf → no "overall"
@@ -320,7 +320,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     });
     useRuntimeStore.setState({ branchStatus: { b1: bs({ behind: 1 }), w1: bs({ behind: 1 }) }, status: {} });
     render(<AgentSidebar project={mkProject([build, worker])} />);
-    fireEvent.click(screen.getByText("Orchestrator"));
+    fireEvent.contextMenu(screen.getByText("Orchestrator"));
     expect(document.body.textContent).toMatch(/1 worker\. \d+% complete overall\./);
   });
 });
@@ -383,7 +383,7 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
     });
     list.scrollTo = scrollTo as typeof list.scrollTo;
 
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
 
     expect(scrollTo).toHaveBeenCalledTimes(1);
     const opts = scrollTo.mock.calls[0]![0]!;
@@ -408,7 +408,7 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
     });
     list.scrollTo = scrollTo as typeof list.scrollTo;
 
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
 
     expect(scrollTo).toHaveBeenCalledTimes(1);
     const opts = scrollTo.mock.calls[0]![0]!;
@@ -423,7 +423,7 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
     const scrollTo = vi.fn();
     list.scrollTo = scrollTo as typeof list.scrollTo;
 
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
 
     expect(scrollTo).not.toHaveBeenCalled();
   });
@@ -438,7 +438,7 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
     list.scrollTo = scrollTo as typeof list.scrollTo;
 
     const row = screen.getByText(TITLE);
-    fireEvent.click(row); // open the card → reveal scrolls up to 196 (baseline captured as 0)
+    fireEvent.contextMenu(row); // open the card → reveal scrolls up to 196 (baseline captured as 0)
     expect(scrollTo).toHaveBeenCalledTimes(1);
 
     fireEvent.mouseOut(row); // leave → after the close + restore debounce, ease back to baseline 0
@@ -464,7 +464,7 @@ describe("AgentRow — auto-scrolls the column so a bottom-of-viewport hover car
     });
     list.scrollTo = scrollTo as typeof list.scrollTo;
 
-    fireEvent.click(screen.getByText(TITLE)); // reveal → scrolls up to 196
+    fireEvent.contextMenu(screen.getByText(TITLE)); // reveal → scrolls up to 196
     expect(screen.getByText("/tmp/demo/.worktrees/a1")).toBeTruthy(); // card open
     expect(scrollTo).toHaveBeenCalledTimes(1);
 
@@ -494,7 +494,7 @@ describe("AgentSidebar — two-finger scroll works while a hover card is open", 
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
     const list = screen.getByTestId("agent-list-scroll");
     list.getBoundingClientRect = () => LIST_RECT;
-    fireEvent.click(screen.getByText(TITLE)); // open the hover card
+    fireEvent.contextMenu(screen.getByText(TITLE)); // open the hover card
     return { list, card: screen.getByTestId("agent-hover-card") };
   };
 
@@ -537,7 +537,7 @@ describe("AgentSidebar — two-finger scroll works while a hover card is open", 
 // case below is a site the ladder sweep missed precisely because nothing here named it (roborev
 // 53613 / 53614 / 53616), so each asserts the token the site reaches for, and the one it came from.
 describe("AgentSidebar — the chrome tokens the hover card and its chips reach for", () => {
-  const openOverlay = () => fireEvent.click(screen.getByText(TITLE));
+  const openOverlay = () => fireEvent.contextMenu(screen.getByText(TITLE));
 
   // The ahead pill painted `${C.success}22` behind `successInk`. The ladder's table measured that
   // ink on the BARE plane (light 4.552) and never on the wash it actually sits on, where it fell to
@@ -599,26 +599,40 @@ describe("AgentSidebar — the Improve Sparkle row is a plane when active, never
     expect(sparkleRow(container).style.background).toBe("transparent");
   });
 
-  // …AND THE PLANE IS NOT THE SELECTED STATE (roborev 53662). `forest` on the `deepForest` column
-  // measures 1.082 (dark) / 1.375 (light): on an AGENT row that is fine, because what carries
-  // selection there is the square right edge, the concave fillets opening onto the terminal, and
-  // the open card's `hairline` outline. This row has none of that geometry, so the move above left
-  // it with a fill nobody can see and nothing else — no selected state at all.
+  // THE GOLD RAIL IS GONE — a deliberate product call in the build-column cleanup: the column is a
+  // quiet list and the rail was the last colored decoration in it. This pair used to assert the
+  // rail, and now asserts what replaced it.
   //
-  // The rail is the state, in the app's existing vocabulary: `CommandPalette`'s selected result row
-  // takes the same `3px solid C.goldFill`. Opaque gold is the one token that can read on this row
-  // without touching its inks, since it is a SHAPE beside them rather than a fill under them; the
-  // floor it clears against both the row's own fill and the column is in theme/chromeContrast.test.
-  it("carries its selected state on a gold rail — the fill step is invisible on this row", () => {
+  // It could not simply be deleted. `forest` on the `deepForest` column measures 1.082 (dark) /
+  // 1.375 (light), so the active FILL on this row is not visible, and this row has none of the
+  // geometry an agent row uses instead (square right edge, concave fillets, the open card's
+  // outline). Landing it fill-only would have shipped a control with no perceivable selected state
+  // — WCAG 1.4.11, not a taste question (roborev 53814).
+  //
+  // So the state is a NEUTRAL hairline outline: `hairline` is the token whose whole job is to be a
+  // line visible on any plane, and it carries no color, which is what was actually being cut. Do
+  // NOT restore `3px solid C.goldFill`, and do not drop the outline to "simplify" — that is the
+  // regression these two exist to catch, in both directions.
+  it("marks the active row with a neutral hairline outline, not a gold rail", () => {
     useUiStore.setState({ workMode: "build", activeSpecial: "sparkle" } as never);
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    expect(sparkleRow(container).style.borderLeft).toBe("3px solid var(--c-gold-fill)");
+    const row = sparkleRow(container);
+    expect(row.style.borderLeft).toBe("1px solid var(--c-hairline)");
+    expect(row.style.borderLeft).not.toContain("gold");
   });
 
-  it("keeps the rail's width when inactive, so selecting a row shifts nothing", () => {
+  it("keeps the outline's width when inactive, so selecting a row shifts nothing", () => {
     useUiStore.setState({ workMode: "build", activeSpecial: null } as never);
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    expect(sparkleRow(container).style.borderLeft).toBe("3px solid transparent");
+    expect(sparkleRow(container).style.borderLeft).toBe("1px solid transparent");
+  });
+
+  // The separator between this row and the agent list above it is a HAIRLINE, not a color treatment,
+  // so it stayed. Pinned so "remove the decoration" doesn't quietly take the structure with it.
+  it("keeps the hairline that separates it from the agent list", () => {
+    useUiStore.setState({ workMode: "build", activeSpecial: null } as never);
+    const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    expect(sparkleRow(container).style.borderTop).toBe("1px solid var(--c-hairline)");
   });
 });
 
@@ -632,7 +646,7 @@ describe("AgentSidebar — the Improve Sparkle row is a plane when active, never
 describe("AgentSidebar — the epic pill takes a hairline border, not a teal tint", () => {
   it("draws a border the card can actually show", () => {
     render(<AgentSidebar project={mkProject([mkAgent({ epicId: "e1" })])} />);
-    fireEvent.click(screen.getByText(TITLE));
+    fireEvent.contextMenu(screen.getByText(TITLE));
     // TWO instances, and both are meant to be there: the collapsed column row renders the same
     // strip the expanded hover card does. Assert on both rather than picking one — the card's is
     // the copy the `barSurface` measurement is about, and the row's still has to clear the column.

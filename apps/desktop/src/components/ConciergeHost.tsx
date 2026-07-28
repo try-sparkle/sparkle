@@ -288,6 +288,9 @@ function feedStatuses(feed: ConciergeFeed): Omit<AwaySnapshot, "at"> {
   return {
     status: Object.fromEntries(agents.map((a): [string, AgentTabStatus] => [a.id, a.status])),
     agentIds: agents.map((a) => a.id),
+    // Carried so the recap can tell a head that was genuinely working at the away edge from one
+    // standing in for its subtree — see AwaySnapshot.rolledUpGreen.
+    rolledUpGreen: agents.filter((a) => a.rolledUpGreen).map((a) => a.id),
   };
 }
 
@@ -473,7 +476,14 @@ export function ConciergeHost({
   useEffect(() => {
     feedRef.current = feed;
     if (usePresenceStore.getState().mode !== "away") return;
-    for (const a of allAgents(feed)) if (a.status === "working") sawWorking.current.add(a.id);
+    // `!a.rolledUpGreen`: a head whose `working` is only its SUBTREE's must not count as having
+    // worked. Its status goes idle→working→idle purely because a worker ran, and `buildRecap` reads
+    // that shape as the head finishing a job — so one unit of work came back as two "finished" rows,
+    // the worker that did it and the orchestrator standing in for it (roborev 53886). The worker's
+    // own entry is unaffected, so nothing is lost from the recap.
+    for (const a of allAgents(feed)) {
+      if (a.status === "working" && !a.rolledUpGreen) sawWorking.current.add(a.id);
+    }
   }, [feed]);
 
   // The thread lives in a persisted store, not component state, so it SURVIVES AN APP RESTART

@@ -63,6 +63,7 @@
   --c-gold-hot-ink: #ffe9b8;
   --c-gold-fill: #f5c26b;
   --c-on-gold-fill: #090b14;
+  --c-mixed-ink: #ecb968;
 }
 :root[data-theme="light"] {
   --c-forest: #ffffff;
@@ -85,6 +86,7 @@
   --c-gold-hot-ink: #5c3f05;
   --c-gold-fill: #9a6a00;
   --c-on-gold-fill: #ffffff;
+  --c-mixed-ink: #b45309;
 }
 
 * {

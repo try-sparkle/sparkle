@@ -94,3 +94,16 @@ export function assignLabels<T extends HintInput>(targets: T[]): LabeledHint<T>[
     return { ...t, label: CHROME_HINTS[t.hintId] ?? null };
   });
 }
+
+/** Marks the element while HintOverlay is firing its synthetic `click()` for a keyboard jump.
+ *
+ *  A hint jump means "take me to this thing". A handler may reasonably do LESS for that than for a
+ *  deliberate click: the Build column's agent rows fold their worker subtree on click, and a jump
+ *  that also folded — and persisted the fold — made repeated jumps flip-flop a subtree the user
+ *  never touched. Read it with `el.hasAttribute(HINT_JUMP_ATTR)` inside the handler.
+ *
+ *  This is an EXPLICIT signal on purpose. The obvious alternative, sniffing `event.detail === 0`,
+ *  describes the dispatch mechanism rather than the intent — assistive-tech activations
+ *  (VoiceOver / Switch Control AXPress on a non-native control) also arrive with detail 0, so they
+ *  would be misread as hint jumps and silently lose the behavior they asked for. */
+export const HINT_JUMP_ATTR = "data-hint-jump";

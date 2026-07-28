@@ -118,6 +118,11 @@ export interface ConciergeAgent {
    *  Mute and scope are deliberately NOT consulted: they are applied to the agent itself, and a
    *  user who muted an orchestrator muted its build, workers included. */
   representedElsewhere: boolean;
+  /** This agent reads `working` only because its WORKERS do — engine/workerRollup promoted it in
+   *  publishedStatusFor. Consumers that diff status over time must not read the promotion as the
+   *  head starting and finishing work of its own: the away-recap did exactly that and reported one
+   *  unit of work twice, as the worker AND the orchestrator standing in for it. */
+  rolledUpGreen: boolean;
 }
 
 /** How many agents sit in each band. Every band is counted — a surface that only cares about
@@ -310,8 +315,16 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
   // The same overlaid status every other surface bands/colors on. Run over the FLATTENED fleet so
   // a worker's red bubbles to its orchestrator regardless of which project holds them.
   const allAgents = projects.flatMap((p) => p.agents);
-  const derived = publishedStatusFor(allAgents, mergedStatus, new Set(openAgentIds), (id) =>
-    resolveStage(branchStatus[id], workflowStage[id]),
+  // `rolledUpGreen` collects the heads whose `working` is their SUBTREE's, not their own. The away-
+  // recap needs that distinction: a promoted head goes idle→working→idle purely because its worker
+  // ran, which reads as the head finishing a job it never started (roborev 53886).
+  const rolledUpGreen = new Set<string>();
+  const derived = publishedStatusFor(
+    allAgents,
+    mergedStatus,
+    new Set(openAgentIds),
+    (id) => resolveStage(branchStatus[id], workflowStage[id]),
+    rolledUpGreen,
   );
 
   // Band + parent for EVERY agent in the fleet, so representation can be resolved across projects
@@ -388,6 +401,8 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
       return {
         id: a.id,
         name: displayName(a),
+        // This row is `working` only because its workers are. See ConciergeAgent.rolledUpGreen.
+        rolledUpGreen: rolledUpGreen.has(a.id),
         projectId: p.id,
         projectName: p.name,
         kind: a.kind,

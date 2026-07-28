@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { expandOnGrowth, workerCounts } from "./workerExpansion";
+import {
+  expandOnGrowth,
+  expandOnRedWorker,
+  redWorkerCounts,
+  workerCounts,
+} from "./workerExpansion";
+import type { AgentTabStatus } from "../types";
 
 describe("expandOnGrowth — which orchestrators auto-expand", () => {
   it("expands a parent that gained a worker", () => {
@@ -91,5 +97,79 @@ describe("workerCounts — the snapshot expandOnGrowth compares", () => {
 
   it("is empty for no agents", () => {
     expect(workerCounts([])).toEqual({});
+  });
+});
+
+describe("redWorkerCounts — how many workers under each parent are painted red", () => {
+  const agents = [
+    { id: "p1", kind: "build" as const, parentId: null },
+    { id: "w1", kind: "worker" as const, parentId: "p1" },
+    { id: "w2", kind: "worker" as const, parentId: "p1" },
+    { id: "p2", kind: "build" as const, parentId: null },
+  ];
+  const statuses = (m: Record<string, AgentTabStatus>) => (id: string) => m[id] ?? "stopped";
+
+  it("counts only the red ones", () => {
+    expect(redWorkerCounts(agents, statuses({ w1: "waiting", w2: "working" }))).toEqual({
+      p1: 1,
+      p2: 0,
+    });
+  });
+
+  // The explicit zero is load-bearing: expandOnRedWorker skips ids it has never seen, so a parent
+  // omitted while calm would have its FIRST red worker read as a first sighting and stay folded —
+  // the one case the whole expansion exists for.
+  it("gives a calm parent an explicit zero rather than no entry", () => {
+    expect(redWorkerCounts(agents, statuses({ w1: "working", w2: "idle" }))).toEqual({
+      p1: 0,
+      p2: 0,
+    });
+  });
+
+  // `blocked` is RED in AGENT_STATUS but is NOT in `needsAttention` — asking the wrong predicate
+  // here is the bug that shipped twice, leaving a blocked worker unable to surface on its parent.
+  it("counts a BLOCKED worker, which needsAttention would have missed", () => {
+    expect(redWorkerCounts(agents, statuses({ w1: "blocked" }))).toEqual({ p1: 1, p2: 0 });
+  });
+
+  // `unmerged` is GRAY on purpose — a landing state, not an alarm. It went gray after 27 of 51
+  // agents sat in that band and made red meaningless; re-escalating it here would rebuild that.
+  it("does not count an unmerged worker as red", () => {
+    expect(redWorkerCounts(agents, statuses({ w1: "unmerged", w2: "done" }))).toEqual({
+      p1: 0,
+      p2: 0,
+    });
+  });
+});
+
+describe("expandOnRedWorker — a worker going red pops its parent open, ONCE", () => {
+  it("fires on the transition from no reds to one", () => {
+    expect(expandOnRedWorker({ p1: 0 }, { p1: 1 })).toEqual(["p1"]);
+  });
+
+  // Already open-worthy and still is: re-firing every render would re-expand a subtree the user
+  // folded on purpose, which is the behavior the transition gate exists to avoid.
+  it("does not fire again while the count merely grows", () => {
+    expect(expandOnRedWorker({ p1: 1 }, { p1: 2 })).toEqual([]);
+  });
+
+  it("does not fire while the count holds steady", () => {
+    expect(expandOnRedWorker({ p1: 2 }, { p1: 2 })).toEqual([]);
+  });
+
+  it("does not fire when reds clear", () => {
+    expect(expandOnRedWorker({ p1: 2 }, { p1: 0 })).toEqual([]);
+  });
+
+  // On boot the previous snapshot is empty. Without this, every parent with an already-red worker
+  // would look like a fresh transition and blow open on every relaunch.
+  it("treats a first sighting as a baseline, not a transition", () => {
+    expect(expandOnRedWorker({}, { p1: 3 })).toEqual([]);
+  });
+
+  it("reports each parent that turned, and only those", () => {
+    expect(
+      expandOnRedWorker({ p1: 0, p2: 1, p3: 0 }, { p1: 1, p2: 2, p3: 0 }),
+    ).toEqual(["p1"]);
   });
 });

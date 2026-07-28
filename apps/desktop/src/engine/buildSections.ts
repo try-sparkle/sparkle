@@ -215,10 +215,20 @@ export function groupAgentsByStage<T extends { id: string }>(
   stageOf: (id: string) => WorkflowStageId,
   statusOf: (id: string) => AgentTabStatus,
   visibleBands: Record<StatusBand, boolean>,
+  /** Which band a row belongs to for FILTERING. Defaults to the row's own status, which is what
+   *  every caller wanted until orchestrator heads started rolling their workers up: a head with a
+   *  blocked worker is painted red but is itself `idle`, so filtering on its own status hid it from
+   *  the very chip a user clicks to find blocked work. Callers that paint a rolled-up disc pass the
+   *  matching accessor so the dot and the chip agree — see engine/workerRollup.bandOfRollup.
+   *
+   *  Optional rather than required so `statusOf`-only callers keep working unchanged; pass BOTH
+   *  consistently, though, since a caller whose dot and filter disagree is the bug this exists to
+   *  prevent. */
+  bandOf: (id: string) => StatusBand = (id) => bandOfStatus(statusOf(id)),
 ): BuildSectionGroup<T>[] {
   const buckets = new Map<BuildSectionId, T[]>();
   for (const agent of agents) {
-    if (!visibleBands[bandOfStatus(statusOf(agent.id))]) continue;
+    if (!visibleBands[bandOf(agent.id)]) continue;
     const section = sectionOfStage(stageOf(agent.id));
     const arr = buckets.get(section);
     if (arr) arr.push(agent);

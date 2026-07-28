@@ -18,6 +18,7 @@
 // numbers in colors.ts, the comments state no ratios, and inequality assertions ("lighter than")
 // are banned here — an inequality is precisely what let the 1.08:1 pair through.
 import { describe, expect, it } from "vitest";
+import { AGENT_STATUS } from "@sparkle/ui";
 // The BRAND literals the tinted fills below composite. Imported, never re-typed: the gold hex had
 // already been copied into three places (packages/ui/tokens.ts, THEME_HEX's goldInk/goldFill, and
 // this file's `over()` calls), so retuning a brand token could leave this guard measuring a stale
@@ -593,6 +594,42 @@ describe("the concierge column's themed INKS clear AA where they are read", () =
             `${mode}: ${ink} (${hex[ink]}) on the ${tint} 14% badge tint (${fill}) over row ${row}`,
           ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
         }
+      }
+    }
+  });
+});
+
+describe("`mixedInk` — the orchestrator's mixed-workers disc", () => {
+  // A 12px disc with no border, so this contrast IS its edge — same reasoning as the Send button
+  // below, and the same 3:1 non-text floor. It is swept over all four planes rather than just the
+  // build column's `deepForest`, because a status disc is rendered in the TopBar cluster and the
+  // concierge digest too, and those sit on different surfaces.
+  it("clears the non-text control floor on every plane, in both themes", () => {
+    for (const mode of MODES) {
+      const hex = THEME_HEX[mode];
+      for (const plane of PLANES) {
+        expect(
+          contrast(hex.mixedInk, hex[plane]),
+          `${mode}: mixedInk (${hex.mixedInk}) on ${plane} (${hex[plane]})`,
+        ).toBeGreaterThanOrEqual(CONTROL_MIN_CONTRAST);
+      }
+    }
+  });
+
+  // The whole point of the color is that it is neither of the two it sits between. If it drifts
+  // close enough to red or green to be mistaken for one, the row silently reports a state it isn't
+  // in — worse than having no mixed color at all, because it looks definite.
+  it("stays distinguishable from the red and green it summarizes", () => {
+    for (const mode of MODES) {
+      const hex = THEME_HEX[mode];
+      for (const [name, other] of [
+        ["red", AGENT_STATUS.waiting.color],
+        ["green", AGENT_STATUS.working.color],
+      ] as const) {
+        expect(
+          contrast(hex.mixedInk, other),
+          `${mode}: mixedInk (${hex.mixedInk}) vs the ${name} dot (${other})`,
+        ).toBeGreaterThanOrEqual(RAMP_MIN_SPLIT);
       }
     }
   });

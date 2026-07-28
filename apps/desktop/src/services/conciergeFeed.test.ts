@@ -416,16 +416,62 @@ describe("buildConciergeFeed — representedElsewhere", () => {
     expect(feed.scopedCounts.needs_you).toBe(2);
   });
 
-  it("representation is BAND equality, not parenthood: a working worker under an idle parent still counts", () => {
+  // `rolledUpGreen` — the stamp the away-recap reads to tell a head that WORKED from one standing
+  // in for its subtree. Without it the recap reports one unit of work twice, as the worker and the
+  // orchestrator promoted on its behalf.
+  it("stamps rolledUpGreen on an idle head whose worker is working", () => {
+    const feed = build([project("p1", [agent("orch"), worker("w1", "orch")])], {
+      orch: "idle",
+      w1: "working",
+    });
+    expect(by(feed)["orch"]).toMatchObject({ status: "working", rolledUpGreen: true });
+  });
+
+  it("does not stamp a head working under its own steam", () => {
+    const feed = build([project("p1", [agent("orch"), worker("w1", "orch")])], {
+      orch: "working",
+      w1: "working",
+    });
+    expect(by(feed)["orch"]).toMatchObject({ status: "working", rolledUpGreen: false });
+  });
+
+  it("does not stamp the worker itself — only heads are promoted", () => {
+    const feed = build([project("p1", [agent("orch"), worker("w1", "orch")])], {
+      orch: "idle",
+      w1: "working",
+    });
+    expect(by(feed)["w1"]).toMatchObject({ rolledUpGreen: false });
+  });
+
+  // THIS CASE FLIPPED, and the flip is the point of the worker rollup rather than a regression here.
+  // It used to assert that an `idle` orchestrator with a `working` worker bands `done`, so the
+  // worker was NOT represented and had to be counted on its own. `publishedStatusFor` now promotes
+  // such a head to `working` (engine/workerRollup.withWorkerRollupGreen), because the Build column
+  // paints its disc green and a folded subtree meant the head was the only row on screen — the two
+  // surfaces reporting different bands for the same fleet is the drift this file's header warns
+  // about. The head speaks for its subtree now, so the worker IS represented.
+  it("an idle orchestrator with a working worker bands RUNNING, and represents it", () => {
     const feed = build([project("p1", [agent("orch"), worker("w1", "orch")])], {
       orch: "idle",
       w1: "working",
     });
     const byId = by(feed);
-    // The parent bands `done`; nothing else is reporting that this work is in flight.
-    expect(byId["orch"]!.band).toBe("done");
+    expect(byId["orch"]!.band).toBe("running");
+    expect(byId["w1"]).toMatchObject({ band: "running", representedElsewhere: true });
+  });
+
+  // The mechanism the case above used to demonstrate is unchanged: representation is BAND EQUALITY,
+  // not parenthood. Shown here with bands that genuinely differ — the orchestrator is asking you
+  // something itself (own red wins over the rollup), so its `needs_you` cannot stand in for the
+  // `running` worker underneath it, and the worker still has to be reported.
+  it("representation is BAND equality, not parenthood", () => {
+    const feed = build([project("p1", [agent("orch"), worker("w1", "orch")])], {
+      orch: "waiting",
+      w1: "working",
+    });
+    const byId = by(feed);
+    expect(byId["orch"]!.band).toBe("needs_you");
     expect(byId["w1"]).toMatchObject({ band: "running", representedElsewhere: false });
-    expect(feed.scopedCounts).toEqual({ needs_you: 0, running: 1, done: 1 });
   });
 
   it("resolves an orchestrator in ANOTHER project — the fleet is flattened before the red bubbles", () => {

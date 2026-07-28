@@ -102,8 +102,8 @@ import { C as BRAND, AGENT_STATUS } from "@sparkle/ui";
 // moved to `barSurface`, and why the three 10px secondary lines on AgentPane's selected account
 // row take `cream` there instead. See theme/chromeContrast.test.ts for the measurement.
 export const THEME_HEX = {
-  dark: { forest: "#05070d", deepForest: "#0f1220", conciergeSurface: "#191d2d", conciergeMuted: "#8b90a6", barSurface: "#161a2b", hairline: "#63698c", pillFill: "#454d71", cream: "#ece7da", muted: "#8b90a6", chatBubble: "#354065", chatBubbleActive: "#4e5a90", accentInk: "#34e0f0", agentIdle: "#8b90a6", successInk: "#34c759", dangerInk: "#e87b7b", goldInk: "#f5c26b", goldHotInk: "#ffe9b8", goldFill: "#f5c26b", onGoldFill: "#090b14", amberInk: "#ecb968" },
-  light: { forest: "#ffffff", deepForest: "#d9dce1", conciergeSurface: "#eceef2", conciergeMuted: "#536280", barSurface: "#f1f4fa", hairline: "#6e7a93", pillFill: "#929bad", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#92ade5", chatBubbleActive: "#5f87e0", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d", dangerInk: "#aa241d", goldInk: "#7a5205", goldHotInk: "#5c3f05", goldFill: "#9a6a00", onGoldFill: "#ffffff", amberInk: "#664200" },
+  dark: { forest: "#05070d", deepForest: "#0f1220", conciergeSurface: "#191d2d", conciergeMuted: "#8b90a6", barSurface: "#161a2b", hairline: "#63698c", pillFill: "#454d71", cream: "#ece7da", muted: "#8b90a6", chatBubble: "#354065", chatBubbleActive: "#4e5a90", accentInk: "#34e0f0", agentIdle: "#8b90a6", successInk: "#34c759", dangerInk: "#e87b7b", goldInk: "#f5c26b", goldHotInk: "#ffe9b8", goldFill: "#f5c26b", onGoldFill: "#090b14", amberInk: "#ecb968", mixedInk: "#ecb968" },
+  light: { forest: "#ffffff", deepForest: "#d9dce1", conciergeSurface: "#eceef2", conciergeMuted: "#536280", barSurface: "#f1f4fa", hairline: "#6e7a93", pillFill: "#929bad", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#92ade5", chatBubbleActive: "#5f87e0", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d", dangerInk: "#aa241d", goldInk: "#7a5205", goldHotInk: "#5c3f05", goldFill: "#9a6a00", onGoldFill: "#ffffff", amberInk: "#664200", mixedInk: "#b45309" },
 } as const;
 
 // Themed token object for component inline styles. The four theme-dependent tokens become
@@ -236,6 +236,21 @@ export const C = {
   // the same invisibility one layer in, so light pairs the deep fill with white. The two move
   // together — never pick one and hardcode the other.
   onGoldFill: "var(--c-on-gold-fill)",
+  // MIXED — the orange an orchestrator's status disc takes when its workers disagree: some running,
+  // some needing you. It is a SHAPE token (a 12px disc), never text.
+  //
+  // It is deliberately NOT an AGENT_STATUS entry, and that is the important part. There is no PTY
+  // state called "mixed"; the color summarizes a SET. AGENT_STATUS's three color tiers are pinned
+  // 1:1 to the three filter bands (engine/statusBandLabels.test.ts), so a fourth entry would either
+  // need a fourth chip or silently break that agreement — and the two times this taxonomy has been
+  // edited casually (`blocked`, `unmerged`) both produced shipped bugs. The rollup keeps its own
+  // vocabulary in engine/workerRollup.ts and maps into a band there.
+  //
+  // Dark reuses the amber the app already carries; light goes to a deep burnt orange, because
+  // #ecb968 on light mode's near-white planes has no visible edge — the same split every other
+  // opaque brand color takes here. Held to the non-text CONTROL floor on all four planes in
+  // theme/chromeContrast.test.ts.
+  mixedInk: "var(--c-mixed-ink)",
 };
 
 // ── THE CHROME FLOORS ─────────────────────────────────────────────────────────────────────────

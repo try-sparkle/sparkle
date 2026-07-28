@@ -186,6 +186,17 @@ export interface AwaySnapshot {
   /** The agents in the feed at snapshot time. `newlyEntered` is restricted to these, so an agent
    *  that appeared and vanished while away can't leave a ghost in the recap. */
   agentIds: string[];
+  /** Of `agentIds`, the heads whose `working` was their SUBTREE's rather than their own
+   *  (ConciergeAgent.rolledUpGreen).
+   *
+   *  Needed at the SNAPSHOT edge, not just mid-stretch. A head already rolled-up-green when the user
+   *  walked away is recorded here as `working`, so when its worker finishes the diff reads
+   *  `working → idle`, `rested` is false, and the sawWorking guard never runs — the head files as
+   *  finished alongside the worker that actually did the work. That is the COMMON shape (leave while
+   *  it runs, come back when it's done), so covering only the mid-stretch half left the reported bug
+   *  in place for it (roborev 53917). Optional so a caller that predates this field still compiles;
+   *  absent reads as "none were promoted", which is the pre-rollup behavior. */
+  rolledUpGreen?: string[];
   at: number;
 }
 
@@ -272,7 +283,11 @@ export function buildRecap(args: {
     // id with no snapshot status counts as resting, since "it was already sitting there" is the
     // safe reading and a genuinely fresh agent is excluded by `agentIds` anyway.
     const before = snapshot.status[agentId];
-    const rested = before === undefined || RESTING_STATUSES.has(before);
+    // A `working` that was only ever the subtree's counts as RESTING for this agent: the head did
+    // not leave anything, so its worker finishing is not the head finishing. Without this the
+    // promoted head is reported as a finish it never made — see AwaySnapshot.rolledUpGreen.
+    const beforeWasRollup = before === "working" && snapshot.rolledUpGreen?.includes(agentId);
+    const rested = before === undefined || beforeWasRollup || RESTING_STATUSES.has(before);
     if (FINISHED_STATUSES.has(status) && rested && !sawWorking?.has(agentId)) continue;
     const change: RecapChange = {
       agentId,

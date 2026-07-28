@@ -237,6 +237,11 @@ function feedWith(status: string, band: StatusBand = "needs_you", statusLabel = 
     topLevel: true,
     // Nothing above it in the tree, so no ancestor row can be speaking for it.
     representedElsewhere: false,
+    // Spelled out rather than left off: this suite casts feeds through `as unknown as
+    // ConciergeFeed`, so an omitted field is silently `undefined` instead of a compile error — and
+    // `rolledUpGreen` reads as false when absent, which is the value that makes the recap's
+    // double-count guard look like it works. See the promoted-head rows at the end of this file.
+    rolledUpGreen: false,
   };
   const counts = { needs_you: 0, running: 0, done: 0, [band]: 1 };
   return {
@@ -1815,6 +1820,82 @@ describe("ConciergeHost — Away → Here recap", () => {
     const card = within(thread()).getByTestId("concierge-recap");
     expect(card.textContent).toContain("1 finished");
     expect(within(card).getByTestId("recap-change").getAttribute("data-status")).toBe("done");
+  });
+  // ── A HEAD STANDING IN FOR ITS SUBTREE ────────────────────────────────────────────────────────
+  //
+  // engine/workerRollup promotes a calm orchestrator to `working` when its workers roll up green,
+  // so every surface bands the fleet alike. Two lines in THIS component keep that promotion out of
+  // the recap: `feedStatuses` records the promoted ids on the snapshot, and the sawWorking filter
+  // skips them. Both were unpinned — deleting either left the suite green while restoring the
+  // reported double-count for the common shape (roborev 53931). These rows are that pin.
+  const pairFeed = (
+    headStatus: string,
+    workerStatus: string,
+    rolledUpGreen: boolean,
+  ) => {
+    const mk = (id: string, name: string, status: string, over: Record<string, unknown>) => ({
+      id, name, projectId: "p1", projectName: "sparkle", kind: "build" as const,
+      status, statusColor: "#8aa0c4", statusLabel: "Done — your turn",
+      band: (status === "working" ? "running" : "done") as StatusBand,
+      inScope: true, muted: false, representedElsewhere: false, rolledUpGreen: false, ...over,
+    });
+    const agents = [
+      mk("ag1", "Kraken Auth", headStatus, { topLevel: true, rolledUpGreen }),
+      mk("w1", "Parser Worker", workerStatus, { topLevel: false, parentId: "ag1" }),
+    ];
+    const counts = { needs_you: 0, running: 0, done: 0 };
+    return {
+      projects: [{ id: "p1", name: "sparkle", inScope: true, counts, agents }],
+      counts, scopedCounts: counts, pinnedProjectId: null,
+    };
+  };
+
+  it("reports only the WORKER when a promoted head's worker finishes", () => {
+    // The common shape: both read `working` at the away edge, but the head's is its subtree's.
+    h.feed = pairFeed("working", "working", true);
+    useRuntimeStore.setState({ status: { ag1: "working", w1: "working" } });
+    const { rerender } = render(<ConciergeHost feed={h.feed as unknown as ConciergeFeed} />);
+    away();
+    // A MID-STRETCH TICK, and it is what makes this row exercise the sawWorking filter rather than
+    // only the snapshot. That effect bails on mount (presence is still `here`) and its dep is
+    // `feed`, so `away()` alone never runs it — without a re-render while away, `sawWorking` stays
+    // empty and `!a.rolledUpGreen` could be deleted with every test still green (roborev 53936).
+    // The real feed does tick like this: it keeps updating while the window is blurred.
+    clockNow += 5 * 60_000;
+    rerender(
+      <ConciergeHost feed={pairFeed("working", "working", true) as unknown as ConciergeFeed} />,
+    );
+    clockNow += 35 * 60_000;
+    useRuntimeStore.setState({ status: { ag1: "idle", w1: "idle" } });
+    rerender(<ConciergeHost feed={pairFeed("idle", "idle", false) as unknown as ConciergeFeed} />);
+    back();
+
+    const card = within(thread()).getByTestId("concierge-recap");
+    const rows = within(card).getAllByTestId("recap-change");
+    expect(rows).toHaveLength(1);
+    expect(card.textContent).toContain("Parser Worker");
+    expect(card.textContent).not.toContain("Kraken Auth");
+  });
+
+  // THE CONVERSE, so the filter can't be widened into dropping genuine finishes. Same mid-stretch
+  // tick, `rolledUpGreen: false` — the head reaches sawWorking and is reported.
+  it("still reports a head that was working under its OWN steam", () => {
+    h.feed = pairFeed("working", "working", false);
+    useRuntimeStore.setState({ status: { ag1: "working", w1: "working" } });
+    const { rerender } = render(<ConciergeHost feed={h.feed as unknown as ConciergeFeed} />);
+    away();
+    clockNow += 5 * 60_000;
+    rerender(
+      <ConciergeHost feed={pairFeed("working", "working", false) as unknown as ConciergeFeed} />,
+    );
+    clockNow += 35 * 60_000;
+    useRuntimeStore.setState({ status: { ag1: "idle", w1: "idle" } });
+    rerender(<ConciergeHost feed={pairFeed("idle", "idle", false) as unknown as ConciergeFeed} />);
+    back();
+
+    const card = within(thread()).getByTestId("concierge-recap");
+    expect(within(card).getAllByTestId("recap-change")).toHaveLength(2);
+    expect(card.textContent).toContain("Kraken Auth");
   });
 });
 
