@@ -1200,6 +1200,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
             counts={bandCounts}
             visible={statusFilter}
             onToggle={toggleStatusBand}
+            onReset={showAllStatusBands}
           />
         )}
         {(() => {

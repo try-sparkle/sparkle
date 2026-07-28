@@ -130,20 +130,37 @@ describe("AgentSidebar — the status filter", () => {
     const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta"), mkAgent("a3", "Gamma")]);
     setStatuses({ a1: "waiting", a2: "working", a3: "idle" });
     render(<AgentSidebar project={project} />);
-    expect(screen.getByTestId("status-chip-needs_you").textContent).toContain("1 Needs you");
-    expect(screen.getByTestId("status-chip-running").textContent).toContain("1 Running");
-    expect(screen.getByTestId("status-chip-done").textContent).toContain("1 Done");
     for (const b of ["needs_you", "running", "done"]) {
       expect(screen.getByTestId(`status-chip-${b}`).getAttribute("data-on")).toBe("true");
     }
   });
 
-  it("pluralizes the verb: '1 Needs you' but '2 Need you'", () => {
+  it("renders the count ALONE — the band name lives on aria-label, not in the chip", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta"), mkAgent("a3", "Gamma")]);
+    setStatuses({ a1: "waiting", a2: "working", a3: "idle" });
+    render(<AgentSidebar project={project} />);
+    // The words never fit at sidebar width ("2 Needs you" truncated to "2 Need…"), so the chip is
+    // dot + count. If a label creeps back into the chip body it truncates again.
+    for (const b of ["needs_you", "running", "done"]) {
+      expect(screen.getByTestId(`status-chip-${b}`).textContent).toBe("1");
+    }
+    // ...but the band must still be NAMED somewhere, or three bare dots are unidentifiable.
+    expect(screen.getByTestId("status-chip-needs_you").getAttribute("aria-label")).toContain(
+      "1 Needs you",
+    );
+    expect(screen.getByTestId("status-chip-running").getAttribute("aria-label")).toContain(
+      "1 Running",
+    );
+    expect(screen.getByTestId("status-chip-done").getAttribute("aria-label")).toContain("1 Done");
+  });
+
+  it("pluralizes the verb in the accessible name: '1 Needs you' but '2 Need you'", () => {
     const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
     setStatuses({ a1: "waiting", a2: "approval" });
     render(<AgentSidebar project={project} />);
-    expect(screen.getByTestId("status-chip-needs_you").textContent).toContain("2 Need you");
-    expect(screen.getByTestId("status-chip-needs_you").textContent).not.toContain("2 Needs you");
+    const label = screen.getByTestId("status-chip-needs_you").getAttribute("aria-label") ?? "";
+    expect(label).toContain("2 Need you");
+    expect(label).not.toContain("2 Needs you");
   });
 
   it("clicking a chip hides that band's rows", () => {
@@ -166,7 +183,29 @@ describe("AgentSidebar — the status filter", () => {
     fireEvent.click(screen.getByTestId("status-chip-running"));
     // Still says 1 — counted over the UNFILTERED rows. A hidden band reading "0" would leave the
     // user with no idea anything is behind it.
-    expect(screen.getByTestId("status-chip-running").textContent).toContain("1 Running");
+    expect(screen.getByTestId("status-chip-running").textContent).toBe("1");
+    expect(screen.getByTestId("status-chip-running").getAttribute("aria-label")).toContain(
+      "1 Running",
+    );
+  });
+
+  it("offers Reset only once a band is off, and it restores every band", () => {
+    const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
+    setStatuses({ a1: "working", a2: "idle" });
+    render(<AgentSidebar project={project} />);
+    // Nothing is filtered yet, so a Reset link would be a permanently dead control.
+    expect(screen.queryByTestId("status-filter-reset")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("status-chip-running"));
+    expect(screen.queryByText("Alpha")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("status-filter-reset"));
+    expect(screen.queryByText("Alpha")).toBeTruthy();
+    for (const b of ["needs_you", "running", "done"]) {
+      expect(screen.getByTestId(`status-chip-${b}`).getAttribute("data-on")).toBe("true");
+    }
+    // And it retires itself again — there is nothing left to reset.
+    expect(screen.queryByTestId("status-filter-reset")).toBeNull();
   });
 
   it("hides a section the filter emptied, header and all", () => {
@@ -193,6 +232,17 @@ describe("AgentSidebar — the status filter", () => {
     const showAll = screen.getByText("Show all");
     fireEvent.click(showAll);
     expect(screen.queryByText("Alpha")).toBeTruthy();
+  });
+
+  it("wraps rather than overflowing — the sidebar drags down to 160px", () => {
+    const project = seed([mkAgent("a1", "Alpha")]);
+    setStatuses({ a1: "working" });
+    render(<AgentSidebar project={project} />);
+    // Content-sized chips plus a nowrap Reset want ~168px against ~140px of content width at the
+    // sidebar's MIN_WIDTH. The list's `overflowY: auto` makes overflow-x `auto` too, so an
+    // unwrapped row scrolls sideways and `marginLeft: auto` collapses, hiding Reset exactly when
+    // it is needed. Wrapping is the only thing standing between this layout and that.
+    expect(screen.getByTestId("status-filter-bar").style.flexWrap).toBe("wrap");
   });
 
   it("does not render the filter at all when the project has no agents", () => {
