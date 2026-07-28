@@ -100,7 +100,7 @@ export function bandOfRollup(dot: RollupDot): StatusBand {
  *  that drift in its worst form — the color tells you something needs you and the chip that should
  *  find it doesn't.
  *
- *  Only `kind: "worker"` children are rolled up, matching engine/workerExpansion.workerCounts: they
+ *  Only `kind: "worker"` children are rolled up, matching engine/workerExpansion.workerAttention: they
  *  are the only children that render as rows, so a nested shell must not tint its parent's disc. */
 export function rollupDotAccessor<
   T extends { id: string; kind: string; parentId: string | null },

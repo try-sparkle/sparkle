@@ -96,6 +96,12 @@ export const LIVE_THUMBNAIL_MESSAGES = 6;
 /** …and how big any ONE retained preview may be, in base64 characters (~3 MB of string). */
 export const LIVE_THUMBNAIL_MAX_CHARS = 4 * 1024 * 1024;
 
+/** …and how much every retained preview may add up to, ACROSS messages and across the attachments
+ *  within a message. Expressed as a multiple of the per-attachment cap because that is the
+ *  relationship that matters: a single largest-allowed image still fits comfortably, while the
+ *  aggregate can never reach the message-cap × attachment-cap product. Roughly 24 MB as UTF-16. */
+export const LIVE_THUMBNAIL_TOTAL_CHARS = 3 * LIVE_THUMBNAIL_MAX_CHARS;
+
 /**
  * Bound what the LIVE thread retains in memory, which is a different axis from the localStorage cap.
  *
@@ -105,12 +111,21 @@ export const LIVE_THUMBNAIL_MAX_CHARS = 4 * 1024 * 1024;
  * change the string was released at send time, when `takeAttachments` cleared it and the composer
  * row unmounted.
  *
- * Two caps, because either alone leaves the failure reachable. Screenshots are downscaled in Rust
- * (`screenshot.rs` PREVIEW_MAX_DIM = 1600), but a PICKED or DROPPED image is not: `attachments.rs`
- * emits a `data_url` for any image up to `MAX_PREVIEW_BYTES` = 40 MB, i.e. a ~53 MB base64 string —
- * so a count cap alone still admits hundreds of MB, and a size cap alone still grows without bound.
+ * THREE caps, because each alone leaves the failure reachable:
+ *
+ *   - {@link LIVE_THUMBNAIL_MESSAGES} bounds how many bubbles keep previews at all.
+ *   - {@link LIVE_THUMBNAIL_MAX_CHARS} bounds any ONE preview. Screenshots are downscaled in Rust
+ *     (`screenshot.rs` PREVIEW_MAX_DIM = 1600), but a PICKED or DROPPED image is not:
+ *     `attachments.rs` emits a `data_url` for any image up to `MAX_PREVIEW_BYTES` = 40 MB, i.e. a
+ *     ~53 MB base64 string.
+ *   - {@link LIVE_THUMBNAIL_TOTAL_CHARS} bounds the SUM (roborev 53786). Nothing limits attachments
+ *     per message — `loadAttachmentPaths` and the composer load every dropped path — so with only
+ *     the first two caps ONE drop of 20 photos pinned ~20 × 4M chars (~160 MB as UTF-16), and six
+ *     such bubbles multiplied it. Same unbounded-retention failure this function exists to close,
+ *     reached along a different axis.
+ *
  * The retained bitmap matters as much as the string: the browser decodes at full resolution to draw
- * a 72 px thumbnail.
+ * a 72 px thumbnail, so the aggregate governs decoded pixels too.
  *
  * Runs on every write, and returns the INPUT ARRAY UNCHANGED when nothing needed stripping — the
  * common case by far. Bubbles are memoized on identity, so rebuilding the array (or an untouched
@@ -118,6 +133,11 @@ export const LIVE_THUMBNAIL_MAX_CHARS = 4 * 1024 * 1024;
  */
 export function boundLiveThumbnails(chat: ConciergeMessage[]): ConciergeMessage[] {
   let budget = LIVE_THUMBNAIL_MESSAGES;
+  let chars = LIVE_THUMBNAIL_TOTAL_CHARS;
+  // Once the aggregate can't cover a preview, everything older is stripped rather than letting a
+  // smaller straggler squeeze past a larger one — "the newest previews, until the budget runs out"
+  // is a rule a reader can predict; best-fit is not.
+  let exhausted = false;
   let out: ConciergeMessage[] | null = null;
   // Newest first: the budget is spent on the messages the reader is nearest to.
   for (let i = chat.length - 1; i >= 0; i--) {
@@ -128,11 +148,19 @@ export function boundLiveThumbnails(chat: ConciergeMessage[]): ConciergeMessage[
     if (!m.attachments.some((a) => a.dataUrl !== undefined)) continue;
     const withinCount = budget > 0;
     budget -= 1;
-    const next = m.attachments.map((a) =>
-      a.dataUrl !== undefined && (!withinCount || a.dataUrl.length > LIVE_THUMBNAIL_MAX_CHARS)
-        ? withoutPreview(a)
-        : a,
-    );
+    const next = m.attachments.map((a) => {
+      if (a.dataUrl === undefined) return a;
+      // The per-attachment cap is the FAST REJECT: an oversized preview is dropped whatever the
+      // aggregate has left, and costs the aggregate nothing because nothing is retained. It also
+      // must not exhaust the budget — one 40 MB paste would otherwise strip the whole thread.
+      if (!withinCount || a.dataUrl.length > LIVE_THUMBNAIL_MAX_CHARS) return withoutPreview(a);
+      if (exhausted || a.dataUrl.length > chars) {
+        exhausted = true;
+        return withoutPreview(a);
+      }
+      chars -= a.dataUrl.length;
+      return a;
+    });
     if (next.every((a, j) => a === m.attachments![j])) continue;
     out ??= chat.slice();
     out[i] = { ...m, attachments: next };

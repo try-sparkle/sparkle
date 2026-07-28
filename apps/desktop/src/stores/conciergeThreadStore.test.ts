@@ -17,6 +17,7 @@ import {
   boundLiveThumbnails,
   LIVE_THUMBNAIL_MESSAGES,
   LIVE_THUMBNAIL_MAX_CHARS,
+  LIVE_THUMBNAIL_TOTAL_CHARS,
 } from "./conciergeThreadStore";
 import type { ConciergeMessage } from "../components/Concierge/types";
 
@@ -282,6 +283,120 @@ describe("conciergeThreadStore", () => {
       expect(out).not.toBe(chat);
       expect(out[0]).not.toBe(chat[0]); // the one that lost its preview
       expect(out.slice(1).every((m, i) => m === chat[i + 1])).toBe(true);
+    });
+
+    // THE AGGREGATE AXIS (roborev 53786). The message cap and the per-attachment cap bound their
+    // own axes and nothing bounds the sum: nothing limits attachments PER MESSAGE — the composer
+    // and loadAttachmentPaths load every dropped path — so one drop of 20 photos used to pin
+    // 20 × up to 4M chars, and six such bubbles multiplied it. Same unbounded retention this
+    // function exists to close, reached sideways.
+    describe("total character budget", () => {
+      /** One `you` message carrying several previews, each `chars` base64 characters. */
+      const withImages = (id: string, count: number, chars: number): ConciergeMessage => ({
+        id,
+        kind: "you",
+        text: `msg ${id}`,
+        attachments: Array.from({ length: count }, (_, i) => ({
+          id: `a-${id}-${i}`,
+          kind: "image" as const,
+          path: `/tmp/${id}-${i}.png`,
+          name: `${id}-${i}.png`,
+          dataUrl: `data:image/png;base64,${"A".repeat(chars)}`,
+        })),
+      });
+      const previewsOf = (m: ConciergeMessage | undefined): (string | undefined)[] =>
+        m?.kind === "you" ? (m.attachments ?? []).map((a) => a.dataUrl) : [];
+
+      /** A preview just inside the per-attachment cap, so only the AGGREGATE can reject it. */
+      const NEAR_MAX = LIVE_THUMBNAIL_MAX_CHARS - 100;
+      /** How many of those the total admits. The total is 3× the per-attachment cap, so three
+       *  near-max previews fit and the fourth cannot — whether they sit in one bubble or six. */
+      const FITS = 3;
+      const kept = (previews: (string | undefined)[]) => previews.filter((p) => p !== undefined);
+
+      it("keeps only SOME previews of a single multi-attachment message", () => {
+        // The case the old caps missed entirely: one drop, five photos, one bubble. The message cap
+        // sees a single message and the per-attachment cap sees five acceptable images.
+        const out = boundLiveThumbnails([withImages("drop", 5, NEAR_MAX)]);
+        const previews = previewsOf(out[0]);
+        expect(kept(previews)).toHaveLength(FITS);
+        // Array order within the message, so the tiles that keep their thumbnail are the leading
+        // ones the reader sees first — not an arbitrary subset.
+        expect(previews.slice(FITS)).toEqual([undefined, undefined]);
+        // The retained previews really do fit the budget, which is the property being bought.
+        expect(kept(previews).reduce((n, p) => n + p!.length, 0)).toBeLessThanOrEqual(
+          LIVE_THUMBNAIL_TOTAL_CHARS,
+        );
+        // The naming record survives stripping, exactly as on the other axes.
+        const stripped = out[0]?.kind === "you" ? out[0].attachments?.[4] : undefined;
+        expect(stripped?.name).toBe("drop-4.png");
+      });
+
+      it("spends the budget ACROSS messages, newest first", () => {
+        // Four bubbles, comfortably inside the message cap of 6, that together overrun the total.
+        const chat = Array.from({ length: FITS + 1 }, (_, i) => withImages(`m${i}`, 1, NEAR_MAX));
+        const out = boundLiveThumbnails(chat);
+        expect(previewsOf(out[0])).toEqual([undefined]); // the oldest loses it…
+        expect(out.slice(1).every((m) => previewsOf(m)[0] !== undefined)).toBe(true); // …newest keep
+      });
+
+      it("does not let OVERSIZED previews eat the aggregate on their way out", () => {
+        // The per-attachment cap is the FAST REJECT: an oversized preview is stripped and costs the
+        // total nothing, so the ordinary preview behind it still fits. If it decremented the budget
+        // instead, a few 40 MB pastes would strip the whole thread behind them.
+        //
+        // THREE oversized bubbles, not one, and that is the whole point of the fixture: one would
+        // leave 8.3M chars of budget even if it DID charge, so the ordinary preview would survive
+        // either way and the test could not fail on the behaviour it names (roborev 53894). Three
+        // at 4.19M each overrun the 12.58M total, so charging them strips the ordinary one.
+        const huge = LIVE_THUMBNAIL_MAX_CHARS + 1;
+        const out = boundLiveThumbnails([
+          withImage("ordinary"), // oldest, so it is spent LAST
+          withImages("huge1", 1, huge),
+          withImages("huge2", 1, huge),
+          withImages("huge3", 1, huge),
+        ]);
+        expect(previewsOf(out[1])).toEqual([undefined]);
+        expect(previewsOf(out[2])).toEqual([undefined]);
+        expect(previewsOf(out[3])).toEqual([undefined]);
+        expect(previewOf(out[0])).toBeDefined();
+      });
+
+      it("an oversized attachment does not exhaust the budget for its own SIBLINGS", () => {
+        // Same invariant one level down: the fast reject must not set `exhausted`, or a single
+        // oversized image in a drop would cost every tile after it in the SAME bubble.
+        const chat: ConciergeMessage[] = [
+          {
+            id: "mixed",
+            kind: "you",
+            text: "one bad apple",
+            attachments: [
+              {
+                id: "a-huge",
+                kind: "image",
+                path: "/tmp/huge.png",
+                name: "huge.png",
+                dataUrl: `data:image/png;base64,${"A".repeat(LIVE_THUMBNAIL_MAX_CHARS + 1)}`,
+              },
+              {
+                id: "a-ok",
+                kind: "image",
+                path: "/tmp/ok.png",
+                name: "ok.png",
+                dataUrl: `data:image/png;base64,${"A".repeat(100)}`,
+              },
+            ],
+          },
+        ];
+        const previews = previewsOf(boundLiveThumbnails(chat)[0]);
+        expect(previews[0]).toBeUndefined(); // the oversized one
+        expect(previews[1]).toBeDefined(); // its sibling, unaffected
+      });
+
+      it("still returns the input array when everything fits", () => {
+        const chat = [withImages("small", 5, 100)];
+        expect(boundLiveThumbnails(chat)).toBe(chat);
+      });
     });
   });
 

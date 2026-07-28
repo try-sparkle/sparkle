@@ -34,6 +34,7 @@ import { useUiStore } from "../stores/uiStore";
 import {
   isOverDndTarget,
   NEW_BUILD_AGENT_DND_TARGET,
+  reportDropWithNoTarget,
   TERMINAL_STAGE_DND_TARGET,
 } from "../services/dndTargets";
 import { safeUnlisten } from "../services/safeUnlisten";
@@ -104,7 +105,12 @@ export function useTerminalDrop(enabled: boolean, agentId: string | null): Termi
             setDropActive(false);
           } else if (p.type === "drop") {
             setDropActive(false);
-            if (!isTerminalDropPosition(p.position)) return;
+            if (!isTerminalDropPosition(p.position)) {
+              // Silent when some other target owns the drop; speaks only for a drop that matched
+              // no target at all (services/dndTargets.reportDropWithNoTarget).
+              reportDropWithNoTarget(p.position);
+              return;
+            }
             const paths = p.paths ?? [];
             if (paths.length === 0) return;
             // Kinds and counts, never paths — the log ships with support tickets and crash reports

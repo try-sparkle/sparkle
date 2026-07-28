@@ -66,7 +66,9 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 import {
   CONCIERGE_COLUMN_DND_TARGET,
   NEW_BUILD_AGENT_DND_TARGET,
+  reportDropWithNoTarget,
 } from "../services/dndTargets";
+import { log } from "../logger";
 
 // jsdom has no elementFromPoint — stub it to place the "cursor" over one of the two surfaces that
 // own a dropped file themselves (services/dndTargets.FILE_DROP_TARGETS), or over neither.
@@ -84,6 +86,9 @@ const fire = (payload: unknown) => act(() => captured.handler!({ payload }));
 
 beforeEach(() => {
   vi.mocked(loadAttachment).mockClear();
+  vi.mocked(log.warn).mockClear();
+  vi.mocked(log.debug).mockClear();
+  vi.mocked(log.info).mockClear();
   overButton = false;
   overConciergeBox = false;
   captured.handler = null;
@@ -179,5 +184,49 @@ describe("Composer — new-build-agent drop target", () => {
     expect(usePendingAttachmentsStore.getState().drain("someone-else")).toEqual([
       "/tmp/theirs.txt",
     ]);
+  });
+});
+
+// THE CATCH-ALL WIRING (roborev 53914). dndTargets covers the counter itself, but the half that
+// decides whether the alarm behaves is HERE: this composer accepts any drop outside
+// FILE_DROP_TARGETS — the sidebar, the tab strip, the top bar — none of which any `data-dnd-target`
+// region describes, so without a registration the other listeners report those successful drops as
+// dead. Deleting `registerCatchAllDropTarget()` restores exactly the false warnings the change
+// removed; deleting `unregisterCatchAll()` from the cleanup leaks the counter and permanently
+// disables the alarm for the session, and RATCHETS, because the Sparkle pane mounts and unmounts
+// every time the user switches panes. Both mutations leave the rest of the suite green.
+describe("Composer — registers as the window-global catch-all drop target", () => {
+  /** A position over neither marked target, i.e. the drop only a catch-all would claim. */
+  const nowhere = { x: 400, y: 400 };
+
+  it("suppresses the dead-drop WARNING while it is mounted and active", () => {
+    renderComposer();
+    reportDropWithNoTarget(nowhere);
+    expect(log.warn).not.toHaveBeenCalled();
+    // Downgraded, not dropped — at INFO, which always forwards to the persistent log (debug
+    // does not in a shipped build), so a support capture still carries the record.
+    expect(log.info).toHaveBeenCalled();
+  });
+
+  it("releases the registration on unmount, so the alarm comes back", () => {
+    renderComposer();
+    cleanup();
+    // A DIFFERENT position: the reporter dedupes on the last one it saw.
+    reportDropWithNoTarget({ x: 401, y: 400 });
+    expect(log.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not register at all when it is not the active pane", () => {
+    render(
+      <Composer
+        agentId="a1"
+        active={false}
+        disabled={false}
+        inputRef={createRef<HTMLTextAreaElement>()}
+        onSubmitPrompt={vi.fn()}
+      />,
+    );
+    reportDropWithNoTarget({ x: 402, y: 400 });
+    expect(log.warn).toHaveBeenCalledTimes(1);
   });
 });

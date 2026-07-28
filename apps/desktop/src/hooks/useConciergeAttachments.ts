@@ -30,7 +30,9 @@ import {
 import {
   CONCIERGE_COLUMN_DND_TARGET,
   isOverDndTarget,
+  reportDropWithNoTarget,
 } from "../services/dndTargets";
+import { describePaths } from "../services/logSafePaths";
 import { useTerminalDropStore } from "../stores/terminalDropStore";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { log } from "../logger";
@@ -153,10 +155,20 @@ export function useConciergeAttachments(): ConciergeAttachments {
             setDropActive(false);
           } else if (p.type === "drop") {
             setDropActive(false);
-            if (!isOverDndTarget(p.position, CONCIERGE_COLUMN_DND_TARGET)) return;
+            if (!isOverDndTarget(p.position, CONCIERGE_COLUMN_DND_TARGET)) {
+              // Silent when another target owns the drop; speaks only for a drop that matched no
+              // target at all (services/dndTargets.reportDropWithNoTarget).
+              reportDropWithNoTarget(p.position);
+              return;
+            }
             const paths = p.paths ?? [];
             if (paths.length === 0) return;
-            log.info("composer", `dropped ${paths.length} file(s) on the concierge box`, paths);
+            // Kinds and counts, never paths — this line used to write the RAW absolute paths,
+            // which carry the account name and the file's own title into a log that ships with
+            // support tickets and crash reports (see services/logSafePaths).
+            log.info("composer", `dropped ${paths.length} file(s) on the concierge box`, {
+              ...describePaths(paths),
+            });
             attachPaths(paths);
           }
         })

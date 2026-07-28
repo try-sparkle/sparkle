@@ -1,5 +1,13 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { useUiStore, ZOOM_MIN, ZOOM_MAX, ZOOM_STEP, ZOOM_DEFAULT, COMPOSER_DEFAULT } from "./uiStore";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import {
+  useUiStore,
+  ZOOM_MIN,
+  ZOOM_MAX,
+  ZOOM_STEP,
+  ZOOM_DEFAULT,
+  COMPOSER_DEFAULT,
+  REVEAL_REQUEST_TTL_MS,
+} from "./uiStore";
 
 describe("uiStore theme", () => {
   // The store is a module-level singleton; the rehydrate test below mutates global fields
@@ -564,5 +572,67 @@ describe("uiStore — the open project set survives a relaunch", () => {
     // Sanity: the blob really did rehydrate, so the null above isn't a no-op passing by default.
     expect(useUiStore.getState().themePref).toBe("dark");
     expect(useUiStore.getState().composerHeight).toBe(200);
+  });
+});
+
+// The reveal request is one-shot and CLEARED BY THE ROW THAT MATCHES IT — but that row is not
+// guaranteed to mount (a filtered status band, `mode === "plan"` rendering no list at all, a project
+// switched or closed, the agent removed right after spawn). Without a deadline the id sat pending
+// for the rest of the session and fired at an arbitrary later moment, yanking the column to a row
+// nobody asked to see (roborev 53784). REVEAL_REQUEST_TTL_MS is the policy.
+describe("uiStore revealAgentId — the request expires", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    useUiStore.setState({ revealAgentId: null });
+  });
+  afterEach(() => {
+    // Drain any armed expiry before handing the timers back, so a pending 5s callback can't fire
+    // into a later test's state.
+    useUiStore.getState().clearRevealAgent(useUiStore.getState().revealAgentId ?? "");
+    useUiStore.setState({ revealAgentId: null });
+    vi.useRealTimers();
+  });
+
+  it("stays pending for the whole window a row might still mount in", () => {
+    useUiStore.getState().requestRevealAgent("a-1");
+    vi.advanceTimersByTime(REVEAL_REQUEST_TTL_MS - 1);
+    expect(useUiStore.getState().revealAgentId).toBe("a-1");
+  });
+
+  it("expires once nothing has consumed it, so it can never fire later", () => {
+    useUiStore.getState().requestRevealAgent("a-1");
+    vi.advanceTimersByTime(REVEAL_REQUEST_TTL_MS);
+    expect(useUiStore.getState().revealAgentId).toBeNull();
+  });
+
+  it("a consumed request disarms its expiry, so it cannot clear a LATER one", () => {
+    // The bug this guards: row a-1 mounts and clears, then a second spawn requests a-2 inside the
+    // first request's window. A surviving timer would blank a-2 before its row ever mounted.
+    useUiStore.getState().requestRevealAgent("a-1");
+    vi.advanceTimersByTime(100);
+    useUiStore.getState().clearRevealAgent("a-1");
+    useUiStore.getState().requestRevealAgent("a-2");
+    vi.advanceTimersByTime(REVEAL_REQUEST_TTL_MS - 1);
+    expect(useUiStore.getState().revealAgentId).toBe("a-2");
+  });
+
+  it("a replacing request restarts the clock rather than inheriting the old deadline", () => {
+    useUiStore.getState().requestRevealAgent("a-1");
+    vi.advanceTimersByTime(REVEAL_REQUEST_TTL_MS - 1);
+    useUiStore.getState().requestRevealAgent("a-2");
+    // The first request's deadline passes here; a-2 must be untouched by it.
+    vi.advanceTimersByTime(2);
+    expect(useUiStore.getState().revealAgentId).toBe("a-2");
+    vi.advanceTimersByTime(REVEAL_REQUEST_TTL_MS);
+    expect(useUiStore.getState().revealAgentId).toBeNull();
+  });
+
+  it("clearRevealAgent still refuses to retire a request that names a different row", () => {
+    useUiStore.getState().requestRevealAgent("a-1");
+    useUiStore.getState().clearRevealAgent("someone-else");
+    expect(useUiStore.getState().revealAgentId).toBe("a-1");
+    // …and the expiry it did NOT cancel is still armed.
+    vi.advanceTimersByTime(REVEAL_REQUEST_TTL_MS);
+    expect(useUiStore.getState().revealAgentId).toBeNull();
   });
 });

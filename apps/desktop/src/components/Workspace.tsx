@@ -16,6 +16,7 @@ import { reattachProjectOnOpen } from "../services/cloudAgents/startup";
 import { NewAgentRuntimeToggle } from "./NewAgentRuntimeToggle";
 import { useNewBuildAgentDrop } from "../hooks/useNewBuildAgentDrop";
 import { AgentSidebar, NewBuildAgentButton } from "./AgentSidebar";
+import { PLAN_COLUMN_Z } from "./layers";
 import { PlanBuildToggle } from "./PlanBuildToggle";
 import { ProjectTabsBar } from "./ProjectTabsBar";
 import { OfflineBanner } from "./OfflineBanner";
@@ -608,6 +609,15 @@ export function Workspace() {
               position: "relative",
               minHeight: 0,
               background: C.forest,
+              // NO `isolation: isolate` HERE, and it is worth saying why, because it looks like the
+              // tidy answer to "contain the stage's own high z-indices". It also DEMOTES the whole
+              // subtree to layer 0 — including the full-window `position: fixed` surfaces that are
+              // supposed to escape this stage. `composer/ModalOverlay` (fixed, inset 0, zIndex 1000)
+              // and AgentPane's click-away backdrop both live in panes inside here and are meant to
+              // cover column ①; isolated, they lose to any `z-index: 1` descendant of the concierge
+              // column, so the dim backdrop gets punched through by the compose box and the
+              // click-away stops dismissing. The sidebar's overlay panel clears this stage by
+              // out-numbering it instead — see components/layers.ts.
             }}
           >
             {/* Each lazy surface gets its own Suspense so loading one never blanks a sibling that's
@@ -713,7 +723,9 @@ export function Workspace() {
                 display: "flex",
                 flexDirection: "column",
                 background: C.deepForest,
-                zIndex: 5,
+                // Must stay above the sidebar's overlay panel, which is a sibling here — see
+                // components/layers.ts for the ordering contract and why it matters.
+                zIndex: PLAN_COLUMN_Z,
               }}
             >
               <div style={{ paddingTop: 12 }}>

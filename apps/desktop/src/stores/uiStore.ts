@@ -76,6 +76,33 @@ export const ZOOM_DEFAULT = 1.0;
 const clampZoom = (z: number) =>
   Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(z * 100) / 100));
 
+/**
+ * How long a "scroll this agent's row into view" request stays live before it expires.
+ *
+ * WHY IT NEEDS ONE AT ALL (roborev 53784). The request is cleared by the row that matches it —
+ * but that row is NOT guaranteed to mount. The status filter bar can hide the new agent's band,
+ * `mode === "plan"` renders no list, the project can be switched or closed, and removing the agent
+ * doesn't clear the request either. Without a deadline the id simply sits there for the rest of
+ * the session and then fires at an ARBITRARY later moment — the user re-enables a filter band,
+ * flips back to Build, or reopens the project, and the column yanks to a row nobody asked to see.
+ *
+ * A deadline covers every one of those escape hatches with one mechanism, rather than teaching the
+ * store about removals, project lifecycle and selection. Five seconds is far longer than the real
+ * window: the spawn adds the agent and the sidebar re-renders in the same tick, so a row that is
+ * going to mount has mounted. Past that the user has moved on, and moving their column is wrong.
+ */
+export const REVEAL_REQUEST_TTL_MS = 5000;
+
+/** The live expiry, if any. Module state rather than store state: it is a scheduling detail, and
+ *  putting a timer id in the store would persist/serialize something meaningless. */
+let revealExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+function cancelRevealExpiry(): void {
+  if (revealExpiryTimer !== null) {
+    clearTimeout(revealExpiryTimer);
+    revealExpiryTimer = null;
+  }
+}
+
 // Theme preference. Lives here (not theme/theme.ts) so theme.ts can import it without a
 // circular dependency — theme.ts depends on the store, never the reverse.
 export type ThemePref = "auto" | "light" | "dark";
@@ -229,9 +256,10 @@ interface UiState {
   // build agent is spawned (§13 — selecting it was never enough; the row could be below the fold,
   // so the user had to go hunting for the thing they just created). ONE-SHOT: the row that matches
   // scrolls itself in and clears the id, so a later remount of the list can't yank the column back.
-  // A request naming a row that isn't mounted (a filtered status band, a collapsed parent) simply
-  // stays pending until that row appears or the next spawn replaces it. Transient — NOT persisted;
-  // a scroll intent from a previous launch is meaningless.
+  // Transient — NOT persisted; a scroll intent from a previous launch is meaningless.
+  //
+  // AND IT EXPIRES — see REVEAL_REQUEST_TTL_MS. The row is not guaranteed to mount, and an
+  // unbounded request is a scroll that fires at an arbitrary later moment (roborev 53784).
   revealAgentId: string | null;
   requestRevealAgent: (id: string) => void;
   clearRevealAgent: (id: string) => void;
@@ -372,10 +400,25 @@ export const useUiStore = create<UiState>()(
       composeFocusSeq: 0,
       requestComposeFocus: () => set((s) => ({ composeFocusSeq: s.composeFocusSeq + 1 })),
       revealAgentId: null,
-      requestRevealAgent: (id) => set({ revealAgentId: id }),
+      requestRevealAgent: (id) => {
+        // Arm the deadline BEFORE publishing the id, so there is no window in which a pending
+        // request exists without an expiry attached to it.
+        cancelRevealExpiry();
+        revealExpiryTimer = setTimeout(() => {
+          revealExpiryTimer = null;
+          // Id-guarded like clearRevealAgent: a newer request must not be cancelled by an older
+          // timer that somehow outlived its own cancellation.
+          set((s) => (s.revealAgentId === id ? { revealAgentId: null } : s));
+        }, REVEAL_REQUEST_TTL_MS);
+        set({ revealAgentId: id });
+      },
       // Id-guarded so a row can only retire ITS OWN request: without the check, a stale effect from
       // a row unmounting mid-spawn would swallow the request that named a different row.
-      clearRevealAgent: (id) => set((s) => (s.revealAgentId === id ? { revealAgentId: null } : s)),
+      clearRevealAgent: (id) => {
+        if (get().revealAgentId !== id) return;
+        cancelRevealExpiry();
+        set({ revealAgentId: null });
+      },
       pinnedProjectId: null,
       togglePinnedProject: (id) =>
         set((s) => ({ pinnedProjectId: s.pinnedProjectId === id ? null : id })),

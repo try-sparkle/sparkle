@@ -102,6 +102,7 @@ import {
   wasProjectVisited,
 } from "../services/sessionProjects";
 import type { AgentTab, Project } from "../types";
+import { PLAN_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
 
 function mkAgent(id: string): AgentTab {
   return {
@@ -445,6 +446,27 @@ describe("Workspace — Plan mode collapses columns 2+3", () => {
     // The panes are covered, not torn down — their PTYs must survive a mode flip.
     expect(screen.getByTestId("pane-a1")).toBeTruthy();
     expect(screen.getByTestId("pane-a1").dataset.visible).toBe("false");
+    // The board paints at the SHARED layer, not an inline number of its own. With the Build column
+    // floated out by the overlay pull tab it is a sibling of this board, and if it out-ranks the
+    // board it paints through it and covers the PlanBuildToggle — the only way back to Build. The
+    // ordering itself is asserted in AgentSidebar.pullTabs.test.tsx; this pins the board's end of it
+    // so an inline z-index re-edit here can't slip past that assertion.
+    expect(Number(screen.getByTestId("plan-column").style.zIndex)).toBe(PLAN_COLUMN_Z);
+    expect(PLAN_COLUMN_Z).toBeGreaterThan(SIDEBAR_OVERLAY_Z);
+  });
+
+  it("leaves the terminal stage un-isolated so its full-window modals still escape it", () => {
+    // `isolation: isolate` here looks like the tidy way to contain the stage's high z-indices
+    // (PinnedPrompt 20, the drop overlay 20, the pane kebab 19-21) below the floated Build column.
+    // It also demotes the whole subtree to layer 0, and the stage hosts full-window `position:
+    // fixed` surfaces that MUST escape it — composer/ModalOverlay at zIndex 1000 and AgentPane's
+    // click-away backdrop, both meant to cover column ①. Isolated, they lose to any `z-index: 1`
+    // descendant of the concierge column: the dim backdrop gets punched through by the compose box
+    // and the click-away stops dismissing. The Build column clears the stage by out-numbering it
+    // (components/layers.ts) instead. Sits next to the `style.filter` assertion above, which pins
+    // the other property this element must not grow for a closely-related reason.
+    render(<Workspace />);
+    expect(screen.getByTestId("terminal-stage").style.isolation).toBe("");
   });
 
   it("the Plan column's Build chevron splits the columns back apart", async () => {

@@ -15,10 +15,12 @@ import {
 import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled } from "react-icons/tb";
-import { FiCloud } from "react-icons/fi";
+// FiChevronsLeft/Right are §10's two pull tabs.
+import { FiCloud, FiChevronsLeft, FiChevronsRight } from "react-icons/fi";
 import { C, AGENT_STATUS, FONT, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
 import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
+import { SIDEBAR_OVERLAY_Z } from "./layers";
 import { WEB_BASE_URL } from "../services/sparkleApi";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
@@ -155,9 +157,11 @@ type SidebarScrollApi = {
   // Cancel a pending ease-back WITHOUT discarding the baseline — called when a card opens, so a
   // re-hover during the debounce window doesn't bounce the column back and re-clip.
   cancelRestore: () => void;
-  // The user took over the scroll (their own wheel/drag closed the card): drop the baseline and any
-  // pending ease-back so we never yank the list away from where they just put it.
-  abandonReveal: () => void;
+  // Drop the baseline and any pending ease-back so nothing yanks the list away from where it is
+  // now. `abortInFlight` additionally kills an ease-back that is ALREADY ANIMATING, via a direct
+  // scroll-offset write — pass it from the reveal path, and NOT from the user-scroll path, where
+  // that write would cancel the user's own momentum scroll.
+  abandonReveal: (abortInFlight?: boolean) => void;
   // True while our own smooth scroll (reveal or restore) is in flight toward its target.
   isAutoScrolling: () => boolean;
 };
@@ -475,6 +479,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   });
 
   const startResize = (e: React.MouseEvent) => {
+    // Left button only. A right-click or a middle-click on the strip used to install the global
+    // move/up listeners too, which left the body cursor pinned to col-resize until the next
+    // primary click released it.
+    if (e.button !== 0) return;
     e.preventDefault();
     const startX = e.clientX;
     const startW = width;
@@ -496,6 +504,59 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   };
+
+  // Keyboard path for the same resize. The tab is a real focusable control (role="separator" with
+  // aria-value*), so a pointer is not the only way to move this boundary — arrows nudge, Shift
+  // jumps, Home/End slam to the clamp. Persisted on each commit: unlike a drag there is no
+  // "settle" event to hang the write off.
+  const RESIZE_STEP = 16;
+  const commitWidth = (next: number) => {
+    const clamped = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, next));
+    setWidth(clamped);
+    localStorage.setItem("sparkle-sidebar-width", String(clamped));
+  };
+  const onResizeKey = (e: React.KeyboardEvent) => {
+    const step = e.shiftKey ? RESIZE_STEP * 4 : RESIZE_STEP;
+    if (e.key === "ArrowLeft") commitWidth(width - step);
+    else if (e.key === "ArrowRight") commitWidth(width + step);
+    else if (e.key === "Home") commitWidth(MIN_WIDTH);
+    else if (e.key === "End") commitWidth(MAX_WIDTH);
+    else return;
+    e.preventDefault();
+  };
+
+  // OVERLAY MODE (§10, the second pull tab). Same right edge, second control: instead of RESIZING
+  // the column — which reflows the whole shell and forces the terminal to re-measure — this lifts
+  // the column OUT of flow and floats it over the terminal. An in-flow spacer holds the column's
+  // old slot so nothing beside it moves; the panel just gets wider on top.
+  //
+  // Persisted like the width, and for the same reason: it's a stated preference about the shape of
+  // the app, not a transient view state, so it must survive a relaunch.
+  const OVERLAY_KEY = "sparkle-sidebar-overlay";
+  const [overlay, setOverlay] = useState<boolean>(
+    () => localStorage.getItem(OVERLAY_KEY) === "1",
+  );
+  const toggleOverlay = () => {
+    const next = !overlay;
+    setOverlay(next);
+    localStorage.setItem(OVERLAY_KEY, next ? "1" : "0");
+  };
+
+  // Geometry for the floating panel. Same SHAPE as the row hover-card's anchoring math
+  // (PRD/feat/hover-popout-terminal-area.md, and `cardLeft`/`ext` further down this file) — pin to
+  // the anchor, grow RIGHT into the terminal area, clamp against the room available, floor it so a
+  // narrow window yields a usable panel rather than a sliver — but expressed in CSS rather than in
+  // a measured rect.
+  //
+  // WHY NOT MEASURE. The obvious build is getBoundingClientRect on a spacer + position:fixed. That
+  // rect is a SNAPSHOT, and this shell moves underneath it without a window resize: OfflineBanner
+  // and ZeroCreditBanner mount and unmount above the flex row and ProjectTabsBar changes height,
+  // each of which slides the column down while a fixed panel stays pinned to the stale coordinates
+  // — visibly detached from its own spacer, with no self-correction. Positioning against the ②+③
+  // wrapper instead (it is already `position: relative`, so it is our containing block) tracks
+  // every one of those shifts for free, and `max()/min()` do the clamping the same way, against
+  // that wrapper's live width instead of a stored `window.innerWidth`.
+  const OVERLAY_WIDTH = "max(280px, min(480px, 100%))";
 
   const onSelect = (id: string) => {
     if (!project) return;
@@ -939,9 +1000,51 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         }, 90);
       },
       cancelRestore: clearRestoreTimer,
-      abandonReveal: () => {
+      abandonReveal: (abortInFlight = false) => {
         clearRestoreTimer();
         baselineRef.current = null;
+        // CLEARING THE TIMER ONLY CANCELS AN EASE-BACK THAT HASN'T FIRED YET. Once restore()'s 90ms
+        // debounce elapses it nulls the baseline ITSELF and starts smoothScrollTo, so from that
+        // moment the two lines above are a no-op while the animation keeps gliding toward the old
+        // baseline — and the animation outlives the debounce by far (roborev 53907). A direct
+        // scrollTop write aborts an in-flight smooth scroll, the same trick the wheel handler above
+        // uses.
+        //
+        // WHO IS CALLING decides whether we touch the offset, stated by the caller rather than
+        // inferred (roborev 53940). An earlier revision gated on `autoTargetRef.current != null` as
+        // a proxy for "a programmatic scroll is live", which fails both ways: that flag has a hard
+        // 700ms fallback lifetime, so an ease-back outliving it (long distance, busy main thread
+        // right after a spawn click, WebKit's slower curve) finds the flag already null and skips
+        // the abort — silently restoring the bug this exists to fix.
+        //
+        //   - reveal path (abortInFlight): always abort. There may be an animation to kill.
+        //   - hover-card user-scroll path: never write. It runs from INSIDE a live user gesture,
+        //     and writing the scroll offset during trackpad momentum or Chromium's animated wheel
+        //     scroll cancels it, stopping the user's flick dead. (It also returns early whenever
+        //     isAutoScrolling(), so it could never have anything to abort in the first place.)
+        if (abortInFlight) {
+          const sc = listScrollRef.current;
+          if (sc) {
+            // Perturb, THEN restore. Writing the identical value back can be elided — engines
+            // early-return from the scroll-offset setter on a zero delta, and during a smooth
+            // scroll scrollTop reads the live animated offset — which would leave the animation
+            // running and this whole abort doing nothing. The wheel handler's `+= delta` never has
+            // that problem. Both writes land in one task, so nothing paints in between.
+            const here = sc.scrollTop;
+            sc.scrollTop = here + (here > 0 ? -1 : 1);
+            sc.scrollTop = here;
+          }
+        }
+        // Flag and its fallback timer are cleared TOGETHER, unconditionally. Splitting them (the
+        // flag inside a guard, the timer outside) could drop the timer while leaving the flag set
+        // forever — a stuck "this scroll is ours" state where cards stop closing on user scroll and
+        // scrollToReveal captures a stale baseline, which is the exact failure that fallback timer
+        // was added to prevent.
+        autoTargetRef.current = null;
+        if (autoClearTimerRef.current) {
+          clearTimeout(autoClearTimerRef.current);
+          autoClearTimerRef.current = null;
+        }
       },
       isAutoScrolling: () => autoTargetRef.current != null,
     };
@@ -1162,7 +1265,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // the ladder and that they drift; a rolled-up dot filtered by its own raw status would be that
   // failure in its purest form — a row painted red that the "Needs you" chip cannot find.
   //
-  // Only `kind: "worker"` children count, matching engine/workerExpansion.workerCounts: they are
+  // Only `kind: "worker"` children count, matching engine/workerExpansion.workerAttention: they are
   // the only children that render as rows, so a nested shell must not tint its parent's disc.
   // ONE composition, shared with publishedStatusFor — see rollupViewFor. This used to assemble the
   // `own` map, the dismissed set and the in-motion predicate inline, which was a second copy of that
@@ -1261,7 +1364,19 @@ export function AgentSidebar({ project }: { project: Project | null }) {
 
   return (
     <SidebarScrollContext.Provider value={sidebarScroll}>
+    {/* The in-flow SLOT. Only exists in overlay mode, where the column itself has left the flow:
+        it holds the column's old width so the terminal beside it does not reflow (and does not
+        re-measure its PTY) just because the panel popped out. Empty and inert by construction. */}
+    {overlay && (
+      <div
+        data-testid="agent-sidebar-slot"
+        aria-hidden
+        style={{ width, flex: "0 0 auto", height: "100%" }}
+      />
+    )}
     <div
+      data-testid="agent-sidebar-column"
+      data-overlay={String(overlay)}
       style={{
         width,
         flex: "0 0 auto",
@@ -1275,6 +1390,24 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         display: "flex",
         flexDirection: "column",
         height: "100%",
+        // OVERLAY MODE: the same element, lifted out of flow and laid over the terminal. Absolute
+        // against the ②+③ wrapper, whose content box starts exactly where this column starts — so
+        // left/top/bottom 0 reproduces the docked anchor with no measurement, and the spacer below
+        // holds the slot so nothing beside it reflows.
+        ...(overlay
+          ? {
+              position: "absolute" as const,
+              left: 0,
+              top: 0,
+              bottom: 0,
+              height: "auto",
+              width: OVERLAY_WIDTH,
+              // See components/layers.ts: above the (isolated) terminal stage, below Plan mode's
+              // board. Both sides of that ordering live in that one module.
+              zIndex: SIDEBAR_OVERLAY_Z,
+              boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+            }
+          : null),
       }}
     >
       {/* The brand chrome that used to top this column — the Sparkle.ai logo, the voice waveform
@@ -1288,18 +1421,20 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       {/* Column-2 header (PRD §3): the Plan / Build segmented toggle. Build keeps its two-stage
           behavior here — a second click on the active chevron spawns a fresh build agent.
 
-          The top gap is conditional because the two configurations start at different heights. With
-          the helper island ENABLED (the default) the row above is absent entirely, so the strip
-          would sit flush against ProjectTabsBar — the app's other piece of top chrome — and the two
-          controls read as one welded band. With the helper row present, its own 14px of top padding
-          already does this job, and stacking a second gap on top only double-spaces that case. */}
+          The top gap is UNCONDITIONAL. This strip is the top of the column, so without it it would
+          sit flush against ProjectTabsBar — the app's other piece of top chrome — and the two would
+          read as one welded band. It used to be conditional, because a "Show Helper" row sometimes
+          sat above and contributed its own 14px of top padding; §6 deleted that row, so there is no
+          longer a configuration in which something above supplies the spacing. Hiding the helper
+          ISLAND is still possible (§15 put Hide back on the island and in the View menu) but brings
+          no sidebar row back, so it cannot affect this either — AgentSidebar.rowChrome.test.tsx
+          pins exactly that. Do not restore the conditional. */}
       {project && (
         <PlanBuildToggle
           mode={mode}
           beadsEnabled={beadsEnabled}
           onPickPlan={onPickPlan}
           onPickBuild={onPickBuild}
-          // §6 removed the Show Helper row, so the "a row is above me" spacing case is gone.
           style={{ marginTop: 20 }}
         />
       )}
@@ -1636,22 +1771,124 @@ export function AgentSidebar({ project }: { project: Project | null }) {
         />
       )}
 
-      {/* Drag handle on the right edge — resize the column wider/narrower. */}
+      {/* THE TWO PULL TABS on the right edge (§10). Left boundary only — this is the one column
+          boundary that gets them.
+
+          1. RESIZE — the full-height 6px `col-resize` strip. It reflows the layout: the column
+             takes the space, the terminal gives it up.
+          2. OVERLAY — pops this column OUT as a floating panel over the terminal instead, leaving
+             the layout alone (an in-flow spacer holds the slot). The SAME button docks it back,
+             and it rides on the panel itself, so the overlay can never hide its own way out.
+
+          They are stacked vertically and each carries its own accessible name and title, so they
+          read as two distinct controls rather than two mystery grey strips.
+
+          zIndex: the sticky "+ New Build Agent" wrapper is zIndex 3 but stops 8px shy of this edge
+          (the scroll container's padding), so the 6px strip never actually fought it. The overlay
+          tab is wider than that 8px gap, so both tabs are lifted ABOVE 3 rather than left to rely
+          on two pixels of clearance.
+
+          The resize strip is suppressed while floating: the panel's width is derived from the
+          viewport, not dragged, so a drag there would silently move a boundary you can't see. */}
+      {!overlay && (
+        <div
+          onMouseDown={startResize}
+          onKeyDown={onResizeKey}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize the agent column"
+          aria-valuenow={width}
+          aria-valuemin={MIN_WIDTH}
+          aria-valuemax={MAX_WIDTH}
+          tabIndex={0}
+          title="Drag to resize the agent column (or focus it and use ← →)"
+          data-testid="sidebar-resize-tab"
+          style={{
+            // Kept fully inside the column (right:0) so the 6px hit area can't intercept
+            // clicks on the adjacent panel's left edge.
+            position: "absolute",
+            top: 0,
+            right: 0,
+            width: 6,
+            height: "100%",
+            cursor: "col-resize",
+            zIndex: 4,
+          }}
+        />
+      )}
       <div
-        onMouseDown={startResize}
-        title="Drag to resize"
         style={{
-          // Kept fully inside the column (right:0) so the 6px hit area can't intercept
-          // clicks on the adjacent panel's left edge.
           position: "absolute",
-          top: 0,
           right: 0,
-          width: 6,
-          height: "100%",
-          cursor: "col-resize",
-          zIndex: 1,
+          top: "50%",
+          transform: "translateY(-50%)",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "flex-end",
+          gap: 6,
+          zIndex: 5,
+          // The WRAPPER is inert; only the button below re-enables pointer events. It sits above
+          // the resize strip (zIndex 5 vs 4) and is wider than the grip inside it, so without this
+          // it swallows the mousedown over the one part of the resize tab a user can actually SEE
+          // — the grip — and the visible affordance becomes the single dead spot on the edge.
+          // Caught in the browser (the grip looked fine and did nothing); jsdom cannot hit-test.
+          pointerEvents: "none",
         }}
-      />
+      >
+        {/* The grip: pure signage for the strip behind it, so the resize tab is VISIBLE and not
+            just a 6px band of nothing. pointerEvents:none — every drag belongs to the strip. */}
+        {!overlay && (
+          <div
+            aria-hidden
+            data-testid="sidebar-resize-grip"
+            style={{
+              width: 4,
+              height: 28,
+              marginRight: 1,
+              borderRadius: 2,
+              background: C.hairline,
+              pointerEvents: "none",
+            }}
+          />
+        )}
+        <button
+          type="button"
+          onClick={toggleOverlay}
+          aria-pressed={overlay}
+          aria-label={
+            overlay
+              ? "Dock the agent column back into the layout"
+              : "Pop the agent column out over the terminal"
+          }
+          title={
+            overlay
+              ? "Dock the agent column back into the layout"
+              : "Pop the agent column out over the terminal"
+          }
+          data-testid="sidebar-overlay-tab"
+          style={{
+            // Also kept fully inside the column, for the same reason as the strip: a tab hanging
+            // over the terminal would eat clicks meant for the terminal's left edge.
+            width: 14,
+            height: 34,
+            padding: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            // Re-enabled against the inert wrapper above — this button is the ONLY interactive
+            // thing in the cluster; everything else falls through to the resize strip.
+            pointerEvents: "auto",
+            border: `1px solid ${C.hairline}`,
+            borderRight: "none",
+            borderRadius: "4px 0 0 4px",
+            background: C.barSurface,
+            color: overlay ? C.accentInk : C.muted,
+          }}
+        >
+          {overlay ? <FiChevronsLeft size={11} /> : <FiChevronsRight size={11} />}
+        </button>
+      </div>
     </div>
     </SidebarScrollContext.Provider>
   );
@@ -2085,12 +2322,25 @@ const AgentRow = memo(function AgentRow({
   // (PinnedPrompt.tsx) — an already-visible row doesn't move. Clearing makes it one-shot, so a
   // remount of the list later can't yank the column away from where the user put it. Optional call:
   // jsdom has no layout and no scrollIntoView.
+  //
+  // ORDER MATTERS: `abandonReveal()` FIRST, then scroll. This scrolls the very container the hover
+  // auto-scroll coordinator drives, and `restore()` schedules a 90ms debounced ease-back to
+  // `baselineRef` when a hover card closes. Leave the cursor an open card and click "+ New Build
+  // Agent" — the spawn adds the agent synchronously, so this effect runs at CLICK time — and
+  // without this the ease-back drags the column straight back, silently undoing the whole feature.
+  // `abandonReveal(true)` handles both halves: it cancels a pending ease-back AND aborts one
+  // already animating. The `true` is load-bearing — the user-scroll caller must NOT abort, or it
+  // would cancel the user's own momentum scroll (see the api's doc comment). Doing this after the
+  // scroll would race the animation instead of preventing it, which is why the order is asserted
+  // in AgentSidebar.revealRow.test. The visual outcome is not testable in jsdom (no layout, no
+  // scroll animation) — the CALL ORDER is (roborev 53784, 53907, 53929, 53940).
   const revealAgentId = useUiStore((s) => s.revealAgentId);
   useEffect(() => {
     if (revealAgentId !== a.id) return;
+    sidebarScroll?.abandonReveal(true);
     rowRef.current?.scrollIntoView?.({ block: "nearest" });
     useUiStore.getState().clearRevealAgent(a.id);
-  }, [revealAgentId, a.id]);
+  }, [revealAgentId, a.id, sidebarScroll]);
 
   // Hover open/close with a short close delay, so moving the cursor from the in-flow row onto the
   // overlay sitting on top of it (which fires the row's mouseleave) doesn't flicker it shut.

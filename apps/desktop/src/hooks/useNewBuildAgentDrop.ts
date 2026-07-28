@@ -16,7 +16,11 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useSpawnBuildAgent } from "./useSpawnBuildAgent";
 import { useUiStore } from "../stores/uiStore";
 import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
-import { isOverDndTarget, NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
+import {
+  isOverDndTarget,
+  NEW_BUILD_AGENT_DND_TARGET,
+  reportDropWithNoTarget,
+} from "../services/dndTargets";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { describePaths } from "../services/logSafePaths";
 import { log } from "../logger";
@@ -41,7 +45,13 @@ export function useNewBuildAgentDrop(project: Project | null): void {
           setBuildAgentHover(false);
         } else if (p.type === "drop") {
           setBuildAgentHover(false);
-          if (!isOverDndTarget(p.position, NEW_BUILD_AGENT_DND_TARGET)) return;
+          if (!isOverDndTarget(p.position, NEW_BUILD_AGENT_DND_TARGET)) {
+            // Not ours — usually because another target owns it, in which case this is silent.
+            // It only speaks up when the drop matched NOTHING, which is the coordinate-space bug
+            // signature the last regression had no log line for at all.
+            reportDropWithNoTarget(p.position);
+            return;
+          }
           const paths = p.paths ?? [];
           if (paths.length === 0) return;
           const id = spawnRef.current();

@@ -9,7 +9,7 @@
 //
 // The Merge action is deliberately gated (prMergeEligibility) and merges with a MERGE COMMIT via the
 // Rust `merge_pr` command — never a blind or `--auto` merge. See services/openPrs.ts and AGENTS.md.
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import {
@@ -58,33 +58,25 @@ export function agentLinkForBranch(
   return null;
 }
 
-/** Breathing room kept between the dropdown and the window edge when it has to be nudged. */
-const VIEWPORT_MARGIN = 8;
-
-/**
- * How far (px) to nudge the dropdown horizontally so it renders entirely inside the window.
- *
- * The badge sits flush right in the project tab bar, so the panel is anchored to the badge's RIGHT
- * edge (`right: 0`) — a left anchor ran a 340–460px panel straight off the window and clipped every
- * control on it. Right-anchoring is enough at any normal window size; this exists for the cases it
- * isn't (a zoomed-in window shrinks the viewport in CSS pixels, which can push the panel's LEFT edge
- * out instead). Pure so the arithmetic is testable without a layout engine.
- *
- * Right overhang is corrected first, then left — so if the panel is somehow wider than the window,
- * the left edge wins and the header stays readable rather than both edges being wrong.
- */
-export function panelShiftX(
-  rect: { left: number; right: number },
-  viewportWidth: number,
-  margin: number = VIEWPORT_MARGIN,
-): number {
-  let dx = 0;
-  const overflowRight = rect.right + dx - (viewportWidth - margin);
-  if (overflowRight > 0) dx -= overflowRight;
-  const underflowLeft = margin - (rect.left + dx);
-  if (underflowLeft > 0) dx += underflowLeft;
-  return dx;
-}
+// CONTAINMENT IS PURE CSS, and deliberately so (roborev 53787).
+//
+// There used to be a measure-and-nudge layout effect here: it read the panel's rect, computed a
+// `translateX` via a `panelShiftX` helper, and re-ran on `resize`. It was justified by "the app
+// supports zoom, and zooming in shrinks the viewport in CSS pixels" — and that is simply not what
+// zoom is in this app. `uiStore.zoom` (ZOOM_MIN/ZOOM_MAX) is an application-level FONT-SCALE; its
+// only consumer is Terminal.tsx, which multiplies xterm's fontSize by it. It does not change
+// `window.innerWidth`, does not change `100vw`, and does not fire a `resize` event. So the effect's
+// one trigger was a real window resize — exactly the case the `100vw` clamps below already handle —
+// while the case it was written for could never re-run it. Worse, its deps were `[open, prs?.length]`,
+// so every content-driven change while the panel is open (the error banner appearing, "Open agent"
+// appearing once resolveAgent finds one, the merge-in-flight labels, tab-bar reflow when the trial
+// indicator mounts) left the applied shift stale.
+//
+// It is dropped rather than rewired because the clamps genuinely suffice. The window enforces
+// `minWidth: 900` (src-tauri/tauri.conf.json), the panel is anchored to the badge's RIGHT edge, and
+// `max-width` caps it at 460px — so its left edge lands at least ~440px inside the window, and the
+// `calc(100vw - 16px)` half of each clamp is the backstop if that minimum ever moves. Both clamps
+// are asserted directly in the test file; deleting either one fails the suite.
 
 /** Colour for a PR's aggregate CI rollup, matching the status-dot palette used elsewhere. */
 function checksColor(checks: PrRow["checks"]): string {
@@ -131,12 +123,6 @@ export function OpenPrMenu({
   // Guards the async refetch against a project switch / unmount, exactly like the old badge did: a
   // slow probe for the previous repo must never paint its list under the new repo's name.
   const aliveRef = useRef(true);
-  // Containment: the panel is right-anchored in CSS and then nudged, if measurement says it still
-  // pokes out of the window. `shiftRef` mirrors the applied value so a re-measure can subtract it
-  // and describe the UNtranslated panel — otherwise each pass would compound the last one.
-  const panelRef = useRef<HTMLDivElement | null>(null);
-  const shiftRef = useRef(0);
-  const [shiftX, setShiftX] = useState(0);
 
   const refetch = useMemo(
     () => async () => {
@@ -165,29 +151,6 @@ export function OpenPrMenu({
       window.clearInterval(id);
     };
   }, [rootPath, refetch]);
-
-  // Measure once the panel is on screen (and on resize) and nudge it fully inside the window.
-  // Layout effect, not effect: the correction paints in the same frame, so the panel never flashes
-  // in a clipped position first. Re-runs when the row count changes because that changes its width.
-  useLayoutEffect(() => {
-    if (!open) {
-      shiftRef.current = 0;
-      setShiftX(0);
-      return;
-    }
-    const measure = () => {
-      const el = panelRef.current;
-      if (!el) return;
-      const r = el.getBoundingClientRect();
-      const applied = shiftRef.current;
-      const dx = panelShiftX({ left: r.left - applied, right: r.right - applied }, window.innerWidth);
-      shiftRef.current = dx;
-      setShiftX(dx);
-    };
-    measure();
-    window.addEventListener("resize", measure);
-    return () => window.removeEventListener("resize", measure);
-  }, [open, prs?.length]);
 
   const label = formatPrBadge(prs?.length ?? null);
   // Nothing waiting, or we couldn't find out — both render nothing (same rule as the old badge). Also
@@ -275,7 +238,6 @@ export function OpenPrMenu({
             style={{ position: "fixed", inset: 0, zIndex: 40 }}
           />
           <div
-            ref={panelRef}
             data-testid="open-pr-panel"
             style={{
               position: "absolute",
@@ -284,15 +246,16 @@ export function OpenPrMenu({
               // left anchor put 340–460px of panel outside the window and clipped every control.
               right: 0,
               marginTop: 4,
-              // Clamped to the window in CSS first (min-width beats max-width, so BOTH need the
-              // clamp), then nudged by the measured `shiftX` for whatever CSS can't see.
+              // Clamped to the window. BOTH need the clamp: min-width beats max-width in the
+              // cascade, so clamping only max-width leaves a 340px floor that can exceed a narrow
+              // viewport. These two lines plus the right anchor ARE the containment — see the note
+              // above the component for why the measured nudge that used to follow them is gone.
               minWidth: "min(340px, calc(100vw - 16px))",
               maxWidth: "min(460px, calc(100vw - 16px))",
               // Same idea vertically: never taller than the window, and scroll inside when the list
               // is longer than that.
               maxHeight: "min(420px, calc(100vh - 80px))",
               overflowY: "auto",
-              transform: shiftX ? `translateX(${shiftX}px)` : undefined,
               background: C.deepForest,
               border: `1px solid ${C.hairline}`,
               borderRadius: 8,

@@ -36,7 +36,7 @@ import { applySuggestion } from "../services/suggestions/applySuggestion";
 import type { SuggestionButton } from "../services/suggestions/types";
 import { trialSendAllowed, recordTrialSend } from "../services/trialMeter";
 import { safeUnlisten } from "../services/safeUnlisten";
-import { isOverFileDropTarget } from "../services/dndTargets";
+import { isOverFileDropTarget, registerCatchAllDropTarget } from "../services/dndTargets";
 import { useProjectStore } from "../stores/projectStore";
 import { captureScreenRegion } from "../screenshot";
 import { AttachmentRow } from "./composer/AttachmentRow";
@@ -784,6 +784,11 @@ export function Composer({
   // listener-ordering assumption is needed.
   useEffect(() => {
     if (!active) return;
+    // Announce that a CATCH-ALL is live. This composer accepts any drop outside FILE_DROP_TARGETS —
+    // the sidebar, the tab strip, the top bar — which no `data-dnd-target` region describes, so
+    // without this the other listeners' miss paths would report those successful drops as dead
+    // (services/dndTargets.registerCatchAllDropTarget).
+    const unregisterCatchAll = registerCatchAllDropTarget();
     const unlistenPromise = getCurrentWebview()
       .onDragDropEvent((event) => {
         const p = event.payload;
@@ -793,6 +798,10 @@ export function Composer({
           setDropActive(false);
         } else if (p.type === "drop") {
           setDropActive(false);
+          // NO reportDropWithNoTarget here, unlike the other three drop listeners. This composer is
+          // the CATCH-ALL: its early return fires only when the position IS over another target, so
+          // it can never be looking at a drop that matched nothing. Reporting here would be dead
+          // code by construction (the helper self-suppresses on a known target anyway).
           if (overOtherTarget(p.position)) return;
           const paths = p.paths ?? [];
           if (paths.length === 0) return;
@@ -803,9 +812,15 @@ export function Composer({
       .catch((e) => {
         // A failed listen has no unlisten fn to return; log and let cleanup no-op.
         log.error("composer", "drag-drop listen failed", e);
+        // AND release the catch-all claim: the counter went up synchronously, but no listener is
+        // accepting anything now. Leaving it up would suppress every OTHER listener's dead-drop
+        // report for as long as this pane is active — drops really dead, alarm off, the worst
+        // combination (roborev 53914). The release fn is idempotent, so cleanup stays safe.
+        unregisterCatchAll();
         return undefined;
       });
     return () => {
+      unregisterCatchAll();
       setDropActive(false);
       // safeUnlisten awaits the listen() promise so a handler that resolves AFTER unmount is still
       // torn down (and the Tauri teardown race is swallowed).

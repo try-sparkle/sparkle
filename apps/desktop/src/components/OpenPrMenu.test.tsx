@@ -12,7 +12,7 @@ const h = vi.hoisted(() => ({
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => h.invoke(...a) }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: (u: string) => h.openUrl(u) }));
 
-import { OpenPrMenu, agentLinkForBranch, panelShiftX, type PrAgentLink } from "./OpenPrMenu";
+import { OpenPrMenu, agentLinkForBranch, type PrAgentLink } from "./OpenPrMenu";
 import type { PrRow } from "../services/openPrs";
 import type { AgentTab, Project } from "../types";
 
@@ -128,68 +128,108 @@ describe("OpenPrMenu", () => {
   });
 });
 
-describe("panelShiftX", () => {
-  it("leaves a panel that already fits alone", () => {
-    expect(panelShiftX({ left: 420, right: 880 }, 900)).toBe(0);
-  });
-
-  it("pulls a panel that overhangs the RIGHT edge back inside", () => {
-    // right edge 60px past the window → nudge left far enough to clear the 8px margin too.
-    expect(panelShiftX({ left: 500, right: 960 }, 900)).toBe(-68);
-  });
-
-  it("pushes a panel that overhangs the LEFT edge back inside", () => {
-    expect(panelShiftX({ left: -4, right: 280 }, 300)).toBe(12);
-  });
-
-  it("keeps the left edge visible when the panel is wider than the window (no fit possible)", () => {
-    // Nothing can satisfy both edges here; the left edge wins so the header stays readable.
-    expect(panelShiftX({ left: -100, right: 400 }, 300)).toBe(108);
-  });
-});
-
 /** The badge cluster's own geometry in the model below: flush right, 20px of chrome beyond it. */
 const BADGE_RIGHT_INSET = 20;
 const BADGE_WIDTH = 110;
+/** The window's enforced floor (src-tauri/tauri.conf.json `minWidth`). The panel's containment
+ *  guarantee is stated at this width, so the tests state it at this width too. */
+const MIN_WINDOW_WIDTH = 900;
+
+/** Split `340px, calc(100vw - 16px)` on TOP-LEVEL commas only, so a nested `min(...)` survives. */
+function splitTopLevel(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = "";
+  for (const ch of s) {
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    if (ch === "," && depth === 0) {
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+/**
+ * Resolve the small subset of CSS length syntax the panel uses — `min(a, b)`, `calc(100vw - Npx)`,
+ * `Npx`, `100vw` — against a viewport width.
+ *
+ * jsdom computes no layout, so the model below has to do this itself. Doing it from the ELEMENT'S
+ * OWN style string is the point (roborev 53787): the old stub hardcoded `Math.min(460, innerWidth
+ * - 16)`, so deleting either clamp from the component failed no test at all. Returns null for
+ * anything unrecognised — including an EMPTY string, i.e. a clamp that was removed — and the model
+ * turns that into an unbounded width, which the containment assertions then catch.
+ */
+function cssLength(value: string, innerWidth: number): number | null {
+  const v = value.trim();
+  const min = /^min\((.*)\)$/.exec(v);
+  if (min) {
+    const parts = splitTopLevel(min[1]!).map((p) => cssLength(p, innerWidth));
+    return parts.some((p) => p === null) ? null : Math.min(...(parts as number[]));
+  }
+  const calc = /^calc\(100vw\s*-\s*([\d.]+)px\)$/.exec(v);
+  if (calc) return innerWidth - Number(calc[1]);
+  const px = /^([\d.]+)px$/.exec(v);
+  if (px) return Number(px[1]);
+  if (v === "100vw") return innerWidth;
+  return null;
+}
 
 /**
  * A deliberately small layout model for jsdom, which computes no geometry of its own. The badge sits
  * flush right in the tab bar; the panel hangs off whichever badge edge its own style anchors it to
- * (so a regression back to `left: 0` really does move the rect), with the CSS width clamp
- * `min(460px, 100vw - 16px)` applied. Transform-aware, so the component's measure → shift →
- * re-measure path converges exactly as it does in a real browser.
+ * (so a regression back to `left: 0` really does move the rect), at the width its OWN `min-width` /
+ * `max-width` resolve to.
+ *
+ * `restore()` puts BOTH stubs back. It used to restore only `getBoundingClientRect`, leaving
+ * `window.innerWidth` permanently redefined at 1200 — then 300 after the resize test — for every
+ * later test in the file, while their rects fell back to jsdom's all-zero geometry (roborev 53787).
  */
 function stubLayout(innerWidth: number) {
-  const real = HTMLElement.prototype.getBoundingClientRect;
+  const realRect = HTMLElement.prototype.getBoundingClientRect;
+  const realInnerWidth = Object.getOwnPropertyDescriptor(window, "innerWidth");
   Object.defineProperty(window, "innerWidth", { value: innerWidth, configurable: true });
   HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
-    if (this.dataset.testid !== "open-pr-panel") return real.call(this);
-    const m = /translateX\((-?[\d.]+)px\)/.exec(this.style.transform || "");
-    const dx = m ? Number(m[1]) : 0;
-    const width = Math.min(460, innerWidth - 16);
+    if (this.dataset.testid !== "open-pr-panel") return realRect.call(this);
+    const minW = cssLength(this.style.minWidth, innerWidth);
+    const maxW = cssLength(this.style.maxWidth, innerWidth);
+    // The panel's content fills to its max width; min-width then BEATS max-width in the cascade,
+    // which is exactly why clamping only one of the two is a bug. An unreadable (or deleted) clamp
+    // resolves to null and widens the panel without bound, so the assertions fail loudly.
+    const width = Math.max(minW ?? 0, maxW ?? Number.POSITIVE_INFINITY);
     const badgeRight = innerWidth - BADGE_RIGHT_INSET;
     // Right-anchored: the panel's right edge meets the badge's. Left-anchored (the bug): its left
     // edge meets the badge's left, and the panel runs off the window from there.
     const left = this.style.right === "0px" ? badgeRight - width : badgeRight - BADGE_WIDTH;
     return {
-      left: left + dx,
-      right: left + width + dx,
+      left,
+      right: left + width,
       width,
       top: 40,
       bottom: 40 + 420,
       height: 420,
-      x: left + dx,
+      x: left,
       y: 40,
     } as DOMRect;
   };
   return () => {
-    HTMLElement.prototype.getBoundingClientRect = real;
+    HTMLElement.prototype.getBoundingClientRect = realRect;
+    if (realInnerWidth) Object.defineProperty(window, "innerWidth", realInnerWidth);
   };
 }
 
-/** The rendered panel's real horizontal extent = its stubbed rect (already transform-aware). */
-function panelRect(el: HTMLElement) {
-  return el.getBoundingClientRect();
+/** Open the menu at a stubbed viewport width and hand back the panel plus its modelled rect. */
+async function openPanelAt(innerWidth: number) {
+  const restore = stubLayout(innerWidth);
+  stubList([PASS, FAILING]);
+  render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+  fireEvent.click(await screen.findByTestId("open-pr-badge"));
+  const panel = await screen.findByTestId("open-pr-panel");
+  return { panel, rect: panel.getBoundingClientRect(), restore };
 }
 
 describe("OpenPrMenu (containment — §12a)", () => {
@@ -203,56 +243,51 @@ describe("OpenPrMenu (containment — §12a)", () => {
     expect(panel.style.left).toBe("");
   });
 
-  it("keeps the panel's right edge within window.innerWidth at a roomy width", async () => {
-    const restore = stubLayout(1200);
+  // THE CLAMPS THEMSELVES, asserted against the real style string rather than a model of it. Both
+  // are load-bearing: min-width beats max-width in the cascade, so clamping only max-width leaves a
+  // 340px floor that a narrow viewport cannot honour. The commit that added them said so; nothing
+  // tested it (roborev 53787).
+  it("clamps BOTH min-width and max-width to the viewport", async () => {
+    stubList([PASS]);
+    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    const panel = await screen.findByTestId("open-pr-panel");
+    expect(panel.style.minWidth).toBe("min(340px, calc(100vw - 16px))");
+    expect(panel.style.maxWidth).toBe("min(460px, calc(100vw - 16px))");
+  });
+
+  it("sits fully inside the window at the ENFORCED minimum window width", async () => {
+    // 900 is the floor tauri.conf.json enforces, and the whole containment argument rests on it: a
+    // ≤460px panel anchored to a right-hand badge lands hundreds of px inside a 900px window. No
+    // measured nudge is involved any more — this is what the CSS alone buys.
+    const { rect, restore } = await openPanelAt(MIN_WINDOW_WIDTH);
     try {
-      stubList([PASS, FAILING]);
-      render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
-      fireEvent.click(await screen.findByTestId("open-pr-badge"));
-      const r = panelRect(await screen.findByTestId("open-pr-panel"));
-      expect(r.right).toBeLessThanOrEqual(window.innerWidth);
-      expect(r.left).toBeGreaterThanOrEqual(0);
+      expect(rect.left).toBeGreaterThanOrEqual(0);
+      expect(rect.right).toBeLessThanOrEqual(window.innerWidth);
     } finally {
       restore();
     }
   });
 
-  it("keeps BOTH edges inside the window when it is narrower than the panel wants to be", async () => {
-    // 300px stands in for a heavily zoomed window: the CSS width clamp alone still leaves the panel
-    // hanging 4px off the LEFT edge, so the measured nudge has to finish the job.
-    const restore = stubLayout(300);
+  it("sits fully inside the window at a roomy width", async () => {
+    const { rect, restore } = await openPanelAt(1200);
     try {
-      stubList([PASS, FAILING]);
-      render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
-      fireEvent.click(await screen.findByTestId("open-pr-badge"));
-      const panel = await screen.findByTestId("open-pr-panel");
-      await waitFor(() => expect(panel.style.transform).toContain("translateX"));
-      const r = panelRect(panel);
-      expect(r.right).toBeLessThanOrEqual(window.innerWidth);
-      expect(r.left).toBeGreaterThanOrEqual(0);
+      expect(rect.left).toBeGreaterThanOrEqual(0);
+      expect(rect.right).toBeLessThanOrEqual(window.innerWidth);
     } finally {
       restore();
     }
   });
 
-  it("re-measures on window resize, so a shrink can't strand the panel off-window", async () => {
-    const restore = stubLayout(1200);
+  it("never grows wider than the viewport, even below the enforced floor", async () => {
+    // 300px is below anything the window manager will hand us, so full containment is not the claim
+    // here — the panel is anchored to a badge that is itself near the right edge. What the clamps DO
+    // guarantee at any width is that the panel is no wider than the viewport less its margin, and
+    // that is the property either clamp being dropped breaks: an unclamped min-width floors it at
+    // 340, an unclamped max-width at 460, both past a 284px allowance.
+    const { rect, restore } = await openPanelAt(300);
     try {
-      stubList([PASS]);
-      render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
-      fireEvent.click(await screen.findByTestId("open-pr-badge"));
-      const panel = await screen.findByTestId("open-pr-panel");
-      restore();
-      const restoreNarrow = stubLayout(300);
-      try {
-        fireEvent(window, new Event("resize"));
-        await waitFor(() => expect(panel.style.transform).toContain("translateX"));
-        const r = panelRect(panel);
-        expect(r.right).toBeLessThanOrEqual(window.innerWidth);
-        expect(r.left).toBeGreaterThanOrEqual(0);
-      } finally {
-        restoreNarrow();
-      }
+      expect(rect.width).toBeLessThanOrEqual(300 - 16);
     } finally {
       restore();
     }
@@ -265,7 +300,17 @@ describe("OpenPrMenu (containment — §12a)", () => {
     const panel = await screen.findByTestId("open-pr-panel");
     expect(panel.style.overflowY).toBe("auto");
     // The cap is the smaller of the design height and what the window actually has.
-    expect(panel.getAttribute("style")).toContain("min(420px, calc(100vh - 80px))");
+    expect(panel.style.maxHeight).toBe("min(420px, calc(100vh - 80px))");
+  });
+
+  it("leaves window.innerWidth exactly as it found it", async () => {
+    // The teardown guarantee itself, so the leak that made every later test in this file run at a
+    // stubbed 1200 (then 300) with zero-geometry rects cannot come back unnoticed.
+    const before = window.innerWidth;
+    const { restore } = await openPanelAt(1200);
+    expect(window.innerWidth).toBe(1200);
+    restore();
+    expect(window.innerWidth).toBe(before);
   });
 });
 
