@@ -3567,22 +3567,61 @@ pub fn remove_worktree_at(
         Ok(_) if !wt.exists() => Ok(()),
         Ok(_) => discard_half_deleted_worktree(root, &wt),
         Err(e) => {
-            // Ignore "not a working tree" / "is not a working tree" so removal is
-            // idempotent; surface anything else.
-            let lower = e.to_lowercase();
-            let half_deleted = lower.contains("not a working tree")
-                || lower.contains("is not a working tree")
-                || lower.contains("no such file or directory")
-                // A checkout whose own `.git` link file is broken, phrased as
-                // `validation failed, cannot remove working tree: '<path>/.git' <reason>`.
-                || (lower.contains("validation failed") && broken_git_link_reason(&lower));
-            if half_deleted {
+            if removal_error_is_recoverable(&e.to_lowercase(), wt.exists()) {
                 discard_half_deleted_worktree(root, &wt)
             } else {
                 Err(e)
             }
         }
     }
+}
+
+/// Does a lowercased `git worktree remove --force` failure describe a checkout that our own
+/// cleanup can finish, rather than a reason to give up and report the error?
+///
+/// Everything here shares one property: **re-running the same command cannot converge.** Git has
+/// already stopped recognizing the path as a removable worktree, so each retry reproduces the
+/// identical failure, and the caller — which retries on error — spins. That is not hypothetical:
+/// the un-matched case below produced bursts of the same warning, several within a single
+/// hundred milliseconds, repeating for minutes against one path.
+///
+/// `checkout_remains` is `wt.exists()`, read after the failure. Only the last branch needs it.
+fn removal_error_is_recoverable(lower: &str, checkout_remains: bool) -> bool {
+    // Already gone, or never a worktree — removal is idempotent.
+    lower.contains("not a working tree")
+        || lower.contains("is not a working tree")
+        || lower.contains("no such file or directory")
+        // A checkout whose own `.git` link file is broken, phrased as
+        // `validation failed, cannot remove working tree: '<path>/.git' <reason>`.
+        || (lower.contains("validation failed") && broken_git_link_reason(lower))
+        // `failed to delete '<path>': Directory not empty` — git unlinked the tree bottom-up and
+        // then could not rmdir, because something landed in a directory it had already emptied
+        // (a tool still writing, a package manager finishing an install, the OS dropping a
+        // metadata file). Git aborts having already destroyed most of the checkout, so what is
+        // left IS a half-deleted worktree, and the one thing it will never be again is a valid
+        // one. `remove_dir_all` deletes a non-empty directory, so the recovery finishes exactly
+        // the step git gave up on — where a retry only re-walks the tree git already deleted and
+        // re-hits the same rmdir, forever.
+        //
+        // Anchored on BOTH halves of the phrase, and gated on the checkout still being there.
+        // `git worktree remove` deletes two things and uses this same wording for both: after
+        // the checkout it removes the admin dir under the git common dir, and an ENOTEMPTY
+        // *there* means the opposite of a leak we can finish. The recovery's `remove_dir_all`
+        // would no-op, `prune` would hit the same ENOTEMPTY and only warn, and we would return
+        // Ok while the record still claims the agent's branch.
+        //
+        // `checkout_remains` separates them exactly, and is the only signal that does. Which
+        // path git names in the message cannot be matched reliably from here: matching the
+        // worktree path positively fails open because git prints the path it RESOLVED and ours
+        // is not canonicalized (on macOS a `/var/...` path is stored as `/private/var/...`),
+        // and excluding the admin path fails open on any layout where it isn't `<root>/.git`
+        // — a submodule (`.git/modules/<name>/worktrees/`), a bare repo, `--separate-git-dir`.
+        // Both would also be scanning the whole multi-line stderr blob rather than the failing
+        // line. Existence is a fact about the one directory we care about, needs no parsing,
+        // and holds under every layout.
+        || (checkout_remains
+            && lower.contains("failed to delete")
+            && lower.contains("directory not empty"))
 }
 
 /// Does a lowercased `validation failed` message blame the checkout's own `.git` link file?
@@ -6009,6 +6048,87 @@ mod tests {
             "stale admin record pruned"
         );
         remove_worktree_at(&root_str, "p", "a", &app_data).unwrap(); // still idempotent
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The fourth way teardown gets stuck, and the only one where the checkout was fine until
+    /// git touched it: `git worktree remove --force` unlinks the tree bottom-up, and if anything
+    /// lands in a directory it has already emptied, the final rmdir fails with
+    /// `failed to delete '<path>': Directory not empty`. By then most of the checkout is gone, so
+    /// a retry re-walks a tree that no longer exists and re-hits the same rmdir — which is why
+    /// this signature arrived in bursts, several per hundred milliseconds, against one path.
+    ///
+    /// Reproducing the race deterministically would mean winning it, so this asserts the two
+    /// halves separately: the classifier routes git's exact wording to the recovery, and the
+    /// recovery clears a non-empty leftover dir and prunes the record it leaves claimed.
+    #[test]
+    fn a_failed_rmdir_routes_to_the_recovery_instead_of_erroring() {
+        // Git's phrasing, verbatim except for the path. Lowercased, as the caller passes it.
+        // The checkout is still on disk, which is what makes it the checkout's rmdir that failed.
+        let msg = "error: failed to delete '/tmp/wt/agent': directory not empty";
+        assert!(removal_error_is_recoverable(msg, true));
+        // Same wording, opposite meaning: git reuses it for the admin dir it deletes AFTER the
+        // checkout, and by then the checkout is gone. The recovery would no-op and reporting
+        // success would leave the record still claiming the agent's branch, so this must surface.
+        // Only `checkout_remains` tells the two apart — the message alone cannot.
+        assert!(!removal_error_is_recoverable(msg, false));
+
+        // The pre-existing recoverable shapes must keep routing there regardless of the flag.
+        for remains in [true, false] {
+            assert!(removal_error_is_recoverable(
+                "fatal: '/tmp/wt/agent' is not a working tree",
+                remains
+            ));
+            assert!(removal_error_is_recoverable(
+                "fatal: validation failed, cannot remove working tree: '/tmp/wt/agent/.git' does not exist",
+                remains
+            ));
+            // A genuine reason to stop must still surface, not be swallowed as a leak to clean up.
+            assert!(!removal_error_is_recoverable(
+                "fatal: could not lock config file .git/config: permission denied",
+                remains
+            ));
+            assert!(!removal_error_is_recoverable("fatal: not a git repository", remains));
+        }
+    }
+
+    /// The recovery half of the case above: whatever git left behind is non-empty by definition
+    /// (that is why its rmdir failed), so the cleanup has to delete a populated directory and
+    /// still prune the admin record that keeps the agent's branch claimed.
+    #[test]
+    fn the_recovery_clears_a_non_empty_leftover_dir() {
+        let root = unique_root("rm-notempty");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("rm-notempty-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        let info = create_worktree_at(&root_str, "p", "a", "HEAD", &app_data).unwrap();
+
+        // Stand in for the post-abort remains: the checkout is destroyed (no `.git` link), but
+        // the dir is far from empty — nested, and holding the kind of stray file that wins the
+        // race in the first place.
+        let wt = Path::new(&info.path);
+        std::fs::remove_file(wt.join(".git")).unwrap();
+        std::fs::create_dir_all(wt.join("node_modules/pkg/dist")).unwrap();
+        std::fs::write(wt.join("node_modules/pkg/dist/index.js"), b"//\n").unwrap();
+        std::fs::write(wt.join(".DS_Store"), b"\0").unwrap();
+
+        // Count the admin records directly instead of grepping `worktree list` for our path:
+        // git stores the path it RESOLVED, and on macOS a `/var/...` temp path comes back as
+        // `/private/var/...`, so a substring assertion would hold whether or not prune ran.
+        let records = || {
+            std::fs::read_dir(root.join(".git/worktrees"))
+                .map(|d| d.filter_map(|e| e.ok()).count())
+                .unwrap_or(0)
+        };
+        assert_eq!(records(), 1, "the agent's admin record exists before teardown");
+
+        discard_half_deleted_worktree(&root_str, wt).unwrap();
+        assert!(!wt.exists(), "non-empty leftover dir removed");
+        assert_eq!(records(), 0, "stale admin record pruned");
+        // Nothing left to delete or prune — the repeat teardown the caller issues is a no-op.
+        discard_half_deleted_worktree(&root_str, wt).unwrap();
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
