@@ -9,6 +9,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isAppWindowSearch,
+  isSatelliteSearch,
   parseAgentIdFromSearch,
   parseProjectIdFromSearch,
   parseSuppressSelfFocus,
@@ -16,11 +17,31 @@ import {
 } from "./windowIdentity";
 
 describe("parseViewFromSearch / isAppWindowSearch", () => {
-  it("names the two auxiliary webviews Rust actually opens", () => {
+  it("names the auxiliary webviews Rust actually opens", () => {
     expect(parseViewFromSearch("?view=helper")).toBe("helper");
     expect(parseViewFromSearch("?view=capture")).toBe("capture");
     expect(isAppWindowSearch("?view=helper")).toBe(false);
     expect(isAppWindowSearch("?view=capture")).toBe(false);
+  });
+
+  it("knows the satellite, and a satellite is NOT the app window", () => {
+    // A torn-off project tab (src-tauri/src/project_window.rs). The second half is the load-bearing
+    // one: the updater poller and the decompose watcher gate on isAppWindowSearch and must run in
+    // exactly ONE webview. A satellite claiming to be the app window would run both a second time —
+    // silently, since neither failure is visible until two windows fight over the same work.
+    expect(parseViewFromSearch("?view=project&project=p1")).toBe("project");
+    expect(isAppWindowSearch("?view=project&project=p1")).toBe(false);
+    expect(isSatelliteSearch("?view=project&project=p1")).toBe(true);
+  });
+
+  it("does not mistake the other webviews (or the app window) for a satellite", () => {
+    expect(isSatelliteSearch("?view=helper")).toBe(false);
+    expect(isSatelliteSearch("?view=capture")).toBe(false);
+    expect(isSatelliteSearch("")).toBe(false);
+    // A bare `?project=` with no `?view=` is a deep link INTO the app window, not a satellite —
+    // windowContext's boot selection already honours it. Treating it as a satellite would render
+    // the shell without its concierge column.
+    expect(isSatelliteSearch("?project=p1")).toBe(false);
   });
 
   it("no longer knows `tray` — the menu-bar webview went with the helper island", () => {

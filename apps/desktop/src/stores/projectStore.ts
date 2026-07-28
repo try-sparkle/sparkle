@@ -183,6 +183,11 @@ export interface ProjectState {
    *  against the attention sort. With nothing re-sorting rows behind the user's back there is
    *  nothing to anchor against, so the pin concept is gone entirely. */
   reorderAgent: (projectId: string, agentId: string, beforeAgentId: string | null) => void;
+  /** Move a project before `beforeProjectId`, or to the end when it is null. This IS tab reorder:
+   *  engine/openProjects.ts renders the strip in `projects` order and deliberately does not
+   *  re-derive order from the open set, so the drag has to move the project itself. Same
+   *  drop-onto-a-slot semantics as reorderAgent, including its direction rule. */
+  reorderProject: (projectId: string, beforeProjectId: string | null) => void;
   /** Release a manual name freeze so the agent auto-names again. (Formerly also cleared a row
    *  anchor; row anchoring no longer exists — see reorderAgent.) */
   unpinAgent: (projectId: string, agentId: string) => void;
@@ -1283,6 +1288,32 @@ export const useProjectStore = create<ProjectState>()(
             return { ...p, agents };
           }),
         })),
+
+      reorderProject: (projectId, beforeProjectId) =>
+        set((s) => {
+          const from = s.projects.findIndex((p) => p.id === projectId);
+          // Unknown project, or a tab dropped on itself. Returning an EMPTY partial leaves the
+          // `projects` reference identical, so a no-op drag doesn't hand every consumer a fresh
+          // array and re-render the shell (the same reason reorderAgent returns `p` unchanged).
+          if (from < 0 || projectId === beforeProjectId) return {};
+          const moved = s.projects[from] as Project;
+          const targetAt =
+            beforeProjectId == null ? -1 : s.projects.findIndex((p) => p.id === beforeProjectId);
+          const rest = s.projects.filter((p) => p.id !== projectId);
+          // Resolve the anchor AFTER removing the dragged project, so the index is right whether it
+          // moved left or right — computing it against the original array is the classic off-by-one.
+          const to =
+            beforeProjectId == null ? rest.length : rest.findIndex((p) => p.id === beforeProjectId);
+          // A missing anchor (the target tab was closed mid-drag) appends rather than discarding
+          // the move.
+          let at = to < 0 ? rest.length : to;
+          // DIRECTION MATTERS — see reorderAgent's note. Dropping onto a tab means "take that tab's
+          // slot", so a tab dragged RIGHTWARD lands AFTER the target. Without this, dragging a tab
+          // onto its immediate right-hand neighbour removes it and re-inserts it at the very index
+          // it came from: the user drags, nothing moves, and the strip reads as broken.
+          if (targetAt >= 0 && from < targetAt) at = Math.min(at + 1, rest.length);
+          return { projects: [...rest.slice(0, at), moved, ...rest.slice(at)] };
+        }),
 
       unpinAgent: (projectId, agentId) =>
         set((s) => ({

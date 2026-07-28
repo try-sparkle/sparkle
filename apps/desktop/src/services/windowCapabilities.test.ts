@@ -88,21 +88,30 @@ describe("default capability", () => {
     expect(granted).toContain("core:default");
   });
 
-  it("covers exactly the single-window shell's webviews — and no runtime windows", () => {
+  it("covers the shell's webviews plus the satellite pool — and still has no glob", () => {
     // A window whose label matches no capability gets ZERO permissions in Tauri v2 — including
     // `event.listen`, which fails at RUNTIME with "event.listen not allowed on window <label>" and
     // is invisible to typecheck and to any test that mocks @tauri-apps/api. That is exactly how the
     // helper island shipped broken for one commit: the window was created in Rust, its React tree
     // mounted fine, and every subscription silently rejected.
     //
-    // So when you add a webview, add its label BOTH here and in default.json. The
-    // single-window shell (CM-U7 part 2) has no runtime window creation, so the win-* glob is
-    // GONE on purpose — its reappearance would mean multi-window crept back in.
+    // So when you add a webview, add its label BOTH here and in default.json.
+    //
+    // The `project-N` labels are the SATELLITE POOL: a project tab torn out onto another monitor
+    // (src-tauri/src/project_window.rs, whose POOL constant must list exactly these). They are
+    // enumerated rather than globbed deliberately. CM-U7 part 2 deleted a `win-*` glob along with
+    // the multi-window era, and a glob is what makes the "label with no capability" failure mode
+    // invisible again: any future label silently acquires full permissions, so nobody is ever
+    // forced to think about a new window's privileges. A fixed pool also caps how many satellites
+    // can exist, which is a property we want. Keep the no-glob assertion below — it is the part
+    // that actually matters, and it is why this list is allowed to grow but not to become a
+    // pattern.
     //
     // Membership, not ORDER: reordering the JSON array changes nothing about what is granted, and
-    // pinning order turns a harmless edit into a failing test (roborev 46485-L). The win-* check
-    // is stated separately because it is the part that actually matters.
-    expect(new Set(capabilities.windows)).toEqual(new Set(["main", "helper", "capture"]));
+    // pinning order turns a harmless edit into a failing test (roborev 46485-L).
+    expect(new Set(capabilities.windows)).toEqual(
+      new Set(["main", "helper", "capture", "project-1", "project-2", "project-3", "project-4"]),
+    );
     expect(capabilities.windows.some((w: string) => w.includes("*"))).toBe(false);
   });
 });

@@ -46,6 +46,7 @@ mod naming;
 mod onepassword;
 mod preflight;
 mod proc;
+mod project_window;
 mod pty;
 mod retention;
 mod route_classify;
@@ -582,7 +583,10 @@ pub fn run() {
             frontmost::get_frontmost,
             capture_window::show_capture_window,
             capture_window::hide_capture_window,
-            capture_window::is_capture_open
+            capture_window::is_capture_open,
+            project_window::open_project_window,
+            project_window::set_project_window_bounds,
+            project_window::close_project_window
         ])
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")

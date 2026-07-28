@@ -10,17 +10,30 @@
 //     nothing persists a webview URL — no window-state plugin, and the deep-link plugin only
 //     emits an event — so no stale tray URL can arrive and the value is gone for good.)
 //
-// `?project=`/`?agent=` (a cold-start deep link from a notification hand-off) and `?focus=0` have
-// no writer at present. Their parsers are kept — they are the documented re-entry points if a deep
-// link is wired again — but nothing is claimed about them being produced today. Kept free of any
-// Tauri import so they unit-test without a webview.
+// `?view=project&project=<id>` is the SATELLITE: a project tab torn out onto another monitor,
+// created by src-tauri/src/project_window.rs from a fixed label pool. It renders columns ② + ③ for
+// that one project — no concierge, no tab strip, no control listener — which is what keeps it from
+// being the peer app window that CM-U7 part 2 purged. `?project=` finally has a writer; `?agent=`
+// still does not, and `?focus=0` has none either (its parser is kept as the documented re-entry
+// point if a deep link is wired again). Kept free of any Tauri import so they unit-test without a
+// webview.
 
 /** Which auxiliary webview this is, or null if the search names no KNOWN auxiliary view. Note the
  *  asymmetry with isAppWindowSearch: an unrecognized `?view=` is null here (we refuse to invent a
  *  webview kind) but is still NOT the app window. */
-export function parseViewFromSearch(search: string): "helper" | "capture" | null {
+export function parseViewFromSearch(search: string): "helper" | "capture" | "project" | null {
   const view = new URLSearchParams(search).get("view");
-  return view === "helper" || view === "capture" ? view : null;
+  return view === "helper" || view === "capture" || view === "project" ? view : null;
+}
+
+/** Is this a SATELLITE — a project tab torn out onto another monitor (src-tauri/project_window.rs)?
+ *
+ *  A satellite renders columns ② + ③ for the one project named by `?project=`: no concierge, no tab
+ *  strip, no control listener. It is deliberately NOT the app window, so it inherits the correct
+ *  side of every `isAppWindowSearch` gate for free — the updater poller and the decompose watcher
+ *  must run in exactly one webview, and that webview is `main`. */
+export function isSatelliteSearch(search: string): boolean {
+  return parseViewFromSearch(search) === "project";
 }
 
 /** Is this the ONE app window (as opposed to the helper / capture webviews)? The single-window
