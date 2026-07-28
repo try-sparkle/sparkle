@@ -50,6 +50,10 @@ export interface WorkflowState {
   // The agent's work is SHIPPED — its tip is contained in a published release tag — drives the top
   // "Shipped to Production" stage LIVE (previously unreachable). Optional for the same back-compat
   // reason. Tip-relative, so a squash-landed branch reads false here (see Rust `tip_in_release`).
+  //
+  // Rust suppresses this (and the tip-relative PR probe behind `prState`) for a branch that has
+  // authored NOTHING — otherwise both describe the commit it was cut from, i.e. main's history, and
+  // a seconds-old agent reads as shipped/merged. See `branch_carries_no_own_work` in worktree.rs.
   shipped?: boolean;
   // The repo has an `origin` remote. Gated on `probePrState` in Rust (like the PR probe), so a
   // fast/local poll reports false. Optional for the same back-compat reason as landed/pushed/shipped

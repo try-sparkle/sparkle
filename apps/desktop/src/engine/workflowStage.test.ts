@@ -206,6 +206,64 @@ describe("deriveLiveStage — live signals establish committedSeen after relaunc
   });
 });
 
+// A brand-new build agent was landing in the "Remote: Merged to Main" / "Remote: Shipped to
+// Production" sections of the Build column. Its branch tip is main's HEAD, so Rust's TIP-KEYED
+// probes answered about main: the commit→PR lookup returned the last merged PR (prState "merged")
+// and `git tag --contains` found the last release (shipped). prState is also a `committedSeen`
+// source, so the bogus signal unlocked the reachability bumps as well.
+//
+// Rust now suppresses both for a branch that has authored nothing (worktree.rs
+// `branch_carries_no_own_work`). These pin the two shapes that meet at that boundary — the SECOND
+// one is the contract test: if a future signal source lets prState/shipped through for a no-op
+// branch again, `merged_from_an_inherited_tip` is what fails.
+describe("deriveLiveStage — a freshly cut branch must not inherit main's remote facts", () => {
+  // What Rust reports for an agent opened seconds ago: cut from origin/main, so its tip is trivially
+  // inside local AND origin main and merging it back adds nothing — but it authored nothing, was
+  // never pushed, and (post-fix) carries no PR or release attribution.
+  const freshlyCut = ws({
+    inLocalMain: true,
+    inOriginMain: true,
+    landed: true,
+    aheadOfBase: 0,
+    pushed: false,
+    shipped: false,
+    prState: null,
+  });
+
+  it("sits at the build start line, not on main", () => {
+    expect(deriveLiveStage({ kind: "build", bs: bs(0), ws: freshlyCut })).toBe("building_unsaved");
+  });
+
+  it("its first commit advances it one rung — still nowhere near merged", () => {
+    // The commit moves the tip OFF main, so every inherited reachability fact drops with it.
+    expect(
+      deriveLiveStage({
+        kind: "build",
+        bs: bs(1),
+        ws: ws({ inLocalMain: false, inOriginMain: false, landed: false, aheadOfBase: 1 }),
+      }),
+    ).toBe("building_saved");
+  });
+
+  it("merged_from_an_inherited_tip: an unsuppressed commit-probe PR would jump it to merged", () => {
+    // The pre-fix reading, kept as an executable description of the bug: with prState leaking
+    // through, committedSeen flips true and the row goes straight to the top of the ladder. Nothing
+    // in this module can tell that PR apart from a real one — which is why the gate lives in Rust.
+    expect(
+      deriveLiveStage({ kind: "build", bs: bs(0), ws: { ...freshlyCut, prState: "merged" } }),
+    ).toBe("merged");
+    // …and the same leak via the release tag.
+    expect(
+      deriveLiveStage({
+        kind: "build",
+        bs: bs(0),
+        ws: { ...freshlyCut, prState: "merged" },
+        shipped: true,
+      }),
+    ).toBe("shipped");
+  });
+});
+
 describe("rollup + dominant", () => {
   it("rollup headline = least-advanced; counts cover all 10 ids", () => {
     const r = rollupStages(["merged", "building_saved", "pushed"]);

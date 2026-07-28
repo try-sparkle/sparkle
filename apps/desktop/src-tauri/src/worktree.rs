@@ -1929,6 +1929,129 @@ fn branch_landed(root: &str, target: &str, branch: &str, tip: &str) -> bool {
         || merge_adds_nothing(root, &origin_ref, branch)
 }
 
+/// Commits reachable from `branch` but not from `base` — i.e. what `branch` authored on top of it.
+/// A missing ref or any git error reads as 0; callers that must not mistake "couldn't count" for
+/// "authored nothing" pair this with an ancestry check (see `branch_carries_no_own_work`).
+fn commits_beyond(root: &str, base: &str, branch: &str) -> u32 {
+    if base.trim().is_empty() || branch.trim().is_empty() {
+        return 0;
+    }
+    git(root, &["rev-list", "--count", &format!("{base}..{branch}")])
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The ref an agent branch was CUT FROM: a worker is cut from its orchestrator's branch, everyone
+/// else from the project's integration ref. `None` means "cut point unknown" — a worker whose
+/// orchestrator branch no longer resolves (a spun-down parent whose branch was deleted). That case
+/// must NOT quietly fall back to `base`: measured against main, the worker's INHERITED orchestrator
+/// commits read as its own work, which switches the no-op guard off for precisely the branch it
+/// exists to protect. Callers decline to attribute instead (see `branch_carries_no_own_work`).
+fn cut_from_ref(root: &str, parent_branch: &str, base: &str) -> Option<String> {
+    if parent_branch.trim().is_empty() {
+        return Some(base.to_string());
+    }
+    if rev_parse_tip(root, parent_branch).is_empty() {
+        return None;
+    }
+    Some(parent_branch.to_string())
+}
+
+/// Reflog verbs that mean the branch gained work AUTHORED ON IT. git does not translate reflog
+/// messages, so matching them is stable across locales. Every OTHER way a ref moves — `branch:
+/// Created from`, `checkout:`, `rebase (finish):`, `reset:` — advances it without the agent having
+/// written anything, which is why "did the ref ever move" is the wrong question to ask.
+/// `revert` earns its place empirically, not by analogy: `git revert --no-edit HEAD` writes
+/// `revert: Revert "…"`, NOT `commit: …` (verified on git 2.54), so the `commit` prefix does not
+/// cover it. It needs no no-op exclusion the way `merge` does — a revert always creates a commit.
+const WORK_REFLOG_VERBS: [&str; 4] = ["commit", "cherry-pick", "am", "revert"];
+
+/// Does one reflog message describe the branch gaining a commit of its own?
+///
+/// `merge` needs the extra clause. An ORCHESTRATOR integrates its workers with
+/// `git merge --no-ff sparkle/agent-<worker>` into its own branch and may never run `git commit`
+/// itself — pure coordination is a normal shape here — so its whole reflog can read
+/// `merge …: Merge made by the 'ort' strategy.` That merge commit IS a commit authored on this
+/// branch. A FAST-FORWARD merge is not: the ref just adopts another branch's history, creating
+/// nothing.
+///
+/// Match "Fast-forward" as a SUBSTRING, not a suffix. git only ends the line there when no `-m` was
+/// given; with a message it writes `merge <ref>: Fast-forward (no commit created; -m option
+/// ignored)` (verified on git 2.54 for both `merge -m` and `merge --ff-only -m`). A suffix test
+/// therefore reads `git merge -m "sync" main` on an EMPTY agent branch as authored work, whose tip
+/// is main's HEAD — which is precisely the misattribution this whole guard exists to prevent.
+fn reflog_entry_is_work(msg: &str) -> bool {
+    if msg.starts_with("merge ") {
+        return !msg.contains("Fast-forward");
+    }
+    WORK_REFLOG_VERBS.iter().any(|v| msg.starts_with(v))
+}
+
+/// Has this branch ever recorded a commit of its own? Read from the branch's REFLOG — the only
+/// local record that survives the branch's work being absorbed into another ref.
+///
+/// This is the durable answer to "did this agent ever do anything", and it is durable in the two
+/// ways the inferential clauses below are not: a LOCAL `merge --no-ff` (`land_agent_branch_at`,
+/// Sparkle's own landing path, and how EVERY worker integrates) leaves the agent's `commit:`
+/// entries untouched, and a `fetch --prune` that deletes the remote-tracking ref cannot touch them
+/// either.
+///
+/// `None` = UNKNOWN, never "no": a bare repo, `core.logAllRefUpdates=false`, or a reflog gc'd to
+/// nothing all yield an empty log, and the caller falls back to inference rather than reading
+/// silence as proof. (A reflog expired down to only later non-work entries would read `Some(false)`;
+/// that is bounded by `gc.reflogExpire` — 90 days for reachable entries — and fails in the
+/// one-directional way described below.)
+fn branch_ever_committed(root: &str, branch: &str) -> Option<bool> {
+    if branch.trim().is_empty() {
+        return None;
+    }
+    let log = git(root, &["reflog", "show", "--format=%gs", &format!("refs/heads/{branch}")]).ok()?;
+    let mut lines = log.lines().map(str::trim).filter(|l| !l.is_empty()).peekable();
+    lines.peek()?; // no reflog at all ⇒ unknown, not "never committed"
+    Some(lines.any(reflog_entry_is_work))
+}
+
+/// Pure: does this branch carry NONE of its own work — is its tip simply the commit it was cut from?
+///
+/// `ever_committed` — read from the branch's reflog — DECIDES IT WHENEVER IT IS KNOWN, in both
+/// directions. The reflog is a complete record of every movement of this ref, so if none of those
+/// movements authored anything, nothing did; and if one of them did, that survives the work being
+/// absorbed elsewhere, which is what rescues a branch landed by a local `merge --no-ff` (whose
+/// arithmetic is identical to a brand-new branch's).
+///
+/// `cut_relative` — `(commits beyond the cut ref, is the tip still inside it)` — is ONLY the
+/// fallback for a repo that keeps no reflog. It is not a second opinion, because it is wrong in the
+/// dangerous direction: rewrite the cut ref (an upstream force-push or rebase of `main`, then a
+/// fetch) and a work-free branch reads `(authored > 0, tip outside)` — the has-work shape —
+/// attributing the stale integration HEAD's PR and release tag to an agent that did nothing. Only
+/// the reflog can tell those apart, so a conclusive reflog is never overruled by arithmetic.
+/// `None` there means the cut point ITSELF is unknown (a worker whose orchestrator branch was
+/// deleted); an unknown cut point can only yield a guess about someone else's history, so we
+/// decline to attribute.
+///
+/// `pushed` is deliberately NOT evidence of work, in either direction: the close-agent Save/Ship
+/// path will push a branch that has committed nothing, which would switch the guard off for the
+/// exact no-op branch it exists to catch; and `refs/remotes/origin/<branch>` is deletable by an
+/// ordinary `fetch --prune`, which would retroactively demote a genuinely merged branch to no-op.
+///
+/// Erring toward "no own work" is deliberate: it can only WITHHOLD tip-derived rungs, never
+/// fabricate them, and the monotonic stage watermark keeps every rung the branch already earned.
+/// Showing a seconds-old agent as "Merged to Main" is the failure that actually misleads someone
+/// about where their work is.
+fn branch_carries_no_own_work(
+    ever_committed: Option<bool>,
+    cut_relative: Option<(u32, bool)>,
+) -> bool {
+    match ever_committed {
+        Some(ever) => !ever,
+        None => match cut_relative {
+            Some((authored, tip_in_cut_ref)) => authored == 0 && tip_in_cut_ref,
+            None => true,
+        },
+    }
+}
+
 /// True iff the agent branch has been pushed to `origin` — its remote-tracking ref exists locally.
 /// git creates/updates `refs/remotes/origin/<branch>` on a successful push, so a pure `rev-parse` of
 /// that ref answers "was this branch pushed" offline, with no fetch. Any missing ref / git error
@@ -2764,68 +2887,10 @@ pub fn agent_workflow_state_at(
     if has_origin {
         maybe_refresh_origin(root, &default_branch);
     }
-    let in_local_main = ref_contains(root, &default_branch, &tip);
-    let origin_ref = format!("origin/{default_branch}");
-    let in_origin_main = ref_contains(root, &origin_ref, &tip);
-    let in_parent = ref_contains(root, parent_branch, &tip);
-
-    // Squash/rebase merges create a NEW commit on the integration branch, so the agent tip is not an
-    // ancestor and the reachability checks above miss it. `branch_landed` folds local/origin ancestry
-    // with a merge-tree no-op probe (shared with the close-agent safe delete so both agree).
-    let landed = branch_landed(root, &default_branch, &branch, &tip);
-
-    // Pushed / shipped: two LOCAL, offline-safe signals that drive the "Pushed" and "Shipped" stages
-    // live (formerly only reachable via a PR probe / never, respectively). `branch_pushed` is a
-    // remote-tracking-ref lookup; `tip_in_release` is a release-tag containment check. Both frontend-
-    // gated by committedSeen, so a no-op branch can't skip stages.
-    let pushed = branch_pushed(root, &branch);
-    let shipped = tip_in_release(root, &tip);
-
-    // Commits the agent AUTHORED that aren't yet landed (0 once merged into the integration ref).
-    // Measured against the ref the branch was actually CUT FROM — `origin/<default>` when a
-    // remote-tracking ref exists (see `effective_base`, which cuts new branches from origin),
-    // else local `<default>`. Comparing against LOCAL `<default>` here is wrong when it lags the
-    // remote: a brand-new branch cut from `origin/<default>` would count the inherited, un-pulled
-    // commits as the agent's own work — tripping the frontend's `committedSeen` gate which, together
-    // with `in_origin_main` (trivially true for such a tip), falsely reads a no-op agent as "Merged".
-    let base_for_ahead = if git(root, &["rev-parse", "--verify", "--quiet", &origin_ref]).is_ok() {
-        origin_ref.clone()
-    } else {
-        default_branch.clone()
-    };
-    let ahead_of_base = git(root, &["rev-list", "--count", &format!("{base_for_ahead}..{branch}")])
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-
-    // Only spend a network round-trip on the PR probe when asked AND a remote exists. Try the
-    // TIP-RELATIVE lookup first (finds the PR by commit, so a renamed head still resolves and a
-    // tip stacked past a merge stops reading as "merged"); fall back to the branch-name probe when
-    // the tip isn't associated with any PR (e.g. un-pushed, or a head gh can't map by commit).
-    let (pr_state, pr_number, pr_url) = if has_origin {
-        let by_commit = probe_pr_by_commit(root, &tip);
-        if commit_pr_is_usable(&by_commit) {
-            by_commit
-        } else {
-            probe_pr(root, &branch)
-        }
-    } else {
-        (None, None, None)
-    };
-
-    Ok(WorkflowState {
-        in_local_main,
-        in_origin_main,
-        in_parent,
-        ahead_of_base,
-        landed,
-        pushed,
-        shipped,
-        has_remote: has_origin,
-        pr_state,
-        pr_number,
-        pr_url,
-    })
+    // ONE implementation, shared with the batched project poll — see `workflow_state_shared`. These
+    // two used to carry byte-identical copies of the whole derivation, which is how a fix applied to
+    // one silently left the other (the path the sidebar actually polls) wrong.
+    Ok(workflow_state_shared(root, agent_id, parent_branch, &default_branch, has_origin, &tip))
 }
 
 /// Live workflow stage signals for an agent: local-ref reachability + a best-effort GitHub PR
@@ -3036,21 +3101,56 @@ fn workflow_state_shared(
     let in_origin_main = ref_contains(root, &origin_ref, tip);
     let in_parent = ref_contains(root, parent_branch, tip);
     let landed = branch_landed(root, default_branch, &branch, tip);
-    // Live Pushed/Shipped signals (sparkle-v7d0) — both pure local, offline-safe lookups (see
-    // agent_workflow_state_at). Kept in the batched path too so the 30s project poll lights these.
+    // Live Pushed signal (sparkle-v7d0) — a pure local, offline-safe remote-tracking-ref lookup.
     let pushed = branch_pushed(root, &branch);
-    let shipped = tip_in_release(root, tip);
+    // Commits the agent AUTHORED that aren't yet landed (0 once merged into the integration ref).
+    // Measured against the ref the branch was actually CUT FROM — `origin/<default>` when a
+    // remote-tracking ref exists (see `effective_base`, which cuts new branches from origin),
+    // else local `<default>`. Comparing against LOCAL `<default>` here is wrong when it lags the
+    // remote: a brand-new branch cut from `origin/<default>` would count the inherited, un-pulled
+    // commits as the agent's own work — tripping the frontend's `committedSeen` gate which, together
+    // with `in_origin_main` (trivially true for such a tip), falsely reads a no-op agent as "Merged".
     let base_for_ahead = if git(root, &["rev-parse", "--verify", "--quiet", &origin_ref]).is_ok() {
         origin_ref.clone()
     } else {
         default_branch.to_string()
     };
-    let ahead_of_base = git(root, &["rev-list", "--count", &format!("{base_for_ahead}..{branch}")])
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
+    let ahead_of_base = commits_beyond(root, &base_for_ahead, &branch);
+
+    // ── The no-op-branch guard for TIP-INHERITED facts (sparkle: "Build 5 → Remote: Merged") ─────
+    // `tip_in_release` and `probe_pr_by_commit` both answer a question about a COMMIT, not about
+    // this agent. A branch that has authored nothing carries the commit it was cut from — the
+    // integration branch's HEAD — so those two probes describe MAIN'S history and get attributed to
+    // an agent that has done no work at all. On this repo that reads: a seconds-old build agent's
+    // tip is main's HEAD, which is the merge commit of the last merged PR, so the commit probe
+    // returns that PR with `merged_at` set → `pr_state = "merged"` → the row files itself under
+    // "Remote: Merged to Main"; and if the cut point is old enough to be inside a release tag,
+    // `shipped` fires too → "Remote: Shipped to Production". Worse, `pr_state != null` is one of the
+    // frontend's `committedSeen` sources, so the bogus signal ALSO unlocks the reachability bumps
+    // (`in_origin_main` is trivially true for such a tip) that the no-op guard exists to hold shut.
+    //
+    // So: when the branch carries none of its own work, suppress both. Ancestry (`in_local_main` /
+    // `landed`) is left alone — those stay honest raw facts and the frontend already gates them.
+    //
+    // Answered from the branch's REFLOG plus arithmetic against the ref it was cut from. The reflog
+    // is what keeps a branch's `commit:` entries visible after a local `merge --no-ff` absorbs the
+    // work into main (Sparkle's own land path, and how every worker integrates) — at which point the
+    // arithmetic alone reads exactly like a brand-new branch. See `branch_carries_no_own_work`.
+    let cut_relative = cut_from_ref(root, parent_branch, &base_for_ahead).map(|cut_ref| {
+        (commits_beyond(root, &cut_ref, &branch), ref_contains(root, &cut_ref, tip))
+    });
+    let no_own_work = branch_carries_no_own_work(branch_ever_committed(root, &branch), cut_relative);
+    let shipped = !no_own_work && tip_in_release(root, tip);
+
+    // Only spend a network round-trip on the PR probe when asked AND a remote exists. Try the
+    // TIP-RELATIVE lookup first (finds the PR by commit, so a renamed head still resolves and a
+    // tip stacked past a merge stops reading as "merged"); fall back to the branch-name probe when
+    // the tip isn't associated with any PR (e.g. un-pushed, or a head gh can't map by commit).
+    // The branch-name probe is agent-scoped by construction (`--head sparkle/agent-<id>`), so it is
+    // safe to keep running for a no-op branch — it simply finds nothing.
     let (pr_state, pr_number, pr_url) = if has_origin {
-        let by_commit = probe_pr_by_commit(root, tip);
+        let by_commit =
+            if no_own_work { (None, None, None) } else { probe_pr_by_commit(root, tip) };
         if commit_pr_is_usable(&by_commit) {
             by_commit
         } else {
@@ -7027,6 +7127,389 @@ mod tests {
         assert!(!s2.in_origin_main, "no origin remote in this fixture → not Merged");
         assert!(s2.pr_state.is_none(), "no PR probe requested / no remote");
         assert!(s2.landed, "a normal --no-ff merge is reachable, so landed is trivially true too");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // ── The no-op-branch guard on TIP-INHERITED facts ────────────────────────────────────────────
+    // A seconds-old build agent was filing itself under "Remote: Merged to Main" / "Remote: Shipped
+    // to Production". Its branch tip IS main's HEAD, so every tip-keyed probe answered about MAIN:
+    // `git tag --contains <tip>` found the last release, and the commit→PR lookup found the merged
+    // PR whose merge commit main is sitting on. Neither fact belongs to an agent that has authored
+    // nothing. These pin the guard that suppresses them.
+
+    #[test]
+    fn branch_carries_no_own_work_lets_a_known_reflog_decide() {
+        // `Some(true)` rescues the case arithmetic cannot see: after a local `merge --no-ff` the
+        // work is inside main, so `(authored 0, tip inside)` is the brand-new-branch shape exactly.
+        assert!(!branch_carries_no_own_work(Some(true), Some((0, true))));
+        // `Some(false)` is conclusive TOO, and must not be overruled by the arithmetic: a rewritten
+        // cut ref (upstream force-push/rebase, then fetch) makes a work-free branch read
+        // `(authored > 0, tip outside)` — the has-work shape — which would fabricate a rung.
+        assert!(branch_carries_no_own_work(Some(false), Some((3, false))));
+        assert!(branch_carries_no_own_work(Some(false), Some((0, true))));
+        // Unknown reflog (bare repo / logAllRefUpdates off / gc'd away) ⇒ the arithmetic decides.
+        assert!(branch_carries_no_own_work(None, Some((0, true))));
+        // Its very FIRST commit takes it out of the no-op class — this is not an age heuristic.
+        assert!(!branch_carries_no_own_work(None, Some((1, true))));
+        // A squash/rebase-landed branch's tip is NOT an ancestor of the cut ref — and this clause is
+        // also what stops a `commits_beyond` git error (which reads 0) from faking the no-op case.
+        assert!(!branch_carries_no_own_work(None, Some((0, false))));
+        // Cut point unknown (worker whose orchestrator branch was deleted) ⇒ decline to attribute
+        // rather than measure the parent's inherited commits as this branch's own work.
+        assert!(branch_carries_no_own_work(None, None));
+    }
+
+    /// `pushed` is not a parameter at all, and that is load-bearing: the close-agent Save/Ship path
+    /// pushes without an `ahead > 0` guard, so a work-free push must not buy an exemption — and
+    /// `refs/remotes/origin/<branch>` is deletable by `fetch --prune`, so its absence must not
+    /// demote a merged branch. Both readings are fixed by the signals above, not by the push.
+    #[test]
+    fn a_work_free_push_does_not_exempt_a_branch_from_the_no_op_guard() {
+        let root = unique_root("pushed-noop");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("pushed-noop-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        git(&root_str, &["tag", "v5.0.0"]).unwrap();
+        create_worktree_at(&root_str, "p", "pushy", "main", &app_data).unwrap();
+        // Fake the push's only observable trace: the remote-tracking ref.
+        let tip = rev_parse_tip(&root_str, "sparkle/agent-pushy");
+        git(&root_str, &["update-ref", "refs/remotes/origin/sparkle/agent-pushy", &tip]).unwrap();
+
+        let st = agent_workflow_state_at(&root_str, "pushy", "", false).unwrap();
+        assert!(st.pushed, "fixture: the branch reads as pushed");
+        assert!(!st.shipped, "a pushed but work-free branch is still a no-op branch");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The reflog verbs must classify each way a ref can move. `rebase (finish)` is the one that
+    /// makes "did the ref ever advance" the wrong question: Refresh rebases an idle agent's empty
+    /// branch onto a newer base, moving the ref without the agent having written anything. And a
+    /// MERGE COMMIT is work authored here (an orchestrator that only integrates workers may never
+    /// run `git commit` at all) while a FAST-FORWARD merely adopts another branch's history.
+    #[test]
+    fn reflog_entry_is_work_separates_authored_commits_from_bare_ref_moves() {
+        for authored in [
+            "commit: agent work",
+            "commit (amend): agent work",
+            "commit (initial): first",
+            "cherry-pick: picked",
+            "am: patch",
+            // git revert writes its OWN verb, not `commit:` — assuming otherwise silently withheld
+            // every rung from a branch whose only authored commit was a revert.
+            "revert: Revert \"agent work\"",
+            "merge sparkle/agent-wk: Merge made by the 'ort' strategy.",
+        ] {
+            assert!(reflog_entry_is_work(authored), "should count as work: {authored}");
+        }
+        for moved in [
+            "branch: Created from main",
+            "checkout: moving from main to sparkle/agent-x",
+            "rebase (finish): refs/heads/sparkle/agent-x onto abc123",
+            "reset: moving to main",
+            "merge main: Fast-forward",
+            // git only ENDS the line at "Fast-forward" when no -m was given; `git merge -m …` and
+            // `git merge --ff-only -m …` both append this (git 2.54). A suffix match read these as
+            // authored work on a branch whose tip is main's HEAD — the original bug, restored.
+            "merge main: Fast-forward (no commit created; -m option ignored)",
+            "merge origin/main: Fast-forward (no commit created; -m option ignored)",
+        ] {
+            assert!(!reflog_entry_is_work(moved), "should NOT count as work: {moved}");
+        }
+    }
+
+    /// End-to-end for the two shapes that make the reflog authoritative in BOTH directions: a
+    /// work-free branch that fast-forwards main into itself with `-m` (reflog says work, wrongly,
+    /// unless the FF suffix is matched as a substring), and a work-free branch whose cut ref was
+    /// REWRITTEN out from under it (arithmetic says work, wrongly, unless a conclusive reflog wins).
+    /// Both would otherwise attribute main's release tag to an agent that has done nothing.
+    #[test]
+    fn workflow_state_holds_the_line_for_a_work_free_branch_after_a_merge_or_a_rewritten_base() {
+        let root = unique_root("ff-and-rewrite");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("ff-and-rewrite-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let ff = create_worktree_at(&root_str, "p", "ffagent", "main", &app_data).unwrap();
+
+        // main moves on, and someone syncs the (still empty) agent branch with an -m fast-forward.
+        std::fs::write(Path::new(&root_str).join("m.txt"), "main work").unwrap();
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "main advances"]).unwrap();
+        git(&root_str, &["tag", "v7.0.0"]).unwrap();
+        git(&ff.path, &["merge", "-m", "sync main", "main"]).unwrap();
+        assert_eq!(
+            branch_ever_committed(&root_str, "sparkle/agent-ffagent"),
+            Some(false),
+            "fixture: the -m fast-forward is the only entry beyond creation, and authored nothing"
+        );
+        let st = agent_workflow_state_at(&root_str, "ffagent", "", false).unwrap();
+        assert!(
+            !st.shipped,
+            "a fast-forward authored nothing, whatever message form git recorded it under"
+        );
+
+        // A second agent cut from the ADVANCED main, whose cut ref is then REWRITTEN out from under
+        // it (the upstream-force-push shape): its untouched tip now carries a commit main dropped.
+        create_worktree_at(&root_str, "p", "rwagent", "main", &app_data).unwrap();
+        git(&root_str, &["reset", "--hard", "HEAD~1"]).unwrap();
+        git(&root_str, &["commit", "--allow-empty", "-m", "rewritten history"]).unwrap();
+        let st2 = agent_workflow_state_at(&root_str, "rwagent", "", false).unwrap();
+        assert!(
+            st2.ahead_of_base > 0,
+            "fixture: the rewrite strands its inherited tip, so the arithmetic reads has-work"
+        );
+        assert!(
+            !st2.shipped,
+            "the reflog conclusively says it authored nothing — arithmetic must not overrule it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// A branch whose ONLY authored commit is a revert. Since the reflog is conclusive, the verb
+    /// list is the sole gate on "did this branch author anything", and `git revert` files its work
+    /// under its own verb rather than `commit:` — so omitting it silently withheld every tip-derived
+    /// rung from a legitimate revert, even once landed and released.
+    #[test]
+    fn workflow_state_reports_shipped_for_a_branch_whose_only_commit_is_a_revert() {
+        let root = unique_root("revert-only");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("revert-only-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        std::fs::write(Path::new(&root_str).join("bad.txt"), "regression").unwrap();
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "the change to be reverted"]).unwrap();
+
+        let agent = create_worktree_at(&root_str, "p", "reverter", "main", &app_data).unwrap();
+        git(&agent.path, &["revert", "--no-edit", "HEAD"]).unwrap();
+        assert_eq!(
+            branch_ever_committed(&root_str, "sparkle/agent-reverter"),
+            Some(true),
+            "fixture: its reflog reads `revert: …`, never `commit: …`"
+        );
+        // Land it locally and release it — the shape three rounds of this fix exist to protect.
+        git(&root_str, &["merge", "--no-ff", "sparkle/agent-reverter", "-m", "land revert"]).unwrap();
+        git(&root_str, &["tag", "v8.0.0"]).unwrap();
+
+        let st = agent_workflow_state_at(&root_str, "reverter", "", false).unwrap();
+        assert_eq!(st.ahead_of_base, 0, "fixture: absorbed into main, so the arithmetic reads 0");
+        assert!(st.shipped, "a revert is authored work like any other commit");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// An ORCHESTRATOR that only integrates its workers (`merge --no-ff` into its own branch) and
+    /// never runs `git commit` itself still carries real, released work. Its whole reflog is one
+    /// `merge …: Merge made by …` entry, so a verb list without that case would suppress its
+    /// `shipped` — a regression against the arithmetic this guard replaced.
+    #[test]
+    fn workflow_state_reports_shipped_for_an_orchestrator_that_only_merged_its_workers() {
+        let root = unique_root("merge-only");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("merge-only-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let boss = create_worktree_at(&root_str, "p", "boss2", "main", &app_data).unwrap();
+        let hand = create_worktree_at(&root_str, "p", "hand2", "sparkle/agent-boss2", &app_data)
+            .unwrap();
+        std::fs::write(Path::new(&hand.path).join("w.txt"), "worker work").unwrap();
+        git(&hand.path, &["add", "-A"]).unwrap();
+        git(&hand.path, &["commit", "-m", "worker work"]).unwrap();
+        // The orchestrator ONLY merges — it authors no commit of its own.
+        git(&boss.path, &["merge", "--no-ff", "sparkle/agent-hand2", "-m", "land hand2"]).unwrap();
+        assert_eq!(
+            branch_ever_committed(&root_str, "sparkle/agent-boss2"),
+            Some(true),
+            "fixture: its reflog holds a merge-commit entry and no `commit:` entry"
+        );
+        // Land it and release it, all locally and unpushed.
+        git(&root_str, &["merge", "--no-ff", "sparkle/agent-boss2", "-m", "land boss2"]).unwrap();
+        git(&root_str, &["tag", "v6.0.0"]).unwrap();
+
+        let st = agent_workflow_state_at(&root_str, "boss2", "", false).unwrap();
+        assert_eq!(st.ahead_of_base, 0, "fixture: absorbed into main, so the arithmetic reads 0");
+        assert!(st.shipped, "integration commits are work authored on this branch");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn branch_ever_committed_reads_work_verbs_and_ignores_ref_moves() {
+        let r = init_repo("reflog-verbs");
+        git(&r, &["branch", "sparkle/agent-idle", "main"]).unwrap();
+        assert_eq!(
+            branch_ever_committed(&r, "sparkle/agent-idle"),
+            Some(false),
+            "only a `branch: Created from` entry ⇒ never committed"
+        );
+        // Move the ref WITHOUT authoring: the Refresh/rebase shape.
+        git(&r, &["commit", "--allow-empty", "-q", "-m", "main advances"]).unwrap();
+        git(&r, &["branch", "-f", "sparkle/agent-idle", "main"]).unwrap();
+        assert_eq!(
+            branch_ever_committed(&r, "sparkle/agent-idle"),
+            Some(false),
+            "a ref that moved but recorded no work verb is still a no-op branch"
+        );
+        // A branch that actually commits.
+        git(&r, &["checkout", "-q", "-b", "sparkle/agent-busy", "main"]).unwrap();
+        git(&r, &["commit", "--allow-empty", "-q", "-m", "agent work"]).unwrap();
+        assert_eq!(branch_ever_committed(&r, "sparkle/agent-busy"), Some(true));
+        // A branch with no reflog at all is UNKNOWN, never "never committed".
+        git(&r, &["-c", "core.logAllRefUpdates=false", "branch", "sparkle/agent-nolog", "main"])
+            .unwrap();
+        assert_eq!(branch_ever_committed(&r, "sparkle/agent-nolog"), None);
+        assert_eq!(branch_ever_committed(&r, "sparkle/agent-missing"), None);
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&r));
+    }
+
+    /// Sparkle's OWN landing path is a local `git merge --no-ff` with no push of the agent branch
+    /// (`land_agent_branch_at`, and how every worker integrates). That leaves the branch looking
+    /// exactly like a brand-new one under ancestry — authored 0, unpushed, tip inside main — so an
+    /// inference-only guard suppressed `shipped` for every landed branch. The reflog is what tells
+    /// them apart.
+    #[test]
+    fn workflow_state_still_reports_shipped_for_a_branch_landed_by_a_local_merge() {
+        let root = unique_root("landed-tag");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("landed-tag-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "lander", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info.path).join("f.txt"), "work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+        // Land it locally and cut a release from the merge — the branch is never pushed.
+        git(&root_str, &["merge", "--no-ff", "sparkle/agent-lander", "-m", "land"]).unwrap();
+        git(&root_str, &["tag", "v4.0.0"]).unwrap();
+
+        let st = agent_workflow_state_at(&root_str, "lander", "", false).unwrap();
+        assert_eq!(st.ahead_of_base, 0, "fixture: its work is absorbed into main, so authored reads 0");
+        assert!(!st.pushed, "fixture: never pushed — the inference clauses see a no-op branch");
+        assert!(st.shipped, "the reflog proves it committed, so its release tag is its own");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// A branch cut from main that has authored nothing must NOT inherit main's release tag. This is
+    /// the "Prepare changes for main branch → Remote: Shipped to Production" half of the bug, and it
+    /// shares its gate with the commit→PR probe (the "Build 5 → Remote: Merged to Main" half), which
+    /// needs a live `gh` to observe directly.
+    #[test]
+    fn workflow_state_does_not_inherit_a_release_tag_onto_a_branch_that_authored_nothing() {
+        let root = unique_root("noop-tag");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("noop-tag-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        // A published release containing main's current tip — exactly the shape a real repo is in.
+        git(&root_str, &["tag", "v1.0.0"]).unwrap();
+        create_worktree_at(&root_str, "p", "fresh", "main", &app_data).unwrap();
+
+        // Precondition: the tip really is inside the release tag, so the suppression (not an absent
+        // tag) is what this asserts.
+        let tip = rev_parse_tip(&root_str, "sparkle/agent-fresh");
+        assert!(tip_in_release(&root_str, &tip), "fixture: the inherited tip IS in v1.0.0");
+
+        let st = agent_workflow_state_at(&root_str, "fresh", "", false).unwrap();
+        assert!(!st.shipped, "a branch that authored nothing must not read as Shipped");
+        assert_eq!(st.ahead_of_base, 0, "fixture: nothing authored yet");
+        assert!(st.in_local_main, "ancestry is still reported honestly — only attribution is gated");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The other side of the gate: once the agent has authored a commit that a release tag covers,
+    /// `shipped` is its own fact and must be reported.
+    #[test]
+    fn workflow_state_reports_shipped_once_the_agent_authored_the_tagged_work() {
+        let root = unique_root("own-tag");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("own-tag-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "real", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info.path).join("f.txt"), "work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+        // The release was cut from this agent's own commit.
+        let tip = rev_parse_tip(&root_str, "sparkle/agent-real");
+        git(&root_str, &["tag", "v2.0.0", &tip]).unwrap();
+
+        let st = agent_workflow_state_at(&root_str, "real", "", false).unwrap();
+        assert!(st.shipped, "the tagged commit is the agent's OWN work → Shipped");
+        assert_eq!(st.ahead_of_base, 1);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// A freshly spawned WORKER is cut from its orchestrator's branch, not from main, so its
+    /// inherited tip carries the PARENT's commits. Measuring "did I author anything" against main
+    /// would count those as the worker's own and re-open the same misattribution one level down —
+    /// `cut_from_ref` is what aims the question at the parent instead.
+    #[test]
+    fn workflow_state_measures_a_fresh_workers_own_work_against_its_parent_branch() {
+        let root = unique_root("noop-worker");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("noop-worker-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        // The orchestrator: a branch with real commits of its own, released.
+        let parent = create_worktree_at(&root_str, "p", "boss", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&parent.path).join("boss.txt"), "boss work").unwrap();
+        git(&parent.path, &["add", "-A"]).unwrap();
+        git(&parent.path, &["commit", "-m", "orchestrator work"]).unwrap();
+        let parent_branch = "sparkle/agent-boss";
+        git(&root_str, &["tag", "v3.0.0", &rev_parse_tip(&root_str, parent_branch)]).unwrap();
+        // The worker, cut from the orchestrator's branch, having done nothing yet.
+        create_worktree_at(&root_str, "p", "hand", parent_branch, &app_data).unwrap();
+
+        let st = agent_workflow_state_at(&root_str, "hand", parent_branch, false).unwrap();
+        assert!(!st.shipped, "a worker that authored nothing must not inherit the parent's release");
+        assert!(st.in_parent, "its tip is (trivially) inside the parent branch");
+        assert!(
+            st.ahead_of_base > 0,
+            "aheadOfBase is still measured vs main — the parent's commits inflate it, which is \
+             exactly why the no-op question must never be asked with main as the cut ref"
+        );
+
+        // …and the guard must survive the orchestrator being spun down and its branch deleted.
+        //
+        // To make `cut_from_ref → None` the thing under test, this half REMOVES the worker's reflog
+        // (the shape a bare repo or `core.logAllRefUpdates=false` produces) so the decision falls to
+        // the cut-relative arithmetic. Were the cut ref to fall back to main, that arithmetic reads
+        // `(authored > 0, tip NOT inside main)` — the has-work shape — and the parent's release
+        // would be attributed to a worker that did nothing. Only `None` makes this assertion hold.
+        git(&root_str, &["worktree", "remove", "--force", &parent.path]).unwrap();
+        git(&root_str, &["branch", "-D", parent_branch]).unwrap();
+        let hand_reflog = Path::new(&root_str).join(".git/logs/refs/heads/sparkle/agent-hand");
+        std::fs::remove_file(&hand_reflog).unwrap();
+        assert_eq!(
+            branch_ever_committed(&root_str, "sparkle/agent-hand"),
+            None,
+            "fixture: with no reflog the arithmetic decides, so the cut ref is what's under test"
+        );
+        assert!(
+            !ref_contains(&root_str, "main", &rev_parse_tip(&root_str, "sparkle/agent-hand")),
+            "fixture: the worker's tip is NOT inside main, so a base-ref fallback would classify \
+             it as having work and this assertion would fail"
+        );
+        let orphaned = agent_workflow_state_at(&root_str, "hand", parent_branch, false).unwrap();
+        assert!(
+            !orphaned.shipped,
+            "with the parent branch gone the cut point is unknown — decline to attribute, don't guess"
+        );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
     }

@@ -150,6 +150,16 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
   // trust EXPLICIT action signals: a branch that was PUSHED to its remote or ever had a PR must have
   // carried real work — and, unlike inLocalMain/landed, neither is ever true for a no-op branch, so
   // the no-op guard stays intact (sparkle bug-2, trust-live-signal).
+  //
+  // ⚠️ `prState` CARRIES ITS WEIGHT HERE ONLY BECAUSE RUST GUARANTEES IT IS AGENT-SCOPED. That
+  // invariant was silently broken once: the tip-relative probe (`probe_pr_by_commit`) asks GitHub
+  // which PR contains a COMMIT, and a branch that has authored nothing is sitting on main's HEAD —
+  // the merge commit of the last merged PR. So a seconds-old agent reported prState "merged", which
+  // both established committedSeen here AND bumped straight to `merged`; the row filed itself under
+  // "Remote: Merged to Main". The fix is upstream in `worktree.rs`
+  // (`branch_carries_no_own_work` suppresses the commit probe and the release-tag check for a branch
+  // with no work of its own), so DON'T re-derive that here — but if you ever add another PR/shipped
+  // source, it owes the same guarantee before it may feed this gate.
   const committedSeen =
     idx >= stageIndex("building_saved") ||
     prevIdx >= stageIndex("building_saved") ||
