@@ -1379,6 +1379,93 @@ impl ParkOutcome {
     }
 }
 
+/// Tracked files that the agent's OWN session tooling rewrites, which are therefore never work in
+/// progress. Exact repo-relative paths, never prefixes: a directory rule would quietly grow to
+/// cover files that are genuine work.
+///
+/// `.beads/interactions.jsonl` is the whole list today. Beads is the work-tracker Sparkle installs
+/// hooks for, and those hooks append to this log on every agent session — so the file is modified
+/// within seconds of an agent starting, long before the pass has decided to do anything.
+///
+/// "Regenerated" is NOT "worthless": the lines are real records (an issue closing, and the reason
+/// written for closing it) and the file has a commit history, so they are meant to land. Eligibility
+/// here means only that they can be moved OUT OF THE WAY without asking — which is why the park
+/// stashes them rather than restoring over them. See the call site.
+const TOOLING_CHURN_PATHS: &[&str] = &[".beads/interactions.jsonl"];
+
+/// Stash message identifying a park's own churn entry, so the next park can retire it rather than
+/// stack another. Matched by substring against `git stash list`, so it must stay distinctive.
+const PARK_CHURN_STASH_MARKER: &str = "sparkle: session-tooling churn from park";
+
+/// Split one porcelain-v1 line into its `XY` status code and its path.
+///
+/// Porcelain v1 is `XY<space><path>`, which would be a fixed-offset slice were it not for [`git`]
+/// TRIMMING its output: the FIRST line of the status arrives with its leading `X` space already
+/// eaten, so the real caller sees `M .beads/…` where the format says ` M .beads/…`. Reading a fixed
+/// offset there yields the code `M ` and a path missing its first character — which matched nothing
+/// in [`TOOLING_CHURN_PATHS`], so the fix silently did nothing on a one-file status, the only shape
+/// it was written for. Accept both, and re-pad the stripped form so callers always compare a real
+/// two-column code.
+///
+/// Returns `None` for anything that is not recognisably `XY<space><path>`, so a garbled or
+/// truncated line can never read as clean.
+fn split_status_line(line: &str) -> Option<(String, &str)> {
+    // Status codes are ASCII, so a line that does not start with two single-byte characters is not
+    // one — the boundary checks keep the slicing panic-free rather than merely correct.
+    if line.len() > 3 && line.is_char_boundary(2) && line.is_char_boundary(3) && &line[2..3] == " " {
+        return Some((line[..2].to_string(), &line[3..]));
+    }
+    if line.len() > 2 && line.is_char_boundary(1) && line.is_char_boundary(2) && &line[1..2] == " " {
+        return Some((format!(" {}", &line[..1]), &line[2..]));
+    }
+    None
+}
+
+/// Decide whether a `git status --porcelain` tree is parkable, and if so which paths must be
+/// restored first. `None` means "real work in progress — decline"; `Some(paths)` means the only
+/// dirt is session-tooling churn (possibly none at all, for an already-clean tree).
+///
+/// WHY THIS EXISTS. The dirty check was a bare `!porcelain.is_empty()`, which is correct for an
+/// interactive agent but made parking IMPOSSIBLE for the recurring headless one. The tooling above
+/// dirties the worktree during pass N; nothing commits it (a pass is instructed not to commit work
+/// it did not author); pass N+1 reads a dirty tree and declines; repeat every hour, forever. The
+/// decline is not a one-off — it is a fixed point. Observed on the app-owned worktree as an
+/// unbroken hourly run of `starting from a stale base — dirty` while the branch drifted to 38
+/// commits behind `origin/main`, past the threshold at which the desktop build refuses to build
+/// from it at all. The staleness this function exists to prevent was being caused by its own guard.
+///
+/// STILL CONSERVATIVE, deliberately, because the cost of a false positive here is destroyed work:
+///   * only the exact paths in [`TOOLING_CHURN_PATHS`] are ever eligible,
+///   * only status codes made of ` ` and `M` (` M`, `M `, `MM`) — an ordinary edit to a tracked
+///     file. Untracked (`??`) is excluded so this can never DELETE a file; added/deleted/renamed
+///     and every unmerged code (`U`, `AA`, `DD`) is excluded because each one means something
+///     happened that a plain restore would not faithfully undo,
+///   * a rename entry (`old -> new`) or a quoted path is refused outright rather than parsed,
+///   * ONE ineligible entry declines the WHOLE tree. Tooling churn alongside real work is real
+///     work, so a pass that left an edit behind is protected exactly as it was before.
+fn tooling_churn_to_restore(porcelain: &str) -> Option<Vec<String>> {
+    let mut restore = Vec::new();
+    for line in porcelain.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (code, path) = split_status_line(line)?;
+        if !matches!(code.as_str(), " M" | "M " | "MM") {
+            return None;
+        }
+        // A path git had to quote (spaces, non-ASCII, control characters) is C-escaped, so the
+        // bytes here are not the bytes to hand back to git. None of the eligible paths need it.
+        if path.starts_with('"') || path.contains(" -> ") {
+            return None;
+        }
+        if !TOOLING_CHURN_PATHS.contains(&path) {
+            return None;
+        }
+        restore.push(path.to_string());
+    }
+    Some(restore)
+}
+
 /// Core (AppHandle-free, testable): park an UNATTENDED, app-owned agent worktree back on a fresh
 /// `origin/<base>` so the next headless run starts from an up-to-date base instead of inheriting
 /// whatever branch the previous run left checked out.
@@ -1439,9 +1526,13 @@ pub fn park_worktree_on_base_at(
 
     // Never disturb work in progress. `--porcelain` covers untracked, staged, modified AND the
     // unmerged entries a halted rebase/merge leaves behind, so a mid-operation tree lands here too.
-    if !git(&wt_str, &["status", "--porcelain"])?.is_empty() {
-        return Ok(ParkOutcome::declined("dirty"));
-    }
+    //
+    // The one exception is dirt the AGENT'S OWN TOOLING writes: see `tooling_churn_to_restore` for
+    // why a bare emptiness check made this decline PERMANENTLY on the recurring headless worktree.
+    let churn = match tooling_churn_to_restore(&git(&wt_str, &["status", "--porcelain"])?) {
+        Some(paths) => paths,
+        None => return Ok(ParkOutcome::declined("dirty")),
+    };
 
     // Containment check: refuse if ANY commit reachable from HEAD or from the agent's own branch is
     // missing from every origin ref. `--not --remotes=origin` is the whole safety story — a run that
@@ -1486,6 +1577,71 @@ pub fn park_worktree_on_base_at(
     {
         let gl = repo_git_lock(root);
         let _lock = gl.lock().unwrap_or_else(|e| e.into_inner());
+        // Clear the tooling churn FIRST, inside the lock and immediately before the checkout, so the
+        // tree the checkout sees is the clean one every other branch above already required.
+        //
+        // STASHED, NOT DISCARDED, and the difference is the whole argument for doing this at all.
+        // `checkout HEAD --` would be simpler and was the first cut — but these lines are not noise:
+        // the log carries work-tracker state (an issue closing, with the reason someone wrote for
+        // closing it), and it has a real commit history, so its lines are meant to land. Being
+        // *routinely regenerated* is what makes the churn safe to move out of the way; it is not
+        // what would make it safe to delete. A stash keeps every line recoverable by hand.
+        //
+        // It also makes the failure path honest. `checkout -B` can still fail, and returning
+        // `checkout-failed` after having destroyed content would be a decline that first deleted
+        // something — strictly worse than the pre-change decline, which never touched the tree.
+        // With a stash, that path loses nothing either.
+        //
+        // Best-effort: if the stash fails the tree stays dirty and `checkout -B` reports
+        // `checkout-failed`, which is the conservative outcome.
+        if !churn.is_empty() {
+            // The marker is PER AGENT because `refs/stash` is repository-wide, not per-worktree.
+            // This command is parameterized by `agent_id` and several app-owned worktrees share one
+            // repo, so a shared marker would have agent A's park retiring agent B's only recovery
+            // copy — the reverse of what the retiring is for.
+            let marker = format!("{PARK_CHURN_STASH_MARKER} [{agent_id}]");
+            let mut stash: Vec<&str> = vec!["stash", "push", "--quiet", "-m", &marker, "--"];
+            stash.extend(churn.iter().map(String::as_str));
+            // PUSH FIRST, RETIRE AFTER — never the other way round. Retiring first was deletion
+            // deferred by one pass: `stash push` is fallible (a locked index, a pathspec git
+            // refuses), and on that path the previous entry was already gone and no new one
+            // existed, so a decline that was supposed to lose nothing had destroyed the only
+            // recoverable copy. Sequenced this way, a failed push leaves the older entry exactly
+            // where it was and the tree dirty, which `checkout -B` then declines on.
+            //
+            // Retiring at all is bounded growth, not supersession: park runs hourly and the churn
+            // is dirty on essentially every pass, so an unconditional push stacks an entry per hour
+            // forever, each pinning its blobs against gc and each showing up in the main checkout's
+            // `git stash list`. Do NOT read the surviving entry as containing the retired ones —
+            // each stash is the diff against the tree at ITS park, and the file is reverted in
+            // between, so pass N+1's churn is only the lines written since pass N. One recoverable
+            // copy of the CURRENT churn is the guarantee; a full history of it is not.
+            match git(&wt_str, &stash) {
+                Ok(_) => {
+                    tracing::info!(paths = churn.len(), "park stashed session-tooling churn");
+                    // Highest index first — dropping renumbers everything below it. `stash@{0}` is
+                    // the entry just pushed, so skipping it is what keeps this a retire and not a
+                    // self-erase.
+                    if let Ok(list) = git(&wt_str, &["stash", "list", "--format=%gd%x09%gs"]) {
+                        let stale: Vec<String> = list
+                            .lines()
+                            .filter(|l| l.contains(&marker))
+                            .filter_map(|l| l.split('\t').next())
+                            .filter(|r| *r != "stash@{0}")
+                            .map(str::to_string)
+                            .collect();
+                        for entry in stale.iter().rev() {
+                            let _ = git(&wt_str, &["stash", "drop", "--quiet", entry]);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    paths = churn.len(),
+                    error = %e,
+                    "park could not stash session-tooling churn"
+                ),
+            }
+        }
         if git(&wt_str, &["checkout", "-B", &branch, &base_sha]).is_err() {
             return Ok(ParkOutcome::declined("checkout-failed"));
         }
@@ -4855,6 +5011,162 @@ mod tests {
         let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
         assert_eq!(out, ParkOutcome::declined("dirty"));
         assert!(Path::new(&wt).join("scratch.txt").exists(), "uncommitted work must survive");
+    }
+
+    // THE FIXED POINT: the agent's own beads hook appends to a TRACKED log on every session, so the
+    // worktree is dirty before the pass does anything. With a bare emptiness check that dirt made
+    // every future park decline — the observed hourly `stale base — dirty` that let the app-owned
+    // worktree drift 38 commits behind. Churn alone must park, and must not survive the park.
+    #[test]
+    fn park_restores_session_tooling_churn_instead_of_declining() {
+        let (r, wt, app_data) = init_repo_with_origin("park-churn");
+        let beads = Path::new(&wt).join(".beads");
+        std::fs::create_dir_all(&beads).unwrap();
+        std::fs::write(beads.join("interactions.jsonl"), "{\"id\":1}\n").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "beads log"]).unwrap();
+        git(&wt, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+        advance_origin_main_elsewhere(&r, "park-churn", "up1");
+        // What the hook does the moment an agent starts: one more line, uncommitted.
+        std::fs::write(beads.join("interactions.jsonl"), "{\"id\":1}\n{\"id\":2}\n").unwrap();
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert!(out.parked, "tooling churn alone must not block parking: {out:?}");
+        assert!(
+            git(&wt, &["status", "--porcelain"]).unwrap().is_empty(),
+            "the churn must be cleared, not carried onto the fresh base"
+        );
+        // MOVED, NOT DESTROYED. These lines are work-tracker records, not noise — being routinely
+        // regenerated is what makes them safe to set aside, not safe to delete.
+        assert!(
+            git(&wt, &["stash", "list"]).unwrap().contains("session-tooling churn"),
+            "the churn must be recoverable from the stash"
+        );
+        assert!(
+            git(&wt, &["stash", "show", "-p", "stash@{0}"]).unwrap().contains("{\"id\":2}"),
+            "every churn line must survive inside the stash"
+        );
+    }
+
+    // Hourly x forever: an unconditional stash push would stack an entry per pass into the
+    // REPOSITORY-WIDE `refs/stash`, where they also surface in the main checkout's `git stash list`.
+    // Parking twice must leave exactly one — and it must still be the real content, poppable.
+    #[test]
+    fn repeated_parks_keep_exactly_one_recoverable_churn_stash() {
+        let (r, wt, app_data) = init_repo_with_origin("park-churn-twice");
+        let beads = Path::new(&wt).join(".beads");
+        std::fs::create_dir_all(&beads).unwrap();
+        std::fs::write(beads.join("interactions.jsonl"), "{\"id\":1}\n").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "beads log"]).unwrap();
+        git(&wt, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+
+        for (n, line) in [(1, "{\"id\":2}"), (2, "{\"id\":3}")] {
+            advance_origin_main_elsewhere(&r, "park-churn-twice", &format!("up{n}"));
+            std::fs::write(beads.join("interactions.jsonl"), format!("{{\"id\":1}}\n{line}\n"))
+                .unwrap();
+            let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+            assert!(out.parked, "park {n} must succeed: {out:?}");
+        }
+
+        let entries = git(&wt, &["stash", "list"]).unwrap();
+        assert_eq!(
+            entries.lines().filter(|l| l.contains("session-tooling churn")).count(),
+            1,
+            "a park retires its previous churn stash instead of stacking another: {entries}"
+        );
+        // Recoverable in the sense that matters: pop reproduces the file, not just a diff mentioning it.
+        git(&wt, &["stash", "pop"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(beads.join("interactions.jsonl")).unwrap(),
+            "{\"id\":1}\n{\"id\":3}\n",
+            "the surviving stash holds THIS pass's churn, restored intact (each stash is the diff \
+             at its own park — a later one does not contain an earlier one)"
+        );
+    }
+
+    // The valve that keeps the exception from becoming a hole: one real edit alongside the churn is
+    // real work, and gets exactly the protection it had before.
+    #[test]
+    fn park_still_declines_when_real_work_sits_beside_the_churn() {
+        let (r, wt, app_data) = init_repo_with_origin("park-churn-mixed");
+        let beads = Path::new(&wt).join(".beads");
+        std::fs::create_dir_all(&beads).unwrap();
+        std::fs::write(beads.join("interactions.jsonl"), "{\"id\":1}\n").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "beads log"]).unwrap();
+        git(&wt, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+        advance_origin_main_elsewhere(&r, "park-churn-mixed", "up1");
+        std::fs::write(beads.join("interactions.jsonl"), "{\"id\":1}\n{\"id\":2}\n").unwrap();
+        std::fs::write(format!("{wt}/scratch.txt"), "uncommitted").unwrap();
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert_eq!(out, ParkOutcome::declined("dirty"));
+        assert!(Path::new(&wt).join("scratch.txt").exists(), "uncommitted work must survive");
+        assert_eq!(
+            std::fs::read_to_string(beads.join("interactions.jsonl")).unwrap(),
+            "{\"id\":1}\n{\"id\":2}\n",
+            "a decline restores nothing at all"
+        );
+    }
+
+    // Unit-level pins for the parser, where the destructive mistakes would live.
+    #[test]
+    fn only_modifications_to_known_tooling_paths_are_restorable() {
+        assert_eq!(tooling_churn_to_restore(""), Some(vec![]));
+        for code in [" M", "M ", "MM"] {
+            assert_eq!(
+                tooling_churn_to_restore(&format!("{code} .beads/interactions.jsonl")),
+                Some(vec![".beads/interactions.jsonl".into()]),
+                "{code} is an ordinary edit to the churn file"
+            );
+        }
+        // Untracked is excluded so restoring can never delete a file someone's tool just wrote.
+        assert_eq!(tooling_churn_to_restore("?? .beads/interactions.jsonl"), None);
+        // Deletes, adds, renames and unmerged states are not faithfully undone by a plain restore.
+        for line in [
+            " D .beads/interactions.jsonl",
+            "A  .beads/interactions.jsonl",
+            "UU .beads/interactions.jsonl",
+            "R  .beads/old.jsonl -> .beads/interactions.jsonl",
+        ] {
+            assert_eq!(tooling_churn_to_restore(line), None, "{line} must not be restorable");
+        }
+        // A path outside the list — including a near-miss under the same directory — is work.
+        assert_eq!(tooling_churn_to_restore(" M .beads/config.yaml"), None);
+        assert_eq!(tooling_churn_to_restore(" M src/main.rs"), None);
+        // One ineligible entry declines the whole tree, whichever side it is on.
+        assert_eq!(
+            tooling_churn_to_restore(" M .beads/interactions.jsonl\n M src/main.rs"),
+            None
+        );
+        assert_eq!(
+            tooling_churn_to_restore(" M src/main.rs\n M .beads/interactions.jsonl"),
+            None
+        );
+        // A quoted (C-escaped) path is refused rather than parsed back into bytes for git.
+        assert_eq!(tooling_churn_to_restore(" M \".beads/interactions.jsonl\""), None);
+        // Truncated/garbage lines are not silently treated as clean.
+        assert_eq!(tooling_churn_to_restore(" M"), None);
+        // THE SHAPE THE REAL CALLER PASSES: `git` trims, so a one-file status arrives without its
+        // leading column and a multi-line one only loses it on the FIRST line. Reading a fixed
+        // offset here made the whole fix a no-op on exactly the case it exists for.
+        assert_eq!(
+            tooling_churn_to_restore("M .beads/interactions.jsonl"),
+            Some(vec![".beads/interactions.jsonl".into()]),
+            "a trimmed ` M` line is still an ordinary edit"
+        );
+        assert_eq!(
+            tooling_churn_to_restore("M  .beads/interactions.jsonl"),
+            Some(vec![".beads/interactions.jsonl".into()]),
+            "a trimmed `M ` line is unchanged by the trim and must still parse"
+        );
+        assert_eq!(tooling_churn_to_restore("M src/main.rs"), None, "trimmed real work declines");
+        assert_eq!(
+            tooling_churn_to_restore("M .beads/interactions.jsonl\n M .beads/interactions.jsonl"),
+            Some(vec![".beads/interactions.jsonl".into(), ".beads/interactions.jsonl".into()]),
+            "only the first line loses its column; later ones keep it"
+        );
     }
 
     // Already on the fresh base → a reported no-op, so the caller doesn't log a false "stale base".
