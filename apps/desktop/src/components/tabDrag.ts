@@ -9,6 +9,13 @@
 // secondary display has a non-zero (often negative) origin, so nothing here may assume a screen
 // starts at (0,0). Callers converting from Tauri's monitor API must divide by `scaleFactor` first
 // (HelperApp.tsx's `toRect` is the one converter — reuse it rather than reimplementing).
+//
+// THE SLOP GATE LATCHES — see `TabDragInput.dragging`. The resolver is pure, so it cannot remember
+// that a drag already started; the caller carries that one bit. Without it the gate is re-evaluated
+// against the press origin every frame, and a drag that wanders back over its own press point falls
+// out of `reorder`/`tearoff` into `idle` — the drag ghost vanishes and the release reads as a plain
+// click. This is the same frame-to-frame instability `outside`'s inclusive boundary exists to
+// prevent, one gate over. `HelperApp.tsx:384` is the repo idiom: set the flag once, never clear it.
 
 export interface Rect {
   x: number;
@@ -35,6 +42,11 @@ export interface TabDragInput {
   tabs: readonly TabRect[];
   /** The tab under the press. */
   draggedId: string;
+  /** Has this gesture already cleared the slop and become a drag? Required, not optional, because
+   *  a caller that forgets it inherits the flicker described in the module header — and there is no
+   *  safe default to fall back on. Latch it to true on the first non-idle result and leave it set
+   *  for the rest of the gesture; reset only on pointer-up/cancel. */
+  dragging: boolean;
 }
 
 export interface TabDragOpts {
@@ -85,8 +97,9 @@ export function resolveTabDrag(input: TabDragInput, o: TabDragOpts): TabDragResu
   const dx = Math.abs(input.pointer.x - input.origin.x);
   const dy = Math.abs(input.pointer.y - input.origin.y);
   // Either axis alone is enough: a tab pulled straight DOWN must tear out without first being
-  // nudged sideways.
-  if (dx <= o.slop && dy <= o.slop) return { kind: "idle" };
+  // nudged sideways. Once `dragging` latches, the gate is spent for the rest of the gesture — a
+  // pointer that returns to the press point is still a drag, not a fresh click.
+  if (!input.dragging && dx <= o.slop && dy <= o.slop) return { kind: "idle" };
 
   if (outside(input.pointer, input.strip, o.tearMargin)) return { kind: "tearoff" };
 

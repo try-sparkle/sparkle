@@ -26,14 +26,24 @@ export function parseViewFromSearch(search: string): "helper" | "capture" | "pro
   return view === "helper" || view === "capture" || view === "project" ? view : null;
 }
 
-/** Is this a SATELLITE — a project tab torn out onto another monitor (src-tauri/project_window.rs)?
+/** The project a SATELLITE window renders, or null if this search isn't a well-formed satellite
+ *  (src-tauri/project_window.rs).
  *
  *  A satellite renders columns ② + ③ for the one project named by `?project=`: no concierge, no tab
  *  strip, no control listener. It is deliberately NOT the app window, so it inherits the correct
  *  side of every `isAppWindowSearch` gate for free — the updater poller and the decompose watcher
- *  must run in exactly one webview, and that webview is `main`. */
-export function isSatelliteSearch(search: string): boolean {
-  return parseViewFromSearch(search) === "project";
+ *  must run in exactly one webview, and that webview is `main`.
+ *
+ *  Returns the ID rather than a boolean ON PURPOSE. The predicate this replaced answered only
+ *  "?view=project", so `?view=project` and `?view=project&project=` were both `true` while
+ *  `parseProjectIdFromSearch` called them `null` — two helpers disagreeing about the same URL, and
+ *  the natural caller shape `if (isSatellite(s)) render(parseProjectId(s))` got a satellite with no
+ *  project and no compile error. A satellite without a project is not a meaningful window, so the
+ *  pair is asserted here and the id comes back with the answer: the invalid state is now
+ *  unrepresentable rather than merely tested for. Rust rejects empty ids too, but this module is
+ *  pure precisely so it doesn't have to rely on a cross-language guarantee. */
+export function parseSatelliteProjectId(search: string): string | null {
+  return parseViewFromSearch(search) === "project" ? parseProjectIdFromSearch(search) : null;
 }
 
 /** Is this the ONE app window (as opposed to the helper / capture webviews)? The single-window

@@ -31,47 +31,92 @@ pub const POOL: [&str; 4] = ["project-1", "project-2", "project-3", "project-4"]
 const DEFAULT_W: f64 = 1000.0;
 const DEFAULT_H: f64 = 720.0;
 
-/// **Both commands in this module are `#[tauri::command(async)]`, and that is load-bearing.**
+/// One `bool` per pool slot: is it RESERVED by an in-flight claim? See `ALLOC`.
+pub type Slots = Mutex<[bool; POOL.len()]>;
+
+/// The process-wide reservation set — the allocator's exclusion mechanism.
 ///
-/// A plain `#[tauri::command]` compiles to `ExecutionContext::Blocking` (tauri-macros
-/// `wrapper.rs:50`), whose generated body is a DIRECT inline call — nothing spawns anywhere on the
-/// path from the IPC handler to it. So a sync command body runs on the thread delivering the IPC:
-/// the macOS main thread, which is also the event loop.
+/// THREADING, and read this before changing anything here. An earlier version of this module
+/// asserted "Tauri v2 runs command handlers off the main thread". That is FALSE for a plain
+/// `#[tauri::command]`: `tauri-macros`'s wrapper defaults to `ExecutionContext::Blocking` and
+/// generates the `"sync"` kind, whose body runs INLINE on the thread delivering the IPC — on macOS,
+/// the main/event-loop thread.
 ///
-/// That matters because `WebviewWindow::destroy()` is one of the few calls that can ONLY be
-/// serviced by the event loop: `tauri-runtime-wry:2283` sends it with `send_event` under an
-/// explicit "destroy cannot use the `send_user_message` function" note, and `handle_user_message`
-/// PANICS with "cannot handle `WindowMessage::Destroy` on the main thread" if it ever arrives
-/// inline. The window leaves the manager only when the loop dequeues that message.
+/// `#[tauri::command(async)]` on a sync fn is NOT the fix, though it looks like one: its
+/// `"sync_threadpool"` label (`wrapper.rs:264`) is only a tracing field, and `body_async` calls the
+/// sync body inside `async move {}` handed to `tokio::spawn` — so the wait leaves the event loop
+/// only to park a worker shared with every other async command. So every command here that waits is
+/// an `async fn` whose blocking half goes through `tauri::async_runtime::spawn_blocking`, exactly as
+/// `folder_picker.rs` and `dictation.rs` do. `the_waiting_commands_run_off_the_event_loop_thread_
+/// and_off_the_async_workers` pins BOTH halves and fails if either is lost.
 ///
-/// A sync command that waits for a destroy therefore blocks the only thread that could complete
-/// it: the wait can never succeed, and it freezes the UI for its whole timeout. `(async)` puts the
-/// body on the async runtime instead (`respond_async_serialized` → `async_runtime::spawn`,
-/// `ipc/mod.rs:375`; a sync fn marked `(async)` is the "sync_threadpool" kind, i.e. blocking in it
-/// is expected). `capture_window.rs:166` reaches the same place by hand with `std::thread::spawn`.
+/// That matters because `WebviewWindow::destroy()` ALWAYS posts to the event loop
+/// (`tauri-runtime-wry` uses `proxy.send_event`, and handling `WindowMessage::Destroy` on the main
+/// thread is an outright `panic!`). The window leaves the manager only when that loop drains the
+/// message. So anything that waits for a destroy, on the loop's own thread, blocks the very thing
+/// it is waiting for. `folder_picker.rs` states the general rule — "blocking the main thread while
+/// waiting on the main thread is a self-deadlock" — and `capture_window.rs` puts its retry loop on
+/// a spawned thread for exactly this reason.
 ///
-/// Reverting either command to plain `#[tauri::command]` silently re-breaks both waits below.
+/// WHY A RESERVATION SET RATHER THAN A LOCK HELD ACROSS THE BUILD. The scan is only meaningful if
+/// nothing else can take the slot between it and our build, but `build()` from a non-main thread
+/// dispatches window creation to the event loop and BLOCKS on it. Holding a blocking mutex across
+/// that means one stalled event loop serializes every tear-off in the process, and a main-thread
+/// claimer would deadlock against an off-main holder outright. So the lock covers only
+/// scan-and-reserve — which touches nothing but this array and cheap manager reads — and is
+/// released before the build. The reservation is what keeps the slot exclusive meanwhile.
 ///
-/// ---
-///
-/// `ALLOC` serializes allocate-and-build across the WHOLE process.
-///
-/// Because the commands are async, two tear-offs that overlap by a millisecond genuinely run
-/// concurrently: both scan the pool, both see slot 0 free, and the second `build()` fails with
-/// "a window with label project-1 already exists" — a dead tear-off while three slots sit idle.
-/// (As SYNC commands they were serialized on the main thread and could not race — so this lock is
-/// what makes going async safe, not redundant with it.) A scan is only meaningful if nothing can
-/// build between it and OUR build, so the lock is held across BOTH, never just the scan.
+/// The set is NOT a second source of truth for what exists: it covers only the window between
+/// claiming a slot and that slot becoming observable in the window manager. Occupancy itself stays
+/// derived (see `_OCCUPANCY_IS_DERIVED`), because a user red-buttoning a satellite would drift bookkeeping
+/// we kept.
 ///
 /// Process-wide (a `static`) rather than Tauri managed state on purpose: the invariant it protects
 /// is "one owner per label in this process's window manager", which is a property of the process,
 /// not of any `App`. A `State<T>` would also be reachable only from a command, leaving
 /// `init_*`-style callers outside the lock.
+static ALLOC: Slots = Mutex::new([false; POOL.len()]);
+
+/// Holds one slot reserved for the life of a build attempt, and releases it on ANY exit — including
+/// a panic mid-build, which must not leak a slot out of the pool until relaunch.
+struct Reservation<'a> {
+    slots: &'a Slots,
+    idx: usize,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        let mut reserved = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        reserved[self.idx] = false;
+    }
+}
+
+/// Scan-and-reserve, atomically. The returned guard owns the slot until it is dropped.
 ///
-/// Nothing SLEEPS while holding it. `build()` from a non-main thread dispatches to the main thread
-/// and blocks there, which is unavoidable if the claim is to be atomic; a settle nap is not, and
-/// napping under the lock would park every other tear-off behind one exhausted caller.
-static ALLOC: Mutex<()> = Mutex::new(());
+/// `exists` probes happen under the lock deliberately: they are cheap manager map reads that never
+/// dispatch to the event loop, unlike `build`. Recover from poisoning rather than unwrapping — a
+/// panic in one tear-off must not make every future tear-off in the session fail, and this guard
+/// protects a claim, not data, so there is no half-written state for it to be hiding.
+/// `tried` marks slots this pass has already attempted, and is what makes the retry loop
+/// STRUCTURALLY finite: at most `POOL.len()` build attempts per pass, whatever any build returns.
+/// The predecessor got that for free by walking an index forward; reserving and releasing does not,
+/// because a failed build leaves the slot both unreserved and (if the failure was label-independent)
+/// still absent from the registry — so a caller that merely re-scanned would pick the same slot
+/// forever. Terminating must not depend on correctly classifying an error.
+fn reserve_free_slot<'a, R: SlotRegistry>(
+    slots: &'a Slots,
+    reg: &R,
+    tried: &[bool; POOL.len()],
+) -> Option<Reservation<'a>> {
+    let mut reserved = slots.lock().unwrap_or_else(|e| e.into_inner());
+    for (i, label) in POOL.iter().enumerate() {
+        if !tried[i] && !reserved[i] && !reg.exists(label) {
+            reserved[i] = true;
+            return Some(Reservation { slots, idx: i });
+        }
+    }
+    None
+}
 
 /// How long `close_project_window` will wait for a destroyed window to actually leave the manager,
 /// and how often it looks. Short: `destroy` is a message to the event loop, which normally drains
@@ -92,22 +137,21 @@ pub fn is_pool_label(label: &str) -> bool {
     POOL.contains(&label)
 }
 
-/// The first free slot, or None when every satellite is already open.
+/// OCCUPANCY IS DERIVED, NEVER TRACKED — the rule `reserve_free_slot` implements by asking
+/// `reg.exists` on every scan instead of consulting a table.
 ///
-/// Occupancy is passed in rather than tracked in state on purpose: the caller derives it from
-/// whether the window actually EXISTS. A user closing a satellite with the red button destroys the
-/// window without telling us, so any slot bookkeeping we kept would drift and leak the pool until
-/// relaunch.
+/// A user closing a satellite with the red button destroys the window without telling us, so any
+/// slot bookkeeping we kept would drift and leak the pool until relaunch. The window manager cannot
+/// drift that way: it is never *stale*, only ever *late*. `destroy()` posts teardown to the event
+/// loop, so for the few frames until that message is drained the manager still hands back a dying
+/// window. That is the one place our own writes are ordered against these reads, which is why
+/// `close_project_window` waits for the removal to be observable and `claim_slot` re-scans once
+/// before crying exhaustion. A USER-initiated close never has this problem: nobody is asking in the
+/// same breath.
 ///
-/// The manager cannot drift the way bookkeeping would — it is never *stale*, only ever *late*.
-/// `destroy()` posts teardown to the event loop and returns, so for the few frames until that
-/// message is processed the manager still hands back a dying window. That is the one place our own
-/// writes are ordered against these reads, which is why `close_project_window` waits for the
-/// removal to be observable and `open_project_window` re-scans once before crying exhaustion. A
-/// USER-initiated close never has this problem: nobody is asking in the same breath.
-pub fn first_free(occupied: &[bool]) -> Option<usize> {
-    occupied.iter().position(|taken| !taken)
-}
+/// (The reservation set in `ALLOC` is not an exception. It records in-flight CLAIMS, not existence,
+/// and every entry is released the moment its build settles one way or the other.)
+const _OCCUPANCY_IS_DERIVED: () = ();
 
 /// Poll `exists` until it reports gone, or until `timeout` elapses. `true` = observed gone.
 ///
@@ -147,12 +191,12 @@ pub fn is_safe_project_id(id: &str) -> bool {
 
 /// The two things slot allocation needs from the window manager, behind a seam.
 ///
-/// This exists so the LOCK can be tested (roborev: the allocator was a check-then-act race).
-/// "Is the mutex held across the scan AND the build?" is not something you can read off the source
-/// with confidence — `let _ = ALLOC.lock()` drops the guard on the spot and looks identical at a
-/// glance — and it cannot be probed through `AppHandle` in a unit test. Against a fake registry it
-/// is just a concurrency test: four threads, four distinct labels, zero collisions.
-/// `capture_window.rs`'s `TakeoverTeardown` is the same trick for the same reason.
+/// This exists so the EXCLUSION can be tested (roborev: the allocator was a check-then-act race).
+/// "Is scan-and-reserve actually atomic?" is not something you can read off the source with
+/// confidence — dropping a guard early looks identical at a glance — and it cannot be probed
+/// through `AppHandle` in a unit test. Against a fake registry it is just a concurrency test: four
+/// threads, four distinct labels, zero collisions. `capture_window.rs`'s `TakeoverTeardown` is the
+/// same trick for the same reason.
 pub trait SlotRegistry {
     /// Is a window with this label registered right now?
     fn exists(&self, label: &str) -> bool;
@@ -160,75 +204,70 @@ pub trait SlotRegistry {
     fn build(&self, label: &str) -> Result<(), String>;
 }
 
-/// What one locked pass over the pool concluded.
-enum Pass {
-    /// Claimed and built this label.
-    Took(&'static str),
-    /// A build failed for a reason that is NOT "someone else has this label". Retrying elsewhere
-    /// would fail the same way.
-    Broke(String),
-    /// Every slot is occupied.
-    Full,
+/// Claim the first free pool slot and build into it, atomically with respect to other claims.
+///
+/// The scan and the build are ONE operation under `ALLOC`: a scan whose result can be invalidated
+/// before the build is just a guess. See `ALLOC` for why the lock is process-wide, and
+/// `open_project_window` for the two belts layered over it.
+pub fn claim_slot<R: SlotRegistry>(reg: &R, settle: Duration) -> Result<&'static str, String> {
+    claim_slot_in(&ALLOC, reg, settle)
 }
 
-/// One atomic scan-and-build pass. The lock spans both — a scan whose result can be invalidated
-/// before the build is just a guess. See `ALLOC`.
-fn claim_pass<R: SlotRegistry>(reg: &R) -> Pass {
-    // Recover from poisoning rather than unwrapping: a panic inside one tear-off must not make
-    // every future tear-off in the session fail. The guard protects a label claim, not data — there
-    // is no half-written state for a poisoned lock to be hiding. Same convention as `helper.rs`.
-    let _guard = ALLOC.lock().unwrap_or_else(|e| e.into_inner());
-
-    let occupied: Vec<bool> = POOL.iter().map(|l| reg.exists(l)).collect();
-    let mut from = 0;
-    while let Some(rel) = first_free(&occupied[from..]) {
-        let slot = from + rel;
-        let label = POOL[slot];
-        match reg.build(label) {
-            Ok(()) => return Pass::Took(label),
-            Err(e) => {
-                // Fall through to the next slot ONLY if this one turned out to be taken — i.e. we
-                // lost a race to something that does not hold `ALLOC`. Re-probing is a better test
-                // than matching on the message: any OTHER failure (a malformed URL, an OS refusal,
-                // a webview that would not create) will fail identically on every remaining slot,
-                // and marching the pool would half-create and tear down three more OS windows for
-                // a tear-off that was never going to work.
-                if !reg.exists(label) {
-                    return Pass::Broke(e);
+/// `claim_slot` against an explicit reservation set.
+///
+/// The production set is the `static ALLOC`, and it must be: there is exactly one window manager per
+/// process, so exclusion has to be process-wide. Tests pass their OWN set — not for style, but
+/// because a shared static is a genuine isolation bug in a test binary. Cargo runs these tests as
+/// parallel threads of one process, so a concurrent test holding reservations would make an
+/// unrelated test's independent fake registry report slots busy that its own registry calls free.
+/// That is exactly how `a_pool_that_only_looks_full_is_re_scanned_after_a_settle` failed in-suite
+/// while passing alone.
+pub fn claim_slot_in<R: SlotRegistry>(
+    slots: &Slots,
+    reg: &R,
+    settle: Duration,
+) -> Result<&'static str, String> {
+    let mut last_build_err: Option<String> = None;
+    for attempt in 0..2 {
+        if attempt == 1 {
+            // Only reached when pass 0 found no slot it could take. Give a dispatched destroy a
+            // beat to actually leave the manager before telling the user the desk is full. NOT
+            // under the lock — see ALLOC: sleeping while holding it would stall every concurrent
+            // tear-off behind a pool that merely LOOKS full.
+            std::thread::sleep(settle);
+        }
+        // Each iteration reserves one slot, builds outside the lock, and drops the reservation.
+        // `tried` bounds the pass at POOL.len() attempts no matter what the builds return.
+        let mut tried = [false; POOL.len()];
+        while let Some(res) = reserve_free_slot(slots, reg, &tried) {
+            tried[res.idx] = true;
+            let label = POOL[res.idx];
+            match reg.build(label) {
+                Ok(()) => return Ok(label),
+                Err(e) => {
+                    // Fall through to the next slot ONLY if this one turned out to be genuinely
+                    // taken — a race lost to something that does not take ALLOC. Any other failure
+                    // (malformed URL, webview/GPU creation failure, OOM) would fail identically on
+                    // every remaining slot, so retrying burns up to 8 real window-creation attempts
+                    // and then reports the LAST slot's error, masking the actual cause. Bail with
+                    // the original error instead.
+                    if !reg.exists(label) {
+                        return Err(e);
+                    }
+                    tracing::warn!(label, error = %e, "satellite slot taken mid-build; trying next");
+                    last_build_err = Some(e);
                 }
-                tracing::warn!(label, error = %e, "satellite slot lost a race; trying the next");
-                from = slot + 1;
             }
         }
     }
-    Pass::Full
-}
-
-/// Claim the first free pool slot and build into it, atomically with respect to other claims.
-///
-/// A pool that reads full is re-scanned once after `settle`, because a `destroy` dispatched from
-/// outside `close_project_window` leaves its window registered for a few frames. **That nap
-/// happens with `ALLOC` released** — the lock protects a claim, not a wait, and holding it here
-/// would park every other tear-off behind one exhausted caller. It also only works at all because
-/// the caller is off the event-loop thread; see `ALLOC` on why both commands are `(async)`.
-pub fn claim_slot<R: SlotRegistry>(reg: &R, settle: Duration) -> Result<&'static str, String> {
-    match claim_pass(reg) {
-        Pass::Took(label) => return Ok(label),
-        Pass::Broke(e) => return Err(e),
-        Pass::Full => {}
-    }
-    std::thread::sleep(settle);
-    match claim_pass(reg) {
-        Pass::Took(label) => Ok(label),
-        Pass::Broke(e) => Err(e),
-        // Exhaustion wins over any race we lost getting here: "the desk is full" is the message the
-        // frontend branches on, and "a window with label project-1 already exists" would send it
-        // down the wrong path for a pool that is simply in use.
-        Pass::Full => Err(format!(
-            "all {} satellite windows are already open",
-            POOL.len()
-        )),
-    }
+    // Prefer the exhaustion message when the pool really is full: that is the one the frontend
+    // branches on. A stale "already exists" from one slot would otherwise mask it.
+    let full = format!("all {} satellite windows are already open", POOL.len());
+    Err(match last_build_err {
+        Some(e) if !POOL.iter().all(|l| reg.exists(l)) => e,
+        Some(e) => format!("{full} (last build error: {e})"),
+        None => full,
+    })
 }
 
 /// The real registry, against a live app. Deliberately thin — everything interesting is in
@@ -283,31 +322,41 @@ fn build_satellite(
 /// Does NOT check whether the project already has a window — that is the frontend's job, which owns
 /// the label→project registry (`services/windowRegistry.ts`) and can focus the existing one instead.
 ///
-/// Allocation is serialized process-wide (`ALLOC`) and the lock is held across the occupancy scan
-/// AND the build: they are one atomic claim, not two steps. Two belts on top of that brace, because
-/// the window manager is shared with code that does not take this lock:
-///  - a `build()` that fails because its label is taken falls through to the next free slot (any
-///    other build failure is reported straight away — it would just repeat on the next slot);
+/// Allocation is serialized process-wide: scan-and-reserve is atomic under `ALLOC`, and the build
+/// runs outside it against a reserved slot (see `ALLOC` for why the lock must not span the build).
+/// Two belts on top of that, because the window manager is shared with code that does not reserve:
+///  - a `build()` that fails because its label is taken falls through to the next free slot;
 ///  - a pool that reads as full is re-scanned once after a short settle, since a `destroy` posted
 ///    from outside `close_project_window` leaves its window briefly still registered.
 ///
-/// `(async)` is required, not stylistic: see `ALLOC`. The settle below is a real sleep, and on the
-/// event-loop thread it would both freeze the UI and prevent the very destroy it waits for.
+/// Runs on the BLOCKING pool, and BOTH halves of that matter — see `ALLOC`. Off the event loop,
+/// because the `EXHAUSTED_SETTLE` sleep would otherwise stall the very loop that must drain the
+/// pending destroy it is waiting for. Off the general async workers too, because `spawn_blocking` is
+/// the only thing that actually gets it there.
 ///
-/// Blocking: worst case this waits `EXHAUSTED_SETTLE` before reporting exhaustion, plus however
-/// long the other holder of `ALLOC` takes to build. Both are bounded; nothing here waits forever.
-#[tauri::command(async)]
-pub fn open_project_window(
+/// Blocking: worst case waits `EXHAUSTED_SETTLE` before reporting exhaustion. Bounded; nothing here
+/// waits forever.
+#[tauri::command]
+pub async fn open_project_window(
     app: AppHandle,
     project_id: String,
     x: Option<f64>,
     y: Option<f64>,
 ) -> Result<String, String> {
-    if !is_safe_project_id(&project_id) {
-        return Err("invalid project id".into());
-    }
-    let slots = AppSlots { app: &app, project_id: &project_id, x, y };
-    claim_slot(&slots, EXHAUSTED_SETTLE).map(|l| l.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        if !is_safe_project_id(&project_id) {
+            return Err("invalid project id".into());
+        }
+        let slots = AppSlots {
+            app: &app,
+            project_id: &project_id,
+            x,
+            y,
+        };
+        claim_slot(&slots, EXHAUSTED_SETTLE).map(|l| l.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("the tear-off task failed to run: {e}")))
 }
 
 /// Move and resize in one call, for the same reason `set_helper_bounds` does it in one: driving
@@ -347,19 +396,31 @@ pub fn set_project_window_bounds(
 /// better move than to carry on, and `open_project_window`'s settle-and-re-scan is the backstop.
 /// `Ok` therefore means "destroy dispatched, and observed gone unless a warning says otherwise".
 ///
-/// **`(async)` is what makes this work at all** — see `ALLOC`. `destroy` is drained only by the
-/// event loop, so as a plain sync command this poll would block the thread that has to remove the
-/// window: it could never observe success, would log its warning every single time, and would
-/// freeze the UI for the full `CLOSE_TIMEOUT` on every close. Do not remove the `(async)`.
-#[tauri::command(async)]
-pub fn close_project_window(app: AppHandle, label: String) -> Result<(), String> {
-    if !is_pool_label(&label) {
+/// THE `spawn_blocking` HAND-OFF IS LOAD-BEARING and this command is broken without it — which is
+/// why a test pins it. `destroy()` is drained only by the event loop, so polling for the removal on
+/// that same thread can never observe it: the wait would spin the full `CLOSE_TIMEOUT` with the
+/// whole UI frozen, log the warning every time, and still leave the slot reading as busy — strictly
+/// worse than not waiting at all. Getting off the event loop is necessary but NOT sufficient:
+/// running this body on a shared tokio worker instead (which is all `#[tauri::command(async)]` on a
+/// sync fn buys) would park a worker every other command needs for up to `CLOSE_TIMEOUT`. See
+/// `ALLOC` for the crate-level details.
+#[tauri::command]
+pub async fn close_project_window(app: AppHandle, label: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || close_blocking(&app, &label))
+        .await
+        .unwrap_or_else(|e| Err(format!("the satellite close task failed to run: {e}")))
+}
+
+/// The blocking half of `close_project_window`. MUST NOT run on the event-loop thread (it waits for
+/// work only that loop can complete) and MUST NOT run on a general async worker (it sleeps).
+fn close_blocking(app: &AppHandle, label: &str) -> Result<(), String> {
+    if !is_pool_label(label) {
         return Err("not a satellite window".into());
     }
-    if let Some(win) = app.get_webview_window(&label) {
+    if let Some(win) = app.get_webview_window(label) {
         let _ = win.destroy();
         let gone = wait_until_gone(
-            || app.get_webview_window(&label).is_some(),
+            || app.get_webview_window(label).is_some(),
             CLOSE_TIMEOUT,
             CLOSE_POLL_INTERVAL,
         );
@@ -384,6 +445,14 @@ mod tests {
     /// whose React tree mounts fine and whose every `invoke`/`listen` rejects silently at runtime.
     /// The helper island shipped broken for exactly one commit on this.
     const CAPABILITIES: &str = include_str!("../capabilities/default.json");
+
+    /// A reservation set of this test's own. Cargo runs these as parallel threads of ONE process,
+    /// so sharing the production `static ALLOC` would let a concurrent test's reservations make an
+    /// unrelated fake registry report slots busy that its own registry calls free — which is
+    /// precisely how the re-scan test failed in-suite while passing alone.
+    fn fresh() -> Slots {
+        Mutex::new([false; POOL.len()])
+    }
 
     /// The labels the capability file ACTUALLY grants — the `windows` array, parsed.
     ///
@@ -429,7 +498,10 @@ mod tests {
         // literal anywhere in the file, so the day the description quotes the word, the assertion
         // silently starts running against prose and passes for free.
         for w in granted_windows(CAPABILITIES) {
-            assert!(!w.contains('*'), "windows list must not contain a glob: {w}");
+            assert!(
+                !w.contains('*'),
+                "windows list must not contain a glob: {w}"
+            );
         }
     }
 
@@ -487,75 +559,77 @@ mod tests {
         assert!(!is_pool_label(""));
     }
 
-    #[test]
-    fn first_free_takes_the_lowest_open_slot() {
-        assert_eq!(first_free(&[false, false, false, false]), Some(0));
-        assert_eq!(first_free(&[true, false, false, false]), Some(1));
-        // Reuses a hole left by a closed window rather than marching to the end.
-        assert_eq!(first_free(&[true, false, true, false]), Some(1));
-    }
-
-    #[test]
-    fn first_free_reports_exhaustion() {
-        assert_eq!(first_free(&[true, true, true, true]), None);
-        // An empty pool is exhausted, not slot 0 — the caller must not index into nothing.
-        assert_eq!(first_free(&[]), None);
-    }
-
     /// A window manager with a deliberately WIDE check-then-act window: every `exists` probe
     /// sleeps, so an allocator that scans outside the lock is overwhelmingly likely to have
     /// another thread claim its slot before it builds. `build` refuses a label that is already
     /// registered, exactly like Tauri ("a window with label project-1 already exists").
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-
     #[derive(Default)]
     struct FakeSlots {
         registered: Mutex<Vec<String>>,
-        /// Labels that something OUTSIDE the lock claims between our scan and our build — the
-        /// build fails AND the label is registered afterwards, which is what a genuinely lost
-        /// race looks like. The allocator must walk to the next slot.
-        race_labels: Vec<&'static str>,
-        /// Labels whose build fails for a reason that has nothing to do with ownership (bad URL,
-        /// OS refusal). Nothing ends up registered, so retrying elsewhere is pure waste.
-        broken_labels: Vec<&'static str>,
+        /// Labels whose build fails because an outside party took the slot between our scan and
+        /// our build — a race lost OUTSIDE the reservation, which the allocator must survive by
+        /// trying the next slot. The build REGISTERS the label as it fails, because that is what
+        /// makes it a lost race rather than a broken build: the allocator distinguishes the two by
+        /// re-probing `exists`, so a fake that failed without registering would be testing the
+        /// bail-out path while claiming to test the fall-through.
+        poisoned_labels: Vec<&'static str>,
+        /// Builds that fail for a reason that has nothing to do with the label (malformed URL,
+        /// webview creation failure). These must NOT be retried against other slots.
+        unbuildable: bool,
+        /// Free `drain_label` once this many `exists` probes have been served. Probe-driven rather
+        /// than wall-clock so the re-scan test cannot be decided by lock contention.
+        drain_after_probes: Option<usize>,
+        drain_label: Option<&'static str>,
+        probes: std::sync::atomic::AtomicUsize,
         probe_delay: Duration,
-        /// Frees `.1` once more than `.0` probes have been seen. Drives the settle scenario off
-        /// the allocator's own progress instead of wall-clock, so lock contention from tests
-        /// running in parallel cannot turn it into a pass-0 success.
-        free_after_probes: Option<(usize, &'static str)>,
+        /// How long a build takes. LOAD-BEARING for the concurrency test: in production `build()`
+        /// dispatches window creation to the event loop and blocks on it, so it is far slower than
+        /// a scan, and it runs OUTSIDE the lock. An instant build closes the race window by
+        /// accident — every thread finishes building before the next one finishes scanning — and
+        /// the concurrency test then passes even with the reservation removed. Verified: with this
+        /// at zero, deleting `reserved[i] = true` does not fail a single test.
+        build_delay: Duration,
+        /// Every `build` attempt, counted. The attempt COUNT is the only thing that distinguishes
+        /// "bailed on a doomed build" from "marched through the pool retrying it" — both end with
+        /// the same error text and an empty registry.
+        builds: std::sync::atomic::AtomicUsize,
         /// Builds refused because the scan that chose the label was already stale by the time we
         /// built. This is the race itself, counted.
-        collisions: AtomicUsize,
-        probes: AtomicUsize,
-        builds: AtomicUsize,
+        collisions: std::sync::atomic::AtomicUsize,
     }
 
     impl SlotRegistry for FakeSlots {
         fn exists(&self, label: &str) -> bool {
-            let seen = self.probes.fetch_add(1, SeqCst) + 1;
-            if let Some((after, freed)) = self.free_after_probes {
-                if seen > after {
-                    let mut reg = self.registered.lock().unwrap_or_else(|e| e.into_inner());
-                    reg.retain(|l| l != freed);
+            use std::sync::atomic::Ordering::SeqCst;
+            std::thread::sleep(self.probe_delay);
+            let n = self.probes.fetch_add(1, SeqCst) + 1;
+            let mut reg = self.registered.lock().unwrap_or_else(|e| e.into_inner());
+            if let (Some(after), Some(drop_me)) = (self.drain_after_probes, self.drain_label) {
+                if n >= after {
+                    reg.retain(|l| l != drop_me);
                 }
             }
-            std::thread::sleep(self.probe_delay);
-            let reg = self.registered.lock().unwrap_or_else(|e| e.into_inner());
             reg.iter().any(|r| r == label)
         }
         fn build(&self, label: &str) -> Result<(), String> {
-            self.builds.fetch_add(1, SeqCst);
-            if self.broken_labels.contains(&label) {
-                return Err(format!("failed to create webview for {label}"));
+            // Before anything else: this is the slow, off-lock operation another claimer can scan
+            // straight through if nothing is holding the slot for us.
+            self.builds
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.build_delay);
+            if self.unbuildable {
+                return Err("webview creation failed".into());
             }
             let mut reg = self.registered.lock().unwrap_or_else(|e| e.into_inner());
-            if self.race_labels.contains(&label) && !reg.iter().any(|r| r == label) {
-                // Someone else got this label in the gap. Their window is real, hence the push.
+            if self.poisoned_labels.contains(&label) && !reg.iter().any(|r| r == label) {
+                // The outside party's window is now real: registering it is what makes the next
+                // `exists` probe report the slot as genuinely taken.
                 reg.push(label.to_string());
                 return Err(format!("a window with label {label} already exists"));
             }
             if reg.iter().any(|r| r == label) {
-                self.collisions.fetch_add(1, SeqCst);
+                self.collisions
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return Err(format!("a window with label {label} already exists"));
             }
             reg.push(label.to_string());
@@ -577,49 +651,105 @@ mod tests {
         // by mutation: dropping the guard before the loop fails this with 6 collisions, 3 runs
         // out of 3, while the distinct-labels assertion below stays green.
         let reg = std::sync::Arc::new(FakeSlots {
-            probe_delay: Duration::from_millis(2),
+            probe_delay: Duration::from_millis(1),
+            // Build must OUTLAST a scan, as it does in production (it dispatches to the event loop
+            // and blocks). Without that, each thread finishes building before the next finishes
+            // scanning, the race window never opens, and this test passes with the reservation
+            // deleted — the exact false-green the previous round shipped.
+            build_delay: Duration::from_millis(25),
             ..Default::default()
         });
+        // ONE reservation set shared by all four threads — that shared set IS the exclusion under
+        // test. (Per-thread sets would be the trivially broken case.)
+        let slots = fresh();
         let got: Vec<Result<&'static str, String>> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..POOL.len())
                 .map(|_| {
                     let reg = reg.clone();
-                    s.spawn(move || claim_slot(&*reg, Duration::from_millis(1)))
+                    let slots = &slots;
+                    s.spawn(move || claim_slot_in(slots, &*reg, Duration::from_millis(1)))
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         assert_eq!(
-            reg.collisions.load(SeqCst),
+            reg.collisions.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a slot was claimed between another claim's scan and its build — the lock does not \
              span scan+build"
         );
         let mut labels: Vec<&str> = got
             .iter()
-            .map(|r| *r.as_ref().expect("every overlapping tear-off must get a slot"))
+            .map(|r| {
+                *r.as_ref()
+                    .expect("every overlapping tear-off must get a slot")
+            })
             .collect();
         labels.sort_unstable();
-        assert_eq!(labels, POOL, "four concurrent claims must take four distinct slots");
+        assert_eq!(
+            labels, POOL,
+            "four concurrent claims must take four distinct slots"
+        );
     }
 
     #[test]
     fn a_build_that_loses_a_race_falls_through_to_the_next_slot() {
         // Belt for anything that touches the window manager without taking ALLOC. Losing slot 0
         // should cost slot 0, not the tear-off.
-        let reg = FakeSlots { race_labels: vec!["project-1", "project-2"], ..Default::default() };
-        assert_eq!(claim_slot(&reg, Duration::from_millis(1)), Ok("project-3"));
+        let reg = FakeSlots {
+            poisoned_labels: vec!["project-1", "project-2"],
+            ..Default::default()
+        };
+        assert_eq!(
+            claim_slot_in(&fresh(), &reg, Duration::from_millis(1)),
+            Ok("project-3")
+        );
     }
 
     #[test]
-    fn a_build_failure_that_is_not_a_race_stops_instead_of_marching_the_pool() {
-        // A malformed URL or a refused webview fails identically on every slot. Marching would
-        // half-create and tear down three more OS windows (eight builds across both passes) for a
-        // tear-off that cannot succeed, and would bury the real reason under a race message.
-        let reg = FakeSlots { broken_labels: POOL.to_vec(), ..Default::default() };
-        let err = claim_slot(&reg, Duration::from_millis(1)).expect_err("nothing could be built");
-        assert_eq!(err, "failed to create webview for project-1");
-        assert_eq!(reg.builds.load(SeqCst), 1, "must not try the rest of the pool");
+    fn a_pool_lost_to_outside_claims_reports_exhaustion_with_the_build_error_as_context() {
+        // Every slot gets taken out from under us. The user-facing message must be the EXHAUSTION
+        // one — that is what the frontend branches on — with the build error kept as context rather
+        // than shown instead of it.
+        let reg = FakeSlots {
+            poisoned_labels: POOL.to_vec(),
+            ..Default::default()
+        };
+        let err = claim_slot_in(&fresh(), &reg, Duration::from_millis(1))
+            .expect_err("nothing could be built");
+        assert!(
+            err.starts_with("all 4 satellite windows are already open"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("already exists"),
+            "the build error is kept as context: {err}"
+        );
+    }
+
+    #[test]
+    fn a_build_that_fails_for_a_non_label_reason_bails_instead_of_burning_the_pool() {
+        // A malformed URL or a webview/GPU failure will fail identically on every slot. Retrying
+        // it costs up to 8 real window-creation attempts and then reports the LAST slot's error,
+        // masking the actual cause. One attempt, original error, out.
+        let reg = FakeSlots {
+            unbuildable: true,
+            ..Default::default()
+        };
+        let err = claim_slot_in(&fresh(), &reg, Duration::from_millis(1))
+            .expect_err("build always fails");
+        assert_eq!(
+            err, "webview creation failed",
+            "the ORIGINAL cause must survive"
+        );
+        // The load-bearing assertion. Both the bail and the march end with this error text and an
+        // empty registry; only the attempt COUNT tells them apart. Without the bail this is 8 —
+        // every slot, twice — each one a real window-creation attempt in production.
+        assert_eq!(
+            reg.builds.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a label-independent failure must be tried ONCE, not against every slot in the pool"
+        );
     }
 
     #[test]
@@ -629,22 +759,8 @@ mod tests {
             let mut r = reg.registered.lock().unwrap();
             r.extend(POOL.iter().map(|l| l.to_string()));
         }
-        let err = claim_slot(&reg, Duration::from_millis(1)).expect_err("the pool is full");
-        assert_eq!(err, "all 4 satellite windows are already open");
-    }
-
-    #[test]
-    fn a_full_pool_that_also_lost_a_race_still_reports_exhaustion() {
-        // "all 4 satellite windows are already open" is the message the frontend branches on. A
-        // race lost on the way to discovering the pool is full must not replace it with
-        // "a window with label project-1 already exists", which reads as a bug rather than a
-        // full desk.
-        let reg = FakeSlots { race_labels: vec!["project-1"], ..Default::default() };
-        {
-            let mut r = reg.registered.lock().unwrap();
-            r.extend(["project-2", "project-3", "project-4"].map(|l| l.to_string()));
-        }
-        let err = claim_slot(&reg, Duration::from_millis(1)).expect_err("the pool is full");
+        let err =
+            claim_slot_in(&fresh(), &reg, Duration::from_millis(1)).expect_err("the pool is full");
         assert_eq!(err, "all 4 satellite windows are already open");
     }
 
@@ -654,60 +770,30 @@ mod tests {
         // a few frames. Without the second pass, the tear-off that follows a close is refused for
         // a slot that is mid-free — the exact symptom in the roborev finding.
         //
-        // The slot is freed on PROBE COUNT, not after a wall-clock delay: ALLOC is process-global
-        // and every other claim_slot test contends for it, so a timer-driven drain could fire
-        // while this thread was still waiting for the lock, hand pass 0 a free slot, and leave the
-        // re-scan belt untested behind a green assertion. Probe-driven, pass 0 provably sees a
-        // full pool. The probe-count assertion below is what pins the path.
+        // The drain is driven by PROBE COUNT, not wall-clock. The earlier version freed the slot
+        // after a fixed 20ms while `ALLOC` is process-global and contended by the other tests in
+        // this binary: if this test waited >20ms to acquire it, pass 0 already saw the slot free
+        // and returned without ever reaching pass 1 — green, with the re-scan belt untested.
+        // Freeing on the (POOL.len()+1)-th probe means only a genuine SECOND pass can succeed.
         let reg = FakeSlots {
-            free_after_probes: Some((POOL.len(), "project-3")),
+            drain_after_probes: Some(POOL.len() + 1),
+            drain_label: Some("project-3"),
             ..Default::default()
         };
         {
             let mut r = reg.registered.lock().unwrap();
             r.extend(POOL.iter().map(|l| l.to_string()));
         }
-        assert_eq!(claim_slot(&reg, Duration::from_millis(1)), Ok("project-3"));
-        assert!(
-            reg.probes.load(SeqCst) >= POOL.len() * 2,
-            "must have scanned the pool twice — a single-pass success would mean the settle belt \
-             was never exercised (probes: {})",
-            reg.probes.load(SeqCst)
+        assert_eq!(
+            claim_slot_in(&fresh(), &reg, Duration::from_millis(1)),
+            Ok("project-3")
         );
-    }
-
-    /// This module's own source, embedded at COMPILE time. Same trick as `CAPABILITIES` below,
-    /// for a contract that is just as invisible at runtime.
-    const THIS_SOURCE: &str = include_str!("project_window.rs");
-
-    #[test]
-    fn both_waiting_commands_stay_off_the_event_loop_thread() {
-        // The one property in this module that NOTHING else can catch. A plain `#[tauri::command]`
-        // is `ExecutionContext::Blocking` (tauri-macros wrapper.rs:50) and its generated body is a
-        // direct inline call — so the body runs on the thread delivering the IPC, i.e. the macOS
-        // main thread and event loop. `destroy` is drained ONLY by that loop
-        // (tauri-runtime-wry:2283 sends it with `send_event`; handle_user_message panics with
-        // "cannot handle `WindowMessage::Destroy` on the main thread"). Sync + a wait for a
-        // destroy = a wait that can never succeed, that freezes the UI for its whole timeout, and
-        // that leaves the slot unfree on return — strictly worse than not waiting at all.
-        //
-        // It type-checks, it passes every other test here, and it only shows up as a hang on a
-        // real desktop. So it is pinned in the source.
-        for cmd in ["pub fn open_project_window", "pub fn close_project_window"] {
-            let head = THIS_SOURCE
-                .split(cmd)
-                .next()
-                .expect("command must be defined in this file");
-            let attr = head
-                .rsplit_once("#[tauri::command")
-                .expect("command must carry a #[tauri::command] attribute")
-                .1;
-            assert!(
-                attr.starts_with("(async)"),
-                "{cmd} must be #[tauri::command(async)] — it waits on the event loop, and a sync \
-                 command body runs ON the event loop, so the wait could never complete"
-            );
-        }
+        // Assert the PATH, not just the outcome: pass 0 alone is exactly POOL.len() probes, so
+        // anything more can only be the re-scan.
+        assert!(
+            reg.probes.load(std::sync::atomic::Ordering::SeqCst) > POOL.len(),
+            "the slot must have been found on a SECOND scan, not the first"
+        );
     }
 
     #[test]
@@ -724,7 +810,11 @@ mod tests {
             Duration::from_millis(1),
         );
         assert!(gone, "should observe the window leave the manager");
-        assert_eq!(looks.get(), 3, "must re-check rather than trust the first read");
+        assert_eq!(
+            looks.get(),
+            3,
+            "must re-check rather than trust the first read"
+        );
     }
 
     #[test]
@@ -732,13 +822,15 @@ mod tests {
         // A wedged event loop must cost the caller a bounded delay, not the session. Unbounded
         // waiting here would hang the IPC thread for a window that is never coming back.
         let start = Instant::now();
-        let gone = wait_until_gone(
-            || true,
-            Duration::from_millis(40),
-            Duration::from_millis(5),
+        let gone = wait_until_gone(|| true, Duration::from_millis(40), Duration::from_millis(5));
+        assert!(
+            !gone,
+            "a window that never leaves must be reported as still there"
         );
-        assert!(!gone, "a window that never leaves must be reported as still there");
-        assert!(start.elapsed() >= Duration::from_millis(40), "must actually wait its timeout");
+        assert!(
+            start.elapsed() >= Duration::from_millis(40),
+            "must actually wait its timeout"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "must not wait appreciably past its timeout (waited {:?})",
@@ -753,6 +845,78 @@ mod tests {
         assert!(CLOSE_TIMEOUT <= Duration::from_millis(750));
         assert!(CLOSE_POLL_INTERVAL < CLOSE_TIMEOUT);
         assert!(EXHAUSTED_SETTLE <= CLOSE_TIMEOUT);
+    }
+
+    /// This module's own source, embedded at compile time — the `include_str!` trick the capability
+    /// guard above uses, pointed at ourselves.
+    const SOURCE: &str = include_str!("project_window.rs");
+
+    /// A definition's body: from its signature to the next line that is exactly `}`.
+    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+        let at = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let rest = &src[at..];
+        let end = rest.find("\n}").map(|e| e + 2).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// The attribute line immediately preceding a definition.
+    fn attr_above(src: &str, signature: &str) -> String {
+        let at = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found in source"));
+        src[..at]
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .expect("a command must have an attribute above it")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn the_waiting_commands_run_off_the_event_loop_thread_and_off_the_async_workers() {
+        // Two separate properties, and BOTH were got wrong in turn. This is invisible to every
+        // other test here, because they all exercise the waits against a fake registry rather than
+        // against the runtime they must not occupy.
+        //
+        // 1. OFF THE EVENT LOOP. A plain `#[tauri::command]` is `ExecutionContext::Blocking`:
+        //    tauri-macros generates the "sync" kind, whose body runs inline on the thread
+        //    delivering the IPC (the main thread on macOS). `destroy()` is only ever drained BY
+        //    that thread's loop — handling it there is an explicit panic in tauri-runtime-wry — so
+        //    a sync command polling for the removal blocks the one thread that could deliver it.
+        // 2. OFF THE SHARED ASYNC WORKERS. `#[tauri::command(async)]` on a SYNC fn looks like it
+        //    fixes this and does not: its "sync_threadpool" label (wrapper.rs:264) is only a
+        //    tracing field, and `body_async` calls the sync body inside `async move {}` handed to
+        //    `tokio::spawn`. The 500ms sleep would park a worker every other command shares.
+        //    `spawn_blocking` is what actually moves it, per `folder_picker.rs`/`dictation.rs`.
+        // SEARCH ONLY THE PRE-TEST SLICE. Everything below `mod tests` is this module quoting
+        // itself: the first version of the second assertion below did `SOURCE.contains("spawn_
+        // blocking(…)")` against the whole file and so matched its OWN string literal — vacuous,
+        // green no matter what the command bodies did. It looked mutation-checked because the
+        // mutant also reverted the attribute, which the FIRST assertion caught.
+        let code = &SOURCE[..SOURCE
+            .find("mod tests")
+            .expect("the test module must exist")];
+
+        for sig in [
+            "pub async fn open_project_window(",
+            "pub async fn close_project_window(",
+        ] {
+            assert_eq!(
+                attr_above(code, sig),
+                "#[tauri::command]",
+                "{sig} must be an async fn command (ExecutionContext::Async), not (async) on a sync fn"
+            );
+            // Anchored to THIS command's body, not merely present somewhere in the file — an
+            // unrelated `spawn_blocking` added later must not satisfy it.
+            let body = body_of(code, sig);
+            assert!(
+                body.contains("spawn_blocking"),
+                "{sig} must hand its blocking work to spawn_blocking; body was:\n{body}"
+            );
+        }
     }
 
     #[test]

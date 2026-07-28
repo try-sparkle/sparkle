@@ -24,6 +24,7 @@ import { clearPin } from "../services/accountStore";
 import { usageTelemetry } from "../services/usageTelemetry";
 import { perfSpan, perfStart } from "../perfTrace";
 import { useUiStore } from "./uiStore";
+import { openProjectsOf } from "../engine/openProjects";
 
 // Cap on how many prompts we keep per agent so the persisted localStorage record stays bounded.
 // The oldest entries fall off; the most recent PROMPT_HISTORY_LIMIT are kept — PER SOURCE (see
@@ -1297,8 +1298,6 @@ export const useProjectStore = create<ProjectState>()(
           // array and re-render the shell (the same reason reorderAgent returns `p` unchanged).
           if (from < 0 || projectId === beforeProjectId) return {};
           const moved = s.projects[from] as Project;
-          const targetAt =
-            beforeProjectId == null ? -1 : s.projects.findIndex((p) => p.id === beforeProjectId);
           const rest = s.projects.filter((p) => p.id !== projectId);
           // Resolve the anchor AFTER removing the dragged project, so the index is right whether it
           // moved left or right — computing it against the original array is the classic off-by-one.
@@ -1306,13 +1305,46 @@ export const useProjectStore = create<ProjectState>()(
             beforeProjectId == null ? rest.length : rest.findIndex((p) => p.id === beforeProjectId);
           // A missing anchor (the target tab was closed mid-drag) appends rather than discarding
           // the move.
-          let at = to < 0 ? rest.length : to;
-          // DIRECTION MATTERS — see reorderAgent's note. Dropping onto a tab means "take that tab's
-          // slot", so a tab dragged RIGHTWARD lands AFTER the target. Without this, dragging a tab
-          // onto its immediate right-hand neighbour removes it and re-inserts it at the very index
-          // it came from: the user drags, nothing moves, and the strip reads as broken.
-          if (targetAt >= 0 && from < targetAt) at = Math.min(at + 1, rest.length);
-          return { projects: [...rest.slice(0, at), moved, ...rest.slice(at)] };
+          const at = to < 0 ? rest.length : to;
+          const next = [...rest.slice(0, at), moved, ...rest.slice(at)];
+          // NO DIRECTION BUMP HERE — and that is the difference from reorderAgent, so don't "fix"
+          // it by copying that function's `from < targetAt → at + 1` line back in.
+          //
+          // The two have callers with INCOMPATIBLE anchor semantics. reorderAgent's caller
+          // (AgentSidebar's onDropAgent) passes the row the pointer was dropped ONTO, so "take that
+          // row's slot" needs the bump. The tab strip's caller passes tabDrag.ts's `beforeId`, which
+          // is already a MIDPOINT-derived insertion gap — "the tab to insert before", with direction
+          // baked in by the Chrome rule that you displace a tab only once you pass its centre.
+          // Applying the bump on top double-counts direction: with tabs a,b,c,d, the pointer range
+          // that means "hasn't passed b's centre yet, don't move" instead produced [b,a,c,d], so the
+          // strip swapped a full half-tab early and every rightward drop landed one slot too far
+          // right. Leftward drags were unaffected, which made it read as an asymmetric glitch.
+          //
+          // Insert-before is now the whole contract; tabDrag.ts owns direction.
+          //
+          // THE NO-OP TEST IS STRIP-RELATIVE, NOT ARRAY-RELATIVE. `at === from` looks like the
+          // obvious guard and is WRONG, because the drag's anchor is an OPEN tab id while this
+          // splices the FULL array. With projects [b, hidden, c] and strip [b, c], dropping `b`
+          // before `c` — the ordinary "left my own midpoint, haven't reached c's" pointer range —
+          // gives at=1, from=0, so an array-relative guard lets it through: the strip is visibly
+          // unchanged, yet `projects` becomes [hidden, b, c]. Two things break. The reference
+          // changes, so a drag that did nothing re-renders the shell — the exact cost the guard
+          // exists to avoid, on the exact case that motivated it. Worse, `hidden` is silently
+          // reordered across `b`, and closed-project order is user-visible later: closedProjectsOf
+          // feeds the "+" reopen list, so reopening `hidden` puts its tab on the other side of `b`.
+          // A drag the user reads as "nothing happened" must not permanently reshuffle projects
+          // they cannot see.
+          //
+          // So: compare the STRIPS. If the visible order is unchanged, change nothing at all.
+          // openProjectIds is read here rather than passed in (the useUiStore.getState() idiom this
+          // file already uses for pinnedProjectId) so no caller can forget it. A `null` set means
+          // "never seeded, everything is open", where the strip IS the full array and this reduces
+          // to the array-relative comparison.
+          const openIds = useUiStore.getState().openProjectIds;
+          const before = openProjectsOf(s.projects, openIds);
+          const after = openProjectsOf(next, openIds);
+          if (before.every((p, i) => p.id === after[i]?.id)) return {};
+          return { projects: next };
         }),
 
       unpinAgent: (projectId, agentId) =>

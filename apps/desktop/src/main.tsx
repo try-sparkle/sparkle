@@ -14,7 +14,11 @@ import { disableNativeTooltips } from "./disableNativeTooltips";
 import { resolveThemeFromStorage } from "./theme/theme";
 import { useHistoryStore } from "./stores/historyStore";
 import { refreshModelCatalog } from "./services/models";
-import { parseSuppressSelfFocus } from "./services/windowIdentity";
+import {
+  parseSuppressSelfFocus,
+  parseViewFromSearch,
+  isAppWindowSearch,
+} from "./services/windowIdentity";
 import "@xterm/xterm/css/xterm.css";
 import "./index.css";
 
@@ -31,11 +35,23 @@ disableNativeTooltips();
 initLogger();
 
 // Which webview this is (parsed before the boot side effects below, which gate on it).
-const view = new URLSearchParams(window.location.search).get("view");
+//
+// PARSED BY services/windowIdentity, not by hand, and the boot gates below are POSITIVE
+// (`if (isAppWindow)`) rather than a `!isCapture && !isHelper` denylist. The denylist was an
+// allowlist of two negatives, so every view kind added afterwards inherited the app window's boot
+// work by default. That went wrong the moment Rust could mint `?view=project&project=<id>`
+// (project_window.rs): a satellite fell through every guard and would have started a second jank
+// monitor, installed perf devtools, opened a phantom PostHog session with an APP_OPENED per
+// tear-off, started its own 24h history-prune interval against the same store, and double-counted
+// the launch in usage telemetry. `isAppWindowSearch` keys on `?view=` being ABSENT — the app
+// window's URL is a bare index.html from tauri.conf.json — so a new view kind is now excluded by
+// default and adding one in Rust cannot outrun the TypeScript.
+const search = window.location.search;
+const view = parseViewFromSearch(search);
 const isCapture = view === "capture";
-// The floating helper island: another tiny, always-alive webview, so it joins the capture view
-// in every boot-side-effect guard below.
+// The floating helper island: another tiny, always-alive webview.
 const isHelper = view === "helper";
+const isAppWindow = isAppWindowSearch(search);
 
 // Main-thread stall detector (perfTrace): logs every frame gap > threshold as a "jank stall" so a
 // reproduction of the slowness surfaces exactly when the app froze and for how long, to correlate
@@ -47,24 +63,24 @@ const isHelper = view === "helper";
 // field is stamped at all). Reading `getCurrentWindow().label` here would compute that same constant
 // at module scope, before createRoot — where a malformed `__TAURI_INTERNALS__` would throw and blank
 // the app. If secondary app windows ever return, pass their label in; nothing else needs to change.
-if (!isCapture && !isHelper) startJankMonitor();
+if (isAppWindow) startJankMonitor();
 
 // Render counting is always on (a Map bump); the per-render LOG is gated off by default because
 // each line is a main-thread Tauri IPC (bead sparkle-abv2). This exposes the toggle and the
 // counters so `sparklePerf.counts()` / `sparklePerf.setRenderLogging(true)` work from devtools.
-if (!isCapture && !isHelper) installPerfDevtools();
+if (isAppWindow) installPerfDevtools();
 
 // Analytics (PostHog) — masked session replay + autocapture + lifecycle events.
 // No-ops when no key is configured. Started after the logger so init errors surface.
 // Skipped in the capture and helper webviews: both are created hidden at every launch and would
 // add a phantom PostHog session + APP_OPENED per boot.
-if (!isCapture && !isHelper) initAnalytics();
+if (isAppWindow) initAnalytics();
 
 // Enforce the history retention window: read the active tier, prune once on launch, then once a
 // day. Best-effort — a failure here (e.g. backend not ready) must not block the UI from rendering.
 // Also skipped in the always-alive hidden capture/helper webviews — main already prunes.
 const HISTORY_PRUNE_INTERVAL_MS = 86_400_000; // 24h
-if (!isCapture && !isHelper) {
+if (isAppWindow) {
   void (async () => {
     try {
       await useHistoryStore.getState().loadEntitlement();
@@ -98,6 +114,14 @@ if (isHelper) {
 // pipeline) instead of unmounting the whole tree into a blank window. The helper and capture
 // webviews are tiny, single-purpose surfaces — left unwrapped so their minimal render paths stay
 // untouched.
+//
+// KNOWN GAP — `view === "project"` still falls through to <App/>. The boot side effects above no
+// longer run for a satellite, but the SHELL it would mount is still the full app: tab strip,
+// concierge, and AppBoot's resetWindowRegistry()/resetWindowStatus(). The satellite renderer
+// (columns ② + ③ only) is the next unit of this feature, together with the live-pane handoff.
+// Until it lands, NOTHING may invoke `open_project_window` — and nothing does: the command is
+// registered in lib.rs but has no frontend caller, which is what keeps this gap latent rather than
+// live. Wire the caller and the renderer in the same change.
 ReactDOM.createRoot(document.getElementById("root")!).render(
   isHelper ? (
     <HelperApp />
@@ -114,7 +138,10 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
 // Fire-and-forget: refreshModelCatalog swallows every failure (no host/key/network → the curated
 // list stands), and the ModelPill re-renders in place when fresh models land. Main webview only —
 // the helper island never shows a model picker.
-if (!isHelper) {
+//
+// This gate was `!isHelper`, which contradicted the "main webview only" it claims: the capture
+// webview ran the refresh too, and a satellite would have as well. Now says what it meant.
+if (isAppWindow) {
   void refreshModelCatalog();
 }
 
@@ -123,7 +150,7 @@ if (!isHelper) {
 // swallows every error, and no-ops when no install_id is resolvable (plain-browser dev/preview,
 // where the Tauri trial command is absent). Only the main webview counts — the helper shares the
 // same install and would otherwise double-count launches (the capture webview likewise).
-if (!isCapture && !isHelper) {
+if (isAppWindow) {
   void usageTelemetry.trackAppOpen();
   // beforeunload is the pragmatic best-effort "app closing" hook in the webview (reload/close).
   // A dropped session_end is acceptable — the server can also reap stale sessions.
@@ -143,7 +170,9 @@ if (!isCapture && !isHelper) {
 // webview MUST be skipped: it is created hidden and only ever shown by Rust's
 // show_capture_window; a boot-time self-show would flash the takeover at launch. The
 // `__TAURI_INTERNALS__` guard no-ops in the plain-browser dev/preview (no OS window to show).
-if (!isCapture && !isHelper && "__TAURI_INTERNALS__" in window) {
+// A satellite is excluded because Rust builds it with `.visible(true)` and positions it at build
+// time (project_window.rs) — it is already on screen, so there is nothing here to reveal.
+if (isAppWindow && "__TAURI_INTERNALS__" in window) {
   // A restored, non-active window (`?focus=0`) must be SHOWN but not self-focused: session restore
   // reopens several windows at once and focuses exactly one — the last-active — which the restore
   // orchestrator sets explicitly. Without this, whichever restored window paints last would steal

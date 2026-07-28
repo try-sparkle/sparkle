@@ -22,8 +22,8 @@ const OPTS: TabDragOpts = { slop: 3, tearMargin: 40 };
 // Centre of tab "a", the press origin for most cases.
 const ORIGIN = { x: 200, y: 68 };
 
-const drag = (pointer: { x: number; y: number }, draggedId = "a") =>
-  resolveTabDrag({ pointer, origin: ORIGIN, strip: STRIP, tabs: TABS, draggedId }, OPTS);
+const drag = (pointer: { x: number; y: number }, draggedId = "a", dragging = false) =>
+  resolveTabDrag({ pointer, origin: ORIGIN, strip: STRIP, tabs: TABS, draggedId, dragging }, OPTS);
 
 describe("resolveTabDrag — slop", () => {
   it("is idle until the press moves further than the slop", () => {
@@ -34,6 +34,23 @@ describe("resolveTabDrag — slop", () => {
     expect(drag({ x: 204, y: 68 }).kind).toBe("reorder");
     // Vertical alone counts too — a straight-down tear must not need horizontal movement first.
     expect(drag({ x: 200, y: 200 }).kind).toBe("tearoff");
+  });
+
+  it("stays a drag after it latches, even back at the press point", () => {
+    // The gate is spent once `dragging` is set. Re-evaluating it every frame let a drag that
+    // wandered back over its own origin collapse to idle mid-gesture: the ghost disappears and the
+    // release reads as a plain click on the tab.
+    expect(drag({ x: 201, y: 69 }, "a", true).kind).toBe("reorder");
+    // And exactly ON the origin, which is the worst case for a re-evaluated gate.
+    expect(drag(ORIGIN, "a", true).kind).toBe("reorder");
+    // The unlatched gesture at the same points is still idle — the latch is the only difference.
+    expect(drag({ x: 201, y: 69 }).kind).toBe("idle");
+    expect(drag(ORIGIN).kind).toBe("idle");
+  });
+
+  it("still tears off when a latched drag is outside the strip", () => {
+    // Latching must not pin the gesture to `reorder` — it only skips the slop gate.
+    expect(drag({ x: 400, y: 200 }, "a", true)).toEqual({ kind: "tearoff" });
   });
 });
 
@@ -60,7 +77,14 @@ describe("resolveTabDrag — reorder within the strip", () => {
 
   it("appends when there are no tabs at all", () => {
     const r = resolveTabDrag(
-      { pointer: { x: 400, y: 68 }, origin: ORIGIN, strip: STRIP, tabs: [], draggedId: "a" },
+      {
+        pointer: { x: 400, y: 68 },
+        origin: ORIGIN,
+        strip: STRIP,
+        tabs: [],
+        draggedId: "a",
+        dragging: false,
+      },
       OPTS,
     );
     expect(r).toEqual({ kind: "reorder", beforeId: null });

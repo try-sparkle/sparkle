@@ -9,7 +9,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isAppWindowSearch,
-  isSatelliteSearch,
+  parseSatelliteProjectId,
   parseAgentIdFromSearch,
   parseProjectIdFromSearch,
   parseSuppressSelfFocus,
@@ -31,17 +31,45 @@ describe("parseViewFromSearch / isAppWindowSearch", () => {
     // silently, since neither failure is visible until two windows fight over the same work.
     expect(parseViewFromSearch("?view=project&project=p1")).toBe("project");
     expect(isAppWindowSearch("?view=project&project=p1")).toBe(false);
-    expect(isSatelliteSearch("?view=project&project=p1")).toBe(true);
+    expect(parseSatelliteProjectId("?view=project&project=p1")).toBe("p1");
+  });
+
+  it("keeps a satellite off the app-window BOOT path, not just off isAppWindowSearch", () => {
+    // main.tsx gates every boot side effect (jank monitor, perf devtools, analytics, the 24h
+    // history-prune interval, usage telemetry, show-on-ready) on isAppWindowSearch. It used to
+    // hand-roll `!isCapture && !isHelper` instead — a denylist of two negatives that a satellite
+    // fell straight through, giving it a second jank monitor, a phantom PostHog session with an
+    // APP_OPENED per tear-off, and a duplicate prune loop against the same store. This pins the
+    // predicate that gate now reads, for every view kind that exists.
+    for (const search of ["?view=project&project=p1", "?view=helper", "?view=capture"]) {
+      expect(isAppWindowSearch(search)).toBe(false);
+    }
+    // And the fail-closed property that makes the positive form safe: a view kind nobody has
+    // taught this module about is excluded by default, so adding one in Rust cannot outrun the TS.
+    expect(isAppWindowSearch("?view=whatever-lands-next")).toBe(false);
   });
 
   it("does not mistake the other webviews (or the app window) for a satellite", () => {
-    expect(isSatelliteSearch("?view=helper")).toBe(false);
-    expect(isSatelliteSearch("?view=capture")).toBe(false);
-    expect(isSatelliteSearch("")).toBe(false);
+    expect(parseSatelliteProjectId("?view=helper")).toBeNull();
+    expect(parseSatelliteProjectId("?view=capture")).toBeNull();
+    expect(parseSatelliteProjectId("")).toBeNull();
     // A bare `?project=` with no `?view=` is a deep link INTO the app window, not a satellite —
     // windowContext's boot selection already honours it. Treating it as a satellite would render
     // the shell without its concierge column.
-    expect(isSatelliteSearch("?project=p1")).toBe(false);
+    expect(parseSatelliteProjectId("?project=p1")).toBeNull();
+  });
+
+  it("refuses a satellite that names no project", () => {
+    // The predicate this replaced answered only "?view=project", so these three were `true` while
+    // parseProjectIdFromSearch called them null — two helpers disagreeing about one URL. The
+    // natural caller shape `if (isSatellite(s)) render(parseProjectId(s))` then got a satellite
+    // with no project and no compile error. A satellite without a project is not a window.
+    for (const search of ["?view=project", "?view=project&project=", "?view=project&project=%20"]) {
+      expect(parseSatelliteProjectId(search)).toBeNull();
+      // Still not the app window, though — it carries `?view=`, so it must stay off the boot path
+      // even when it is too malformed to be a satellite.
+      expect(isAppWindowSearch(search)).toBe(false);
+    }
   });
 
   it("no longer knows `tray` — the menu-bar webview went with the helper island", () => {
