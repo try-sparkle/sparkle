@@ -3,7 +3,9 @@
 // Connects to the orchestration relay as this user's Mac (role "host"), authenticated with
 // the desktop bearer. When a local agent needs the user (approval/question), the app emits an
 // `attention_needed`; the relay forwards it to the paired phone. When the phone answers, the
-// relay sends a `decision` back here and we inject it into that agent's live PTY via writePty.
+// relay sends a `decision` back here and we inject it into that agent's live PTY via
+// writePtyChained (chained, not raw: a relayed keystroke carries its own CR and must not land
+// inside another operation's paste→CR window — see pty.writePtyChained, roborev 54375).
 //
 // Contracts match the DEPLOYED relay (verified end-to-end): register{clerk_token,role},
 // registered ack, attention_needed, decision, attention_resolved.
@@ -14,7 +16,7 @@
 import type { Socket } from "socket.io-client";
 import type { RelaySocketLike } from "./agentTransport";
 import { invoke } from "@tauri-apps/api/core";
-import { onPtyOutput, writePty } from "../pty";
+import { onPtyOutput, writePtyChained } from "../pty";
 import { getAgentScrollback } from "./terminalScrollback";
 import { closeBuildAgent } from "./closeBuildAgent";
 import { parseControlAction, CLOSE_AGENT_ACTION } from "./suggestions/controlButtons";
@@ -241,7 +243,7 @@ export async function startRelayHost(): Promise<void> {
   socket.on("agent_input", (i: AgentInputPayload) => {
     const w = authorizeAgentInput(watched, i);
     if (w) {
-      void writePty(w.agentId, w.text).catch((e) =>
+      void writePtyChained(w.agentId, w.text).catch((e) =>
         console.debug("relay agent_input writePty failed", e),
       );
     }
@@ -265,7 +267,7 @@ export async function startRelayHost(): Promise<void> {
       );
       return;
     }
-    void writePty(r.agentId, frameSubmit(r.value)).catch((e) =>
+    void writePtyChained(r.agentId, frameSubmit(r.value)).catch((e) =>
       console.debug("relay suggestion_click writePty failed", e),
     );
   });
@@ -274,7 +276,7 @@ export async function startRelayHost(): Promise<void> {
   socket.on("decision", (d: DecisionPayload) => {
     const w = authorizeDecision(liveAttentions, d);
     if (w) {
-      void writePty(w.agentId, w.text).catch((e) =>
+      void writePtyChained(w.agentId, w.text).catch((e) =>
         console.debug("relay decision writePty failed", e),
       );
     }

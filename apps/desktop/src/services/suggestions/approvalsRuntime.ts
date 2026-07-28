@@ -12,7 +12,7 @@ import { useApprovalsStore } from "../../stores/approvalsStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { aiFeatureVisibleNow } from "../aiGate";
-import { writePty } from "../../pty";
+import { writePtyChained } from "../../pty";
 import { classifyApproval } from "./approvalClassifier";
 import { detectClaudeCodePicker, detectResumePrompt } from "./heuristics";
 import {
@@ -60,7 +60,8 @@ export function maybeAutoApprove(
   // re-send the keystroke (a re-hash of the same settled screen must not double-answer).
   if (handled.has(sig)) return classification.category;
   handled.add(sig);
-  void writePty(agentId, classification.approveOption);
+  // Chained: the option keystroke carries its own CR (see pty.writePtyChained).
+  void writePtyChained(agentId, classification.approveOption);
   log.info("approvals", "auto-approved", { agentId, category: classification.category });
   return classification.category;
 }
@@ -95,7 +96,8 @@ export function maybeAutoResume(
   // Already answered THIS picker instance: keep buttons suppressed, but never re-send the keystroke.
   if (handled.has(sig)) return rule;
   handled.add(sig);
-  void writePty(agentId, rule === "summary" ? detected.summaryOption : detected.fullOption);
+  // Chained: the option keystroke carries its own CR (see pty.writePtyChained).
+  void writePtyChained(agentId, rule === "summary" ? detected.summaryOption : detected.fullOption);
   log.info("approvals", "auto-resumed", { agentId, mode: rule });
   return rule;
 }

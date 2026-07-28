@@ -86,14 +86,118 @@ const ESC = String.fromCharCode(27);
 export const PASTE_START = `${ESC}[200~`;
 export const PASTE_END = `${ESC}[201~`;
 
+/**
+ * Neutralize bracketed-paste markers embedded in text we are about to wrap in a paste, so the
+ * content can't terminate paste mode early and have its tail interpreted as KEYSTROKES by the
+ * running CLI (roborev 2197). Applies to anything the user didn't type at the terminal themselves —
+ * a terminal selection, a dropped file's path.
+ *
+ * A single split/join pass is insufficient: removing a marker can reconstitute a new one from its
+ * neighbors (e.g. "\x1b[20\x1b[201~1~" → "\x1b[201~" after one pass). Loop until stable so no marker
+ * survives regardless of how deeply it is interleaved (roborev 2210).
+ *
+ * Lives here, beside the markers it strips, rather than beside any one caller: it is a property of
+ * the paste framing, and a second private copy is how one call site quietly loses the guard.
+ */
+export function stripPasteMarkers(s: string): string {
+  let t = s;
+  while (t.includes(PASTE_START) || t.includes(PASTE_END)) {
+    t = t.split(PASTE_START).join("").split(PASTE_END).join("");
+  }
+  return t;
+}
+
 /** Gap between the bracketed paste and the carriage return, so the CLI has finished ingesting
  *  the paste before the Enter arrives. */
 const SUBMIT_CR_DELAY_MS = 60;
 
-/** Per-agent submit chain, so two concurrent submits to the same agent can't interleave their
- *  paste and CR writes (which would submit one prompt's text with the other's carriage return).
- *  Mirrors the deliveryChain in services/agentModel.ts. */
-const submitChains = new Map<string, Promise<void>>();
+/** Per-agent chain for MULTI-WRITE PTY operations, so two of them can't interleave their writes.
+ *  THE ONE chain for this agent — `services/agentModel` used to run a second, disjoint one of its
+ *  own, which gave no ordering guarantee against this one at all (roborev 54387).
+ *
+ *  Every operation that is not a single atomic write belongs on this chain, and so does every
+ *  operation that must not land in the MIDDLE of one — which is why a no-submit paste is queued
+ *  here too, not just a submit. {@link deliverSubmit} deliberately leaves SUBMIT_CR_DELAY_MS
+ *  between its paste and its carriage return; an unchained write landing inside that window is
+ *  appended to the in-flight prompt and then submitted BY that pending CR. For a dropped file that
+ *  means a turn the user never pressed Enter on, carrying paths they never approved, while the
+ *  confirmation says nothing has been sent (roborev 54369). */
+const ptyWriteChains = new Map<string, Promise<void>>();
+
+/**
+ * Queue a whole PTY OPERATION behind whatever is already in flight for this agent, and return ITS
+ * promise (not the swallowed tail) so the caller still sees a failure.
+ *
+ * Exported for operations this module does not own — `services/agentModel`'s `/model` delivery,
+ * whose type-then-wait-200ms-then-Enter sequence is the widest paste→CR window in the app and so
+ * has the most to lose from an interleaved write (and the most to break with one of its own).
+ */
+export function chainPtyOp(id: string, run: () => Promise<void>): Promise<void> {
+  const prev = ptyWriteChains.get(id) ?? Promise.resolve();
+  // A rejected predecessor must not wedge the chain for the next write, so queue behind its
+  // settlement rather than its success.
+  const p = prev.then(run);
+  const tail = p.catch(() => {});
+  ptyWriteChains.set(id, tail);
+  // Drop the entry once this agent's queue drains, so the map doesn't grow per agent forever.
+  void tail.then(() => {
+    if (ptyWriteChains.get(id) === tail) ptyWriteChains.delete(id);
+  });
+  return p;
+}
+
+/**
+ * A single PROGRAMMATIC write, queued on the per-agent chain — the picker answer, an auto-approve
+ * keystroke, a relayed phone keystroke.
+ *
+ * Being atomic is not enough to make a write safe (roborev 54375). These payloads carry their OWN
+ * carriage return (`frameSubmit` produces `"2\r"`), so one landing inside another operation's
+ * paste→CR window appends its digit to the in-flight prompt, submits that mutated prompt with the
+ * pending CR, and leaves the picker it meant to answer unanswered. `services/requery.ts` submits
+ * with no user action at all, so that window opens on its own.
+ *
+ * Deliberately NOT for live keystrokes from xterm's `onData`: those are the user typing, in real
+ * time, at a terminal they are looking at — serializing them behind a background submit would
+ * reorder what they typed.
+ *
+ * Keeps {@link writePty}'s tolerant handling of the "no such pty" teardown race.
+ */
+export function writePtyChained(id: string, data: string): Promise<void> {
+  return chainPtyOp(id, () => writePty(id, data));
+}
+
+/**
+ * The STRICT chained single write: same queueing, but a dead PTY REJECTS with PtyGoneError instead
+ * of resolving as if it landed.
+ *
+ * For a write that represents a DELIBERATE USER ACTION whose caller reports success — the concierge
+ * picker answer. The tolerant variant above cannot fail, so a caller that catches PtyGoneError
+ * around it has an unreachable branch and reports a delivery that never happened (roborev 54387) —
+ * exactly the failure {@link submitPrompt} was made strict to prevent. Fire-and-forget writes
+ * (auto-approve, the phone relay) keep the tolerant one: nothing is claiming success on their
+ * behalf, and the teardown race is noise there.
+ */
+export function writePtyChainedStrict(id: string, data: string): Promise<void> {
+  return chainPtyOp(id, () => writePtyStrict(id, data));
+}
+
+/**
+ * Insert text at the agent's CURRENT input line and stop — one bracketed paste, no carriage
+ * return. The user is left with the text sitting in the CLI's prompt, free to type around it and
+ * press Enter themselves.
+ *
+ * Queued on the per-agent write chain, so it can never land between another write's paste and its
+ * carriage return and be submitted by it — see {@link ptyWriteChains}.
+ *
+ * REJECTS with PtyGoneError when the PTY is dead, like {@link submitPrompt} and for the same
+ * reason: this is a deliberate user action (a drop, a menu pick), so "it went nowhere" has to be
+ * reportable rather than swallowed as the teardown race {@link writePty} tolerates.
+ */
+export function pasteIntoPty(id: string, text: string): Promise<void> {
+  return chainPtyOp(id, () =>
+    writePtyStrict(id, `${PASTE_START}${stripPasteMarkers(text)}${PASTE_END}`),
+  );
+}
 
 async function deliverSubmit(id: string, text: string): Promise<void> {
   // Bug B: a user-submitted message is the strongest recovery signal — a new turn is starting, so
@@ -101,7 +205,12 @@ async function deliverSubmit(id: string, text: string): Promise<void> {
   // text lands (and echoes back through pty:output) so a resuming agent goes green and its own echo
   // isn't mistaken for a self-prompt wedge. No-op when no engine is registered for this id.
   noteUserInputForAgent(id, text);
-  await writePtyStrict(id, `${PASTE_START}${text}${PASTE_END}`);
+  // Marker-stripped like every other paste this module frames. A no-op for composer-typed text, and
+  // NOT a no-op for submitPrompt's untrusted-text callers — the concierge free-text path and
+  // conciergeTools' sendToAgentTerminal carry phone-relayed and model-authored strings, which could
+  // close bracketed-paste mode mid-payload and have their tail read as KEYSTROKES (roborev 2197,
+  // reopened here at 54397: the guard existed only in one caller, selectionActions.fixInAgent).
+  await writePtyStrict(id, `${PASTE_START}${stripPasteMarkers(text)}${PASTE_END}`);
   await new Promise((r) => setTimeout(r, SUBMIT_CR_DELAY_MS));
   await writePtyStrict(id, "\r");
 }
@@ -114,17 +223,7 @@ async function deliverSubmit(id: string, text: string): Promise<void> {
  *  land, and silently resolving here is what let a dead agent swallow user prompts while the
  *  composer recorded them into history as if they'd been delivered. Callers must handle it. */
 export function submitPrompt(id: string, text: string): Promise<void> {
-  const prev = submitChains.get(id) ?? Promise.resolve();
-  // A rejected predecessor must not wedge the chain for the next submit, so queue behind its
-  // settlement rather than its success.
-  const run = prev.then(() => deliverSubmit(id, text));
-  const tail = run.catch(() => {});
-  submitChains.set(id, tail);
-  // Drop the entry once this agent's queue drains, so the map doesn't grow per agent forever.
-  void tail.then(() => {
-    if (submitChains.get(id) === tail) submitChains.delete(id);
-  });
-  return run;
+  return chainPtyOp(id, () => deliverSubmit(id, text));
 }
 
 export function resizePty(id: string, cols: number, rows: number): Promise<void> {

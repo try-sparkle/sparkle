@@ -45,6 +45,7 @@ vi.mock("../../stores/runtimeStore", () => ({
 }));
 
 import { ConciergeSuggestions } from "./ConciergeSuggestions";
+import { PtyGoneError } from "../../pty";
 import { useTerminalOverlayStore } from "../../stores/terminalOverlayStore";
 
 const BUTTON = {
@@ -76,11 +77,16 @@ function setup(
 ) {
   if (!over.noStage) mountStage();
   const onFailure = vi.fn();
-  // Pass-through queue: the host's real one serializes, but these tests are about the click's
-  // behaviour, not its ordering. `onApply` receiving the WHOLE action is the contract that matters
-  // here — terminal-kind pills write inside applySuggestion, so a wrapper around only the prompt
-  // branch would leave them unqueued (roborev 53119).
-  const onApply = vi.fn((run: () => Promise<boolean>) => run());
+  // Models ConciergeHost's real `enqueue`, INCLUDING ITS SWALLOW: `fn().catch(() => onFailure)`
+  // with `onFailure === false`, so one hung or throwing delivery can't wedge the global send chain
+  // (ConciergeHost.tsx). A pass-through stand-in let a rejection reach the component, which the
+  // real wrapper never does — so the dead-PTY and generic-error rows passed against behavior the
+  // shipped host cannot produce, while the click stayed a silent dead button in the app
+  // (roborev 54421). Serialization is not modeled; these tests are about the click's outcome, not
+  // its ordering. `onApply` receiving the WHOLE action is the other contract that matters here —
+  // terminal-kind pills write inside applySuggestion, so a wrapper around only the prompt branch
+  // would leave them unqueued (roborev 53119).
+  const onApply = vi.fn((run: () => Promise<boolean>) => run().catch(() => false));
   render(
     <ConciergeSuggestions
       agentId="a1"
@@ -170,6 +176,23 @@ describe("ConciergeSuggestions — outcomes", () => {
     fireEvent.click(screen.getByText("Yes"));
     await waitFor(() => expect(onFailure).toHaveBeenCalledTimes(1));
     expect(onFailure.mock.calls[0]![0]).toContain("Kraken Auth");
+    expect(h.clear).not.toHaveBeenCalled();
+  });
+
+  // The click that RACES the exit — not the one the gate catches. `disabled` comes from
+  // runtimeStore, which lags the actual PTY exit, so this click looks perfectly live and sails past
+  // the gate above. applySuggestion throws PtyGoneError; folding that into its `false` return made
+  // this a silent dead button, since `false` means "host vetoed" and hosts stay quiet for that
+  // (roborev 54409).
+  it("reports a dead PTY even though the gate saw the agent as live", async () => {
+    h.status = "working"; // the gate is OPEN — this is the race, not the refusal
+    h.applySuggestion.mockRejectedValue(new PtyGoneError("a1"));
+    const { onFailure } = setup();
+    fireEvent.click(screen.getByText("Yes"));
+    await waitFor(() => expect(onFailure).toHaveBeenCalledTimes(1));
+    expect(onFailure.mock.calls[0]![0]).toMatch(/isn't running/i);
+    expect(onFailure.mock.calls[0]![0]).toContain("Kraken Auth");
+    // The row survives, so the user can retry once the agent is back.
     expect(h.clear).not.toHaveBeenCalled();
   });
 });

@@ -14,7 +14,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { screen } = vi.hoisted(() => ({ screen: { text: "" } }));
 vi.mock("../pty", () => ({
-  writePty: vi.fn(async () => {}),
+  writePtyChainedStrict: vi.fn(async () => {}),
   submitPrompt: vi.fn(async () => {}),
   PtyGoneError: class extends Error {},
 }));

@@ -23,7 +23,7 @@ const h = vi.hoisted(() => ({
 
 vi.mock("../pty", () => {
   class PtyGoneError extends Error {}
-  return { writePty: vi.fn(async () => {}), submitPrompt: h.submitPrompt, PtyGoneError };
+  return { writePtyChainedStrict: vi.fn(async () => {}), submitPrompt: h.submitPrompt, PtyGoneError };
 });
 vi.mock("./terminalScrollback", () => ({ getAgentScrollback: vi.fn(() => "SCREEN") }));
 vi.mock("./suggestions/heuristics", () => ({

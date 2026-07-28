@@ -4,7 +4,11 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // The auto-answer executor is the one place a keystroke is emitted, so mock the PTY write + the
 // feature gate and drive the real classifier + effective-rule resolution through the actual stores.
 const writePty = vi.fn((_id: string, _data: string) => Promise.resolve());
-vi.mock("../../pty", () => ({ writePty: (id: string, data: string) => writePty(id, data) }));
+vi.mock("../../pty", () => ({
+  // The module writes through the CHAINED variant: these keystrokes carry their own carriage
+  // return, so they must not land inside another operation's paste→CR window (roborev 54375).
+  writePtyChained: (id: string, data: string) => writePty(id, data),
+}));
 
 // Auto-approve is gated on the flag-only VISIBLE read (aiFeatureVisibleNow), NOT the credit-gated
 // aiFeatureNow — it spends no AI credits, so an out-of-credit user must still be unblocked.

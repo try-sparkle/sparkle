@@ -1,15 +1,11 @@
 // apps/desktop/src/components/selectionActions.ts
 // Behavior for the terminal selection popup. Kept separate from the popup component so each
 // action is unit-testable in isolation (the component just wires buttons to these).
-import { writePty } from "../pty";
+import { pasteIntoPty, PtyGoneError, submitPrompt } from "../pty";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { appendNote, createTask } from "../services/projectFs";
 import { useProjectStore } from "../stores/projectStore";
 import { landInAgent } from "../services/landInAgent";
-
-const ESC = "\x1b";
-const PASTE_START = `${ESC}[200~`;
-const PASTE_END = `${ESC}[201~`;
 
 /** Google search URL for the selection. */
 export function searchUrl(text: string): string {
@@ -23,30 +19,38 @@ export function truncateTitle(text: string, max = 80): string {
   return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : firstLine;
 }
 
-// Neutralize bracketed-paste markers embedded in untrusted selection text so it can't
-// terminate paste mode early and inject keystrokes into the agent's PTY (roborev 2197).
-// A single split/join pass is insufficient: removing a marker can reconstitute a new one
-// from its neighbors (e.g. "\x1b[20\x1b[201~1~" → "\x1b[201~" after one pass). Loop until
-// stable so that no marker survives regardless of how deeply it is interleaved (roborev 2210).
-function stripPasteMarkers(s: string): string {
-  let t = s;
-  while (t.includes(PASTE_START) || t.includes(PASTE_END)) {
-    t = t.split(PASTE_START).join("").split(PASTE_END).join("");
+// Both writes below go through pty.ts's per-agent chain rather than raw `writePty` (roborev 54387).
+// These are the same two shapes the composer and the terminal drop already put on it — a
+// paste-then-Enter and a paste-with-no-Enter — and the popup is no more entitled to skip it: an
+// unchained selection paste can land inside a background requery's paste→CR gap (and `fixInAgent`'s
+// own gap can swallow someone else's paste), merging two prompts into one turn and losing the
+// "fix this" request entirely. Both primitives also own the framing AND the marker-stripping
+// (roborev 2197/2210) — `deliverSubmit` strips too, as of roborev 54397, so the selection text is
+// guarded on both paths without this file repeating the rule.
+//
+// They are STRICT: a dead PTY rejects. That is what the popup wants — `act()` in SelectionPopup
+// toasts a thrown message, so a click that went nowhere says so instead of quietly closing.
+
+/** Turn a PtyGoneError into something worth putting in a toast. */
+async function intoAgent(run: () => Promise<void>): Promise<void> {
+  try {
+    await run();
+  } catch (e) {
+    if (e instanceof PtyGoneError) throw new Error("That agent's terminal isn't running any more.");
+    throw e;
   }
-  return t;
 }
 
 /** Paste an error into the terminal's own agent, framed as a fix request, and submit it. */
-export async function fixInAgent(agentId: string, text: string): Promise<void> {
-  await writePty(agentId, `${PASTE_START}I hit this error, please fix it:\n\n${stripPasteMarkers(text)}${PASTE_END}`);
-  // Brief gap before Enter so the program registers the paste as one block (mirrors Composer).
-  await new Promise((r) => setTimeout(r, 60));
-  await writePty(agentId, "\r");
+export function fixInAgent(agentId: string, text: string): Promise<void> {
+  return intoAgent(() =>
+    submitPrompt(agentId, `I hit this error, please fix it:\n\n${text}`),
+  );
 }
 
 /** Paste raw text into the terminal's own agent without submitting — the user edits, then sends. */
-export async function sendToAgent(agentId: string, text: string): Promise<void> {
-  await writePty(agentId, `${PASTE_START}${stripPasteMarkers(text)}${PASTE_END}`);
+export function sendToAgent(agentId: string, text: string): Promise<void> {
+  return intoAgent(() => pasteIntoPty(agentId, text));
 }
 
 /** Open a new shell tab that runs the selection as a command in the project root. */

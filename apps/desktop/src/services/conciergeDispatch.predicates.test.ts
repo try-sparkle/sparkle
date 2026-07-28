@@ -12,7 +12,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../pty", () => ({
-  writePty: vi.fn(async () => {}),
+  writePtyChainedStrict: vi.fn(async () => {}),
   submitPrompt: vi.fn(async () => {}),
   PtyGoneError: class extends Error {},
 }));

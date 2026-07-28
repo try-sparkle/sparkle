@@ -57,7 +57,7 @@
 // waiting" is a different fact from "the terminal is gone", and only one of them asks the user to
 // restart anything.
 
-import { PtyGoneError, submitPrompt, writePty } from "../pty";
+import { PtyGoneError, submitPrompt, writePtyChainedStrict } from "../pty";
 import { describeAuthority, isDispatchAuthority, type DispatchAuthority } from "./dispatchAuthority";
 import { frameSubmit } from "./relayGate";
 import { log } from "../logger";
@@ -334,7 +334,12 @@ export async function dispatchConciergeAnswer(
     }
     const sent = frameSubmit(match.value);
     try {
-      await writePty(agentId, sent);
+      // CHAINED because `sent` carries its own carriage return: an unchained write landing inside
+      // another operation's paste→CR window would append this digit to THAT prompt and submit it
+      // (roborev 54375). STRICT because the `catch` below reports pty-gone to the user and records
+      // no turn — with the tolerant variant that branch is unreachable and this path claims a
+      // delivery that never happened (roborev 54387). See pty.writePtyChainedStrict.
+      await writePtyChainedStrict(agentId, sent);
       // Only a USER's answer is a turn: a machine-authored relay ("approve") must not write a
       // history entry, because that entry counts toward the naming ladder's promptCount and would
       // consume the first-turn deferral a self-reporting agent relies on.

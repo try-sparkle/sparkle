@@ -1102,6 +1102,22 @@ export function Composer({
   // trial gate on this composer's send path, its attachment-aware deliverPrompt, and the
   // auto-approve nudge, which renders into this composer and nowhere else.
   const onSuggestionClick = async (b: SuggestionButton) => {
+    try {
+      await runSuggestionClick(b);
+    } catch (e) {
+      if (!(e instanceof PtyGoneError)) throw e;
+      // The keystroke reached nothing (roborev 54409). `beforeTerminalWrite` already ran — it HAS
+      // to, it reads the screen the keystroke is about to move on — so its one side effect outlives
+      // the abort: an "always approve this?" nudge, offered off a Yes that never landed, on an
+      // agent that is gone. Clearing it here is the rollback; the nudge lives in this composer and
+      // nowhere else, which is why the core doesn't own it.
+      setApprovalNudge(null);
+      log.warn("composer", "suggestion click hit a dead PTY", { agentId, kind: b.kind });
+      setDeliveryNotice("That agent had stopped, so that didn't go through.");
+    }
+  };
+
+  const runSuggestionClick = async (b: SuggestionButton) => {
     const acted = await applySuggestion(agentId, b, {
       disabled,
       // Auto-approve nudge (spec §4): if the clicked button was the plain "Yes" on a classifiable

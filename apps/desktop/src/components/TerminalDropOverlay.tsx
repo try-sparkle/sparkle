@@ -1,5 +1,5 @@
 // The drag-over affordance for the terminal drop target (hooks/useTerminalDrop): a dashed teal
-// scrim over the agent's terminal, named with the agent it would attach to.
+// scrim over the agent's terminal, named with the agent whose terminal would receive the paths.
 //
 // This is the ONLY affordance available. A native OS drag fires no mouse events, so there is no
 // :hover, no cursor change, nothing the browser gives us for free — without this scrim the user
@@ -49,7 +49,7 @@ export function TerminalDropOverlay({ agentName }: { agentName: string }) {
         }}
       >
         <FiPaperclip size={14} aria-hidden />
-        Drop to attach to {agentName}
+        Drop into {agentName}&rsquo;s terminal
       </div>
     </div>
   );

@@ -134,13 +134,15 @@ describe("loadAttachmentPaths", () => {
 // What the AGENT reads vs what the THREAD shows are deliberately different renderings of the same
 // message: the removed composer contract, kept (buildSendPayload / buildDisplay).
 describe("payload vs display", () => {
-  // A path with whitespace is the case quotePath exists for.
+  // A path with whitespace is the case the quoting exists for. The rule is POSIX single-quoting
+  // (services/shellQuote), NOT JSON/double quoting: this payload can reach a live `kind: "shell"`
+  // tab, where submitPrompt supplies the carriage return itself (roborev 54375).
   const spaced = "/tmp/my@shots/a.png".replace("@", " ");
   const atts = [
     att({ id: "1", path: spaced, name: "a.png" }),
     att({ id: "2", path: "/tmp/log.txt", name: "log.txt", kind: "file", dataUrl: undefined }),
   ];
-  const both = JSON.stringify(spaced) + " /tmp/log.txt";
+  const both = `'${spaced}' /tmp/log.txt`;
 
   it("prefixes the (quoted) real paths to the typed text for the target", () => {
     expect(attachedPayload("  look at this  ", atts)).toBe(both + " look at this");

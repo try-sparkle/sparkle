@@ -5,7 +5,7 @@
 //
 // THE FIX. promptCount only advances via appendPrompt, whose call sites are the Composer's
 // onSubmitPrompt and the build seed. AskUserQuestion picker answers are neither — they're Claude
-// Code's own TUI menu inside the PTY, answered via writePty — so a build agent interacting mostly
+// Code's own TUI menu inside the PTY, answered via writePtyChainedStrict — so a build agent interacting mostly
 // through pickers sits at promptCount 1 forever, permanently parked in agentNaming's
 // deferred_first_turn branch. Picker answers now ALSO go through appendPrompt, tagged
 // source:"picker", so promptHistory.length (the promptCount the ladder reads) advances.
@@ -24,10 +24,11 @@ import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const writePty = vi.fn(() => Promise.resolve());
+const writePtyChainedStrict = vi.fn(() => Promise.resolve());
 vi.mock("../pty", () => ({
   submitPrompt: vi.fn(() => Promise.resolve()),
-  writePty: (...a: unknown[]) => writePty(...(a as [])),
+  writePtyChainedStrict: (...a: unknown[]) => writePtyChainedStrict(...(a as [])),
+  PtyGoneError: class PtyGoneError extends Error {},
 }));
 vi.mock("../screenshot", () => ({ captureScreenRegion: vi.fn(() => Promise.resolve(null)) }));
 vi.mock("@tauri-apps/api/webview", () => ({
@@ -109,7 +110,7 @@ const promptHistoryOf = (id: string) =>
     ?.promptHistory ?? [];
 
 beforeEach(() => {
-  writePty.mockClear();
+  writePtyChainedStrict.mockClear();
   suggestionButtons.mockReturnValue([PICKER_ANSWER]);
   useDictationStore.setState({ insertTarget: null, enabled: true, status: "idle", interim: "" });
   useUiStore.getState().setComposerMinimized(false);
@@ -169,10 +170,10 @@ describe("Composer — picker answers advance promptCount", () => {
   // write, never a replacement).
   it("still sends the keystroke to the PTY — recording is additive, not a replacement", async () => {
     // A picker answer is interactive terminal input, not a metered send. It must keep taking the
-    // writePty path (and keep bypassing the trial gate, exactly like typing into the terminal).
+    // writePtyChainedStrict path (and keep bypassing the trial gate, exactly like typing into the terminal).
     renderComposer();
     await userEvent.click(pill());
-    expect(writePty).toHaveBeenCalledWith("a1", "1\n");
+    expect(writePtyChainedStrict).toHaveBeenCalledWith("a1", "1\n");
   });
 
   it("does nothing to history when the agent belongs to no loaded project", async () => {
@@ -181,6 +182,6 @@ describe("Composer — picker answers advance promptCount", () => {
     useProjectStore.setState({ projects: [] });
     renderComposer();
     await userEvent.click(pill());
-    expect(writePty).toHaveBeenCalledWith("a1", "1\n");
+    expect(writePtyChainedStrict).toHaveBeenCalledWith("a1", "1\n");
   });
 });

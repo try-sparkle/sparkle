@@ -223,15 +223,16 @@ function AgentPaneInner({
     },
     [agent.id],
   );
-  // Drop files on this terminal to attach them to this agent's next message. Replaces the old
-  // drag-vision hint, whose whole content was "images have nowhere to go, drop them on the Sparkle
-  // box instead" — that stopped being true when the terminal became a real drop target, and a pill
-  // saying it over an overlay saying "drop to attach" would be a contradiction on screen.
+  // Drop files on this terminal and their paths are pasted straight into it, at the CLI's current
+  // input line — a drop lands where it was dropped (useTerminalDrop's header covers why it used to
+  // land in the Sparkle box instead). The paste is followed by the caret, so the user can type the
+  // ask onto the text they can see waiting there; nothing is submitted until they press Enter.
   //
   // Only the VISIBLE pane listens. The webview drag event is window-global and every visited pane
   // stays mounted and stacked in the same stage, so `visible` is the ONLY thing that can name which
   // agent a drop belongs to — see useTerminalDrop's header.
-  const terminalDrop = useTerminalDrop(visible, agent.id);
+  const focusTerminalForDrop = useCallback(() => termFocusRef.current?.(), []);
+  const terminalDrop = useTerminalDrop(visible, agent.id, focusTerminalForDrop);
 
   // Publish this agent's "mark a prompt at the current terminal row" capability while its pane is
   // mounted, so the concierge dispatch path can drop the jump-to-prompt marker the composer used to
@@ -1023,12 +1024,13 @@ function AgentPaneInner({
               onPick={pickAccount}
             />
           )}
-          {/* Confirmation of what a drop landed, to whom, and that it has NOT been sent (see
-              useTerminalDrop / TerminalDropPill). Portaled, anchored above this pane. */}
+          {/* Confirmation of what a drop pasted into this terminal, and that it has NOT been sent
+              (see useTerminalDrop / TerminalDropPill). Portaled, anchored above this pane. */}
           {terminalDrop.dropped && (
             <TerminalDropPill
               count={terminalDrop.dropped.count}
               images={terminalDrop.dropped.images}
+              delivered={terminalDrop.dropped.delivered}
               agentName={agent.name}
               anchorRef={terminalStageRef}
               onDismiss={terminalDrop.dismiss}

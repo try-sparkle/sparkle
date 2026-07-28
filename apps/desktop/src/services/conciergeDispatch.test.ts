@@ -6,12 +6,12 @@ import type { SuggestionButton } from "./suggestions/types";
 // `instanceof PtyGoneError` check (it imports from "../pty") matches what the tests throw.
 vi.mock("../pty", () => {
   class PtyGoneError extends Error {}
-  return { writePty: vi.fn(async () => {}), submitPrompt: vi.fn(async () => {}), PtyGoneError };
+  return { writePtyChainedStrict: vi.fn(async () => {}), submitPrompt: vi.fn(async () => {}), PtyGoneError };
 });
 vi.mock("./terminalScrollback", () => ({ getAgentScrollback: vi.fn(() => "SCREEN") }));
 vi.mock("./suggestions/heuristics", () => ({ detectTerminalPrompts: vi.fn(() => [] as SuggestionButton[]) }));
 
-import { PtyGoneError, submitPrompt, writePty } from "../pty";
+import { PtyGoneError, submitPrompt, writePtyChainedStrict } from "../pty";
 import { getAgentScrollback } from "./terminalScrollback";
 import { detectTerminalPrompts } from "./suggestions/heuristics";
 import { dispatchConciergeAnswer, matchAnswerToOption } from "./conciergeDispatch";
@@ -84,7 +84,7 @@ describe("dispatchConciergeAnswer", () => {
     const r = await dispatchConciergeAnswer("agent-1", "approve", { authority: TEST_AUTHORITY });
     expect(r).toMatchObject({ ok: true, path: "picker-option", agentId: "agent-1", matchedLabel: "Yes" });
     // frameSubmit normalizes "y\n" → exactly one trailing CR.
-    expect(writePty).toHaveBeenCalledWith("agent-1", "y\r");
+    expect(writePtyChainedStrict).toHaveBeenCalledWith("agent-1", "y\r");
     expect(submitPrompt).not.toHaveBeenCalled();
   });
 
@@ -92,14 +92,14 @@ describe("dispatchConciergeAnswer", () => {
     setPrompt(YN);
     await dispatchConciergeAnswer("agent-1", "no", { authority: TEST_AUTHORITY });
     expect(getAgentScrollback).toHaveBeenCalledWith("agent-1");
-    expect(writePty).toHaveBeenCalledWith("agent-1", "n\r");
+    expect(writePtyChainedStrict).toHaveBeenCalledWith("agent-1", "n\r");
   });
 
   it("refuses (no keystroke) when a picker is live but the answer maps to no option", async () => {
     setPrompt(YN);
     const r = await dispatchConciergeAnswer("agent-1", "maybe later", { authority: TEST_AUTHORITY });
     expect(r).toMatchObject({ ok: false, path: "ambiguous-picker", options: YN });
-    expect(writePty).not.toHaveBeenCalled();
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
     expect(submitPrompt).not.toHaveBeenCalled();
   });
 
@@ -108,7 +108,7 @@ describe("dispatchConciergeAnswer", () => {
     const r = await dispatchConciergeAnswer("agent-1", "add a test for the webhook", { authority: TEST_AUTHORITY });
     expect(r).toMatchObject({ ok: true, path: "free-text", sent: "add a test for the webhook" });
     expect(submitPrompt).toHaveBeenCalledWith("agent-1", "add a test for the webhook");
-    expect(writePty).not.toHaveBeenCalled();
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
   });
 
   it("reports pty-gone (not a silent success) when the free-text PTY is dead", async () => {
@@ -120,7 +120,7 @@ describe("dispatchConciergeAnswer", () => {
 
   it("reports pty-gone when the picker write hits a dead PTY", async () => {
     setPrompt(YN);
-    (writePty as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new PtyGoneError("dead"));
+    (writePtyChainedStrict as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new PtyGoneError("dead"));
     const r = await dispatchConciergeAnswer("agent-1", "yes", { authority: TEST_AUTHORITY });
     expect(r).toMatchObject({ ok: false, path: "pty-gone" });
   });
@@ -132,7 +132,7 @@ describe("dispatchConciergeAnswer", () => {
       expect(r).toMatchObject({ ok: false, path: "empty" });
     }
     expect(submitPrompt).not.toHaveBeenCalled();
-    expect(writePty).not.toHaveBeenCalled();
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
   });
 
   it("treats a null scrollback as no live prompt (free-text path)", async () => {

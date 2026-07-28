@@ -12,7 +12,7 @@
 //     REMOVE a working "Close Build Agent" from the concierge.
 //   • "send a terminal button's LABEL ('Yes', '2') rather than its raw keystroke ('2\n'), because
 //     that is what reads correctly in the thread and what the picker matcher works on." The matcher
-//     is never involved: terminal buttons go straight to the PTY via `writePty`, which is what a
+//     is never involved: terminal buttons go straight to the PTY via `writePtyChainedStrict`, which is what a
 //     raw-mode Ink picker actually needs. Routing the label through the text path instead would
 //     hand a live picker a string to re-match — strictly more ways to mis-select. The readable
 //     label is already what gets recorded for history (see the `recordPickerTurn` row below), which
@@ -23,13 +23,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
-  writePty: vi.fn(async () => {}),
+  writePtyChainedStrict: vi.fn(async () => {}),
+  PtyGoneError: class PtyGoneError extends Error {},
   closeBuildAgent: vi.fn(async () => {}),
   recordEvent: vi.fn(),
   appendPrompt: vi.fn(() => "p1"),
 }));
 
-vi.mock("../../pty", () => ({ writePty: h.writePty }));
+vi.mock("../../pty", () => ({
+  writePtyChainedStrict: h.writePtyChainedStrict,
+  PtyGoneError: h.PtyGoneError,
+}));
 vi.mock("../closeBuildAgent", () => ({ closeBuildAgent: h.closeBuildAgent }));
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => "some screen" }));
 vi.mock("../../stores/suggestionStore", () => ({
@@ -64,7 +68,7 @@ const promptBtn: SuggestionButton = {
 };
 
 beforeEach(() => {
-  h.writePty.mockClear();
+  h.writePtyChainedStrict.mockClear();
   h.closeBuildAgent.mockClear();
   h.recordEvent.mockClear();
   h.appendPrompt.mockClear();
@@ -78,7 +82,7 @@ describe("applySuggestion — control kind", () => {
       expect(h.closeBuildAgent).toHaveBeenCalledWith("ag1");
       // No PTY write and no text delivery — that is WHY it works in a host whose only message
       // channel is text.
-      expect(h.writePty).not.toHaveBeenCalled();
+      expect(h.writePtyChainedStrict).not.toHaveBeenCalled();
       expect(deliverPrompt).not.toHaveBeenCalled();
     });
   });
@@ -103,8 +107,22 @@ describe("applySuggestion — terminal kind", () => {
   // nothing re-matches it. This is the row that fails if someone substitutes `b.label`.
   it("writes the raw keystroke to the PTY, never the label", async () => {
     await applySuggestion("ag1", terminalBtn, { deliverPrompt: vi.fn() });
-    expect(h.writePty).toHaveBeenCalledWith("ag1", "2\n");
-    expect(h.writePty).not.toHaveBeenCalledWith("ag1", "2 · Yes");
+    expect(h.writePtyChainedStrict).toHaveBeenCalledWith("ag1", "2\n");
+    expect(h.writePtyChainedStrict).not.toHaveBeenCalledWith("ag1", "2 · Yes");
+  });
+
+  it("throws on a dead PTY — no turn, no learning, and NOT the veto value", async () => {
+    // Everything after the write CLAIMS it landed: the picker turn advances the naming ladder's
+    // promptCount, the learning event trains the re-ranker, and `true` tells the host to clear the
+    // row the user would have retried from. It must THROW rather than return `false`, because
+    // `false` means "the host vetoed this" — which hosts answer by staying quiet, since they
+    // already know why. Returning it here made the click a silent dead button (roborev 54409).
+    h.writePtyChainedStrict.mockRejectedValueOnce(new h.PtyGoneError("ag1"));
+    await expect(
+      applySuggestion("ag1", terminalBtn, { deliverPrompt: vi.fn() }),
+    ).rejects.toBeInstanceOf(h.PtyGoneError);
+    expect(h.appendPrompt).not.toHaveBeenCalled();
+    expect(h.recordEvent).not.toHaveBeenCalled();
   });
 
   // …while the READABLE label is what reaches history. The "send the label" rule was reaching for
@@ -126,13 +144,13 @@ describe("applySuggestion — terminal kind", () => {
       disabled: true,
     });
     expect(did).toBe(false);
-    expect(h.writePty).not.toHaveBeenCalled();
+    expect(h.writePtyChainedStrict).not.toHaveBeenCalled();
     expect(h.recordEvent).not.toHaveBeenCalled();
   });
 
   it("runs beforeTerminalWrite while the prompt is still on screen", async () => {
     const order: string[] = [];
-    h.writePty.mockImplementationOnce(async () => {
+    h.writePtyChainedStrict.mockImplementationOnce(async () => {
       order.push("write");
     });
     await applySuggestion("ag1", terminalBtn, {
@@ -156,7 +174,7 @@ describe("applySuggestion — prompt kind", () => {
     const did = await applySuggestion("ag1", promptBtn, { deliverPrompt });
     expect(did).toBe(true);
     expect(deliverPrompt).toHaveBeenCalledWith("Land this to main.");
-    expect(h.writePty).not.toHaveBeenCalled();
+    expect(h.writePtyChainedStrict).not.toHaveBeenCalled();
   });
 
   // A veto means NOTHING happened — so teaching the re-ranker from it would poison the history with

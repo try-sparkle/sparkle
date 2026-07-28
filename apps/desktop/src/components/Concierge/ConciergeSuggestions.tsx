@@ -74,6 +74,7 @@ import { createPortal } from "react-dom";
 import { SuggestionRow, SUGGESTION_PILL_HEIGHT } from "../composer/SuggestionRow";
 import { terminalSuggestionAnchorStyle } from "../terminalStageAnchor";
 import { applySuggestion } from "../../services/suggestions/applySuggestion";
+import { PtyGoneError } from "../../pty";
 import { useSuggestions } from "../../services/suggestions/useSuggestions";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useTerminalOverlayStore } from "../../stores/terminalOverlayStore";
@@ -136,22 +137,33 @@ export function ConciergeSuggestions({
   const onClick = useCallback(
     (b: SuggestionButton) => {
       void (async () => {
-        try {
-          if (
-            await onApply(() =>
-              applySuggestion(agentId, b, { disabled, deliverPrompt: onDeliverPrompt }),
-            )
-          ) {
-            clear();
-          } else if (disabled) {
-            // A vetoed click was a completely silent no-op: nothing delivered, nothing cleared,
-            // nothing said — on the one surface whose contract is that every delivery path reports
-            // its outcome (roborev 53074). Say why instead.
-            onFailure(`${agentName} isn't running, so I couldn't do that.`);
+        // CAUGHT INSIDE THE QUEUED FUNCTION, not around `onApply` (roborev 54421). The host wires
+        // `onApply` to ConciergeHost's `enqueue`, which is deliberately failure-swallowing —
+        // `fn().catch(() => onFailure)` with `onFailure === false`, so one hung or throwing delivery
+        // can't wedge the global send chain. A `catch` on the OUTSIDE therefore never runs: the
+        // rejection is already a `false` by the time it gets back here, indistinguishable from a
+        // veto, and the click goes silent again. ConciergeHost's Approve path solves it the same
+        // way, and says so.
+        let failed: "pty-gone" | "error" | null = null;
+        const acted = await onApply(async () => {
+          try {
+            return await applySuggestion(agentId, b, { disabled, deliverPrompt: onDeliverPrompt });
+          } catch (e) {
+            failed = e instanceof PtyGoneError ? "pty-gone" : "error";
+            return false;
           }
-        } catch {
-          onFailure(`I couldn't run that on ${agentName}.`);
+        });
+        if (acted) {
+          clear();
+          return;
         }
+        // A vetoed click was a completely silent no-op: nothing delivered, nothing cleared, nothing
+        // said — on the one surface whose contract is that every delivery path reports its outcome
+        // (roborev 53074). Say why instead. A dead PTY is NOT the `disabled` case: that flag comes
+        // from runtimeStore, which lags the real exit, so the click that races it looks perfectly
+        // live — but it is the same fact for the user, so it gets the same words.
+        if (failed === "error") onFailure(`I couldn't run that on ${agentName}.`);
+        else if (failed || disabled) onFailure(`${agentName} isn't running, so I couldn't do that.`);
       })();
     },
     [agentId, agentName, disabled, onDeliverPrompt, onApply, onFailure, clear],

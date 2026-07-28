@@ -16,14 +16,14 @@ import type { SuggestionButton } from "./suggestions/types";
 
 vi.mock("../pty", () => {
   class PtyGoneError extends Error {}
-  return { writePty: vi.fn(async () => {}), submitPrompt: vi.fn(async () => {}), PtyGoneError };
+  return { writePtyChainedStrict: vi.fn(async () => {}), submitPrompt: vi.fn(async () => {}), PtyGoneError };
 });
 vi.mock("./terminalScrollback", () => ({ getAgentScrollback: vi.fn(() => "SCREEN") }));
 vi.mock("./suggestions/heuristics", () => ({
   detectTerminalPrompts: vi.fn(() => [] as SuggestionButton[]),
 }));
 
-import { submitPrompt, writePty } from "../pty";
+import { submitPrompt, writePtyChainedStrict } from "../pty";
 import { dispatchConciergeAnswer } from "./conciergeDispatch";
 import {
   DISPATCH_AUTHORITY_KINDS,
@@ -98,7 +98,7 @@ describe("the gate — an un-authorized dispatch is refused", () => {
       expect(r.ok === false && r.path).toBe("unauthorized");
       // The assertion the refusal is actually FOR. A result object saying "unauthorized" while the
       // keystrokes had already gone into the PTY would be a gate in name only.
-      expect(writePty).not.toHaveBeenCalled();
+      expect(writePtyChainedStrict).not.toHaveBeenCalled();
       expect(submitPrompt).not.toHaveBeenCalled();
     });
   }

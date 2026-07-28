@@ -2,7 +2,7 @@
 // that is ALREADY running, by typing the interactive REPL's `/model <id>` slash command into its
 // live PTY — no respawn, the conversation continues on the new model. The store update
 // (projectStore.setAgentModel) is separate and always happens; this is only the live delivery.
-import { writePty } from "../pty";
+import { chainPtyOp, writePty } from "../pty";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { isDefaultModel } from "./models";
 
@@ -23,10 +23,14 @@ export const MODEL_SUBMIT_DELAY_MS = 200;
 // and would still garble the command (roborev 23548/23549).
 const CLEAR_LINE = "\x05\x15";
 
-// Per-agent delivery chain: two picks inside the MODEL_SUBMIT_DELAY_MS window would otherwise
-// interleave their writes ("/model a" "/model b" "\r" "\r" → the junk line "/model a/model b").
-// Chaining serializes them — both apply in order, the last pick wins (roborev 23524).
-const deliveryChain = new Map<string, Promise<void>>();
+// Delivery runs on pty.ts's per-agent chain (`chainPtyOp`), not a private one. Two picks inside the
+// MODEL_SUBMIT_DELAY_MS window would otherwise interleave their writes ("/model a" "/model b" "\r"
+// "\r" → the junk line "/model a/model b"); chaining serializes them, last pick wins (roborev
+// 23524). This used to be its OWN Map, which serialized model picks against each other and against
+// NOTHING ELSE — and this sequence has the app's widest paste→CR window (200ms), so a composer send
+// or a background requery landing inside it produced "/model claude-opus-5<user prompt>" as one
+// garbled slash-command line: roborev 23524's failure mode re-entered from the other side (roborev
+// 54387). Two disjoint chains guarantee no ordering between them; one does.
 
 /** Is it safe to inject keystrokes into this agent's PTY right now? Best-effort, keyed off the
  *  LAST-KNOWN hook-driven status (which can lag the actual screen by a beat): skip while the
@@ -69,15 +73,8 @@ async function deliver(agentId: string, modelId: string): Promise<void> {
  */
 export function applyModelToRunningAgent(agentId: string, modelId: string): Promise<void> {
   if (isDefaultModel(modelId)) return Promise.resolve();
-  const next = (deliveryChain.get(agentId) ?? Promise.resolve())
-    .then(() => deliver(agentId, modelId))
+  return chainPtyOp(agentId, () => deliver(agentId, modelId))
     // warn, not debug: writePty already swallows the expected "pty exited" teardown race, so
     // anything landing here is an UNEXPECTED failure that shouldn't be console-filtered away.
     .catch((e) => console.warn("applyModelToRunningAgent failed for", agentId, e));
-  deliveryChain.set(agentId, next);
-  // Drop the map entry once the chain drains, so it can't grow over a long session.
-  void next.then(() => {
-    if (deliveryChain.get(agentId) === next) deliveryChain.delete(agentId);
-  });
-  return next;
 }

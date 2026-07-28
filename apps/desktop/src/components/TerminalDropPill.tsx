@@ -1,21 +1,23 @@
-// Confirmation pill for files dropped on an agent's terminal (hooks/useTerminalDrop). Successor to
-// DragVisionHintPill, which existed to say the opposite — that a dropped image had nowhere to go,
-// because CM-U7 removed the pane composer. The terminal IS a drop target now, so the pill reports
-// what landed and where it is waiting.
+// Confirmation pill for files dropped on an agent's terminal (hooks/useTerminalDrop). The paths are
+// pasted into that terminal's input line; this says so, and says what did NOT happen.
 //
-// WHAT THIS PILL MAY PROMISE: only what happened. The files are ATTACHED, not sent — they ride
-// along with the user's next message to this agent, and nothing moves until they hit Send. Saying
-// "sent" would be the same class of lie the old copy was written to avoid, and a worse one: a
-// terminal write cannot be taken back.
+// WHAT THIS PILL MAY PROMISE: only what happened. The paths are PASTED, not sent — they sit at the
+// CLI's prompt until the user presses Enter, and the pill has to make that unmistakable, because a
+// user who assumes it was sent will sit waiting for an answer that is not coming. It used to say
+// the files were "attached" and point at the Sparkle box, which is what this change removed: the
+// drop now lands in the terminal the user dropped on.
+//
+// It also reports FAILURE. `delivered: false` means the agent's PTY was gone and nothing was
+// pasted — the one case where a confirmation would otherwise be a straight lie about a file the
+// user can no longer see anywhere.
 //
 // Rendered through a portal (like SelectionPopup.tsx) so the terminal's overflow:hidden can't clip
 // it, and positioned with viewport-clamped fixed coords just inside the terminal pane's top edge.
 // Styling mirrors the app's dark popovers / ModelPill. No emoji — icons come from react-icons/fi.
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import { FiPaperclip, FiX } from "react-icons/fi";
-import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
-import { useUiStore } from "../stores/uiStore";
+import { FiAlertTriangle, FiPaperclip, FiX } from "react-icons/fi";
+import { C } from "../theme/colors";
 
 /** Auto-dismiss the pill after this long if the user doesn't act. */
 const AUTO_DISMISS_MS = 8000;
@@ -34,14 +36,18 @@ export function describeDrop(count: number, images: number): string {
 export function TerminalDropPill({
   count,
   images,
+  delivered = true,
   agentName,
   anchorRef,
   onDismiss,
 }: {
   count: number;
-  /** How many of `count` are images — wording only; every dropped file is attached. */
+  /** How many of `count` are images — wording only; every dropped file is pasted the same way. */
   images: number;
-  /** The agent the files were attached to — the pane that was dropped on. */
+  /** False when the agent's PTY was gone, so nothing was pasted. Defaults to the success wording
+   *  so a caller that never fails doesn't have to say so. */
+  delivered?: boolean;
+  /** The agent whose terminal was dropped on. */
   agentName: string;
   /** The terminal pane the pill floats over. Falls back to the top-center of the window. */
   anchorRef?: RefObject<HTMLElement | null>;
@@ -84,19 +90,16 @@ export function TerminalDropPill({
     setPos({ left, top });
   }, [anchorRef]);
 
-  // The drop already asked for the caret; this button is for the user who clicked away in the
-  // meantime, and re-asks for exactly the same thing.
-  const onGoToCompose = () => {
-    useUiStore.getState().requestComposeFocus();
-    onDismissRef.current();
-  };
-
   return createPortal(
     <div
       ref={cardRef}
       data-testid="terminal-drop-pill"
       role="dialog"
-      aria-label={`Attached to ${agentName}`}
+      aria-label={
+        delivered
+          ? `Pasted into ${agentName}'s terminal`
+          : `Nothing pasted — ${agentName}'s terminal isn't running`
+      }
       style={{
         position: "fixed",
         left: pos.left,
@@ -150,32 +153,32 @@ export function TerminalDropPill({
       </button>
 
       <div style={{ display: "flex", gap: 8, alignItems: "flex-start", paddingRight: 18 }}>
-        <FiPaperclip size={16} style={{ flex: "none", color: C.tealInk, marginTop: 1 }} aria-hidden />
+        {delivered ? (
+          <FiPaperclip
+            size={16}
+            style={{ flex: "none", color: C.tealInk, marginTop: 1 }}
+            aria-hidden
+          />
+        ) : (
+          <FiAlertTriangle
+            size={16}
+            style={{ flex: "none", color: C.amberInk, marginTop: 1 }}
+            aria-hidden
+          />
+        )}
         <div style={{ fontSize: 12, lineHeight: 1.4 }}>
-          Attached {describeDrop(count, images)} to <strong>{agentName}</strong>. Nothing has been
-          sent yet — say what you want done with it in the Sparkle box and hit Send.
+          {delivered ? (
+            <>
+              Pasted {describeDrop(count, images)} into <strong>{agentName}</strong>&rsquo;s
+              terminal. Nothing has been sent — type what you want done with it and press Enter.
+            </>
+          ) : (
+            <>
+              <strong>{agentName}</strong>&rsquo;s terminal isn&rsquo;t running, so{" "}
+              {describeDrop(count, images)} went nowhere. Restart the agent and drop again.
+            </>
+          )}
         </div>
-      </div>
-
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10 }}>
-        <button
-          type="button"
-          onClick={onGoToCompose}
-          style={{
-            background: C.teal,
-            color: ON_BRAND_FILL,
-            border: "none",
-            borderRadius: 4,
-            padding: "5px 12px",
-            fontSize: 12,
-            fontWeight: FONT_WEIGHT.semibold,
-            cursor: "pointer",
-            fontFamily: "inherit",
-            whiteSpace: "nowrap",
-          }}
-        >
-          Go to the Sparkle box
-        </button>
       </div>
     </div>,
     document.body,

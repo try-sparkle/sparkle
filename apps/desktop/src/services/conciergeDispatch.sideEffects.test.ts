@@ -11,7 +11,7 @@ import type { SuggestionButton } from "./suggestions/types";
 
 vi.mock("../pty", () => {
   class PtyGoneError extends Error {}
-  return { writePty: vi.fn(async () => {}), submitPrompt: vi.fn(async () => {}), PtyGoneError };
+  return { writePtyChainedStrict: vi.fn(async () => {}), submitPrompt: vi.fn(async () => {}), PtyGoneError };
 });
 vi.mock("./terminalScrollback", () => ({ getAgentScrollback: vi.fn(() => "SCREEN") }));
 vi.mock("./suggestions/heuristics", () => ({
@@ -31,7 +31,7 @@ vi.mock("./trialMeter", () => ({
 const aiFeatureNow = vi.fn((_key?: string) => true);
 vi.mock("./aiGate", () => ({ aiFeatureNow: (k: string) => aiFeatureNow(k) }));
 
-import { submitPrompt, writePty } from "../pty";
+import { submitPrompt, writePtyChainedStrict } from "../pty";
 import { detectTerminalPrompts } from "./suggestions/heuristics";
 import {
   abandonPendingSends,
@@ -410,7 +410,7 @@ describe("dispatchConciergeAnswer — a user PROMPT is not a picker answer", () 
     expect(r.ok).toBe(false);
     expect(r.path).toBe("ambiguous-picker");
     expect(r.options).toHaveLength(2);
-    expect(writePty).not.toHaveBeenCalled();
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
     expect(submitPrompt).not.toHaveBeenCalled();
   });
 
@@ -640,7 +640,7 @@ describe("cloud agents have no local PTY (roborev 46916)", () => {
     expect(r.path).toBe("cloud-agent");
     // The refusal short-circuits BEFORE the screen is even read: no PTY write, no keystroke,
     // no picker detection — there is no terminal to detect against — and nothing is charged.
-    expect(writePty).not.toHaveBeenCalled();
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
     expect(submitPrompt).not.toHaveBeenCalled();
     expect(detectTerminalPrompts).not.toHaveBeenCalled();
     expect(recordTrialSend).not.toHaveBeenCalled();

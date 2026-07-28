@@ -23,7 +23,7 @@ export const NEW_BUILD_AGENT_DND_TARGET = "new-build-agent";
 export const CONCIERGE_COLUMN_DND_TARGET = "concierge-column";
 
 /** The terminal stage — the box in Workspace that every agent pane is stacked inside. Dropping
- *  files here attaches them to the VISIBLE agent's next message (hooks/useTerminalDrop).
+ *  files here pastes their paths into the VISIBLE agent's own terminal (hooks/useTerminalDrop).
  *
  *  DELIBERATELY NOT in FILE_DROP_TARGETS below, even though it does own its drops. That list is
  *  "surfaces the two window-global listeners must stand DOWN over", and the Sparkle pane's

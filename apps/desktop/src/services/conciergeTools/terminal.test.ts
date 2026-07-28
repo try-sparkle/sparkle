@@ -22,7 +22,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // test below asserts against these, because `ok: false` alone would still pass if the text had gone
 // out and the result were mislabelled afterwards.
 vi.mock("../../pty", () => ({
-  writePty: vi.fn(async () => {}),
+  writePtyChainedStrict: vi.fn(async () => {}),
   submitPrompt: vi.fn(async () => {}),
   PtyGoneError: class extends Error {},
 }));
@@ -40,7 +40,7 @@ vi.mock("../../stores/runtimeStore", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { submitPrompt, writePty } from "../../pty";
+import { submitPrompt, writePtyChainedStrict } from "../../pty";
 import { searchHistory } from "../history";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { getAgentScrollback } from "../terminalScrollback";
@@ -510,7 +510,7 @@ describe("sendToAgentTerminal — refusals, none of which may reach the PTY", ()
       expect(r.ok, label).toBe(false);
       expect(r.path, label).toBe("unauthorized");
       expect(submitPrompt, label).not.toHaveBeenCalled();
-      expect(writePty, label).not.toHaveBeenCalled();
+      expect(writePtyChainedStrict, label).not.toHaveBeenCalled();
     }
   });
 
@@ -524,7 +524,7 @@ describe("sendToAgentTerminal — refusals, none of which may reach the PTY", ()
     expect(r.ok).toBe(false);
     expect(r.path).toBe("unauthorized");
     expect(submitPrompt).not.toHaveBeenCalled();
-    expect(writePty).not.toHaveBeenCalled();
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
   });
 
   it("refuses a send whose policy was denied", async () => {
@@ -552,7 +552,7 @@ describe("sendToAgentTerminal — refusals, none of which may reach the PTY", ()
     expect(r.ok).toBe(false);
     expect(r.path).toBe("unknown-agent");
     expect(submitPrompt).not.toHaveBeenCalled();
-    expect(writePty).not.toHaveBeenCalled();
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
   });
 
   // There is no cloud input path, and inventing one here would be a lie. The dispatcher already
@@ -563,7 +563,7 @@ describe("sendToAgentTerminal — refusals, none of which may reach the PTY", ()
     expect(r.ok).toBe(false);
     expect(r.path).toBe("cloud-agent");
     expect(submitPrompt).not.toHaveBeenCalled();
-    expect(writePty).not.toHaveBeenCalled();
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
   });
 
   it("refuses empty text without a round trip to the PTY", async () => {

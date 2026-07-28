@@ -14,7 +14,7 @@
 // through dispatchConciergeAnswer's relay with its outcome reporting. Forcing those together
 // would mean one host quietly inheriting the other's side effects, so the caller injects it.
 // Composer's approval-nudge pre-step is likewise host-local — it renders into the composer.
-import { writePty } from "../../pty";
+import { writePtyChainedStrict } from "../../pty";
 import { closeBuildAgent } from "../closeBuildAgent";
 import { getAgentScrollback } from "../terminalScrollback";
 import { useProjectStore } from "../../stores/projectStore";
@@ -73,7 +73,25 @@ export async function applySuggestion(
     // keystroke (y/n, a menu digit) — interactive terminal input, not a metered "send" — so they
     // intentionally bypass the trial-cap gate, exactly like typing into the terminal directly.
     opts.beforeTerminalWrite?.(b);
-    await writePty(agentId, b.value);
+    // CHAINED: a terminal button's value carries its own submit ("1\n"), so an unchained write
+    // landing in another operation's paste→CR window would answer that prompt instead of this
+    // picker (roborev 54387). The phone relay's identical click already went through the chain.
+    //
+    // STRICT, and a dead PTY PROPAGATES (roborev 54397/54409). Everything below this line CLAIMS
+    // the keystroke landed: `recordPickerTurn` writes a history entry that advances the naming
+    // ladder's promptCount, `recordEvent` teaches the re-ranker from it, and `true` tells the host
+    // to clear the suggestion row — the row the user would have retried from. So the write must be
+    // able to fail.
+    //
+    // It THROWS rather than returning `false`, and that is the whole design: `false` already means
+    // "the host vetoed this" (the deliverPrompt branch below), which every host answers by staying
+    // quiet, because nothing happened and the host already knows why. A dead PTY is the opposite —
+    // the host has NO idea, and its stale `disabled` flag says the agent is fine (the race this
+    // exists for is the PTY dying a beat before runtimeStore catches up). Folding the two into one
+    // value made the click a silent dead button on both surfaces. Hosts catch this and say so:
+    // ConciergeSuggestions posts the failure line, Composer clears its approval nudge — the one
+    // pre-write side effect that outlives an abort — and posts a delivery notice.
+    await writePtyChainedStrict(agentId, b.value);
     recordPickerTurn(agentId, b.label);
   } else if ((await opts.deliverPrompt(b.value)) === false) {
     return false; // host vetoed — nothing happened, so record nothing and clear nothing
