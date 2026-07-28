@@ -1,7 +1,13 @@
 // The one compose box in the app (the terminal has none — the concierge is where you talk).
-// Attach row (Screenshot / Image / Files) above a mic + textarea + Send row; ⌘/Ctrl+Enter
-// submits. Purely presentational: submit reports trimmed text via onSend and clears; the mic
-// button only reports onMicToggle — micLive (the armed state) is a prop, owned upstream.
+// Attach row (Screenshot / Image / Files) above a textarea + Send row; ⌘/Ctrl+Enter submits.
+// Purely presentational: submit reports trimmed text via onSend and clears.
+//
+// THERE IS NO MIC BUTTON HERE, and putting one back would re-create the bug this box was fixed for.
+// It used to carry one immediately left of the textarea, next to Send — which meant the concierge
+// column showed TWO microphones, this one and the waveform ring in the column header a few inches
+// above it, with nothing to say which was in charge. The ring won: it is the app's single mic
+// control (arm / mute / off) and it also names the concierge as the voice surface, which is what
+// steers dictated speech into this box. See LogoWaveform and dictationStore.voiceSurface.
 //
 // ATTACHMENTS (parity row #21). The attach buttons report a KIND; the host runs the picker and owns
 // the resulting list, which comes back as `attachments` and renders as removable chips. The box
@@ -68,7 +74,7 @@ import {
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { FiCamera, FiFile, FiImage, FiMic, FiPaperclip, FiX } from "react-icons/fi";
+import { FiCamera, FiFile, FiImage, FiPaperclip, FiX } from "react-icons/fi";
 import { C, COMPOSE_SCRIM, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
 import type { Attachment, ConciergeAttachKind } from "./types";
 import { useUiStore } from "../../stores/uiStore";
@@ -81,6 +87,8 @@ import {
 } from "../composer/RichPlaceholder";
 import { ComposerOutOfCreditsNotice } from "../OutOfCreditsNotice";
 import { useVoicePlaceholder } from "../../voice/useVoicePlaceholder";
+import { useDictationStore } from "../../stores/dictationStore";
+import { focusQuietly, isProgrammaticFocus } from "../../services/programmaticFocus";
 import {
   CONCIERGE_THREAD_TESTID,
   composeDragH,
@@ -106,12 +114,14 @@ export const CONCIERGE_PLACEHOLDER = "Ask about any project, or say what to buil
 
 /** How wide the textarea's TEXT column actually is at the shipped column width, and therefore the
  *  budget any right-edge reservation would have to fit inside. From Workspace's 360px: the
- *  column's own 12px×2 padding, the mic button (~31), the Send button (~63), the row's two 8px
- *  gaps, and the textarea's 12px×2 padding + 1px×2 border all come off. Approximate on purpose —
- *  it exists to be COMPARED against SUGGESTION_PILL_ZONE, and the two are far enough apart that a
- *  few pixels either way cannot change the answer. Exported so that comparison is a test rather
- *  than a claim in a comment (see ComposeBox.placeholder.test.tsx). */
-export const CONCIERGE_TEXTAREA_TEXT_WIDTH = 360 - 24 - 31 - 63 - 16 - 26;
+ *  column's own 12px×2 padding, the Send button (~63), the row's 8px gap, and the textarea's
+ *  12px×2 padding + 1px×2 border all come off. (It used to subtract a ~31px mic button and a
+ *  second 8px gap as well; that button is gone — the header ring is the one mic — so the text
+ *  column is 39px wider than it was.) Approximate on purpose — it exists to be COMPARED against
+ *  SUGGESTION_PILL_ZONE, and the two are far enough apart that a few pixels either way cannot
+ *  change the answer. Exported so that comparison is a test rather than a claim in a comment
+ *  (see ComposeBox.placeholder.test.tsx). */
+export const CONCIERGE_TEXTAREA_TEXT_WIDTH = 360 - 24 - 63 - 8 - 26;
 
 /** The textarea's border (1px) + padding (10px/12px): where a native placeholder's first line would
  *  land, and therefore where the overlay must paint.
@@ -156,12 +166,10 @@ export function appendDictated(current: string, segment: string): string {
 
 export function ComposeBox({
   onSend,
-  onMicToggle,
   onAttach,
   onRemoveAttachment,
   attachments = [],
   dropActive = false,
-  micLive = false,
   interim = "",
   registerInsert,
   onTextEdit,
@@ -169,14 +177,12 @@ export function ComposeBox({
   /** Reports the trimmed text (empty only when something is attached). May return a promise
    *  resolving FALSE when the send failed, in which case the box restores the draft (see submit). */
   onSend: (text: string) => void | Promise<boolean>;
-  onMicToggle: () => void;
   onAttach: (kind: ConciergeAttachKind) => void;
   onRemoveAttachment?: (id: string) => void;
   /** Staged files, owned by the host — rendered as chips, cleared by the host on send. */
   attachments?: Attachment[];
   /** A native file drag is over this box (the host hit-tests the window-global event). */
   dropActive?: boolean;
-  micLive?: boolean;
   /** Live, uncommitted transcript; rendered as a ghost line, never submitted. */
   interim?: string;
   /** Must be referentially STABLE (useCallback upstream) — the box re-registers whenever it
@@ -211,7 +217,16 @@ export function ComposeBox({
   useEffect(() => {
     if (composeFocusSeq === handledFocusSeq.current) return;
     handledFocusSeq.current = composeFocusSeq;
-    textareaRef.current?.focus();
+    // Quiet, because this effect runs a render after the request: it is the app moving the caret,
+    // and the focus event it produces must not be mistaken for the user's.
+    focusQuietly(textareaRef.current);
+    // …but dictation DOES follow, said outright rather than inferred from that focus. Every caller
+    // of requestComposeFocus is a user gesture (the drop pill's "go to compose", a file drop,
+    // spawning an agent, the capture-window handoff), so reaching this effect at all IS the user
+    // asking for this box. Stating it here rather than carrying an intent flag through the focus
+    // event is what makes it survive the caret arriving late — or already being here, in which case
+    // no focus event fires at all (roborev 54259).
+    ownVoiceRef.current();
   }, [composeFocusSeq]);
   useEffect(() => {
     if (!registerInsert) return;
@@ -219,6 +234,18 @@ export function ComposeBox({
     registerInsert(append);
     return () => registerInsert(null);
   }, [registerInsert]);
+  /** "I am talking to Sparkle" — name this box the voice surface, so useConciergeDictation claims
+   *  the app-wide dictation target for it. The box has no mic of its own to say it with (see the
+   *  header above), so putting the caret in it, or typing in it, is the gesture. There is no
+   *  registerInsert call to pair with it: the effect above already registered this box's append,
+   *  and the hook claims off the arbiter. */
+  const ownVoice = useCallback(() => {
+    const s = useDictationStore.getState();
+    if (s.voiceSurface !== "concierge") s.setVoiceSurface("concierge");
+  }, []);
+  // Read by the composeFocusSeq effect above, which must not re-run when this identity changes.
+  const ownVoiceRef = useRef(ownVoice);
+  ownVoiceRef.current = ownVoice;
 
   // Report what this box STARTS WITH, once, on mount — which for a fresh box is "" (`text` is
   // component state, so a remount resets it).
@@ -558,30 +585,17 @@ export function ComposeBox({
           flex: "none",
         }}
       />
+      {/* NO MIC BUTTON IN THIS ROW. There used to be one immediately left of the textarea, beside
+          Send — a second microphone in a column whose header already carries the waveform ring, ~2
+          inches apart and with no way to tell which one was in charge. The ring is now the app's
+          single mic control: it owns arm/mute/off AND, since it names the concierge as the voice
+          surface, it is what routes speech into this box. See LogoWaveform and
+          dictationStore.voiceSurface.
+
+          Removing the button did not remove the box from the mic pipeline: it still registers its
+          append fn (the effect above) and still paints the live interim preview and every voice
+          placeholder state below. It just no longer offers a redundant way to arm. */}
       <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
-        <button
-          type="button"
-          aria-label="Talk to Sparkle"
-          aria-pressed={micLive}
-          title="Talk to Sparkle"
-          onClick={onMicToggle}
-          style={{
-            ...attachStyle,
-            padding: "7px 8px",
-            // Prototype `.composer .mic.live` — a gold-hot glyph in a gold-bordered gold tint.
-            // The BORDER is opaque, so it takes the themed goldFill; the 12% wash stays literal,
-            // because a translucent tint composites against whatever is behind it.
-            ...(micLive
-              ? {
-                  color: C.goldHotInk,
-                  borderColor: C.goldFill,
-                  background: `color-mix(in srgb, ${C.gold} 12%, transparent)`,
-                }
-              : null),
-          }}
-        >
-          <FiMic size={15} aria-hidden />
-        </button>
         {/* Positioning context for the placeholder overlays. They are absolutely placed over the
             textarea's first text line, so the textarea cannot be their own parent.
 
@@ -615,7 +629,24 @@ export function ComposeBox({
               // dictated-origin latch) from "a segment just landed in it".
               onTextEdit?.(e.target.value);
             }}
-            onKeyDown={onKeyDown}
+            onKeyDown={(e) => {
+              ownVoice();
+              onKeyDown(e);
+            }}
+            // The MIRROR of the agent composer's surface claim (Composer.tsx `ownVoice`). Without
+            // it the arbiter is one-way: once the user's cursor has been in an agent composer,
+            // nothing short of the header ring brings dictation back here, so clicking into this
+            // box and speaking would send every segment to a composer in another column while the
+            // caret blinks here — this bug's own symptom, mirrored. Genuine focus only: this box is
+            // focused programmatically too (after a send, and on a capture-window handoff), and
+            // neither is the user saying where their voice should go.
+            onFocus={(e) => {
+              if (!isProgrammaticFocus(e.currentTarget)) ownVoice();
+            }}
+            // …and a pointer press, because a click on an already-focused box fires no focus event,
+            // and this box IS often already focused — the composeFocusSeq effect above puts the
+            // caret here on every requestComposeFocus (roborev 54239).
+            onPointerDown={ownVoice}
             style={{
               flex: 1,
               // `resize: none` stays: the browser's own corner grip resizes only the textarea, which

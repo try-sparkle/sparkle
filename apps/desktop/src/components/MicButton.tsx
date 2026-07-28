@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { TbMicrophone, TbMicrophoneOff } from "react-icons/tb";
 import { FiDownloadCloud } from "react-icons/fi";
 import { C, DANGER } from "../theme/colors";
-import { useDictationStore } from "../stores/dictationStore";
+import { useDictationStore, type VoiceSurface } from "../stores/dictationStore";
 import { useAuthStore } from "../stores/authStore";
 import { hasAiCredits } from "../services/aiGate";
 import type { Me } from "../services/entitlement";
@@ -355,15 +355,22 @@ const MIC_OPTIONS: {
  *  Positioned absolutely inside the caller's `position: relative` box; `placement` picks whether it
  *  grows UP (composer mic, anchored at window bottom) or DOWN (top ring). `hoverProps` is threaded
  *  from the caller's useHoverMenu so hovering the pill itself keeps it open. `surfaceColor` is the
- *  pill's own background — the pause glyph's bar-separation ring must match it. */
+ *  pill's own background — the pause glyph's bar-separation ring must match it.
+ *
+ *  `surface` names which mic this pill belongs to, and is recorded BEFORE the pick runs so the
+ *  store never sees a live-and-routing mic without also knowing where its transcript goes. Picking
+ *  "Listening" here is one of the ways the mic goes live, so it has to arbitrate ownership exactly
+ *  like a click on the mic itself does — see dictationStore.voiceSurface. */
 export function MicMenu({
   placement = "up",
+  surface,
   surfaceColor = C.deepForest,
   glyphSize = 18,
   onChoose,
   hoverProps,
 }: {
   placement?: "up" | "down";
+  surface: VoiceSurface;
   surfaceColor?: string;
   glyphSize?: number;
   onChoose?: () => void;
@@ -407,6 +414,7 @@ export function MicMenu({
             aria-label={opt.label}
             title={opt.title}
             onClick={() => {
+              useDictationStore.getState().setVoiceSurface(surface);
               run[opt.key]();
               onChoose?.();
             }}
@@ -467,6 +475,11 @@ export function ComposerMic({
         type="button"
         data-hint="composer-mic"
         onClick={() => {
+          // This mic belongs to an AGENT composer, so operating it points dictation at that box —
+          // and keeps it there for the wake word afterwards. Without this the concierge, which now
+          // claims on any routing mic it believes is its own, would take the transcript straight
+          // back off a composer the user just deliberately armed (dictationStore.voiceSurface).
+          useDictationStore.getState().setVoiceSurface("agent");
           onArm?.();
           onClick();
         }}
@@ -493,7 +506,18 @@ export function ComposerMic({
         <MicGlyph variant={variant} size={20} surfaceColor={C.forest} />
       </button>
       {menu.open && (
-        <MicMenu placement="up" onChoose={menu.close} hoverProps={menu.hoverProps} />
+        // `onArm` on the pill too, not just on the button: picking "Listening" here arms the mic
+        // exactly as a click on the glyph does, so the composer that owns this pill has to claim
+        // the app-wide insert target on that path as well. MicMenu records the surface itself.
+        <MicMenu
+          placement="up"
+          surface="agent"
+          onChoose={() => {
+            onArm?.();
+            menu.close();
+          }}
+          hoverProps={menu.hoverProps}
+        />
       )}
     </span>
   );

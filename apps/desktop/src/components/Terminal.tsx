@@ -125,6 +125,23 @@ export interface TerminalApi {
  * keystrokes back to the PTY, and tears the PTY down on unmount. Mouse-select + Cmd+C
  * copy are built into xterm.
  */
+/** The two ways Terminal asks the pane for the composer caret, split by PROVENANCE.
+ *
+ *  Exported, and routed through rather than called inline, because which callback each site uses is
+ *  the whole point and is otherwise untestable without standing up xterm and a PTY — it regressed
+ *  three times on this branch while every test stayed green (roborev 54265). `chord` is the user
+ *  asking for the box by name (⌘J); `reveal` is the app moving the caret because the pane appeared.
+ *  Only the first may re-aim dictation; see SparkleAgentPane. */
+export const composerFocusRequest = {
+  chord: (h: ComposerFocusHandlers) => h.onUserRequestFocus?.(),
+  reveal: (h: ComposerFocusHandlers) => h.onRequestFocus?.(),
+};
+
+export interface ComposerFocusHandlers {
+  onRequestFocus?: () => void;
+  onUserRequestFocus?: () => void;
+}
+
 export function Terminal({
   agentId,
   projectId,
@@ -137,6 +154,7 @@ export function Terminal({
   onReady,
   onExit,
   onRequestFocus,
+  onUserRequestFocus,
   onSubmitLine,
   composerOverlay = false,
   focusRef,
@@ -173,7 +191,14 @@ export function Terminal({
   onReady?: () => void;
   onExit?: () => void;
   // Called when the active tab is shown, to put initial focus in the composer.
+  /** The APP wants the caret in the composer — the reveal effect below, on pane show / agent
+   *  change. Incidental: it must not re-aim dictation. */
   onRequestFocus?: () => void;
+  /** The USER asked for the composer — the ⌘J chord. A separate callback rather than a flag on the
+   *  one above, because provenance cannot be recovered downstream: the chord un-minimizes the
+   *  composer, whose textarea is not rendered while minimized, so the caret does not arrive until a
+   *  later, app-driven focus. Two call sites, two callbacks (roborev 54252 / 54259). */
+  onUserRequestFocus?: () => void;
   // Called when the user submits a line to the agent by pressing Enter directly in the terminal
   // (a carriage return in USER input) — one call per submitted line. The parent uses this to meter
   // free-trial prompts for trial users who type into the raw terminal (no composer). Best-effort.
@@ -212,6 +237,8 @@ export function Terminal({
   // Latest onRequestFocus, read by the (agentId-keyed) effect without re-subscribing.
   const onRequestFocusRef = useRef(onRequestFocus);
   onRequestFocusRef.current = onRequestFocus;
+  const onUserRequestFocusRef = useRef(onUserRequestFocus);
+  onUserRequestFocusRef.current = onUserRequestFocus;
   // Latest onSubmitLine, read by the (agentId-keyed) onData handler without re-subscribing.
   const onSubmitLineRef = useRef(onSubmitLine);
   onSubmitLineRef.current = onSubmitLine;
@@ -554,7 +581,13 @@ export function Terminal({
       const toggle = useKeybindingsStore.getState().bindings.toggleComposer;
       if (isComposerToggleKey(e, toggle)) {
         useUiStore.getState().setComposerMinimized(false);
-        onRequestFocusRef.current?.();
+        // The chord IS the user asking for the composer, so dictation follows them there. Its own
+        // callback, because the caret may not land until the un-minimize re-render and nothing
+        // downstream could tell that focus apart from the reveal effect's.
+        composerFocusRequest.chord({
+          onRequestFocus: onRequestFocusRef.current,
+          onUserRequestFocus: onUserRequestFocusRef.current,
+        });
         return false;
       }
       // Swallow the whole toggle chord (incl. the keyup) so no stray sequence reaches the PTY.
@@ -985,7 +1018,11 @@ export function Terminal({
       if (cancelled || disposedRef.current) return;
       // safeFit() bails if disposed and swallows the not-laid-out / torn-down-core throw itself.
       safeFit();
-      onRequestFocusRef.current?.();
+      // Pane reveal / agent change — not the user asking, so this must NOT re-aim dictation.
+      composerFocusRequest.reveal({
+        onRequestFocus: onRequestFocusRef.current,
+        onUserRequestFocus: onUserRequestFocusRef.current,
+      });
       // Push the true size to the PTY so its wrap column matches xterm (no-op while unmeasured).
       syncPtySize(transportRef.current, term);
       // Defer the repaint one frame so the just-resized canvas has valid char dimensions before we

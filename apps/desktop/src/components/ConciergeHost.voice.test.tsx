@@ -20,10 +20,12 @@ const h = vi.hoisted(() => ({
     done?: (e: { id: string; sessionId: string; text: string }) => void;
     error?: (e: { id: string; detail: string }) => void;
   },
+  // `micLive` is still part of the hook's contract (the host reads it to buzz the wordmark), but
+  // there is no longer a toggleMic: the box's mic button is gone, so nothing here can turn the mic
+  // on. Arming happens at the header ring, and the hook claims dictation off store state.
   dictation: {
-    micLive: false,
     interim: "",
-    toggleMic: vi.fn(),
+    micLive: false,
     registerInsert: vi.fn(),
   },
   maybePauseOnSubmit: vi.fn(),
@@ -345,19 +347,20 @@ describe("ConciergeHost — dictated input", () => {
 });
 
 describe("ConciergeHost — mic", () => {
-  it("the compose mic drives the real dictation toggle", async () => {
+  it("the compose row has no mic of its own to drive", () => {
+    // There used to be one here, beside Send, and it was the ONLY thing that claimed the app-wide
+    // dictation target — which is why arming from the header ring transcribed into an agent pane
+    // instead of this box. The claim moved into useConciergeDictation (state-derived, so the wake
+    // word works too) and the button went away with it.
     mount();
-    fireEvent.click(screen.getByRole("button", { name: "Talk to Sparkle" }));
-    expect(h.dictation.toggleMic).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "Talk to Sparkle" })).toBeNull();
+    expect(document.querySelector('[data-hint="composer-mic"]')).toBeNull();
   });
 
-  it("a live mic buzzes the wordmark and paints the live transcript", async () => {
+  it("a live mic still paints the live transcript into the box", async () => {
     h.dictation.micLive = true;
     h.dictation.interim = "approve the dep";
     mount();
     expect(screen.getByTestId("concierge-interim").textContent).toBe("approve the dep");
-    expect(
-      screen.getByRole("button", { name: "Talk to Sparkle" }).getAttribute("aria-pressed"),
-    ).toBe("true");
   });
 });

@@ -512,7 +512,7 @@ export function ConciergeHost({
   // The mic is the dictation hook's now (CM-U9) — it owns armed state, the app-wide dictation
   // target and the live interim transcript, so there is no local micLive to keep in sync.
   const dictation = useConciergeDictation();
-  const { micLive, toggleMic, registerInsert: dictationRegisterInsert } = dictation;
+  const { registerInsert: dictationRegisterInsert } = dictation;
 
   // The brain text accumulated for the in-flight turn, keyed by turn id. Kept in a ref rather than
   // re-derived from the rendered thread so the done handler can announce the WHOLE reply into the
@@ -1646,7 +1646,6 @@ export function ConciergeHost({
     () => ({
       onSend: send,
       onRedirect: (messageId: string) => void redirect(messageId),
-      onMicToggle: toggleMic,
       onAttach: attach,
       onRemoveAttachment: removeAttachment,
       // PRD §3 (cross-project surfacing): clicking a nudge card "opens that project's tab,
@@ -1745,7 +1744,7 @@ export function ConciergeHost({
     }),
     // `play` is absent on purpose: voice OUTPUT (TTS) was removed in §5, so main's `play` dep does
     // not survive the merge. `revealAgent` is main's, and stays.
-    [resolveAgent, revealAgent, approve, send, redirect, attach, removeAttachment, toggleMic],
+    [resolveAgent, revealAgent, approve, send, redirect, attach, removeAttachment],
   );
 
   const pinnedProjectName = useMemo(() => {
@@ -1811,7 +1810,6 @@ export function ConciergeHost({
       <ConciergeColumn
         model={model}
         controller={controller}
-        micLive={micLive}
         width={width}
         searchSlot={searchSlot}
         // Armed sends, each cancellable, directly above the box. `cancelIntent` runs the arm site's

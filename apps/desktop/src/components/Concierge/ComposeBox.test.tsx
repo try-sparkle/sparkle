@@ -1,8 +1,11 @@
 // @vitest-environment jsdom
 //
 // The compose box's contract: Send and ⌘/Ctrl+Enter both submit trimmed text and clear the
-// box (empty text never submits), the mic reports onMicToggle, and each attach button
-// reports its kind.
+// box (empty text never submits), and each attach button reports its kind.
+//
+// There is no mic here any more. The box used to own one, beside Send, and this file used to pin
+// its gold live-border and its onMicToggle callback. The column's single mic is now the ring in the
+// header — see ConciergeColumn.oneMic.test.tsx, which counts them so nothing puts a second one back.
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { C, ON_GOLD_FILL } from "../../theme/colors";
@@ -13,18 +16,16 @@ afterEach(() => cleanup());
 
 function setup(
   over: {
-    micLive?: boolean;
     onSend?: (text: string) => void | Promise<boolean>;
   } = {},
 ) {
   const onSend = vi.fn(over.onSend);
-  const onMicToggle = vi.fn();
   const onAttach = vi.fn();
   const { onSend: _drop, ...rest } = over;
   const view = render(
-    <ComposeBox onSend={onSend} onMicToggle={onMicToggle} onAttach={onAttach} {...rest} />,
+    <ComposeBox onSend={onSend} onAttach={onAttach} {...rest} />,
   );
-  return { onSend, onMicToggle, onAttach, container: view.container };
+  return { onSend, onAttach, container: view.container };
 }
 
 // "Message", not "Message Sparkle": the box no longer knows where a send goes — the host routes it.
@@ -57,12 +58,8 @@ describe("ComposeBox — the Send button carries the concierge gold", () => {
     expect(send.style.color).toBe(ON_GOLD_FILL);
   });
 
-  it("the LIVE mic borders in the same themed gold, with the gold-hot glyph", () => {
-    setup({ micLive: true });
-    const mic = screen.getByRole("button", { name: "Talk to Sparkle" });
-    expect(mic.style.borderColor).toBe(C.goldFill);
-    expect(mic.style.color).toBe(C.goldHotInk);
-  });
+  // The gold pair used to be pinned twice here, once on Send and once on the live mic beside it.
+  // Only Send is left to carry it; the header ring paints from its own tokens (LogoWaveform).
 });
 
 describe("ComposeBox — submit", () => {
@@ -156,22 +153,13 @@ describe("ComposeBox — the box names no destination", () => {
   });
 
   // Empty to look at, not empty to a screen reader.
-  it("stays screen-reader usable: the textarea and the mic keep non-visible labels", () => {
+  it("stays screen-reader usable: the textarea keeps a non-visible label", () => {
     setup();
     expect(screen.getByRole("textbox", { name: "Message" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Talk to Sparkle" })).toBeTruthy();
   });
 });
 
-describe("ComposeBox — mic + attachments", () => {
-  it("the mic button reports onMicToggle and reflects micLive as aria-pressed", () => {
-    const { onMicToggle } = setup({ micLive: true });
-    const mic = screen.getByRole("button", { name: "Talk to Sparkle" });
-    expect(mic.getAttribute("aria-pressed")).toBe("true");
-    fireEvent.click(mic);
-    expect(onMicToggle).toHaveBeenCalledTimes(1);
-  });
-
+describe("ComposeBox — attachments", () => {
   it("each attach button reports its kind", () => {
     const { onAttach } = setup();
     fireEvent.click(screen.getByRole("button", { name: "Screenshot" }));
@@ -267,7 +255,6 @@ describe("ComposeBox — the initial-text report", () => {
     render(
       <ComposeBox
         onSend={vi.fn()}
-        onMicToggle={vi.fn()}
         onAttach={vi.fn()}
         onTextEdit={onTextEdit}
       />,
@@ -280,7 +267,6 @@ describe("ComposeBox — the initial-text report", () => {
     const { rerender } = render(
       <ComposeBox
         onSend={vi.fn()}
-        onMicToggle={vi.fn()}
         onAttach={vi.fn()}
         onTextEdit={onTextEdit}
       />,
@@ -290,7 +276,6 @@ describe("ComposeBox — the initial-text report", () => {
     rerender(
       <ComposeBox
         onSend={vi.fn()}
-        onMicToggle={vi.fn()}
         onAttach={vi.fn()}
         onTextEdit={onTextEdit}
       />,
@@ -305,7 +290,6 @@ describe("ComposeBox — the initial-text report", () => {
     const onTextEdit = vi.fn();
     const props = {
       onSend: vi.fn(),
-      onMicToggle: vi.fn(),
       onAttach: vi.fn(),
       onTextEdit,
     };

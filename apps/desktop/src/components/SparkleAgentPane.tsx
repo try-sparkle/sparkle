@@ -22,6 +22,8 @@ import { Terminal, type TerminalApi } from "./Terminal";
 import { Composer } from "./Composer";
 import { Onboarding } from "./Onboarding";
 import { paneVisibilityStyle } from "./paneVisibility";
+import { focusQuietly } from "../services/programmaticFocus";
+import { useDictationStore } from "../stores/dictationStore";
 
 type Phase = "preparing" | "ready" | "no-claude" | "error";
 
@@ -148,7 +150,7 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
     if (!visible || !ptyReady) return;
     const raf = requestAnimationFrame(() => {
       if (composerMinimized) termFocusRef.current?.();
-      else composerInputRef.current?.focus();
+      else focusQuietly(composerInputRef.current);
     });
     return () => cancelAnimationFrame(raf);
   }, [composerMinimized, visible, ptyReady]);
@@ -215,7 +217,16 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
               composerOverlay
               onStatus={(s) => setStatus(agentId, s)}
               onReady={() => setPtyReady(true)}
-              onRequestFocus={() => composerInputRef.current?.focus()}
+              // Pane reveal / agent change: incidental, so quiet — it must not re-aim dictation.
+              onRequestFocus={() => focusQuietly(composerInputRef.current)}
+              // The ⌘J chord: the user naming the box they want, so dictation goes with them. Said
+              // OUTRIGHT here rather than inferred from the focus event downstream, because the
+              // caret may not arrive until the un-minimize re-render — and by then the focus is
+              // indistinguishable from the reveal effect's (roborev 54259).
+              onUserRequestFocus={() => {
+                useDictationStore.getState().setVoiceSurface("agent");
+                focusQuietly(composerInputRef.current);
+              }}
               focusRef={termFocusRef}
               apiRef={terminalApiRef}
             />

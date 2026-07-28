@@ -169,7 +169,6 @@ vi.mock("./Concierge/ConciergeSuggestions", async () => {
 // simulated send — mutating global dictation state and coupling these tests to the mic pipeline.
 vi.mock("../useConciergeDictation", () => ({
   useConciergeDictation: () => ({
-    micLive: false,
     interim: "",
     toggleMic: vi.fn(),
     // Keep the append the host registers, so a row can put a spoken segment in the box through the

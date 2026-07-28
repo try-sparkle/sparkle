@@ -76,6 +76,7 @@ import { isComposerToggleKey } from "./composerToggle";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { arrowOverflowDirection } from "./composerArrowOverflow";
 import { useDictationStore } from "../stores/dictationStore";
+import { focusQuietly, isProgrammaticFocus } from "../services/programmaticFocus";
 import { useSettingsStore } from "../stores/settingsStore";
 import { maybePauseOnSubmit } from "../services/dictationControls";
 import {
@@ -446,7 +447,7 @@ export function Composer({
       // dictation (their explicit choice); the transcribed text still lands in the box and is there
       // when they reopen it. (Reopening on every transcript is what made the toggle feel
       // mic-dependent — see the terminal gesture-reclaim design, 2026-07-10.)
-      inputRef?.current?.focus();
+      focusQuietly(inputRef?.current);
       // Selection must be set after React commits the new value, or it snaps back. Mirror the
       // exact rAF pattern acceptGhost uses (and re-sync the ghost mirror's scrollTop, since moving
       // the caret can scroll the textarea programmatically without firing onScroll).
@@ -469,7 +470,18 @@ export function Composer({
     // same claim here, clicking into the concierge box once sent every later segment there even
     // after the user came back and armed THIS composer's mic — recoverable only by switching tabs
     // so this effect re-runs. "The mic you clicked owns the transcript" has to hold both ways.
-    claimDictationRef.current = () => useDictationStore.getState().registerInsert(append);
+    //
+    // TARGET only — deliberately not the arbiter. Naming the voice surface is a separate, stronger
+    // statement (see ownVoice below), and this runs on programmatic focus too.
+    //
+    // Idempotent, because it is now on a keystroke path. dictationStore is persist-wrapped, so every
+    // set() partializes and writes localStorage and wakes every subscriber (crossWindowSync's
+    // signature watcher among them) — re-registering the same stable `append` on each arrow key is
+    // pure churn (roborev 54228).
+    claimDictationRef.current = () => {
+      const store = useDictationStore.getState();
+      if (store.insertTarget !== append) store.registerInsert(append);
+    };
     return () => {
       // Only clear if we're still the registered target (avoid clobbering a newer pane).
       const store = useDictationStore.getState();
@@ -522,7 +534,7 @@ export function Composer({
         setValue((v) => (v.trim() ? `${v}${v.endsWith("\n") ? "" : "\n"}${text}` : text));
         setGhostDismissed(true); // the inserted text isn't a typed prefix — don't ghost off it
         setMinimized(false);
-        requestAnimationFrame(() => inputRef?.current?.focus());
+        requestAnimationFrame(() => focusQuietly(inputRef?.current));
       },
     };
     return () => {
@@ -562,8 +574,23 @@ export function Composer({
   // optional inputRef the parent passes in (used for focus + insert()).
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   /** Take the global dictation slot for this composer. Assigned by the registration effect below;
-   *  called when the user focuses this box or arms its mic. */
+   *  called when this box is focused or its mic is armed. Moves the TARGET, not the arbiter. */
   const claimDictationRef = useRef<() => void>(() => {});
+  /** "The user is talking to THIS composer" — take the slot AND name the voice surface, which is
+   *  what actually keeps the concierge from taking dictation back (dictationStore.voiceSurface).
+   *
+   *  Runs on GENUINE focus of this box (see services/programmaticFocus for how that is told apart
+   *  from the app's own focus() calls — pane reveal, un-minimize, insertPrompt, attachPaths,
+   *  showBlockAsText), and on key input into it. Focus rather than pointerdown alone because
+   *  TAB-navigating in fires neither pointerdown nor a keydown on the box being entered, and a
+   *  keyboard-only user whose caret is here must not have the wake word type into another column
+   *  (roborev 54228). Focus still claims the TARGET unconditionally (roborev 53304); only this
+   *  names the surface. */
+  const ownVoice = useCallback(() => {
+    const s = useDictationStore.getState();
+    if (s.voiceSurface !== "agent") s.setVoiceSurface("agent");
+    claimDictationRef.current();
+  }, []);
   const setTaRef = (el: HTMLTextAreaElement | null) => {
     taRef.current = el;
     if (inputRef) inputRef.current = el;
@@ -724,7 +751,7 @@ export function Composer({
   // Once the PTY is live, pull focus into the composer so the user types here, not the
   // terminal underneath — unless it's minimized (then the terminal owns focus; see AgentPane).
   useEffect(() => {
-    if (!disabled && !minimized) inputRef?.current?.focus();
+    if (!disabled && !minimized) focusQuietly(inputRef?.current);
   }, [disabled, inputRef, minimized]);
 
   // Load dropped/handed-off file paths into attachment tiles (images get a preview, others a
@@ -733,7 +760,7 @@ export function Composer({
   const attachPaths = useCallback(
     (paths: string[]) => {
       setMinimized(false); // surface the box so the new tiles are visible
-      inputRef?.current?.focus();
+      focusQuietly(inputRef?.current);
       void Promise.all(
         paths.map((path) =>
           loadAttachment(path).catch((e: unknown) => {
@@ -883,7 +910,7 @@ export function Composer({
   const showBlockAsText = (block: TextBlock) => {
     setValue((v) => (v ? `${v}${v.endsWith("\n") ? "" : "\n"}${block.text}` : block.text));
     removeTextBlock(block.id);
-    inputRef?.current?.focus();
+    focusQuietly(inputRef?.current);
   };
 
   // Single source of truth for "is there nothing to send?" — used by both send()'s own gate and
@@ -1544,11 +1571,24 @@ export function Composer({
                 setGhostDismissed(false); // a fresh edit re-enables suggestions
                 syncCaret();
               }}
-              onKeyDown={onKeyDown}
+              onKeyDown={(e) => {
+                ownVoice(); // typing here is an unambiguous "I am in this box"
+                onKeyDown(e);
+              }}
               // Focusing this composer claims the dictation slot for it — the mirror of the
               // concierge box's claim, so whichever compose surface the user is actually in owns
-              // the transcript (roborev 53304).
-              onFocus={() => claimDictationRef.current()}
+              // the transcript (roborev 53304). The slot is claimed however focus arrived; the
+              // voice SURFACE is named only when the user is the one who arrived.
+              onFocus={(e) => {
+                claimDictationRef.current();
+                if (!isProgrammaticFocus(e.currentTarget)) ownVoice();
+              }}
+              // BOTH, and neither is redundant. A click on an ALREADY-FOCUSED box fires no focus
+              // event — and that box is often already focused, because the app focuses it on pane
+              // reveal, un-minimize, attach and insert. Without this, placing the caret with the
+              // mouse in a quietly-focused composer left the mic pointed at the other column
+              // (roborev 54239). Both paths are guarded/idempotent, so the overlap is free.
+              onPointerDown={ownVoice}
               onPaste={onPaste}
               onKeyUp={syncCaret}
               onSelect={syncCaret}

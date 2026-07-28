@@ -31,7 +31,7 @@ function stubContentHeight(h: number) {
 }
 
 function setup() {
-  return render(<ComposeBox onSend={vi.fn()} onMicToggle={vi.fn()} onAttach={vi.fn()} />);
+  return render(<ComposeBox onSend={vi.fn()} onAttach={vi.fn()} />);
 }
 
 describe("ComposeBox — auto-grow", () => {

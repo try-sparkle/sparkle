@@ -398,6 +398,10 @@ export const useUiStore = create<UiState>()(
       openSettings: (cat) => set({ settingsRequest: cat }),
       clearSettingsRequest: () => set({ settingsRequest: null }),
       composeFocusSeq: 0,
+      // EVERY caller of this is the user asking for the caret — the drop pill's "go to compose"
+      // button, a file drop, spawning an agent, the capture-window handoff. ComposeBox's effect
+      // relies on that: it names the concierge as the voice surface outright. An APP-driven refocus
+      // must NOT use this seam; give it one of its own.
       requestComposeFocus: () => set((s) => ({ composeFocusSeq: s.composeFocusSeq + 1 })),
       revealAgentId: null,
       requestRevealAgent: (id) => {

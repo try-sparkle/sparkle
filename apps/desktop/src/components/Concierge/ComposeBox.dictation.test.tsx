@@ -6,14 +6,22 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { appendDictated, ComposeBox } from "./ComposeBox";
+import { useDictationStore } from "../../stores/dictationStore";
+import {
+  focusQuietly,
+  resetProgrammaticFocusForTest,
+} from "../../services/programmaticFocus";
+import { useUiStore } from "../../stores/uiStore";
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  resetProgrammaticFocusForTest(); // module state outlives a component tree
+});
 
 type Append = (text: string) => void;
 
-function setup(over: { micLive?: boolean; interim?: string } = {}) {
+function setup(over: { interim?: string } = {}) {
   const onSend = vi.fn();
-  const onMicToggle = vi.fn();
   const onAttach = vi.fn();
   // A STABLE identity, as the box requires: an unstable one would re-register every render.
   const seen: (Append | null)[] = [];
@@ -23,7 +31,6 @@ function setup(over: { micLive?: boolean; interim?: string } = {}) {
   const view = render(
     <ComposeBox
       onSend={onSend}
-      onMicToggle={onMicToggle}
       onAttach={onAttach}
       registerInsert={registerInsert}
       {...over}
@@ -35,7 +42,7 @@ function setup(over: { micLive?: boolean; interim?: string } = {}) {
     if (!append) throw new Error("no insert target registered");
     act(() => append(segment));
   };
-  return { onSend, onMicToggle, onAttach, seen, dictate, view };
+  return { onSend, onAttach, seen, dictate, view };
 }
 
 const box = () => screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
@@ -69,38 +76,38 @@ describe("ComposeBox — dictation lifecycle", () => {
   });
 
   it("PARTIAL: the live transcript renders outside the textarea and leaves the text alone", () => {
-    setup({ micLive: true, interim: "approve the dep" });
+    setup({ interim: "approve the dep" });
     expect(interimNode()?.textContent).toBe("approve the dep");
     expect(box().value).toBe("");
   });
 
   it("PARTIAL: no interim means no ghost row at all", () => {
-    setup({ micLive: true });
+    setup();
     expect(interimNode()).toBeNull();
   });
 
   it("COMMIT: a finished segment lands in the textarea", () => {
-    const { dictate } = setup({ micLive: true });
+    const { dictate } = setup();
     dictate("approve the deploy");
     expect(box().value).toBe("approve the deploy");
   });
 
   it("COMMIT: successive segments accumulate, space-separated", () => {
-    const { dictate } = setup({ micLive: true });
+    const { dictate } = setup();
     dictate("approve the deploy");
     dictate("then tell me what broke");
     expect(box().value).toBe("approve the deploy then tell me what broke");
   });
 
   it("COMMIT: dictated text appends to what the user already typed", () => {
-    const { dictate } = setup({ micLive: true });
+    const { dictate } = setup();
     fireEvent.change(box(), { target: { value: "hey" } });
     dictate("approve it");
     expect(box().value).toBe("hey approve it");
   });
 
   it("COMMIT: dictated text is editable and sendable exactly like typed text", () => {
-    const { dictate, onSend } = setup({ micLive: true });
+    const { dictate, onSend } = setup();
     dictate("approve the deploy");
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     expect(onSend).toHaveBeenCalledWith("approve the deploy");
@@ -108,7 +115,7 @@ describe("ComposeBox — dictation lifecycle", () => {
   });
 
   it("the un-committed preview is NEVER submitted", () => {
-    const { onSend } = setup({ micLive: true, interim: "half a phra" });
+    const { onSend } = setup({ interim: "half a phra" });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     expect(onSend).not.toHaveBeenCalled();
   });
@@ -119,20 +126,102 @@ describe("ComposeBox — dictation lifecycle", () => {
     expect(seen.at(-1)).toBeNull();
   });
 
-  it("the mic reflects the live state and reports the toggle", () => {
-    const { onMicToggle } = setup({ micLive: true });
-    const mic = screen.getByRole("button", { name: "Talk to Sparkle" });
-    expect(mic.getAttribute("aria-pressed")).toBe("true");
-    fireEvent.click(mic);
-    expect(onMicToggle).toHaveBeenCalledTimes(1);
-  });
-
+  // The box's own mic button is gone — the column's single mic is the header ring, and the box is
+  // now a pure dictation SINK: it registers a target and paints what arrives, with no control of
+  // its own. Who is allowed to send it speech is decided in useConciergeDictation (see its tests);
+  // that the column shows exactly one mic is pinned in ConciergeColumn.oneMic.test.tsx.
   it("without registerInsert the box behaves exactly as the text-only version did", () => {
     const onSend = vi.fn();
-    render(<ComposeBox onSend={onSend} onMicToggle={vi.fn()} onAttach={vi.fn()} />);
+    render(<ComposeBox onSend={onSend} onAttach={vi.fn()} />);
     const only = screen.getAllByRole("textbox", { name: "Message" }).at(-1)!;
     fireEvent.change(only, { target: { value: "typed" } });
     fireEvent.keyDown(only, { key: "Enter", metaKey: true });
     expect(onSend).toHaveBeenCalledWith("typed");
+  });
+});
+
+// The MIRROR of Composer's surface claim (Composer.dictation.test.tsx, "naming the voice surface").
+// Without this side, the arbiter is one-way: once the user's cursor has been in an agent composer,
+// only the header ring brings dictation back, so clicking into THIS box and speaking would send
+// every segment to a composer in another column while the caret blinks here.
+describe("ComposeBox — naming the voice surface", () => {
+  const ta = () => screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
+
+  it("the USER focusing it aims dictation at the concierge", () => {
+    useDictationStore.setState({ voiceSurface: "agent" });
+    setup();
+    fireEvent.focus(ta());
+    expect(useDictationStore.getState().voiceSurface).toBe("concierge");
+  });
+
+  it("TYPING in it aims dictation here too", () => {
+    useDictationStore.setState({ voiceSurface: "agent" });
+    setup();
+    fireEvent.keyDown(ta(), { key: "a" });
+    expect(useDictationStore.getState().voiceSurface).toBe("concierge");
+  });
+
+  it("TAB-navigating in counts — no pointer or keystroke lands on the box itself", () => {
+    useDictationStore.setState({ voiceSurface: "agent" });
+    setup();
+    act(() => ta().focus());
+    expect(useDictationStore.getState().voiceSurface).toBe("concierge");
+  });
+
+  it("CLICKING a box the app already focused still aims here", () => {
+    // The mirror of the agent side's guard: a click on an ALREADY-FOCUSED textarea fires no focus
+    // event, so a focus-only claim would leave the mic pointed at the other column while the caret
+    // blinks in this one (roborev 54245).
+    useDictationStore.setState({ voiceSurface: "agent" });
+    setup();
+    act(() => focusQuietly(ta()));
+    expect(useDictationStore.getState().voiceSurface).toBe("agent"); // the app's focus moved nothing
+
+    fireEvent.pointerDown(ta()); // …and now the user clicks in
+
+    expect(useDictationStore.getState().voiceSurface).toBe("concierge");
+  });
+
+  it("requestComposeFocus aims dictation here — the caret the USER asked for", () => {
+    // The seam behind the drop pill's "go to compose", a file drop, spawning an agent, and the
+    // capture-window handoff. The focus itself is quiet, like every focus the app performs; what
+    // makes dictation follow is that the effect NAMES the concierge outright, because reaching it
+    // at all means a user gesture asked for this box (roborev 54259).
+    useDictationStore.setState({ voiceSurface: "agent" });
+    setup();
+    act(() => ta().blur());
+
+    act(() => useUiStore.getState().requestComposeFocus());
+
+    expect(document.activeElement).toBe(ta());
+    expect(useDictationStore.getState().voiceSurface).toBe("concierge");
+  });
+
+  it("…and even when the caret is ALREADY here, so no focus event fires at all", () => {
+    // The load-bearing half of naming the surface in the effect rather than inferring it from the
+    // focus event: dropping files on the terminal, or clicking the drop pill's "go to compose",
+    // while the caret is already in this box focuses nothing — .focus() on the focused element
+    // dispatches no event (roborev 54265). Without the effect's own claim this silently does
+    // nothing, and the words keep going to the other column.
+    useDictationStore.setState({ voiceSurface: "agent" });
+    setup();
+    act(() => ta().focus()); // the caret is already here
+    useDictationStore.setState({ voiceSurface: "agent" }); // …and that focus already had its say
+    let focusEvents = 0;
+    ta().addEventListener("focus", () => { focusEvents += 1; });
+
+    act(() => useUiStore.getState().requestComposeFocus());
+
+    expect(focusEvents).toBe(0); // nothing to infer from
+    expect(useDictationStore.getState().voiceSurface).toBe("concierge");
+  });
+
+  it("PROGRAMMATIC focus does not re-aim it", () => {
+    // Symmetrical to the agent side: this box is focused by code too — after a send, and on a
+    // handoff from the capture window — and neither is a statement about where speech should go.
+    useDictationStore.setState({ voiceSurface: "agent" });
+    setup();
+    act(() => focusQuietly(ta()));
+    expect(useDictationStore.getState().voiceSurface).toBe("agent");
   });
 });

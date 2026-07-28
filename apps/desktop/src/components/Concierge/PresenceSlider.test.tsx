@@ -84,7 +84,7 @@ describe("presenceTitle — names the CAUSE, not just the state", () => {
 
 describe("ComposeBox integration", () => {
   it("renders the slider above Send", () => {
-    render(<ComposeBox onSend={vi.fn()} onMicToggle={vi.fn()} onAttach={vi.fn()} />);
+    render(<ComposeBox onSend={vi.fn()} onAttach={vi.fn()} />);
     const slider = screen.getByTestId("presence-slider");
     const send = screen.getByRole("button", { name: "Send" });
     // Document order is the accessible reading order, and it is what "above" means in a column
@@ -93,7 +93,7 @@ describe("ComposeBox integration", () => {
   });
 
   it("typing in the box resets the idle timer", () => {
-    render(<ComposeBox onSend={vi.fn()} onMicToggle={vi.fn()} onAttach={vi.fn()} />);
+    render(<ComposeBox onSend={vi.fn()} onAttach={vi.fn()} />);
     vi.advanceTimersByTime(IDLE_AWAY_MS - 1000);
     fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
       target: { value: "still here" },

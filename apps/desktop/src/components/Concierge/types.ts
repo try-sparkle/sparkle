@@ -197,8 +197,6 @@ export interface ConciergeController {
   /** A digest line was clicked — open that project's tab and reveal its lead agent. This is the
    *  handoff to column two that the digest exists to make (bead sparkle-4562.4). */
   onDigestClick?(digest: ConciergeDigestMessage): void;
-  /** Toggle the mic. The box owns no mic state — `micLive` comes down as a prop (CM-U9). */
-  onMicToggle(): void;
   /** Whole-card click: open the nudge's source project/agent. */
   onNudgeClick(nudge: ConciergeNudge): void;
   /** An action button on the card; never accompanied by onNudgeClick. */
@@ -208,8 +206,6 @@ export interface ConciergeController {
 export interface ConciergeColumnProps {
   model: ConciergeViewModel;
   controller: ConciergeController;
-  /** Mic armed/live — tints the mic button. */
-  micLive?: boolean;
   /** Column width in px (the shell is fixed-width; the workspace owns resizing). */
   width?: number;
   /** Optional affordance rendered under the scope/vitals line — the shell drops the ⌘K palette

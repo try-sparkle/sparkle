@@ -25,7 +25,6 @@ function setup(over: { attachments?: Attachment[]; dropActive?: boolean } = {}) 
   render(
     <ComposeBox
       onSend={onSend}
-      onMicToggle={vi.fn()}
       onAttach={vi.fn()}
       onRemoveAttachment={onRemoveAttachment}
       {...over}
@@ -111,7 +110,6 @@ function renderWith(dropActive: boolean) {
   return render(
     <ComposeBox
       onSend={vi.fn()}
-      onMicToggle={vi.fn()}
       onAttach={vi.fn()}
       dropActive={dropActive}
     />,

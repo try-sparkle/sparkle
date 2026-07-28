@@ -44,7 +44,6 @@ const model: ConciergeViewModel = {
 function controller(): ConciergeController {
   return {
     onSend: vi.fn(),
-    onMicToggle: vi.fn(),
     onAttach: vi.fn(),
     onNudgeClick: vi.fn(),
     onNudgeAction: vi.fn(),

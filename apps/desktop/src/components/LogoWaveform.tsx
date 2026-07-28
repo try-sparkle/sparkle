@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { FiAlertTriangle } from "react-icons/fi";
 // Themed tokens (muted/forest/cream flip on data-theme); brand teal/accent pass through as
 // constants. Import from ../theme/colors — like Composer — so the waveform stays legible in
@@ -135,6 +135,15 @@ export function LogoWaveform() {
   const setEnabled = useDictationStore((s) => s.setEnabled);
   const clearOutOfCreditsNotice = useDictationStore((s) => s.clearOutOfCreditsNotice);
   const hasCredits = useHasAiCredits();
+  // This ring is the CONCIERGE's mic — it lives in that column's header, directly above the box you
+  // talk to Sparkle in, and since the box's own mic button was removed it is the app's primary mic
+  // control. Every gesture on it therefore names the concierge as the surface that owns dictated
+  // speech, which is what routes the transcript into that box (useConciergeDictation) instead of
+  // into whichever agent pane last mounted. It also decides where the WAKE WORD lands afterwards:
+  // the arbiter is sticky, so "Hey Sparkle" with no click keeps talking to the surface you last
+  // operated. An agent composer's own mic sets it the other way — see ComposerMic.
+  const setVoiceSurface = useDictationStore((s) => s.setVoiceSurface);
+  const ownVoice = useCallback(() => setVoiceSurface("concierge"), [setVoiceSurface]);
 
   // Safety net: if the mic is somehow armed while the balance is empty (e.g. credits ran out mid
   // session), force it off so voice detection can't keep running without credits. The primary
@@ -256,6 +265,19 @@ export function LogoWaveform() {
   // and takes effect once capture resumes.
   const active = phase === "active";
 
+  // Every control on this ring goes through one of these two, never through the bare store action,
+  // so none of them can put the mic live without also naming where the speech should land. Missing
+  // one would leave a control that arms a mic whose transcript goes to an agent pane — the exact
+  // failure the removed compose-box button used to paper over.
+  const onTogglePhase = () => {
+    ownVoice();
+    togglePhase();
+  };
+  const onMicClick = () => {
+    ownVoice();
+    mic.onClick();
+  };
+
   // Mic tint + icon come from the shared tri-state mapping (MicButton.micVisual), so the ring and
   // the composer mic look and behave the same:
   //   off    → gray slash    (hover teal "click to turn on")
@@ -349,7 +371,7 @@ export function LogoWaveform() {
         {/* Waveform — clicking anywhere on the strip toggles phase (start/stop). */}
         <button
           type="button"
-          onClick={togglePhase}
+          onClick={onTogglePhase}
           aria-label={active ? "Stop listening" : "Activate Sparkle voice"}
           disabled={!enabled}
           style={{
@@ -399,7 +421,7 @@ export function LogoWaveform() {
         <button
           type="button"
           data-hint="mic"
-          onClick={mic.onClick}
+          onClick={onMicClick}
           // Two hover concerns share this button: the direction-aware glyph recolor (micHover) and
           // opening the three-option pill (menu.hoverProps). Fire both on each enter/leave.
           onMouseEnter={() => {
@@ -445,7 +467,12 @@ export function LogoWaveform() {
         {/* Three-option hover pill, centered under the ring. Opens downward over the waveform strip
             (the ring is pinned near the top of the sidebar, so there's no room above). */}
         {menu.open && (
-          <MicMenu placement="down" onChoose={menu.close} hoverProps={menu.hoverProps} />
+          <MicMenu
+            placement="down"
+            surface="concierge"
+            onChoose={menu.close}
+            hoverProps={menu.hoverProps}
+          />
         )}
       </div>
 
@@ -527,7 +554,7 @@ export function LogoWaveform() {
         // (start/stop), mirroring the waveform's behavior.
         <button
           type="button"
-          onClick={togglePhase}
+          onClick={onTogglePhase}
           aria-label={active ? "Stop listening" : "Activate Sparkle voice"}
           style={{
             display: "block",

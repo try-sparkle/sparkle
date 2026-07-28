@@ -19,6 +19,9 @@ let outOfCreditsTimer: ReturnType<typeof setTimeout> | null = null;
 
 type Status = "idle" | "listening" | "error";
 
+/** The mic surfaces that can own dictated speech. See {@link DictationState.voiceSurface}. */
+export type VoiceSurface = "concierge" | "agent";
+
 interface ModelProgress {
   done: number;
   total: number | null;
@@ -67,6 +70,22 @@ interface DictationState {
   outOfCreditsNotice: boolean;
   /** The active composer's append fn, or null. Set via registerInsert. */
   insertTarget: ((text: string) => void) | null;
+  /** WHICH mic surface the user last operated, and therefore where dictated speech belongs.
+   *
+   *  There is one app-wide `insertTarget` but more than one box that can hold it, so something has
+   *  to say who wins. That used to be implicit in the click: the concierge compose box had its own
+   *  mic button and claimed the target from its handler, and the agent composer's ComposerMic
+   *  claimed from its own (Composer.tsx `claimDictationRef`). Removing the concierge's button left
+   *  the wake word — and the top ring, which has no box of its own — with nothing to claim on, so
+   *  speech went wherever the last-mounted agent pane had registered. That is the bug this field
+   *  fixes: the decision is now explicit state rather than a side effect of which button existed.
+   *
+   *  Defaults to "concierge" because the ring in the concierge header is the app's primary mic
+   *  control and sits directly above the box you talk to Sparkle in — so wake-word activation, which
+   *  involves no click at all, routes there. "agent" is set only by an explicit arm on an agent
+   *  composer's own mic. Runtime only (never persisted): a relaunch should come back pointing at
+   *  the always-present ring, not at whichever pane happened to be focused last session. */
+  voiceSurface: VoiceSurface;
 
   setStatus: (s: Status) => void;
   setLevel: (l: number) => void;
@@ -89,6 +108,10 @@ interface DictationState {
   /** Clear the notice immediately and cancel any pending auto-deactivate timer. */
   clearOutOfCreditsNotice: () => void;
   registerInsert: (fn: ((text: string) => void) | null) => void;
+  /** Record which mic surface the user just operated. Called from the mic controls themselves —
+   *  the concierge ring (LogoWaveform) and the agent composer's ComposerMic — so the arbiter is
+   *  set by the same gesture that arms the mic. */
+  setVoiceSurface: (s: VoiceSurface) => void;
   insert: (text: string) => void;
 }
 
@@ -106,6 +129,7 @@ export const useDictationStore = create<DictationState>()(
       phase: "passive",
       outOfCreditsNotice: false,
       insertTarget: null,
+      voiceSurface: "concierge",
 
       setStatus: (status) => set({ status }),
       setLevel: (level) => set({ level }),
@@ -139,6 +163,7 @@ export const useDictationStore = create<DictationState>()(
         set({ outOfCreditsNotice: false });
       },
       registerInsert: (insertTarget) => set({ insertTarget }),
+      setVoiceSurface: (voiceSurface) => set({ voiceSurface }),
       insert: (text) => {
         const fn = get().insertTarget;
         if (fn) fn(text);

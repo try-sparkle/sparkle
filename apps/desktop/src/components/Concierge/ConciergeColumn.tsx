@@ -33,7 +33,6 @@ const WAVEFORM_INSET = -14;
 export function ConciergeColumn({
   model,
   controller,
-  micLive = false,
   width = 380,
   searchSlot,
   interim = "",
@@ -163,12 +162,10 @@ export function ConciergeColumn({
       </div>
       <ComposeBox
         onSend={controller.onSend}
-        onMicToggle={controller.onMicToggle}
         onAttach={controller.onAttach}
         onRemoveAttachment={controller.onRemoveAttachment}
         attachments={model.attachments}
         dropActive={model.dropActive}
-        micLive={micLive}
         interim={interim}
         registerInsert={registerInsert}
         onTextEdit={onTextEdit}

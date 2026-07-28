@@ -30,7 +30,7 @@ import { DEFAULT_WAKE_WORD, DEFAULT_STOP_WORD } from "../../voice/voiceDefaults"
 
 function setup(over: { interim?: string } = {}) {
   return render(
-    <ComposeBox onSend={vi.fn()} onMicToggle={vi.fn()} onAttach={vi.fn()} {...over} />,
+    <ComposeBox onSend={vi.fn()} onAttach={vi.fn()} {...over} />,
   );
 }
 

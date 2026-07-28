@@ -71,7 +71,7 @@ function renderColumn({ columnH, chrome }: { columnH: number; chrome: number }) 
   const view = render(
     <section aria-label="Sparkle concierge">
       <div data-testid={CONCIERGE_THREAD_TESTID} />
-      <ComposeBox onSend={vi.fn()} onMicToggle={vi.fn()} onAttach={vi.fn()} />
+      <ComposeBox onSend={vi.fn()} onAttach={vi.fn()} />
     </section>,
   );
   const thread = view.container.querySelector<HTMLElement>(
@@ -154,7 +154,7 @@ describe("the drag ceiling is measured, not assumed", () => {
   it("falls back to the window when the thread is not in the DOM", () => {
     // A standalone ComposeBox (as other tests render it) must still work rather than clamp to zero.
     window.innerHeight = 900;
-    render(<ComposeBox onSend={vi.fn()} onMicToggle={vi.fn()} onAttach={vi.fn()} />);
+    render(<ComposeBox onSend={vi.fn()} onAttach={vi.fn()} />);
     const root = box().closest("div[data-testid='concierge-compose']") as HTMLElement;
     fireResize(root);
     // DISCRIMINATING: the old assertion (`> 0`) could not fail for any pool, since composeRenderH

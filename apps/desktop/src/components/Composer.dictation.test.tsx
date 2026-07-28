@@ -24,6 +24,7 @@ vi.mock("../logger", () => ({
 
 import { Composer } from "./Composer";
 import { useDictationStore } from "../stores/dictationStore";
+import { focusQuietly, resetProgrammaticFocusForTest } from "../services/programmaticFocus";
 import { useUiStore } from "../stores/uiStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
 
@@ -35,7 +36,11 @@ beforeEach(() => {
     status: "idle",
     interim: "",
     phase: "passive",
+    // Reset too, or a test that reads it inherits whatever the previous one left — which is how
+    // the idempotence test below passed for the wrong reason (roborev 54239).
+    voiceSurface: "concierge",
   });
+  resetProgrammaticFocusForTest(); // module state outlives a component tree
   useUiStore.getState().setComposerMinimized(false);
   usePromptHistoryStore.setState({ history: [] });
 });
@@ -405,5 +410,150 @@ describe("Composer — send wiring", () => {
 
     expect(onSubmitPrompt).not.toHaveBeenCalled();
     expect(submitPrompt).not.toHaveBeenCalled();
+  });
+});
+
+// WHO OWNS THE TRANSCRIPT — the seam, tested where it actually lives.
+//
+// There is one app-wide insert target and more than one box that can hold it, so
+// dictationStore.voiceSurface decides which box dictated speech belongs to. Two claims, and the
+// difference between them is the whole point:
+//
+//   any focus          → claim the TARGET (roborev 53304), however focus arrived.
+//   the USER's focus,  → also name the SURFACE. The app focuses this textarea constantly on its
+//   or typing            own initiative, and those must not re-aim the microphone.
+//
+// Collapsing the two is a live bug in both directions: naming the surface on every focus lets a
+// pane reveal or an attachment drop silently redirect the mic (and it sticks), while never naming
+// it lets the concierge's derived re-claim pull the transcript out of the box the user is in.
+describe("Composer — naming the voice surface", () => {
+  /** Mount, then hand the target back, so an assertion that the target MOVED can actually fail.
+   *  The registration effect fills insertTarget at mount, which made an earlier `typeof === function`
+   *  check vacuous — it passed with the claim deleted entirely (roborev 54228). */
+  function renderAndClearTarget(voiceSurface: "concierge" | "agent" = "concierge") {
+    useDictationStore.setState({ voiceSurface });
+    const r = renderComposer();
+    act(() => useDictationStore.setState({ insertTarget: null }));
+    return r;
+  }
+
+  it("the USER focusing it names this composer, and takes the target", () => {
+    renderAndClearTarget();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+
+    fireEvent.focus(ta);
+
+    expect(useDictationStore.getState().voiceSurface).toBe("agent");
+    // The target moved BECAUSE of the focus — it was null a line ago.
+    expect(useDictationStore.getState().insertTarget).not.toBeNull();
+  });
+
+  it("TYPING in it names it too", () => {
+    renderAndClearTarget();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+
+    fireEvent.keyDown(ta, { key: "a" });
+
+    expect(useDictationStore.getState().voiceSurface).toBe("agent");
+    expect(useDictationStore.getState().insertTarget).not.toBeNull();
+  });
+
+  it("TAB-navigating in counts — there is no pointer or keystroke on the box itself", () => {
+    // The reason the surface claim hangs off focus rather than off pointerdown+keydown: Tab's
+    // keydown fires on the element being LEFT, so a keyboard-only user entering this box produces
+    // neither event here. Getting this wrong puts their caret in one column and their voice in
+    // another (roborev 54228).
+    renderAndClearTarget();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+
+    // The composer auto-focuses at mount (through focusQuietly), and .focus() on an
+    // already-focused element dispatches nothing — so leave it first, the way a Tab that arrives
+    // here does.
+    act(() => ta.blur());
+    act(() => ta.focus()); // what the browser does at the end of a Tab
+
+    expect(useDictationStore.getState().voiceSurface).toBe("agent");
+  });
+
+  it("PROGRAMMATIC focus claims the target but does NOT re-aim the mic", () => {
+    // The regression guard. This textarea is focused by code all over the app — pane reveal and
+    // un-minimize (SparkleAgentPane), insertPrompt, attachPaths, showBlockAsText. If any of those
+    // moved the arbiter, opening a pane or dropping a file on it would redirect the user's voice
+    // with no voice gesture at all, and it would STICK: nothing moves the arbiter back on its own.
+    renderAndClearTarget();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+
+    act(() => ta.blur()); // see above: a re-focus of the focused element is a no-op
+    act(() => focusQuietly(ta));
+
+    expect(useDictationStore.getState().voiceSurface).toBe("concierge");
+    // …and it STILL claims the target, which is the half that must not regress with it.
+    expect(useDictationStore.getState().insertTarget).not.toBeNull();
+  });
+
+  it("ARMING this composer's own mic names it, and takes the target", () => {
+    // The third gesture. ComposerMic renders only while the mic is armed (it hides when off), so
+    // seed it armed-but-paused — the state a user clicks it in to start dictating.
+    useDictationStore.setState({ voiceSurface: "concierge", enabled: true, phase: "passive" });
+    renderComposer();
+    act(() => useDictationStore.setState({ insertTarget: null }));
+    const mic = document.querySelector('[data-hint="composer-mic"]') as HTMLButtonElement;
+    expect(mic).toBeTruthy();
+
+    fireEvent.click(mic);
+
+    expect(useDictationStore.getState().voiceSurface).toBe("agent");
+    // onArm is what moves the target; without it the click would name the surface and leave the
+    // words with nowhere to land.
+    expect(useDictationStore.getState().insertTarget).not.toBeNull();
+  });
+
+  it("CLICKING a box the app already focused still names it", () => {
+    // The gap a focus-only claim leaves, and it is the common case rather than an edge one: these
+    // boxes are focused by the app constantly, and a click on an already-focused element fires no
+    // focus event at all. Without a pointer path the user places their caret here, says the wake
+    // word, and the words land in the other column (roborev 54239).
+    useDictationStore.setState({ voiceSurface: "concierge" });
+    renderComposer();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    act(() => focusQuietly(ta)); // whatever the app did; the mic must not move for it
+    expect(useDictationStore.getState().voiceSurface).toBe("concierge");
+
+    fireEvent.pointerDown(ta); // …and now the user clicks into it
+
+    expect(useDictationStore.getState().voiceSurface).toBe("agent");
+  });
+
+  it("a bare pane REVEAL does not — nobody asked for it", () => {
+    // The regression that shipped twice on this branch: an app-driven focus must leave the mic
+    // alone. The other half — that the ⌘J chord DOES move it — is not this component's to answer
+    // any more; the pane says it outright, and SparkleAgentPane.focus.test.tsx pins that.
+    useDictationStore.setState({ voiceSurface: "concierge" });
+    renderComposer();
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    act(() => ta.blur());
+
+    act(() => focusQuietly(ta)); // the app on its own — no call site named a surface
+
+    expect(useDictationStore.getState().voiceSurface).toBe("concierge");
+  });
+
+  it("a keystroke does not re-register the target it already holds", () => {
+    // dictationStore is persist-wrapped: every set() partializes and writes localStorage and wakes
+    // every subscriber. On a keystroke path that is pure churn, so the claim is idempotent.
+    useDictationStore.setState({ voiceSurface: "agent" }); // already ours: the arbiter write is
+    renderComposer();                                       // not a candidate, only the target one
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    const held = useDictationStore.getState().insertTarget;
+    expect(held).not.toBeNull();
+
+    let writes = 0;
+    const stop = useDictationStore.subscribe(() => { writes += 1; });
+    fireEvent.keyDown(ta, { key: "ArrowLeft" });
+    fireEvent.keyDown(ta, { key: "ArrowRight" });
+    stop();
+
+    expect(useDictationStore.getState().insertTarget).toBe(held);
+    expect(writes).toBe(0);
   });
 });

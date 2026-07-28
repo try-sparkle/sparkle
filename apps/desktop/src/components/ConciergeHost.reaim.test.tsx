@@ -57,7 +57,6 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 }));
 vi.mock("../useConciergeDictation", () => ({
   useConciergeDictation: () => ({
-    micLive: false,
     interim: "",
     toggleMic: vi.fn(),
     registerInsert: vi.fn(),

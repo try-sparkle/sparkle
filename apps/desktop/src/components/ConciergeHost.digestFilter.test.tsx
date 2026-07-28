@@ -84,7 +84,6 @@ vi.mock("./Concierge", async (importOriginal) => {
 // real dictation hook and couple these navigation rows to the mic pipeline.
 vi.mock("../useConciergeDictation", () => ({
   useConciergeDictation: () => ({
-    micLive: false,
     interim: "",
     toggleMic: vi.fn(),
     registerInsert: vi.fn(),

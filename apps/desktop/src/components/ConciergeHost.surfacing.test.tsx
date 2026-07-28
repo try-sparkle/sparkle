@@ -66,7 +66,6 @@ vi.mock("../services/conciergeRouter", () => ({
 vi.mock("./Concierge/ConciergeSuggestions", () => ({ ConciergeSuggestions: () => null }));
 vi.mock("../useConciergeDictation", () => ({
   useConciergeDictation: () => ({
-    micLive: false,
     interim: "",
     toggleMic: vi.fn(),
     registerInsert: vi.fn(),
