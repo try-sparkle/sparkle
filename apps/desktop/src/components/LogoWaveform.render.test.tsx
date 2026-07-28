@@ -207,14 +207,23 @@ describe("LogoWaveform — honest listening", () => {
   });
 
   it("mic hover cue is direction-aware: paused rests ORANGE→RED on hover; off rests gray→TEAL", () => {
-    // Probe jsdom's normalized form of each hex so the assertions are format-agnostic.
+    // Probe jsdom's normalized form of each token so the assertions are format-agnostic. `C.teal`
+    // and `C.amber` are literal hex and come back as `rgb(...)`; `DANGER` is a themed `var()` and
+    // comes back verbatim. Both are fine — what is NOT fine is the two silently colliding.
+    //
+    // THE COLLISION IS A REAL FAILURE MODE (roborev 54231). If cssstyle ever REJECTS the var()
+    // assignment instead of storing it, `probe.style.color` keeps whatever was set before, so RED
+    // would quietly become ORANGE and every assertion below would still pass while testing nothing.
+    // It does not reject it in the jsdom this suite runs on — verified — but the distinctness is
+    // asserted rather than assumed, so the day that changes this test goes red instead of hollow.
     const probe = document.createElement("span");
-    probe.style.color = DANGER;
-    const RED = probe.style.color;
     probe.style.color = C.teal;
     const TEAL = probe.style.color;
     probe.style.color = C.amber;
     const ORANGE = probe.style.color;
+    probe.style.color = DANGER;
+    const RED = probe.style.color;
+    expect(new Set([TEAL, ORANGE, RED]).size, "two cue colours normalized to the same string — the assertions below would be vacuous").toBe(3);
 
     // Paused (on, waiting for the wake word): rests ORANGE (the pause affordance), turns RED on
     // hover — telegraphing the destructive "click to turn off".
@@ -238,11 +247,15 @@ describe("LogoWaveform — honest listening", () => {
   });
 
   it("active mic rests on the live tint and turns ORANGE (pause) on hover, never red", () => {
+    // Distinctness asserted for the same reason as the test above: a var() that cssstyle declined
+    // would leave RED holding ORANGE's value, and `not.toBe(RED)` would then be the same assertion
+    // twice rather than the two separate contracts it looks like.
     const probe = document.createElement("span");
     probe.style.color = C.amber;
     const ORANGE = probe.style.color;
     probe.style.color = DANGER;
     const RED = probe.style.color;
+    expect(ORANGE, "the pause tint and the destructive red normalized to one string").not.toBe(RED);
 
     useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
     render(<LogoWaveform />);

@@ -1444,11 +1444,26 @@ export function AgentSidebar({
         flex: "0 0 auto",
         position: "relative",
         background: C.deepForest,
-        // The app's most prominent structural edge: this column against the terminal. It used to
-        // be a SEAM — `forest` deliberately matching the terminal plane on the other side — but
-        // under the near-black repaint that boundary has neither a fill step (1.08:1) nor a line,
-        // so it stopped existing rather than staying subtle. See theme/colors `hairline`.
-        borderRight: `1px solid ${C.hairline}`,
+        // THE LINE IS GONE BECAUSE SOMETHING HAS TO FLOW THROUGH THIS SEAM. The active agent row
+        // is painted in `forest`, the terminal's own colour, so it reads as an opening INTO the
+        // pane it selects, and the concave fillets below shape that opening. A 1px rule here cuts
+        // straight across it: the row docks against the line instead of bleeding through, and the
+        // fillets curve into nothing. See the seam rule beside the plane tokens in theme/colors —
+        // it is "does anything cross this boundary", not "how big is the step".
+        //
+        // The rule was added in the first place because the black-and-gold repaint had flattened
+        // this pair to almost nothing — a boundary with neither a fill step nor a line, so it
+        // stopped existing. Blueprint re-derives the ramp and the pair is a real step again, which
+        // is what makes an undrawn seam viable. (No ratio quoted here on purpose: the last two
+        // review rounds were spent on ratios written into comments that then went stale.)
+        //
+        // THAT STEP IS NOW GUARDED FROM BOTH SIDES, and this comment used to overclaim it: it said
+        // chromeContrast asserted the step, when the only two assertions naming the pair were
+        // CEILINGS (`toBeLessThan`). Nothing held it up (roborev 54215). It is bounded as a band
+        // now — ≥ PLANE_MIN_SPLIT so an undrawn seam stays visible, < CHROME_MIN_CONTRAST so it
+        // never reads as a drawn line — because a seam with no rule has no fallback if the fill
+        // goes flat.
+        borderRight: "none",
         display: "flex",
         flexDirection: "column",
         height: "100%",
@@ -3838,7 +3853,17 @@ function AlertCircleIcon({ size = 14 }: { size?: number }) {
       height={size}
       viewBox="0 0 24 24"
       fill="none"
-      stroke={DANGER}
+      // `currentColor` IN THE ATTRIBUTE, THE TOKEN IN A CSS PROPERTY — never the token here.
+      // `stroke` is an SVG PRESENTATION ATTRIBUTE, and `var()` is not substituted in those (WebKit,
+      // which is what Tauri renders with on macOS, does not support it). Passing `stroke={DANGER}`
+      // once DANGER became `var(--c-danger-ink)` made the attribute invalid, so it fell back to the
+      // initial `none` and this icon rendered INVISIBLE — with the whole suite green, because
+      // nothing measured attribute-vs-property usage (roborev 54231).
+      //
+      // Routing through `color` works because that IS a CSS property, where var() resolves, and
+      // `currentColor` reads it back out. theme/svgTokens.test.ts now sweeps for the broken form.
+      stroke="currentColor"
+      style={{ color: DANGER }}
       strokeWidth={2}
       strokeLinecap="round"
       strokeLinejoin="round"

@@ -219,12 +219,16 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     // Resting active row: the terminal color (var(--c-forest)), square right edge, pulled 8px right
     // (past the list padding) so it reaches the sidebar's right border.
     //
-    // This used to say "with no seam", on the reasoning that the row, that border and the terminal
-    // beyond it were all C.forest, so the row bled through an edge nobody had drawn. The column's
-    // border is C.hairline now — deliberately the app's most prominent structural edge — so the row
-    // DOCKS against a drawn boundary instead. The active state still reads: it is the only row
-    // painted the terminal's own colour, with a square corner and concave fillets shaping that edge
-    // into an opening. See the note at AgentSidebar's row style.
+    // THE ROW BLEEDS THROUGH — there is no drawn boundary here. The row, the column's right edge
+    // and the terminal beyond it are all `C.forest`, so the active row runs straight out of the
+    // list and into the pane it selects; the square corner and the concave fillets shape that edge
+    // into an opening rather than a card.
+    //
+    // This paragraph said the opposite for one commit. A `hairline` rule had been added to the
+    // column when the black-and-gold palette flattened this plane pair to 1.08:1, and the row
+    // DOCKED against it. Blueprint restores the step (1.216 dark / 1.201 light, now bounded from
+    // both sides in theme/chromeContrast) and the rule is gone again — see the seam rule beside the
+    // plane tokens in theme/colors for why this seam in particular cannot carry one.
     const row = document.querySelector('[draggable="true"]') as HTMLElement;
     expect(row.style.background).toBe("var(--c-forest)");
     expect(row.style.marginRight).toBe("-8px");
@@ -265,18 +269,29 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     expect(label.style.color).toBe("var(--c-muted)");
   });
 
-  // Two edges the first repaint sweep skipped, both left at 1.08:1. The column's right border was
-  // excluded as "a seam meant to match the terminal plane" — but a seam that matches is only
-  // invisible-on-purpose while the planes differ, and four near-black planes leave this boundary
-  // (the app's most prominent structural edge) with neither a fill step nor a line. The ticket-row
-  // separators were never in the exclusion list at all: a plane ruled onto a plane is exactly the
-  // divider defect `hairline` exists to remove. Floors in theme/chromeContrast.test.ts.
-  it("the column's right border against the terminal is a hairline, not the terminal plane", () => {
+  // THE SEAM IS A PLANE STEP AGAIN, NOT A DRAWN LINE — and the palette is the reason the
+  // assertion could flip. This used to demand a `hairline` here, because the black-and-gold
+  // repaint left `deepForest` and `forest` 1.08:1 apart: a boundary with neither a fill step nor
+  // a line, so a rule was the only way to make the app's most prominent structural edge exist.
+  //
+  // Blueprint re-derives the ramp to darken left to right, and this exact pair is now a measured
+  // step in both themes (theme/chromeContrast.test.ts owns that floor, which is why this file
+  // asserts the ABSENCE of a border rather than restating a ratio it cannot see).
+  //
+  // Drawing it is now actively wrong: the line cut across the active row, which is painted in the
+  // terminal's own colour so it can flow INTO the pane it opens. With a rule there the row docked
+  // against it and the concave fillets shaped an opening that was immediately sealed.
+  //
+  // On the assertion itself: jsdom serializes `borderRight: "none"` to the EMPTY STRING, so
+  // `toBe("none")` fails against a component that is doing exactly the right thing. Both spellings
+  // are accepted, and the load-bearing half is the second one — no hairline, whatever the
+  // serializer prints — so re-drawing the rule fails this test rather than slipping through.
+  it("the column has NO drawn right border — the plane step carries the boundary", () => {
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
     const column = container.firstElementChild as HTMLElement;
     expect(column.style.background).toBe("var(--c-deep-forest)");
-    expect(column.style.borderRight).toContain("var(--c-hairline)");
-    expect(column.style.borderRight).not.toContain("var(--c-forest)");
+    expect(["", "none"]).toContain(column.style.borderRight);
+    expect(column.style.borderRight).not.toContain("var(--c-hairline)");
   });
 
   it("omits the description span entirely when the description is empty", () => {

@@ -4,13 +4,12 @@
 // ── WHY IT IS PAINTED, NOT DRAWN ────────────────────────────────────────────────────────────────
 // `/sparkle-logo.svg` carries its own `linearGradient` — cyan #34E0F0 → blue #3E7BFF — so rendering
 // it as an `<img>` made the app's one brand mark the single largest patch of a hue the token layer
-// declares DECORATIVE. `packages/ui/tokens.ts` names gold "the primary accent of the black-and-gold
-// shell". So the asset is used as an alpha MASK over a themed fill instead, which buys two things an
-// asset edit could not:
-//   • it is THEMED. A literal gold baked into the asset would be #f5c26b on light mode's near-white
-//     column, i.e. invisible — the trap `goldFill` documents. `goldInk` is gold in dark and a deep
-//     gold-brown in light, and chromeContrast.test.ts already holds it to the AA floor on every
-//     plane.
+// declares DECORATIVE. So the asset is used as an alpha MASK over a themed fill instead, which buys
+// two things an asset edit could not:
+//   • it is THEMED. A literal accent baked into the asset would be a pale blue on light mode's
+//     near-white column, i.e. invisible — the trap `goldFill` documents. `goldInk` is a bright blue
+//     in dark and a deep saturated blue in light, and chromeContrast.test.ts already holds it to the
+//     AA floor on every plane.
 //   • the asset stays untouched, so nothing else that ships it (the marketing site, the installer)
 //     inherits a desktop-only decision.
 //

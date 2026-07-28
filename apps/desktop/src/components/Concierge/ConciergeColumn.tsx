@@ -61,11 +61,21 @@ export function ConciergeColumn({
         background: C.conciergeSurface,
         // THE COLUMN'S EDGE, not a wash of one. This was `color-mix(muted 25%, transparent)` — a
         // quarter-strength tint, which on light mode's near-white planes is very nearly nothing.
-        // Light's plane ramp is capped (see PLANE_MIN_SPLIT in theme/colors: `forest`↔`deepForest`
-        // is pinned BELOW the chrome floor by another guard, so the three columns cannot be spaced
-        // more than ~1.46:1 apart end to end), which means the boundary has to come from an EDGE
-        // rather than a bigger step in fill. `hairline` is the token whose whole job is a 1px rule
-        // that must be SEEN, and it is held to that floor on every plane in both themes.
+        //
+        // WHY THIS SEAM KEEPS A RULE WHILE THE BUILDER↔TERMINAL SEAM DROPPED ONE: nothing crosses
+        // this boundary. The concierge column is a closed surface, so a 1px rule costs nothing and
+        // buys an edge that does not depend on the fill step at all. The sidebar's seam removed its
+        // rule because the ACTIVE ROW has to bleed through it into the terminal.
+        //
+        // That is a difference in what the seam has to DO, not in how big its step is — do not
+        // re-derive it from a contrast number in either direction, and do not write one here. Two
+        // review rounds went on exactly that: a stale ratio, then a corrected ratio that will go
+        // stale the next time the ramp moves. The two seams are not even the same size in light,
+        // and the rule is still the same for both. It lives beside the plane tokens in theme/colors;
+        // chromeContrast holds the measurements.
+        //
+        // `hairline` is the token whose whole job is a 1px rule that must be SEEN, and it is held
+        // to the chrome floor on every plane in both themes.
         borderRight: `1px solid ${C.hairline}`,
         color: C.cream,
         fontFamily: "Verdana, Geneva, sans-serif",

@@ -271,10 +271,10 @@ export function HintOverlay() {
             // options" complaint. Centering ties each badge unambiguously to one row.
             top: Math.max(2, c.rect.top + c.rect.height / 2 - BADGE_H / 2),
             left: Math.max(2, c.rect.left - 6),
-            // The themed opaque-gold PAIR (fill + the ink that sits on it): the prototype's
-            // gold under near-black in dark, a deep gold under light ink in light. These badges
-            // float over whatever is on screen, including light mode's white terminal. This said
-            // "gold #e0982f" while painting the amber STATUS token; the gold token exists now.
+            // The themed opaque-accent PAIR (fill + the ink that sits on it): a bright blue under
+            // near-black in dark, a deep blue under white ink in light. These badges float over
+            // whatever is on screen, including the light terminal plane, which is why the pair has
+            // to be themed rather than a constant.
             background: C.goldFill,
             color: ON_GOLD_FILL,
             font: `700 ${BADGE_LINE_H}px/1 ${FONT.mono}`,

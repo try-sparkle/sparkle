@@ -120,20 +120,12 @@ describe("the OTHER ink on the composer plate — muted text, no tint under it",
   for (const theme of ["dark", "light"] as const) {
     it(`measures conciergeMuted on the composer plate in ${theme} mode`, () => {
       const ratio = contrast(THEME_HEX[theme].conciergeMuted, composerPlate(theme));
-      if (theme === "dark") {
-        expect(ratio).toBeGreaterThanOrEqual(AA_NORMAL); // ≈5.8:1 — fine
-      } else {
-        // KNOWN RESIDUAL, still open, and now the ONLY one on this surface — the recap card's
-        // sibling residual was closed by the black-and-gold repaint (see below), this one was not.
-        // It improved from ≈3.19:1 to ≈3.66:1 when `conciergeMuted` moved, which is progress and
-        // still under the floor. Bounded from both sides on purpose — the lower bound fails on a
-        // regression, the upper keeps the exception visible so this row goes red the day someone
-        // fixes it properly. It is a property of the composer's PLATE, not of any one control, so
-        // the fix is a scrim-level ink (or dropping the scrim) rather than a per-component patch;
-        // see PRD/sparkle/concierge-presence.md.
-        expect(ratio).toBeGreaterThan(3.5);
-        expect(ratio).toBeLessThan(AA_NORMAL);
-      }
+      // THE RESIDUAL IS CLOSED. It was bounded from above precisely so this row would go red
+      // "the day someone fixes it properly" — the Blueprint repaint is that day. Light's planes
+      // were re-derived so the column is the LIGHTEST plane rather than a mid grey, and the ink
+      // moved with them, so `conciergeMuted` now clears AA on the composer's scrimmed plate in
+      // both themes. The exception, and its upper bound, are gone rather than re-tuned.
+      expect(ratio).toBeGreaterThanOrEqual(AA_NORMAL);
     });
   }
 });

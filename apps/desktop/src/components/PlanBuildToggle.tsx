@@ -33,13 +33,19 @@ import type { WorkMode } from "../stores/uiStore";
 // text with it again. It pairs with ON_GOLD_FILL, which the palette guarantees (chromeContrast).
 const BUILD_FILL = C.goldFill;
 
-// The SAME gold as ink, and the distinction is a floor rather than a shade preference (roborev
-// 53986). `goldFill` is a FILL: it is held to CONTROL_MIN_CONTRAST (3:1) because the Send button's
-// own edge is the only thing it has to survive. `NewAgentRow` applies its `hoverColor` to `color`
-// and `borderColor` — a 13px label, i.e. TEXT — and light's `goldFill` (#9a6a00) measures ≈3.2:1 on
-// the sidebar's `deepForest` plane, under the AA ink floor. `goldInk` (#7a5205) measures ≈4.75:1 on
-// the same plane and is already swept there by theme/chromeContrast.test.ts. Fill for the chevron,
-// ink for the label; they are one gold with two floors, not two golds.
+// The SAME accent as ink, and the distinction is a GUARANTEE rather than a shade preference
+// (roborev 53986). `goldFill` is a FILL: the guard holds it to CONTROL_MIN_CONTRAST (3:1), because
+// surviving its own edge is all a fill has to do. `goldInk` is swept at the AA ink floor (4.5) on
+// every plane. `NewAgentRow` applies its `hoverColor` to `color` and `borderColor` — a 13px label,
+// i.e. TEXT — so it takes the ink.
+//
+// THE NUMBERS THAT USED TO BE HERE ARE GONE ON PURPOSE. This block justified the split by measuring
+// light's `goldFill` at ≈3.2:1 on `deepForest`, under AA. Blueprint moved both tokens and that is
+// no longer true — the fill measures 5.201 there and the ink 6.085, so today either would read.
+// The split stays anyway, and stating why is the point: 5.201 is SLACK, not a promise. Nothing
+// asserts it, so the next repaint may spend it, and a label painted with the fill would go
+// illegible with every guard still green. Fill for the chevron, ink for the label; one accent with
+// two floors, and the label depends on the stronger one.
 export const BUILD_INK = C.goldInk;
 
 // Depth (px) of the chevron point/notch carved into a button's vertical edge.
@@ -99,11 +105,13 @@ function createBtnStyle(
     //
     // GRAYSCALE ONLY — the 0.9 opacity that used to ride with it is gone (roborev 54002). Opacity
     // composites the whole button, LABEL INCLUDED, over the plane behind it, so it lightened the
-    // fill and dimmed the white ink at the same time: in light mode the desaturated #9a6a00 (gray
-    // #6d6d6d) went from 5.17:1 against `onGoldFill` to 4.28:1 at 0.9 over `deepForest` — under AA
-    // for a 13px label, on the app's most prominent control. Desaturation alone is what says
-    // "inactive"; it costs no contrast, and theme/chromeContrast.test.ts measures the grayscaled
-    // fill against the ink now rather than only the active pair.
+    // fill and dimmed the ink at the same time, dropping a 13px label under AA on the app's most
+    // prominent control. Desaturation alone is what says "inactive" and it costs almost nothing:
+    // under Blueprint the grayscaled fill measures 6.06:1 against `onGoldFill` in dark (active pair
+    // 6.61) and 8.72:1 in light (active pair 7.57) — light's inactive state is actually the
+    // stronger of the two, because a deep blue greys to a mid grey under white ink.
+    // theme/chromeContrast.test.ts measures the grayscaled fill against the ink, not only the
+    // active pair, so this stays true through a repaint rather than being re-derived by hand.
     filter: active ? "none" : "grayscale(1)",
     transition: "filter 120ms ease",
     // Flex-align the (enlarged, line-height-0) glyph against the label so the

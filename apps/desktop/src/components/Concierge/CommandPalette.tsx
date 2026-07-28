@@ -18,7 +18,7 @@ import {
   type MouseEvent,
 } from "react";
 import { FiSearch } from "react-icons/fi";
-import { C, DANGER, FONT_WEIGHT } from "../../theme/colors";
+import { BADGE_EDGE_PCT, C, DANGER, FONT_WEIGHT } from "../../theme/colors";
 import { useHistoryStore } from "../../stores/historyStore";
 import type { HistoryHit, RetentionTier } from "../../services/history";
 import { relativeTime, renderSnippet } from "../HistorySearch";
@@ -42,6 +42,8 @@ const RETENTION_LABEL: Record<RetentionTier, string> = {
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
 
+
+
 const kindBadge = (kind: HistoryHit["kind"]): CSSProperties => ({
   flex: "0 0 auto",
   fontSize: 9,
@@ -50,11 +52,29 @@ const kindBadge = (kind: HistoryHit["kind"]): CSSProperties => ({
   fontWeight: FONT_WEIGHT.semibold,
   padding: "1px 5px",
   borderRadius: 5,
-  // Same accent treatment as the nudge-card badges: tinted fill + hairline, themed text — so it
-  // follows them onto the concierge gold (literal for the color-mix fill, themed ink for the label).
-  color: kind === "prompt" ? C.goldInk : C.accentInk,
-  background: `color-mix(in srgb, ${kind === "prompt" ? C.gold : C.accent} 14%, transparent)`,
-  border: `1px solid color-mix(in srgb, ${kind === "prompt" ? C.gold : C.accent} 45%, transparent)`,
+  // THE KIND IS CARRIED BY EDGE WEIGHT, ON THE THEMED INK. Three attempts converged here and the
+  // dead ends are worth recording, because each one looked right (roborev 54169 → 54231 → 54253).
+  //
+  // 1. `kind === "prompt" ? C.goldInk : C.accentInk` stopped meaning anything when Blueprint
+  //    retired gold: both tokens became the same value, so the ternary painted one colour twice.
+  // 2. Replacing it with solid-vs-outline used `C.accent`, an UNTHEMED cyan literal. On the dark
+  //    panel that reads; on the LIGHT panel it composites to almost nothing, so the badge had no
+  //    visible edge at all in light mode and the distinction still did not exist. The comment
+  //    claiming otherwise also measured a plane the badge never renders on — it renders on
+  //    `C.deepForest`, the palette panel, or the selected-row wash.
+  // 3. A heavier FILL cannot carry it either, and this is the constraint that decides the design:
+  //    the label is `accentInk` and the fill would be a tint of `accentInk`, so the two collide.
+  //    The label drops under AA at even a slight fill and keeps falling as the fill grows —
+  //    anything strong enough to see makes the text it contains unreadable.
+  //
+  // So both kinds keep a transparent ground and the same ink, and the WEIGHT of the themed edge is
+  // the signal. NO RATIOS HERE: this comment has now been wrong about its own numbers twice, and
+  // the guard is the contract. `chromeContrast.test.ts` measures these exact composites — both
+  // weights, on both surfaces, in both themes, plus that the two weights stay distinguishable and
+  // that the label clears AA on the ground it sits on.
+  color: C.accentInk,
+  background: "transparent",
+  border: `1px solid color-mix(in srgb, ${C.accentInk} ${BADGE_EDGE_PCT[kind === "prompt" ? "prompt" : "other"]}%, transparent)`,
 });
 
 export interface CommandPaletteProps {

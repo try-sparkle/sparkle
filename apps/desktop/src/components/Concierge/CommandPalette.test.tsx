@@ -24,6 +24,7 @@ vi.mock("../../services/history", async (orig) => {
 
 import { AGENT_CLOSED_MESSAGE, CommandPalette, PaletteTrigger } from "./CommandPalette";
 import { useHistoryStore } from "../../stores/historyStore";
+import { BADGE_EDGE_PCT } from "../../theme/colors";
 import type { HistoryHit } from "../../services/history";
 import type { JumpOutcome } from "./paletteJump";
 
@@ -77,6 +78,32 @@ describe("CommandPalette — visibility + filtering", () => {
     expect(screen.getByText("Demo · Builder")).toBeTruthy();
     expect(screen.getByText("prompt")).toBeTruthy();
     expect(screen.getByText(/minute ago/i)).toBeTruthy();
+  });
+
+  // ── THE PAINTED BORDER MUST CONSUME THE CONSTANT THE THEME GUARD MEASURES ─────────────────────
+  // chromeContrast.test.ts measures BADGE_EDGE_PCT composited over the surfaces this badge renders
+  // on, which is only worth anything if the component still READS that constant. It did not always:
+  // the weights were inline literals while the guard kept its own copy, so writing `? 85 : 32` back
+  // into the template — the exact edit that produced an invisible light-mode edge in roborev 54231 —
+  // left the guard measuring 45% and passing (54263, 54266). This is the link in that chain:
+  // numeric floor → constant → rendered style. Break any one of the three and a test fails.
+  it("the kind badge paints the edge weight the contrast guard measures", () => {
+    useHistoryStore.setState({
+      query: "rust",
+      results: [hit({ id: "p", kind: "prompt" }), hit({ id: "o", kind: "response" })],
+    });
+    render(<CommandPalette open onClose={vi.fn()} jump={() => jumped} />);
+    const badgeFor = (label: string) => screen.getByText(label) as HTMLElement;
+
+    expect(badgeFor("prompt").style.border).toContain(`${BADGE_EDGE_PCT.prompt}%`);
+    expect(badgeFor("response").style.border).toContain(`${BADGE_EDGE_PCT.other}%`);
+    // …and the two really are different weights, so the kind is carried by something.
+    expect(BADGE_EDGE_PCT.prompt).not.toBe(BADGE_EDGE_PCT.other);
+    // No fill on either: a tint of `accentInk` under `accentInk` text is what made the label
+    // illegible, which is why the edge carries the kind at all.
+    for (const label of ["prompt", "response"]) {
+      expect(badgeFor(label).style.background).toBe("transparent");
+    }
   });
 
   it("shows the retention-scoped empty state when a query has no matches", () => {

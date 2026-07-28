@@ -33,24 +33,32 @@ export const C = {
   amber: "#e0982f", // caution / progress / waiting (kept warm for legibility)
   sienna: "#e0533f", // dangerous actions / error / deny (kept red for legibility)
 
-  // Concierge GOLD — the founder-approved accent from the canonical prototype
-  // (PRD/sparkle/concierge-mode/prototype.html `--gold` / `--gold-hot`). This is the
-  // primary accent of the black-and-gold shell: the Send button, the wordmark, the
-  // pinned-scope line, the project chip on a nudge, the keycap chiclets.
+  // THE PRIMARY ACCENT. The keys are still named `gold`/`goldHot` and the values are BLUE — read
+  // this before "fixing" either half.
   //
-  // NOT the same thing as `amber`, and the distinction is the whole point. `amber` is the
-  // STATUS token — caution / waiting / in-progress — and for a long time the codebase had no
-  // gold at all, so every surface that wanted the prototype's gold substituted amber (or
-  // re-derived a tint from it with lightenHex, or hardcoded a #D4AF37). Those substitutions
-  // are gone; use `gold` for accent and keep `amber` for "this is waiting on something".
+  // Blueprint retired gold from the shell entirely: one accent, and it is blue. The NAMES survive
+  // because they carry a documented three-role split (translucent tint / themed ink / opaque fill),
+  // threaded through a dozen call sites in the desktop theme layer, and that structure is still
+  // exactly right — it was the HUE that changed. Renaming them would bury a behavioural change in a
+  // hundred-file mechanical diff. `apps/desktop/src/theme/chromeContrast.test.ts` asserts these two
+  // are blue-dominant and that no retired gold literal can come back.
+  //
+  // The role: the Send button, the wordmark, the pinned-scope line, the project chip on a nudge,
+  // the keycap chiclets.
+  //
+  // STILL NOT the same thing as `amber`, and the distinction is the whole point. `amber` is the
+  // STATUS token — caution / waiting / in-progress. For a long time the codebase had no accent
+  // token at all, so every surface that wanted one substituted amber (or re-derived a tint with
+  // lightenHex, or hardcoded a #D4AF37). Those substitutions are gone; use these for accent and
+  // keep `amber` for "this is waiting on something".
   //
   // These stay LITERAL hex (like every token here — mobile is React Native and web reads them
   // at build, so neither can consume var()), and a canvas 2d gradient can't consume var()
   // either, which is why the star field reads them straight. As TEXT in LIGHT mode they are
   // far too pale — use the themed goldInk / goldHotInk from the desktop theme layer there, and
   // the themed goldFill for anything OPAQUE.
-  gold: "#f5c26b", // prototype --gold: translucent tints, glows, canvas sprites
-  goldHot: "#ffe9b8", // prototype --gold-hot: the hot core / brightest tint
+  gold: "#4d86e8", // translucent tints, glows, canvas sprites
+  goldHot: "#a9caff", // the hot core / brightest tint
 
   // Text
   cream: "#eaf1ff", // headings, button labels, primary text (light on navy)

@@ -5,8 +5,9 @@ import { useConnectionStore } from "../stores/connectionStore";
 // a hardcoded #D4AF37 whose comment explained it needed "a true gold, not the theme's warmer
 // amber" — i.e. it was describing a token that didn't exist yet. It does now, so the banner is on
 // the same gold as the Send button and the chiclets instead of a fourth one nobody can keep in
-// sync. `goldFill`, not the literal BRAND.gold: a full-width band of #f5c26b under near-black ink
-// is the prototype's dark shell, but on light mode's near-white chrome it is a smudge.
+// sync. `goldFill`, not the literal BRAND.gold: a full-width band of the constant accent under
+// near-black ink works on the dark shell, but on light mode's near-white chrome it is a smudge —
+// the themed fill carries a deep blue there instead, with white ink.
 const GOLD = C.goldFill;
 const GOLD_TEXT = ON_GOLD_FILL;
 

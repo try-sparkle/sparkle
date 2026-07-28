@@ -671,12 +671,15 @@ const errorBanner: CSSProperties = {
   gap: 10,
   fontSize: 12.5,
   // The shared alert red, not a second copy of its hex — this banner and the trial/redeem alerts
-  // were drifting apart one literal at a time. It is the PAIR, though, not one value used twice
-  // (roborev 54002): `DANGER` is an unthemed brand constant that measures 3.91:1 on light's white
-  // modal — under AA for this 12.5px text — so the INK is the themed `dangerInk` (7.77:1 there,
-  // and swept on this plane and the settings dialog's by theme/chromeContrast.test.ts) and the
-  // constant stays on the border, which is a shape and clears the 3:1 control floor on `forest`.
-  // Same split OnePasswordPane took.
+  // were drifting apart one literal at a time.
+  //
+  // IT IS NO LONGER A PAIR, and the reason matters more than the tidy-up. This used to be a split:
+  // themed `dangerInk` for the TEXT, the unthemed `DANGER` constant for the BORDER, because the
+  // constant failed AA as ink but cleared the 3:1 control floor as a shape. Blueprint killed the
+  // premise — light `forest` stopped being white, and the constant fell to 2.461 there, under the
+  // control floor, so the border this comment licensed was failing at the one site it named.
+  // `DANGER` IS `C.dangerInk` now, so both lines below are the same themed ink, swept on every
+  // plane in both themes by theme/chromeContrast.test.ts. Nothing to keep in step.
   color: C.dangerInk,
   border: `1px solid ${DANGER}`,
   borderRadius: 8,
