@@ -17,7 +17,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { normalizeCaptureMode, type CaptureSendPayload } from "../capture/types";
 import { clearWindowProject, findWindowForProject } from "./windowRegistry";
 import { useProjectStore } from "../stores/projectStore";
-import { useRuntimeStore } from "../stores/runtimeStore";
+import { landInAgent } from "./landInAgent";
 import { useComposeHandoffStore } from "../stores/composeHandoffStore";
 import { useUiStore } from "../stores/uiStore";
 import {
@@ -136,9 +136,9 @@ export function dispatchBuild(payload: CaptureSendPayload): void {
       fallbackAgentId: agentId,
     });
   }
-  useUiStore.getState().setActiveSpecial(null);
-  store.selectAgent(payload.projectId, agentId);
-  useRuntimeStore.getState().open(agentId);
+  // Leave the special view, select, open — and (new) scroll the row on screen, which this path was
+  // missing: a capture can land on an agent well below the fold of a long column.
+  landInAgent(payload.projectId, agentId);
   useComposeHandoffStore.getState().set({
     origin: "capture-build",
     projectId: payload.projectId,

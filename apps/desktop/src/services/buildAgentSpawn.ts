@@ -9,8 +9,8 @@
 // The bead is created async + best-effort and attached when `bd` returns: a build agent without a
 // bead is still fine if bd is unavailable.
 import { useProjectStore } from "../stores/projectStore";
-import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { landInAgent } from "./landInAgent";
 import { createBeadFull } from "./tasks";
 import { isBeadsUnavailable } from "./beads";
 import { log } from "../logger";
@@ -24,15 +24,18 @@ export function spawnBuildAgentInProject(project: Project): string | null {
   const store = useProjectStore.getState();
   const id = store.addAgent(project.id, { kind: "build" });
   if (!id) return null;
-  useUiStore.getState().setActiveSpecial(null); // creating an agent leaves the special (Sparkle/board) view
   // Start the spawn-latency waterfall the instant the agent is added — AgentPane.prepare() and
   // Terminal add the remaining milestones through to "pty ready" under the same key (perfTrace).
   perfStart(id, "spawn", { kind: "build" });
-  useProjectStore.getState().selectAgent(project.id, id);
-  useRuntimeStore.getState().open(id);
-  // …and LAND the user in it (§13): scroll the new row into view and hand the caret to the one
-  // compose surface (the concierge box). Both are one-shot request tokens the UI consumes.
-  useUiStore.getState().requestRevealAgent(id);
+  // LAND the user in it (§13): leave the special (Sparkle/board) view, select, open, and scroll the
+  // new row into view. Those four steps were written out here, which is how the OTHER hand-off
+  // paths ended up with partial copies — services/sendToBuild called `open()` alone, so clicking
+  // "Start"/"Build It" on the Plan board left the user on the board with nothing visibly changed.
+  // They live in services/landInAgent now, one implementation for every path.
+  landInAgent(project.id, id);
+  // The caret is the half landInAgent deliberately leaves to the caller, and this path has earned
+  // it: the agent arrives EMPTY, so the next thing the user does is type. sendToBuild has NOT —
+  // it arrives with a seeded prompt — which is exactly why this is not folded into the helper.
   useUiStore.getState().requestComposeFocus();
   // Title the bead with the agent's (default) name so beads stay distinguishable on the board rather
   // than a row of identical placeholders. Best-effort: if the agent is removed within the sub-second

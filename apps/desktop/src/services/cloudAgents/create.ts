@@ -19,6 +19,12 @@ export interface CreateCloudAgentDeps {
   selectAgent: (projectId: string, agentId: string) => void;
   /** runtimeStore.open (mount the tab's terminal). */
   open: (agentId: string) => void;
+  /** uiStore.requestRevealAgent — scroll the new row into view. Selecting decides which pane
+   *  renders; it does not put the row where the eye is, and a cloud tab is appended to a column
+   *  that is often already taller than the viewport. Injected like the rest so this module stays
+   *  store-free (see the header): services/landInAgent is the equivalent for the local paths, and
+   *  the two must not drift — if you add a step there, add it here. */
+  reveal: (agentId: string) => void;
 }
 
 export type CreateCloudAgentResult =
@@ -70,5 +76,6 @@ export async function createCloudAgent(
   }
   deps.selectAgent(input.projectId, id);
   deps.open(id);
+  deps.reveal(id);
   return { ok: true, id };
 }

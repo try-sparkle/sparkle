@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 const addAgentMock = vi.fn();
 const appendPromptMock = vi.fn();
 const setAgentEpicIdMock = vi.fn();
+const selectAgentMock = vi.fn();
 let projects: Array<{ id: string; agents: Array<{ id: string; kind: string; epicId?: string }> }> =
   [];
 
@@ -16,6 +17,7 @@ vi.mock("../stores/projectStore", () => ({
       addAgent: addAgentMock,
       appendPrompt: appendPromptMock,
       setAgentEpicId: setAgentEpicIdMock,
+      selectAgent: selectAgentMock,
     }),
   },
 }));
@@ -25,6 +27,21 @@ vi.mock("../stores/runtimeStore", () => ({
   useRuntimeStore: { getState: () => ({ open: openMock }) },
 }));
 
+// sendToBuild reaches these through services/landInAgent, which is left REAL so these tests prove
+// the real hand-off (not a mock of it) does all four steps.
+const setActiveSpecialMock = vi.fn();
+const requestRevealAgentMock = vi.fn();
+const requestComposeFocusMock = vi.fn();
+vi.mock("../stores/uiStore", () => ({
+  useUiStore: {
+    getState: () => ({
+      setActiveSpecial: setActiveSpecialMock,
+      requestRevealAgent: requestRevealAgentMock,
+      requestComposeFocus: requestComposeFocusMock,
+    }),
+  },
+}));
+
 import { sendToBuild } from "./sendToBuild";
 
 describe("sendToBuild", () => {
@@ -32,7 +49,11 @@ describe("sendToBuild", () => {
     addAgentMock.mockReset();
     appendPromptMock.mockReset();
     setAgentEpicIdMock.mockReset();
+    selectAgentMock.mockReset();
     openMock.mockReset();
+    setActiveSpecialMock.mockReset();
+    requestRevealAgentMock.mockReset();
+    requestComposeFocusMock.mockReset();
     appendPromptMock.mockReturnValue("prompt-id");
     projects = [];
   });
@@ -77,6 +98,52 @@ describe("sendToBuild", () => {
     expect(openMock).toHaveBeenCalledWith("build1");
     expect(appendPromptMock).toHaveBeenCalledWith("proj1", "build1", expect.stringContaining("epic-7"));
     expect(setAgentEpicIdMock).toHaveBeenCalledWith("proj1", "build1", "epic-7");
+  });
+
+  // §13 — "Start"/"Build It" must LAND the user in the orchestrator. These four steps are the
+  // whole point: `open()` alone (what this used to do) mounts the pane BEHIND the Plan board and
+  // changes nothing the user can see, which is why hitting Build It read as "nothing happened".
+  describe("lands the user in the orchestrator", () => {
+    it("leaves the Plan board, selects, opens, and reveals the row on the CREATE path", () => {
+      projects = [{ id: "proj1", agents: [] }];
+      addAgentMock.mockReturnValue("build-new");
+
+      sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: "PRD/feature.md" });
+
+      // Both Build It handlers are clicked FROM the board, so activeSpecial is "board" and the
+      // board owns the pane. Without this the selection below is invisible.
+      expect(setActiveSpecialMock).toHaveBeenCalledWith(null);
+      expect(selectAgentMock).toHaveBeenCalledWith("proj1", "build-new");
+      expect(openMock).toHaveBeenCalledWith("build-new");
+      expect(requestRevealAgentMock).toHaveBeenCalledWith("build-new");
+    });
+
+    // The REUSE path was strictly worse than the create path and is the one a user hits second:
+    // with an existing orchestrator `addAgent` is never called, so not even its default
+    // `select: true` fired. Re-hitting Build It on an epic did nothing observable at all.
+    it("does the same on the REUSE path, where addAgent's default selection never fires", () => {
+      projects = [
+        { id: "proj1", agents: [{ id: "build1", kind: "build", epicId: "epic-7" }] },
+      ];
+
+      sendToBuild({ projectId: "proj1", epicId: "epic-7", prdPath: "PRD/x.md" });
+
+      expect(addAgentMock).not.toHaveBeenCalled();
+      expect(setActiveSpecialMock).toHaveBeenCalledWith(null);
+      expect(selectAgentMock).toHaveBeenCalledWith("proj1", "build1");
+      expect(requestRevealAgentMock).toHaveBeenCalledWith("build1");
+    });
+
+    // The orchestrator arrives with a seeded prompt, so there is nothing for the user to type and
+    // the caret is not ours to take — it belongs to whatever they were doing on the board.
+    it("does NOT steal the caret — the seed prompt means there is nothing to type", () => {
+      projects = [{ id: "proj1", agents: [] }];
+      addAgentMock.mockReturnValue("build-new");
+
+      sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
+
+      expect(requestComposeFocusMock).not.toHaveBeenCalled();
+    });
   });
 
   it("spawns a FRESH orchestrator when the only build agent is bound to a DIFFERENT epic", () => {

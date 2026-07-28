@@ -7,12 +7,19 @@ function deps(startSession: CreateCloudAgentDeps["api"]["startSession"]) {
   const addAgent = vi.fn((_p: string, opts: AddAgentOpts): string | null => opts.id ?? "generated");
   const selectAgent = vi.fn();
   const open = vi.fn();
-  return { d: { api: { startSession }, addAgent, selectAgent, open }, addAgent, selectAgent, open };
+  const reveal = vi.fn();
+  return {
+    d: { api: { startSession }, addAgent, selectAgent, open, reveal },
+    addAgent,
+    selectAgent,
+    open,
+    reveal,
+  };
 }
 
 describe("createCloudAgent", () => {
-  it("creates the tab with id = server session id, runtime cloud, then selects + opens it", async () => {
-    const { d, addAgent, selectAgent, open } = deps(async () => ({ sessionId: "sess-xyz" }));
+  it("creates the tab with id = server session id, runtime cloud, then selects + opens + reveals it", async () => {
+    const { d, addAgent, selectAgent, open, reveal } = deps(async () => ({ sessionId: "sess-xyz" }));
     const res = await createCloudAgent(
       { projectId: "p1", goal: "do it", repoUrl: "https://github.com/a/b", name: "Cloud A" },
       d,
@@ -26,6 +33,11 @@ describe("createCloudAgent", () => {
     });
     expect(selectAgent).toHaveBeenCalledWith("p1", "sess-xyz");
     expect(open).toHaveBeenCalledWith("sess-xyz");
+    // Selecting decides which pane renders; it does not scroll the new row on screen. Cloud tabs
+    // are appended to a column that is often taller than the viewport, so the reveal is the half
+    // that makes "the thing I just created" visible — the same claim services/landInAgent makes
+    // for every local path.
+    expect(reveal).toHaveBeenCalledWith("sess-xyz");
   });
 
   it("omits name when not supplied (leaves the tab open to auto-naming)", async () => {
@@ -91,8 +103,8 @@ describe("createCloudAgent", () => {
     expect(addAgent).not.toHaveBeenCalled();
   });
 
-  it("when the store refuses the insert (project gone) it neither selects nor opens a phantom tab", async () => {
-    const { d, selectAgent, open } = deps(async () => ({ sessionId: "sess-orphan" }));
+  it("when the store refuses the insert (project gone) it neither selects, opens, nor reveals a phantom tab", async () => {
+    const { d, selectAgent, open, reveal } = deps(async () => ({ sessionId: "sess-orphan" }));
     d.addAgent = vi.fn(() => null); // projectStore.addAgent's unknown-project return
     const res = await createCloudAgent({ projectId: "gone", goal: "g", repoUrl: "r" }, d);
     expect(res.ok).toBe(false);
@@ -100,6 +112,9 @@ describe("createCloudAgent", () => {
     if (!res.ok) expect(res.guidance.message).toMatch(/started/i);
     expect(selectAgent).not.toHaveBeenCalled();
     expect(open).not.toHaveBeenCalled();
+    // A reveal names a ROW. There is no row — scrolling to an id that was never inserted is the
+    // one thing worse than not scrolling at all.
+    expect(reveal).not.toHaveBeenCalled();
   });
 
   // The reason is the machine-readable half of that honesty: the dialog disables its Start button

@@ -5,8 +5,7 @@ import { writePty } from "../pty";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { appendNote, createTask } from "../services/projectFs";
 import { useProjectStore } from "../stores/projectStore";
-import { useRuntimeStore } from "../stores/runtimeStore";
-import { useUiStore } from "../stores/uiStore";
+import { landInAgent } from "../services/landInAgent";
 
 const ESC = "\x1b";
 const PASTE_START = `${ESC}[200~`;
@@ -59,9 +58,10 @@ export function runAsCommand(projectId: string, text: string): void {
     shellCommand: text,
   });
   if (!id) return; // project vanished (closed/removed) — nothing to select or open
-  useUiStore.getState().setActiveSpecial(null);
-  ps.selectAgent(projectId, id);
-  useRuntimeStore.getState().open(id);
+  // Leave the special view, select, open, and scroll the new shell row on screen. The reveal is
+  // new here: running a selection as a command appends a tab at the end of a column that is often
+  // already taller than the viewport, so without it the output you asked for lands off screen.
+  landInAgent(projectId, id);
 }
 
 export function searchWeb(text: string): Promise<void> {

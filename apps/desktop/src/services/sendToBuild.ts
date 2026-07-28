@@ -4,8 +4,8 @@
 // the PTY launch); and seeds it with a first prompt that points at the epic + PRD and tells it to
 // execute the epic's children following the beads protocol.
 import { useProjectStore } from "../stores/projectStore";
-import { useRuntimeStore } from "../stores/runtimeStore";
 import { beadsProtocol } from "./buildAgent";
+import { landInAgent } from "./landInAgent";
 
 export interface SendToBuildArgs {
   projectId: string;
@@ -81,8 +81,16 @@ export function sendToBuild(args: SendToBuildArgs): string {
   // AgentTab.epicId, so it shows immediately — before any worker binds to a bead.
   store.setAgentEpicId(args.projectId, agentId, args.epicId);
 
-  // Open it: mounts the pane and drives the PTY launch (same as clicking the tab).
-  useRuntimeStore.getState().open(agentId);
+  // LAND the user in it. "Start"/"Build It" are clicked FROM the Plan board, so `activeSpecial` is
+  // "board" and the board owns the pane — this used to call `open()` alone, which mounts the pane
+  // behind the board and changes nothing the user can see. On the reuse path it was worse still:
+  // with an existing orchestrator `addAgent` never runs, so not even its default selection fired
+  // and the handoff was completely invisible. landInAgent does all four steps (leave the board,
+  // select, open, reveal the row) — see its header for why they travel together.
+  //
+  // No `requestComposeFocus`: the orchestrator arrives with a seeded prompt below, so there is
+  // nothing for the user to type and the caret is not ours to take.
+  landInAgent(args.projectId, agentId);
 
   // Seed the orchestrator's first message with the epic + PRD + beads protocol.
   useProjectStore.getState().appendPrompt(args.projectId, agentId, buildSeedPrompt(args));

@@ -88,6 +88,7 @@ export function NewCloudAgentDialog({ project, onClose }: { project: Project; on
           addAgent: (_serverProjectId, opts) => ps.addAgent(project.id, opts),
           selectAgent: (_serverProjectId, agentId) => ps.selectAgent(project.id, agentId),
           open: (agentId) => useRuntimeStore.getState().open(agentId),
+          reveal: (agentId) => useUiStore.getState().requestRevealAgent(agentId),
         },
       );
 
