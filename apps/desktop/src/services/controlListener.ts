@@ -653,7 +653,19 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
   // Read defensively: this payload was assembled by a model's MCP client, and the reply has to name
   // the domain/op it was asked about even when they arrive as the wrong type.
   const domain = typeof req.payload.domain === "string" ? req.payload.domain : "";
-  const op = typeof req.payload.op === "string" ? req.payload.op : "";
+  // `toolOp`, NOT `op`. bridgeClient FLATTENS this payload into the wire envelope and writes the
+  // envelope's own reserved fields (id/token/op/callerAgentId) AFTER the spread, so an inner field
+  // called `op` was overwritten by the envelope's `op` ("concierge_tool") and then stripped by the
+  // Rust bridge as reserved. The handler read an empty string and EVERY op-dispatched tool failed
+  // with `unknown-op`, while `get_state` — which carries no inner op — worked. That shipped in
+  // v0.55.0. The `op` fallback below is read-only compatibility for an older MCP server bundled
+  // beside a newer app; it can be dropped once no such pairing exists.
+  const op =
+    typeof req.payload.toolOp === "string"
+      ? req.payload.toolOp
+      : typeof req.payload.op === "string"
+        ? req.payload.op
+        : "";
   if (req.callerAgentId !== CONCIERGE_CALLER_AGENT_ID) {
     return {
       ok: false,

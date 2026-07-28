@@ -64,7 +64,7 @@ async function call(domain: string, op: string, args: Record<string, unknown> = 
     reqId: `r-${op}`,
     op: "concierge_tool",
     callerAgentId: CONCIERGE_CALLER_AGENT_ID,
-    payload: { domain, op, args, toolCallId: `tc-${op}` },
+    payload: { domain, toolOp: op, args, toolCallId: `tc-${op}` },
   });
   await flush();
   return replies[0]?.result;
@@ -143,13 +143,29 @@ describe("the concierge tool spine, end to end (nothing below the listener is mo
     expect(result?.ok).toBe(false);
   });
 
+  it("still understands the legacy `op` field from an older bundled MCP server", async () => {
+    // v0.55.0 sent the operation as `op`, which the wire envelope ate (see
+    // apps/mcp-control/src/envelopeCollision.test.ts). A newer app can be paired with an older
+    // bundled server, so the handler keeps reading `op` as a fallback. Drop this — and the
+    // fallback — once no such pairing can exist.
+    replies.length = 0;
+    fire({
+      reqId: "r-legacy",
+      op: "concierge_tool",
+      callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+      payload: { domain: "workspace", op: "list_projects", args: {}, toolCallId: "tc-legacy" },
+    });
+    await flush();
+    expect(replies[0]?.result).toMatchObject({ ok: true, op: "list_projects" });
+  });
+
   it("is reachable ONLY by the concierge — a build agent gets nothing", async () => {
     replies.length = 0;
     fire({
       reqId: "r-forbidden",
       op: "concierge_tool",
       callerAgentId: "e4a0cd29-525c-4ce7-8214-8e0411385b5e",
-      payload: { domain: "workspace", op: "list_projects", args: {}, toolCallId: "tc-x" },
+      payload: { domain: "workspace", toolOp: "list_projects", args: {}, toolCallId: "tc-x" },
     });
     await flush();
     expect(replies[0]?.result).toMatchObject({ ok: false });
