@@ -1458,10 +1458,46 @@ fn log_worktree_op_duration(op: &'static str, elapsed: std::time::Duration, ok: 
     if worktree_op_is_slow(elapsed) {
         tracing::warn!(
             op, elapsed_ms = %ms, ok,
-            "worktree operation was slow; anything queued behind it on this project's git lock waited too"
+            "worktree operation was slow; see the matching repo-lock wait to tell queueing from work"
         );
     } else {
         tracing::info!(op, elapsed_ms = %ms, ok, "worktree operation finished");
+    }
+}
+
+/// A lock wait at or past this is worth its own line. Deliberately well under
+/// [`WORKTREE_OP_SLOW_MS`]: the point is to explain a total that has ALREADY crossed the slow
+/// threshold, so the wait has to be visible before it alone would trip that threshold. Any shorter
+/// and the ordinary contention of a fan-out teardown — every window issuing its own removal —
+/// would log continuously without telling anyone anything.
+const REPO_LOCK_WAIT_LOG_MS: u128 = 1_000;
+
+/// Is this lock wait worth a line of its own? Split out from the logging for the same reason as
+/// [`worktree_op_is_slow`] — a `tracing` call has nothing to assert against.
+fn repo_lock_wait_is_notable(waited: std::time::Duration) -> bool {
+    waited.as_millis() >= REPO_LOCK_WAIT_LOG_MS
+}
+
+/// Record how long an op sat waiting for the per-repo git lock, as a number distinct from its
+/// total.
+///
+/// [`log_worktree_op_duration`]'s clock starts in the async command, BEFORE the blocking body
+/// takes the lock — so its `elapsed_ms` is lock wait plus work, and on its own it cannot say which
+/// dominates. The warning used to assert the strong reading ("anything queued behind it waited
+/// too"), which the number does not support: a 30s removal that waited 29s for the lock did almost
+/// nothing itself and delayed nobody further.
+///
+/// The distinction picks the fix, which is why it is worth a field. A large wait means too many
+/// removals are serialized against one repo — teardown fan-out, addressed by deduplicating them.
+/// A large total-minus-wait means the deletion itself is the cost — addressed by moving the
+/// `node_modules` unlink out from under the lock. Aiming at the wrong one buys nothing.
+///
+/// Logged at INFO, not WARN: a wait is context for a warning that has already fired, not a second
+/// alarm. No path, no id — the caller has logged those.
+fn log_repo_lock_wait(op: &'static str, waited: std::time::Duration) {
+    if repo_lock_wait_is_notable(waited) {
+        let ms = waited.as_millis();
+        tracing::info!(op, waited_ms = %ms, "waited for this project's git lock before starting");
     }
 }
 
@@ -1568,6 +1604,41 @@ fn tooling_churn_to_restore(porcelain: &str) -> Option<Vec<String>> {
     Some(restore)
 }
 
+/// Whether HEAD's commits are put at risk by the park, given HEAD's branch (`None` when detached)
+/// and the agent's own branch name.
+///
+/// WHY THIS IS NARROWER THAN "HEAD HAS UNPUSHED COMMITS". The park ends in
+/// `checkout -B sparkle/agent-<id> <base>`, which moves exactly ONE ref: the agent's own branch.
+/// Every other local branch is left pointing exactly where it was. So a commit that some *other*
+/// named branch holds is still reachable by name after the park — `git log <that branch>` shows it,
+/// and it is not a candidate for gc. It was never at risk, and refusing to park over it protects
+/// nothing.
+///
+/// That distinction is the whole bug. The recurring headless pass does its work on a topic branch
+/// (`sparkle/improve-<topic>`), not on `sparkle/agent-<id>`. When a pass is killed by its watchdog —
+/// or finishes but cannot push, e.g. an unauthenticated `gh` — it leaves that topic branch checked
+/// out with commits no origin ref contains. Counting HEAD unconditionally then reads those as
+/// unpushed and declines, *and does so on every subsequent hour*: nothing ever pushes an abandoned
+/// branch, so the decline is permanent. The worktree is pinned to that branch forever, and every
+/// later pass starts from a base that drifts further behind `origin/main` — eventually past the
+/// threshold at which the desktop build refuses to build from it. This is the same shape as the
+/// `dirty` valve's own regression (see [`tooling_churn_to_restore`]): a guard against destroying
+/// work became the thing causing the staleness it exists to prevent.
+///
+/// STILL CONSERVATIVE where it counts. Two cases keep HEAD in the at-risk set:
+///   * DETACHED HEAD — no ref names those commits, so moving off them strands them outright. This
+///     is the case the valve is really for, and it stays fully protected.
+///   * HEAD ON THE AGENT'S OWN BRANCH — that is precisely the ref `checkout -B` resets, so its
+///     commits go unreachable. Unchanged from before.
+/// The agent branch is also checked independently of HEAD by the caller, so it is protected whether
+/// or not it happens to be checked out.
+fn head_is_at_risk(head_branch: Option<&str>, agent_branch: &str) -> bool {
+    match head_branch {
+        None => true,
+        Some(b) => b == agent_branch,
+    }
+}
+
 /// Summarise a `git status --porcelain` tree by STATUS CODE ONLY, for the log line that accompanies
 /// a `dirty` decline.
 ///
@@ -1626,9 +1697,13 @@ fn describe_blocking_dirt(porcelain: &str) -> String {
 /// there is provably nothing to lose:
 ///   * the worktree exists and is a real worktree (`no-worktree` otherwise),
 ///   * the tree is clean — no uncommitted or unmerged files (`dirty`),
-///   * every commit reachable from HEAD *and* from the agent's own branch already exists on some
-///     `origin/*` ref (`unpushed`) — this is the valve that protects a run which committed but
-///     could not push (e.g. an unauthenticated `gh`), and a case-by-case draft awaiting review.
+///   * every commit this park could put beyond reach already exists on some `origin/*` ref
+///     (`unpushed`) — this is the valve that protects a run which committed but could not push
+///     (e.g. an unauthenticated `gh`). That set is the agent's own branch, plus HEAD only when HEAD
+///     is detached or on the agent branch: `checkout -B` moves one ref, so a commit any OTHER named
+///     branch holds stays reachable by name and was never at risk. See [`head_is_at_risk`] for why
+///     counting HEAD unconditionally made this decline PERMANENTLY on the recurring headless
+///     worktree. A draft on a topic branch is therefore kept by that branch's ref, not by this valve.
 /// Only then does it `checkout -B` the agent branch onto the fresh base. A failed fetch is
 /// non-fatal: it falls through to the last-known `origin/<base>`, so an offline machine still gets
 /// parked (just not freshened) rather than erroring.
@@ -1691,25 +1766,50 @@ pub fn park_worktree_on_base_at(
         }
     };
 
-    // Containment check: refuse if ANY commit reachable from HEAD or from the agent's own branch is
-    // missing from every origin ref. `--not --remotes=origin` is the whole safety story — a run that
-    // committed and failed to push is indistinguishable from a run that pushed, except right here.
+    // Containment check: refuse if ANY commit this park would put beyond reach is missing from every
+    // origin ref. `--not --remotes=origin` is the whole safety story — a run that committed and
+    // failed to push is indistinguishable from a run that pushed, except right here.
     let branch = format!("sparkle/agent-{agent_id}");
     let branch_ref = format!("refs/heads/{branch}");
-    let mut tips: Vec<&str> = vec!["HEAD"];
+    let head_branch =
+        git(&wt_str, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default().trim().to_string();
+    // `--abbrev-ref` prints the literal string `HEAD` when detached; an empty result means the probe
+    // itself failed, which must not read as "on a branch".
+    let head_branch_name = match head_branch.as_str() {
+        "" | "HEAD" => None,
+        b => Some(b),
+    };
+    let mut tips: Vec<&str> = Vec::new();
+    if head_is_at_risk(head_branch_name, &branch) {
+        tips.push("HEAD");
+    }
     if git(root, &["rev-parse", "--verify", "--quiet", &branch_ref]).is_ok() {
         tips.push(branch_ref.as_str());
     }
-    let mut rev_list: Vec<&str> = vec!["rev-list", "--count"];
-    rev_list.extend_from_slice(&tips);
-    rev_list.extend_from_slice(&["--not", "--remotes=origin"]);
-    // A failure here (no origin, unborn HEAD) must read as "can't prove it's safe" → decline.
-    let unpushed: u32 = match git(&wt_str, &rev_list).ok().and_then(|s| s.trim().parse().ok()) {
-        Some(n) => n,
-        None => return Ok(ParkOutcome::declined("unpushed")),
+    // Counted here (the tree is still on the departing branch) but REPORTED only after the park
+    // actually happens — see the emit site at the end of this function.
+    let stepped_over: u32 = match head_branch_name.filter(|_| !head_is_at_risk(head_branch_name, &branch)) {
+        Some(_) => git(&wt_str, &["rev-list", "--count", "HEAD", "--not", "--remotes=origin"])
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0),
+        None => 0,
     };
-    if unpushed > 0 {
-        return Ok(ParkOutcome::declined("unpushed"));
+
+    // Nothing this park touches can strand a commit, so there is nothing to prove — and no rev-list
+    // to run, which matters because rev-list with no positive tip is an error, not a zero.
+    if !tips.is_empty() {
+        let mut rev_list: Vec<&str> = vec!["rev-list", "--count"];
+        rev_list.extend_from_slice(&tips);
+        rev_list.extend_from_slice(&["--not", "--remotes=origin"]);
+        // A failure here (no origin, unborn HEAD) must read as "can't prove it's safe" → decline.
+        let unpushed: u32 = match git(&wt_str, &rev_list).ok().and_then(|s| s.trim().parse().ok()) {
+            Some(n) => n,
+            None => return Ok(ParkOutcome::declined("unpushed")),
+        };
+        if unpushed > 0 {
+            return Ok(ParkOutcome::declined("unpushed"));
+        }
     }
 
     let base = effective_base(root, &logical, false);
@@ -1723,8 +1823,6 @@ pub fn park_worktree_on_base_at(
     // the branch too (not just the SHA) keeps the outcome honest when a topic branch happens to
     // point at the base commit.
     let head_sha = git(&wt_str, &["rev-parse", "HEAD"]).unwrap_or_default().trim().to_string();
-    let head_branch =
-        git(&wt_str, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default().trim().to_string();
     if head_sha == base_sha && head_branch == branch {
         return Ok(ParkOutcome::declined("already-fresh"));
     }
@@ -1802,6 +1900,29 @@ pub fn park_worktree_on_base_at(
         if git(&wt_str, &["checkout", "-B", &branch, &base_sha]).is_err() {
             return Ok(ParkOutcome::declined("checkout-failed"));
         }
+    }
+    // SAY WHAT WE STEPPED OVER — and only now, because only now is it true. Every path above can
+    // still decline (`unpushed` on the agent branch, `no-base`, `checkout-failed`), and a diagnostic
+    // that announces a park which then did not happen is worse than none.
+    //
+    // COUNT ONLY, NEVER THE BRANCH NAME. This runs for every agent worktree, including ones cut from
+    // a user's own repository, where a branch name is their content — the same rule
+    // `describe_blocking_dirt` follows for filenames and `park_worktree_on_base` follows for its
+    // reason token. The count is what makes the situation legible ("something was left behind, go
+    // look"); `git branch --no-merged` in that clone is what names it, and that is the caller's to
+    // run, not ours to log.
+    if stepped_over > 0 {
+        // `agent_id` and nothing more: park runs hourly for every app-owned worktree into one log
+        // stream, so a bare count says something was left behind without saying WHERE — and the
+        // follow-up this delegates to (`git branch --no-merged`) has to be run in a specific clone.
+        // It is a Sparkle-generated id, already carried by the sibling `park_worktree_on_base` line,
+        // so it identifies the worktree without naming any of its content.
+        tracing::warn!(
+            %agent_id,
+            commits = stepped_over,
+            "park: stepped over unpushed commits still held by the branch we left; \
+             they remain reachable by that branch, but nothing else records them"
+        );
     }
     Ok(ParkOutcome { parked: true, reason: "parked".into() })
 }
@@ -4006,7 +4127,11 @@ pub fn remove_worktree_at(
     // The guard is held across the whole removal — including the half-deleted-checkout recovery
     // below — so the recovery's own prune/delete is serialized against a concurrent add too.
     let gl = repo_git_lock(root);
+    // Timed because the command's own duration clock starts before this point — see
+    // [`log_repo_lock_wait`] for why separating the two is what makes the number actionable.
+    let lock_since = std::time::Instant::now();
     let _g = gl.lock().unwrap_or_else(|e| e.into_inner());
+    log_repo_lock_wait("remove_agent_worktree", lock_since.elapsed());
     match git(root, &["worktree", "remove", "--force", &wt_str]) {
         // Success is NOT proof the dir is gone. For a path git no longer recognizes as a
         // worktree it exits 0 having deleted nothing, so a "clean" teardown can still leak the
@@ -5379,6 +5504,125 @@ mod tests {
         assert!(Path::new(&wt).join("pass-work.txt").exists(), "its files must survive");
     }
 
+    /// The regression this fix exists for: a killed pass leaves its OWN topic branch checked out
+    /// with commits no origin ref contains. `checkout -B sparkle/agent-a1` does not move that
+    /// branch, so its commits stay reachable by name — nothing is at risk and the park must proceed.
+    /// Before this, the decline was permanent: nothing ever pushes an abandoned branch, so every
+    /// later hourly pass inherited a base drifting further behind `origin/main`.
+    #[test]
+    fn park_proceeds_when_the_unpushed_commits_are_held_by_another_branch() {
+        let (r, wt, app_data) = init_repo_with_origin("park-abandoned-topic");
+        git(&wt, &["checkout", "-q", "-b", "sparkle/improve-some-topic"]).unwrap();
+        std::fs::write(format!("{wt}/pass-work.txt"), "committed by a pass that was killed").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "work from a pass the watchdog killed"]).unwrap();
+        let abandoned_tip = git(&wt, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        advance_origin_main(&r, "up1");
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert!(out.parked, "an abandoned topic branch must not pin the worktree: {out:?}");
+        assert_eq!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "sparkle/agent-a1",
+            "the park must land on the agent's own branch",
+        );
+        // The point of allowing this: the commits are still there, just not checked out.
+        assert_eq!(
+            git(&r, &["rev-parse", "refs/heads/sparkle/improve-some-topic"]).unwrap().trim(),
+            abandoned_tip,
+            "the abandoned branch must still name its commits",
+        );
+    }
+
+    /// A DETACHED HEAD keeps the full protection: no ref names those commits, so parking off them
+    /// strands them outright. This is the case the valve is really for.
+    #[test]
+    fn park_still_declines_on_unpushed_commits_at_a_detached_head() {
+        let (r, wt, app_data) = init_repo_with_origin("park-detached");
+        git(&wt, &["checkout", "-q", "--detach"]).unwrap();
+        std::fs::write(format!("{wt}/loose.txt"), "reachable from nothing but HEAD").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "a commit no branch names"]).unwrap();
+        let tip = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+        advance_origin_main(&r, "up1");
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert_eq!(out, ParkOutcome::declined("unpushed"));
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip, "the commit must survive");
+    }
+
+    /// The agent's own branch is checked independently of HEAD, so unpushed work on it is protected
+    /// even while the worktree sits on some other branch — `checkout -B` would reset it.
+    #[test]
+    fn park_declines_for_the_agent_branch_even_when_head_is_elsewhere() {
+        let (r, wt, app_data) = init_repo_with_origin("park-agent-branch-offscreen");
+        std::fs::write(format!("{wt}/agent-work.txt"), "on the agent's own branch").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "unpushed work on the agent branch"]).unwrap();
+        let agent_tip = git(&wt, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        // Move HEAD onto a branch that IS fully contained in origin, leaving the agent branch behind.
+        git(&wt, &["checkout", "-q", "-b", "sparkle/improve-elsewhere", "origin/main"]).unwrap();
+        advance_origin_main(&r, "up1");
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert_eq!(out, ParkOutcome::declined("unpushed"));
+        assert_eq!(
+            git(&r, &["rev-parse", "refs/heads/sparkle/agent-a1"]).unwrap().trim(),
+            agent_tip,
+            "the ref `checkout -B` would reset must be left where it is",
+        );
+    }
+
+    /// The empty-tip-set path: HEAD on a topic branch AND no `sparkle/agent-<id>` ref at all, so
+    /// nothing this park touches can strand a commit. Worth its own test because the skip is not
+    /// merely an optimisation — `git rev-list --count --not --remotes=origin` with no positive tip
+    /// EXITS NON-ZERO, and the failure branch reads that as "can't prove it's safe" and declines.
+    /// Running it anyway would resurrect the permanent decline this commit exists to remove.
+    #[test]
+    fn park_proceeds_when_no_ref_it_touches_exists_at_all() {
+        let (r, wt, app_data) = init_repo_with_origin("park-no-agent-branch");
+        git(&wt, &["checkout", "-q", "-b", "sparkle/improve-orphan"]).unwrap();
+        std::fs::write(format!("{wt}/pass-work.txt"), "unpushed, held only by this branch").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "work from a pass that could not push"]).unwrap();
+        // Retire the agent branch, leaving nothing in the at-risk tip set.
+        git(&r, &["branch", "-D", "sparkle/agent-a1"]).unwrap();
+        assert!(
+            git(&r, &["rev-parse", "--verify", "--quiet", "refs/heads/sparkle/agent-a1"]).is_err(),
+            "precondition: the agent branch must be absent",
+        );
+        advance_origin_main(&r, "up1");
+
+        let orphan_tip = git(&r, &["rev-parse", "refs/heads/sparkle/improve-orphan"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        assert!(out.parked, "an empty tip set has nothing to prove: {out:?}");
+        // The property that MAKES parking acceptable here, not just that it happened: parking is
+        // only safe because the departing branch keeps naming its commits.
+        assert_eq!(
+            git(&r, &["rev-parse", "refs/heads/sparkle/improve-orphan"]).unwrap().trim(),
+            orphan_tip,
+            "the departing branch must survive the checkout at its tip",
+        );
+    }
+
+    #[test]
+    fn head_is_at_risk_only_when_detached_or_on_the_agent_branch() {
+        // Detached: nothing else names these commits.
+        assert!(head_is_at_risk(None, "sparkle/agent-a1"));
+        // The one ref the park resets.
+        assert!(head_is_at_risk(Some("sparkle/agent-a1"), "sparkle/agent-a1"));
+        // Any other branch survives the checkout untouched, so it puts nothing at risk.
+        assert!(!head_is_at_risk(Some("sparkle/improve-topic"), "sparkle/agent-a1"));
+        assert!(!head_is_at_risk(Some("main"), "sparkle/agent-a1"));
+        // Not a prefix match: a branch that merely starts with the agent branch's name is a
+        // different ref, and `checkout -B` does not touch it.
+        assert!(!head_is_at_risk(Some("sparkle/agent-a10"), "sparkle/agent-a1"));
+    }
+
     // Uncommitted work is even more fragile than a commit — `checkout -B` would carry or clobber it.
     #[test]
     fn park_declines_on_a_dirty_worktree() {
@@ -5585,8 +5829,11 @@ mod tests {
     fn park_proves_containment_against_a_freshly_fetched_origin() {
         let (r, wt, app_data) = init_repo_with_origin("park-pruned");
 
-        // The previous pass committed on its own topic branch and pushed it for review.
-        git(&wt, &["checkout", "-q", "-b", "sparkle/last-pass-topic"]).unwrap();
+        // The previous pass committed ON THE AGENT'S OWN BRANCH and pushed it for review under a
+        // topic name. Staying on the agent branch is load-bearing: `head_is_at_risk` excludes HEAD
+        // when it sits on any other branch, so committing on a topic branch here would empty the
+        // at-risk tip set down to the pushed initial commit and make the containment proof — and
+        // therefore this whole test — pass trivially whether or not the fetch ran first.
         std::fs::write(format!("{wt}/landed.txt"), "work that got merged").unwrap();
         git(&wt, &["add", "."]).unwrap();
         git(&wt, &["commit", "-q", "-m", "work from the previous pass"]).unwrap();
@@ -8809,5 +9056,29 @@ mod tests {
         // reaching it is already outside it.
         assert!(worktree_op_is_slow(Duration::from_millis(WORKTREE_OP_SLOW_MS as u64)));
         assert!(worktree_op_is_slow(Duration::from_secs(33)));
+    }
+
+    /// The lock-wait boundary, and the ordering property that makes the field worth logging.
+    ///
+    /// A wait only ever explains a total that has already tripped the slow threshold, so it has to
+    /// become visible strictly BEFORE it would trip that threshold on its own — otherwise the two
+    /// numbers cross at the same point and the wait can never distinguish queueing from work,
+    /// which is its whole purpose.
+    #[test]
+    fn repo_lock_wait_boundary() {
+        use std::time::Duration;
+        // Uncontended is the common case on every agent close; it must stay silent.
+        assert!(!repo_lock_wait_is_notable(Duration::from_millis(0)));
+        assert!(!repo_lock_wait_is_notable(Duration::from_millis(
+            REPO_LOCK_WAIT_LOG_MS as u64 - 1
+        )));
+        assert!(repo_lock_wait_is_notable(Duration::from_millis(
+            REPO_LOCK_WAIT_LOG_MS as u64
+        )));
+        // The case from the logs: a removal reporting ~30s total that spent nearly all of it
+        // queued behind other removals rather than deleting anything.
+        assert!(repo_lock_wait_is_notable(Duration::from_secs(29)));
+        // A notable wait must not itself require a slow total to be reported.
+        assert!(REPO_LOCK_WAIT_LOG_MS < WORKTREE_OP_SLOW_MS);
     }
 }
