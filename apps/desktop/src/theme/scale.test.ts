@@ -124,8 +124,8 @@ function offScale(prop: string, allowed: readonly number[]): { file: string; val
 // being a ratchet at all — and this failure is loud, one line to resolve, and the message says
 // which way to move. But a long-lived branch should expect to re-take this number just before it
 // merges, the way a lockfile gets refreshed.
-const MAX_OFF_SCALE_TYPE = 140;
-const MAX_OFF_SCALE_RADIUS = 61;
+const MAX_OFF_SCALE_TYPE = 139;
+const MAX_OFF_SCALE_RADIUS = 60;
 
 // EXACT, not `<=` (roborev 54238). The file told the next person to lower the ceiling when they
 // migrated, and then used a bound that cannot tell whether they did: remove twenty literals without

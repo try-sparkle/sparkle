@@ -530,6 +530,7 @@ fn concierge_mcp_config_json(
 /// Closing it properly needs peer verification at accept time (`LOCAL_PEERPID` against the pid we
 /// spawned); that is tracked as follow-up, and until it lands the guarantee is "not casually
 /// visible", NOT "unobtainable".
+#[cfg(unix)]
 fn write_concierge_mcp_config(
     dir: &std::path::Path,
     json: &str,
@@ -593,6 +594,7 @@ fn write_concierge_mcp_config(
 ///    silently degrading a live turn to observe-only. 30 minutes is far longer than any real turn
 ///    and still bounds the exposure to something finite. The file for THIS turn is skipped
 ///    outright, since we are about to write it.
+#[cfg(unix)]
 fn prune_stale_mcp_configs(dir: &std::path::Path, keep: &std::path::Path) {
     const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -623,6 +625,25 @@ fn prune_stale_mcp_configs(dir: &std::path::Path, keep: &std::path::Path) {
 /// bundled, bridge won't bind). A concierge that can still SEE and ADVISE is far better than a
 /// turn that fails outright, so a missing control surface degrades to the old observe-only
 /// posture and logs why.
+/// WINDOWS: there is no control surface to hand the concierge, so the turn runs observe-only.
+///
+/// The concierge's control bridge is a UNIX-DOMAIN SOCKET, and `lib.rs` already swaps the whole
+/// `bridge` module for `bridge_windows.rs` on this target — a stub whose every entry point returns
+/// "not yet supported on Windows (Phase-2 follow-up)". Referencing the Unix-only surface from this
+/// file broke the Windows build (4 compile errors) while macOS stayed green, because nothing here
+/// was platform-gated even though everything it calls is.
+///
+/// Degrading to `None` is the SAME path a missing node / unbundled server / unbindable socket
+/// already takes, so the concierge still sees and advises; it simply cannot act. When the bridge
+/// gains a Windows transport (named pipe or localhost TCP), delete this arm — the rest of the file
+/// is already platform-agnostic.
+#[cfg(not(unix))]
+fn resolve_concierge_mcp_config(_app: &AppHandle, _turn_token: u64) -> Option<std::path::PathBuf> {
+    tracing::info!("concierge control surface unavailable on this platform; observe-only turn");
+    None
+}
+
+#[cfg(unix)]
 fn resolve_concierge_mcp_config(app: &AppHandle, turn_token: u64) -> Option<std::path::PathBuf> {
     let manager = app.try_state::<crate::bridge::ControlBridgeManager>()?;
     let (sock, token) = match crate::bridge::start_concierge_control_bridge_at(
@@ -1502,6 +1523,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn prune_never_deletes_a_still_live_turns_config() {
         // roborev 54255, finding 2. The prune runs before the child spawns and before the slot
@@ -1525,6 +1547,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn each_turn_gets_its_own_config_file() {
         // Two overlapping turns must not share one path: a superseded turn's child may not have
@@ -1541,6 +1564,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn stale_configs_are_pruned_but_fresh_ones_survive() {
         use std::os::unix::fs::PermissionsExt as _;
