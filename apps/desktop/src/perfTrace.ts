@@ -293,6 +293,59 @@ export function renderCounts(): Record<string, number> {
   return out;
 }
 
+/** How many components a stall line names. Three fits the line and covers the realistic case — one
+ *  runaway component, occasionally a parent/child pair that thrash together. */
+const STALL_RENDER_TOP_N = 3;
+
+/** Shortest gap between two render baselines taken by the jank monitor. Bounds the monitor's own
+ *  allocation to ~5 Maps/sec instead of one per frame. */
+const RENDER_BASELINE_MIN_MS = 200;
+
+/** Cumulative render counts collapsed to the COMPONENT, with the per-key tail dropped.
+ *
+ *  `renderStats` is keyed `"Component:key"` and the key half is an agent id or a path, so it can
+ *  never reach the shared log — the same rule {@link openTraceKinds} follows. Collapsing here rather
+ *  than at the call site means the caller has nothing sensitive to forget to strip.
+ *
+ *  A Map (not a Record) because the jank monitor holds one of these as a baseline across frames and
+ *  only ever diffs it; there is no reason to pay for a prototype. */
+export function renderTotalsByComponent(): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const [id, stat] of renderStats) {
+    const sep = id.indexOf(":");
+    // Defensive: a caller that passed an empty component would otherwise bucket under "".
+    const component = sep > 0 ? id.slice(0, sep) : id;
+    out.set(component, (out.get(component) ?? 0) + stat.count);
+  }
+  return out;
+}
+
+/** Components that rendered between two {@link renderTotalsByComponent} snapshots, busiest first,
+ *  as `"AgentPane×42, Sidebar×7"` — or undefined when nothing rendered.
+ *
+ *  Pure and exported for its test. Only the top `topN` are named: the point is to finger the one or
+ *  two components that burned the frame, and a full list would put a hundred names in a log line.
+ *  A component present only in `after` counts its whole total (it mounted inside the window). */
+export function renderBurst(
+  before: Map<string, number>,
+  after: Map<string, number>,
+  topN = STALL_RENDER_TOP_N,
+): string | undefined {
+  const deltas: Array<[string, number]> = [];
+  for (const [component, count] of after) {
+    const delta = count - (before.get(component) ?? 0);
+    if (delta > 0) deltas.push([component, delta]);
+  }
+  if (deltas.length === 0) return undefined;
+  // Ties broken by name so the line is stable across runs — a log a human diffs should not reorder
+  // for reasons that are really Map insertion order.
+  deltas.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  return deltas
+    .slice(0, topN)
+    .map(([component, n]) => (n > 1 ? `${component}×${n}` : component))
+    .join(", ");
+}
+
 /** Expose the gate + counters on `window.sparklePerf` for devtools. A debug flag you cannot reach
  *  without a rebuild is not a debug flag, and the counters are what make logging-off tolerable:
  *  `sparklePerf.counts()` answers "which pane is thrashing?" with zero IPC. Called once at startup;
@@ -600,6 +653,14 @@ export function startJankMonitor(thresholdMs = 150, windowLabel = "main"): void 
     minorTotalMs = 0;
     minorMaxMs = 0;
   };
+  // Render baseline for stall attribution: the counts as of the last healthy frame, so a severe
+  // stall can be diffed against them (see the `rendered` field below). Refreshed on healthy frames
+  // only, and at most every RENDER_BASELINE_MIN_MS — an unthrottled refresh would allocate a Map per
+  // frame, which is a strange thing for a jank monitor to do. The cost of the throttle is that the
+  // diff may include up to that much healthy time; at 200ms against a stall of 1s or more, the
+  // handful of ordinary renders that adds does not change which component is on top.
+  let renderBase = renderTotalsByComponent();
+  let renderBaseAt = last;
   const tick = () => {
     const now = perfNow();
     const gap = now - last;
@@ -632,11 +693,23 @@ export function startJankMonitor(thresholdMs = 150, windowLabel = "main"): void 
         // rollup covering many frames, so a single snapshot of what was open would be attributing
         // one window's worth of stalls to whatever happened to be in flight at flush time.
         const during = openTraceKinds();
+        // `rendered` is what `during` cannot answer. An interaction trace only exists while someone
+        // is driving the UI, so a stall from a background poll or a periodic timer reports no
+        // `during` at all — which is the majority of them in a real session, and leaves a
+        // once-a-minute second-long freeze with nothing in the line to chase. React work is the
+        // usual body of such a freeze, and the render counters already tally it unconditionally
+        // (see perfRender), so diffing them across the gap names the component for free.
+        //
+        // A CORRELATION HINT, exactly as `during` is: these components rendered inside the frozen
+        // frame, which is not proof they froze it — a stall with an unrelated cause still catches
+        // whatever rendered alongside it.
+        const rendered = renderBurst(renderBase, renderTotalsByComponent());
         log.warn("perf", "jank stall", {
           ms: Math.round(gap),
           heapMb: heapMb(),
           win: windowLabel,
           ...(during ? { during } : {}),
+          ...(rendered ? { rendered } : {}),
         });
       } else {
         if (minorCount === 0) openedAt = now;
@@ -649,6 +722,14 @@ export function startJankMonitor(thresholdMs = 150, windowLabel = "main"): void 
     // window is hidden there are no new stalls to report anyway — a pending rollup simply waits for
     // the return, which is also when a reader would care about it.
     if (minorCount > 0 && now - openedAt >= JANK_ROLLUP_MS) flushMinors(now);
+    // Close the attribution window. One condition covers both jobs it has: a healthy stretch past
+    // the throttle gets a fresh baseline, and the tick that just REPORTED a stall re-baselines here
+    // too — its own gap is necessarily larger than the throttle, so the next stall is diffed from
+    // this frame rather than re-reporting renders already attributed to this one.
+    if (now - renderBaseAt >= RENDER_BASELINE_MIN_MS) {
+      renderBase = renderTotalsByComponent();
+      renderBaseAt = now;
+    }
     requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
